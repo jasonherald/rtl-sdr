@@ -16,6 +16,9 @@ const TAP_COUNT_FACTOR: f64 = 3.8;
 /// Tolerance for detecting singular points in RRC formula.
 const RRC_SINGULARITY_EPS: f64 = 1e-12;
 
+/// Maximum allowed tap count to prevent unreasonable allocations.
+const MAX_TAP_COUNT: usize = 1_000_000;
+
 /// Estimate the number of FIR filter taps needed for a given transition width.
 ///
 /// Ports SDR++ `dsp::taps::estimateTapCount`.
@@ -29,7 +32,13 @@ const RRC_SINGULARITY_EPS: f64 = 1e-12;
 pub fn estimate_tap_count(transition_width: f64, sample_rate: f64) -> Result<usize, DspError> {
     validate_positive_finite(transition_width, "transition_width")?;
     validate_positive_finite(sample_rate, "sample_rate")?;
-    Ok((TAP_COUNT_FACTOR * sample_rate / transition_width) as usize)
+    let count = (TAP_COUNT_FACTOR * sample_rate / transition_width) as usize;
+    if count > MAX_TAP_COUNT {
+        return Err(DspError::InvalidParameter(format!(
+            "estimated tap count ({count}) exceeds maximum ({MAX_TAP_COUNT})"
+        )));
+    }
+    Ok(count)
 }
 
 /// Generate lowpass FIR filter taps using windowed sinc method.
@@ -339,6 +348,28 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map_or(0, |(i, _)| i);
         assert_eq!(peak, center, "peak should be at center tap");
+    }
+
+    #[test]
+    fn test_root_raised_cosine_limit_branch() {
+        // beta=0.625, symbol_rate=9600, sample_rate=48000 -> ts=5.0, limit=2.0
+        // With count=5, half=2.5, tap indices 0..5 give t = -2.0, -1.0, 0.0, 1.0, 2.0
+        // t=±2.0 exactly hits the limit-point singular branch
+        let taps = root_raised_cosine(5, 0.625, 9600.0, TEST_SAMPLE_RATE).unwrap();
+        assert_eq!(taps.len(), 5);
+        // Limit-point taps (first and last) should be finite and non-zero
+        assert!(
+            taps[0].is_finite() && taps[0] != 0.0,
+            "limit tap is {}",
+            taps[0]
+        );
+        assert!(
+            taps[4].is_finite() && taps[4] != 0.0,
+            "limit tap is {}",
+            taps[4]
+        );
+        // Should be symmetric
+        assert_symmetric(&taps);
     }
 
     #[test]
