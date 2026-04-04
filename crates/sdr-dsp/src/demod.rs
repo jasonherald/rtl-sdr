@@ -189,11 +189,12 @@ impl FmDemod {
     }
 }
 
-/// Broadcast FM demodulator — wideband FM with deemphasis.
+/// Broadcast FM demodulator — wideband FM discrimination stage.
 ///
-/// Ports the mono path of SDR++ `dsp::demod::BroadcastFM`. Uses quadrature
-/// discrimination with deviation set for broadcast FM (75kHz). Stereo decode
-/// and RDS are handled at the radio module level.
+/// Ports the discrimination stage of SDR++ `dsp::demod::BroadcastFM`.
+/// Uses quadrature discrimination with deviation set for broadcast FM (75kHz).
+/// Deemphasis filtering, stereo decode, and RDS are handled at the radio
+/// module level (`sdr-radio`), not in this discriminator.
 pub struct BroadcastFmDemod {
     quad: Quadrature,
 }
@@ -232,9 +233,11 @@ impl BroadcastFmDemod {
 
 /// SSB demodulator — single-sideband demodulation via frequency translation.
 ///
-/// Ports SDR++ `dsp::demod::SSB`. Extracts real audio from a complex
-/// baseband SSB signal. For USB, the signal is already at baseband.
-/// For LSB, the spectrum is conjugated (negated imaginary) before extraction.
+/// Ports SDR++ `dsp::demod::SSB`. Extracts audio from a complex baseband
+/// SSB signal using Hilbert-style demodulation:
+/// - USB: `re + im` (selects upper sideband)
+/// - LSB: `re - im` (selects lower sideband via spectrum flip)
+/// - DSB: `re` (both sidebands, no sideband selection)
 pub struct SsbDemod {
     mode: SsbMode,
 }

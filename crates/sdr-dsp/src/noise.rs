@@ -99,14 +99,14 @@ impl NoiseBlanker {
     ///
     /// Returns `DspError::InvalidParameter` if `rate` is not in (0, 1) or `level` is non-positive.
     pub fn new(rate: f32, level: f32) -> Result<Self, DspError> {
-        if rate <= 0.0 || rate >= 1.0 {
+        if !rate.is_finite() || rate <= 0.0 || rate >= 1.0 {
             return Err(DspError::InvalidParameter(format!(
-                "rate must be in (0, 1), got {rate}"
+                "rate must be finite and in (0, 1), got {rate}"
             )));
         }
-        if level <= 0.0 {
+        if !level.is_finite() || level < 1.0 {
             return Err(DspError::InvalidParameter(format!(
-                "level must be positive, got {level}"
+                "level must be finite and >= 1.0, got {level}"
             )));
         }
         Ok(Self {
@@ -164,24 +164,19 @@ impl NoiseBlanker {
 /// frequency bin and reconstructs the signal from that bin only, effectively
 /// removing noise from narrow FM signals.
 ///
-/// Note: This is a simplified version that operates per-sample with a sliding
-/// window. For the full FFT-based version, use with the `fft` module.
+/// Note: Currently a passthrough stub. The full FFT-based implementation
+/// will be added during pipeline integration when the FFT engine is available.
 pub struct FmIfNoiseReduction {
-    enabled: bool,
+    _private: (),
 }
 
 impl FmIfNoiseReduction {
-    /// Create a new FM IF noise reduction processor.
+    /// Create a new FM IF noise reduction processor (passthrough stub).
     pub fn new() -> Self {
-        Self { enabled: true }
+        Self { _private: () }
     }
 
-    /// Enable or disable the noise reduction.
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-
-    /// Process complex samples. When disabled, acts as passthrough.
+    /// Process complex samples. Currently acts as passthrough.
     ///
     /// # Errors
     ///
@@ -252,7 +247,9 @@ mod tests {
     fn test_blanker_new_invalid() {
         assert!(NoiseBlanker::new(0.0, 5.0).is_err());
         assert!(NoiseBlanker::new(1.0, 5.0).is_err());
-        assert!(NoiseBlanker::new(0.1, 0.0).is_err());
+        assert!(NoiseBlanker::new(0.1, 0.5).is_err()); // level < 1.0
+        assert!(NoiseBlanker::new(f32::NAN, 5.0).is_err());
+        assert!(NoiseBlanker::new(0.1, f32::NAN).is_err());
     }
 
     #[test]
