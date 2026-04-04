@@ -61,8 +61,8 @@ impl FftEngine for RustFftEngine {
         }
 
         // Safety: Complex and RustFftComplex<f32> have identical memory layout
-        // (two contiguous f32 fields). Both are #[repr(C)] / repr(transparent)
-        // compatible. We reinterpret the slice in-place to avoid copying.
+        // (two contiguous f32 fields, both #[repr(C)], same field order: re/im).
+        // We reinterpret the slice in-place to avoid copying.
         //
         // This is the standard approach for bridging SDR complex types with
         // rustfft's num_complex::Complex<f32>.
@@ -227,5 +227,13 @@ mod tests {
             std::mem::align_of::<Complex>(),
             std::mem::align_of::<RustFftComplex<f32>>()
         );
+
+        // Verify field order matches: re at offset 0, im at offset 1 (in f32 units)
+        let c = Complex::new(1.0, 2.0);
+        let c_ptr = std::ptr::from_ref(&c).cast::<f32>();
+        let re_ptr = std::ptr::from_ref(&c.re);
+        let im_ptr = std::ptr::from_ref(&c.im);
+        assert_eq!(re_ptr, c_ptr, "re should be first field");
+        assert_eq!(im_ptr, c_ptr.wrapping_add(1), "im should be second field");
     }
 }
