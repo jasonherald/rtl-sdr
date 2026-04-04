@@ -33,6 +33,11 @@ pub fn estimate_tap_count(transition_width: f64, sample_rate: f64) -> Result<usi
     validate_positive_finite(transition_width, "transition_width")?;
     validate_positive_finite(sample_rate, "sample_rate")?;
     let count = (TAP_COUNT_FACTOR * sample_rate / transition_width) as usize;
+    if count == 0 {
+        return Err(DspError::InvalidParameter(
+            "transition_width too large for sample_rate — estimated 0 taps".to_string(),
+        ));
+    }
     if count > MAX_TAP_COUNT {
         return Err(DspError::InvalidParameter(format!(
             "estimated tap count ({count}) exceeds maximum ({MAX_TAP_COUNT})"
@@ -278,6 +283,8 @@ mod tests {
         assert!(estimate_tap_count(f64::NAN, TEST_SAMPLE_RATE).is_err());
         assert!(estimate_tap_count(f64::INFINITY, TEST_SAMPLE_RATE).is_err());
         assert!(estimate_tap_count(f64::NEG_INFINITY, TEST_SAMPLE_RATE).is_err());
+        // Large transition_width producing zero taps
+        assert!(estimate_tap_count(1_000_000.0, 1_000.0).is_err());
     }
 
     #[test]
