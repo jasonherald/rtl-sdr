@@ -27,9 +27,9 @@ impl Quadrature {
     ///
     /// Returns `DspError::InvalidParameter` if `deviation` is zero or non-finite.
     pub fn new(deviation: f32) -> Result<Self, DspError> {
-        if !deviation.is_finite() || deviation == 0.0 {
+        if !deviation.is_finite() || deviation <= 0.0 {
             return Err(DspError::InvalidParameter(format!(
-                "deviation must be non-zero and finite, got {deviation}"
+                "deviation must be positive and finite, got {deviation}"
             )));
         }
         Ok(Self {
@@ -343,11 +343,10 @@ impl CwDemod {
             });
         }
         for (i, &s) in input.iter().enumerate() {
-            // Mix with BFO
+            // Mix with BFO and extract real part directly:
+            // Re(s * bfo) = s.re * cos - s.im * sin
             let (sin, cos) = self.bfo_phase.sin_cos();
-            let bfo = Complex::new(cos, sin);
-            let mixed = s * bfo;
-            output[i] = mixed.re;
+            output[i] = s.re * cos - s.im * sin;
             // Advance BFO phase
             self.bfo_phase += self.bfo_phase_inc;
             self.bfo_phase = math::normalize_phase(self.bfo_phase);
