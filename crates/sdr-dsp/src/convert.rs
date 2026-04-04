@@ -113,10 +113,10 @@ pub fn lr_to_stereo(left: &[f32], right: &[f32], output: &mut [Stereo]) -> Resul
     Ok(left.len())
 }
 
-/// Reinterpret complex samples as stereo (re → L, im → R).
+/// Convert complex samples to stereo (re → L, im → R).
 ///
-/// Ports SDR++ `dsp::convert::ComplexToStereo`. This is a direct memory
-/// reinterpretation since both types have identical layout (two f32 fields).
+/// Ports SDR++ `dsp::convert::ComplexToStereo`. Maps re to left channel
+/// and im to right channel via explicit field assignment.
 ///
 /// # Errors
 ///
@@ -200,7 +200,11 @@ mod tests {
         let left = [1.0_f32, 2.0];
         let right = [3.0_f32];
         let mut output = [Stereo::default(); 2];
-        assert!(lr_to_stereo(&left, &right, &mut output).is_err());
+        let err = lr_to_stereo(&left, &right, &mut output).unwrap_err();
+        assert!(
+            matches!(err, DspError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
     }
 
     #[test]
@@ -239,7 +243,11 @@ mod tests {
     fn test_buffer_too_small() {
         let input = [Complex::default(); 5];
         let mut output = [0.0_f32; 3];
-        assert!(complex_to_real(&input, &mut output).is_err());
+        let err = complex_to_real(&input, &mut output).unwrap_err();
+        assert!(
+            matches!(err, DspError::BufferTooSmall { need: 5, got: 3 }),
+            "expected BufferTooSmall {{need: 5, got: 3}}, got {err:?}"
+        );
     }
 
     #[test]
