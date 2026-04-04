@@ -38,6 +38,10 @@ pub fn sinc(x: f64) -> f64 {
 /// Ports SDR++ `dsp::math::fastAtan2`. Note: SDR++ parameter order is
 /// `fastAtan2(x, y)` where x=real, y=imag — this matches that convention.
 /// Worst-case error ~0.07 radians.
+///
+/// Note: `Complex::fast_phase` in sdr-types uses the same algorithm inline.
+/// Duplication is intentional — sdr-types cannot depend on sdr-dsp, and
+/// `Complex::fast_phase` avoids the function call overhead in tight loops.
 #[inline]
 pub fn fast_atan2(x: f32, y: f32) -> f32 {
     let abs_y = y.abs();
@@ -61,6 +65,8 @@ mod tests {
 
     const EPS_F32: f32 = 1e-6;
     const EPS_F64: f64 = 1e-10;
+    const TEST_SAMPLE_RATE: f64 = 48_000.0;
+    const FAST_ATAN2_MAX_ERROR: f32 = 0.08;
 
     fn approx_eq_f32(a: f32, b: f32) -> bool {
         (a - b).abs() < EPS_F32
@@ -73,11 +79,14 @@ mod tests {
     #[test]
     fn test_hz_to_rads() {
         // Nyquist frequency should give pi radians/sample
-        assert!(approx_eq_f64(hz_to_rads(24000.0, 48000.0), PI));
+        assert!(approx_eq_f64(hz_to_rads(24_000.0, TEST_SAMPLE_RATE), PI));
         // DC should give 0
-        assert!(approx_eq_f64(hz_to_rads(0.0, 48000.0), 0.0));
+        assert!(approx_eq_f64(hz_to_rads(0.0, TEST_SAMPLE_RATE), 0.0));
         // Quarter sample rate should give pi/2
-        assert!(approx_eq_f64(hz_to_rads(12000.0, 48000.0), PI / 2.0));
+        assert!(approx_eq_f64(
+            hz_to_rads(12_000.0, TEST_SAMPLE_RATE),
+            PI / 2.0
+        ));
     }
 
     #[test]
@@ -137,7 +146,10 @@ mod tests {
             let fast = fast_atan2(*x, *y);
             let exact = y.atan2(*x);
             let diff = (fast - exact).abs();
-            assert!(diff < 0.08, "fast_atan2 error {diff} for ({x}, {y})");
+            assert!(
+                diff < FAST_ATAN2_MAX_ERROR,
+                "fast_atan2 error {diff} for ({x}, {y})"
+            );
         }
         // Zero returns zero
         assert_eq!(fast_atan2(0.0, 0.0), 0.0);
