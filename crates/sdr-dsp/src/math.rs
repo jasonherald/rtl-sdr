@@ -100,11 +100,11 @@ mod tests {
             normalize_phase(5.0 * core::f32::consts::PI),
             core::f32::consts::PI
         ));
-        // Multi-wrap negative: -5*pi should normalize to pi (or -pi mapped to pi)
+        // Multi-wrap negative: -5*pi should normalize to pi (not -pi per contract)
         let result = normalize_phase(-5.0 * core::f32::consts::PI);
         assert!(
-            approx_eq_f32(result, core::f32::consts::PI)
-                || approx_eq_f32(result, -core::f32::consts::PI),
+            approx_eq_f32(result, core::f32::consts::PI),
+            "expected pi, got {result}"
         );
         // Zero stays zero
         assert!(approx_eq_f32(normalize_phase(0.0), 0.0));
