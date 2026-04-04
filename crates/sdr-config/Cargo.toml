@@ -1,0 +1,17 @@
+[package]
+name = "sdr-config"
+version = "0.1.0"
+description = "JSON configuration persistence"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

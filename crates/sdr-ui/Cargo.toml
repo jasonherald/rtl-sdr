@@ -1,0 +1,27 @@
+[package]
+name = "sdr-ui"
+version = "0.1.0"
+description = "GTK4 + libadwaita UI — waterfall, FFT, VFO controls"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+sdr-dsp.workspace = true
+sdr-pipeline.workspace = true
+sdr-config.workspace = true
+sdr-radio.workspace = true
+sdr-source-rtlsdr.workspace = true
+sdr-source-network.workspace = true
+sdr-source-file.workspace = true
+sdr-sink-audio.workspace = true
+sdr-sink-network.workspace = true
+gtk4.workspace = true
+libadwaita.workspace = true
+glow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

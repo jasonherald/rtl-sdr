@@ -1,0 +1,18 @@
+[package]
+name = "sdr-source-file"
+version = "0.1.0"
+description = "WAV file IQ playback source module"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+sdr-pipeline.workspace = true
+sdr-config.workspace = true
+hound.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

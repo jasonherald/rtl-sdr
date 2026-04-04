@@ -1,0 +1,15 @@
+[package]
+name = "sdr-rtlsdr"
+version = "0.1.0"
+description = "Pure Rust port of librtlsdr — RTL2832U USB control and tuner drivers"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

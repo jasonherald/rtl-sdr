@@ -1,0 +1,13 @@
+[package]
+name = "sdr-types"
+version = "0.1.0"
+description = "Foundation types, errors, and constants for sdr-rs"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

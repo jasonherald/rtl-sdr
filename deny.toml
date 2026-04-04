@@ -1,0 +1,79 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[output]
+feature-depth = 1
+
+# =============================================================================
+# Advisories — check for known vulnerabilities
+# =============================================================================
+[advisories]
+ignore = []
+
+# =============================================================================
+# Licenses — only allow known-good open source licenses
+# =============================================================================
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "LGPL-2.0-or-later",
+    "LGPL-2.1-or-later",
+    "LGPL-3.0-or-later",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+# =============================================================================
+# Bans — prevent unwanted or duplicate crates
+# =============================================================================
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = [
+    # AGPL-licensed — incompatible with MIT
+    { crate = "sieve-rs", reason = "AGPL-3.0 licensed" },
+    # OpenSSL/native-tls banned — no C TLS dependencies
+    { crate = "openssl", reason = "OpenSSL is disallowed in this workspace" },
+    { crate = "openssl-sys", reason = "OpenSSL is disallowed in this workspace" },
+    { crate = "native-tls", reason = "native-tls is disallowed; use rustls if needed" },
+]
+skip = []
+skip-tree = []
+
+# =============================================================================
+# Sources — only allow crates from crates.io
+# =============================================================================
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

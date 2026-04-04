@@ -1,0 +1,15 @@
+[package]
+name = "sdr-dsp"
+version = "0.1.0"
+description = "Pure DSP library: math, filters, FFT, demodulation, resampling"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+rustfft.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

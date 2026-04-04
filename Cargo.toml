@@ -1,0 +1,113 @@
+[package]
+name = "sdr"
+version = "0.1.0"
+description = "Software-defined radio application — Rust port of SDR++"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-ui.workspace = true
+sdr-pipeline.workspace = true
+sdr-config.workspace = true
+sdr-radio.workspace = true
+sdr-source-rtlsdr.workspace = true
+sdr-source-network.workspace = true
+sdr-source-file.workspace = true
+sdr-sink-audio.workspace = true
+sdr-sink-network.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow.workspace = true
+gtk4.workspace = true
+libadwaita.workspace = true
+
+[lints]
+workspace = true
+
+[workspace]
+resolver = "3"
+members = [
+    ".",
+    "crates/sdr-types",
+    "crates/sdr-dsp",
+    "crates/sdr-pipeline",
+    "crates/sdr-rtlsdr",
+    "crates/sdr-source-rtlsdr",
+    "crates/sdr-source-network",
+    "crates/sdr-source-file",
+    "crates/sdr-sink-audio",
+    "crates/sdr-sink-network",
+    "crates/sdr-radio",
+    "crates/sdr-config",
+    "crates/sdr-ui",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/jasonherald/rtl-sdr"
+
+[workspace.dependencies]
+# Internal crates
+sdr-types = { path = "crates/sdr-types" }
+sdr-dsp = { path = "crates/sdr-dsp" }
+sdr-pipeline = { path = "crates/sdr-pipeline" }
+sdr-rtlsdr = { path = "crates/sdr-rtlsdr" }
+sdr-source-rtlsdr = { path = "crates/sdr-source-rtlsdr" }
+sdr-source-network = { path = "crates/sdr-source-network" }
+sdr-source-file = { path = "crates/sdr-source-file" }
+sdr-sink-audio = { path = "crates/sdr-sink-audio" }
+sdr-sink-network = { path = "crates/sdr-sink-network" }
+sdr-radio = { path = "crates/sdr-radio" }
+sdr-config = { path = "crates/sdr-config" }
+sdr-ui = { path = "crates/sdr-ui" }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# FFT
+rustfft = "6"
+
+# USB
+rusb = "0.9"
+
+# Audio (Linux)
+# pipewire = "0.8"
+
+# WAV files
+hound = "3"
+
+# GTK4 / UI
+gtk4 = { version = "0.11", features = ["v4_10"] }
+libadwaita = { version = "0.9", features = ["v1_5"] }
+glow = "0.16"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow common patterns that pedantic flags unnecessarily
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Flag unwrap/panic in library code
+unwrap_used = "warn"
+panic = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
