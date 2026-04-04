@@ -3,10 +3,10 @@
 all: lint
 
 build:
-	cargo build --workspace
+	cargo build --workspace --locked
 
 test:
-	cargo test --workspace
+	cargo test --workspace --locked
 
 clippy:
 	cargo clippy --all-targets --workspace -- -D warnings
