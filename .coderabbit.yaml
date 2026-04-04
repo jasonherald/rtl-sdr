@@ -1,0 +1,96 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+tone_instructions: "Professional and concise. Prioritize idiomatic Rust, correctness, performance, and GTK4/libadwaita best practices. This is a real-time DSP application — flag any potential performance issues in hot paths, unnecessary allocations in signal processing, or thread safety concerns."
+
+reviews:
+  profile: "assertive"
+  high_level_summary: true
+  sequence_diagrams: false
+  poem: false
+  collapse_walkthrough: false
+  changed_files_summary: true
+
+  path_filters:
+    - "!target/**"
+    - "!original/**"
+
+  path_instructions:
+    - path: "crates/sdr-types/**"
+      instructions: |
+        Foundation types crate. Verify:
+        - Complex and Stereo types implement Copy, Send, Sync
+        - Arithmetic operator implementations are correct (especially Complex multiply)
+        - No unnecessary allocations in type conversions
+        - Error types use thiserror with descriptive messages
+    - path: "crates/sdr-dsp/**"
+      instructions: |
+        Pure DSP library — no threading, no I/O. Verify:
+        - All functions are pure: no side effects, no thread spawning, no I/O
+        - DSP processors use process(input, output) -> usize pattern
+        - No unnecessary allocations in hot paths (filters, FFT, demod)
+        - Numerical accuracy: check for potential precision loss in filter calculations
+        - Window functions sum to expected values
+        - FIR tap generation produces symmetric taps for linear phase
+    - path: "crates/sdr-pipeline/**"
+      instructions: |
+        Threading and streaming infrastructure. Verify:
+        - Stream<T> double-buffer swap has correct mutex/condvar usage (no deadlocks)
+        - Stop semantics: stopWriter/stopReader properly unblock waiting threads
+        - No data races: all shared state protected
+        - Block trait implementations properly join worker threads on stop
+        - Chain rewiring is correct when processors are disabled
+    - path: "crates/sdr-rtlsdr/**"
+      instructions: |
+        Pure Rust librtlsdr port. Verify:
+        - USB control transfers use correct register addresses and values
+        - I2C communication matches original C implementation exactly
+        - Tuner register sequences match hardware datasheets
+        - Device handle properly cleaned up on Drop
+        - Async bulk transfer callbacks don't leak memory
+        - unsafe blocks (if any for USB) are minimal and well-documented
+    - path: "crates/sdr-ui/**"
+      instructions: |
+        GTK4/libadwaita UI. Verify:
+        - All GTK widget access is on the main thread
+        - DSP-to-UI communication uses glib channels, never direct widget access from threads
+        - OpenGL rendering in GtkGLArea follows GTK4 lifecycle (realize/unrealize/render signals)
+        - No Rc<RefCell<>> patterns — use GTK4 object model
+        - Paper UI design: proper spacing, rounded corners, consistent styling
+    - path: "crates/**"
+      instructions: |
+        General rules for all crates:
+        - No unwrap() in library code (use proper error handling)
+        - No panic! in library code
+        - Library crates must use thiserror for error types (not anyhow)
+        - Use tracing for logging, never println!
+        - Named constants for magic numbers
+        - Tests at file bottom in #[cfg(test)] mod tests
+
+  tools:
+    clippy:
+      enabled: true
+    gitleaks:
+      enabled: true
+    markdownlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    actionlint:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: "local"
+  issues:
+    scope: "local"
+  pull_requests:
+    scope: "local"
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true

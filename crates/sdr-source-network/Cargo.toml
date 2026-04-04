@@ -1,0 +1,17 @@
+[package]
+name = "sdr-source-network"
+version = "0.1.0"
+description = "TCP/UDP network IQ source module"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+sdr-pipeline.workspace = true
+sdr-config.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

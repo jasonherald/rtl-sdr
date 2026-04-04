@@ -1,0 +1,20 @@
+[package]
+name = "sdr-sink-audio"
+version = "0.1.0"
+description = "Audio output sink — PipeWire (Linux) / CoreAudio (macOS)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+sdr-pipeline.workspace = true
+sdr-config.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# [target.'cfg(target_os = "linux")'.dependencies]
+# pipewire.workspace = true
+
+[lints]
+workspace = true

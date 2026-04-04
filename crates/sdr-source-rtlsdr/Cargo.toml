@@ -1,0 +1,18 @@
+[package]
+name = "sdr-source-rtlsdr"
+version = "0.1.0"
+description = "RTL-SDR USB source module"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+sdr-pipeline.workspace = true
+sdr-rtlsdr.workspace = true
+sdr-config.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
