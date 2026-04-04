@@ -1,4 +1,4 @@
-.PHONY: all build test clippy fmt fmt-check lint deny audit clean
+.PHONY: all build test clippy fmt fmt-check lint deny audit clean install
 
 all: lint
 
@@ -23,7 +23,10 @@ deny:
 audit:
 	cargo audit
 
-lint: fmt-check clippy test deny
+lint: fmt-check clippy test deny audit
 
 clean:
 	cargo clean
+
+install: build
+	cargo install --path .

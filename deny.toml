@@ -61,6 +61,10 @@ allow = []
 deny = [
     # AGPL-licensed — incompatible with MIT
     { crate = "sieve-rs", reason = "AGPL-3.0 licensed" },
+    # OpenSSL/native-tls banned — no C TLS dependencies
+    { crate = "openssl", reason = "OpenSSL is disallowed in this workspace" },
+    { crate = "openssl-sys", reason = "OpenSSL is disallowed in this workspace" },
+    { crate = "native-tls", reason = "native-tls is disallowed; use rustls if needed" },
 ]
 skip = []
 skip-tree = []

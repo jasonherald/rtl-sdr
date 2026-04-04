@@ -12,7 +12,7 @@ The original C++ project includes `librtlsdr` (the USB driver library), which is
 
 ### Workspace Crates
 
-```
+```text
 crates/
   sdr-types/           # Foundation: Complex, Stereo, SampleRate, Frequency, error types, constants, enums
   sdr-dsp/             # Pure DSP: math, taps, FFT, filters, multirate, demod, convert, correction, AGC/PLL, noise
@@ -26,13 +26,13 @@ crates/
   sdr-radio/           # Radio decoder: demod selection, IF/AF chains, mode switching
   sdr-config/          # JSON config persistence (serde_json)
   sdr-ui/              # GTK4 + libadwaita: waterfall, FFT plot, VFO overlay, controls
-  sdr-app/             # Binary entry point
+  sdr (binary)         # Entry point (src/main.rs)
 ```
 
 ### Dependency Graph
 
-```
-sdr-app
+```text
+sdr (binary)
   └── sdr-ui
         ├── sdr-pipeline
         │     ├── sdr-dsp
@@ -194,7 +194,7 @@ The `sdr-rtlsdr` crate replaces C `librtlsdr` entirely. Uses `rusb` for USB comm
 
 ## Signal Processing Pipeline
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │ SOURCE (RTL-SDR USB, Network TCP/UDP, WAV File) │
 │ Output: Stream<Complex>                         │
@@ -249,7 +249,7 @@ The `sdr-rtlsdr` crate replaces C `librtlsdr` entirely. Uses `rusb` for USB comm
 
 ## GTK4 UI Layout
 
-```
+```text
 +------------------------------------------------------------+
 | AdwHeaderBar (title, play/stop, frequency display)         |
 +----------+-------------------------------------------------+
