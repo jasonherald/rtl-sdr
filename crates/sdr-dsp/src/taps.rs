@@ -135,6 +135,12 @@ pub fn band_pass(
     validate_positive_finite(band_start, "band_start")?;
     validate_positive_finite(band_stop, "band_stop")?;
     validate_positive_finite(sample_rate, "sample_rate")?;
+    let nyquist = sample_rate / 2.0;
+    if band_stop >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "band_stop ({band_stop}) must be less than Nyquist ({nyquist})"
+        )));
+    }
 
     let offset_omega = math::hz_to_rads(f64::midpoint(band_start, band_stop), sample_rate);
     let mut count = estimate_tap_count(transition_width, sample_rate)?;
