@@ -142,9 +142,13 @@ impl PolyphaseResampler {
         input: &[Complex],
         output: &mut [Complex],
     ) -> Result<usize, DspError> {
-        // Estimate max output count
-        let max_out =
-            ((input.len() as f64) * (self.interp as f64) / (self.decim as f64)) as usize + 2;
+        // Compute exact upper bound on output count from current state
+        let remaining = input.len().saturating_sub(self.offset);
+        let max_out = if remaining == 0 {
+            0
+        } else {
+            (remaining * self.interp + self.phase) / self.decim + 1
+        };
         if output.len() < max_out {
             return Err(DspError::BufferTooSmall {
                 need: max_out,
@@ -364,10 +368,10 @@ impl PowerDecimator {
             return Ok(input.len());
         }
 
-        let expected_out = input.len() / self.ratio as usize;
-        if output.len() < expected_out.max(1) {
+        let expected_out = input.len().div_ceil(self.ratio as usize);
+        if output.len() < expected_out {
             return Err(DspError::BufferTooSmall {
-                need: expected_out.max(1),
+                need: expected_out,
                 got: output.len(),
             });
         }
@@ -442,6 +446,12 @@ impl RationalResampler {
         if !out_sample_rate.is_finite() || out_sample_rate <= 0.0 {
             return Err(DspError::InvalidParameter(format!(
                 "out_sample_rate must be positive and finite, got {out_sample_rate}"
+            )));
+        }
+        // Rates below 1 Hz round to 0 in the GCD reduction, reject them
+        if in_sample_rate < 1.0 || out_sample_rate < 1.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample rates must be >= 1.0 Hz for integer GCD reduction (got {in_sample_rate}, {out_sample_rate})"
             )));
         }
 
@@ -706,6 +716,53 @@ mod tests {
         assert!(
             count >= 500 && count <= 700,
             "expected ~600 for 6x upsample, got {count}"
+        );
+    }
+
+    #[test]
+    fn test_rational_resampler_sub_hz_rejected() {
+        assert!(RationalResampler::new(0.5, 48_000.0).is_err());
+        assert!(RationalResampler::new(48_000.0, 0.5).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_rational_resampler_tone_fidelity() {
+        // Generate a 1kHz tone at 48kHz, downsample to 8kHz, verify tone is preserved
+        use core::f32::consts::PI;
+        let in_rate = 48_000.0_f64;
+        let out_rate = 8_000.0_f64;
+        let tone_freq = 1_000.0_f32; // 1kHz - well below 4kHz Nyquist of output
+        let n_in = 4800; // 100ms of input
+
+        let input: Vec<Complex> = (0..n_in)
+            .map(|i| {
+                let phase = 2.0 * PI * tone_freq * (i as f32) / (in_rate as f32);
+                Complex::new(phase.cos(), 0.0)
+            })
+            .collect();
+
+        let mut r = RationalResampler::new(in_rate, out_rate).unwrap();
+        let mut output = vec![Complex::default(); n_in];
+        let count = r.process(&input, &mut output).unwrap();
+
+        // Skip initial transient (first 20% of output), check remaining samples
+        let skip = count / 5;
+        let steady = &output[skip..count];
+
+        // The output should still contain a sinusoidal signal — check it's not all zeros
+        let peak = steady.iter().map(|s| s.re.abs()).fold(0.0_f32, f32::max);
+        assert!(peak > 0.3, "tone should be preserved, peak = {peak}");
+
+        // Check the signal has oscillations (not DC) by counting zero crossings
+        let crossings = steady
+            .windows(2)
+            .filter(|w| (w[0].re >= 0.0) != (w[1].re >= 0.0))
+            .count();
+        // 1kHz at 8kHz rate for ~640 samples -> ~160 cycles -> ~320 crossings
+        assert!(
+            crossings > 50,
+            "expected oscillations, got {crossings} zero crossings"
         );
     }
 
