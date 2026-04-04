@@ -13,6 +13,9 @@ use crate::window;
 /// Tap count estimation scaling factor (from SDR++ `estimateTapCount`).
 const TAP_COUNT_FACTOR: f64 = 3.8;
 
+/// Tolerance for detecting singular points in RRC formula.
+const RRC_SINGULARITY_EPS: f64 = 1e-12;
+
 /// Estimate the number of FIR filter taps needed for a given transition width.
 ///
 /// Ports SDR++ `dsp::taps::estimateTapCount`.
@@ -43,6 +46,12 @@ pub fn low_pass(
     odd_tap_count: bool,
 ) -> Result<Vec<f32>, DspError> {
     validate_positive_finite(cutoff, "cutoff")?;
+    let nyquist = sample_rate / 2.0;
+    if cutoff >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "cutoff ({cutoff}) must be less than Nyquist ({nyquist})"
+        )));
+    }
     let mut count = estimate_tap_count(transition_width, sample_rate)?;
     if odd_tap_count && count.is_multiple_of(2) {
         count += 1;
@@ -65,6 +74,12 @@ pub fn high_pass(
     sample_rate: f64,
 ) -> Result<Vec<f32>, DspError> {
     validate_positive_finite(cutoff, "cutoff")?;
+    let nyquist = sample_rate / 2.0;
+    if cutoff >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "cutoff ({cutoff}) must be less than Nyquist ({nyquist})"
+        )));
+    }
     let mut count = estimate_tap_count(transition_width, sample_rate)?;
     // Always force odd tap count for highpass (Type I FIR avoids Nyquist zero)
     if count.is_multiple_of(2) {
@@ -109,6 +124,7 @@ pub fn band_pass(
         ));
     }
     validate_positive_finite(band_start, "band_start")?;
+    validate_positive_finite(band_stop, "band_stop")?;
     validate_positive_finite(sample_rate, "sample_rate")?;
 
     let offset_omega = math::hz_to_rads(f64::midpoint(band_start, band_stop), sample_rate);
@@ -173,7 +189,9 @@ pub fn root_raised_cosine(
             let t = i as f64 - half + 0.5;
             let val = if t == 0.0 {
                 (1.0 + beta * (4.0 / PI - 1.0)) / ts
-            } else if (t - limit).abs() < 1e-12 || (t + limit).abs() < 1e-12 {
+            } else if (t - limit).abs() < RRC_SINGULARITY_EPS
+                || (t + limit).abs() < RRC_SINGULARITY_EPS
+            {
                 let sin_term = (PI / (4.0 * beta)).sin();
                 let cos_term = (PI / (4.0 * beta)).cos();
                 ((1.0 + 2.0 / PI) * sin_term + (1.0 - 2.0 / PI) * cos_term) * beta
@@ -244,6 +262,7 @@ mod tests {
         assert!(estimate_tap_count(1_000.0, 0.0).is_err());
         assert!(estimate_tap_count(f64::NAN, TEST_SAMPLE_RATE).is_err());
         assert!(estimate_tap_count(f64::INFINITY, TEST_SAMPLE_RATE).is_err());
+        assert!(estimate_tap_count(f64::NEG_INFINITY, TEST_SAMPLE_RATE).is_err());
     }
 
     #[test]
