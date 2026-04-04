@@ -157,6 +157,14 @@ impl std::ops::MulAssign<f32> for Complex {
     }
 }
 
+impl std::ops::DivAssign<f32> for Complex {
+    #[inline]
+    fn div_assign(&mut self, rhs: f32) {
+        self.re /= rhs;
+        self.im /= rhs;
+    }
+}
+
 impl std::ops::Neg for Complex {
     type Output = Self;
     #[inline]
@@ -223,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_fast_phase() {
-        // Fast phase should be within ~0.01 radians of true phase
+        // Fast phase should be within ~0.08 radians of true phase
         let cases = [
             Complex::new(1.0, 0.0),
             Complex::new(0.0, 1.0),
@@ -323,6 +331,14 @@ mod tests {
         a *= 2.0;
         assert_eq!(a.re, 4.0);
         assert_eq!(a.im, 6.0);
+    }
+
+    #[test]
+    fn test_div_assign() {
+        let mut a = Complex::new(4.0, 6.0);
+        a /= 2.0;
+        assert_eq!(a.re, 2.0);
+        assert_eq!(a.im, 3.0);
     }
 
     #[test]
