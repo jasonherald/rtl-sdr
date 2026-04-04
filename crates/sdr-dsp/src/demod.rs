@@ -25,7 +25,7 @@ impl Quadrature {
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` if `deviation` is zero or non-finite.
+    /// Returns `DspError::InvalidParameter` if `deviation` is non-positive or non-finite.
     pub fn new(deviation: f32) -> Result<Self, DspError> {
         if !deviation.is_finite() || deviation <= 0.0 {
             return Err(DspError::InvalidParameter(format!(
@@ -46,6 +46,17 @@ impl Quadrature {
     /// Returns `DspError::InvalidParameter` if parameters are invalid.
     #[allow(clippy::cast_possible_truncation)]
     pub fn from_hz(deviation_hz: f64, sample_rate: f64) -> Result<Self, DspError> {
+        if !deviation_hz.is_finite() || deviation_hz <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "deviation_hz must be positive and finite, got {deviation_hz}"
+            )));
+        }
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate must be positive and finite, got {sample_rate}"
+            )));
+        }
+        #[allow(clippy::cast_possible_truncation)]
         let dev = math::hz_to_rads(deviation_hz, sample_rate) as f32;
         Self::new(dev)
     }
@@ -366,8 +377,12 @@ mod tests {
     #[test]
     fn test_quadrature_new_invalid() {
         assert!(Quadrature::new(0.0).is_err());
+        assert!(Quadrature::new(-1.0).is_err());
         assert!(Quadrature::new(f32::NAN).is_err());
         assert!(Quadrature::new(f32::INFINITY).is_err());
+        // from_hz rejects negative inputs even if they'd produce positive rads
+        assert!(Quadrature::from_hz(-1000.0, -48000.0).is_err());
+        assert!(Quadrature::from_hz(1000.0, -48000.0).is_err());
     }
 
     #[test]
