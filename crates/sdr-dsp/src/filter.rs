@@ -104,15 +104,49 @@ impl FirFilter {
 
         Ok(input.len())
     }
+}
 
-    /// Process Complex samples through the filter (real taps).
+/// FIR filter for Complex samples with real (f32) taps.
+///
+/// Separate from `FirFilter` to avoid state corruption from mixing
+/// f32 and Complex processing on the same delay line.
+pub struct ComplexFirFilter {
+    taps: Vec<f32>,
+    delay_line: Vec<Complex>,
+}
+
+impl ComplexFirFilter {
+    /// Create a new complex FIR filter with the given real taps.
     ///
-    /// Each complex sample's re and im are independently convolved with the taps.
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `taps` is empty.
+    pub fn new(taps: Vec<f32>) -> Result<Self, DspError> {
+        if taps.is_empty() {
+            return Err(DspError::InvalidParameter(
+                "FIR taps must not be empty".to_string(),
+            ));
+        }
+        let delay_line = vec![Complex::default(); taps.len() - 1];
+        Ok(Self { taps, delay_line })
+    }
+
+    /// Reset the delay line to zero.
+    pub fn reset(&mut self) {
+        self.delay_line.fill(Complex::default());
+    }
+
+    /// Number of taps.
+    pub fn tap_count(&self) -> usize {
+        self.taps.len()
+    }
+
+    /// Process Complex samples through the filter.
     ///
     /// # Errors
     ///
     /// Returns `DspError::BufferTooSmall` if `output.len() < input.len()`.
-    pub fn process_complex(
+    pub fn process(
         &mut self,
         input: &[Complex],
         output: &mut [Complex],
@@ -124,16 +158,7 @@ impl FirFilter {
             });
         }
 
-        // We need a complex delay line — reinterpret our f32 delay line as pairs
-        // For simplicity, use a separate complex processing path
-        let tap_count = self.taps.len();
-        let delay_len = tap_count - 1;
-
-        // Ensure delay line is sized for complex (2 floats per sample)
-        let needed = delay_len * 2;
-        if self.delay_line.len() != needed {
-            self.delay_line.resize(needed, 0.0);
-        }
+        let delay_len = self.taps.len() - 1;
 
         #[allow(clippy::needless_range_loop)]
         for i in 0..input.len() {
@@ -141,34 +166,25 @@ impl FirFilter {
             let mut acc_im = 0.0_f32;
             for (j, &tap) in self.taps.iter().enumerate() {
                 let sample_idx = i + delay_len - j;
-                let (val_re, val_im) = if sample_idx < delay_len {
-                    (
-                        self.delay_line[sample_idx * 2],
-                        self.delay_line[sample_idx * 2 + 1],
-                    )
+                let val = if sample_idx < delay_len {
+                    self.delay_line[sample_idx]
                 } else {
-                    let s = input[sample_idx - delay_len];
-                    (s.re, s.im)
+                    input[sample_idx - delay_len]
                 };
-                acc_re += val_re * tap;
-                acc_im += val_im * tap;
+                acc_re += val.re * tap;
+                acc_im += val.im * tap;
             }
             output[i] = Complex::new(acc_re, acc_im);
         }
 
         // Update delay line
         if input.len() >= delay_len {
-            for (k, &s) in input[input.len() - delay_len..].iter().enumerate() {
-                self.delay_line[k * 2] = s.re;
-                self.delay_line[k * 2 + 1] = s.im;
-            }
+            self.delay_line
+                .copy_from_slice(&input[input.len() - delay_len..]);
         } else {
             let shift = delay_len - input.len();
-            self.delay_line.copy_within(input.len() * 2.., 0);
-            for (k, &s) in input.iter().enumerate() {
-                self.delay_line[(shift + k) * 2] = s.re;
-                self.delay_line[(shift + k) * 2 + 1] = s.im;
-            }
+            self.delay_line.copy_within(input.len().., 0);
+            self.delay_line[shift..].copy_from_slice(input);
         }
 
         Ok(input.len())
@@ -319,11 +335,26 @@ impl DeemphasisFilter {
     }
 
     /// Update the time constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if parameters are non-positive or non-finite.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn set_tau(&mut self, tau: f64, sample_rate: f64) {
+    pub fn set_tau(&mut self, tau: f64, sample_rate: f64) -> Result<(), DspError> {
+        if !tau.is_finite() || tau <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "tau must be positive and finite, got {tau}"
+            )));
+        }
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate must be positive and finite, got {sample_rate}"
+            )));
+        }
         let dt = 1.0 / sample_rate;
         self.alpha = (dt / (tau + dt)) as f32;
         self.one_minus_alpha = 1.0 - self.alpha;
+        Ok(())
     }
 
     /// Reset the filter state.
@@ -428,15 +459,27 @@ mod tests {
     }
 
     #[test]
-    fn test_fir_complex() {
-        let mut fir = FirFilter::new(vec![1.0]).unwrap();
+    fn test_complex_fir_identity() {
+        let mut fir = ComplexFirFilter::new(vec![1.0]).unwrap();
         let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
         let mut output = [Complex::default(); 2];
-        fir.process_complex(&input, &mut output).unwrap();
+        fir.process(&input, &mut output).unwrap();
         assert!((output[0].re - 1.0).abs() < 1e-6);
         assert!((output[0].im - 2.0).abs() < 1e-6);
         assert!((output[1].re - 3.0).abs() < 1e-6);
         assert!((output[1].im - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_complex_fir_delay() {
+        let mut fir = ComplexFirFilter::new(vec![0.0, 1.0]).unwrap();
+        let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
+        let mut output = [Complex::default(); 2];
+        fir.process(&input, &mut output).unwrap();
+        assert!((output[0].re).abs() < 1e-6);
+        assert!((output[0].im).abs() < 1e-6);
+        assert!((output[1].re - 1.0).abs() < 1e-6);
+        assert!((output[1].im - 2.0).abs() < 1e-6);
     }
 
     #[test]
