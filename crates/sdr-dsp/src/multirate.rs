@@ -23,6 +23,18 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// Maximum power-of-two decimation ratio supported.
 const MAX_POWER_DECIM_RATIO: u32 = 8192; // 2^13
 
+/// Normalized cutoff frequency for power decimator stages (fraction of sample rate).
+const POWER_DECIM_CUTOFF: f64 = 0.25;
+
+/// Normalized transition width for power decimator stages (fraction of sample rate).
+const POWER_DECIM_TRANSITION: f64 = 0.1;
+
+/// Transition width as a fraction of filter bandwidth for rational resampler.
+const RESAMP_TRANSITION_RATIO: f64 = 0.1;
+
+/// Tolerance in Hz for considering two sample rates equal (passthrough).
+const RATE_EQUALITY_TOLERANCE: f64 = 1.0;
+
 // --- Polyphase Resampler ---
 
 /// Polyphase filter bank for efficient rational resampling.
@@ -66,6 +78,7 @@ pub struct PolyphaseResampler {
     delay_line: Vec<Complex>,
     phase: usize,
     offset: usize,
+    work_buf: Vec<Complex>,
 }
 
 impl PolyphaseResampler {
@@ -101,6 +114,7 @@ impl PolyphaseResampler {
             delay_line,
             phase: 0,
             offset: 0,
+            work_buf: Vec::new(),
         })
     }
 
@@ -141,10 +155,13 @@ impl PolyphaseResampler {
         let tpp = self.bank.taps_per_phase;
         let delay_len = tpp - 1;
 
-        // Build working buffer: delay_line + input
-        let mut work = Vec::with_capacity(delay_len + input.len());
-        work.extend_from_slice(&self.delay_line[..delay_len]);
-        work.extend_from_slice(input);
+        // Reuse pre-allocated work buffer: delay_line + input
+        self.work_buf.clear();
+        self.work_buf.reserve(delay_len + input.len());
+        self.work_buf
+            .extend_from_slice(&self.delay_line[..delay_len]);
+        self.work_buf.extend_from_slice(input);
+        let work = &self.work_buf;
 
         let mut out_count = 0;
 
@@ -187,6 +204,8 @@ impl PolyphaseResampler {
 pub struct PowerDecimator {
     stages: Vec<DecimStage>,
     ratio: u32,
+    buf_a: Vec<Complex>,
+    buf_b: Vec<Complex>,
 }
 
 /// Single decimation stage with delay line and taps.
@@ -275,7 +294,12 @@ impl PowerDecimator {
         }
 
         let stages = Self::build_stages(ratio)?;
-        Ok(Self { stages, ratio })
+        Ok(Self {
+            stages,
+            ratio,
+            buf_a: Vec::new(),
+            buf_b: Vec::new(),
+        })
     }
 
     /// Build cascaded decimation stages.
@@ -297,7 +321,7 @@ impl PowerDecimator {
 
             // Generate lowpass taps for this stage
             // Cutoff at 0.25 (half of Nyquist), transition 0.1 of sample rate
-            let stage_taps = taps::low_pass(0.25, 0.1, 1.0, true)?;
+            let stage_taps = taps::low_pass(POWER_DECIM_CUTOFF, POWER_DECIM_TRANSITION, 1.0, true)?;
             stages.push(DecimStage::new(stage_taps, stage_decim as usize));
         }
 
@@ -348,18 +372,30 @@ impl PowerDecimator {
             });
         }
 
-        // Process through cascaded stages using temporary buffers
-        let mut current: Vec<Complex> = input.to_vec();
-        let mut temp = vec![Complex::default(); input.len()];
+        // Process through cascaded stages using pre-allocated ping-pong buffers
+        self.buf_a.clear();
+        self.buf_a.extend_from_slice(input);
+        self.buf_b.resize(input.len(), Complex::default());
 
+        let mut use_a = true;
         for stage in &mut self.stages {
-            let count = stage.process(&current, &mut temp);
-            current.clear();
-            current.extend_from_slice(&temp[..count]);
+            let (src, dst) = if use_a {
+                (&self.buf_a as &[Complex], &mut self.buf_b)
+            } else {
+                (&self.buf_b as &[Complex], &mut self.buf_a)
+            };
+            let count = stage.process(src, dst);
+            if use_a {
+                self.buf_b.truncate(count);
+            } else {
+                self.buf_a.truncate(count);
+            }
+            use_a = !use_a;
         }
 
-        let out_count = current.len();
-        output[..out_count].copy_from_slice(&current);
+        let result = if use_a { &self.buf_a } else { &self.buf_b };
+        let out_count = result.len();
+        output[..out_count].copy_from_slice(result);
         Ok(out_count)
     }
 }
@@ -376,6 +412,7 @@ pub struct RationalResampler {
     mode: ResamplerMode,
     decimator: Option<PowerDecimator>,
     resampler: Option<PolyphaseResampler>,
+    temp_buf: Vec<Complex>,
 }
 
 enum ResamplerMode {
@@ -409,11 +446,12 @@ impl RationalResampler {
         }
 
         // Check if rates are equal (passthrough)
-        if (in_sample_rate - out_sample_rate).abs() < 1.0 {
+        if (in_sample_rate - out_sample_rate).abs() < RATE_EQUALITY_TOLERANCE {
             return Ok(Self {
                 mode: ResamplerMode::Passthrough,
                 decimator: None,
                 resampler: None,
+                temp_buf: Vec::new(),
             });
         }
 
@@ -447,12 +485,13 @@ impl RationalResampler {
                 },
                 decimator,
                 resampler: None,
+                temp_buf: Vec::new(),
             });
         }
 
         // Design lowpass filter for the polyphase resampler
         let tap_bandwidth = in_sample_rate.min(out_sample_rate) / 2.0;
-        let tap_trans_width = tap_bandwidth * 0.1;
+        let tap_trans_width = tap_bandwidth * RESAMP_TRANSITION_RATIO;
         let tap_sample_rate = intermediate_rate * interp as f64;
         let mut filter_taps =
             taps::low_pass(tap_bandwidth, tap_trans_width, tap_sample_rate, true)?;
@@ -474,6 +513,7 @@ impl RationalResampler {
             mode,
             decimator,
             resampler,
+            temp_buf: Vec::new(),
         })
     }
 
@@ -510,28 +550,29 @@ impl RationalResampler {
                 output[..input.len()].copy_from_slice(input);
                 Ok(input.len())
             }
-            ResamplerMode::DecimOnly => self
-                .decimator
-                .as_mut()
-                .expect("decimator should exist in DecimOnly mode")
-                .process(input, output),
-            ResamplerMode::ResampOnly => self
-                .resampler
-                .as_mut()
-                .expect("resampler should exist in ResampOnly mode")
-                .process(input, output),
+            ResamplerMode::DecimOnly => {
+                let decim = self.decimator.as_mut().ok_or_else(|| {
+                    DspError::InvalidParameter("decimator missing in DecimOnly mode".to_string())
+                })?;
+                decim.process(input, output)
+            }
+            ResamplerMode::ResampOnly => {
+                let resamp = self.resampler.as_mut().ok_or_else(|| {
+                    DspError::InvalidParameter("resampler missing in ResampOnly mode".to_string())
+                })?;
+                resamp.process(input, output)
+            }
             ResamplerMode::Both => {
-                let decim = self
-                    .decimator
-                    .as_mut()
-                    .expect("decimator should exist in Both mode");
-                let mut temp = vec![Complex::default(); input.len()];
-                let decim_count = decim.process(input, &mut temp)?;
+                let decim = self.decimator.as_mut().ok_or_else(|| {
+                    DspError::InvalidParameter("decimator missing in Both mode".to_string())
+                })?;
+                self.temp_buf.resize(input.len(), Complex::default());
+                let decim_count = decim.process(input, &mut self.temp_buf)?;
 
-                self.resampler
-                    .as_mut()
-                    .expect("resampler should exist in Both mode")
-                    .process(&temp[..decim_count], output)
+                let resamp = self.resampler.as_mut().ok_or_else(|| {
+                    DspError::InvalidParameter("resampler missing in Both mode".to_string())
+                })?;
+                resamp.process(&self.temp_buf[..decim_count], output)
             }
         }
     }
