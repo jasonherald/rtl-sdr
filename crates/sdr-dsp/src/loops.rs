@@ -27,6 +27,9 @@ pub struct PhaseControlLoop {
 impl PhaseControlLoop {
     /// Create a new phase control loop.
     #[allow(clippy::too_many_arguments)]
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `max_phase <= min_phase` or `max_freq <= min_freq`.
     pub fn new(
         alpha: f32,
         beta: f32,
@@ -36,8 +39,18 @@ impl PhaseControlLoop {
         freq: f32,
         min_freq: f32,
         max_freq: f32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DspError> {
+        if max_phase <= min_phase {
+            return Err(DspError::InvalidParameter(format!(
+                "max_phase ({max_phase}) must be > min_phase ({min_phase})"
+            )));
+        }
+        if max_freq <= min_freq {
+            return Err(DspError::InvalidParameter(format!(
+                "max_freq ({max_freq}) must be > min_freq ({min_freq})"
+            )));
+        }
+        Ok(Self {
             alpha,
             beta,
             phase,
@@ -47,7 +60,7 @@ impl PhaseControlLoop {
             max_freq,
             freq,
             phase_delta: max_phase - min_phase,
-        }
+        })
     }
 
     /// Compute critically-damped loop coefficients from bandwidth.
@@ -130,6 +143,16 @@ impl Agc {
         if init_gain <= 0.0 {
             return Err(DspError::InvalidParameter(format!(
                 "init_gain must be positive, got {init_gain}"
+            )));
+        }
+        if !(0.0..=1.0).contains(&attack) {
+            return Err(DspError::InvalidParameter(format!(
+                "attack must be in [0, 1], got {attack}"
+            )));
+        }
+        if !(0.0..=1.0).contains(&decay) {
+            return Err(DspError::InvalidParameter(format!(
+                "decay must be in [0, 1], got {decay}"
             )));
         }
         Ok(Self {
@@ -245,13 +268,17 @@ impl Pll {
     /// - `init_freq`: initial frequency estimate (radians/sample)
     /// - `min_freq`: minimum frequency limit
     /// - `max_freq`: maximum frequency limit
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `min_freq >= max_freq`.
     pub fn new(
         bandwidth: f32,
         init_phase: f32,
         init_freq: f32,
         min_freq: f32,
         max_freq: f32,
-    ) -> Self {
+    ) -> Result<Self, DspError> {
         let (alpha, beta) = PhaseControlLoop::critically_damped(bandwidth);
         let pcl = PhaseControlLoop::new(
             alpha,
@@ -262,12 +289,12 @@ impl Pll {
             init_freq,
             min_freq,
             max_freq,
-        );
-        Self {
+        )?;
+        Ok(Self {
             pcl,
             init_phase,
             init_freq,
-        }
+        })
     }
 
     /// Reset the PLL to initial state.
@@ -389,7 +416,7 @@ mod tests {
             })
             .collect();
 
-        let mut pll = Pll::new(0.01, 0.0, 0.0, -PI, PI);
+        let mut pll = Pll::new(0.01, 0.0, 0.0, -PI, PI).unwrap();
         let mut output = vec![Complex::default(); 2000];
         pll.process(&input, &mut output).unwrap();
 
@@ -404,7 +431,7 @@ mod tests {
     #[test]
     fn test_pll_output_is_unit_phasor() {
         let input = vec![Complex::new(1.0, 0.0); 100];
-        let mut pll = Pll::new(0.01, 0.0, 0.0, -PI, PI);
+        let mut pll = Pll::new(0.01, 0.0, 0.0, -PI, PI).unwrap();
         let mut output = vec![Complex::default(); 100];
         pll.process(&input, &mut output).unwrap();
         // Every output should be a unit phasor (amplitude ~1.0)
@@ -419,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_pll_reset() {
-        let mut pll = Pll::new(0.01, 0.0, 0.0, -PI, PI);
+        let mut pll = Pll::new(0.01, 0.0, 0.0, -PI, PI).unwrap();
         let input = vec![Complex::new(1.0, 0.0); 100];
         let mut output = vec![Complex::default(); 100];
         pll.process(&input, &mut output).unwrap();
