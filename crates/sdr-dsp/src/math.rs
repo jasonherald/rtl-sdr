@@ -10,17 +10,19 @@ pub fn hz_to_rads(freq: f64, sample_rate: f64) -> f64 {
     2.0 * PI * (freq / sample_rate)
 }
 
-/// Normalize a phase difference to the range `(-pi, pi]`.
+/// Normalize a phase value to the range `(-pi, pi]`.
 ///
-/// Ports SDR++ `dsp::math::normalizePhase`.
+/// Handles arbitrary input values (not just single-wrap).
+/// Based on SDR++ `dsp::math::normalizePhase` but extended for robustness.
 #[inline]
-pub fn normalize_phase(mut diff: f32) -> f32 {
-    if diff > core::f32::consts::PI {
-        diff -= 2.0 * core::f32::consts::PI;
-    } else if diff <= -core::f32::consts::PI {
-        diff += 2.0 * core::f32::consts::PI;
+pub fn normalize_phase(diff: f32) -> f32 {
+    let mut result =
+        (diff + core::f32::consts::PI).rem_euclid(core::f32::consts::TAU) - core::f32::consts::PI;
+    // rem_euclid can return exactly -PI due to floating point; map to PI
+    if result <= -core::f32::consts::PI {
+        result += core::f32::consts::TAU;
     }
-    diff
+    result
 }
 
 /// Sinc function: `sin(x) / x`, with `sinc(0) = 1`.
@@ -75,10 +77,7 @@ mod tests {
         // DC should give 0
         assert!(approx_eq_f64(hz_to_rads(0.0, 48000.0), 0.0));
         // Quarter sample rate should give pi/2
-        assert!(approx_eq_f64(
-            hz_to_rads(12000.0, 48000.0),
-            PI / 2.0
-        ));
+        assert!(approx_eq_f64(hz_to_rads(12000.0, 48000.0), PI / 2.0));
     }
 
     #[test]
@@ -96,6 +95,19 @@ mod tests {
             normalize_phase(-core::f32::consts::PI - 0.5),
             core::f32::consts::PI - 0.5
         ));
+        // Multi-wrap: 5*pi should normalize to pi
+        assert!(approx_eq_f32(
+            normalize_phase(5.0 * core::f32::consts::PI),
+            core::f32::consts::PI
+        ));
+        // Multi-wrap negative: -5*pi should normalize to pi (or -pi mapped to pi)
+        let result = normalize_phase(-5.0 * core::f32::consts::PI);
+        assert!(
+            approx_eq_f32(result, core::f32::consts::PI)
+                || approx_eq_f32(result, -core::f32::consts::PI),
+        );
+        // Zero stays zero
+        assert!(approx_eq_f32(normalize_phase(0.0), 0.0));
     }
 
     #[test]

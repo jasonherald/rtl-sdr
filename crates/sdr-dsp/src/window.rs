@@ -5,6 +5,20 @@
 
 use core::f64::consts::PI;
 
+// Window coefficient constants.
+const HANN_COEFS: [f64; 2] = [0.5, 0.5];
+const HAMMING_COEFS: [f64; 2] = [0.54, 0.46];
+const BLACKMAN_COEFS: [f64; 3] = [0.42, 0.5, 0.08];
+
+#[allow(clippy::unreadable_literal)]
+const BLACKMAN_HARRIS_COEFS: [f64; 4] = [0.35875, 0.48829, 0.14128, 0.01168];
+
+#[allow(clippy::unreadable_literal)]
+const BLACKMAN_NUTTALL_COEFS: [f64; 4] = [0.3635819, 0.4891775, 0.1365995, 0.0106411];
+
+#[allow(clippy::unreadable_literal)]
+const NUTTALL_COEFS: [f64; 4] = [0.355768, 0.487396, 0.144232, 0.012604];
+
 /// Generalized cosine window — base implementation for most window functions.
 ///
 /// Ports SDR++ `dsp::window::cosine`. Computes:
@@ -29,40 +43,37 @@ pub fn rectangular(_n: f64, _big_n: f64) -> f64 {
 /// Hann window.
 #[inline]
 pub fn hann(n: f64, big_n: f64) -> f64 {
-    cosine(n, big_n, &[0.5, 0.5])
+    cosine(n, big_n, &HANN_COEFS)
 }
 
 /// Hamming window.
 #[inline]
 pub fn hamming(n: f64, big_n: f64) -> f64 {
-    cosine(n, big_n, &[0.54, 0.46])
+    cosine(n, big_n, &HAMMING_COEFS)
 }
 
 /// Blackman window.
 #[inline]
 pub fn blackman(n: f64, big_n: f64) -> f64 {
-    cosine(n, big_n, &[0.42, 0.5, 0.08])
+    cosine(n, big_n, &BLACKMAN_COEFS)
 }
 
 /// Blackman-Harris window (4-term).
 #[inline]
-#[allow(clippy::unreadable_literal)]
 pub fn blackman_harris(n: f64, big_n: f64) -> f64 {
-    cosine(n, big_n, &[0.35875, 0.48829, 0.14128, 0.01168])
+    cosine(n, big_n, &BLACKMAN_HARRIS_COEFS)
 }
 
 /// Blackman-Nuttall window (4-term).
 #[inline]
-#[allow(clippy::unreadable_literal)]
 pub fn blackman_nuttall(n: f64, big_n: f64) -> f64 {
-    cosine(n, big_n, &[0.3635819, 0.4891775, 0.1365995, 0.0106411])
+    cosine(n, big_n, &BLACKMAN_NUTTALL_COEFS)
 }
 
 /// Nuttall window (4-term, continuous first derivative).
 #[inline]
-#[allow(clippy::unreadable_literal)]
 pub fn nuttall(n: f64, big_n: f64) -> f64 {
-    cosine(n, big_n, &[0.355768, 0.487396, 0.144232, 0.012604])
+    cosine(n, big_n, &NUTTALL_COEFS)
 }
 
 /// Apply a window function to a buffer in-place.
@@ -103,6 +114,12 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < EPS
+    }
+
+    /// Compute the coherent gain (sum of window values) for a window of size N.
+    #[allow(clippy::cast_precision_loss)]
+    fn window_sum(wf: fn(f64, f64) -> f64, big_n: usize) -> f64 {
+        (0..big_n).map(|i| wf(i as f64, big_n as f64)).sum()
     }
 
     #[test]
@@ -185,6 +202,31 @@ mod tests {
                     "symmetry failed at n={n}: {left} != {right}"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::type_complexity)]
+    fn test_window_coherent_gain() {
+        // Coherent gain = sum(w[n]) / N. For each window, verify it matches
+        // the expected value (first coefficient of the cosine series).
+        let n = 128;
+        let cases: [(fn(f64, f64) -> f64, f64); 7] = [
+            (rectangular, 1.0),
+            (hann, HANN_COEFS[0]),
+            (hamming, HAMMING_COEFS[0]),
+            (blackman, BLACKMAN_COEFS[0]),
+            (blackman_harris, BLACKMAN_HARRIS_COEFS[0]),
+            (blackman_nuttall, BLACKMAN_NUTTALL_COEFS[0]),
+            (nuttall, NUTTALL_COEFS[0]),
+        ];
+        #[allow(clippy::cast_precision_loss)]
+        for (wf, expected_gain) in &cases {
+            let gain = window_sum(*wf, n) / n as f64;
+            assert!(
+                (gain - expected_gain).abs() < 1e-6,
+                "coherent gain mismatch: got {gain}, expected {expected_gain}"
+            );
         }
     }
 
