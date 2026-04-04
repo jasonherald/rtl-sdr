@@ -1,1 +1,6 @@
-// sdr-dsp: Pure DSP library (no threading, no I/O)
+//! Pure DSP library (no threading, no I/O).
+//!
+//! All functions are pure: no side effects, no thread spawning, no I/O.
+
+pub mod math;
+pub mod window;
