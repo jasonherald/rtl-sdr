@@ -261,9 +261,9 @@ impl SsbDemod {
 
     /// Process complex samples, outputting demodulated audio.
     ///
-    /// For USB: output = re (real part of analytic signal)
-    /// For LSB: output = re (of conjugated signal)
-    /// For DSB: output = re (same as USB)
+    /// - USB: `output = re + im` (upper sideband via Hilbert demod)
+    /// - LSB: `output = re - im` (lower sideband via spectrum flip)
+    /// - DSB: `output = re` (both sidebands)
     ///
     /// # Errors
     ///
@@ -344,7 +344,8 @@ impl CwDemod {
         }
         for (i, &s) in input.iter().enumerate() {
             // Mix with BFO
-            let bfo = Complex::new(self.bfo_phase.cos(), self.bfo_phase.sin());
+            let (sin, cos) = self.bfo_phase.sin_cos();
+            let bfo = Complex::new(cos, sin);
             let mixed = s * bfo;
             output[i] = mixed.re;
             // Advance BFO phase
