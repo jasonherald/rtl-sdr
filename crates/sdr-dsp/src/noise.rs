@@ -7,10 +7,11 @@ use sdr_types::{Complex, DspError};
 /// Power squelch — gates signal based on average power level.
 ///
 /// Ports SDR++ `dsp::noise_reduction::PowerSquelch`. Computes the mean
-/// amplitude of the input block and compares against a threshold in dB.
+/// power of the input block and compares against a threshold in dB.
 /// If below threshold, the entire block is zeroed.
 pub struct PowerSquelch {
     level_db: f32,
+    open: bool,
 }
 
 impl PowerSquelch {
@@ -18,7 +19,15 @@ impl PowerSquelch {
     ///
     /// - `level_db`: threshold in dB (e.g., -50.0). Signal below this is muted.
     pub fn new(level_db: f32) -> Self {
-        Self { level_db }
+        Self {
+            level_db,
+            open: false,
+        }
+    }
+
+    /// Returns whether the squelch is currently open (signal above threshold).
+    pub fn is_open(&self) -> bool {
+        self.open
     }
 
     /// Update the squelch threshold.
@@ -28,13 +37,18 @@ impl PowerSquelch {
 
     /// Process complex samples. Passes or zeros the entire block.
     ///
-    /// Returns `true` if the signal is above the threshold (open), `false` if muted.
+    /// Returns the number of output samples (always `input.len()`).
+    /// Use [`is_open`] after processing to check squelch state.
     ///
     /// # Errors
     ///
     /// Returns `DspError::BufferTooSmall` if `output.len() < input.len()`.
     #[allow(clippy::cast_precision_loss)]
-    pub fn process(&self, input: &[Complex], output: &mut [Complex]) -> Result<bool, DspError> {
+    pub fn process(
+        &mut self,
+        input: &[Complex],
+        output: &mut [Complex],
+    ) -> Result<usize, DspError> {
         if output.len() < input.len() {
             return Err(DspError::BufferTooSmall {
                 need: input.len(),
@@ -42,23 +56,25 @@ impl PowerSquelch {
             });
         }
         if input.is_empty() {
-            return Ok(false);
+            self.open = false;
+            return Ok(0);
         }
 
-        // Compute mean amplitude
-        let sum: f32 = input.iter().map(|s| s.amplitude()).sum();
-        let mean = sum / input.len() as f32;
+        // Compute mean power (amplitude squared)
+        let sum: f32 = input.iter().map(|s| s.re * s.re + s.im * s.im).sum();
+        let mean_power = sum / input.len() as f32;
 
-        // Compare in dB
-        let power_db = 10.0 * mean.max(f32::MIN_POSITIVE).log10();
+        // Compare in dB (10*log10 for power)
+        let power_db = 10.0 * mean_power.max(f32::MIN_POSITIVE).log10();
 
         if power_db >= self.level_db {
             output[..input.len()].copy_from_slice(input);
-            Ok(true)
+            self.open = true;
         } else {
             output[..input.len()].fill(Complex::default());
-            Ok(false)
+            self.open = false;
         }
+        Ok(input.len())
     }
 }
 
@@ -124,14 +140,18 @@ impl NoiseBlanker {
         }
         for (i, &s) in input.iter().enumerate() {
             let in_amp = s.amplitude();
-            let mut gain = 1.0_f32;
-            if in_amp != 0.0 {
-                self.amp = self.amp * self.inv_rate + in_amp * self.rate;
+            // Always update EMA so baseline decays during silence
+            self.amp = self.amp * self.inv_rate + in_amp * self.rate;
+            let gain = if self.amp > f32::MIN_POSITIVE {
                 let excess = in_amp / self.amp;
                 if excess > self.level {
-                    gain = 1.0 / excess;
+                    1.0 / excess
+                } else {
+                    1.0
                 }
-            }
+            } else {
+                1.0
+            };
             output[i] = s * gain;
         }
         Ok(input.len())
@@ -195,21 +215,21 @@ mod tests {
 
     #[test]
     fn test_squelch_opens_on_strong_signal() {
-        let squelch = PowerSquelch::new(-30.0);
+        let mut squelch = PowerSquelch::new(-30.0);
         let input = vec![Complex::new(1.0, 0.0); 100];
         let mut output = vec![Complex::default(); 100];
-        let open = squelch.process(&input, &mut output).unwrap();
-        assert!(open, "strong signal should open squelch");
+        squelch.process(&input, &mut output).unwrap();
+        assert!(squelch.is_open(), "strong signal should open squelch");
         assert!(output[0].re > 0.0, "output should not be zeroed");
     }
 
     #[test]
     fn test_squelch_closes_on_weak_signal() {
-        let squelch = PowerSquelch::new(10.0); // very high threshold
+        let mut squelch = PowerSquelch::new(10.0); // very high threshold
         let input = vec![Complex::new(0.001, 0.0); 100];
         let mut output = vec![Complex::default(); 100];
-        let open = squelch.process(&input, &mut output).unwrap();
-        assert!(!open, "weak signal should close squelch");
+        squelch.process(&input, &mut output).unwrap();
+        assert!(!squelch.is_open(), "weak signal should close squelch");
         assert!(
             output[0].re.abs() < 1e-10,
             "output should be zeroed when squelch closed"
@@ -218,11 +238,12 @@ mod tests {
 
     #[test]
     fn test_squelch_empty_input() {
-        let squelch = PowerSquelch::new(-50.0);
+        let mut squelch = PowerSquelch::new(-50.0);
         let input: &[Complex] = &[];
         let mut output: Vec<Complex> = vec![];
-        let open = squelch.process(input, &mut output).unwrap();
-        assert!(!open);
+        let count = squelch.process(input, &mut output).unwrap();
+        assert_eq!(count, 0);
+        assert!(!squelch.is_open());
     }
 
     // --- Noise Blanker tests ---
@@ -293,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_buffer_too_small() {
-        let squelch = PowerSquelch::new(-50.0);
+        let mut squelch = PowerSquelch::new(-50.0);
         let input = [Complex::default(); 10];
         let mut output = [Complex::default(); 5];
         assert!(squelch.process(&input, &mut output).is_err());

@@ -15,6 +15,7 @@ use crate::math;
 pub struct Quadrature {
     inv_deviation: f32,
     last_phase: f32,
+    first_sample: bool,
 }
 
 impl Quadrature {
@@ -34,6 +35,7 @@ impl Quadrature {
         Ok(Self {
             inv_deviation: 1.0 / deviation,
             last_phase: 0.0,
+            first_sample: true,
         })
     }
 
@@ -51,6 +53,7 @@ impl Quadrature {
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
         self.last_phase = 0.0;
+        self.first_sample = true;
     }
 
     /// Process complex samples, outputting demodulated audio.
@@ -67,7 +70,14 @@ impl Quadrature {
         }
         for (i, &s) in input.iter().enumerate() {
             let current_phase = s.phase();
-            output[i] = math::normalize_phase(current_phase - self.last_phase) * self.inv_deviation;
+            if self.first_sample {
+                // Seed phase from first sample to avoid startup click
+                output[i] = 0.0;
+                self.first_sample = false;
+            } else {
+                output[i] =
+                    math::normalize_phase(current_phase - self.last_phase) * self.inv_deviation;
+            }
             self.last_phase = current_phase;
         }
         Ok(input.len())
@@ -179,6 +189,47 @@ impl FmDemod {
     }
 }
 
+/// Broadcast FM demodulator — wideband FM with deemphasis.
+///
+/// Ports the mono path of SDR++ `dsp::demod::BroadcastFM`. Uses quadrature
+/// discrimination with deviation set for broadcast FM (75kHz). Stereo decode
+/// and RDS are handled at the radio module level.
+pub struct BroadcastFmDemod {
+    quad: Quadrature,
+}
+
+/// Standard broadcast FM deviation: 75 kHz.
+const BROADCAST_FM_DEVIATION_HZ: f64 = 75_000.0;
+
+impl BroadcastFmDemod {
+    /// Create a new broadcast FM demodulator.
+    ///
+    /// - `sample_rate`: input sample rate in Hz
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `sample_rate` is invalid.
+    pub fn new(sample_rate: f64) -> Result<Self, DspError> {
+        Ok(Self {
+            quad: Quadrature::from_hz(BROADCAST_FM_DEVIATION_HZ, sample_rate)?,
+        })
+    }
+
+    /// Reset the demodulator state.
+    pub fn reset(&mut self) {
+        self.quad.reset();
+    }
+
+    /// Process complex samples, outputting mono FM audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::BufferTooSmall` if `output.len() < input.len()`.
+    pub fn process(&mut self, input: &[Complex], output: &mut [f32]) -> Result<usize, DspError> {
+        self.quad.process(input, output)
+    }
+}
+
 /// SSB demodulator — single-sideband demodulation via frequency translation.
 ///
 /// Ports SDR++ `dsp::demod::SSB`. Extracts real audio from a complex
@@ -222,14 +273,20 @@ impl SsbDemod {
             });
         }
         match self.mode {
-            SsbMode::Lsb => {
-                // LSB: conjugate then take real part
+            SsbMode::Usb => {
+                // USB: sum of re and im (Hilbert demod, upper sideband)
                 for (i, &s) in input.iter().enumerate() {
-                    output[i] = s.conj().re;
+                    output[i] = s.re + s.im;
                 }
             }
-            SsbMode::Usb | SsbMode::Dsb => {
-                // USB/DSB: take real part directly
+            SsbMode::Lsb => {
+                // LSB: difference of re and im (spectrum flip)
+                for (i, &s) in input.iter().enumerate() {
+                    output[i] = s.re - s.im;
+                }
+            }
+            SsbMode::Dsb => {
+                // DSB: take real part (both sidebands)
                 for (i, &s) in input.iter().enumerate() {
                     output[i] = s.re;
                 }
@@ -389,24 +446,42 @@ mod tests {
     // --- SSB tests ---
 
     #[test]
-    fn test_ssb_usb_extracts_real() {
+    fn test_ssb_usb() {
         let mut demod = SsbDemod::new(SsbMode::Usb);
         let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
         let mut output = [0.0_f32; 2];
         demod.process(&input, &mut output).unwrap();
-        assert!((output[0] - 1.0).abs() < 1e-6);
-        assert!((output[1] - 3.0).abs() < 1e-6);
+        // USB: re + im
+        assert!((output[0] - 3.0).abs() < 1e-6); // 1+2
+        assert!((output[1] - 7.0).abs() < 1e-6); // 3+4
     }
 
     #[test]
-    fn test_ssb_lsb_conjugates() {
-        let mut demod = SsbDemod::new(SsbMode::Lsb);
-        let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
-        let mut output = [0.0_f32; 2];
+    fn test_ssb_lsb_differs_from_usb() {
+        let mut usb = SsbDemod::new(SsbMode::Usb);
+        let mut lsb = SsbDemod::new(SsbMode::Lsb);
+        let input = [Complex::new(1.0, 2.0)];
+        let mut usb_out = [0.0_f32; 1];
+        let mut lsb_out = [0.0_f32; 1];
+        usb.process(&input, &mut usb_out).unwrap();
+        lsb.process(&input, &mut lsb_out).unwrap();
+        // USB: 1+2=3, LSB: 1-2=-1 — they must differ
+        assert!((usb_out[0] - 3.0).abs() < 1e-6);
+        assert!((lsb_out[0] - (-1.0)).abs() < 1e-6);
+        assert!(
+            (usb_out[0] - lsb_out[0]).abs() > 1.0,
+            "USB and LSB must differ"
+        );
+    }
+
+    #[test]
+    fn test_ssb_dsb() {
+        let mut demod = SsbDemod::new(SsbMode::Dsb);
+        let input = [Complex::new(1.0, 2.0)];
+        let mut output = [0.0_f32; 1];
         demod.process(&input, &mut output).unwrap();
-        // conj().re == re (conjugation doesn't change real part)
+        // DSB: re only
         assert!((output[0] - 1.0).abs() < 1e-6);
-        assert!((output[1] - 3.0).abs() < 1e-6);
     }
 
     // --- CW tests ---
