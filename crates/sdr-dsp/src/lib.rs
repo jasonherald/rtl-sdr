@@ -5,5 +5,6 @@
 pub mod fft;
 pub mod filter;
 pub mod math;
+pub mod multirate;
 pub mod taps;
 pub mod window;
