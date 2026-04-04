@@ -36,7 +36,7 @@ impl Complex {
 
     /// Fast phase approximation using rational polynomial.
     ///
-    /// Ports SDR++ `complex_t::fastPhase()` — accurate to ~0.01 radians.
+    /// Ports SDR++ `complex_t::fastPhase()` — worst-case error ~0.07 radians.
     #[inline]
     pub fn fast_phase(self) -> f32 {
         let abs_im = self.im.abs();
@@ -123,6 +123,7 @@ impl std::ops::Mul<f32> for Complex {
 
 impl std::ops::Div<f32> for Complex {
     type Output = Self;
+    /// Scalar division. Follows IEEE 754: division by zero yields infinity.
     #[inline]
     fn div(self, rhs: f32) -> Self {
         Self {
@@ -173,6 +174,12 @@ impl std::ops::Neg for Complex {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    // Compile-time verification of thread safety.
+    const _: fn() = || {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Complex>();
+    };
 
     const EPS: f32 = 1e-6;
 

@@ -85,6 +85,14 @@ impl std::ops::SubAssign for Stereo {
     }
 }
 
+impl std::ops::DivAssign<f32> for Stereo {
+    #[inline]
+    fn div_assign(&mut self, rhs: f32) {
+        self.l /= rhs;
+        self.r /= rhs;
+    }
+}
+
 impl std::ops::MulAssign<f32> for Stereo {
     #[inline]
     fn mul_assign(&mut self, rhs: f32) {
@@ -99,6 +107,12 @@ impl std::ops::MulAssign<f32> for Stereo {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    // Compile-time verification of thread safety.
+    const _: fn() = || {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Stereo>();
+    };
 
     #[test]
     fn test_new_and_default() {
@@ -164,6 +178,14 @@ mod tests {
         a *= 2.0;
         assert_eq!(a.l, 4.0);
         assert_eq!(a.r, 6.0);
+    }
+
+    #[test]
+    fn test_div_assign() {
+        let mut a = Stereo::new(4.0, 6.0);
+        a /= 2.0;
+        assert_eq!(a.l, 2.0);
+        assert_eq!(a.r, 3.0);
     }
 
     #[test]
