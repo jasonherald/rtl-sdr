@@ -1,3 +1,6 @@
+/// Alpha-max-beta-min coefficient for fast amplitude approximation.
+const FAST_AMPLITUDE_BETA: f32 = 0.4;
+
 /// IQ complex sample type — matches SDR++ `dsp::complex_t` memory layout.
 ///
 /// Two f32 fields (re, im) representing in-phase and quadrature components.
@@ -64,9 +67,9 @@ impl Complex {
         let re_abs = self.re.abs();
         let im_abs = self.im.abs();
         if re_abs > im_abs {
-            re_abs + 0.4 * im_abs
+            re_abs + FAST_AMPLITUDE_BETA * im_abs
         } else {
-            im_abs + 0.4 * re_abs
+            im_abs + FAST_AMPLITUDE_BETA * re_abs
         }
     }
 }

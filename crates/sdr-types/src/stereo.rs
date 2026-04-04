@@ -58,6 +58,17 @@ impl std::ops::Mul<f32> for Stereo {
     }
 }
 
+impl std::ops::Div<f32> for Stereo {
+    type Output = Self;
+    #[inline]
+    fn div(self, rhs: f32) -> Self {
+        Self {
+            l: self.l / rhs,
+            r: self.r / rhs,
+        }
+    }
+}
+
 impl std::ops::AddAssign for Stereo {
     #[inline]
     fn add_assign(&mut self, rhs: Self) {
@@ -130,6 +141,13 @@ mod tests {
         let s = Stereo::new(2.0, 3.0) * 2.0;
         assert_eq!(s.l, 4.0);
         assert_eq!(s.r, 6.0);
+    }
+
+    #[test]
+    fn test_scalar_div() {
+        let s = Stereo::new(4.0, 6.0) / 2.0;
+        assert_eq!(s.l, 2.0);
+        assert_eq!(s.r, 3.0);
     }
 
     #[test]
