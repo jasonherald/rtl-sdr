@@ -7,10 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+sdr-types.workspace = true
+sdr-dsp.workspace = true
 sdr-ui.workspace = true
 sdr-pipeline.workspace = true
 sdr-config.workspace = true
 sdr-radio.workspace = true
+sdr-rtlsdr.workspace = true
 sdr-source-rtlsdr.workspace = true
 sdr-source-network.workspace = true
 sdr-source-file.workspace = true
