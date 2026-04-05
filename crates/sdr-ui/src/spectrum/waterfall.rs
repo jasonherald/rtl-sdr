@@ -324,6 +324,10 @@ fn create_data_texture(gl: &glow::Context, width: usize) -> Result<glow::Texture
 
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
 
+        // R8 is 1 byte/pixel — set alignment to 1 so non-power-of-4 widths
+        // don't cause row misalignment from the default GL_UNPACK_ALIGNMENT of 4.
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+
         // Initialize with zeros.
         let data = vec![0u8; width * HISTORY_LINES];
         gl.tex_image_2d(

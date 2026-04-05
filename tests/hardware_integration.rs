@@ -208,18 +208,25 @@ fn pipeline_iq_frontend_produces_fft() {
     tracing::info!("IqFrontend: processed {processed} samples, FFT ready: {fft_ready}");
     assert!(processed > 0, "No samples processed");
 
-    // If we read enough samples, FFT should be ready
-    if iq_count >= TEST_FFT_SIZE {
-        assert!(fft_ready, "FFT should be ready with {iq_count} samples");
+    assert!(
+        iq_count >= TEST_FFT_SIZE,
+        "Need at least {TEST_FFT_SIZE} IQ samples for FFT validation, got {iq_count}"
+    );
+    assert!(fft_ready, "FFT should be ready with {iq_count} samples");
 
-        // FFT output should be in dB range (roughly -120 to 0)
-        let fft_min = fft_out.iter().copied().reduce(f32::min).unwrap_or(0.0);
-        let fft_max = fft_out.iter().copied().reduce(f32::max).unwrap_or(0.0);
-        tracing::info!("FFT range: {fft_min:.1} to {fft_max:.1} dB");
+    // FFT output should be in dB range with finite values
+    let fft_min = fft_out.iter().copied().reduce(f32::min).unwrap_or(0.0);
+    let fft_max = fft_out.iter().copied().reduce(f32::max).unwrap_or(0.0);
+    tracing::info!("FFT range: {fft_min:.1} to {fft_max:.1} dB");
 
-        assert!(fft_max > -120.0, "FFT max too low: {fft_max}");
-        assert!(fft_min < 0.0, "FFT min should be negative dB: {fft_min}");
-    }
+    assert!(
+        fft_min.is_finite() && fft_max.is_finite(),
+        "Non-finite FFT dB values"
+    );
+    assert!(
+        fft_max > fft_min,
+        "Flat FFT output indicates invalid spectrum computation"
+    );
 }
 
 #[test]
@@ -241,27 +248,36 @@ fn pipeline_fft_standalone() {
     let mut iq = vec![Complex::default(); bytes_read / 2];
     let count = RtlSdrSource::convert_samples(&raw[..bytes_read], &mut iq);
 
-    if count >= TEST_FFT_SIZE {
-        let mut engine = RustFftEngine::new(TEST_FFT_SIZE).expect("create FFT engine");
-        let mut fft_buf = iq[..TEST_FFT_SIZE].to_vec();
-        engine.forward(&mut fft_buf).expect("FFT forward");
+    assert!(
+        count >= TEST_FFT_SIZE,
+        "Need at least {TEST_FFT_SIZE} IQ samples, got {count}"
+    );
 
-        let mut power = vec![0.0_f32; TEST_FFT_SIZE];
-        sdr_dsp::fft::power_spectrum_db(&fft_buf, &mut power).expect("power_spectrum_db");
+    let mut engine = RustFftEngine::new(TEST_FFT_SIZE).expect("create FFT engine");
+    let mut fft_buf = iq[..TEST_FFT_SIZE].to_vec();
+    engine.forward(&mut fft_buf).expect("FFT forward");
 
-        let peak_bin = power
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let peak_db = power[peak_bin];
-        tracing::info!(
-            "FFT peak at bin {peak_bin} ({:.1} dB), noise floor ~{:.1} dB",
-            peak_db,
-            power.iter().sum::<f32>() / power.len() as f32
-        );
-    }
+    let mut power = vec![0.0_f32; TEST_FFT_SIZE];
+    sdr_dsp::fft::power_spectrum_db(&fft_buf, &mut power).expect("power_spectrum_db");
+    assert!(
+        power.iter().all(|v| v.is_finite()),
+        "Non-finite power spectrum values"
+    );
+
+    let peak_bin = power
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let peak_db = power[peak_bin];
+    let min_db = power.iter().copied().reduce(f32::min).unwrap_or(peak_db);
+    tracing::info!(
+        "FFT peak at bin {peak_bin} ({:.1} dB), noise floor ~{:.1} dB",
+        peak_db,
+        power.iter().sum::<f32>() / power.len() as f32
+    );
+    assert!(peak_db > min_db, "No spectral dynamic range detected");
 }
 
 // =========================================================================
