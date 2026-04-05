@@ -115,6 +115,15 @@ impl Source for FileSource {
             WavReader::open(&self.path).map_err(|e| SourceError::OpenFailed(e.to_string()))?;
 
         let spec = reader.spec();
+
+        // Validate WAV layout: need 2 channels (I + Q)
+        if spec.channels != 2 {
+            return Err(SourceError::OpenFailed(format!(
+                "WAV file must have 2 channels (I/Q), got {}",
+                spec.channels
+            )));
+        }
+
         self.sample_rate = f64::from(spec.sample_rate);
 
         let is_float = spec.sample_format == hound::SampleFormat::Float;

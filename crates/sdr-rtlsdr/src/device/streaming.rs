@@ -1,12 +1,13 @@
+#![allow(unused_imports)]
 //! Data streaming — buffer reset, sync read, async read.
 //!
 //! Ports `rtlsdr_reset_buffer`, `rtlsdr_read_sync`,
 //! `rtlsdr_read_async`, `rtlsdr_cancel_async`.
 //!
 //! Note: The C implementation uses libusb's async transfer API with multiple
-//! pre-submitted bulk transfers. The Rust implementation uses a worker thread
-//! with synchronous bulk reads, which provides equivalent functionality
-//! without requiring raw libusb async bindings.
+//! pre-submitted bulk transfers. The Rust implementation uses a blocking
+//! read loop that checks a shared cancellation flag. True async support
+//! will be added when the pipeline is wired up with worker threads.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,100 +54,57 @@ impl RtlSdrDevice {
         } else {
             Duration::from_millis(BULK_TIMEOUT)
         };
-        let n = self.handle.read_bulk(0x81, buf, timeout)?;
+        let n = self
+            .handle
+            .read_bulk(crate::constants::BULK_ENDPOINT, buf, timeout)?;
         Ok(n)
     }
 
-    /// Start asynchronous reading with a callback.
+    /// Read IQ samples in a blocking loop, calling the callback for each buffer.
     ///
-    /// Ports `rtlsdr_read_async`. Spawns a worker thread that reads bulk
-    /// data and calls the callback for each buffer. Blocks until cancelled
-    /// via `cancel_async()` or the callback returns.
+    /// This is a simplified port of `rtlsdr_read_async`. It blocks the calling
+    /// thread and reads bulk data, calling `cb` for each completed buffer.
+    /// Use `cancel_flag` to signal cancellation from another thread.
     ///
     /// - `cb`: callback called with each buffer of IQ data
-    /// - `buf_num`: number of buffers (0 = default 15)
+    /// - `cancel_flag`: set to `true` from another thread to stop reading
     /// - `buf_len`: buffer length in bytes (0 = default, must be multiple of 512)
-    pub fn read_async(
-        &mut self,
+    pub fn read_async_blocking(
+        &self,
         mut cb: ReadAsyncCb,
-        buf_num: u32,
+        cancel_flag: &AtomicBool,
         buf_len: u32,
     ) -> Result<(), RtlSdrError> {
-        if self.async_status != AsyncStatus::Inactive {
-            return Err(RtlSdrError::DeviceBusy);
-        }
-
-        self.async_status = AsyncStatus::Running;
-
-        let _buf_num = if buf_num > 0 {
-            buf_num
-        } else {
-            DEFAULT_BUF_NUMBER
-        };
-
         let actual_buf_len = if buf_len > 0 && buf_len.is_multiple_of(512) {
             buf_len as usize
         } else {
             DEFAULT_BUF_LENGTH as usize
         };
 
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel_flag);
-
-        // Store cancel flag for cancel_async()
-        // (In a full implementation this would be a field on the struct)
-
-        let timeout = if BULK_TIMEOUT == 0 {
-            Duration::from_secs(1)
-        } else {
-            Duration::from_millis(BULK_TIMEOUT)
-        };
-
+        // Use short timeout so we check cancel_flag frequently
+        let timeout = Duration::from_secs(1);
         let mut buf = vec![0u8; actual_buf_len];
 
-        // Read loop — equivalent to the libusb event loop in the C version
-        while !cancel_clone.load(Ordering::Relaxed) {
-            match self.handle.read_bulk(0x81, &mut buf, timeout) {
-                Ok(n) => {
-                    if n > 0 {
-                        cb(&buf[..n]);
-                    }
+        while !cancel_flag.load(Ordering::Relaxed) {
+            match self
+                .handle
+                .read_bulk(crate::constants::BULK_ENDPOINT, &mut buf, timeout)
+            {
+                Ok(n) if n > 0 => {
+                    cb(&buf[..n]);
                 }
-                Err(rusb::Error::Timeout) => {
-                    // Timeout is normal when waiting for data
-                }
+                // Zero-length read or timeout — check cancel flag and retry
+                Ok(_) | Err(rusb::Error::Timeout) => {}
                 Err(rusb::Error::NoDevice) => {
-                    self.dev_lost = true;
-                    break;
+                    return Err(RtlSdrError::DeviceLost);
                 }
                 Err(e) => {
-                    tracing::error!("async read error: {e}");
-                    break;
+                    tracing::error!("bulk read error: {e}");
+                    return Err(RtlSdrError::Usb(e));
                 }
             }
         }
 
-        self.async_status = AsyncStatus::Inactive;
-
-        if self.dev_lost {
-            return Err(RtlSdrError::DeviceLost);
-        }
-
         Ok(())
-    }
-
-    /// Cancel an ongoing async read.
-    ///
-    /// Ports `rtlsdr_cancel_async`.
-    pub fn cancel_async(&mut self) -> Result<(), RtlSdrError> {
-        if self.async_status == AsyncStatus::Running {
-            self.async_status = AsyncStatus::Canceling;
-            // The async read loop checks this status
-            Ok(())
-        } else {
-            Err(RtlSdrError::InvalidParameter(
-                "no async read in progress".to_string(),
-            ))
-        }
     }
 }

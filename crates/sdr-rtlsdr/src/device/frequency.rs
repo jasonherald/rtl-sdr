@@ -7,6 +7,10 @@ use crate::error::RtlSdrError;
 use crate::reg::TunerType;
 use crate::usb;
 
+/// Offset tuning multiplier: 1.7x half-rate, based on keenerds 1/f noise measurements.
+const OFFSET_TUNING_MULTIPLIER_NUM: u32 = 170;
+const OFFSET_TUNING_MULTIPLIER_DEN: u32 = 100;
+
 use super::RtlSdrDevice;
 
 impl RtlSdrDevice {
@@ -140,7 +144,11 @@ impl RtlSdrDevice {
         }
 
         // Based on keenerds 1/f noise measurements
-        self.offs_freq = if on { (self.rate / 2) * 170 / 100 } else { 0 };
+        self.offs_freq = if on {
+            (self.rate / 2) * OFFSET_TUNING_MULTIPLIER_NUM / OFFSET_TUNING_MULTIPLIER_DEN
+        } else {
+            0
+        };
         self.set_if_freq(self.offs_freq)?;
 
         if let Some(tuner) = &mut self.tuner {

@@ -125,7 +125,7 @@ fn convert_samples(
                     raw[offset + 6],
                     raw[offset + 7],
                 ]);
-                output[i] = Complex::new(re as f32 / 2_147_483_647.0, im as f32 / 2_147_483_647.0);
+                output[i] = Complex::new(re as f32 / 2_147_483_648.0, im as f32 / 2_147_483_648.0);
             }
         }
         SampleFormat::Float32 => {

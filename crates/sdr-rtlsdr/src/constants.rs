@@ -251,6 +251,9 @@ pub const CTRL_TIMEOUT: u64 = 300;
 /// USB bulk transfer timeout (ms). 0 = no timeout.
 pub const BULK_TIMEOUT: u64 = 0;
 
+/// USB bulk transfer endpoint for IQ data.
+pub const BULK_ENDPOINT: u8 = 0x81;
+
 /// EEPROM I2C address.
 pub const EEPROM_ADDR: u8 = 0xa0;
 

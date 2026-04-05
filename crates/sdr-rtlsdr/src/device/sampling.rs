@@ -22,7 +22,7 @@ impl RtlSdrDevice {
             // Disable tuner
             if let Some(tuner) = &mut self.tuner {
                 usb::set_i2c_repeater(&self.handle, true)?;
-                let _ = tuner.exit(&self.handle);
+                tuner.exit(&self.handle)?;
                 usb::set_i2c_repeater(&self.handle, false)?;
             }
 
@@ -44,7 +44,7 @@ impl RtlSdrDevice {
             // Re-enable tuner
             if let Some(tuner) = &mut self.tuner {
                 usb::set_i2c_repeater(&self.handle, true)?;
-                let _ = tuner.init(&self.handle);
+                tuner.init(&self.handle)?;
                 usb::set_i2c_repeater(&self.handle, false)?;
             }
 
@@ -70,7 +70,10 @@ impl RtlSdrDevice {
             self.direct_sampling = 0;
         }
 
-        self.set_center_freq(self.freq)?;
+        // Only retune if a frequency has been programmed
+        if self.freq > 0 {
+            self.set_center_freq(self.freq)?;
+        }
 
         Ok(())
     }

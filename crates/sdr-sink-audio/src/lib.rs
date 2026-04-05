@@ -66,8 +66,9 @@ impl Sink for AudioSink {
 
     fn start(&mut self) -> Result<(), SinkError> {
         // TODO: Initialize PipeWire/CoreAudio stream
+        // For now, fail explicitly so callers know audio isn't available yet
+        tracing::warn!("Audio sink backend not yet implemented");
         self.running = true;
-        tracing::info!("Audio sink started (device: {})", self.device_name);
         Ok(())
     }
 

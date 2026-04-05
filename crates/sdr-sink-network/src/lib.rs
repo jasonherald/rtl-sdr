@@ -76,15 +76,15 @@ impl NetworkSink {
 
         if self.stereo {
             for (i, s) in samples.iter().enumerate() {
-                let l = (s.l * 32768.0) as i16;
-                let r = (s.r * 32768.0) as i16;
+                let l = (s.l.clamp(-1.0, 1.0) * 32767.0) as i16;
+                let r = (s.r.clamp(-1.0, 1.0) * 32767.0) as i16;
                 buf[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
                 buf[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
             }
         } else {
             // Mono: average L and R
             for (i, s) in samples.iter().enumerate() {
-                let mono = ((s.l + s.r) / 2.0 * 32768.0) as i16;
+                let mono = (((s.l + s.r) / 2.0).clamp(-1.0, 1.0) * 32767.0) as i16;
                 buf[i * 2..i * 2 + 2].copy_from_slice(&mono.to_le_bytes());
             }
         }

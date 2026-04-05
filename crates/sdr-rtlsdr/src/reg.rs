@@ -82,7 +82,7 @@ impl TunerType {
             Self::Fc0013 => FC0013_GAINS,
             Self::Fc2580 => FC2580_GAINS,
             Self::R820T | Self::R828D => R82XX_GAINS,
-            Self::Unknown => &[0],
+            Self::Unknown => &[],
         }
     }
 }

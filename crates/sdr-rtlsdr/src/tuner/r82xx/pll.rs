@@ -59,6 +59,13 @@ impl R82xxPriv {
             mix_div <<= 1;
         }
 
+        // Check that we found a valid divider
+        if mix_div > 64 {
+            return Err(RtlSdrError::Tuner(format!(
+                "no valid VCO divider for {freq} Hz"
+            )));
+        }
+
         // Read back and check VCO fine tune
         let mut data = [0u8; 5];
         self.read(handle, 0x00, &mut data)?;
@@ -87,9 +94,9 @@ impl R82xxPriv {
         let nint = (vco_div / 65536) as u32;
         let sdm = (vco_div % 65536) as u32;
 
-        if nint > ((128 / u32::from(vco_power_ref)) - 1) {
+        if nint < 13 || nint > ((128 / u32::from(vco_power_ref)) - 1) {
             return Err(RtlSdrError::Tuner(format!(
-                "no valid PLL values for {freq} Hz"
+                "no valid PLL values for {freq} Hz (nint={nint})"
             )));
         }
 

@@ -64,9 +64,6 @@ impl R82xxPriv {
             return Ok(());
         }
 
-        // Store shadow
-        self.shadow_store(reg, val);
-
         let max_msg = self.max_i2c_msg_len;
         let mut pos = 0usize;
         let mut current_reg = reg;
@@ -91,6 +88,9 @@ impl R82xxPriv {
             remaining -= size;
             pos += size;
         }
+
+        // Update shadow only after all writes succeed
+        self.shadow_store(reg, val);
 
         Ok(())
     }

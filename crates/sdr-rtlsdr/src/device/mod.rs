@@ -49,6 +49,7 @@ pub struct RtlSdrDevice {
     pub(crate) fir: [i32; FIR_LEN],
 
     // Async streaming state
+    #[allow(dead_code)]
     pub(crate) async_status: AsyncStatus,
 
     // Device info
@@ -211,7 +212,7 @@ impl RtlSdrDevice {
         if let Ok(reg) = usb::i2c_read_reg(&self.handle, R828D_I2C_ADDR, R82XX_CHECK_ADDR) {
             if reg == R82XX_CHECK_VAL {
                 tracing::info!("Found Rafael Micro R828D tuner");
-                let is_v4 = self.manufact == "RTLSDRBlog" && self.product == "Blog V4";
+                let is_v4 = self.is_blog_v4();
                 if is_v4 {
                     tracing::info!("RTL-SDR Blog V4 Detected");
                 }
@@ -253,7 +254,7 @@ impl RtlSdrDevice {
     fn create_r82xx_tuner(&mut self) {
         let (i2c_addr, chip) = match self.tuner_type {
             TunerType::R828D => {
-                let is_v4 = self.manufact == "RTLSDRBlog" && self.product == "Blog V4";
+                let is_v4 = self.is_blog_v4();
                 if !is_v4 {
                     self.tun_xtal = R828D_XTAL_FREQ;
                 }
@@ -278,7 +279,7 @@ impl RtlSdrDevice {
         };
 
         let mut r82xx = R82xxPriv::new(&config);
-        let is_v4 = self.manufact == "RTLSDRBlog" && self.product == "Blog V4";
+        let is_v4 = self.is_blog_v4();
         r82xx.set_blog_v4(is_v4);
         self.tuner = Some(Box::new(r82xx));
     }
@@ -422,6 +423,11 @@ impl RtlSdrDevice {
         }
 
         Ok(())
+    }
+
+    /// Check if this is an RTL-SDR Blog V4 device.
+    pub fn is_blog_v4(&self) -> bool {
+        self.manufact == "RTLSDRBlog" && self.product == "Blog V4"
     }
 
     /// Check if the device matches a manufacturer/product pair.
