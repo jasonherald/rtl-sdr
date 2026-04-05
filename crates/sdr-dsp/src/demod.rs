@@ -307,10 +307,20 @@ impl SsbDemod {
     }
 
     /// Set the bandwidth.
-    pub fn set_bandwidth(&mut self, bandwidth: f64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `bandwidth` is non-positive or non-finite.
+    pub fn set_bandwidth(&mut self, bandwidth: f64) -> Result<(), DspError> {
+        if !bandwidth.is_finite() || bandwidth <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "bandwidth must be positive and finite, got {bandwidth}"
+            )));
+        }
         self.bandwidth = bandwidth;
         let translation = Self::get_translation(self.mode, bandwidth);
         self.xlator = crate::channel::FrequencyXlator::from_hz(translation, self.sample_rate);
+        Ok(())
     }
 
     /// Get the frequency translation for the given mode and bandwidth.
