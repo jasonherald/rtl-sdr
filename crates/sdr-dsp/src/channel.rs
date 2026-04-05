@@ -119,7 +119,7 @@ impl RxVfo {
         let xlator = FrequencyXlator::from_hz(-offset, in_sample_rate);
         let resampler = RationalResampler::new(in_sample_rate, out_sample_rate)?;
 
-        let filter = if (bandwidth - out_sample_rate).abs() > 1.0 {
+        let filter = if bandwidth < out_sample_rate - 1.0 {
             let filter_width = bandwidth / 2.0;
             let filter_trans = filter_width * 0.1;
             let filter_taps = taps::low_pass(filter_width, filter_trans, out_sample_rate, true)?;
@@ -155,7 +155,7 @@ impl RxVfo {
     /// Returns `DspError::InvalidParameter` if bandwidth is invalid.
     pub fn set_bandwidth(&mut self, bandwidth: f64) -> Result<(), DspError> {
         self.bandwidth = bandwidth;
-        if (bandwidth - self.out_sample_rate).abs() > 1.0 {
+        if bandwidth < self.out_sample_rate - 1.0 {
             let filter_width = bandwidth / 2.0;
             let filter_trans = filter_width * 0.1;
             let filter_taps =
@@ -192,8 +192,11 @@ impl RxVfo {
         self.xlator_buf.resize(input.len(), Complex::default());
         self.xlator.process(input, &mut self.xlator_buf)?;
 
-        // Step 2: Resample
-        self.resamp_buf.resize(input.len() * 2, Complex::default());
+        // Step 2: Resample — size buffer for worst-case expansion ratio
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ratio = (self.out_sample_rate / self.in_sample_rate).ceil() as usize;
+        let resamp_size = input.len() * ratio.max(1) + 16;
+        self.resamp_buf.resize(resamp_size, Complex::default());
         let resamp_count = self
             .resampler
             .process(&self.xlator_buf, &mut self.resamp_buf)?;

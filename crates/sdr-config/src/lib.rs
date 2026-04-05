@@ -38,7 +38,7 @@ impl Drop for AutoSaveHandle {
             let mut stop = lock.lock().unwrap_or_else(PoisonError::into_inner);
             *stop = true;
         }
-        cvar.notify_one();
+        cvar.notify_all();
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -166,11 +166,18 @@ impl ConfigManager {
     }
 }
 
-/// Merge loaded config with defaults — adds missing keys from defaults.
+/// Recursively merge loaded config with defaults — adds missing keys at all levels.
 fn merge_defaults(mut loaded: Value, defaults: &Value) -> Value {
     if let (Some(loaded_obj), Some(defaults_obj)) = (loaded.as_object_mut(), defaults.as_object()) {
         for (key, default_val) in defaults_obj {
-            if !loaded_obj.contains_key(key) {
+            if let Some(existing) = loaded_obj.get_mut(key) {
+                // Recursively merge nested objects
+                if existing.is_object() && default_val.is_object() {
+                    let merged = merge_defaults(existing.take(), default_val);
+                    *existing = merged;
+                }
+                // Existing non-object value takes precedence
+            } else {
                 loaded_obj.insert(key.clone(), default_val.clone());
             }
         }
@@ -188,13 +195,13 @@ fn auto_save_worker(
 ) {
     let (lock, cvar) = &*stop_flag;
     loop {
-        // Wait for interval or stop signal
+        // Wait for interval or stop signal (predicate avoids missed-notify stall)
         {
             let stop = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            let result = cvar
-                .wait_timeout(stop, Duration::from_millis(AUTO_SAVE_INTERVAL_MS))
+            let (guard, _timeout) = cvar
+                .wait_timeout_while(stop, Duration::from_millis(AUTO_SAVE_INTERVAL_MS), |s| !*s)
                 .unwrap_or_else(PoisonError::into_inner);
-            if *result.0 {
+            if *guard {
                 break;
             }
         }
@@ -335,6 +342,16 @@ mod tests {
         assert_eq!(merged["a"], 1);
         assert_eq!(merged["b"], 2);
         assert_eq!(merged["c"], 3);
+    }
+
+    #[test]
+    fn test_merge_defaults_recursive() {
+        let loaded = json!({"audio": {"volume": 0.8}});
+        let defaults = json!({"audio": {"volume": 0.5, "device": "default"}, "freq": 100});
+        let merged = merge_defaults(loaded, &defaults);
+        assert_eq!(merged["audio"]["volume"], 0.8); // loaded wins
+        assert_eq!(merged["audio"]["device"], "default"); // merged from defaults
+        assert_eq!(merged["freq"], 100); // top-level default
     }
 
     #[test]
