@@ -2,6 +2,7 @@
 //!
 //! All functions are pure: no side effects, no thread spawning, no I/O.
 
+pub mod channel;
 pub mod convert;
 pub mod correction;
 pub mod demod;
