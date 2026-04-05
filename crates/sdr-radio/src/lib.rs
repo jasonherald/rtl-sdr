@@ -111,6 +111,11 @@ impl RadioModule {
     /// This reconfigures the demodulator, IF chain feature flags, and AF chain
     /// (including resampler) to match the new mode's requirements.
     ///
+    /// IF chain features (noise blanker, squelch, FM IF NR) are **only disabled**
+    /// when the new mode doesn't support them. They are not automatically
+    /// re-enabled on mode switch, preserving the user's explicit disable choice.
+    /// Call `set_squelch_enabled(true)` etc. to re-enable after switching.
+    ///
     /// # Errors
     ///
     /// Returns `RadioError` if the new demodulator or AF chain cannot be created.
