@@ -3,6 +3,7 @@
 pub mod app;
 pub mod css;
 pub mod messages;
+pub mod spectrum;
 pub mod state;
 pub mod window;
 
