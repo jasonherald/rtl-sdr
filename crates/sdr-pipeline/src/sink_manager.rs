@@ -233,4 +233,11 @@ mod tests {
         mgr.register_stream("main", 48_000.0);
         assert!(mgr.set_stream_sink("main", "NonExistent").is_err());
     }
+
+    #[test]
+    fn test_set_stream_sink_stream_not_found() {
+        let mut mgr = SinkManager::new();
+        mgr.register_sink(Box::new(MockSink::new("Audio"))).unwrap();
+        assert!(mgr.set_stream_sink("nonexistent", "Audio").is_err());
+    }
 }

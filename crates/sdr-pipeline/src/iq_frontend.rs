@@ -30,8 +30,6 @@ pub enum FftWindow {
 pub struct IqFrontend {
     sample_rate: f64,
     fft_size: usize,
-    #[allow(dead_code)]
-    fft_window: FftWindow,
     fft_engine: RustFftEngine,
     fft_window_buf: Vec<f32>,
     fft_input: Vec<Complex>,
@@ -87,7 +85,6 @@ impl IqFrontend {
         Ok(Self {
             sample_rate,
             fft_size,
-            fft_window,
             fft_engine,
             fft_window_buf,
             fft_input: vec![Complex::default(); fft_size],

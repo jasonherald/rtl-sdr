@@ -226,4 +226,15 @@ mod tests {
         names.sort_unstable();
         assert_eq!(names, vec!["a", "b"]);
     }
+
+    #[test]
+    fn test_set_bandwidth_limits_invalid() {
+        let mut mgr = VfoManager::new();
+        mgr.create_vfo(VfoParams::new("vfo1", 0.0, 200_000.0, 48_000.0))
+            .unwrap();
+        assert!(
+            mgr.set_bandwidth_limits("vfo1", 100_000.0, 50_000.0)
+                .is_err()
+        );
+    }
 }

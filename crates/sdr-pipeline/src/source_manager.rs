@@ -71,8 +71,10 @@ impl SourceManager {
     pub fn unregister(&mut self, name: &str) -> Option<Box<dyn Source>> {
         // Stop the source if it's the selected running source
         if self.selected.as_deref() == Some(name) && self.running {
-            if let Some(source) = self.sources.get_mut(name) {
-                let _ = source.stop();
+            if let Some(source) = self.sources.get_mut(name)
+                && let Err(e) = source.stop()
+            {
+                tracing::warn!("failed to stop source during unregister: {e}");
             }
             self.running = false;
             self.selected = None;
@@ -268,5 +270,58 @@ mod tests {
         mgr.unregister("Test");
         assert!(mgr.selected().is_none());
         assert!(mgr.source_names().is_empty());
+    }
+
+    #[test]
+    fn test_unregister_stops_running_source() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TrackingSource {
+            stopped: Arc<AtomicBool>,
+        }
+        impl Source for TrackingSource {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn name(&self) -> &str {
+                "Tracker"
+            }
+            fn start(&mut self) -> Result<(), SourceError> {
+                Ok(())
+            }
+            fn stop(&mut self) -> Result<(), SourceError> {
+                self.stopped.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            fn tune(&mut self, _: f64) -> Result<(), SourceError> {
+                Ok(())
+            }
+            fn sample_rates(&self) -> &[f64] {
+                &[]
+            }
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn set_sample_rate(&mut self, _: f64) -> Result<(), SourceError> {
+                Ok(())
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let source = TrackingSource {
+            stopped: Arc::clone(&stopped),
+        };
+
+        let mut mgr = SourceManager::new();
+        mgr.register(Box::new(source)).unwrap();
+        mgr.select("Tracker").unwrap();
+        mgr.start().unwrap();
+        assert!(mgr.is_running());
+
+        mgr.unregister("Tracker");
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "source should have been stopped"
+        );
+        assert!(!mgr.is_running());
     }
 }
