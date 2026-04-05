@@ -262,13 +262,17 @@ impl BroadcastFmDemod {
 
 /// SSB demodulator — single-sideband demodulation via frequency translation.
 ///
-/// Ports SDR++ `dsp::demod::SSB`. Extracts audio from a complex baseband
-/// SSB signal using Hilbert-style demodulation:
-/// - USB: `re + im` (selects upper sideband)
-/// - LSB: `re - im` (selects lower sideband via spectrum flip)
-/// - DSB: `re` (both sidebands, no sideband selection)
+/// Faithful port of SDR++ `dsp::demod::SSB`. Uses a frequency translator
+/// to shift the sideband to baseband before extracting the real part:
+/// - USB: translate by `+bandwidth/2`, then extract real
+/// - LSB: translate by `-bandwidth/2`, then extract real
+/// - DSB: no translation, extract real
 pub struct SsbDemod {
     mode: SsbMode,
+    xlator: crate::channel::FrequencyXlator,
+    xlator_buf: Vec<Complex>,
+    bandwidth: f64,
+    sample_rate: f64,
 }
 
 /// SSB demodulation mode.
@@ -284,15 +288,51 @@ pub enum SsbMode {
 
 impl SsbDemod {
     /// Create a new SSB demodulator.
-    pub fn new(mode: SsbMode) -> Self {
-        Self { mode }
+    ///
+    /// - `mode`: USB, LSB, or DSB
+    /// - `bandwidth`: channel bandwidth in Hz
+    /// - `sample_rate`: sample rate in Hz
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn new(mode: SsbMode, bandwidth: f64, sample_rate: f64) -> Self {
+        let translation = Self::get_translation(mode, bandwidth);
+        let xlator = crate::channel::FrequencyXlator::from_hz(translation, sample_rate);
+        Self {
+            mode,
+            xlator,
+            xlator_buf: Vec::new(),
+            bandwidth,
+            sample_rate,
+        }
+    }
+
+    /// Set the demodulation mode.
+    pub fn set_mode(&mut self, mode: SsbMode) {
+        self.mode = mode;
+        let translation = Self::get_translation(mode, self.bandwidth);
+        self.xlator = crate::channel::FrequencyXlator::from_hz(translation, self.sample_rate);
+    }
+
+    /// Set the bandwidth.
+    pub fn set_bandwidth(&mut self, bandwidth: f64) {
+        self.bandwidth = bandwidth;
+        let translation = Self::get_translation(self.mode, bandwidth);
+        self.xlator = crate::channel::FrequencyXlator::from_hz(translation, self.sample_rate);
+    }
+
+    /// Get the frequency translation for the given mode and bandwidth.
+    ///
+    /// Ports `SSB::getTranslation()`.
+    fn get_translation(mode: SsbMode, bandwidth: f64) -> f64 {
+        match mode {
+            SsbMode::Usb => bandwidth / 2.0,
+            SsbMode::Lsb => -bandwidth / 2.0,
+            SsbMode::Dsb => 0.0,
+        }
     }
 
     /// Process complex samples, outputting demodulated audio.
     ///
-    /// - USB: `output = re + im` (upper sideband via Hilbert demod)
-    /// - LSB: `output = re - im` (lower sideband via spectrum flip)
-    /// - DSB: `output = re` (both sidebands)
+    /// Translates the sideband to baseband, then extracts the real part.
     ///
     /// # Errors
     ///
@@ -304,26 +344,16 @@ impl SsbDemod {
                 got: output.len(),
             });
         }
-        match self.mode {
-            SsbMode::Usb => {
-                // USB: sum of re and im (Hilbert demod, upper sideband)
-                for (i, &s) in input.iter().enumerate() {
-                    output[i] = s.re + s.im;
-                }
-            }
-            SsbMode::Lsb => {
-                // LSB: difference of re and im (spectrum flip)
-                for (i, &s) in input.iter().enumerate() {
-                    output[i] = s.re - s.im;
-                }
-            }
-            SsbMode::Dsb => {
-                // DSB: take real part (both sidebands)
-                for (i, &s) in input.iter().enumerate() {
-                    output[i] = s.re;
-                }
-            }
+
+        // Step 1: Frequency translate to move sideband to baseband
+        self.xlator_buf.resize(input.len(), Complex::default());
+        self.xlator.process(input, &mut self.xlator_buf)?;
+
+        // Step 2: Extract real part (ComplexToReal)
+        for (i, &s) in self.xlator_buf.iter().enumerate() {
+            output[i] = s.re;
         }
+
         Ok(input.len())
     }
 }
@@ -506,42 +536,62 @@ mod tests {
     // --- SSB tests ---
 
     #[test]
-    fn test_ssb_usb() {
-        let mut demod = SsbDemod::new(SsbMode::Usb);
+    fn test_ssb_dsb_extracts_real() {
+        // DSB mode: no frequency translation, just extract real part
+        let mut demod = SsbDemod::new(SsbMode::Dsb, 3000.0, 48_000.0);
         let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
         let mut output = [0.0_f32; 2];
         demod.process(&input, &mut output).unwrap();
-        // USB: re + im
-        assert!((output[0] - 3.0).abs() < 1e-6); // 1+2
-        assert!((output[1] - 7.0).abs() < 1e-6); // 3+4
+        // DSB: real part only (no translation)
+        assert!((output[0] - 1.0).abs() < 1e-5);
+        assert!((output[1] - 3.0).abs() < 1e-5);
     }
 
     #[test]
-    fn test_ssb_lsb_differs_from_usb() {
-        let mut usb = SsbDemod::new(SsbMode::Usb);
-        let mut lsb = SsbDemod::new(SsbMode::Lsb);
-        let input = [Complex::new(1.0, 2.0)];
-        let mut usb_out = [0.0_f32; 1];
-        let mut lsb_out = [0.0_f32; 1];
+    fn test_ssb_usb_lsb_differ() {
+        // USB and LSB should produce different output for asymmetric signals
+        let mut usb = SsbDemod::new(SsbMode::Usb, 3000.0, 48_000.0);
+        let mut lsb = SsbDemod::new(SsbMode::Lsb, 3000.0, 48_000.0);
+        // Generate a tone signal (not DC) so translation matters
+        let input: Vec<Complex> = (0..100)
+            .map(|i| {
+                let phase = 2.0 * PI * 500.0 * (i as f32) / 48_000.0;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+        let mut usb_out = vec![0.0_f32; 100];
+        let mut lsb_out = vec![0.0_f32; 100];
         usb.process(&input, &mut usb_out).unwrap();
         lsb.process(&input, &mut lsb_out).unwrap();
-        // USB: 1+2=3, LSB: 1-2=-1 — they must differ
-        assert!((usb_out[0] - 3.0).abs() < 1e-6);
-        assert!((lsb_out[0] - (-1.0)).abs() < 1e-6);
+        // USB and LSB should differ for a non-DC signal
+        let diff: f32 = usb_out
+            .iter()
+            .zip(&lsb_out)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         assert!(
-            (usb_out[0] - lsb_out[0]).abs() > 1.0,
-            "USB and LSB must differ"
+            diff > 1.0,
+            "USB and LSB should produce different output, diff={diff}"
         );
     }
 
     #[test]
-    fn test_ssb_dsb() {
-        let mut demod = SsbDemod::new(SsbMode::Dsb);
-        let input = [Complex::new(1.0, 2.0)];
-        let mut output = [0.0_f32; 1];
+    fn test_ssb_produces_audio() {
+        // Verify SSB produces non-zero audio output from a tone
+        let mut demod = SsbDemod::new(SsbMode::Usb, 3000.0, 48_000.0);
+        let input: Vec<Complex> = (0..1000)
+            .map(|i| {
+                let phase = 2.0 * PI * 1000.0 * (i as f32) / 48_000.0;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+        let mut output = vec![0.0_f32; 1000];
         demod.process(&input, &mut output).unwrap();
-        // DSB: re only
-        assert!((output[0] - 1.0).abs() < 1e-6);
+        let peak = output[100..]
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(peak > 0.3, "SSB should produce audible output, peak={peak}");
     }
 
     // --- CW tests ---
