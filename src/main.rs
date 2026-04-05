@@ -1,4 +1,7 @@
-fn main() {
+use gtk4::glib;
+
+fn main() -> glib::ExitCode {
     tracing_subscriber::fmt::init();
-    tracing::info!("sdr-rs: not yet implemented");
+    tracing::info!("sdr-rs starting");
+    sdr_ui::run()
 }
