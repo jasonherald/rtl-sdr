@@ -151,7 +151,6 @@ impl RxVfo {
     }
 
     /// Update the frequency offset.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn set_offset(&mut self, offset: f64) {
         self.offset = offset;
         self.xlator.set_offset_hz(-offset, self.in_sample_rate);
