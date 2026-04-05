@@ -20,7 +20,7 @@ pub trait Sink: Send {
     fn stop(&mut self) -> Result<(), SinkError>;
 
     /// Set the sample rate.
-    fn set_sample_rate(&mut self, rate: f64);
+    fn set_sample_rate(&mut self, rate: f64) -> Result<(), SinkError>;
 
     /// Current sample rate.
     fn sample_rate(&self) -> f64;
@@ -174,7 +174,9 @@ mod tests {
         fn stop(&mut self) -> Result<(), SinkError> {
             Ok(())
         }
-        fn set_sample_rate(&mut self, _rate: f64) {}
+        fn set_sample_rate(&mut self, _rate: f64) -> Result<(), SinkError> {
+            Ok(())
+        }
         fn sample_rate(&self) -> f64 {
             48_000.0
         }
