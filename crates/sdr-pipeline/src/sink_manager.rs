@@ -13,7 +13,7 @@ const MIN_VOLUME: f32 = 0.0;
 const MAX_VOLUME: f32 = 1.0;
 
 /// Default volume for new streams.
-const DEFAULT_VOLUME: f32 = 1.0;
+const DEFAULT_VOLUME: f32 = MAX_VOLUME;
 
 /// Trait for an audio/data output sink.
 ///
@@ -254,6 +254,10 @@ mod tests {
         mgr.register_sink(Box::new(MockSink::new("Audio"))).unwrap();
         mgr.register_stream("main", 48_000.0);
         mgr.set_stream_sink("main", "Audio").unwrap();
+        assert_eq!(
+            mgr.streams.get("main").unwrap().active_sink.as_deref(),
+            Some("Audio")
+        );
     }
 
     #[test]
