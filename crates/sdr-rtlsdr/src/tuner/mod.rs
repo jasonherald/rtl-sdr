@@ -11,7 +11,7 @@ use crate::error::RtlSdrError;
 ///
 /// Tuners communicate with the RTL2832 via I2C. The I2C repeater must be
 /// enabled before calling these methods and disabled after.
-pub trait Tuner {
+pub trait Tuner: Send {
     /// Initialize the tuner.
     fn init(&mut self, handle: &rusb::DeviceHandle<rusb::GlobalContext>)
     -> Result<(), RtlSdrError>;
