@@ -104,6 +104,7 @@ impl Quadrature {
 pub struct AmDemod {
     dc_offset: f32,
     dc_rate: f32,
+    first_sample: bool,
 }
 
 /// DC blocker convergence rate for AM demodulator.
@@ -115,12 +116,14 @@ impl AmDemod {
         Self {
             dc_offset: 0.0,
             dc_rate: AM_DC_RATE,
+            first_sample: true,
         }
     }
 
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
         self.dc_offset = 0.0;
+        self.first_sample = true;
     }
 
     /// Process complex samples, outputting demodulated audio.
@@ -137,10 +140,16 @@ impl AmDemod {
         }
         for (i, &s) in input.iter().enumerate() {
             let amp = s.amplitude();
-            // Inline DC blocking
-            let out = amp - self.dc_offset;
-            self.dc_offset += out * self.dc_rate;
-            output[i] = out;
+            if self.first_sample {
+                // Seed DC offset from first sample to avoid startup pop
+                self.dc_offset = amp;
+                self.first_sample = false;
+                output[i] = 0.0;
+            } else {
+                let out = amp - self.dc_offset;
+                self.dc_offset += out * self.dc_rate;
+                output[i] = out;
+            }
         }
         Ok(input.len())
     }
@@ -232,7 +241,10 @@ impl BroadcastFmDemod {
         self.quad.reset();
     }
 
-    /// Process complex samples, outputting mono FM audio.
+    /// Process complex samples, outputting raw FM discriminator output.
+    ///
+    /// The output is the broadcast FM composite baseband signal, not final audio.
+    /// Deemphasis and stereo decode are applied downstream in `sdr-radio`.
     ///
     /// # Errors
     ///
@@ -323,16 +335,39 @@ impl CwDemod {
     /// Create a new CW demodulator.
     ///
     /// - `tone_offset`: BFO offset in radians/sample (typically ~700-1000 Hz worth)
-    pub fn new(tone_offset: f32) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `tone_offset` is non-finite.
+    pub fn new(tone_offset: f32) -> Result<Self, DspError> {
+        if !tone_offset.is_finite() {
+            return Err(DspError::InvalidParameter(format!(
+                "tone_offset must be finite, got {tone_offset}"
+            )));
+        }
+        Ok(Self {
             bfo_phase: 0.0,
             bfo_phase_inc: tone_offset,
-        }
+        })
     }
 
     /// Create from tone offset in Hz and sample rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if parameters are non-finite or `sample_rate` is non-positive.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn from_hz(tone_offset_hz: f64, sample_rate: f64) -> Self {
+    pub fn from_hz(tone_offset_hz: f64, sample_rate: f64) -> Result<Self, DspError> {
+        if !tone_offset_hz.is_finite() {
+            return Err(DspError::InvalidParameter(format!(
+                "tone_offset_hz must be finite, got {tone_offset_hz}"
+            )));
+        }
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate must be positive and finite, got {sample_rate}"
+            )));
+        }
         Self::new(math::hz_to_rads(tone_offset_hz, sample_rate) as f32)
     }
 
@@ -506,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_cw_produces_tone() {
-        let mut demod = CwDemod::from_hz(700.0, 48_000.0);
+        let mut demod = CwDemod::from_hz(700.0, 48_000.0).unwrap();
         let input = vec![Complex::new(1.0, 0.0); 1000];
         let mut output = vec![0.0_f32; 1000];
         demod.process(&input, &mut output).unwrap();
@@ -523,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_cw_reset() {
-        let mut demod = CwDemod::from_hz(700.0, 48_000.0);
+        let mut demod = CwDemod::from_hz(700.0, 48_000.0).unwrap();
         let input = vec![Complex::new(1.0, 0.0); 100];
         let mut output = vec![0.0_f32; 100];
         demod.process(&input, &mut output).unwrap();
