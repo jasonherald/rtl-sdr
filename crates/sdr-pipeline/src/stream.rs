@@ -116,9 +116,6 @@ impl<T: Copy + Send + Default + 'static> Stream<T> {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.data_ready = false;
-        }
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.can_swap = true;
         }
         self.swap_cv.notify_all();

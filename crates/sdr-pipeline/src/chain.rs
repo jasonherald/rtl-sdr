@@ -119,8 +119,10 @@ impl<T: Copy + Default> Chain<T> {
         }
 
         // Process through enabled steps using ping-pong buffers (a ↔ b)
-        self.buf_a.resize(input.len(), T::default());
-        self.buf_b.resize(input.len(), T::default());
+        // Size to output.len() to support interpolating processors
+        let buf_size = output.len().max(input.len());
+        self.buf_a.resize(buf_size, T::default());
+        self.buf_b.resize(buf_size, T::default());
         self.buf_a[..input.len()].copy_from_slice(input);
 
         let mut current_count = input.len();

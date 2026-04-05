@@ -30,6 +30,9 @@ impl<T: Copy + Default> Splitter<T> {
 
     /// Remove an output by index.
     ///
+    /// Note: this shifts all subsequent indices. Callers should not cache
+    /// indices across removals.
+    ///
     /// # Errors
     ///
     /// Returns `DspError::InvalidParameter` if the index is out of bounds.
