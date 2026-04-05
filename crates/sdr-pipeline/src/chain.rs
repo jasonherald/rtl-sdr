@@ -83,6 +83,21 @@ impl<T: Copy + Default> Chain<T> {
         Ok(self.find_step(name)?.enabled)
     }
 
+    /// Remove a processor by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if the name is not found.
+    pub fn remove(&mut self, name: &str) -> Result<(), DspError> {
+        let idx = self
+            .steps
+            .iter()
+            .position(|s| s.name == name)
+            .ok_or_else(|| DspError::InvalidParameter(format!("step not found: {name}")))?;
+        self.steps.remove(idx);
+        Ok(())
+    }
+
     /// Number of steps in the chain.
     pub fn len(&self) -> usize {
         self.steps.len()
