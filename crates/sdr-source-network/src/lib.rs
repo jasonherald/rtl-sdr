@@ -24,6 +24,7 @@ use std::net::{TcpStream, UdpSocket};
 /// Network IQ source for the pipeline.
 ///
 /// Receives complex IQ samples over TCP or UDP with format conversion.
+/// Carries incomplete sample bytes across calls to prevent stream misalignment.
 pub struct NetworkSource {
     hostname: String,
     port: u16,
@@ -32,6 +33,10 @@ pub struct NetworkSource {
     sample_rate: f64,
     frequency: f64,
     connection: Option<NetworkConnection>,
+    // Pre-allocated receive buffer (reused across calls)
+    recv_buf: Vec<u8>,
+    // Carry-over buffer for incomplete samples from TCP partial reads
+    carry_buf: Vec<u8>,
 }
 
 enum NetworkConnection {
@@ -50,6 +55,8 @@ impl NetworkSource {
             sample_rate: 1_000_000.0,
             frequency: 0.0,
             connection: None,
+            recv_buf: Vec::new(),
+            carry_buf: Vec::new(),
         }
     }
 
@@ -61,39 +68,67 @@ impl NetworkSource {
     /// Read samples from the network connection and convert to Complex.
     ///
     /// Returns the number of Complex samples written.
+    /// Carries incomplete sample bytes across calls for TCP streams.
     pub fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
         let sample_size = self.sample_format.complex_byte_size();
         let max_bytes = output.len() * sample_size;
-        let mut buf = vec![0u8; max_bytes];
+
+        // Ensure recv_buf is large enough
+        self.recv_buf.resize(max_bytes + self.carry_buf.len(), 0);
+
+        // Prepend any carry-over bytes from previous call
+        let carry_len = self.carry_buf.len();
+        if carry_len > 0 {
+            self.recv_buf[..carry_len].copy_from_slice(&self.carry_buf);
+        }
 
         let bytes_read = match &mut self.connection {
             Some(NetworkConnection::Tcp(stream)) => {
-                stream.read(&mut buf).map_err(SourceError::Io)?
+                let n = stream
+                    .read(&mut self.recv_buf[carry_len..])
+                    .map_err(SourceError::Io)?;
+                if n == 0 {
+                    // TCP EOF — connection closed
+                    return Err(SourceError::Io(std::io::Error::from(
+                        std::io::ErrorKind::UnexpectedEof,
+                    )));
+                }
+                carry_len + n
             }
             Some(NetworkConnection::Udp(socket)) => {
-                let (n, _addr) = socket.recv_from(&mut buf).map_err(SourceError::Io)?;
-                n
+                let (n, _addr) = socket
+                    .recv_from(&mut self.recv_buf[carry_len..])
+                    .map_err(SourceError::Io)?;
+                carry_len + n
             }
             None => return Err(SourceError::NotRunning),
         };
 
-        let count = bytes_read / sample_size;
-        Ok(convert_samples(
-            &buf[..bytes_read],
+        // Convert only complete samples
+        let complete_bytes = (bytes_read / sample_size) * sample_size;
+        let count = complete_bytes / sample_size;
+
+        convert_samples(
+            &self.recv_buf[..complete_bytes],
             output,
             self.sample_format,
             count,
-        ))
+        );
+
+        // Carry over incomplete bytes for next call
+        let leftover = bytes_read - complete_bytes;
+        self.carry_buf.clear();
+        if leftover > 0 {
+            self.carry_buf
+                .extend_from_slice(&self.recv_buf[complete_bytes..bytes_read]);
+        }
+
+        Ok(count)
     }
 }
 
 /// Convert raw network bytes to Complex f32 samples.
-fn convert_samples(
-    raw: &[u8],
-    output: &mut [Complex],
-    format: SampleFormat,
-    count: usize,
-) -> usize {
+fn convert_samples(raw: &[u8], output: &mut [Complex], format: SampleFormat, count: usize) {
     let count = count.min(output.len());
     match format {
         SampleFormat::Int8 => {
@@ -147,7 +182,6 @@ fn convert_samples(
             }
         }
     }
-    count
 }
 
 impl Source for NetworkSource {
@@ -168,22 +202,22 @@ impl Source for NetworkSource {
             }
         };
         self.connection = Some(conn);
+        self.carry_buf.clear();
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), SourceError> {
         self.connection = None;
+        self.carry_buf.clear();
         Ok(())
     }
 
     fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
         self.frequency = frequency_hz;
-        // Network source doesn't tune — frequency is informational
         Ok(())
     }
 
     fn sample_rates(&self) -> &[f64] {
-        // Network source accepts any sample rate
         &[]
     }
 
@@ -198,12 +232,12 @@ impl Source for NetworkSource {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_convert_int16() {
-        // Int16: 32767 = max positive, -32768 = max negative
         let raw: [u8; 8] = [
             0xff, 0x7f, // re = 32767
             0x00, 0x80, // im = -32768
@@ -211,8 +245,7 @@ mod tests {
             0x00, 0x00, // im = 0
         ];
         let mut output = [Complex::default(); 2];
-        let count = convert_samples(&raw, &mut output, SampleFormat::Int16, 2);
-        assert_eq!(count, 2);
+        convert_samples(&raw, &mut output, SampleFormat::Int16, 2);
         assert!((output[0].re - 1.0).abs() < 0.001);
         assert!((output[0].im - (-1.0)).abs() < 0.001);
         assert!((output[1].re).abs() < 0.001);
@@ -227,8 +260,7 @@ mod tests {
         raw[4..8].copy_from_slice(&im_bytes);
 
         let mut output = [Complex::default(); 1];
-        let count = convert_samples(&raw, &mut output, SampleFormat::Float32, 1);
-        assert_eq!(count, 1);
+        convert_samples(&raw, &mut output, SampleFormat::Float32, 1);
         assert!((output[0].re - 0.5).abs() < 1e-6);
         assert!((output[0].im - (-0.25)).abs() < 1e-6);
     }
@@ -237,5 +269,15 @@ mod tests {
     fn test_new() {
         let source = NetworkSource::new("localhost", 1234, Protocol::Udp);
         assert_eq!(source.name(), "Network");
+        assert!(source.carry_buf.is_empty());
+    }
+
+    #[test]
+    fn test_carry_buf_cleared_on_start_stop() {
+        let mut source = NetworkSource::new("localhost", 1234, Protocol::Udp);
+        source.carry_buf.push(0x42);
+        // Stop clears carry buffer
+        source.stop().unwrap();
+        assert!(source.carry_buf.is_empty());
     }
 }
