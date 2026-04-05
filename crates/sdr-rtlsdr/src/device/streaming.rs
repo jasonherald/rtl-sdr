@@ -25,6 +25,12 @@ pub type ReadAsyncCb = Box<dyn FnMut(&[u8]) + Send>;
 /// Maximum allowed buffer length for async reads (16 MB).
 const MAX_BUF_LENGTH: u32 = 16 * 1024 * 1024;
 
+/// USB bulk transfer alignment requirement (bytes).
+const BULK_ALIGNMENT: u32 = 512;
+
+/// Async read loop timeout for cancel flag polling.
+const ASYNC_POLL_TIMEOUT: Duration = Duration::from_secs(1);
+
 impl RtlSdrDevice {
     /// Reset the USB endpoint buffer.
     ///
@@ -55,10 +61,14 @@ impl RtlSdrDevice {
         } else {
             Duration::from_millis(BULK_TIMEOUT)
         };
-        let n = self
+        match self
             .handle
-            .read_bulk(crate::constants::BULK_ENDPOINT, buf, timeout)?;
-        Ok(n)
+            .read_bulk(crate::constants::BULK_ENDPOINT, buf, timeout)
+        {
+            Ok(n) => Ok(n),
+            Err(rusb::Error::NoDevice) => Err(RtlSdrError::DeviceLost),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Read IQ samples in a blocking loop, calling the callback for each buffer.
@@ -78,16 +88,15 @@ impl RtlSdrDevice {
     ) -> Result<(), RtlSdrError> {
         let actual_buf_len = if buf_len == 0 {
             DEFAULT_BUF_LENGTH as usize
-        } else if !buf_len.is_multiple_of(512) || buf_len > MAX_BUF_LENGTH {
+        } else if !buf_len.is_multiple_of(BULK_ALIGNMENT) || buf_len > MAX_BUF_LENGTH {
             return Err(RtlSdrError::InvalidParameter(format!(
-                "buf_len must be a multiple of 512 and <= {MAX_BUF_LENGTH}, got {buf_len}"
+                "buf_len must be a multiple of {BULK_ALIGNMENT} and <= {MAX_BUF_LENGTH}, got {buf_len}"
             )));
         } else {
             buf_len as usize
         };
 
-        // Use short timeout so we check cancel_flag frequently
-        let timeout = Duration::from_secs(1);
+        let timeout = ASYNC_POLL_TIMEOUT;
         let mut buf = vec![0u8; actual_buf_len];
 
         while !cancel_flag.load(Ordering::Relaxed) {

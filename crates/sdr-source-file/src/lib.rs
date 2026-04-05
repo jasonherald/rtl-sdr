@@ -16,6 +16,18 @@
 //! Reads IQ samples from WAV files for testing and replay.
 
 use hound::WavReader;
+
+/// Required number of WAV channels for IQ data (I + Q).
+const REQUIRED_CHANNELS: u16 = 2;
+
+/// Expected bits per sample for supported float format.
+const FLOAT32_BPS: u16 = 32;
+
+/// Expected bits per sample for supported integer format.
+const INT16_BPS: u16 = 16;
+
+/// Int16 normalization divisor.
+const INT16_SCALE: f32 = 32768.0;
 use sdr_pipeline::source_manager::Source;
 use sdr_types::{Complex, SourceError};
 use std::path::PathBuf;
@@ -93,7 +105,7 @@ impl FileSource {
             let mut samples = state.reader.samples::<i16>();
             while count < output.len() {
                 let re = match samples.next() {
-                    Some(Ok(v)) => f32::from(v) / 32768.0,
+                    Some(Ok(v)) => f32::from(v) / INT16_SCALE,
                     Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
                     None => break,
                 };
@@ -105,7 +117,7 @@ impl FileSource {
                         break;
                     }
                 };
-                let im = f32::from(im_raw) / 32768.0;
+                let im = f32::from(im_raw) / INT16_SCALE;
                 output[count] = Complex::new(re, im);
                 count += 1;
             }
@@ -127,25 +139,26 @@ impl Source for FileSource {
         let spec = reader.spec();
 
         // Validate WAV layout: need 2 channels (I + Q)
-        if spec.channels != 2 {
+        if spec.channels != REQUIRED_CHANNELS {
             return Err(SourceError::OpenFailed(format!(
                 "WAV file must have 2 channels (I/Q), got {}",
                 spec.channels
             )));
         }
 
-        self.sample_rate = f64::from(spec.sample_rate);
-
-        // Validate supported sample format
+        // Validate supported sample format before mutating state
         let is_float = match (spec.sample_format, spec.bits_per_sample) {
-            (hound::SampleFormat::Float, 32) => true,
-            (hound::SampleFormat::Int, 16) => false,
+            (hound::SampleFormat::Float, FLOAT32_BPS) => true,
+            (hound::SampleFormat::Int, INT16_BPS) => false,
             (fmt, bps) => {
                 return Err(SourceError::OpenFailed(format!(
                     "unsupported WAV format: {fmt:?} {bps}-bit; only Float32 and Int16 are supported"
                 )));
             }
         };
+
+        // Only update sample_rate after all validation passes
+        self.sample_rate = f64::from(spec.sample_rate);
 
         self.reader = Some(WavReaderState {
             reader,
