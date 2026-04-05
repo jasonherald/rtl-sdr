@@ -98,10 +98,12 @@ impl SourceManager {
         if !self.sources.contains_key(name) {
             return Err(SourceError::DeviceNotFound(name.to_string()));
         }
-        // Stop the currently running source before switching
-        if self.running && self.selected.as_deref() != Some(name) {
-            // Use stop() for consistent error handling
-            let _ = self.stop();
+        // Best-effort stop before switching — log but don't block the switch
+        if self.running
+            && self.selected.as_deref() != Some(name)
+            && let Err(e) = self.stop()
+        {
+            tracing::warn!("failed to stop source during reselect: {e}");
         }
         self.selected = Some(name.to_string());
         Ok(())
