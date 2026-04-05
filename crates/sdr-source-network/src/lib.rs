@@ -70,6 +70,9 @@ impl NetworkSource {
     /// Returns the number of Complex samples written.
     /// Carries incomplete sample bytes across calls for TCP streams.
     pub fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+        if output.is_empty() {
+            return Ok(0);
+        }
         let sample_size = self.sample_format.complex_byte_size();
         let max_bytes = output.len() * sample_size;
 

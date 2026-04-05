@@ -19,7 +19,7 @@
 use sdr_pipeline::sink_manager::Sink;
 use sdr_types::{Protocol, SinkError, Stereo};
 use std::io::Write;
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 
 /// Default network sink sample rate.
 const DEFAULT_SAMPLE_RATE: f64 = 48_000.0;
@@ -36,8 +36,8 @@ pub struct NetworkSink {
     connection: Option<NetworkSinkConnection>,
     // Pre-allocated buffers to avoid hot-path allocation
     send_buf: Vec<u8>,
-    // Cached UDP target address
-    cached_addr: String,
+    // Resolved UDP target address (avoids ToSocketAddrs parsing on every send)
+    cached_addr: Option<SocketAddr>,
 }
 
 enum NetworkSinkConnection {
@@ -59,7 +59,7 @@ impl NetworkSink {
             stereo: false,
             connection: None,
             send_buf: Vec::new(),
-            cached_addr: format!("{hostname}:{port}"),
+            cached_addr: None,
         }
     }
 
@@ -131,9 +131,11 @@ impl NetworkSink {
                 // No client connected — silently drop (matching C++ behavior)
             }
             NetworkSinkConnection::Udp(socket) => {
-                socket
-                    .send_to(&self.send_buf, &self.cached_addr)
-                    .map_err(SinkError::Io)?;
+                if let Some(addr) = self.cached_addr {
+                    socket
+                        .send_to(&self.send_buf, addr)
+                        .map_err(SinkError::Io)?;
+                }
             }
         }
 
@@ -159,6 +161,18 @@ impl Sink for NetworkSink {
                 }
             }
             Protocol::Udp => {
+                // Resolve target address once at startup (avoids per-packet parsing)
+                let target = (self.hostname.as_str(), self.port)
+                    .to_socket_addrs()
+                    .map_err(SinkError::Io)?
+                    .next()
+                    .ok_or_else(|| {
+                        SinkError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            format!("could not resolve {}:{}", self.hostname, self.port),
+                        ))
+                    })?;
+                self.cached_addr = Some(target);
                 let socket =
                     UdpSocket::bind(format!("0.0.0.0:{}", self.port)).map_err(SinkError::Io)?;
                 NetworkSinkConnection::Udp(socket)
@@ -192,15 +206,12 @@ mod tests {
         let sink = NetworkSink::new("localhost", 7355, Protocol::Udp);
         assert_eq!(sink.name(), "Network");
         assert!((sink.sample_rate() - DEFAULT_SAMPLE_RATE).abs() < f64::EPSILON);
-        assert_eq!(sink.cached_addr, "localhost:7355");
+        assert!(sink.cached_addr.is_none());
     }
 
     #[test]
-    fn test_send_buf_reuse() {
-        let mut sink = NetworkSink::new("localhost", 7355, Protocol::Udp);
-        sink.set_stereo(false);
-        // Verify send_buf grows but is reused
-        let _samples = [Stereo::new(0.5, -0.5)];
+    fn test_send_buf_initially_empty() {
+        let sink = NetworkSink::new("localhost", 7355, Protocol::Udp);
         assert!(sink.send_buf.is_empty());
     }
 }

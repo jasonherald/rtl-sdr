@@ -206,6 +206,8 @@ impl IqFrontend {
         self.effective_sample_rate = new_effective_rate;
         self.decimator = new_decimator;
         self.dc_blocker = new_dc_blocker;
+        // Discard any partially accumulated FFT data from the old rate
+        self.fft_accum_count = 0;
         Ok(())
     }
 
