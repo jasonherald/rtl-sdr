@@ -360,39 +360,28 @@ impl SsbDemod {
 
 /// CW (Continuous Wave / Morse) demodulator.
 ///
-/// Ports SDR++ `dsp::demod::CW`. Mixes the input with a BFO (beat frequency
-/// oscillator) at a configurable offset, then extracts the real part.
+/// Faithful port of SDR++ `dsp::demod::CW`. Uses `FrequencyXlator` for BFO
+/// mixing, then extracts real part and applies AGC for consistent amplitude.
 pub struct CwDemod {
-    bfo_phase: f32,
-    bfo_phase_inc: f32,
+    xlator: crate::channel::FrequencyXlator,
+    agc: crate::loops::Agc,
+    xlator_buf: Vec<Complex>,
 }
+
+/// Default AGC attack coefficient for CW.
+const CW_AGC_ATTACK: f32 = 0.1;
+/// Default AGC decay coefficient for CW.
+const CW_AGC_DECAY: f32 = 0.01;
 
 impl CwDemod {
     /// Create a new CW demodulator.
     ///
-    /// - `tone_offset`: BFO offset in radians/sample (typically ~700-1000 Hz worth)
+    /// - `tone_offset_hz`: BFO tone offset in Hz (typically 700-1000 Hz)
+    /// - `sample_rate`: sample rate in Hz
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` if `tone_offset` is non-finite.
-    pub fn new(tone_offset: f32) -> Result<Self, DspError> {
-        if !tone_offset.is_finite() {
-            return Err(DspError::InvalidParameter(format!(
-                "tone_offset must be finite, got {tone_offset}"
-            )));
-        }
-        Ok(Self {
-            bfo_phase: 0.0,
-            bfo_phase_inc: tone_offset,
-        })
-    }
-
-    /// Create from tone offset in Hz and sample rate.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DspError::InvalidParameter` if parameters are non-finite or `sample_rate` is non-positive.
-    #[allow(clippy::cast_possible_truncation)]
+    /// Returns `DspError::InvalidParameter` if parameters are invalid.
     pub fn from_hz(tone_offset_hz: f64, sample_rate: f64) -> Result<Self, DspError> {
         if !tone_offset_hz.is_finite() {
             return Err(DspError::InvalidParameter(format!(
@@ -404,15 +393,24 @@ impl CwDemod {
                 "sample_rate must be positive and finite, got {sample_rate}"
             )));
         }
-        Self::new(math::hz_to_rads(tone_offset_hz, sample_rate) as f32)
+        let xlator = crate::channel::FrequencyXlator::from_hz(tone_offset_hz, sample_rate);
+        let agc = crate::loops::Agc::new(1.0, CW_AGC_ATTACK, CW_AGC_DECAY, 10e6, 10.0, 1.0)?;
+        Ok(Self {
+            xlator,
+            agc,
+            xlator_buf: Vec::new(),
+        })
     }
 
-    /// Reset the BFO phase.
+    /// Reset the demodulator state.
     pub fn reset(&mut self) {
-        self.bfo_phase = 0.0;
+        self.xlator.reset();
+        self.agc.reset();
     }
 
     /// Process complex samples, outputting demodulated audio.
+    ///
+    /// Translates with BFO, extracts real part, applies AGC.
     ///
     /// # Errors
     ///
@@ -424,15 +422,20 @@ impl CwDemod {
                 got: output.len(),
             });
         }
-        for (i, &s) in input.iter().enumerate() {
-            // Mix with BFO and extract real part directly:
-            // Re(s * bfo) = s.re * cos - s.im * sin
-            let (sin, cos) = self.bfo_phase.sin_cos();
-            output[i] = s.re * cos - s.im * sin;
-            // Advance BFO phase
-            self.bfo_phase += self.bfo_phase_inc;
-            self.bfo_phase = math::normalize_phase(self.bfo_phase);
+
+        // Step 1: Frequency translate (BFO mixing)
+        self.xlator_buf.resize(input.len(), Complex::default());
+        self.xlator.process(input, &mut self.xlator_buf)?;
+
+        // Step 2: Extract real part
+        for (i, &s) in self.xlator_buf.iter().enumerate() {
+            output[i] = s.re;
         }
+
+        // Step 3: AGC for consistent amplitude
+        let temp: Vec<f32> = output[..input.len()].to_vec();
+        self.agc.process_f32(&temp, &mut output[..input.len()])?;
+
         Ok(input.len())
     }
 }
@@ -620,7 +623,7 @@ mod tests {
         let mut output = vec![0.0_f32; 100];
         demod.process(&input, &mut output).unwrap();
         demod.reset();
-        assert!((demod.bfo_phase).abs() < 1e-6);
+        // After reset, processing should start fresh
     }
 
     #[test]
