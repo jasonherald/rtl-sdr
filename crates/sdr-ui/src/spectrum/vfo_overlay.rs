@@ -45,9 +45,9 @@ const MIN_DISPLAY_SPAN_HZ: f64 = 1_000.0;
 /// Maximum display span in Hz.
 const MAX_DISPLAY_SPAN_HZ: f64 = 50_000_000.0;
 
-/// Maximum number of overlay vertices (passband rect + center line + 2 edges).
-/// Rect = 4 verts (triangle strip), center = 2, left edge = 2, right edge = 2 => 10 verts.
-const MAX_OVERLAY_VERTICES: usize = 10;
+/// Maximum number of overlay vertices for any single draw call.
+/// Each primitive is drawn separately: passband rect (4), center quad (4), edge lines (4).
+const MAX_OVERLAY_VERTICES: usize = 4;
 
 /// Maximum vertex buffer size in floats (2 floats per vertex).
 const MAX_OVERLAY_FLOATS: usize = MAX_OVERLAY_VERTICES * 2;
@@ -373,7 +373,7 @@ impl VfoOverlayRenderer {
             right_x, 1.0, // top-right
         ];
 
-        let bytes = bytemuck_cast_slice(&vertices);
+        let bytes = f32_slice_as_bytes(&vertices);
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
@@ -416,7 +416,7 @@ impl VfoOverlayRenderer {
             cx + half_w,
             1.0,
         ];
-        let bytes = bytemuck_cast_slice(&vertices);
+        let bytes = f32_slice_as_bytes(&vertices);
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
@@ -449,7 +449,7 @@ impl VfoOverlayRenderer {
             left_x, -1.0, left_x, 1.0, // left edge
             right_x, -1.0, right_x, 1.0, // right edge
         ];
-        let bytes = bytemuck_cast_slice(&vertices);
+        let bytes = f32_slice_as_bytes(&vertices);
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
@@ -498,7 +498,7 @@ void main() {
 
 /// Reinterpret a `&[f32]` as `&[u8]` for uploading to GL buffers.
 #[allow(unsafe_code)]
-fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
+fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
 }
 
