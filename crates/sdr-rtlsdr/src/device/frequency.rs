@@ -110,12 +110,10 @@ impl RtlSdrDevice {
 
         self.set_sample_freq_correction(ppm)?;
 
-        // Update tuner xtal with corrected value (audit fix #4)
-        // This propagates PPM correction to the tuner's reference clock
+        // Propagate corrected xtal to tuner (audit fix #4)
+        let corrected_xtal = self.get_tuner_xtal();
         if let Some(tuner) = &mut self.tuner {
-            // The R82XX tuner stores xtal internally; we'd need to update it.
-            // For now, retune which uses the corrected xtal via get_tuner_xtal()
-            let _ = tuner; // tuner xtal is read from device at tune time
+            tuner.set_xtal(corrected_xtal);
         }
 
         if self.freq > 0 {

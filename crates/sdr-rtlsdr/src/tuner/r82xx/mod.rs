@@ -282,6 +282,10 @@ impl R82xxPriv {
 }
 
 impl Tuner for R82xxPriv {
+    fn set_xtal(&mut self, xtal: u32) {
+        self.xtal = xtal;
+    }
+
     fn init(
         &mut self,
         handle: &rusb::DeviceHandle<rusb::GlobalContext>,

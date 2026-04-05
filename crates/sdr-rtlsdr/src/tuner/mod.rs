@@ -42,6 +42,9 @@ pub trait Tuner {
         gain: i32,
     ) -> Result<(), RtlSdrError>;
 
+    /// Update the crystal frequency (for PPM correction propagation).
+    fn set_xtal(&mut self, xtal: u32);
+
     /// Set manual (1) or automatic (0) gain mode.
     fn set_gain_mode(
         &mut self,
