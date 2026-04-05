@@ -340,7 +340,7 @@ impl VfoOverlayRenderer {
         self.draw_passband_fill(gl, vfo);
 
         // Draw center frequency line.
-        self.draw_center_line(gl, vfo);
+        self.draw_center_line(gl, vfo, width);
 
         // Draw left and right bandwidth handle edges.
         self.draw_edge_lines(gl, vfo);
@@ -390,17 +390,32 @@ impl VfoOverlayRenderer {
         }
     }
 
-    /// Draw the center frequency line.
+    /// Draw the center frequency line as a thin quad for consistent width.
+    ///
+    /// Uses a triangle strip instead of `GL_LINES` with `line_width(2.0)`
+    /// because OpenGL core profile only guarantees line width 1.0.
     #[allow(
         unsafe_code,
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    fn draw_center_line(&self, gl: &glow::Context, vfo: &VfoState) {
+    fn draw_center_line(&self, gl: &glow::Context, vfo: &VfoState, width: i32) {
         #[allow(clippy::cast_precision_loss)]
         let cx = vfo.center_clip_x() as f32;
 
-        let vertices: [f32; 4] = [cx, -1.0, cx, 1.0];
+        // 2px wide quad in clip space.
+        #[allow(clippy::cast_precision_loss)]
+        let half_w = if width > 0 { 2.0 / width as f32 } else { 0.002 };
+        let vertices: [f32; 8] = [
+            cx - half_w,
+            -1.0,
+            cx + half_w,
+            -1.0,
+            cx - half_w,
+            1.0,
+            cx + half_w,
+            1.0,
+        ];
         let bytes = bytemuck_cast_slice(&vertices);
 
         unsafe {
@@ -414,9 +429,7 @@ impl VfoOverlayRenderer {
                 VFO_CENTER_COLOR[3],
             );
 
-            gl.line_width(2.0);
-            gl.draw_arrays(glow::LINES, 0, 2);
-            gl.line_width(1.0);
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
         }
     }
 

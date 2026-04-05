@@ -468,10 +468,10 @@ fn attach_scroll_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>)
         };
         let width = f64::from(area.width());
 
-        // Get cursor position from the controller's current point.
-        // GTK4 EventControllerScroll doesn't directly provide position in the
-        // scroll signal, so we use the widget's half-width as a reasonable
-        // default (zoom centered on the display).
+        // TODO: Anchor zoom on cursor position instead of display center.
+        // GTK4 EventControllerScroll doesn't provide position in the scroll
+        // signal. Add an EventControllerMotion to track the pointer and use
+        // its last-known X coordinate here for cursor-centered zoom.
         let cursor_x = width / 2.0;
 
         let mut vfo = vfo_state.borrow_mut();
