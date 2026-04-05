@@ -67,9 +67,16 @@ impl SourceManager {
         Ok(())
     }
 
-    /// Unregister a source by name.
+    /// Unregister a source by name. Stops it first if running.
     pub fn unregister(&mut self, name: &str) -> Option<Box<dyn Source>> {
-        if self.selected.as_deref() == Some(name) {
+        // Stop the source if it's the selected running source
+        if self.selected.as_deref() == Some(name) && self.running {
+            if let Some(source) = self.sources.get_mut(name) {
+                let _ = source.stop();
+            }
+            self.running = false;
+            self.selected = None;
+        } else if self.selected.as_deref() == Some(name) {
             self.selected = None;
         }
         self.sources.remove(name)
@@ -104,16 +111,7 @@ impl SourceManager {
     ///
     /// Returns `SourceError` if no source is selected or start fails.
     pub fn start(&mut self) -> Result<(), SourceError> {
-        let name = self
-            .selected
-            .as_ref()
-            .ok_or(SourceError::NotRunning)?
-            .clone();
-        let source = self
-            .sources
-            .get_mut(&name)
-            .ok_or(SourceError::DeviceNotFound(name))?;
-        source.start()?;
+        self.with_selected_source(|source| source.start())?;
         self.running = true;
         Ok(())
     }
@@ -124,16 +122,7 @@ impl SourceManager {
     ///
     /// Returns `SourceError` if no source is selected or stop fails.
     pub fn stop(&mut self) -> Result<(), SourceError> {
-        let name = self
-            .selected
-            .as_ref()
-            .ok_or(SourceError::NotRunning)?
-            .clone();
-        let source = self
-            .sources
-            .get_mut(&name)
-            .ok_or(SourceError::DeviceNotFound(name))?;
-        source.stop()?;
+        self.with_selected_source(|source| source.stop())?;
         self.running = false;
         Ok(())
     }
@@ -144,6 +133,19 @@ impl SourceManager {
     ///
     /// Returns `SourceError` if no source is selected or tune fails.
     pub fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
+        self.with_selected_source(|source| source.tune(frequency_hz))
+    }
+
+    /// Whether a source is currently running.
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Helper: look up the selected source and apply a closure.
+    fn with_selected_source<F, R>(&mut self, f: F) -> Result<R, SourceError>
+    where
+        F: FnOnce(&mut dyn Source) -> Result<R, SourceError>,
+    {
         let name = self
             .selected
             .as_ref()
@@ -153,12 +155,7 @@ impl SourceManager {
             .sources
             .get_mut(&name)
             .ok_or(SourceError::DeviceNotFound(name))?;
-        source.tune(frequency_hz)
-    }
-
-    /// Whether a source is currently running.
-    pub fn is_running(&self) -> bool {
-        self.running
+        f(source.as_mut())
     }
 }
 

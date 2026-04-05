@@ -37,6 +37,7 @@ pub struct IqFrontend {
     fft_input: Vec<Complex>,
     fft_output: Vec<f32>,
     dc_blocker: Option<DcBlocker>,
+    dc_scratch: Vec<Complex>,
     invert_iq: bool,
 }
 
@@ -92,6 +93,7 @@ impl IqFrontend {
             fft_input: vec![Complex::default(); fft_size],
             fft_output: vec![0.0; fft_size],
             dc_blocker,
+            dc_scratch: Vec::new(),
             invert_iq: false,
         })
     }
@@ -168,8 +170,9 @@ impl IqFrontend {
 
         // Step 3: DC blocking
         if let Some(dc) = &mut self.dc_blocker {
-            let temp: Vec<Complex> = output[..input.len()].to_vec();
-            dc.process(&temp, &mut output[..input.len()])?;
+            self.dc_scratch.resize(input.len(), Complex::default());
+            self.dc_scratch.copy_from_slice(&output[..input.len()]);
+            dc.process(&self.dc_scratch, &mut output[..input.len()])?;
         }
 
         // Step 4: Compute FFT from the last fft_size samples (or available)

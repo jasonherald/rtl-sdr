@@ -6,6 +6,9 @@
 use sdr_types::DspError;
 use std::collections::HashMap;
 
+/// Default minimum VFO bandwidth in Hz.
+const DEFAULT_MIN_BANDWIDTH: f64 = 1_000.0;
+
 /// Parameters for a Virtual Frequency Oscillator.
 #[derive(Clone, Debug)]
 pub struct VfoParams {
@@ -32,7 +35,7 @@ impl VfoParams {
             name: name.to_string(),
             offset,
             bandwidth,
-            min_bandwidth: 1_000.0,
+            min_bandwidth: DEFAULT_MIN_BANDWIDTH,
             max_bandwidth: sample_rate,
             sample_rate,
             snap_interval: 0.0,
@@ -118,8 +121,13 @@ impl VfoManager {
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` if the VFO is not found.
+    /// Returns `DspError::InvalidParameter` if the VFO is not found or `min > max`.
     pub fn set_bandwidth_limits(&mut self, name: &str, min: f64, max: f64) -> Result<(), DspError> {
+        if min > max {
+            return Err(DspError::InvalidParameter(format!(
+                "min bandwidth ({min}) must be <= max bandwidth ({max})"
+            )));
+        }
         let vfo = self.get_vfo_mut(name)?;
         vfo.min_bandwidth = min;
         vfo.max_bandwidth = max;

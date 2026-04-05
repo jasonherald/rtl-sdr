@@ -81,7 +81,7 @@ impl SinkManager {
         self.sinks.keys().map(String::as_str).collect()
     }
 
-    /// Register a named audio stream.
+    /// Register a named audio stream. Replaces any existing stream with the same name.
     pub fn register_stream(&mut self, name: &str, sample_rate: f64) {
         self.streams.insert(
             name.to_string(),
