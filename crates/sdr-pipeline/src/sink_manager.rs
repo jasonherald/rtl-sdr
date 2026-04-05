@@ -302,4 +302,13 @@ mod tests {
         mgr.set_volume("main", -0.5).unwrap();
         assert!((mgr.volume("main").unwrap()).abs() < f32::EPSILON);
     }
+
+    #[test]
+    fn test_volume_rejects_nan() {
+        let mut mgr = SinkManager::new();
+        mgr.register_stream("main", 48_000.0);
+        assert!(mgr.set_volume("main", f32::NAN).is_err());
+        assert!(mgr.set_volume("main", f32::INFINITY).is_err());
+        assert!(mgr.set_volume("main", f32::NEG_INFINITY).is_err());
+    }
 }
