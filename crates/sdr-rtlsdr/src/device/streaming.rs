@@ -19,8 +19,11 @@ use crate::usb;
 use super::RtlSdrDevice;
 
 /// Callback type for async reading.
-/// Called with (buffer, length) for each completed transfer.
+/// Called with a byte slice of IQ data for each completed bulk transfer.
 pub type ReadAsyncCb = Box<dyn FnMut(&[u8]) + Send>;
+
+/// Maximum allowed buffer length for async reads (16 MB).
+const MAX_BUF_LENGTH: u32 = 16 * 1024 * 1024;
 
 impl RtlSdrDevice {
     /// Reset the USB endpoint buffer.
@@ -73,10 +76,14 @@ impl RtlSdrDevice {
         cancel_flag: &AtomicBool,
         buf_len: u32,
     ) -> Result<(), RtlSdrError> {
-        let actual_buf_len = if buf_len > 0 && buf_len.is_multiple_of(512) {
-            buf_len as usize
-        } else {
+        let actual_buf_len = if buf_len == 0 {
             DEFAULT_BUF_LENGTH as usize
+        } else if !buf_len.is_multiple_of(512) || buf_len > MAX_BUF_LENGTH {
+            return Err(RtlSdrError::InvalidParameter(format!(
+                "buf_len must be a multiple of 512 and <= {MAX_BUF_LENGTH}, got {buf_len}"
+            )));
+        } else {
+            buf_len as usize
         };
 
         // Use short timeout so we check cancel_flag frequently

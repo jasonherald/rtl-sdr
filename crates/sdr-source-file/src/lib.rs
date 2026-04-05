@@ -81,7 +81,10 @@ impl FileSource {
                 let im = match samples.next() {
                     Some(Ok(v)) => v,
                     Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
-                    None => break,
+                    None => {
+                        tracing::warn!("truncated IQ frame: Q sample missing after I");
+                        break;
+                    }
                 };
                 output[count] = Complex::new(re, im);
                 count += 1;
@@ -97,7 +100,10 @@ impl FileSource {
                 let im_raw = match samples.next() {
                     Some(Ok(v)) => v,
                     Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
-                    None => break,
+                    None => {
+                        tracing::warn!("truncated IQ frame: Q sample missing after I");
+                        break;
+                    }
                 };
                 let im = f32::from(im_raw) / 32768.0;
                 output[count] = Complex::new(re, im);

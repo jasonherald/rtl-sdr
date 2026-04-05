@@ -1,16 +1,4 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_wrap,
-    clippy::cast_lossless,
-    clippy::needless_range_loop,
-    clippy::redundant_closure_for_method_calls,
-    clippy::unnecessary_literal_bound,
-    clippy::doc_markdown,
-    clippy::manual_midpoint,
-    clippy::redundant_closure
-)]
+#![allow(clippy::doc_markdown, clippy::unnecessary_literal_bound)]
 //! Audio output sink — PipeWire (Linux) / CoreAudio (macOS).
 //!
 //! Ports SDR++ `AudioSinkModule`. Platform-specific audio output
@@ -108,7 +96,7 @@ mod tests {
     fn test_new() {
         let sink = AudioSink::new();
         assert_eq!(sink.name(), "Audio");
-        assert!((sink.sample_rate() - 48_000.0).abs() < f64::EPSILON);
+        assert!((sink.sample_rate() - DEFAULT_AUDIO_SAMPLE_RATE).abs() < f64::EPSILON);
         assert_eq!(sink.device_name(), "default");
     }
 
