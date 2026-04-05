@@ -137,6 +137,12 @@ impl<T: Copy + Default> Chain<T> {
             } else {
                 current_count = (step.processor)(&self.buf_b[..current_count], &mut self.buf_a)?;
             }
+            if current_count > buf_size {
+                return Err(DspError::BufferTooSmall {
+                    need: current_count,
+                    got: buf_size,
+                });
+            }
             src_is_a = !src_is_a;
         }
 
