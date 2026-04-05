@@ -157,6 +157,13 @@ impl Source for FileSource {
             }
         };
 
+        // Reject 0 Hz sample rate
+        if spec.sample_rate == 0 {
+            return Err(SourceError::OpenFailed(
+                "WAV file has 0 Hz sample rate".to_string(),
+            ));
+        }
+
         // Only update sample_rate after all validation passes
         self.sample_rate = f64::from(spec.sample_rate);
 
@@ -189,8 +196,14 @@ impl Source for FileSource {
         self.sample_rate
     }
 
-    fn set_sample_rate(&mut self, _rate: f64) -> Result<(), SourceError> {
-        // Sample rate is fixed by the WAV file
+    fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError> {
+        // Sample rate is fixed by the WAV file — reject mismatches
+        if self.sample_rate > 0.0 && (rate - self.sample_rate).abs() > 1.0 {
+            return Err(SourceError::OpenFailed(format!(
+                "file source sample rate is fixed at {} Hz by WAV header",
+                self.sample_rate
+            )));
+        }
         Ok(())
     }
 }
