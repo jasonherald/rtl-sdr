@@ -73,17 +73,15 @@ impl NetworkSource {
         let sample_size = self.sample_format.complex_byte_size();
         let max_bytes = output.len() * sample_size;
 
-        // Ensure recv_buf is large enough
-        self.recv_buf.resize(max_bytes + self.carry_buf.len(), 0);
-
-        // Prepend any carry-over bytes from previous call
-        let carry_len = self.carry_buf.len();
-        if carry_len > 0 {
-            self.recv_buf[..carry_len].copy_from_slice(&self.carry_buf);
-        }
-
         let bytes_read = match &mut self.connection {
             Some(NetworkConnection::Tcp(stream)) => {
+                // TCP is a byte stream — prepend carry-over from previous partial read
+                let carry_len = self.carry_buf.len();
+                self.recv_buf.resize(max_bytes + carry_len, 0);
+                if carry_len > 0 {
+                    self.recv_buf[..carry_len].copy_from_slice(&self.carry_buf);
+                }
+
                 let n = stream
                     .read(&mut self.recv_buf[carry_len..])
                     .map_err(SourceError::Io)?;
@@ -96,10 +94,12 @@ impl NetworkSource {
                 carry_len + n
             }
             Some(NetworkConnection::Udp(socket)) => {
+                // UDP delivers complete datagrams — no carry-over needed
+                self.recv_buf.resize(max_bytes, 0);
                 let (n, _addr) = socket
-                    .recv_from(&mut self.recv_buf[carry_len..])
+                    .recv_from(&mut self.recv_buf)
                     .map_err(SourceError::Io)?;
-                carry_len + n
+                n
             }
             None => return Err(SourceError::NotRunning),
         };
@@ -115,10 +115,10 @@ impl NetworkSource {
             count,
         );
 
-        // Carry over incomplete bytes for next call
+        // Carry over incomplete bytes for TCP only (UDP datagrams are atomic)
         let leftover = bytes_read - complete_bytes;
         self.carry_buf.clear();
-        if leftover > 0 {
+        if leftover > 0 && matches!(self.connection, Some(NetworkConnection::Tcp(_))) {
             self.carry_buf
                 .extend_from_slice(&self.recv_buf[complete_bytes..bytes_read]);
         }

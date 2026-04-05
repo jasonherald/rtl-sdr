@@ -82,6 +82,11 @@ impl NetworkSink {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     tracing::info!("network sink: TCP client connected from {addr}");
+                    // Accepted stream inherits nonblocking from listener —
+                    // switch to blocking so write_all works correctly.
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        tracing::warn!("network sink: failed to set TCP stream blocking: {e}");
+                    }
                     *client = Some(stream);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

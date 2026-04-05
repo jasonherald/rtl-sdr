@@ -53,6 +53,7 @@ pub struct IqFrontend {
     // Scratch buffers
     decim_buf: Vec<Complex>,
     dc_scratch: Vec<Complex>,
+    fft_work: Vec<Complex>,
 }
 
 impl IqFrontend {
@@ -75,6 +76,11 @@ impl IqFrontend {
         fft_window: FftWindow,
         dc_blocking: bool,
     ) -> Result<Self, DspError> {
+        if decim_ratio == 0 {
+            return Err(DspError::InvalidParameter(
+                "decimation ratio must be >= 1".to_string(),
+            ));
+        }
         let fft_engine = RustFftEngine::new(fft_size)?;
 
         // Pre-compute window coefficients
@@ -121,6 +127,7 @@ impl IqFrontend {
             fft_output: vec![0.0; fft_size],
             decim_buf: Vec::new(),
             dc_scratch: Vec::new(),
+            fft_work: vec![Complex::default(); fft_size],
         })
     }
 
@@ -172,17 +179,33 @@ impl IqFrontend {
     ///
     /// Returns `DspError` if the ratio is invalid.
     pub fn set_decimation(&mut self, ratio: u32) -> Result<(), DspError> {
-        self.decim_ratio = ratio;
-        self.effective_sample_rate = self.sample_rate / f64::from(ratio);
-        self.decimator = if ratio > 1 {
+        if ratio == 0 {
+            return Err(DspError::InvalidParameter(
+                "decimation ratio must be >= 1".to_string(),
+            ));
+        }
+
+        // Validate before mutating — construct decimator first
+        let new_decimator = if ratio > 1 {
             Some(PowerDecimator::new(ratio)?)
         } else {
             None
         };
-        // Update DC blocker rate for new effective sample rate
-        if self.dc_blocker.is_some() {
-            self.set_dc_blocking(true)?;
-        }
+        let new_effective_rate = self.sample_rate / f64::from(ratio);
+
+        // Rebuild DC blocker at new rate before committing
+        let new_dc_blocker = if self.dc_blocker.is_some() {
+            let rate = DC_BLOCK_RATE_FACTOR / new_effective_rate;
+            Some(DcBlocker::new(rate)?)
+        } else {
+            None
+        };
+
+        // All validated — commit state atomically
+        self.decim_ratio = ratio;
+        self.effective_sample_rate = new_effective_rate;
+        self.decimator = new_decimator;
+        self.dc_blocker = new_dc_blocker;
         Ok(())
     }
 
@@ -278,19 +301,19 @@ impl IqFrontend {
 
     /// Compute FFT from the accumulated buffer.
     fn compute_fft(&mut self, fft_out: &mut [f32]) -> Result<(), DspError> {
-        // Apply window to accumulated samples
-        let mut windowed = self.fft_accum.clone();
-        for (i, s) in windowed.iter_mut().enumerate() {
+        // Copy accumulated samples into pre-allocated work buffer and apply window
+        self.fft_work.copy_from_slice(&self.fft_accum);
+        for (i, s) in self.fft_work.iter_mut().enumerate() {
             let w = self.fft_window_buf[i];
             s.re *= w;
             s.im *= w;
         }
 
         // Execute FFT
-        self.fft_engine.forward(&mut windowed)?;
+        self.fft_engine.forward(&mut self.fft_work)?;
 
         // Convert to power spectrum dB
-        fft::power_spectrum_db(&windowed, &mut self.fft_output)?;
+        fft::power_spectrum_db(&self.fft_work, &mut self.fft_output)?;
         fft_out[..self.fft_size].copy_from_slice(&self.fft_output);
 
         Ok(())
@@ -324,6 +347,20 @@ mod tests {
     #[test]
     fn test_new_zero_fft() {
         assert!(IqFrontend::new(TEST_SAMPLE_RATE, 1, 0, FftWindow::Nuttall, true).is_err());
+    }
+
+    #[test]
+    fn test_new_zero_decimation_rejected() {
+        assert!(IqFrontend::new(TEST_SAMPLE_RATE, 0, TEST_FFT_SIZE, FftWindow::Nuttall, false).is_err());
+    }
+
+    #[test]
+    fn test_set_decimation_zero_rejected() {
+        let mut fe = IqFrontend::new(TEST_SAMPLE_RATE, 1, TEST_FFT_SIZE, FftWindow::Nuttall, false).unwrap();
+        assert!(fe.set_decimation(0).is_err());
+        // State should be unchanged after rejection
+        assert_eq!(fe.decim_ratio(), 1);
+        assert!((fe.effective_sample_rate() - TEST_SAMPLE_RATE).abs() < 1.0);
     }
 
     #[test]
