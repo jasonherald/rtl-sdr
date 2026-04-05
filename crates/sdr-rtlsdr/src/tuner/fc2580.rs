@@ -406,6 +406,17 @@ impl Fc2580Tuner {
         Self { xtal, freq: 0 }
     }
 
+    /// Convert crystal frequency to kHz with rounding, guarding against zero.
+    fn xtal_khz(&self) -> Result<u32, RtlSdrError> {
+        let khz = self.xtal.saturating_add(500) / 1000;
+        if khz == 0 {
+            return Err(RtlSdrError::Tuner(
+                "FC2580: crystal frequency too low".to_string(),
+            ));
+        }
+        Ok(khz)
+    }
+
     /// Write a single register via I2C.
     #[allow(clippy::unused_self)]
     fn write_reg(
@@ -788,8 +799,7 @@ impl Tuner for Fc2580Tuner {
         // AGC mode: external (matching the C source TODO comment)
         let agc_mode = AGC_EXTERNAL;
 
-        // Crystal frequency in kHz: round(xtal / 1000)
-        let crystal_freq_khz = (self.xtal + 500) / 1000;
+        let crystal_freq_khz = self.xtal_khz()?;
 
         self.set_init(handle, agc_mode, crystal_freq_khz)
     }
@@ -812,13 +822,13 @@ impl Tuner for Fc2580Tuner {
         handle: &rusb::DeviceHandle<rusb::GlobalContext>,
         freq: u32,
     ) -> Result<(), RtlSdrError> {
-        self.freq = freq;
-
         // Convert Hz to kHz: round(freq / 1000)
-        let rf_freq_khz = (freq + 500) / 1000;
-        let crystal_freq_khz = (self.xtal + 500) / 1000;
+        let rf_freq_khz = freq.saturating_add(500) / 1000;
+        let crystal_freq_khz = self.xtal_khz()?;
 
-        self.set_freq_internal(handle, rf_freq_khz, crystal_freq_khz)
+        self.set_freq_internal(handle, rf_freq_khz, crystal_freq_khz)?;
+        self.freq = freq;
+        Ok(())
     }
 
     /// Set the tuner bandwidth. Returns 0 as the IF frequency.
@@ -830,7 +840,7 @@ impl Tuner for Fc2580Tuner {
         bw: u32,
         _sample_rate: u32,
     ) -> Result<u32, RtlSdrError> {
-        let crystal_freq_khz = (self.xtal + 500) / 1000;
+        let crystal_freq_khz = self.xtal_khz()?;
 
         // Map bandwidth in Hz to the filter mode byte
         let filter_mode = match bw {

@@ -1231,7 +1231,11 @@ impl Tuner for E4kTuner {
         handle: &rusb::DeviceHandle<rusb::GlobalContext>,
         gain: i32,
     ) -> Result<(), RtlSdrError> {
-        let mixgain: i8 = if gain > MIXER_GAIN_THRESH { 12 } else { 4 };
+        let mixgain: i8 = if gain > MIXER_GAIN_THRESH {
+            MIXER_GAIN_12DB
+        } else {
+            MIXER_GAIN_4DB
+        };
 
         // LNA gain: gain minus mixer contribution, capped at 300 (tenths of dB)
         let lna_gain = (gain - i32::from(mixgain) * 10).min(MAX_LNA_GAIN);
