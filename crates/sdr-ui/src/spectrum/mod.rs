@@ -8,6 +8,7 @@ pub mod colormap;
 pub mod fft_plot;
 pub mod frequency_axis;
 pub mod gl_renderer;
+pub mod vfo_overlay;
 pub mod waterfall;
 
 use std::cell::RefCell;
@@ -17,6 +18,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use fft_plot::FftPlotRenderer;
+use vfo_overlay::{BwHandle, HitZone, VfoOverlayRenderer, VfoState};
 use waterfall::WaterfallRenderer;
 
 /// Number of FFT bins for the display.
@@ -58,6 +60,7 @@ const TEST_NOISE_FREQ_SCALE: f32 = 0.1;
 struct FftPlotState {
     gl: glow::Context,
     renderer: FftPlotRenderer,
+    vfo_renderer: VfoOverlayRenderer,
     current_data: Vec<f32>,
 }
 
@@ -65,6 +68,7 @@ struct FftPlotState {
 struct WaterfallState {
     gl: glow::Context,
     renderer: WaterfallRenderer,
+    vfo_renderer: VfoOverlayRenderer,
 }
 
 /// Build the spectrum view containing the FFT plot and waterfall display.
@@ -74,11 +78,20 @@ struct WaterfallState {
 ///
 /// Currently drives both displays with synthetic test data for visual validation.
 pub fn build_spectrum_view() -> gtk4::Paned {
+    let vfo_state: Rc<RefCell<VfoState>> = Rc::new(RefCell::new(VfoState::default()));
     let fft_state: Rc<RefCell<Option<FftPlotState>>> = Rc::new(RefCell::new(None));
     let waterfall_state: Rc<RefCell<Option<WaterfallState>>> = Rc::new(RefCell::new(None));
 
-    let fft_area = build_fft_area(Rc::clone(&fft_state));
-    let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state));
+    let fft_area = build_fft_area(Rc::clone(&fft_state), Rc::clone(&vfo_state));
+    let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state));
+
+    // Attach interaction gestures to both the waterfall and FFT areas.
+    attach_click_gesture(&waterfall_area, &vfo_state);
+    attach_drag_gesture(&waterfall_area, &vfo_state);
+    attach_scroll_gesture(&waterfall_area, &vfo_state);
+
+    // Also attach scroll-to-zoom on the FFT area for convenience.
+    attach_scroll_gesture(&fft_area, &vfo_state);
 
     let paned = gtk4::Paned::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -111,7 +124,10 @@ pub fn build_spectrum_view() -> gtk4::Paned {
 }
 
 /// Build the `GtkGLArea` for the FFT power spectrum plot.
-fn build_fft_area(state: Rc<RefCell<Option<FftPlotState>>>) -> gtk4::GLArea {
+fn build_fft_area(
+    state: Rc<RefCell<Option<FftPlotState>>>,
+    vfo_state: Rc<RefCell<VfoState>>,
+) -> gtk4::GLArea {
     let area = gtk4::GLArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -129,10 +145,11 @@ fn build_fft_area(state: Rc<RefCell<Option<FftPlotState>>>) -> gtk4::GLArea {
         }
 
         match create_gl_context_and_fft_renderer() {
-            Ok((gl, renderer)) => {
+            Ok((gl, renderer, vfo_renderer)) => {
                 *state_realize.borrow_mut() = Some(FftPlotState {
                     gl,
                     renderer,
+                    vfo_renderer,
                     current_data: vec![MIN_DB; FFT_SIZE],
                 });
                 tracing::info!("FFT plot GL renderer initialized");
@@ -150,27 +167,27 @@ fn build_fft_area(state: Rc<RefCell<Option<FftPlotState>>>) -> gtk4::GLArea {
         if area.error().is_some() {
             tracing::warn!("FFT GLArea error on unrealize — skipping GL cleanup");
         } else if let Some(s) = state_unrealize.borrow().as_ref() {
+            s.vfo_renderer.destroy(&s.gl);
             s.renderer.destroy(&s.gl);
             tracing::info!("FFT plot GL renderer destroyed");
         }
         *state_unrealize.borrow_mut() = None;
     });
 
-    // On render: draw the FFT plot.
+    // On render: draw the FFT plot, then the VFO overlay on top.
     area.connect_render(move |area, _ctx| {
         if let Some(s) = state.borrow().as_ref() {
             let width = area.width();
             let height = area.height();
-            // Account for HiDPI scale factor.
             let scale = area.scale_factor();
-            s.renderer.render(
-                &s.gl,
-                &s.current_data,
-                width * scale,
-                height * scale,
-                MIN_DB,
-                MAX_DB,
-            );
+            let phys_w = width * scale;
+            let phys_h = height * scale;
+
+            s.renderer
+                .render(&s.gl, &s.current_data, phys_w, phys_h, MIN_DB, MAX_DB);
+
+            let vfo = vfo_state.borrow();
+            s.vfo_renderer.render(&s.gl, &vfo, phys_w, phys_h);
         }
         glib::Propagation::Stop
     });
@@ -179,7 +196,10 @@ fn build_fft_area(state: Rc<RefCell<Option<FftPlotState>>>) -> gtk4::GLArea {
 }
 
 /// Build the `GtkGLArea` for the waterfall spectrogram.
-fn build_waterfall_area(state: Rc<RefCell<Option<WaterfallState>>>) -> gtk4::GLArea {
+fn build_waterfall_area(
+    state: Rc<RefCell<Option<WaterfallState>>>,
+    vfo_state: Rc<RefCell<VfoState>>,
+) -> gtk4::GLArea {
     let area = gtk4::GLArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -197,8 +217,12 @@ fn build_waterfall_area(state: Rc<RefCell<Option<WaterfallState>>>) -> gtk4::GLA
         }
 
         match create_gl_context_and_waterfall_renderer() {
-            Ok((gl, renderer)) => {
-                *state_realize.borrow_mut() = Some(WaterfallState { gl, renderer });
+            Ok((gl, renderer, vfo_renderer)) => {
+                *state_realize.borrow_mut() = Some(WaterfallState {
+                    gl,
+                    renderer,
+                    vfo_renderer,
+                });
                 tracing::info!("waterfall GL renderer initialized");
             }
             Err(e) => {
@@ -214,19 +238,26 @@ fn build_waterfall_area(state: Rc<RefCell<Option<WaterfallState>>>) -> gtk4::GLA
         if area.error().is_some() {
             tracing::warn!("waterfall GLArea error on unrealize — skipping GL cleanup");
         } else if let Some(s) = state_unrealize.borrow().as_ref() {
+            s.vfo_renderer.destroy(&s.gl);
             s.renderer.destroy(&s.gl);
             tracing::info!("waterfall GL renderer destroyed");
         }
         *state_unrealize.borrow_mut() = None;
     });
 
-    // On render: draw the waterfall.
+    // On render: draw the waterfall, then the VFO overlay on top.
     area.connect_render(move |area, _ctx| {
         if let Some(s) = state.borrow().as_ref() {
             let width = area.width();
             let height = area.height();
             let scale = area.scale_factor();
-            s.renderer.render(&s.gl, width * scale, height * scale);
+            let phys_w = width * scale;
+            let phys_h = height * scale;
+
+            s.renderer.render(&s.gl, phys_w, phys_h);
+
+            let vfo = vfo_state.borrow();
+            s.vfo_renderer.render(&s.gl, &vfo, phys_w, phys_h);
         }
         glib::Propagation::Stop
     });
@@ -267,20 +298,195 @@ unsafe extern "C" {
     ) -> *const std::os::raw::c_void;
 }
 
-/// Create a glow context and FFT plot renderer.
+/// Create a glow context, FFT plot renderer, and VFO overlay renderer.
 fn create_gl_context_and_fft_renderer()
--> Result<(glow::Context, FftPlotRenderer), gl_renderer::GlError> {
+-> Result<(glow::Context, FftPlotRenderer, VfoOverlayRenderer), gl_renderer::GlError> {
     let gl = create_glow_context();
     let renderer = FftPlotRenderer::new(&gl)?;
-    Ok((gl, renderer))
+    let vfo_renderer = VfoOverlayRenderer::new(&gl)?;
+    Ok((gl, renderer, vfo_renderer))
 }
 
-/// Create a glow context and waterfall renderer.
+/// Create a glow context, waterfall renderer, and VFO overlay renderer.
 fn create_gl_context_and_waterfall_renderer()
--> Result<(glow::Context, WaterfallRenderer), gl_renderer::GlError> {
+-> Result<(glow::Context, WaterfallRenderer, VfoOverlayRenderer), gl_renderer::GlError> {
     let gl = create_glow_context();
     let renderer = WaterfallRenderer::new(&gl, FFT_SIZE)?;
-    Ok((gl, renderer))
+    let vfo_renderer = VfoOverlayRenderer::new(&gl)?;
+    Ok((gl, renderer, vfo_renderer))
+}
+
+/// Attach a click-to-tune gesture to a `GtkGLArea`.
+///
+/// Single-clicking sets the VFO center to the clicked frequency.
+fn attach_click_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
+    let click = gtk4::GestureClick::new();
+
+    let vfo_state = Rc::clone(vfo_state);
+    let area_weak = area.downgrade();
+    click.connect_pressed(move |_gesture, _n_press, x, _y| {
+        let Some(area) = area_weak.upgrade() else {
+            return;
+        };
+        let width = f64::from(area.width());
+        let mut vfo = vfo_state.borrow_mut();
+        let hz = vfo.pixel_to_hz(x, width);
+        vfo.offset_hz = hz;
+        tracing::debug!(offset_hz = vfo.offset_hz, "click-to-tune");
+        drop(vfo);
+
+        // Request re-render. The periodic test-data timer also triggers
+        // re-renders of both areas, so the FFT plot overlay updates too.
+        area.queue_render();
+    });
+
+    area.add_controller(click);
+}
+
+/// Attach a drag gesture for VFO center movement and bandwidth handle adjustment.
+fn attach_drag_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
+    let drag = gtk4::GestureDrag::new();
+
+    // Snapshot of VFO state at drag start, for computing deltas.
+    let drag_start_offset_hz: Rc<std::cell::Cell<f64>> = Rc::new(std::cell::Cell::new(0.0));
+    let drag_start_bw_hz: Rc<std::cell::Cell<f64>> = Rc::new(std::cell::Cell::new(0.0));
+
+    // On drag begin: determine if we're dragging a handle or the passband.
+    let vfo_begin = Rc::clone(vfo_state);
+    let start_offset = Rc::clone(&drag_start_offset_hz);
+    let start_bw = Rc::clone(&drag_start_bw_hz);
+    let area_weak_begin = area.downgrade();
+    drag.connect_drag_begin(move |_gesture, x, _y| {
+        let Some(area) = area_weak_begin.upgrade() else {
+            return;
+        };
+        let width = f64::from(area.width());
+        let mut vfo = vfo_begin.borrow_mut();
+        let hit = vfo.hit_test(x, width);
+
+        start_offset.set(vfo.offset_hz);
+        start_bw.set(vfo.bandwidth_hz);
+
+        match hit {
+            HitZone::LeftHandle => {
+                vfo.bw_dragging = Some(BwHandle::Left);
+                vfo.dragging = false;
+            }
+            HitZone::RightHandle => {
+                vfo.bw_dragging = Some(BwHandle::Right);
+                vfo.dragging = false;
+            }
+            HitZone::Passband => {
+                vfo.dragging = true;
+                vfo.bw_dragging = None;
+            }
+            HitZone::Outside => {
+                // Click-to-tune is handled by the click gesture; drag from
+                // outside does nothing.
+                vfo.dragging = false;
+                vfo.bw_dragging = None;
+            }
+        }
+    });
+
+    // On drag update: move VFO or adjust bandwidth.
+    let vfo_update = Rc::clone(vfo_state);
+    let start_offset_update = Rc::clone(&drag_start_offset_hz);
+    let start_bw_update = Rc::clone(&drag_start_bw_hz);
+    let area_weak_update = area.downgrade();
+    drag.connect_drag_update(move |_gesture, offset_x, _offset_y| {
+        let Some(area) = area_weak_update.upgrade() else {
+            return;
+        };
+        let width = f64::from(area.width());
+        let mut vfo = vfo_update.borrow_mut();
+
+        if vfo.dragging {
+            let delta_hz = vfo.pixels_to_hz(offset_x, width);
+            vfo.offset_hz = start_offset_update.get() + delta_hz;
+            area.queue_render();
+        } else if let Some(handle) = vfo.bw_dragging {
+            let delta_hz = vfo.pixels_to_hz(offset_x, width);
+            let original_bw = start_bw_update.get();
+            let original_offset = start_offset_update.get();
+
+            match handle {
+                BwHandle::Left => {
+                    // Moving the left edge: the left edge moves by delta,
+                    // but the right edge stays fixed.
+                    // right_edge = original_offset + original_bw/2 (fixed)
+                    // left_edge  = original_offset - original_bw/2 + delta
+                    // new_bw = right_edge - left_edge = original_bw - delta
+                    // new_center = (left_edge + right_edge) / 2
+                    let new_bw = original_bw - delta_hz;
+                    if new_bw > 0.0 {
+                        let right_edge = original_offset + original_bw / 2.0;
+                        vfo.bandwidth_hz = new_bw;
+                        vfo.clamp_bandwidth();
+                        vfo.offset_hz = right_edge - vfo.bandwidth_hz / 2.0;
+                    }
+                }
+                BwHandle::Right => {
+                    // Moving the right edge: the left edge stays fixed.
+                    let new_bw = original_bw + delta_hz;
+                    if new_bw > 0.0 {
+                        let left_edge = original_offset - original_bw / 2.0;
+                        vfo.bandwidth_hz = new_bw;
+                        vfo.clamp_bandwidth();
+                        vfo.offset_hz = left_edge + vfo.bandwidth_hz / 2.0;
+                    }
+                }
+            }
+            area.queue_render();
+        }
+    });
+
+    // On drag end: clear drag state.
+    let vfo_end = Rc::clone(vfo_state);
+    drag.connect_drag_end(move |_gesture, _offset_x, _offset_y| {
+        let mut vfo = vfo_end.borrow_mut();
+        vfo.dragging = false;
+        vfo.bw_dragging = None;
+    });
+
+    area.add_controller(drag);
+}
+
+/// Attach a scroll-to-zoom gesture to a `GtkGLArea`.
+///
+/// Scrolling zooms the frequency display range centered on the cursor position.
+fn attach_scroll_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
+    let scroll = gtk4::EventControllerScroll::new(
+        gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
+    );
+
+    let vfo_state = Rc::clone(vfo_state);
+    let area_weak = area.downgrade();
+    scroll.connect_scroll(move |_controller, _dx, dy| {
+        let Some(area) = area_weak.upgrade() else {
+            return glib::Propagation::Stop;
+        };
+        let width = f64::from(area.width());
+
+        // Get cursor position from the controller's current point.
+        // GTK4 EventControllerScroll doesn't directly provide position in the
+        // scroll signal, so we use the widget's half-width as a reasonable
+        // default (zoom centered on the display).
+        let cursor_x = width / 2.0;
+
+        let mut vfo = vfo_state.borrow_mut();
+        let cursor_hz = vfo.pixel_to_hz(cursor_x, width);
+
+        // dy > 0 = scroll down = zoom out; dy < 0 = scroll up = zoom in.
+        vfo.zoom(cursor_hz, -dy);
+
+        drop(vfo);
+        area.queue_render();
+
+        glib::Propagation::Stop
+    });
+
+    area.add_controller(scroll);
 }
 
 /// Start a periodic timer that generates synthetic FFT test data and pushes
