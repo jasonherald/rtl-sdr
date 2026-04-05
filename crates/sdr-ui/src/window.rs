@@ -6,6 +6,8 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use crate::spectrum;
+
 /// Default window width in pixels.
 const DEFAULT_WIDTH: i32 = 1200;
 /// Default window height in pixels.
@@ -57,20 +59,16 @@ fn build_split_view() -> adw::OverlaySplitView {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .build();
 
-    // Main content area
-    let content_label = gtk4::Label::builder()
-        .label("Spectrum display coming soon")
-        .css_classes(["spectrum-area"])
-        .hexpand(true)
-        .vexpand(true)
-        .build();
+    // Main content area — spectrum display (FFT plot + waterfall).
+    let spectrum_view = spectrum::build_spectrum_view();
+    spectrum_view.add_css_class("spectrum-area");
 
     let content_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .hexpand(true)
         .vexpand(true)
         .build();
-    content_box.append(&content_label);
+    content_box.append(&spectrum_view);
 
     adw::OverlaySplitView::builder()
         .sidebar(&sidebar_scroll)
