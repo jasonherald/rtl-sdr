@@ -68,11 +68,9 @@ impl<T: Copy + Send + Default + 'static> Stream<T> {
     /// Blocks until the consumer has flushed the previous data.
     /// Returns `false` if the writer was stopped (graceful shutdown).
     pub fn swap(&mut self, size: usize) -> bool {
-        assert!(
-            size <= self.write_buf.len(),
-            "swap size ({size}) exceeds buffer capacity ({})",
-            self.write_buf.len()
-        );
+        if size == 0 || size > self.write_buf.len() {
+            return false;
+        }
 
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);

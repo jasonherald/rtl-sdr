@@ -317,6 +317,39 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_processor() {
+        let mut chain: Chain<f32> = Chain::new();
+        chain.add("a", |input: &[f32], output: &mut [f32]| {
+            for (i, &v) in input.iter().enumerate() {
+                output[i] = v + 1.0;
+            }
+            Ok(input.len())
+        });
+        chain.add("b", |input: &[f32], output: &mut [f32]| {
+            for (i, &v) in input.iter().enumerate() {
+                output[i] = v * 2.0;
+            }
+            Ok(input.len())
+        });
+
+        // Remove "a", only "b" remains
+        chain.remove("a").unwrap();
+        assert_eq!(chain.len(), 1);
+
+        let input = [3.0];
+        let mut output = [0.0_f32; 1];
+        let count = chain.process(&input, &mut output).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(output[0], 6.0); // 3*2, not (3+1)*2
+    }
+
+    #[test]
+    fn test_remove_not_found() {
+        let mut chain: Chain<f32> = Chain::new();
+        assert!(chain.remove("nonexistent").is_err());
+    }
+
+    #[test]
     fn test_buffer_too_small() {
         let mut chain: Chain<f32> = Chain::new();
         let input = [1.0, 2.0, 3.0];
