@@ -395,10 +395,11 @@ mod tests {
 
     #[test]
     fn test_processor_overflow_detected() {
+        const OVERSIZED_COUNT: usize = 999_999;
         let mut chain: Chain<f32> = Chain::new();
         // Processor that claims to have written more than buffer size
         chain
-            .add("overflow", |_: &[f32], _: &mut [f32]| Ok(999_999))
+            .add("overflow", |_: &[f32], _: &mut [f32]| Ok(OVERSIZED_COUNT))
             .unwrap();
         let input = [1.0];
         let mut output = [0.0_f32; 1];
