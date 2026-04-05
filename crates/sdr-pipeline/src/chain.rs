@@ -375,6 +375,25 @@ mod tests {
     }
 
     #[test]
+    fn test_add_duplicate_name() {
+        let mut chain: Chain<f32> = Chain::new();
+        chain
+            .add("a", |i: &[f32], o: &mut [f32]| {
+                o[..i.len()].copy_from_slice(i);
+                Ok(i.len())
+            })
+            .unwrap();
+        assert!(
+            chain
+                .add("a", |i: &[f32], o: &mut [f32]| {
+                    o[..i.len()].copy_from_slice(i);
+                    Ok(i.len())
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_buffer_too_small() {
         let mut chain: Chain<f32> = Chain::new();
         let input = [1.0, 2.0, 3.0];

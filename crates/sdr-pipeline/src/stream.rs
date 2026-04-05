@@ -235,13 +235,20 @@ mod tests {
         s.stop_writer();
         assert!(!s.swap(1), "swap should return false when writer stopped");
         s.clear_write_stop();
+        // After clearing, swap should work again
+        s.write_buf()[0] = 1.0;
+        assert!(s.swap(1), "swap should succeed after clear_write_stop");
     }
 
     #[test]
     fn test_stop_reader() {
-        let s: Stream<f32> = Stream::with_capacity(256);
+        let mut s: Stream<f32> = Stream::with_capacity(256);
         s.stop_reader();
         assert_eq!(s.read(), -1, "read should return -1 when reader stopped");
         s.clear_read_stop();
+        // After clearing, read should work again (need data first)
+        s.write_buf()[0] = 1.0;
+        s.swap(1);
+        assert_eq!(s.read(), 1, "read should succeed after clear_read_stop");
     }
 }
