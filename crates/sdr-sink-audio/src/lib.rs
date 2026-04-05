@@ -65,11 +65,14 @@ impl Sink for AudioSink {
     }
 
     fn start(&mut self) -> Result<(), SinkError> {
-        // TODO: Initialize PipeWire/CoreAudio stream
-        // For now, fail explicitly so callers know audio isn't available yet
-        tracing::warn!("Audio sink backend not yet implemented");
-        self.running = true;
-        Ok(())
+        // Fail fast — no PipeWire/CoreAudio backend yet
+        tracing::warn!(
+            "Audio sink backend not yet implemented (device: {})",
+            self.device_name
+        );
+        Err(SinkError::OpenFailed(
+            "audio backend not yet implemented".to_string(),
+        ))
     }
 
     fn stop(&mut self) -> Result<(), SinkError> {
@@ -102,11 +105,8 @@ mod tests {
     }
 
     #[test]
-    fn test_start_stop() {
+    fn test_start_fails_no_backend() {
         let mut sink = AudioSink::new();
-        sink.start().unwrap();
-        assert!(sink.running);
-        sink.stop().unwrap();
-        assert!(!sink.running);
+        assert!(sink.start().is_err(), "start should fail without backend");
     }
 }
