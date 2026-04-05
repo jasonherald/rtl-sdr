@@ -15,6 +15,9 @@ const VFO_FILTER_TRANSITION_RATIO: f64 = 0.1;
 /// Guard padding for resampler output buffer to handle worst-case rounding.
 const RESAMPLER_OUTPUT_PADDING: usize = 16;
 
+/// Tolerance in Hz for considering bandwidth equal to sample rate (no filter needed).
+const BANDWIDTH_BYPASS_TOLERANCE: f64 = 1.0;
+
 /// Frequency translator — shifts a signal in frequency using an NCO.
 ///
 /// Ports SDR++ `dsp::channel::FrequencyXlator`. Multiplies each input
@@ -125,7 +128,7 @@ impl RxVfo {
         let xlator = FrequencyXlator::from_hz(-offset, in_sample_rate);
         let resampler = RationalResampler::new(in_sample_rate, out_sample_rate)?;
 
-        let filter = if bandwidth < out_sample_rate - 1.0 {
+        let filter = if bandwidth < out_sample_rate - BANDWIDTH_BYPASS_TOLERANCE {
             let filter_width = bandwidth / 2.0;
             let filter_trans = filter_width * VFO_FILTER_TRANSITION_RATIO;
             let filter_taps = taps::low_pass(filter_width, filter_trans, out_sample_rate, true)?;
@@ -160,16 +163,19 @@ impl RxVfo {
     ///
     /// Returns `DspError::InvalidParameter` if bandwidth is invalid.
     pub fn set_bandwidth(&mut self, bandwidth: f64) -> Result<(), DspError> {
-        self.bandwidth = bandwidth;
-        if bandwidth < self.out_sample_rate - 1.0 {
+        // Build new filter before mutating state (transactional)
+        let new_filter = if bandwidth < self.out_sample_rate - BANDWIDTH_BYPASS_TOLERANCE {
             let filter_width = bandwidth / 2.0;
             let filter_trans = filter_width * VFO_FILTER_TRANSITION_RATIO;
             let filter_taps =
                 taps::low_pass(filter_width, filter_trans, self.out_sample_rate, true)?;
-            self.filter = Some(ComplexFirFilter::new(filter_taps)?);
+            Some(ComplexFirFilter::new(filter_taps)?)
         } else {
-            self.filter = None;
-        }
+            None
+        };
+        // Only update state after successful construction
+        self.bandwidth = bandwidth;
+        self.filter = new_filter;
         Ok(())
     }
 

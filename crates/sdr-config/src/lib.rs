@@ -59,8 +59,8 @@ impl ConfigManager {
         let mut should_save = false;
 
         let data = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => match serde_json::from_str(&content) {
+            match std::fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice(&bytes) {
                     Ok(parsed) => merge_defaults(parsed, defaults),
                     Err(e) => {
                         tracing::warn!("config file corrupt, resetting: {e}");
@@ -224,33 +224,43 @@ fn auto_save_worker(
             }
         };
 
-        if should_save {
-            flush_to_disk(&data, &path);
+        if should_save && !flush_to_disk(&data, &path) {
+            // Re-mark dirty so next cycle retries
+            let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
+            *m = true;
         }
     }
 }
 
-/// Check modified flag and flush to disk if set.
+/// Check modified flag and flush to disk if set. Re-marks dirty on failure.
 fn flush_if_modified(modified: &Arc<Mutex<bool>>, data: &Arc<RwLock<Value>>, path: &Path) {
     let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
     if *m {
         *m = false;
         drop(m);
-        flush_to_disk(data, path);
+        if !flush_to_disk(data, path) {
+            // Re-mark dirty so next cycle retries
+            let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
+            *m = true;
+        }
     }
 }
 
-/// Write data to disk, logging any errors.
-fn flush_to_disk(data: &Arc<RwLock<Value>>, path: &Path) {
+/// Write data to disk, logging any errors. Returns true on success.
+fn flush_to_disk(data: &Arc<RwLock<Value>>, path: &Path) -> bool {
     let d = data.read().unwrap_or_else(PoisonError::into_inner);
     match serde_json::to_string_pretty(&*d) {
         Ok(content) => {
             if let Err(e) = std::fs::write(path, &content) {
                 tracing::error!("auto-save write failed: {e}");
+                false
+            } else {
+                true
             }
         }
         Err(e) => {
             tracing::error!("auto-save serialization failed: {e}");
+            false
         }
     }
 }
