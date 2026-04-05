@@ -79,6 +79,8 @@ pub struct WaterfallRenderer {
     vbo: glow::Buffer,
     data_texture: glow::Texture,
     colormap_texture: glow::Texture,
+    /// Pre-allocated buffer for uploading one row of normalized pixel data.
+    row_buffer: Vec<u8>,
     /// Current write position in the ring buffer (`0..HISTORY_LINES`).
     write_row: usize,
     /// Width of the data texture in texels (= number of FFT bins).
@@ -188,6 +190,7 @@ impl WaterfallRenderer {
             vbo,
             data_texture,
             colormap_texture,
+            row_buffer: vec![0u8; width],
             write_row: 0,
             texture_width: width,
             scroll_offset_loc,
@@ -216,11 +219,11 @@ impl WaterfallRenderer {
             return;
         }
 
-        // Normalize dB values to 0..255 bytes.
-        let mut row_data = vec![0u8; self.texture_width];
+        // Normalize dB values to 0..255 using pre-allocated row buffer.
+        self.row_buffer.fill(0);
         for (i, &db) in fft_data.iter().take(bin_count).enumerate() {
             let normalized = ((db - self.min_db) / db_range).clamp(0.0, 1.0);
-            row_data[i] = (normalized * 255.0).round() as u8;
+            self.row_buffer[i] = (normalized * 255.0).round() as u8;
         }
 
         unsafe {
@@ -234,7 +237,7 @@ impl WaterfallRenderer {
                 1,
                 glow::RED,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&row_data)),
+                glow::PixelUnpackData::Slice(Some(&self.row_buffer)),
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
         }

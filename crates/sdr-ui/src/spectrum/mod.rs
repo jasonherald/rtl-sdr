@@ -103,8 +103,8 @@ pub fn build_spectrum_view() -> gtk4::Paned {
     start_test_data_timer(
         Rc::clone(&fft_state),
         Rc::clone(&waterfall_state),
-        fft_area.clone(),
-        waterfall_area.clone(),
+        &fft_area,
+        &waterfall_area,
     );
 
     paned
@@ -289,14 +289,25 @@ fn create_gl_context_and_waterfall_renderer()
 fn start_test_data_timer(
     fft_state: Rc<RefCell<Option<FftPlotState>>>,
     waterfall_state: Rc<RefCell<Option<WaterfallState>>>,
-    fft_area: gtk4::GLArea,
-    waterfall_area: gtk4::GLArea,
+    fft_area: &gtk4::GLArea,
+    waterfall_area: &gtk4::GLArea,
 ) {
     let frame_counter = Rc::new(std::cell::Cell::new(0_usize));
+
+    // Use weak references so the timer stops when the GLAreas are dropped.
+    let fft_area_weak = fft_area.downgrade();
+    let waterfall_area_weak = waterfall_area.downgrade();
 
     glib::timeout_add_local(
         std::time::Duration::from_millis(TEST_FRAME_INTERVAL_MS),
         move || {
+            // Stop the timer if either GLArea has been destroyed.
+            let (Some(fft_area), Some(waterfall_area)) =
+                (fft_area_weak.upgrade(), waterfall_area_weak.upgrade())
+            else {
+                return glib::ControlFlow::Break;
+            };
+
             let frame = frame_counter.get();
             frame_counter.set(frame.wrapping_add(1));
 
