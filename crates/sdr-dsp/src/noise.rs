@@ -60,12 +60,12 @@ impl PowerSquelch {
             return Ok(0);
         }
 
-        // Compute mean power (amplitude squared)
-        let sum: f32 = input.iter().map(|s| s.re * s.re + s.im * s.im).sum();
-        let mean_power = sum / input.len() as f32;
+        // Compute mean amplitude (matching C++ volk_32fc_magnitude_32f + accumulate)
+        let sum: f32 = input.iter().map(|s| s.amplitude()).sum();
+        let mean_amplitude = sum / input.len() as f32;
 
-        // Compare in dB (10*log10 for power)
-        let power_db = 10.0 * mean_power.max(f32::MIN_POSITIVE).log10();
+        // Compare in dB (10*log10 of amplitude, matching C++ behavior)
+        let power_db = 10.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
 
         if power_db >= self.level_db {
             output[..input.len()].copy_from_slice(input);
