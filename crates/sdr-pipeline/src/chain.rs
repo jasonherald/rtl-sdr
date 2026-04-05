@@ -43,15 +43,24 @@ impl<T: Copy + Default> Chain<T> {
     }
 
     /// Add a named processor to the chain (initially enabled).
-    pub fn add<F>(&mut self, name: &str, processor: F)
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if a step with the same name already exists.
+    pub fn add<F>(&mut self, name: &str, processor: F) -> Result<(), DspError>
     where
         F: FnMut(&[T], &mut [T]) -> Result<usize, DspError> + Send + 'static,
     {
+        if self.steps.iter().any(|s| s.name == name) {
+            return Err(DspError::InvalidParameter(format!(
+                "step already exists: {name}"
+            )));
+        }
         self.steps.push(ChainStep {
             processor: Box::new(processor),
             enabled: true,
             name: name.to_string(),
         });
+        Ok(())
     }
 
     /// Enable a processor by name.
@@ -211,12 +220,14 @@ mod tests {
     #[test]
     fn test_single_processor() {
         let mut chain: Chain<f32> = Chain::new();
-        chain.add("double", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = v * 2.0;
-            }
-            Ok(input.len())
-        });
+        chain
+            .add("double", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = v * 2.0;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
 
         let input = [1.0, 2.0, 3.0];
         let mut output = [0.0_f32; 3];
@@ -228,18 +239,22 @@ mod tests {
     #[test]
     fn test_chained_processors() {
         let mut chain: Chain<f32> = Chain::new();
-        chain.add("add_one", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = v + 1.0;
-            }
-            Ok(input.len())
-        });
-        chain.add("double", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = v * 2.0;
-            }
-            Ok(input.len())
-        });
+        chain
+            .add("add_one", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = v + 1.0;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
+        chain
+            .add("double", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = v * 2.0;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
 
         let input = [1.0, 2.0, 3.0];
         let mut output = [0.0_f32; 3];
@@ -252,18 +267,22 @@ mod tests {
     #[test]
     fn test_disable_processor() {
         let mut chain: Chain<f32> = Chain::new();
-        chain.add("add_one", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = v + 1.0;
-            }
-            Ok(input.len())
-        });
-        chain.add("double", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = v * 2.0;
-            }
-            Ok(input.len())
-        });
+        chain
+            .add("add_one", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = v + 1.0;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
+        chain
+            .add("double", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = v * 2.0;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
 
         // Disable the first processor
         chain.disable("add_one").unwrap();
@@ -279,12 +298,14 @@ mod tests {
     #[test]
     fn test_enable_disable_toggle() {
         let mut chain: Chain<f32> = Chain::new();
-        chain.add("negate", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = -v;
-            }
-            Ok(input.len())
-        });
+        chain
+            .add("negate", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = -v;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
 
         assert!(chain.is_enabled("negate").unwrap());
         chain.disable("negate").unwrap();
@@ -296,8 +317,8 @@ mod tests {
     #[test]
     fn test_all_disabled_passthrough() {
         let mut chain: Chain<f32> = Chain::new();
-        chain.add("a", |_: &[f32], _: &mut [f32]| Ok(0));
-        chain.add("b", |_: &[f32], _: &mut [f32]| Ok(0));
+        chain.add("a", |_: &[f32], _: &mut [f32]| Ok(0)).unwrap();
+        chain.add("b", |_: &[f32], _: &mut [f32]| Ok(0)).unwrap();
         chain.disable("a").unwrap();
         chain.disable("b").unwrap();
 
@@ -319,18 +340,22 @@ mod tests {
     #[test]
     fn test_remove_processor() {
         let mut chain: Chain<f32> = Chain::new();
-        chain.add("a", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = v + 1.0;
-            }
-            Ok(input.len())
-        });
-        chain.add("b", |input: &[f32], output: &mut [f32]| {
-            for (i, &v) in input.iter().enumerate() {
-                output[i] = v * 2.0;
-            }
-            Ok(input.len())
-        });
+        chain
+            .add("a", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = v + 1.0;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
+        chain
+            .add("b", |input: &[f32], output: &mut [f32]| {
+                for (i, &v) in input.iter().enumerate() {
+                    output[i] = v * 2.0;
+                }
+                Ok(input.len())
+            })
+            .unwrap();
 
         // Remove "a", only "b" remains
         chain.remove("a").unwrap();

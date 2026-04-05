@@ -218,6 +218,18 @@ mod tests {
     }
 
     #[test]
+    fn test_swap_zero_size_returns_false() {
+        let mut s: Stream<f32> = Stream::with_capacity(256);
+        assert!(!s.swap(0));
+    }
+
+    #[test]
+    fn test_swap_exceeds_capacity_returns_false() {
+        let mut s: Stream<f32> = Stream::with_capacity(256);
+        assert!(!s.swap(257));
+    }
+
+    #[test]
     fn test_stop_writer() {
         let mut s: Stream<f32> = Stream::with_capacity(256);
         s.stop_writer();
