@@ -355,6 +355,11 @@ impl Tuner for R82xxPriv {
                 let cable_2_in = if band == HF { 0x08 } else { 0x00 };
                 self.write_reg_mask(handle, 0x06, cable_2_in, 0x08)?;
 
+                // Control upconverter GPIO switch on newer Blog V4 batches
+                // (audit fix #3 — GPIO 5 for upconverter switch)
+                crate::usb::set_gpio_output(handle, 5)?;
+                crate::usb::set_gpio_bit(handle, 5, cable_2_in == 0)?;
+
                 let cable_1_in = if band == VHF { 0x40 } else { 0x00 };
                 self.write_reg_mask(handle, 0x05, cable_1_in, 0x40)?;
 

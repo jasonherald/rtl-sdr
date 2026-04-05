@@ -32,5 +32,7 @@ pub mod reg;
 pub mod tuner;
 pub mod usb;
 
-pub use device::RtlSdrDevice;
+pub use device::{
+    RtlSdrDevice, get_device_count, get_device_name, get_device_usb_strings, get_index_by_serial,
+};
 pub use error::RtlSdrError;
