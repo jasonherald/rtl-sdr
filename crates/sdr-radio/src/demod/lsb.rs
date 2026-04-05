@@ -78,7 +78,9 @@ impl Demodulator for LsbDemodulator {
     }
 
     fn set_bandwidth(&mut self, bw: f64) {
-        let _ = self.demod.set_bandwidth(bw);
+        if let Err(e) = self.demod.set_bandwidth(bw) {
+            tracing::warn!("LSB: set_bandwidth({bw}) failed: {e}");
+        }
     }
 
     fn config(&self) -> &DemodConfig {

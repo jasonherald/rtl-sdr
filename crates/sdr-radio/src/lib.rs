@@ -153,10 +153,24 @@ impl RadioModule {
         Ok(())
     }
 
+    /// Estimate the maximum output sample count for a given input count.
+    ///
+    /// Use this to size the `output` buffer before calling [`process()`](Self::process).
+    /// Accounts for the AF chain resampling ratio (e.g., CW 3kHz → 48kHz = 16x).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn max_output_samples(&self, input_count: usize) -> usize {
+        let cfg = self.demod.config();
+        let ratio = (self.audio_sample_rate / cfg.af_sample_rate).ceil() as usize;
+        input_count * ratio.max(1) + 16
+    }
+
     /// Process complex IQ samples through the full radio chain.
     ///
     /// Returns the number of stereo audio samples written to `output`.
-    /// The output count may differ from `input.len()` due to resampling.
+    /// The output count may differ from `input.len()` due to AF resampling.
+    ///
+    /// Callers must size `output` using [`max_output_samples()`](Self::max_output_samples)
+    /// to accommodate upsampling (e.g., CW 3kHz → 48kHz produces ~16x more samples).
     ///
     /// # Errors
     ///

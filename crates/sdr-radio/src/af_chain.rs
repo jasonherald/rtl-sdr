@@ -31,10 +31,14 @@ pub struct AfChain {
     resampler: Option<RationalResampler>,
     af_sample_rate: f64,
     audio_sample_rate: f64,
-    /// Scratch buffer for deemphasis L channel.
+    /// Scratch buffer for deemphasis L input channel.
     deemp_buf_l: Vec<f32>,
-    /// Scratch buffer for deemphasis R channel.
+    /// Scratch buffer for deemphasis R input channel.
     deemp_buf_r: Vec<f32>,
+    /// Scratch buffer for deemphasis L output.
+    deemp_out_l: Vec<f32>,
+    /// Scratch buffer for deemphasis R output.
+    deemp_out_r: Vec<f32>,
     /// Scratch buffer for complex resampler input.
     resamp_in: Vec<Complex>,
     /// Scratch buffer for complex resampler output.
@@ -66,6 +70,8 @@ impl AfChain {
             af_sample_rate,
             audio_sample_rate,
             deemp_buf_l: Vec::new(),
+            deemp_out_l: Vec::new(),
+            deemp_out_r: Vec::new(),
             deemp_buf_r: Vec::new(),
             resamp_in: Vec::new(),
             resamp_out: Vec::new(),
@@ -143,15 +149,15 @@ impl AfChain {
                     self.deemp_buf_r[i] = s.r;
                 }
 
-                // Apply deemphasis to each channel in-place
-                let mut out_l = vec![0.0_f32; n];
-                let mut out_r = vec![0.0_f32; n];
-                deemp_l.process(&self.deemp_buf_l[..n], &mut out_l)?;
-                deemp_r.process(&self.deemp_buf_r[..n], &mut out_r)?;
+                // Apply deemphasis using pre-allocated output buffers
+                self.deemp_out_l.resize(n, 0.0);
+                self.deemp_out_r.resize(n, 0.0);
+                deemp_l.process(&self.deemp_buf_l[..n], &mut self.deemp_out_l[..n])?;
+                deemp_r.process(&self.deemp_buf_r[..n], &mut self.deemp_out_r[..n])?;
 
-                // Reassemble stereo
-                self.deemp_buf_l[..n].copy_from_slice(&out_l);
-                self.deemp_buf_r[..n].copy_from_slice(&out_r);
+                // Swap input and output buffers so downstream reads from out
+                std::mem::swap(&mut self.deemp_buf_l, &mut self.deemp_out_l);
+                std::mem::swap(&mut self.deemp_buf_r, &mut self.deemp_out_r);
                 true
             } else {
                 false

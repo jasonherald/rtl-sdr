@@ -78,9 +78,9 @@ impl Demodulator for UsbDemodulator {
     }
 
     fn set_bandwidth(&mut self, bw: f64) {
-        // SSB demod uses bandwidth for frequency translation offset.
-        // Ignore errors from out-of-range values silently (UI should clamp).
-        let _ = self.demod.set_bandwidth(bw);
+        if let Err(e) = self.demod.set_bandwidth(bw) {
+            tracing::warn!("USB: set_bandwidth({bw}) failed: {e}");
+        }
     }
 
     fn config(&self) -> &DemodConfig {
