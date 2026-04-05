@@ -3,6 +3,10 @@
 //! Each tuner IC (R820T, E4000, FC0012, etc.) implements the `Tuner` trait,
 //! providing frequency, gain, and bandwidth control via I2C.
 
+pub mod e4k;
+pub mod fc0012;
+pub mod fc0013;
+pub mod fc2580;
 pub mod r82xx;
 
 use crate::error::RtlSdrError;
