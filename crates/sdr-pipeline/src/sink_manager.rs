@@ -93,7 +93,9 @@ impl SinkManager {
 
     /// Get the names of all registered sinks.
     pub fn sink_names(&self) -> Vec<&str> {
-        self.sinks.keys().map(String::as_str).collect()
+        let mut names: Vec<&str> = self.sinks.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     /// Register a named audio stream. Replaces any existing stream with the same name.
@@ -116,15 +118,22 @@ impl SinkManager {
 
     /// Get stream names.
     pub fn stream_names(&self) -> Vec<&str> {
-        self.streams.keys().map(String::as_str).collect()
+        let mut names: Vec<&str> = self.streams.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     /// Set the volume for a stream (0.0 to 1.0).
     ///
     /// # Errors
     ///
-    /// Returns `SinkError` if the stream is not found.
+    /// Returns `SinkError` if the stream is not found or volume is non-finite.
     pub fn set_volume(&mut self, stream_name: &str, volume: f32) -> Result<(), SinkError> {
+        if !volume.is_finite() {
+            return Err(SinkError::OpenFailed(format!(
+                "volume must be finite, got {volume}"
+            )));
+        }
         let stream = self
             .streams
             .get_mut(stream_name)
