@@ -485,7 +485,7 @@ impl Fc0013Tuner {
     /// Set tuner frequency and bandwidth.
     ///
     /// Exact port of `fc0013_set_params`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn set_params(
         &self,
         handle: &rusb::DeviceHandle<rusb::GlobalContext>,
@@ -574,6 +574,10 @@ impl Fc0013Tuner {
         // so the shift and division must be done in u32 to avoid u16 overflow.
         let xin_remainder =
             (f_vco - (f_vco / u64::from(xtal_freq_div_2)) * u64::from(xtal_freq_div_2)) / 1000;
+        debug_assert!(
+            xin_remainder <= 0xFFFF,
+            "XIN remainder exceeds u16 range: {xin_remainder}"
+        );
         let xin_wide = (u32::from(xin_remainder as u16) << 15) / (xtal_freq_div_2 / 1000);
         let mut xin = xin_wide as u16;
         if xin >= XIN_THRESHOLD {

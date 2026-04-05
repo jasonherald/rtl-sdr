@@ -497,14 +497,23 @@ impl Fc2580Tuner {
         }
 
         // Filter calibration: poll up to 5 times, re-trigger if not complete
+        let mut cal_ok = false;
         for _ in 0..FILTER_CAL_MAX_RETRIES {
             // USB latency serves as the wait (original C: fc2580_wait_msec 5ms)
             let cal_mon = self.read_reg(handle, REG_2F)?;
             if (cal_mon & FILTER_CAL_MON_MASK) == FILTER_CAL_COMPLETE {
+                cal_ok = true;
                 break;
             }
             self.write_reg(handle, REG_2E, FILTER_CAL_RESET)?;
             self.write_reg(handle, REG_2E, FILTER_CAL_TRIGGER)?;
+        }
+
+        if !cal_ok {
+            tracing::warn!(
+                "FC2580: filter calibration did not complete after {} retries",
+                FILTER_CAL_MAX_RETRIES
+            );
         }
 
         self.write_reg(handle, REG_2E, FILTER_CAL_RESET)?;
@@ -712,6 +721,7 @@ impl Fc2580Tuner {
         self.write_reg(handle, REG_1B, k_val as u8)?;
 
         // Load N value
+        debug_assert!(n_val <= 255, "FC2580 PLL n_val exceeds u8 range: {n_val}");
         self.write_reg(handle, REG_1C, n_val as u8)?;
 
         // UHF LNA Load Cap

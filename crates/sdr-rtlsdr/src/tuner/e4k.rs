@@ -786,6 +786,7 @@ impl E4kTuner {
         let fvco = u64::from(fosc) * z + (u64::from(fosc) * u64::from(x as u16)) / PLL_Y;
         let flo = (fvco / u64::from(r)) as u32;
 
+        debug_assert!(z <= 255, "PLL integer part exceeds u8 range");
         Some(PllParams {
             fosc,
             flo,
