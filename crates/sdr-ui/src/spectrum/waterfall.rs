@@ -215,7 +215,7 @@ impl WaterfallRenderer {
     pub fn push_line(&mut self, gl: &glow::Context, fft_data: &[f32]) {
         let bin_count = fft_data.len().min(self.texture_width);
         let db_range = self.max_db - self.min_db;
-        if db_range <= 0.0 {
+        if !db_range.is_finite() || db_range <= 0.0 {
             return;
         }
 
@@ -293,8 +293,10 @@ impl WaterfallRenderer {
 
     /// Update the display range in dB.
     pub fn set_db_range(&mut self, min_db: f32, max_db: f32) {
-        self.min_db = min_db;
-        self.max_db = max_db;
+        if min_db.is_finite() && max_db.is_finite() && max_db > min_db {
+            self.min_db = min_db;
+            self.max_db = max_db;
+        }
     }
 
     /// Release GL resources.
