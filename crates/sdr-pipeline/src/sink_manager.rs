@@ -71,8 +71,14 @@ impl SinkManager {
         Ok(())
     }
 
-    /// Unregister a sink by name.
+    /// Unregister a sink by name. Clears any stream references to it.
     pub fn unregister_sink(&mut self, name: &str) -> Option<Box<dyn Sink>> {
+        // Clear stale active_sink references in streams
+        for stream in self.streams.values_mut() {
+            if stream.active_sink.as_deref() == Some(name) {
+                stream.active_sink = None;
+            }
+        }
         self.sinks.remove(name)
     }
 
@@ -241,5 +247,25 @@ mod tests {
         let mut mgr = SinkManager::new();
         mgr.register_sink(Box::new(MockSink::new("Audio"))).unwrap();
         assert!(mgr.set_stream_sink("nonexistent", "Audio").is_err());
+    }
+
+    #[test]
+    fn test_unregister_sink_clears_stream_refs() {
+        let mut mgr = SinkManager::new();
+        mgr.register_sink(Box::new(MockSink::new("Audio"))).unwrap();
+        mgr.register_stream("main", 48_000.0);
+        mgr.set_stream_sink("main", "Audio").unwrap();
+        mgr.unregister_sink("Audio");
+        // Stream's active_sink should be cleared
+        let stream = mgr.streams.get("main").unwrap();
+        assert!(stream.active_sink.is_none());
+    }
+
+    #[test]
+    fn test_volume_clamp_negative() {
+        let mut mgr = SinkManager::new();
+        mgr.register_stream("main", 48_000.0);
+        mgr.set_volume("main", -0.5).unwrap();
+        assert!((mgr.volume("main").unwrap()).abs() < f32::EPSILON);
     }
 }
