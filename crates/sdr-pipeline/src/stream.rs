@@ -4,18 +4,39 @@
 //! transport. A producer writes into `write_buf`, then calls `swap(count)`
 //! to publish the data. A consumer calls `read()` to wait for data,
 //! processes `read_buf[..count]`, then calls `flush()` to release the buffer.
+//!
+//! All methods take `&self`, enabling the stream to be shared between
+//! producer and consumer threads via `Arc<Stream<T>>`.
+//!
+//! # Safety
+//!
+//! This module uses `UnsafeCell` and `unsafe impl Send/Sync` for the buffer
+//! storage. This is sound because the SPSC protocol guarantees that only one
+//! thread accesses each buffer at a time, enforced by the Mutex+Condvar state.
 
 use sdr_types::STREAM_BUFFER_SIZE;
+use std::cell::UnsafeCell;
 use std::sync::{Condvar, Mutex, PoisonError};
 
 /// Double-buffer swap channel for streaming samples between DSP blocks.
 ///
 /// Thread-safe single-producer, single-consumer channel with backpressure.
-/// The producer writes to `write_buf` and swaps; the consumer reads from
-/// `read_buf` after `read()` returns.
+/// All methods take `&self` so the stream can be shared via `Arc<Stream<T>>`
+/// between producer and consumer threads.
+///
+/// # Safety
+///
+/// This type uses `UnsafeCell` for the buffer storage to allow swapping
+/// under the mutex without requiring `&mut self`. The mutex in `StreamState`
+/// ensures that only one thread accesses the buffers at a time during swap.
+/// Between swaps, the producer exclusively owns `write_buf` and the consumer
+/// exclusively owns `read_buf` — this invariant is enforced by the protocol
+/// (producer calls swap, consumer calls read then flush).
+#[allow(clippy::doc_markdown)]
 pub struct Stream<T: Copy + Send + Default + 'static> {
-    write_buf: Box<[T]>,
-    read_buf: Box<[T]>,
+    /// Two buffers — index 0 and 1. Which is "write" vs "read" is tracked
+    /// by `write_idx` in the state.
+    bufs: [UnsafeCell<Box<[T]>>; 2],
     state: Mutex<StreamState>,
     swap_cv: Condvar,
     ready_cv: Condvar,
@@ -23,12 +44,25 @@ pub struct Stream<T: Copy + Send + Default + 'static> {
 
 #[allow(clippy::struct_excessive_bools)]
 struct StreamState {
+    /// Index of the current write buffer (0 or 1). Read buffer is `1 - write_idx`.
+    write_idx: usize,
     can_swap: bool,
     data_ready: bool,
     data_size: usize,
     reader_stop: bool,
     writer_stop: bool,
+    capacity: usize,
 }
+
+// Safety: Stream uses Mutex+Condvar for all shared state access.
+// The UnsafeCell buffers are only accessed by one thread at a time:
+// - Producer writes to bufs[write_idx] exclusively between flushes
+// - Consumer reads from bufs[1-write_idx] exclusively between read() and flush()
+// - swap() occurs under the mutex, switching the indices atomically
+#[allow(unsafe_code)]
+unsafe impl<T: Copy + Send + Default + 'static> Send for Stream<T> {}
+#[allow(unsafe_code)]
+unsafe impl<T: Copy + Send + Default + 'static> Sync for Stream<T> {}
 
 impl<T: Copy + Send + Default + 'static> Stream<T> {
     /// Create a new stream with the default buffer size.
@@ -39,14 +73,18 @@ impl<T: Copy + Send + Default + 'static> Stream<T> {
     /// Create a new stream with the given buffer capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            write_buf: vec![T::default(); capacity].into_boxed_slice(),
-            read_buf: vec![T::default(); capacity].into_boxed_slice(),
+            bufs: [
+                UnsafeCell::new(vec![T::default(); capacity].into_boxed_slice()),
+                UnsafeCell::new(vec![T::default(); capacity].into_boxed_slice()),
+            ],
             state: Mutex::new(StreamState {
+                write_idx: 0,
                 can_swap: true,
                 data_ready: false,
                 data_size: 0,
                 reader_stop: false,
                 writer_stop: false,
+                capacity,
             }),
             swap_cv: Condvar::new(),
             ready_cv: Condvar::new(),
@@ -54,13 +92,32 @@ impl<T: Copy + Send + Default + 'static> Stream<T> {
     }
 
     /// Get a mutable reference to the write buffer.
-    pub fn write_buf(&mut self) -> &mut [T] {
-        &mut self.write_buf
+    ///
+    /// # Safety
+    ///
+    /// Safe because the producer is the only thread that accesses the write
+    /// buffer between `swap()` calls. The SPSC protocol guarantees this.
+    #[allow(unsafe_code, clippy::mut_from_ref, clippy::doc_markdown)]
+    pub fn write_buf(&self) -> &mut [T] {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let idx = state.write_idx;
+        drop(state);
+        // Safety: only the producer thread calls write_buf(), and it's the
+        // only thread accessing bufs[write_idx] between swap() calls.
+        unsafe { &mut *self.bufs[idx].get() }
     }
 
     /// Get a reference to the read buffer.
+    ///
+    /// Valid after `read()` returns a positive count, until `flush()` is called.
+    #[allow(unsafe_code)]
     pub fn read_buf(&self) -> &[T] {
-        &self.read_buf
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let idx = 1 - state.write_idx;
+        drop(state);
+        // Safety: only the consumer thread calls read_buf(), and it's the
+        // only thread accessing bufs[1-write_idx] between read() and flush().
+        unsafe { &*self.bufs[idx].get() }
     }
 
     /// Swap the write buffer with the read buffer, publishing `size` samples.
@@ -68,27 +125,29 @@ impl<T: Copy + Send + Default + 'static> Stream<T> {
     /// Blocks until the consumer has flushed the previous data.
     /// Returns `false` if the writer was stopped or `size` is invalid
     /// (zero or exceeds capacity).
-    pub fn swap(&mut self, size: usize) -> bool {
-        if size == 0 || size > self.write_buf.len() {
+    pub fn swap(&self, size: usize) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if size == 0 || size > state.capacity {
             return false;
         }
 
-        {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state = self
-                .swap_cv
-                .wait_while(state, |s| !s.can_swap && !s.writer_stop)
-                .unwrap_or_else(PoisonError::into_inner);
+        state = self
+            .swap_cv
+            .wait_while(state, |s| !s.can_swap && !s.writer_stop)
+            .unwrap_or_else(PoisonError::into_inner);
 
-            if state.writer_stop {
-                return false;
-            }
-
-            state.data_size = size;
-            std::mem::swap(&mut self.write_buf, &mut self.read_buf);
-            state.can_swap = false;
-            state.data_ready = true;
+        if state.writer_stop {
+            return false;
         }
+
+        // Swap buffers by flipping the index
+        state.data_size = size;
+        state.write_idx = 1 - state.write_idx;
+        state.can_swap = false;
+        state.data_ready = true;
+
+        drop(state);
         self.ready_cv.notify_all();
 
         true
@@ -154,7 +213,8 @@ impl<T: Copy + Send + Default + 'static> Stream<T> {
 
     /// Buffer capacity (number of samples).
     pub fn capacity(&self) -> usize {
-        self.write_buf.len()
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.capacity
     }
 }
 
@@ -172,6 +232,8 @@ impl<T: Copy + Send + Default + 'static> Default for Stream<T> {
 )]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn test_new_default_capacity() {
@@ -187,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_single_thread_swap_read_flush() {
-        let mut s: Stream<f32> = Stream::with_capacity(256);
+        let s: Stream<f32> = Stream::with_capacity(256);
 
         s.write_buf()[0] = 42.0;
         s.write_buf()[1] = 43.0;
@@ -203,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_multiple_swap_read_cycles() {
-        let mut s: Stream<f32> = Stream::with_capacity(256);
+        let s: Stream<f32> = Stream::with_capacity(256);
 
         for cycle in 0..5 {
             let val = (cycle + 1) as f32;
@@ -219,19 +281,19 @@ mod tests {
 
     #[test]
     fn test_swap_zero_size_returns_false() {
-        let mut s: Stream<f32> = Stream::with_capacity(256);
+        let s: Stream<f32> = Stream::with_capacity(256);
         assert!(!s.swap(0));
     }
 
     #[test]
     fn test_swap_exceeds_capacity_returns_false() {
-        let mut s: Stream<f32> = Stream::with_capacity(256);
+        let s: Stream<f32> = Stream::with_capacity(256);
         assert!(!s.swap(257));
     }
 
     #[test]
     fn test_stop_writer() {
-        let mut s: Stream<f32> = Stream::with_capacity(256);
+        let s: Stream<f32> = Stream::with_capacity(256);
         s.stop_writer();
         assert!(!s.swap(1), "swap should return false when writer stopped");
         s.clear_write_stop();
@@ -242,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_stop_reader() {
-        let mut s: Stream<f32> = Stream::with_capacity(256);
+        let s: Stream<f32> = Stream::with_capacity(256);
         s.stop_reader();
         assert_eq!(s.read(), -1, "read should return -1 when reader stopped");
         s.clear_read_stop();
@@ -250,5 +312,71 @@ mod tests {
         s.write_buf()[0] = 1.0;
         s.swap(1);
         assert_eq!(s.read(), 1, "read should succeed after clear_read_stop");
+    }
+
+    #[test]
+    fn test_producer_consumer_threads() {
+        let stream = Arc::new(Stream::<f32>::with_capacity(256));
+
+        let producer_stream = Arc::clone(&stream);
+        let consumer_stream = Arc::clone(&stream);
+
+        let n_iterations = 10;
+
+        // Producer thread
+        let producer = thread::spawn(move || {
+            for i in 0..n_iterations {
+                producer_stream.write_buf()[0] = (i + 1) as f32;
+                assert!(producer_stream.swap(1));
+            }
+        });
+
+        // Consumer thread
+        let consumer = thread::spawn(move || {
+            let mut total = 0;
+            for _ in 0..n_iterations {
+                let count = consumer_stream.read();
+                assert!(count > 0);
+                total += count;
+                consumer_stream.flush();
+            }
+            assert_eq!(total, n_iterations);
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+    }
+
+    #[test]
+    fn test_data_integrity_across_threads() {
+        let stream = Arc::new(Stream::<f32>::with_capacity(256));
+
+        let producer_stream = Arc::clone(&stream);
+        let consumer_stream = Arc::clone(&stream);
+
+        let n_iterations = 100;
+
+        let producer = thread::spawn(move || {
+            for i in 0..n_iterations {
+                let buf = producer_stream.write_buf();
+                buf[0] = i as f32;
+                buf[1] = (i * 2) as f32;
+                assert!(producer_stream.swap(2));
+            }
+        });
+
+        let consumer = thread::spawn(move || {
+            for i in 0..n_iterations {
+                let count = consumer_stream.read();
+                assert_eq!(count, 2);
+                let buf = consumer_stream.read_buf();
+                assert!((buf[0] - i as f32).abs() < f32::EPSILON);
+                assert!((buf[1] - (i * 2) as f32).abs() < f32::EPSILON);
+                consumer_stream.flush();
+            }
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
     }
 }
