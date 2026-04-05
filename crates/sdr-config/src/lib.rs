@@ -254,7 +254,11 @@ fn flush_to_disk(data: &Arc<RwLock<Value>>, path: &Path) -> bool {
     let d = data.read().unwrap_or_else(PoisonError::into_inner);
     match serde_json::to_string_pretty(&*d) {
         Ok(content) => {
-            if let Err(e) = std::fs::write(path, &content) {
+            // Atomic write: temp file + rename
+            let tmp_path = path.with_extension("tmp");
+            if let Err(e) =
+                std::fs::write(&tmp_path, &content).and_then(|()| std::fs::rename(&tmp_path, path))
+            {
                 tracing::error!("auto-save write failed: {e}");
                 false
             } else {

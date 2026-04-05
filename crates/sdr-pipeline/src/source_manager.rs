@@ -100,13 +100,8 @@ impl SourceManager {
         }
         // Stop the currently running source before switching
         if self.running && self.selected.as_deref() != Some(name) {
-            let current = self.selected.clone().unwrap_or_default();
-            if let Some(source) = self.sources.get_mut(&current)
-                && let Err(e) = source.stop()
-            {
-                tracing::warn!("failed to stop source during reselect: {e}");
-            }
-            self.running = false;
+            // Use stop() for consistent error handling
+            let _ = self.stop();
         }
         self.selected = Some(name.to_string());
         Ok(())

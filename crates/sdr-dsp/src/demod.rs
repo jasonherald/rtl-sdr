@@ -273,17 +273,30 @@ impl SsbDemod {
     /// - `mode`: USB, LSB, or DSB
     /// - `bandwidth`: channel bandwidth in Hz
     /// - `sample_rate`: sample rate in Hz
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `bandwidth` or `sample_rate` are invalid.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn new(mode: SsbMode, bandwidth: f64, sample_rate: f64) -> Self {
+    pub fn new(mode: SsbMode, bandwidth: f64, sample_rate: f64) -> Result<Self, DspError> {
+        if !bandwidth.is_finite() || bandwidth <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "bandwidth must be positive and finite, got {bandwidth}"
+            )));
+        }
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate must be positive and finite, got {sample_rate}"
+            )));
+        }
         let translation = Self::get_translation(mode, bandwidth);
         let xlator = crate::channel::FrequencyXlator::from_hz(translation, sample_rate);
-        Self {
+        Ok(Self {
             mode,
             xlator,
             xlator_buf: Vec::new(),
             bandwidth,
             sample_rate,
-        }
+        })
     }
 
     /// Set the demodulation mode.
@@ -347,12 +360,21 @@ pub struct CwDemod {
     xlator: crate::channel::FrequencyXlator,
     agc: crate::loops::Agc,
     xlator_buf: Vec<Complex>,
+    agc_buf: Vec<f32>,
 }
 
 /// Default AGC attack coefficient for CW.
 const CW_AGC_ATTACK: f32 = 0.1;
 /// Default AGC decay coefficient for CW.
 const CW_AGC_DECAY: f32 = 0.01;
+/// AGC maximum gain (matching C++ 10e6).
+const CW_AGC_MAX_GAIN: f32 = 10e6;
+/// AGC maximum output amplitude (matching C++ 10.0).
+const CW_AGC_MAX_OUTPUT: f32 = 10.0;
+/// AGC set point (target amplitude).
+const CW_AGC_SET_POINT: f32 = 1.0;
+/// AGC initial gain.
+const CW_AGC_INIT_GAIN: f32 = 1.0;
 
 impl CwDemod {
     /// Create a new CW demodulator.
@@ -375,11 +397,19 @@ impl CwDemod {
             )));
         }
         let xlator = crate::channel::FrequencyXlator::from_hz(tone_offset_hz, sample_rate);
-        let agc = crate::loops::Agc::new(1.0, CW_AGC_ATTACK, CW_AGC_DECAY, 10e6, 10.0, 1.0)?;
+        let agc = crate::loops::Agc::new(
+            CW_AGC_SET_POINT,
+            CW_AGC_ATTACK,
+            CW_AGC_DECAY,
+            CW_AGC_MAX_GAIN,
+            CW_AGC_MAX_OUTPUT,
+            CW_AGC_INIT_GAIN,
+        )?;
         Ok(Self {
             xlator,
             agc,
             xlator_buf: Vec::new(),
+            agc_buf: Vec::new(),
         })
     }
 
@@ -413,9 +443,11 @@ impl CwDemod {
             output[i] = s.re;
         }
 
-        // Step 3: AGC for consistent amplitude
-        let temp: Vec<f32> = output[..input.len()].to_vec();
-        self.agc.process_f32(&temp, &mut output[..input.len()])?;
+        // Step 3: AGC for consistent amplitude (use pre-allocated buffer)
+        self.agc_buf.resize(input.len(), 0.0);
+        self.agc_buf.copy_from_slice(&output[..input.len()]);
+        self.agc
+            .process_f32(&self.agc_buf, &mut output[..input.len()])?;
 
         Ok(input.len())
     }
@@ -522,7 +554,7 @@ mod tests {
     #[test]
     fn test_ssb_dsb_extracts_real() {
         // DSB mode: no frequency translation, just extract real part
-        let mut demod = SsbDemod::new(SsbMode::Dsb, 3000.0, 48_000.0);
+        let mut demod = SsbDemod::new(SsbMode::Dsb, 3000.0, 48_000.0).unwrap();
         let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
         let mut output = [0.0_f32; 2];
         demod.process(&input, &mut output).unwrap();
@@ -534,8 +566,8 @@ mod tests {
     #[test]
     fn test_ssb_usb_lsb_differ() {
         // USB and LSB should produce different output for asymmetric signals
-        let mut usb = SsbDemod::new(SsbMode::Usb, 3000.0, 48_000.0);
-        let mut lsb = SsbDemod::new(SsbMode::Lsb, 3000.0, 48_000.0);
+        let mut usb = SsbDemod::new(SsbMode::Usb, 3000.0, 48_000.0).unwrap();
+        let mut lsb = SsbDemod::new(SsbMode::Lsb, 3000.0, 48_000.0).unwrap();
         // Generate a tone signal (not DC) so translation matters
         let input: Vec<Complex> = (0..100)
             .map(|i| {
@@ -562,7 +594,7 @@ mod tests {
     #[test]
     fn test_ssb_produces_audio() {
         // Verify SSB produces non-zero audio output from a tone
-        let mut demod = SsbDemod::new(SsbMode::Usb, 3000.0, 48_000.0);
+        let mut demod = SsbDemod::new(SsbMode::Usb, 3000.0, 48_000.0).unwrap();
         let input: Vec<Complex> = (0..1000)
             .map(|i| {
                 let phase = 2.0 * PI * 1000.0 * (i as f32) / 48_000.0;
