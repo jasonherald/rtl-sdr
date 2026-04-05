@@ -394,6 +394,18 @@ mod tests {
     }
 
     #[test]
+    fn test_processor_overflow_detected() {
+        let mut chain: Chain<f32> = Chain::new();
+        // Processor that claims to have written more than buffer size
+        chain
+            .add("overflow", |_: &[f32], _: &mut [f32]| Ok(999_999))
+            .unwrap();
+        let input = [1.0];
+        let mut output = [0.0_f32; 1];
+        assert!(chain.process(&input, &mut output).is_err());
+    }
+
+    #[test]
     fn test_buffer_too_small() {
         let mut chain: Chain<f32> = Chain::new();
         let input = [1.0, 2.0, 3.0];
