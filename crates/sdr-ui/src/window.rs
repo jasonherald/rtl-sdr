@@ -129,7 +129,6 @@ fn build_header_bar(sidebar_toggle: &gtk4::ToggleButton) -> adw::HeaderBar {
 /// Build the app menu button with About / Keyboard Shortcuts / Quit actions.
 fn build_menu_button() -> gtk4::MenuButton {
     let menu = gio::Menu::new();
-    menu.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
     menu.append(Some("_About SDR-RS"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
 
