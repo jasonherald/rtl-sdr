@@ -68,10 +68,10 @@ impl NetworkSource {
 
         let bytes_read = match &mut self.connection {
             Some(NetworkConnection::Tcp(stream)) => {
-                stream.read(&mut buf).map_err(|e| SourceError::Io(e))?
+                stream.read(&mut buf).map_err(SourceError::Io)?
             }
             Some(NetworkConnection::Udp(socket)) => {
-                let (n, _addr) = socket.recv_from(&mut buf).map_err(|e| SourceError::Io(e))?;
+                let (n, _addr) = socket.recv_from(&mut buf).map_err(SourceError::Io)?;
                 n
             }
             None => return Err(SourceError::NotRunning),

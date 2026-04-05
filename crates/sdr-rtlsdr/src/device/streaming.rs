@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 //! Data streaming — buffer reset, sync read, async read.
 //!
 //! Ports `rtlsdr_reset_buffer`, `rtlsdr_read_sync`,
@@ -9,13 +8,12 @@
 //! read loop that checks a shared cancellation flag. True async support
 //! will be added when the pipeline is wired up with worker threads.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::constants::{BULK_TIMEOUT, DEFAULT_BUF_LENGTH, DEFAULT_BUF_NUMBER};
+use crate::constants::{BULK_TIMEOUT, DEFAULT_BUF_LENGTH};
 use crate::error::RtlSdrError;
-use crate::reg::{AsyncStatus, Block};
+use crate::reg::Block;
 use crate::usb;
 
 use super::RtlSdrDevice;

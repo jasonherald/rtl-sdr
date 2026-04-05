@@ -23,6 +23,9 @@
 use sdr_pipeline::sink_manager::Sink;
 use sdr_types::SinkError;
 
+/// Default audio sample rate (Hz).
+const DEFAULT_AUDIO_SAMPLE_RATE: f64 = 48_000.0;
+
 /// Audio output sink.
 ///
 /// Outputs demodulated audio to the system's audio device.
@@ -37,7 +40,7 @@ impl AudioSink {
     pub fn new() -> Self {
         Self {
             device_name: "default".to_string(),
-            sample_rate: 48_000.0,
+            sample_rate: DEFAULT_AUDIO_SAMPLE_RATE,
             running: false,
         }
     }
@@ -82,6 +85,11 @@ impl Sink for AudioSink {
     }
 
     fn set_sample_rate(&mut self, rate: f64) -> Result<(), SinkError> {
+        if !rate.is_finite() || rate <= 0.0 {
+            return Err(SinkError::OpenFailed(format!(
+                "sample rate must be positive and finite, got {rate}"
+            )));
+        }
         self.sample_rate = rate;
         Ok(())
     }
