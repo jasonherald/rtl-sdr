@@ -15,7 +15,8 @@
     clippy::float_cmp,
     clippy::map_unwrap_or,
     clippy::expect_fun_call,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    clippy::panic
 )]
 
 use sdr_dsp::fft::{FftEngine, RustFftEngine};
@@ -406,14 +407,16 @@ fn end_to_end_mode_switching() {
     ];
 
     for mode in &modes {
-        radio.set_mode(*mode).expect(&format!("set mode {mode:?}"));
+        radio
+            .set_mode(*mode)
+            .unwrap_or_else(|e| panic!("set mode {mode:?}: {e}"));
 
         let max_out = radio.max_output_samples(processed_count);
         let mut audio_out = vec![Stereo::default(); max_out];
 
         let audio_count = radio
             .process(&processed_iq[..processed_count], &mut audio_out)
-            .expect(&format!("{mode:?}::process"));
+            .unwrap_or_else(|e| panic!("{mode:?}::process: {e}"));
 
         tracing::info!("{mode:?}: {audio_count} audio samples from {processed_count} IQ");
         assert!(audio_count > 0, "{mode:?}: no audio output");

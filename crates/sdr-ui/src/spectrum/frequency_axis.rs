@@ -101,7 +101,7 @@ pub fn compute_grid_lines(start_hz: f64, end_hz: f64, max_lines: usize) -> Vec<(
         .iter()
         .copied()
         .find(|&s| (span / s) < max_lines as f64)
-        .unwrap_or(span); // fallback: one line per span
+        .unwrap_or(span * 2.0); // fallback: step > span guarantees at most 1 line
 
     // First grid line at or after start_hz, snapped to `step`.
     let first = (start_hz / step).ceil() * step;

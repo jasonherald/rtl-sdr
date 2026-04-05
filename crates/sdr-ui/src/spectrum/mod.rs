@@ -31,7 +31,7 @@ const MIN_DB: f32 = -120.0;
 const MAX_DB: f32 = 0.0;
 
 /// Interval between synthetic test frames, in milliseconds.
-const TEST_FRAME_INTERVAL_MS: u64 = 50;
+const TEST_FRAME_INTERVAL_MS: u64 = 16;
 
 /// Width of synthetic signal peaks in bins.
 const TEST_PEAK_WIDTH: usize = 20;
@@ -117,6 +117,7 @@ fn build_fft_area(state: Rc<RefCell<Option<FftPlotState>>>) -> gtk4::GLArea {
         .vexpand(true)
         .auto_render(false)
         .build();
+    area.set_required_version(3, 0);
 
     // On realize: create GL context and renderer.
     let state_realize = Rc::clone(&state);
@@ -144,8 +145,11 @@ fn build_fft_area(state: Rc<RefCell<Option<FftPlotState>>>) -> gtk4::GLArea {
 
     // On unrealize: clean up GL resources.
     let state_unrealize = Rc::clone(&state);
-    area.connect_unrealize(move |_area| {
-        if let Some(s) = state_unrealize.borrow().as_ref() {
+    area.connect_unrealize(move |area| {
+        area.make_current();
+        if area.error().is_some() {
+            tracing::warn!("FFT GLArea error on unrealize — skipping GL cleanup");
+        } else if let Some(s) = state_unrealize.borrow().as_ref() {
             s.renderer.destroy(&s.gl);
             tracing::info!("FFT plot GL renderer destroyed");
         }
@@ -181,6 +185,7 @@ fn build_waterfall_area(state: Rc<RefCell<Option<WaterfallState>>>) -> gtk4::GLA
         .vexpand(true)
         .auto_render(false)
         .build();
+    area.set_required_version(3, 0);
 
     // On realize: create GL context and renderer.
     let state_realize = Rc::clone(&state);
@@ -204,8 +209,11 @@ fn build_waterfall_area(state: Rc<RefCell<Option<WaterfallState>>>) -> gtk4::GLA
 
     // On unrealize: clean up GL resources.
     let state_unrealize = Rc::clone(&state);
-    area.connect_unrealize(move |_area| {
-        if let Some(s) = state_unrealize.borrow().as_ref() {
+    area.connect_unrealize(move |area| {
+        area.make_current();
+        if area.error().is_some() {
+            tracing::warn!("waterfall GLArea error on unrealize — skipping GL cleanup");
+        } else if let Some(s) = state_unrealize.borrow().as_ref() {
             s.renderer.destroy(&s.gl);
             tracing::info!("waterfall GL renderer destroyed");
         }

@@ -271,8 +271,9 @@ impl WaterfallRenderer {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.colormap_texture));
             gl.uniform_1_i32(Some(&self.colormap_tex_loc), 1);
 
-            // Set scroll offset and history size.
-            gl.uniform_1_f32(Some(&self.scroll_offset_loc), self.write_row as f32);
+            // Set scroll offset to the newest written row (not the next free slot).
+            let newest_row = (self.write_row + HISTORY_LINES - 1) % HISTORY_LINES;
+            gl.uniform_1_f32(Some(&self.scroll_offset_loc), newest_row as f32);
             gl.uniform_1_f32(Some(&self.history_lines_loc), HISTORY_LINES as f32);
 
             gl.bind_vertex_array(Some(self.vao));

@@ -63,9 +63,14 @@ pub fn link_program(
     frag: glow::Shader,
 ) -> Result<glow::Program, GlError> {
     unsafe {
-        let program = gl
-            .create_program()
-            .map_err(|e| GlError::ResourceCreation(e.clone()))?;
+        let program = match gl.create_program() {
+            Ok(p) => p,
+            Err(e) => {
+                gl.delete_shader(vert);
+                gl.delete_shader(frag);
+                return Err(GlError::ResourceCreation(e));
+            }
+        };
 
         gl.attach_shader(program, vert);
         gl.attach_shader(program, frag);
