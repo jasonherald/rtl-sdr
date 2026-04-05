@@ -5,12 +5,15 @@
 use sdr_types::{Complex, DspError};
 
 use crate::filter::ComplexFirFilter;
-
-/// Transition width as a fraction of filter bandwidth for VFO channel filter.
-const VFO_FILTER_TRANSITION_RATIO: f64 = 0.1;
 use crate::math;
 use crate::multirate::RationalResampler;
 use crate::taps;
+
+/// Transition width as a fraction of filter bandwidth for VFO channel filter.
+const VFO_FILTER_TRANSITION_RATIO: f64 = 0.1;
+
+/// Guard padding for resampler output buffer to handle worst-case rounding.
+const RESAMPLER_OUTPUT_PADDING: usize = 16;
 
 /// Frequency translator — shifts a signal in frequency using an NCO.
 ///
@@ -198,13 +201,12 @@ impl RxVfo {
         // Step 2: Resample — size buffer for worst-case expansion ratio
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let ratio = (self.out_sample_rate / self.in_sample_rate).ceil() as usize;
-        let resamp_size = input.len() * ratio.max(1) + 16;
+        let resamp_size = input.len() * ratio.max(1) + RESAMPLER_OUTPUT_PADDING;
         self.resamp_buf.resize(resamp_size, Complex::default());
         let resamp_count = self
             .resampler
             .process(&self.xlator_buf, &mut self.resamp_buf)?;
 
-        // Step 3: Optional filter
         // Step 3: Check output buffer and apply optional filter
         if output.len() < resamp_count {
             return Err(DspError::BufferTooSmall {

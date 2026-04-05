@@ -56,18 +56,21 @@ impl ConfigManager {
     /// Returns `ConfigError::Io` on filesystem errors.
     pub fn load(path: &Path, defaults: &Value) -> Result<Self, ConfigError> {
         let path = path.to_path_buf();
+        let mut should_save = false;
+
         let data = if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match serde_json::from_str(&content) {
                     Ok(parsed) => merge_defaults(parsed, defaults),
                     Err(e) => {
                         tracing::warn!("config file corrupt, resetting: {e}");
+                        should_save = true;
                         defaults.clone()
                     }
                 },
                 Err(e) => {
-                    tracing::warn!("failed to read config, using defaults: {e}");
-                    defaults.clone()
+                    // IO error on existing file — don't overwrite, propagate error
+                    return Err(ConfigError::Io(e));
                 }
             }
         } else {
@@ -75,18 +78,21 @@ impl ConfigManager {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            should_save = true;
             defaults.clone()
         };
 
         let mgr = Self {
             path,
             data: Arc::new(RwLock::new(data)),
-            modified: Arc::new(Mutex::new(true)), // Save on first auto-save cycle
+            modified: Arc::new(Mutex::new(false)),
             auto_save_handle: None,
         };
 
-        // Save initial config
-        mgr.save()?;
+        // Only save when creating new file or resetting corrupt config
+        if should_save {
+            mgr.save()?;
+        }
 
         Ok(mgr)
     }
@@ -201,6 +207,8 @@ fn auto_save_worker(
                 .wait_timeout_while(stop, Duration::from_millis(AUTO_SAVE_INTERVAL_MS), |s| !*s)
                 .unwrap_or_else(PoisonError::into_inner);
             if *guard {
+                // Flush any pending changes before exiting
+                flush_if_modified(&modified, &data, &path);
                 break;
             }
         }
@@ -217,17 +225,32 @@ fn auto_save_worker(
         };
 
         if should_save {
-            let d = data.read().unwrap_or_else(PoisonError::into_inner);
-            match serde_json::to_string_pretty(&*d) {
-                Ok(content) => {
-                    if let Err(e) = std::fs::write(&path, &content) {
-                        tracing::error!("auto-save write failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("auto-save serialization failed: {e}");
-                }
+            flush_to_disk(&data, &path);
+        }
+    }
+}
+
+/// Check modified flag and flush to disk if set.
+fn flush_if_modified(modified: &Arc<Mutex<bool>>, data: &Arc<RwLock<Value>>, path: &Path) {
+    let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
+    if *m {
+        *m = false;
+        drop(m);
+        flush_to_disk(data, path);
+    }
+}
+
+/// Write data to disk, logging any errors.
+fn flush_to_disk(data: &Arc<RwLock<Value>>, path: &Path) {
+    let d = data.read().unwrap_or_else(PoisonError::into_inner);
+    match serde_json::to_string_pretty(&*d) {
+        Ok(content) => {
+            if let Err(e) = std::fs::write(path, &content) {
+                tracing::error!("auto-save write failed: {e}");
             }
+        }
+        Err(e) => {
+            tracing::error!("auto-save serialization failed: {e}");
         }
     }
 }
