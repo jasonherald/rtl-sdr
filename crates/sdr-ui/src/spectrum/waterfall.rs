@@ -6,7 +6,7 @@
 use glow::HasContext;
 
 use super::colormap;
-use super::gl_renderer::{self, GlError};
+use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 
 /// Number of history lines stored in the ring-buffer texture.
 const HISTORY_LINES: usize = 1024;
@@ -420,10 +420,4 @@ fn create_colormap_texture(gl: &glow::Context) -> Result<glow::Texture, GlError>
         gl.bind_texture(glow::TEXTURE_2D, None);
         Ok(texture)
     }
-}
-
-/// Reinterpret a `&[f32]` as `&[u8]` for uploading to GL buffers.
-#[allow(unsafe_code)]
-fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
 }

@@ -5,7 +5,7 @@
 
 use glow::HasContext;
 
-use super::gl_renderer::{self, GlError};
+use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 
 /// Maximum number of FFT bins the renderer can display.
 const MAX_FFT_BINS: usize = 8192;
@@ -312,13 +312,4 @@ impl FftPlotRenderer {
             gl.delete_program(self.program);
         }
     }
-}
-
-/// Reinterpret a `&[f32]` as `&[u8]` for uploading to GL buffers.
-///
-/// This is safe because `f32` has no alignment or validity invariants
-/// beyond its representation, and we only read the bytes for upload.
-#[allow(unsafe_code)]
-fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
 }

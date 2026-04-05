@@ -6,7 +6,7 @@
 
 use glow::HasContext;
 
-use super::gl_renderer::{self, GlError};
+use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -185,6 +185,9 @@ impl VfoState {
     ///
     /// Positive `delta` zooms in, negative zooms out.
     pub fn zoom(&mut self, center_hz: f64, delta: f64) {
+        if delta == 0.0 {
+            return;
+        }
         let factor = if delta > 0.0 {
             1.0 / ZOOM_FACTOR
         } else {
@@ -495,12 +498,6 @@ void main() {
     frag_color = u_color;
 }
 ";
-
-/// Reinterpret a `&[f32]` as `&[u8]` for uploading to GL buffers.
-#[allow(unsafe_code)]
-fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
-}
 
 // ---------------------------------------------------------------------------
 // Tests

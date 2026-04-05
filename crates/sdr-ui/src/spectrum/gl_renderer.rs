@@ -104,3 +104,11 @@ pub fn check_gl_errors(gl: &glow::Context, label: &str) {
         }
     }
 }
+
+/// Reinterpret a `&[f32]` as `&[u8]` for uploading to GL buffers.
+///
+/// Safe because `f32` has no padding and is trivially copyable.
+#[allow(unsafe_code)]
+pub fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
+}
