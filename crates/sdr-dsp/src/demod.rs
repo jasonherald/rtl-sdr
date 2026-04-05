@@ -32,8 +32,14 @@ impl Quadrature {
                 "deviation must be positive and finite, got {deviation}"
             )));
         }
+        let inv_deviation = 1.0 / deviation;
+        if !inv_deviation.is_finite() {
+            return Err(DspError::InvalidParameter(format!(
+                "deviation is too small to represent safely, got {deviation}"
+            )));
+        }
         Ok(Self {
-            inv_deviation: 1.0 / deviation,
+            inv_deviation,
             last_phase: 0.0,
             first_sample: true,
         })
@@ -413,6 +419,7 @@ mod tests {
     fn test_quadrature_new_invalid() {
         assert!(Quadrature::new(0.0).is_err());
         assert!(Quadrature::new(-1.0).is_err());
+        assert!(Quadrature::new(1e-40).is_err()); // tiny subnormal: reciprocal overflows
         assert!(Quadrature::new(f32::NAN).is_err());
         assert!(Quadrature::new(f32::INFINITY).is_err());
         // from_hz rejects negative inputs even if they'd produce positive rads
