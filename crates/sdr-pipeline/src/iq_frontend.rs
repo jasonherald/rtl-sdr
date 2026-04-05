@@ -351,12 +351,28 @@ mod tests {
 
     #[test]
     fn test_new_zero_decimation_rejected() {
-        assert!(IqFrontend::new(TEST_SAMPLE_RATE, 0, TEST_FFT_SIZE, FftWindow::Nuttall, false).is_err());
+        assert!(
+            IqFrontend::new(
+                TEST_SAMPLE_RATE,
+                0,
+                TEST_FFT_SIZE,
+                FftWindow::Nuttall,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_set_decimation_zero_rejected() {
-        let mut fe = IqFrontend::new(TEST_SAMPLE_RATE, 1, TEST_FFT_SIZE, FftWindow::Nuttall, false).unwrap();
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
         assert!(fe.set_decimation(0).is_err());
         // State should be unchanged after rejection
         assert_eq!(fe.decim_ratio(), 1);
