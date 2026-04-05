@@ -15,7 +15,6 @@ use crate::math;
 pub struct Quadrature {
     inv_deviation: f32,
     last_phase: f32,
-    first_sample: bool,
 }
 
 impl Quadrature {
@@ -41,7 +40,6 @@ impl Quadrature {
         Ok(Self {
             inv_deviation,
             last_phase: 0.0,
-            first_sample: true,
         })
     }
 
@@ -70,7 +68,6 @@ impl Quadrature {
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
         self.last_phase = 0.0;
-        self.first_sample = true;
     }
 
     /// Process complex samples, outputting demodulated audio.
@@ -87,14 +84,7 @@ impl Quadrature {
         }
         for (i, &s) in input.iter().enumerate() {
             let current_phase = s.phase();
-            if self.first_sample {
-                // Seed phase from first sample to avoid startup click
-                output[i] = 0.0;
-                self.first_sample = false;
-            } else {
-                output[i] =
-                    math::normalize_phase(current_phase - self.last_phase) * self.inv_deviation;
-            }
+            output[i] = math::normalize_phase(current_phase - self.last_phase) * self.inv_deviation;
             self.last_phase = current_phase;
         }
         Ok(input.len())
@@ -110,7 +100,6 @@ impl Quadrature {
 pub struct AmDemod {
     dc_offset: f32,
     dc_rate: f32,
-    first_sample: bool,
 }
 
 /// DC blocker convergence rate for AM demodulator.
@@ -122,14 +111,12 @@ impl AmDemod {
         Self {
             dc_offset: 0.0,
             dc_rate: AM_DC_RATE,
-            first_sample: true,
         }
     }
 
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
         self.dc_offset = 0.0;
-        self.first_sample = true;
     }
 
     /// Process complex samples, outputting demodulated audio.
@@ -146,16 +133,10 @@ impl AmDemod {
         }
         for (i, &s) in input.iter().enumerate() {
             let amp = s.amplitude();
-            if self.first_sample {
-                // Seed DC offset from first sample to avoid startup pop
-                self.dc_offset = amp;
-                self.first_sample = false;
-                output[i] = 0.0;
-            } else {
-                let out = amp - self.dc_offset;
-                self.dc_offset += out * self.dc_rate;
-                output[i] = out;
-            }
+            // Inline DC blocking matching C++ pattern
+            let out = amp - self.dc_offset;
+            self.dc_offset += out * self.dc_rate;
+            output[i] = out;
         }
         Ok(input.len())
     }

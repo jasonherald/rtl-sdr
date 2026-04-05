@@ -106,7 +106,10 @@ impl ConfigManager {
         let data = self.data.read().unwrap_or_else(PoisonError::into_inner);
         let content =
             serde_json::to_string_pretty(&*data).map_err(|e| ConfigError::Json(e.to_string()))?;
-        std::fs::write(&self.path, content)?;
+        // Atomic write: write to temp file, then rename over original
+        let tmp_path = self.path.with_extension("tmp");
+        std::fs::write(&tmp_path, &content)?;
+        std::fs::rename(&tmp_path, &self.path)?;
         Ok(())
     }
 

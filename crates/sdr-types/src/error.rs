@@ -29,6 +29,8 @@ pub enum SourceError {
     OpenFailed(String),
     #[error("tune failed: {0}")]
     TuneFailed(String),
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
     #[error("not running")]
     NotRunning,
     #[error("already running")]
@@ -44,6 +46,8 @@ pub enum SinkError {
     DeviceNotFound(String),
     #[error("device open failed: {0}")]
     OpenFailed(String),
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
     #[error("not running")]
     NotRunning,
     #[error("already running")]
