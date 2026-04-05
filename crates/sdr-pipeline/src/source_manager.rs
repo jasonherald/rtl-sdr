@@ -1,0 +1,275 @@
+//! Source manager — registration and lifecycle for IQ sources.
+//!
+//! Ports SDR++ `SourceManager`. Manages the set of available IQ sources
+//! (RTL-SDR, Network, File) and controls which one is active.
+
+use sdr_types::SourceError;
+use std::collections::HashMap;
+
+/// Trait for an IQ signal source.
+///
+/// Implemented by each source module (RTL-SDR, network, file).
+pub trait Source: Send {
+    /// Human-readable name (e.g., "RTL-SDR", "Network").
+    fn name(&self) -> &str;
+
+    /// Start producing IQ samples.
+    fn start(&mut self) -> Result<(), SourceError>;
+
+    /// Stop producing samples.
+    fn stop(&mut self) -> Result<(), SourceError>;
+
+    /// Tune to a frequency in Hz.
+    fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError>;
+
+    /// List of supported sample rates in Hz.
+    fn sample_rates(&self) -> &[f64];
+
+    /// Current sample rate in Hz.
+    fn sample_rate(&self) -> f64;
+
+    /// Set sample rate.
+    fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError>;
+}
+
+/// Manages available IQ sources and the active source lifecycle.
+///
+/// Ports SDR++ `SourceManager`.
+pub struct SourceManager {
+    sources: HashMap<String, Box<dyn Source>>,
+    selected: Option<String>,
+    running: bool,
+}
+
+impl SourceManager {
+    /// Create a new empty source manager.
+    pub fn new() -> Self {
+        Self {
+            sources: HashMap::new(),
+            selected: None,
+            running: false,
+        }
+    }
+
+    /// Register a source.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SourceError` if a source with this name already exists.
+    pub fn register(&mut self, source: Box<dyn Source>) -> Result<(), SourceError> {
+        let name = source.name().to_string();
+        if self.sources.contains_key(&name) {
+            return Err(SourceError::OpenFailed(format!(
+                "source already registered: {name}"
+            )));
+        }
+        self.sources.insert(name, source);
+        Ok(())
+    }
+
+    /// Unregister a source by name.
+    pub fn unregister(&mut self, name: &str) -> Option<Box<dyn Source>> {
+        if self.selected.as_deref() == Some(name) {
+            self.selected = None;
+        }
+        self.sources.remove(name)
+    }
+
+    /// Get the names of all registered sources.
+    pub fn source_names(&self) -> Vec<&str> {
+        self.sources.keys().map(String::as_str).collect()
+    }
+
+    /// Select a source by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SourceError::DeviceNotFound` if the name is not registered.
+    pub fn select(&mut self, name: &str) -> Result<(), SourceError> {
+        if !self.sources.contains_key(name) {
+            return Err(SourceError::DeviceNotFound(name.to_string()));
+        }
+        self.selected = Some(name.to_string());
+        Ok(())
+    }
+
+    /// Get the currently selected source name.
+    pub fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    /// Start the selected source.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SourceError` if no source is selected or start fails.
+    pub fn start(&mut self) -> Result<(), SourceError> {
+        let name = self
+            .selected
+            .as_ref()
+            .ok_or(SourceError::NotRunning)?
+            .clone();
+        let source = self
+            .sources
+            .get_mut(&name)
+            .ok_or(SourceError::DeviceNotFound(name))?;
+        source.start()?;
+        self.running = true;
+        Ok(())
+    }
+
+    /// Stop the selected source.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SourceError` if no source is selected or stop fails.
+    pub fn stop(&mut self) -> Result<(), SourceError> {
+        let name = self
+            .selected
+            .as_ref()
+            .ok_or(SourceError::NotRunning)?
+            .clone();
+        let source = self
+            .sources
+            .get_mut(&name)
+            .ok_or(SourceError::DeviceNotFound(name))?;
+        source.stop()?;
+        self.running = false;
+        Ok(())
+    }
+
+    /// Tune the selected source.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SourceError` if no source is selected or tune fails.
+    pub fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
+        let name = self
+            .selected
+            .as_ref()
+            .ok_or(SourceError::NotRunning)?
+            .clone();
+        let source = self
+            .sources
+            .get_mut(&name)
+            .ok_or(SourceError::DeviceNotFound(name))?;
+        source.tune(frequency_hz)
+    }
+
+    /// Whether a source is currently running.
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+}
+
+impl Default for SourceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    struct MockSource {
+        name: String,
+        started: bool,
+        freq: f64,
+    }
+
+    impl MockSource {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                started: false,
+                freq: 0.0,
+            }
+        }
+    }
+
+    impl Source for MockSource {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn start(&mut self) -> Result<(), SourceError> {
+            self.started = true;
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), SourceError> {
+            self.started = false;
+            Ok(())
+        }
+        fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
+            self.freq = frequency_hz;
+            Ok(())
+        }
+        fn sample_rates(&self) -> &[f64] {
+            &[48_000.0, 2_400_000.0]
+        }
+        fn sample_rate(&self) -> f64 {
+            2_400_000.0
+        }
+        fn set_sample_rate(&mut self, _rate: f64) -> Result<(), SourceError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_register_and_select() {
+        let mut mgr = SourceManager::new();
+        mgr.register(Box::new(MockSource::new("Test"))).unwrap();
+        assert_eq!(mgr.source_names(), vec!["Test"]);
+        mgr.select("Test").unwrap();
+        assert_eq!(mgr.selected(), Some("Test"));
+    }
+
+    #[test]
+    fn test_select_not_found() {
+        let mut mgr = SourceManager::new();
+        assert!(mgr.select("NonExistent").is_err());
+    }
+
+    #[test]
+    fn test_start_stop() {
+        let mut mgr = SourceManager::new();
+        mgr.register(Box::new(MockSource::new("Test"))).unwrap();
+        mgr.select("Test").unwrap();
+        mgr.start().unwrap();
+        assert!(mgr.is_running());
+        mgr.stop().unwrap();
+        assert!(!mgr.is_running());
+    }
+
+    #[test]
+    fn test_tune() {
+        let mut mgr = SourceManager::new();
+        mgr.register(Box::new(MockSource::new("Test"))).unwrap();
+        mgr.select("Test").unwrap();
+        mgr.tune(100_000_000.0).unwrap();
+    }
+
+    #[test]
+    fn test_start_no_selection() {
+        let mut mgr = SourceManager::new();
+        assert!(mgr.start().is_err());
+    }
+
+    #[test]
+    fn test_duplicate_register() {
+        let mut mgr = SourceManager::new();
+        mgr.register(Box::new(MockSource::new("Test"))).unwrap();
+        assert!(mgr.register(Box::new(MockSource::new("Test"))).is_err());
+    }
+
+    #[test]
+    fn test_unregister() {
+        let mut mgr = SourceManager::new();
+        mgr.register(Box::new(MockSource::new("Test"))).unwrap();
+        mgr.select("Test").unwrap();
+        mgr.unregister("Test");
+        assert!(mgr.selected().is_none());
+        assert!(mgr.source_names().is_empty());
+    }
+}
