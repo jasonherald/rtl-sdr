@@ -6,6 +6,15 @@
 use sdr_types::SinkError;
 use std::collections::HashMap;
 
+/// Minimum volume level.
+const MIN_VOLUME: f32 = 0.0;
+
+/// Maximum volume level.
+const MAX_VOLUME: f32 = 1.0;
+
+/// Default volume for new streams.
+const DEFAULT_VOLUME: f32 = 1.0;
+
 /// Trait for an audio/data output sink.
 ///
 /// Implemented by each sink module (audio, network).
@@ -93,7 +102,7 @@ impl SinkManager {
             name.to_string(),
             ManagedStream {
                 name: name.to_string(),
-                volume: 1.0,
+                volume: DEFAULT_VOLUME,
                 sample_rate,
                 active_sink: None,
             },
@@ -120,7 +129,7 @@ impl SinkManager {
             .streams
             .get_mut(stream_name)
             .ok_or_else(|| SinkError::DeviceNotFound(stream_name.to_string()))?;
-        stream.volume = volume.clamp(0.0, 1.0);
+        stream.volume = volume.clamp(MIN_VOLUME, MAX_VOLUME);
         Ok(())
     }
 
@@ -135,9 +144,21 @@ impl SinkManager {
     ///
     /// Returns `SinkError` if stream or sink is not found.
     pub fn set_stream_sink(&mut self, stream_name: &str, sink_name: &str) -> Result<(), SinkError> {
-        if !self.sinks.contains_key(sink_name) {
-            return Err(SinkError::DeviceNotFound(sink_name.to_string()));
-        }
+        // Get stream sample rate first
+        let sample_rate = self
+            .streams
+            .get(stream_name)
+            .ok_or_else(|| SinkError::DeviceNotFound(stream_name.to_string()))?
+            .sample_rate;
+
+        // Apply sample rate to the sink
+        let sink = self
+            .sinks
+            .get_mut(sink_name)
+            .ok_or_else(|| SinkError::DeviceNotFound(sink_name.to_string()))?;
+        sink.set_sample_rate(sample_rate)?;
+
+        // Update stream's active sink
         let stream = self
             .streams
             .get_mut(stream_name)
