@@ -27,8 +27,8 @@ pub const CHECK_VAL: u8 = 0x56;
 // Crystal and clock constants
 // ---------------------------------------------------------------------------
 
-/// Crystal oscillator frequency in Hz (16.384 MHz, at least on the Logilink VG0002A).
-const CRYSTAL_FREQ: u32 = 16_384_000;
+/// Default crystal oscillator frequency in Hz (16.384 MHz, at least on the Logilink VG0002A).
+pub const CRYSTAL_FREQ: u32 = 16_384_000;
 
 /// Use external clock input (0 = internal XTAL oscillator, 1 = external clock).
 const USE_EXT_CLK: u8 = 0;
@@ -778,8 +778,8 @@ impl Tuner for Fc2580Tuner {
         // AGC mode: external (matching the C source TODO comment)
         let agc_mode = AGC_EXTERNAL;
 
-        // Crystal frequency in kHz: round(CrystalFreqHz / 1000)
-        let crystal_freq_khz = (CRYSTAL_FREQ + 500) / 1000;
+        // Crystal frequency in kHz: round(xtal / 1000)
+        let crystal_freq_khz = (self.xtal + 500) / 1000;
 
         self.set_init(handle, agc_mode, crystal_freq_khz)
     }
@@ -806,7 +806,7 @@ impl Tuner for Fc2580Tuner {
 
         // Convert Hz to kHz: round(freq / 1000)
         let rf_freq_khz = (freq + 500) / 1000;
-        let crystal_freq_khz = (CRYSTAL_FREQ + 500) / 1000;
+        let crystal_freq_khz = (self.xtal + 500) / 1000;
 
         self.set_freq_internal(handle, rf_freq_khz, crystal_freq_khz)
     }
@@ -820,7 +820,7 @@ impl Tuner for Fc2580Tuner {
         bw: u32,
         _sample_rate: u32,
     ) -> Result<u32, RtlSdrError> {
-        let crystal_freq_khz = (CRYSTAL_FREQ + 500) / 1000;
+        let crystal_freq_khz = (self.xtal + 500) / 1000;
 
         // Map bandwidth in Hz to the filter mode byte
         let filter_mode = match bw {

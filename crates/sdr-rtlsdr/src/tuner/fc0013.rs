@@ -50,6 +50,8 @@ const REG_VCO_BW: u8 = 0x06;
 const REG_XTAL_SPEED: u8 = 0x07;
 
 /// RC calibration push register (reg 0x10).
+/// Used by `rc_cal_add`/`rc_cal_reset` (ported for completeness).
+#[allow(dead_code)]
 const REG_RC_CAL: u8 = 0x10;
 
 /// Multi select / 64x divider register (reg 0x11).
@@ -194,12 +196,18 @@ const MANUAL_GAIN_BIT: u8 = 1 << 3;
 const FIXED_IF_GAIN: u8 = 0x0a;
 
 /// RC calibration forcing mode value for register 0x0d.
+/// Used by `rc_cal_add` (ported for completeness).
+#[allow(dead_code)]
 const RC_CAL_FORCE: u8 = 0x11;
 
 /// RC calibration reset value for register 0x0d.
+/// Used by `rc_cal_reset` (ported for completeness).
+#[allow(dead_code)]
 const RC_CAL_RESET: u8 = 0x01;
 
 /// Maximum valid RC calibration value.
+/// Used by `rc_cal_add` (ported for completeness).
+#[allow(dead_code)]
 const RC_CAL_MAX: u8 = 0x0f;
 
 // ---------------------------------------------------------------------------
@@ -633,9 +641,10 @@ impl Fc0013Tuner {
 
     /// Add an offset to the RC calibration value.
     ///
-    /// Exact port of `fc0013_rc_cal_add`.
+    /// Exact port of `fc0013_rc_cal_add`. Currently unused but available
+    /// for future RC filter recalibration support.
     #[allow(dead_code)]
-    pub fn rc_cal_add(
+    pub(crate) fn rc_cal_add(
         &self,
         handle: &rusb::DeviceHandle<rusb::GlobalContext>,
         rc_val: i32,
@@ -665,9 +674,10 @@ impl Fc0013Tuner {
 
     /// Reset the RC calibration.
     ///
-    /// Exact port of `fc0013_rc_cal_reset`.
+    /// Exact port of `fc0013_rc_cal_reset`. Currently unused but available
+    /// for future RC filter recalibration support.
     #[allow(dead_code)]
-    pub fn rc_cal_reset(
+    pub(crate) fn rc_cal_reset(
         &self,
         handle: &rusb::DeviceHandle<rusb::GlobalContext>,
     ) -> Result<(), RtlSdrError> {

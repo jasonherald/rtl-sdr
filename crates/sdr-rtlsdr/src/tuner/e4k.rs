@@ -777,9 +777,10 @@ impl E4kTuner {
         // Compute integer component of multiplier
         let z = intended_fvco / u64::from(fosc);
 
-        // Compute fractional part
+        // Compute fractional part (remainder < fosc, so x < PLL_Y, fits in u16)
         let remainder = intended_fvco - u64::from(fosc) * z;
         let x = ((remainder * PLL_Y) / u64::from(fosc)) as u32;
+        debug_assert!(x <= 0xFFFF, "PLL fractional part exceeds u16 range");
 
         // Compute actual LO frequency
         let fvco = u64::from(fosc) * z + (u64::from(fosc) * u64::from(x as u16)) / PLL_Y;
