@@ -66,7 +66,8 @@ impl<T: Copy + Send + Default + 'static> Stream<T> {
     /// Swap the write buffer with the read buffer, publishing `size` samples.
     ///
     /// Blocks until the consumer has flushed the previous data.
-    /// Returns `false` if the writer was stopped (graceful shutdown).
+    /// Returns `false` if the writer was stopped or `size` is invalid
+    /// (zero or exceeds capacity).
     pub fn swap(&mut self, size: usize) -> bool {
         if size == 0 || size > self.write_buf.len() {
             return false;
