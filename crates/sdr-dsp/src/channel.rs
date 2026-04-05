@@ -5,6 +5,9 @@
 use sdr_types::{Complex, DspError};
 
 use crate::filter::ComplexFirFilter;
+
+/// Transition width as a fraction of filter bandwidth for VFO channel filter.
+const VFO_FILTER_TRANSITION_RATIO: f64 = 0.1;
 use crate::math;
 use crate::multirate::RationalResampler;
 use crate::taps;
@@ -121,7 +124,7 @@ impl RxVfo {
 
         let filter = if bandwidth < out_sample_rate - 1.0 {
             let filter_width = bandwidth / 2.0;
-            let filter_trans = filter_width * 0.1;
+            let filter_trans = filter_width * VFO_FILTER_TRANSITION_RATIO;
             let filter_taps = taps::low_pass(filter_width, filter_trans, out_sample_rate, true)?;
             Some(ComplexFirFilter::new(filter_taps)?)
         } else {
@@ -157,7 +160,7 @@ impl RxVfo {
         self.bandwidth = bandwidth;
         if bandwidth < self.out_sample_rate - 1.0 {
             let filter_width = bandwidth / 2.0;
-            let filter_trans = filter_width * 0.1;
+            let filter_trans = filter_width * VFO_FILTER_TRANSITION_RATIO;
             let filter_taps =
                 taps::low_pass(filter_width, filter_trans, self.out_sample_rate, true)?;
             self.filter = Some(ComplexFirFilter::new(filter_taps)?);
@@ -202,25 +205,19 @@ impl RxVfo {
             .process(&self.xlator_buf, &mut self.resamp_buf)?;
 
         // Step 3: Optional filter
-        if let Some(filter) = &mut self.filter {
-            if output.len() < resamp_count {
-                return Err(DspError::BufferTooSmall {
-                    need: resamp_count,
-                    got: output.len(),
-                });
-            }
-            filter.process(&self.resamp_buf[..resamp_count], output)?;
-            Ok(resamp_count)
-        } else {
-            if output.len() < resamp_count {
-                return Err(DspError::BufferTooSmall {
-                    need: resamp_count,
-                    got: output.len(),
-                });
-            }
-            output[..resamp_count].copy_from_slice(&self.resamp_buf[..resamp_count]);
-            Ok(resamp_count)
+        // Step 3: Check output buffer and apply optional filter
+        if output.len() < resamp_count {
+            return Err(DspError::BufferTooSmall {
+                need: resamp_count,
+                got: output.len(),
+            });
         }
+        if let Some(filter) = &mut self.filter {
+            filter.process(&self.resamp_buf[..resamp_count], output)?;
+        } else {
+            output[..resamp_count].copy_from_slice(&self.resamp_buf[..resamp_count]);
+        }
+        Ok(resamp_count)
     }
 }
 

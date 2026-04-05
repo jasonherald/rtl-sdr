@@ -125,9 +125,8 @@ impl ConfigManager {
     {
         let mut data = self.data.write().unwrap_or_else(PoisonError::into_inner);
         let result = f(&mut data);
-        if let Ok(mut modified) = self.modified.lock() {
-            *modified = true;
-        }
+        let mut m = self.modified.lock().unwrap_or_else(PoisonError::into_inner);
+        *m = true;
         result
     }
 
@@ -219,10 +218,15 @@ fn auto_save_worker(
 
         if should_save {
             let d = data.read().unwrap_or_else(PoisonError::into_inner);
-            if let Ok(content) = serde_json::to_string_pretty(&*d)
-                && let Err(e) = std::fs::write(&path, &content)
-            {
-                tracing::error!("auto-save failed: {e}");
+            match serde_json::to_string_pretty(&*d) {
+                Ok(content) => {
+                    if let Err(e) = std::fs::write(&path, &content) {
+                        tracing::error!("auto-save write failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("auto-save serialization failed: {e}");
+                }
             }
         }
     }
