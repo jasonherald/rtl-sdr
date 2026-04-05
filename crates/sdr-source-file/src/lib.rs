@@ -78,8 +78,10 @@ impl FileSource {
                         break;
                     }
                 };
-                let Some(Ok(im)) = samples.next() else {
-                    break;
+                let im = match samples.next() {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
+                    None => break,
                 };
                 output[count] = Complex::new(re, im);
                 count += 1;
@@ -92,8 +94,10 @@ impl FileSource {
                     Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
                     None => break,
                 };
-                let Some(Ok(im_raw)) = samples.next() else {
-                    break;
+                let im_raw = match samples.next() {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
+                    None => break,
                 };
                 let im = f32::from(im_raw) / 32768.0;
                 output[count] = Complex::new(re, im);
@@ -126,7 +130,16 @@ impl Source for FileSource {
 
         self.sample_rate = f64::from(spec.sample_rate);
 
-        let is_float = spec.sample_format == hound::SampleFormat::Float;
+        // Validate supported sample format
+        let is_float = match (spec.sample_format, spec.bits_per_sample) {
+            (hound::SampleFormat::Float, 32) => true,
+            (hound::SampleFormat::Int, 16) => false,
+            (fmt, bps) => {
+                return Err(SourceError::OpenFailed(format!(
+                    "unsupported WAV format: {fmt:?} {bps}-bit; only Float32 and Int16 are supported"
+                )));
+            }
+        };
 
         self.reader = Some(WavReaderState {
             reader,
