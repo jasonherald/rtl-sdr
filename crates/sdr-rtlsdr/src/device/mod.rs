@@ -32,7 +32,7 @@ use crate::usb;
 /// Ports `struct rtlsdr_dev` from librtlsdr. Manages the USB connection,
 /// baseband configuration, and tuner driver.
 pub struct RtlSdrDevice {
-    pub(crate) handle: rusb::DeviceHandle<rusb::GlobalContext>,
+    pub(crate) handle: std::sync::Arc<rusb::DeviceHandle<rusb::GlobalContext>>,
     pub(crate) tuner_type: TunerType,
     pub(crate) tuner: Option<Box<dyn Tuner>>,
 
@@ -81,7 +81,7 @@ impl RtlSdrDevice {
         handle.claim_interface(0)?;
 
         let mut dev = Self {
-            handle,
+            handle: std::sync::Arc::new(handle),
             tuner_type: TunerType::Unknown,
             tuner: None,
             rtl_xtal: DEF_RTL_XTAL_FREQ,

@@ -9,7 +9,8 @@
 //! 5. Processes through `RadioModule` (IF chain, demod, AF chain).
 //! 6. Sends FFT data back to the UI for display.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use sdr_dsp::channel::RxVfo;
@@ -29,6 +30,10 @@ const IQ_PAIRS_PER_READ: usize = 16_384;
 /// Raw USB buffer size in bytes (2 bytes per IQ pair: I + Q).
 const RAW_BUF_SIZE: usize = IQ_PAIRS_PER_READ * 2;
 
+/// Number of queued blocks in the USB reader channel.
+/// At 2 Msps, each block is 16384 samples = 8.2 ms. 32 blocks = ~260 ms buffer.
+const USB_READER_QUEUE_DEPTH: usize = 32;
+
 /// Default FFT size for spectrum display.
 const DEFAULT_FFT_SIZE: usize = 2048;
 
@@ -45,9 +50,6 @@ const DEFAULT_DECIMATION: u32 = 8;
 
 /// Default center frequency in Hz (100 MHz — FM broadcast).
 const DEFAULT_CENTER_FREQ: f64 = 100_000_000.0;
-
-/// Sleep duration when a USB read returns zero bytes or errors transiently (ms).
-const IDLE_SLEEP_MS: u64 = 50;
 
 /// Timeout for blocking `recv` when the pipeline is stopped (ms).
 const RECV_TIMEOUT_MS: u64 = 50;
@@ -126,9 +128,80 @@ fn dsp_thread_main(dsp_tx: mpsc::Sender<DspToUi>, ui_rx: mpsc::Receiver<UiToDsp>
     }
 }
 
+/// Async USB reader — runs bulk reads on a dedicated thread, decoupling
+/// USB I/O from DSP processing. Prevents data loss at high sample rates
+/// (>2 Msps) where synchronous reads can't keep up.
+struct UsbReader {
+    cancel: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    receiver: mpsc::Receiver<Vec<u8>>,
+}
+
+impl UsbReader {
+    /// Start the reader thread. It continuously reads from the USB bulk endpoint
+    /// and pushes raw byte buffers into the bounded channel.
+    fn start(device: &RtlSdrDevice) -> Self {
+        let (tx, rx) = mpsc::sync_channel(USB_READER_QUEUE_DEPTH);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+        let handle = device.usb_handle();
+
+        let thread = std::thread::Builder::new()
+            .name("usb-reader".to_string())
+            .spawn(move || {
+                tracing::debug!("USB reader thread started");
+                let mut buf = vec![0u8; RAW_BUF_SIZE];
+                let timeout = Duration::from_secs(1);
+                while !cancel_clone.load(Ordering::Relaxed) {
+                    match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut buf, timeout)
+                    {
+                        Ok(n) if n > 0 => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break; // DSP thread dropped receiver
+                            }
+                        }
+                        Ok(_) | Err(rusb::Error::Timeout) => {} // zero/timeout, retry
+                        Err(e) => {
+                            tracing::warn!("USB reader error: {e}");
+                            break;
+                        }
+                    }
+                }
+                tracing::debug!("USB reader thread stopped");
+            })
+            .expect("failed to spawn USB reader thread");
+
+        Self {
+            cancel,
+            thread: Some(thread),
+            receiver: rx,
+        }
+    }
+
+    /// Try to receive the next block of raw USB data (non-blocking).
+    fn try_recv(&self) -> Option<Vec<u8>> {
+        self.receiver.try_recv().ok()
+    }
+
+    /// Stop the reader thread and wait for it to finish.
+    fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for UsbReader {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Mutable state owned by the DSP thread.
 struct DspState {
     device: Option<RtlSdrDevice>,
+    usb_reader: Option<UsbReader>,
     frontend: IqFrontend,
     radio: RadioModule,
     audio_sink: AudioSink,
@@ -151,7 +224,6 @@ struct DspState {
     vfo_offset: f64,
 
     // Pre-allocated buffers
-    raw_buf: Vec<u8>,
     iq_buf: Vec<Complex>,
     processed_buf: Vec<Complex>,
     fft_buf: Vec<f32>,
@@ -178,6 +250,7 @@ impl DspState {
 
         Ok(Self {
             device: None,
+            usb_reader: None,
             frontend,
             radio,
             audio_sink: AudioSink::new(),
@@ -193,7 +266,6 @@ impl DspState {
             vfo: None,
             vfo_buf: Vec::new(),
             vfo_offset: 0.0,
-            raw_buf: vec![0u8; RAW_BUF_SIZE],
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
@@ -516,6 +588,10 @@ fn open_device(state: &mut DspState) -> Result<(), String> {
     // leaves no partially-open device behind.
     rebuild_frontend(state)?;
     rebuild_vfo(state)?;
+    // Start the async USB reader thread before storing the device.
+    // This decouples USB I/O from DSP processing, preventing data loss
+    // at high sample rates (>2 Msps).
+    state.usb_reader = Some(UsbReader::start(&device));
     state.device = Some(device);
 
     tracing::info!(
@@ -528,7 +604,12 @@ fn open_device(state: &mut DspState) -> Result<(), String> {
 
 /// Stop the device and release resources.
 fn cleanup(state: &mut DspState) {
-    // Stop the audio sink first so it doesn't try to read stale data.
+    // Stop the USB reader thread first.
+    if let Some(mut reader) = state.usb_reader.take() {
+        reader.stop();
+    }
+
+    // Stop the audio sink so it doesn't try to read stale data.
     if let Err(e) = state.audio_sink.stop() {
         tracing::debug!("audio sink stop: {e}");
     }
@@ -589,34 +670,29 @@ fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
 /// Read one block of IQ data from the device, process it, and send FFT data
 /// to the UI.
 fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
-    // Destructure to allow simultaneous borrows of different fields.
-    let Some(device) = state.device.as_ref() else {
+    if state.device.is_none() {
         tracing::warn!("process_iq_block called without device");
         state.running = false;
         let _ = dsp_tx.send(DspToUi::SourceStopped);
         return;
+    }
+
+    // Receive raw USB data from the async reader thread.
+    // This decouples USB I/O from DSP — the reader thread fills the channel
+    // continuously, and we consume blocks as fast as we can process them.
+    let Some(raw_data) = state.usb_reader.as_ref().and_then(UsbReader::try_recv) else {
+        // No data available yet — yield briefly to avoid busy-waiting.
+        std::thread::sleep(Duration::from_micros(100));
+        return;
     };
 
-    // Read raw USB samples.
-    let raw_buf = &mut state.raw_buf;
-    let bytes_read = match device.read_sync(raw_buf) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("USB read error: {e}");
-            let _ = dsp_tx.send(DspToUi::Error(format!("Read error: {e}")));
-            // On persistent read errors the user should stop manually.
-            std::thread::sleep(Duration::from_millis(IDLE_SLEEP_MS));
-            return;
-        }
-    };
-
+    let bytes_read = raw_data.len();
     if bytes_read == 0 {
-        std::thread::sleep(Duration::from_millis(IDLE_SLEEP_MS));
         return;
     }
 
     // Convert uint8 pairs to f32 Complex.
-    let iq_count = RtlSdrSource::convert_samples(&state.raw_buf[..bytes_read], &mut state.iq_buf);
+    let iq_count = RtlSdrSource::convert_samples(&raw_data[..bytes_read], &mut state.iq_buf);
 
     // Process through IQ frontend (decimation, DC blocking, FFT).
     match state.frontend.process(
@@ -725,7 +801,7 @@ mod tests {
         assert!(DEFAULT_FFT_SIZE > 0);
         assert!(DEFAULT_SAMPLE_RATE > 0.0);
         assert!(DEFAULT_CENTER_FREQ > 0.0);
-        assert!(IDLE_SLEEP_MS > 0);
+        assert!(USB_READER_QUEUE_DEPTH > 0);
         assert!(RECV_TIMEOUT_MS > 0);
         assert!(VFO_OUTPUT_PADDING > 0);
     };
@@ -735,7 +811,7 @@ mod tests {
         let state = DspState::new().unwrap();
         assert!(!state.running);
         assert!(state.device.is_none());
-        assert_eq!(state.raw_buf.len(), RAW_BUF_SIZE);
+        assert!(state.usb_reader.is_none());
         assert_eq!(state.iq_buf.len(), IQ_PAIRS_PER_READ);
         assert_eq!(state.fft_buf.len(), DEFAULT_FFT_SIZE);
         // VFO starts as None (created on device open).
