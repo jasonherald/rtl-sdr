@@ -262,13 +262,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetBandwidth(bw) => {
             tracing::debug!(bandwidth_hz = bw, "set bandwidth");
-            state.bandwidth = bw;
-            // Update the VFO channel filter for the new bandwidth.
-            if let Some(vfo) = &mut state.vfo
-                && let Err(e) = vfo.set_bandwidth(bw)
-            {
-                tracing::warn!("VFO bandwidth update failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Bandwidth failed: {e}")));
+            // Update the VFO channel filter first; only persist on success.
+            if let Some(vfo) = &mut state.vfo {
+                match vfo.set_bandwidth(bw) {
+                    Ok(()) => state.bandwidth = bw,
+                    Err(e) => {
+                        tracing::warn!("VFO bandwidth update failed: {e}");
+                        let _ = dsp_tx.send(DspToUi::Error(format!("Bandwidth failed: {e}")));
+                    }
+                }
+            } else {
+                state.bandwidth = bw;
             }
             // Also pass to the radio module (some demods use it internally).
             state.radio.set_bandwidth(bw);

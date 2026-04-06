@@ -89,14 +89,12 @@ impl Demodulator for LsbDemodulator {
         }
         self.mono_buf.resize(input.len(), 0.0);
         let count = self.demod.process(input, &mut self.mono_buf)?;
-
-        // Apply AGC to normalize SSB audio levels before stereo conversion.
-        self.agc_buf.resize(count, 0.0);
-        self.agc
-            .process_f32(&self.mono_buf[..count], &mut self.agc_buf[..count])?;
-
-        sdr_dsp::convert::mono_to_stereo(&self.agc_buf[..count], &mut output[..count])?;
-        Ok(count)
+        super::process_with_agc_to_stereo(
+            &mut self.agc,
+            &self.mono_buf[..count],
+            &mut self.agc_buf,
+            &mut output[..count],
+        )
     }
 
     fn set_bandwidth(&mut self, bw: f64) {
