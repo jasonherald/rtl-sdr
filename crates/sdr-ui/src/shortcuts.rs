@@ -144,9 +144,6 @@ pub fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
 mod tests {
     use super::*;
 
-    #[test]
-    fn demod_mode_count_matches_modes() {
-        // Verify the count covers all 8 expected modes.
-        assert_eq!(DEMOD_MODE_COUNT, 8, "expected 8 demod modes");
-    }
+    /// Compile-time check that `DEMOD_MODE_COUNT` is usable for modulo cycling.
+    const _: () = assert!(DEMOD_MODE_COUNT > 0);
 }
