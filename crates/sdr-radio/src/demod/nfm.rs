@@ -31,6 +31,12 @@ const NFM_DEVIATION_HZ: f64 = 6_250.0;
 /// Transition width for post-discriminator lowpass as a fraction of cutoff.
 const NFM_LPF_TRANSITION_RATIO: f64 = 0.3;
 
+/// Nyquist guard margin (Hz) for LPF bypass detection.
+const NFM_NYQUIST_GUARD_HZ: f64 = 1.0;
+
+/// Passthrough FIR tap (identity filter).
+const NFM_PASSTHROUGH_TAPS: [f32; 1] = [1.0];
+
 /// Narrowband FM demodulator using `FmDemod` from sdr-dsp.
 ///
 /// Produces mono audio converted to stereo. Includes a post-discriminator
@@ -50,10 +56,11 @@ pub struct NfmDemodulator {
 fn build_nfm_lpf_taps(bandwidth: f64) -> Result<Option<Vec<f32>>, DspError> {
     let cutoff = bandwidth / 2.0;
     let nyquist = NFM_IF_SAMPLE_RATE / 2.0;
-    if cutoff >= nyquist - 1.0 {
+    if cutoff >= nyquist - NFM_NYQUIST_GUARD_HZ {
         return Ok(None); // bandwidth spans full IF — bypass LPF
     }
-    let transition = (cutoff * NFM_LPF_TRANSITION_RATIO).min(nyquist - cutoff - 1.0);
+    let transition =
+        (cutoff * NFM_LPF_TRANSITION_RATIO).min(nyquist - cutoff - NFM_NYQUIST_GUARD_HZ);
     let lpf_taps = taps::low_pass(cutoff, transition, NFM_IF_SAMPLE_RATE, false)?;
     Ok(Some(lpf_taps))
 }
@@ -68,7 +75,7 @@ impl NfmDemodulator {
         let demod = FmDemod::from_hz(NFM_DEVIATION_HZ, NFM_IF_SAMPLE_RATE)?;
         let audio_lpf = match build_nfm_lpf_taps(NFM_DEFAULT_BANDWIDTH)? {
             Some(taps) => FirFilter::new(taps)?,
-            None => FirFilter::new(vec![1.0])?, // passthrough
+            None => FirFilter::new(NFM_PASSTHROUGH_TAPS.to_vec())?, // passthrough
         };
         let config = DemodConfig {
             if_sample_rate: NFM_IF_SAMPLE_RATE,
@@ -119,29 +126,30 @@ impl Demodulator for NfmDemodulator {
     }
 
     fn set_bandwidth(&mut self, bw: f64) {
-        // Rebuild the FM discriminator with deviation = bw/2 so the
-        // demodulator sensitivity tracks the channel bandwidth.
-        match FmDemod::from_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
-            Ok(new_demod) => self.demod = new_demod,
+        // Stage both updates before committing — avoids half-retuned state.
+        let new_demod = match FmDemod::from_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
+            Ok(d) => d,
             Err(e) => {
                 tracing::warn!("NFM: set_bandwidth({bw}) demod failed: {e}");
                 return;
             }
-        }
-        // Retune post-discriminator lowpass in place (preserves delay line)
-        match build_nfm_lpf_taps(bw) {
-            Ok(Some(taps)) => {
-                if let Err(e) = self.audio_lpf.set_taps(taps) {
-                    tracing::warn!("NFM: set_bandwidth({bw}) set_taps failed: {e}");
-                }
+        };
+
+        let new_taps = match build_nfm_lpf_taps(bw) {
+            Ok(Some(taps)) => taps,
+            Ok(None) => NFM_PASSTHROUGH_TAPS.to_vec(),
+            Err(e) => {
+                tracing::warn!("NFM: set_bandwidth({bw}) LPF failed: {e}");
+                return;
             }
-            Ok(None) => {
-                if let Err(e) = self.audio_lpf.set_taps(vec![1.0]) {
-                    tracing::warn!("NFM: set_bandwidth({bw}) passthrough set_taps failed: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("NFM: set_bandwidth({bw}) LPF failed: {e}"),
+        };
+
+        // Both validated — commit atomically
+        if let Err(e) = self.audio_lpf.set_taps(new_taps) {
+            tracing::warn!("NFM: set_bandwidth({bw}) set_taps failed: {e}");
+            return;
         }
+        self.demod = new_demod;
     }
 
     fn config(&self) -> &DemodConfig {

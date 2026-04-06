@@ -191,6 +191,7 @@ impl IqFrontend {
     pub fn set_fft_rate(&mut self, fps: f64) {
         self.fft_rate = fps.max(MIN_FFT_RATE_HZ);
         self.fft_skip_samples = calc_fft_skip_samples(self.effective_sample_rate, self.fft_rate);
+        self.fft_accum_count = 0;
         self.fft_skip_counter = 0;
         self.fft_accumulating = true;
     }
@@ -330,12 +331,14 @@ impl IqFrontend {
 
         // Step 4: Accumulate samples for FFT with rate control.
         // Only accumulate when we're within the target FPS budget.
-        // Cap to one FFT per process() call — the API only exposes one
-        // fft_ready flag and one fft_out buffer.
+        // Cap to one FFT emission per process() call — the API only exposes
+        // one fft_out buffer — but keep consuming all samples so skip counters
+        // and accumulation state stay correct for subsequent calls.
         let mut fft_ready = false;
         let mut pos = 0;
         while pos < processed {
-            if self.fft_accumulating {
+            if self.fft_accumulating && !fft_ready {
+                // Accumulate toward next FFT frame (suppressed if already emitted)
                 let remaining_fft = self.fft_size - self.fft_accum_count;
                 let available = processed - pos;
                 let to_copy = remaining_fft.min(available);
@@ -351,11 +354,9 @@ impl IqFrontend {
                     fft_ready = true;
                     self.fft_accum_count = 0;
                     self.fft_accumulating = false;
-                    // One FFT per call — skip remaining samples for rate control
-                    break;
                 }
             } else {
-                // Not accumulating — just count samples toward next FFT window
+                // Not accumulating (or already emitted) — count toward next window
                 let remaining_skip = self.fft_skip_samples.saturating_sub(self.fft_skip_counter);
                 let available = processed - pos;
                 let to_skip = remaining_skip.min(available);
