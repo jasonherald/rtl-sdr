@@ -77,7 +77,7 @@ cargo run --release
 
 13-crate workspace with clear dependency boundaries:
 
-```
+```text
 sdr (binary)            Entry point
 sdr-ui                  GTK4/libadwaita UI
 sdr-radio               Radio decoder, demod, IF/AF chains

@@ -237,7 +237,9 @@ mod tests {
 
     #[test]
     fn test_start_nonexistent() {
-        let mut source = FileSource::new(std::path::Path::new("/nonexistent.wav"));
+        let mut source = FileSource::new(
+            &std::env::temp_dir().join(format!("sdr_missing_{}.wav", std::process::id())),
+        );
         let err = source.start().unwrap_err();
         // Opening a nonexistent file yields an IO error
         assert!(

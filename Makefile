@@ -1,43 +1,111 @@
-.PHONY: all build test clippy fmt fmt-check lint deny audit clean install
+# SDR-RS — Software-defined radio application
+# Makefile for building, installing, and managing
 
-all: lint
+BINDIR      ?= $(HOME)/.cargo/bin
+DATADIR     ?= $(HOME)/.local/share
+ICONDIR     ?= $(DATADIR)/icons/hicolor/scalable/apps
+DESKTOPDIR  ?= $(DATADIR)/applications
+CARGO       ?= cargo
+CARGO_FLAGS ?= --release
+
+.PHONY: all build install install-bin install-icon install-desktop \
+        uninstall test clippy fmt fmt-check lint deny audit clean help
+
+# ─────────────────────────────────────────────────────────────────────
+# Default
+# ─────────────────────────────────────────────────────────────────────
+
+all: build
+
+help:
+	@echo "SDR-RS — Software-defined radio application"
+	@echo ""
+	@echo "Usage:"
+	@echo "  make install      Build release and install (binary + icon + desktop shortcut)"
+	@echo "  make uninstall    Remove binary, icon, and desktop shortcut"
+	@echo "  make build        Build release binary only"
+	@echo "  make test         Run all workspace tests"
+	@echo "  make lint         Run all checks (fmt, clippy, test, deny, audit)"
+	@echo "  make clean        Remove build artifacts"
+	@echo ""
+	@echo "Variables:"
+	@echo "  BINDIR=<path>    Binary location    (default: ~/.cargo/bin)"
+	@echo "  DATADIR=<path>   Data/share prefix  (default: ~/.local/share)"
+
+# ─────────────────────────────────────────────────────────────────────
+# Build
+# ─────────────────────────────────────────────────────────────────────
 
 build:
-	cargo build --workspace --locked
+	$(CARGO) build --workspace $(CARGO_FLAGS)
+
+# ─────────────────────────────────────────────────────────────────────
+# Install
+# ─────────────────────────────────────────────────────────────────────
+
+install: build install-bin install-icon install-desktop
+	@echo ""
+	@echo "SDR-RS installed successfully!"
+	@echo "  Binary:   $(BINDIR)/sdr-rs"
+	@echo "  Icon:     $(ICONDIR)/com.sdr.rs.svg"
+	@echo "  Desktop:  $(DESKTOPDIR)/com.sdr.rs.desktop"
+	@echo ""
+	@echo "Launch from your app menu or run: sdr-rs"
+	@echo ""
+
+install-bin:
+	@mkdir -p $(BINDIR)
+	install -m 755 target/release/sdr $(BINDIR)/sdr-rs
+
+install-icon:
+	@mkdir -p $(ICONDIR)
+	cp data/com.sdr.rs.svg $(ICONDIR)/com.sdr.rs.svg
+	@for size in 48 64 128 256; do \
+		mkdir -p $(DATADIR)/icons/hicolor/$${size}x$${size}/apps; \
+		rsvg-convert -w $$size -h $$size data/com.sdr.rs.svg \
+			-o $(DATADIR)/icons/hicolor/$${size}x$${size}/apps/com.sdr.rs.png 2>/dev/null || true; \
+	done
+	@gtk-update-icon-cache $(DATADIR)/icons/hicolor/ 2>/dev/null || true
+
+install-desktop:
+	@mkdir -p $(DESKTOPDIR)
+	cp data/com.sdr.rs.desktop $(DESKTOPDIR)/com.sdr.rs.desktop
+	@update-desktop-database $(DESKTOPDIR) 2>/dev/null || true
+
+# ─────────────────────────────────────────────────────────────────────
+# Uninstall
+# ─────────────────────────────────────────────────────────────────────
+
+uninstall:
+	rm -f $(BINDIR)/sdr-rs
+	rm -f $(ICONDIR)/com.sdr.rs.svg
+	rm -f $(DESKTOPDIR)/com.sdr.rs.desktop
+	@update-desktop-database $(DESKTOPDIR) 2>/dev/null || true
+	@echo "SDR-RS uninstalled"
+
+# ─────────────────────────────────────────────────────────────────────
+# Quality
+# ─────────────────────────────────────────────────────────────────────
 
 test:
-	cargo test --workspace --locked
+	$(CARGO) test --workspace
 
 clippy:
-	cargo clippy --all-targets --workspace -- -D warnings
+	$(CARGO) clippy --all-targets --workspace -- -D warnings
 
 fmt:
-	cargo fmt --all
+	$(CARGO) fmt --all
 
 fmt-check:
-	cargo fmt --all -- --check
+	$(CARGO) fmt --all -- --check
 
 deny:
-	cargo deny check
+	$(CARGO) deny check
 
 audit:
-	cargo audit
+	$(CARGO) audit
 
 lint: fmt-check clippy test deny audit
 
 clean:
-	cargo clean
-
-PREFIX ?= /usr/local
-BINDIR ?= $(PREFIX)/bin
-DATADIR ?= $(PREFIX)/share
-
-install: build
-	install -Dm755 target/release/sdr $(DESTDIR)$(BINDIR)/sdr-rs
-	install -Dm644 data/com.sdr.rs.desktop $(DESTDIR)$(DATADIR)/applications/com.sdr.rs.desktop
-	install -Dm644 data/com.sdr.rs.svg $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/com.sdr.rs.svg
-
-uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/sdr-rs
-	rm -f $(DESTDIR)$(DATADIR)/applications/com.sdr.rs.desktop
-	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/com.sdr.rs.svg
+	$(CARGO) clean

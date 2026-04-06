@@ -910,15 +910,33 @@ mod tests {
         }
     }
 
+    /// Verify all tap tables are symmetric (linear-phase FIR requirement).
     #[test]
-    fn test_fir_2_2_symmetry() {
-        let n = FIR_2_2.len();
-        for i in 0..n / 2 {
-            let diff = (FIR_2_2[i] - FIR_2_2[n - 1 - i]).abs();
-            assert!(
-                diff < 1e-9,
-                "fir_2_2 not symmetric at index {i}: diff = {diff}"
-            );
+    fn test_all_tap_tables_symmetric() {
+        let tables: &[(&str, &[f32])] = &[
+            ("FIR_2_2", FIR_2_2),
+            ("FIR_4_2", FIR_4_2),
+            ("FIR_8_4", FIR_8_4),
+            ("FIR_16_8", FIR_16_8),
+            ("FIR_32_8", FIR_32_8),
+            ("FIR_64_8", FIR_64_8),
+            ("FIR_128_16", FIR_128_16),
+            ("FIR_256_32", FIR_256_32),
+            ("FIR_512_32", FIR_512_32),
+            ("FIR_1024_64", FIR_1024_64),
+            ("FIR_2048_64", FIR_2048_64),
+            ("FIR_4096_64", FIR_4096_64),
+            ("FIR_8192_128", FIR_8192_128),
+        ];
+        for (name, taps) in tables {
+            let n = taps.len();
+            for i in 0..n / 2 {
+                let diff = (taps[i] - taps[n - 1 - i]).abs();
+                assert!(
+                    diff < 1e-9,
+                    "{name} not symmetric at index {i}: diff = {diff}"
+                );
+            }
         }
     }
 }
