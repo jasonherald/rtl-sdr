@@ -250,7 +250,7 @@ mod tests {
 
     /// Helper: write a 2-channel float32 WAV to a temp file and return its path.
     fn write_test_wav(name: &str, sample_rate: u32, samples: &[(f32, f32)]) -> PathBuf {
-        let path = std::env::temp_dir().join(name);
+        let path = std::env::temp_dir().join(format!("{}_{name}", std::process::id()));
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate,

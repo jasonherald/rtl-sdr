@@ -5,6 +5,7 @@
 //! decimation stages with precomputed tap tables for the given overall ratio.
 
 /// A single decimation stage: decimation factor + FIR taps.
+#[derive(Debug, Clone, Copy)]
 pub struct DecimStage {
     /// Decimation factor for this stage.
     pub decimation: usize,
@@ -13,6 +14,7 @@ pub struct DecimStage {
 }
 
 /// A decimation plan: ordered list of stages whose product equals the overall ratio.
+#[derive(Debug, Clone, Copy)]
 pub struct DecimPlan {
     /// Stages to apply in order.
     pub stages: &'static [DecimStage],
