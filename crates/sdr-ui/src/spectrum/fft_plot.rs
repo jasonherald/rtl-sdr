@@ -5,7 +5,7 @@
 
 use glow::HasContext;
 
-use super::gl_renderer::{self, GlError};
+use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 
 /// Maximum number of FFT bins the renderer can display.
 const MAX_FFT_BINS: usize = 8192;
@@ -213,7 +213,7 @@ impl FftPlotRenderer {
             vertices.extend_from_slice(&[x, -1.0, x, 1.0]);
         }
 
-        let bytes = bytemuck_cast_slice(&vertices);
+        let bytes = f32_slice_as_bytes(&vertices);
         let vertex_count = vertices.len() / 2;
 
         unsafe {
@@ -250,7 +250,7 @@ impl FftPlotRenderer {
             vertices.extend_from_slice(&[x, -1.0, x, y]);
         }
 
-        let bytes = bytemuck_cast_slice(&vertices);
+        let bytes = f32_slice_as_bytes(&vertices);
         let vertex_count = vertices.len() / 2;
 
         unsafe {
@@ -285,7 +285,7 @@ impl FftPlotRenderer {
             vertices.extend_from_slice(&[x, y]);
         }
 
-        let bytes = bytemuck_cast_slice(&vertices);
+        let bytes = f32_slice_as_bytes(&vertices);
         let vertex_count = vertices.len() / 2;
 
         unsafe {
@@ -312,13 +312,4 @@ impl FftPlotRenderer {
             gl.delete_program(self.program);
         }
     }
-}
-
-/// Reinterpret a `&[f32]` as `&[u8]` for uploading to GL buffers.
-///
-/// This is safe because `f32` has no alignment or validity invariants
-/// beyond its representation, and we only read the bytes for upload.
-#[allow(unsafe_code)]
-fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
 }

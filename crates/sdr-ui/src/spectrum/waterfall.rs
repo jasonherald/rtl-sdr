@@ -6,7 +6,7 @@
 use glow::HasContext;
 
 use super::colormap;
-use super::gl_renderer::{self, GlError};
+use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 
 /// Number of history lines stored in the ring-buffer texture.
 const HISTORY_LINES: usize = 1024;
@@ -152,7 +152,7 @@ impl WaterfallRenderer {
             gl.bind_vertex_array(Some(vao));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
 
-            let bytes = bytemuck_cast_slice(&QUAD_VERTICES);
+            let bytes = f32_slice_as_bytes(&QUAD_VERTICES);
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
 
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -420,10 +420,4 @@ fn create_colormap_texture(gl: &glow::Context) -> Result<glow::Texture, GlError>
         gl.bind_texture(glow::TEXTURE_2D, None);
         Ok(texture)
     }
-}
-
-/// Reinterpret a `&[f32]` as `&[u8]` for uploading to GL buffers.
-#[allow(unsafe_code)]
-fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) }
 }
