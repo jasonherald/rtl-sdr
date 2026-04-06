@@ -176,8 +176,8 @@ fn handle_dsp_message(
         DspToUi::FftData(data) => {
             spectrum_handle.push_fft_data(&data);
         }
-        DspToUi::SnrUpdate(snr) => {
-            status_bar.update_snr(snr);
+        DspToUi::SignalLevel(level) => {
+            status_bar.update_signal_level(level);
         }
         DspToUi::Error(err_msg) => {
             tracing::warn!(error = %err_msg, "DSP error");

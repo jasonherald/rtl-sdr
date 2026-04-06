@@ -1,4 +1,4 @@
-//! Bottom status bar displaying live metrics: SNR, sample rate, demod mode, frequency.
+//! Bottom status bar displaying live metrics: signal level, sample rate, demod mode, frequency.
 
 use gtk4::prelude::*;
 
@@ -14,8 +14,8 @@ const SPS_PER_MSPS: f64 = 1_000_000.0;
 /// Samples per second per ksps.
 const SPS_PER_KSPS: f64 = 1_000.0;
 
-/// Default SNR display text when no data has arrived.
-const DEFAULT_SNR_TEXT: &str = "SNR: -- dB";
+/// Default signal level display text when no data has arrived.
+const DEFAULT_LEVEL_TEXT: &str = "Level: -- dBFS";
 /// Default sample rate display text when no data has arrived.
 const DEFAULT_SAMPLE_RATE_TEXT: &str = "SR: --";
 /// Default demod display text when no data has arrived.
@@ -27,8 +27,8 @@ const DEFAULT_FREQUENCY_TEXT: &str = "-- Hz";
 pub struct StatusBar {
     /// The container widget to pack into the window.
     pub widget: gtk4::Box,
-    /// Label showing current SNR in dB.
-    pub snr_label: gtk4::Label,
+    /// Label showing signal level in dBFS.
+    pub signal_level_label: gtk4::Label,
     /// Label showing effective sample rate.
     pub sample_rate_label: gtk4::Label,
     /// Label showing demod mode and bandwidth.
@@ -38,9 +38,10 @@ pub struct StatusBar {
 }
 
 impl StatusBar {
-    /// Update the SNR display with a new measurement.
-    pub fn update_snr(&self, db: f32) {
-        self.snr_label.set_label(&format!("SNR: {db:.1} dB"));
+    /// Update the signal level display with a new measurement (dBFS).
+    pub fn update_signal_level(&self, db: f32) {
+        self.signal_level_label
+            .set_label(&format!("Level: {db:.1} dBFS"));
     }
 
     /// Update the sample rate display.
@@ -63,7 +64,7 @@ impl StatusBar {
 
 /// Build the status bar widget with initial placeholder labels.
 pub fn build_status_bar() -> StatusBar {
-    let snr_label = gtk4::Label::new(Some(DEFAULT_SNR_TEXT));
+    let signal_level_label = gtk4::Label::new(Some(DEFAULT_LEVEL_TEXT));
     let sample_rate_label = gtk4::Label::new(Some(DEFAULT_SAMPLE_RATE_TEXT));
     let demod_label = gtk4::Label::new(Some(DEFAULT_DEMOD_TEXT));
     let frequency_label = gtk4::Label::new(Some(DEFAULT_FREQUENCY_TEXT));
@@ -74,7 +75,7 @@ pub fn build_status_bar() -> StatusBar {
         .css_classes(["status-bar"])
         .build();
 
-    widget.append(&snr_label);
+    widget.append(&signal_level_label);
     widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     widget.append(&sample_rate_label);
     widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
@@ -84,7 +85,7 @@ pub fn build_status_bar() -> StatusBar {
 
     StatusBar {
         widget,
-        snr_label,
+        signal_level_label,
         sample_rate_label,
         demod_label,
         frequency_label,

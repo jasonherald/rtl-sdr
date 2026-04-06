@@ -357,6 +357,11 @@ impl RadioModule {
     pub fn af_chain(&self) -> &AfChain {
         &self.af_chain
     }
+
+    /// Get a mutable reference to the AF chain.
+    pub fn af_chain_mut(&mut self) -> &mut AfChain {
+        &mut self.af_chain
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ pub enum DspToUi {
     /// New FFT magnitude data ready for display.
     FftData(Vec<f32>),
     /// Updated SNR measurement in dB.
-    SnrUpdate(f32),
+    SignalLevel(f32),
     /// A non-fatal error occurred in the pipeline.
     Error(String),
     /// The source has stopped (device disconnected, EOF, etc.).
@@ -71,6 +71,8 @@ pub enum UiToDsp {
     SetWfmStereo(bool),
     /// Set the FFT display frame rate (FPS).
     SetFftRate(f64),
+    /// Enable or disable the audio high-pass filter (voice modes).
+    SetHighPass(bool),
 }
 
 #[cfg(test)]
@@ -82,8 +84,8 @@ mod tests {
         let fft = DspToUi::FftData(vec![1.0, 2.0, 3.0]);
         assert!(matches!(fft, DspToUi::FftData(v) if v.len() == 3));
 
-        let snr = DspToUi::SnrUpdate(12.5);
-        assert!(matches!(snr, DspToUi::SnrUpdate(s) if (s - 12.5).abs() < f32::EPSILON));
+        let snr = DspToUi::SignalLevel(12.5);
+        assert!(matches!(snr, DspToUi::SignalLevel(s) if (s - 12.5).abs() < f32::EPSILON));
 
         let err = DspToUi::Error("test error".to_string());
         assert!(matches!(err, DspToUi::Error(ref s) if s == "test error"));
@@ -179,5 +181,8 @@ mod tests {
 
         let fft_rate = UiToDsp::SetFftRate(30.0);
         assert!(matches!(fft_rate, UiToDsp::SetFftRate(r) if (r - 30.0).abs() < f64::EPSILON));
+
+        let hp = UiToDsp::SetHighPass(true);
+        assert!(matches!(hp, UiToDsp::SetHighPass(true)));
     }
 }

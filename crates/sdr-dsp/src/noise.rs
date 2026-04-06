@@ -391,6 +391,28 @@ mod tests {
         assert!(!squelch.is_open());
     }
 
+    #[test]
+    fn test_squelch_db_scale_regression() {
+        // Pin the 20*log10(amplitude) scale: amplitude 0.1 → -20 dB.
+        // A threshold at -15 dB should close, -25 dB should open.
+        let input = vec![Complex::new(0.1, 0.0); 100];
+
+        let mut squelch_close = PowerSquelch::new(-15.0);
+        let mut output = vec![Complex::default(); 100];
+        squelch_close.process(&input, &mut output).unwrap();
+        assert!(
+            !squelch_close.is_open(),
+            "amplitude 0.1 (-20 dB) should be below -15 dB threshold"
+        );
+
+        let mut squelch_open = PowerSquelch::new(-25.0);
+        squelch_open.process(&input, &mut output).unwrap();
+        assert!(
+            squelch_open.is_open(),
+            "amplitude 0.1 (-20 dB) should be above -25 dB threshold"
+        );
+    }
+
     // --- Noise Blanker tests ---
 
     #[test]

@@ -576,6 +576,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_quadrature_phase_wrap_near_pi() {
+        // Signal with phase delta near ±π — the old atan2-difference method
+        // was sensitive to wrapping here; conjugate-multiply handles it naturally.
+        let deviation = PI;
+        let mut demod = Quadrature::new(deviation).unwrap();
+
+        // Create two samples with phase jump close to π (just under)
+        let phase1 = PI - 0.1;
+        let phase2 = -PI + 0.2; // wraps around: actual delta ≈ 0.3
+        let input = vec![
+            Complex::new(phase1.cos(), phase1.sin()),
+            Complex::new(phase2.cos(), phase2.sin()),
+        ];
+        let mut output = vec![0.0_f32; 2];
+        demod.process(&input, &mut output).unwrap();
+        // Second sample: delta ≈ (-π+0.2) - (π-0.1) = -2π+0.3 → normalized ≈ 0.3
+        // Scaled by 1/deviation = 1/π
+        assert!(
+            output[1].abs() < 1.0,
+            "phase wrap should not produce spike, got {}",
+            output[1]
+        );
+    }
+
+    #[test]
+    fn test_quadrature_continuity_across_calls() {
+        // Verify state persists correctly across process() calls.
+        let freq = 0.3_f32;
+        let deviation = 1.0;
+        let mut demod = Quadrature::new(deviation).unwrap();
+        let input: Vec<Complex> = (0..100)
+            .map(|i| {
+                let phase = freq * i as f32;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+
+        // Process in two halves
+        let mut out1 = vec![0.0_f32; 50];
+        let mut out2 = vec![0.0_f32; 50];
+        demod.process(&input[..50], &mut out1).unwrap();
+        demod.process(&input[50..], &mut out2).unwrap();
+
+        // First sample of second call should be continuous with last of first
+        let boundary_diff = (out2[0] - out1[49]).abs();
+        assert!(
+            boundary_diff < 0.05,
+            "cross-call boundary should be smooth, diff = {boundary_diff}"
+        );
+    }
+
     // --- AM tests ---
 
     #[test]

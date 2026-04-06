@@ -490,6 +490,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.fft_rate = fps;
             state.frontend.set_fft_rate(fps);
         }
+
+        UiToDsp::SetHighPass(enabled) => {
+            tracing::debug!(enabled, "set high-pass filter");
+            state.radio.af_chain_mut().set_high_pass_enabled(enabled);
+        }
     }
 }
 
@@ -675,8 +680,8 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
                                 .sum();
                             #[allow(clippy::cast_precision_loss)]
                             let rms = (sum_sq / (2.0 * audio_count as f32)).sqrt();
-                            let snr_db = 20.0 * rms.max(f32::MIN_POSITIVE).log10();
-                            let _ = dsp_tx.send(DspToUi::SnrUpdate(snr_db));
+                            let level_db = 20.0 * rms.max(f32::MIN_POSITIVE).log10();
+                            let _ = dsp_tx.send(DspToUi::SignalLevel(level_db));
                         }
 
                         // Apply volume with perceptual (power-law) scaling.
