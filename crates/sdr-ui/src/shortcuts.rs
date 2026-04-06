@@ -41,7 +41,11 @@ pub fn setup_shortcuts(
     if let Some(trigger) = trigger_m {
         let action = gtk4::CallbackAction::new(move |_widget, _args| {
             if let Some(dd) = demod_dropdown_weak.upgrade() {
-                let next_idx = (dd.selected() + 1) % DEMOD_MODE_COUNT;
+                let sel = dd.selected();
+                if sel == gtk4::INVALID_LIST_POSITION {
+                    return glib::Propagation::Proceed;
+                }
+                let next_idx = (sel + 1) % DEMOD_MODE_COUNT;
                 dd.set_selected(next_idx);
                 return glib::Propagation::Stop;
             }
