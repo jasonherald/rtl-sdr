@@ -10,6 +10,9 @@ use sdr_types::{Complex, DspError, Stereo};
 /// Default audio output sample rate (Hz).
 const DEFAULT_AUDIO_RATE: f64 = 48_000.0;
 
+/// Default high-pass cutoff frequency (Hz) for voice modes.
+const HIGH_PASS_CUTOFF_HZ: f64 = 300.0;
+
 /// Guard padding for resampler output buffer to handle worst-case rounding.
 const RESAMPLER_OUTPUT_PADDING: usize = 16;
 
@@ -24,10 +27,45 @@ const RATE_EQUALITY_TOLERANCE: f64 = 1.0;
 ///
 /// The resampler operates on Complex samples (Stereo -> Complex -> resample -> Stereo)
 /// since `RationalResampler` is defined for Complex data.
+/// Single-pole IIR high-pass filter for removing low-frequency hum/rumble.
+///
+/// Uses the Julius O. Smith textbook topology:
+/// `y[n] = x[n] - x[n-1] + R * y[n-1]`
+/// where `R = 1 - (2π × f_cutoff / sample_rate)`.
+/// Has an explicit zero at DC for perfect DC rejection.
+struct HighPassFilter {
+    r: f32,
+    last_in: f32,
+    last_out: f32,
+}
+
+impl HighPassFilter {
+    fn new(cutoff_hz: f64, sample_rate: f64) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let r = (1.0 - (core::f64::consts::TAU * cutoff_hz / sample_rate)) as f32;
+        Self {
+            r,
+            last_in: 0.0,
+            last_out: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process_sample(&mut self, x: f32) -> f32 {
+        let y = x - self.last_in + self.r * self.last_out;
+        self.last_in = x;
+        self.last_out = y;
+        y
+    }
+}
+
 pub struct AfChain {
     deemp_l: Option<DeemphasisFilter>,
     deemp_r: Option<DeemphasisFilter>,
     deemp_enabled: bool,
+    hp_l: Option<HighPassFilter>,
+    hp_r: Option<HighPassFilter>,
+    hp_enabled: bool,
     resampler: Option<RationalResampler>,
     af_sample_rate: f64,
     audio_sample_rate: f64,
@@ -66,6 +104,9 @@ impl AfChain {
             deemp_l: None,
             deemp_r: None,
             deemp_enabled: false,
+            hp_l: None,
+            hp_r: None,
+            hp_enabled: false,
             resampler,
             af_sample_rate,
             audio_sample_rate,
@@ -106,6 +147,31 @@ impl AfChain {
             self.deemp_r = None;
         }
         Ok(())
+    }
+
+    /// Enable or disable the high-pass filter (voice modes).
+    ///
+    /// Removes low-frequency hum and rumble below 300 Hz.
+    pub fn set_high_pass_enabled(&mut self, enabled: bool) {
+        self.hp_enabled = enabled;
+        if enabled && self.hp_l.is_none() {
+            self.hp_l = Some(HighPassFilter::new(
+                HIGH_PASS_CUTOFF_HZ,
+                self.audio_sample_rate,
+            ));
+            self.hp_r = Some(HighPassFilter::new(
+                HIGH_PASS_CUTOFF_HZ,
+                self.audio_sample_rate,
+            ));
+        } else if !enabled {
+            self.hp_l = None;
+            self.hp_r = None;
+        }
+    }
+
+    /// Returns whether the high-pass filter is enabled.
+    pub fn high_pass_enabled(&self) -> bool {
+        self.hp_enabled
     }
 
     /// Returns whether deemphasis is enabled.
@@ -207,6 +273,17 @@ impl AfChain {
                     .zip(self.deemp_out_r[..resamp_count].iter()),
             ) {
                 *out = Stereo::new(l, r);
+            }
+        }
+
+        // Stage 3: High-pass filter at audio output rate.
+        // Removes low-frequency hum and rumble (cutoff ~300 Hz).
+        if self.hp_enabled
+            && let (Some(hp_l), Some(hp_r)) = (&mut self.hp_l, &mut self.hp_r)
+        {
+            for s in &mut output[..resamp_count] {
+                s.l = hp_l.process_sample(s.l);
+                s.r = hp_r.process_sample(s.r);
             }
         }
 
