@@ -11,6 +11,8 @@ const MIN_BANDWIDTH_HZ: f64 = 100.0;
 const MAX_BANDWIDTH_HZ: f64 = 250_000.0;
 /// Bandwidth step in Hz.
 const BANDWIDTH_STEP_HZ: f64 = 100.0;
+/// Bandwidth page increment in Hz (scroll/page-up/down).
+const BANDWIDTH_PAGE_HZ: f64 = 1_000.0;
 
 /// Default squelch level in dB.
 const DEFAULT_SQUELCH_DB: f64 = -100.0;
@@ -20,6 +22,8 @@ const MIN_SQUELCH_DB: f64 = -160.0;
 const MAX_SQUELCH_DB: f64 = 0.0;
 /// Squelch step in dB.
 const SQUELCH_STEP_DB: f64 = 1.0;
+/// Squelch page increment in dB.
+const SQUELCH_PAGE_DB: f64 = 10.0;
 
 /// Radio / demodulator configuration panel with references to interactive rows.
 pub struct RadioPanel {
@@ -63,7 +67,7 @@ pub fn build_radio_panel() -> RadioPanel {
         MIN_BANDWIDTH_HZ,
         MAX_BANDWIDTH_HZ,
         BANDWIDTH_STEP_HZ,
-        1_000.0,
+        BANDWIDTH_PAGE_HZ,
         0.0,
     );
     let bandwidth_row = adw::SpinRow::builder()
@@ -81,7 +85,7 @@ pub fn build_radio_panel() -> RadioPanel {
         MIN_SQUELCH_DB,
         MAX_SQUELCH_DB,
         SQUELCH_STEP_DB,
-        10.0,
+        SQUELCH_PAGE_DB,
         0.0,
     );
     let squelch_level_row = adw::SpinRow::builder()

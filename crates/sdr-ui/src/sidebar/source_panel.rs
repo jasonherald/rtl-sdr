@@ -18,6 +18,8 @@ const MIN_GAIN_DB: f64 = 0.0;
 const MAX_GAIN_DB: f64 = 49.6;
 /// Gain step in dB.
 const GAIN_STEP_DB: f64 = 0.1;
+/// Gain page increment in dB.
+const GAIN_PAGE_DB: f64 = 1.0;
 
 /// Default network port.
 const DEFAULT_PORT: f64 = 1234.0;
@@ -25,6 +27,10 @@ const DEFAULT_PORT: f64 = 1234.0;
 const MIN_PORT: f64 = 1.0;
 /// Maximum port number.
 const MAX_PORT: f64 = 65535.0;
+/// Port spin step.
+const PORT_STEP: f64 = 1.0;
+/// Port page increment.
+const PORT_PAGE: f64 = 100.0;
 
 /// Source device configuration panel with references to all interactive rows.
 pub struct SourcePanel {
@@ -83,7 +89,7 @@ fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::SwitchRow) {
         MIN_GAIN_DB,
         MAX_GAIN_DB,
         GAIN_STEP_DB,
-        1.0,
+        GAIN_PAGE_DB,
         0.0,
     );
     let gain_row = adw::SpinRow::builder()
@@ -108,7 +114,8 @@ fn build_network_rows() -> (adw::EntryRow, adw::SpinRow, adw::ComboRow) {
         .text("localhost")
         .build();
 
-    let port_adj = gtk4::Adjustment::new(DEFAULT_PORT, MIN_PORT, MAX_PORT, 1.0, 100.0, 0.0);
+    let port_adj =
+        gtk4::Adjustment::new(DEFAULT_PORT, MIN_PORT, MAX_PORT, PORT_STEP, PORT_PAGE, 0.0);
     let port_row = adw::SpinRow::builder()
         .title("Port")
         .adjustment(&port_adj)
@@ -228,10 +235,16 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&iq_inversion_row);
     group.add(&decimation_row);
 
-    // Set initial visibility: show RTL-SDR controls, hide Network controls.
-    hostname_row.set_visible(false);
-    port_row.set_visible(false);
-    protocol_row.set_visible(false);
+    // Derive initial visibility from the selected device.
+    let selected = device_row.selected();
+    let is_rtlsdr = selected == DEVICE_RTLSDR;
+    let is_network = selected == DEVICE_NETWORK;
+    sample_rate_row.set_visible(is_rtlsdr);
+    gain_row.set_visible(is_rtlsdr);
+    agc_row.set_visible(is_rtlsdr);
+    hostname_row.set_visible(is_network);
+    port_row.set_visible(is_network);
+    protocol_row.set_visible(is_network);
 
     connect_device_visibility(
         &device_row,

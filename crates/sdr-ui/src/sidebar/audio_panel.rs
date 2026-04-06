@@ -1,4 +1,4 @@
-//! Audio output configuration panel — sink type selection.
+//! Audio output configuration panel — device and sink type selection.
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
