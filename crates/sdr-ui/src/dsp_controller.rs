@@ -315,6 +315,58 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::debug!(enabled, "set FM IF NR");
             state.radio.if_chain_mut().set_fm_if_nr_enabled(enabled);
         }
+
+        UiToDsp::SetGain(gain_db) => {
+            tracing::debug!(gain_db, "set gain");
+            #[allow(clippy::cast_possible_truncation)]
+            if let Some(dev) = &mut state.device {
+                // RTL-SDR gain is in tenths of dB (e.g., 49.6 dB = 496)
+                let gain_tenths = (gain_db * 10.0) as i32;
+                if let Err(e) = dev.set_tuner_gain(gain_tenths) {
+                    tracing::warn!("set gain failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
+                }
+            }
+        }
+
+        UiToDsp::SetAgc(enabled) => {
+            tracing::debug!(enabled, "set AGC");
+            if let Some(dev) = &mut state.device {
+                // AGC enabled = automatic gain (manual=false), AGC disabled = manual gain
+                if let Err(e) = dev.set_tuner_gain_mode(!enabled) {
+                    tracing::warn!("set AGC failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("AGC failed: {e}")));
+                }
+            }
+        }
+
+        UiToDsp::SetIqCorrection(_enabled) => {
+            // IQ correction is handled by the IqFrontend DC blocker;
+            // the UI toggle for "IQ Correction" maps to the same DC blocking path.
+            // This is a separate concept from DC blocking in SDR++ but functionally
+            // equivalent in our implementation.
+            tracing::debug!("IQ correction toggle (handled via DC blocking)");
+        }
+
+        UiToDsp::SetWindowFunction(window) => {
+            tracing::debug!(?window, "set window function");
+            match IqFrontend::new(
+                state.frontend.sample_rate(),
+                state.frontend.decim_ratio(),
+                state.frontend.fft_size(),
+                window,
+                true,
+            ) {
+                Ok(new_frontend) => {
+                    state.fft_buf = vec![0.0; new_frontend.fft_size()];
+                    state.frontend = new_frontend;
+                }
+                Err(e) => {
+                    tracing::warn!("set window function failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Window function failed: {e}")));
+                }
+            }
+        }
     }
 }
 

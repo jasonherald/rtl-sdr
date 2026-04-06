@@ -55,6 +55,14 @@ pub enum UiToDsp {
     SetNbEnabled(bool),
     /// Enable or disable FM IF noise reduction.
     SetFmIfNrEnabled(bool),
+    /// Set the RTL-SDR tuner gain (tenths of dB).
+    SetGain(f64),
+    /// Enable or disable RTL-SDR AGC.
+    SetAgc(bool),
+    /// Enable or disable IQ correction.
+    SetIqCorrection(bool),
+    /// Set the FFT window function.
+    SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow),
 }
 
 #[cfg(test)]

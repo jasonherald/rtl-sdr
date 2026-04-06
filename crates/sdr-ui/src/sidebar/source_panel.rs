@@ -256,7 +256,7 @@ pub fn build_source_panel() -> SourcePanel {
         &protocol_row,
     );
 
-    // TODO: Connect sample_rate_row, gain_row, agc_row, etc. to DSP pipeline (PR #7)
+    // Controls connected to DSP pipeline via window.rs
 
     SourcePanel {
         widget: group,

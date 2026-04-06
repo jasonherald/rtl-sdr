@@ -9,6 +9,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
 use sdr_source_rtlsdr::SAMPLE_RATES;
 
@@ -372,6 +373,27 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
                 state_decim.send_dsp(UiToDsp::SetDecimation(factor));
             }
         });
+
+    // Gain control
+    let state_gain = Rc::clone(state);
+    panels.source.gain_row.connect_value_notify(move |row| {
+        state_gain.send_dsp(UiToDsp::SetGain(row.value()));
+    });
+
+    // AGC toggle
+    let state_agc = Rc::clone(state);
+    panels.source.agc_row.connect_active_notify(move |row| {
+        state_agc.send_dsp(UiToDsp::SetAgc(row.is_active()));
+    });
+
+    // IQ correction toggle
+    let state_iq_corr = Rc::clone(state);
+    panels
+        .source
+        .iq_correction_row
+        .connect_active_notify(move |row| {
+            state_iq_corr.send_dsp(UiToDsp::SetIqCorrection(row.is_active()));
+        });
 }
 
 /// Connect radio panel controls to DSP commands.
@@ -431,6 +453,13 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     });
 }
 
+/// FFT window function options matching the display panel combo.
+const WINDOW_FUNCTIONS: [FftWindow; 3] = [
+    FftWindow::Rectangular,
+    FftWindow::Blackman,
+    FftWindow::Nuttall,
+];
+
 /// Connect display panel controls to DSP commands.
 fn connect_display_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // FFT size
@@ -442,6 +471,18 @@ fn connect_display_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             let idx = row.selected() as usize;
             if let Some(&size) = FFT_SIZES.get(idx) {
                 state_fft.send_dsp(UiToDsp::SetFftSize(size));
+            }
+        });
+
+    // Window function
+    let state_wf = Rc::clone(state);
+    panels
+        .display
+        .window_fn_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected() as usize;
+            if let Some(&window) = WINDOW_FUNCTIONS.get(idx) {
+                state_wf.send_dsp(UiToDsp::SetWindowFunction(window));
             }
         });
 }
