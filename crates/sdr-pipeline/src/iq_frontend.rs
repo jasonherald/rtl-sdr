@@ -667,10 +667,7 @@ mod tests {
 
         // At 10 FPS target, should get roughly 10 FFTs from 1 second of data.
         // Allow some tolerance for boundary effects.
-        assert!(
-            (5..=15).contains(&fft_count),
-            "expected ~10 FFTs at 10 FPS, got {fft_count}"
-        );
+        assert_eq!(fft_count, 10, "expected 10 FFTs at 10 FPS, got {fft_count}");
     }
 
     #[test]
@@ -701,9 +698,9 @@ mod tests {
             }
         }
 
-        assert!(
-            (5..=15).contains(&fft_count),
-            "expected ~10 FFTs at 10 FPS with non-aligned chunks, got {fft_count}"
+        assert_eq!(
+            fft_count, 10,
+            "expected 10 FFTs at 10 FPS with non-aligned chunks, got {fft_count}"
         );
     }
 }

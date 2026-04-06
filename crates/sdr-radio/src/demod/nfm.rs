@@ -55,13 +55,13 @@ pub struct NfmDemodulator {
 /// Returns `None` if cutoff is at or above Nyquist (no filter needed).
 fn build_nfm_lpf_taps(bandwidth: f64) -> Result<Option<Vec<f32>>, DspError> {
     let cutoff = bandwidth / 2.0;
-    let nyquist = NFM_IF_SAMPLE_RATE / 2.0;
+    let nyquist = NFM_AF_SAMPLE_RATE / 2.0;
     if cutoff >= nyquist - NFM_NYQUIST_GUARD_HZ {
-        return Ok(None); // bandwidth spans full IF — bypass LPF
+        return Ok(None); // bandwidth spans full audio rate — bypass LPF
     }
     let transition =
         (cutoff * NFM_LPF_TRANSITION_RATIO).min(nyquist - cutoff - NFM_NYQUIST_GUARD_HZ);
-    let lpf_taps = taps::low_pass(cutoff, transition, NFM_IF_SAMPLE_RATE, false)?;
+    let lpf_taps = taps::low_pass(cutoff, transition, NFM_AF_SAMPLE_RATE, false)?;
     Ok(Some(lpf_taps))
 }
 
@@ -132,15 +132,7 @@ impl Demodulator for NfmDemodulator {
             );
             return;
         }
-        // Stage both updates before committing — avoids half-retuned state.
-        let new_demod = match FmDemod::from_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("NFM: set_bandwidth({bw}) demod failed: {e}");
-                return;
-            }
-        };
-
+        // Stage LPF taps before committing — avoids half-retuned state.
         let new_taps = match build_nfm_lpf_taps(bw) {
             Ok(Some(taps)) => taps,
             Ok(None) => NFM_PASSTHROUGH_TAPS.to_vec(),
@@ -150,12 +142,14 @@ impl Demodulator for NfmDemodulator {
             }
         };
 
-        // Both validated — commit atomically
-        if let Err(e) = self.audio_lpf.set_taps(new_taps) {
-            tracing::warn!("NFM: set_bandwidth({bw}) set_taps failed: {e}");
+        // Update deviation in-place (preserves phase state — no transient pop)
+        if let Err(e) = self.demod.set_deviation_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
+            tracing::warn!("NFM: set_bandwidth({bw}) demod failed: {e}");
             return;
         }
-        self.demod = new_demod;
+        if let Err(e) = self.audio_lpf.set_taps(new_taps) {
+            tracing::warn!("NFM: set_bandwidth({bw}) set_taps failed: {e}");
+        }
     }
 
     fn config(&self) -> &DemodConfig {
