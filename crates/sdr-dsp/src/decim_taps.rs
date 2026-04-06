@@ -882,13 +882,17 @@ pub const PLANS: &[DecimPlan] = &[
 pub const MAX_RATIO: u32 = 1 << PLANS.len();
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
+    /// Number of precomputed decimation plans (ratios 2 through 8192).
+    const EXPECTED_PLAN_COUNT: usize = 13;
+    /// Tolerance for tap symmetry checks.
+    const SYMMETRY_EPSILON: f32 = 1e-9;
+
     #[test]
     fn test_plans_count() {
-        assert_eq!(PLANS.len(), 13);
+        assert_eq!(PLANS.len(), EXPECTED_PLAN_COUNT);
     }
 
     #[test]
@@ -935,7 +939,7 @@ mod tests {
             for i in 0..n / 2 {
                 let diff = (taps[i] - taps[n - 1 - i]).abs();
                 assert!(
-                    diff < 1e-9,
+                    diff < SYMMETRY_EPSILON,
                     "{name} not symmetric at index {i}: diff = {diff}"
                 );
             }
