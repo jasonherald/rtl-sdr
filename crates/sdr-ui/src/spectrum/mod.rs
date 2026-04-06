@@ -269,9 +269,9 @@ fn build_waterfall_area(
 ///
 /// Must be called after `GtkGLArea::make_current()`.
 ///
-/// Uses `eglGetProcAddress` or `glXGetProcAddress` (depending on the display
-/// backend) to resolve GL function pointers. Falls back to `dlsym` for
-/// symbols not found via the platform loader.
+/// Uses `dlsym(RTLD_DEFAULT)` to resolve GL function pointers from all loaded
+/// shared objects. Falls back to `eglGetProcAddress` for GLES symbols not
+/// found in the global symbol table.
 #[allow(unsafe_code)]
 fn create_glow_context() -> glow::Context {
     unsafe {

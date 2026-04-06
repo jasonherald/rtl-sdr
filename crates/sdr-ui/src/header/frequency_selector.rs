@@ -119,7 +119,6 @@ pub fn build_frequency_selector() -> FrequencySelector {
         .spacing(0)
         .css_classes(["frequency-selector"])
         .focusable(true)
-        .can_focus(true)
         .build();
 
     let frequency = Rc::new(Cell::new(DEFAULT_FREQUENCY_HZ));

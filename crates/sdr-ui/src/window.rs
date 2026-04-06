@@ -111,6 +111,7 @@ fn build_header_bar(sidebar_toggle: &gtk4::ToggleButton) -> adw::HeaderBar {
     let freq_selector = header::build_frequency_selector();
     freq_selector.connect_frequency_changed(|freq| {
         tracing::debug!(frequency_hz = freq, "frequency changed");
+        // TODO: Send UiToDsp::Tune(freq as f64) to DSP pipeline (PR #7)
     });
 
     // App menu
