@@ -8,6 +8,7 @@
 
 use sdr_types::{Complex, DspError};
 
+use crate::decim_taps;
 use crate::taps;
 
 /// GCD of two unsigned integers (Euclidean algorithm).
@@ -21,13 +22,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 }
 
 /// Maximum power-of-two decimation ratio supported.
-const MAX_POWER_DECIM_RATIO: u32 = 8192; // 2^13
-
-/// Normalized cutoff frequency for power decimator stages (fraction of sample rate).
-const POWER_DECIM_CUTOFF: f64 = 0.25;
-
-/// Normalized transition width for power decimator stages (fraction of sample rate).
-const POWER_DECIM_TRANSITION: f64 = 0.1;
+const MAX_POWER_DECIM_RATIO: u32 = decim_taps::MAX_RATIO;
 
 /// Transition width as a fraction of filter bandwidth for rational resampler.
 const RESAMP_TRANSITION_RATIO: f64 = 0.1;
@@ -201,10 +196,10 @@ impl PolyphaseResampler {
     }
 }
 
-/// Power-of-2 decimator using cascaded half-band FIR stages.
+/// Power-of-2 decimator using cascaded FIR stages with precomputed taps.
 ///
-/// Ports SDR++ `dsp::multirate::PowerDecimator`. Instead of pre-computed
-/// tap tables, generates lowpass taps dynamically for each stage.
+/// Ports SDR++ `dsp::multirate::PowerDecimator` with the same optimized
+/// decimation plans and precomputed FIR tap tables.
 pub struct PowerDecimator {
     stages: Vec<DecimStage>,
     ratio: u32,
@@ -306,28 +301,29 @@ impl PowerDecimator {
         })
     }
 
-    /// Build cascaded decimation stages.
+    /// Build cascaded decimation stages from precomputed tap tables.
     ///
-    /// Decomposes the ratio into stages of 2x decimation each,
-    /// generating lowpass taps for each stage.
+    /// Uses the optimized decimation plans from `decim_taps`, which provide
+    /// multi-rate stages with precomputed FIR taps (ported from SDR++).
     fn build_stages(ratio: u32) -> Result<Vec<DecimStage>, DspError> {
         if ratio == 1 {
             return Ok(vec![]);
         }
 
-        let mut stages = Vec::new();
-        let mut remaining = ratio;
-
-        while remaining > 1 {
-            // Each stage decimates by 2
-            let stage_decim = 2;
-            remaining /= stage_decim;
-
-            // Generate lowpass taps for this stage
-            // Cutoff at 0.25 (half of Nyquist), transition 0.1 of sample rate
-            let stage_taps = taps::low_pass(POWER_DECIM_CUTOFF, POWER_DECIM_TRANSITION, 1.0, true)?;
-            stages.push(DecimStage::new(stage_taps, stage_decim as usize));
+        // Plans are indexed by log2(ratio) - 1
+        let plan_idx = ratio.trailing_zeros() as usize - 1;
+        if plan_idx >= decim_taps::PLANS.len() {
+            return Err(DspError::InvalidParameter(format!(
+                "no decimation plan for ratio {ratio}"
+            )));
         }
+
+        let plan = &decim_taps::PLANS[plan_idx];
+        let stages = plan
+            .stages
+            .iter()
+            .map(|s| DecimStage::new(s.taps.to_vec(), s.decimation))
+            .collect();
 
         Ok(stages)
     }

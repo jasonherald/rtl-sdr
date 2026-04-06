@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SDR-RS
+GenericName=Software-Defined Radio
+Comment=Software-defined radio receiver
+Exec=sdr-rs
+Icon=com.sdr.rs
+Terminal=false
+Categories=Audio;HamRadio;Science;
+Keywords=SDR;radio;RTL-SDR;receiver;spectrum;
