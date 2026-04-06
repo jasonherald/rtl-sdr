@@ -20,7 +20,7 @@ pub fn build_audio_panel() -> AudioPanel {
         .description("Output configuration")
         .build();
 
-    // TODO: Populate with actual audio devices from PipeWire/PulseAudio (PR #7)
+    // TODO(issue #92): populate with actual audio devices from PipeWire/PulseAudio
     let device_model = gtk4::StringList::new(&["Default"]);
     let device_row = adw::ComboRow::builder()
         .title("Device")
@@ -33,7 +33,7 @@ pub fn build_audio_panel() -> AudioPanel {
         .model(&sink_model)
         .build();
 
-    // TODO: Connect rows to DSP pipeline (PR #7)
+    // TODO(issue #92): connect rows to DSP pipeline for device/sink switching
 
     group.add(&device_row);
     group.add(&sink_type_row);

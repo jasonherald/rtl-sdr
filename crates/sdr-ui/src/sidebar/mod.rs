@@ -32,7 +32,7 @@ pub struct SidebarPanels {
 /// Build the complete sidebar `ScrolledWindow` containing all configuration panels.
 ///
 /// Returns both the scroll widget (for embedding in the split view) and the
-/// `SidebarPanels` struct (for DSP bridge signal wiring in PR #7).
+/// `SidebarPanels` struct (for DSP bridge signal wiring — see issue #92).
 pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let source = build_source_panel();
     let audio = build_audio_panel();
