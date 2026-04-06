@@ -117,6 +117,11 @@ struct DspState {
     #[allow(dead_code)]
     volume: f32,
 
+    // Persisted frontend settings (restored after rebuild)
+    dc_blocking: bool,
+    invert_iq: bool,
+    window_fn: FftWindow,
+
     // Pre-allocated buffers
     raw_buf: Vec<u8>,
     iq_buf: Vec<Complex>,
@@ -147,6 +152,9 @@ impl DspState {
             center_freq: DEFAULT_CENTER_FREQ,
             sample_rate: DEFAULT_SAMPLE_RATE,
             volume: 1.0,
+            dc_blocking: true,
+            invert_iq: false,
+            window_fn: FftWindow::Nuttall,
             raw_buf: vec![0u8; RAW_BUF_SIZE],
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
@@ -276,6 +284,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetDcBlocking(enabled) => {
             tracing::debug!(enabled, "set DC blocking");
+            state.dc_blocking = enabled;
             if let Err(e) = state.frontend.set_dc_blocking(enabled) {
                 tracing::warn!("set DC blocking failed: {e}");
             }
@@ -283,6 +292,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetIqInversion(enabled) => {
             tracing::debug!(enabled, "set IQ inversion");
+            state.invert_iq = enabled;
             state.frontend.set_invert_iq(enabled);
         }
 
@@ -292,10 +302,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 state.frontend.sample_rate(),
                 state.frontend.decim_ratio(),
                 size,
-                FftWindow::Nuttall,
-                true,
+                state.window_fn,
+                state.dc_blocking,
             ) {
-                Ok(new_frontend) => {
+                Ok(mut new_frontend) => {
+                    new_frontend.set_invert_iq(state.invert_iq);
                     state.frontend = new_frontend;
                     state.fft_buf = vec![0.0; size];
                 }
@@ -340,24 +351,28 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             }
         }
 
-        UiToDsp::SetIqCorrection(_enabled) => {
-            // IQ correction is handled by the IqFrontend DC blocker;
-            // the UI toggle for "IQ Correction" maps to the same DC blocking path.
-            // This is a separate concept from DC blocking in SDR++ but functionally
-            // equivalent in our implementation.
-            tracing::debug!("IQ correction toggle (handled via DC blocking)");
+        UiToDsp::SetIqCorrection(enabled) => {
+            // IQ correction removes DC offset from the IQ signal.
+            // Route to the DC blocker which serves the same purpose.
+            tracing::debug!(enabled, "set IQ correction (via DC blocker)");
+            state.dc_blocking = enabled;
+            if let Err(e) = state.frontend.set_dc_blocking(enabled) {
+                tracing::warn!("set IQ correction failed: {e}");
+            }
         }
 
         UiToDsp::SetWindowFunction(window) => {
             tracing::debug!(?window, "set window function");
+            state.window_fn = window;
             match IqFrontend::new(
                 state.frontend.sample_rate(),
                 state.frontend.decim_ratio(),
                 state.frontend.fft_size(),
                 window,
-                true,
+                state.dc_blocking,
             ) {
-                Ok(new_frontend) => {
+                Ok(mut new_frontend) => {
+                    new_frontend.set_invert_iq(state.invert_iq);
                     state.fft_buf = vec![0.0; new_frontend.fft_size()];
                     state.frontend = new_frontend;
                 }
@@ -407,17 +422,18 @@ fn cleanup(state: &mut DspState) {
     tracing::info!("RTL-SDR device closed");
 }
 
-/// Rebuild the IQ frontend with the current sample rate, preserving other settings.
+/// Rebuild the IQ frontend with the current sample rate, preserving user settings.
 fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
-    let new_frontend = IqFrontend::new(
+    let mut new_frontend = IqFrontend::new(
         state.sample_rate,
         state.frontend.decim_ratio(),
         state.frontend.fft_size(),
-        FftWindow::Nuttall,
-        true,
+        state.window_fn,
+        state.dc_blocking,
     )
     .map_err(|e| format!("frontend rebuild: {e}"))?;
 
+    new_frontend.set_invert_iq(state.invert_iq);
     state.frontend = new_frontend;
     Ok(())
 }

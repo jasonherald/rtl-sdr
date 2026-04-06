@@ -55,7 +55,7 @@ pub enum UiToDsp {
     SetNbEnabled(bool),
     /// Enable or disable FM IF noise reduction.
     SetFmIfNrEnabled(bool),
-    /// Set the RTL-SDR tuner gain (tenths of dB).
+    /// Set the RTL-SDR tuner gain (dB). Converted to tenths internally.
     SetGain(f64),
     /// Enable or disable RTL-SDR AGC.
     SetAgc(bool),
@@ -144,5 +144,20 @@ mod tests {
 
         let nr = UiToDsp::SetFmIfNrEnabled(false);
         assert!(matches!(nr, UiToDsp::SetFmIfNrEnabled(false)));
+
+        let gain = UiToDsp::SetGain(33.8);
+        assert!(matches!(gain, UiToDsp::SetGain(g) if (g - 33.8).abs() < f64::EPSILON));
+
+        let agc = UiToDsp::SetAgc(true);
+        assert!(matches!(agc, UiToDsp::SetAgc(true)));
+
+        let iq_corr = UiToDsp::SetIqCorrection(false);
+        assert!(matches!(iq_corr, UiToDsp::SetIqCorrection(false)));
+
+        let wf = UiToDsp::SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow::Blackman);
+        assert!(matches!(
+            wf,
+            UiToDsp::SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow::Blackman)
+        ));
     }
 }
