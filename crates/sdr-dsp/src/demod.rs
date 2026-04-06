@@ -213,6 +213,16 @@ impl FmDemod {
         deviation_hz: f64,
         sample_rate: f64,
     ) -> Result<(), DspError> {
+        if !deviation_hz.is_finite() || deviation_hz <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "deviation_hz must be positive and finite, got {deviation_hz}"
+            )));
+        }
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate must be positive and finite, got {sample_rate}"
+            )));
+        }
         let dev = math::hz_to_rads(deviation_hz, sample_rate) as f32;
         self.quad.set_deviation(dev)
     }

@@ -266,12 +266,41 @@ mod tests {
     }
 
     #[test]
-    fn test_nfm_set_bandwidth() {
+    fn test_nfm_set_bandwidth_continuity() {
+        // Verify mid-stream bandwidth retune doesn't cause a boundary pop.
+        // Process a steady FM tone, retune mid-stream, check the first
+        // post-retune sample stays close to its neighbors.
         let mut demod = NfmDemodulator::new().unwrap();
-        // Should not panic
+        let freq = 0.05_f32;
+        let n = 2000;
+        let input: Vec<Complex> = (0..n)
+            .map(|i| {
+                let phase = freq * i as f32;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+
+        // Process first half
+        let mut out1 = vec![Stereo::default(); 1000];
+        demod.process(&input[..1000], &mut out1).unwrap();
+        let pre_retune = out1[999].l;
+
+        // Retune mid-stream
         demod.set_bandwidth(25_000.0);
-        demod.set_bandwidth(5_000.0);
-        // Verify passthrough path at max bandwidth (cutoff at Nyquist)
+
+        // Process second half
+        let mut out2 = vec![Stereo::default(); 1000];
+        demod.process(&input[1000..], &mut out2).unwrap();
+        let post_retune = out2[0].l;
+
+        // The boundary should be smooth — no large transient pop
+        let jump = (post_retune - pre_retune).abs();
+        assert!(
+            jump < 1.0,
+            "retune boundary should be smooth, jump = {jump}"
+        );
+
+        // Also verify passthrough path at max bandwidth
         demod.set_bandwidth(NFM_MAX_BANDWIDTH);
     }
 }
