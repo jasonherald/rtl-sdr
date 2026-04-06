@@ -68,9 +68,9 @@ impl PowerSquelch {
         let sum: f32 = input.iter().map(|s| s.amplitude()).sum();
         let mean_amplitude = sum / input.len() as f32;
 
-        // Compare in dB (10*log10 of amplitude, matching C++ behavior).
-        // Both measured and threshold use the same scale (10*log10 of mean amplitude).
-        let measured_db = 10.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
+        // Convert to standard dB: 20*log10(amplitude) = 10*log10(power).
+        // This matches the standard dBFS convention used by most SDR tools.
+        let measured_db = 20.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
 
         if measured_db >= self.level_db {
             output[..input.len()].copy_from_slice(input);
