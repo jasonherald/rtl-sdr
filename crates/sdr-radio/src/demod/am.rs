@@ -177,7 +177,11 @@ impl Demodulator for AmDemodulator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::cast_precision_loss)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::cast_precision_loss,
+    clippy::cloned_instead_of_copied
+)]
 mod tests {
     use super::*;
     use core::f32::consts::PI;

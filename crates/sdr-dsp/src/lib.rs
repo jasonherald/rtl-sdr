@@ -18,5 +18,6 @@ pub mod loops;
 pub mod math;
 pub mod multirate;
 pub mod noise;
+pub mod stereo;
 pub mod taps;
 pub mod window;

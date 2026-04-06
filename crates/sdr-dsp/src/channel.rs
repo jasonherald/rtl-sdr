@@ -24,7 +24,7 @@ const PHASOR_RENORM_INTERVAL: usize = 512;
 /// Frequency translator — shifts a signal in frequency using an NCO.
 ///
 /// Ports SDR++ `dsp::channel::FrequencyXlator`. Uses complex phasor
-/// multiplication (multiply-accumulate) instead of per-sample sin_cos,
+/// multiplication (multiply-accumulate) instead of per-sample `sin_cos`,
 /// matching the VOLK approach used by C++ SDR++. ~3-5x faster.
 pub struct FrequencyXlator {
     /// Running complex phasor (current rotation state).
@@ -84,7 +84,7 @@ impl FrequencyXlator {
     /// Process complex samples, shifting them in frequency.
     ///
     /// Uses complex multiply-accumulate (4 multiply-adds per sample)
-    /// instead of sin_cos per sample for ~3-5x speedup.
+    /// instead of `sin_cos` per sample for ~3-5x speedup.
     ///
     /// # Errors
     ///

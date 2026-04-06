@@ -210,7 +210,7 @@ impl FmIfNoiseReduction {
     /// # Errors
     ///
     /// Returns `DspError::InvalidParameter` if `fft_size` is 0.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     pub fn with_fft_size(fft_size: usize) -> Result<Self, DspError> {
         if fft_size == 0 {
             return Err(DspError::InvalidParameter(
@@ -228,9 +228,7 @@ impl FmIfNoiseReduction {
 
         // Precompute Nuttall window — matches C++ per-sample sliding window approach.
         let window: Vec<f32> = (0..fft_size)
-            .map(|i| {
-                crate::window::nuttall(i as f64, fft_size as f64) as f32
-            })
+            .map(|i| crate::window::nuttall(i as f64, fft_size as f64) as f32)
             .collect();
 
         Ok(Self {
