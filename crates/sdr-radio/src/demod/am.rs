@@ -1,7 +1,9 @@
 //! Amplitude modulation demodulator.
 
 use sdr_dsp::demod::AmDemod;
+use sdr_dsp::filter::FirFilter;
 use sdr_dsp::loops::Agc;
+use sdr_dsp::taps;
 use sdr_types::{Complex, DspError, Stereo};
 
 use super::{DemodConfig, Demodulator, VfoReference};
@@ -37,15 +39,35 @@ const AM_AGC_MAX_OUTPUT: f32 = 10.0;
 /// AGC initial gain for AM mode.
 const AM_AGC_INIT_GAIN: f32 = 1.0;
 
+/// Transition width for AM lowpass as a fraction of cutoff.
+const AM_LPF_TRANSITION_RATIO: f64 = 0.3;
+
 /// AM demodulator using `AmDemod` from sdr-dsp.
 ///
-/// Extracts the amplitude envelope, applies DC blocking and AGC, and outputs stereo.
+/// Matches C++ SDR++ AM demod architecture:
+/// 1. **Carrier AGC** — normalizes complex signal before magnitude extraction
+///    (stabilizes carrier level across fading/AGC pumping)
+/// 2. **Envelope detection** — magnitude + DC blocking
+/// 3. **Audio lowpass** — bandwidth-dependent FIR at bandwidth/2
+/// 4. **Audio AGC** — normalizes audio output levels
 pub struct AmDemodulator {
     demod: AmDemod,
-    agc: Agc,
+    carrier_agc: Agc,
+    audio_agc: Agc,
+    audio_lpf: FirFilter,
     config: DemodConfig,
+    carrier_buf: Vec<Complex>,
     mono_buf: Vec<f32>,
+    lpf_buf: Vec<f32>,
     agc_buf: Vec<f32>,
+}
+
+/// Build a lowpass FIR for AM audio filtering at the given bandwidth.
+fn build_am_lpf(bandwidth: f64) -> Result<FirFilter, DspError> {
+    let cutoff = bandwidth / 2.0;
+    let transition = cutoff * AM_LPF_TRANSITION_RATIO;
+    let lpf_taps = taps::low_pass(cutoff, transition, AM_IF_SAMPLE_RATE, false)?;
+    FirFilter::new(lpf_taps)
 }
 
 impl AmDemodulator {
@@ -56,7 +78,7 @@ impl AmDemodulator {
     /// Returns `DspError` if the AGC cannot be created.
     pub fn new() -> Result<Self, DspError> {
         let demod = AmDemod::new();
-        let agc = Agc::new(
+        let carrier_agc = Agc::new(
             AM_AGC_SET_POINT,
             AM_AGC_ATTACK,
             AM_AGC_DECAY,
@@ -64,6 +86,15 @@ impl AmDemodulator {
             AM_AGC_MAX_OUTPUT,
             AM_AGC_INIT_GAIN,
         )?;
+        let audio_agc = Agc::new(
+            AM_AGC_SET_POINT,
+            AM_AGC_ATTACK,
+            AM_AGC_DECAY,
+            AM_AGC_MAX_GAIN,
+            AM_AGC_MAX_OUTPUT,
+            AM_AGC_INIT_GAIN,
+        )?;
+        let audio_lpf = build_am_lpf(AM_DEFAULT_BANDWIDTH)?;
         let config = DemodConfig {
             if_sample_rate: AM_IF_SAMPLE_RATE,
             af_sample_rate: AM_AF_SAMPLE_RATE,
@@ -83,9 +114,13 @@ impl AmDemodulator {
         };
         Ok(Self {
             demod,
-            agc,
+            carrier_agc,
+            audio_agc,
+            audio_lpf,
             config,
+            carrier_buf: Vec::new(),
             mono_buf: Vec::new(),
+            lpf_buf: Vec::new(),
             agc_buf: Vec::new(),
         })
     }
@@ -99,20 +134,37 @@ impl Demodulator for AmDemodulator {
                 got: output.len(),
             });
         }
-        self.mono_buf.resize(input.len(), 0.0);
-        let count = self.demod.process(input, &mut self.mono_buf)?;
 
-        // Apply AGC to normalize AM audio levels before stereo conversion.
+        // Step 1: Carrier AGC — normalize complex signal before envelope detection.
+        // Stabilizes carrier level across fading, matching C++ CARRIER mode.
+        self.carrier_buf.resize(input.len(), Complex::default());
+        self.carrier_agc
+            .process_complex(input, &mut self.carrier_buf)?;
+
+        // Step 2: Envelope detection (magnitude + DC blocking)
+        self.mono_buf.resize(input.len(), 0.0);
+        let count = self.demod.process(&self.carrier_buf, &mut self.mono_buf)?;
+
+        // Step 3: Audio lowpass — bandwidth-dependent, matching C++ internal LPF
+        self.lpf_buf.resize(count, 0.0);
+        self.audio_lpf
+            .process_f32(&self.mono_buf[..count], &mut self.lpf_buf[..count])?;
+
+        // Step 4: Audio AGC — normalize output audio levels
         self.agc_buf.resize(count, 0.0);
-        self.agc
-            .process_f32(&self.mono_buf[..count], &mut self.agc_buf[..count])?;
+        self.audio_agc
+            .process_f32(&self.lpf_buf[..count], &mut self.agc_buf[..count])?;
 
         sdr_dsp::convert::mono_to_stereo(&self.agc_buf[..count], &mut output[..count])?;
         Ok(count)
     }
 
-    fn set_bandwidth(&mut self, _bw: f64) {
-        // Bandwidth is handled by the VFO channel filter.
+    fn set_bandwidth(&mut self, bw: f64) {
+        // Rebuild internal lowpass at new bandwidth/2
+        match build_am_lpf(bw) {
+            Ok(new_lpf) => self.audio_lpf = new_lpf,
+            Err(e) => tracing::warn!("AM: set_bandwidth({bw}) LPF failed: {e}"),
+        }
     }
 
     fn config(&self) -> &DemodConfig {
@@ -153,12 +205,12 @@ mod tests {
         let mut output = vec![Stereo::default(); 1000];
         let count = demod.process(&input, &mut output).unwrap();
         assert_eq!(count, 1000);
-        // Output should have non-zero audio after DC blocker settles
+        // Output should have non-zero audio after DC blocker + AGC settles
         let peak = output[500..]
             .iter()
             .map(|s| s.l.abs())
             .fold(0.0_f32, f32::max);
-        assert!(peak > 0.1, "AM should extract envelope, peak = {peak}");
+        assert!(peak > 0.01, "AM should extract envelope, peak = {peak}");
         // L and R should match (mono-to-stereo)
         for s in &output {
             assert!(
@@ -166,5 +218,38 @@ mod tests {
                 "mono-to-stereo: L and R should match"
             );
         }
+    }
+
+    #[test]
+    fn test_am_carrier_agc_stabilizes() {
+        let mut demod = AmDemodulator::new().unwrap();
+        // Feed signal with varying carrier amplitude — carrier AGC should stabilize
+        let input: Vec<Complex> = (0..2000)
+            .map(|i| {
+                // Carrier amplitude ramps up
+                let carrier = 0.1 + (i as f32 / 2000.0) * 2.0;
+                Complex::new(carrier, 0.0)
+            })
+            .collect();
+        let mut output = vec![Stereo::default(); 2000];
+        let count = demod.process(&input, &mut output).unwrap();
+        assert_eq!(count, 2000);
+        // After AGC settles, output should be relatively stable despite carrier ramp
+        let late_range: Vec<f32> = output[1500..].iter().map(|s| s.l).collect();
+        let late_max = late_range.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let late_min = late_range.iter().cloned().fold(f32::INFINITY, f32::min);
+        let range = late_max - late_min;
+        assert!(
+            range < 2.0,
+            "carrier AGC should stabilize output, range = {range}"
+        );
+    }
+
+    #[test]
+    fn test_am_set_bandwidth() {
+        let mut demod = AmDemodulator::new().unwrap();
+        // Should not panic
+        demod.set_bandwidth(5_000.0);
+        demod.set_bandwidth(15_000.0);
     }
 }
