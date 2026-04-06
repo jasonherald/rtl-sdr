@@ -17,7 +17,7 @@ use sdr_radio::RadioModule;
 use sdr_rtlsdr::RtlSdrDevice;
 use sdr_sink_audio::AudioSink;
 use sdr_source_rtlsdr::RtlSdrSource;
-use sdr_types::{Complex, Stereo};
+use sdr_types::{Complex, SinkError, Stereo};
 
 use crate::messages::{DspToUi, UiToDsp};
 
@@ -537,7 +537,16 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
                             .audio_sink
                             .write_samples(&state.audio_buf[..audio_count])
                         {
-                            tracing::debug!("audio write: {e}");
+                            // Terminal failures: surface to UI once and stop the sink.
+                            if matches!(e, SinkError::Disconnected | SinkError::NotRunning) {
+                                tracing::warn!("audio sink died: {e}");
+                                let _ = dsp_tx.send(DspToUi::Error(
+                                    "Audio output lost — restart playback".to_string(),
+                                ));
+                                let _ = state.audio_sink.stop();
+                            } else {
+                                tracing::debug!("audio write: {e}");
+                            }
                         }
                     }
                     Err(e) => {

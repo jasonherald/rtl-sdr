@@ -4,8 +4,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
-/// Total number of demod modes in the cycle order.
-const DEMOD_MODE_COUNT: u32 = 8;
+use crate::header::demod_selector::DEMOD_MODE_COUNT;
 
 /// Set up keyboard shortcuts on the application window.
 ///
@@ -146,8 +145,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demod_mode_count_matches_dropdown() {
-        // Sanity: the constant matches the number of demod modes.
-        assert_eq!(DEMOD_MODE_COUNT, 8);
+    fn demod_mode_count_matches_modes() {
+        // Verify the count covers all 8 expected modes.
+        assert_eq!(DEMOD_MODE_COUNT, 8, "expected 8 demod modes");
     }
 }

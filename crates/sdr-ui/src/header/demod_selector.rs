@@ -8,6 +8,10 @@ use sdr_types::DemodMode;
 /// Display labels for each demodulation mode, in dropdown order.
 const DEMOD_LABELS: &[&str] = &["WFM", "NFM", "AM", "USB", "LSB", "DSB", "CW", "RAW"];
 
+/// Number of available demod modes.
+#[allow(clippy::cast_possible_truncation)]
+pub const DEMOD_MODE_COUNT: u32 = DEMOD_LABELS.len() as u32;
+
 /// All demod modes in the same order as `DEMOD_LABELS`.
 const DEMOD_MODES: &[DemodMode] = &[
     DemodMode::Wfm,

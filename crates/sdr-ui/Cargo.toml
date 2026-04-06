@@ -16,7 +16,7 @@ sdr-rtlsdr.workspace = true
 sdr-source-rtlsdr.workspace = true
 sdr-source-network.workspace = true
 sdr-source-file.workspace = true
-sdr-sink-audio.workspace = true
+sdr-sink-audio = { workspace = true, features = ["pipewire"] }
 sdr-sink-network.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
