@@ -21,6 +21,8 @@ use fft_plot::FftPlotRenderer;
 use vfo_overlay::{BwHandle, HitZone, VfoOverlayRenderer, VfoState};
 use waterfall::WaterfallRenderer;
 
+use crate::messages::UiToDsp;
+
 /// Number of FFT bins for the display (used for initial buffer sizing).
 const FFT_SIZE: usize = 1024;
 
@@ -83,7 +85,9 @@ impl SpectrumHandle {
 ///
 /// Returns a `(GtkPaned, SpectrumHandle)` — the paned widget for layout,
 /// and a handle for pushing real FFT data into the display.
-pub fn build_spectrum_view() -> (gtk4::Paned, SpectrumHandle) {
+pub fn build_spectrum_view(
+    dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
+) -> (gtk4::Paned, SpectrumHandle) {
     let vfo_state: Rc<RefCell<VfoState>> = Rc::new(RefCell::new(VfoState::default()));
     let fft_state: Rc<RefCell<Option<FftPlotState>>> = Rc::new(RefCell::new(None));
     let waterfall_state: Rc<RefCell<Option<WaterfallState>>> = Rc::new(RefCell::new(None));
@@ -92,8 +96,8 @@ pub fn build_spectrum_view() -> (gtk4::Paned, SpectrumHandle) {
     let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state));
 
     // Attach interaction gestures to both the waterfall and FFT areas.
-    attach_click_gesture(&waterfall_area, &vfo_state);
-    attach_drag_gesture(&waterfall_area, &vfo_state);
+    attach_click_gesture(&waterfall_area, &vfo_state, dsp_tx.clone());
+    attach_drag_gesture(&waterfall_area, &vfo_state, dsp_tx);
     attach_scroll_gesture(&waterfall_area, &vfo_state);
 
     // Also attach scroll-to-zoom on the FFT area for convenience.
@@ -339,7 +343,11 @@ fn create_gl_context_and_waterfall_renderer()
 /// Attach a click-to-tune gesture to a `GtkGLArea`.
 ///
 /// Single-clicking sets the VFO center to the clicked frequency.
-fn attach_click_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
+fn attach_click_gesture(
+    area: &gtk4::GLArea,
+    vfo_state: &Rc<RefCell<VfoState>>,
+    dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
+) {
     let click = gtk4::GestureClick::new();
 
     let vfo_state = Rc::clone(vfo_state);
@@ -352,11 +360,15 @@ fn attach_click_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) 
         let mut vfo = vfo_state.borrow_mut();
         let hz = vfo.pixel_to_hz(x, width);
         vfo.offset_hz = hz;
-        tracing::debug!(offset_hz = vfo.offset_hz, "click-to-tune");
+        let offset = vfo.offset_hz;
+        tracing::debug!(offset_hz = offset, "click-to-tune");
         drop(vfo);
 
-        // Request re-render. The periodic test-data timer also triggers
-        // re-renders of both areas, so the FFT plot overlay updates too.
+        // Send VFO offset to DSP thread for actual tuning
+        if let Err(e) = dsp_tx.send(UiToDsp::SetVfoOffset(offset)) {
+            tracing::warn!("click-to-tune DSP send failed: {e}");
+        }
+
         area.queue_render();
     });
 
@@ -364,7 +376,12 @@ fn attach_click_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) 
 }
 
 /// Attach a drag gesture for VFO center movement and bandwidth handle adjustment.
-fn attach_drag_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
+#[allow(clippy::needless_pass_by_value)]
+fn attach_drag_gesture(
+    area: &gtk4::GLArea,
+    vfo_state: &Rc<RefCell<VfoState>>,
+    dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
+) {
     let drag = gtk4::GestureDrag::new();
 
     // Snapshot of VFO state at drag start, for computing deltas.
@@ -414,6 +431,7 @@ fn attach_drag_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
     let start_offset_update = Rc::clone(&drag_start_offset_hz);
     let start_bw_update = Rc::clone(&drag_start_bw_hz);
     let area_weak_update = area.downgrade();
+    let dsp_tx_update = dsp_tx.clone();
     drag.connect_drag_update(move |_gesture, offset_x, _offset_y| {
         let Some(area) = area_weak_update.upgrade() else {
             return;
@@ -424,6 +442,7 @@ fn attach_drag_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
         if vfo.dragging {
             let delta_hz = vfo.pixels_to_hz(offset_x, width);
             vfo.offset_hz = start_offset_update.get() + delta_hz;
+            let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(vfo.offset_hz));
             area.queue_render();
         } else if let Some(handle) = vfo.bw_dragging {
             let delta_hz = vfo.pixels_to_hz(offset_x, width);
@@ -457,6 +476,8 @@ fn attach_drag_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
                     }
                 }
             }
+            let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(vfo.offset_hz));
+            let _ = dsp_tx_update.send(UiToDsp::SetBandwidth(vfo.bandwidth_hz));
             area.queue_render();
         }
     });

@@ -171,6 +171,10 @@ impl Demodulator for WfmDemodulator {
     fn name(&self) -> &'static str {
         "WFM"
     }
+
+    fn set_stereo(&mut self, enabled: bool) {
+        WfmDemodulator::set_stereo(self, enabled);
+    }
 }
 
 #[cfg(test)]
