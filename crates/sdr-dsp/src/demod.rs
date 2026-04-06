@@ -14,7 +14,7 @@ const INITIAL_SAMPLE: Complex = Complex { re: 1.0, im: 0.0 };
 ///
 /// Uses the conjugate-multiply method (standard in GNU Radio, liquid-dsp):
 /// `out[i] = atan2(cross, dot) * inv_deviation`
-/// where `cross = re[n]*im[n-1] - im[n]*re[n-1]` and
+/// where `cross = im[n]*re[n-1] - re[n]*im[n-1]` and
 ///       `dot   = re[n]*re[n-1] + im[n]*im[n-1]`
 ///
 /// This is mathematically equivalent to phase-difference but:
@@ -596,10 +596,11 @@ mod tests {
         let mut output = vec![0.0_f32; 2];
         demod.process(&input, &mut output).unwrap();
         // Second sample: delta ≈ (-π+0.2) - (π-0.1) = -2π+0.3 → normalized ≈ 0.3
-        // Scaled by 1/deviation = 1/π
+        // Scaled by 1/deviation = 1/π → expected ≈ 0.3/π ≈ 0.0955
+        let expected = 0.3 / PI;
         assert!(
-            output[1].abs() < 1.0,
-            "phase wrap should not produce spike, got {}",
+            (output[1] - expected).abs() < 0.05,
+            "phase-wrap delta mismatch: expected ~{expected}, got {}",
             output[1]
         );
     }

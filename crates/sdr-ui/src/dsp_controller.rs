@@ -155,8 +155,6 @@ struct DspState {
     iq_buf: Vec<Complex>,
     processed_buf: Vec<Complex>,
     fft_buf: Vec<f32>,
-    /// Pre-allocated send buffer — swapped with `fft_buf` to avoid clone.
-    fft_send_buf: Vec<f32>,
     audio_buf: Vec<Stereo>,
 }
 
@@ -199,7 +197,6 @@ impl DspState {
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
-            fft_send_buf: vec![0.0; DEFAULT_FFT_SIZE],
             audio_buf: Vec::new(),
         })
     }
@@ -388,7 +385,6 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     new_frontend.set_fft_rate(state.fft_rate);
                     state.frontend = new_frontend;
                     state.fft_buf = vec![0.0; size];
-                    state.fft_send_buf = vec![0.0; size];
                 }
                 Err(e) => {
                     tracing::warn!("set FFT size failed: {e}");
@@ -630,13 +626,10 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     ) {
         Ok((processed_count, fft_ready)) => {
             // Send FFT data to UI if a new frame is ready.
+            // Replace fft_buf with a fresh zeroed buffer and send the filled one.
             if fft_ready {
-                // Swap buffers so we send the filled one and keep the spare.
-                // The UI thread drops the Vec after consuming; the next FFT
-                // frame reuses the (now-empty) fft_buf which gets refilled.
-                std::mem::swap(&mut state.fft_buf, &mut state.fft_send_buf);
-                let send =
-                    std::mem::replace(&mut state.fft_send_buf, vec![0.0; state.fft_buf.len()]);
+                let fft_len = state.fft_buf.len();
+                let send = std::mem::replace(&mut state.fft_buf, vec![0.0; fft_len]);
                 let _ = dsp_tx.send(DspToUi::FftData(send));
             }
 
