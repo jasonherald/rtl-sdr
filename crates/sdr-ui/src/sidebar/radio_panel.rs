@@ -186,4 +186,12 @@ mod tests {
         assert!(super::DEFAULT_SQUELCH_DB <= super::MAX_SQUELCH_DB);
         assert!(super::SQUELCH_STEP_DB > 0.0);
     };
+
+    /// Compile-time validation that NB level constants are consistent.
+    const _: () = {
+        assert!(super::MIN_NB_LEVEL >= 1.0); // NoiseBlanker requires >= 1.0
+        assert!(super::MIN_NB_LEVEL <= super::MAX_NB_LEVEL);
+        assert!(super::DEFAULT_NB_LEVEL >= super::MIN_NB_LEVEL);
+        assert!(super::DEFAULT_NB_LEVEL <= super::MAX_NB_LEVEL);
+    };
 }
