@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 sdr-types.workspace = true
 sdr-dsp.workspace = true
-sdr-ui = { workspace = true, features = ["pipewire"] }
+sdr-ui.workspace = true
 sdr-pipeline.workspace = true
 sdr-config.workspace = true
 sdr-radio.workspace = true
@@ -24,6 +24,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sdr-ui = { workspace = true, features = ["pipewire"] }
 
 [lints]
 workspace = true
