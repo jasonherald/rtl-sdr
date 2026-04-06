@@ -84,8 +84,8 @@ rustfft = "6"
 # USB
 rusb = "0.9"
 
-# Audio (Linux)
-# pipewire = "0.8"
+# Audio (PipeWire on Linux)
+pipewire = "0.9"
 
 # WAV files
 hound = "3"

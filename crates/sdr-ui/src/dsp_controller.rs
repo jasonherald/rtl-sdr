@@ -12,8 +12,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
+use sdr_pipeline::sink_manager::Sink;
 use sdr_radio::RadioModule;
 use sdr_rtlsdr::RtlSdrDevice;
+use sdr_sink_audio::AudioSink;
 use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, Stereo};
 
@@ -30,6 +32,9 @@ const DEFAULT_FFT_SIZE: usize = 2048;
 
 /// Default sample rate in Hz (2.4 MHz).
 const DEFAULT_SAMPLE_RATE: f64 = 2_400_000.0;
+
+/// Default decimation ratio (2.4M / 8 = 300 kHz effective rate).
+const DEFAULT_DECIMATION: u32 = 8;
 
 /// Default center frequency in Hz (100 MHz — FM broadcast).
 const DEFAULT_CENTER_FREQ: f64 = 100_000_000.0;
@@ -111,10 +116,10 @@ struct DspState {
     device: Option<RtlSdrDevice>,
     frontend: IqFrontend,
     radio: RadioModule,
+    audio_sink: AudioSink,
     running: bool,
     center_freq: f64,
     sample_rate: f64,
-    #[allow(dead_code)]
     volume: f32,
 
     // Persisted frontend settings (restored after rebuild)
@@ -134,7 +139,7 @@ impl DspState {
     fn new() -> Result<Self, String> {
         let frontend = IqFrontend::new(
             DEFAULT_SAMPLE_RATE,
-            1, // no decimation
+            DEFAULT_DECIMATION,
             DEFAULT_FFT_SIZE,
             FftWindow::Nuttall,
             true, // DC blocking on by default
@@ -148,6 +153,7 @@ impl DspState {
             device: None,
             frontend,
             radio,
+            audio_sink: AudioSink::new(),
             running: false,
             center_freq: DEFAULT_CENTER_FREQ,
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -176,6 +182,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::info!("starting DSP pipeline");
             match open_device(state) {
                 Ok(()) => {
+                    // Start the audio sink -- if it fails, log but continue
+                    // so the spectrum display still works.
+                    if let Err(e) = state.audio_sink.start() {
+                        tracing::warn!("audio sink failed to start (spectrum still works): {e}");
+                        let _ = dsp_tx.send(DspToUi::Error(format!("Audio output failed: {e}")));
+                    }
                     state.running = true;
                     tracing::info!("DSP pipeline started");
                 }
@@ -407,6 +419,12 @@ fn open_device(state: &mut DspState) -> Result<(), String> {
 
     rebuild_frontend(state)?;
 
+    // Configure the radio module's input resampler for the effective sample rate.
+    let effective_rate = state.frontend.effective_sample_rate();
+    if let Err(e) = state.radio.set_input_sample_rate(effective_rate) {
+        tracing::warn!("failed to set radio input sample rate: {e}");
+    }
+
     tracing::info!(
         sample_rate = state.sample_rate,
         center_freq = state.center_freq,
@@ -417,6 +435,11 @@ fn open_device(state: &mut DspState) -> Result<(), String> {
 
 /// Stop the device and release resources.
 fn cleanup(state: &mut DspState) {
+    // Stop the audio sink first so it doesn't try to read stale data.
+    if let Err(e) = state.audio_sink.stop() {
+        tracing::debug!("audio sink stop: {e}");
+    }
+
     // Dropping the device closes the USB handle.
     state.device = None;
     tracing::info!("RTL-SDR device closed");
@@ -435,6 +458,14 @@ fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
 
     new_frontend.set_invert_iq(state.invert_iq);
     state.frontend = new_frontend;
+
+    // Update the radio module's input resampler for the new effective rate.
+    let effective_rate = state.frontend.effective_sample_rate();
+    state
+        .radio
+        .set_input_sample_rate(effective_rate)
+        .map_err(|e| format!("radio input resample: {e}"))?;
+
     Ok(())
 }
 
@@ -490,8 +521,20 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
                     &state.processed_buf[..processed_count],
                     &mut state.audio_buf,
                 ) {
-                    Ok(_audio_count) => {
-                        // Audio sink output will be connected in a future PR.
+                    Ok(audio_count) => {
+                        // Apply volume scaling.
+                        for s in &mut state.audio_buf[..audio_count] {
+                            s.l *= state.volume;
+                            s.r *= state.volume;
+                        }
+
+                        // Send to PipeWire for playback.
+                        if let Err(e) = state
+                            .audio_sink
+                            .write_samples(&state.audio_buf[..audio_count])
+                        {
+                            tracing::debug!("audio write: {e}");
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("radio processing error: {e}");

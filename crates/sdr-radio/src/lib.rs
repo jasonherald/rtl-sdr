@@ -9,10 +9,14 @@ pub mod demod;
 pub mod if_chain;
 
 use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, DEEMPHASIS_TAU_US};
+use sdr_dsp::multirate::RationalResampler;
 use sdr_types::{Complex, DemodMode, DspError, Stereo};
 
 use af_chain::AfChain;
 use demod::{DemodConfig, Demodulator, create_demodulator};
+
+/// Tolerance for considering two sample rates equal (skip resampling).
+const RATE_TOLERANCE: f64 = 1.0;
 use if_chain::IfChain;
 
 /// Default audio output sample rate (Hz).
@@ -65,8 +69,14 @@ pub struct RadioModule {
     af_chain: AfChain,
     deemp_mode: DeemphasisMode,
     audio_sample_rate: f64,
-    /// Scratch buffer for IF chain output (complex, at IF sample rate).
+    /// Input sample rate from the IQ frontend (Hz).
+    input_sample_rate: f64,
+    /// Resampler from input rate to demod IF rate (None if rates match).
+    input_resampler: Option<RationalResampler>,
+    /// Scratch buffer for IF chain output (complex, at input sample rate).
     if_buf: Vec<Complex>,
+    /// Scratch buffer for resampled IQ (at demod IF rate).
+    resamp_buf: Vec<Complex>,
     /// Scratch buffer for demod output (stereo, at AF sample rate).
     demod_buf: Vec<Stereo>,
 }
@@ -92,7 +102,10 @@ impl RadioModule {
             af_chain,
             deemp_mode: DeemphasisMode::None,
             audio_sample_rate,
+            input_sample_rate: 0.0,
+            input_resampler: None,
             if_buf: Vec::new(),
+            resamp_buf: Vec::new(),
             demod_buf: Vec::new(),
         })
     }
@@ -123,15 +136,22 @@ impl RadioModule {
         let new_demod = create_demodulator(mode).map_err(|e| {
             RadioError::ModeSwitchFailed(format!("failed to create demod for {mode:?}: {e}"))
         })?;
-        let cfg = new_demod.config();
+
+        // Extract config values before moving new_demod
+        let af_rate = new_demod.config().af_sample_rate;
+        let if_rate = new_demod.config().if_sample_rate;
+        let deemp_allowed = new_demod.config().deemp_allowed;
+        let fm_if_nr_allowed = new_demod.config().fm_if_nr_allowed;
+        let nb_allowed = new_demod.config().nb_allowed;
+        let squelch_allowed = new_demod.config().squelch_allowed;
 
         // Reconfigure AF chain for the new AF sample rate
-        let new_af_chain = AfChain::new(cfg.af_sample_rate, self.audio_sample_rate)
+        let new_af_chain = AfChain::new(af_rate, self.audio_sample_rate)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to create AF chain: {e}")))?;
 
         // Apply deemphasis if the mode supports it
         let mut af_chain = new_af_chain;
-        if cfg.deemp_allowed && self.deemp_mode != DeemphasisMode::None {
+        if deemp_allowed && self.deemp_mode != DeemphasisMode::None {
             af_chain
                 .set_deemp_enabled(true, self.deemp_mode.tau())
                 .map_err(|e| {
@@ -140,19 +160,32 @@ impl RadioModule {
         }
 
         // Update IF chain feature flags based on new mode capabilities
-        if !cfg.fm_if_nr_allowed {
+        if !fm_if_nr_allowed {
             self.if_chain.set_fm_if_nr_enabled(false);
         }
-        if !cfg.nb_allowed {
+        if !nb_allowed {
             self.if_chain.set_nb_enabled(false);
         }
-        if !cfg.squelch_allowed {
+        if !squelch_allowed {
             self.if_chain.set_squelch_enabled(false);
         }
 
         self.mode = mode;
         self.demod = new_demod;
         self.af_chain = af_chain;
+
+        // Rebuild input resampler for the new demod's IF rate
+        if self.input_sample_rate > 0.0 {
+            if (self.input_sample_rate - if_rate).abs() < RATE_TOLERANCE {
+                self.input_resampler = None;
+            } else {
+                self.input_resampler = Some(
+                    RationalResampler::new(self.input_sample_rate, if_rate).map_err(|e| {
+                        RadioError::ModeSwitchFailed(format!("input resampler: {e}"))
+                    })?,
+                );
+            }
+        }
 
         tracing::debug!("switched to mode {:?}", mode);
         Ok(())
@@ -165,8 +198,16 @@ impl RadioModule {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn max_output_samples(&self, input_count: usize) -> usize {
         let cfg = self.demod.config();
-        let ratio = (self.audio_sample_rate / cfg.af_sample_rate).ceil() as usize;
-        input_count * ratio.max(1) + 16
+        // Account for input resampling (input_rate → IF rate) + AF resampling (AF rate → audio rate)
+        let input_ratio = if self.input_sample_rate > 0.0 {
+            (cfg.if_sample_rate / self.input_sample_rate).max(1.0)
+        } else {
+            1.0
+        };
+        let af_ratio = (self.audio_sample_rate / cfg.af_sample_rate).ceil() as usize;
+        #[allow(clippy::cast_precision_loss)]
+        let resampled_input = ((input_count as f64) * input_ratio).ceil() as usize + 16;
+        resampled_input * af_ratio.max(1) + 16
     }
 
     /// Process complex IQ samples through the full radio chain.
@@ -196,9 +237,32 @@ impl RadioModule {
         self.if_buf.resize(n, Complex::default());
         self.if_chain.process(input, &mut self.if_buf)?;
 
+        // Stage 1.5: Resample from input rate to demod IF rate (if needed)
+        let demod_input = if let Some(resampler) = &mut self.input_resampler {
+            // Estimate output size: input * (if_rate / input_rate) + padding
+            let if_rate = self.demod.config().if_sample_rate;
+            let ratio = if_rate / self.input_sample_rate;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let est_out = ((n as f64) * ratio).ceil() as usize + 16;
+            self.resamp_buf.resize(est_out, Complex::default());
+            resampler.process(&self.if_buf[..n], &mut self.resamp_buf)?
+        } else {
+            n
+        };
+
+        let demod_src = if self.input_resampler.is_some() {
+            &self.resamp_buf[..demod_input]
+        } else {
+            &self.if_buf[..n]
+        };
+
         // Stage 2: Demodulation
-        self.demod_buf.resize(n, Stereo::default());
-        let demod_count = self.demod.process(&self.if_buf[..n], &mut self.demod_buf)?;
+        self.demod_buf.resize(demod_input, Stereo::default());
+        let demod_count = self.demod.process(demod_src, &mut self.demod_buf)?;
 
         // Stage 3: AF chain (deemphasis + resampling)
         let af_count = self
@@ -206,6 +270,27 @@ impl RadioModule {
             .process(&self.demod_buf[..demod_count], output)?;
 
         Ok(af_count)
+    }
+
+    /// Set the input sample rate from the IQ frontend.
+    ///
+    /// This configures an internal resampler to convert from the actual
+    /// input rate to the demod's expected IF sample rate. Call this whenever
+    /// the frontend's effective sample rate changes (decimation, sample rate).
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if the resampler cannot be created.
+    pub fn set_input_sample_rate(&mut self, rate: f64) -> Result<(), RadioError> {
+        self.input_sample_rate = rate;
+        let if_rate = self.demod.config().if_sample_rate;
+        if (rate - if_rate).abs() < RATE_TOLERANCE {
+            self.input_resampler = None;
+        } else {
+            self.input_resampler =
+                Some(RationalResampler::new(rate, if_rate).map_err(RadioError::Dsp)?);
+        }
+        Ok(())
     }
 
     /// Set the channel bandwidth.

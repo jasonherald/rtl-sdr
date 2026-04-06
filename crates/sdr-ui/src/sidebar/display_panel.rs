@@ -34,7 +34,7 @@ pub struct DisplayPanel {
 pub fn build_display_panel() -> DisplayPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Display")
-        .description("Spectrum & waterfall settings")
+        .description("Spectrum and waterfall settings")
         .build();
 
     // --- FFT Size ---

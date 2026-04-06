@@ -207,7 +207,7 @@ fn connect_device_visibility(
 pub fn build_source_panel() -> SourcePanel {
     let group = adw::PreferencesGroup::builder()
         .title("Source")
-        .description("Device & input configuration")
+        .description("Device and input configuration")
         .build();
 
     // File source omitted until a file picker is implemented.

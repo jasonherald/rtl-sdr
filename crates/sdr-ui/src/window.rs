@@ -63,20 +63,19 @@ pub fn build_window(app: &adw::Application) {
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
 
+    // Toast overlay wraps the toolbar view for error notifications.
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&toolbar_view));
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("SDR-RS")
         .default_width(DEFAULT_WIDTH)
         .default_height(DEFAULT_HEIGHT)
-        .content(&toolbar_view)
+        .content(&toast_overlay)
         .build();
 
     window.add_breakpoint(breakpoint);
-
-    // Toast overlay for error messages.
-    let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&toolbar_view));
-    window.set_content(Some(&toast_overlay));
 
     // Set initial status bar values.
     status_bar.update_demod("WFM", DEFAULT_WFM_BANDWIDTH_HZ);
