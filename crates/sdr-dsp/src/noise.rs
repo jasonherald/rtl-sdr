@@ -179,7 +179,7 @@ const FM_IF_NR_FFT_SIZE: usize = 256;
 /// Matches C++ implementation:
 /// - Nuttall window applied before FFT (reduces spectral leakage)
 /// - Keeps exactly 1 peak bin (most selective noise rejection)
-/// - 50% overlap processing for smooth output transitions
+/// - Block-based processing with internal buffering
 pub struct FmIfNoiseReduction {
     fft_forward: Arc<dyn Fft<f32>>,
     fft_inverse: Arc<dyn Fft<f32>>,
@@ -347,6 +347,10 @@ impl FmIfNoiseReduction {
 #[allow(clippy::unwrap_used, clippy::float_cmp, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
+    use rustfft::FftPlanner;
+
+    /// Minimum energy ratio for NR tone preservation test.
+    const MIN_ENERGY_RATIO: f32 = 0.05;
 
     // --- Power Squelch tests ---
 
@@ -477,14 +481,35 @@ mod tests {
         let count = nr.process(&input, &mut output).unwrap();
         assert_eq!(count, fft_size);
 
-        // Output should have meaningful energy (tone preserved in peak bin).
-        // With Nuttall window + single-bin selection, energy ratio is lower
-        // than passthrough (~10-15%) but the dominant frequency is preserved.
+        // Verify the dominant output bin matches the input tone bin.
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let mut spectrum: Vec<RustFftComplex<f32>> = output
+            .iter()
+            .map(|s| RustFftComplex::new(s.re, s.im))
+            .collect();
+        fft.process(&mut spectrum);
+        let dominant_bin = spectrum
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                let ma = a.1.re * a.1.re + a.1.im * a.1.im;
+                let mb = b.1.re * b.1.re + b.1.im * b.1.im;
+                ma.partial_cmp(&mb).unwrap()
+            })
+            .map_or(0, |(i, _)| i);
+        assert_eq!(
+            dominant_bin, tone_bin,
+            "recovered dominant bin should match tone_bin"
+        );
+
+        // Energy should be above a minimum floor (Nuttall window + single-bin
+        // selection reduces passthrough to ~10-15%).
         let energy: f32 = output.iter().map(|s| s.re * s.re + s.im * s.im).sum();
         let input_energy: f32 = input.iter().map(|s| s.re * s.re + s.im * s.im).sum();
         assert!(
-            energy > input_energy * 0.05,
-            "tone should be preserved, energy ratio = {}",
+            energy > input_energy * MIN_ENERGY_RATIO,
+            "tone energy ratio {} below MIN_ENERGY_RATIO {MIN_ENERGY_RATIO}",
             energy / input_energy
         );
     }

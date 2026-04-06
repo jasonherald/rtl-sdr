@@ -126,7 +126,7 @@ impl IqFrontend {
         };
 
         #[allow(clippy::cast_sign_loss)]
-        let fft_skip_samples = (effective_sample_rate / DEFAULT_FFT_RATE).round() as usize;
+        let fft_skip_samples = (effective_sample_rate / DEFAULT_FFT_RATE).round().max(1.0) as usize;
 
         Ok(Self {
             sample_rate,
@@ -181,7 +181,9 @@ impl IqFrontend {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn set_fft_rate(&mut self, fps: f64) {
         self.fft_rate = fps.max(1.0);
-        self.fft_skip_samples = (self.effective_sample_rate / self.fft_rate).round() as usize;
+        self.fft_skip_samples = (self.effective_sample_rate / self.fft_rate)
+            .round()
+            .max(1.0) as usize;
         self.fft_skip_counter = 0;
         self.fft_accumulating = true;
     }
@@ -249,7 +251,7 @@ impl IqFrontend {
         // Recalculate FFT rate control for new effective sample rate
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         {
-            self.fft_skip_samples = (new_effective_rate / self.fft_rate).round() as usize;
+            self.fft_skip_samples = (new_effective_rate / self.fft_rate).round().max(1.0) as usize;
         }
         self.fft_skip_counter = 0;
         self.fft_accumulating = true;

@@ -106,6 +106,8 @@ mod tests {
         let cfg = demod.config();
         assert!((cfg.if_sample_rate - 3_000.0).abs() < f64::EPSILON);
         assert!((cfg.default_bandwidth - 200.0).abs() < f64::EPSILON);
+        assert!((cfg.max_bandwidth - 500.0).abs() < f64::EPSILON);
+        assert!(!cfg.nb_allowed);
         assert!(!cfg.squelch_allowed);
     }
 

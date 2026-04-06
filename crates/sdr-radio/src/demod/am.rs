@@ -62,12 +62,17 @@ pub struct AmDemodulator {
     agc_buf: Vec<f32>,
 }
 
-/// Build a lowpass FIR for AM audio filtering at the given bandwidth.
-fn build_am_lpf(bandwidth: f64) -> Result<FirFilter, DspError> {
+/// Build lowpass FIR taps for AM audio filtering at the given bandwidth.
+/// Returns `None` if cutoff is at or above Nyquist (no filter needed).
+fn build_am_lpf_taps(bandwidth: f64) -> Result<Option<Vec<f32>>, DspError> {
     let cutoff = bandwidth / 2.0;
-    let transition = cutoff * AM_LPF_TRANSITION_RATIO;
+    let nyquist = AM_IF_SAMPLE_RATE / 2.0;
+    if cutoff >= nyquist - 1.0 {
+        return Ok(None); // bandwidth spans full IF — bypass LPF
+    }
+    let transition = (cutoff * AM_LPF_TRANSITION_RATIO).min(nyquist - cutoff - 1.0);
     let lpf_taps = taps::low_pass(cutoff, transition, AM_IF_SAMPLE_RATE, false)?;
-    FirFilter::new(lpf_taps)
+    Ok(Some(lpf_taps))
 }
 
 impl AmDemodulator {
@@ -94,7 +99,10 @@ impl AmDemodulator {
             AM_AGC_MAX_OUTPUT,
             AM_AGC_INIT_GAIN,
         )?;
-        let audio_lpf = build_am_lpf(AM_DEFAULT_BANDWIDTH)?;
+        let audio_lpf = match build_am_lpf_taps(AM_DEFAULT_BANDWIDTH)? {
+            Some(taps) => FirFilter::new(taps)?,
+            None => FirFilter::new(vec![1.0])?, // passthrough
+        };
         let config = DemodConfig {
             if_sample_rate: AM_IF_SAMPLE_RATE,
             af_sample_rate: AM_AF_SAMPLE_RATE,
@@ -160,9 +168,17 @@ impl Demodulator for AmDemodulator {
     }
 
     fn set_bandwidth(&mut self, bw: f64) {
-        // Rebuild internal lowpass at new bandwidth/2
-        match build_am_lpf(bw) {
-            Ok(new_lpf) => self.audio_lpf = new_lpf,
+        // Retune internal lowpass in place (preserves delay line for seamless transition)
+        match build_am_lpf_taps(bw) {
+            Ok(Some(taps)) => {
+                if let Err(e) = self.audio_lpf.set_taps(taps) {
+                    tracing::warn!("AM: set_bandwidth({bw}) set_taps failed: {e}");
+                }
+            }
+            Ok(None) => {
+                // Bandwidth at Nyquist — bypass LPF with passthrough tap
+                let _ = self.audio_lpf.set_taps(vec![1.0]);
+            }
             Err(e) => tracing::warn!("AM: set_bandwidth({bw}) LPF failed: {e}"),
         }
     }

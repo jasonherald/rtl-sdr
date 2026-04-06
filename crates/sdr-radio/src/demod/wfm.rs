@@ -113,6 +113,11 @@ impl WfmDemodulator {
     /// to produce independent L/R channels. When disabled (default), both
     /// channels receive the same mono (L+R) signal.
     pub fn set_stereo(&mut self, enabled: bool) {
+        if self.stereo != enabled {
+            // Reset stateful blocks to avoid stale history from the inactive path
+            self.audio_lpf.reset();
+            self.stereo_decoder.reset();
+        }
         self.stereo = enabled;
         if enabled {
             tracing::info!("WFM stereo decode enabled");
@@ -228,5 +233,17 @@ mod tests {
         let mut output = vec![Stereo::default(); len];
         let count = demod.process(&input, &mut output).unwrap();
         assert_eq!(count, len);
+
+        // Verify channel separation — stereo path should not collapse to dual-mono
+        let settle = 2000;
+        let mean_sep = output[settle..]
+            .iter()
+            .map(|s| (s.l - s.r).abs())
+            .sum::<f32>()
+            / (len - settle) as f32;
+        assert!(
+            mean_sep > 1e-3,
+            "stereo path should not collapse to dual-mono, mean_sep = {mean_sep}"
+        );
     }
 }

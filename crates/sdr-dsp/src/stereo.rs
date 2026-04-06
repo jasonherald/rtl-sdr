@@ -140,11 +140,9 @@ impl FmStereoDecoder {
 
         for (i, pilot) in self.pilot_buf.iter().enumerate() {
             // Feed pilot to PLL as complex signal (real=pilot, im=0)
-            let pilot_complex = sdr_types::Complex::new(*pilot, 0.0);
+            let pilot_complex = [sdr_types::Complex::new(*pilot, 0.0)];
             let mut pll_out = [sdr_types::Complex::default()];
-            self.pilot_pll
-                .process(&[pilot_complex], &mut pll_out)
-                .expect("PLL single sample should not fail");
+            self.pilot_pll.process(&pilot_complex, &mut pll_out)?;
 
             // Double the PLL phase: 19 kHz → 38 kHz subcarrier.
             // cos(2θ) = cos²(θ) − sin²(θ), using the PLL phasor components.
