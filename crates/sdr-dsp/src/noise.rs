@@ -170,27 +170,25 @@ impl NoiseBlanker {
 /// Default FFT size for FM IF noise reduction.
 const FM_IF_NR_FFT_SIZE: usize = 256;
 
-/// Number of bins around the peak to preserve (radius on each side).
-const FM_IF_NR_PEAK_RADIUS: usize = 2;
-
 /// FM IF noise reduction — frequency-domain peak tracking.
 ///
 /// Ports SDR++ `dsp::noise_reduction::FMIF`. Uses FFT to find the dominant
 /// frequency bin and reconstructs the signal from that bin only, effectively
 /// removing noise from narrow FM signals.
 ///
-/// The algorithm:
-/// 1. Forward FFT the input block
-/// 2. Find the bin with maximum magnitude
-/// 3. Zero all bins outside a narrow window around the peak
-/// 4. Inverse FFT to reconstruct the cleaned signal
+/// Matches C++ implementation:
+/// - Nuttall window applied before FFT (reduces spectral leakage)
+/// - Keeps exactly 1 peak bin (most selective noise rejection)
+/// - Block-based processing with internal buffering
 pub struct FmIfNoiseReduction {
     fft_forward: Arc<dyn Fft<f32>>,
     fft_inverse: Arc<dyn Fft<f32>>,
     fft_size: usize,
     fft_buf: Vec<RustFftComplex<f32>>,
     scratch: Vec<RustFftComplex<f32>>,
-    /// Overlap buffer for input blocks smaller than FFT size.
+    /// Precomputed Nuttall window coefficients.
+    window: Vec<f32>,
+    /// Input accumulation buffer.
     overlap_buf: Vec<Complex>,
     overlap_count: usize,
 }
@@ -212,6 +210,7 @@ impl FmIfNoiseReduction {
     /// # Errors
     ///
     /// Returns `DspError::InvalidParameter` if `fft_size` is 0.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     pub fn with_fft_size(fft_size: usize) -> Result<Self, DspError> {
         if fft_size == 0 {
             return Err(DspError::InvalidParameter(
@@ -227,12 +226,18 @@ impl FmIfNoiseReduction {
         let scratch = vec![RustFftComplex::new(0.0, 0.0); scratch_len];
         let fft_buf = vec![RustFftComplex::new(0.0, 0.0); fft_size];
 
+        // Precompute Nuttall window — matches C++ per-sample sliding window approach.
+        let window: Vec<f32> = (0..fft_size)
+            .map(|i| crate::window::nuttall(i as f64, fft_size as f64) as f32)
+            .collect();
+
         Ok(Self {
             fft_forward,
             fft_inverse,
             fft_size,
             fft_buf,
             scratch,
+            window,
             overlap_buf: vec![Complex::default(); fft_size],
             overlap_count: 0,
         })
@@ -272,18 +277,22 @@ impl FmIfNoiseReduction {
 
             // Process a complete block when we have enough samples.
             if self.overlap_count == self.fft_size {
-                // Guard: ensure output has room for a full FFT block.
                 if out_pos + self.fft_size <= output.len() {
                     self.process_block(&mut output[out_pos..out_pos + self.fft_size]);
                     out_pos += self.fft_size;
+                    self.overlap_count = 0;
+                } else {
+                    // Output too small for this block — keep it buffered for next call.
+                    break;
                 }
-                self.overlap_count = 0;
             }
         }
 
-        // Copy through any partial block samples that weren't processed yet.
-        // This ensures output count matches input count for downstream consumers.
-        if self.overlap_count > 0 && out_pos < input.len() {
+        // Pass through unprocessed tail samples so output count matches input.
+        // These samples are buffered in overlap_buf for the next FFT block;
+        // copy the original input (not overlap_buf which may contain stale data
+        // from prior calls) to maintain correct signal flow.
+        if out_pos < input.len() {
             let remaining = input.len() - out_pos;
             output[out_pos..out_pos + remaining].copy_from_slice(&input[input.len() - remaining..]);
             out_pos += remaining;
@@ -292,22 +301,24 @@ impl FmIfNoiseReduction {
         Ok(out_pos)
     }
 
-    /// Process a single FFT-size block: forward FFT, peak-select, inverse FFT.
+    /// Process a single FFT-size block: window, FFT, single-peak select, IFFT.
     #[allow(clippy::cast_precision_loss)]
     fn process_block(&mut self, output: &mut [Complex]) {
         let n = self.fft_size;
         let inv_n = 1.0 / n as f32;
 
-        // Copy overlap buffer into FFT working buffer.
+        // Apply Nuttall window and copy to FFT buffer.
+        // Window reduces spectral leakage for more precise peak detection.
         for (i, s) in self.overlap_buf[..n].iter().enumerate() {
-            self.fft_buf[i] = RustFftComplex::new(s.re, s.im);
+            let w = self.window[i];
+            self.fft_buf[i] = RustFftComplex::new(s.re * w, s.im * w);
         }
 
         // Forward FFT.
         self.fft_forward
             .process_with_scratch(&mut self.fft_buf, &mut self.scratch);
 
-        // Find the bin with maximum magnitude.
+        // Find the single bin with maximum magnitude — matches C++ keeping exactly 1 bin.
         let mut peak_bin = 0;
         let mut peak_mag = 0.0_f32;
         for (i, bin) in self.fft_buf.iter().enumerate() {
@@ -318,24 +329,12 @@ impl FmIfNoiseReduction {
             }
         }
 
-        // Zero all bins outside a narrow window around the peak.
-        for (i, bin) in self.fft_buf.iter_mut().enumerate() {
-            // Compute circular distance from peak bin.
-            let dist_fwd = if i >= peak_bin {
-                i - peak_bin
-            } else {
-                n - peak_bin + i
-            };
-            let dist_rev = if peak_bin >= i {
-                peak_bin - i
-            } else {
-                n - i + peak_bin
-            };
-            let dist = dist_fwd.min(dist_rev);
-            if dist > FM_IF_NR_PEAK_RADIUS {
-                *bin = RustFftComplex::new(0.0, 0.0);
-            }
+        // Zero all bins except the single peak — most selective noise rejection.
+        let peak_val = self.fft_buf[peak_bin];
+        for bin in &mut self.fft_buf {
+            *bin = RustFftComplex::new(0.0, 0.0);
         }
+        self.fft_buf[peak_bin] = peak_val;
 
         // Inverse FFT.
         self.fft_inverse
@@ -352,6 +351,10 @@ impl FmIfNoiseReduction {
 #[allow(clippy::unwrap_used, clippy::float_cmp, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
+    use rustfft::FftPlanner;
+
+    /// Minimum energy ratio for NR tone preservation test.
+    const MIN_ENERGY_RATIO: f32 = 0.05;
 
     // --- Power Squelch tests ---
 
@@ -482,12 +485,35 @@ mod tests {
         let count = nr.process(&input, &mut output).unwrap();
         assert_eq!(count, fft_size);
 
-        // Output should have significant energy (tone preserved).
+        // Verify the dominant output bin matches the input tone bin.
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let mut spectrum: Vec<RustFftComplex<f32>> = output
+            .iter()
+            .map(|s| RustFftComplex::new(s.re, s.im))
+            .collect();
+        fft.process(&mut spectrum);
+        let dominant_bin = spectrum
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                let ma = a.1.re * a.1.re + a.1.im * a.1.im;
+                let mb = b.1.re * b.1.re + b.1.im * b.1.im;
+                ma.partial_cmp(&mb).unwrap()
+            })
+            .map_or(0, |(i, _)| i);
+        assert_eq!(
+            dominant_bin, tone_bin,
+            "recovered dominant bin should match tone_bin"
+        );
+
+        // Energy should be above a minimum floor (Nuttall window + single-bin
+        // selection reduces passthrough to ~10-15%).
         let energy: f32 = output.iter().map(|s| s.re * s.re + s.im * s.im).sum();
         let input_energy: f32 = input.iter().map(|s| s.re * s.re + s.im * s.im).sum();
         assert!(
-            energy > input_energy * 0.5,
-            "tone should be mostly preserved, energy ratio = {}",
+            energy > input_energy * MIN_ENERGY_RATIO,
+            "tone energy ratio {} below MIN_ENERGY_RATIO {MIN_ENERGY_RATIO}",
             energy / input_energy
         );
     }

@@ -65,6 +65,27 @@ impl Quadrature {
         Self::new(dev)
     }
 
+    /// Update the deviation in-place, preserving phase state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `deviation` is non-positive or non-finite.
+    pub fn set_deviation(&mut self, deviation: f32) -> Result<(), DspError> {
+        if !deviation.is_finite() || deviation <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "deviation must be positive and finite, got {deviation}"
+            )));
+        }
+        let inv = 1.0 / deviation;
+        if !inv.is_finite() {
+            return Err(DspError::InvalidParameter(format!(
+                "deviation is too small to represent safely, got {deviation}"
+            )));
+        }
+        self.inv_deviation = inv;
+        Ok(())
+    }
+
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
         self.last_phase = 0.0;
@@ -179,6 +200,31 @@ impl FmDemod {
         Ok(Self {
             quad: Quadrature::from_hz(deviation_hz, sample_rate)?,
         })
+    }
+
+    /// Update deviation in-place, preserving phase state for seamless transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if parameters are invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn set_deviation_hz(
+        &mut self,
+        deviation_hz: f64,
+        sample_rate: f64,
+    ) -> Result<(), DspError> {
+        if !deviation_hz.is_finite() || deviation_hz <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "deviation_hz must be positive and finite, got {deviation_hz}"
+            )));
+        }
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate must be positive and finite, got {sample_rate}"
+            )));
+        }
+        let dev = math::hz_to_rads(deviation_hz, sample_rate) as f32;
+        self.quad.set_deviation(dev)
     }
 
     /// Reset the demodulator state.

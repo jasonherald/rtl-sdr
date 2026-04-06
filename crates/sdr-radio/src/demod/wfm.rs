@@ -2,6 +2,7 @@
 
 use sdr_dsp::demod::BroadcastFmDemod;
 use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, FirFilter};
+use sdr_dsp::stereo::FmStereoDecoder;
 use sdr_dsp::taps;
 use sdr_types::{Complex, DspError, Stereo};
 
@@ -34,30 +35,25 @@ const WFM_SNAP_INTERVAL: f64 = 100_000.0;
 
 /// Wideband FM demodulator using `BroadcastFmDemod` from sdr-dsp.
 ///
-/// Produces dual-mono output (discriminator through 15 kHz LPF, same
-/// signal to both L and R channels).
+/// Supports both mono and stereo output:
+/// - **Mono** (default): discriminator → 15 kHz LPF → dual-mono stereo
+/// - **Stereo**: discriminator → full stereo decode (19 kHz pilot PLL,
+///   38 kHz subcarrier demod, L+R/L−R matrixing)
 ///
-/// A `stereo` flag is available (opt-in, default off) for future stereo
-/// decode matching C++ `broadcast_fm.h`:
-///   1. Extract 19 kHz pilot via bandpass filter
-///   2. PLL lock onto pilot, double to 38 kHz carrier
-///   3. Multiply baseband by 38 kHz carrier to extract L-R
-///   4. LPF the L-R signal at 15 kHz
-///   5. Matrix: L = (L+R + L-R) / 2, R = (L+R - L-R) / 2
-///
-/// Until the stereo pipeline is implemented, output is always dual-mono
-/// regardless of the `stereo` flag.
+/// Stereo decode matches C++ SDR++ `broadcast_fm.h`.
 pub struct WfmDemodulator {
     demod: BroadcastFmDemod,
     /// 15 kHz lowpass filter — removes pilot tone, stereo subcarrier, RDS, noise.
+    /// Used in mono mode.
     audio_lpf: FirFilter,
+    /// FM stereo decoder — pilot PLL, subcarrier extraction, L/R matrixing.
+    /// Used in stereo mode.
+    stereo_decoder: FmStereoDecoder,
     config: DemodConfig,
     mono_buf: Vec<f32>,
     lpf_buf: Vec<f32>,
-    /// When true, perform stereo decode (pilot extraction + L-R matrixing).
+    /// When true, perform stereo decode (pilot extraction + L−R matrixing).
     /// Default: false (mono), matching C++ SDR++ `_stereo = false` default.
-    // TODO(issue #92): implement full stereo decode pipeline (pilot BPF, PLL,
-    // 38 kHz carrier multiply, L-R extraction, stereo matrix).
     stereo: bool,
 }
 
@@ -81,6 +77,8 @@ impl WfmDemodulator {
         )?;
         let audio_lpf = FirFilter::new(lpf_taps)?;
 
+        let stereo_decoder = FmStereoDecoder::new(WFM_IF_SAMPLE_RATE)?;
+
         let config = DemodConfig {
             if_sample_rate: WFM_IF_SAMPLE_RATE,
             af_sample_rate: WFM_AF_SAMPLE_RATE,
@@ -101,6 +99,7 @@ impl WfmDemodulator {
         Ok(Self {
             demod,
             audio_lpf,
+            stereo_decoder,
             config,
             mono_buf: Vec::new(),
             lpf_buf: Vec::new(),
@@ -113,13 +112,17 @@ impl WfmDemodulator {
     /// When enabled, the demodulator will perform pilot-tone stereo decode
     /// to produce independent L/R channels. When disabled (default), both
     /// channels receive the same mono (L+R) signal.
-    ///
-    /// Note: stereo decode is not yet implemented — this flag is plumbed for
-    /// future use. Currently always outputs mono regardless of this setting.
     pub fn set_stereo(&mut self, enabled: bool) {
+        if self.stereo != enabled {
+            // Reset stateful blocks to avoid stale history from the inactive path
+            self.audio_lpf.reset();
+            self.stereo_decoder.reset();
+        }
         self.stereo = enabled;
         if enabled {
-            tracing::info!("WFM stereo decode requested (not yet implemented, outputting mono)");
+            tracing::info!("WFM stereo decode enabled");
+        } else {
+            tracing::info!("WFM stereo decode disabled (mono)");
         }
     }
 
@@ -140,13 +143,18 @@ impl Demodulator for WfmDemodulator {
         self.mono_buf.resize(input.len(), 0.0);
         let count = self.demod.process(input, &mut self.mono_buf)?;
 
-        // Apply 15 kHz lowpass to remove pilot, subcarrier, RDS, and noise.
-        self.lpf_buf.resize(count, 0.0);
-        self.audio_lpf
-            .process_f32(&self.mono_buf[..count], &mut self.lpf_buf[..count])?;
+        if self.stereo {
+            // Stereo decode: pilot PLL → 38 kHz subcarrier → L−R → matrix
+            self.stereo_decoder
+                .process(&self.mono_buf[..count], &mut output[..count])?;
+        } else {
+            // Mono: 15 kHz lowpass → dual-mono
+            self.lpf_buf.resize(count, 0.0);
+            self.audio_lpf
+                .process_f32(&self.mono_buf[..count], &mut self.lpf_buf[..count])?;
+            sdr_dsp::convert::mono_to_stereo(&self.lpf_buf[..count], &mut output[..count])?;
+        }
 
-        // Convert filtered mono to stereo (same signal both channels)
-        sdr_dsp::convert::mono_to_stereo(&self.lpf_buf[..count], &mut output[..count])?;
         Ok(count)
     }
 
@@ -166,7 +174,7 @@ impl Demodulator for WfmDemodulator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 
@@ -189,5 +197,53 @@ mod tests {
         let mut output = vec![Stereo::default(); 1000];
         let count = demod.process(&input, &mut output).unwrap();
         assert_eq!(count, 1000);
+    }
+
+    #[test]
+    fn test_wfm_stereo_mode() {
+        let mut demod = WfmDemodulator::new().unwrap();
+        assert!(!demod.is_stereo());
+        demod.set_stereo(true);
+        assert!(demod.is_stereo());
+
+        // Process in stereo mode — should not crash
+        let input = vec![Complex::new(1.0, 0.0); 5000];
+        let mut output = vec![Stereo::default(); 5000];
+        let count = demod.process(&input, &mut output).unwrap();
+        assert_eq!(count, 5000);
+    }
+
+    #[test]
+    fn test_wfm_stereo_produces_different_channels() {
+        let mut demod = WfmDemodulator::new().unwrap();
+        demod.set_stereo(true);
+
+        // Generate composite FM signal with stereo content
+        let len = 10000;
+        let input: Vec<Complex> = (0..len)
+            .map(|i| {
+                let t = i as f32 / 250_000.0;
+                // FM with composite: mono + pilot + stereo subcarrier
+                let phase = core::f32::consts::PI * 2.0 * 1000.0 * t
+                    + 0.1 * (core::f32::consts::PI * 2.0 * 19_000.0 * t).sin()
+                    + 0.3 * (core::f32::consts::PI * 2.0 * 38_000.0 * t).sin();
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+        let mut output = vec![Stereo::default(); len];
+        let count = demod.process(&input, &mut output).unwrap();
+        assert_eq!(count, len);
+
+        // Verify channel separation — stereo path should not collapse to dual-mono
+        let settle = 2000;
+        let mean_sep = output[settle..]
+            .iter()
+            .map(|s| (s.l - s.r).abs())
+            .sum::<f32>()
+            / (len - settle) as f32;
+        assert!(
+            mean_sep > 1e-3,
+            "stereo path should not collapse to dual-mono, mean_sep = {mean_sep}"
+        );
     }
 }

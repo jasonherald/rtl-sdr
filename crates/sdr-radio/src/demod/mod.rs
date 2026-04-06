@@ -18,10 +18,10 @@ mod wfm;
 
 /// AGC set point (target output amplitude) for SSB modes.
 pub(crate) const SSB_AGC_SET_POINT: f32 = 1.0;
-/// AGC attack coefficient for SSB modes.
-pub(crate) const SSB_AGC_ATTACK: f32 = 0.001;
-/// AGC decay coefficient for SSB modes.
-pub(crate) const SSB_AGC_DECAY: f32 = 0.0001;
+/// AGC attack coefficient for SSB modes — matches C++ SDR++ (1/480).
+pub(crate) const SSB_AGC_ATTACK: f32 = 0.002_083_333;
+/// AGC decay coefficient for SSB modes — matches C++ SDR++ (1/4800).
+pub(crate) const SSB_AGC_DECAY: f32 = 0.000_208_333;
 /// AGC maximum gain for SSB modes.
 pub(crate) const SSB_AGC_MAX_GAIN: f32 = 1e6;
 /// AGC maximum output amplitude for SSB modes.
