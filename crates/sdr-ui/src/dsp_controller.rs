@@ -288,9 +288,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 tracing::warn!("set decimation failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Decimation failed: {e}")));
             } else {
-                let _ = dsp_tx.send(DspToUi::SampleRateChanged(
-                    state.frontend.effective_sample_rate(),
-                ));
+                // Update RadioModule for the new effective sample rate.
+                let effective = state.frontend.effective_sample_rate();
+                if let Err(e) = state.radio.set_input_sample_rate(effective) {
+                    tracing::warn!("radio input resample update failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Input resampler failed: {e}")));
+                }
+                let _ = dsp_tx.send(DspToUi::SampleRateChanged(effective));
             }
         }
 

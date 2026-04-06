@@ -1,32 +1,11 @@
 //! Keyboard shortcuts and help overlay for the SDR-RS application.
 
-use std::rc::Rc;
-
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
-use sdr_types::DemodMode;
-
-use crate::header::demod_selector;
-use crate::messages::UiToDsp;
-use crate::state::AppState;
 
 /// Total number of demod modes in the cycle order.
 const DEMOD_MODE_COUNT: u32 = 8;
-
-/// Demod mode cycle order matching the dropdown: NFM -> WFM -> AM -> USB -> LSB -> DSB -> CW -> RAW -> NFM.
-/// The dropdown order is WFM(0), NFM(1), AM(2), USB(3), LSB(4), DSB(5), CW(6), RAW(7).
-/// Cycling goes through the dropdown order: 0 -> 1 -> 2 -> ... -> 7 -> 0.
-const CYCLE_ORDER: [DemodMode; 8] = [
-    DemodMode::Wfm,
-    DemodMode::Nfm,
-    DemodMode::Am,
-    DemodMode::Usb,
-    DemodMode::Lsb,
-    DemodMode::Dsb,
-    DemodMode::Cw,
-    DemodMode::Raw,
-];
 
 /// Set up keyboard shortcuts on the application window.
 ///
@@ -34,9 +13,8 @@ const CYCLE_ORDER: [DemodMode; 8] = [
 /// and attaches a help overlay for `Ctrl+?`.
 pub fn setup_shortcuts(
     window: &adw::ApplicationWindow,
-    state: &Rc<AppState>,
     play_button: &gtk4::ToggleButton,
-    split_view: &adw::OverlaySplitView,
+    sidebar_toggle: &gtk4::ToggleButton,
     demod_dropdown: &gtk4::DropDown,
 ) {
     let controller = gtk4::ShortcutController::new();
@@ -57,38 +35,31 @@ pub fn setup_shortcuts(
         controller.add_shortcut(shortcut);
     }
 
-    // M: Cycle demod mode
-    let state_demod = Rc::clone(state);
+    // M: Cycle demod mode (by advancing the dropdown index — its
+    // `connect_selected_notify` handler dispatches the DSP command).
     let demod_dropdown_weak = demod_dropdown.downgrade();
     let trigger_m = gtk4::ShortcutTrigger::parse_string("m");
     if let Some(trigger) = trigger_m {
         let action = gtk4::CallbackAction::new(move |_widget, _args| {
-            let current = state_demod.demod_mode.get();
-            let next = cycle_demod_mode(current);
-            state_demod.demod_mode.set(next);
-            state_demod.send_dsp(UiToDsp::SetDemodMode(next));
-            tracing::debug!(?next, "demod mode cycled via shortcut");
-
-            // Update the dropdown to reflect the new mode.
-            if let Some(dd) = demod_dropdown_weak.upgrade()
-                && let Some(idx) = demod_selector::demod_mode_to_index(next)
-            {
-                dd.set_selected(idx);
+            if let Some(dd) = demod_dropdown_weak.upgrade() {
+                let next_idx = (dd.selected() + 1) % DEMOD_MODE_COUNT;
+                dd.set_selected(next_idx);
+                return glib::Propagation::Stop;
             }
-
-            glib::Propagation::Stop
+            glib::Propagation::Proceed
         });
         let shortcut = gtk4::Shortcut::new(Some(trigger), Some(action));
         controller.add_shortcut(shortcut);
     }
 
-    // F9: Toggle sidebar visibility
-    let split_view_weak = split_view.downgrade();
+    // F9: Toggle sidebar visibility (via the toggle button, which drives
+    // the split view through its signal handler).
+    let sidebar_toggle_weak = sidebar_toggle.downgrade();
     let trigger_f9 = gtk4::ShortcutTrigger::parse_string("F9");
     if let Some(trigger) = trigger_f9 {
         let action = gtk4::CallbackAction::new(move |_widget, _args| {
-            if let Some(sv) = split_view_weak.upgrade() {
-                sv.set_show_sidebar(!sv.shows_sidebar());
+            if let Some(btn) = sidebar_toggle_weak.upgrade() {
+                btn.set_active(!btn.is_active());
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -98,14 +69,6 @@ pub fn setup_shortcuts(
     }
 
     window.add_controller(controller);
-}
-
-/// Cycle to the next demod mode in sequence.
-fn cycle_demod_mode(current: DemodMode) -> DemodMode {
-    let current_idx = CYCLE_ORDER.iter().position(|&m| m == current).unwrap_or(0);
-    #[allow(clippy::cast_possible_truncation)]
-    let next_idx = ((current_idx as u32 + 1) % DEMOD_MODE_COUNT) as usize;
-    CYCLE_ORDER[next_idx]
 }
 
 /// Build the keyboard shortcuts help window.
@@ -183,19 +146,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cycle_demod_wraps_around() {
-        assert_eq!(cycle_demod_mode(DemodMode::Wfm), DemodMode::Nfm);
-        assert_eq!(cycle_demod_mode(DemodMode::Nfm), DemodMode::Am);
-        assert_eq!(cycle_demod_mode(DemodMode::Am), DemodMode::Usb);
-        assert_eq!(cycle_demod_mode(DemodMode::Usb), DemodMode::Lsb);
-        assert_eq!(cycle_demod_mode(DemodMode::Lsb), DemodMode::Dsb);
-        assert_eq!(cycle_demod_mode(DemodMode::Dsb), DemodMode::Cw);
-        assert_eq!(cycle_demod_mode(DemodMode::Cw), DemodMode::Raw);
-        assert_eq!(cycle_demod_mode(DemodMode::Raw), DemodMode::Wfm);
-    }
-
-    #[test]
-    fn cycle_order_has_correct_count() {
-        assert_eq!(CYCLE_ORDER.len(), DEMOD_MODE_COUNT as usize);
+    fn demod_mode_count_matches_dropdown() {
+        // Sanity: the constant matches the number of demod modes.
+        assert_eq!(DEMOD_MODE_COUNT, 8);
     }
 }

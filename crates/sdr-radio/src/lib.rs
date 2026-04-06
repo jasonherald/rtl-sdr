@@ -282,14 +282,15 @@ impl RadioModule {
     ///
     /// Returns `RadioError` if the resampler cannot be created.
     pub fn set_input_sample_rate(&mut self, rate: f64) -> Result<(), RadioError> {
-        self.input_sample_rate = rate;
         let if_rate = self.demod.config().if_sample_rate;
-        if (rate - if_rate).abs() < RATE_TOLERANCE {
-            self.input_resampler = None;
+        let resampler = if (rate - if_rate).abs() < RATE_TOLERANCE {
+            None
         } else {
-            self.input_resampler =
-                Some(RationalResampler::new(rate, if_rate).map_err(RadioError::Dsp)?);
-        }
+            Some(RationalResampler::new(rate, if_rate).map_err(RadioError::Dsp)?)
+        };
+        // Commit state only after the resampler is successfully built.
+        self.input_sample_rate = rate;
+        self.input_resampler = resampler;
         Ok(())
     }
 

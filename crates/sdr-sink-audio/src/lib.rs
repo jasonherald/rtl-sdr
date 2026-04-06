@@ -83,8 +83,14 @@ impl AudioSink {
         // If the channel is full we drop this chunk rather than blocking the
         // DSP thread indefinitely. A brief audio dropout is preferable to
         // stalling the entire pipeline.
-        if tx.try_send(buf).is_err() {
-            tracing::debug!("audio channel full -- dropping chunk");
+        match tx.try_send(buf) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                tracing::debug!("audio channel full -- dropping chunk");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err(SinkError::Disconnected);
+            }
         }
 
         Ok(())
@@ -110,11 +116,7 @@ impl Sink for AudioSink {
         let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(CHANNEL_BOUND);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Quit>();
 
-        self.tx = Some(tx);
-        self.quit_tx = Some(quit_tx);
-
         let running = Arc::clone(&self.running);
-        running.store(true, Ordering::Release);
 
         let handle = std::thread::Builder::new()
             .name("pw-audio".into())
@@ -126,6 +128,10 @@ impl Sink for AudioSink {
             })
             .map_err(|e| SinkError::OpenFailed(format!("spawn PipeWire thread: {e}")))?;
 
+        // Commit state only after spawn succeeds.
+        self.tx = Some(tx);
+        self.quit_tx = Some(quit_tx);
+        self.running.store(true, Ordering::Release);
         self.pw_thread = Some(handle);
         tracing::info!("audio sink started (PipeWire, {AUDIO_SAMPLE_RATE} Hz stereo f32)");
         Ok(())
@@ -158,6 +164,12 @@ impl Sink for AudioSink {
         if !rate.is_finite() || rate <= 0.0 {
             return Err(SinkError::InvalidParameter(format!(
                 "sample rate must be positive and finite, got {rate}"
+            )));
+        }
+        #[allow(clippy::cast_lossless)]
+        if (rate - f64::from(AUDIO_SAMPLE_RATE)).abs() > f64::EPSILON {
+            return Err(SinkError::InvalidParameter(format!(
+                "only {AUDIO_SAMPLE_RATE} Hz output is currently supported, got {rate}"
             )));
         }
         self.sample_rate = rate;
@@ -312,16 +324,16 @@ fn process_callback(stream: &pipewire::stream::Stream, data: &mut AudioCallbackD
     let n_samples = n_frames * (AUDIO_CHANNELS as usize);
 
     // Drain all available chunks from the channel (non-blocking).
+    // Each chunk is already a Vec; move it into the remainder buffer.
     while let Ok(chunk) = data.rx.try_recv() {
         data.remainder.extend_from_slice(&chunk);
     }
 
     // Copy samples into the PipeWire buffer.
     let available = data.remainder.len().min(n_samples);
-    let (to_copy, leftover) = data.remainder.split_at(available);
 
     // Write interleaved f32 samples as bytes.
-    for (i, &sample) in to_copy.iter().enumerate() {
+    for (i, &sample) in data.remainder[..available].iter().enumerate() {
         let offset = i * std::mem::size_of::<f32>();
         let end = offset + std::mem::size_of::<f32>();
         if end <= slice.len() {
@@ -338,8 +350,10 @@ fn process_callback(stream: &pipewire::stream::Stream, data: &mut AudioCallbackD
         }
     }
 
-    // Keep leftover for the next callback.
-    data.remainder = leftover.to_vec();
+    // Shift leftover samples to the front without allocating.
+    let leftover_len = data.remainder.len() - available;
+    data.remainder.copy_within(available.., 0);
+    data.remainder.truncate(leftover_len);
 
     // Update the chunk metadata.
     let chunk = buf_data.chunk_mut();
@@ -376,7 +390,9 @@ mod tests {
     #[test]
     fn test_set_sample_rate_validation() {
         let mut sink = AudioSink::new();
-        assert!(sink.set_sample_rate(44100.0).is_ok());
+        // Only 48 kHz is accepted.
+        assert!(sink.set_sample_rate(f64::from(AUDIO_SAMPLE_RATE)).is_ok());
+        assert!(sink.set_sample_rate(44100.0).is_err());
         assert!(sink.set_sample_rate(-1.0).is_err());
         assert!(sink.set_sample_rate(f64::NAN).is_err());
         assert!(sink.set_sample_rate(f64::INFINITY).is_err());

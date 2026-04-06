@@ -40,12 +40,6 @@ const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
 /// Interval in milliseconds for polling the DSP→UI channel.
 const DSP_POLL_INTERVAL_MS: u64 = 16;
 
-/// Default WFM bandwidth in Hz (used for initial status bar display).
-const DEFAULT_WFM_BANDWIDTH_HZ: f64 = 150_000.0;
-
-/// Default center frequency in Hz (must match `state::DEFAULT_CENTER_FREQUENCY_HZ`).
-const DEFAULT_CENTER_FREQUENCY_HZ: f64 = 100_000_000.0;
-
 /// Build and present the main application window.
 pub fn build_window(app: &adw::Application) {
     // --- Channel setup ---
@@ -77,14 +71,19 @@ pub fn build_window(app: &adw::Application) {
 
     window.add_breakpoint(breakpoint);
 
-    // Set initial status bar values.
-    status_bar.update_demod("WFM", DEFAULT_WFM_BANDWIDTH_HZ);
-    status_bar.update_frequency(DEFAULT_CENTER_FREQUENCY_HZ);
+    // Set initial status bar values from the actual UI state.
+    if let Some(mode) = demod_selector::index_to_demod_mode(demod_dropdown.selected()) {
+        let label = header::demod_mode_label(mode);
+        let bw = panels.radio.bandwidth_row.value();
+        status_bar.update_demod(label, bw);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    status_bar.update_frequency(freq_selector.frequency() as f64);
 
     setup_app_actions(app, &window);
 
     // --- Keyboard shortcuts ---
-    shortcuts::setup_shortcuts(&window, &state, &play_button, &split_view, &demod_dropdown);
+    shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
 
     // Help overlay (Ctrl+? shows keyboard shortcuts).
     let shortcuts_window = shortcuts::build_shortcuts_window();
@@ -106,11 +105,12 @@ pub fn build_window(app: &adw::Application) {
         status_bar_for_freq.update_frequency(freq_f64);
     });
     let status_bar_for_demod = Rc::clone(&status_bar_demod);
+    let bw_row_for_demod = panels.radio.bandwidth_row.clone();
     demod_dropdown.connect_selected_notify(move |dd| {
         if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
             let label = header::demod_mode_label(mode);
-            // Use 0.0 as placeholder — bandwidth updated separately from radio panel.
-            status_bar_for_demod.update_demod(label, 0.0);
+            let bw = bw_row_for_demod.value();
+            status_bar_for_demod.update_demod(label, bw);
         }
     });
 
