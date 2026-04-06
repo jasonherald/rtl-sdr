@@ -13,6 +13,38 @@ mod raw;
 mod usb;
 mod wfm;
 
+// Shared AGC profile for SSB modes (USB, LSB, DSB).
+// Centralized here so all three modes stay in sync when retuning.
+
+/// AGC set point (target output amplitude) for SSB modes.
+pub(crate) const SSB_AGC_SET_POINT: f32 = 1.0;
+/// AGC attack coefficient for SSB modes.
+pub(crate) const SSB_AGC_ATTACK: f32 = 0.001;
+/// AGC decay coefficient for SSB modes.
+pub(crate) const SSB_AGC_DECAY: f32 = 0.0001;
+/// AGC maximum gain for SSB modes.
+pub(crate) const SSB_AGC_MAX_GAIN: f32 = 1e6;
+/// AGC maximum output amplitude for SSB modes.
+pub(crate) const SSB_AGC_MAX_OUTPUT: f32 = 10.0;
+/// AGC initial gain for SSB modes.
+pub(crate) const SSB_AGC_INIT_GAIN: f32 = 1.0;
+
+/// Process mono audio through AGC and convert to stereo.
+///
+/// Shared helper for SSB modes (USB, LSB, DSB) to avoid code duplication.
+pub(crate) fn process_with_agc_to_stereo(
+    agc: &mut sdr_dsp::loops::Agc,
+    mono_in: &[f32],
+    agc_buf: &mut Vec<f32>,
+    stereo_out: &mut [Stereo],
+) -> Result<usize, DspError> {
+    let count = mono_in.len();
+    agc_buf.resize(count, 0.0);
+    agc.process_f32(&mono_in[..count], &mut agc_buf[..count])?;
+    sdr_dsp::convert::mono_to_stereo(&agc_buf[..count], &mut stereo_out[..count])?;
+    Ok(count)
+}
+
 pub use am::AmDemodulator;
 pub use cw::CwDemodulator;
 pub use dsb::DsbDemodulator;
@@ -105,7 +137,7 @@ pub fn create_demodulator(
     match mode {
         DemodMode::Wfm => Ok(Box::new(WfmDemodulator::new()?)),
         DemodMode::Nfm => Ok(Box::new(NfmDemodulator::new()?)),
-        DemodMode::Am => Ok(Box::new(AmDemodulator::new())),
+        DemodMode::Am => Ok(Box::new(AmDemodulator::new()?)),
         DemodMode::Usb => Ok(Box::new(UsbDemodulator::new()?)),
         DemodMode::Lsb => Ok(Box::new(LsbDemodulator::new()?)),
         DemodMode::Dsb => Ok(Box::new(DsbDemodulator::new()?)),

@@ -46,7 +46,7 @@ impl IfChain {
             nb_enabled: false,
             squelch: PowerSquelch::new(SQUELCH_DEFAULT_LEVEL_DB),
             squelch_enabled: false,
-            fm_if_nr: FmIfNoiseReduction::new(),
+            fm_if_nr: FmIfNoiseReduction::new()?,
             fm_if_nr_enabled: false,
             buf_a: Vec::new(),
             buf_b: Vec::new(),
@@ -251,13 +251,14 @@ mod tests {
         chain.set_fm_if_nr_enabled(true);
         assert!(chain.fm_if_nr_enabled());
 
-        let input = vec![Complex::new(1.0, 2.0); 100];
-        let mut output = vec![Complex::default(); 100];
+        // Use a signal large enough for the FFT block size (256 default).
+        let input = vec![Complex::new(1.0, 0.0); 512];
+        let mut output = vec![Complex::default(); 512];
         let count = chain.process(&input, &mut output).unwrap();
-        assert_eq!(count, 100);
-        // FM IF NR is currently passthrough, so output should match input
-        assert_eq!(output[0].re, 1.0);
-        assert_eq!(output[0].im, 2.0);
+        assert_eq!(count, 512);
+        // DC signal should mostly survive (peak bin = 0).
+        let energy: f32 = output.iter().map(|s| s.re * s.re + s.im * s.im).sum();
+        assert!(energy > 0.0, "FM IF NR should produce output");
     }
 
     #[test]
@@ -268,10 +269,10 @@ mod tests {
         chain.set_squelch_level(-50.0);
         chain.set_fm_if_nr_enabled(true);
 
-        let input = vec![Complex::new(1.0, 0.0); 500];
-        let mut output = vec![Complex::default(); 500];
+        let input = vec![Complex::new(1.0, 0.0); 512];
+        let mut output = vec![Complex::default(); 512];
         let count = chain.process(&input, &mut output).unwrap();
-        assert_eq!(count, 500);
+        assert_eq!(count, 512);
     }
 
     #[test]

@@ -1,10 +1,17 @@
 //! Wideband FM (broadcast) demodulator.
 
 use sdr_dsp::demod::BroadcastFmDemod;
-use sdr_dsp::filter::DEEMPHASIS_TAU_EU;
+use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, FirFilter};
+use sdr_dsp::taps;
 use sdr_types::{Complex, DspError, Stereo};
 
 use super::{DemodConfig, Demodulator, VfoReference};
+
+/// Audio lowpass cutoff frequency (Hz) — removes pilot, stereo subcarrier, RDS.
+const AUDIO_LOWPASS_CUTOFF_HZ: f64 = 15_000.0;
+
+/// Audio lowpass transition width (Hz).
+const AUDIO_LOWPASS_TRANSITION_HZ: f64 = 4_000.0;
 
 /// IF sample rate for WFM mode (Hz).
 const WFM_IF_SAMPLE_RATE: f64 = 250_000.0;
@@ -31,8 +38,11 @@ const WFM_SNAP_INTERVAL: f64 = 100_000.0;
 /// with deemphasis. Full stereo decode is deferred to a later phase.
 pub struct WfmDemodulator {
     demod: BroadcastFmDemod,
+    /// 15 kHz lowpass filter — removes pilot tone, stereo subcarrier, RDS, noise.
+    audio_lpf: FirFilter,
     config: DemodConfig,
     mono_buf: Vec<f32>,
+    lpf_buf: Vec<f32>,
 }
 
 impl WfmDemodulator {
@@ -43,6 +53,18 @@ impl WfmDemodulator {
     /// Returns `DspError` if the underlying FM demod cannot be created.
     pub fn new() -> Result<Self, DspError> {
         let demod = BroadcastFmDemod::new(WFM_IF_SAMPLE_RATE)?;
+
+        // 15 kHz lowpass removes pilot tone (19 kHz), stereo subcarrier
+        // (23-53 kHz), RDS (57 kHz), and wideband noise from the FM
+        // composite baseband. Matches C++ broadcast_fm.h audioFirTaps.
+        let lpf_taps = taps::low_pass(
+            AUDIO_LOWPASS_CUTOFF_HZ,
+            AUDIO_LOWPASS_TRANSITION_HZ,
+            WFM_IF_SAMPLE_RATE,
+            false,
+        )?;
+        let audio_lpf = FirFilter::new(lpf_taps)?;
+
         let config = DemodConfig {
             if_sample_rate: WFM_IF_SAMPLE_RATE,
             af_sample_rate: WFM_AF_SAMPLE_RATE,
@@ -55,15 +77,17 @@ impl WfmDemodulator {
             deemp_allowed: true,
             post_proc_enabled: true,
             default_deemp_tau: DEEMPHASIS_TAU_EU,
-            fm_if_nr_allowed: false,
-            nb_allowed: true,
-            high_pass_allowed: false,
+            fm_if_nr_allowed: true,
+            nb_allowed: false,
+            high_pass_allowed: true,
             squelch_allowed: true,
         };
         Ok(Self {
             demod,
+            audio_lpf,
             config,
             mono_buf: Vec::new(),
+            lpf_buf: Vec::new(),
         })
     }
 }
@@ -78,14 +102,21 @@ impl Demodulator for WfmDemodulator {
         }
         self.mono_buf.resize(input.len(), 0.0);
         let count = self.demod.process(input, &mut self.mono_buf)?;
-        // Convert mono discriminator output to stereo (same signal both channels)
-        sdr_dsp::convert::mono_to_stereo(&self.mono_buf[..count], &mut output[..count])?;
+
+        // Apply 15 kHz lowpass to remove pilot, subcarrier, RDS, and noise.
+        self.lpf_buf.resize(count, 0.0);
+        self.audio_lpf
+            .process_f32(&self.mono_buf[..count], &mut self.lpf_buf[..count])?;
+
+        // Convert filtered mono to stereo (same signal both channels)
+        sdr_dsp::convert::mono_to_stereo(&self.lpf_buf[..count], &mut output[..count])?;
         Ok(count)
     }
 
     fn set_bandwidth(&mut self, _bw: f64) {
         // WFM bandwidth affects the VFO channel filter, not the discriminator.
-        // The demod itself always operates at the fixed IF sample rate.
+        // Unlike NFM, broadcast FM deviation is fixed at 75 kHz by standard,
+        // so BroadcastFmDemod does not need rebuilding when bandwidth changes.
     }
 
     fn config(&self) -> &DemodConfig {

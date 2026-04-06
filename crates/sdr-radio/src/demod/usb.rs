@@ -1,9 +1,13 @@
 //! Upper sideband (USB) demodulator.
 
 use sdr_dsp::demod::{SsbDemod, SsbMode};
+use sdr_dsp::loops::Agc;
 use sdr_types::{Complex, DspError, Stereo};
 
-use super::{DemodConfig, Demodulator, VfoReference};
+use super::{
+    DemodConfig, Demodulator, SSB_AGC_ATTACK, SSB_AGC_DECAY, SSB_AGC_INIT_GAIN, SSB_AGC_MAX_GAIN,
+    SSB_AGC_MAX_OUTPUT, SSB_AGC_SET_POINT, VfoReference,
+};
 
 /// IF sample rate for USB mode (Hz).
 const USB_IF_SAMPLE_RATE: f64 = 24_000.0;
@@ -26,8 +30,10 @@ const USB_SNAP_INTERVAL: f64 = 100.0;
 /// Upper sideband demodulator using `SsbDemod(Usb)` from sdr-dsp.
 pub struct UsbDemodulator {
     demod: SsbDemod,
+    agc: Agc,
     config: DemodConfig,
     mono_buf: Vec<f32>,
+    agc_buf: Vec<f32>,
 }
 
 impl UsbDemodulator {
@@ -38,6 +44,14 @@ impl UsbDemodulator {
     /// Returns `DspError` if the underlying SSB demod cannot be created.
     pub fn new() -> Result<Self, DspError> {
         let demod = SsbDemod::new(SsbMode::Usb, USB_DEFAULT_BANDWIDTH, USB_IF_SAMPLE_RATE)?;
+        let agc = Agc::new(
+            SSB_AGC_SET_POINT,
+            SSB_AGC_ATTACK,
+            SSB_AGC_DECAY,
+            SSB_AGC_MAX_GAIN,
+            SSB_AGC_MAX_OUTPUT,
+            SSB_AGC_INIT_GAIN,
+        )?;
         let config = DemodConfig {
             if_sample_rate: USB_IF_SAMPLE_RATE,
             af_sample_rate: USB_AF_SAMPLE_RATE,
@@ -57,8 +71,10 @@ impl UsbDemodulator {
         };
         Ok(Self {
             demod,
+            agc,
             config,
             mono_buf: Vec::new(),
+            agc_buf: Vec::new(),
         })
     }
 }
@@ -73,8 +89,12 @@ impl Demodulator for UsbDemodulator {
         }
         self.mono_buf.resize(input.len(), 0.0);
         let count = self.demod.process(input, &mut self.mono_buf)?;
-        sdr_dsp::convert::mono_to_stereo(&self.mono_buf[..count], &mut output[..count])?;
-        Ok(count)
+        super::process_with_agc_to_stereo(
+            &mut self.agc,
+            &self.mono_buf[..count],
+            &mut self.agc_buf,
+            &mut output[..count],
+        )
     }
 
     fn set_bandwidth(&mut self, bw: f64) {

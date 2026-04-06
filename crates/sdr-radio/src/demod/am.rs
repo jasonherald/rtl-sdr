@@ -1,6 +1,7 @@
 //! Amplitude modulation demodulator.
 
 use sdr_dsp::demod::AmDemod;
+use sdr_dsp::loops::Agc;
 use sdr_types::{Complex, DspError, Stereo};
 
 use super::{DemodConfig, Demodulator, VfoReference};
@@ -23,19 +24,46 @@ const AM_MAX_BANDWIDTH: f64 = 15_000.0;
 /// Default frequency snap interval for AM (Hz).
 const AM_SNAP_INTERVAL: f64 = 1_000.0;
 
+/// AGC set point (target output amplitude) for AM mode.
+const AM_AGC_SET_POINT: f32 = 1.0;
+/// AGC attack coefficient for AM mode.
+const AM_AGC_ATTACK: f32 = 0.001;
+/// AGC decay coefficient for AM mode.
+const AM_AGC_DECAY: f32 = 0.0001;
+/// AGC maximum gain for AM mode.
+const AM_AGC_MAX_GAIN: f32 = 1e6;
+/// AGC maximum output amplitude for AM mode.
+const AM_AGC_MAX_OUTPUT: f32 = 10.0;
+/// AGC initial gain for AM mode.
+const AM_AGC_INIT_GAIN: f32 = 1.0;
+
 /// AM demodulator using `AmDemod` from sdr-dsp.
 ///
-/// Extracts the amplitude envelope, applies DC blocking, and outputs stereo.
+/// Extracts the amplitude envelope, applies DC blocking and AGC, and outputs stereo.
 pub struct AmDemodulator {
     demod: AmDemod,
+    agc: Agc,
     config: DemodConfig,
     mono_buf: Vec<f32>,
+    agc_buf: Vec<f32>,
 }
 
 impl AmDemodulator {
     /// Create a new AM demodulator.
-    pub fn new() -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError` if the AGC cannot be created.
+    pub fn new() -> Result<Self, DspError> {
         let demod = AmDemod::new();
+        let agc = Agc::new(
+            AM_AGC_SET_POINT,
+            AM_AGC_ATTACK,
+            AM_AGC_DECAY,
+            AM_AGC_MAX_GAIN,
+            AM_AGC_MAX_OUTPUT,
+            AM_AGC_INIT_GAIN,
+        )?;
         let config = DemodConfig {
             if_sample_rate: AM_IF_SAMPLE_RATE,
             af_sample_rate: AM_AF_SAMPLE_RATE,
@@ -53,17 +81,13 @@ impl AmDemodulator {
             high_pass_allowed: true,
             squelch_allowed: true,
         };
-        Self {
+        Ok(Self {
             demod,
+            agc,
             config,
             mono_buf: Vec::new(),
-        }
-    }
-}
-
-impl Default for AmDemodulator {
-    fn default() -> Self {
-        Self::new()
+            agc_buf: Vec::new(),
+        })
     }
 }
 
@@ -77,7 +101,13 @@ impl Demodulator for AmDemodulator {
         }
         self.mono_buf.resize(input.len(), 0.0);
         let count = self.demod.process(input, &mut self.mono_buf)?;
-        sdr_dsp::convert::mono_to_stereo(&self.mono_buf[..count], &mut output[..count])?;
+
+        // Apply AGC to normalize AM audio levels before stereo conversion.
+        self.agc_buf.resize(count, 0.0);
+        self.agc
+            .process_f32(&self.mono_buf[..count], &mut self.agc_buf[..count])?;
+
+        sdr_dsp::convert::mono_to_stereo(&self.agc_buf[..count], &mut output[..count])?;
         Ok(count)
     }
 
@@ -102,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_am_config() {
-        let demod = AmDemodulator::new();
+        let demod = AmDemodulator::new().unwrap();
         let cfg = demod.config();
         assert!((cfg.if_sample_rate - 15_000.0).abs() < f64::EPSILON);
         assert!((cfg.default_bandwidth - 10_000.0).abs() < f64::EPSILON);
@@ -112,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_am_process_envelope() {
-        let mut demod = AmDemodulator::new();
+        let mut demod = AmDemodulator::new().unwrap();
         // AM signal: carrier with modulated amplitude
         let input: Vec<Complex> = (0..1000)
             .map(|i| {

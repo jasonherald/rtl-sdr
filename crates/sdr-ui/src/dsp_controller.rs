@@ -5,12 +5,14 @@
 //! 1. Checks for UI commands (non-blocking when running, blocking when stopped).
 //! 2. Reads IQ samples from the RTL-SDR device via `read_sync`.
 //! 3. Processes samples through `IqFrontend` (decimation, DC blocking, FFT).
-//! 4. Processes through `RadioModule` (IF chain, demod, AF chain).
-//! 5. Sends FFT data back to the UI for display.
+//! 4. Processes through `RxVfo` (frequency translation, resampling, channel filter).
+//! 5. Processes through `RadioModule` (IF chain, demod, AF chain).
+//! 6. Sends FFT data back to the UI for display.
 
 use std::sync::mpsc;
 use std::time::Duration;
 
+use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::sink_manager::Sink;
 use sdr_radio::RadioModule;
@@ -30,10 +32,12 @@ const RAW_BUF_SIZE: usize = IQ_PAIRS_PER_READ * 2;
 /// Default FFT size for spectrum display.
 const DEFAULT_FFT_SIZE: usize = 2048;
 
-/// Default sample rate in Hz (2.4 MHz).
-const DEFAULT_SAMPLE_RATE: f64 = 2_400_000.0;
+/// Default sample rate in Hz (2.0 Msps).
+/// With decimation 8, effective rate = 250 kHz, matching WFM IF exactly.
+/// This avoids the input resampler entirely for WFM.
+const DEFAULT_SAMPLE_RATE: f64 = 2_000_000.0;
 
-/// Default decimation ratio (2.4M / 8 = 300 kHz effective rate).
+/// Default decimation ratio (2.0M / 8 = 250 kHz effective rate).
 const DEFAULT_DECIMATION: u32 = 8;
 
 /// Default center frequency in Hz (100 MHz — FM broadcast).
@@ -44,6 +48,9 @@ const IDLE_SLEEP_MS: u64 = 50;
 
 /// Timeout for blocking `recv` when the pipeline is stopped (ms).
 const RECV_TIMEOUT_MS: u64 = 50;
+
+/// Padding added to VFO output buffer to handle resampler edge effects.
+const VFO_OUTPUT_PADDING: usize = 64;
 
 /// RTL-SDR device index to open.
 const DEVICE_INDEX: u32 = 0;
@@ -126,6 +133,13 @@ struct DspState {
     dc_blocking: bool,
     invert_iq: bool,
     window_fn: FftWindow,
+    /// Current channel bandwidth (persisted so VFO rebuilds use it, not mode default).
+    bandwidth: f64,
+
+    // RxVFO — frequency translation + resampling + channel filter
+    vfo: Option<RxVfo>,
+    vfo_buf: Vec<Complex>,
+    vfo_offset: f64,
 
     // Pre-allocated buffers
     raw_buf: Vec<u8>,
@@ -148,6 +162,10 @@ impl DspState {
 
         let radio =
             RadioModule::with_default_rate().map_err(|e| format!("RadioModule init: {e}"))?;
+        let initial_bandwidth = radio.demod_config().default_bandwidth;
+
+        // The RxVfo and RadioModule input rate are configured in open_device()
+        // once we know the actual effective sample rate from the hardware.
 
         Ok(Self {
             device: None,
@@ -161,6 +179,10 @@ impl DspState {
             dc_blocking: true,
             invert_iq: false,
             window_fn: FftWindow::Nuttall,
+            bandwidth: initial_bandwidth,
+            vfo: None,
+            vfo_buf: Vec::new(),
+            vfo_offset: 0.0,
             raw_buf: vec![0u8; RAW_BUF_SIZE],
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
@@ -227,11 +249,32 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if let Err(e) = state.radio.set_mode(mode) {
                 tracing::warn!("set demod mode failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Mode switch failed: {e}")));
+            } else {
+                // Reset bandwidth to the new mode's default.
+                state.bandwidth = state.radio.demod_config().default_bandwidth;
+                // Rebuild the RxVfo for the new demod's IF rate and bandwidth.
+                if let Err(e) = rebuild_vfo(state) {
+                    tracing::warn!("VFO rebuild on mode switch failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
+                }
             }
         }
 
         UiToDsp::SetBandwidth(bw) => {
             tracing::debug!(bandwidth_hz = bw, "set bandwidth");
+            // Update the VFO channel filter first; only persist on success.
+            if let Some(vfo) = &mut state.vfo {
+                match vfo.set_bandwidth(bw) {
+                    Ok(()) => state.bandwidth = bw,
+                    Err(e) => {
+                        tracing::warn!("VFO bandwidth update failed: {e}");
+                        let _ = dsp_tx.send(DspToUi::Error(format!("Bandwidth failed: {e}")));
+                    }
+                }
+            } else {
+                state.bandwidth = bw;
+            }
+            // Also pass to the radio module (some demods use it internally).
             state.radio.set_bandwidth(bw);
         }
 
@@ -271,6 +314,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             }
             match rebuild_frontend(state) {
                 Ok(()) => {
+                    // Rebuild VFO for the new effective rate.
+                    if let Err(e) = rebuild_vfo(state) {
+                        tracing::warn!("VFO rebuild on sample rate change failed: {e}");
+                        let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
+                    }
                     let _ = dsp_tx.send(DspToUi::SampleRateChanged(
                         state.frontend.effective_sample_rate(),
                     ));
@@ -288,13 +336,14 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 tracing::warn!("set decimation failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Decimation failed: {e}")));
             } else {
-                // Update RadioModule for the new effective sample rate.
-                let effective = state.frontend.effective_sample_rate();
-                if let Err(e) = state.radio.set_input_sample_rate(effective) {
-                    tracing::warn!("radio input resample update failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Input resampler failed: {e}")));
+                // Rebuild VFO for the new effective sample rate.
+                if let Err(e) = rebuild_vfo(state) {
+                    tracing::warn!("VFO rebuild on decimation change failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                 }
-                let _ = dsp_tx.send(DspToUi::SampleRateChanged(effective));
+                let _ = dsp_tx.send(DspToUi::SampleRateChanged(
+                    state.frontend.effective_sample_rate(),
+                ));
             }
         }
 
@@ -398,6 +447,14 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 }
             }
         }
+
+        UiToDsp::SetVfoOffset(offset) => {
+            tracing::debug!(offset_hz = offset, "set VFO offset");
+            state.vfo_offset = offset;
+            if let Some(vfo) = &mut state.vfo {
+                vfo.set_offset(offset);
+            }
+        }
     }
 }
 
@@ -418,16 +475,12 @@ fn open_device(state: &mut DspState) -> Result<(), String> {
         .reset_buffer()
         .map_err(|e| format!("reset buffer: {e}"))?;
 
-    // Rebuild the frontend to match the configured sample rate.
-    state.device = Some(device);
-
+    // Rebuild frontend and VFO before committing the device to state.
+    // If either fails, the local `device` handle is dropped and startup
+    // leaves no partially-open device behind.
     rebuild_frontend(state)?;
-
-    // Configure the radio module's input resampler for the effective sample rate.
-    let effective_rate = state.frontend.effective_sample_rate();
-    if let Err(e) = state.radio.set_input_sample_rate(effective_rate) {
-        tracing::warn!("failed to set radio input sample rate: {e}");
-    }
+    rebuild_vfo(state)?;
+    state.device = Some(device);
 
     tracing::info!(
         sample_rate = state.sample_rate,
@@ -462,14 +515,37 @@ fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
 
     new_frontend.set_invert_iq(state.invert_iq);
     state.frontend = new_frontend;
+    Ok(())
+}
 
-    // Update the radio module's input resampler for the new effective rate.
+/// Build or rebuild the `RxVfo` from the current frontend and demod configuration.
+///
+/// Also tells `RadioModule` that its input is now at the demod IF rate (since the
+/// VFO handles resampling from the frontend effective rate to the IF rate).
+fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
     let effective_rate = state.frontend.effective_sample_rate();
+    let demod_cfg = state.radio.demod_config();
+    let if_rate = demod_cfg.if_sample_rate;
+
+    let vfo = RxVfo::new(effective_rate, if_rate, state.bandwidth, state.vfo_offset)
+        .map_err(|e| format!("RxVfo build: {e}"))?;
+
+    state.vfo = Some(vfo);
+
+    // Tell RadioModule it receives samples at the demod IF rate — no internal
+    // resampling needed since the VFO already handled it.
     state
         .radio
-        .set_input_sample_rate(effective_rate)
-        .map_err(|e| format!("radio input resample: {e}"))?;
+        .set_input_sample_rate(if_rate)
+        .map_err(|e| format!("radio input rate: {e}"))?;
 
+    tracing::debug!(
+        frontend_rate = effective_rate,
+        if_rate,
+        bandwidth = state.bandwidth,
+        offset = state.vfo_offset,
+        "RxVfo rebuilt"
+    );
     Ok(())
 }
 
@@ -517,19 +593,44 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
                 let _ = dsp_tx.send(DspToUi::FftData(state.fft_buf.clone()));
             }
 
-            // Process through radio module for audio output.
             if processed_count > 0 {
-                let max_out = state.radio.max_output_samples(processed_count);
+                // Pass through RxVfo: frequency translate, resample, channel filter.
+                let radio_input = if let Some(vfo) = &mut state.vfo {
+                    // Size VFO output buffer generously for resampling expansion.
+                    let demod_cfg = state.radio.demod_config();
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        clippy::cast_precision_loss
+                    )]
+                    let ratio = (demod_cfg.if_sample_rate / state.frontend.effective_sample_rate())
+                        .ceil() as usize;
+                    let vfo_out_size = processed_count * ratio.max(1) + VFO_OUTPUT_PADDING;
+                    state.vfo_buf.resize(vfo_out_size, Complex::default());
+
+                    match vfo.process(&state.processed_buf[..processed_count], &mut state.vfo_buf) {
+                        Ok(vfo_count) => &state.vfo_buf[..vfo_count],
+                        Err(e) => {
+                            tracing::warn!("VFO processing error: {e}");
+                            return;
+                        }
+                    }
+                } else {
+                    // No VFO configured — pass frontend output directly (fallback).
+                    &state.processed_buf[..processed_count]
+                };
+
+                // Process through radio module for audio output.
+                let max_out = state.radio.max_output_samples(radio_input.len());
                 state.audio_buf.resize(max_out, Stereo::default());
-                match state.radio.process(
-                    &state.processed_buf[..processed_count],
-                    &mut state.audio_buf,
-                ) {
+                match state.radio.process(radio_input, &mut state.audio_buf) {
                     Ok(audio_count) => {
-                        // Apply volume scaling.
+                        // Apply volume with perceptual (power-law) scaling.
+                        // Quadratic curve maps the linear slider to perceived loudness.
+                        let vol = state.volume * state.volume;
                         for s in &mut state.audio_buf[..audio_count] {
-                            s.l *= state.volume;
-                            s.r *= state.volume;
+                            s.l *= vol;
+                            s.r *= vol;
                         }
 
                         // Send to PipeWire for playback.
@@ -553,7 +654,7 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
                         tracing::warn!("radio processing error: {e}");
                     }
                 }
-            }
+            } // end if processed_count > 0
         }
         Err(e) => {
             tracing::warn!("frontend processing error: {e}");
@@ -562,7 +663,7 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 
@@ -574,6 +675,7 @@ mod tests {
         assert!(DEFAULT_CENTER_FREQ > 0.0);
         assert!(IDLE_SLEEP_MS > 0);
         assert!(RECV_TIMEOUT_MS > 0);
+        assert!(VFO_OUTPUT_PADDING > 0);
     };
 
     #[test]
@@ -584,5 +686,110 @@ mod tests {
         assert_eq!(state.raw_buf.len(), RAW_BUF_SIZE);
         assert_eq!(state.iq_buf.len(), IQ_PAIRS_PER_READ);
         assert_eq!(state.fft_buf.len(), DEFAULT_FFT_SIZE);
+        // VFO starts as None (created on device open).
+        assert!(state.vfo.is_none());
+        assert!((state.vfo_offset - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rebuild_vfo_creates_vfo_and_sets_radio_rate() {
+        let mut state = DspState::new().unwrap();
+        // Simulate what open_device does: frontend is already built at default rate.
+        rebuild_vfo(&mut state).unwrap();
+        assert!(state.vfo.is_some());
+    }
+
+    #[test]
+    fn rebuild_vfo_after_mode_switch_changes_rates() {
+        let mut state = DspState::new().unwrap();
+        // Start with NFM (default) — IF rate 50 kHz
+        rebuild_vfo(&mut state).unwrap();
+
+        // Switch to WFM — IF rate 250 kHz
+        state.radio.set_mode(sdr_types::DemodMode::Wfm).unwrap();
+        rebuild_vfo(&mut state).unwrap();
+        assert!(state.vfo.is_some());
+
+        // Switch to NFM — IF rate 50 kHz (different from WFM)
+        state.radio.set_mode(sdr_types::DemodMode::Nfm).unwrap();
+        rebuild_vfo(&mut state).unwrap();
+        assert!(state.vfo.is_some());
+    }
+
+    #[test]
+    fn vfo_preserves_signal_at_zero_offset() {
+        // Create an RxVfo at same in/out rate, full bandwidth, offset 0.
+        // The signal at DC should pass through essentially unchanged.
+        let rate = 250_000.0;
+        let mut vfo = RxVfo::new(rate, rate, rate, 0.0).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); 1000];
+        let mut output = vec![Complex::default(); 1100];
+        let count = vfo.process(&input, &mut output).unwrap();
+        assert_eq!(count, 1000);
+        // DC signal at zero offset should pass through with ~unity amplitude.
+        for (i, s) in output[..count].iter().enumerate() {
+            assert!(
+                s.amplitude() > 0.9,
+                "sample {i}: amplitude {} too low",
+                s.amplitude()
+            );
+        }
+    }
+
+    #[test]
+    fn vfo_translates_offset_signal_to_baseband() {
+        // Generate a tone at +10 kHz offset within a 250 kHz stream.
+        // Set VFO offset to +10 kHz so the tone lands at DC after translation.
+        let in_rate = 250_000.0;
+        let offset_hz = 10_000.0;
+        let n = 2500;
+
+        // Generate a pure tone at +offset_hz.
+        let input: Vec<Complex> = (0..n)
+            .map(|i| {
+                let phase = 2.0 * std::f64::consts::PI * offset_hz * (i as f64) / in_rate;
+                #[allow(clippy::cast_possible_truncation)]
+                Complex::new(phase.cos() as f32, phase.sin() as f32)
+            })
+            .collect();
+
+        let mut vfo = RxVfo::new(in_rate, in_rate, in_rate, offset_hz).unwrap();
+        let mut output = vec![Complex::default(); n + 100];
+        let count = vfo.process(&input, &mut output).unwrap();
+        assert!(count > 0);
+
+        // After translation by -offset_hz, the signal should be near DC.
+        // Skip the first few samples (filter settling) and check that the
+        // imaginary part is small (signal is near real-only at DC).
+        let settle = count / 4;
+        let avg_imag: f32 = output[settle..count]
+            .iter()
+            .map(|s| s.im.abs())
+            .sum::<f32>()
+            / (count - settle) as f32;
+        assert!(
+            avg_imag < 0.15,
+            "after translation, signal should be near DC — avg |imag| = {avg_imag}"
+        );
+    }
+
+    #[test]
+    fn vfo_resamples_250k_to_50k() {
+        // Simulates WFM frontend (250 kHz) feeding NFM demod (50 kHz).
+        let in_rate = 250_000.0;
+        let out_rate = 50_000.0;
+        let bandwidth = 12_500.0;
+        let n = 2500; // 10 ms at 250 kHz
+
+        let mut vfo = RxVfo::new(in_rate, out_rate, bandwidth, 0.0).unwrap();
+        let input = vec![Complex::new(1.0, 0.0); n];
+        let mut output = vec![Complex::default(); n]; // more than enough
+        let count = vfo.process(&input, &mut output).unwrap();
+
+        // Expected ~500 samples (2500 * 50k/250k)
+        assert!(
+            (400..=600).contains(&count),
+            "expected ~500 samples at 50 kHz, got {count}"
+        );
     }
 }
