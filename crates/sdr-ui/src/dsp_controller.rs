@@ -133,6 +133,8 @@ struct DspState {
     dc_blocking: bool,
     invert_iq: bool,
     window_fn: FftWindow,
+    /// Current channel bandwidth (persisted so VFO rebuilds use it, not mode default).
+    bandwidth: f64,
 
     // RxVFO — frequency translation + resampling + channel filter
     vfo: Option<RxVfo>,
@@ -160,6 +162,7 @@ impl DspState {
 
         let radio =
             RadioModule::with_default_rate().map_err(|e| format!("RadioModule init: {e}"))?;
+        let initial_bandwidth = radio.demod_config().default_bandwidth;
 
         // The RxVfo and RadioModule input rate are configured in open_device()
         // once we know the actual effective sample rate from the hardware.
@@ -176,6 +179,7 @@ impl DspState {
             dc_blocking: true,
             invert_iq: false,
             window_fn: FftWindow::Nuttall,
+            bandwidth: initial_bandwidth,
             vfo: None,
             vfo_buf: Vec::new(),
             vfo_offset: 0.0,
@@ -246,6 +250,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 tracing::warn!("set demod mode failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Mode switch failed: {e}")));
             } else {
+                // Reset bandwidth to the new mode's default.
+                state.bandwidth = state.radio.demod_config().default_bandwidth;
                 // Rebuild the RxVfo for the new demod's IF rate and bandwidth.
                 if let Err(e) = rebuild_vfo(state) {
                     tracing::warn!("VFO rebuild on mode switch failed: {e}");
@@ -256,6 +262,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetBandwidth(bw) => {
             tracing::debug!(bandwidth_hz = bw, "set bandwidth");
+            state.bandwidth = bw;
             // Update the VFO channel filter for the new bandwidth.
             if let Some(vfo) = &mut state.vfo
                 && let Err(e) = vfo.set_bandwidth(bw)
@@ -464,13 +471,12 @@ fn open_device(state: &mut DspState) -> Result<(), String> {
         .reset_buffer()
         .map_err(|e| format!("reset buffer: {e}"))?;
 
-    // Rebuild the frontend to match the configured sample rate.
-    state.device = Some(device);
-
+    // Rebuild frontend and VFO before committing the device to state.
+    // If either fails, the local `device` handle is dropped and startup
+    // leaves no partially-open device behind.
     rebuild_frontend(state)?;
-
-    // Build the RxVfo and configure RadioModule to receive at the demod IF rate.
     rebuild_vfo(state)?;
+    state.device = Some(device);
 
     tracing::info!(
         sample_rate = state.sample_rate,
@@ -516,9 +522,8 @@ fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
     let effective_rate = state.frontend.effective_sample_rate();
     let demod_cfg = state.radio.demod_config();
     let if_rate = demod_cfg.if_sample_rate;
-    let bandwidth = demod_cfg.default_bandwidth;
 
-    let vfo = RxVfo::new(effective_rate, if_rate, bandwidth, state.vfo_offset)
+    let vfo = RxVfo::new(effective_rate, if_rate, state.bandwidth, state.vfo_offset)
         .map_err(|e| format!("RxVfo build: {e}"))?;
 
     state.vfo = Some(vfo);
@@ -533,7 +538,7 @@ fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
     tracing::debug!(
         frontend_rate = effective_rate,
         if_rate,
-        bandwidth,
+        bandwidth = state.bandwidth,
         offset = state.vfo_offset,
         "RxVfo rebuilt"
     );

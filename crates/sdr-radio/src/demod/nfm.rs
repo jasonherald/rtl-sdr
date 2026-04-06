@@ -85,8 +85,9 @@ impl Demodulator for NfmDemodulator {
     fn set_bandwidth(&mut self, bw: f64) {
         // Rebuild the FM discriminator with deviation = bw/2 so the
         // demodulator sensitivity tracks the channel bandwidth.
-        if let Ok(new_demod) = FmDemod::from_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
-            self.demod = new_demod;
+        match FmDemod::from_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
+            Ok(new_demod) => self.demod = new_demod,
+            Err(e) => tracing::warn!("NFM: set_bandwidth({bw}) failed: {e}"),
         }
     }
 

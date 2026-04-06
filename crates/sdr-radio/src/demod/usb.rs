@@ -4,7 +4,10 @@ use sdr_dsp::demod::{SsbDemod, SsbMode};
 use sdr_dsp::loops::Agc;
 use sdr_types::{Complex, DspError, Stereo};
 
-use super::{DemodConfig, Demodulator, VfoReference};
+use super::{
+    DemodConfig, Demodulator, SSB_AGC_ATTACK, SSB_AGC_DECAY, SSB_AGC_INIT_GAIN, SSB_AGC_MAX_GAIN,
+    SSB_AGC_MAX_OUTPUT, SSB_AGC_SET_POINT, VfoReference,
+};
 
 /// IF sample rate for USB mode (Hz).
 const USB_IF_SAMPLE_RATE: f64 = 24_000.0;
@@ -23,19 +26,6 @@ const USB_MAX_BANDWIDTH: f64 = 12_000.0;
 
 /// Default frequency snap interval for USB (Hz).
 const USB_SNAP_INTERVAL: f64 = 100.0;
-
-/// AGC set point (target output amplitude) for SSB modes.
-const SSB_AGC_SET_POINT: f32 = 1.0;
-/// AGC attack coefficient for SSB modes.
-const SSB_AGC_ATTACK: f32 = 0.001;
-/// AGC decay coefficient for SSB modes.
-const SSB_AGC_DECAY: f32 = 0.0001;
-/// AGC maximum gain for SSB modes.
-const SSB_AGC_MAX_GAIN: f32 = 1e6;
-/// AGC maximum output amplitude for SSB modes.
-const SSB_AGC_MAX_OUTPUT: f32 = 10.0;
-/// AGC initial gain for SSB modes.
-const SSB_AGC_INIT_GAIN: f32 = 1.0;
 
 /// Upper sideband demodulator using `SsbDemod(Usb)` from sdr-dsp.
 pub struct UsbDemodulator {
