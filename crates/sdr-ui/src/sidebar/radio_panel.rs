@@ -119,7 +119,7 @@ pub fn build_radio_panel() -> RadioPanel {
     group.add(&noise_blanker_row);
     group.add(&fm_if_nr_row);
 
-    // TODO: Connect all rows to DSP pipeline (PR #7)
+    // All rows connected to DSP pipeline via window.rs
 
     RadioPanel {
         widget: group,

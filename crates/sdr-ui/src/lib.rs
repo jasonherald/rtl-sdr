@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod css;
+pub mod dsp_controller;
 pub mod header;
 pub mod messages;
 pub mod sidebar;

@@ -74,7 +74,7 @@ pub fn build_display_panel() -> DisplayPanel {
     group.add(&frame_rate_row);
     group.add(&color_map_row);
 
-    // TODO: Connect all rows to spectrum display (PR #7)
+    // FFT size and window function connected via window.rs
 
     DisplayPanel {
         widget: group,

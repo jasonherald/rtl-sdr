@@ -21,7 +21,7 @@ use fft_plot::FftPlotRenderer;
 use vfo_overlay::{BwHandle, HitZone, VfoOverlayRenderer, VfoState};
 use waterfall::WaterfallRenderer;
 
-/// Number of FFT bins for the display.
+/// Number of FFT bins for the display (used for initial buffer sizing).
 const FFT_SIZE: usize = 1024;
 
 /// Default FFT plot pane height fraction (30% of total).
@@ -31,30 +31,6 @@ const FFT_PANE_FRACTION: f64 = 0.30;
 const MIN_DB: f32 = -120.0;
 /// Maximum display level in dB.
 const MAX_DB: f32 = 0.0;
-
-/// Interval between synthetic test frames, in milliseconds.
-const TEST_FRAME_INTERVAL_MS: u64 = 16;
-
-/// Width of synthetic signal peaks in bins.
-const TEST_PEAK_WIDTH: usize = 20;
-/// Center offset within the peak width.
-const TEST_PEAK_CENTER: i32 = 10;
-/// Noise floor level in dB for test data.
-const TEST_NOISE_FLOOR_DB: f32 = -90.0;
-/// Peak 1 signal level in dB.
-const TEST_PEAK1_DB: f32 = -30.0;
-/// Peak 2 signal level in dB.
-const TEST_PEAK2_DB: f32 = -40.0;
-/// dB falloff per bin distance from peak center.
-const TEST_PEAK_FALLOFF_DB: f32 = -3.0;
-/// Peak 1 drift rate in bins per frame.
-const TEST_PEAK1_DRIFT: usize = 100;
-/// Peak 2 drift rate in bins per frame.
-const TEST_PEAK2_DRIFT: usize = 80;
-/// Noise variation amplitude in dB.
-const TEST_NOISE_VARIATION_DB: f32 = 3.0;
-/// Noise variation frequency scaling factor.
-const TEST_NOISE_FREQ_SCALE: f32 = 0.1;
 
 /// Shared state for the FFT plot `GtkGLArea`.
 struct FftPlotState {
@@ -71,13 +47,43 @@ struct WaterfallState {
     vfo_renderer: VfoOverlayRenderer,
 }
 
+/// Handle for pushing FFT data into the spectrum display from outside.
+///
+/// Obtained from `build_spectrum_view` and used by the `DspToUi::FftData`
+/// handler to update both the FFT plot and waterfall with real DSP data.
+pub struct SpectrumHandle {
+    fft_state: Rc<RefCell<Option<FftPlotState>>>,
+    waterfall_state: Rc<RefCell<Option<WaterfallState>>>,
+    fft_area: gtk4::GLArea,
+    waterfall_area: gtk4::GLArea,
+}
+
+impl SpectrumHandle {
+    /// Push a new FFT frame into both the FFT plot and waterfall display.
+    ///
+    /// Call this from the GTK main loop when `DspToUi::FftData` arrives.
+    pub fn push_fft_data(&self, data: &[f32]) {
+        // Update FFT plot data.
+        if let Some(s) = self.fft_state.borrow_mut().as_mut() {
+            s.current_data.clear();
+            s.current_data.extend_from_slice(data);
+        }
+        self.fft_area.queue_render();
+
+        // Push a new line to the waterfall.
+        if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
+            self.waterfall_area.make_current();
+            s.renderer.push_line(&s.gl, data);
+        }
+        self.waterfall_area.queue_render();
+    }
+}
+
 /// Build the spectrum view containing the FFT plot and waterfall display.
 ///
-/// Returns a `GtkPaned` with vertical orientation: FFT plot on top,
-/// waterfall on bottom. Both are `GtkGLArea` widgets rendered via OpenGL.
-///
-/// Currently drives both displays with synthetic test data for visual validation.
-pub fn build_spectrum_view() -> gtk4::Paned {
+/// Returns a `(GtkPaned, SpectrumHandle)` — the paned widget for layout,
+/// and a handle for pushing real FFT data into the display.
+pub fn build_spectrum_view() -> (gtk4::Paned, SpectrumHandle) {
     let vfo_state: Rc<RefCell<VfoState>> = Rc::new(RefCell::new(VfoState::default()));
     let fft_state: Rc<RefCell<Option<FftPlotState>>> = Rc::new(RefCell::new(None));
     let waterfall_state: Rc<RefCell<Option<WaterfallState>>> = Rc::new(RefCell::new(None));
@@ -112,15 +118,14 @@ pub fn build_spectrum_view() -> gtk4::Paned {
         }
     });
 
-    // Start synthetic test data generation.
-    start_test_data_timer(
-        Rc::clone(&fft_state),
-        Rc::clone(&waterfall_state),
-        &fft_area,
-        &waterfall_area,
-    );
+    let handle = SpectrumHandle {
+        fft_state,
+        waterfall_state,
+        fft_area: fft_area.clone(),
+        waterfall_area: waterfall_area.clone(),
+    };
 
-    paned
+    (paned, handle)
 }
 
 /// Build the `GtkGLArea` for the FFT power spectrum plot.
@@ -504,139 +509,13 @@ fn attach_scroll_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>)
     area.add_controller(scroll);
 }
 
-/// Start a periodic timer that generates synthetic FFT test data and pushes
-/// it to both renderers. This provides visual validation until real DSP data
-/// is connected.
-fn start_test_data_timer(
-    fft_state: Rc<RefCell<Option<FftPlotState>>>,
-    waterfall_state: Rc<RefCell<Option<WaterfallState>>>,
-    fft_area: &gtk4::GLArea,
-    waterfall_area: &gtk4::GLArea,
-) {
-    let frame_counter = Rc::new(std::cell::Cell::new(0_usize));
-
-    // Use weak references so the timer stops when the GLAreas are dropped.
-    let fft_area_weak = fft_area.downgrade();
-    let waterfall_area_weak = waterfall_area.downgrade();
-
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(TEST_FRAME_INTERVAL_MS),
-        move || {
-            // Stop the timer if either GLArea has been destroyed.
-            let (Some(fft_area), Some(waterfall_area)) =
-                (fft_area_weak.upgrade(), waterfall_area_weak.upgrade())
-            else {
-                return glib::ControlFlow::Break;
-            };
-
-            let frame = frame_counter.get();
-            frame_counter.set(frame.wrapping_add(1));
-
-            let data = generate_test_fft(FFT_SIZE, frame);
-
-            // Update FFT plot data.
-            if let Some(s) = fft_state.borrow_mut().as_mut() {
-                s.current_data.clear();
-                s.current_data.extend_from_slice(&data);
-            }
-            fft_area.queue_render();
-
-            // Push a new line to the waterfall.
-            if let Some(s) = waterfall_state.borrow_mut().as_mut() {
-                waterfall_area.make_current();
-                s.renderer.push_line(&s.gl, &data);
-            }
-            waterfall_area.queue_render();
-
-            glib::ControlFlow::Continue
-        },
-    );
-}
-
-/// Generate synthetic FFT test data for visual validation.
-///
-/// Produces a noise floor with two moving peaks, suitable for verifying
-/// that the spectrum display and waterfall are rendering correctly.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
-fn generate_test_fft(size: usize, frame: usize) -> Vec<f32> {
-    let mut data = vec![TEST_NOISE_FLOOR_DB; size];
-
-    // Two peaks that slowly drift across the spectrum.
-    let peak1_center = (size / 4 + frame % TEST_PEAK1_DRIFT) % size;
-    let peak2_center = (3 * size / 4 + size - frame % TEST_PEAK2_DRIFT) % size;
-
-    for i in 0..TEST_PEAK_WIDTH {
-        let dist = (TEST_PEAK_CENTER - i as i32).abs() as f32;
-
-        let idx1 = (peak1_center + i) % size;
-        data[idx1] = TEST_PEAK1_DB + dist * TEST_PEAK_FALLOFF_DB;
-
-        let idx2 = (peak2_center + i) % size;
-        data[idx2] = TEST_PEAK2_DB + dist * TEST_PEAK_FALLOFF_DB;
-    }
-
-    // Add subtle noise variation.
-    let variation = (frame as f32 * TEST_NOISE_FREQ_SCALE).sin() * TEST_NOISE_VARIATION_DB;
-    for d in &mut data {
-        *d += variation;
-    }
-
-    data
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_generate_test_fft_size() {
-        let data = generate_test_fft(FFT_SIZE, 0);
-        assert_eq!(data.len(), FFT_SIZE);
-    }
-
-    #[test]
-    fn test_generate_test_fft_has_peaks() {
-        let data = generate_test_fft(FFT_SIZE, 0);
-        let max_val = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let min_val = data.iter().copied().fold(f32::INFINITY, f32::min);
-        // Peaks should be well above the noise floor.
-        assert!(
-            max_val > TEST_NOISE_FLOOR_DB + 20.0,
-            "max value {max_val} should be well above noise floor"
-        );
-        // There should be dynamic range.
-        assert!(
-            max_val - min_val > 30.0,
-            "dynamic range {} dB is too small",
-            max_val - min_val
-        );
-    }
-
-    #[test]
-    fn test_generate_test_fft_peaks_move() {
-        let data_frame_start = generate_test_fft(FFT_SIZE, 0);
-        let data_frame_later = generate_test_fft(FFT_SIZE, 50);
-
-        // Find peak positions.
-        let peak_at_start = data_frame_start
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i);
-        let peak_at_later = data_frame_later
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i);
-
-        // Peaks should have moved between frames.
-        assert_ne!(
-            peak_at_start, peak_at_later,
-            "peaks should drift between frames"
-        );
-    }
+    /// Compile-time validation that spectrum display constants are consistent.
+    const _: () = {
+        assert!(super::FFT_SIZE > 0);
+        assert!(super::FFT_PANE_FRACTION > 0.0);
+        assert!(super::FFT_PANE_FRACTION < 1.0);
+        assert!(super::MIN_DB < super::MAX_DB);
+    };
 }
