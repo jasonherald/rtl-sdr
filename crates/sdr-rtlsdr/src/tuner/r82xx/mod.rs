@@ -317,12 +317,12 @@ impl Tuner for R82xxPriv {
     ) -> Result<(), RtlSdrError> {
         // RTL-SDR Blog V4 HF upconversion
         let upconvert_freq = if self.is_blog_v4 && freq < 28_800_000 {
-            freq + 28_800_000
+            freq.saturating_add(28_800_000)
         } else {
             freq
         };
 
-        let lo_freq = upconvert_freq + self.int_freq;
+        let lo_freq = upconvert_freq.saturating_add(self.int_freq);
 
         self.set_mux(handle, lo_freq)?;
         self.set_pll(handle, lo_freq)?;

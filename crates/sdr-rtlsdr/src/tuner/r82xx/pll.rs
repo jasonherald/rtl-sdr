@@ -26,7 +26,7 @@ impl R82xxPriv {
     ) -> Result<(), RtlSdrError> {
         let vco_min: u32 = 1_770_000; // kHz
         let vco_max: u32 = vco_min * 2;
-        let freq_khz = (freq + 500) / 1000;
+        let freq_khz = freq.saturating_add(500) / 1000;
         let pll_ref = self.xtal;
 
         // Set PLL autotune = 128kHz

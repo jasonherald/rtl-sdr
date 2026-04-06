@@ -52,6 +52,8 @@ pub enum SinkError {
     NotRunning,
     #[error("already running")]
     AlreadyRunning,
+    #[error("channel disconnected")]
+    Disconnected,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

@@ -17,10 +17,12 @@ use crate::dsp_controller;
 use crate::header;
 use crate::header::demod_selector;
 use crate::messages::{DspToUi, UiToDsp};
+use crate::shortcuts;
 use crate::sidebar;
 use crate::sidebar::SidebarPanels;
 use crate::spectrum;
 use crate::state::AppState;
+use crate::status_bar::{self, StatusBar};
 
 /// Default window width in pixels.
 const DEFAULT_WIDTH: i32 = 1200;
@@ -48,31 +50,78 @@ pub fn build_window(app: &adw::Application) {
     let state = AppState::new_shared(ui_tx);
 
     // --- Build UI ---
-    let (split_view, panels, spectrum_handle) = build_split_view();
+    let (split_view, panels, spectrum_handle, status_bar) = build_split_view();
     let sidebar_toggle = build_sidebar_toggle(&split_view);
-    let (header, play_button) = build_header_bar(&sidebar_toggle, &state);
+    let (header, play_button, demod_dropdown, freq_selector) =
+        build_header_bar(&sidebar_toggle, &state);
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
+
+    // Toast overlay wraps the toolbar view for error notifications.
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&toolbar_view));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("SDR-RS")
         .default_width(DEFAULT_WIDTH)
         .default_height(DEFAULT_HEIGHT)
-        .content(&toolbar_view)
+        .content(&toast_overlay)
         .build();
 
     window.add_breakpoint(breakpoint);
 
-    // Toast overlay for error messages.
-    let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&toolbar_view));
-    window.set_content(Some(&toast_overlay));
+    // Set initial status bar values from the actual UI state.
+    if let Some(mode) = demod_selector::index_to_demod_mode(demod_dropdown.selected()) {
+        let label = header::demod_mode_label(mode);
+        let bw = panels.radio.bandwidth_row.value();
+        status_bar.update_demod(label, bw);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    status_bar.update_frequency(freq_selector.frequency() as f64);
 
     setup_app_actions(app, &window);
 
+    // --- Keyboard shortcuts ---
+    shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
+
+    // Help overlay (Ctrl+? shows keyboard shortcuts).
+    let shortcuts_window = shortcuts::build_shortcuts_window();
+    window.set_help_overlay(Some(&shortcuts_window));
+
     // --- Connect sidebar panels to DSP ---
     connect_sidebar_panels(&panels, &state);
+
+    // --- Wire frequency selector to DSP and status bar ---
+    let status_bar_demod = Rc::new(status_bar);
+    let status_bar_for_freq = Rc::clone(&status_bar_demod);
+    let state_freq = Rc::clone(&state);
+    freq_selector.connect_frequency_changed(move |freq| {
+        tracing::debug!(frequency_hz = freq, "frequency changed");
+        #[allow(clippy::cast_precision_loss)]
+        let freq_f64 = freq as f64;
+        state_freq.center_frequency.set(freq_f64);
+        state_freq.send_dsp(UiToDsp::Tune(freq_f64));
+        status_bar_for_freq.update_frequency(freq_f64);
+    });
+    let status_bar_for_demod = Rc::clone(&status_bar_demod);
+    let bw_row_for_demod = panels.radio.bandwidth_row.clone();
+    demod_dropdown.connect_selected_notify(move |dd| {
+        if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
+            let label = header::demod_mode_label(mode);
+            let bw = bw_row_for_demod.value();
+            status_bar_for_demod.update_demod(label, bw);
+        }
+    });
+
+    // --- Wire radio panel bandwidth changes to status bar ---
+    let status_bar_for_bw = Rc::clone(&status_bar_demod);
+    let state_for_bw = Rc::clone(&state);
+    panels.radio.bandwidth_row.connect_value_notify(move |row| {
+        let mode = state_for_bw.demod_mode.get();
+        let label = header::demod_mode_label(mode);
+        status_bar_for_bw.update_demod(label, row.value());
+    });
 
     // --- Spawn DSP thread ---
     dsp_controller::spawn_dsp_thread(dsp_tx, ui_rx);
@@ -94,6 +143,7 @@ pub fn build_window(app: &adw::Application) {
                         &play_button_weak,
                         &state_rx,
                         &toast_overlay_weak,
+                        &status_bar_demod,
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -116,13 +166,14 @@ fn handle_dsp_message(
     play_button_weak: &glib::WeakRef<gtk4::ToggleButton>,
     state: &Rc<AppState>,
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
+    status_bar: &Rc<StatusBar>,
 ) {
     match msg {
         DspToUi::FftData(data) => {
             spectrum_handle.push_fft_data(&data);
         }
-        DspToUi::SnrUpdate(_snr) => {
-            // Store for future status bar.
+        DspToUi::SnrUpdate(snr) => {
+            status_bar.update_snr(snr);
         }
         DspToUi::Error(err_msg) => {
             tracing::warn!(error = %err_msg, "DSP error");
@@ -141,6 +192,7 @@ fn handle_dsp_message(
         }
         DspToUi::SampleRateChanged(rate) => {
             tracing::info!(effective_sample_rate = rate, "sample rate changed");
+            status_bar.update_sample_rate(rate);
         }
         DspToUi::DeviceInfo(info) => {
             tracing::info!(device_info = %info, "device info received");
@@ -148,20 +200,25 @@ fn handle_dsp_message(
     }
 }
 
-/// Build the `AdwOverlaySplitView` with sidebar configuration panels and content.
+/// Build the `AdwOverlaySplitView` with sidebar configuration panels, content,
+/// and status bar.
 ///
-/// Returns the split view, sidebar panels, and spectrum display handle.
+/// Returns the split view, sidebar panels, spectrum display handle, and status bar.
 fn build_split_view() -> (
     adw::OverlaySplitView,
     SidebarPanels,
     spectrum::SpectrumHandle,
+    StatusBar,
 ) {
     // Sidebar — configuration panels.
     let (sidebar_scroll, panels) = sidebar::build_sidebar();
 
-    // Main content area — spectrum display (FFT plot + waterfall).
+    // Main content area — spectrum display (FFT plot + waterfall) + status bar.
     let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view();
     spectrum_view.add_css_class("spectrum-area");
+
+    // Status bar at the bottom.
+    let status_bar = status_bar::build_status_bar();
 
     let content_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -169,6 +226,7 @@ fn build_split_view() -> (
         .vexpand(true)
         .build();
     content_box.append(&spectrum_view);
+    content_box.append(&status_bar.widget);
 
     let split_view = adw::OverlaySplitView::builder()
         .sidebar(&sidebar_scroll)
@@ -176,7 +234,7 @@ fn build_split_view() -> (
         .show_sidebar(true)
         .build();
 
-    (split_view, panels, spectrum_handle)
+    (split_view, panels, spectrum_handle, status_bar)
 }
 
 /// Build the sidebar toggle button bound to the split view.
@@ -201,11 +259,17 @@ fn build_sidebar_toggle(split_view: &adw::OverlaySplitView) -> gtk4::ToggleButto
 /// Build the `AdwHeaderBar` with play/stop, frequency selector, demod selector,
 /// and volume control.
 ///
-/// Returns the header bar and the play button (for updating state from `DspToUi`).
+/// Returns the header bar, play button, demod dropdown, and frequency selector
+/// (for shortcuts, status bar wiring, and frequency change callbacks).
 fn build_header_bar(
     sidebar_toggle: &gtk4::ToggleButton,
     state: &Rc<AppState>,
-) -> (adw::HeaderBar, gtk4::ToggleButton) {
+) -> (
+    adw::HeaderBar,
+    gtk4::ToggleButton,
+    gtk4::DropDown,
+    header::frequency_selector::FrequencySelector,
+) {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()
         .icon_name("media-playback-start-symbolic")
@@ -227,16 +291,10 @@ fn build_header_bar(
         }
     });
 
-    // Frequency selector as the title widget
+    // Frequency selector as the title widget.
+    // NOTE: The frequency-changed callback is connected later in `build_window`
+    // so it can also update the status bar.
     let freq_selector = header::build_frequency_selector();
-    let state_freq = Rc::clone(state);
-    freq_selector.connect_frequency_changed(move |freq| {
-        tracing::debug!(frequency_hz = freq, "frequency changed");
-        #[allow(clippy::cast_precision_loss)]
-        let freq_f64 = freq as f64;
-        state_freq.center_frequency.set(freq_f64);
-        state_freq.send_dsp(UiToDsp::Tune(freq_f64));
-    });
 
     // Demod selector dropdown
     let (demod_dropdown, _demod_mode_cell) = header::build_demod_selector();
@@ -282,12 +340,13 @@ fn build_header_bar(
     header.pack_end(&menu_button);
     header.pack_end(&volume_button);
 
-    (header, play_button)
+    (header, play_button, demod_dropdown.clone(), freq_selector)
 }
 
-/// Build the app menu button with About / Quit actions.
+/// Build the app menu button with Keyboard Shortcuts / About / Quit actions.
 fn build_menu_button() -> gtk4::MenuButton {
     let menu = gio::Menu::new();
+    menu.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
     menu.append(Some("_About SDR-RS"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
 

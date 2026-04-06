@@ -8,6 +8,10 @@ use sdr_types::DemodMode;
 /// Display labels for each demodulation mode, in dropdown order.
 const DEMOD_LABELS: &[&str] = &["WFM", "NFM", "AM", "USB", "LSB", "DSB", "CW", "RAW"];
 
+/// Number of available demod modes.
+#[allow(clippy::cast_possible_truncation)]
+pub const DEMOD_MODE_COUNT: u32 = DEMOD_LABELS.len() as u32;
+
 /// All demod modes in the same order as `DEMOD_LABELS`.
 const DEMOD_MODES: &[DemodMode] = &[
     DemodMode::Wfm,
@@ -68,6 +72,17 @@ pub fn index_to_demod_mode(index: u32) -> Option<DemodMode> {
     DEMOD_MODES.get(index as usize).copied()
 }
 
+/// Return the display label for a demod mode (e.g., "WFM", "NFM", "AM").
+///
+/// Returns `"??"` if the mode is not in the list (should not happen).
+pub fn demod_mode_label(mode: DemodMode) -> &'static str {
+    DEMOD_MODES
+        .iter()
+        .position(|&m| m == mode)
+        .and_then(|i| DEMOD_LABELS.get(i).copied())
+        .unwrap_or("??")
+}
+
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
@@ -96,5 +111,17 @@ mod tests {
     #[test]
     fn out_of_range_index_returns_none() {
         assert!(index_to_demod_mode(99).is_none());
+    }
+
+    #[test]
+    fn demod_mode_label_all_modes() {
+        assert_eq!(demod_mode_label(DemodMode::Wfm), "WFM");
+        assert_eq!(demod_mode_label(DemodMode::Nfm), "NFM");
+        assert_eq!(demod_mode_label(DemodMode::Am), "AM");
+        assert_eq!(demod_mode_label(DemodMode::Usb), "USB");
+        assert_eq!(demod_mode_label(DemodMode::Lsb), "LSB");
+        assert_eq!(demod_mode_label(DemodMode::Dsb), "DSB");
+        assert_eq!(demod_mode_label(DemodMode::Cw), "CW");
+        assert_eq!(demod_mode_label(DemodMode::Raw), "RAW");
     }
 }

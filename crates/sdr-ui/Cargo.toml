@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+pipewire = ["sdr-sink-audio/pipewire"]
+
 [dependencies]
 sdr-types.workspace = true
 sdr-dsp.workspace = true

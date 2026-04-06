@@ -35,9 +35,19 @@ const APP_CSS: &str = r#"
 
 /* Status bar — subtle padding, smaller font, border-top */
 .status-bar {
-    padding: 4px 8px;
-    font-size: 0.85em;
-    border-top: 1px solid @borders;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: alpha(@theme_fg_color, 0.7);
+    background-color: alpha(@theme_bg_color, 0.95);
+    border-top: 1px solid alpha(@borders, 0.5);
+}
+
+.status-bar label {
+    margin: 0 8px;
+}
+
+.status-bar separator {
+    margin: 2px 0;
 }
 
 /* Play button — destructive color when active (recording/running) */
