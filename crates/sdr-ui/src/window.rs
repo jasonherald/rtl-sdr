@@ -12,7 +12,6 @@ use libadwaita::prelude::*;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
 use sdr_source_rtlsdr::SAMPLE_RATES;
-use sdr_types::DemodMode;
 
 use crate::dsp_controller;
 use crate::header;
@@ -78,12 +77,7 @@ pub fn build_window(app: &adw::Application) {
         let bw = panels.radio.bandwidth_row.value();
         status_bar.update_demod(label, bw);
 
-        // Sync initial visibility for mode-specific controls
-        let is_fm = mode == DemodMode::Wfm || mode == DemodMode::Nfm;
-        panels.radio.set_fm_controls_visible(is_fm);
-        panels
-            .radio
-            .set_wfm_controls_visible(mode == DemodMode::Wfm);
+        panels.radio.apply_demod_visibility(mode);
     }
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
@@ -114,20 +108,13 @@ pub fn build_window(app: &adw::Application) {
     });
     let status_bar_for_demod = Rc::clone(&status_bar_demod);
     let bw_row_for_demod = panels.radio.bandwidth_row.clone();
-    let stereo_row_for_demod = panels.radio.stereo_row.clone();
-    let fm_controls_deemp = panels.radio.deemphasis_row.clone();
-    let fm_controls_nr = panels.radio.fm_if_nr_row.clone();
+    let radio_for_demod = panels.radio.clone();
     demod_dropdown.connect_selected_notify(move |dd| {
         if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
             let label = header::demod_mode_label(mode);
             let bw = bw_row_for_demod.value();
             status_bar_for_demod.update_demod(label, bw);
-
-            // Show/hide mode-specific controls
-            let is_fm = mode == DemodMode::Wfm || mode == DemodMode::Nfm;
-            fm_controls_deemp.set_visible(is_fm);
-            fm_controls_nr.set_visible(is_fm);
-            stereo_row_for_demod.set_visible(mode == DemodMode::Wfm);
+            radio_for_demod.apply_demod_visibility(mode);
         }
     });
 

@@ -37,6 +37,7 @@ const SQUELCH_STEP_DB: f64 = 1.0;
 const SQUELCH_PAGE_DB: f64 = 10.0;
 
 /// Radio / demodulator configuration panel with references to interactive rows.
+#[derive(Clone)]
 pub struct RadioPanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
     pub widget: adw::PreferencesGroup,
@@ -59,18 +60,16 @@ pub struct RadioPanel {
 }
 
 impl RadioPanel {
-    /// Show or hide FM-specific controls based on the current demod mode.
+    /// Update mode-specific control visibility for the given demod mode.
     ///
-    /// Call this when the demod mode changes to show FM IF NR only for FM modes
-    /// (WFM and NFM).
-    pub fn set_fm_controls_visible(&self, visible: bool) {
-        self.deemphasis_row.set_visible(visible);
-        self.fm_if_nr_row.set_visible(visible);
-    }
-
-    /// Show or hide WFM-specific controls.
-    pub fn set_wfm_controls_visible(&self, visible: bool) {
-        self.stereo_row.set_visible(visible);
+    /// Centralizes FM/WFM visibility policy so startup and mode-switch
+    /// handlers stay in sync.
+    pub fn apply_demod_visibility(&self, mode: sdr_types::DemodMode) {
+        let is_fm = matches!(mode, sdr_types::DemodMode::Wfm | sdr_types::DemodMode::Nfm);
+        self.deemphasis_row.set_visible(is_fm);
+        self.fm_if_nr_row.set_visible(is_fm);
+        self.stereo_row
+            .set_visible(mode == sdr_types::DemodMode::Wfm);
     }
 }
 
