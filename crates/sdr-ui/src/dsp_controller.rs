@@ -63,12 +63,17 @@ const DEVICE_INDEX: u32 = 0;
 /// This function returns immediately; the DSP work happens on a background
 /// thread that runs until the UI channel is dropped.
 pub fn spawn_dsp_thread(dsp_tx: mpsc::Sender<DspToUi>, ui_rx: mpsc::Receiver<UiToDsp>) {
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("dsp-controller".into())
         .spawn(move || {
             dsp_thread_main(dsp_tx, ui_rx);
-        })
-        .expect("failed to spawn DSP controller thread");
+        }) {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("failed to spawn DSP controller thread: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Main function for the DSP controller thread.

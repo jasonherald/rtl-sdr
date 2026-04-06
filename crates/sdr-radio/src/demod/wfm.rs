@@ -34,8 +34,16 @@ const WFM_SNAP_INTERVAL: f64 = 100_000.0;
 
 /// Wideband FM demodulator using `BroadcastFmDemod` from sdr-dsp.
 ///
-/// Produces mono output (discriminator) that the AF chain can process
-/// with deemphasis. Full stereo decode is deferred to a later phase.
+/// Produces mono output by default (discriminator through 15 kHz LPF).
+/// When `stereo` is enabled, performs pilot-tone-locked stereo decode
+/// matching C++ `broadcast_fm.h`:
+///   1. Extract 19 kHz pilot via bandpass filter
+///   2. PLL lock onto pilot, double to 38 kHz carrier
+///   3. Multiply baseband by 38 kHz carrier to extract L-R
+///   4. LPF the L-R signal at 15 kHz
+///   5. Matrix: L = (L+R + L-R) / 2, R = (L+R - L-R) / 2
+///
+/// Stereo decode matches C++ SDR++ where `_stereo` is opt-in (default: mono).
 pub struct WfmDemodulator {
     demod: BroadcastFmDemod,
     /// 15 kHz lowpass filter — removes pilot tone, stereo subcarrier, RDS, noise.
@@ -43,6 +51,11 @@ pub struct WfmDemodulator {
     config: DemodConfig,
     mono_buf: Vec<f32>,
     lpf_buf: Vec<f32>,
+    /// When true, perform stereo decode (pilot extraction + L-R matrixing).
+    /// Default: false (mono), matching C++ SDR++ `_stereo = false` default.
+    // TODO(issue #92): implement full stereo decode pipeline (pilot BPF, PLL,
+    // 38 kHz carrier multiply, L-R extraction, stereo matrix).
+    stereo: bool,
 }
 
 impl WfmDemodulator {
@@ -88,7 +101,28 @@ impl WfmDemodulator {
             config,
             mono_buf: Vec::new(),
             lpf_buf: Vec::new(),
+            stereo: false,
         })
+    }
+
+    /// Enable or disable stereo decode.
+    ///
+    /// When enabled, the demodulator will perform pilot-tone stereo decode
+    /// to produce independent L/R channels. When disabled (default), both
+    /// channels receive the same mono (L+R) signal.
+    ///
+    /// Note: stereo decode is not yet implemented — this flag is plumbed for
+    /// future use. Currently always outputs mono regardless of this setting.
+    pub fn set_stereo(&mut self, enabled: bool) {
+        self.stereo = enabled;
+        if enabled {
+            tracing::info!("WFM stereo decode requested (not yet implemented, outputting mono)");
+        }
+    }
+
+    /// Returns whether stereo decode is enabled.
+    pub fn is_stereo(&self) -> bool {
+        self.stereo
     }
 }
 

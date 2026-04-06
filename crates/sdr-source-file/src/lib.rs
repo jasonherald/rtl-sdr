@@ -45,10 +45,6 @@ pub struct FileSource {
 
 struct WavReaderState {
     reader: WavReader<std::io::BufReader<std::fs::File>>,
-    #[allow(dead_code)]
-    channels: u16,
-    #[allow(dead_code)]
-    bits_per_sample: u16,
     is_float: bool,
 }
 
@@ -77,49 +73,63 @@ impl FileSource {
         let mut count = 0;
 
         if state.is_float {
-            let mut samples = state.reader.samples::<f32>();
-            while count < output.len() {
-                let re = match samples.next() {
-                    Some(Ok(v)) => v,
-                    Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
-                    None => {
-                        if self.looping {
-                            // Would need to seek back to start — simplified for now
+            loop {
+                let mut samples = state.reader.samples::<f32>();
+                while count < output.len() {
+                    let re = match samples.next() {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
+                        None => break,
+                    };
+                    let im = match samples.next() {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
+                        None => {
+                            tracing::warn!("truncated IQ frame: Q sample missing after I");
                             break;
                         }
-                        break;
-                    }
-                };
-                let im = match samples.next() {
-                    Some(Ok(v)) => v,
-                    Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
-                    None => {
-                        tracing::warn!("truncated IQ frame: Q sample missing after I");
-                        break;
-                    }
-                };
-                output[count] = Complex::new(re, im);
-                count += 1;
+                    };
+                    output[count] = Complex::new(re, im);
+                    count += 1;
+                }
+                if count < output.len() && self.looping {
+                    state
+                        .reader
+                        .seek(0)
+                        .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+                    continue;
+                }
+                break;
             }
         } else {
-            let mut samples = state.reader.samples::<i16>();
-            while count < output.len() {
-                let re = match samples.next() {
-                    Some(Ok(v)) => f32::from(v) / INT16_SCALE,
-                    Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
-                    None => break,
-                };
-                let im_raw = match samples.next() {
-                    Some(Ok(v)) => v,
-                    Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
-                    None => {
-                        tracing::warn!("truncated IQ frame: Q sample missing after I");
-                        break;
-                    }
-                };
-                let im = f32::from(im_raw) / INT16_SCALE;
-                output[count] = Complex::new(re, im);
-                count += 1;
+            loop {
+                let mut samples = state.reader.samples::<i16>();
+                while count < output.len() {
+                    let re = match samples.next() {
+                        Some(Ok(v)) => f32::from(v) / INT16_SCALE,
+                        Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
+                        None => break,
+                    };
+                    let im_raw = match samples.next() {
+                        Some(Ok(v)) => v,
+                        Some(Err(e)) => return Err(SourceError::OpenFailed(e.to_string())),
+                        None => {
+                            tracing::warn!("truncated IQ frame: Q sample missing after I");
+                            break;
+                        }
+                    };
+                    let im = f32::from(im_raw) / INT16_SCALE;
+                    output[count] = Complex::new(re, im);
+                    count += 1;
+                }
+                if count < output.len() && self.looping {
+                    state
+                        .reader
+                        .seek(0)
+                        .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+                    continue;
+                }
+                break;
             }
         }
 
@@ -167,12 +177,7 @@ impl Source for FileSource {
         // Only update sample_rate after all validation passes
         self.sample_rate = f64::from(spec.sample_rate);
 
-        self.reader = Some(WavReaderState {
-            reader,
-            channels: spec.channels,
-            bits_per_sample: spec.bits_per_sample,
-            is_float,
-        });
+        self.reader = Some(WavReaderState { reader, is_float });
 
         Ok(())
     }

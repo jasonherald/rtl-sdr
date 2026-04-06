@@ -68,10 +68,11 @@ impl PowerSquelch {
         let sum: f32 = input.iter().map(|s| s.amplitude()).sum();
         let mean_amplitude = sum / input.len() as f32;
 
-        // Compare in dB (10*log10 of amplitude, matching C++ behavior)
-        let power_db = 10.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
+        // Compare in dB (10*log10 of amplitude, matching C++ behavior).
+        // Both measured and threshold use the same scale (10*log10 of mean amplitude).
+        let measured_db = 10.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
 
-        if power_db >= self.level_db {
+        if measured_db >= self.level_db {
             output[..input.len()].copy_from_slice(input);
             self.open = true;
         } else {
