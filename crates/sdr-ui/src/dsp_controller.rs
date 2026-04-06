@@ -32,6 +32,9 @@ const RAW_BUF_SIZE: usize = IQ_PAIRS_PER_READ * 2;
 /// Default FFT size for spectrum display.
 const DEFAULT_FFT_SIZE: usize = 2048;
 
+/// Default FFT display rate in FPS.
+const DEFAULT_FFT_RATE: f64 = 60.0;
+
 /// Default sample rate in Hz (2.0 Msps).
 /// With decimation 8, effective rate = 250 kHz, matching WFM IF exactly.
 /// This avoids the input resampler entirely for WFM.
@@ -138,6 +141,7 @@ struct DspState {
     dc_blocking: bool,
     invert_iq: bool,
     window_fn: FftWindow,
+    fft_rate: f64,
     /// Current channel bandwidth (persisted so VFO rebuilds use it, not mode default).
     bandwidth: f64,
 
@@ -151,6 +155,8 @@ struct DspState {
     iq_buf: Vec<Complex>,
     processed_buf: Vec<Complex>,
     fft_buf: Vec<f32>,
+    /// Pre-allocated send buffer — swapped with `fft_buf` to avoid clone.
+    fft_send_buf: Vec<f32>,
     audio_buf: Vec<Stereo>,
 }
 
@@ -184,6 +190,7 @@ impl DspState {
             dc_blocking: true,
             invert_iq: false,
             window_fn: FftWindow::Nuttall,
+            fft_rate: DEFAULT_FFT_RATE,
             bandwidth: initial_bandwidth,
             vfo: None,
             vfo_buf: Vec::new(),
@@ -192,6 +199,7 @@ impl DspState {
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
+            fft_send_buf: vec![0.0; DEFAULT_FFT_SIZE],
             audio_buf: Vec::new(),
         })
     }
@@ -377,8 +385,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             ) {
                 Ok(mut new_frontend) => {
                     new_frontend.set_invert_iq(state.invert_iq);
+                    new_frontend.set_fft_rate(state.fft_rate);
                     state.frontend = new_frontend;
                     state.fft_buf = vec![0.0; size];
+                    state.fft_send_buf = vec![0.0; size];
                 }
                 Err(e) => {
                     tracing::warn!("set FFT size failed: {e}");
@@ -443,6 +453,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             ) {
                 Ok(mut new_frontend) => {
                     new_frontend.set_invert_iq(state.invert_iq);
+                    new_frontend.set_fft_rate(state.fft_rate);
                     state.fft_buf = vec![0.0; new_frontend.fft_size()];
                     state.frontend = new_frontend;
                 }
@@ -476,6 +487,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetFftRate(fps) => {
             tracing::debug!(fps, "set FFT rate");
+            state.fft_rate = fps;
             state.frontend.set_fft_rate(fps);
         }
     }
@@ -537,6 +549,7 @@ fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
     .map_err(|e| format!("frontend rebuild: {e}"))?;
 
     new_frontend.set_invert_iq(state.invert_iq);
+    new_frontend.set_fft_rate(state.fft_rate);
     state.frontend = new_frontend;
     Ok(())
 }
@@ -613,7 +626,13 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
         Ok((processed_count, fft_ready)) => {
             // Send FFT data to UI if a new frame is ready.
             if fft_ready {
-                let _ = dsp_tx.send(DspToUi::FftData(state.fft_buf.clone()));
+                // Swap buffers so we send the filled one and keep the spare.
+                // The UI thread drops the Vec after consuming; the next FFT
+                // frame reuses the (now-empty) fft_buf which gets refilled.
+                std::mem::swap(&mut state.fft_buf, &mut state.fft_send_buf);
+                let send =
+                    std::mem::replace(&mut state.fft_send_buf, vec![0.0; state.fft_buf.len()]);
+                let _ = dsp_tx.send(DspToUi::FftData(send));
             }
 
             if processed_count > 0 {
@@ -648,6 +667,18 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
                 state.audio_buf.resize(max_out, Stereo::default());
                 match state.radio.process(radio_input, &mut state.audio_buf) {
                     Ok(audio_count) => {
+                        // Compute signal level for SNR display (before volume).
+                        if audio_count > 0 {
+                            let sum_sq: f32 = state.audio_buf[..audio_count]
+                                .iter()
+                                .map(|s| s.l * s.l + s.r * s.r)
+                                .sum();
+                            #[allow(clippy::cast_precision_loss)]
+                            let rms = (sum_sq / (2.0 * audio_count as f32)).sqrt();
+                            let snr_db = 20.0 * rms.max(f32::MIN_POSITIVE).log10();
+                            let _ = dsp_tx.send(DspToUi::SnrUpdate(snr_db));
+                        }
+
                         // Apply volume with perceptual (power-law) scaling.
                         // Quadratic curve maps the linear slider to perceived loudness.
                         let vol = state.volume * state.volume;
