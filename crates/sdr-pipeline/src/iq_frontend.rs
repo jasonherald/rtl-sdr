@@ -337,8 +337,8 @@ impl IqFrontend {
         let mut fft_ready = false;
         let mut pos = 0;
         while pos < processed {
-            if self.fft_accumulating && !fft_ready {
-                // Accumulate toward next FFT frame (suppressed if already emitted)
+            if self.fft_accumulating {
+                // Accumulate samples into the FFT buffer
                 let remaining_fft = self.fft_size - self.fft_accum_count;
                 let available = processed - pos;
                 let to_copy = remaining_fft.min(available);
@@ -350,13 +350,17 @@ impl IqFrontend {
                 pos += to_copy;
 
                 if self.fft_accum_count >= self.fft_size {
-                    self.compute_fft(fft_out)?;
-                    fft_ready = true;
+                    if !fft_ready {
+                        // First full window this call — emit it
+                        self.compute_fft(fft_out)?;
+                        fft_ready = true;
+                    }
+                    // Suppress additional emissions; reset for next window
                     self.fft_accum_count = 0;
                     self.fft_accumulating = false;
                 }
             } else {
-                // Not accumulating (or already emitted) — count toward next window
+                // Not accumulating — count toward next FFT window
                 let remaining_skip = self.fft_skip_samples.saturating_sub(self.fft_skip_counter);
                 let available = processed - pos;
                 let to_skip = remaining_skip.min(available);
@@ -666,6 +670,40 @@ mod tests {
         assert!(
             (5..=15).contains(&fft_count),
             "expected ~10 FFTs at 10 FPS, got {fft_count}"
+        );
+    }
+
+    #[test]
+    fn test_fft_rate_control_non_aligned_chunks() {
+        // Use chunk sizes that don't align with fft_size to exercise
+        // mid-block carry-over and tail accumulation.
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
+        fe.set_fft_rate(10.0);
+
+        let chunk_size = 500; // Not a multiple of 1024
+        let chunk = vec![Complex::new(1.0, 0.0); chunk_size];
+        let mut output = vec![Complex::default(); chunk_size];
+        let mut fft_out = vec![0.0_f32; TEST_FFT_SIZE];
+        let mut fft_count = 0;
+
+        // 48000 / 500 = 96 chunks for ~1 second
+        for _ in 0..96 {
+            let (_, fft_ready) = fe.process(&chunk, &mut output, &mut fft_out).unwrap();
+            if fft_ready {
+                fft_count += 1;
+            }
+        }
+
+        assert!(
+            (5..=15).contains(&fft_count),
+            "expected ~10 FFTs at 10 FPS with non-aligned chunks, got {fft_count}"
         );
     }
 }

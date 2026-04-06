@@ -126,6 +126,12 @@ impl Demodulator for NfmDemodulator {
     }
 
     fn set_bandwidth(&mut self, bw: f64) {
+        if !bw.is_finite() || !(NFM_MIN_BANDWIDTH..=NFM_MAX_BANDWIDTH).contains(&bw) {
+            tracing::warn!(
+                "NFM: ignoring invalid bandwidth {bw} Hz (expected {NFM_MIN_BANDWIDTH}..={NFM_MAX_BANDWIDTH} Hz)"
+            );
+            return;
+        }
         // Stage both updates before committing — avoids half-retuned state.
         let new_demod = match FmDemod::from_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
             Ok(d) => d,
@@ -173,6 +179,8 @@ mod tests {
         let cfg = demod.config();
         assert!((cfg.if_sample_rate - 50_000.0).abs() < f64::EPSILON);
         assert!((cfg.default_bandwidth - 12_500.0).abs() < f64::EPSILON);
+        assert!((cfg.max_bandwidth - NFM_MAX_BANDWIDTH).abs() < f64::EPSILON);
+        assert!((cfg.default_snap_interval - NFM_SNAP_INTERVAL).abs() < f64::EPSILON);
         assert!(cfg.fm_if_nr_allowed);
         assert!(cfg.squelch_allowed);
         assert!(cfg.deemp_allowed);
