@@ -74,6 +74,7 @@ impl FileSource {
 
         if state.is_float {
             loop {
+                let count_before = count;
                 let mut samples = state.reader.samples::<f32>();
                 while count < output.len() {
                     let re = match samples.next() {
@@ -95,19 +96,19 @@ impl FileSource {
                 if count >= output.len() || !self.looping {
                     break;
                 }
-                let count_before = count;
-                state
-                    .reader
-                    .seek(0)
-                    .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
                 // Guard: if a full pass produced nothing, the file is empty/corrupt.
                 if count == count_before {
                     tracing::warn!("looping enabled but no IQ frames available; breaking");
                     break;
                 }
+                state
+                    .reader
+                    .seek(0)
+                    .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
             }
         } else {
             loop {
+                let count_before = count;
                 let mut samples = state.reader.samples::<i16>();
                 while count < output.len() {
                     let re = match samples.next() {
@@ -130,15 +131,14 @@ impl FileSource {
                 if count >= output.len() || !self.looping {
                     break;
                 }
-                let count_before = count;
-                state
-                    .reader
-                    .seek(0)
-                    .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
                 if count == count_before {
                     tracing::warn!("looping enabled but no IQ frames available; breaking");
                     break;
                 }
+                state
+                    .reader
+                    .seek(0)
+                    .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
             }
         }
 
