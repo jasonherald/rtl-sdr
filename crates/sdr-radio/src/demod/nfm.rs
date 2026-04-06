@@ -82,8 +82,12 @@ impl Demodulator for NfmDemodulator {
         Ok(count)
     }
 
-    fn set_bandwidth(&mut self, _bw: f64) {
-        // Bandwidth is handled by the VFO channel filter, not the discriminator.
+    fn set_bandwidth(&mut self, bw: f64) {
+        // Rebuild the FM discriminator with deviation = bw/2 so the
+        // demodulator sensitivity tracks the channel bandwidth.
+        if let Ok(new_demod) = FmDemod::from_hz(bw / 2.0, NFM_IF_SAMPLE_RATE) {
+            self.demod = new_demod;
+        }
     }
 
     fn config(&self) -> &DemodConfig {

@@ -105,7 +105,7 @@ pub fn create_demodulator(
     match mode {
         DemodMode::Wfm => Ok(Box::new(WfmDemodulator::new()?)),
         DemodMode::Nfm => Ok(Box::new(NfmDemodulator::new()?)),
-        DemodMode::Am => Ok(Box::new(AmDemodulator::new())),
+        DemodMode::Am => Ok(Box::new(AmDemodulator::new()?)),
         DemodMode::Usb => Ok(Box::new(UsbDemodulator::new()?)),
         DemodMode::Lsb => Ok(Box::new(LsbDemodulator::new()?)),
         DemodMode::Dsb => Ok(Box::new(DsbDemodulator::new()?)),

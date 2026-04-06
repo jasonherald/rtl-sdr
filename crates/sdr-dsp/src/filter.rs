@@ -131,6 +131,22 @@ impl ComplexFirFilter {
         Ok(Self { taps, delay_line })
     }
 
+    /// Replace the filter taps. Resets the delay line.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `taps` is empty.
+    pub fn set_taps(&mut self, taps: Vec<f32>) -> Result<(), DspError> {
+        if taps.is_empty() {
+            return Err(DspError::InvalidParameter(
+                "FIR taps must not be empty".to_string(),
+            ));
+        }
+        self.delay_line = vec![Complex::default(); taps.len() - 1];
+        self.taps = taps;
+        Ok(())
+    }
+
     /// Reset the delay line to zero.
     pub fn reset(&mut self) {
         self.delay_line.fill(Complex::default());
@@ -480,6 +496,26 @@ mod tests {
         assert!((output[0].im).abs() < 1e-6);
         assert!((output[1].re - 1.0).abs() < 1e-6);
         assert!((output[1].im - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_complex_fir_set_taps() {
+        let mut fir = ComplexFirFilter::new(vec![1.0]).unwrap();
+        // Identity -> 2-tap delay filter
+        fir.set_taps(vec![0.0, 1.0]).unwrap();
+        assert_eq!(fir.tap_count(), 2);
+        let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
+        let mut output = [Complex::default(); 2];
+        fir.process(&input, &mut output).unwrap();
+        // First output should be zero (from delay line reset)
+        assert!((output[0].re).abs() < 1e-6);
+        assert!((output[1].re - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_complex_fir_set_taps_empty() {
+        let mut fir = ComplexFirFilter::new(vec![1.0]).unwrap();
+        assert!(fir.set_taps(vec![]).is_err());
     }
 
     #[test]

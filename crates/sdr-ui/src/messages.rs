@@ -63,6 +63,8 @@ pub enum UiToDsp {
     SetIqCorrection(bool),
     /// Set the FFT window function.
     SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow),
+    /// Set the VFO frequency offset from center in Hz (for click-to-tune).
+    SetVfoOffset(f64),
 }
 
 #[cfg(test)]
@@ -159,5 +161,8 @@ mod tests {
             wf,
             UiToDsp::SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow::Blackman)
         ));
+
+        let vfo = UiToDsp::SetVfoOffset(25_000.0);
+        assert!(matches!(vfo, UiToDsp::SetVfoOffset(o) if (o - 25_000.0).abs() < f64::EPSILON));
     }
 }

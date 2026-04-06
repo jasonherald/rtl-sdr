@@ -1,6 +1,7 @@
 //! Double sideband (DSB) demodulator.
 
 use sdr_dsp::demod::{SsbDemod, SsbMode};
+use sdr_dsp::loops::Agc;
 use sdr_types::{Complex, DspError, Stereo};
 
 use super::{DemodConfig, Demodulator, VfoReference};
@@ -23,11 +24,26 @@ const DSB_MAX_BANDWIDTH: f64 = 12_000.0;
 /// Default frequency snap interval for DSB (Hz).
 const DSB_SNAP_INTERVAL: f64 = 100.0;
 
+/// AGC set point (target output amplitude) for SSB modes.
+const SSB_AGC_SET_POINT: f32 = 1.0;
+/// AGC attack coefficient for SSB modes.
+const SSB_AGC_ATTACK: f32 = 0.001;
+/// AGC decay coefficient for SSB modes.
+const SSB_AGC_DECAY: f32 = 0.0001;
+/// AGC maximum gain for SSB modes.
+const SSB_AGC_MAX_GAIN: f32 = 1e6;
+/// AGC maximum output amplitude for SSB modes.
+const SSB_AGC_MAX_OUTPUT: f32 = 10.0;
+/// AGC initial gain for SSB modes.
+const SSB_AGC_INIT_GAIN: f32 = 1.0;
+
 /// Double sideband demodulator using `SsbDemod(Dsb)` from sdr-dsp.
 pub struct DsbDemodulator {
     demod: SsbDemod,
+    agc: Agc,
     config: DemodConfig,
     mono_buf: Vec<f32>,
+    agc_buf: Vec<f32>,
 }
 
 impl DsbDemodulator {
@@ -38,6 +54,14 @@ impl DsbDemodulator {
     /// Returns `DspError` if the underlying SSB demod cannot be created.
     pub fn new() -> Result<Self, DspError> {
         let demod = SsbDemod::new(SsbMode::Dsb, DSB_DEFAULT_BANDWIDTH, DSB_IF_SAMPLE_RATE)?;
+        let agc = Agc::new(
+            SSB_AGC_SET_POINT,
+            SSB_AGC_ATTACK,
+            SSB_AGC_DECAY,
+            SSB_AGC_MAX_GAIN,
+            SSB_AGC_MAX_OUTPUT,
+            SSB_AGC_INIT_GAIN,
+        )?;
         let config = DemodConfig {
             if_sample_rate: DSB_IF_SAMPLE_RATE,
             af_sample_rate: DSB_AF_SAMPLE_RATE,
@@ -57,8 +81,10 @@ impl DsbDemodulator {
         };
         Ok(Self {
             demod,
+            agc,
             config,
             mono_buf: Vec::new(),
+            agc_buf: Vec::new(),
         })
     }
 }
@@ -73,7 +99,13 @@ impl Demodulator for DsbDemodulator {
         }
         self.mono_buf.resize(input.len(), 0.0);
         let count = self.demod.process(input, &mut self.mono_buf)?;
-        sdr_dsp::convert::mono_to_stereo(&self.mono_buf[..count], &mut output[..count])?;
+
+        // Apply AGC to normalize SSB audio levels before stereo conversion.
+        self.agc_buf.resize(count, 0.0);
+        self.agc
+            .process_f32(&self.mono_buf[..count], &mut self.agc_buf[..count])?;
+
+        sdr_dsp::convert::mono_to_stereo(&self.agc_buf[..count], &mut output[..count])?;
         Ok(count)
     }
 
@@ -93,7 +125,7 @@ impl Demodulator for DsbDemodulator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 
@@ -107,15 +139,23 @@ mod tests {
     }
 
     #[test]
-    fn test_dsb_extracts_real_part() {
+    fn test_dsb_produces_audio() {
         let mut demod = DsbDemodulator::new().unwrap();
-        // DSB with no translation should extract the real part
-        let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
-        let mut output = [Stereo::default(); 2];
+        // Feed a longer signal so AGC can settle, then verify output is non-zero.
+        let input: Vec<Complex> = (0..500)
+            .map(|i| {
+                let phase = 2.0 * core::f32::consts::PI * 1000.0 * (i as f32) / 24_000.0;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+        let mut output = vec![Stereo::default(); 500];
         let count = demod.process(&input, &mut output).unwrap();
-        assert_eq!(count, 2);
-        // DSB extracts real part (no frequency translation)
-        assert!((output[0].l - 1.0).abs() < 1e-5);
-        assert!((output[1].l - 3.0).abs() < 1e-5);
+        assert_eq!(count, 500);
+        // After AGC settles, output should have meaningful amplitude.
+        let peak = output[100..]
+            .iter()
+            .map(|s| s.l.abs())
+            .fold(0.0_f32, f32::max);
+        assert!(peak > 0.1, "DSB should produce audio, peak = {peak}");
     }
 }

@@ -97,8 +97,10 @@ impl AfChain {
     pub fn set_deemp_enabled(&mut self, enabled: bool, tau: f64) -> Result<(), DspError> {
         self.deemp_enabled = enabled;
         if enabled && tau > 0.0 {
-            self.deemp_l = Some(DeemphasisFilter::new(tau, self.af_sample_rate)?);
-            self.deemp_r = Some(DeemphasisFilter::new(tau, self.af_sample_rate)?);
+            // Deemphasis runs AFTER resampling, so use the audio output rate.
+            // C++ SDR++ applies deemphasis at 48 kHz, not the demod AF rate.
+            self.deemp_l = Some(DeemphasisFilter::new(tau, self.audio_sample_rate)?);
+            self.deemp_r = Some(DeemphasisFilter::new(tau, self.audio_sample_rate)?);
         } else {
             self.deemp_l = None;
             self.deemp_r = None;
@@ -137,93 +139,78 @@ impl AfChain {
 
         let n = input.len();
 
-        // Stage 1: Deemphasis (operates on L and R channels separately)
-        let deemph_applied = if self.deemp_enabled {
-            if let (Some(deemp_l), Some(deemp_r)) = (&mut self.deemp_l, &mut self.deemp_r) {
-                self.deemp_buf_l.resize(n, 0.0);
-                self.deemp_buf_r.resize(n, 0.0);
-
-                // Extract L and R channels
-                for (i, s) in input.iter().enumerate() {
-                    self.deemp_buf_l[i] = s.l;
-                    self.deemp_buf_r[i] = s.r;
-                }
-
-                // Apply deemphasis using pre-allocated output buffers
-                self.deemp_out_l.resize(n, 0.0);
-                self.deemp_out_r.resize(n, 0.0);
-                deemp_l.process(&self.deemp_buf_l[..n], &mut self.deemp_out_l[..n])?;
-                deemp_r.process(&self.deemp_buf_r[..n], &mut self.deemp_out_r[..n])?;
-
-                // Swap input and output buffers so downstream reads from out
-                std::mem::swap(&mut self.deemp_buf_l, &mut self.deemp_out_l);
-                std::mem::swap(&mut self.deemp_buf_r, &mut self.deemp_out_r);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // Stage 2: Resampling
-        if let Some(resampler) = &mut self.resampler {
-            // Convert stereo to complex for resampling
+        // Stage 1: Resample from AF rate to audio output rate.
+        // C++ SDR++ order: Resample FIRST, then deemphasis at audio rate.
+        let (resampled, resamp_count) = if let Some(resampler) = &mut self.resampler {
             self.resamp_in.resize(n, Complex::default());
-            if deemph_applied {
-                for i in 0..n {
-                    self.resamp_in[i] = Complex::new(self.deemp_buf_l[i], self.deemp_buf_r[i]);
-                }
-            } else {
-                for (i, s) in input.iter().enumerate() {
-                    self.resamp_in[i] = Complex::new(s.l, s.r);
-                }
+            for (i, s) in input.iter().enumerate() {
+                self.resamp_in[i] = Complex::new(s.l, s.r);
             }
 
-            // Allocate output buffer with headroom
             let ratio = (self.audio_sample_rate / self.af_sample_rate).ceil() as usize;
             let max_out = n * ratio.max(1) + RESAMPLER_OUTPUT_PADDING;
             self.resamp_out.resize(max_out, Complex::default());
 
             let out_count = resampler.process(&self.resamp_in[..n], &mut self.resamp_out)?;
+            (true, out_count)
+        } else {
+            (false, n)
+        };
 
-            if output.len() < out_count {
-                return Err(DspError::BufferTooSmall {
-                    need: out_count,
-                    got: output.len(),
-                });
-            }
+        if output.len() < resamp_count {
+            return Err(DspError::BufferTooSmall {
+                need: resamp_count,
+                got: output.len(),
+            });
+        }
 
-            // Convert complex back to stereo
+        // Write resampled (or passthrough) samples to output.
+        if resampled {
             for (out, c) in output
                 .iter_mut()
                 .zip(self.resamp_out.iter())
-                .take(out_count)
+                .take(resamp_count)
             {
                 *out = Stereo::new(c.re, c.im);
             }
-            Ok(out_count)
         } else {
-            // No resampling needed
-            if output.len() < n {
-                return Err(DspError::BufferTooSmall {
-                    need: n,
-                    got: output.len(),
-                });
-            }
-            if deemph_applied {
-                for (out, (&l, &r)) in output
-                    .iter_mut()
-                    .zip(self.deemp_buf_l.iter().zip(self.deemp_buf_r.iter()))
-                    .take(n)
-                {
-                    *out = Stereo::new(l, r);
-                }
-            } else {
-                output[..n].copy_from_slice(input);
-            }
-            Ok(n)
+            output[..n].copy_from_slice(input);
         }
+
+        // Stage 2: Deemphasis at the audio output rate (48 kHz).
+        // Applied AFTER resampling, matching SDR++ signal chain order.
+        if self.deemp_enabled
+            && let (Some(deemp_l), Some(deemp_r)) = (&mut self.deemp_l, &mut self.deemp_r)
+        {
+            self.deemp_buf_l.resize(resamp_count, 0.0);
+            self.deemp_buf_r.resize(resamp_count, 0.0);
+
+            for (i, s) in output[..resamp_count].iter().enumerate() {
+                self.deemp_buf_l[i] = s.l;
+                self.deemp_buf_r[i] = s.r;
+            }
+
+            self.deemp_out_l.resize(resamp_count, 0.0);
+            self.deemp_out_r.resize(resamp_count, 0.0);
+            deemp_l.process(
+                &self.deemp_buf_l[..resamp_count],
+                &mut self.deemp_out_l[..resamp_count],
+            )?;
+            deemp_r.process(
+                &self.deemp_buf_r[..resamp_count],
+                &mut self.deemp_out_r[..resamp_count],
+            )?;
+
+            for (out, (&l, &r)) in output[..resamp_count].iter_mut().zip(
+                self.deemp_out_l[..resamp_count]
+                    .iter()
+                    .zip(self.deemp_out_r[..resamp_count].iter()),
+            ) {
+                *out = Stereo::new(l, r);
+            }
+        }
+
+        Ok(resamp_count)
     }
 }
 

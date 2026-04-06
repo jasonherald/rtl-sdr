@@ -1,6 +1,7 @@
 //! Upper sideband (USB) demodulator.
 
 use sdr_dsp::demod::{SsbDemod, SsbMode};
+use sdr_dsp::loops::Agc;
 use sdr_types::{Complex, DspError, Stereo};
 
 use super::{DemodConfig, Demodulator, VfoReference};
@@ -23,11 +24,26 @@ const USB_MAX_BANDWIDTH: f64 = 12_000.0;
 /// Default frequency snap interval for USB (Hz).
 const USB_SNAP_INTERVAL: f64 = 100.0;
 
+/// AGC set point (target output amplitude) for SSB modes.
+const SSB_AGC_SET_POINT: f32 = 1.0;
+/// AGC attack coefficient for SSB modes.
+const SSB_AGC_ATTACK: f32 = 0.001;
+/// AGC decay coefficient for SSB modes.
+const SSB_AGC_DECAY: f32 = 0.0001;
+/// AGC maximum gain for SSB modes.
+const SSB_AGC_MAX_GAIN: f32 = 1e6;
+/// AGC maximum output amplitude for SSB modes.
+const SSB_AGC_MAX_OUTPUT: f32 = 10.0;
+/// AGC initial gain for SSB modes.
+const SSB_AGC_INIT_GAIN: f32 = 1.0;
+
 /// Upper sideband demodulator using `SsbDemod(Usb)` from sdr-dsp.
 pub struct UsbDemodulator {
     demod: SsbDemod,
+    agc: Agc,
     config: DemodConfig,
     mono_buf: Vec<f32>,
+    agc_buf: Vec<f32>,
 }
 
 impl UsbDemodulator {
@@ -38,6 +54,14 @@ impl UsbDemodulator {
     /// Returns `DspError` if the underlying SSB demod cannot be created.
     pub fn new() -> Result<Self, DspError> {
         let demod = SsbDemod::new(SsbMode::Usb, USB_DEFAULT_BANDWIDTH, USB_IF_SAMPLE_RATE)?;
+        let agc = Agc::new(
+            SSB_AGC_SET_POINT,
+            SSB_AGC_ATTACK,
+            SSB_AGC_DECAY,
+            SSB_AGC_MAX_GAIN,
+            SSB_AGC_MAX_OUTPUT,
+            SSB_AGC_INIT_GAIN,
+        )?;
         let config = DemodConfig {
             if_sample_rate: USB_IF_SAMPLE_RATE,
             af_sample_rate: USB_AF_SAMPLE_RATE,
@@ -57,8 +81,10 @@ impl UsbDemodulator {
         };
         Ok(Self {
             demod,
+            agc,
             config,
             mono_buf: Vec::new(),
+            agc_buf: Vec::new(),
         })
     }
 }
@@ -73,7 +99,13 @@ impl Demodulator for UsbDemodulator {
         }
         self.mono_buf.resize(input.len(), 0.0);
         let count = self.demod.process(input, &mut self.mono_buf)?;
-        sdr_dsp::convert::mono_to_stereo(&self.mono_buf[..count], &mut output[..count])?;
+
+        // Apply AGC to normalize SSB audio levels before stereo conversion.
+        self.agc_buf.resize(count, 0.0);
+        self.agc
+            .process_f32(&self.mono_buf[..count], &mut self.agc_buf[..count])?;
+
+        sdr_dsp::convert::mono_to_stereo(&self.agc_buf[..count], &mut output[..count])?;
         Ok(count)
     }
 
