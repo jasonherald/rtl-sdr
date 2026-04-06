@@ -26,10 +26,10 @@ const AM_SNAP_INTERVAL: f64 = 1_000.0;
 
 /// AGC set point (target output amplitude) for AM mode.
 const AM_AGC_SET_POINT: f32 = 1.0;
-/// AGC attack coefficient for AM mode.
-const AM_AGC_ATTACK: f32 = 0.001;
-/// AGC decay coefficient for AM mode.
-const AM_AGC_DECAY: f32 = 0.0001;
+/// AGC attack coefficient for AM mode — matches C++ SDR++ (1/300).
+const AM_AGC_ATTACK: f32 = 0.003_333_333;
+/// AGC decay coefficient for AM mode — matches C++ SDR++ (1/3000).
+const AM_AGC_DECAY: f32 = 0.000_333_333;
 /// AGC maximum gain for AM mode.
 const AM_AGC_MAX_GAIN: f32 = 1e6;
 /// AGC maximum output amplitude for AM mode.

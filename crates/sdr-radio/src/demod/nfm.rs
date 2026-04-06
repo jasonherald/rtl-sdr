@@ -17,11 +17,11 @@ const NFM_DEFAULT_BANDWIDTH: f64 = 12_500.0;
 /// Minimum bandwidth for NFM (Hz).
 const NFM_MIN_BANDWIDTH: f64 = 1_000.0;
 
-/// Maximum bandwidth for NFM (Hz).
-const NFM_MAX_BANDWIDTH: f64 = 25_000.0;
+/// Maximum bandwidth for NFM (Hz) — matches IF sample rate (C++ SDR++).
+const NFM_MAX_BANDWIDTH: f64 = 50_000.0;
 
-/// Default frequency snap interval for NFM (Hz).
-const NFM_SNAP_INTERVAL: f64 = 12_500.0;
+/// Default frequency snap interval for NFM (Hz) — C++ uses 2500 Hz.
+const NFM_SNAP_INTERVAL: f64 = 2_500.0;
 
 /// FM deviation for narrowband FM, computed as half the default bandwidth (Hz).
 const NFM_DEVIATION_HZ: f64 = 6_250.0;
@@ -52,11 +52,11 @@ impl NfmDemodulator {
             bandwidth_locked: false,
             default_snap_interval: NFM_SNAP_INTERVAL,
             vfo_reference: VfoReference::Center,
-            deemp_allowed: false,
+            deemp_allowed: true,
             post_proc_enabled: true,
             default_deemp_tau: 0.0,
             fm_if_nr_allowed: true,
-            nb_allowed: true,
+            nb_allowed: false,
             high_pass_allowed: true,
             squelch_allowed: true,
         };

@@ -67,7 +67,7 @@ impl UsbDemodulator {
             fm_if_nr_allowed: false,
             nb_allowed: true,
             high_pass_allowed: true,
-            squelch_allowed: false,
+            squelch_allowed: true,
         };
         Ok(Self {
             demod,

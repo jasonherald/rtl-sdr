@@ -17,14 +17,14 @@ const CW_DEFAULT_BANDWIDTH: f64 = 200.0;
 /// Minimum bandwidth for CW (Hz).
 const CW_MIN_BANDWIDTH: f64 = 50.0;
 
-/// Maximum bandwidth for CW (Hz).
-const CW_MAX_BANDWIDTH: f64 = 1_000.0;
+/// Maximum bandwidth for CW (Hz) — C++ SDR++ uses 500 Hz.
+const CW_MAX_BANDWIDTH: f64 = 500.0;
 
 /// Default frequency snap interval for CW (Hz).
 const CW_SNAP_INTERVAL: f64 = 10.0;
 
-/// BFO tone offset for CW (Hz) — standard sidetone frequency.
-const CW_TONE_OFFSET_HZ: f64 = 700.0;
+/// BFO tone offset for CW (Hz) — C++ SDR++ uses 800 Hz.
+const CW_TONE_OFFSET_HZ: f64 = 800.0;
 
 /// CW demodulator using `CwDemod` from sdr-dsp.
 ///
@@ -56,7 +56,7 @@ impl CwDemodulator {
             post_proc_enabled: true,
             default_deemp_tau: 0.0,
             fm_if_nr_allowed: false,
-            nb_allowed: true,
+            nb_allowed: false,
             high_pass_allowed: false,
             squelch_allowed: false,
         };
