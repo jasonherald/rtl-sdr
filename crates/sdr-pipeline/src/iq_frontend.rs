@@ -330,7 +330,8 @@ impl IqFrontend {
 
         // Step 4: Accumulate samples for FFT with rate control.
         // Only accumulate when we're within the target FPS budget.
-        // Skip FFT accumulation between frames to save CPU.
+        // Cap to one FFT per process() call — the API only exposes one
+        // fft_ready flag and one fft_out buffer.
         let mut fft_ready = false;
         let mut pos = 0;
         while pos < processed {
@@ -349,8 +350,9 @@ impl IqFrontend {
                     self.compute_fft(fft_out)?;
                     fft_ready = true;
                     self.fft_accum_count = 0;
-                    // After computing FFT, stop accumulating until skip budget elapses
                     self.fft_accumulating = false;
+                    // One FFT per call — skip remaining samples for rate control
+                    break;
                 }
             } else {
                 // Not accumulating — just count samples toward next FFT window
@@ -361,7 +363,6 @@ impl IqFrontend {
                 pos += to_skip;
 
                 if self.fft_skip_counter >= self.fft_skip_samples {
-                    // Budget elapsed — start accumulating next FFT frame
                     self.fft_accumulating = true;
                     self.fft_skip_counter = 0;
                 }

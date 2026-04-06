@@ -42,6 +42,9 @@ const AM_AGC_INIT_GAIN: f32 = 1.0;
 /// Transition width for AM lowpass as a fraction of cutoff.
 const AM_LPF_TRANSITION_RATIO: f64 = 0.3;
 
+/// Nyquist guard margin (Hz) for LPF bypass detection.
+const AM_LPF_NYQUIST_GUARD_HZ: f64 = 1.0;
+
 /// AM demodulator using `AmDemod` from sdr-dsp.
 ///
 /// Matches C++ SDR++ AM demod architecture:
@@ -66,12 +69,13 @@ pub struct AmDemodulator {
 /// Returns `None` if cutoff is at or above Nyquist (no filter needed).
 fn build_am_lpf_taps(bandwidth: f64) -> Result<Option<Vec<f32>>, DspError> {
     let cutoff = bandwidth / 2.0;
-    let nyquist = AM_IF_SAMPLE_RATE / 2.0;
-    if cutoff >= nyquist - 1.0 {
-        return Ok(None); // bandwidth spans full IF — bypass LPF
+    let nyquist = AM_AF_SAMPLE_RATE / 2.0;
+    if cutoff >= nyquist - AM_LPF_NYQUIST_GUARD_HZ {
+        return Ok(None); // bandwidth spans full audio rate — bypass LPF
     }
-    let transition = (cutoff * AM_LPF_TRANSITION_RATIO).min(nyquist - cutoff - 1.0);
-    let lpf_taps = taps::low_pass(cutoff, transition, AM_IF_SAMPLE_RATE, false)?;
+    let transition =
+        (cutoff * AM_LPF_TRANSITION_RATIO).min(nyquist - cutoff - AM_LPF_NYQUIST_GUARD_HZ);
+    let lpf_taps = taps::low_pass(cutoff, transition, AM_AF_SAMPLE_RATE, false)?;
     Ok(Some(lpf_taps))
 }
 
@@ -176,8 +180,9 @@ impl Demodulator for AmDemodulator {
                 }
             }
             Ok(None) => {
-                // Bandwidth at Nyquist — bypass LPF with passthrough tap
-                let _ = self.audio_lpf.set_taps(vec![1.0]);
+                if let Err(e) = self.audio_lpf.set_taps(vec![1.0]) {
+                    tracing::warn!("AM: set_bandwidth({bw}) passthrough set_taps failed: {e}");
+                }
             }
             Err(e) => tracing::warn!("AM: set_bandwidth({bw}) LPF failed: {e}"),
         }

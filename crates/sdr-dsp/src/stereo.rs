@@ -48,8 +48,12 @@ pub struct FmStereoDecoder {
     diff_lpf: FirFilter,
     /// Delay buffer to compensate pilot BPF group delay on composite signal.
     composite_delay: Vec<f32>,
+    /// Current write position in composite delay circular buffer.
+    delay_write_pos: usize,
     /// Group delay of pilot BPF in samples.
     bpf_delay: usize,
+    /// Delayed composite scratch buffer for mono LPF path alignment.
+    delayed_composite: Vec<f32>,
     /// Scratch buffers.
     pilot_buf: Vec<f32>,
     mono_buf: Vec<f32>,
@@ -99,8 +103,10 @@ impl FmStereoDecoder {
             pilot_pll,
             mono_lpf,
             diff_lpf,
-            composite_delay: vec![0.0; bpf_delay],
+            composite_delay: vec![0.0; bpf_delay.max(1)],
+            delay_write_pos: 0,
             bpf_delay,
+            delayed_composite: Vec::new(),
             pilot_buf: Vec::new(),
             mono_buf: Vec::new(),
             diff_buf: Vec::new(),
@@ -115,6 +121,7 @@ impl FmStereoDecoder {
         self.mono_lpf.reset();
         self.diff_lpf.reset();
         self.composite_delay.fill(0.0);
+        self.delay_write_pos = 0;
     }
 
     /// Decode stereo from FM composite baseband.
@@ -148,6 +155,7 @@ impl FmStereoDecoder {
         // The pilot BPF introduces a group delay; we delay the composite signal
         // by the same amount so the subcarrier phase aligns with the composite.
         self.diff_buf.resize(len, 0.0);
+        self.delayed_composite.resize(len, 0.0);
 
         for (i, pilot) in self.pilot_buf.iter().enumerate() {
             // Feed pilot to PLL as complex signal (real=pilot, im=0)
@@ -161,24 +169,30 @@ impl FmStereoDecoder {
             let sin_t = pll_out[0].im;
             let subcarrier = cos_t * cos_t - sin_t * sin_t;
 
-            // Use delay-compensated composite for phase-aligned L−R extraction.
+            // Delay-compensate composite for phase-aligned extraction.
+            // Uses persistent write position for correct streaming across calls.
             let delayed = if self.bpf_delay > 0 {
-                // Read oldest sample from delay buffer, push current sample in
-                let old = self.composite_delay[i % self.bpf_delay];
-                self.composite_delay[i % self.bpf_delay] = input[i];
+                let old = self.composite_delay[self.delay_write_pos];
+                self.composite_delay[self.delay_write_pos] = input[i];
+                self.delay_write_pos = (self.delay_write_pos + 1) % self.bpf_delay;
                 old
             } else {
                 input[i]
             };
+
+            // Save delayed composite for mono LPF path (timing alignment)
+            self.delayed_composite[i] = delayed;
 
             // Multiply delay-matched composite by subcarrier → extracts L−R.
             // Scale by 2.0 to compensate for DSB-SC encoding.
             self.diff_buf[i] = delayed * subcarrier * 2.0;
         }
 
-        // Step 4: Lowpass L+R (mono) at 15 kHz
+        // Step 4: Lowpass L+R (mono) at 15 kHz.
+        // Use the same delay-compensated composite so L+R and L−R are time-aligned.
         self.mono_buf.resize(len, 0.0);
-        self.mono_lpf.process_f32(input, &mut self.mono_buf)?;
+        self.mono_lpf
+            .process_f32(&self.delayed_composite[..len], &mut self.mono_buf)?;
 
         // Step 5: Lowpass L−R (difference) at 15 kHz
         self.diff_lpf_buf.resize(len, 0.0);
@@ -238,7 +252,7 @@ mod tests {
         let settle = 1000;
         for s in &output[settle..] {
             assert!(
-                (s.l - s.r).abs() < 0.5,
+                (s.l - s.r).abs() < 0.1,
                 "mono signal: L and R should be similar, L={}, R={}",
                 s.l,
                 s.r
@@ -300,5 +314,41 @@ mod tests {
         // After reset, should process cleanly
         let count = decoder.process(&input, &mut output).unwrap();
         assert_eq!(count, 1000);
+    }
+
+    #[test]
+    fn test_stereo_decoder_streaming_continuity() {
+        // Verify delay buffer state is correct across multiple process() calls.
+        let mut decoder = FmStereoDecoder::new(TEST_SAMPLE_RATE).unwrap();
+        let chunk_size = 512;
+        let num_chunks = 10;
+
+        // Generate continuous 1 kHz tone across all chunks
+        let full_input: Vec<f32> = (0..chunk_size * num_chunks)
+            .map(|i| (2.0 * PI * 1000.0 * (i as f32) / TEST_SAMPLE_RATE as f32).sin())
+            .collect();
+
+        let mut all_outputs = Vec::new();
+        for chunk in full_input.chunks(chunk_size) {
+            let mut output = vec![Stereo::default(); chunk.len()];
+            decoder.process(chunk, &mut output).unwrap();
+            all_outputs.extend(output);
+        }
+
+        // Process same input in single call for reference
+        let mut decoder_ref = FmStereoDecoder::new(TEST_SAMPLE_RATE).unwrap();
+        let mut ref_output = vec![Stereo::default(); full_input.len()];
+        decoder_ref.process(&full_input, &mut ref_output).unwrap();
+
+        // After settling, chunked and single-call outputs should match
+        let settle = 2000;
+        for i in settle..all_outputs.len() {
+            assert!(
+                (all_outputs[i].l - ref_output[i].l).abs() < 1e-4,
+                "L channel mismatch at {i}: chunked={}, ref={}",
+                all_outputs[i].l,
+                ref_output[i].l
+            );
+        }
     }
 }

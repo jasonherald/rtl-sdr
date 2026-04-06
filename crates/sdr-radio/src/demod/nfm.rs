@@ -136,7 +136,9 @@ impl Demodulator for NfmDemodulator {
                 }
             }
             Ok(None) => {
-                let _ = self.audio_lpf.set_taps(vec![1.0]);
+                if let Err(e) = self.audio_lpf.set_taps(vec![1.0]) {
+                    tracing::warn!("NFM: set_bandwidth({bw}) passthrough set_taps failed: {e}");
+                }
             }
             Err(e) => tracing::warn!("NFM: set_bandwidth({bw}) LPF failed: {e}"),
         }
@@ -259,5 +261,7 @@ mod tests {
         // Should not panic
         demod.set_bandwidth(25_000.0);
         demod.set_bandwidth(5_000.0);
+        // Verify passthrough path at max bandwidth (cutoff at Nyquist)
+        demod.set_bandwidth(NFM_MAX_BANDWIDTH);
     }
 }

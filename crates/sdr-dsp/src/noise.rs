@@ -288,10 +288,13 @@ impl FmIfNoiseReduction {
             }
         }
 
-        // Flush any buffered partial-block samples so output count matches input.
-        if self.overlap_count > 0 && out_pos < input.len() {
-            let remaining = (input.len() - out_pos).min(self.overlap_count);
-            output[out_pos..out_pos + remaining].copy_from_slice(&self.overlap_buf[..remaining]);
+        // Pass through unprocessed tail samples so output count matches input.
+        // These samples are buffered in overlap_buf for the next FFT block;
+        // copy the original input (not overlap_buf which may contain stale data
+        // from prior calls) to maintain correct signal flow.
+        if out_pos < input.len() {
+            let remaining = input.len() - out_pos;
+            output[out_pos..out_pos + remaining].copy_from_slice(&input[input.len() - remaining..]);
             out_pos += remaining;
         }
 
