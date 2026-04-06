@@ -9,12 +9,18 @@ use crate::math;
 
 /// Quadrature FM demodulator — extracts instantaneous frequency from IQ.
 ///
-/// Ports SDR++ `dsp::demod::Quadrature`. Computes the phase difference
-/// between successive samples, normalized by the deviation:
-/// `out[i] = normalize_phase(phase[i] - phase[i-1]) * inv_deviation`
+/// Uses the conjugate-multiply method (standard in GNU Radio, liquid-dsp):
+/// `out[i] = atan2(cross, dot) * inv_deviation`
+/// where `cross = re[n]*im[n-1] - im[n]*re[n-1]` and
+///       `dot   = re[n]*re[n-1] + im[n]*im[n-1]`
+///
+/// This is mathematically equivalent to phase-difference but:
+/// - One atan2 per sample instead of two
+/// - No phase wrapping needed (conjugate product handles it)
+/// - More numerically stable near ±π
 pub struct Quadrature {
     inv_deviation: f32,
-    last_phase: f32,
+    last_sample: Complex,
 }
 
 impl Quadrature {
@@ -39,7 +45,7 @@ impl Quadrature {
         }
         Ok(Self {
             inv_deviation,
-            last_phase: 0.0,
+            last_sample: Complex::new(1.0, 0.0),
         })
     }
 
@@ -88,10 +94,14 @@ impl Quadrature {
 
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
-        self.last_phase = 0.0;
+        self.last_sample = Complex::new(1.0, 0.0);
     }
 
     /// Process complex samples, outputting demodulated audio.
+    ///
+    /// Uses conjugate-multiply: `z[n] * conj(z[n-1])` gives a complex
+    /// whose argument is the instantaneous phase difference, without
+    /// needing explicit phase unwrapping.
     ///
     /// # Errors
     ///
@@ -104,9 +114,13 @@ impl Quadrature {
             });
         }
         for (i, &s) in input.iter().enumerate() {
-            let current_phase = s.phase();
-            output[i] = math::normalize_phase(current_phase - self.last_phase) * self.inv_deviation;
-            self.last_phase = current_phase;
+            // Conjugate multiply: product = s * conj(last)
+            // real part (dot):  s.re*last.re + s.im*last.im
+            // imag part (cross): s.im*last.re - s.re*last.im
+            let dot = s.re * self.last_sample.re + s.im * self.last_sample.im;
+            let cross = s.im * self.last_sample.re - s.re * self.last_sample.im;
+            output[i] = cross.atan2(dot) * self.inv_deviation;
+            self.last_sample = s;
         }
         Ok(input.len())
     }
