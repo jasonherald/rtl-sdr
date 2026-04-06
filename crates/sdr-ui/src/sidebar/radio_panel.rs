@@ -203,5 +203,7 @@ mod tests {
         assert!(super::MIN_NB_LEVEL <= super::MAX_NB_LEVEL);
         assert!(super::DEFAULT_NB_LEVEL >= super::MIN_NB_LEVEL);
         assert!(super::DEFAULT_NB_LEVEL <= super::MAX_NB_LEVEL);
+        assert!(super::NB_LEVEL_STEP > 0.0);
+        assert!(super::NB_LEVEL_PAGE > 0.0);
     };
 }

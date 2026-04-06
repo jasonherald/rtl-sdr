@@ -72,11 +72,18 @@ pub fn build_window(app: &adw::Application) {
 
     window.add_breakpoint(breakpoint);
 
-    // Set initial status bar values from the actual UI state.
+    // Set initial status bar values and mode-specific control visibility.
     if let Some(mode) = demod_selector::index_to_demod_mode(demod_dropdown.selected()) {
         let label = header::demod_mode_label(mode);
         let bw = panels.radio.bandwidth_row.value();
         status_bar.update_demod(label, bw);
+
+        // Sync initial visibility for mode-specific controls
+        let is_fm = mode == DemodMode::Wfm || mode == DemodMode::Nfm;
+        panels.radio.set_fm_controls_visible(is_fm);
+        panels
+            .radio
+            .set_wfm_controls_visible(mode == DemodMode::Wfm);
     }
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
