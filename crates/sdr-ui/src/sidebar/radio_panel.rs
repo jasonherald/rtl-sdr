@@ -14,6 +14,13 @@ const BANDWIDTH_STEP_HZ: f64 = 100.0;
 /// Bandwidth page increment in Hz (scroll/page-up/down).
 const BANDWIDTH_PAGE_HZ: f64 = 1_000.0;
 
+/// Default noise blanker level (threshold multiplier).
+const DEFAULT_NB_LEVEL: f64 = 5.0;
+/// Minimum noise blanker level.
+const MIN_NB_LEVEL: f64 = 1.0;
+/// Maximum noise blanker level.
+const MAX_NB_LEVEL: f64 = 20.0;
+
 /// Default squelch level in dB.
 const DEFAULT_SQUELCH_DB: f64 = -100.0;
 /// Minimum squelch level in dB.
@@ -39,8 +46,12 @@ pub struct RadioPanel {
     pub deemphasis_row: adw::ComboRow,
     /// Noise blanker toggle.
     pub noise_blanker_row: adw::SwitchRow,
+    /// Noise blanker level control (visible when NB is enabled).
+    pub nb_level_row: adw::SpinRow,
     /// FM IF noise reduction toggle (visible only for FM modes).
     pub fm_if_nr_row: adw::SwitchRow,
+    /// WFM stereo decode toggle (visible only for WFM mode).
+    pub stereo_row: adw::SwitchRow,
 }
 
 impl RadioPanel {
@@ -51,6 +62,11 @@ impl RadioPanel {
     pub fn set_fm_controls_visible(&self, visible: bool) {
         self.deemphasis_row.set_visible(visible);
         self.fm_if_nr_row.set_visible(visible);
+    }
+
+    /// Show or hide WFM-specific controls.
+    pub fn set_wfm_controls_visible(&self, visible: bool) {
+        self.stereo_row.set_visible(visible);
     }
 }
 
@@ -106,10 +122,27 @@ pub fn build_radio_panel() -> RadioPanel {
     // --- Noise Blanker ---
     let noise_blanker_row = adw::SwitchRow::builder().title("Noise Blanker").build();
 
+    // --- Noise Blanker Level ---
+    let nb_level_adj =
+        gtk4::Adjustment::new(DEFAULT_NB_LEVEL, MIN_NB_LEVEL, MAX_NB_LEVEL, 0.5, 1.0, 0.0);
+    let nb_level_row = adw::SpinRow::builder()
+        .title("NB Level")
+        .subtitle("Threshold multiplier")
+        .adjustment(&nb_level_adj)
+        .digits(1)
+        .build();
+
     // --- FM IF Noise Reduction ---
     let fm_if_nr_row = adw::SwitchRow::builder()
         .title("FM IF NR")
         .subtitle("IF noise reduction for FM modes")
+        .build();
+
+    // --- WFM Stereo ---
+    let stereo_row = adw::SwitchRow::builder()
+        .title("Stereo")
+        .subtitle("WFM stereo decode")
+        .visible(false) // Only shown in WFM mode
         .build();
 
     group.add(&bandwidth_row);
@@ -117,7 +150,9 @@ pub fn build_radio_panel() -> RadioPanel {
     group.add(&squelch_level_row);
     group.add(&deemphasis_row);
     group.add(&noise_blanker_row);
+    group.add(&nb_level_row);
     group.add(&fm_if_nr_row);
+    group.add(&stereo_row);
 
     // All rows connected to DSP pipeline via window.rs
 
@@ -128,7 +163,9 @@ pub fn build_radio_panel() -> RadioPanel {
         squelch_level_row,
         deemphasis_row,
         noise_blanker_row,
+        nb_level_row,
         fm_if_nr_row,
+        stereo_row,
     }
 }
 

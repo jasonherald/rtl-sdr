@@ -65,6 +65,12 @@ pub enum UiToDsp {
     SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow),
     /// Set the VFO frequency offset from center in Hz (for click-to-tune).
     SetVfoOffset(f64),
+    /// Set the noise blanker level (threshold multiplier, >= 1.0).
+    SetNbLevel(f32),
+    /// Enable or disable WFM stereo decode.
+    SetWfmStereo(bool),
+    /// Set the FFT display frame rate (FPS).
+    SetFftRate(f64),
 }
 
 #[cfg(test)]
@@ -164,5 +170,14 @@ mod tests {
 
         let vfo = UiToDsp::SetVfoOffset(25_000.0);
         assert!(matches!(vfo, UiToDsp::SetVfoOffset(o) if (o - 25_000.0).abs() < f64::EPSILON));
+
+        let nb = UiToDsp::SetNbLevel(5.0);
+        assert!(matches!(nb, UiToDsp::SetNbLevel(l) if (l - 5.0).abs() < f32::EPSILON));
+
+        let stereo = UiToDsp::SetWfmStereo(true);
+        assert!(matches!(stereo, UiToDsp::SetWfmStereo(true)));
+
+        let fft_rate = UiToDsp::SetFftRate(30.0);
+        assert!(matches!(fft_rate, UiToDsp::SetFftRate(r) if (r - 30.0).abs() < f64::EPSILON));
     }
 }

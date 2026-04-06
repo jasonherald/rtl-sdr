@@ -12,6 +12,7 @@ use libadwaita::prelude::*;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
 use sdr_source_rtlsdr::SAMPLE_RATES;
+use sdr_types::DemodMode;
 
 use crate::dsp_controller;
 use crate::header;
@@ -50,7 +51,7 @@ pub fn build_window(app: &adw::Application) {
     let state = AppState::new_shared(ui_tx);
 
     // --- Build UI ---
-    let (split_view, panels, spectrum_handle, status_bar) = build_split_view();
+    let (split_view, panels, spectrum_handle, status_bar) = build_split_view(&state);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
     let (header, play_button, demod_dropdown, freq_selector) =
         build_header_bar(&sidebar_toggle, &state);
@@ -106,11 +107,20 @@ pub fn build_window(app: &adw::Application) {
     });
     let status_bar_for_demod = Rc::clone(&status_bar_demod);
     let bw_row_for_demod = panels.radio.bandwidth_row.clone();
+    let stereo_row_for_demod = panels.radio.stereo_row.clone();
+    let fm_controls_deemp = panels.radio.deemphasis_row.clone();
+    let fm_controls_nr = panels.radio.fm_if_nr_row.clone();
     demod_dropdown.connect_selected_notify(move |dd| {
         if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
             let label = header::demod_mode_label(mode);
             let bw = bw_row_for_demod.value();
             status_bar_for_demod.update_demod(label, bw);
+
+            // Show/hide mode-specific controls
+            let is_fm = mode == DemodMode::Wfm || mode == DemodMode::Nfm;
+            fm_controls_deemp.set_visible(is_fm);
+            fm_controls_nr.set_visible(is_fm);
+            stereo_row_for_demod.set_visible(mode == DemodMode::Wfm);
         }
     });
 
@@ -204,7 +214,9 @@ fn handle_dsp_message(
 /// and status bar.
 ///
 /// Returns the split view, sidebar panels, spectrum display handle, and status bar.
-fn build_split_view() -> (
+fn build_split_view(
+    state: &Rc<AppState>,
+) -> (
     adw::OverlaySplitView,
     SidebarPanels,
     spectrum::SpectrumHandle,
@@ -214,7 +226,7 @@ fn build_split_view() -> (
     let (sidebar_scroll, panels) = sidebar::build_sidebar();
 
     // Main content area — spectrum display (FFT plot + waterfall) + status bar.
-    let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view();
+    let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view(state.ui_tx.clone());
     spectrum_view.add_css_class("spectrum-area");
 
     // Status bar at the bottom.
@@ -505,10 +517,23 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             state_noise_blanker.send_dsp(UiToDsp::SetNbEnabled(row.is_active()));
         });
 
+    // Noise blanker level
+    let state_nb_level = Rc::clone(state);
+    panels.radio.nb_level_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation)]
+        state_nb_level.send_dsp(UiToDsp::SetNbLevel(row.value() as f32));
+    });
+
     // FM IF NR
     let state_fm_nr = Rc::clone(state);
     panels.radio.fm_if_nr_row.connect_active_notify(move |row| {
         state_fm_nr.send_dsp(UiToDsp::SetFmIfNrEnabled(row.is_active()));
+    });
+
+    // WFM Stereo
+    let state_stereo = Rc::clone(state);
+    panels.radio.stereo_row.connect_active_notify(move |row| {
+        state_stereo.send_dsp(UiToDsp::SetWfmStereo(row.is_active()));
     });
 }
 
@@ -543,6 +568,15 @@ fn connect_display_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             if let Some(&window) = WINDOW_FUNCTIONS.get(idx) {
                 state_wf.send_dsp(UiToDsp::SetWindowFunction(window));
             }
+        });
+
+    // Frame rate (FFT rate control)
+    let state_fps = Rc::clone(state);
+    panels
+        .display
+        .frame_rate_row
+        .connect_value_notify(move |row| {
+            state_fps.send_dsp(UiToDsp::SetFftRate(row.value()));
         });
 }
 

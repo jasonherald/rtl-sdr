@@ -123,6 +123,9 @@ pub trait Demodulator {
 
     /// Human-readable name of this demod mode.
     fn name(&self) -> &'static str;
+
+    /// Enable or disable stereo decode (WFM only, no-op for other modes).
+    fn set_stereo(&mut self, _enabled: bool) {}
 }
 
 /// Create a boxed demodulator for the given mode.

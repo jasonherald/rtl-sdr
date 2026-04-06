@@ -460,6 +460,24 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 vfo.set_offset(offset);
             }
         }
+
+        UiToDsp::SetNbLevel(level) => {
+            tracing::debug!(level, "set noise blanker level");
+            if let Err(e) = state.radio.if_chain_mut().set_nb_level(level) {
+                tracing::warn!("set NB level failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("NB level failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetWfmStereo(enabled) => {
+            tracing::debug!(enabled, "set WFM stereo");
+            state.radio.set_wfm_stereo(enabled);
+        }
+
+        UiToDsp::SetFftRate(fps) => {
+            tracing::debug!(fps, "set FFT rate");
+            state.frontend.set_fft_rate(fps);
+        }
     }
 }
 

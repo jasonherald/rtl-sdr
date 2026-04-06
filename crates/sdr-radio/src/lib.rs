@@ -325,6 +325,14 @@ impl RadioModule {
         Ok(())
     }
 
+    /// Enable or disable WFM stereo decode.
+    ///
+    /// Only has an effect when the current mode is WFM. For other modes this
+    /// is a no-op via the default trait implementation.
+    pub fn set_wfm_stereo(&mut self, enabled: bool) {
+        self.demod.set_stereo(enabled);
+    }
+
     /// Get the current demodulation mode.
     pub fn current_mode(&self) -> DemodMode {
         self.mode
