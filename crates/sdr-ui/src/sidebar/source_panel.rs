@@ -30,7 +30,7 @@ const MAX_PORT: f64 = 65535.0;
 pub struct SourcePanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
     pub widget: adw::PreferencesGroup,
-    /// Device type selector (RTL-SDR, Network, File).
+    /// Device type selector (RTL-SDR, Network).
     pub device_row: adw::ComboRow,
     /// RTL-SDR sample rate selector.
     pub sample_rate_row: adw::ComboRow,
@@ -48,17 +48,34 @@ pub struct SourcePanel {
     pub dc_blocking_row: adw::SwitchRow,
     /// IQ correction toggle (always visible).
     pub iq_correction_row: adw::SwitchRow,
+    /// IQ inversion toggle (always visible).
+    pub iq_inversion_row: adw::SwitchRow,
     /// Decimation factor selector (always visible).
     pub decimation_row: adw::ComboRow,
 }
 
+/// Default sample rate selector index (2.4 MHz = index 7).
+const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
+
 /// Build RTL-SDR-specific rows: sample rate, gain, AGC.
 fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::SwitchRow) {
-    let sample_rate_model = gtk4::StringList::new(&["250 kHz", "1.024 MHz", "2.4 MHz", "3.2 MHz"]);
+    let sample_rate_model = gtk4::StringList::new(&[
+        "250 kHz",
+        "1.024 MHz",
+        "1.536 MHz",
+        "1.792 MHz",
+        "1.920 MHz",
+        "2.048 MHz",
+        "2.160 MHz",
+        "2.4 MHz",
+        "2.560 MHz",
+        "2.880 MHz",
+        "3.2 MHz",
+    ]);
     let sample_rate_row = adw::ComboRow::builder()
         .title("Sample Rate")
         .model(&sample_rate_model)
-        .selected(2) // default to 2.4 MHz
+        .selected(DEFAULT_SAMPLE_RATE_INDEX)
         .build();
 
     let gain_adj = gtk4::Adjustment::new(
@@ -107,8 +124,13 @@ fn build_network_rows() -> (adw::EntryRow, adw::SpinRow, adw::ComboRow) {
     (hostname_row, port_row, protocol_row)
 }
 
-/// Build common controls: DC blocking, IQ correction, decimation.
-fn build_common_rows() -> (adw::SwitchRow, adw::SwitchRow, adw::ComboRow) {
+/// Build common controls: DC blocking, IQ correction, IQ inversion, decimation.
+fn build_common_rows() -> (
+    adw::SwitchRow,
+    adw::SwitchRow,
+    adw::SwitchRow,
+    adw::ComboRow,
+) {
     let dc_blocking_row = adw::SwitchRow::builder()
         .title("DC Blocking")
         .active(true)
@@ -116,13 +138,20 @@ fn build_common_rows() -> (adw::SwitchRow, adw::SwitchRow, adw::ComboRow) {
 
     let iq_correction_row = adw::SwitchRow::builder().title("IQ Correction").build();
 
+    let iq_inversion_row = adw::SwitchRow::builder().title("Invert IQ").build();
+
     let decimation_model = gtk4::StringList::new(&["None", "2x", "4x", "8x", "16x"]);
     let decimation_row = adw::ComboRow::builder()
         .title("Decimation")
         .model(&decimation_model)
         .build();
 
-    (dc_blocking_row, iq_correction_row, decimation_row)
+    (
+        dc_blocking_row,
+        iq_correction_row,
+        iq_inversion_row,
+        decimation_row,
+    )
 }
 
 /// Wire the device selector to show/hide source-specific rows.
@@ -174,7 +203,8 @@ pub fn build_source_panel() -> SourcePanel {
         .description("Device & input configuration")
         .build();
 
-    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network", "File"]);
+    // File source omitted until a file picker is implemented.
+    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network"]);
     let device_row = adw::ComboRow::builder()
         .title("Device")
         .model(&device_model)
@@ -182,7 +212,8 @@ pub fn build_source_panel() -> SourcePanel {
 
     let (sample_rate_row, gain_row, agc_row) = build_rtlsdr_rows();
     let (hostname_row, port_row, protocol_row) = build_network_rows();
-    let (dc_blocking_row, iq_correction_row, decimation_row) = build_common_rows();
+    let (dc_blocking_row, iq_correction_row, iq_inversion_row, decimation_row) =
+        build_common_rows();
 
     // Add all rows to the group.
     group.add(&device_row);
@@ -194,6 +225,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&protocol_row);
     group.add(&dc_blocking_row);
     group.add(&iq_correction_row);
+    group.add(&iq_inversion_row);
     group.add(&decimation_row);
 
     // Set initial visibility: show RTL-SDR controls, hide Network controls.
@@ -224,6 +256,7 @@ pub fn build_source_panel() -> SourcePanel {
         protocol_row,
         dc_blocking_row,
         iq_correction_row,
+        iq_inversion_row,
         decimation_row,
     }
 }

@@ -45,6 +45,7 @@ impl RadioPanel {
     /// Call this when the demod mode changes to show FM IF NR only for FM modes
     /// (WFM and NFM).
     pub fn set_fm_controls_visible(&self, visible: bool) {
+        self.deemphasis_row.set_visible(visible);
         self.fm_if_nr_row.set_visible(visible);
     }
 }

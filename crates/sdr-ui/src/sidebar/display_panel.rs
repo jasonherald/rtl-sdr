@@ -13,6 +13,9 @@ const MAX_FPS: f64 = 60.0;
 /// Default FFT size selector index (2048 = index 2).
 const DEFAULT_FFT_SIZE_INDEX: u32 = 2;
 
+/// Default window function selector index (Blackman = index 1).
+const DEFAULT_WINDOW_FN_INDEX: u32 = 1;
+
 /// Display settings panel with references to interactive rows.
 pub struct DisplayPanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
@@ -47,7 +50,7 @@ pub fn build_display_panel() -> DisplayPanel {
     let window_fn_row = adw::ComboRow::builder()
         .title("Window Function")
         .model(&window_fn_model)
-        .selected(1) // default to Blackman
+        .selected(DEFAULT_WINDOW_FN_INDEX)
         .build();
 
     // --- Frame Rate ---
@@ -60,7 +63,7 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- Color Map ---
-    let colormap_model = gtk4::StringList::new(&["Turbo", "Viridis", "Plasma"]);
+    let colormap_model = gtk4::StringList::new(&["Turbo"]);
     let color_map_row = adw::ComboRow::builder()
         .title("Color Map")
         .model(&colormap_model)
