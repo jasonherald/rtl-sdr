@@ -356,6 +356,12 @@ mod tests {
     /// Minimum energy ratio for NR tone preservation test.
     const MIN_ENERGY_RATIO: f32 = 0.05;
 
+    // Squelch dB regression constants: amplitude 0.1 → -20 dBFS.
+    const SQUELCH_REG_AMPLITUDE: f32 = 0.1;
+    const SQUELCH_REG_BLOCK_LEN: usize = 100;
+    const SQUELCH_REG_CLOSE_DB: f32 = -15.0;
+    const SQUELCH_REG_OPEN_DB: f32 = -25.0;
+
     // --- Power Squelch tests ---
 
     #[test]
@@ -393,19 +399,19 @@ mod tests {
 
     #[test]
     fn test_squelch_db_scale_regression() {
-        // Pin the 20*log10(amplitude) scale: amplitude 0.1 → -20 dB.
+        // Pin the 20*log10(amplitude) scale: amplitude 0.1 → -20 dBFS.
         // A threshold at -15 dB should close, -25 dB should open.
-        let input = vec![Complex::new(0.1, 0.0); 100];
+        let input = vec![Complex::new(SQUELCH_REG_AMPLITUDE, 0.0); SQUELCH_REG_BLOCK_LEN];
 
-        let mut squelch_close = PowerSquelch::new(-15.0);
-        let mut output = vec![Complex::default(); 100];
+        let mut squelch_close = PowerSquelch::new(SQUELCH_REG_CLOSE_DB);
+        let mut output = vec![Complex::default(); SQUELCH_REG_BLOCK_LEN];
         squelch_close.process(&input, &mut output).unwrap();
         assert!(
             !squelch_close.is_open(),
             "amplitude 0.1 (-20 dB) should be below -15 dB threshold"
         );
 
-        let mut squelch_open = PowerSquelch::new(-25.0);
+        let mut squelch_open = PowerSquelch::new(SQUELCH_REG_OPEN_DB);
         squelch_open.process(&input, &mut output).unwrap();
         assert!(
             squelch_open.is_open(),

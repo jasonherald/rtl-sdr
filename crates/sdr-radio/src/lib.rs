@@ -68,6 +68,7 @@ pub struct RadioModule {
     if_chain: IfChain,
     af_chain: AfChain,
     deemp_mode: DeemphasisMode,
+    high_pass_enabled: bool,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -101,6 +102,7 @@ impl RadioModule {
             if_chain,
             af_chain,
             deemp_mode: DeemphasisMode::None,
+            high_pass_enabled: false,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -144,12 +146,13 @@ impl RadioModule {
         let fm_if_nr_allowed = new_demod.config().fm_if_nr_allowed;
         let nb_allowed = new_demod.config().nb_allowed;
         let squelch_allowed = new_demod.config().squelch_allowed;
+        let high_pass_allowed = new_demod.config().high_pass_allowed;
 
         // Reconfigure AF chain for the new AF sample rate
         let new_af_chain = AfChain::new(af_rate, self.audio_sample_rate)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to create AF chain: {e}")))?;
 
-        // Apply deemphasis if the mode supports it
+        // Reapply persisted AF chain settings to the new chain
         let mut af_chain = new_af_chain;
         if deemp_allowed && self.deemp_mode != DeemphasisMode::None {
             af_chain
@@ -157,6 +160,9 @@ impl RadioModule {
                 .map_err(|e| {
                     RadioError::ModeSwitchFailed(format!("failed to set deemphasis: {e}"))
                 })?;
+        }
+        if self.high_pass_enabled && high_pass_allowed {
+            af_chain.set_high_pass_enabled(true);
         }
 
         // Update IF chain feature flags based on new mode capabilities
@@ -323,6 +329,14 @@ impl RadioModule {
             self.af_chain.set_deemp_enabled(false, 0.0)?;
         }
         Ok(())
+    }
+
+    /// Enable or disable the audio high-pass filter.
+    ///
+    /// Persists across mode changes — reapplied when the AF chain is rebuilt.
+    pub fn set_high_pass_enabled(&mut self, enabled: bool) {
+        self.high_pass_enabled = enabled;
+        self.af_chain.set_high_pass_enabled(enabled);
     }
 
     /// Enable or disable WFM stereo decode.

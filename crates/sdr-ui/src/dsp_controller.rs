@@ -493,7 +493,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetHighPass(enabled) => {
             tracing::debug!(enabled, "set high-pass filter");
-            state.radio.af_chain_mut().set_high_pass_enabled(enabled);
+            state.radio.set_high_pass_enabled(enabled);
         }
     }
 }

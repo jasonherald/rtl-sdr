@@ -7,6 +7,9 @@ use sdr_types::{Complex, DspError};
 
 use crate::math;
 
+/// Initial sample state for conjugate-multiply discriminator (unit vector at phase 0).
+const INITIAL_SAMPLE: Complex = Complex { re: 1.0, im: 0.0 };
+
 /// Quadrature FM demodulator — extracts instantaneous frequency from IQ.
 ///
 /// Uses the conjugate-multiply method (standard in GNU Radio, liquid-dsp):
@@ -45,7 +48,7 @@ impl Quadrature {
         }
         Ok(Self {
             inv_deviation,
-            last_sample: Complex::new(1.0, 0.0),
+            last_sample: INITIAL_SAMPLE,
         })
     }
 
@@ -94,7 +97,7 @@ impl Quadrature {
 
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
-        self.last_sample = Complex::new(1.0, 0.0);
+        self.last_sample = INITIAL_SAMPLE;
     }
 
     /// Process complex samples, outputting demodulated audio.
@@ -568,7 +571,7 @@ mod tests {
     fn test_quadrature_silence() {
         // DC signal (constant phase) should give zero output
         let mut demod = Quadrature::new(1.0).unwrap();
-        let input = vec![Complex::new(1.0, 0.0); 100];
+        let input = vec![INITIAL_SAMPLE; 100];
         let mut output = vec![0.0_f32; 100];
         demod.process(&input, &mut output).unwrap();
         for &v in &output[1..] {
@@ -737,7 +740,7 @@ mod tests {
     #[test]
     fn test_cw_produces_tone() {
         let mut demod = CwDemod::from_hz(700.0, 48_000.0).unwrap();
-        let input = vec![Complex::new(1.0, 0.0); 1000];
+        let input = vec![INITIAL_SAMPLE; 1000];
         let mut output = vec![0.0_f32; 1000];
         demod.process(&input, &mut output).unwrap();
         // Should produce an oscillating signal (the BFO tone)
@@ -754,7 +757,7 @@ mod tests {
     #[test]
     fn test_cw_reset() {
         let mut demod = CwDemod::from_hz(700.0, 48_000.0).unwrap();
-        let input = vec![Complex::new(1.0, 0.0); 100];
+        let input = vec![INITIAL_SAMPLE; 100];
         let mut output = vec![0.0_f32; 100];
         demod.process(&input, &mut output).unwrap();
         demod.reset();
