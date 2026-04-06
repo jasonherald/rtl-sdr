@@ -7,6 +7,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::header;
+use crate::sidebar;
 use crate::spectrum;
 
 /// Default window width in pixels.
@@ -39,26 +40,11 @@ pub fn build_window(app: &adw::Application) {
     window.present();
 }
 
-/// Build the `AdwOverlaySplitView` with sidebar and content placeholders.
+/// Build the `AdwOverlaySplitView` with sidebar configuration panels and content.
 fn build_split_view() -> adw::OverlaySplitView {
-    // Sidebar content
-    let sidebar_label = gtk4::Label::builder()
-        .label("Configuration panels coming soon")
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-
-    let sidebar_box = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .build();
-    sidebar_box.append(&sidebar_label);
-
-    let sidebar_scroll = gtk4::ScrolledWindow::builder()
-        .child(&sidebar_box)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .build();
+    // Sidebar — configuration panels.
+    let (sidebar_scroll, _panels) = sidebar::build_sidebar();
+    // TODO: Store `_panels` for DSP bridge signal wiring (PR #7)
 
     // Main content area — spectrum display (FFT plot + waterfall).
     let spectrum_view = spectrum::build_spectrum_view();
