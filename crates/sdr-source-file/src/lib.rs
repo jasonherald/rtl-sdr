@@ -92,14 +92,19 @@ impl FileSource {
                     output[count] = Complex::new(re, im);
                     count += 1;
                 }
-                if count < output.len() && self.looping {
-                    state
-                        .reader
-                        .seek(0)
-                        .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
-                    continue;
+                if count >= output.len() || !self.looping {
+                    break;
                 }
-                break;
+                let count_before = count;
+                state
+                    .reader
+                    .seek(0)
+                    .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+                // Guard: if a full pass produced nothing, the file is empty/corrupt.
+                if count == count_before {
+                    tracing::warn!("looping enabled but no IQ frames available; breaking");
+                    break;
+                }
             }
         } else {
             loop {
@@ -122,14 +127,18 @@ impl FileSource {
                     output[count] = Complex::new(re, im);
                     count += 1;
                 }
-                if count < output.len() && self.looping {
-                    state
-                        .reader
-                        .seek(0)
-                        .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
-                    continue;
+                if count >= output.len() || !self.looping {
+                    break;
                 }
-                break;
+                let count_before = count;
+                state
+                    .reader
+                    .seek(0)
+                    .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+                if count == count_before {
+                    tracing::warn!("looping enabled but no IQ frames available; breaking");
+                    break;
+                }
             }
         }
 

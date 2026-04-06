@@ -34,16 +34,19 @@ const WFM_SNAP_INTERVAL: f64 = 100_000.0;
 
 /// Wideband FM demodulator using `BroadcastFmDemod` from sdr-dsp.
 ///
-/// Produces mono output by default (discriminator through 15 kHz LPF).
-/// When `stereo` is enabled, performs pilot-tone-locked stereo decode
-/// matching C++ `broadcast_fm.h`:
+/// Produces dual-mono output (discriminator through 15 kHz LPF, same
+/// signal to both L and R channels).
+///
+/// A `stereo` flag is available (opt-in, default off) for future stereo
+/// decode matching C++ `broadcast_fm.h`:
 ///   1. Extract 19 kHz pilot via bandpass filter
 ///   2. PLL lock onto pilot, double to 38 kHz carrier
 ///   3. Multiply baseband by 38 kHz carrier to extract L-R
 ///   4. LPF the L-R signal at 15 kHz
 ///   5. Matrix: L = (L+R + L-R) / 2, R = (L+R - L-R) / 2
 ///
-/// Stereo decode matches C++ SDR++ where `_stereo` is opt-in (default: mono).
+/// Until the stereo pipeline is implemented, output is always dual-mono
+/// regardless of the `stereo` flag.
 pub struct WfmDemodulator {
     demod: BroadcastFmDemod,
     /// 15 kHz lowpass filter — removes pilot tone, stereo subcarrier, RDS, noise.
