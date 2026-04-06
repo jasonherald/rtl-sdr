@@ -31,7 +31,10 @@ impl FirFilter {
         Ok(Self { taps, delay_line })
     }
 
-    /// Replace the filter taps. Resets the delay line.
+    /// Replace the filter taps, preserving delay line data for seamless transition.
+    ///
+    /// Matches C++ SDR++ `FIR::setTaps` — avoids clicks/transients during live
+    /// bandwidth adjustments by keeping existing delay line samples.
     ///
     /// # Errors
     ///
@@ -42,7 +45,17 @@ impl FirFilter {
                 "FIR taps must not be empty".to_string(),
             ));
         }
-        self.delay_line = vec![0.0; taps.len() - 1];
+        let new_delay_len = taps.len() - 1;
+        let old_delay_len = self.delay_line.len();
+        if new_delay_len != old_delay_len {
+            let mut new_delay = vec![0.0_f32; new_delay_len];
+            // Copy existing delay data, aligned to the end (most recent samples)
+            let copy_len = old_delay_len.min(new_delay_len);
+            let src_start = old_delay_len.saturating_sub(copy_len);
+            let dst_start = new_delay_len - copy_len;
+            new_delay[dst_start..].copy_from_slice(&self.delay_line[src_start..]);
+            self.delay_line = new_delay;
+        }
         self.taps = taps;
         Ok(())
     }
@@ -131,7 +144,10 @@ impl ComplexFirFilter {
         Ok(Self { taps, delay_line })
     }
 
-    /// Replace the filter taps. Resets the delay line.
+    /// Replace the filter taps, preserving delay line data for seamless transition.
+    ///
+    /// Matches C++ SDR++ `FIR::setTaps` — avoids clicks/transients during live
+    /// bandwidth adjustments by keeping existing delay line samples.
     ///
     /// # Errors
     ///
@@ -142,7 +158,16 @@ impl ComplexFirFilter {
                 "FIR taps must not be empty".to_string(),
             ));
         }
-        self.delay_line = vec![Complex::default(); taps.len() - 1];
+        let new_delay_len = taps.len() - 1;
+        let old_delay_len = self.delay_line.len();
+        if new_delay_len != old_delay_len {
+            let mut new_delay = vec![Complex::default(); new_delay_len];
+            let copy_len = old_delay_len.min(new_delay_len);
+            let src_start = old_delay_len.saturating_sub(copy_len);
+            let dst_start = new_delay_len - copy_len;
+            new_delay[dst_start..].copy_from_slice(&self.delay_line[src_start..]);
+            self.delay_line = new_delay;
+        }
         self.taps = taps;
         Ok(())
     }
@@ -507,9 +532,58 @@ mod tests {
         let input = [Complex::new(1.0, 2.0), Complex::new(3.0, 4.0)];
         let mut output = [Complex::default(); 2];
         fir.process(&input, &mut output).unwrap();
-        // First output should be zero (from delay line reset)
+        // First output uses delay line (zero-extended since old had 0 delay taps)
         assert!((output[0].re).abs() < 1e-6);
         assert!((output[1].re - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_fir_set_taps_preserves_delay() {
+        // Process a block so delay line has data, then swap taps
+        let mut fir = FirFilter::new(vec![0.0, 1.0]).unwrap();
+        let input = [10.0, 20.0, 30.0];
+        let mut output = [0.0_f32; 3];
+        fir.process_f32(&input, &mut output).unwrap();
+        // delay line now holds [30.0]
+
+        // Swap to a 3-tap filter — delay line should keep 30.0
+        fir.set_taps(vec![0.0, 0.0, 1.0]).unwrap();
+        let input2 = [40.0, 50.0];
+        let mut output2 = [0.0_f32; 2];
+        fir.process_f32(&input2, &mut output2).unwrap();
+        // output2[0] should be delay[0] = 0.0 (zero-extended), output2[1] = 30.0 (preserved)
+        assert!(
+            (output2[0]).abs() < 1e-6,
+            "zero-extended position, got {}",
+            output2[0]
+        );
+        assert!(
+            (output2[1] - 30.0).abs() < 1e-6,
+            "preserved delay sample, got {}",
+            output2[1]
+        );
+    }
+
+    #[test]
+    fn test_fir_set_taps_same_length() {
+        // Same length swap should keep delay line intact
+        let mut fir = FirFilter::new(vec![0.0, 1.0]).unwrap();
+        let input = [5.0, 10.0];
+        let mut output = [0.0_f32; 2];
+        fir.process_f32(&input, &mut output).unwrap();
+        // delay line = [10.0]
+
+        // Swap to identity (same 2-tap count) — delay stays [10.0]
+        fir.set_taps(vec![1.0, 0.0]).unwrap();
+        let input2 = [20.0];
+        let mut output2 = [0.0_f32; 1];
+        fir.process_f32(&input2, &mut output2).unwrap();
+        // With taps [1.0, 0.0]: output = 1.0*20.0 + 0.0*10.0 = 20.0
+        assert!(
+            (output2[0] - 20.0).abs() < 1e-6,
+            "same-length tap swap, got {}",
+            output2[0]
+        );
     }
 
     #[test]
