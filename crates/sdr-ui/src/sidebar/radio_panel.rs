@@ -20,6 +20,10 @@ const DEFAULT_NB_LEVEL: f64 = 5.0;
 const MIN_NB_LEVEL: f64 = 1.0;
 /// Maximum noise blanker level.
 const MAX_NB_LEVEL: f64 = 20.0;
+/// Noise blanker level step.
+const NB_LEVEL_STEP: f64 = 0.5;
+/// Noise blanker page increment.
+const NB_LEVEL_PAGE: f64 = 1.0;
 
 /// Default squelch level in dB.
 const DEFAULT_SQUELCH_DB: f64 = -100.0;
@@ -46,7 +50,7 @@ pub struct RadioPanel {
     pub deemphasis_row: adw::ComboRow,
     /// Noise blanker toggle.
     pub noise_blanker_row: adw::SwitchRow,
-    /// Noise blanker level control (visible when NB is enabled).
+    /// Noise blanker level control.
     pub nb_level_row: adw::SpinRow,
     /// FM IF noise reduction toggle (visible only for FM modes).
     pub fm_if_nr_row: adw::SwitchRow,
@@ -123,8 +127,14 @@ pub fn build_radio_panel() -> RadioPanel {
     let noise_blanker_row = adw::SwitchRow::builder().title("Noise Blanker").build();
 
     // --- Noise Blanker Level ---
-    let nb_level_adj =
-        gtk4::Adjustment::new(DEFAULT_NB_LEVEL, MIN_NB_LEVEL, MAX_NB_LEVEL, 0.5, 1.0, 0.0);
+    let nb_level_adj = gtk4::Adjustment::new(
+        DEFAULT_NB_LEVEL,
+        MIN_NB_LEVEL,
+        MAX_NB_LEVEL,
+        NB_LEVEL_STEP,
+        NB_LEVEL_PAGE,
+        0.0,
+    );
     let nb_level_row = adw::SpinRow::builder()
         .title("NB Level")
         .subtitle("Threshold multiplier")
