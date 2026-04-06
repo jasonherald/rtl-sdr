@@ -1,7 +1,7 @@
 //! Narrowband FM demodulator.
 
 use sdr_dsp::demod::FmDemod;
-use sdr_dsp::filter::FirFilter;
+use sdr_dsp::filter::{DEEMPHASIS_TAU_US, FirFilter};
 use sdr_dsp::taps;
 use sdr_types::{Complex, DspError, Stereo};
 
@@ -81,7 +81,7 @@ impl NfmDemodulator {
             vfo_reference: VfoReference::Center,
             deemp_allowed: true,
             post_proc_enabled: true,
-            default_deemp_tau: 0.0,
+            default_deemp_tau: DEEMPHASIS_TAU_US,
             fm_if_nr_allowed: true,
             nb_allowed: false,
             high_pass_allowed: true,
@@ -166,6 +166,10 @@ mod tests {
         assert!(cfg.fm_if_nr_allowed);
         assert!(cfg.squelch_allowed);
         assert!(cfg.deemp_allowed);
+        assert!(
+            cfg.default_deemp_tau > 0.0,
+            "NFM should default to active deemphasis"
+        );
         assert!(!cfg.nb_allowed);
     }
 
@@ -211,9 +215,8 @@ mod tests {
 
     #[test]
     fn test_nfm_lpf_smooths_output() {
-        let mut demod = NfmDemodulator::new().unwrap();
-        // Feed noise-like signal — LPF should smooth the discriminator output.
-        // Alternating I/Q values create abrupt phase changes that the LPF filters.
+        // Compare filtered NFM output against an unfiltered baseline to verify
+        // the LPF actually reduces high-frequency jumps.
         let input: Vec<Complex> = (0..2000)
             .map(|i| {
                 if i % 2 == 0 {
@@ -223,19 +226,30 @@ mod tests {
                 }
             })
             .collect();
+
+        // Baseline: raw FM discriminator (no LPF)
+        let mut raw_demod =
+            sdr_dsp::demod::FmDemod::from_hz(NFM_DEVIATION_HZ, NFM_IF_SAMPLE_RATE).unwrap();
+        let mut raw_buf = vec![0.0_f32; 2000];
+        raw_demod.process(&input, &mut raw_buf).unwrap();
+        let baseline_jump = raw_buf[500..]
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0_f32, f32::max);
+
+        // Filtered: full NFM demod with LPF
+        let mut demod = NfmDemodulator::new().unwrap();
         let mut output = vec![Stereo::default(); 2000];
-        let count = demod.process(&input, &mut output).unwrap();
-        assert_eq!(count, 2000);
-        // Verify the LPF is active: output should be smoother than raw discriminator.
-        // Consecutive samples should not have huge jumps after LPF settles.
-        let max_jump = output[500..count]
+        demod.process(&input, &mut output).unwrap();
+        let filtered_jump = output[500..]
             .windows(2)
             .map(|w| (w[1].l - w[0].l).abs())
             .fold(0.0_f32, f32::max);
-        // Without LPF, jumps would be very large; with LPF they're smoothed
+
+        // LPF should meaningfully reduce jumps compared to raw discriminator
         assert!(
-            max_jump < 5.0,
-            "LPF should smooth output, max_jump = {max_jump}"
+            filtered_jump < baseline_jump * 0.8,
+            "LPF should reduce jumps: filtered={filtered_jump}, baseline={baseline_jump}"
         );
     }
 

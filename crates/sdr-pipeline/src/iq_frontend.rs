@@ -31,6 +31,17 @@ const DC_BLOCK_RATE_FACTOR: f64 = 50.0;
 /// Default target FFT frame rate in Hz (matches typical 60 FPS UI refresh).
 const DEFAULT_FFT_RATE: f64 = 60.0;
 
+/// Minimum FFT rate floor (Hz) — prevents division by zero or zero-skip budgets.
+const MIN_FFT_RATE_HZ: f64 = 1.0;
+
+/// Compute FFT skip budget: samples between FFT frames.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn calc_fft_skip_samples(effective_sample_rate: f64, fps: f64) -> usize {
+    (effective_sample_rate / fps.max(MIN_FFT_RATE_HZ))
+        .round()
+        .max(MIN_FFT_RATE_HZ) as usize
+}
+
 /// IQ frontend processing hub.
 ///
 /// Processes raw IQ from a source through decimation, correction,
@@ -125,8 +136,7 @@ impl IqFrontend {
             None
         };
 
-        #[allow(clippy::cast_sign_loss)]
-        let fft_skip_samples = (effective_sample_rate / DEFAULT_FFT_RATE).round().max(1.0) as usize;
+        let fft_skip_samples = calc_fft_skip_samples(effective_sample_rate, DEFAULT_FFT_RATE);
 
         Ok(Self {
             sample_rate,
@@ -178,12 +188,9 @@ impl IqFrontend {
     /// Controls how many FFT frames are computed per second, matching
     /// the C++ SDR++ Reshaper concept. FFTs that would exceed the target
     /// rate are skipped to save CPU.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn set_fft_rate(&mut self, fps: f64) {
-        self.fft_rate = fps.max(1.0);
-        self.fft_skip_samples = (self.effective_sample_rate / self.fft_rate)
-            .round()
-            .max(1.0) as usize;
+        self.fft_rate = fps.max(MIN_FFT_RATE_HZ);
+        self.fft_skip_samples = calc_fft_skip_samples(self.effective_sample_rate, self.fft_rate);
         self.fft_skip_counter = 0;
         self.fft_accumulating = true;
     }
@@ -249,10 +256,7 @@ impl IqFrontend {
         // Discard any partially accumulated FFT data from the old rate
         self.fft_accum_count = 0;
         // Recalculate FFT rate control for new effective sample rate
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        {
-            self.fft_skip_samples = (new_effective_rate / self.fft_rate).round().max(1.0) as usize;
-        }
+        self.fft_skip_samples = calc_fft_skip_samples(new_effective_rate, self.fft_rate);
         self.fft_skip_counter = 0;
         self.fft_accumulating = true;
         Ok(())

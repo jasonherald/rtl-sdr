@@ -46,6 +46,10 @@ pub struct FmStereoDecoder {
     mono_lpf: FirFilter,
     /// Lowpass filter for L−R (difference) signal.
     diff_lpf: FirFilter,
+    /// Delay buffer to compensate pilot BPF group delay on composite signal.
+    composite_delay: Vec<f32>,
+    /// Group delay of pilot BPF in samples.
+    bpf_delay: usize,
     /// Scratch buffers.
     pilot_buf: Vec<f32>,
     mono_buf: Vec<f32>,
@@ -71,6 +75,8 @@ impl FmStereoDecoder {
             sample_rate,
             true,
         )?;
+        // BPF group delay = (tap_count - 1) / 2 for linear-phase FIR
+        let bpf_delay = (pilot_taps.len().saturating_sub(1)) / 2;
         let pilot_bpf = FirFilter::new(pilot_taps)?;
 
         // PLL centered at 19 kHz
@@ -93,6 +99,8 @@ impl FmStereoDecoder {
             pilot_pll,
             mono_lpf,
             diff_lpf,
+            composite_delay: vec![0.0; bpf_delay],
+            bpf_delay,
             pilot_buf: Vec::new(),
             mono_buf: Vec::new(),
             diff_buf: Vec::new(),
@@ -106,6 +114,7 @@ impl FmStereoDecoder {
         self.pilot_pll.reset();
         self.mono_lpf.reset();
         self.diff_lpf.reset();
+        self.composite_delay.fill(0.0);
     }
 
     /// Decode stereo from FM composite baseband.
@@ -135,7 +144,9 @@ impl FmStereoDecoder {
         self.pilot_bpf.process_f32(input, &mut self.pilot_buf)?;
 
         // Steps 2-3: PLL locks onto pilot, doubles phase to 38 kHz subcarrier,
-        // multiplies composite to extract L−R.
+        // multiplies delay-compensated composite to extract L−R.
+        // The pilot BPF introduces a group delay; we delay the composite signal
+        // by the same amount so the subcarrier phase aligns with the composite.
         self.diff_buf.resize(len, 0.0);
 
         for (i, pilot) in self.pilot_buf.iter().enumerate() {
@@ -150,9 +161,19 @@ impl FmStereoDecoder {
             let sin_t = pll_out[0].im;
             let subcarrier = cos_t * cos_t - sin_t * sin_t;
 
-            // Multiply composite by subcarrier → extracts L−R.
+            // Use delay-compensated composite for phase-aligned L−R extraction.
+            let delayed = if self.bpf_delay > 0 {
+                // Read oldest sample from delay buffer, push current sample in
+                let old = self.composite_delay[i % self.bpf_delay];
+                self.composite_delay[i % self.bpf_delay] = input[i];
+                old
+            } else {
+                input[i]
+            };
+
+            // Multiply delay-matched composite by subcarrier → extracts L−R.
             // Scale by 2.0 to compensate for DSB-SC encoding.
-            self.diff_buf[i] = input[i] * subcarrier * 2.0;
+            self.diff_buf[i] = delayed * subcarrier * 2.0;
         }
 
         // Step 4: Lowpass L+R (mono) at 15 kHz

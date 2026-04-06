@@ -277,20 +277,21 @@ impl FmIfNoiseReduction {
 
             // Process a complete block when we have enough samples.
             if self.overlap_count == self.fft_size {
-                // Guard: ensure output has room for a full FFT block.
                 if out_pos + self.fft_size <= output.len() {
                     self.process_block(&mut output[out_pos..out_pos + self.fft_size]);
                     out_pos += self.fft_size;
+                    self.overlap_count = 0;
+                } else {
+                    // Output too small for this block — keep it buffered for next call.
+                    break;
                 }
-                self.overlap_count = 0;
             }
         }
 
-        // Copy through any partial block samples that weren't processed yet.
-        // This ensures output count matches input count for downstream consumers.
+        // Flush any buffered partial-block samples so output count matches input.
         if self.overlap_count > 0 && out_pos < input.len() {
-            let remaining = input.len() - out_pos;
-            output[out_pos..out_pos + remaining].copy_from_slice(&input[input.len() - remaining..]);
+            let remaining = (input.len() - out_pos).min(self.overlap_count);
+            output[out_pos..out_pos + remaining].copy_from_slice(&self.overlap_buf[..remaining]);
             out_pos += remaining;
         }
 

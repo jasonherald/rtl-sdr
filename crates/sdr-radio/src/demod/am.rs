@@ -196,6 +196,7 @@ impl Demodulator for AmDemodulator {
 #[allow(
     clippy::unwrap_used,
     clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
     clippy::cloned_instead_of_copied
 )]
 mod tests {
@@ -242,26 +243,43 @@ mod tests {
 
     #[test]
     fn test_am_carrier_agc_stabilizes() {
-        let mut demod = AmDemodulator::new().unwrap();
-        // Feed signal with varying carrier amplitude — carrier AGC should stabilize
-        let input: Vec<Complex> = (0..2000)
-            .map(|i| {
-                // Carrier amplitude ramps up
-                let carrier = 0.1 + (i as f32 / 2000.0) * 2.0;
-                Complex::new(carrier, 0.0)
-            })
-            .collect();
-        let mut output = vec![Stereo::default(); 2000];
-        let count = demod.process(&input, &mut output).unwrap();
-        assert_eq!(count, 2000);
-        // After AGC settles, output should be relatively stable despite carrier ramp
-        let late_range: Vec<f32> = output[1500..].iter().map(|s| s.l).collect();
-        let late_max = late_range.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let late_min = late_range.iter().cloned().fold(f32::INFINITY, f32::min);
-        let range = late_max - late_min;
+        // Feed AM-modulated signals at two very different carrier levels.
+        // Carrier AGC should normalize so recovered audio amplitude is
+        // similar regardless of carrier strength.
+        let mod_freq = 500.0_f32;
+        let mod_depth = 0.3;
+        let settle = 1500;
+        let len = 3000;
+
+        let mut peaks = Vec::new();
+        for &carrier_amp in &[0.1_f32, 2.0] {
+            let mut demod = AmDemodulator::new().unwrap();
+            let input: Vec<Complex> = (0..len)
+                .map(|i| {
+                    let t = i as f32 / AM_IF_SAMPLE_RATE as f32;
+                    let envelope =
+                        carrier_amp * (1.0 + mod_depth * (2.0 * PI * mod_freq * t).sin());
+                    Complex::new(envelope, 0.0)
+                })
+                .collect();
+            let mut output = vec![Stereo::default(); len];
+            demod.process(&input, &mut output).unwrap();
+            let peak = output[settle..]
+                .iter()
+                .map(|s| s.l.abs())
+                .fold(0.0_f32, f32::max);
+            peaks.push(peak);
+        }
+
+        // Both carrier levels should produce similar audio amplitude after AGC
+        let ratio = if peaks[0] > peaks[1] {
+            peaks[0] / peaks[1].max(1e-10)
+        } else {
+            peaks[1] / peaks[0].max(1e-10)
+        };
         assert!(
-            range < 2.0,
-            "carrier AGC should stabilize output, range = {range}"
+            ratio < 10.0,
+            "carrier AGC should normalize audio across carrier levels, ratio = {ratio}"
         );
     }
 
