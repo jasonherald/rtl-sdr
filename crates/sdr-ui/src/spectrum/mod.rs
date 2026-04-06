@@ -269,18 +269,33 @@ fn build_waterfall_area(
 ///
 /// Must be called after `GtkGLArea::make_current()`.
 ///
-/// Uses `dlsym(RTLD_DEFAULT, ...)` to resolve OpenGL function pointers from
-/// the GL library already loaded by GTK4's display backend. At runtime, GTK4
-/// has already loaded libEGL + libGLESv2 (Wayland) or libGL (X11), so all
-/// GL symbols are available via the dynamic linker's global scope.
+/// Uses `dlsym(RTLD_DEFAULT)` to resolve GL function pointers from all loaded
+/// shared objects. Falls back to `eglGetProcAddress` for GLES symbols not
+/// found in the global symbol table.
 #[allow(unsafe_code)]
 fn create_glow_context() -> glow::Context {
     unsafe {
         glow::Context::from_loader_function_cstr(|name| {
-            // dlsym with RTLD_DEFAULT searches all loaded shared objects.
-            // GTK4 has already loaded the platform GL library (libGL, libGLESv2,
-            // or libEGL) so GL entry points are resolvable.
-            dlsym(RTLD_DEFAULT, name.as_ptr())
+            // Try the platform-specific proc address first, then fall back to dlsym.
+            // On Wayland: eglGetProcAddress. On X11: glXGetProcAddress.
+            // dlsym(RTLD_DEFAULT) searches all loaded shared objects as fallback.
+            let ptr = dlsym(RTLD_DEFAULT, name.as_ptr());
+            if !ptr.is_null() {
+                return ptr;
+            }
+            // Try eglGetProcAddress for GLES functions not in the global symbol table.
+            let egl_handle = dlsym(RTLD_DEFAULT, c"eglGetProcAddress".as_ptr());
+            if !egl_handle.is_null() {
+                let egl_get_proc: unsafe extern "C" fn(
+                    *const std::os::raw::c_char,
+                )
+                    -> *const std::os::raw::c_void = std::mem::transmute(egl_handle);
+                let result = egl_get_proc(name.as_ptr());
+                if !result.is_null() {
+                    return result;
+                }
+            }
+            std::ptr::null()
         })
     }
 }
@@ -291,7 +306,7 @@ const RTLD_DEFAULT: *mut std::os::raw::c_void = std::ptr::null_mut();
 
 #[allow(unsafe_code)]
 unsafe extern "C" {
-    /// POSIX `dlsym` — resolve a symbol from a shared object handle.
+    /// POSIX `dlsym` — resolve a symbol from a dynamic library handle.
     fn dlsym(
         handle: *mut std::os::raw::c_void,
         symbol: *const std::os::raw::c_char,

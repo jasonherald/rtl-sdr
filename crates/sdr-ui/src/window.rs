@@ -6,6 +6,7 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use crate::header;
 use crate::spectrum;
 
 /// Default window width in pixels.
@@ -106,16 +107,19 @@ fn build_header_bar(sidebar_toggle: &gtk4::ToggleButton) -> adw::HeaderBar {
         .css_classes(["play-button"])
         .build();
 
-    // Title widget (placeholder for future frequency selector)
-    let title_label = gtk4::Label::builder()
-        .label("SDR-RS")
-        .css_classes(["title"])
-        .build();
+    // Frequency selector as the title widget
+    let freq_selector = header::build_frequency_selector();
+    freq_selector.connect_frequency_changed(|freq| {
+        tracing::debug!(frequency_hz = freq, "frequency changed");
+        // TODO: Send UiToDsp::Tune(freq as f64) to DSP pipeline (PR #7)
+    });
 
     // App menu
     let menu_button = build_menu_button();
 
-    let header = adw::HeaderBar::builder().title_widget(&title_label).build();
+    let header = adw::HeaderBar::builder()
+        .title_widget(&freq_selector.widget)
+        .build();
 
     header.pack_start(sidebar_toggle);
     header.pack_start(&play_button);

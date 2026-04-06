@@ -1,12 +1,36 @@
 //! Custom CSS for the SDR-RS application.
 
 /// Inline CSS for the application.
-const APP_CSS: &str = r"
-/* Frequency selector — monospace, accent color (used in PR 4) */
+const APP_CSS: &str = r#"
+/* Frequency selector — monospace digit display */
 .frequency-selector {
-    font-family: monospace;
-    font-size: 1.4em;
-    color: @accent_color;
+    font-family: "SF Mono", "JetBrains Mono", "Fira Code", monospace;
+    font-size: 24px;
+    font-weight: 300;
+    letter-spacing: 1px;
+}
+
+.frequency-selector .digit {
+    padding: 2px 1px;
+    border-radius: 4px;
+    min-width: 16px;
+}
+
+.frequency-selector .digit:hover {
+    background-color: alpha(@accent_color, 0.1);
+}
+
+.frequency-selector .digit.selected {
+    background-color: alpha(@accent_color, 0.2);
+}
+
+.frequency-selector .digit.leading-zero {
+    opacity: 0.3;
+}
+
+.frequency-selector .separator {
+    opacity: 0.3;
+    padding: 0 2px;
 }
 
 /* Status bar — subtle padding, smaller font, border-top */
@@ -27,7 +51,7 @@ const APP_CSS: &str = r"
     border: none;
     background: transparent;
 }
-";
+"#;
 
 /// Load the application CSS into the default display's style context.
 ///
