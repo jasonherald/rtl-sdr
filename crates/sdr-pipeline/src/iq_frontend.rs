@@ -28,6 +28,9 @@ pub enum FftWindow {
 /// Matches C++ `genDCBlockRate`.
 const DC_BLOCK_RATE_FACTOR: f64 = 50.0;
 
+/// Default target FFT frame rate in Hz (matches typical 60 FPS UI refresh).
+const DEFAULT_FFT_RATE: f64 = 60.0;
+
 /// IQ frontend processing hub.
 ///
 /// Processes raw IQ from a source through decimation, correction,
@@ -49,6 +52,16 @@ pub struct IqFrontend {
     fft_accum: Vec<Complex>,
     fft_accum_count: usize,
     fft_output: Vec<f32>,
+
+    // FFT rate control (Reshaper) — avoids computing more FFTs than the UI displays.
+    // Matches C++ SDR++ Reshaper concept.
+    fft_rate: f64,
+    /// Samples between FFT frames at the current rate.
+    fft_skip_samples: usize,
+    /// Counter: samples processed since last FFT output.
+    fft_skip_counter: usize,
+    /// Whether we're currently accumulating for the next FFT.
+    fft_accumulating: bool,
 
     // Scratch buffers
     decim_buf: Vec<Complex>,
@@ -112,6 +125,9 @@ impl IqFrontend {
             None
         };
 
+        #[allow(clippy::cast_sign_loss)]
+        let fft_skip_samples = (effective_sample_rate / DEFAULT_FFT_RATE).round() as usize;
+
         Ok(Self {
             sample_rate,
             decim_ratio,
@@ -125,6 +141,10 @@ impl IqFrontend {
             fft_accum: vec![Complex::default(); fft_size],
             fft_accum_count: 0,
             fft_output: vec![0.0; fft_size],
+            fft_rate: DEFAULT_FFT_RATE,
+            fft_skip_samples,
+            fft_skip_counter: 0,
+            fft_accumulating: true,
             decim_buf: Vec::new(),
             dc_scratch: Vec::new(),
             fft_work: vec![Complex::default(); fft_size],
@@ -151,6 +171,24 @@ impl IqFrontend {
     /// Get the FFT size.
     pub fn fft_size(&self) -> usize {
         self.fft_size
+    }
+
+    /// Set the target FFT rate in frames per second.
+    ///
+    /// Controls how many FFT frames are computed per second, matching
+    /// the C++ SDR++ Reshaper concept. FFTs that would exceed the target
+    /// rate are skipped to save CPU.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn set_fft_rate(&mut self, fps: f64) {
+        self.fft_rate = fps.max(1.0);
+        self.fft_skip_samples = (self.effective_sample_rate / self.fft_rate).round() as usize;
+        self.fft_skip_counter = 0;
+        self.fft_accumulating = true;
+    }
+
+    /// Get the current target FFT rate.
+    pub fn fft_rate(&self) -> f64 {
+        self.fft_rate
     }
 
     /// Enable or disable IQ inversion correction.
@@ -208,6 +246,14 @@ impl IqFrontend {
         self.dc_blocker = new_dc_blocker;
         // Discard any partially accumulated FFT data from the old rate
         self.fft_accum_count = 0;
+        // Recalculate FFT rate control for new effective sample rate
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.fft_skip_samples =
+                (new_effective_rate / self.fft_rate).round() as usize;
+        }
+        self.fft_skip_counter = 0;
+        self.fft_accumulating = true;
         Ok(())
     }
 
@@ -277,24 +323,44 @@ impl IqFrontend {
             dc.process(&self.dc_scratch, &mut output[..processed])?;
         }
 
-        // Step 4: Accumulate samples for FFT
+        // Step 4: Accumulate samples for FFT with rate control.
+        // Only accumulate when we're within the target FPS budget.
+        // Skip FFT accumulation between frames to save CPU.
         let mut fft_ready = false;
         let mut pos = 0;
         while pos < processed {
-            let remaining_fft = self.fft_size - self.fft_accum_count;
-            let available = processed - pos;
-            let to_copy = remaining_fft.min(available);
+            if self.fft_accumulating {
+                let remaining_fft = self.fft_size - self.fft_accum_count;
+                let available = processed - pos;
+                let to_copy = remaining_fft.min(available);
 
-            self.fft_accum[self.fft_accum_count..self.fft_accum_count + to_copy]
-                .copy_from_slice(&output[pos..pos + to_copy]);
-            self.fft_accum_count += to_copy;
-            pos += to_copy;
+                self.fft_accum[self.fft_accum_count..self.fft_accum_count + to_copy]
+                    .copy_from_slice(&output[pos..pos + to_copy]);
+                self.fft_accum_count += to_copy;
+                self.fft_skip_counter += to_copy;
+                pos += to_copy;
 
-            if self.fft_accum_count >= self.fft_size {
-                // Full FFT buffer — compute spectrum
-                self.compute_fft(fft_out)?;
-                fft_ready = true;
-                self.fft_accum_count = 0;
+                if self.fft_accum_count >= self.fft_size {
+                    self.compute_fft(fft_out)?;
+                    fft_ready = true;
+                    self.fft_accum_count = 0;
+                    // After computing FFT, stop accumulating until skip budget elapses
+                    self.fft_accumulating = false;
+                }
+            } else {
+                // Not accumulating — just count samples toward next FFT window
+                let remaining_skip =
+                    self.fft_skip_samples.saturating_sub(self.fft_skip_counter);
+                let available = processed - pos;
+                let to_skip = remaining_skip.min(available);
+                self.fft_skip_counter += to_skip;
+                pos += to_skip;
+
+                if self.fft_skip_counter >= self.fft_skip_samples {
+                    // Budget elapsed — start accumulating next FFT frame
+                    self.fft_accumulating = true;
+                    self.fft_skip_counter = 0;
+                }
             }
         }
 
@@ -557,6 +623,43 @@ mod tests {
         assert!(
             (900..=1100).contains(&count),
             "expected ~1024 after 2x decim, got {count}"
+        );
+    }
+
+    #[test]
+    fn test_fft_rate_control() {
+        // At 48kHz with 1024 FFT, no rate control would produce ~47 FFTs/sec.
+        // Set rate to 10 FPS — should produce far fewer FFTs.
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
+        fe.set_fft_rate(10.0);
+        assert!((fe.fft_rate() - 10.0).abs() < f64::EPSILON);
+
+        // Process 48000 samples (1 second) in 1024-sample chunks
+        let chunk = vec![Complex::new(1.0, 0.0); TEST_FFT_SIZE];
+        let mut output = vec![Complex::default(); TEST_FFT_SIZE];
+        let mut fft_out = vec![0.0_f32; TEST_FFT_SIZE];
+        let mut fft_count = 0;
+
+        // 48000 / 1024 = ~47 chunks
+        for _ in 0..47 {
+            let (_, fft_ready) = fe.process(&chunk, &mut output, &mut fft_out).unwrap();
+            if fft_ready {
+                fft_count += 1;
+            }
+        }
+
+        // At 10 FPS target, should get roughly 10 FFTs from 1 second of data.
+        // Allow some tolerance for boundary effects.
+        assert!(
+            (5..=15).contains(&fft_count),
+            "expected ~10 FFTs at 10 FPS, got {fft_count}"
         );
     }
 }
