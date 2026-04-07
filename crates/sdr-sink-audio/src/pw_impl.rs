@@ -31,14 +31,29 @@ pub struct AudioSink {
     tx: Option<mpsc::SyncSender<Vec<f32>>>,
     quit_tx: Option<pipewire::channel::Sender<Quit>>,
     pw_thread: Option<std::thread::JoinHandle<()>>,
+    /// Target PipeWire node name for routing (empty = system default).
+    target_node: String,
+}
+
+/// An audio sink device with display name and PipeWire node name.
+#[derive(Clone, Debug)]
+pub struct AudioDevice {
+    /// Human-readable name (from `node.description`).
+    pub display_name: String,
+    /// PipeWire node name (used for `target.object` routing).
+    pub node_name: String,
 }
 
 /// Query PipeWire for available audio output sinks.
 ///
-/// Connects briefly to the PipeWire daemon, lists all Audio/Sink nodes,
-/// and returns their names. Always includes "Default" as the first entry.
-pub fn list_audio_sinks() -> Vec<String> {
-    let mut sinks = vec!["Default".to_string()];
+/// Connects briefly to the PipeWire daemon, lists all `Audio/Sink` nodes,
+/// and returns their display names and node names. Always includes "Default"
+/// as the first entry (routes to the system default sink).
+pub fn list_audio_sinks() -> Vec<AudioDevice> {
+    let mut sinks = vec![AudioDevice {
+        display_name: "Default".to_string(),
+        node_name: String::new(), // empty = system default
+    }];
 
     // Run a short-lived PipeWire main loop to collect sink names.
     // Must run on a separate thread because PipeWire main loops
@@ -59,7 +74,7 @@ pub fn list_audio_sinks() -> Vec<String> {
                 return Vec::new();
             };
 
-            let found_sinks = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let found_sinks = std::rc::Rc::new(std::cell::RefCell::new(Vec::<AudioDevice>::new()));
             let found_clone = std::rc::Rc::clone(&found_sinks);
 
             // Listen for global objects — Audio/Sink nodes are output devices
@@ -69,11 +84,16 @@ pub fn list_audio_sinks() -> Vec<String> {
                     if let Some(props) = global.props {
                         let media_class = props.get("media.class").unwrap_or("");
                         if media_class == "Audio/Sink" {
-                            let name = props
+                            let display_name = props
                                 .get("node.description")
                                 .or_else(|| props.get("node.name"))
-                                .unwrap_or("Unknown Sink");
-                            found_clone.borrow_mut().push(name.to_string());
+                                .unwrap_or("Unknown Sink")
+                                .to_string();
+                            let node_name = props.get("node.name").unwrap_or("unknown").to_string();
+                            found_clone.borrow_mut().push(AudioDevice {
+                                display_name,
+                                node_name,
+                            });
                         }
                     }
                 })
@@ -106,9 +126,9 @@ pub fn list_audio_sinks() -> Vec<String> {
         });
 
     if let Ok(found) = result {
-        for name in found {
-            if !sinks.contains(&name) {
-                sinks.push(name);
+        for dev in found {
+            if !sinks.iter().any(|s| s.node_name == dev.node_name) {
+                sinks.push(dev);
             }
         }
     }
@@ -127,7 +147,29 @@ impl AudioSink {
             tx: None,
             quit_tx: None,
             pw_thread: None,
+            target_node: String::new(),
         }
+    }
+
+    /// Set the target audio device by node name.
+    ///
+    /// Call before `start()` to route to a specific sink. If the sink is
+    /// already running, it will be restarted with the new target.
+    ///
+    /// Pass an empty string for the system default sink.
+    pub fn set_target(&mut self, node_name: &str) -> Result<(), SinkError> {
+        // Check owned state (tx/thread) rather than the atomic flag, which
+        // the worker thread may clear before cleanup finishes.
+        let had_state = self.tx.is_some() || self.pw_thread.is_some();
+        if had_state {
+            self.stop()?;
+        }
+        self.target_node.clear();
+        self.target_node.push_str(node_name);
+        if had_state {
+            self.start()?;
+        }
+        Ok(())
     }
 
     /// Send stereo audio samples to PipeWire for playback.
@@ -176,11 +218,12 @@ impl Sink for AudioSink {
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Quit>();
 
         let running = Arc::clone(&self.running);
+        let target = self.target_node.clone();
 
         let handle = std::thread::Builder::new()
             .name("pw-audio".into())
             .spawn(move || {
-                if let Err(e) = pipewire_thread(rx, quit_rx) {
+                if let Err(e) = pipewire_thread(rx, quit_rx, &target) {
                     tracing::error!("PipeWire thread failed: {e}");
                 }
                 running.store(false, Ordering::Release);
@@ -262,6 +305,7 @@ impl Drop for AudioSink {
 fn pipewire_thread(
     rx: mpsc::Receiver<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Quit>,
+    target_node: &str,
 ) -> Result<(), SinkError> {
     use pipewire as pw;
     use pw::spa;
@@ -280,18 +324,21 @@ fn pipewire_thread(
         quit_loop.quit();
     });
 
-    let stream = pw::stream::StreamBox::new(
-        &core,
-        "sdr-audio",
-        pw::properties::properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Playback",
-            *pw::keys::MEDIA_ROLE => "Music",
-            *pw::keys::NODE_NAME => "sdr-rs",
-            *pw::keys::APP_NAME => "SDR-RS",
-        },
-    )
-    .map_err(|e| SinkError::OpenFailed(format!("Stream::new: {e}")))?;
+    let mut props = pw::properties::properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::NODE_NAME => "sdr-rs",
+        *pw::keys::APP_NAME => "SDR-RS",
+    };
+    // Route to a specific sink if requested (empty = system default)
+    if !target_node.is_empty() {
+        props.insert("target.object", target_node);
+        tracing::info!(target = target_node, "routing audio to specific sink");
+    }
+
+    let stream = pw::stream::StreamBox::new(&core, "sdr-audio", props)
+        .map_err(|e| SinkError::OpenFailed(format!("Stream::new: {e}")))?;
 
     let _listener = stream
         .add_local_listener_with_user_data(AudioCallbackData::new(rx))

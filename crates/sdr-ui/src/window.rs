@@ -413,6 +413,7 @@ fn connect_sidebar_panels(
     connect_source_panel(panels, state);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
+    connect_audio_panel(panels, state);
 }
 
 /// Connect source panel controls to DSP commands.
@@ -618,6 +619,19 @@ fn connect_display_panel(
                 .unwrap_or(spectrum::colormap::ColormapStyle::Turbo);
             spectrum_for_cmap.set_colormap(style);
         });
+}
+
+/// Connect audio panel controls to DSP commands.
+fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
+    // Audio device selector — routes PipeWire output to the selected sink
+    let state_dev = Rc::clone(state);
+    let node_names = panels.audio.device_node_names.clone();
+    panels.audio.device_row.connect_selected_notify(move |row| {
+        let idx = row.selected() as usize;
+        if let Some(node_name) = node_names.get(idx) {
+            state_dev.send_dsp(UiToDsp::SetAudioDevice(node_name.clone()));
+        }
+    });
 }
 
 /// Register application-level actions (About, Quit).

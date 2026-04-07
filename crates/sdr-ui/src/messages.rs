@@ -75,6 +75,8 @@ pub enum UiToDsp {
     SetFftRate(f64),
     /// Enable or disable the audio high-pass filter (voice modes).
     SetHighPass(bool),
+    /// Set the audio output device by `PipeWire` node name.
+    SetAudioDevice(String),
 }
 
 #[cfg(test)]
@@ -186,5 +188,8 @@ mod tests {
 
         let hp = UiToDsp::SetHighPass(true);
         assert!(matches!(hp, UiToDsp::SetHighPass(true)));
+
+        let device = UiToDsp::SetAudioDevice("default".to_string());
+        assert!(matches!(device, UiToDsp::SetAudioDevice(ref s) if s == "default"));
     }
 }
