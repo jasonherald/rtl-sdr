@@ -209,8 +209,7 @@ pub fn build_source_panel() -> SourcePanel {
         .description("Device and input configuration")
         .build();
 
-    // File source omitted until a file picker is implemented.
-    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network"]);
+    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network", "File"]);
     let device_row = adw::ComboRow::builder()
         .title("Device")
         .model(&device_model)
