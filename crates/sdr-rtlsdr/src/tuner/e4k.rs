@@ -779,19 +779,20 @@ impl E4kTuner {
 
         // Compute fractional part (remainder < fosc, so x < PLL_Y, fits in u16)
         let remainder = intended_fvco - u64::from(fosc) * z;
-        let x = ((remainder * PLL_Y) / u64::from(fosc)) as u32;
-        debug_assert!(x <= 0xFFFF, "PLL fractional part exceeds u16 range");
+        let x_raw = (remainder * PLL_Y) / u64::from(fosc);
+        if x_raw > u64::from(u16::MAX) || z > 255 {
+            return None; // PLL parameters out of range for this frequency
+        }
+        let x = x_raw as u16;
 
-        // Compute actual LO frequency
-        let fvco = u64::from(fosc) * z + (u64::from(fosc) * u64::from(x as u16)) / PLL_Y;
+        // Compute actual LO frequency (u64 throughout to prevent overflow)
+        let fvco = u64::from(fosc) * z + (u64::from(fosc) * u64::from(x)) / PLL_Y;
         let flo = (fvco / u64::from(r)) as u32;
-
-        debug_assert!(z <= 255, "PLL integer part exceeds u8 range");
         Some(PllParams {
             fosc,
             flo,
             z: z as u8,
-            x: x as u16,
+            x,
             r,
             r_idx,
         })
