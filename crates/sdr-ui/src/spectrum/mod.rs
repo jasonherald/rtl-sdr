@@ -154,6 +154,9 @@ impl SpectrumHandle {
 
     /// Update the display dB range for both the FFT plot and waterfall.
     pub fn set_db_range(&self, min_db: f32, max_db: f32) {
+        if min_db >= max_db {
+            return;
+        }
         self.min_db.set(min_db);
         self.max_db.set(max_db);
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
