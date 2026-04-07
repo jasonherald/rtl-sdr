@@ -801,8 +801,8 @@ fn connect_display_panel(
         .connect_selected_notify(move |row| {
             let style_manager = adw::StyleManager::default();
             let scheme = match row.selected() {
-                1 => adw::ColorScheme::ForceDark,
-                2 => adw::ColorScheme::ForceLight,
+                sidebar::display_panel::THEME_DARK => adw::ColorScheme::ForceDark,
+                sidebar::display_panel::THEME_LIGHT => adw::ColorScheme::ForceLight,
                 _ => adw::ColorScheme::Default,
             };
             style_manager.set_color_scheme(scheme);
@@ -954,4 +954,5 @@ fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
         }
     ));
     app.add_action(&about_action);
+    app.set_accels_for_action("app.about", &["F1"]);
 }

@@ -14,6 +14,11 @@ const MAX_FPS: f64 = 60.0;
 /// Default FFT size selector index (2048 = index 2).
 const DEFAULT_FFT_SIZE_INDEX: u32 = 2;
 
+/// Theme selector indices (must match `StringList` order in `build_display_panel`).
+pub const THEME_SYSTEM: u32 = 0;
+pub const THEME_DARK: u32 = 1;
+pub const THEME_LIGHT: u32 = 2;
+
 /// Default window function selector index (Blackman = index 1).
 const DEFAULT_WINDOW_FN_INDEX: u32 = 1;
 

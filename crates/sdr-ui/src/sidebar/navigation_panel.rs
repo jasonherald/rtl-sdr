@@ -300,14 +300,35 @@ pub fn build_navigation_panel() -> NavigationPanel {
         &name_entry,
     );
 
-    // Connect preset row — auto-tune on selection
+    // Connect preset row — auto-tune on selection, clear active bookmark
     let on_nav_preset = std::rc::Rc::clone(&on_navigate);
+    let active_for_preset = std::rc::Rc::clone(&active_bookmark);
+    let entry_for_preset = name_entry.clone();
+    let list_for_preset = bookmark_list.downgrade();
+    let scroll_for_preset = bookmark_scroll.downgrade();
+    let bm_for_preset = std::rc::Rc::clone(&bookmarks);
     preset_row.connect_selected_notify(move |row| {
         let idx = row.selected() as usize;
         if let Some(preset) = BAND_PRESETS.get(idx)
             && let Some(cb) = on_nav_preset.borrow().as_ref()
         {
+            // Clear active bookmark — we're tuning via preset, not bookmark.
+            *active_for_preset.borrow_mut() = ActiveBookmark::default();
+            entry_for_preset.set_text("");
             cb(preset.frequency, preset.demod_mode, preset.bandwidth);
+            // Rebuild to remove stale highlight
+            if let Some(lb) = list_for_preset.upgrade()
+                && let Some(sc) = scroll_for_preset.upgrade()
+            {
+                rebuild_bookmark_list(
+                    &lb,
+                    &sc,
+                    &bm_for_preset,
+                    &on_nav_preset,
+                    &active_for_preset,
+                    &entry_for_preset,
+                );
+            }
         }
     });
 
@@ -382,6 +403,15 @@ pub fn rebuild_bookmark_list(
         let del_name = bm.name.clone();
         let del_freq = bm.frequency;
         delete_btn.connect_clicked(move |_| {
+            // Clear active state if deleting the active bookmark.
+            {
+                let active = active_rc.borrow();
+                if active.name == del_name && active.frequency == del_freq {
+                    drop(active);
+                    *active_rc.borrow_mut() = ActiveBookmark::default();
+                    entry_del.set_text("");
+                }
+            }
             bm_rc
                 .borrow_mut()
                 .retain(|b| !(b.name == del_name && b.frequency == del_freq));
