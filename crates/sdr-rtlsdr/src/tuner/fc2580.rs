@@ -465,7 +465,7 @@ impl Fc2580Tuner {
                 self.write_reg(
                     handle,
                     REG_37,
-                    (FILTER_1_53_COEFF * freq_xtal_khz / 1_000_000) as u8,
+                    (FILTER_1_53_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8,
                 )?;
                 self.write_reg(handle, REG_39, FILTER_1_53_REG_39)?;
                 self.write_reg(handle, REG_2E, FILTER_CAL_TRIGGER)?;
@@ -475,7 +475,7 @@ impl Fc2580Tuner {
                 self.write_reg(
                     handle,
                     REG_37,
-                    (FILTER_6_COEFF * freq_xtal_khz / 1_000_000) as u8,
+                    (FILTER_6_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8,
                 )?;
                 self.write_reg(handle, REG_39, FILTER_6_REG_39)?;
                 self.write_reg(handle, REG_2E, FILTER_CAL_TRIGGER)?;
@@ -485,7 +485,7 @@ impl Fc2580Tuner {
                 self.write_reg(
                     handle,
                     REG_37,
-                    (FILTER_7_COEFF * freq_xtal_khz / 1_000_000) as u8,
+                    (FILTER_7_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8,
                 )?;
                 self.write_reg(handle, REG_39, FILTER_7_REG_39)?;
                 self.write_reg(handle, REG_2E, FILTER_CAL_TRIGGER)?;
@@ -495,7 +495,7 @@ impl Fc2580Tuner {
                 self.write_reg(
                     handle,
                     REG_37,
-                    (FILTER_8_COEFF * freq_xtal_khz / 1_000_000) as u8,
+                    (FILTER_8_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8,
                 )?;
                 self.write_reg(handle, REG_39, FILTER_8_REG_39)?;
                 self.write_reg(handle, REG_2E, FILTER_CAL_TRIGGER)?;
@@ -731,8 +731,12 @@ impl Fc2580Tuner {
         // Load lower part of K value
         self.write_reg(handle, REG_1B, k_val as u8)?;
 
-        // Load N value
-        debug_assert!(n_val <= 255, "FC2580 PLL n_val exceeds u8 range: {n_val}");
+        // Load N value (must fit in u8 register)
+        if n_val > 255 {
+            return Err(RtlSdrError::Tuner(format!(
+                "FC2580 PLL n_val {n_val} exceeds u8 range"
+            )));
+        }
         self.write_reg(handle, REG_1C, n_val as u8)?;
 
         // UHF LNA Load Cap
@@ -1038,19 +1042,19 @@ mod tests {
         let freq_xtal_khz: u32 = 16384;
 
         // BW 1.53 MHz: 4151 * 16384 / 1000000 = 68 (truncated)
-        let val = (FILTER_1_53_COEFF * freq_xtal_khz / 1_000_000) as u8;
+        let val = (FILTER_1_53_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8;
         assert_eq!(val, 68);
 
         // BW 6 MHz: 4400 * 16384 / 1000000 = 72 (truncated)
-        let val = (FILTER_6_COEFF * freq_xtal_khz / 1_000_000) as u8;
+        let val = (FILTER_6_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8;
         assert_eq!(val, 72);
 
         // BW 7 MHz: 3910 * 16384 / 1000000 = 64 (truncated)
-        let val = (FILTER_7_COEFF * freq_xtal_khz / 1_000_000) as u8;
+        let val = (FILTER_7_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8;
         assert_eq!(val, 64);
 
         // BW 8 MHz: 3300 * 16384 / 1000000 = 54 (truncated)
-        let val = (FILTER_8_COEFF * freq_xtal_khz / 1_000_000) as u8;
+        let val = (FILTER_8_COEFF * freq_xtal_khz / 1_000_000).min(255) as u8;
         assert_eq!(val, 54);
     }
 
