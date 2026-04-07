@@ -214,7 +214,8 @@ pub fn build_spectrum_view(
         &fill_enabled,
         &cursor_callback,
     );
-    let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state));
+    let waterfall_area =
+        build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state), &min_db, &max_db);
 
     // Attach interaction gestures to both the waterfall and FFT areas.
     attach_click_gesture(&waterfall_area, &vfo_state, dsp_tx.clone());
@@ -392,6 +393,8 @@ fn build_fft_area(
 fn build_waterfall_area(
     state: Rc<RefCell<Option<WaterfallState>>>,
     vfo_state: Rc<RefCell<VfoState>>,
+    min_db: &Rc<Cell<f32>>,
+    max_db: &Rc<Cell<f32>>,
 ) -> gtk4::GLArea {
     let area = gtk4::GLArea::builder()
         .hexpand(true)
@@ -400,8 +403,10 @@ fn build_waterfall_area(
         .build();
     area.set_required_version(3, 0);
 
-    // On realize: create GL context and renderer.
+    // On realize: create GL context and renderer with current dB range.
     let state_realize = Rc::clone(&state);
+    let min_db_realize = Rc::clone(min_db);
+    let max_db_realize = Rc::clone(max_db);
     area.connect_realize(move |area| {
         area.make_current();
         if area.error().is_some() {
@@ -410,7 +415,10 @@ fn build_waterfall_area(
         }
 
         match create_gl_context_and_waterfall_renderer() {
-            Ok((gl, renderer, vfo_renderer)) => {
+            Ok((gl, mut renderer, vfo_renderer)) => {
+                // Apply stored dB range so the waterfall matches the FFT plot
+                // even if set_db_range was called before realization.
+                renderer.set_db_range(min_db_realize.get(), max_db_realize.get());
                 *state_realize.borrow_mut() = Some(WaterfallState {
                     gl,
                     renderer,
