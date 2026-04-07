@@ -536,6 +536,29 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         });
     });
 
+    // Network protocol
+    let state_proto = Rc::clone(state);
+    let host_for_proto = panels.source.hostname_row.clone();
+    let port_for_proto = panels.source.port_row.clone();
+    panels
+        .source
+        .protocol_row
+        .connect_selected_notify(move |row| {
+            let hostname = host_for_proto.text().to_string();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let port = port_for_proto.value() as u16;
+            let protocol = if row.selected() == 1 {
+                sdr_types::Protocol::Udp
+            } else {
+                sdr_types::Protocol::TcpClient
+            };
+            state_proto.send_dsp(UiToDsp::SetNetworkConfig {
+                hostname,
+                port,
+                protocol,
+            });
+        });
+
     // File path (apply on Enter key)
     let state_file = Rc::clone(state);
     panels.source.file_path_row.connect_apply(move |row| {

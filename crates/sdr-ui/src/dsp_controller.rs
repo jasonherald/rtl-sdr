@@ -714,6 +714,7 @@ fn auto_decimation_ratio(sample_rate: f64, if_rate: f64) -> u32 {
 
 /// Read one block of IQ data from the source, process it, and send FFT data
 /// to the UI.
+#[allow(clippy::too_many_lines)]
 fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     let Some(source) = &mut state.source else {
         tracing::warn!("process_iq_block called without source");
@@ -729,7 +730,19 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
         }
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!("source read error: {e}");
+            // Fatal errors (USB reader death, device lost) — stop the pipeline
+            if matches!(
+                e,
+                sdr_types::SourceError::ReadFailed(_) | sdr_types::SourceError::NotRunning
+            ) {
+                tracing::error!("fatal source error: {e}");
+                cleanup(state);
+                state.running = false;
+                let _ = dsp_tx.send(DspToUi::Error(format!("Source error: {e}")));
+                let _ = dsp_tx.send(DspToUi::SourceStopped);
+            } else {
+                tracing::warn!("source read error: {e}");
+            }
             return;
         }
     };
