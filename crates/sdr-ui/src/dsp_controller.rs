@@ -3,21 +3,20 @@
 //!
 //! The DSP thread runs a loop that:
 //! 1. Checks for UI commands (non-blocking when running, blocking when stopped).
-//! 2. Reads IQ samples from the RTL-SDR device via `read_sync`.
+//! 2. Reads IQ samples from the active source via `Source::read_samples`.
 //! 3. Processes samples through `IqFrontend` (decimation, DC blocking, FFT).
 //! 4. Processes through `RxVfo` (frequency translation, resampling, channel filter).
 //! 5. Processes through `RadioModule` (IF chain, demod, AF chain).
 //! 6. Sends FFT data back to the UI for display.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::sink_manager::Sink;
+use sdr_pipeline::source_manager::Source;
 use sdr_radio::RadioModule;
-use sdr_rtlsdr::RtlSdrDevice;
 use sdr_sink_audio::AudioSink;
 use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, SinkError, Stereo};
@@ -26,13 +25,6 @@ use crate::messages::{DspToUi, UiToDsp};
 
 /// Number of IQ sample pairs per USB bulk read.
 const IQ_PAIRS_PER_READ: usize = 16_384;
-
-/// Raw USB buffer size in bytes (2 bytes per IQ pair: I + Q).
-const RAW_BUF_SIZE: usize = IQ_PAIRS_PER_READ * 2;
-
-/// Number of queued blocks in the USB reader channel.
-/// At 2 Msps, each block is 16384 samples = 8.2 ms. 32 blocks = ~260 ms buffer.
-const USB_READER_QUEUE_DEPTH: usize = 32;
 
 /// Default FFT size for spectrum display.
 const DEFAULT_FFT_SIZE: usize = 2048;
@@ -128,148 +120,9 @@ fn dsp_thread_main(dsp_tx: mpsc::Sender<DspToUi>, ui_rx: mpsc::Receiver<UiToDsp>
     }
 }
 
-/// Slot in the lock-free ring buffer.
-struct RingSlot {
-    data: std::sync::Mutex<Vec<u8>>,
-    len: std::sync::atomic::AtomicUsize,
-    /// 0 = empty (writer can fill), 1 = full (reader can consume)
-    state: std::sync::atomic::AtomicU8,
-}
-
-/// Lock-free SPSC ring buffer for USB data blocks.
-///
-/// The writer (USB thread) fills empty slots, the reader (DSP thread)
-/// consumes full slots. No copies, no allocations in steady state.
-struct UsbRingBuffer {
-    slots: Vec<RingSlot>,
-    slot_count: usize,
-    write_idx: std::sync::atomic::AtomicUsize,
-    read_idx: std::sync::atomic::AtomicUsize,
-}
-
-impl UsbRingBuffer {
-    fn new(slot_count: usize, slot_size: usize) -> Self {
-        let slots = (0..slot_count)
-            .map(|_| RingSlot {
-                data: std::sync::Mutex::new(vec![0u8; slot_size]),
-                len: std::sync::atomic::AtomicUsize::new(0),
-                state: std::sync::atomic::AtomicU8::new(0), // empty
-            })
-            .collect();
-        Self {
-            slots,
-            slot_count,
-            write_idx: std::sync::atomic::AtomicUsize::new(0),
-            read_idx: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-}
-
-/// Async USB reader — runs bulk reads on a dedicated thread using a
-/// lock-free ring buffer. Zero copies, zero allocations on the hot path.
-struct UsbReader {
-    cancel: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    ring: Arc<UsbRingBuffer>,
-}
-
-impl UsbReader {
-    fn start(device: &RtlSdrDevice) -> Self {
-        let ring = Arc::new(UsbRingBuffer::new(USB_READER_QUEUE_DEPTH, RAW_BUF_SIZE));
-        let ring_writer = Arc::clone(&ring);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel);
-        let handle = device.usb_handle();
-
-        let thread = std::thread::Builder::new()
-            .name("usb-reader".to_string())
-            .spawn(move || {
-                tracing::info!("USB reader thread started (ring slots={USB_READER_QUEUE_DEPTH})");
-                let timeout = Duration::from_secs(1);
-
-                while !cancel_clone.load(Ordering::Relaxed) {
-                    let idx =
-                        ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
-                    let slot = &ring_writer.slots[idx];
-
-                    // Wait for slot to be empty
-                    if slot.state.load(Ordering::Acquire) != 0 {
-                        // Ring full — DSP can't keep up. Spin briefly.
-                        std::thread::yield_now();
-                        continue;
-                    }
-
-                    // Lock the slot's buffer for writing. Never contended because
-                    // the state flag ensures reader and writer don't overlap.
-                    let mut data = slot.data.lock().expect("ring slot poisoned");
-
-                    match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut data, timeout)
-                    {
-                        Ok(n) if n > 0 => {
-                            slot.len.store(n, Ordering::Relaxed);
-                            slot.state.store(1, Ordering::Release); // mark full
-                            ring_writer.write_idx.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(_) | Err(rusb::Error::Timeout) => {}
-                        Err(e) => {
-                            tracing::warn!("USB reader error: {e}");
-                            break;
-                        }
-                    }
-                }
-                tracing::debug!("USB reader thread stopped");
-            })
-            .expect("failed to spawn USB reader thread");
-
-        Self {
-            cancel,
-            thread: Some(thread),
-            ring,
-        }
-    }
-
-    /// Try to read the next block, converting samples directly into the
-    /// output buffer. Returns the number of IQ samples converted, or None
-    /// if no block is available.
-    fn try_read_into(&self, iq_buf: &mut [Complex]) -> Option<usize> {
-        let idx = self.ring.read_idx.load(Ordering::Relaxed) % self.ring.slot_count;
-        let slot = &self.ring.slots[idx];
-
-        if slot.state.load(Ordering::Acquire) != 1 {
-            return None; // slot empty
-        }
-
-        let len = slot.len.load(Ordering::Relaxed);
-        let count = {
-            let data = slot.data.lock().expect("ring slot poisoned");
-            RtlSdrSource::convert_samples(&data[..len], iq_buf)
-        };
-
-        // Release the slot back to the writer
-        slot.state.store(0, Ordering::Release);
-        self.ring.read_idx.fetch_add(1, Ordering::Relaxed);
-
-        Some(count)
-    }
-
-    fn stop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for UsbReader {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
 /// Mutable state owned by the DSP thread.
 struct DspState {
-    device: Option<RtlSdrDevice>,
-    usb_reader: Option<UsbReader>,
+    source: Option<Box<dyn Source>>,
     frontend: IqFrontend,
     radio: RadioModule,
     audio_sink: AudioSink,
@@ -313,12 +166,11 @@ impl DspState {
             RadioModule::with_default_rate().map_err(|e| format!("RadioModule init: {e}"))?;
         let initial_bandwidth = radio.demod_config().default_bandwidth;
 
-        // The RxVfo and RadioModule input rate are configured in open_device()
+        // The RxVfo and RadioModule input rate are configured in open_source()
         // once we know the actual effective sample rate from the hardware.
 
         Ok(Self {
-            device: None,
-            usb_reader: None,
+            source: None,
             frontend,
             radio,
             audio_sink: AudioSink::new(),
@@ -352,7 +204,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 return;
             }
             tracing::info!("starting DSP pipeline");
-            match open_device(state) {
+            match open_source(state) {
                 Ok(()) => {
                     // Start the audio sink -- if it fails, log but continue
                     // so the spectrum display still works.
@@ -363,14 +215,16 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.running = true;
                     tracing::info!("DSP pipeline started");
 
-                    // Send the device's supported gain values to the UI.
-                    if let Some(dev) = &state.device {
-                        let gains: Vec<f64> = dev
-                            .tuner_gains()
+                    // Send the source's supported gain values to the UI.
+                    if let Some(source) = &state.source {
+                        let gains: Vec<f64> = source
+                            .gains()
                             .iter()
                             .map(|&g| f64::from(g) / 10.0) // tenths of dB → dB
                             .collect();
-                        let _ = dsp_tx.send(DspToUi::GainList(gains));
+                        if !gains.is_empty() {
+                            let _ = dsp_tx.send(DspToUi::GainList(gains));
+                        }
                     }
                 }
                 Err(e) => {
@@ -395,9 +249,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::Tune(freq) => {
             tracing::debug!(frequency_hz = freq, "tune command");
             state.center_freq = freq;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            if let Some(dev) = &mut state.device
-                && let Err(e) = dev.set_center_freq(freq as u32)
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.tune(freq)
             {
                 tracing::warn!("tune failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Tune failed: {e}")));
@@ -478,9 +331,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetSampleRate(rate) => {
             tracing::debug!(sample_rate = rate, "set sample rate");
             state.sample_rate = rate;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            if let Some(dev) = &mut state.device
-                && let Err(e) = dev.set_sample_rate(rate as u32)
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_sample_rate(rate)
             {
                 tracing::warn!("set sample rate failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Sample rate failed: {e}")));
@@ -587,10 +439,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetGain(gain_db) => {
             tracing::debug!(gain_db, "set gain");
             #[allow(clippy::cast_possible_truncation)]
-            if let Some(dev) = &mut state.device {
-                // RTL-SDR gain is in tenths of dB (e.g., 49.6 dB = 496)
+            if let Some(source) = &mut state.source {
+                // Source gain is in tenths of dB (e.g., 49.6 dB = 496)
                 let gain_tenths = (gain_db * 10.0) as i32;
-                if let Err(e) = dev.set_tuner_gain(gain_tenths) {
+                if let Err(e) = source.set_gain(gain_tenths) {
                     tracing::warn!("set gain failed: {e}");
                     let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
                 }
@@ -599,9 +451,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetAgc(enabled) => {
             tracing::debug!(enabled, "set AGC");
-            if let Some(dev) = &mut state.device {
+            if let Some(source) = &mut state.source {
                 // AGC enabled = automatic gain (manual=false), AGC disabled = manual gain
-                if let Err(e) = dev.set_tuner_gain_mode(!enabled) {
+                if let Err(e) = source.set_gain_mode(!enabled) {
                     tracing::warn!("set AGC failed: {e}");
                     let _ = dsp_tx.send(DspToUi::Error(format!("AGC failed: {e}")));
                 }
@@ -683,47 +535,33 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
     }
 }
 
-/// Open the RTL-SDR device and configure it for streaming.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn open_device(state: &mut DspState) -> Result<(), String> {
-    let mut device = RtlSdrDevice::open(DEVICE_INDEX).map_err(|e| e.to_string())?;
+/// Open the active IQ source and configure it for streaming.
+fn open_source(state: &mut DspState) -> Result<(), String> {
+    let mut source: Box<dyn Source> = Box::new(RtlSdrSource::new(DEVICE_INDEX));
 
-    device
-        .set_sample_rate(state.sample_rate as u32)
-        .map_err(|e| format!("set sample rate: {e}"))?;
+    source
+        .set_sample_rate(state.sample_rate)
+        .map_err(|e| e.to_string())?;
+    source.tune(state.center_freq).map_err(|e| e.to_string())?;
+    source.start().map_err(|e| e.to_string())?;
 
-    device
-        .set_center_freq(state.center_freq as u32)
-        .map_err(|e| format!("set center freq: {e}"))?;
-
-    device
-        .reset_buffer()
-        .map_err(|e| format!("reset buffer: {e}"))?;
-
-    // Rebuild frontend and VFO before committing the device to state.
-    // If either fails, the local `device` handle is dropped and startup
-    // leaves no partially-open device behind.
+    // Rebuild frontend and VFO before committing the source to state.
     rebuild_frontend(state)?;
     rebuild_vfo(state)?;
-    // Start the async USB reader thread before storing the device.
-    // This decouples USB I/O from DSP processing, preventing data loss
-    // at high sample rates (>2 Msps).
-    state.usb_reader = Some(UsbReader::start(&device));
-    state.device = Some(device);
+    state.source = Some(source);
 
     tracing::info!(
         sample_rate = state.sample_rate,
         center_freq = state.center_freq,
-        "RTL-SDR device opened"
+        "source opened"
     );
     Ok(())
 }
 
-/// Stop the device and release resources.
+/// Stop the source and release resources.
 fn cleanup(state: &mut DspState) {
-    // Stop the USB reader thread first.
-    if let Some(mut reader) = state.usb_reader.take() {
-        reader.stop();
+    if let Some(source) = &mut state.source {
+        let _ = source.stop();
     }
 
     // Stop the audio sink so it doesn't try to read stale data.
@@ -731,9 +569,8 @@ fn cleanup(state: &mut DspState) {
         tracing::debug!("audio sink stop: {e}");
     }
 
-    // Dropping the device closes the USB handle.
-    state.device = None;
-    tracing::info!("RTL-SDR device closed");
+    state.source = None;
+    tracing::info!("source closed");
 }
 
 /// Rebuild the IQ frontend with the current sample rate, preserving user settings.
@@ -802,33 +639,27 @@ fn auto_decimation_ratio(sample_rate: f64, if_rate: f64) -> u32 {
     pow2.clamp(1, 8192) // MAX_POWER_DECIM_RATIO
 }
 
-/// Read one block of IQ data from the device, process it, and send FFT data
+/// Read one block of IQ data from the source, process it, and send FFT data
 /// to the UI.
 fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
-    if state.device.is_none() {
-        tracing::warn!("process_iq_block called without device");
+    let Some(source) = &mut state.source else {
+        tracing::warn!("process_iq_block called without source");
         state.running = false;
         let _ = dsp_tx.send(DspToUi::SourceStopped);
         return;
-    }
-
-    // Receive raw USB data from the async reader thread.
-    // This decouples USB I/O from DSP — the reader thread fills the channel
-    // continuously, and we consume blocks as fast as we can process them.
-    let Some(reader) = &state.usb_reader else {
-        return;
     };
 
-    // Read from the lock-free ring buffer and convert to IQ in one step.
-    let Some(iq_count) = reader.try_read_into(&mut state.iq_buf) else {
-        // No data yet — yield to avoid busy-waiting.
-        std::thread::yield_now();
-        return;
+    let iq_count = match source.read_samples(&mut state.iq_buf) {
+        Ok(0) => {
+            std::thread::yield_now();
+            return;
+        }
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("source read error: {e}");
+            return;
+        }
     };
-
-    if iq_count == 0 {
-        return;
-    }
 
     // Process through IQ frontend (decimation, DC blocking, FFT).
     match state.frontend.process(
@@ -933,11 +764,9 @@ mod tests {
 
     /// Compile-time validation that DSP buffer constants are consistent.
     const _: () = {
-        assert!(RAW_BUF_SIZE == IQ_PAIRS_PER_READ * 2);
         assert!(DEFAULT_FFT_SIZE > 0);
         assert!(DEFAULT_SAMPLE_RATE > 0.0);
         assert!(DEFAULT_CENTER_FREQ > 0.0);
-        assert!(USB_READER_QUEUE_DEPTH > 0);
         assert!(RECV_TIMEOUT_MS > 0);
         assert!(VFO_OUTPUT_PADDING > 0);
     };
@@ -946,8 +775,7 @@ mod tests {
     fn dsp_state_creates_successfully() {
         let state = DspState::new().unwrap();
         assert!(!state.running);
-        assert!(state.device.is_none());
-        assert!(state.usb_reader.is_none());
+        assert!(state.source.is_none());
         assert_eq!(state.iq_buf.len(), IQ_PAIRS_PER_READ);
         assert_eq!(state.fft_buf.len(), DEFAULT_FFT_SIZE);
         // VFO starts as None (created on device open).
@@ -958,7 +786,7 @@ mod tests {
     #[test]
     fn rebuild_vfo_creates_vfo_and_sets_radio_rate() {
         let mut state = DspState::new().unwrap();
-        // Simulate what open_device does: frontend is already built at default rate.
+        // Simulate what open_source does: frontend is already built at default rate.
         rebuild_vfo(&mut state).unwrap();
         assert!(state.vfo.is_some());
     }
