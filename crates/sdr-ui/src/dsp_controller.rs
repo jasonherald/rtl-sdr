@@ -145,6 +145,8 @@ struct DspState {
     vfo_offset: f64,
 
     // Source type and configuration
+    /// User-configured sample rate (persisted across source switches).
+    configured_sample_rate: f64,
     source_type: SourceType,
     network_host: String,
     network_port: u16,
@@ -184,6 +186,7 @@ impl DspState {
             running: false,
             center_freq: DEFAULT_CENTER_FREQ,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            configured_sample_rate: DEFAULT_SAMPLE_RATE,
             volume: 1.0,
             dc_blocking: true,
             invert_iq: false,
@@ -342,6 +345,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetSampleRate(rate) => {
             tracing::debug!(sample_rate = rate, "set sample rate");
+            state.configured_sample_rate = rate;
             if let Some(source) = &mut state.source {
                 if let Err(e) = source.set_sample_rate(rate) {
                     tracing::warn!("set sample rate failed: {e}");
@@ -620,7 +624,7 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
         SourceType::File => Box::new(sdr_source_file::FileSource::new(&state.file_path)),
     };
 
-    if let Err(e) = source.set_sample_rate(state.sample_rate) {
+    if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {
         if state.source_type == SourceType::File {
             tracing::warn!("file source sample rate mismatch: {e}");
         } else {
@@ -646,8 +650,11 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
     }
 
     // Rebuild frontend and VFO before committing the source to state.
-    rebuild_frontend(state)?;
-    rebuild_vfo(state)?;
+    // If either fails, stop the source to avoid a leaked running source.
+    if let Err(e) = rebuild_frontend(state).and_then(|()| rebuild_vfo(state)) {
+        let _ = source.stop();
+        return Err(e);
+    }
     state.source = Some(source);
 
     tracing::info!(
