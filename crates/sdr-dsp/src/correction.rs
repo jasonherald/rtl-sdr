@@ -6,20 +6,26 @@ use sdr_types::{Complex, DspError};
 
 /// DC blocking filter — removes DC offset from a signal.
 ///
-/// Ports SDR++ `dsp::correction::DCBlocker`. Implements a simple
-/// feedback loop: `out[i] = in[i] - offset; offset += out[i] * rate`.
+/// Uses the Julius O. Smith textbook topology:
+/// `y[n] = x[n] - x[n-1] + R * y[n-1]`
+/// where `R = 1 - (2π × cutoff / sample_rate)`.
 ///
-/// The `rate` parameter controls convergence speed. Typical values:
-/// - Direct rate: 0.0001 to 0.01
-/// - Or computed as `rate_hz / sample_rate` (e.g., 1.0 / 48000.0)
+/// This filter has an explicit zero at DC (z=1), guaranteeing perfect
+/// DC rejection at steady state. The pole near z=R provides the
+/// high-pass cutoff frequency.
 pub struct DcBlocker {
-    rate: f32,
-    offset_re: f32,
-    offset_im: f32,
+    r: f32,
+    last_in_re: f32,
+    last_in_im: f32,
+    last_out_re: f32,
+    last_out_im: f32,
 }
 
 impl DcBlocker {
     /// Create a new DC blocker with the given convergence rate.
+    ///
+    /// The `rate` parameter sets the cutoff: `R = 1 - rate`.
+    /// Typical values: 0.0001 to 0.01 (lower = narrower notch at DC).
     ///
     /// # Errors
     ///
@@ -32,9 +38,11 @@ impl DcBlocker {
             )));
         }
         Ok(Self {
-            rate: rate as f32,
-            offset_re: 0.0,
-            offset_im: 0.0,
+            r: (1.0 - rate) as f32,
+            last_in_re: 0.0,
+            last_in_im: 0.0,
+            last_out_re: 0.0,
+            last_out_im: 0.0,
         })
     }
 
@@ -47,10 +55,12 @@ impl DcBlocker {
         Self::new(rate_hz / sample_rate)
     }
 
-    /// Reset the DC offset estimate to zero.
+    /// Reset the DC blocker state.
     pub fn reset(&mut self) {
-        self.offset_re = 0.0;
-        self.offset_im = 0.0;
+        self.last_in_re = 0.0;
+        self.last_in_im = 0.0;
+        self.last_out_re = 0.0;
+        self.last_out_im = 0.0;
     }
 
     /// Process complex samples, removing DC offset.
@@ -70,10 +80,13 @@ impl DcBlocker {
             });
         }
         for (i, &s) in input.iter().enumerate() {
-            let out_re = s.re - self.offset_re;
-            let out_im = s.im - self.offset_im;
-            self.offset_re += out_re * self.rate;
-            self.offset_im += out_im * self.rate;
+            // y[n] = x[n] - x[n-1] + R * y[n-1]
+            let out_re = s.re - self.last_in_re + self.r * self.last_out_re;
+            let out_im = s.im - self.last_in_im + self.r * self.last_out_im;
+            self.last_in_re = s.re;
+            self.last_in_im = s.im;
+            self.last_out_re = out_re;
+            self.last_out_im = out_im;
             output[i] = Complex::new(out_re, out_im);
         }
         Ok(input.len())
@@ -110,6 +123,23 @@ mod tests {
     }
 
     #[test]
+    fn test_dc_blocker_perfect_dc_rejection() {
+        // The textbook topology has an explicit zero at DC — verify
+        // that steady-state DC is perfectly rejected (not just reduced).
+        let mut dc = DcBlocker::new(0.001).unwrap();
+        let input = vec![Complex::new(1.0, 0.5); 50_000];
+        let mut output = vec![Complex::default(); 50_000];
+        dc.process(&input, &mut output).unwrap();
+        // With the zero at DC, the output converges to exactly 0.0
+        let last = output[49_999];
+        assert!(
+            last.re.abs() < 0.01,
+            "DC should be perfectly rejected, re = {}",
+            last.re
+        );
+    }
+
+    #[test]
     fn test_dc_blocker_passes_ac() {
         let mut dc = DcBlocker::new(0.001).unwrap();
         // AC signal (alternating) with no DC
@@ -136,7 +166,7 @@ mod tests {
         let mut output = vec![Complex::default(); 100];
         dc.process(&input, &mut output).unwrap();
         dc.reset();
-        // After reset, offset should be zero again
+        // After reset, state should be zero
         let zeros = vec![Complex::new(0.0, 0.0); 10];
         let mut out2 = vec![Complex::default(); 10];
         dc.process(&zeros, &mut out2).unwrap();
