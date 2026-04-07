@@ -14,6 +14,14 @@ pub fn build_app() -> adw::Application {
 
     app.connect_startup(|_| {
         css::load_css();
+
+        // Register the local data/ directory as an icon search path so the
+        // app icon resolves in uninstalled dev builds (not just after `make install`).
+        if let Some(display) = gtk4::gdk::Display::default() {
+            let icon_theme = gtk4::IconTheme::for_display(&display);
+            icon_theme.add_search_path("data");
+        }
+
         tracing::info!("sdr-rs UI starting");
     });
 

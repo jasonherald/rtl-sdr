@@ -75,38 +75,42 @@ pub fn setup_shortcuts(
     window.add_controller(controller);
 }
 
-/// Show the keyboard shortcuts dialog.
-///
-/// Presents a modal `AdwDialog` listing all keyboard shortcuts.
-/// Uses a dialog instead of `GtkShortcutsWindow` to avoid the close-kills-app
-/// issue on Wayland compositors like Hyprland.
-pub fn show_shortcuts_dialog(parent: &impl gtk4::prelude::IsA<gtk4::Widget>) {
-    let shortcuts = [
-        (
-            "Playback",
-            &[("Space", "Play / Stop"), ("M", "Cycle demod mode")][..],
-        ),
-        ("Navigation", &[("F9", "Toggle sidebar")][..]),
-        (
-            "Application",
-            &[
-                ("Ctrl+/", "Keyboard shortcuts"),
-                ("Ctrl+Q", "Quit"),
-                ("F1", "About"),
-            ][..],
-        ),
-    ];
+/// Shortcut catalog — single source of truth for the help dialog.
+const SHORTCUT_CATALOG: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Playback",
+        &[("Space", "Play / Stop"), ("M", "Cycle demod mode")],
+    ),
+    ("Navigation", &[("F9", "Toggle sidebar")]),
+    (
+        "Application",
+        &[
+            ("Ctrl+/", "Keyboard shortcuts"),
+            ("Ctrl+Q", "Quit"),
+            ("F1", "About"),
+        ],
+    ),
+];
 
+/// Dialog layout constants.
+const DIALOG_CONTENT_WIDTH: i32 = 400;
+const DIALOG_CONTENT_HEIGHT: i32 = 400;
+const DIALOG_SPACING: i32 = 16;
+const DIALOG_MARGIN: i32 = 12;
+const DIALOG_MARGIN_SIDE: i32 = 24;
+
+/// Show the keyboard shortcuts dialog as a modal `AdwDialog`.
+pub fn show_shortcuts_dialog(parent: &impl gtk4::prelude::IsA<gtk4::Widget>) {
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(24)
-        .margin_end(24)
+        .spacing(DIALOG_SPACING)
+        .margin_top(DIALOG_MARGIN)
+        .margin_bottom(DIALOG_MARGIN)
+        .margin_start(DIALOG_MARGIN_SIDE)
+        .margin_end(DIALOG_MARGIN_SIDE)
         .build();
 
-    for (group_name, entries) in &shortcuts {
+    for (group_name, entries) in SHORTCUT_CATALOG {
         let group_label = gtk4::Label::builder()
             .label(*group_name)
             .css_classes(["heading"])
@@ -143,8 +147,8 @@ pub fn show_shortcuts_dialog(parent: &impl gtk4::prelude::IsA<gtk4::Widget>) {
 
     let dialog = adw::Dialog::builder()
         .title("Keyboard Shortcuts")
-        .content_width(400)
-        .content_height(400)
+        .content_width(DIALOG_CONTENT_WIDTH)
+        .content_height(DIALOG_CONTENT_HEIGHT)
         .build();
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(parent));
