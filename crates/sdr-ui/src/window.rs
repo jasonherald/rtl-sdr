@@ -16,7 +16,7 @@ use sdr_source_rtlsdr::SAMPLE_RATES;
 use crate::dsp_controller;
 use crate::header;
 use crate::header::demod_selector;
-use crate::messages::{DspToUi, UiToDsp};
+use crate::messages::{DspToUi, SourceType, UiToDsp};
 use crate::shortcuts;
 use crate::sidebar;
 use crate::sidebar::SidebarPanels;
@@ -480,6 +480,40 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .connect_active_notify(move |row| {
             state_iq_corr.send_dsp(UiToDsp::SetIqCorrection(row.is_active()));
         });
+
+    // Source type selector
+    let state_source = Rc::clone(state);
+    panels
+        .source
+        .device_row
+        .connect_selected_notify(move |row| {
+            let source_type = match row.selected() {
+                1 => SourceType::Network,
+                2 => SourceType::File,
+                _ => SourceType::RtlSdr,
+            };
+            state_source.send_dsp(UiToDsp::SetSourceType(source_type));
+        });
+
+    // Network hostname (fires on Enter key)
+    let state_host = Rc::clone(state);
+    let port_for_host = panels.source.port_row.clone();
+    panels.source.hostname_row.connect_apply(move |row| {
+        let hostname = row.text().to_string();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let port = port_for_host.value() as u16;
+        state_host.send_dsp(UiToDsp::SetNetworkConfig { hostname, port });
+    });
+
+    // Network port
+    let state_port = Rc::clone(state);
+    let host_for_port = panels.source.hostname_row.clone();
+    panels.source.port_row.connect_value_notify(move |row| {
+        let hostname = host_for_port.text().to_string();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let port = row.value() as u16;
+        state_port.send_dsp(UiToDsp::SetNetworkConfig { hostname, port });
+    });
 }
 
 /// Connect radio panel controls to DSP commands.

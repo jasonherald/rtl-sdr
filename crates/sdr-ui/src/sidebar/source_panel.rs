@@ -197,7 +197,6 @@ fn connect_device_visibility(
             port_row.set_visible(is_network);
             protocol_row.set_visible(is_network);
 
-            // TODO(issue #92): send device change to DSP pipeline
             tracing::debug!(device = selected, "source device changed");
         }
     ));

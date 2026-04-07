@@ -210,10 +210,16 @@ mod tests {
         assert!(matches!(device, UiToDsp::SetAudioDevice(ref s) if s == "default"));
 
         let src_type = UiToDsp::SetSourceType(SourceType::RtlSdr);
-        assert!(matches!(src_type, UiToDsp::SetSourceType(SourceType::RtlSdr)));
+        assert!(matches!(
+            src_type,
+            UiToDsp::SetSourceType(SourceType::RtlSdr)
+        ));
 
         let src_net = UiToDsp::SetSourceType(SourceType::Network);
-        assert!(matches!(src_net, UiToDsp::SetSourceType(SourceType::Network)));
+        assert!(matches!(
+            src_net,
+            UiToDsp::SetSourceType(SourceType::Network)
+        ));
 
         let src_file = UiToDsp::SetSourceType(SourceType::File);
         assert!(matches!(src_file, UiToDsp::SetSourceType(SourceType::File)));
