@@ -13,20 +13,29 @@
 )]
 //! RTL-SDR source module — wraps sdr-rtlsdr for the pipeline.
 //!
-//! Converts raw uint8 IQ samples from the USB device to f32 Complex
-//! samples for the signal processing pipeline.
+//! Owns a USB reader thread and lock-free ring buffer. Converts raw
+//! uint8 IQ samples from the USB device to f32 Complex samples for
+//! the signal processing pipeline.
 
 use sdr_pipeline::source_manager::Source;
 use sdr_rtlsdr::RtlSdrDevice;
 use sdr_types::{Complex, SourceError};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// IQ sample conversion factor: `(sample - 127.4) / 128.0`
 ///
 /// Matches SDR++ `RTLSDRSourceModule::asyncHandler`.
 const IQ_OFFSET: f32 = 127.4;
 const IQ_SCALE: f32 = 128.0;
+
+/// Raw USB buffer size in bytes (16K IQ pairs x 2 bytes each).
+const RAW_BUF_SIZE: usize = 16_384 * 2;
+
+/// Number of slots in the USB ring buffer.
+/// At 2 Msps, each slot is 16384 samples = ~8.2 ms. 32 slots = ~260 ms buffer.
+const RING_SLOTS: usize = 32;
 
 /// RTL-SDR USB sample rates (Hz).
 pub const SAMPLE_RATES: &[f64] = &[
@@ -43,16 +52,68 @@ pub const SAMPLE_RATES: &[f64] = &[
     3_200_000.0,
 ];
 
+// ---------------------------------------------------------------------------
+// Ring buffer — lock-free SPSC for USB bulk read data
+// ---------------------------------------------------------------------------
+
+/// A single slot in the ring buffer.
+///
+/// The `Mutex` is never contended: the atomic `state` flag ensures the
+/// writer and reader never access the same slot simultaneously.
+struct RingSlot {
+    data: Mutex<Vec<u8>>,
+    len: AtomicUsize,
+    /// 0 = empty (writer can fill), 1 = full (reader can consume).
+    state: AtomicU8,
+}
+
+/// Lock-free SPSC ring buffer for USB data blocks.
+///
+/// The writer (USB reader thread) fills empty slots, the reader (DSP
+/// thread via `read_samples`) consumes full slots. No copies, no
+/// allocations in steady state.
+struct UsbRingBuffer {
+    slots: Vec<RingSlot>,
+    slot_count: usize,
+    write_idx: AtomicUsize,
+    read_idx: AtomicUsize,
+}
+
+impl UsbRingBuffer {
+    fn new(slot_count: usize, slot_size: usize) -> Self {
+        let slots = (0..slot_count)
+            .map(|_| RingSlot {
+                data: Mutex::new(vec![0u8; slot_size]),
+                len: AtomicUsize::new(0),
+                state: AtomicU8::new(0), // empty
+            })
+            .collect();
+        Self {
+            slots,
+            slot_count,
+            write_idx: AtomicUsize::new(0),
+            read_idx: AtomicUsize::new(0),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RtlSdrSource
+// ---------------------------------------------------------------------------
+
 /// RTL-SDR IQ source for the pipeline.
 ///
 /// Ports SDR++ `RTLSDRSourceModule`. Opens the RTL-SDR device,
-/// configures it, and converts uint8 IQ pairs to f32 Complex samples.
+/// configures it, spawns a USB reader thread, and converts uint8 IQ
+/// pairs to f32 Complex samples via `read_samples`.
 pub struct RtlSdrSource {
     device: Option<RtlSdrDevice>,
     device_index: u32,
     sample_rate: f64,
     frequency: f64,
     running: Arc<AtomicBool>,
+    ring: Option<Arc<UsbRingBuffer>>,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RtlSdrSource {
@@ -64,6 +125,8 @@ impl RtlSdrSource {
             sample_rate: SAMPLE_RATES[7], // 2.4 MHz default
             frequency: 100_000_000.0,     // 100 MHz default
             running: Arc::new(AtomicBool::new(false)),
+            ring: None,
+            reader_thread: None,
         }
     }
 
@@ -104,6 +167,54 @@ impl Source for RtlSdrSource {
             .reset_buffer()
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
 
+        // Create the ring buffer and spawn the USB reader thread.
+        let ring = Arc::new(UsbRingBuffer::new(RING_SLOTS, RAW_BUF_SIZE));
+        let ring_writer = Arc::clone(&ring);
+        let cancel = Arc::clone(&self.running);
+        let handle = device.usb_handle();
+
+        let thread = std::thread::Builder::new()
+            .name("usb-reader".into())
+            .spawn(move || {
+                tracing::info!("USB reader thread started (ring slots={RING_SLOTS})");
+                let timeout = Duration::from_secs(1);
+
+                while cancel.load(Ordering::Relaxed) {
+                    let idx =
+                        ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
+                    let slot = &ring_writer.slots[idx];
+
+                    // Wait for slot to be empty.
+                    if slot.state.load(Ordering::Acquire) != 0 {
+                        // Ring full — DSP can't keep up. Yield briefly.
+                        std::thread::yield_now();
+                        continue;
+                    }
+
+                    // Lock the slot's buffer for writing. Never contended because
+                    // the state flag ensures reader and writer don't overlap.
+                    let mut data = slot.data.lock().expect("ring slot poisoned");
+
+                    match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut data, timeout)
+                    {
+                        Ok(n) if n > 0 => {
+                            slot.len.store(n, Ordering::Relaxed);
+                            slot.state.store(1, Ordering::Release); // mark full
+                            ring_writer.write_idx.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(_) | Err(rusb::Error::Timeout) => {}
+                        Err(e) => {
+                            tracing::warn!("USB reader error: {e}");
+                            break;
+                        }
+                    }
+                }
+                tracing::debug!("USB reader thread stopped");
+            })
+            .map_err(|e| SourceError::OpenFailed(format!("failed to spawn USB reader: {e}")))?;
+
+        self.ring = Some(ring);
+        self.reader_thread = Some(thread);
         self.device = Some(device);
         self.running.store(true, Ordering::Relaxed);
         Ok(())
@@ -111,6 +222,10 @@ impl Source for RtlSdrSource {
 
     fn stop(&mut self) -> Result<(), SourceError> {
         self.running.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.reader_thread.take() {
+            let _ = thread.join();
+        }
+        self.ring = None;
         self.device = None; // Drop closes the device
         Ok(())
     }
@@ -141,6 +256,57 @@ impl Source for RtlSdrSource {
                 .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
         }
         Ok(())
+    }
+
+    fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+        let ring = self.ring.as_ref().ok_or(SourceError::NotRunning)?;
+        let idx = ring.read_idx.load(Ordering::Relaxed) % ring.slot_count;
+        let slot = &ring.slots[idx];
+
+        if slot.state.load(Ordering::Acquire) != 1 {
+            return Ok(0); // No data available yet
+        }
+
+        let len = slot.len.load(Ordering::Relaxed);
+        let count = {
+            let data = slot
+                .data
+                .lock()
+                .map_err(|e| SourceError::ReadFailed(e.to_string()))?;
+            Self::convert_samples(&data[..len], output)
+        };
+
+        // Release the slot back to the writer.
+        slot.state.store(0, Ordering::Release);
+        ring.read_idx.fetch_add(1, Ordering::Relaxed);
+
+        Ok(count)
+    }
+
+    fn set_gain(&mut self, gain_tenths: i32) -> Result<(), SourceError> {
+        if let Some(device) = &mut self.device {
+            device
+                .set_tuner_gain(gain_tenths)
+                .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn set_gain_mode(&mut self, manual: bool) -> Result<(), SourceError> {
+        if let Some(device) = &mut self.device {
+            device
+                .set_tuner_gain_mode(manual)
+                .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn gains(&self) -> &[i32] {
+        if let Some(device) = &self.device {
+            device.tuner_gains()
+        } else {
+            &[]
+        }
     }
 }
 
