@@ -514,6 +514,13 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         let port = row.value() as u16;
         state_port.send_dsp(UiToDsp::SetNetworkConfig { hostname, port });
     });
+
+    // File path (apply on Enter key)
+    let state_file = Rc::clone(state);
+    panels.source.file_path_row.connect_apply(move |row| {
+        let path = std::path::PathBuf::from(row.text().to_string());
+        state_file.send_dsp(UiToDsp::SetFilePath(path));
+    });
 }
 
 /// Connect radio panel controls to DSP commands.
