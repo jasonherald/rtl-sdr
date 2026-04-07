@@ -313,6 +313,7 @@ impl WaterfallRenderer {
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(Some(&flat)),
             );
+            gl.bind_texture(glow::TEXTURE_2D, None);
         }
     }
 
