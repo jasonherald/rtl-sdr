@@ -258,7 +258,7 @@ fn pipeline_fft_standalone() {
     engine.forward(&mut fft_buf).expect("FFT forward");
 
     let mut power = vec![0.0_f32; TEST_FFT_SIZE];
-    sdr_dsp::fft::power_spectrum_db(&fft_buf, &mut power).expect("power_spectrum_db");
+    sdr_dsp::fft::power_spectrum_db(&fft_buf, &mut power, 1.0).expect("power_spectrum_db");
     assert!(
         power.iter().all(|v| v.is_finite()),
         "Non-finite power spectrum values"

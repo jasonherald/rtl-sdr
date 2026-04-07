@@ -22,6 +22,8 @@ const DEFAULT_SAMPLE_RATE_TEXT: &str = "SR: --";
 const DEFAULT_DEMOD_TEXT: &str = "-- --";
 /// Default frequency display text when no data has arrived.
 const DEFAULT_FREQUENCY_TEXT: &str = "-- Hz";
+/// Default cursor readout text when the cursor is not over the spectrum.
+const DEFAULT_CURSOR_TEXT: &str = "Cursor: --";
 
 /// Bottom status bar showing live metrics.
 pub struct StatusBar {
@@ -35,6 +37,8 @@ pub struct StatusBar {
     pub demod_label: gtk4::Label,
     /// Label showing center frequency.
     pub frequency_label: gtk4::Label,
+    /// Label showing cursor frequency and power readout.
+    pub cursor_label: gtk4::Label,
 }
 
 impl StatusBar {
@@ -60,6 +64,21 @@ impl StatusBar {
     pub fn update_frequency(&self, hz: f64) {
         self.frequency_label.set_label(&format_frequency(hz));
     }
+
+    /// Update the cursor readout with frequency and power at the mouse position.
+    ///
+    /// When `power_db` is `f32::NEG_INFINITY`, the cursor has left the area
+    /// and the readout is cleared.
+    pub fn update_cursor(&self, freq_hz: f64, power_db: f32) {
+        if power_db == f32::NEG_INFINITY {
+            self.cursor_label.set_label(DEFAULT_CURSOR_TEXT);
+        } else {
+            self.cursor_label.set_label(&format!(
+                "Cursor: {} / {power_db:.1} dB",
+                format_frequency(freq_hz)
+            ));
+        }
+    }
 }
 
 /// Build the status bar widget with initial placeholder labels.
@@ -68,6 +87,7 @@ pub fn build_status_bar() -> StatusBar {
     let sample_rate_label = gtk4::Label::new(Some(DEFAULT_SAMPLE_RATE_TEXT));
     let demod_label = gtk4::Label::new(Some(DEFAULT_DEMOD_TEXT));
     let frequency_label = gtk4::Label::new(Some(DEFAULT_FREQUENCY_TEXT));
+    let cursor_label = gtk4::Label::new(Some(DEFAULT_CURSOR_TEXT));
 
     let widget = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
@@ -82,6 +102,8 @@ pub fn build_status_bar() -> StatusBar {
     widget.append(&demod_label);
     widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     widget.append(&frequency_label);
+    widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
+    widget.append(&cursor_label);
 
     StatusBar {
         widget,
@@ -89,6 +111,7 @@ pub fn build_status_bar() -> StatusBar {
         sample_rate_label,
         demod_label,
         frequency_label,
+        cursor_label,
     }
 }
 

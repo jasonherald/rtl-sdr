@@ -41,6 +41,7 @@ const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
 const DSP_POLL_INTERVAL_MS: u64 = 16;
 
 /// Build and present the main application window.
+#[allow(clippy::too_many_lines)]
 pub fn build_window(app: &adw::Application) {
     // --- Channel setup ---
     let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
@@ -103,6 +104,13 @@ pub fn build_window(app: &adw::Application) {
         &demod_dropdown,
         &status_bar_demod,
     );
+
+    // Wire cursor readout from spectrum to status bar.
+    let status_bar_for_cursor = Rc::clone(&status_bar_demod);
+    spectrum_handle.connect_cursor_moved(move |freq_hz, power_db| {
+        status_bar_for_cursor.update_cursor(freq_hz, power_db);
+    });
+
     let status_bar_for_freq = Rc::clone(&status_bar_demod);
     let state_freq = Rc::clone(&state);
     freq_selector.connect_frequency_changed(move |freq| {
@@ -670,6 +678,14 @@ const COLORMAP_STYLES: [spectrum::colormap::ColormapStyle; 4] = [
     spectrum::colormap::ColormapStyle::Inferno,
 ];
 
+/// Averaging mode options matching the display panel combo.
+const AVERAGING_MODES: [spectrum::AveragingMode; 4] = [
+    spectrum::AveragingMode::None,
+    spectrum::AveragingMode::PeakHold,
+    spectrum::AveragingMode::RunningAvg,
+    spectrum::AveragingMode::MinHold,
+];
+
 /// Connect display panel controls to DSP commands.
 fn connect_display_panel(
     panels: &SidebarPanels,
@@ -721,6 +737,60 @@ fn connect_display_panel(
                 .copied()
                 .unwrap_or(spectrum::colormap::ColormapStyle::Turbo);
             spectrum_for_cmap.set_colormap(style);
+        });
+
+    // Min dB level — update the spectrum dB range (skip if min >= max).
+    let spectrum_min = Rc::clone(spectrum_handle);
+    let max_row_for_min = panels.display.max_db_row.clone();
+    panels.display.min_db_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation)]
+        let min_db = row.value() as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        let max_db = max_row_for_min.value() as f32;
+        if min_db >= max_db {
+            return;
+        }
+        spectrum_min.set_db_range(min_db, max_db);
+        tracing::debug!(min_db, max_db, "dB range changed");
+    });
+
+    // Max dB level — update the spectrum dB range (skip if max <= min).
+    let spectrum_max = Rc::clone(spectrum_handle);
+    let min_row_for_max = panels.display.min_db_row.clone();
+    panels.display.max_db_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation)]
+        let max_db = row.value() as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        let min_db = min_row_for_max.value() as f32;
+        if max_db <= min_db {
+            return;
+        }
+        spectrum_max.set_db_range(min_db, max_db);
+        tracing::debug!(min_db, max_db, "dB range changed");
+    });
+
+    // Spectrum fill mode toggle.
+    let spectrum_fill = Rc::clone(spectrum_handle);
+    panels
+        .display
+        .fill_mode_row
+        .connect_active_notify(move |row| {
+            spectrum_fill.set_fill_enabled(row.is_active());
+            tracing::debug!(fill = row.is_active(), "fill mode changed");
+        });
+
+    // Averaging mode selector.
+    let spectrum_avg = Rc::clone(spectrum_handle);
+    panels
+        .display
+        .averaging_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected() as usize;
+            let mode = AVERAGING_MODES
+                .get(idx)
+                .copied()
+                .unwrap_or(spectrum::AveragingMode::None);
+            spectrum_avg.set_averaging_mode(mode);
         });
 }
 
