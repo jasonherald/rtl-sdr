@@ -8,6 +8,7 @@ pub mod colormap;
 pub mod fft_plot;
 pub mod frequency_axis;
 pub mod gl_renderer;
+pub mod signal_history;
 pub mod vfo_overlay;
 pub mod waterfall;
 
@@ -18,6 +19,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 use fft_plot::FftPlotRenderer;
+use signal_history::SignalHistoryRenderer;
 use vfo_overlay::{BwHandle, HitZone, VfoOverlayRenderer, VfoState};
 use waterfall::WaterfallRenderer;
 
@@ -69,6 +71,12 @@ struct WaterfallState {
     vfo_renderer: VfoOverlayRenderer,
 }
 
+/// Shared state for the signal history `GtkGLArea`.
+struct SignalHistoryState {
+    gl: glow::Context,
+    renderer: SignalHistoryRenderer,
+}
+
 /// Handle for pushing FFT data into the spectrum display from outside.
 ///
 /// Obtained from `build_spectrum_view` and used by the `DspToUi::FftData`
@@ -76,8 +84,10 @@ struct WaterfallState {
 pub struct SpectrumHandle {
     fft_state: Rc<RefCell<Option<FftPlotState>>>,
     waterfall_state: Rc<RefCell<Option<WaterfallState>>>,
+    signal_history_state: Rc<RefCell<Option<SignalHistoryState>>>,
     fft_area: gtk4::GLArea,
     waterfall_area: gtk4::GLArea,
+    signal_history_area: gtk4::GLArea,
     min_db: Rc<Cell<f32>>,
     max_db: Rc<Cell<f32>>,
     fill_enabled: Rc<Cell<bool>>,
@@ -152,7 +162,7 @@ impl SpectrumHandle {
         self.waterfall_area.queue_render();
     }
 
-    /// Update the display dB range for both the FFT plot and waterfall.
+    /// Update the display dB range for the FFT plot, waterfall, and signal history.
     pub fn set_db_range(&self, min_db: f32, max_db: f32) {
         if min_db >= max_db {
             tracing::trace!(min_db, max_db, "set_db_range: ignoring inverted range");
@@ -165,6 +175,7 @@ impl SpectrumHandle {
         }
         self.fft_area.queue_render();
         self.waterfall_area.queue_render();
+        self.signal_history_area.queue_render();
     }
 
     /// Enable or disable the spectrum fill area under the trace.
@@ -181,6 +192,16 @@ impl SpectrumHandle {
         tracing::debug!(?mode, "averaging mode changed");
     }
 
+    /// Push a signal level sample (in dB) into the history graph.
+    ///
+    /// Call this from the GTK main loop when `DspToUi::SignalLevel` arrives.
+    pub fn push_signal_level(&self, db: f32) {
+        if let Some(s) = self.signal_history_state.borrow_mut().as_mut() {
+            s.renderer.push(db);
+        }
+        self.signal_history_area.queue_render();
+    }
+
     /// Register a callback invoked when the cursor moves over the FFT area.
     ///
     /// The callback receives `(frequency_hz, power_db)`. When the cursor
@@ -190,16 +211,21 @@ impl SpectrumHandle {
     }
 }
 
-/// Build the spectrum view containing the FFT plot and waterfall display.
+/// Height in pixels for the collapsible signal history area.
+const SIGNAL_HISTORY_HEIGHT: i32 = 100;
+
+/// Build the spectrum view containing the FFT plot, waterfall display,
+/// and a collapsible signal history graph.
 ///
-/// Returns a `(GtkPaned, SpectrumHandle)` — the paned widget for layout,
-/// and a handle for pushing real FFT data into the display.
+/// Returns a `(gtk4::Box, SpectrumHandle)` — the box widget for layout,
+/// and a handle for pushing real FFT/signal data into the display.
 pub fn build_spectrum_view(
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
-) -> (gtk4::Paned, SpectrumHandle) {
+) -> (gtk4::Box, SpectrumHandle) {
     let vfo_state: Rc<RefCell<VfoState>> = Rc::new(RefCell::new(VfoState::default()));
     let fft_state: Rc<RefCell<Option<FftPlotState>>> = Rc::new(RefCell::new(None));
     let waterfall_state: Rc<RefCell<Option<WaterfallState>>> = Rc::new(RefCell::new(None));
+    let signal_history_state: Rc<RefCell<Option<SignalHistoryState>>> = Rc::new(RefCell::new(None));
 
     let min_db: Rc<Cell<f32>> = Rc::new(Cell::new(DEFAULT_MIN_DB));
     let max_db: Rc<Cell<f32>> = Rc::new(Cell::new(DEFAULT_MAX_DB));
@@ -220,6 +246,8 @@ pub fn build_spectrum_view(
         &min_db,
         &max_db,
     );
+    let signal_history_area =
+        build_signal_history_area(Rc::clone(&signal_history_state), &min_db, &max_db);
 
     // Attach interaction gestures to both the waterfall and FFT areas.
     attach_click_gesture(&waterfall_area, &vfo_state, dsp_tx.clone());
@@ -248,11 +276,30 @@ pub fn build_spectrum_view(
         }
     });
 
+    // Wrap the signal history GLArea in a collapsible expander.
+    let expander = gtk4::Expander::builder()
+        .label("Signal History")
+        .expanded(true)
+        .build();
+    expander.set_child(Some(&signal_history_area));
+
+    // Combine the FFT+waterfall paned and the signal history expander
+    // into a vertical box.
+    let outer_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    outer_box.append(&paned);
+    outer_box.append(&expander);
+
     let handle = SpectrumHandle {
         fft_state,
         waterfall_state,
+        signal_history_state,
         fft_area: fft_area.clone(),
         waterfall_area: waterfall_area.clone(),
+        signal_history_area: signal_history_area.clone(),
         min_db,
         max_db,
         fill_enabled,
@@ -261,7 +308,7 @@ pub fn build_spectrum_view(
         cursor_callback,
     };
 
-    (paned, handle)
+    (outer_box, handle)
 }
 
 /// Build the `GtkGLArea` for the FFT power spectrum plot.
@@ -470,6 +517,78 @@ fn build_waterfall_area(
     area
 }
 
+/// Build the `GtkGLArea` for the signal strength history graph.
+fn build_signal_history_area(
+    state: Rc<RefCell<Option<SignalHistoryState>>>,
+    min_db: &Rc<Cell<f32>>,
+    max_db: &Rc<Cell<f32>>,
+) -> gtk4::GLArea {
+    let area = gtk4::GLArea::builder()
+        .hexpand(true)
+        .vexpand(false)
+        .height_request(SIGNAL_HISTORY_HEIGHT)
+        .auto_render(false)
+        .build();
+    area.set_required_version(3, 0);
+
+    // On realize: create GL context and renderer.
+    let state_realize = Rc::clone(&state);
+    area.connect_realize(move |area| {
+        area.make_current();
+        if area.error().is_some() {
+            tracing::warn!("signal history GLArea has error after make_current");
+            return;
+        }
+
+        match create_gl_context_and_signal_history_renderer() {
+            Ok((gl, renderer)) => {
+                *state_realize.borrow_mut() = Some(SignalHistoryState { gl, renderer });
+                tracing::info!("signal history GL renderer initialized");
+            }
+            Err(e) => {
+                tracing::warn!("failed to initialize signal history renderer: {e}");
+            }
+        }
+    });
+
+    // On unrealize: clean up GL resources.
+    let state_unrealize = Rc::clone(&state);
+    area.connect_unrealize(move |area| {
+        area.make_current();
+        if area.error().is_some() {
+            tracing::warn!("signal history GLArea error on unrealize — skipping GL cleanup");
+        } else if let Some(s) = state_unrealize.borrow().as_ref() {
+            s.renderer.destroy(&s.gl);
+            tracing::info!("signal history GL renderer destroyed");
+        }
+        *state_unrealize.borrow_mut() = None;
+    });
+
+    // On render: draw the signal history plot.
+    let min_db_render = Rc::clone(min_db);
+    let max_db_render = Rc::clone(max_db);
+    area.connect_render(move |area, _ctx| {
+        if let Some(s) = state.borrow_mut().as_mut() {
+            let width = area.width();
+            let height = area.height();
+            let scale = area.scale_factor();
+            let phys_w = width * scale;
+            let phys_h = height * scale;
+
+            s.renderer.render(
+                &s.gl,
+                phys_w,
+                phys_h,
+                min_db_render.get(),
+                max_db_render.get(),
+            );
+        }
+        glib::Propagation::Stop
+    });
+
+    area
+}
+
 /// Create a glow GL context from the current GDK GL context.
 ///
 /// Must be called after `GtkGLArea::make_current()`.
@@ -534,6 +653,14 @@ fn create_gl_context_and_waterfall_renderer()
     let renderer = WaterfallRenderer::new(&gl, FFT_SIZE)?;
     let vfo_renderer = VfoOverlayRenderer::new(&gl)?;
     Ok((gl, renderer, vfo_renderer))
+}
+
+/// Create a glow context and signal history renderer.
+fn create_gl_context_and_signal_history_renderer()
+-> Result<(glow::Context, SignalHistoryRenderer), gl_renderer::GlError> {
+    let gl = create_glow_context();
+    let renderer = SignalHistoryRenderer::new(&gl)?;
+    Ok((gl, renderer))
 }
 
 /// Attach a click-to-tune gesture to a `GtkGLArea`.
