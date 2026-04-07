@@ -558,6 +558,14 @@ const WINDOW_FUNCTIONS: [FftWindow; 3] = [
     FftWindow::Nuttall,
 ];
 
+/// Colormap options matching the display panel combo.
+const COLORMAP_STYLES: [spectrum::colormap::ColormapStyle; 4] = [
+    spectrum::colormap::ColormapStyle::Turbo,
+    spectrum::colormap::ColormapStyle::Viridis,
+    spectrum::colormap::ColormapStyle::Plasma,
+    spectrum::colormap::ColormapStyle::Inferno,
+];
+
 /// Connect display panel controls to DSP commands.
 fn connect_display_panel(
     panels: &SidebarPanels,
@@ -603,12 +611,11 @@ fn connect_display_panel(
         .display
         .color_map_row
         .connect_selected_notify(move |row| {
-            let style = match row.selected() {
-                1 => spectrum::colormap::ColormapStyle::Viridis,
-                2 => spectrum::colormap::ColormapStyle::Plasma,
-                3 => spectrum::colormap::ColormapStyle::Inferno,
-                _ => spectrum::colormap::ColormapStyle::Turbo,
-            };
+            let idx = row.selected() as usize;
+            let style = COLORMAP_STYLES
+                .get(idx)
+                .copied()
+                .unwrap_or(spectrum::colormap::ColormapStyle::Turbo);
             spectrum_for_cmap.set_colormap(style);
         });
 }

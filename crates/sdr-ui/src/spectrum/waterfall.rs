@@ -291,7 +291,6 @@ impl WaterfallRenderer {
         }
     }
 
-    /// Update the display range in dB.
     /// Update the colormap texture with a new style.
     #[allow(
         unsafe_code,
