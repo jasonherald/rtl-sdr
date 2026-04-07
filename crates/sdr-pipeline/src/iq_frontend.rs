@@ -153,7 +153,9 @@ impl IqFrontend {
             None
         };
 
-        let fft_skip_samples = calc_fft_skip_samples(effective_sample_rate, DEFAULT_FFT_RATE);
+        // FFT rate control uses raw sample rate — FFT is computed on
+        // pre-decimation data to show the full tuner bandwidth.
+        let fft_skip_samples = calc_fft_skip_samples(sample_rate, DEFAULT_FFT_RATE);
 
         Ok(Self {
             sample_rate,
@@ -208,7 +210,7 @@ impl IqFrontend {
     /// rate are skipped to save CPU.
     pub fn set_fft_rate(&mut self, fps: f64) {
         self.fft_rate = fps.max(MIN_FFT_RATE_HZ);
-        self.fft_skip_samples = calc_fft_skip_samples(self.effective_sample_rate, self.fft_rate);
+        self.fft_skip_samples = calc_fft_skip_samples(self.sample_rate, self.fft_rate);
         self.fft_accum_count = 0;
         self.fft_skip_counter = 0;
         self.fft_accumulating = true;
@@ -310,7 +312,50 @@ impl IqFrontend {
             });
         }
 
-        // Step 1: Decimation
+        // Step 1: FFT accumulation from raw input (pre-decimation).
+        // Shows the full tuner bandwidth in the waterfall/FFT display,
+        // matching how SDR++ renders its spectrum.
+        let mut fft_ready = false;
+        {
+            let mut pos = 0;
+            let raw_len = input.len();
+            while pos < raw_len {
+                if self.fft_accumulating {
+                    let remaining_fft = self.fft_size - self.fft_accum_count;
+                    let available = raw_len - pos;
+                    let to_copy = remaining_fft.min(available);
+
+                    self.fft_accum[self.fft_accum_count..self.fft_accum_count + to_copy]
+                        .copy_from_slice(&input[pos..pos + to_copy]);
+                    self.fft_accum_count += to_copy;
+                    self.fft_skip_counter += to_copy;
+                    pos += to_copy;
+
+                    if self.fft_accum_count >= self.fft_size {
+                        if !fft_ready {
+                            self.compute_fft(fft_out)?;
+                            fft_ready = true;
+                        }
+                        self.fft_accum_count = 0;
+                        self.fft_accumulating = false;
+                    }
+                } else {
+                    let remaining_skip =
+                        self.fft_skip_samples.saturating_sub(self.fft_skip_counter);
+                    let available = raw_len - pos;
+                    let to_skip = remaining_skip.min(available);
+                    self.fft_skip_counter += to_skip;
+                    pos += to_skip;
+
+                    if self.fft_skip_counter >= self.fft_skip_samples {
+                        self.fft_accumulating = true;
+                        self.fft_skip_counter = 0;
+                    }
+                }
+            }
+        }
+
+        // Step 2: Decimation (audio/demod pipeline only — FFT already done)
         let processed = if let Some(decim) = &mut self.decimator {
             self.decim_buf.resize(input.len(), Complex::default());
             let count = decim.process(input, &mut self.decim_buf)?;
@@ -333,63 +378,18 @@ impl IqFrontend {
             input.len()
         };
 
-        // Step 2: IQ inversion (conjugate)
+        // Step 3: IQ inversion (conjugate) — demod path only
         if self.invert_iq {
             for s in &mut output[..processed] {
                 s.im = -s.im;
             }
         }
 
-        // Step 3: DC blocking
+        // Step 4: DC blocking — demod path only
         if let Some(dc) = &mut self.dc_blocker {
             self.dc_scratch.resize(processed, Complex::default());
             self.dc_scratch.copy_from_slice(&output[..processed]);
             dc.process(&self.dc_scratch, &mut output[..processed])?;
-        }
-
-        // Step 4: Accumulate samples for FFT with rate control.
-        // Only accumulate when we're within the target FPS budget.
-        // Cap to one FFT emission per process() call — the API only exposes
-        // one fft_out buffer — but keep consuming all samples so skip counters
-        // and accumulation state stay correct for subsequent calls.
-        let mut fft_ready = false;
-        let mut pos = 0;
-        while pos < processed {
-            if self.fft_accumulating {
-                // Accumulate samples into the FFT buffer
-                let remaining_fft = self.fft_size - self.fft_accum_count;
-                let available = processed - pos;
-                let to_copy = remaining_fft.min(available);
-
-                self.fft_accum[self.fft_accum_count..self.fft_accum_count + to_copy]
-                    .copy_from_slice(&output[pos..pos + to_copy]);
-                self.fft_accum_count += to_copy;
-                self.fft_skip_counter += to_copy;
-                pos += to_copy;
-
-                if self.fft_accum_count >= self.fft_size {
-                    if !fft_ready {
-                        // First full window this call — emit it
-                        self.compute_fft(fft_out)?;
-                        fft_ready = true;
-                    }
-                    // Suppress additional emissions; reset for next window
-                    self.fft_accum_count = 0;
-                    self.fft_accumulating = false;
-                }
-            } else {
-                // Not accumulating — count toward next FFT window
-                let remaining_skip = self.fft_skip_samples.saturating_sub(self.fft_skip_counter);
-                let available = processed - pos;
-                let to_skip = remaining_skip.min(available);
-                self.fft_skip_counter += to_skip;
-                pos += to_skip;
-
-                if self.fft_skip_counter >= self.fft_skip_samples {
-                    self.fft_accumulating = true;
-                    self.fft_skip_counter = 0;
-                }
-            }
         }
 
         Ok((processed, fft_ready))
@@ -415,6 +415,9 @@ impl IqFrontend {
             self.window_coherent_gain,
         )?;
 
+        // No fftshift — testing if signal centers without it.
+        // DC is at bin 0 (left edge). VFO display range is set to
+        // [0, effective_rate] to match.
         fft_out[..self.fft_size].copy_from_slice(&self.fft_output);
 
         Ok(())
@@ -512,7 +515,7 @@ mod tests {
         assert_eq!(count, TEST_FFT_SIZE);
         assert!(fft_ready, "FFT should be ready after fft_size samples");
 
-        // DC signal should have peak at bin 0
+        // After fftshift, DC signal peaks at center bin (N/2).
         let peak_bin = fft_out
             .iter()
             .enumerate()

@@ -230,6 +230,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.running = true;
                     tracing::info!("DSP pipeline started");
 
+                    // Send display bandwidth (raw rate) so the spectrum display
+                    // shows the full tuner bandwidth.
+                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
+                        state.frontend.effective_sample_rate(),
+                    ));
+
                     // Send the source's supported gain values to the UI.
                     if let Some(source) = &state.source {
                         let gains: Vec<f64> = source
@@ -297,6 +303,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                 }
                 let _ = dsp_tx.send(DspToUi::SampleRateChanged(
+                    state.frontend.effective_sample_rate(),
+                ));
+                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
                     state.frontend.effective_sample_rate(),
                 ));
             }
@@ -384,6 +393,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     let _ = dsp_tx.send(DspToUi::SampleRateChanged(
                         state.frontend.effective_sample_rate(),
                     ));
+                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
+                        state.frontend.effective_sample_rate(),
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!("frontend rebuild failed: {e}");
@@ -404,6 +416,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                 }
                 let _ = dsp_tx.send(DspToUi::SampleRateChanged(
+                    state.frontend.effective_sample_rate(),
+                ));
+                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
                     state.frontend.effective_sample_rate(),
                 ));
             }
@@ -582,6 +597,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                             }
                         }
                         let _ = dsp_tx.send(DspToUi::SampleRateChanged(
+                            state.frontend.effective_sample_rate(),
+                        ));
+                        let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
                             state.frontend.effective_sample_rate(),
                         ));
                     }

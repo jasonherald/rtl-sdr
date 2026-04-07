@@ -23,7 +23,7 @@ pub const THEME_LIGHT: u32 = 2;
 const DEFAULT_WINDOW_FN_INDEX: u32 = 1;
 
 /// Default minimum dB level for the display range.
-const DEFAULT_MIN_DB: f64 = -120.0;
+const DEFAULT_MIN_DB: f64 = -70.0;
 /// Default maximum dB level for the display range.
 const DEFAULT_MAX_DB: f64 = 0.0;
 
@@ -59,7 +59,7 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- FFT Size ---
-    let fft_size_model = gtk4::StringList::new(&["512", "1024", "2048", "4096", "8192"]);
+    let fft_size_model = gtk4::StringList::new(&["512", "1024", "2048"]);
     let fft_size_row = adw::ComboRow::builder()
         .title("FFT Size")
         .model(&fft_size_model)

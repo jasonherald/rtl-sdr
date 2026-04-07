@@ -32,7 +32,7 @@ const DEFAULT_HEIGHT: i32 = 800;
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
 /// FFT sizes available in the display panel dropdown (must match panel order).
-const FFT_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192];
+const FFT_SIZES: &[usize] = &[512, 1024, 2048];
 
 /// Decimation factors available in the source panel dropdown (must match panel order).
 const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
@@ -222,6 +222,10 @@ fn handle_dsp_message(
         DspToUi::SampleRateChanged(rate) => {
             tracing::info!(effective_sample_rate = rate, "sample rate changed");
             status_bar.update_sample_rate(rate);
+        }
+        DspToUi::DisplayBandwidth(raw_rate) => {
+            tracing::info!(raw_sample_rate = raw_rate, "display bandwidth updated");
+            spectrum_handle.set_display_bandwidth(raw_rate);
         }
         DspToUi::DeviceInfo(info) => {
             tracing::info!(device_info = %info, "device info received");
