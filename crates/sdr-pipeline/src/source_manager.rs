@@ -3,7 +3,7 @@
 //! Ports SDR++ `SourceManager`. Manages the set of available IQ sources
 //! (RTL-SDR, Network, File) and controls which one is active.
 
-use sdr_types::SourceError;
+use sdr_types::{Complex, SourceError};
 use std::collections::HashMap;
 
 /// Trait for an IQ signal source.
@@ -30,6 +30,24 @@ pub trait Source: Send {
 
     /// Set sample rate.
     fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError>;
+
+    /// Read IQ samples into the output buffer. Returns number of Complex samples written.
+    fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError>;
+
+    /// Set tuner gain in tenths of dB (no-op default for non-tuner sources).
+    fn set_gain(&mut self, _gain_tenths: i32) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// Set AGC mode (no-op default for non-tuner sources).
+    fn set_gain_mode(&mut self, _manual: bool) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// Get available gain values in tenths of dB (empty for non-tuner sources).
+    fn gains(&self) -> &[i32] {
+        &[]
+    }
 }
 
 /// Manages available IQ sources and the active source lifecycle.
@@ -222,6 +240,12 @@ mod tests {
         fn set_sample_rate(&mut self, _rate: f64) -> Result<(), SourceError> {
             Ok(())
         }
+        fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+            for s in output.iter_mut() {
+                *s = Complex::default();
+            }
+            Ok(output.len())
+        }
     }
 
     #[test]
@@ -312,6 +336,12 @@ mod tests {
             }
             fn set_sample_rate(&mut self, _: f64) -> Result<(), SourceError> {
                 Ok(())
+            }
+            fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+                for s in output.iter_mut() {
+                    *s = Complex::default();
+                }
+                Ok(output.len())
             }
         }
 
