@@ -192,13 +192,19 @@ impl SignalHistoryRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    fn draw_grid(&self, gl: &glow::Context, _db_range: f32, _min_db: f32) {
+    fn draw_grid(&self, gl: &glow::Context, db_range: f32, min_db: f32) {
+        // Draw grid lines at round 20 dB intervals aligned to actual dB values.
+        const DB_STEP: f32 = 20.0;
         let mut vertices = Vec::with_capacity((DB_GRID_LINE_COUNT + 1) * 4);
 
-        for i in 0..=DB_GRID_LINE_COUNT {
-            let frac = i as f32 / DB_GRID_LINE_COUNT as f32;
-            let y = -1.0 + 2.0 * frac;
-            vertices.extend_from_slice(&[-1.0, y, 1.0, y]);
+        if db_range > 0.0 {
+            let first = (min_db / DB_STEP).ceil() * DB_STEP;
+            let mut db = first;
+            while db < min_db + db_range {
+                let y = -1.0 + 2.0 * ((db - min_db) / db_range);
+                vertices.extend_from_slice(&[-1.0, y, 1.0, y]);
+                db += DB_STEP;
+            }
         }
 
         let bytes = f32_slice_as_bytes(&vertices);
@@ -291,6 +297,6 @@ mod tests {
     const _: () = {
         assert!(super::HISTORY_SIZE > 0);
         assert!(super::DB_GRID_LINE_COUNT > 0);
-        assert!(super::MAX_VERTICES >= super::HISTORY_SIZE);
+        assert!(super::MAX_VERTICES >= super::HISTORY_SIZE + (super::DB_GRID_LINE_COUNT + 1) * 2);
     };
 }
