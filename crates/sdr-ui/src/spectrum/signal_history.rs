@@ -53,6 +53,9 @@ pub struct SignalHistoryRenderer {
     samples: Vec<f32>,
     write_pos: usize,
     count: usize,
+    // Reusable staging buffers to avoid per-frame allocations.
+    grid_vertices: Vec<f32>,
+    trace_vertices: Vec<f32>,
 }
 
 impl SignalHistoryRenderer {
@@ -116,6 +119,8 @@ impl SignalHistoryRenderer {
             samples: vec![f32::NEG_INFINITY; HISTORY_SIZE],
             write_pos: 0,
             count: 0,
+            grid_vertices: Vec::with_capacity((DB_GRID_LINE_COUNT + 1) * 4),
+            trace_vertices: Vec::with_capacity(HISTORY_SIZE * 2),
         })
     }
 
@@ -143,7 +148,14 @@ impl SignalHistoryRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    pub fn render(&self, gl: &glow::Context, width: i32, height: i32, min_db: f32, max_db: f32) {
+    pub fn render(
+        &mut self,
+        gl: &glow::Context,
+        width: i32,
+        height: i32,
+        min_db: f32,
+        max_db: f32,
+    ) {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -192,23 +204,23 @@ impl SignalHistoryRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    fn draw_grid(&self, gl: &glow::Context, db_range: f32, min_db: f32) {
+    fn draw_grid(&mut self, gl: &glow::Context, db_range: f32, min_db: f32) {
         // Draw grid lines at round 20 dB intervals aligned to actual dB values.
         const DB_STEP: f32 = 20.0;
-        let mut vertices = Vec::with_capacity((DB_GRID_LINE_COUNT + 1) * 4);
+        self.grid_vertices.clear();
 
         if db_range > 0.0 {
             let first = (min_db / DB_STEP).ceil() * DB_STEP;
             let mut db = first;
             while db < min_db + db_range {
                 let y = -1.0 + 2.0 * ((db - min_db) / db_range);
-                vertices.extend_from_slice(&[-1.0, y, 1.0, y]);
+                self.grid_vertices.extend_from_slice(&[-1.0, y, 1.0, y]);
                 db += DB_STEP;
             }
         }
 
-        let bytes = f32_slice_as_bytes(&vertices);
-        let vertex_count = vertices.len() / 2;
+        let bytes = f32_slice_as_bytes(&self.grid_vertices);
+        let vertex_count = self.grid_vertices.len() / 2;
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
@@ -235,13 +247,13 @@ impl SignalHistoryRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    fn draw_trace(&self, gl: &glow::Context, db_range: f32, min_db: f32) {
+    fn draw_trace(&mut self, gl: &glow::Context, db_range: f32, min_db: f32) {
         if self.count == 0 {
             return;
         }
 
         let n = self.count;
-        let mut vertices = Vec::with_capacity(n * 2);
+        self.trace_vertices.clear();
 
         // Start from the oldest sample in the circular buffer.
         let start = if self.count < HISTORY_SIZE {
@@ -259,11 +271,11 @@ impl SignalHistoryRenderer {
             // Y axis: dB mapped to [-1, 1] clip space.
             let y = -1.0 + 2.0 * ((db - min_db) / db_range).clamp(0.0, 1.0);
 
-            vertices.extend_from_slice(&[x, y]);
+            self.trace_vertices.extend_from_slice(&[x, y]);
         }
 
-        let bytes = f32_slice_as_bytes(&vertices);
-        let vertex_count = vertices.len() / 2;
+        let bytes = f32_slice_as_bytes(&self.trace_vertices);
+        let vertex_count = self.trace_vertices.len() / 2;
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);

@@ -568,7 +568,7 @@ fn build_signal_history_area(
     let min_db_render = Rc::clone(min_db);
     let max_db_render = Rc::clone(max_db);
     area.connect_render(move |area, _ctx| {
-        if let Some(s) = state.borrow().as_ref() {
+        if let Some(s) = state.borrow_mut().as_mut() {
             let width = area.width();
             let height = area.height();
             let scale = area.scale_factor();
