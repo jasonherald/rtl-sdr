@@ -79,6 +79,15 @@ impl SpectrumHandle {
         }
         self.waterfall_area.queue_render();
     }
+
+    /// Change the waterfall colormap.
+    pub fn set_colormap(&self, style: colormap::ColormapStyle) {
+        if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
+            self.waterfall_area.make_current();
+            s.renderer.set_colormap(&s.gl, style);
+        }
+        self.waterfall_area.queue_render();
+    }
 }
 
 /// Build the spectrum view containing the FFT plot and waterfall display.

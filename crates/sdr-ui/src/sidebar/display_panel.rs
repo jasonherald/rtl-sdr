@@ -63,7 +63,7 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- Color Map ---
-    let colormap_model = gtk4::StringList::new(&["Turbo"]);
+    let colormap_model = gtk4::StringList::new(&["Turbo", "Viridis", "Plasma", "Inferno"]);
     let color_map_row = adw::ComboRow::builder()
         .title("Color Map")
         .model(&colormap_model)

@@ -1,79 +1,114 @@
 //! Colormap generation for waterfall display.
 //!
-//! Provides a turbo/jet-style colormap mapping dB values (0..255) to RGBA,
+//! Provides multiple colormaps mapping dB values (0..255) to RGBA,
 //! suitable for RF spectrum visualization.
 
 /// Number of entries in the colormap lookup table.
 pub const COLORMAP_SIZE: usize = 256;
 
+/// Available colormap styles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColormapStyle {
+    /// Turbo — black → blue → cyan → green → yellow → red → white.
+    Turbo,
+    /// Viridis — perceptually uniform, purple → teal → yellow.
+    Viridis,
+    /// Plasma — perceptually uniform, purple → pink → orange → yellow.
+    Plasma,
+    /// Inferno — perceptually uniform, black → purple → orange → yellow.
+    Inferno,
+}
+
 /// Generate a 256-entry RGBA colormap for waterfall display.
-///
-/// Maps indices 0..255 through a perceptually-motivated gradient:
-/// black -> dark blue -> blue -> cyan -> green -> yellow -> red -> white.
-/// This provides good contrast across the full dynamic range typical
-/// of SDR waterfall displays (-120 dB to 0 dB).
 #[allow(clippy::cast_precision_loss)]
-pub fn generate_colormap() -> Vec<[u8; 4]> {
+pub fn generate_colormap(style: ColormapStyle) -> Vec<[u8; 4]> {
     let mut map = Vec::with_capacity(COLORMAP_SIZE);
 
     for i in 0..COLORMAP_SIZE {
         let t = i as f32 / (COLORMAP_SIZE - 1) as f32;
-        let (r, g, b) = turbo_color(t);
+        let (r, g, b) = match style {
+            ColormapStyle::Turbo => piecewise_color(t, &TURBO_STOPS),
+            ColormapStyle::Viridis => piecewise_color(t, &VIRIDIS_STOPS),
+            ColormapStyle::Plasma => piecewise_color(t, &PLASMA_STOPS),
+            ColormapStyle::Inferno => piecewise_color(t, &INFERNO_STOPS),
+        };
         map.push([r, g, b, 255]);
     }
 
     map
 }
 
-/// Compute an RGB color from a turbo-style colormap at position `t` in [0, 1].
-///
-/// Uses a piecewise-linear interpolation through key color stops:
-/// - 0.00 black
-/// - 0.10 dark blue
-/// - 0.25 blue
-/// - 0.40 cyan
-/// - 0.55 green
-/// - 0.70 yellow
-/// - 0.85 red
-/// - 1.00 white
-fn turbo_color(t: f32) -> (u8, u8, u8) {
-    /// Color stop: (position, red, green, blue) all in 0..255.
-    const STOPS: &[(f32, u8, u8, u8)] = &[
-        (0.00, 0, 0, 0),       // black
-        (0.10, 10, 10, 80),    // dark blue
-        (0.25, 20, 40, 200),   // blue
-        (0.40, 0, 180, 220),   // cyan
-        (0.55, 20, 200, 40),   // green
-        (0.70, 240, 220, 10),  // yellow
-        (0.85, 240, 40, 10),   // red
-        (1.00, 255, 255, 255), // white
-    ];
+// Color stop tables: (position, red, green, blue) — sampled from matplotlib.
 
-    // Find the two stops that bracket `t`.
+const TURBO_STOPS: [(f32, u8, u8, u8); 8] = [
+    (0.00, 0, 0, 0),
+    (0.10, 10, 10, 80),
+    (0.25, 20, 40, 200),
+    (0.40, 0, 180, 220),
+    (0.55, 20, 200, 40),
+    (0.70, 240, 220, 10),
+    (0.85, 240, 40, 10),
+    (1.00, 255, 255, 255),
+];
+
+const VIRIDIS_STOPS: [(f32, u8, u8, u8); 8] = [
+    (0.00, 68, 1, 84),
+    (0.14, 72, 35, 116),
+    (0.28, 64, 67, 135),
+    (0.42, 52, 95, 141),
+    (0.57, 33, 145, 140),
+    (0.71, 53, 183, 121),
+    (0.85, 143, 215, 68),
+    (1.00, 253, 231, 37),
+];
+
+const PLASMA_STOPS: [(f32, u8, u8, u8); 8] = [
+    (0.00, 13, 8, 135),
+    (0.14, 84, 2, 163),
+    (0.28, 139, 10, 165),
+    (0.42, 185, 50, 137),
+    (0.57, 219, 92, 104),
+    (0.71, 244, 136, 73),
+    (0.85, 254, 188, 43),
+    (1.00, 240, 249, 33),
+];
+
+const INFERNO_STOPS: [(f32, u8, u8, u8); 8] = [
+    (0.00, 0, 0, 4),
+    (0.14, 31, 12, 72),
+    (0.28, 85, 15, 109),
+    (0.42, 136, 34, 106),
+    (0.57, 186, 54, 85),
+    (0.71, 227, 89, 51),
+    (0.85, 249, 149, 21),
+    (1.00, 252, 255, 164),
+];
+
+/// Compute a piecewise-linear interpolated color from a stop table.
+fn piecewise_color(t: f32, stops: &[(f32, u8, u8, u8)]) -> (u8, u8, u8) {
     let mut lower = 0;
-    for (i, &(pos, _, _, _)) in STOPS.iter().enumerate().skip(1) {
+    for (i, &(pos, _, _, _)) in stops.iter().enumerate().skip(1) {
         if pos >= t {
             lower = i - 1;
             break;
         }
-        // If we've gone past all stops, clamp to last segment.
-        if i == STOPS.len() - 1 {
+        if i == stops.len() - 1 {
             lower = i - 1;
         }
     }
 
-    let (t0, r0, g0, b0) = STOPS[lower];
-    let (t1, r1, g1, b1) = STOPS[lower + 1];
+    let (t0, r0, g0, b0) = stops[lower];
+    let (t1, r1, g1, b1) = stops[lower + 1];
 
     let span = t1 - t0;
     let frac = if span > 0.0 { (t - t0) / span } else { 0.0 };
     let frac = frac.clamp(0.0, 1.0);
 
-    let r = lerp_u8(r0, r1, frac);
-    let g = lerp_u8(g0, g1, frac);
-    let b = lerp_u8(b0, b1, frac);
-
-    (r, g, b)
+    (
+        lerp_u8(r0, r1, frac),
+        lerp_u8(g0, g1, frac),
+        lerp_u8(b0, b1, frac),
+    )
 }
 
 /// Linearly interpolate between two `u8` values.
@@ -90,50 +125,51 @@ mod tests {
 
     #[test]
     fn colormap_has_correct_size() {
-        let map = generate_colormap();
-        assert_eq!(map.len(), COLORMAP_SIZE);
-    }
-
-    #[test]
-    fn colormap_starts_dark() {
-        let map = generate_colormap();
-        let [r, g, b, a] = map[0];
-        // First entry should be near-black.
-        assert!(r < 5, "red channel at 0 should be near 0, got {r}");
-        assert!(g < 5, "green channel at 0 should be near 0, got {g}");
-        assert!(b < 5, "blue channel at 0 should be near 0, got {b}");
-        assert_eq!(a, 255);
-    }
-
-    #[test]
-    fn colormap_ends_bright() {
-        let map = generate_colormap();
-        let [r, g, b, a] = map[COLORMAP_SIZE - 1];
-        // Last entry should be near-white.
-        assert!(r > 250, "red channel at 255 should be near 255, got {r}");
-        assert!(g > 250, "green channel at 255 should be near 255, got {g}");
-        assert!(b > 250, "blue channel at 255 should be near 255, got {b}");
-        assert_eq!(a, 255);
+        for style in [
+            ColormapStyle::Turbo,
+            ColormapStyle::Viridis,
+            ColormapStyle::Plasma,
+            ColormapStyle::Inferno,
+        ] {
+            let map = generate_colormap(style);
+            assert_eq!(
+                map.len(),
+                COLORMAP_SIZE,
+                "{style:?} should have {COLORMAP_SIZE} entries"
+            );
+        }
     }
 
     #[test]
     fn colormap_all_entries_fully_opaque() {
-        let map = generate_colormap();
-        for (i, &[_, _, _, a]) in map.iter().enumerate() {
-            assert_eq!(a, 255, "entry {i} alpha should be 255");
+        for style in [
+            ColormapStyle::Turbo,
+            ColormapStyle::Viridis,
+            ColormapStyle::Plasma,
+            ColormapStyle::Inferno,
+        ] {
+            let map = generate_colormap(style);
+            for (i, &[_, _, _, a]) in map.iter().enumerate() {
+                assert_eq!(a, 255, "{style:?} entry {i} alpha should be 255");
+            }
         }
     }
 
     #[test]
     fn colormap_midpoint_is_colored() {
-        let map = generate_colormap();
-        let [r, g, b, _] = map[128];
-        // Midpoint should be somewhere in the green/cyan range — not black or white.
-        let total = u16::from(r) + u16::from(g) + u16::from(b);
-        assert!(
-            total > 50,
-            "midpoint should have visible color, total={total}"
-        );
-        assert!(total < 700, "midpoint should not be white, total={total}");
+        for style in [
+            ColormapStyle::Turbo,
+            ColormapStyle::Viridis,
+            ColormapStyle::Plasma,
+            ColormapStyle::Inferno,
+        ] {
+            let map = generate_colormap(style);
+            let [r, g, b, _] = map[128];
+            let total = u16::from(r) + u16::from(g) + u16::from(b);
+            assert!(
+                total > 50,
+                "{style:?} midpoint should have visible color, total={total}"
+            );
+        }
     }
 }

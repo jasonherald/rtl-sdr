@@ -50,7 +50,8 @@ pub fn build_window(app: &adw::Application) {
     let state = AppState::new_shared(ui_tx);
 
     // --- Build UI ---
-    let (split_view, panels, spectrum_handle, status_bar) = build_split_view(&state);
+    let (split_view, panels, spectrum_handle_raw, status_bar) = build_split_view(&state);
+    let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
     let (header, play_button, demod_dropdown, freq_selector) =
         build_header_bar(&sidebar_toggle, &state);
@@ -92,7 +93,7 @@ pub fn build_window(app: &adw::Application) {
     window.set_help_overlay(Some(&shortcuts_window));
 
     // --- Connect sidebar panels to DSP ---
-    connect_sidebar_panels(&panels, &state);
+    connect_sidebar_panels(&panels, &state, &spectrum_handle);
 
     // --- Wire frequency selector to DSP and status bar ---
     let status_bar_demod = Rc::new(status_bar);
@@ -131,7 +132,6 @@ pub fn build_window(app: &adw::Application) {
     dsp_controller::spawn_dsp_thread(dsp_tx, ui_rx);
 
     // --- Poll DspToUi channel from the GTK main loop ---
-    let spectrum_handle = Rc::new(spectrum_handle);
     let play_button_weak = play_button.downgrade();
     let state_rx = Rc::clone(&state);
     let toast_overlay_weak = toast_overlay.downgrade();
@@ -405,10 +405,14 @@ fn build_breakpoint(split_view: &adw::OverlaySplitView) -> adw::Breakpoint {
 }
 
 /// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
-fn connect_sidebar_panels(panels: &SidebarPanels, state: &Rc<AppState>) {
+fn connect_sidebar_panels(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+) {
     connect_source_panel(panels, state);
     connect_radio_panel(panels, state);
-    connect_display_panel(panels, state);
+    connect_display_panel(panels, state, spectrum_handle);
 }
 
 /// Connect source panel controls to DSP commands.
@@ -555,7 +559,11 @@ const WINDOW_FUNCTIONS: [FftWindow; 3] = [
 ];
 
 /// Connect display panel controls to DSP commands.
-fn connect_display_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
+fn connect_display_panel(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+) {
     // FFT size
     let state_fft = Rc::clone(state);
     panels
@@ -587,6 +595,21 @@ fn connect_display_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .frame_rate_row
         .connect_value_notify(move |row| {
             state_fps.send_dsp(UiToDsp::SetFftRate(row.value()));
+        });
+
+    // Colormap
+    let spectrum_for_cmap = Rc::clone(spectrum_handle);
+    panels
+        .display
+        .color_map_row
+        .connect_selected_notify(move |row| {
+            let style = match row.selected() {
+                1 => spectrum::colormap::ColormapStyle::Viridis,
+                2 => spectrum::colormap::ColormapStyle::Plasma,
+                3 => spectrum::colormap::ColormapStyle::Inferno,
+                _ => spectrum::colormap::ColormapStyle::Turbo,
+            };
+            spectrum_for_cmap.set_colormap(style);
         });
 }
 

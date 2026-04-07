@@ -292,6 +292,31 @@ impl WaterfallRenderer {
     }
 
     /// Update the display range in dB.
+    /// Update the colormap texture with a new style.
+    #[allow(
+        unsafe_code,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    pub fn set_colormap(&self, gl: &glow::Context, style: colormap::ColormapStyle) {
+        let map = colormap::generate_colormap(style);
+        let flat: Vec<u8> = map.iter().flat_map(|c| c.iter().copied()).collect();
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.colormap_texture));
+            gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                colormap::COLORMAP_SIZE as i32,
+                1,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&flat)),
+            );
+        }
+    }
+
     pub fn set_db_range(&mut self, min_db: f32, max_db: f32) {
         if min_db.is_finite() && max_db.is_finite() && max_db > min_db {
             self.min_db = min_db;
@@ -381,7 +406,7 @@ fn create_colormap_texture(gl: &glow::Context) -> Result<glow::Texture, GlError>
 
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
 
-        let colormap = colormap::generate_colormap();
+        let colormap = colormap::generate_colormap(colormap::ColormapStyle::Turbo);
         let flat: Vec<u8> = colormap.iter().flat_map(|c| c.iter().copied()).collect();
 
         gl.tex_image_2d(
