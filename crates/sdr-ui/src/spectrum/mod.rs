@@ -104,29 +104,29 @@ impl SpectrumHandle {
 
             match mode {
                 AveragingMode::None => {
-                    s.current_data.clear();
-                    s.current_data.extend_from_slice(data);
+                    s.current_data.resize(data.len(), 0.0);
+                    s.current_data.copy_from_slice(data);
                 }
                 AveragingMode::PeakHold => {
                     for (i, &d) in data.iter().enumerate() {
                         avg[i] = avg[i].max(d);
                     }
-                    s.current_data.clear();
-                    s.current_data.extend_from_slice(&avg);
+                    s.current_data.resize(avg.len(), 0.0);
+                    s.current_data.copy_from_slice(&avg);
                 }
                 AveragingMode::RunningAvg => {
                     for (i, &d) in data.iter().enumerate() {
                         avg[i] = AVERAGING_ALPHA.mul_add(d, (1.0 - AVERAGING_ALPHA) * avg[i]);
                     }
-                    s.current_data.clear();
-                    s.current_data.extend_from_slice(&avg);
+                    s.current_data.resize(avg.len(), 0.0);
+                    s.current_data.copy_from_slice(&avg);
                 }
                 AveragingMode::MinHold => {
                     for (i, &d) in data.iter().enumerate() {
                         avg[i] = avg[i].min(d);
                     }
-                    s.current_data.clear();
-                    s.current_data.extend_from_slice(&avg);
+                    s.current_data.resize(avg.len(), 0.0);
+                    s.current_data.copy_from_slice(&avg);
                 }
             }
         }

@@ -739,7 +739,7 @@ fn connect_display_panel(
             spectrum_for_cmap.set_colormap(style);
         });
 
-    // Min dB level — update the spectrum dB range.
+    // Min dB level — update the spectrum dB range (skip if min >= max).
     let spectrum_min = Rc::clone(spectrum_handle);
     let max_row_for_min = panels.display.max_db_row.clone();
     panels.display.min_db_row.connect_value_notify(move |row| {
@@ -747,11 +747,14 @@ fn connect_display_panel(
         let min_db = row.value() as f32;
         #[allow(clippy::cast_possible_truncation)]
         let max_db = max_row_for_min.value() as f32;
+        if min_db >= max_db {
+            return;
+        }
         spectrum_min.set_db_range(min_db, max_db);
         tracing::debug!(min_db, max_db, "dB range changed");
     });
 
-    // Max dB level — update the spectrum dB range.
+    // Max dB level — update the spectrum dB range (skip if max <= min).
     let spectrum_max = Rc::clone(spectrum_handle);
     let min_row_for_max = panels.display.min_db_row.clone();
     panels.display.max_db_row.connect_value_notify(move |row| {
@@ -759,6 +762,9 @@ fn connect_display_panel(
         let max_db = row.value() as f32;
         #[allow(clippy::cast_possible_truncation)]
         let min_db = min_row_for_max.value() as f32;
+        if max_db <= min_db {
+            return;
+        }
         spectrum_max.set_db_range(min_db, max_db);
         tracing::debug!(min_db, max_db, "dB range changed");
     });

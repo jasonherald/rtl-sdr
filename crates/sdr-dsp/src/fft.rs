@@ -98,6 +98,11 @@ pub fn power_spectrum_db(
     output: &mut [f32],
     window_coherent_gain: f32,
 ) -> Result<(), DspError> {
+    if window_coherent_gain <= 0.0 || !window_coherent_gain.is_finite() {
+        return Err(DspError::InvalidParameter(
+            "window_coherent_gain must be finite and > 0".to_string(),
+        ));
+    }
     if output.len() < fft_output.len() {
         return Err(DspError::BufferTooSmall {
             need: fft_output.len(),
