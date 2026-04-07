@@ -89,9 +89,16 @@ pub fn build_window(app: &adw::Application) {
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
 
-    // Help overlay (Ctrl+? shows keyboard shortcuts).
-    let shortcuts_window = shortcuts::build_shortcuts_window();
-    window.set_help_overlay(Some(&shortcuts_window));
+    // Ctrl+? shows keyboard shortcuts dialog.
+    let window_for_shortcuts = window.downgrade();
+    let shortcuts_action = gio::SimpleAction::new("show-help-overlay", None);
+    shortcuts_action.connect_activate(move |_, _| {
+        if let Some(w) = window_for_shortcuts.upgrade() {
+            shortcuts::show_shortcuts_dialog(&w);
+        }
+    });
+    window.add_action(&shortcuts_action);
+    app.set_accels_for_action("win.show-help-overlay", &["<Ctrl>slash"]);
 
     // --- Wire sidebar panels and frequency/demod to DSP + status bar ---
     let status_bar_demod = Rc::new(status_bar);
@@ -932,7 +939,7 @@ fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
                 .application_name("SDR-RS")
                 .developer_name("Jason Herald")
                 .version(env!("CARGO_PKG_VERSION"))
-                .application_icon("audio-radio-symbolic")
+                .application_icon("com.sdr.rs")
                 .license_type(gtk4::License::MitX11)
                 .website("https://github.com/jasonherald/rtl-sdr")
                 .comments("Software-defined radio for Linux")

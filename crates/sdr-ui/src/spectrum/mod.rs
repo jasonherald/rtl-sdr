@@ -327,9 +327,12 @@ fn build_fft_area(
         .build();
     area.set_required_version(3, 0);
 
-    // On realize: create GL context and renderer.
+    // On realize: create GL context and renderer (only on first realize).
     let state_realize = Rc::clone(&state);
     area.connect_realize(move |area| {
+        if state_realize.borrow().is_some() {
+            return;
+        }
         area.make_current();
         if area.error().is_some() {
             tracing::warn!("FFT GLArea has error after make_current");
@@ -350,20 +353,6 @@ fn build_fft_area(
                 tracing::warn!("failed to initialize FFT plot renderer: {e}");
             }
         }
-    });
-
-    // On unrealize: clean up GL resources.
-    let state_unrealize = Rc::clone(&state);
-    area.connect_unrealize(move |area| {
-        area.make_current();
-        if area.error().is_some() {
-            tracing::warn!("FFT GLArea error on unrealize — skipping GL cleanup");
-        } else if let Some(s) = state_unrealize.borrow().as_ref() {
-            s.vfo_renderer.destroy(&s.gl);
-            s.renderer.destroy(&s.gl);
-            tracing::info!("FFT plot GL renderer destroyed");
-        }
-        *state_unrealize.borrow_mut() = None;
     });
 
     // On render: draw the FFT plot, then the VFO overlay on top.
@@ -454,11 +443,14 @@ fn build_waterfall_area(
         .build();
     area.set_required_version(3, 0);
 
-    // On realize: create GL context and renderer with current dB range.
+    // On realize: create GL context and renderer (only on first realize).
     let state_realize = Rc::clone(&state);
     let min_db_realize = Rc::clone(min_db);
     let max_db_realize = Rc::clone(max_db);
     area.connect_realize(move |area| {
+        if state_realize.borrow().is_some() {
+            return;
+        }
         area.make_current();
         if area.error().is_some() {
             tracing::warn!("waterfall GLArea has error after make_current");
@@ -467,8 +459,6 @@ fn build_waterfall_area(
 
         match create_gl_context_and_waterfall_renderer() {
             Ok((gl, mut renderer, vfo_renderer)) => {
-                // Apply stored dB range so the waterfall matches the FFT plot
-                // even if set_db_range was called before realization.
                 renderer.set_db_range(min_db_realize.get(), max_db_realize.get());
                 *state_realize.borrow_mut() = Some(WaterfallState {
                     gl,
@@ -481,20 +471,6 @@ fn build_waterfall_area(
                 tracing::warn!("failed to initialize waterfall renderer: {e}");
             }
         }
-    });
-
-    // On unrealize: clean up GL resources.
-    let state_unrealize = Rc::clone(&state);
-    area.connect_unrealize(move |area| {
-        area.make_current();
-        if area.error().is_some() {
-            tracing::warn!("waterfall GLArea error on unrealize — skipping GL cleanup");
-        } else if let Some(s) = state_unrealize.borrow().as_ref() {
-            s.vfo_renderer.destroy(&s.gl);
-            s.renderer.destroy(&s.gl);
-            tracing::info!("waterfall GL renderer destroyed");
-        }
-        *state_unrealize.borrow_mut() = None;
     });
 
     // On render: draw the waterfall, then the VFO overlay on top.
@@ -531,9 +507,15 @@ fn build_signal_history_area(
         .build();
     area.set_required_version(3, 0);
 
-    // On realize: create GL context and renderer.
+    // On realize: create GL context and renderer (only on first realize).
+    // Wayland compositors like Hyprland may unrealize/realize on workspace
+    // switches — guard against creating duplicate GL contexts.
     let state_realize = Rc::clone(&state);
     area.connect_realize(move |area| {
+        if state_realize.borrow().is_some() {
+            tracing::debug!("signal history GL already initialized — skipping re-realize");
+            return;
+        }
         area.make_current();
         if area.error().is_some() {
             tracing::warn!("signal history GLArea has error after make_current");
@@ -549,19 +531,6 @@ fn build_signal_history_area(
                 tracing::warn!("failed to initialize signal history renderer: {e}");
             }
         }
-    });
-
-    // On unrealize: clean up GL resources.
-    let state_unrealize = Rc::clone(&state);
-    area.connect_unrealize(move |area| {
-        area.make_current();
-        if area.error().is_some() {
-            tracing::warn!("signal history GLArea error on unrealize — skipping GL cleanup");
-        } else if let Some(s) = state_unrealize.borrow().as_ref() {
-            s.renderer.destroy(&s.gl);
-            tracing::info!("signal history GL renderer destroyed");
-        }
-        *state_unrealize.borrow_mut() = None;
     });
 
     // On render: draw the signal history plot.

@@ -3,6 +3,7 @@
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 
 use crate::header::demod_selector::DEMOD_MODE_COUNT;
 
@@ -74,74 +75,79 @@ pub fn setup_shortcuts(
     window.add_controller(controller);
 }
 
-/// Build the keyboard shortcuts help window.
+/// Show the keyboard shortcuts dialog.
 ///
-/// Returns a `ShortcutsWindow` that lists all available keyboard shortcuts,
-/// suitable for use as the window's help overlay.
-pub fn build_shortcuts_window() -> gtk4::ShortcutsWindow {
-    // --- Playback group ---
-    let play_stop = gtk4::ShortcutsShortcut::builder()
-        .shortcut_type(gtk4::ShortcutType::Accelerator)
-        .title("Play / Stop")
-        .accelerator("space")
+/// Presents a modal `AdwDialog` listing all keyboard shortcuts.
+/// Uses a dialog instead of `GtkShortcutsWindow` to avoid the close-kills-app
+/// issue on Wayland compositors like Hyprland.
+pub fn show_shortcuts_dialog(parent: &impl gtk4::prelude::IsA<gtk4::Widget>) {
+    let shortcuts = [
+        (
+            "Playback",
+            &[("Space", "Play / Stop"), ("M", "Cycle demod mode")][..],
+        ),
+        ("Navigation", &[("F9", "Toggle sidebar")][..]),
+        (
+            "Application",
+            &[
+                ("Ctrl+/", "Keyboard shortcuts"),
+                ("Ctrl+Q", "Quit"),
+                ("F1", "About"),
+            ][..],
+        ),
+    ];
+
+    let content = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(24)
+        .margin_end(24)
         .build();
 
-    let cycle_demod = gtk4::ShortcutsShortcut::builder()
-        .shortcut_type(gtk4::ShortcutType::Accelerator)
-        .title("Cycle demod mode")
-        .accelerator("m")
+    for (group_name, entries) in &shortcuts {
+        let group_label = gtk4::Label::builder()
+            .label(*group_name)
+            .css_classes(["heading"])
+            .halign(gtk4::Align::Start)
+            .build();
+        content.append(&group_label);
+
+        let list = gtk4::ListBox::builder()
+            .selection_mode(gtk4::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+
+        for (key, description) in *entries {
+            let row = adw::ActionRow::builder().title(*description).build();
+            let key_label = gtk4::Label::builder()
+                .label(*key)
+                .css_classes(["dim-label"])
+                .build();
+            row.add_suffix(&key_label);
+            list.append(&row);
+        }
+
+        content.append(&list);
+    }
+
+    let scrolled = gtk4::ScrolledWindow::builder()
+        .child(&content)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
         .build();
 
-    let playback_group = gtk4::ShortcutsGroup::builder().title("Playback").build();
-    // ShortcutsGroup extends Box — use append() (pre-v4.14 API).
-    playback_group.append(&play_stop);
-    playback_group.append(&cycle_demod);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scrolled));
 
-    // --- Navigation group ---
-    let toggle_sidebar = gtk4::ShortcutsShortcut::builder()
-        .shortcut_type(gtk4::ShortcutType::Accelerator)
-        .title("Toggle sidebar")
-        .accelerator("F9")
+    let dialog = adw::Dialog::builder()
+        .title("Keyboard Shortcuts")
+        .content_width(400)
+        .content_height(400)
         .build();
-
-    let nav_group = gtk4::ShortcutsGroup::builder().title("Navigation").build();
-    nav_group.append(&toggle_sidebar);
-
-    // --- Application group ---
-    let shortcuts_help = gtk4::ShortcutsShortcut::builder()
-        .shortcut_type(gtk4::ShortcutType::Accelerator)
-        .title("Keyboard shortcuts")
-        .accelerator("<Ctrl>question")
-        .build();
-
-    let quit = gtk4::ShortcutsShortcut::builder()
-        .shortcut_type(gtk4::ShortcutType::Accelerator)
-        .title("Quit")
-        .accelerator("<Ctrl>q")
-        .build();
-
-    let app_group = gtk4::ShortcutsGroup::builder().title("Application").build();
-    app_group.append(&shortcuts_help);
-    app_group.append(&quit);
-
-    // --- Section and window ---
-    // ShortcutsSection extends Box — use append() (pre-v4.14 API).
-    let section = gtk4::ShortcutsSection::builder()
-        .title("SDR-RS")
-        .section_name("shortcuts")
-        .build();
-    section.append(&playback_group);
-    section.append(&nav_group);
-    section.append(&app_group);
-
-    // ShortcutsWindow uses set_child to accept the section.
-    let shortcuts_window = gtk4::ShortcutsWindow::builder()
-        .modal(true)
-        .resizable(true)
-        .build();
-    shortcuts_window.set_child(Some(&section));
-
-    shortcuts_window
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(parent));
 }
 
 #[cfg(test)]
