@@ -14,6 +14,11 @@ const MAX_FPS: f64 = 60.0;
 /// Default FFT size selector index (2048 = index 2).
 const DEFAULT_FFT_SIZE_INDEX: u32 = 2;
 
+/// Theme selector indices (must match `StringList` order in `build_display_panel`).
+pub const THEME_SYSTEM: u32 = 0;
+pub const THEME_DARK: u32 = 1;
+pub const THEME_LIGHT: u32 = 2;
+
 /// Default window function selector index (Blackman = index 1).
 const DEFAULT_WINDOW_FN_INDEX: u32 = 1;
 
@@ -42,6 +47,8 @@ pub struct DisplayPanel {
     pub fill_mode_row: adw::SwitchRow,
     /// Spectrum averaging mode selector.
     pub averaging_row: adw::ComboRow,
+    /// Theme selector (System / Dark / Light).
+    pub theme_row: adw::ComboRow,
 }
 
 /// Build the display settings panel.
@@ -114,6 +121,13 @@ pub fn build_display_panel() -> DisplayPanel {
         .model(&averaging_model)
         .build();
 
+    // --- Theme ---
+    let theme_model = gtk4::StringList::new(&["System", "Dark", "Light"]);
+    let theme_row = adw::ComboRow::builder()
+        .title("Theme")
+        .model(&theme_model)
+        .build();
+
     group.add(&fft_size_row);
     group.add(&window_fn_row);
     group.add(&frame_rate_row);
@@ -122,6 +136,7 @@ pub fn build_display_panel() -> DisplayPanel {
     group.add(&max_db_row);
     group.add(&fill_mode_row);
     group.add(&averaging_row);
+    group.add(&theme_row);
 
     // FFT size and window function connected via window.rs
 
@@ -135,6 +150,7 @@ pub fn build_display_panel() -> DisplayPanel {
         max_db_row,
         fill_mode_row,
         averaging_row,
+        theme_row,
     }
 }
 

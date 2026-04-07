@@ -414,6 +414,7 @@ impl IqFrontend {
             &mut self.fft_output,
             self.window_coherent_gain,
         )?;
+
         fft_out[..self.fft_size].copy_from_slice(&self.fft_output);
 
         Ok(())
