@@ -69,7 +69,7 @@ impl NetworkSource {
     ///
     /// Returns the number of Complex samples written.
     /// Carries incomplete sample bytes across calls for TCP streams.
-    pub fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+    pub fn read_samples_impl(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
         if output.is_empty() {
             return Ok(0);
         }
@@ -231,6 +231,10 @@ impl Source for NetworkSource {
     fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError> {
         self.sample_rate = rate;
         Ok(())
+    }
+
+    fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+        self.read_samples_impl(output)
     }
 }
 
