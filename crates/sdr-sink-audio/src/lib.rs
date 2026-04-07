@@ -11,10 +11,16 @@
 mod pw_impl;
 
 #[cfg(feature = "pipewire")]
-pub use pw_impl::AudioSink;
+pub use pw_impl::{AudioSink, list_audio_sinks};
 
 #[cfg(not(feature = "pipewire"))]
 mod stub_impl;
 
 #[cfg(not(feature = "pipewire"))]
 pub use stub_impl::AudioSink;
+
+/// Stub for non-PipeWire builds — returns only "Default".
+#[cfg(not(feature = "pipewire"))]
+pub fn list_audio_sinks() -> Vec<String> {
+    vec!["Default".to_string()]
+}

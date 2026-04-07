@@ -33,6 +33,89 @@ pub struct AudioSink {
     pw_thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Query PipeWire for available audio output sinks.
+///
+/// Connects briefly to the PipeWire daemon, lists all Audio/Sink nodes,
+/// and returns their names. Always includes "Default" as the first entry.
+pub fn list_audio_sinks() -> Vec<String> {
+    let mut sinks = vec!["Default".to_string()];
+
+    // Run a short-lived PipeWire main loop to collect sink names.
+    // Must run on a separate thread because PipeWire main loops
+    // are not reentrant and we may already have one running.
+    let result = std::thread::Builder::new()
+        .name("pw-enumerate".to_string())
+        .spawn(move || {
+            let Ok(main_loop) = pipewire::main_loop::MainLoopRc::new(None) else {
+                return Vec::new();
+            };
+            let Ok(context) = pipewire::context::ContextRc::new(&main_loop, None) else {
+                return Vec::new();
+            };
+            let Ok(core) = context.connect(None) else {
+                return Vec::new();
+            };
+            let Ok(registry) = core.get_registry() else {
+                return Vec::new();
+            };
+
+            let found_sinks = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let found_clone = std::rc::Rc::clone(&found_sinks);
+
+            // Listen for global objects — Audio/Sink nodes are output devices
+            let listener = registry
+                .add_listener_local()
+                .global(move |global| {
+                    if let Some(props) = global.props {
+                        let media_class = props.get("media.class").unwrap_or("");
+                        if media_class == "Audio/Sink" {
+                            let name = props
+                                .get("node.description")
+                                .or_else(|| props.get("node.name"))
+                                .unwrap_or("Unknown Sink");
+                            found_clone.borrow_mut().push(name.to_string());
+                        }
+                    }
+                })
+                .register();
+
+            // Listen for the "done" signal — fires after all globals are enumerated
+            let ml_quit = main_loop.downgrade();
+            let core_listener = core
+                .add_listener_local()
+                .done(move |_id, _seq| {
+                    if let Some(ml) = ml_quit.upgrade() {
+                        ml.quit();
+                    }
+                })
+                .register();
+
+            // Trigger sync — done callback fires after all globals are sent
+            core.sync(0).ok();
+            main_loop.run();
+
+            // Listeners must stay alive until after run() completes
+            drop(listener);
+            drop(core_listener);
+            found_sinks.borrow().clone()
+        })
+        .and_then(|handle| {
+            handle
+                .join()
+                .map_err(|_| std::io::Error::other("join failed"))
+        });
+
+    if let Ok(found) = result {
+        for name in found {
+            if !sinks.contains(&name) {
+                sinks.push(name);
+            }
+        }
+    }
+
+    sinks
+}
+
 impl AudioSink {
     /// Create a new audio sink (not yet connected to PipeWire).
     pub fn new() -> Self {
