@@ -11,7 +11,7 @@
 mod pw_impl;
 
 #[cfg(feature = "pipewire")]
-pub use pw_impl::{AudioSink, list_audio_sinks};
+pub use pw_impl::{AudioDevice, AudioSink, list_audio_sinks};
 
 #[cfg(not(feature = "pipewire"))]
 mod stub_impl;
@@ -19,8 +19,21 @@ mod stub_impl;
 #[cfg(not(feature = "pipewire"))]
 pub use stub_impl::AudioSink;
 
+/// Audio device info (stub for non-PipeWire builds).
+#[cfg(not(feature = "pipewire"))]
+#[derive(Clone, Debug)]
+pub struct AudioDevice {
+    /// Human-readable name.
+    pub display_name: String,
+    /// PipeWire node name.
+    pub node_name: String,
+}
+
 /// Stub for non-PipeWire builds — returns only "Default".
 #[cfg(not(feature = "pipewire"))]
-pub fn list_audio_sinks() -> Vec<String> {
-    vec!["Default".to_string()]
+pub fn list_audio_sinks() -> Vec<AudioDevice> {
+    vec![AudioDevice {
+        display_name: "Default".to_string(),
+        node_name: String::new(),
+    }]
 }

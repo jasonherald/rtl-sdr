@@ -11,6 +11,8 @@ pub struct AudioPanel {
     pub device_row: adw::ComboRow,
     /// Sink type selector (Audio, Network).
     pub sink_type_row: adw::ComboRow,
+    /// Node names corresponding to device dropdown indices (for routing).
+    pub device_node_names: Vec<String>,
 }
 
 /// Build the audio output configuration panel.
@@ -25,8 +27,9 @@ pub fn build_audio_panel() -> AudioPanel {
 
     // Query PipeWire for available audio sinks
     let sinks = sdr_sink_audio::list_audio_sinks();
-    let sink_names: Vec<&str> = sinks.iter().map(String::as_str).collect();
-    let device_model = gtk4::StringList::new(&sink_names);
+    let display_names: Vec<&str> = sinks.iter().map(|s| s.display_name.as_str()).collect();
+    let node_names: Vec<String> = sinks.iter().map(|s| s.node_name.clone()).collect();
+    let device_model = gtk4::StringList::new(&display_names);
     let device_row = adw::ComboRow::builder()
         .title("Device")
         .model(&device_model)
@@ -38,8 +41,6 @@ pub fn build_audio_panel() -> AudioPanel {
         .model(&sink_model)
         .build();
 
-    // TODO(issue #92): connect rows to DSP pipeline for device/sink switching
-
     group.add(&device_row);
     group.add(&sink_type_row);
 
@@ -47,5 +48,6 @@ pub fn build_audio_panel() -> AudioPanel {
         widget: group,
         device_row,
         sink_type_row,
+        device_node_names: node_names,
     }
 }

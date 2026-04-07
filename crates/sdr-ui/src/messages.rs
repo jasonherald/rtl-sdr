@@ -75,6 +75,8 @@ pub enum UiToDsp {
     SetFftRate(f64),
     /// Enable or disable the audio high-pass filter (voice modes).
     SetHighPass(bool),
+    /// Set the audio output device by `PipeWire` node name.
+    SetAudioDevice(String),
 }
 
 #[cfg(test)]
