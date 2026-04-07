@@ -77,6 +77,8 @@ struct UsbRingBuffer {
     slot_count: usize,
     write_idx: AtomicUsize,
     read_idx: AtomicUsize,
+    /// Set to true by the reader thread on fatal USB error or panic.
+    error: AtomicBool,
 }
 
 impl UsbRingBuffer {
@@ -85,7 +87,7 @@ impl UsbRingBuffer {
             .map(|_| RingSlot {
                 data: Mutex::new(vec![0u8; slot_size]),
                 len: AtomicUsize::new(0),
-                state: AtomicU8::new(0), // empty
+                state: AtomicU8::new(0),
             })
             .collect();
         Self {
@@ -93,6 +95,7 @@ impl UsbRingBuffer {
             slot_count,
             write_idx: AtomicUsize::new(0),
             read_idx: AtomicUsize::new(0),
+            error: AtomicBool::new(false),
         }
     }
 }
@@ -167,6 +170,9 @@ impl Source for RtlSdrSource {
             .reset_buffer()
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
 
+        // Set running BEFORE spawning so the reader thread sees it immediately.
+        self.running.store(true, Ordering::Release);
+
         // Create the ring buffer and spawn the USB reader thread.
         let ring = Arc::new(UsbRingBuffer::new(RING_SLOTS, RAW_BUF_SIZE));
         let ring_writer = Arc::clone(&ring);
@@ -179,7 +185,7 @@ impl Source for RtlSdrSource {
                 tracing::info!("USB reader thread started (ring slots={RING_SLOTS})");
                 let timeout = Duration::from_secs(1);
 
-                while cancel.load(Ordering::Relaxed) {
+                while cancel.load(Ordering::Acquire) {
                     let idx =
                         ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
                     let slot = &ring_writer.slots[idx];
@@ -193,7 +199,11 @@ impl Source for RtlSdrSource {
 
                     // Lock the slot's buffer for writing. Never contended because
                     // the state flag ensures reader and writer don't overlap.
-                    let mut data = slot.data.lock().expect("ring slot poisoned");
+                    let Ok(mut data) = slot.data.lock() else {
+                        tracing::error!("ring slot mutex poisoned");
+                        ring_writer.error.store(true, Ordering::Release);
+                        break;
+                    };
 
                     match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut data, timeout)
                     {
@@ -205,6 +215,7 @@ impl Source for RtlSdrSource {
                         Ok(_) | Err(rusb::Error::Timeout) => {}
                         Err(e) => {
                             tracing::warn!("USB reader error: {e}");
+                            ring_writer.error.store(true, Ordering::Release);
                             break;
                         }
                     }
@@ -216,7 +227,6 @@ impl Source for RtlSdrSource {
         self.ring = Some(ring);
         self.reader_thread = Some(thread);
         self.device = Some(device);
-        self.running.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -260,6 +270,12 @@ impl Source for RtlSdrSource {
 
     fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
         let ring = self.ring.as_ref().ok_or(SourceError::NotRunning)?;
+        // Check if the reader thread died (USB error or mutex poisoned)
+        if ring.error.load(Ordering::Acquire) {
+            return Err(SourceError::ReadFailed(
+                "USB reader thread died".to_string(),
+            ));
+        }
         let idx = ring.read_idx.load(Ordering::Relaxed) % ring.slot_count;
         let slot = &ring.slots[idx];
 

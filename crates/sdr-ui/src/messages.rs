@@ -90,8 +90,12 @@ pub enum UiToDsp {
     SetAudioDevice(String),
     /// Switch the source type (stops current source if running).
     SetSourceType(SourceType),
-    /// Configure network source hostname and port.
-    SetNetworkConfig { hostname: String, port: u16 },
+    /// Configure network source hostname, port, and protocol.
+    SetNetworkConfig {
+        hostname: String,
+        port: u16,
+        protocol: sdr_types::Protocol,
+    },
     /// Set the file path for file source playback.
     SetFilePath(std::path::PathBuf),
 }
@@ -227,10 +231,11 @@ mod tests {
         let net_cfg = UiToDsp::SetNetworkConfig {
             hostname: "192.168.1.1".to_string(),
             port: 4321,
+            protocol: sdr_types::Protocol::TcpClient,
         };
         assert!(matches!(
             net_cfg,
-            UiToDsp::SetNetworkConfig { ref hostname, port: 4321 } if hostname == "192.168.1.1"
+            UiToDsp::SetNetworkConfig { ref hostname, port: 4321, .. } if hostname == "192.168.1.1"
         ));
 
         let file_path = UiToDsp::SetFilePath(std::path::PathBuf::from("/tmp/test.wav"));

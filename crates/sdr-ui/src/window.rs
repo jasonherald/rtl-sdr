@@ -417,6 +417,7 @@ fn connect_sidebar_panels(
 }
 
 /// Connect source panel controls to DSP commands.
+#[allow(clippy::too_many_lines)]
 fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Sample rate selector
     let state_sr = Rc::clone(state);
@@ -498,21 +499,41 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Network hostname (fires on Enter key)
     let state_host = Rc::clone(state);
     let port_for_host = panels.source.port_row.clone();
+    let proto_for_host = panels.source.protocol_row.clone();
     panels.source.hostname_row.connect_apply(move |row| {
         let hostname = row.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = port_for_host.value() as u16;
-        state_host.send_dsp(UiToDsp::SetNetworkConfig { hostname, port });
+        let protocol = if proto_for_host.selected() == 1 {
+            sdr_types::Protocol::Udp
+        } else {
+            sdr_types::Protocol::TcpClient
+        };
+        state_host.send_dsp(UiToDsp::SetNetworkConfig {
+            hostname,
+            port,
+            protocol,
+        });
     });
 
     // Network port
     let state_port = Rc::clone(state);
     let host_for_port = panels.source.hostname_row.clone();
+    let proto_for_port = panels.source.protocol_row.clone();
     panels.source.port_row.connect_value_notify(move |row| {
         let hostname = host_for_port.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = row.value() as u16;
-        state_port.send_dsp(UiToDsp::SetNetworkConfig { hostname, port });
+        let protocol = if proto_for_port.selected() == 1 {
+            sdr_types::Protocol::Udp
+        } else {
+            sdr_types::Protocol::TcpClient
+        };
+        state_port.send_dsp(UiToDsp::SetNetworkConfig {
+            hostname,
+            port,
+            protocol,
+        });
     });
 
     // File path (apply on Enter key)

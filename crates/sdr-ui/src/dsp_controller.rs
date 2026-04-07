@@ -148,6 +148,7 @@ struct DspState {
     source_type: SourceType,
     network_host: String,
     network_port: u16,
+    network_protocol: sdr_types::Protocol,
     file_path: std::path::PathBuf,
 
     // Pre-allocated buffers
@@ -195,6 +196,7 @@ impl DspState {
             source_type: SourceType::RtlSdr,
             network_host: "127.0.0.1".to_string(),
             network_port: 1234,
+            network_protocol: sdr_types::Protocol::TcpClient,
             file_path: std::path::PathBuf::new(),
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
@@ -545,18 +547,39 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetSourceType(source_type) => {
             tracing::info!(?source_type, "switching source type");
-            if state.running {
+            let was_running = state.running;
+            if was_running {
                 cleanup(state);
                 state.running = false;
-                let _ = dsp_tx.send(DspToUi::SourceStopped);
             }
             state.source_type = source_type;
+            // Restart with the new source type if was playing
+            if was_running {
+                match open_source(state) {
+                    Ok(()) => {
+                        if let Err(e) = state.audio_sink.start() {
+                            tracing::warn!("audio sink restart failed: {e}");
+                        }
+                        state.running = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("source switch failed: {e}");
+                        let _ = dsp_tx.send(DspToUi::Error(format!("Source switch failed: {e}")));
+                        let _ = dsp_tx.send(DspToUi::SourceStopped);
+                    }
+                }
+            }
         }
 
-        UiToDsp::SetNetworkConfig { hostname, port } => {
-            tracing::debug!(%hostname, port, "set network config");
+        UiToDsp::SetNetworkConfig {
+            hostname,
+            port,
+            protocol,
+        } => {
+            tracing::debug!(%hostname, port, ?protocol, "set network config");
             state.network_host = hostname;
             state.network_port = port;
+            state.network_protocol = protocol;
         }
 
         UiToDsp::SetFilePath(path) => {
@@ -573,7 +596,7 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
         SourceType::Network => Box::new(sdr_source_network::NetworkSource::new(
             &state.network_host,
             state.network_port,
-            sdr_types::Protocol::TcpClient,
+            state.network_protocol,
         )),
         SourceType::File => Box::new(sdr_source_file::FileSource::new(&state.file_path)),
     };
@@ -591,6 +614,9 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
     }
 
     source.start().map_err(|e| e.to_string())?;
+
+    // Sync sample rate from the source (file sources have fixed rates).
+    state.sample_rate = source.sample_rate();
 
     // Rebuild frontend and VFO before committing the source to state.
     rebuild_frontend(state)?;
