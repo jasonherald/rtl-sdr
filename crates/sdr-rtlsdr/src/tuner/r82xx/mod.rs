@@ -478,14 +478,26 @@ impl Tuner for R82xxPriv {
             if total_gain >= gain {
                 break;
             }
-            lna_index += 1;
-            total_gain += R82XX_LNA_GAIN_STEPS[lna_index as usize];
+            // Try LNA step first
+            if (lna_index as usize) < R82XX_LNA_GAIN_STEPS.len() - 1 {
+                let step = R82XX_LNA_GAIN_STEPS[lna_index as usize + 1];
+                if step > 0 {
+                    lna_index += 1;
+                    total_gain += step;
+                }
+            }
 
             if total_gain >= gain {
                 break;
             }
-            mix_index += 1;
-            total_gain += R82XX_MIXER_GAIN_STEPS[mix_index as usize];
+            // Then mixer step — skip negative steps (e.g., index 15 = -8 dB)
+            if (mix_index as usize) < R82XX_MIXER_GAIN_STEPS.len() - 1 {
+                let step = R82XX_MIXER_GAIN_STEPS[mix_index as usize + 1];
+                if step > 0 {
+                    mix_index += 1;
+                    total_gain += step;
+                }
+            }
         }
 
         // Set LNA gain

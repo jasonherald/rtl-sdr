@@ -136,6 +136,7 @@ pub fn build_window(app: &adw::Application) {
     let state_rx = Rc::clone(&state);
     let toast_overlay_weak = toast_overlay.downgrade();
 
+    let gain_row_for_dsp = panels.source.gain_row.clone();
     glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
         // Drain all pending DSP messages.
         loop {
@@ -148,6 +149,7 @@ pub fn build_window(app: &adw::Application) {
                         &state_rx,
                         &toast_overlay_weak,
                         &status_bar_demod,
+                        &gain_row_for_dsp,
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -171,6 +173,7 @@ fn handle_dsp_message(
     state: &Rc<AppState>,
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
     status_bar: &Rc<StatusBar>,
+    gain_row: &adw::SpinRow,
 ) {
     match msg {
         DspToUi::FftData(data) => {
@@ -200,6 +203,19 @@ fn handle_dsp_message(
         }
         DspToUi::DeviceInfo(info) => {
             tracing::info!(device_info = %info, "device info received");
+        }
+        DspToUi::GainList(gains) => {
+            if let (Some(&min), Some(&max)) = (gains.first(), gains.last()) {
+                tracing::info!(
+                    count = gains.len(),
+                    min_db = min,
+                    max_db = max,
+                    "tuner gain list received"
+                );
+                // Update the gain slider range to match the device's actual capabilities
+                gain_row.adjustment().set_lower(min);
+                gain_row.adjustment().set_upper(max);
+            }
         }
     }
 }

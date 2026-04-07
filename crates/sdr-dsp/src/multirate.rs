@@ -181,13 +181,16 @@ impl PolyphaseResampler {
 
         self.offset -= input.len();
 
-        // Update delay line: keep last (tpp - 1) input samples
-        if input.len() >= delay_len {
-            self.delay_line[..delay_len].copy_from_slice(&input[input.len() - delay_len..]);
-        } else if delay_len > 0 {
-            let shift = delay_len - input.len();
-            self.delay_line.copy_within(input.len().., 0);
-            self.delay_line[shift..].copy_from_slice(input);
+        // Update delay line: keep last (tpp - 1) samples from input
+        if delay_len > 0 {
+            if input.len() >= delay_len {
+                self.delay_line[..delay_len].copy_from_slice(&input[input.len() - delay_len..]);
+            } else {
+                // Shift existing delay data left, append new input at end
+                let keep = delay_len - input.len();
+                self.delay_line.copy_within(delay_len - keep..delay_len, 0);
+                self.delay_line[keep..delay_len].copy_from_slice(input);
+            }
         }
 
         Ok(out_count)
