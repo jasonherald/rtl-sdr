@@ -1090,6 +1090,7 @@ dependencies = [
  "glow",
  "gtk4",
  "libadwaita",
+ "rusb",
  "sdr-config",
  "sdr-dsp",
  "sdr-pipeline",

@@ -22,6 +22,7 @@ sdr-source-network.workspace = true
 sdr-source-file.workspace = true
 sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
+rusb.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
 glow.workspace = true

@@ -7,14 +7,23 @@ use sdr_types::{Complex, DspError};
 
 use crate::math;
 
+/// Initial sample state for conjugate-multiply discriminator (unit vector at phase 0).
+const INITIAL_SAMPLE: Complex = Complex { re: 1.0, im: 0.0 };
+
 /// Quadrature FM demodulator — extracts instantaneous frequency from IQ.
 ///
-/// Ports SDR++ `dsp::demod::Quadrature`. Computes the phase difference
-/// between successive samples, normalized by the deviation:
-/// `out[i] = normalize_phase(phase[i] - phase[i-1]) * inv_deviation`
+/// Uses the conjugate-multiply method (standard in GNU Radio, liquid-dsp):
+/// `out[i] = atan2(cross, dot) * inv_deviation`
+/// where `cross = im[n]*re[n-1] - re[n]*im[n-1]` and
+///       `dot   = re[n]*re[n-1] + im[n]*im[n-1]`
+///
+/// This is mathematically equivalent to phase-difference but:
+/// - One atan2 per sample instead of two
+/// - No phase wrapping needed (conjugate product handles it)
+/// - More numerically stable near ±π
 pub struct Quadrature {
     inv_deviation: f32,
-    last_phase: f32,
+    last_sample: Complex,
 }
 
 impl Quadrature {
@@ -39,7 +48,7 @@ impl Quadrature {
         }
         Ok(Self {
             inv_deviation,
-            last_phase: 0.0,
+            last_sample: INITIAL_SAMPLE,
         })
     }
 
@@ -88,10 +97,14 @@ impl Quadrature {
 
     /// Reset the demodulator state.
     pub fn reset(&mut self) {
-        self.last_phase = 0.0;
+        self.last_sample = INITIAL_SAMPLE;
     }
 
     /// Process complex samples, outputting demodulated audio.
+    ///
+    /// Uses conjugate-multiply: `z[n] * conj(z[n-1])` gives a complex
+    /// whose argument is the instantaneous phase difference, without
+    /// needing explicit phase unwrapping.
     ///
     /// # Errors
     ///
@@ -104,9 +117,13 @@ impl Quadrature {
             });
         }
         for (i, &s) in input.iter().enumerate() {
-            let current_phase = s.phase();
-            output[i] = math::normalize_phase(current_phase - self.last_phase) * self.inv_deviation;
-            self.last_phase = current_phase;
+            // Conjugate multiply: product = s * conj(last)
+            // real part (dot):  s.re*last.re + s.im*last.im
+            // imag part (cross): s.im*last.re - s.re*last.im
+            let dot = s.re * self.last_sample.re + s.im * self.last_sample.im;
+            let cross = s.im * self.last_sample.re - s.re * self.last_sample.im;
+            output[i] = cross.atan2(dot) * self.inv_deviation;
+            self.last_sample = s;
         }
         Ok(input.len())
     }
@@ -554,12 +571,65 @@ mod tests {
     fn test_quadrature_silence() {
         // DC signal (constant phase) should give zero output
         let mut demod = Quadrature::new(1.0).unwrap();
-        let input = vec![Complex::new(1.0, 0.0); 100];
+        let input = vec![INITIAL_SAMPLE; 100];
         let mut output = vec![0.0_f32; 100];
         demod.process(&input, &mut output).unwrap();
         for &v in &output[1..] {
             assert!(v.abs() < 1e-5, "DC should give ~0, got {v}");
         }
+    }
+
+    #[test]
+    fn test_quadrature_phase_wrap_near_pi() {
+        // Signal with phase delta near ±π — the old atan2-difference method
+        // was sensitive to wrapping here; conjugate-multiply handles it naturally.
+        let deviation = PI;
+        let mut demod = Quadrature::new(deviation).unwrap();
+
+        // Create two samples with phase jump close to π (just under)
+        let phase1 = PI - 0.1;
+        let phase2 = -PI + 0.2; // wraps around: actual delta ≈ 0.3
+        let input = vec![
+            Complex::new(phase1.cos(), phase1.sin()),
+            Complex::new(phase2.cos(), phase2.sin()),
+        ];
+        let mut output = vec![0.0_f32; 2];
+        demod.process(&input, &mut output).unwrap();
+        // Second sample: delta ≈ (-π+0.2) - (π-0.1) = -2π+0.3 → normalized ≈ 0.3
+        // Scaled by 1/deviation = 1/π → expected ≈ 0.3/π ≈ 0.0955
+        let expected = 0.3 / PI;
+        assert!(
+            (output[1] - expected).abs() < 0.05,
+            "phase-wrap delta mismatch: expected ~{expected}, got {}",
+            output[1]
+        );
+    }
+
+    #[test]
+    fn test_quadrature_continuity_across_calls() {
+        // Verify state persists correctly across process() calls.
+        let freq = 0.3_f32;
+        let deviation = 1.0;
+        let mut demod = Quadrature::new(deviation).unwrap();
+        let input: Vec<Complex> = (0..100)
+            .map(|i| {
+                let phase = freq * i as f32;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+
+        // Process in two halves
+        let mut out1 = vec![0.0_f32; 50];
+        let mut out2 = vec![0.0_f32; 50];
+        demod.process(&input[..50], &mut out1).unwrap();
+        demod.process(&input[50..], &mut out2).unwrap();
+
+        // First sample of second call should be continuous with last of first
+        let boundary_diff = (out2[0] - out1[49]).abs();
+        assert!(
+            boundary_diff < 0.05,
+            "cross-call boundary should be smooth, diff = {boundary_diff}"
+        );
     }
 
     // --- AM tests ---
@@ -671,7 +741,7 @@ mod tests {
     #[test]
     fn test_cw_produces_tone() {
         let mut demod = CwDemod::from_hz(700.0, 48_000.0).unwrap();
-        let input = vec![Complex::new(1.0, 0.0); 1000];
+        let input = vec![INITIAL_SAMPLE; 1000];
         let mut output = vec![0.0_f32; 1000];
         demod.process(&input, &mut output).unwrap();
         // Should produce an oscillating signal (the BFO tone)
@@ -688,7 +758,7 @@ mod tests {
     #[test]
     fn test_cw_reset() {
         let mut demod = CwDemod::from_hz(700.0, 48_000.0).unwrap();
-        let input = vec![Complex::new(1.0, 0.0); 100];
+        let input = vec![INITIAL_SAMPLE; 100];
         let mut output = vec![0.0_f32; 100];
         demod.process(&input, &mut output).unwrap();
         demod.reset();

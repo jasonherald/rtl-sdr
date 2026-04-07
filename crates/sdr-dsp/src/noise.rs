@@ -68,9 +68,9 @@ impl PowerSquelch {
         let sum: f32 = input.iter().map(|s| s.amplitude()).sum();
         let mean_amplitude = sum / input.len() as f32;
 
-        // Compare in dB (10*log10 of amplitude, matching C++ behavior).
-        // Both measured and threshold use the same scale (10*log10 of mean amplitude).
-        let measured_db = 10.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
+        // Convert to standard dB: 20*log10(amplitude) = 10*log10(power).
+        // This matches the standard dBFS convention used by most SDR tools.
+        let measured_db = 20.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
 
         if measured_db >= self.level_db {
             output[..input.len()].copy_from_slice(input);
@@ -356,6 +356,12 @@ mod tests {
     /// Minimum energy ratio for NR tone preservation test.
     const MIN_ENERGY_RATIO: f32 = 0.05;
 
+    // Squelch dB regression constants: amplitude 0.1 → -20 dBFS.
+    const SQUELCH_REG_AMPLITUDE: f32 = 0.1;
+    const SQUELCH_REG_BLOCK_LEN: usize = 100;
+    const SQUELCH_REG_CLOSE_DB: f32 = -15.0;
+    const SQUELCH_REG_OPEN_DB: f32 = -25.0;
+
     // --- Power Squelch tests ---
 
     #[test]
@@ -389,6 +395,28 @@ mod tests {
         let count = squelch.process(input, &mut output).unwrap();
         assert_eq!(count, 0);
         assert!(!squelch.is_open());
+    }
+
+    #[test]
+    fn test_squelch_db_scale_regression() {
+        // Pin the 20*log10(amplitude) scale: amplitude 0.1 → -20 dBFS.
+        // A threshold at -15 dB should close, -25 dB should open.
+        let input = vec![Complex::new(SQUELCH_REG_AMPLITUDE, 0.0); SQUELCH_REG_BLOCK_LEN];
+
+        let mut squelch_close = PowerSquelch::new(SQUELCH_REG_CLOSE_DB);
+        let mut output = vec![Complex::default(); SQUELCH_REG_BLOCK_LEN];
+        squelch_close.process(&input, &mut output).unwrap();
+        assert!(
+            !squelch_close.is_open(),
+            "amplitude 0.1 (-20 dB) should be below -15 dB threshold"
+        );
+
+        let mut squelch_open = PowerSquelch::new(SQUELCH_REG_OPEN_DB);
+        squelch_open.process(&input, &mut output).unwrap();
+        assert!(
+            squelch_open.is_open(),
+            "amplitude 0.1 (-20 dB) should be above -25 dB threshold"
+        );
     }
 
     // --- Noise Blanker tests ---

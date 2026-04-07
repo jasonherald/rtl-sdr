@@ -68,6 +68,7 @@ pub struct RadioModule {
     if_chain: IfChain,
     af_chain: AfChain,
     deemp_mode: DeemphasisMode,
+    high_pass_enabled: bool,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -90,7 +91,7 @@ impl RadioModule {
     ///
     /// Returns `RadioError` if initialization fails.
     pub fn new(audio_sample_rate: f64) -> Result<Self, RadioError> {
-        let mode = DemodMode::Nfm;
+        let mode = DemodMode::Wfm;
         let demod = create_demodulator(mode)?;
         let if_chain = IfChain::new()?;
         let af_chain = AfChain::new(demod.config().af_sample_rate, audio_sample_rate)?;
@@ -101,6 +102,7 @@ impl RadioModule {
             if_chain,
             af_chain,
             deemp_mode: DeemphasisMode::None,
+            high_pass_enabled: false,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -144,12 +146,13 @@ impl RadioModule {
         let fm_if_nr_allowed = new_demod.config().fm_if_nr_allowed;
         let nb_allowed = new_demod.config().nb_allowed;
         let squelch_allowed = new_demod.config().squelch_allowed;
+        let high_pass_allowed = new_demod.config().high_pass_allowed;
 
         // Reconfigure AF chain for the new AF sample rate
         let new_af_chain = AfChain::new(af_rate, self.audio_sample_rate)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to create AF chain: {e}")))?;
 
-        // Apply deemphasis if the mode supports it
+        // Reapply persisted AF chain settings to the new chain
         let mut af_chain = new_af_chain;
         if deemp_allowed && self.deemp_mode != DeemphasisMode::None {
             af_chain
@@ -157,6 +160,9 @@ impl RadioModule {
                 .map_err(|e| {
                     RadioError::ModeSwitchFailed(format!("failed to set deemphasis: {e}"))
                 })?;
+        }
+        if self.high_pass_enabled && high_pass_allowed {
+            af_chain.set_high_pass_enabled(true);
         }
 
         // Update IF chain feature flags based on new mode capabilities
@@ -325,6 +331,14 @@ impl RadioModule {
         Ok(())
     }
 
+    /// Enable or disable the audio high-pass filter.
+    ///
+    /// Persists across mode changes — reapplied when the AF chain is rebuilt.
+    pub fn set_high_pass_enabled(&mut self, enabled: bool) {
+        self.high_pass_enabled = enabled;
+        self.af_chain.set_high_pass_enabled(enabled);
+    }
+
     /// Enable or disable WFM stereo decode.
     ///
     /// Only has an effect when the current mode is WFM. For other modes this
@@ -357,6 +371,11 @@ impl RadioModule {
     pub fn af_chain(&self) -> &AfChain {
         &self.af_chain
     }
+
+    /// Get a mutable reference to the AF chain.
+    pub fn af_chain_mut(&mut self) -> &mut AfChain {
+        &mut self.af_chain
+    }
 }
 
 #[cfg(test)]
@@ -368,7 +387,7 @@ mod tests {
     #[test]
     fn test_radio_module_default_mode() {
         let radio = RadioModule::with_default_rate().unwrap();
-        assert_eq!(radio.current_mode(), DemodMode::Nfm);
+        assert_eq!(radio.current_mode(), DemodMode::Wfm);
     }
 
     #[test]

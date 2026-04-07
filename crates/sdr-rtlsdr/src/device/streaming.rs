@@ -52,6 +52,14 @@ impl RtlSdrDevice {
         )
     }
 
+    /// Get a shared reference to the USB handle for spawning a reader thread.
+    ///
+    /// The returned Arc can be sent to another thread for concurrent bulk reads
+    /// while the main thread retains access for control transfers.
+    pub fn usb_handle(&self) -> std::sync::Arc<rusb::DeviceHandle<rusb::GlobalContext>> {
+        std::sync::Arc::clone(&self.handle)
+    }
+
     /// Synchronous (blocking) read of IQ samples.
     ///
     /// Ports `rtlsdr_read_sync`. Returns the number of bytes read.
