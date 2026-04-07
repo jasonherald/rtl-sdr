@@ -97,9 +97,12 @@ impl SpectrumHandle {
             let mode = self.averaging_mode.get();
             let mut avg = self.avg_buffer.borrow_mut();
 
-            // Resize averaging buffer if FFT size changed.
+            // Seed the averaging buffer from the first frame, or re-seed if
+            // the FFT size changed. This avoids mode-specific init values
+            // (e.g., MinHold needs high init, PeakHold needs low init) and
+            // prevents one-frame artifacts after mode switches.
             if avg.len() != data.len() {
-                *avg = vec![DEFAULT_MIN_DB; data.len()];
+                *avg = data.to_vec();
             }
 
             match mode {
