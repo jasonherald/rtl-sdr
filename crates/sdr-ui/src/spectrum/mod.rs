@@ -13,6 +13,22 @@ pub mod vfo_overlay;
 pub mod waterfall;
 
 use std::cell::{Cell, RefCell};
+
+/// In-place FFT shift: swap the first and second halves of a buffer
+/// so that DC (bin 0) moves to the center position. Used on the display
+/// side rather than the DSP pipeline to correctly handle the R820T
+/// tuner's hardware spectrum inversion.
+fn fftshift_in_place(buf: &mut [f32]) {
+    let n = buf.len();
+    if n < 2 {
+        return;
+    }
+    let mid = n / 2;
+    // Swap first half with second half in-place.
+    for i in 0..mid {
+        buf.swap(i, i + mid);
+    }
+}
 use std::rc::Rc;
 
 use gtk4::glib;
@@ -35,7 +51,9 @@ const FFT_SIZE: usize = 1024;
 const FFT_PANE_FRACTION: f64 = 0.30;
 
 /// Default minimum display level in dB.
-const DEFAULT_MIN_DB: f32 = -120.0;
+/// Default minimum display level — matches SDR++ default of -70 dB.
+/// Hides the ADC noise floor so the waterfall background is black.
+const DEFAULT_MIN_DB: f32 = -70.0;
 /// Default maximum display level in dB.
 const DEFAULT_MAX_DB: f32 = 0.0;
 
@@ -85,6 +103,7 @@ pub struct SpectrumHandle {
     fft_state: Rc<RefCell<Option<FftPlotState>>>,
     waterfall_state: Rc<RefCell<Option<WaterfallState>>>,
     signal_history_state: Rc<RefCell<Option<SignalHistoryState>>>,
+    vfo_state: Rc<RefCell<VfoState>>,
     fft_area: gtk4::GLArea,
     waterfall_area: gtk4::GLArea,
     signal_history_area: gtk4::GLArea,
@@ -142,13 +161,22 @@ impl SpectrumHandle {
                     s.current_data.copy_from_slice(&avg);
                 }
             }
+
+            // Display-side fftshift: rotate bins so DC (bin 0) moves to center.
+            // Done here rather than in the DSP pipeline because the R820T's
+            // spectrum inversion makes pipeline-side fftshift show the signal
+            // on the wrong side. Rotating the display data is equivalent.
+            fftshift_in_place(&mut s.current_data);
         }
         self.fft_area.queue_render();
 
-        // Push a new line to the waterfall.
+        // Push a new line to the waterfall (also needs fftshift).
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
             self.waterfall_area.make_current();
-            s.renderer.push_line(&s.gl, data);
+            // Apply fftshift to waterfall data too.
+            let mut shifted = data.to_vec();
+            fftshift_in_place(&mut shifted);
+            s.renderer.push_line(&s.gl, &shifted);
         }
         self.waterfall_area.queue_render();
     }
@@ -190,6 +218,19 @@ impl SpectrumHandle {
         // Reset the averaging buffer so stale data doesn't persist.
         self.avg_buffer.borrow_mut().clear();
         tracing::debug!(?mode, "averaging mode changed");
+    }
+
+    /// Update the VFO display range to match the effective FFT bandwidth.
+    ///
+    /// Called when the sample rate changes (mode switch, decimation change,
+    /// source switch). Sets the display to show ±bandwidth/2 centered on DC.
+    pub fn set_display_bandwidth(&self, effective_sample_rate: f64) {
+        let half = effective_sample_rate / 2.0;
+        let mut vfo = self.vfo_state.borrow_mut();
+        vfo.display_start_hz = -half;
+        vfo.display_end_hz = half;
+        self.fft_area.queue_render();
+        self.waterfall_area.queue_render();
     }
 
     /// Push a signal level sample (in dB) into the history graph.
@@ -297,6 +338,7 @@ pub fn build_spectrum_view(
         fft_state,
         waterfall_state,
         signal_history_state,
+        vfo_state,
         fft_area: fft_area.clone(),
         waterfall_area: waterfall_area.clone(),
         signal_history_area: signal_history_area.clone(),

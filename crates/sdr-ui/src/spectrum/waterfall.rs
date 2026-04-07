@@ -12,7 +12,7 @@ use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 const HISTORY_LINES: usize = 1024;
 
 /// Default minimum display level in dB.
-const DEFAULT_MIN_DB: f32 = -120.0;
+const DEFAULT_MIN_DB: f32 = -70.0;
 /// Default maximum display level in dB.
 const DEFAULT_MAX_DB: f32 = 0.0;
 

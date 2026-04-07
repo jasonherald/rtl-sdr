@@ -20,6 +20,8 @@ pub enum DspToUi {
     DeviceInfo(String),
     /// Available tuner gain values in dB (queried from device on open).
     GainList(Vec<f64>),
+    /// Raw (pre-decimation) sample rate for spectrum display bandwidth.
+    DisplayBandwidth(f64),
 }
 
 /// Available source types for IQ input.
