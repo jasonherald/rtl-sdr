@@ -787,7 +787,7 @@ fn connect_navigation_panel(
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let freq_u64 = freq as u64;
         let name = sidebar::navigation_panel::format_frequency(freq_u64);
-        let bookmark = sidebar::navigation_panel::Bookmark::new_pub(&name, freq_u64, mode, bw);
+        let bookmark = sidebar::navigation_panel::Bookmark::new(&name, freq_u64, mode, bw);
         bm_rc.borrow_mut().push(bookmark);
         sidebar::navigation_panel::save_bookmarks(&bm_rc.borrow());
         sidebar::navigation_panel::rebuild_bookmark_list(&bm_list, &bm_scroll, &bm_rc, &on_nav);

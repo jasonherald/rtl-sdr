@@ -339,6 +339,14 @@ mod tests {
         assert!(DEFAULT_PORT <= MAX_PORT);
     };
 
+    /// Compile-time validation that PPM constants are consistent.
+    const _: () = {
+        assert!(MIN_PPM <= MAX_PPM);
+        assert!(DEFAULT_PPM >= MIN_PPM);
+        assert!(DEFAULT_PPM <= MAX_PPM);
+        assert!(PPM_STEP > 0.0);
+    };
+
     #[test]
     fn device_indices_are_distinct() {
         assert_ne!(DEVICE_RTLSDR, DEVICE_NETWORK);

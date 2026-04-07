@@ -96,19 +96,14 @@ pub struct Bookmark {
 }
 
 impl Bookmark {
-    /// Create a bookmark from the current tuning state (internal).
-    fn new(name: &str, frequency: u64, demod_mode: DemodMode, bandwidth: f64) -> Self {
+    /// Create a bookmark from the current tuning state.
+    pub fn new(name: &str, frequency: u64, demod_mode: DemodMode, bandwidth: f64) -> Self {
         Self {
             name: name.to_string(),
             frequency,
             demod_mode: demod_mode_to_string(demod_mode),
             bandwidth,
         }
-    }
-
-    /// Create a bookmark from UI state (public for window.rs wiring).
-    pub fn new_pub(name: &str, frequency: u64, demod_mode: DemodMode, bandwidth: f64) -> Self {
-        Self::new(name, frequency, demod_mode, bandwidth)
     }
 }
 
@@ -150,10 +145,16 @@ fn bookmarks_path() -> std::path::PathBuf {
 
 fn load_bookmarks() -> Vec<Bookmark> {
     let path = bookmarks_path();
-    let Ok(data) = std::fs::read_to_string(path) else {
+    let Ok(data) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    match serde_json::from_str(&data) {
+        Ok(bookmarks) => bookmarks,
+        Err(e) => {
+            tracing::warn!(?path, "failed to parse bookmarks, starting fresh: {e}");
+            Vec::new()
+        }
+    }
 }
 
 pub fn save_bookmarks(bookmarks: &[Bookmark]) {
@@ -316,7 +317,7 @@ pub fn rebuild_bookmark_list(
     }
 
     let bm_list = bookmarks.borrow();
-    for (i, bm) in bm_list.iter().enumerate() {
+    for bm in bm_list.iter() {
         let row = adw::ActionRow::builder()
             .title(&bm.name)
             .subtitle(format!(
@@ -327,7 +328,7 @@ pub fn rebuild_bookmark_list(
             .activatable(true)
             .build();
 
-        // Delete button
+        // Delete button — identify by name + frequency rather than index
         let delete_btn = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
             .valign(gtk4::Align::Center)
@@ -338,8 +339,12 @@ pub fn rebuild_bookmark_list(
         let nav_rc = std::rc::Rc::clone(on_navigate);
         let list_ref = list_box.downgrade();
         let scroll_ref = scroll.downgrade();
+        let del_name = bm.name.clone();
+        let del_freq = bm.frequency;
         delete_btn.connect_clicked(move |_| {
-            bm_rc.borrow_mut().remove(i);
+            bm_rc
+                .borrow_mut()
+                .retain(|b| !(b.name == del_name && b.frequency == del_freq));
             save_bookmarks(&bm_rc.borrow());
             if let Some(lb) = list_ref.upgrade()
                 && let Some(sc) = scroll_ref.upgrade()
