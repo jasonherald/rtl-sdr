@@ -73,7 +73,6 @@ pub struct PolyphaseResampler {
     delay_line: Vec<Complex>,
     phase: usize,
     offset: usize,
-    work_buf: Vec<Complex>,
 }
 
 impl PolyphaseResampler {
@@ -109,7 +108,6 @@ impl PolyphaseResampler {
             delay_line,
             phase: 0,
             offset: 0,
-            work_buf: Vec::new(),
         })
     }
 
@@ -154,31 +152,28 @@ impl PolyphaseResampler {
         let tpp = self.bank.taps_per_phase;
         let delay_len = tpp - 1;
 
-        // Reuse pre-allocated work buffer: delay_line + input
-        self.work_buf.clear();
-        self.work_buf.reserve(delay_len + input.len());
-        self.work_buf
-            .extend_from_slice(&self.delay_line[..delay_len]);
-        self.work_buf.extend_from_slice(input);
-        let work = &self.work_buf;
-
+        // Convolve directly from delay_line + input without building a
+        // concatenated work buffer. Avoids per-call copy of the delay line.
         let mut out_count = 0;
 
         while self.offset < input.len() {
-            // Convolve with current phase
             let phase_taps = &self.bank.phases[self.phase];
             let buf_start = self.offset;
             let mut acc_re = 0.0_f32;
             let mut acc_im = 0.0_f32;
             for (j, &tap) in phase_taps.iter().enumerate() {
-                let s = work[buf_start + j];
+                let idx = buf_start + j;
+                let s = if idx < delay_len {
+                    self.delay_line[idx]
+                } else {
+                    input[idx - delay_len]
+                };
                 acc_re += s.re * tap;
                 acc_im += s.im * tap;
             }
             output[out_count] = Complex::new(acc_re, acc_im);
             out_count += 1;
 
-            // Advance phase and offset
             self.phase += self.decim;
             self.offset += self.phase / self.interp;
             self.phase %= self.interp;
@@ -186,10 +181,13 @@ impl PolyphaseResampler {
 
         self.offset -= input.len();
 
-        // Update delay line: keep last (tpp - 1) samples from work buffer
-        let work_len = work.len();
-        if work_len >= delay_len {
-            self.delay_line[..delay_len].copy_from_slice(&work[work_len - delay_len..]);
+        // Update delay line: keep last (tpp - 1) input samples
+        if input.len() >= delay_len {
+            self.delay_line[..delay_len].copy_from_slice(&input[input.len() - delay_len..]);
+        } else if delay_len > 0 {
+            let shift = delay_len - input.len();
+            self.delay_line.copy_within(input.len().., 0);
+            self.delay_line[shift..].copy_from_slice(input);
         }
 
         Ok(out_count)
