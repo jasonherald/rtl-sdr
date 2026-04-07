@@ -195,6 +195,7 @@ fn handle_dsp_message(
         }
         DspToUi::SignalLevel(level) => {
             status_bar.update_signal_level(level);
+            spectrum_handle.push_signal_level(level);
         }
         DspToUi::Error(err_msg) => {
             tracing::warn!(error = %err_msg, "DSP error");
