@@ -108,14 +108,17 @@ impl NetworkSink {
 
         if self.stereo {
             for (i, s) in samples.iter().enumerate() {
-                let l = (s.l.clamp(-1.0, 1.0) * 32767.0) as i16;
-                let r = (s.r.clamp(-1.0, 1.0) * 32767.0) as i16;
+                let l = (s.l.clamp(-1.0, 1.0) * 32768.0) as i32;
+                let l = l.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+                let r = (s.r.clamp(-1.0, 1.0) * 32768.0) as i32;
+                let r = r.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
                 self.send_buf[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
                 self.send_buf[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
             }
         } else {
             for (i, s) in samples.iter().enumerate() {
-                let mono = (((s.l + s.r) / 2.0).clamp(-1.0, 1.0) * 32767.0) as i16;
+                let mono_f = ((s.l + s.r) / 2.0).clamp(-1.0, 1.0) * 32768.0;
+                let mono = (mono_f as i32).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
                 self.send_buf[i * 2..i * 2 + 2].copy_from_slice(&mono.to_le_bytes());
             }
         }
