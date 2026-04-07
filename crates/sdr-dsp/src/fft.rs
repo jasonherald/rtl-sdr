@@ -85,14 +85,19 @@ impl FftEngine for RustFftEngine {
 
 /// Compute power spectrum in dB from complex FFT output.
 ///
-/// Converts each complex bin to `10 * log10(re^2 + im^2)` and writes to `output`.
-/// This matches the SDR++ `volk_32fc_s32f_power_spectrum_32f` usage.
+/// Converts each complex bin to `10 * log10(|X[k]|² / (N * cg)²)` where `cg` is
+/// the window's coherent gain. This corrects for the energy loss from windowing
+/// so that signal amplitudes display at their true level.
 ///
 /// # Errors
 ///
 /// Returns `DspError::BufferTooSmall` if `output.len() < fft_output.len()`.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-pub fn power_spectrum_db(fft_output: &[Complex], output: &mut [f32]) -> Result<(), DspError> {
+pub fn power_spectrum_db(
+    fft_output: &[Complex],
+    output: &mut [f32],
+    window_coherent_gain: f32,
+) -> Result<(), DspError> {
     if output.len() < fft_output.len() {
         return Err(DspError::BufferTooSmall {
             need: fft_output.len(),
@@ -100,8 +105,12 @@ pub fn power_spectrum_db(fft_output: &[Complex], output: &mut [f32]) -> Result<(
         });
     }
     let size = fft_output.len() as f32;
+    // Normalization: divide by (N * coherent_gain)² to correct for both
+    // FFT scaling and window energy loss.
+    let norm = size * window_coherent_gain;
+    let norm_sq = norm * norm;
     for (i, bin) in fft_output.iter().enumerate() {
-        let power = (bin.re * bin.re + bin.im * bin.im) / (size * size);
+        let power = (bin.re * bin.re + bin.im * bin.im) / norm_sq;
         output[i] = 10.0 * power.max(f32::MIN_POSITIVE).log10();
     }
     Ok(())
@@ -194,7 +203,8 @@ mod tests {
         engine.forward(&mut buf).unwrap();
 
         let mut output = vec![0.0_f32; FFT_SIZE];
-        power_spectrum_db(&buf, &mut output).unwrap();
+        // coherent_gain = 1.0 for rectangular window (no correction)
+        power_spectrum_db(&buf, &mut output, 1.0).unwrap();
 
         // DC bin should be 0 dB (power = 1.0 after normalization by N^2)
         assert!(
@@ -213,7 +223,7 @@ mod tests {
     fn test_power_spectrum_db_buffer_too_small() {
         let buf = vec![Complex::default(); 64];
         let mut output = vec![0.0_f32; 32];
-        assert!(power_spectrum_db(&buf, &mut output).is_err());
+        assert!(power_spectrum_db(&buf, &mut output, 1.0).is_err());
     }
 
     #[test]

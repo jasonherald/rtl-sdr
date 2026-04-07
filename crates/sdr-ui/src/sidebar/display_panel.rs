@@ -1,4 +1,5 @@
-//! Display settings panel — FFT size, window function, frame rate, color map.
+//! Display settings panel — FFT size, window function, frame rate, color map,
+//! dB range, fill mode, and averaging mode.
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -16,6 +17,11 @@ const DEFAULT_FFT_SIZE_INDEX: u32 = 2;
 /// Default window function selector index (Blackman = index 1).
 const DEFAULT_WINDOW_FN_INDEX: u32 = 1;
 
+/// Default minimum dB level for the display range.
+const DEFAULT_MIN_DB: f64 = -120.0;
+/// Default maximum dB level for the display range.
+const DEFAULT_MAX_DB: f64 = 0.0;
+
 /// Display settings panel with references to interactive rows.
 pub struct DisplayPanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
@@ -28,6 +34,14 @@ pub struct DisplayPanel {
     pub frame_rate_row: adw::SpinRow,
     /// Color map selector.
     pub color_map_row: adw::ComboRow,
+    /// Minimum dB level for the display range.
+    pub min_db_row: adw::SpinRow,
+    /// Maximum dB level for the display range.
+    pub max_db_row: adw::SpinRow,
+    /// Toggle for spectrum fill area under the trace.
+    pub fill_mode_row: adw::SwitchRow,
+    /// Spectrum averaging mode selector.
+    pub averaging_row: adw::ComboRow,
 }
 
 /// Build the display settings panel.
@@ -69,10 +83,45 @@ pub fn build_display_panel() -> DisplayPanel {
         .model(&colormap_model)
         .build();
 
+    // --- Min dB ---
+    let min_db_adj = gtk4::Adjustment::new(DEFAULT_MIN_DB, -200.0, 0.0, 1.0, 10.0, 0.0);
+    let min_db_row = adw::SpinRow::builder()
+        .title("Min Level")
+        .subtitle("dB")
+        .adjustment(&min_db_adj)
+        .digits(0)
+        .build();
+
+    // --- Max dB ---
+    let max_db_adj = gtk4::Adjustment::new(DEFAULT_MAX_DB, -120.0, 20.0, 1.0, 10.0, 0.0);
+    let max_db_row = adw::SpinRow::builder()
+        .title("Max Level")
+        .subtitle("dB")
+        .adjustment(&max_db_adj)
+        .digits(0)
+        .build();
+
+    // --- Fill Mode ---
+    let fill_mode_row = adw::SwitchRow::builder()
+        .title("Spectrum Fill")
+        .active(true)
+        .build();
+
+    // --- Averaging Mode ---
+    let averaging_model = gtk4::StringList::new(&["None", "Peak Hold", "Average", "Min Hold"]);
+    let averaging_row = adw::ComboRow::builder()
+        .title("Averaging")
+        .model(&averaging_model)
+        .build();
+
     group.add(&fft_size_row);
     group.add(&window_fn_row);
     group.add(&frame_rate_row);
     group.add(&color_map_row);
+    group.add(&min_db_row);
+    group.add(&max_db_row);
+    group.add(&fill_mode_row);
+    group.add(&averaging_row);
 
     // FFT size and window function connected via window.rs
 
@@ -82,6 +131,10 @@ pub fn build_display_panel() -> DisplayPanel {
         window_fn_row,
         frame_rate_row,
         color_map_row,
+        min_db_row,
+        max_db_row,
+        fill_mode_row,
+        averaging_row,
     }
 }
 

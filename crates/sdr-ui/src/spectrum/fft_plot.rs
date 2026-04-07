@@ -133,7 +133,7 @@ impl FftPlotRenderer {
     /// * `height` — Viewport height in pixels.
     /// * `min_db` — Bottom of the display range in dB.
     /// * `max_db` — Top of the display range in dB.
-    #[allow(unsafe_code)]
+    #[allow(unsafe_code, clippy::too_many_arguments)]
     pub fn render(
         &self,
         gl: &glow::Context,
@@ -142,6 +142,7 @@ impl FftPlotRenderer {
         height: i32,
         min_db: f32,
         max_db: f32,
+        fill_enabled: bool,
     ) {
         if fft_data.is_empty() || width <= 0 || height <= 0 {
             return;
@@ -173,8 +174,10 @@ impl FftPlotRenderer {
         // Draw grid lines.
         self.draw_grid(gl);
 
-        // Draw filled area under the spectrum curve.
-        self.draw_fill(gl, fft_data, db_range, min_db);
+        // Draw filled area under the spectrum curve (when enabled).
+        if fill_enabled {
+            self.draw_fill(gl, fft_data, db_range, min_db);
+        }
 
         // Draw the spectrum line trace on top.
         self.draw_trace(gl, fft_data, db_range, min_db);

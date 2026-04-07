@@ -24,6 +24,21 @@ pub enum FftWindow {
     Nuttall,
 }
 
+impl FftWindow {
+    /// Coherent gain (DC gain) of the window — first cosine coefficient.
+    ///
+    /// Used to correct power spectrum magnitudes so windowed signals
+    /// display at their true amplitude rather than appearing lower.
+    #[must_use]
+    pub fn coherent_gain(self) -> f32 {
+        match self {
+            Self::Rectangular => 1.0,
+            Self::Blackman => 0.42,
+            Self::Nuttall => 0.355_768,
+        }
+    }
+}
+
 /// DC blocker rate factor: `50.0 / sample_rate`.
 /// Matches C++ `genDCBlockRate`.
 const DC_BLOCK_RATE_FACTOR: f64 = 50.0;
@@ -60,6 +75,8 @@ pub struct IqFrontend {
     fft_size: usize,
     fft_engine: RustFftEngine,
     fft_window_buf: Vec<f32>,
+    /// Window coherent gain for energy correction in power spectrum.
+    window_coherent_gain: f32,
     fft_accum: Vec<Complex>,
     fft_accum_count: usize,
     fft_output: Vec<f32>,
@@ -148,6 +165,7 @@ impl IqFrontend {
             fft_size,
             fft_engine,
             fft_window_buf,
+            window_coherent_gain: fft_window.coherent_gain(),
             fft_accum: vec![Complex::default(); fft_size],
             fft_accum_count: 0,
             fft_output: vec![0.0; fft_size],
@@ -390,8 +408,12 @@ impl IqFrontend {
         // Execute FFT
         self.fft_engine.forward(&mut self.fft_work)?;
 
-        // Convert to power spectrum dB
-        fft::power_spectrum_db(&self.fft_work, &mut self.fft_output)?;
+        // Convert to power spectrum dB (with window energy correction)
+        fft::power_spectrum_db(
+            &self.fft_work,
+            &mut self.fft_output,
+            self.window_coherent_gain,
+        )?;
         fft_out[..self.fft_size].copy_from_slice(&self.fft_output);
 
         Ok(())

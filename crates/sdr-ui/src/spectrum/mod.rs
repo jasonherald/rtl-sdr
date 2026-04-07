@@ -11,7 +11,7 @@ pub mod gl_renderer;
 pub mod vfo_overlay;
 pub mod waterfall;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::glib;
@@ -23,16 +23,36 @@ use waterfall::WaterfallRenderer;
 
 use crate::messages::UiToDsp;
 
+/// Shared cursor callback type — invoked with `(frequency_hz, power_db)`.
+type CursorCallback = Rc<RefCell<Option<Box<dyn Fn(f64, f32)>>>>;
+
 /// Number of FFT bins for the display (used for initial buffer sizing).
 const FFT_SIZE: usize = 1024;
 
 /// Default FFT plot pane height fraction (30% of total).
 const FFT_PANE_FRACTION: f64 = 0.30;
 
-/// Minimum display level in dB.
-const MIN_DB: f32 = -120.0;
-/// Maximum display level in dB.
-const MAX_DB: f32 = 0.0;
+/// Default minimum display level in dB.
+const DEFAULT_MIN_DB: f32 = -120.0;
+/// Default maximum display level in dB.
+const DEFAULT_MAX_DB: f32 = 0.0;
+
+/// Exponential moving average smoothing factor for `RunningAvg` mode.
+const AVERAGING_ALPHA: f32 = 0.3;
+
+/// Spectrum averaging mode for the FFT display.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AveragingMode {
+    /// No averaging — display raw FFT data.
+    #[default]
+    None,
+    /// Hold peak values across frames.
+    PeakHold,
+    /// Exponential moving average (smoothed).
+    RunningAvg,
+    /// Hold minimum values across frames.
+    MinHold,
+}
 
 /// Shared state for the FFT plot `GtkGLArea`.
 struct FftPlotState {
@@ -58,17 +78,57 @@ pub struct SpectrumHandle {
     waterfall_state: Rc<RefCell<Option<WaterfallState>>>,
     fft_area: gtk4::GLArea,
     waterfall_area: gtk4::GLArea,
+    min_db: Rc<Cell<f32>>,
+    max_db: Rc<Cell<f32>>,
+    fill_enabled: Rc<Cell<bool>>,
+    averaging_mode: Rc<Cell<AveragingMode>>,
+    avg_buffer: Rc<RefCell<Vec<f32>>>,
+    cursor_callback: CursorCallback,
 }
 
 impl SpectrumHandle {
     /// Push a new FFT frame into both the FFT plot and waterfall display.
     ///
+    /// Applies the current averaging mode before storing into the display buffer.
     /// Call this from the GTK main loop when `DspToUi::FftData` arrives.
     pub fn push_fft_data(&self, data: &[f32]) {
-        // Update FFT plot data.
+        // Apply averaging, then update FFT plot data.
         if let Some(s) = self.fft_state.borrow_mut().as_mut() {
-            s.current_data.clear();
-            s.current_data.extend_from_slice(data);
+            let mode = self.averaging_mode.get();
+            let mut avg = self.avg_buffer.borrow_mut();
+
+            // Resize averaging buffer if FFT size changed.
+            if avg.len() != data.len() {
+                *avg = vec![DEFAULT_MIN_DB; data.len()];
+            }
+
+            match mode {
+                AveragingMode::None => {
+                    s.current_data.clear();
+                    s.current_data.extend_from_slice(data);
+                }
+                AveragingMode::PeakHold => {
+                    for (i, &d) in data.iter().enumerate() {
+                        avg[i] = avg[i].max(d);
+                    }
+                    s.current_data.clear();
+                    s.current_data.extend_from_slice(&avg);
+                }
+                AveragingMode::RunningAvg => {
+                    for (i, &d) in data.iter().enumerate() {
+                        avg[i] = AVERAGING_ALPHA.mul_add(d, (1.0 - AVERAGING_ALPHA) * avg[i]);
+                    }
+                    s.current_data.clear();
+                    s.current_data.extend_from_slice(&avg);
+                }
+                AveragingMode::MinHold => {
+                    for (i, &d) in data.iter().enumerate() {
+                        avg[i] = avg[i].min(d);
+                    }
+                    s.current_data.clear();
+                    s.current_data.extend_from_slice(&avg);
+                }
+            }
         }
         self.fft_area.queue_render();
 
@@ -88,6 +148,39 @@ impl SpectrumHandle {
         }
         self.waterfall_area.queue_render();
     }
+
+    /// Update the display dB range for both the FFT plot and waterfall.
+    pub fn set_db_range(&self, min_db: f32, max_db: f32) {
+        self.min_db.set(min_db);
+        self.max_db.set(max_db);
+        if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
+            s.renderer.set_db_range(min_db, max_db);
+        }
+        self.fft_area.queue_render();
+        self.waterfall_area.queue_render();
+    }
+
+    /// Enable or disable the spectrum fill area under the trace.
+    pub fn set_fill_enabled(&self, enabled: bool) {
+        self.fill_enabled.set(enabled);
+        self.fft_area.queue_render();
+    }
+
+    /// Set the spectrum averaging mode, resetting the averaging buffer.
+    pub fn set_averaging_mode(&self, mode: AveragingMode) {
+        self.averaging_mode.set(mode);
+        // Reset the averaging buffer so stale data doesn't persist.
+        self.avg_buffer.borrow_mut().clear();
+        tracing::debug!(?mode, "averaging mode changed");
+    }
+
+    /// Register a callback invoked when the cursor moves over the FFT area.
+    ///
+    /// The callback receives `(frequency_hz, power_db)`. When the cursor
+    /// leaves the area, `power_db` is `f32::NEG_INFINITY`.
+    pub fn connect_cursor_moved<F: Fn(f64, f32) + 'static>(&self, f: F) {
+        *self.cursor_callback.borrow_mut() = Some(Box::new(f));
+    }
 }
 
 /// Build the spectrum view containing the FFT plot and waterfall display.
@@ -101,7 +194,19 @@ pub fn build_spectrum_view(
     let fft_state: Rc<RefCell<Option<FftPlotState>>> = Rc::new(RefCell::new(None));
     let waterfall_state: Rc<RefCell<Option<WaterfallState>>> = Rc::new(RefCell::new(None));
 
-    let fft_area = build_fft_area(Rc::clone(&fft_state), Rc::clone(&vfo_state));
+    let min_db: Rc<Cell<f32>> = Rc::new(Cell::new(DEFAULT_MIN_DB));
+    let max_db: Rc<Cell<f32>> = Rc::new(Cell::new(DEFAULT_MAX_DB));
+    let fill_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(true));
+    let cursor_callback: CursorCallback = Rc::new(RefCell::new(None));
+
+    let fft_area = build_fft_area(
+        Rc::clone(&fft_state),
+        &vfo_state,
+        &min_db,
+        &max_db,
+        &fill_enabled,
+        &cursor_callback,
+    );
     let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state));
 
     // Attach interaction gestures to both the waterfall and FFT areas.
@@ -136,6 +241,12 @@ pub fn build_spectrum_view(
         waterfall_state,
         fft_area: fft_area.clone(),
         waterfall_area: waterfall_area.clone(),
+        min_db,
+        max_db,
+        fill_enabled,
+        averaging_mode: Rc::new(Cell::new(AveragingMode::default())),
+        avg_buffer: Rc::new(RefCell::new(Vec::new())),
+        cursor_callback,
     };
 
     (paned, handle)
@@ -144,7 +255,11 @@ pub fn build_spectrum_view(
 /// Build the `GtkGLArea` for the FFT power spectrum plot.
 fn build_fft_area(
     state: Rc<RefCell<Option<FftPlotState>>>,
-    vfo_state: Rc<RefCell<VfoState>>,
+    vfo_state: &Rc<RefCell<VfoState>>,
+    min_db: &Rc<Cell<f32>>,
+    max_db: &Rc<Cell<f32>>,
+    fill_enabled: &Rc<Cell<bool>>,
+    cursor_callback: &CursorCallback,
 ) -> gtk4::GLArea {
     let area = gtk4::GLArea::builder()
         .hexpand(true)
@@ -168,7 +283,7 @@ fn build_fft_area(
                     gl,
                     renderer,
                     vfo_renderer,
-                    current_data: vec![MIN_DB; FFT_SIZE],
+                    current_data: vec![DEFAULT_MIN_DB; FFT_SIZE],
                 });
                 tracing::info!("FFT plot GL renderer initialized");
             }
@@ -193,6 +308,10 @@ fn build_fft_area(
     });
 
     // On render: draw the FFT plot, then the VFO overlay on top.
+    let min_db_render = Rc::clone(min_db);
+    let max_db_render = Rc::clone(max_db);
+    let fill_render = Rc::clone(fill_enabled);
+    let vfo_render = Rc::clone(vfo_state);
     area.connect_render(move |area, _ctx| {
         if let Some(s) = state.borrow().as_ref() {
             let width = area.width();
@@ -201,14 +320,63 @@ fn build_fft_area(
             let phys_w = width * scale;
             let phys_h = height * scale;
 
-            s.renderer
-                .render(&s.gl, &s.current_data, phys_w, phys_h, MIN_DB, MAX_DB);
+            s.renderer.render(
+                &s.gl,
+                &s.current_data,
+                phys_w,
+                phys_h,
+                min_db_render.get(),
+                max_db_render.get(),
+                fill_render.get(),
+            );
 
-            let vfo = vfo_state.borrow();
+            let vfo = vfo_render.borrow();
             s.vfo_renderer.render(&s.gl, &vfo, phys_w, phys_h);
         }
         glib::Propagation::Stop
     });
+
+    // Cursor readout: track mouse motion to compute frequency and power.
+    let motion = gtk4::EventControllerMotion::new();
+    let cursor_vfo = Rc::clone(vfo_state);
+    let cursor_min = Rc::clone(min_db);
+    let cursor_max = Rc::clone(max_db);
+    let cursor_cb = Rc::clone(cursor_callback);
+    let area_weak_motion = area.downgrade();
+    motion.connect_motion(move |_ctrl, x, y| {
+        let Some(area) = area_weak_motion.upgrade() else {
+            return;
+        };
+        let width = f64::from(area.width());
+        let height = f64::from(area.height());
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+
+        let vfo = cursor_vfo.borrow();
+        let freq_hz = vfo.pixel_to_hz(x, width);
+        drop(vfo);
+
+        let lo = cursor_min.get();
+        let hi = cursor_max.get();
+        let db_range = hi - lo;
+        // y=0 is top (max_db), y=height is bottom (min_db).
+        #[allow(clippy::cast_possible_truncation)]
+        let power_db = hi - (y as f32 / height as f32) * db_range;
+
+        if let Some(cb) = cursor_cb.borrow().as_ref() {
+            cb(freq_hz, power_db);
+        }
+    });
+
+    let cursor_cb_leave = Rc::clone(cursor_callback);
+    motion.connect_leave(move |_ctrl| {
+        if let Some(cb) = cursor_cb_leave.borrow().as_ref() {
+            cb(0.0, f32::NEG_INFINITY);
+        }
+    });
+
+    area.add_controller(motion);
 
     area
 }
@@ -546,6 +714,8 @@ mod tests {
         assert!(super::FFT_SIZE > 0);
         assert!(super::FFT_PANE_FRACTION > 0.0);
         assert!(super::FFT_PANE_FRACTION < 1.0);
-        assert!(super::MIN_DB < super::MAX_DB);
+        assert!(super::DEFAULT_MIN_DB < super::DEFAULT_MAX_DB);
+        assert!(super::AVERAGING_ALPHA > 0.0);
+        assert!(super::AVERAGING_ALPHA < 1.0);
     };
 }
