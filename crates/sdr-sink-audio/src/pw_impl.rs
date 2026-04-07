@@ -157,15 +157,19 @@ impl AudioSink {
     /// already running, it will be restarted with the new target.
     ///
     /// Pass an empty string for the system default sink.
-    pub fn set_target(&mut self, node_name: &str) {
-        let was_running = self.running.load(Ordering::Relaxed);
-        if was_running {
-            let _ = self.stop();
+    pub fn set_target(&mut self, node_name: &str) -> Result<(), SinkError> {
+        // Check owned state (tx/thread) rather than the atomic flag, which
+        // the worker thread may clear before cleanup finishes.
+        let had_state = self.tx.is_some() || self.pw_thread.is_some();
+        if had_state {
+            self.stop()?;
         }
-        self.target_node = node_name.to_string();
-        if was_running {
-            let _ = self.start();
+        self.target_node.clear();
+        self.target_node.push_str(node_name);
+        if had_state {
+            self.start()?;
         }
+        Ok(())
     }
 
     /// Send stereo audio samples to PipeWire for playback.

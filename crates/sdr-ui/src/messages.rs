@@ -188,5 +188,8 @@ mod tests {
 
         let hp = UiToDsp::SetHighPass(true);
         assert!(matches!(hp, UiToDsp::SetHighPass(true)));
+
+        let device = UiToDsp::SetAudioDevice("default".to_string());
+        assert!(matches!(device, UiToDsp::SetAudioDevice(ref s) if s == "default"));
     }
 }

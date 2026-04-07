@@ -24,6 +24,11 @@ impl AudioSink {
         }
     }
 
+    /// Stub — no-op for non-PipeWire builds.
+    pub fn set_target(&mut self, _node_name: &str) -> Result<(), SinkError> {
+        Ok(())
+    }
+
     /// Stub — drops samples with periodic debug logging.
     ///
     /// Logs once every 1000 calls so operators can confirm audio data

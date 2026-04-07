@@ -675,7 +675,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetAudioDevice(node_name) => {
             tracing::info!(target_node = %node_name, "set audio device");
-            state.audio_sink.set_target(&node_name);
+            if let Err(e) = state.audio_sink.set_target(&node_name) {
+                tracing::warn!("audio device switch failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Audio device switch failed: {e}")));
+            }
         }
     }
 }
