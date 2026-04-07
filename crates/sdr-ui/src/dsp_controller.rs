@@ -806,11 +806,12 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     ) {
         Ok((processed_count, fft_ready)) => {
             // Send FFT data to UI if a new frame is ready.
-            // Replace fft_buf with a fresh zeroed buffer and send the filled one.
+            // Clone the buffer and zero in-place to avoid per-frame Vec
+            // allocation (the clone reuses allocator memory; zeroing is
+            // a memset with no allocation).
             if fft_ready {
-                let fft_len = state.fft_buf.len();
-                let send = std::mem::replace(&mut state.fft_buf, vec![0.0; fft_len]);
-                let _ = dsp_tx.send(DspToUi::FftData(send));
+                let _ = dsp_tx.send(DspToUi::FftData(state.fft_buf.clone()));
+                state.fft_buf.fill(0.0);
             }
 
             if processed_count > 0 {
