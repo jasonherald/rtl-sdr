@@ -739,19 +739,20 @@ fn connect_navigation_panel(
     let sb = Rc::clone(status_bar);
 
     panels.navigation.connect_navigate(move |freq, mode, bw| {
-        // Update DSP state
         #[allow(clippy::cast_precision_loss)]
         let freq_f64 = freq as f64;
         state_nav.center_frequency.set(freq_f64);
         state_nav.demod_mode.set(mode);
+
+        // Send Tune and Bandwidth directly. SetDemodMode is sent by the
+        // demod dropdown callback when we update its selection below.
         state_nav.send_dsp(UiToDsp::Tune(freq_f64));
-        state_nav.send_dsp(UiToDsp::SetDemodMode(mode));
         state_nav.send_dsp(UiToDsp::SetBandwidth(bw));
 
-        // Update frequency selector display (no callback — we handle DSP above).
+        // Update frequency selector display (does NOT fire callback — no duplicate Tune).
         fs.set_frequency(freq);
 
-        // Update demod dropdown
+        // Update demod dropdown — its callback sends SetDemodMode to DSP.
         if let Some(dd) = dd_weak.upgrade()
             && let Some(idx) = demod_selector::demod_mode_to_index(mode)
         {

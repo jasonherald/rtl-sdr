@@ -234,6 +234,7 @@ pub fn build_navigation_panel() -> NavigationPanel {
     let preset_row = adw::ComboRow::builder()
         .title("Band")
         .model(&preset_model)
+        .selected(gtk4::INVALID_LIST_POSITION)
         .build();
     presets_group.add(&preset_row);
 
