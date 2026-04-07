@@ -1068,6 +1068,7 @@ dependencies = [
 name = "sdr-source-rtlsdr"
 version = "0.1.0"
 dependencies = [
+ "rusb",
  "sdr-config",
  "sdr-pipeline",
  "sdr-rtlsdr",
@@ -1090,7 +1091,6 @@ dependencies = [
  "glow",
  "gtk4",
  "libadwaita",
- "rusb",
  "sdr-config",
  "sdr-dsp",
  "sdr-pipeline",

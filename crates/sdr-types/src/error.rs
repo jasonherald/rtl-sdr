@@ -35,6 +35,8 @@ pub enum SourceError {
     NotRunning,
     #[error("already running")]
     AlreadyRunning,
+    #[error("read failed: {0}")]
+    ReadFailed(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

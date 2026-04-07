@@ -76,7 +76,7 @@ impl FileSource {
     ///
     /// Returns the number of Complex samples written.
     /// Each complex sample uses 2 WAV channels (I = ch0, Q = ch1).
-    pub fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+    pub fn read_samples_impl(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
         let state = self.reader.as_mut().ok_or(SourceError::NotRunning)?;
         let mut count = 0;
 
@@ -220,6 +220,10 @@ impl Source for FileSource {
             )));
         }
         Ok(())
+    }
+
+    fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+        self.read_samples_impl(output)
     }
 }
 

@@ -16,7 +16,7 @@ use sdr_source_rtlsdr::SAMPLE_RATES;
 use crate::dsp_controller;
 use crate::header;
 use crate::header::demod_selector;
-use crate::messages::{DspToUi, UiToDsp};
+use crate::messages::{DspToUi, SourceType, UiToDsp};
 use crate::shortcuts;
 use crate::sidebar;
 use crate::sidebar::SidebarPanels;
@@ -417,6 +417,7 @@ fn connect_sidebar_panels(
 }
 
 /// Connect source panel controls to DSP commands.
+#[allow(clippy::too_many_lines)]
 fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Sample rate selector
     let state_sr = Rc::clone(state);
@@ -480,6 +481,91 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .connect_active_notify(move |row| {
             state_iq_corr.send_dsp(UiToDsp::SetIqCorrection(row.is_active()));
         });
+
+    // Source type selector — guard against transient out-of-range indices
+    let state_source = Rc::clone(state);
+    panels
+        .source
+        .device_row
+        .connect_selected_notify(move |row| {
+            let source_type = match row.selected() {
+                0 => SourceType::RtlSdr,
+                1 => SourceType::Network,
+                2 => SourceType::File,
+                _ => return, // ignore transient indices
+            };
+            state_source.send_dsp(UiToDsp::SetSourceType(source_type));
+        });
+
+    // Network hostname — send on every edit so Play always has current value
+    let state_host = Rc::clone(state);
+    let port_for_host = panels.source.port_row.clone();
+    let proto_for_host = panels.source.protocol_row.clone();
+    panels.source.hostname_row.connect_changed(move |row| {
+        let hostname = row.text().to_string();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let port = port_for_host.value() as u16;
+        let protocol = if proto_for_host.selected() == 1 {
+            sdr_types::Protocol::Udp
+        } else {
+            sdr_types::Protocol::TcpClient
+        };
+        state_host.send_dsp(UiToDsp::SetNetworkConfig {
+            hostname,
+            port,
+            protocol,
+        });
+    });
+
+    // Network port
+    let state_port = Rc::clone(state);
+    let host_for_port = panels.source.hostname_row.clone();
+    let proto_for_port = panels.source.protocol_row.clone();
+    panels.source.port_row.connect_value_notify(move |row| {
+        let hostname = host_for_port.text().to_string();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let port = row.value() as u16;
+        let protocol = if proto_for_port.selected() == 1 {
+            sdr_types::Protocol::Udp
+        } else {
+            sdr_types::Protocol::TcpClient
+        };
+        state_port.send_dsp(UiToDsp::SetNetworkConfig {
+            hostname,
+            port,
+            protocol,
+        });
+    });
+
+    // Network protocol
+    let state_proto = Rc::clone(state);
+    let host_for_proto = panels.source.hostname_row.clone();
+    let port_for_proto = panels.source.port_row.clone();
+    panels
+        .source
+        .protocol_row
+        .connect_selected_notify(move |row| {
+            let hostname = host_for_proto.text().to_string();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let port = port_for_proto.value() as u16;
+            let protocol = match row.selected() {
+                0 => sdr_types::Protocol::TcpClient,
+                1 => sdr_types::Protocol::Udp,
+                _ => return, // ignore transient indices
+            };
+            state_proto.send_dsp(UiToDsp::SetNetworkConfig {
+                hostname,
+                port,
+                protocol,
+            });
+        });
+
+    // File path — send on every edit so Play always has current value
+    let state_file = Rc::clone(state);
+    panels.source.file_path_row.connect_changed(move |row| {
+        let path = std::path::PathBuf::from(row.text().to_string());
+        state_file.send_dsp(UiToDsp::SetFilePath(path));
+    });
 }
 
 /// Connect radio panel controls to DSP commands.

@@ -9,6 +9,8 @@ use libadwaita::prelude::*;
 const DEVICE_RTLSDR: u32 = 0;
 /// Device selector index for Network.
 const DEVICE_NETWORK: u32 = 1;
+/// Device selector index for File.
+const DEVICE_FILE: u32 = 2;
 
 /// Default gain in dB.
 const DEFAULT_GAIN_DB: f64 = 0.0;
@@ -50,6 +52,8 @@ pub struct SourcePanel {
     pub port_row: adw::SpinRow,
     /// Network protocol selector (TCP, UDP).
     pub protocol_row: adw::ComboRow,
+    /// File path entry (File source).
+    pub file_path_row: adw::EntryRow,
     /// DC blocking filter toggle (always visible).
     pub dc_blocking_row: adw::SwitchRow,
     /// IQ correction toggle (always visible).
@@ -162,6 +166,7 @@ fn build_common_rows() -> (
 }
 
 /// Wire the device selector to show/hide source-specific rows.
+#[allow(clippy::too_many_arguments)]
 fn connect_device_visibility(
     device_row: &adw::ComboRow,
     sample_rate_row: &adw::ComboRow,
@@ -170,6 +175,7 @@ fn connect_device_visibility(
     hostname_row: &adw::EntryRow,
     port_row: &adw::SpinRow,
     protocol_row: &adw::ComboRow,
+    file_path_row: &adw::EntryRow,
 ) {
     device_row.connect_selected_notify(glib::clone!(
         #[weak]
@@ -184,10 +190,13 @@ fn connect_device_visibility(
         port_row,
         #[weak]
         protocol_row,
+        #[weak]
+        file_path_row,
         move |row| {
             let selected = row.selected();
             let is_rtlsdr = selected == DEVICE_RTLSDR;
             let is_network = selected == DEVICE_NETWORK;
+            let is_file = selected == DEVICE_FILE;
 
             sample_rate_row.set_visible(is_rtlsdr);
             gain_row.set_visible(is_rtlsdr);
@@ -197,7 +206,8 @@ fn connect_device_visibility(
             port_row.set_visible(is_network);
             protocol_row.set_visible(is_network);
 
-            // TODO(issue #92): send device change to DSP pipeline
+            file_path_row.set_visible(is_file);
+
             tracing::debug!(device = selected, "source device changed");
         }
     ));
@@ -210,8 +220,7 @@ pub fn build_source_panel() -> SourcePanel {
         .description("Device and input configuration")
         .build();
 
-    // File source omitted until a file picker is implemented.
-    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network"]);
+    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network", "File"]);
     let device_row = adw::ComboRow::builder()
         .title("Device")
         .model(&device_model)
@@ -219,6 +228,11 @@ pub fn build_source_panel() -> SourcePanel {
 
     let (sample_rate_row, gain_row, agc_row) = build_rtlsdr_rows();
     let (hostname_row, port_row, protocol_row) = build_network_rows();
+    let file_path_row = adw::EntryRow::builder()
+        .title("File Path")
+        .text("")
+        .visible(false)
+        .build();
     let (dc_blocking_row, iq_correction_row, iq_inversion_row, decimation_row) =
         build_common_rows();
 
@@ -230,6 +244,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&hostname_row);
     group.add(&port_row);
     group.add(&protocol_row);
+    group.add(&file_path_row);
     group.add(&dc_blocking_row);
     group.add(&iq_correction_row);
     group.add(&iq_inversion_row);
@@ -239,12 +254,14 @@ pub fn build_source_panel() -> SourcePanel {
     let selected = device_row.selected();
     let is_rtlsdr = selected == DEVICE_RTLSDR;
     let is_network = selected == DEVICE_NETWORK;
+    let is_file = selected == DEVICE_FILE;
     sample_rate_row.set_visible(is_rtlsdr);
     gain_row.set_visible(is_rtlsdr);
     agc_row.set_visible(is_rtlsdr);
     hostname_row.set_visible(is_network);
     port_row.set_visible(is_network);
     protocol_row.set_visible(is_network);
+    file_path_row.set_visible(is_file);
 
     connect_device_visibility(
         &device_row,
@@ -254,6 +271,7 @@ pub fn build_source_panel() -> SourcePanel {
         &hostname_row,
         &port_row,
         &protocol_row,
+        &file_path_row,
     );
 
     // Controls connected to DSP pipeline via window.rs
@@ -267,6 +285,7 @@ pub fn build_source_panel() -> SourcePanel {
         hostname_row,
         port_row,
         protocol_row,
+        file_path_row,
         dc_blocking_row,
         iq_correction_row,
         iq_inversion_row,
