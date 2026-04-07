@@ -609,6 +609,16 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::debug!(?path, "set file path");
             state.file_path = path;
         }
+
+        UiToDsp::SetPpmCorrection(ppm) => {
+            tracing::debug!(ppm, "set PPM correction");
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_ppm_correction(ppm)
+            {
+                tracing::warn!("set PPM correction failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("PPM correction failed: {e}")));
+            }
+        }
     }
 }
 

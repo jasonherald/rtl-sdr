@@ -324,6 +324,15 @@ impl Source for RtlSdrSource {
             &[]
         }
     }
+
+    fn set_ppm_correction(&mut self, ppm: i32) -> Result<(), SourceError> {
+        if let Some(device) = &mut self.device {
+            device
+                .set_freq_correction(ppm)
+                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

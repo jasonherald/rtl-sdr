@@ -34,6 +34,17 @@ const PORT_STEP: f64 = 1.0;
 /// Port page increment.
 const PORT_PAGE: f64 = 100.0;
 
+/// Default PPM correction.
+const DEFAULT_PPM: f64 = 0.0;
+/// Minimum PPM correction.
+const MIN_PPM: f64 = -200.0;
+/// Maximum PPM correction.
+const MAX_PPM: f64 = 200.0;
+/// PPM step increment.
+const PPM_STEP: f64 = 1.0;
+/// PPM page increment.
+const PPM_PAGE: f64 = 10.0;
+
 /// Source device configuration panel with references to all interactive rows.
 pub struct SourcePanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
@@ -46,6 +57,8 @@ pub struct SourcePanel {
     pub gain_row: adw::SpinRow,
     /// RTL-SDR AGC toggle.
     pub agc_row: adw::SwitchRow,
+    /// RTL-SDR PPM frequency correction.
+    pub ppm_row: adw::SpinRow,
     /// Network hostname entry.
     pub hostname_row: adw::EntryRow,
     /// Network port number.
@@ -67,8 +80,8 @@ pub struct SourcePanel {
 /// Default sample rate selector index (2.4 MHz = index 7).
 const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
 
-/// Build RTL-SDR-specific rows: sample rate, gain, AGC.
-fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::SwitchRow) {
+/// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM correction.
+fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::SwitchRow, adw::SpinRow) {
     let sample_rate_model = gtk4::StringList::new(&[
         "250 kHz",
         "1.024 MHz",
@@ -108,7 +121,15 @@ fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::SwitchRow) {
         .subtitle("Automatic gain control")
         .build();
 
-    (sample_rate_row, gain_row, agc_row)
+    let ppm_adj = gtk4::Adjustment::new(DEFAULT_PPM, MIN_PPM, MAX_PPM, PPM_STEP, PPM_PAGE, 0.0);
+    let ppm_row = adw::SpinRow::builder()
+        .title("PPM Correction")
+        .subtitle("Crystal frequency offset")
+        .adjustment(&ppm_adj)
+        .digits(0)
+        .build();
+
+    (sample_rate_row, gain_row, agc_row, ppm_row)
 }
 
 /// Build network-specific rows: hostname, port, protocol.
@@ -172,6 +193,7 @@ fn connect_device_visibility(
     sample_rate_row: &adw::ComboRow,
     gain_row: &adw::SpinRow,
     agc_row: &adw::SwitchRow,
+    ppm_row: &adw::SpinRow,
     hostname_row: &adw::EntryRow,
     port_row: &adw::SpinRow,
     protocol_row: &adw::ComboRow,
@@ -184,6 +206,8 @@ fn connect_device_visibility(
         gain_row,
         #[weak]
         agc_row,
+        #[weak]
+        ppm_row,
         #[weak]
         hostname_row,
         #[weak]
@@ -201,6 +225,7 @@ fn connect_device_visibility(
             sample_rate_row.set_visible(is_rtlsdr);
             gain_row.set_visible(is_rtlsdr);
             agc_row.set_visible(is_rtlsdr);
+            ppm_row.set_visible(is_rtlsdr);
 
             hostname_row.set_visible(is_network);
             port_row.set_visible(is_network);
@@ -226,7 +251,7 @@ pub fn build_source_panel() -> SourcePanel {
         .model(&device_model)
         .build();
 
-    let (sample_rate_row, gain_row, agc_row) = build_rtlsdr_rows();
+    let (sample_rate_row, gain_row, agc_row, ppm_row) = build_rtlsdr_rows();
     let (hostname_row, port_row, protocol_row) = build_network_rows();
     let file_path_row = adw::EntryRow::builder()
         .title("File Path")
@@ -241,6 +266,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&sample_rate_row);
     group.add(&gain_row);
     group.add(&agc_row);
+    group.add(&ppm_row);
     group.add(&hostname_row);
     group.add(&port_row);
     group.add(&protocol_row);
@@ -258,6 +284,7 @@ pub fn build_source_panel() -> SourcePanel {
     sample_rate_row.set_visible(is_rtlsdr);
     gain_row.set_visible(is_rtlsdr);
     agc_row.set_visible(is_rtlsdr);
+    ppm_row.set_visible(is_rtlsdr);
     hostname_row.set_visible(is_network);
     port_row.set_visible(is_network);
     protocol_row.set_visible(is_network);
@@ -268,6 +295,7 @@ pub fn build_source_panel() -> SourcePanel {
         &sample_rate_row,
         &gain_row,
         &agc_row,
+        &ppm_row,
         &hostname_row,
         &port_row,
         &protocol_row,
@@ -282,6 +310,7 @@ pub fn build_source_panel() -> SourcePanel {
         sample_rate_row,
         gain_row,
         agc_row,
+        ppm_row,
         hostname_row,
         port_row,
         protocol_row,

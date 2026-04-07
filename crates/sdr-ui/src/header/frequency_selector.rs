@@ -25,6 +25,7 @@ const MAX_FREQUENCY_HZ: u64 = 999_999_999_999;
 const DIGITS_PER_GROUP: usize = 3;
 
 /// Frequency selector widget composed of 12 digit labels and 3 separator dots.
+#[derive(Clone)]
 pub struct FrequencySelector {
     /// The container widget to pack into the header bar.
     pub widget: gtk4::Box,
@@ -60,6 +61,17 @@ impl FrequencySelector {
     /// Register a callback invoked whenever the frequency changes from user interaction.
     pub fn connect_frequency_changed<F: Fn(u64) + 'static>(&self, f: F) {
         *self.on_changed.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Programmatically set the frequency and update the display.
+    ///
+    /// Does NOT fire the frequency-changed callback — callers are responsible
+    /// for sending DSP commands and updating the status bar.
+    pub fn set_frequency(&self, freq: u64) {
+        let clamped = freq.min(MAX_FREQUENCY_HZ);
+        self.frequency.set(clamped);
+        let digits = frequency_to_digits(clamped);
+        update_labels_and_styles(&self.digit_labels, &digits, self.selected_digit.get());
     }
 }
 
