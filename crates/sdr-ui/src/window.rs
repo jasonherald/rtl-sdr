@@ -32,7 +32,7 @@ const DEFAULT_HEIGHT: i32 = 800;
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
 /// FFT sizes available in the display panel dropdown (must match panel order).
-const FFT_SIZES: &[usize] = &[512, 1024, 2048];
+const FFT_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
 
 /// Decimation factors available in the source panel dropdown (must match panel order).
 const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
@@ -706,6 +706,7 @@ fn connect_display_panel(
 ) {
     // FFT size
     let state_fft = Rc::clone(state);
+    let spectrum_fft = Rc::clone(spectrum_handle);
     panels
         .display
         .fft_size_row
@@ -713,6 +714,7 @@ fn connect_display_panel(
             let idx = row.selected() as usize;
             if let Some(&size) = FFT_SIZES.get(idx) {
                 state_fft.send_dsp(UiToDsp::SetFftSize(size));
+                spectrum_fft.set_fft_size(size);
             }
         });
 

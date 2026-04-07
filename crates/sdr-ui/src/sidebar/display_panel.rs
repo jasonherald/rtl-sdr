@@ -59,7 +59,9 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- FFT Size ---
-    let fft_size_model = gtk4::StringList::new(&["512", "1024", "2048"]);
+    let fft_size_model = gtk4::StringList::new(&[
+        "512", "1024", "2048", "4096", "8192", "16384", "32768", "65536",
+    ]);
     let fft_size_row = adw::ComboRow::builder()
         .title("FFT Size")
         .model(&fft_size_model)

@@ -11,6 +11,9 @@ use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 /// Number of history lines stored in the ring-buffer texture.
 const HISTORY_LINES: usize = 1024;
 
+/// Maximum waterfall texture width. FFT data wider than this is downsampled.
+pub const MAX_TEXTURE_WIDTH: usize = 4096;
+
 /// Default minimum display level in dB.
 const DEFAULT_MIN_DB: f32 = -70.0;
 /// Default maximum display level in dB.
@@ -72,6 +75,32 @@ const QUAD_VERTICES: [f32; 24] = [
     -1.0, 1.0, 0.0, 0.0, // top-left
 ];
 
+/// Downsample FFT data by max-pooling bins to a target width.
+///
+/// Groups of input bins are reduced to one output bin by taking the maximum
+/// dB value in each group, preserving signal peaks for display.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn downsample_to(data: &[f32], buf: &mut Vec<f32>, target_width: usize) {
+    buf.resize(target_width, f32::NEG_INFINITY);
+    let ratio = data.len() as f32 / target_width as f32;
+    for (i, out) in buf.iter_mut().enumerate().take(target_width) {
+        let start = (i as f32 * ratio) as usize;
+        let end = (((i + 1) as f32) * ratio).ceil() as usize;
+        let end = end.min(data.len());
+        let mut max_val = f32::NEG_INFINITY;
+        for &v in &data[start..end] {
+            if v > max_val {
+                max_val = v;
+            }
+        }
+        *out = max_val;
+    }
+}
+
 /// OpenGL renderer for the scrolling waterfall spectrogram.
 pub struct WaterfallRenderer {
     program: glow::Program,
@@ -90,6 +119,8 @@ pub struct WaterfallRenderer {
     history_lines_loc: glow::UniformLocation,
     data_tex_loc: glow::UniformLocation,
     colormap_tex_loc: glow::UniformLocation,
+    /// Pre-allocated buffer for downsampling large FFT data.
+    downsample_buf: Vec<f32>,
     /// Display range in dB.
     min_db: f32,
     max_db: f32,
@@ -111,7 +142,8 @@ impl WaterfallRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    pub fn new(gl: &glow::Context, width: usize) -> Result<Self, GlError> {
+    pub fn new(gl: &glow::Context, requested_width: usize) -> Result<Self, GlError> {
+        let width = requested_width.min(MAX_TEXTURE_WIDTH);
         let vert = gl_renderer::compile_shader(gl, glow::VERTEX_SHADER, VERT_SHADER)?;
         let frag = gl_renderer::compile_shader(gl, glow::FRAGMENT_SHADER, FRAG_SHADER)?;
         let program = gl_renderer::link_program(gl, vert, frag)?;
@@ -197,6 +229,7 @@ impl WaterfallRenderer {
             history_lines_loc,
             data_tex_loc,
             colormap_tex_loc,
+            downsample_buf: Vec::with_capacity(MAX_TEXTURE_WIDTH),
             min_db: DEFAULT_MIN_DB,
             max_db: DEFAULT_MAX_DB,
         })
@@ -213,15 +246,24 @@ impl WaterfallRenderer {
         clippy::cast_sign_loss
     )]
     pub fn push_line(&mut self, gl: &glow::Context, fft_data: &[f32]) {
-        let bin_count = fft_data.len().min(self.texture_width);
         let db_range = self.max_db - self.min_db;
         if !db_range.is_finite() || db_range <= 0.0 {
             return;
         }
 
+        // Downsample if FFT bins exceed texture width.
+        let display_data = if fft_data.len() > self.texture_width {
+            downsample_to(fft_data, &mut self.downsample_buf, self.texture_width);
+            &self.downsample_buf
+        } else {
+            fft_data
+        };
+
+        let bin_count = display_data.len().min(self.texture_width);
+
         // Normalize dB values to 0..255 using pre-allocated row buffer.
         self.row_buffer.fill(0);
-        for (i, &db) in fft_data.iter().take(bin_count).enumerate() {
+        for (i, &db) in display_data.iter().take(bin_count).enumerate() {
             let normalized = ((db - self.min_db) / db_range).clamp(0.0, 1.0);
             self.row_buffer[i] = (normalized * 255.0).round() as u8;
         }
@@ -321,6 +363,37 @@ impl WaterfallRenderer {
         if min_db.is_finite() && max_db.is_finite() && max_db > min_db {
             self.min_db = min_db;
             self.max_db = max_db;
+        }
+    }
+
+    /// Resize the waterfall texture for a new FFT size.
+    ///
+    /// Deletes the old data texture and creates a new one at the given width
+    /// (capped at `MAX_TEXTURE_WIDTH`). Resets the ring buffer write position.
+    #[allow(
+        unsafe_code,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    pub fn resize(&mut self, gl: &glow::Context, new_width: usize) {
+        let capped_width = new_width.min(MAX_TEXTURE_WIDTH);
+        if capped_width == self.texture_width {
+            return;
+        }
+        unsafe {
+            gl.delete_texture(self.data_texture);
+        }
+        match create_data_texture(gl, capped_width) {
+            Ok(tex) => {
+                self.data_texture = tex;
+                self.texture_width = capped_width;
+                self.row_buffer = vec![0u8; capped_width];
+                self.write_row = 0;
+                tracing::debug!(width = capped_width, "waterfall texture resized");
+            }
+            Err(e) => {
+                tracing::warn!("failed to resize waterfall texture: {e}");
+            }
         }
     }
 

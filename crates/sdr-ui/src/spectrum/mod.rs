@@ -45,7 +45,7 @@ use crate::messages::UiToDsp;
 type CursorCallback = Rc<RefCell<Option<Box<dyn Fn(f64, f32)>>>>;
 
 /// Number of FFT bins for the display (used for initial buffer sizing).
-const FFT_SIZE: usize = 1024;
+const FFT_SIZE: usize = 2048;
 
 /// Default FFT plot pane height fraction (30% of total).
 const FFT_PANE_FRACTION: f64 = 0.30;
@@ -218,6 +218,22 @@ impl SpectrumHandle {
         // Reset the averaging buffer so stale data doesn't persist.
         self.avg_buffer.borrow_mut().clear();
         tracing::debug!(?mode, "averaging mode changed");
+    }
+
+    /// Resize the waterfall texture for a new FFT size.
+    ///
+    /// Called when the user changes the FFT size in the display panel.
+    /// The texture width is capped at `waterfall::MAX_TEXTURE_WIDTH` to stay
+    /// within safe GPU limits; the waterfall renderer downsamples wider FFTs.
+    pub fn set_fft_size(&self, size: usize) {
+        if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
+            self.waterfall_area.make_current();
+            let texture_width = size.min(waterfall::MAX_TEXTURE_WIDTH);
+            s.renderer.resize(&s.gl, texture_width);
+        }
+        // Reset averaging buffer since bin count changed.
+        self.avg_buffer.borrow_mut().clear();
+        self.waterfall_area.queue_render();
     }
 
     /// Update the VFO display range to match the effective FFT bandwidth.
@@ -403,7 +419,7 @@ fn build_fft_area(
     let fill_render = Rc::clone(fill_enabled);
     let vfo_render = Rc::clone(vfo_state);
     area.connect_render(move |area, _ctx| {
-        if let Some(s) = state.borrow().as_ref() {
+        if let Some(s) = state.borrow_mut().as_mut() {
             let width = area.width();
             let height = area.height();
             let scale = area.scale_factor();
