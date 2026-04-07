@@ -214,8 +214,12 @@ pub fn build_spectrum_view(
         &fill_enabled,
         &cursor_callback,
     );
-    let waterfall_area =
-        build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state), &min_db, &max_db);
+    let waterfall_area = build_waterfall_area(
+        Rc::clone(&waterfall_state),
+        Rc::clone(&vfo_state),
+        &min_db,
+        &max_db,
+    );
 
     // Attach interaction gestures to both the waterfall and FFT areas.
     attach_click_gesture(&waterfall_area, &vfo_state, dsp_tx.clone());
