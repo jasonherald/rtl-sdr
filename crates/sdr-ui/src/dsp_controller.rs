@@ -362,6 +362,16 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     }
                     state.running = true;
                     tracing::info!("DSP pipeline started");
+
+                    // Send the device's supported gain values to the UI.
+                    if let Some(dev) = &state.device {
+                        let gains: Vec<f64> = dev
+                            .tuner_gains()
+                            .iter()
+                            .map(|&g| f64::from(g) / 10.0) // tenths of dB → dB
+                            .collect();
+                        let _ = dsp_tx.send(DspToUi::GainList(gains));
+                    }
                 }
                 Err(e) => {
                     tracing::error!("failed to start source: {e}");

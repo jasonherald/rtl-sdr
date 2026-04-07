@@ -18,6 +18,8 @@ pub enum DspToUi {
     SampleRateChanged(f64),
     /// Device information string (e.g., tuner name, USB descriptor).
     DeviceInfo(String),
+    /// Available tuner gain values in dB (queried from device on open).
+    GainList(Vec<f64>),
 }
 
 /// Messages sent from the UI thread to the DSP pipeline thread.
