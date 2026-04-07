@@ -793,6 +793,20 @@ fn connect_display_panel(
                 .unwrap_or(spectrum::AveragingMode::None);
             spectrum_avg.set_averaging_mode(mode);
         });
+
+    // Theme selector (System / Dark / Light).
+    panels
+        .display
+        .theme_row
+        .connect_selected_notify(move |row| {
+            let style_manager = adw::StyleManager::default();
+            let scheme = match row.selected() {
+                1 => adw::ColorScheme::ForceDark,
+                2 => adw::ColorScheme::ForceLight,
+                _ => adw::ColorScheme::Default,
+            };
+            style_manager.set_color_scheme(scheme);
+        });
 }
 
 /// Connect navigation panel (band presets + bookmarks) to DSP commands.
@@ -851,6 +865,8 @@ fn connect_navigation_panel(
     let bm_list = nav.bookmark_list.clone();
     let bm_scroll = nav.bookmark_scroll.clone();
     let on_nav = nav.on_navigate.clone();
+    let active_bm = nav.active_bookmark.clone();
+    let name_entry = nav.name_entry.clone();
 
     nav.add_button.connect_clicked(move |_| {
         let freq = state_bm.center_frequency.get();
@@ -858,11 +874,24 @@ fn connect_navigation_panel(
         let bw = radio_bw.value();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let freq_u64 = freq as u64;
-        let name = sidebar::navigation_panel::format_frequency(freq_u64);
+        let entered = name_entry.text();
+        let name = if entered.is_empty() {
+            sidebar::navigation_panel::format_frequency(freq_u64)
+        } else {
+            entered.to_string()
+        };
         let bookmark = sidebar::navigation_panel::Bookmark::new(&name, freq_u64, mode, bw);
         bm_rc.borrow_mut().push(bookmark);
         sidebar::navigation_panel::save_bookmarks(&bm_rc.borrow());
-        sidebar::navigation_panel::rebuild_bookmark_list(&bm_list, &bm_scroll, &bm_rc, &on_nav);
+        sidebar::navigation_panel::rebuild_bookmark_list(
+            &bm_list,
+            &bm_scroll,
+            &bm_rc,
+            &on_nav,
+            &active_bm,
+            &name_entry,
+        );
+        name_entry.set_text("");
     });
 }
 
@@ -906,6 +935,20 @@ fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
                 .application_icon("audio-radio-symbolic")
                 .license_type(gtk4::License::MitX11)
                 .website("https://github.com/jasonherald/rtl-sdr")
+                .comments("Software-defined radio for Linux")
+                .developers(["Jason Herald"])
+                .copyright("\u{00a9} 2026 Jason Herald")
+                .issue_url("https://github.com/jasonherald/rtl-sdr/issues")
+                .debug_info(format!(
+                    "GTK {}.{}.{}\nLibadwaita {}.{}.{}\nPlatform: {}",
+                    gtk4::major_version(),
+                    gtk4::minor_version(),
+                    gtk4::micro_version(),
+                    adw::major_version(),
+                    adw::minor_version(),
+                    adw::micro_version(),
+                    std::env::consts::OS,
+                ))
                 .build();
             about.present(Some(&window));
         }

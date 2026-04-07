@@ -194,6 +194,13 @@ pub fn format_frequency(freq: u64) -> String {
 /// Callback type for navigation actions (tune to frequency + set mode + bandwidth).
 pub type NavigationCallback = Box<dyn Fn(u64, DemodMode, f64)>;
 
+/// Identity of the currently active bookmark (name + frequency).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ActiveBookmark {
+    pub name: String,
+    pub frequency: u64,
+}
+
 /// Navigation panel containing band presets and frequency bookmarks.
 pub struct NavigationPanel {
     /// Band presets group widget.
@@ -202,6 +209,8 @@ pub struct NavigationPanel {
     pub bookmarks_widget: gtk4::Box,
     /// Band preset combo row (for connection in window.rs).
     pub preset_row: adw::ComboRow,
+    /// Bookmark name entry (user-editable, defaults to formatted frequency).
+    pub name_entry: adw::EntryRow,
     /// Add bookmark button.
     pub add_button: gtk4::Button,
     /// Bookmark scroll container (height adjusted dynamically).
@@ -212,6 +221,8 @@ pub struct NavigationPanel {
     pub bookmarks: std::rc::Rc<std::cell::RefCell<Vec<Bookmark>>>,
     /// Callback fired when a preset or bookmark is recalled.
     pub on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>>,
+    /// Currently active bookmark identity (for visual highlighting).
+    pub active_bookmark: std::rc::Rc<std::cell::RefCell<ActiveBookmark>>,
 }
 
 impl NavigationPanel {
@@ -252,6 +263,9 @@ pub fn build_navigation_panel() -> NavigationPanel {
         .build();
     bookmarks_group.append(&bookmarks_label);
 
+    let name_entry = adw::EntryRow::builder().title("Name").build();
+    bookmarks_group.append(&name_entry);
+
     let bookmark_list = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::None)
         .css_classes(["boxed-list"])
@@ -274,8 +288,17 @@ pub fn build_navigation_panel() -> NavigationPanel {
     let on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
 
+    let active_bookmark = std::rc::Rc::new(std::cell::RefCell::new(ActiveBookmark::default()));
+
     // Build initial bookmark list
-    rebuild_bookmark_list(&bookmark_list, &bookmark_scroll, &bookmarks, &on_navigate);
+    rebuild_bookmark_list(
+        &bookmark_list,
+        &bookmark_scroll,
+        &bookmarks,
+        &on_navigate,
+        &active_bookmark,
+        &name_entry,
+    );
 
     // Connect preset row — auto-tune on selection
     let on_nav_preset = std::rc::Rc::clone(&on_navigate);
@@ -292,11 +315,13 @@ pub fn build_navigation_panel() -> NavigationPanel {
         presets_widget: presets_group,
         bookmarks_widget: bookmarks_group,
         preset_row,
+        name_entry,
         add_button,
         bookmark_scroll,
         bookmark_list,
         bookmarks,
         on_navigate,
+        active_bookmark,
     }
 }
 
@@ -306,11 +331,14 @@ const BOOKMARK_ROW_HEIGHT: i32 = 64;
 const MAX_VISIBLE_BOOKMARKS: i32 = 3;
 
 /// Rebuild the bookmark `ListBox` from the current bookmark list.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_bookmark_list(
     list_box: &gtk4::ListBox,
     scroll: &gtk4::ScrolledWindow,
     bookmarks: &std::rc::Rc<std::cell::RefCell<Vec<Bookmark>>>,
     on_navigate: &std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>>,
+    active: &std::rc::Rc<std::cell::RefCell<ActiveBookmark>>,
+    name_entry: &adw::EntryRow,
 ) {
     // Remove all existing rows.
     while let Some(child) = list_box.first_child() {
@@ -318,7 +346,9 @@ pub fn rebuild_bookmark_list(
     }
 
     let bm_list = bookmarks.borrow();
+    let current_active = active.borrow().clone();
     for bm in bm_list.iter() {
+        let is_active = bm.name == current_active.name && bm.frequency == current_active.frequency;
         let row = adw::ActionRow::builder()
             .title(&bm.name)
             .subtitle(format!(
@@ -329,6 +359,13 @@ pub fn rebuild_bookmark_list(
             .activatable(true)
             .build();
 
+        // Highlight the active bookmark with an accent icon.
+        if is_active {
+            let icon = gtk4::Image::from_icon_name("media-playback-start-symbolic");
+            icon.set_valign(gtk4::Align::Center);
+            row.add_prefix(&icon);
+        }
+
         // Delete button — identify by name + frequency rather than index
         let delete_btn = gtk4::Button::builder()
             .icon_name("user-trash-symbolic")
@@ -338,8 +375,10 @@ pub fn rebuild_bookmark_list(
 
         let bm_rc = std::rc::Rc::clone(bookmarks);
         let nav_rc = std::rc::Rc::clone(on_navigate);
+        let active_rc = std::rc::Rc::clone(active);
         let list_ref = list_box.downgrade();
         let scroll_ref = scroll.downgrade();
+        let entry_del = name_entry.clone();
         let del_name = bm.name.clone();
         let del_freq = bm.frequency;
         delete_btn.connect_clicked(move |_| {
@@ -350,19 +389,48 @@ pub fn rebuild_bookmark_list(
             if let Some(lb) = list_ref.upgrade()
                 && let Some(sc) = scroll_ref.upgrade()
             {
-                rebuild_bookmark_list(&lb, &sc, &bm_rc, &nav_rc);
+                rebuild_bookmark_list(&lb, &sc, &bm_rc, &nav_rc, &active_rc, &entry_del);
             }
         });
         row.add_suffix(&delete_btn);
 
-        // Recall on row activation
+        // Recall on row activation — set active, update name entry, rebuild list
         let freq = bm.frequency;
         let mode = string_to_demod_mode(&bm.demod_mode);
         let bw = bm.bandwidth;
+        let recall_name = bm.name.clone();
         let on_nav_recall = std::rc::Rc::clone(on_navigate);
+        let active_recall = std::rc::Rc::clone(active);
+        let bm_recall = std::rc::Rc::clone(bookmarks);
+        let list_recall = list_box.downgrade();
+        let scroll_recall = scroll.downgrade();
+        let entry_recall = name_entry.clone();
         row.connect_activated(move |_| {
+            // Set this bookmark as active
+            *active_recall.borrow_mut() = ActiveBookmark {
+                name: recall_name.clone(),
+                frequency: freq,
+            };
+            // Show the active bookmark name in the entry (read-only indication)
+            entry_recall.set_text(&recall_name);
+
+            // Fire the navigate callback
             if let Some(cb) = on_nav_recall.borrow().as_ref() {
                 cb(freq, mode, bw);
+            }
+
+            // Rebuild list to update active highlighting
+            if let Some(lb) = list_recall.upgrade()
+                && let Some(sc) = scroll_recall.upgrade()
+            {
+                rebuild_bookmark_list(
+                    &lb,
+                    &sc,
+                    &bm_recall,
+                    &on_nav_recall,
+                    &active_recall,
+                    &entry_recall,
+                );
             }
         });
 
