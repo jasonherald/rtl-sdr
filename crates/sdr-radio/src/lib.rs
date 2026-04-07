@@ -91,7 +91,7 @@ impl RadioModule {
     ///
     /// Returns `RadioError` if initialization fails.
     pub fn new(audio_sample_rate: f64) -> Result<Self, RadioError> {
-        let mode = DemodMode::Nfm;
+        let mode = DemodMode::Wfm;
         let demod = create_demodulator(mode)?;
         let if_chain = IfChain::new()?;
         let af_chain = AfChain::new(demod.config().af_sample_rate, audio_sample_rate)?;
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn test_radio_module_default_mode() {
         let radio = RadioModule::with_default_rate().unwrap();
-        assert_eq!(radio.current_mode(), DemodMode::Nfm);
+        assert_eq!(radio.current_mode(), DemodMode::Wfm);
     }
 
     #[test]

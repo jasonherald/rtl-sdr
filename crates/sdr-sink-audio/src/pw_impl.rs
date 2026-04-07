@@ -14,7 +14,9 @@ const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_CHANNELS: u32 = 2;
 
 /// Bounded channel capacity in chunks.
-const CHANNEL_BOUND: usize = 16;
+/// Large enough to absorb USB timing jitter at high sample rates.
+/// At WFM rates (~393 samples/chunk, ~8ms per chunk), 128 chunks = ~1 second.
+const CHANNEL_BOUND: usize = 128;
 
 /// Bytes per sample frame (2 channels x 4 bytes per f32).
 const FRAME_SIZE: usize = (AUDIO_CHANNELS as usize) * std::mem::size_of::<f32>();
@@ -60,12 +62,9 @@ impl AudioSink {
             buf.push(s.r);
         }
 
-        match tx.try_send(buf) {
+        match tx.send(buf) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
-                tracing::debug!("audio channel full -- dropping chunk");
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(mpsc::SendError(_)) => {
                 return Err(SinkError::Disconnected);
             }
         }
