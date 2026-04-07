@@ -14,14 +14,19 @@ pub struct AudioPanel {
 }
 
 /// Build the audio output configuration panel.
+///
+/// Queries `PipeWire` for available audio output sinks and populates
+/// the device selector dropdown.
 pub fn build_audio_panel() -> AudioPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Audio")
         .description("Output configuration")
         .build();
 
-    // TODO(issue #92): populate with actual audio devices from PipeWire/PulseAudio
-    let device_model = gtk4::StringList::new(&["Default"]);
+    // Query PipeWire for available audio sinks
+    let sinks = sdr_sink_audio::list_audio_sinks();
+    let sink_names: Vec<&str> = sinks.iter().map(String::as_str).collect();
+    let device_model = gtk4::StringList::new(&sink_names);
     let device_row = adw::ComboRow::builder()
         .title("Device")
         .model(&device_model)
