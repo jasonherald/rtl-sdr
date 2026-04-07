@@ -155,6 +155,7 @@ impl SpectrumHandle {
     /// Update the display dB range for both the FFT plot and waterfall.
     pub fn set_db_range(&self, min_db: f32, max_db: f32) {
         if min_db >= max_db {
+            tracing::trace!(min_db, max_db, "set_db_range: ignoring inverted range");
             return;
         }
         self.min_db.set(min_db);
