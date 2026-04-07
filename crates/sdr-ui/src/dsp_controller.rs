@@ -342,13 +342,16 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetSampleRate(rate) => {
             tracing::debug!(sample_rate = rate, "set sample rate");
-            state.sample_rate = rate;
-            if let Some(source) = &mut state.source
-                && let Err(e) = source.set_sample_rate(rate)
-            {
-                tracing::warn!("set sample rate failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Sample rate failed: {e}")));
-                return;
+            if let Some(source) = &mut state.source {
+                if let Err(e) = source.set_sample_rate(rate) {
+                    tracing::warn!("set sample rate failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Sample rate failed: {e}")));
+                    return;
+                }
+                // Use the source's actual rate (may differ due to hardware rounding)
+                state.sample_rate = source.sample_rate();
+            } else {
+                state.sample_rate = rate;
             }
 
             // Auto-select decimation ratio so the effective rate is close to
@@ -559,8 +562,24 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     Ok(()) => {
                         if let Err(e) = state.audio_sink.start() {
                             tracing::warn!("audio sink restart failed: {e}");
+                            let _ =
+                                dsp_tx.send(DspToUi::Error(format!("Audio output failed: {e}")));
                         }
                         state.running = true;
+                        // Refresh UI with new source capabilities
+                        if let Some(source) = &state.source {
+                            let gains: Vec<f64> = source
+                                .gains()
+                                .iter()
+                                .map(|&g| f64::from(g) / 10.0)
+                                .collect();
+                            if !gains.is_empty() {
+                                let _ = dsp_tx.send(DspToUi::GainList(gains));
+                            }
+                        }
+                        let _ = dsp_tx.send(DspToUi::SampleRateChanged(
+                            state.frontend.effective_sample_rate(),
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!("source switch failed: {e}");
@@ -617,6 +636,14 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
 
     // Sync sample rate from the source (file sources have fixed rates).
     state.sample_rate = source.sample_rate();
+
+    // Auto-adjust decimation for the source's actual sample rate.
+    let if_rate = state.radio.demod_config().if_sample_rate;
+    let auto_decim = auto_decimation_ratio(state.sample_rate, if_rate);
+    if auto_decim != state.frontend.decim_ratio() {
+        tracing::info!(auto_decim, "auto-adjusting decimation for source rate");
+        let _ = state.frontend.set_decimation(auto_decim);
+    }
 
     // Rebuild frontend and VFO before committing the source to state.
     rebuild_frontend(state)?;

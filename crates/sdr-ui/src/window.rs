@@ -482,25 +482,26 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             state_iq_corr.send_dsp(UiToDsp::SetIqCorrection(row.is_active()));
         });
 
-    // Source type selector
+    // Source type selector — guard against transient out-of-range indices
     let state_source = Rc::clone(state);
     panels
         .source
         .device_row
         .connect_selected_notify(move |row| {
             let source_type = match row.selected() {
+                0 => SourceType::RtlSdr,
                 1 => SourceType::Network,
                 2 => SourceType::File,
-                _ => SourceType::RtlSdr,
+                _ => return, // ignore transient indices
             };
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));
         });
 
-    // Network hostname (fires on Enter key)
+    // Network hostname — send on every edit so Play always has current value
     let state_host = Rc::clone(state);
     let port_for_host = panels.source.port_row.clone();
     let proto_for_host = panels.source.protocol_row.clone();
-    panels.source.hostname_row.connect_apply(move |row| {
+    panels.source.hostname_row.connect_changed(move |row| {
         let hostname = row.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = port_for_host.value() as u16;
@@ -547,10 +548,10 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             let hostname = host_for_proto.text().to_string();
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let port = port_for_proto.value() as u16;
-            let protocol = if row.selected() == 1 {
-                sdr_types::Protocol::Udp
-            } else {
-                sdr_types::Protocol::TcpClient
+            let protocol = match row.selected() {
+                0 => sdr_types::Protocol::TcpClient,
+                1 => sdr_types::Protocol::Udp,
+                _ => return, // ignore transient indices
             };
             state_proto.send_dsp(UiToDsp::SetNetworkConfig {
                 hostname,
@@ -559,9 +560,9 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             });
         });
 
-    // File path (apply on Enter key)
+    // File path — send on every edit so Play always has current value
     let state_file = Rc::clone(state);
-    panels.source.file_path_row.connect_apply(move |row| {
+    panels.source.file_path_row.connect_changed(move |row| {
         let path = std::path::PathBuf::from(row.text().to_string());
         state_file.send_dsp(UiToDsp::SetFilePath(path));
     });
