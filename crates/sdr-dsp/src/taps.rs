@@ -10,8 +10,13 @@ use sdr_types::DspError;
 use crate::math;
 use crate::window;
 
-/// Tap count estimation scaling factor (from SDR++ `estimateTapCount`).
-const TAP_COUNT_FACTOR: f64 = 3.8;
+/// Tap count estimation scaling factor.
+///
+/// SDR++ uses 3.8, which gives ~45 dB stopband with Nuttall window.
+/// Fred Harris (1978) recommends ~37 for full 93 dB Nuttall stopband.
+/// We use 10.0 as a practical compromise: ~70 dB stopband rejection,
+/// good enough for SDR channel filtering without excessive CPU cost.
+const TAP_COUNT_FACTOR: f64 = 10.0;
 
 /// Tolerance for detecting singular points in RRC formula.
 const RRC_SINGULARITY_EPS: f64 = 1e-12;
@@ -272,7 +277,8 @@ mod tests {
     #[test]
     fn test_estimate_tap_count() {
         let count = estimate_tap_count(1_000.0, TEST_SAMPLE_RATE).unwrap();
-        assert_eq!(count, 182);
+        // TAP_COUNT_FACTOR=10.0: 10 * 48000 / 1000 = 480
+        assert_eq!(count, 480);
     }
 
     #[test]
