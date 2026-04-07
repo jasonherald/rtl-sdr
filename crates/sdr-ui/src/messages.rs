@@ -98,6 +98,8 @@ pub enum UiToDsp {
     },
     /// Set the file path for file source playback.
     SetFilePath(std::path::PathBuf),
+    /// Set PPM frequency correction for RTL-SDR crystal offset.
+    SetPpmCorrection(i32),
 }
 
 #[cfg(test)]
@@ -243,6 +245,9 @@ mod tests {
             file_path,
             UiToDsp::SetFilePath(ref p) if p == std::path::Path::new("/tmp/test.wav")
         ));
+
+        let ppm = UiToDsp::SetPpmCorrection(42);
+        assert!(matches!(ppm, UiToDsp::SetPpmCorrection(42)));
     }
 
     #[test]

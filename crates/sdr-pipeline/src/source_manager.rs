@@ -48,6 +48,11 @@ pub trait Source: Send {
     fn gains(&self) -> &[i32] {
         &[]
     }
+
+    /// Set PPM frequency correction (no-op default for non-tuner sources).
+    fn set_ppm_correction(&mut self, _ppm: i32) -> Result<(), SourceError> {
+        Ok(())
+    }
 }
 
 /// Manages available IQ sources and the active source lifecycle.

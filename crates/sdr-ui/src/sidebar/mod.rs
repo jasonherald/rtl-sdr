@@ -1,14 +1,16 @@
-//! Sidebar configuration panels — source, audio, radio, display.
+//! Sidebar configuration panels — source, audio, radio, display, navigation.
 
 use gtk4::prelude::*;
 
 pub mod audio_panel;
 pub mod display_panel;
+pub mod navigation_panel;
 pub mod radio_panel;
 pub mod source_panel;
 
 pub use audio_panel::{AudioPanel, build_audio_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
+pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
 
@@ -27,6 +29,8 @@ pub struct SidebarPanels {
     pub radio: RadioPanel,
     /// Display / spectrum settings.
     pub display: DisplayPanel,
+    /// Navigation — band presets and bookmarks.
+    pub navigation: NavigationPanel,
 }
 
 /// Build the complete sidebar `ScrolledWindow` containing all configuration panels.
@@ -38,6 +42,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let audio = build_audio_panel();
     let radio = build_radio_panel();
     let display = build_display_panel();
+    let navigation = build_navigation_panel();
 
     let sidebar_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -48,6 +53,8 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         .margin_end(SIDEBAR_MARGIN)
         .build();
 
+    sidebar_box.append(&navigation.presets_widget);
+    sidebar_box.append(&navigation.bookmarks_widget);
     sidebar_box.append(&source.widget);
     sidebar_box.append(&audio.widget);
     sidebar_box.append(&radio.widget);
@@ -63,6 +70,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         audio,
         radio,
         display,
+        navigation,
     };
 
     (scroll, panels)

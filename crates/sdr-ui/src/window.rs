@@ -92,11 +92,17 @@ pub fn build_window(app: &adw::Application) {
     let shortcuts_window = shortcuts::build_shortcuts_window();
     window.set_help_overlay(Some(&shortcuts_window));
 
-    // --- Connect sidebar panels to DSP ---
-    connect_sidebar_panels(&panels, &state, &spectrum_handle);
-
-    // --- Wire frequency selector to DSP and status bar ---
+    // --- Wire sidebar panels and frequency/demod to DSP + status bar ---
     let status_bar_demod = Rc::new(status_bar);
+
+    connect_sidebar_panels(
+        &panels,
+        &state,
+        &spectrum_handle,
+        &freq_selector,
+        &demod_dropdown,
+        &status_bar_demod,
+    );
     let status_bar_for_freq = Rc::clone(&status_bar_demod);
     let state_freq = Rc::clone(&state);
     freq_selector.connect_frequency_changed(move |freq| {
@@ -409,11 +415,15 @@ fn connect_sidebar_panels(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    freq_selector: &header::frequency_selector::FrequencySelector,
+    demod_dropdown: &gtk4::DropDown,
+    status_bar: &Rc<StatusBar>,
 ) {
     connect_source_panel(panels, state);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
+    connect_navigation_panel(panels, state, freq_selector, demod_dropdown, status_bar);
 }
 
 /// Connect source panel controls to DSP commands.
@@ -481,6 +491,13 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .connect_active_notify(move |row| {
             state_iq_corr.send_dsp(UiToDsp::SetIqCorrection(row.is_active()));
         });
+
+    // PPM correction
+    let state_ppm = Rc::clone(state);
+    panels.source.ppm_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation)]
+        state_ppm.send_dsp(UiToDsp::SetPpmCorrection(row.value() as i32));
+    });
 
     // Source type selector — guard against transient out-of-range indices
     let state_source = Rc::clone(state);
@@ -705,6 +722,77 @@ fn connect_display_panel(
                 .unwrap_or(spectrum::colormap::ColormapStyle::Turbo);
             spectrum_for_cmap.set_colormap(style);
         });
+}
+
+/// Connect navigation panel (band presets + bookmarks) to DSP commands.
+fn connect_navigation_panel(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    freq_selector: &header::frequency_selector::FrequencySelector,
+    demod_dropdown: &gtk4::DropDown,
+    status_bar: &Rc<StatusBar>,
+) {
+    // Navigation callback: tune + set mode + set bandwidth, update UI widgets.
+    let state_nav = Rc::clone(state);
+    let fs = freq_selector.clone();
+    let dd_weak = demod_dropdown.downgrade();
+    let sb = Rc::clone(status_bar);
+
+    panels.navigation.connect_navigate(move |freq, mode, bw| {
+        #[allow(clippy::cast_precision_loss)]
+        let freq_f64 = freq as f64;
+        state_nav.center_frequency.set(freq_f64);
+        state_nav.demod_mode.set(mode);
+
+        // Send Tune and Bandwidth directly. SetDemodMode is sent by the
+        // demod dropdown callback when we update its selection below.
+        state_nav.send_dsp(UiToDsp::Tune(freq_f64));
+        state_nav.send_dsp(UiToDsp::SetBandwidth(bw));
+
+        // Update frequency selector display (does NOT fire callback — no duplicate Tune).
+        fs.set_frequency(freq);
+
+        // Update demod dropdown — its callback sends SetDemodMode to DSP.
+        if let Some(dd) = dd_weak.upgrade()
+            && let Some(idx) = demod_selector::demod_mode_to_index(mode)
+        {
+            dd.set_selected(idx);
+        }
+
+        // Update status bar
+        sb.update_frequency(freq_f64);
+        let label = header::demod_mode_label(mode);
+        sb.update_demod(label, bw);
+
+        tracing::info!(
+            frequency = freq,
+            ?mode,
+            bandwidth = bw,
+            "navigated to frequency"
+        );
+    });
+
+    // "Add Bookmark" button
+    let state_bm = Rc::clone(state);
+    let radio_bw = panels.radio.bandwidth_row.clone();
+    let nav = &panels.navigation;
+    let bm_rc = nav.bookmarks.clone();
+    let bm_list = nav.bookmark_list.clone();
+    let bm_scroll = nav.bookmark_scroll.clone();
+    let on_nav = nav.on_navigate.clone();
+
+    nav.add_button.connect_clicked(move |_| {
+        let freq = state_bm.center_frequency.get();
+        let mode = state_bm.demod_mode.get();
+        let bw = radio_bw.value();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let freq_u64 = freq as u64;
+        let name = sidebar::navigation_panel::format_frequency(freq_u64);
+        let bookmark = sidebar::navigation_panel::Bookmark::new(&name, freq_u64, mode, bw);
+        bm_rc.borrow_mut().push(bookmark);
+        sidebar::navigation_panel::save_bookmarks(&bm_rc.borrow());
+        sidebar::navigation_panel::rebuild_bookmark_list(&bm_list, &bm_scroll, &bm_rc, &on_nav);
+    });
 }
 
 /// Connect audio panel controls to DSP commands.
