@@ -752,6 +752,13 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
 
     let iq_count = match source.read_samples(&mut state.iq_buf) {
         Ok(0) => {
+            // File sources return Ok(0) at EOF — stop playback cleanly
+            if state.source_type == SourceType::File {
+                tracing::info!("file source reached EOF");
+                cleanup(state);
+                state.running = false;
+                let _ = dsp_tx.send(DspToUi::SourceStopped);
+            }
             std::thread::yield_now();
             return;
         }
