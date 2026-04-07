@@ -21,7 +21,7 @@ use sdr_sink_audio::AudioSink;
 use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, SinkError, Stereo};
 
-use crate::messages::{DspToUi, UiToDsp};
+use crate::messages::{DspToUi, SourceType, UiToDsp};
 
 /// Number of IQ sample pairs per USB bulk read.
 const IQ_PAIRS_PER_READ: usize = 16_384;
@@ -144,6 +144,12 @@ struct DspState {
     vfo_buf: Vec<Complex>,
     vfo_offset: f64,
 
+    // Source type and configuration
+    source_type: SourceType,
+    network_host: String,
+    network_port: u16,
+    file_path: std::path::PathBuf,
+
     // Pre-allocated buffers
     iq_buf: Vec<Complex>,
     processed_buf: Vec<Complex>,
@@ -186,6 +192,10 @@ impl DspState {
             vfo: None,
             vfo_buf: Vec::new(),
             vfo_offset: 0.0,
+            source_type: SourceType::RtlSdr,
+            network_host: "127.0.0.1".to_string(),
+            network_port: 1234,
+            file_path: std::path::PathBuf::new(),
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
@@ -532,17 +542,54 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::Error(format!("Audio device switch failed: {e}")));
             }
         }
+
+        UiToDsp::SetSourceType(source_type) => {
+            tracing::info!(?source_type, "switching source type");
+            if state.running {
+                cleanup(state);
+                state.running = false;
+                let _ = dsp_tx.send(DspToUi::SourceStopped);
+            }
+            state.source_type = source_type;
+        }
+
+        UiToDsp::SetNetworkConfig { hostname, port } => {
+            tracing::debug!(%hostname, port, "set network config");
+            state.network_host = hostname;
+            state.network_port = port;
+        }
+
+        UiToDsp::SetFilePath(path) => {
+            tracing::debug!(?path, "set file path");
+            state.file_path = path;
+        }
     }
 }
 
 /// Open the active IQ source and configure it for streaming.
 fn open_source(state: &mut DspState) -> Result<(), String> {
-    let mut source: Box<dyn Source> = Box::new(RtlSdrSource::new(DEVICE_INDEX));
+    let mut source: Box<dyn Source> = match state.source_type {
+        SourceType::RtlSdr => Box::new(RtlSdrSource::new(DEVICE_INDEX)),
+        SourceType::Network => Box::new(sdr_source_network::NetworkSource::new(
+            &state.network_host,
+            state.network_port,
+            sdr_types::Protocol::TcpClient,
+        )),
+        SourceType::File => Box::new(sdr_source_file::FileSource::new(&state.file_path)),
+    };
 
-    source
-        .set_sample_rate(state.sample_rate)
-        .map_err(|e| e.to_string())?;
-    source.tune(state.center_freq).map_err(|e| e.to_string())?;
+    if let Err(e) = source.set_sample_rate(state.sample_rate) {
+        if state.source_type == SourceType::File {
+            tracing::warn!("file source sample rate mismatch: {e}");
+        } else {
+            return Err(e.to_string());
+        }
+    }
+
+    if state.source_type == SourceType::RtlSdr {
+        source.tune(state.center_freq).map_err(|e| e.to_string())?;
+    }
+
     source.start().map_err(|e| e.to_string())?;
 
     // Rebuild frontend and VFO before committing the source to state.

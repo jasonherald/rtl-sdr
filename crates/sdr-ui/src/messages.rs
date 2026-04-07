@@ -22,6 +22,17 @@ pub enum DspToUi {
     GainList(Vec<f64>),
 }
 
+/// Available source types for IQ input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceType {
+    /// RTL-SDR USB dongle.
+    RtlSdr,
+    /// TCP/UDP network IQ stream.
+    Network,
+    /// WAV file playback.
+    File,
+}
+
 /// Messages sent from the UI thread to the DSP pipeline thread.
 #[derive(Debug)]
 pub enum UiToDsp {
@@ -77,6 +88,12 @@ pub enum UiToDsp {
     SetHighPass(bool),
     /// Set the audio output device by `PipeWire` node name.
     SetAudioDevice(String),
+    /// Switch the source type (stops current source if running).
+    SetSourceType(SourceType),
+    /// Configure network source hostname and port.
+    SetNetworkConfig { hostname: String, port: u16 },
+    /// Set the file path for file source playback.
+    SetFilePath(std::path::PathBuf),
 }
 
 #[cfg(test)]
@@ -191,5 +208,39 @@ mod tests {
 
         let device = UiToDsp::SetAudioDevice("default".to_string());
         assert!(matches!(device, UiToDsp::SetAudioDevice(ref s) if s == "default"));
+
+        let src_type = UiToDsp::SetSourceType(SourceType::RtlSdr);
+        assert!(matches!(src_type, UiToDsp::SetSourceType(SourceType::RtlSdr)));
+
+        let src_net = UiToDsp::SetSourceType(SourceType::Network);
+        assert!(matches!(src_net, UiToDsp::SetSourceType(SourceType::Network)));
+
+        let src_file = UiToDsp::SetSourceType(SourceType::File);
+        assert!(matches!(src_file, UiToDsp::SetSourceType(SourceType::File)));
+
+        let net_cfg = UiToDsp::SetNetworkConfig {
+            hostname: "192.168.1.1".to_string(),
+            port: 4321,
+        };
+        assert!(matches!(
+            net_cfg,
+            UiToDsp::SetNetworkConfig { ref hostname, port: 4321 } if hostname == "192.168.1.1"
+        ));
+
+        let file_path = UiToDsp::SetFilePath(std::path::PathBuf::from("/tmp/test.wav"));
+        assert!(matches!(
+            file_path,
+            UiToDsp::SetFilePath(ref p) if p == std::path::Path::new("/tmp/test.wav")
+        ));
+    }
+
+    #[test]
+    fn test_source_type_variants() {
+        assert_eq!(SourceType::RtlSdr, SourceType::RtlSdr);
+        assert_ne!(SourceType::RtlSdr, SourceType::Network);
+        assert_ne!(SourceType::Network, SourceType::File);
+
+        let types = [SourceType::RtlSdr, SourceType::Network, SourceType::File];
+        assert_eq!(types.len(), 3);
     }
 }
