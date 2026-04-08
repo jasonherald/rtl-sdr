@@ -536,3 +536,51 @@ fn create_colormap_texture(gl: &glow::Context) -> Result<glow::Texture, GlError>
         Ok(texture)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsample_preserves_peak() {
+        let data = [0.0, 5.0, 1.0, 3.0, 2.0, 8.0, 4.0, 1.0];
+        let mut buf = Vec::new();
+        downsample_to(&data, &mut buf, 4);
+        assert_eq!(buf.len(), 4);
+        assert!((buf[0] - 5.0).abs() < f32::EPSILON);
+        assert!((buf[1] - 3.0).abs() < f32::EPSILON);
+        assert!((buf[2] - 8.0).abs() < f32::EPSILON);
+        assert!((buf[3] - 4.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn downsample_non_divisible() {
+        let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let mut buf = Vec::new();
+        downsample_to(&data, &mut buf, 3);
+        assert_eq!(buf.len(), 3);
+        assert!(buf[0] >= 2.0);
+        assert!(buf[1] >= 4.0);
+        assert!(buf[2] >= 7.0);
+    }
+
+    #[test]
+    fn downsample_single_output() {
+        let data = [1.0, 9.0, 3.0, 2.0];
+        let mut buf = Vec::new();
+        downsample_to(&data, &mut buf, 1);
+        assert_eq!(buf.len(), 1);
+        assert!((buf[0] - 9.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn downsample_same_size_passthrough() {
+        let data = [1.0, 2.0, 3.0];
+        let mut buf = Vec::new();
+        downsample_to(&data, &mut buf, 3);
+        assert_eq!(buf.len(), 3);
+        assert!((buf[0] - 1.0).abs() < f32::EPSILON);
+        assert!((buf[1] - 2.0).abs() < f32::EPSILON);
+        assert!((buf[2] - 3.0).abs() < f32::EPSILON);
+    }
+}
