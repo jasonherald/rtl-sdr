@@ -123,7 +123,7 @@ sdr-rs
 | M | Cycle demod mode |
 | F9 | Toggle sidebar |
 | Ctrl+, | Preferences |
-| Ctrl+? | Keyboard shortcuts |
+| Ctrl+/ | Keyboard shortcuts |
 
 ## Architecture
 
