@@ -51,14 +51,13 @@ impl KeyringStore {
         }
     }
 
-    pub fn has(&self, key: &str) -> bool {
-        match self.get(key) {
-            Ok(val) => val.is_some(),
-            Err(e) => {
-                tracing::warn!(key, "keyring check failed: {e}");
-                false
-            }
-        }
+    /// Check whether a credential exists for the given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`KeyringError`] if the keyring backend is unavailable.
+    pub fn has(&self, key: &str) -> Result<bool, KeyringError> {
+        self.get(key).map(|val| val.is_some())
     }
 
     fn entry(&self, key: &str) -> Result<keyring::Entry, KeyringError> {

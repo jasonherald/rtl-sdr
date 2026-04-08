@@ -177,17 +177,27 @@ pub fn send_request(client: &Client, envelope: &str) -> Result<String, SoapError
         .post(SOAP_ENDPOINT)
         .header("Content-Type", "text/xml; charset=utf-8")
         .body(envelope.to_owned())
-        .send()?
-        .text()?;
+        .send()?;
 
-    if let Some(fault) = extract_soap_fault(&resp) {
+    let status = resp.status();
+    let body = resp.text()?;
+
+    // Check for SOAP faults first — the server may return a fault inside
+    // either a 200 or a 500 response.
+    if let Some(fault) = extract_soap_fault(&body) {
         if fault.contains("Authentication") || fault.contains("auth") || fault.contains("login") {
             return Err(SoapError::AuthFailed);
         }
         return Err(SoapError::Fault(fault));
     }
 
-    Ok(resp)
+    // Reject non-success HTTP responses that weren't SOAP faults (e.g.,
+    // HTML error pages, 503s).
+    if !status.is_success() {
+        return Err(SoapError::Unexpected(format!("HTTP {status}")));
+    }
+
+    Ok(body)
 }
 
 /// Extracts the `<faultstring>` text from a SOAP fault response, if present.

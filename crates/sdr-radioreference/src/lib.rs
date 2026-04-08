@@ -12,7 +12,13 @@ pub use types::{RrFrequency, RrTag, ZipInfo};
 
 /// Application API key — identifies the SDR-RS app to `RadioReference`.
 /// This is not a secret; it's distributed with the application.
-const APP_KEY: &str = "PENDING_API_KEY";
+///
+/// Set via `RADIOREFERENCE_APP_KEY` env var at build time, or defaults to a
+/// placeholder that will fail at runtime with an auth error.
+const APP_KEY: &str = match option_env!("RADIOREFERENCE_APP_KEY") {
+    Some(key) => key,
+    None => "PENDING_API_KEY",
+};
 
 /// `RadioReference` SOAP API client.
 ///
@@ -23,16 +29,25 @@ pub struct RrClient {
 }
 
 impl RrClient {
-    /// Create a new client with the given `RadioReference` credentials.
-    pub fn new(username: &str, password: &str) -> Self {
-        Self {
+    ///
+    /// Configures HTTP timeouts to prevent indefinite hangs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SoapError`] if the HTTP client cannot be constructed.
+    pub fn new(username: &str, password: &str) -> Result<Self, SoapError> {
+        let http = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        Ok(Self {
             auth: soap::SoapAuth {
                 username: username.to_string(),
                 password: password.to_string(),
                 app_key: APP_KEY.to_string(),
             },
-            http: reqwest::blocking::Client::new(),
-        }
+            http,
+        })
     }
 
     /// Test the connection by querying zip code 90210.

@@ -19,9 +19,19 @@ const KEY_RR_USERNAME: &str = "radioreference-username";
 const KEY_RR_PASSWORD: &str = "radioreference-password";
 
 /// Check whether `RadioReference` credentials exist in the keyring.
+///
+/// Returns `false` if the keyring backend is unavailable, logging the error.
 pub fn has_rr_credentials() -> bool {
     let store = KeyringStore::new(KEYRING_SERVICE);
-    store.has(KEY_RR_USERNAME) && store.has(KEY_RR_PASSWORD)
+    let has_user = store.has(KEY_RR_USERNAME).unwrap_or_else(|e| {
+        tracing::warn!("keyring check failed: {e}");
+        false
+    });
+    let has_pass = store.has(KEY_RR_PASSWORD).unwrap_or_else(|e| {
+        tracing::warn!("keyring check failed: {e}");
+        false
+    });
+    has_user && has_pass
 }
 
 /// Load `RadioReference` credentials from the keyring, if present.
@@ -150,7 +160,10 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
             // Spawn blocking SOAP test, then handle result on main thread
             glib::spawn_future_local(async move {
                 let result = gtk4::gio::spawn_blocking(move || {
-                    let client = sdr_radioreference::RrClient::new(&username, &password);
+                    let client = match sdr_radioreference::RrClient::new(&username, &password) {
+                        Ok(c) => c,
+                        Err(e) => return Err(format!("client init: {e}")),
+                    };
                     let test_result = client.test_connection().map_err(|e| e.to_string());
 
                     // Save to keyring on success

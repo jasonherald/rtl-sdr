@@ -218,7 +218,7 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
 
             glib::spawn_future_local(async move {
                 let result = gio::spawn_blocking(move || {
-                    let client = sdr_radioreference::RrClient::new(&username, &password);
+                    let client = sdr_radioreference::RrClient::new(&username, &password)?;
                     let zip_info = client.get_zip_info(&zip)?;
                     let freqs = client.get_county_frequencies(zip_info.county_id)?;
                     Ok::<(sdr_radioreference::ZipInfo, Vec<RrFrequency>), sdr_radioreference::SoapError>(
