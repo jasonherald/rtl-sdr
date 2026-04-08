@@ -2,18 +2,49 @@
 
 Software-defined radio application in Rust -- a port of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus) with a GTK4/libadwaita UI.
 
-<!-- Screenshot: add a screenshot here once the UI is stable -->
+<!-- TODO: add screenshot (#195) -->
 
 ## Features
 
-- 8 demodulation modes: NFM, WFM, AM, DSB, USB, LSB, CW, RAW
+### Radio
+
+- 8 demodulation modes: WFM, NFM, AM, DSB, USB, LSB, CW, RAW
 - RTL-SDR hardware support (pure Rust USB driver, no C library needed)
 - TCP/UDP network IQ source and sink
 - WAV file IQ playback with looping
+- Audio notch filter (biquad IIR, 20-20,000 Hz)
+- Bookmark tuning profiles with full state capture/restore
+
+### Display
+
+- Cairo-rendered FFT spectrum plot and scrolling waterfall
+- Frequency axis with smart Hz/kHz/MHz/GHz labels
+- Spectrum zoom (scroll to zoom, clamped to FFT bandwidth)
+- VFO overlay with drag-to-tune and bandwidth handles
+- Configurable FFT size, window function, colormap, and dB range
+
+### Recording
+
+- Audio WAV recording (48 kHz stereo, IEEE float 32-bit)
+- IQ WAV recording (raw pre-decimation samples)
+- Waterfall PNG export with desktop notification and click-to-open
+
+### Integration
+
+- RadioReference.com frequency database browser (SOAP API client)
+- Secure credential storage via OS keyring (GNOME Keyring / macOS Keychain)
+- Preferences window with directory settings and account management
 - PipeWire audio output (Linux), CoreAudio planned (macOS)
-- GTK4/libadwaita UI with waterfall, FFT, and spectrum displays
-- Configurable DSP pipeline: decimation, resampling, filtering
-- JSON-based configuration persistence
+- Desktop notifications (GNotification) with click-to-open
+
+### Under the Hood
+
+- 14-crate workspace with clear dependency boundaries
+- Pure DSP functions (no threading, no I/O, no side effects)
+- Zero per-frame heap allocations on hot paths
+- Lock-based SPSC audio ring buffer between DSP and audio threads
+- `mallopt(M_ARENA_MAX)` + periodic `malloc_trim` for glibc arena management
+- JSON-based configuration with auto-save
 
 ## Build
 
@@ -23,18 +54,20 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 - **GTK 4.10+** and **libadwaita 1.5+**
 - **PipeWire** development libraries (Linux audio)
 - **libusb** (for RTL-SDR USB access)
+- **libdbus** (for secure credential storage)
 - **libclang** (build-time, for bindgen if needed)
 
 #### Arch Linux
 
 ```bash
-sudo pacman -S gtk4 libadwaita pipewire libusb clang
+sudo pacman -S gtk4 libadwaita pipewire libusb dbus clang
 ```
 
 #### Ubuntu / Debian
 
 ```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev libusb-1.0-0-dev libclang-dev
+sudo apt install libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev \
+  libusb-1.0-0-dev libdbus-1-dev libclang-dev
 ```
 
 #### macOS
@@ -49,6 +82,14 @@ brew install gtk4 libadwaita libusb llvm
 cargo build --release
 ```
 
+### Install
+
+```bash
+make install
+```
+
+Installs the binary, desktop entry, and icon for app launcher integration.
+
 ### Run tests
 
 ```bash
@@ -58,44 +99,60 @@ cargo test --workspace
 ### Lint
 
 ```bash
-cargo clippy --all-targets --workspace -- -D warnings
-cargo fmt --all -- --check
+make lint
 ```
+
+Runs `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo deny`, and `cargo audit`.
 
 ## Usage
 
 ```bash
-cargo run --release
+sdr-rs
 ```
 
 1. Select a source (RTL-SDR device, network, or file)
-2. Set center frequency
-3. Choose demodulation mode (NFM, WFM, AM, USB, LSB, etc.)
+2. Set center frequency using the digit selector (scroll or click digits)
+3. Choose demodulation mode (WFM, NFM, AM, USB, LSB, etc.)
 4. Press **Play**
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| Space | Play / Stop |
+| M | Cycle demod mode |
+| F9 | Toggle sidebar |
+| Ctrl+, | Preferences |
+| Ctrl+? | Keyboard shortcuts |
 
 ## Architecture
 
-13-crate workspace with clear dependency boundaries:
+14-crate workspace with clear dependency boundaries:
 
 ```text
-sdr (binary)            Entry point
-sdr-ui                  GTK4/libadwaita UI
-sdr-radio               Radio decoder, demod, IF/AF chains
-sdr-pipeline            Threading, streaming, signal path
-sdr-dsp                 Pure DSP: math, filters, FFT, demod, resampling
-sdr-types               Foundation types, errors, constants
-sdr-config              JSON configuration persistence
-sdr-rtlsdr              Pure Rust RTL-SDR USB driver
-sdr-source-rtlsdr       RTL-SDR source module
-sdr-source-network      TCP/UDP IQ source
-sdr-source-file         WAV file playback source
-sdr-sink-audio          PipeWire/CoreAudio audio output
-sdr-sink-network        TCP/UDP audio output
+sdr (binary)              Entry point
+sdr-ui                    GTK4/libadwaita UI
+sdr-radio                 Radio decoder, demod, IF/AF chains
+sdr-pipeline              Threading, streaming, signal path
+sdr-dsp                   Pure DSP: math, filters, FFT, demod, resampling
+sdr-types                 Foundation types, errors, constants
+sdr-config                JSON config persistence + OS keyring access
+sdr-rtlsdr                Pure Rust RTL-SDR USB driver (5 tuner chips)
+sdr-radioreference        RadioReference.com SOAP API client
+sdr-source-rtlsdr         RTL-SDR source module
+sdr-source-network        TCP/UDP IQ source
+sdr-source-file           WAV file playback source
+sdr-sink-audio            PipeWire/CoreAudio audio output
+sdr-sink-network          TCP/UDP audio output
 ```
 
 **Signal chain:** Source -> Decimation -> Channel filter -> Demodulator -> AF filter -> Audio sink
 
 DSP functions are pure (no threading, no I/O). Threading and streaming live in `sdr-pipeline`.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting and security scanning details.
 
 ## License
 
