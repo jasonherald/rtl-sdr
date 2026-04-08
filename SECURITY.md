@@ -19,6 +19,10 @@ Use GitHub's private vulnerability reporting to submit a report:
 2. Click **"Report a vulnerability"**
 3. Provide a description, steps to reproduce, and any relevant details
 
+### Alternative reporting
+
+If you cannot use GitHub's private reporting, email **security@aaru.network** with a description, steps to reproduce, and any relevant details.
+
 ### What to expect
 
 - **Acknowledgment** within 48 hours
