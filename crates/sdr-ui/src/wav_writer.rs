@@ -87,30 +87,30 @@ impl WavWriter {
 
     /// Write a slice of stereo audio samples (L, R interleaved as f32 pairs).
     ///
+    /// Uses `bytemuck::cast_slice` for a single bulk write instead of
+    /// per-sample serialization.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the write fails.
     #[allow(clippy::cast_possible_truncation)]
     pub fn write_stereo(&mut self, samples: &[Stereo]) -> std::io::Result<()> {
-        for s in samples {
-            self.writer.write_all(&s.l.to_le_bytes())?;
-            self.writer.write_all(&s.r.to_le_bytes())?;
-        }
+        self.writer.write_all(bytemuck::cast_slice(samples))?;
         self.samples_written = self.samples_written.saturating_add(samples.len() as u32);
         Ok(())
     }
 
     /// Write a slice of IQ samples (I, Q interleaved as f32 pairs).
     ///
+    /// Uses `bytemuck::cast_slice` for a single bulk write instead of
+    /// per-sample serialization.
+    ///
     /// # Errors
     ///
     /// Returns an I/O error if the write fails.
     #[allow(clippy::cast_possible_truncation)]
     pub fn write_iq(&mut self, samples: &[Complex]) -> std::io::Result<()> {
-        for s in samples {
-            self.writer.write_all(&s.re.to_le_bytes())?;
-            self.writer.write_all(&s.im.to_le_bytes())?;
-        }
+        self.writer.write_all(bytemuck::cast_slice(samples))?;
         self.samples_written = self.samples_written.saturating_add(samples.len() as u32);
         Ok(())
     }

@@ -4,7 +4,7 @@ const FAST_AMPLITUDE_BETA: f32 = 0.4;
 /// IQ complex sample type — matches SDR++ `dsp::complex_t` memory layout.
 ///
 /// Two f32 fields (re, im) representing in-phase and quadrature components.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 #[must_use]
 pub struct Complex {
