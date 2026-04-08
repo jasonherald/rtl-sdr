@@ -8,7 +8,7 @@ This also introduces the app's first `AdwPreferencesWindow` and a general-purpos
 
 ## Architecture
 
-```
+```text
 sdr-config          — KeyringStore: get/set/delete secrets via OS keyring
 sdr-radioreference  — NEW crate: SOAP client, RR data types, mode mapping
 sdr-ui              — AdwPreferencesWindow, RadioReference browse dialog
@@ -33,7 +33,7 @@ SOAP calls are blocking HTTP via `reqwest::blocking::Client`. They run on GLib's
 
 ### KeyringStore
 
-Thin wrapper around the `keyring` crate (v2):
+Thin wrapper around the `keyring` crate (v3):
 
 ```rust
 KeyringStore::new("sdr-rs")
@@ -42,7 +42,7 @@ KeyringStore::new("sdr-rs")
   .delete("radioreference-username") -> Result<()>
 ```
 
-Three keyring entries for RadioReference:
+Two keyring entries for RadioReference:
 - `radioreference-username`
 - `radioreference-password`
 
@@ -63,7 +63,7 @@ Add `keyring = "3"` to `sdr-config/Cargo.toml`.
 
 ### Crate Structure
 
-```
+```text
 crates/sdr-radioreference/src/
   lib.rs          — pub API: RrClient, query functions
   soap.rs         — SOAP envelope construction, HTTP transport
@@ -74,7 +74,7 @@ crates/sdr-radioreference/src/
 ### RrClient API
 
 ```rust
-RrClient::new(username: &str, password: &str, app_key: &str) -> Self
+RrClient::new(username: &str, password: &str) -> Result<Self, SoapError>
 
 // Validates credentials by calling getZipCodeInfo("90210") — lightweight, deterministic
 fn test_connection(&self) -> Result<()>
@@ -158,7 +158,7 @@ serde.workspace = true
 
 ### File Structure
 
-```
+```text
 crates/sdr-ui/src/
   preferences/
     mod.rs              — AdwPreferencesWindow construction
@@ -190,7 +190,7 @@ Opened from the app menu (`GtkMenuButton` at top right) > "Preferences" menu ite
 
 ### File Structure
 
-```
+```text
 crates/sdr-ui/src/
   radioreference/
     mod.rs              — AdwDialog construction, search flow orchestration
@@ -203,7 +203,7 @@ New icon button in the header bar (right side, near screenshot button). Uses a r
 
 ### Dialog Layout
 
-```
+```text
 +---------------------------------------------+
 |  RadioReference                        [X]   |
 +----------------------------------------------+

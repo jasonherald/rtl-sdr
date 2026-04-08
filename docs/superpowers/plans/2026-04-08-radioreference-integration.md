@@ -16,7 +16,7 @@
 
 ### New Files
 
-```
+```text
 crates/sdr-radioreference/
   Cargo.toml
   src/
@@ -37,7 +37,7 @@ crates/sdr-ui/src/
 
 ### Modified Files
 
-```
+```text
 Cargo.toml                                      -- workspace members + deps
 crates/sdr-config/Cargo.toml                    -- add keyring dep
 crates/sdr-config/src/lib.rs                    -- add KeyringStore module
