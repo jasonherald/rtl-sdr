@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn downsample_non_divisible() {
-        // 7 bins → 3: ratio 2.333, buckets [0..3), [2..5), [5..7)
+        // 7 bins → 3: ratio 2.333, buckets [0..3), [2..5), [4..7)
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
         let mut buf = Vec::new();
         downsample_to(&data, &mut buf, 3);

@@ -1,5 +1,8 @@
 //! Application setup — creates the `AdwApplication` and connects signals.
 
+use std::time::Duration;
+
+use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
@@ -27,6 +30,21 @@ pub fn build_app() -> adw::Application {
 
     app.connect_activate(|app| {
         window::build_window(app);
+
+        // Periodically trim the glibc heap to return freed pages to the OS.
+        // Without this, freed allocations (especially from per-frame FFT clones)
+        // accumulate in malloc arenas and RSS grows indefinitely.
+        #[cfg(target_os = "linux")]
+        glib::timeout_add_local(Duration::from_mins(1), || {
+            #[allow(unsafe_code)]
+            unsafe {
+                unsafe extern "C" {
+                    fn malloc_trim(pad: usize) -> i32;
+                }
+                malloc_trim(0);
+            }
+            glib::ControlFlow::Continue
+        });
     });
 
     app

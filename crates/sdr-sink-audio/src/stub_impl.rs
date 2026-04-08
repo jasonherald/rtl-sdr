@@ -39,7 +39,7 @@ impl AudioSink {
     /// Always returns `Ok` (samples are discarded).
     pub fn write_samples(&mut self, samples: &[Stereo]) -> Result<(), SinkError> {
         self.write_count += 1;
-        if self.write_count % STUB_LOG_INTERVAL == 0 {
+        if self.write_count.is_multiple_of(STUB_LOG_INTERVAL) {
             tracing::debug!(
                 calls = self.write_count,
                 samples = samples.len(),
