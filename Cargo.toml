@@ -93,6 +93,9 @@ pipewire = "0.9"
 # WAV files
 hound = "3"
 
+# Zero-copy type casting
+bytemuck = { version = "1", features = ["derive"] }
+
 # GTK4 / UI
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }

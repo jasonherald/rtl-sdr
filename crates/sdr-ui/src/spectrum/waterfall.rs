@@ -160,12 +160,7 @@ impl WaterfallRenderer {
     /// Blits the pixel buffer as a Cairo `ImageSurface` scaled to the
     /// requested output size. When zoomed in, only the visible frequency
     /// portion is shown by translating and scaling the source surface.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss
-    )]
+    #[allow(clippy::cast_precision_loss)]
     pub fn render(
         &self,
         cr: &cairo::Context,
@@ -188,42 +183,9 @@ impl WaterfallRenderer {
         );
         let _ = cr.paint();
 
-        // Calculate the stride Cairo requires for ARGB32.
-        let Ok(stride) = cairo::Format::ARgb32.stride_for_width(self.display_width as u32) else {
+        let Ok(surface) = self.to_cairo_surface() else {
             return;
         };
-
-        // If Cairo's required stride matches our tightly-packed data, we can
-        // create the surface directly. Otherwise we need to pad each row.
-        let expected_stride = (self.display_width * 4) as i32;
-        let surface = if stride == expected_stride {
-            cairo::ImageSurface::create_for_data(
-                self.pixel_buf.clone(),
-                cairo::Format::ARgb32,
-                self.display_width as i32,
-                HISTORY_LINES as i32,
-                stride,
-            )
-        } else {
-            // Pad rows to match Cairo's required stride.
-            let mut padded = vec![0u8; stride as usize * HISTORY_LINES];
-            for row in 0..HISTORY_LINES {
-                let src_start = row * self.display_width * 4;
-                let src_end = src_start + self.display_width * 4;
-                let dst_start = row * stride as usize;
-                let dst_end = dst_start + self.display_width * 4;
-                padded[dst_start..dst_end].copy_from_slice(&self.pixel_buf[src_start..src_end]);
-            }
-            cairo::ImageSurface::create_for_data(
-                padded,
-                cairo::Format::ARgb32,
-                self.display_width as i32,
-                HISTORY_LINES as i32,
-                stride,
-            )
-        };
-
-        let Ok(surface) = surface else { return };
 
         // Compute the visible portion of the full-bandwidth surface.
         // The pixel buffer spans -full_bw/2 .. +full_bw/2.
@@ -290,40 +252,50 @@ impl WaterfallRenderer {
         }
     }
 
-    /// Export the waterfall display to a PNG file.
+    /// Build a Cairo `ImageSurface` from the pixel buffer, handling stride
+    /// alignment. Cairo may require row strides wider than our tightly-packed
+    /// data; when they differ, rows are padded to match.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
         clippy::cast_sign_loss
     )]
-    pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
+    fn to_cairo_surface(&self) -> Result<cairo::ImageSurface, String> {
         if self.display_width == 0 {
             return Err("no waterfall data".to_string());
         }
+
         let stride = cairo::Format::ARgb32
             .stride_for_width(self.display_width as u32)
             .map_err(|e| format!("stride: {e}"))?;
-        let expected = (self.display_width * 4) as i32;
-        let buf = if stride == expected {
+
+        let packed_stride = (self.display_width * 4) as i32;
+        let buf = if stride == packed_stride {
             self.pixel_buf.clone()
         } else {
             let mut padded = vec![0u8; stride as usize * HISTORY_LINES];
+            let row_bytes = self.display_width * 4;
             for row in 0..HISTORY_LINES {
-                let src = row * self.display_width * 4;
+                let src = row * row_bytes;
                 let dst = row * stride as usize;
-                padded[dst..dst + self.display_width * 4]
-                    .copy_from_slice(&self.pixel_buf[src..src + self.display_width * 4]);
+                padded[dst..dst + row_bytes].copy_from_slice(&self.pixel_buf[src..src + row_bytes]);
             }
             padded
         };
-        let surface = cairo::ImageSurface::create_for_data(
+
+        cairo::ImageSurface::create_for_data(
             buf,
             cairo::Format::ARgb32,
             self.display_width as i32,
             HISTORY_LINES as i32,
             stride,
         )
-        .map_err(|e| format!("surface: {e}"))?;
+        .map_err(|e| format!("surface: {e}"))
+    }
+
+    /// Export the waterfall display to a PNG file.
+    pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
+        let surface = self.to_cairo_surface()?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

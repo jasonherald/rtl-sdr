@@ -1,7 +1,7 @@
 /// Stereo audio sample — matches SDR++ `dsp::stereo_t` memory layout.
 ///
 /// Two f32 fields (l, r) representing left and right audio channels.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 #[must_use]
 pub struct Stereo {
