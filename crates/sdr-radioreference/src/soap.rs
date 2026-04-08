@@ -4,9 +4,9 @@
 use std::borrow::Cow;
 use std::io::Cursor;
 
-use quick_xml::events::{BytesDecl, BytesText, Event};
 use quick_xml::Reader;
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesText, Event};
 use reqwest::blocking::Client;
 
 use crate::types::{RrFrequency, RrTag, ZipInfo};
@@ -110,18 +110,14 @@ where
         .with_attribute(("xmlns:xsd", NS_XSD))
         .with_attribute(("xmlns:tns", NS_TNS))
         .write_inner_content(|w| {
-            w.create_element("SOAP-ENV:Body")
-                .write_inner_content(|w| {
-                    w.create_element(&*method_tag)
-                        .write_inner_content(|w| {
-                            body_fn(w).map_err(|e| {
-                                std::io::Error::other(e.to_string())
-                            })?;
-                            write_auth_info(w, auth)?;
-                            Ok(())
-                        })?;
+            w.create_element("SOAP-ENV:Body").write_inner_content(|w| {
+                w.create_element(&*method_tag).write_inner_content(|w| {
+                    body_fn(w).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    write_auth_info(w, auth)?;
                     Ok(())
                 })?;
+                Ok(())
+            })?;
             Ok(())
         })?;
 
@@ -131,10 +127,7 @@ where
 
 /// Writes the `<authInfo>` block with `appKey`, `username`, `password`,
 /// `version`, and `style` elements.
-fn write_auth_info(
-    writer: &mut Writer<Cursor<Vec<u8>>>,
-    auth: &SoapAuth,
-) -> std::io::Result<()> {
+fn write_auth_info(writer: &mut Writer<Cursor<Vec<u8>>>, auth: &SoapAuth) -> std::io::Result<()> {
     writer
         .create_element("authInfo")
         .with_attribute(("xsi:type", "tns:authInfo"))
@@ -178,10 +171,7 @@ pub fn send_request(client: &Client, envelope: &str) -> Result<String, SoapError
         .text()?;
 
     if let Some(fault) = extract_soap_fault(&resp) {
-        if fault.contains("Authentication")
-            || fault.contains("auth")
-            || fault.contains("login")
-        {
+        if fault.contains("Authentication") || fault.contains("auth") || fault.contains("login") {
             return Err(SoapError::AuthFailed);
         }
         return Err(SoapError::Fault(fault));
@@ -341,15 +331,12 @@ pub fn parse_zip_info(xml: &str) -> Result<ZipInfo, SoapError> {
     }
 
     Ok(ZipInfo {
-        county_id: county_id
-            .ok_or_else(|| SoapError::Unexpected("missing ctid".into()))?,
-        state_id: state_id
-            .ok_or_else(|| SoapError::Unexpected("missing stid".into()))?,
+        county_id: county_id.ok_or_else(|| SoapError::Unexpected("missing ctid".into()))?,
+        state_id: state_id.ok_or_else(|| SoapError::Unexpected("missing stid".into()))?,
         city: city.ok_or_else(|| SoapError::Unexpected("missing city".into()))?,
         county_name: county_name
             .ok_or_else(|| SoapError::Unexpected("missing countyName".into()))?,
-        state_name: state_name
-            .ok_or_else(|| SoapError::Unexpected("missing stateName".into()))?,
+        state_name: state_name.ok_or_else(|| SoapError::Unexpected("missing stateName".into()))?,
     })
 }
 

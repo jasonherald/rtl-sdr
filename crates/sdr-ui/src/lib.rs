@@ -7,6 +7,7 @@ pub mod header;
 pub mod messages;
 pub mod notify;
 pub mod preferences;
+pub mod radioreference;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod spectrum;

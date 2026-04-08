@@ -57,7 +57,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let (split_view, panels, spectrum_handle_raw, status_bar) = build_split_view(&state);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
-    let (header, play_button, demod_dropdown, freq_selector, screenshot_button) =
+    let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
         build_header_bar(&sidebar_toggle, &state);
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
@@ -140,6 +140,41 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
             }
         }
     });
+
+    // Wire RadioReference browse button.
+    {
+        let bm_list = panels.navigation.bookmark_list.clone();
+        let bm_scroll = panels.navigation.bookmark_scroll.clone();
+        let bm_rc = panels.navigation.bookmarks.clone();
+        let on_nav = panels.navigation.on_navigate.clone();
+        let active_bm = panels.navigation.active_bookmark.clone();
+        let name_entry = panels.navigation.name_entry.clone();
+        let on_save = panels.navigation.on_save.clone();
+
+        rr_button.connect_clicked(move |btn| {
+            let bm_list = bm_list.clone();
+            let bm_scroll = bm_scroll.clone();
+            let bm_rc = bm_rc.clone();
+            let on_nav = on_nav.clone();
+            let active_bm = active_bm.clone();
+            let name_entry = name_entry.clone();
+            let on_save = on_save.clone();
+
+            crate::radioreference::show_browse_dialog(btn, move || {
+                // Reload bookmarks from disk and rebuild the sidebar list.
+                *bm_rc.borrow_mut() = sidebar::navigation_panel::load_bookmarks();
+                sidebar::navigation_panel::rebuild_bookmark_list(
+                    &bm_list,
+                    &bm_scroll,
+                    &bm_rc,
+                    &on_nav,
+                    &active_bm,
+                    &name_entry,
+                    &on_save,
+                );
+            });
+        });
+    }
 
     // Wire cursor readout from spectrum to status bar.
     let status_bar_for_cursor = Rc::clone(&status_bar_demod);
@@ -403,6 +438,7 @@ fn build_header_bar(
     gtk4::DropDown,
     header::frequency_selector::FrequencySelector,
     gtk4::Button,
+    gtk4::Button,
 ) {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()
@@ -477,8 +513,16 @@ fn build_header_bar(
         .tooltip_text("Export waterfall to PNG")
         .build();
 
+    // RadioReference frequency browser button
+    let rr_button = gtk4::Button::builder()
+        .icon_name("network-wireless-symbolic")
+        .tooltip_text("RadioReference Frequency Browser")
+        .visible(crate::preferences::accounts_page::has_rr_credentials())
+        .build();
+
     header.pack_end(&menu_button);
     header.pack_end(&volume_button);
+    header.pack_end(&rr_button);
     header.pack_end(&screenshot_button);
 
     (
@@ -487,6 +531,7 @@ fn build_header_bar(
         demod_dropdown.clone(),
         freq_selector,
         screenshot_button,
+        rr_button,
     )
 }
 

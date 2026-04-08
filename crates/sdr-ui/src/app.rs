@@ -47,7 +47,9 @@ pub fn build_app() -> adw::Application {
     });
 
     app.connect_activate(|app| {
-        let config_path = gtk4::glib::user_config_dir().join("sdr-rs").join("config.json");
+        let config_path = gtk4::glib::user_config_dir()
+            .join("sdr-rs")
+            .join("config.json");
         let defaults = serde_json::json!({});
         let config = match sdr_config::ConfigManager::load(&config_path, &defaults) {
             Ok(c) => std::sync::Arc::new(c),

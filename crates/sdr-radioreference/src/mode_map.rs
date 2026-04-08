@@ -48,7 +48,10 @@ pub fn map_rr_mode(rr_mode: &str) -> MappedMode {
             bandwidth: CW_BW,
         },
         _ => {
-            tracing::warn!(mode = rr_mode, "unknown RadioReference mode, defaulting to NFM");
+            tracing::warn!(
+                mode = rr_mode,
+                "unknown RadioReference mode, defaulting to NFM"
+            );
             MappedMode {
                 demod_mode: "NFM",
                 bandwidth: NFM_BW,

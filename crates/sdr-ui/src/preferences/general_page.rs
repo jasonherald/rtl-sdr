@@ -152,19 +152,15 @@ fn open_folder_picker(
     let key = config_key.to_owned();
     let row = row.clone();
 
-    dialog.select_folder(
-        Some(window),
-        gtk4::gio::Cancellable::NONE,
-        move |result| {
-            if let Ok(folder) = result
-                && let Some(path) = folder.path()
-            {
-                let path_str = path.to_string_lossy().into_owned();
-                row.set_subtitle(&path_str);
-                config.write(|v| {
-                    v[&key] = serde_json::Value::String(path_str);
-                });
-            }
-        },
-    );
+    dialog.select_folder(Some(window), gtk4::gio::Cancellable::NONE, move |result| {
+        if let Ok(folder) = result
+            && let Some(path) = folder.path()
+        {
+            let path_str = path.to_string_lossy().into_owned();
+            row.set_subtitle(&path_str);
+            config.write(|v| {
+                v[&key] = serde_json::Value::String(path_str);
+            });
+        }
+    });
 }

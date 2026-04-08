@@ -251,7 +251,7 @@ fn bookmarks_path() -> std::path::PathBuf {
     path
 }
 
-fn load_bookmarks() -> Vec<Bookmark> {
+pub fn load_bookmarks() -> Vec<Bookmark> {
     let path = bookmarks_path();
     let Ok(data) = std::fs::read_to_string(&path) else {
         return Vec::new();

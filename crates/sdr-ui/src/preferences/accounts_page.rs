@@ -56,14 +56,10 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
         .build();
 
     // --- Username row ---
-    let username_row = adw::EntryRow::builder()
-        .title("Username")
-        .build();
+    let username_row = adw::EntryRow::builder().title("Username").build();
 
     // --- Password row ---
-    let password_row = adw::PasswordEntryRow::builder()
-        .title("Password")
-        .build();
+    let password_row = adw::PasswordEntryRow::builder().title("Password").build();
 
     // Pre-fill username if credentials already exist
     if let Some((stored_user, _)) = load_rr_credentials() {
@@ -88,9 +84,7 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
         .halign(gtk4::Align::Start)
         .build();
 
-    let spinner = gtk4::Spinner::builder()
-        .visible(false)
-        .build();
+    let spinner = gtk4::Spinner::builder().visible(false).build();
 
     let test_button = gtk4::Button::builder()
         .label("Test & Save")
@@ -132,7 +126,11 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
 
             // Validate fields are not empty
             if username.trim().is_empty() || password.trim().is_empty() {
-                show_status(&cb_status_label, "Username and password are required", false);
+                show_status(
+                    &cb_status_label,
+                    "Username and password are required",
+                    false,
+                );
                 return;
             }
 
@@ -152,10 +150,8 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
             // Spawn blocking SOAP test, then handle result on main thread
             glib::spawn_future_local(async move {
                 let result = gtk4::gio::spawn_blocking(move || {
-                    let client =
-                        sdr_radioreference::RrClient::new(&username, &password);
-                    let test_result =
-                        client.test_connection().map_err(|e| e.to_string());
+                    let client = sdr_radioreference::RrClient::new(&username, &password);
+                    let test_result = client.test_connection().map_err(|e| e.to_string());
 
                     // Save to keyring on success
                     if test_result.is_ok() {
@@ -180,11 +176,7 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
 
                 match result {
                     Ok(()) => {
-                        show_status(
-                            &status_label,
-                            "Connected \u{2014} credentials saved",
-                            true,
-                        );
+                        show_status(&status_label, "Connected \u{2014} credentials saved", true);
                         has_credentials.set(true);
                         remove_button.set_visible(true);
                     }
