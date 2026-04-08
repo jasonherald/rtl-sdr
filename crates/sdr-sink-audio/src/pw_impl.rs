@@ -16,6 +16,9 @@ const AUDIO_CHANNELS: u32 = 2;
 /// ~1 second at 48 kHz stereo = 96,000 samples.
 const RING_CAPACITY: usize = 96_000;
 
+/// Initial capacity for the stereo interleave buffer in `write_samples`.
+const INTERLEAVE_BUF_INITIAL_CAP: usize = 1024;
+
 /// Bytes per sample frame (2 channels x 4 bytes per f32).
 const FRAME_SIZE: usize = (AUDIO_CHANNELS as usize) * std::mem::size_of::<f32>();
 
@@ -74,10 +77,21 @@ impl AudioRingBuffer {
         inner.count = cnt;
     }
 
-    /// Read up to `output.len()` samples. Returns count read.
-    fn read(&self, output: &mut [f32]) -> usize {
+    /// Clear the ring buffer (used on start/stop to avoid replaying stale audio).
+    fn clear(&self) {
         let Ok(mut inner) = self.buf.lock() else {
-            return 0;
+            return;
+        };
+        inner.read_pos = 0;
+        inner.write_pos = 0;
+        inner.count = 0;
+    }
+
+    /// Read up to `output.len()` samples. Returns count read.
+    /// Uses `try_lock` to avoid blocking the PipeWire RT callback thread.
+    fn read(&self, output: &mut [f32]) -> usize {
+        let Ok(mut inner) = self.buf.try_lock() else {
+            return 0; // Contended — return silence this cycle.
         };
         let to_read = output.len().min(inner.count);
         let mut rp = inner.read_pos;
@@ -218,7 +232,7 @@ impl AudioSink {
             quit_tx: None,
             pw_thread: None,
             target_node: String::new(),
-            interleave_buf: Vec::with_capacity(1024),
+            interleave_buf: Vec::with_capacity(INTERLEAVE_BUF_INITIAL_CAP),
         }
     }
 
@@ -279,6 +293,7 @@ impl Sink for AudioSink {
         if self.running.load(Ordering::Acquire) {
             return Err(SinkError::AlreadyRunning);
         }
+        self.ring.clear();
 
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Quit>();
 
@@ -318,6 +333,7 @@ impl Sink for AudioSink {
         }
 
         self.running.store(false, Ordering::Release);
+        self.ring.clear();
 
         if had_state {
             tracing::info!("audio sink stopped");

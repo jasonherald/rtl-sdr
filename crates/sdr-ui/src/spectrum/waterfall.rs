@@ -108,6 +108,12 @@ fn supported_texture_width(gl: &glow::Context, requested: usize) -> usize {
     requested.min(MAX_TEXTURE_WIDTH).min(gpu_limit.max(1))
 }
 
+/// Public version of `supported_texture_width` for use by `mod.rs`.
+#[allow(unsafe_code, clippy::cast_sign_loss)]
+pub fn supported_texture_width_for(gl: &glow::Context, requested: usize) -> usize {
+    supported_texture_width(gl, requested)
+}
+
 /// OpenGL renderer for the scrolling waterfall spectrogram.
 pub struct WaterfallRenderer {
     program: glow::Program,

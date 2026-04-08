@@ -178,7 +178,7 @@ impl SpectrumHandle {
         // from the UI, avoiding races with queued old-size frames.
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
             self.waterfall_area.make_current();
-            let target_width = data.len().min(waterfall::MAX_TEXTURE_WIDTH);
+            let target_width = waterfall::supported_texture_width_for(&s.gl, data.len());
             if target_width != s.renderer.texture_width() {
                 s.renderer.resize(&s.gl, data.len());
             }
