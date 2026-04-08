@@ -1695,6 +1695,7 @@ dependencies = [
  "sdr-dsp",
  "sdr-pipeline",
  "sdr-radio",
+ "sdr-radioreference",
  "sdr-rtlsdr",
  "sdr-sink-audio",
  "sdr-sink-network",

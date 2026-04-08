@@ -1,5 +1,6 @@
 //! Preferences window — application settings organized into pages.
 
+pub mod accounts_page;
 pub mod general_page;
 
 use std::sync::Arc;
@@ -31,6 +32,9 @@ pub fn build_preferences_window(
 
     let general_page = general_page::build_general_page(&window, config);
     window.add(&general_page);
+
+    let (accounts_page, _has_credentials) = accounts_page::build_accounts_page();
+    window.add(&accounts_page);
 
     window
 }
