@@ -495,10 +495,15 @@ impl NotchFilter {
     pub fn set_frequency(&mut self, freq: f32) {
         self.frequency = freq;
         self.recalculate_coefficients();
+        self.reset();
     }
 
-    /// Enable or disable the notch filter.
+    /// Enable or disable the notch filter. Resets biquad state on re-enable
+    /// to prevent pops from stale history.
     pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled && !self.enabled {
+            self.reset();
+        }
         self.enabled = enabled;
     }
 

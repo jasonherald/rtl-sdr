@@ -97,13 +97,13 @@ pub struct TuningProfile {
     pub squelch_level: f32,
     pub gain: f64,
     pub agc: bool,
-    pub volume: f32,
+    pub volume: Option<f32>,
     pub deemphasis: u32,
     pub nb_enabled: bool,
     pub nb_level: f32,
     pub fm_if_nr: bool,
     pub wfm_stereo: bool,
-    pub high_pass: bool,
+    pub high_pass: Option<bool>,
 }
 
 /// A user-saved frequency bookmark with optional tuning profile fields.
@@ -181,13 +181,13 @@ impl Bookmark {
             squelch_level: Some(profile.squelch_level),
             gain: Some(profile.gain),
             agc: Some(profile.agc),
-            volume: Some(profile.volume),
+            volume: profile.volume,
             deemphasis: Some(profile.deemphasis),
             nb_enabled: Some(profile.nb_enabled),
             nb_level: Some(profile.nb_level),
             fm_if_nr: Some(profile.fm_if_nr),
             wfm_stereo: Some(profile.wfm_stereo),
-            high_pass: Some(profile.high_pass),
+            high_pass: profile.high_pass,
         }
     }
 
@@ -685,13 +685,13 @@ mod tests {
             squelch_level: -40.0,
             gain: 33.8,
             agc: false,
-            volume: 0.75,
+            volume: Some(0.75),
             deemphasis: 2,
             nb_enabled: false,
             nb_level: 5.0,
             fm_if_nr: true,
             wfm_stereo: true,
-            high_pass: false,
+            high_pass: Some(false),
         };
         let bm = Bookmark::with_profile("Full", 98_100_000, DemodMode::Wfm, 150_000.0, &profile);
         let json = serde_json::to_string(&bm).unwrap();

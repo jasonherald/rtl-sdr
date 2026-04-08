@@ -168,10 +168,10 @@ impl RadioModule {
         if self.high_pass_enabled && high_pass_allowed {
             af_chain.set_high_pass_enabled(true);
         }
-        if self.notch_enabled {
-            af_chain.set_notch_enabled(true);
-            af_chain.set_notch_frequency(self.notch_frequency);
-        }
+        // Always restore notch frequency (even when disabled) so it's
+        // correct when the user re-enables after a mode switch.
+        af_chain.set_notch_frequency(self.notch_frequency);
+        af_chain.set_notch_enabled(self.notch_enabled);
 
         // Update IF chain feature flags based on new mode capabilities
         if !fm_if_nr_allowed {

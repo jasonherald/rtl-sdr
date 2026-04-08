@@ -875,13 +875,17 @@ fn restore_bookmark_profile(
         #[allow(clippy::cast_lossless)]
         radio.squelch_level_row.set_value(sq_lvl as f64);
     }
-    if let Some(gain) = bookmark.gain {
-        state.send_dsp(UiToDsp::SetGain(gain));
-        gain_row.set_value(gain);
-    }
+    // AGC must be set before gain — switching to manual mode first
+    // ensures the saved gain value actually takes effect.
     if let Some(agc) = bookmark.agc {
         state.send_dsp(UiToDsp::SetAgc(agc));
         agc_row.set_active(agc);
+    }
+    if let Some(gain) = bookmark.gain {
+        if bookmark.agc != Some(true) {
+            state.send_dsp(UiToDsp::SetGain(gain));
+        }
+        gain_row.set_value(gain);
     }
     if let Some(vol) = bookmark.volume {
         state.send_dsp(UiToDsp::SetVolume(vol));
@@ -1025,13 +1029,13 @@ fn connect_navigation_panel(
             squelch_level: radio_bm.squelch_level_row.value() as f32,
             gain: source_gain_bm.value(),
             agc: source_agc_bm.is_active(),
-            volume: 1.0, // Volume ScaleButton is not in sidebar; default full.
+            volume: None, // Volume ScaleButton not in sidebar — don't persist.
             deemphasis: radio_bm.deemphasis_row.selected(),
             nb_enabled: radio_bm.noise_blanker_row.is_active(),
             nb_level: radio_bm.nb_level_row.value() as f32,
             fm_if_nr: radio_bm.fm_if_nr_row.is_active(),
             wfm_stereo: radio_bm.stereo_row.is_active(),
-            high_pass: false, // No UI widget yet.
+            high_pass: None, // No UI widget yet — don't persist.
         };
         let bookmark =
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
@@ -1084,14 +1088,14 @@ fn connect_navigation_panel(
             squelch_level: save_radio_sq_lvl.value() as f32,
             gain: save_source_gain.value(),
             agc: save_source_agc.is_active(),
-            volume: 1.0,
+            volume: None,
             deemphasis: save_radio_deemp.selected(),
             nb_enabled: save_radio_nben.is_active(),
             #[allow(clippy::cast_possible_truncation)]
             nb_level: save_radio_nben_lvl.value() as f32,
             fm_if_nr: save_radio_nr.is_active(),
             wfm_stereo: save_radio_stereo.is_active(),
-            high_pass: false,
+            high_pass: None,
         };
         // Find and update the active bookmark in the list.
         let mut bms = save_bm_rc.borrow_mut();
@@ -1106,13 +1110,13 @@ fn connect_navigation_panel(
             bm.squelch_level = Some(profile.squelch_level);
             bm.gain = Some(profile.gain);
             bm.agc = Some(profile.agc);
-            bm.volume = Some(profile.volume);
+            bm.volume = profile.volume;
             bm.deemphasis = Some(profile.deemphasis);
             bm.nb_enabled = Some(profile.nb_enabled);
             bm.nb_level = Some(profile.nb_level);
             bm.fm_if_nr = Some(profile.fm_if_nr);
             bm.wfm_stereo = Some(profile.wfm_stereo);
-            bm.high_pass = Some(profile.high_pass);
+            bm.high_pass = profile.high_pass;
         }
         sidebar::navigation_panel::save_bookmarks(&bms);
         drop(bms);
