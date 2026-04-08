@@ -303,12 +303,7 @@ pub fn build_spectrum_view(
         &fill_enabled,
         &cursor_callback,
     );
-    let waterfall_area = build_waterfall_area(
-        Rc::clone(&waterfall_state),
-        Rc::clone(&vfo_state),
-        &min_db,
-        &max_db,
-    );
+    let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state));
     let signal_history_area =
         build_signal_history_area(Rc::clone(&signal_history_state), &min_db, &max_db);
 
@@ -461,8 +456,6 @@ fn build_fft_area(
 fn build_waterfall_area(
     state: Rc<RefCell<Option<WaterfallState>>>,
     vfo_state: Rc<RefCell<VfoState>>,
-    _min_db: &Rc<Cell<f32>>,
-    _max_db: &Rc<Cell<f32>>,
 ) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::builder()
         .hexpand(true)

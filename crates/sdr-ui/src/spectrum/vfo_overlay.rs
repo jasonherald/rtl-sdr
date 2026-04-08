@@ -13,7 +13,7 @@ use gtk4::cairo;
 // ---------------------------------------------------------------------------
 
 /// Default VFO passband fill color (semi-transparent blue).
-const VFO_COLOR: [f32; 4] = [0.2, 0.6, 1.0, 0.15];
+const VFO_COLOR: [f64; 4] = [0.2, 0.6, 1.0, 0.15];
 
 /// VFO center frequency line color (brighter blue).
 const VFO_CENTER_COLOR: [f64; 4] = [0.3, 0.7, 1.0, 0.5];
@@ -70,7 +70,7 @@ pub struct VfoState {
     /// Display frequency range end (relative to tuner center), in Hz.
     pub display_end_hz: f64,
     /// VFO passband fill color (RGBA).
-    pub color: [f32; 4],
+    pub color: [f64; 4],
     /// Whether the VFO center is currently being dragged.
     pub dragging: bool,
     /// Whether a bandwidth handle is being dragged.
@@ -296,12 +296,7 @@ impl VfoOverlayRenderer {
         let right_x = w * right_frac;
 
         cr.rectangle(left_x, 0.0, right_x - left_x, h);
-        cr.set_source_rgba(
-            f64::from(vfo.color[0]),
-            f64::from(vfo.color[1]),
-            f64::from(vfo.color[2]),
-            f64::from(vfo.color[3]),
-        );
+        cr.set_source_rgba(vfo.color[0], vfo.color[1], vfo.color[2], vfo.color[3]);
         let _ = cr.fill();
     }
 
