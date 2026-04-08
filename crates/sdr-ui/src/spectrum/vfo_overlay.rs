@@ -3,23 +3,23 @@
 //! Draws a semi-transparent passband rectangle, center frequency line, and
 //! bandwidth handles on top of both spectrum views. Provides click-to-tune,
 //! drag-to-move, bandwidth adjustment, and scroll-to-zoom interaction.
+//!
+//! Renders via Cairo draw calls — no OpenGL.
 
-use glow::HasContext;
-
-use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
+use gtk4::cairo;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /// Default VFO passband fill color (semi-transparent blue).
-const VFO_COLOR: [f32; 4] = [0.2, 0.6, 1.0, 0.15];
+const VFO_COLOR: [f64; 4] = [0.2, 0.6, 1.0, 0.15];
 
 /// VFO center frequency line color (brighter blue).
-const VFO_CENTER_COLOR: [f32; 4] = [0.3, 0.7, 1.0, 0.5];
+const VFO_CENTER_COLOR: [f64; 4] = [0.3, 0.7, 1.0, 0.5];
 
 /// VFO bandwidth handle edge color.
-const VFO_EDGE_COLOR: [f32; 4] = [0.5, 0.8, 1.0, 0.6];
+const VFO_EDGE_COLOR: [f64; 4] = [0.5, 0.8, 1.0, 0.6];
 
 /// Click zone width in pixels for grabbing a bandwidth handle.
 const BW_HANDLE_THRESHOLD_PX: f64 = 8.0;
@@ -44,13 +44,6 @@ const MIN_DISPLAY_SPAN_HZ: f64 = 1_000.0;
 
 /// Maximum display span in Hz.
 const MAX_DISPLAY_SPAN_HZ: f64 = 50_000_000.0;
-
-/// Maximum number of overlay vertices for any single draw call.
-/// Each primitive is drawn separately: passband rect (4), center quad (4), edge lines (4).
-const MAX_OVERLAY_VERTICES: usize = 4;
-
-/// Maximum vertex buffer size in floats (2 floats per vertex).
-const MAX_OVERLAY_FLOATS: usize = MAX_OVERLAY_VERTICES * 2;
 
 // ---------------------------------------------------------------------------
 // VFO state
@@ -77,7 +70,7 @@ pub struct VfoState {
     /// Display frequency range end (relative to tuner center), in Hz.
     pub display_end_hz: f64,
     /// VFO passband fill color (RGBA).
-    pub color: [f32; 4],
+    pub color: [f64; 4],
     /// Whether the VFO center is currently being dragged.
     pub dragging: bool,
     /// Whether a bandwidth handle is being dragged.
@@ -99,6 +92,16 @@ impl Default for VfoState {
 }
 
 impl VfoState {
+    /// Convert a frequency (in Hz, relative to display center) to a fractional
+    /// X position (0.0 = left edge, 1.0 = right edge).
+    fn hz_to_frac_x(&self, hz: f64) -> f64 {
+        let span = self.display_end_hz - self.display_start_hz;
+        if span <= 0.0 {
+            return 0.5;
+        }
+        (hz - self.display_start_hz) / span
+    }
+
     /// Convert a frequency (in Hz, relative to display center) to clip-space X.
     ///
     /// Clip space ranges from -1.0 (left) to 1.0 (right).
@@ -149,7 +152,8 @@ impl VfoState {
         self.hz_to_clip_x(self.offset_hz + self.bandwidth_hz / 2.0)
     }
 
-    /// Clip-space X for the VFO center line.
+    /// Clip-space X for the VFO center line (used by tests).
+    #[cfg(test)]
     fn center_clip_x(&self) -> f64 {
         self.hz_to_clip_x(self.offset_hz)
     }
@@ -238,89 +242,29 @@ pub enum HitZone {
 // VFO overlay renderer
 // ---------------------------------------------------------------------------
 
-/// OpenGL renderer for the VFO overlay.
+/// Cairo renderer for the VFO overlay.
 ///
 /// Draws a semi-transparent passband rectangle, center line, and bandwidth
-/// handle edges on top of the FFT plot or waterfall. Uses the same simple
-/// position + uniform color shader as the FFT plot.
-pub struct VfoOverlayRenderer {
-    program: glow::Program,
-    vao: glow::VertexArray,
-    vbo: glow::Buffer,
-    color_location: glow::UniformLocation,
+/// handle edges on top of the FFT plot or waterfall.
+pub struct VfoOverlayRenderer;
+
+impl Default for VfoOverlayRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl VfoOverlayRenderer {
     /// Create a new VFO overlay renderer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `GlError` if shader compilation, linking, or buffer creation fails.
-    #[allow(
-        unsafe_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    pub fn new(gl: &glow::Context) -> Result<Self, GlError> {
-        let vert = gl_renderer::compile_shader(gl, glow::VERTEX_SHADER, VERT_SHADER)?;
-        let frag = gl_renderer::compile_shader(gl, glow::FRAGMENT_SHADER, FRAG_SHADER)?;
-        let program = gl_renderer::link_program(gl, vert, frag)?;
-
-        let color_location = unsafe {
-            gl.get_uniform_location(program, "u_color")
-                .ok_or_else(|| GlError::ResourceCreation("u_color uniform not found".into()))?
-        };
-
-        let (vao, vbo) = unsafe {
-            let vao = gl
-                .create_vertex_array()
-                .map_err(|e| GlError::ResourceCreation(e.clone()))?;
-            let vbo = gl
-                .create_buffer()
-                .map_err(|e| GlError::ResourceCreation(e.clone()))?;
-
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-
-            // Pre-allocate for the overlay geometry.
-            let max_bytes = MAX_OVERLAY_FLOATS * std::mem::size_of::<f32>();
-            gl.buffer_data_size(glow::ARRAY_BUFFER, max_bytes as i32, glow::STREAM_DRAW);
-
-            // Vertex attribute: vec2 at location 0.
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(
-                0,
-                2,
-                glow::FLOAT,
-                false,
-                (2 * std::mem::size_of::<f32>()) as i32,
-                0,
-            );
-
-            gl.bind_vertex_array(None);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-
-            (vao, vbo)
-        };
-
-        Ok(Self {
-            program,
-            vao,
-            vbo,
-            color_location,
-        })
+    pub fn new() -> Self {
+        Self
     }
 
-    /// Render the VFO overlay on top of the current GL framebuffer.
+    /// Render the VFO overlay on top of the current Cairo context.
     ///
-    /// Must be called after the main FFT plot or waterfall has been rendered,
-    /// while the GL context is still current.
-    #[allow(
-        unsafe_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    pub fn render(&self, gl: &glow::Context, vfo: &VfoState, width: i32, height: i32) {
+    /// Must be called after the main FFT plot or waterfall has been rendered.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn render(&self, cr: &cairo::Context, vfo: &VfoState, width: i32, height: i32) {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -330,174 +274,72 @@ impl VfoOverlayRenderer {
             return;
         }
 
-        unsafe {
-            gl.use_program(Some(self.program));
-            gl.bind_vertex_array(Some(self.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-        }
+        let w = f64::from(width);
+        let h = f64::from(height);
 
         // Draw passband fill rectangle.
-        self.draw_passband_fill(gl, vfo);
+        Self::draw_passband_fill(cr, vfo, w, h);
 
         // Draw center frequency line.
-        self.draw_center_line(gl, vfo, width);
+        Self::draw_center_line(cr, vfo, w, h);
 
         // Draw left and right bandwidth handle edges.
-        self.draw_edge_lines(gl, vfo);
-
-        unsafe {
-            gl.disable(glow::BLEND);
-            gl.bind_vertex_array(None);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            gl.use_program(None);
-        }
+        Self::draw_edge_lines(cr, vfo, w, h);
     }
 
-    /// Draw the semi-transparent passband fill as a triangle strip.
-    #[allow(
-        unsafe_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn draw_passband_fill(&self, gl: &glow::Context, vfo: &VfoState) {
-        #[allow(clippy::cast_precision_loss)]
-        let left_x = vfo.left_clip_x() as f32;
-        #[allow(clippy::cast_precision_loss)]
-        let right_x = vfo.right_clip_x() as f32;
+    /// Draw the semi-transparent passband fill as a rectangle.
+    fn draw_passband_fill(cr: &cairo::Context, vfo: &VfoState, w: f64, h: f64) {
+        let left_frac = vfo.hz_to_frac_x(vfo.offset_hz - vfo.bandwidth_hz / 2.0);
+        let right_frac = vfo.hz_to_frac_x(vfo.offset_hz + vfo.bandwidth_hz / 2.0);
 
-        // Triangle strip: bottom-left, top-left, bottom-right, top-right.
-        let vertices: [f32; 8] = [
-            left_x, -1.0, // bottom-left
-            left_x, 1.0, // top-left
-            right_x, -1.0, // bottom-right
-            right_x, 1.0, // top-right
-        ];
+        let left_x = w * left_frac;
+        let right_x = w * right_frac;
 
-        let bytes = f32_slice_as_bytes(&vertices);
-
-        unsafe {
-            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
-
-            gl.uniform_4_f32(
-                Some(&self.color_location),
-                vfo.color[0],
-                vfo.color[1],
-                vfo.color[2],
-                vfo.color[3],
-            );
-
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-        }
+        cr.rectangle(left_x, 0.0, right_x - left_x, h);
+        cr.set_source_rgba(vfo.color[0], vfo.color[1], vfo.color[2], vfo.color[3]);
+        let _ = cr.fill();
     }
 
-    /// Draw the center frequency line as a thin quad for consistent width.
-    ///
-    /// Uses a triangle strip instead of `GL_LINES` with `line_width(2.0)`
-    /// because OpenGL core profile only guarantees line width 1.0.
-    #[allow(
-        unsafe_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn draw_center_line(&self, gl: &glow::Context, vfo: &VfoState, width: i32) {
-        #[allow(clippy::cast_precision_loss)]
-        let cx = vfo.center_clip_x() as f32;
+    /// Draw the center frequency line.
+    fn draw_center_line(cr: &cairo::Context, vfo: &VfoState, w: f64, h: f64) {
+        let center_frac = vfo.hz_to_frac_x(vfo.offset_hz);
+        let cx = (w * center_frac).floor() + 0.5;
 
-        // 1px wide quad in clip space — thin enough to see the signal behind it.
-        #[allow(clippy::cast_precision_loss)]
-        let half_w = if width > 0 { 1.0 / width as f32 } else { 0.001 };
-        let vertices: [f32; 8] = [
-            cx - half_w,
-            -1.0,
-            cx + half_w,
-            -1.0,
-            cx - half_w,
-            1.0,
-            cx + half_w,
-            1.0,
-        ];
-        let bytes = f32_slice_as_bytes(&vertices);
-
-        unsafe {
-            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
-
-            gl.uniform_4_f32(
-                Some(&self.color_location),
-                VFO_CENTER_COLOR[0],
-                VFO_CENTER_COLOR[1],
-                VFO_CENTER_COLOR[2],
-                VFO_CENTER_COLOR[3],
-            );
-
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-        }
+        cr.set_source_rgba(
+            VFO_CENTER_COLOR[0],
+            VFO_CENTER_COLOR[1],
+            VFO_CENTER_COLOR[2],
+            VFO_CENTER_COLOR[3],
+        );
+        cr.set_line_width(2.0);
+        cr.move_to(cx, 0.0);
+        cr.line_to(cx, h);
+        let _ = cr.stroke();
     }
 
     /// Draw left and right bandwidth handle edge lines.
-    #[allow(
-        unsafe_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn draw_edge_lines(&self, gl: &glow::Context, vfo: &VfoState) {
-        #[allow(clippy::cast_precision_loss)]
-        let left_x = vfo.left_clip_x() as f32;
-        #[allow(clippy::cast_precision_loss)]
-        let right_x = vfo.right_clip_x() as f32;
+    fn draw_edge_lines(cr: &cairo::Context, vfo: &VfoState, w: f64, h: f64) {
+        let left_frac = vfo.hz_to_frac_x(vfo.offset_hz - vfo.bandwidth_hz / 2.0);
+        let right_frac = vfo.hz_to_frac_x(vfo.offset_hz + vfo.bandwidth_hz / 2.0);
 
-        let vertices: [f32; 8] = [
-            left_x, -1.0, left_x, 1.0, // left edge
-            right_x, -1.0, right_x, 1.0, // right edge
-        ];
-        let bytes = f32_slice_as_bytes(&vertices);
+        let left_x = (w * left_frac).floor() + 0.5;
+        let right_x = (w * right_frac).floor() + 0.5;
 
-        unsafe {
-            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
+        cr.set_source_rgba(
+            VFO_EDGE_COLOR[0],
+            VFO_EDGE_COLOR[1],
+            VFO_EDGE_COLOR[2],
+            VFO_EDGE_COLOR[3],
+        );
+        cr.set_line_width(1.0);
 
-            gl.uniform_4_f32(
-                Some(&self.color_location),
-                VFO_EDGE_COLOR[0],
-                VFO_EDGE_COLOR[1],
-                VFO_EDGE_COLOR[2],
-                VFO_EDGE_COLOR[3],
-            );
-
-            gl.draw_arrays(glow::LINES, 0, 4);
-        }
-    }
-
-    /// Release GL resources.
-    #[allow(unsafe_code)]
-    pub fn destroy(&self, gl: &glow::Context) {
-        unsafe {
-            gl.delete_buffer(self.vbo);
-            gl.delete_vertex_array(self.vao);
-            gl.delete_program(self.program);
-        }
+        cr.move_to(left_x, 0.0);
+        cr.line_to(left_x, h);
+        cr.move_to(right_x, 0.0);
+        cr.line_to(right_x, h);
+        let _ = cr.stroke();
     }
 }
-
-/// Vertex shader — identical to the FFT plot shader.
-const VERT_SHADER: &str = r"#version 300 es
-precision highp float;
-layout(location = 0) in vec2 a_pos;
-void main() {
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-";
-
-/// Fragment shader — identical to the FFT plot shader.
-const FRAG_SHADER: &str = r"#version 300 es
-precision highp float;
-uniform vec4 u_color;
-out vec4 frag_color;
-void main() {
-    frag_color = u_color;
-}
-";
 
 // ---------------------------------------------------------------------------
 // Tests

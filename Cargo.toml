@@ -96,7 +96,6 @@ hound = "3"
 # GTK4 / UI
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
-glow = "0.16"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

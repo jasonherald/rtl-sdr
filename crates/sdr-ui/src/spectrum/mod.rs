@@ -1,13 +1,12 @@
 //! Spectrum display: FFT plot (top) + waterfall spectrogram (bottom).
 //!
-//! Both are rendered via `GtkGLArea` widgets using OpenGL through `glow`.
-//! A `GtkPaned` splits them vertically, with the FFT plot on top (~30%)
-//! and the waterfall below (~70%).
+//! Both are rendered via `DrawingArea` widgets using Cairo. A `GtkPaned`
+//! splits them vertically, with the FFT plot on top (~30%) and the
+//! waterfall below (~70%).
 
 pub mod colormap;
 pub mod fft_plot;
 pub mod frequency_axis;
-pub mod gl_renderer;
 pub mod signal_history;
 pub mod vfo_overlay;
 pub mod waterfall;
@@ -50,7 +49,6 @@ const FFT_SIZE: usize = 2048;
 /// Default FFT plot pane height fraction (30% of total).
 const FFT_PANE_FRACTION: f64 = 0.30;
 
-/// Default minimum display level in dB.
 /// Default minimum display level — matches SDR++ default of -70 dB.
 /// Hides the ADC noise floor so the waterfall background is black.
 const DEFAULT_MIN_DB: f32 = -70.0;
@@ -74,24 +72,21 @@ pub enum AveragingMode {
     MinHold,
 }
 
-/// Shared state for the FFT plot `GtkGLArea`.
+/// Shared state for the FFT plot `DrawingArea`.
 struct FftPlotState {
-    gl: glow::Context,
     renderer: FftPlotRenderer,
     vfo_renderer: VfoOverlayRenderer,
     current_data: Vec<f32>,
 }
 
-/// Shared state for the waterfall `GtkGLArea`.
+/// Shared state for the waterfall `DrawingArea`.
 struct WaterfallState {
-    gl: glow::Context,
     renderer: WaterfallRenderer,
     vfo_renderer: VfoOverlayRenderer,
 }
 
-/// Shared state for the signal history `GtkGLArea`.
+/// Shared state for the signal history `DrawingArea`.
 struct SignalHistoryState {
-    gl: glow::Context,
     renderer: SignalHistoryRenderer,
 }
 
@@ -104,9 +99,9 @@ pub struct SpectrumHandle {
     waterfall_state: Rc<RefCell<Option<WaterfallState>>>,
     signal_history_state: Rc<RefCell<Option<SignalHistoryState>>>,
     vfo_state: Rc<RefCell<VfoState>>,
-    fft_area: gtk4::GLArea,
-    waterfall_area: gtk4::GLArea,
-    signal_history_area: gtk4::GLArea,
+    fft_area: gtk4::DrawingArea,
+    waterfall_area: gtk4::DrawingArea,
+    signal_history_area: gtk4::DrawingArea,
     min_db: Rc<Cell<f32>>,
     max_db: Rc<Cell<f32>>,
     fill_enabled: Rc<Cell<bool>>,
@@ -170,40 +165,32 @@ impl SpectrumHandle {
             // on the wrong side. Rotating the display data is equivalent.
             fftshift_in_place(&mut s.current_data);
         }
-        self.fft_area.queue_render();
+        self.fft_area.queue_draw();
 
         // Push a new line to the waterfall (also needs fftshift).
-        // Auto-resize the waterfall texture when the FFT size changes —
+        // Auto-resize the waterfall when the FFT size changes —
         // driven by the first matching-size frame rather than synchronously
         // from the UI, avoiding races with queued old-size frames.
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
-            self.waterfall_area.make_current();
-            let target_width = waterfall::supported_texture_width_for(&s.gl, data.len());
+            let target_width = waterfall::supported_texture_width_for(data.len());
             if target_width != s.renderer.texture_width() {
-                s.renderer.resize(&s.gl, data.len());
+                s.renderer.resize(data.len());
             }
             let mut shifted = self.shift_buffer.borrow_mut();
             shifted.resize(data.len(), 0.0);
             shifted.copy_from_slice(data);
             fftshift_in_place(&mut shifted);
-            s.renderer.push_line(&s.gl, &shifted);
-
-            // Flush after texture upload so Mesa reclaims staging buffers.
-            #[allow(unsafe_code)]
-            unsafe {
-                glow::HasContext::flush(&s.gl);
-            }
+            s.renderer.push_line(&shifted);
         }
-        self.waterfall_area.queue_render();
+        self.waterfall_area.queue_draw();
     }
 
     /// Change the waterfall colormap.
     pub fn set_colormap(&self, style: colormap::ColormapStyle) {
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
-            self.waterfall_area.make_current();
-            s.renderer.set_colormap(&s.gl, style);
+            s.renderer.set_colormap(style);
         }
-        self.waterfall_area.queue_render();
+        self.waterfall_area.queue_draw();
     }
 
     /// Update the display dB range for the FFT plot, waterfall, and signal history.
@@ -217,15 +204,15 @@ impl SpectrumHandle {
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
             s.renderer.set_db_range(min_db, max_db);
         }
-        self.fft_area.queue_render();
-        self.waterfall_area.queue_render();
-        self.signal_history_area.queue_render();
+        self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
+        self.signal_history_area.queue_draw();
     }
 
     /// Enable or disable the spectrum fill area under the trace.
     pub fn set_fill_enabled(&self, enabled: bool) {
         self.fill_enabled.set(enabled);
-        self.fft_area.queue_render();
+        self.fft_area.queue_draw();
     }
 
     /// Set the spectrum averaging mode, resetting the averaging buffer.
@@ -239,14 +226,14 @@ impl SpectrumHandle {
     /// Update the VFO display range to match the effective FFT bandwidth.
     ///
     /// Called when the sample rate changes (mode switch, decimation change,
-    /// source switch). Sets the display to show ±bandwidth/2 centered on DC.
+    /// source switch). Sets the display to show +/-bandwidth/2 centered on DC.
     pub fn set_display_bandwidth(&self, effective_sample_rate: f64) {
         let half = effective_sample_rate / 2.0;
         let mut vfo = self.vfo_state.borrow_mut();
         vfo.display_start_hz = -half;
         vfo.display_end_hz = half;
-        self.fft_area.queue_render();
-        self.waterfall_area.queue_render();
+        self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
     }
 
     /// Push a signal level sample (in dB) into the history graph.
@@ -256,7 +243,7 @@ impl SpectrumHandle {
         if let Some(s) = self.signal_history_state.borrow_mut().as_mut() {
             s.renderer.push(db);
         }
-        self.signal_history_area.queue_render();
+        self.signal_history_area.queue_draw();
     }
 
     /// Register a callback invoked when the cursor moves over the FFT area.
@@ -289,6 +276,25 @@ pub fn build_spectrum_view(
     let fill_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(true));
     let cursor_callback: CursorCallback = Rc::new(RefCell::new(None));
 
+    // Initialize renderer state eagerly (no GL context needed).
+    *fft_state.borrow_mut() = Some(FftPlotState {
+        renderer: FftPlotRenderer::new(),
+        vfo_renderer: VfoOverlayRenderer::new(),
+        current_data: vec![DEFAULT_MIN_DB; FFT_SIZE],
+    });
+    *waterfall_state.borrow_mut() = Some(WaterfallState {
+        renderer: {
+            let mut r = WaterfallRenderer::new(FFT_SIZE);
+            r.set_db_range(DEFAULT_MIN_DB, DEFAULT_MAX_DB);
+            r
+        },
+        vfo_renderer: VfoOverlayRenderer::new(),
+    });
+    *signal_history_state.borrow_mut() = Some(SignalHistoryState {
+        renderer: SignalHistoryRenderer::new(),
+    });
+    tracing::info!("spectrum renderers initialized (Cairo)");
+
     let fft_area = build_fft_area(
         Rc::clone(&fft_state),
         &vfo_state,
@@ -297,12 +303,7 @@ pub fn build_spectrum_view(
         &fill_enabled,
         &cursor_callback,
     );
-    let waterfall_area = build_waterfall_area(
-        Rc::clone(&waterfall_state),
-        Rc::clone(&vfo_state),
-        &min_db,
-        &max_db,
-    );
+    let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state));
     let signal_history_area =
         build_signal_history_area(Rc::clone(&signal_history_state), &min_db, &max_db);
 
@@ -333,7 +334,7 @@ pub fn build_spectrum_view(
         }
     });
 
-    // Wrap the signal history GLArea in a collapsible expander.
+    // Wrap the signal history DrawingArea in a collapsible expander.
     let expander = gtk4::Expander::builder()
         .label("Signal History")
         .expanded(true)
@@ -370,7 +371,7 @@ pub fn build_spectrum_view(
     (outer_box, handle)
 }
 
-/// Build the `GtkGLArea` for the FFT power spectrum plot.
+/// Build the `DrawingArea` for the FFT power spectrum plot.
 fn build_fft_area(
     state: Rc<RefCell<Option<FftPlotState>>>,
     vfo_state: &Rc<RefCell<VfoState>>,
@@ -378,76 +379,32 @@ fn build_fft_area(
     max_db: &Rc<Cell<f32>>,
     fill_enabled: &Rc<Cell<bool>>,
     cursor_callback: &CursorCallback,
-) -> gtk4::GLArea {
-    let area = gtk4::GLArea::builder()
+) -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
-        .auto_render(false)
         .build();
-    area.set_required_version(3, 0);
 
-    // On realize: create GL context and renderer (only on first realize).
-    let state_realize = Rc::clone(&state);
-    area.connect_realize(move |area| {
-        if state_realize.borrow().is_some() {
-            return;
-        }
-        area.make_current();
-        if area.error().is_some() {
-            tracing::warn!("FFT GLArea has error after make_current");
-            return;
-        }
-
-        match create_gl_context_and_fft_renderer() {
-            Ok((gl, renderer, vfo_renderer)) => {
-                *state_realize.borrow_mut() = Some(FftPlotState {
-                    gl,
-                    renderer,
-                    vfo_renderer,
-                    current_data: vec![DEFAULT_MIN_DB; FFT_SIZE],
-                });
-                tracing::info!("FFT plot GL renderer initialized");
-            }
-            Err(e) => {
-                tracing::warn!("failed to initialize FFT plot renderer: {e}");
-            }
-        }
-    });
-
-    // On render: draw the FFT plot, then the VFO overlay on top.
+    // Set the draw function — called on every queue_draw().
     let min_db_render = Rc::clone(min_db);
     let max_db_render = Rc::clone(max_db);
     let fill_render = Rc::clone(fill_enabled);
     let vfo_render = Rc::clone(vfo_state);
-    area.connect_render(move |area, _ctx| {
+    area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow_mut().as_mut() {
-            let width = area.width();
-            let height = area.height();
-            let scale = area.scale_factor();
-            let phys_w = width * scale;
-            let phys_h = height * scale;
-
             s.renderer.render(
-                &s.gl,
+                cr,
                 &s.current_data,
-                phys_w,
-                phys_h,
+                width,
+                height,
                 min_db_render.get(),
                 max_db_render.get(),
                 fill_render.get(),
             );
 
             let vfo = vfo_render.borrow();
-            s.vfo_renderer.render(&s.gl, &vfo, phys_w, phys_h);
-
-            // Flush the GL pipeline so Mesa reclaims staging buffers
-            // instead of accumulating them indefinitely.
-            #[allow(unsafe_code)]
-            unsafe {
-                glow::HasContext::flush(&s.gl);
-            }
+            s.vfo_renderer.render(cr, &vfo, width, height);
         }
-        glib::Propagation::Stop
     });
 
     // Cursor readout: track mouse motion to compute frequency and power.
@@ -495,224 +452,57 @@ fn build_fft_area(
     area
 }
 
-/// Build the `GtkGLArea` for the waterfall spectrogram.
+/// Build the `DrawingArea` for the waterfall spectrogram.
 fn build_waterfall_area(
     state: Rc<RefCell<Option<WaterfallState>>>,
     vfo_state: Rc<RefCell<VfoState>>,
-    min_db: &Rc<Cell<f32>>,
-    max_db: &Rc<Cell<f32>>,
-) -> gtk4::GLArea {
-    let area = gtk4::GLArea::builder()
+) -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
-        .auto_render(false)
         .build();
-    area.set_required_version(3, 0);
 
-    // On realize: create GL context and renderer (only on first realize).
-    let state_realize = Rc::clone(&state);
-    let min_db_realize = Rc::clone(min_db);
-    let max_db_realize = Rc::clone(max_db);
-    area.connect_realize(move |area| {
-        if state_realize.borrow().is_some() {
-            return;
-        }
-        area.make_current();
-        if area.error().is_some() {
-            tracing::warn!("waterfall GLArea has error after make_current");
-            return;
-        }
-
-        match create_gl_context_and_waterfall_renderer() {
-            Ok((gl, mut renderer, vfo_renderer)) => {
-                renderer.set_db_range(min_db_realize.get(), max_db_realize.get());
-                *state_realize.borrow_mut() = Some(WaterfallState {
-                    gl,
-                    renderer,
-                    vfo_renderer,
-                });
-                tracing::info!("waterfall GL renderer initialized");
-            }
-            Err(e) => {
-                tracing::warn!("failed to initialize waterfall renderer: {e}");
-            }
-        }
-    });
-
-    // On render: draw the waterfall, then the VFO overlay on top.
-    area.connect_render(move |area, _ctx| {
+    area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow().as_ref() {
-            let width = area.width();
-            let height = area.height();
-            let scale = area.scale_factor();
-            let phys_w = width * scale;
-            let phys_h = height * scale;
-
-            s.renderer.render(&s.gl, phys_w, phys_h);
+            s.renderer.render(cr, width, height);
 
             let vfo = vfo_state.borrow();
-            s.vfo_renderer.render(&s.gl, &vfo, phys_w, phys_h);
-
-            #[allow(unsafe_code)]
-            unsafe {
-                glow::HasContext::flush(&s.gl);
-            }
+            s.vfo_renderer.render(cr, &vfo, width, height);
         }
-        glib::Propagation::Stop
     });
 
     area
 }
 
-/// Build the `GtkGLArea` for the signal strength history graph.
+/// Build the `DrawingArea` for the signal strength history graph.
 fn build_signal_history_area(
     state: Rc<RefCell<Option<SignalHistoryState>>>,
     min_db: &Rc<Cell<f32>>,
     max_db: &Rc<Cell<f32>>,
-) -> gtk4::GLArea {
-    let area = gtk4::GLArea::builder()
+) -> gtk4::DrawingArea {
+    let area = gtk4::DrawingArea::builder()
         .hexpand(true)
         .vexpand(false)
         .height_request(SIGNAL_HISTORY_HEIGHT)
-        .auto_render(false)
         .build();
-    area.set_required_version(3, 0);
 
-    // On realize: create GL context and renderer (only on first realize).
-    // Wayland compositors like Hyprland may unrealize/realize on workspace
-    // switches — guard against creating duplicate GL contexts.
-    let state_realize = Rc::clone(&state);
-    area.connect_realize(move |area| {
-        if state_realize.borrow().is_some() {
-            tracing::debug!("signal history GL already initialized — skipping re-realize");
-            return;
-        }
-        area.make_current();
-        if area.error().is_some() {
-            tracing::warn!("signal history GLArea has error after make_current");
-            return;
-        }
-
-        match create_gl_context_and_signal_history_renderer() {
-            Ok((gl, renderer)) => {
-                *state_realize.borrow_mut() = Some(SignalHistoryState { gl, renderer });
-                tracing::info!("signal history GL renderer initialized");
-            }
-            Err(e) => {
-                tracing::warn!("failed to initialize signal history renderer: {e}");
-            }
-        }
-    });
-
-    // On render: draw the signal history plot.
     let min_db_render = Rc::clone(min_db);
     let max_db_render = Rc::clone(max_db);
-    area.connect_render(move |area, _ctx| {
-        if let Some(s) = state.borrow_mut().as_mut() {
-            let width = area.width();
-            let height = area.height();
-            let scale = area.scale_factor();
-            let phys_w = width * scale;
-            let phys_h = height * scale;
-
-            s.renderer.render(
-                &s.gl,
-                phys_w,
-                phys_h,
-                min_db_render.get(),
-                max_db_render.get(),
-            );
-
-            #[allow(unsafe_code)]
-            unsafe {
-                glow::HasContext::flush(&s.gl);
-            }
+    area.set_draw_func(move |_area, cr, width, height| {
+        if let Some(s) = state.borrow().as_ref() {
+            s.renderer
+                .render(cr, width, height, min_db_render.get(), max_db_render.get());
         }
-        glib::Propagation::Stop
     });
 
     area
 }
 
-/// Create a glow GL context from the current GDK GL context.
-///
-/// Must be called after `GtkGLArea::make_current()`.
-///
-/// Uses `dlsym(RTLD_DEFAULT)` to resolve GL function pointers from all loaded
-/// shared objects. Falls back to `eglGetProcAddress` for GLES symbols not
-/// found in the global symbol table.
-#[allow(unsafe_code)]
-fn create_glow_context() -> glow::Context {
-    unsafe {
-        glow::Context::from_loader_function_cstr(|name| {
-            // Try the platform-specific proc address first, then fall back to dlsym.
-            // On Wayland: eglGetProcAddress. On X11: glXGetProcAddress.
-            // dlsym(RTLD_DEFAULT) searches all loaded shared objects as fallback.
-            let ptr = dlsym(RTLD_DEFAULT, name.as_ptr());
-            if !ptr.is_null() {
-                return ptr;
-            }
-            // Try eglGetProcAddress for GLES functions not in the global symbol table.
-            let egl_handle = dlsym(RTLD_DEFAULT, c"eglGetProcAddress".as_ptr());
-            if !egl_handle.is_null() {
-                let egl_get_proc: unsafe extern "C" fn(
-                    *const std::os::raw::c_char,
-                )
-                    -> *const std::os::raw::c_void = std::mem::transmute(egl_handle);
-                let result = egl_get_proc(name.as_ptr());
-                if !result.is_null() {
-                    return result;
-                }
-            }
-            std::ptr::null()
-        })
-    }
-}
-
-/// Handle for `dlsym(RTLD_DEFAULT, ...)` — search all loaded shared objects.
-#[allow(unsafe_code)]
-const RTLD_DEFAULT: *mut std::os::raw::c_void = std::ptr::null_mut();
-
-#[allow(unsafe_code)]
-unsafe extern "C" {
-    /// POSIX `dlsym` — resolve a symbol from a dynamic library handle.
-    fn dlsym(
-        handle: *mut std::os::raw::c_void,
-        symbol: *const std::os::raw::c_char,
-    ) -> *const std::os::raw::c_void;
-}
-
-/// Create a glow context, FFT plot renderer, and VFO overlay renderer.
-fn create_gl_context_and_fft_renderer()
--> Result<(glow::Context, FftPlotRenderer, VfoOverlayRenderer), gl_renderer::GlError> {
-    let gl = create_glow_context();
-    let renderer = FftPlotRenderer::new(&gl)?;
-    let vfo_renderer = VfoOverlayRenderer::new(&gl)?;
-    Ok((gl, renderer, vfo_renderer))
-}
-
-/// Create a glow context, waterfall renderer, and VFO overlay renderer.
-fn create_gl_context_and_waterfall_renderer()
--> Result<(glow::Context, WaterfallRenderer, VfoOverlayRenderer), gl_renderer::GlError> {
-    let gl = create_glow_context();
-    let renderer = WaterfallRenderer::new(&gl, FFT_SIZE)?;
-    let vfo_renderer = VfoOverlayRenderer::new(&gl)?;
-    Ok((gl, renderer, vfo_renderer))
-}
-
-/// Create a glow context and signal history renderer.
-fn create_gl_context_and_signal_history_renderer()
--> Result<(glow::Context, SignalHistoryRenderer), gl_renderer::GlError> {
-    let gl = create_glow_context();
-    let renderer = SignalHistoryRenderer::new(&gl)?;
-    Ok((gl, renderer))
-}
-
-/// Attach a click-to-tune gesture to a `GtkGLArea`.
+/// Attach a click-to-tune gesture to a `DrawingArea`.
 ///
 /// Single-clicking sets the VFO center to the clicked frequency.
 fn attach_click_gesture(
-    area: &gtk4::GLArea,
+    area: &gtk4::DrawingArea,
     vfo_state: &Rc<RefCell<VfoState>>,
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
 ) {
@@ -737,7 +527,7 @@ fn attach_click_gesture(
             tracing::warn!("click-to-tune DSP send failed: {e}");
         }
 
-        area.queue_render();
+        area.queue_draw();
     });
 
     area.add_controller(click);
@@ -746,7 +536,7 @@ fn attach_click_gesture(
 /// Attach a drag gesture for VFO center movement and bandwidth handle adjustment.
 #[allow(clippy::needless_pass_by_value)]
 fn attach_drag_gesture(
-    area: &gtk4::GLArea,
+    area: &gtk4::DrawingArea,
     vfo_state: &Rc<RefCell<VfoState>>,
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
 ) {
@@ -811,7 +601,7 @@ fn attach_drag_gesture(
             let delta_hz = vfo.pixels_to_hz(offset_x, width);
             vfo.offset_hz = start_offset_update.get() + delta_hz;
             let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(vfo.offset_hz));
-            area.queue_render();
+            area.queue_draw();
         } else if let Some(handle) = vfo.bw_dragging {
             let delta_hz = vfo.pixels_to_hz(offset_x, width);
             let original_bw = start_bw_update.get();
@@ -846,7 +636,7 @@ fn attach_drag_gesture(
             }
             let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(vfo.offset_hz));
             let _ = dsp_tx_update.send(UiToDsp::SetBandwidth(vfo.bandwidth_hz));
-            area.queue_render();
+            area.queue_draw();
         }
     });
 
@@ -861,10 +651,10 @@ fn attach_drag_gesture(
     area.add_controller(drag);
 }
 
-/// Attach a scroll-to-zoom gesture to a `GtkGLArea`.
+/// Attach a scroll-to-zoom gesture to a `DrawingArea`.
 ///
 /// Scrolling zooms the frequency display range centered on the cursor position.
-fn attach_scroll_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>) {
+fn attach_scroll_gesture(area: &gtk4::DrawingArea, vfo_state: &Rc<RefCell<VfoState>>) {
     let scroll = gtk4::EventControllerScroll::new(
         gtk4::EventControllerScrollFlags::VERTICAL | gtk4::EventControllerScrollFlags::DISCRETE,
     );
@@ -890,23 +680,10 @@ fn attach_scroll_gesture(area: &gtk4::GLArea, vfo_state: &Rc<RefCell<VfoState>>)
         vfo.zoom(cursor_hz, -dy);
 
         drop(vfo);
-        area.queue_render();
+        area.queue_draw();
 
         glib::Propagation::Stop
     });
 
     area.add_controller(scroll);
-}
-
-#[cfg(test)]
-mod tests {
-    /// Compile-time validation that spectrum display constants are consistent.
-    const _: () = {
-        assert!(super::FFT_SIZE > 0);
-        assert!(super::FFT_PANE_FRACTION > 0.0);
-        assert!(super::FFT_PANE_FRACTION < 1.0);
-        assert!(super::DEFAULT_MIN_DB < super::DEFAULT_MAX_DB);
-        assert!(super::AVERAGING_ALPHA > 0.0);
-        assert!(super::AVERAGING_ALPHA < 1.0);
-    };
 }

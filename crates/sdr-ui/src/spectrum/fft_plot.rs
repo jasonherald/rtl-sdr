@@ -1,13 +1,12 @@
-//! FFT spectrum plot renderer using OpenGL via glow.
+//! FFT spectrum plot renderer using Cairo.
 //!
 //! Draws the power spectrum as a filled area with a line trace on top,
 //! plus horizontal dB grid lines and vertical frequency grid lines.
+//! Renders directly via Cairo draw calls — no OpenGL, no pixel buffers.
 
-use glow::HasContext;
+use gtk4::cairo;
 
-use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
-
-/// Maximum bins for display rendering (limits vertex count).
+/// Maximum bins for display rendering.
 /// FFT data wider than this is max-pooled down before drawing.
 const MAX_DISPLAY_BINS: usize = 4096;
 
@@ -17,40 +16,15 @@ const DB_GRID_LINE_COUNT: usize = 8;
 /// Number of vertical frequency grid lines.
 const FREQ_GRID_LINE_COUNT: usize = 10;
 
-/// Maximum vertices for the filled spectrum area (2 per bin: top + bottom).
-const MAX_FILL_VERTICES: usize = MAX_DISPLAY_BINS * 2;
-
-/// Maximum vertices for grid lines (2 per line, both axes).
-const MAX_GRID_VERTICES: usize = (DB_GRID_LINE_COUNT + FREQ_GRID_LINE_COUNT) * 2;
-
 // Colors (RGBA, 0.0..1.0)
 /// Spectrum trace line color — accent blue.
-const TRACE_COLOR: [f32; 4] = [0.3, 0.7, 1.0, 1.0];
+const TRACE_COLOR: [f64; 4] = [0.3, 0.7, 1.0, 1.0];
 /// Spectrum fill color — semi-transparent blue.
-const FILL_COLOR: [f32; 4] = [0.2, 0.4, 0.8, 0.35];
+const FILL_COLOR: [f64; 4] = [0.2, 0.4, 0.8, 0.35];
 /// Grid line color — dim gray.
-const GRID_COLOR: [f32; 4] = [0.4, 0.4, 0.4, 0.5];
+const GRID_COLOR: [f64; 4] = [0.4, 0.4, 0.4, 0.5];
 /// Background clear color — near-black.
-const BACKGROUND_COLOR: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
-
-/// Vertex shader — maps 2D positions directly to clip space.
-const VERT_SHADER: &str = r"#version 300 es
-precision highp float;
-layout(location = 0) in vec2 a_pos;
-void main() {
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-";
-
-/// Fragment shader — outputs a uniform color.
-const FRAG_SHADER: &str = r"#version 300 es
-precision highp float;
-uniform vec4 u_color;
-out vec4 frag_color;
-void main() {
-    frag_color = u_color;
-}
-";
+const BACKGROUND_COLOR: [f64; 4] = [0.08, 0.08, 0.10, 1.0];
 
 /// Downsample FFT data by max-pooling bins to fit display width.
 ///
@@ -85,102 +59,44 @@ fn downsample_fft<'a>(data: &'a [f32], buf: &'a mut Vec<f32>) -> &'a [f32] {
     buf
 }
 
-/// OpenGL renderer for the FFT power spectrum plot.
+/// Cairo renderer for the FFT power spectrum plot.
 ///
 /// Renders a filled area under the spectrum curve, a line trace on top,
 /// and grid lines for dB and frequency reference.
 pub struct FftPlotRenderer {
-    program: glow::Program,
-    vao: glow::VertexArray,
-    vbo: glow::Buffer,
-    color_location: glow::UniformLocation,
     /// Pre-allocated buffer for downsampling large FFT data.
     downsample_buf: Vec<f32>,
-    // Pre-allocated vertex staging buffers to avoid per-frame allocation.
-    grid_vertices: Vec<f32>,
-    fill_vertices: Vec<f32>,
-    trace_vertices: Vec<f32>,
+}
+
+impl Default for FftPlotRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FftPlotRenderer {
-    /// Create a new FFT plot renderer, compiling shaders and allocating GL buffers.
-    ///
-    /// # Errors
-    ///
-    /// Returns `GlError` if shader compilation, linking, or buffer creation fails.
-    #[allow(
-        unsafe_code,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    pub fn new(gl: &glow::Context) -> Result<Self, GlError> {
-        let vert = gl_renderer::compile_shader(gl, glow::VERTEX_SHADER, VERT_SHADER)?;
-        let frag = gl_renderer::compile_shader(gl, glow::FRAGMENT_SHADER, FRAG_SHADER)?;
-        let program = gl_renderer::link_program(gl, vert, frag)?;
-
-        let color_location = unsafe {
-            gl.get_uniform_location(program, "u_color")
-                .ok_or_else(|| GlError::ResourceCreation("u_color uniform not found".into()))?
-        };
-
-        let (vao, vbo) = unsafe {
-            let vao = gl
-                .create_vertex_array()
-                .map_err(|e| GlError::ResourceCreation(e.clone()))?;
-            let vbo = gl
-                .create_buffer()
-                .map_err(|e| GlError::ResourceCreation(e.clone()))?;
-
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-
-            // Pre-allocate buffer for the largest usage (fill vertices: 2 floats each).
-            let max_bytes = MAX_FILL_VERTICES * 2 * std::mem::size_of::<f32>();
-            gl.buffer_data_size(glow::ARRAY_BUFFER, max_bytes as i32, glow::STREAM_DRAW);
-
-            // Vertex attribute: vec2 at location 0.
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(
-                0,
-                2,
-                glow::FLOAT,
-                false,
-                (2 * std::mem::size_of::<f32>()) as i32,
-                0,
-            );
-
-            gl.bind_vertex_array(None);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-
-            (vao, vbo)
-        };
-
-        Ok(Self {
-            program,
-            vao,
-            vbo,
-            color_location,
+    /// Create a new FFT plot renderer.
+    pub fn new() -> Self {
+        Self {
             downsample_buf: Vec::with_capacity(MAX_DISPLAY_BINS),
-            grid_vertices: Vec::with_capacity(MAX_GRID_VERTICES * 2),
-            fill_vertices: Vec::with_capacity(MAX_DISPLAY_BINS * 4),
-            trace_vertices: Vec::with_capacity(MAX_DISPLAY_BINS * 2),
-        })
+        }
     }
 
-    /// Render the FFT spectrum plot.
+    /// Render the FFT spectrum plot using Cairo.
     ///
     /// # Arguments
     ///
-    /// * `gl` — The glow GL context.
+    /// * `cr` — The Cairo drawing context.
     /// * `fft_data` — Power spectrum values in dB (one per frequency bin).
     /// * `width` — Viewport width in pixels.
     /// * `height` — Viewport height in pixels.
     /// * `min_db` — Bottom of the display range in dB.
     /// * `max_db` — Top of the display range in dB.
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    /// * `fill_enabled` — Whether to draw the filled area under the trace.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
     pub fn render(
         &mut self,
-        gl: &glow::Context,
+        cr: &cairo::Context,
         fft_data: &[f32],
         width: i32,
         height: i32,
@@ -197,170 +113,136 @@ impl FftPlotRenderer {
             return;
         }
 
-        // Downsample large FFTs to limit vertex count.
-        // Take the buffer out of self to avoid holding a mutable borrow
-        // across the draw calls that also borrow self.
+        let w = f64::from(width);
+        let h = f64::from(height);
+
+        // Downsample large FFTs to limit draw call count.
         let mut ds_buf = std::mem::take(&mut self.downsample_buf);
         let display_data = downsample_fft(fft_data, &mut ds_buf);
 
-        unsafe {
-            gl.viewport(0, 0, width, height);
-            gl.clear_color(
-                BACKGROUND_COLOR[0],
-                BACKGROUND_COLOR[1],
-                BACKGROUND_COLOR[2],
-                BACKGROUND_COLOR[3],
-            );
-            gl.clear(glow::COLOR_BUFFER_BIT);
+        // Background.
+        cr.set_source_rgba(
+            BACKGROUND_COLOR[0],
+            BACKGROUND_COLOR[1],
+            BACKGROUND_COLOR[2],
+            BACKGROUND_COLOR[3],
+        );
+        let _ = cr.paint();
 
-            gl.use_program(Some(self.program));
-            gl.bind_vertex_array(Some(self.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+        // Grid lines.
+        Self::draw_grid(cr, w, h);
 
-            gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-        }
-
-        // Draw grid lines.
-        self.draw_grid(gl);
-
-        // Draw filled area under the spectrum curve (when enabled).
+        // Filled area under the spectrum curve.
         if fill_enabled {
-            self.draw_fill(gl, display_data, db_range, min_db);
+            Self::draw_fill(cr, display_data, w, h, db_range, min_db);
         }
 
-        // Draw the spectrum line trace on top.
-        self.draw_trace(gl, display_data, db_range, min_db);
+        // Spectrum line trace on top.
+        Self::draw_trace(cr, display_data, w, h, db_range, min_db);
 
         // Return the downsample buffer to self for reuse next frame.
         let _ = display_data;
         self.downsample_buf = ds_buf;
-
-        unsafe {
-            gl.disable(glow::BLEND);
-            gl.bind_vertex_array(None);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            gl.use_program(None);
-        }
     }
 
     /// Draw horizontal dB grid lines and vertical frequency grid lines.
-    #[allow(
-        unsafe_code,
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn draw_grid(&mut self, gl: &glow::Context) {
-        self.grid_vertices.clear();
+    #[allow(clippy::cast_precision_loss)]
+    fn draw_grid(cr: &cairo::Context, w: f64, h: f64) {
+        cr.set_source_rgba(GRID_COLOR[0], GRID_COLOR[1], GRID_COLOR[2], GRID_COLOR[3]);
+        cr.set_line_width(1.0);
 
+        // Horizontal dB grid lines.
         for i in 0..=DB_GRID_LINE_COUNT {
-            let frac = i as f32 / DB_GRID_LINE_COUNT as f32;
-            let y = -1.0 + 2.0 * frac;
-            self.grid_vertices.extend_from_slice(&[-1.0, y, 1.0, y]);
+            let frac = i as f64 / DB_GRID_LINE_COUNT as f64;
+            let y = (h * frac).floor() + 0.5; // snap to pixel center for crisp 1px lines
+            cr.move_to(0.0, y);
+            cr.line_to(w, y);
         }
 
+        // Vertical frequency grid lines.
         for i in 0..=FREQ_GRID_LINE_COUNT {
-            let frac = i as f32 / FREQ_GRID_LINE_COUNT as f32;
-            let x = -1.0 + 2.0 * frac;
-            self.grid_vertices.extend_from_slice(&[x, -1.0, x, 1.0]);
+            let frac = i as f64 / FREQ_GRID_LINE_COUNT as f64;
+            let x = (w * frac).floor() + 0.5;
+            cr.move_to(x, 0.0);
+            cr.line_to(x, h);
         }
 
-        let bytes = f32_slice_as_bytes(&self.grid_vertices);
-        let vertex_count = self.grid_vertices.len() / 2;
-
-        unsafe {
-            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
-
-            gl.uniform_4_f32(
-                Some(&self.color_location),
-                GRID_COLOR[0],
-                GRID_COLOR[1],
-                GRID_COLOR[2],
-                GRID_COLOR[3],
-            );
-
-            gl.draw_arrays(glow::LINES, 0, vertex_count as i32);
-        }
+        let _ = cr.stroke();
     }
 
-    /// Draw the filled area under the spectrum curve as a triangle strip.
-    #[allow(
-        unsafe_code,
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn draw_fill(&mut self, gl: &glow::Context, fft_data: &[f32], db_range: f32, min_db: f32) {
+    /// Draw the filled area under the spectrum curve.
+    #[allow(clippy::cast_precision_loss)]
+    fn draw_fill(
+        cr: &cairo::Context,
+        fft_data: &[f32],
+        w: f64,
+        h: f64,
+        db_range: f32,
+        min_db: f32,
+    ) {
         let bin_count = fft_data.len();
-        self.fill_vertices.clear();
-
-        for (i, &db) in fft_data.iter().take(bin_count).enumerate() {
-            let x = -1.0 + 2.0 * (i as f32 / (bin_count - 1).max(1) as f32);
-            let y = -1.0 + 2.0 * ((db - min_db) / db_range).clamp(0.0, 1.0);
-            self.fill_vertices.extend_from_slice(&[x, -1.0, x, y]);
+        if bin_count == 0 {
+            return;
         }
 
-        let bytes = f32_slice_as_bytes(&self.fill_vertices);
-        let vertex_count = self.fill_vertices.len() / 2;
+        let db_range_f64 = f64::from(db_range);
+        let min_db_f64 = f64::from(min_db);
 
-        unsafe {
-            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
+        // Build a path: trace line, then close along the bottom edge.
+        let first_db = f64::from(fft_data[0]);
+        let first_y = h * (1.0 - ((first_db - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
+        cr.move_to(0.0, first_y);
 
-            gl.uniform_4_f32(
-                Some(&self.color_location),
-                FILL_COLOR[0],
-                FILL_COLOR[1],
-                FILL_COLOR[2],
-                FILL_COLOR[3],
-            );
-
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, vertex_count as i32);
+        for (i, &db) in fft_data.iter().enumerate().skip(1) {
+            let x = w * i as f64 / (bin_count - 1).max(1) as f64;
+            let y = h * (1.0 - ((f64::from(db) - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
+            cr.line_to(x, y);
         }
+
+        // Close along the bottom edge.
+        cr.line_to(w, h);
+        cr.line_to(0.0, h);
+        cr.close_path();
+
+        cr.set_source_rgba(FILL_COLOR[0], FILL_COLOR[1], FILL_COLOR[2], FILL_COLOR[3]);
+        let _ = cr.fill();
     }
 
     /// Draw the spectrum line trace.
-    #[allow(
-        unsafe_code,
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap
-    )]
-    fn draw_trace(&mut self, gl: &glow::Context, fft_data: &[f32], db_range: f32, min_db: f32) {
+    #[allow(clippy::cast_precision_loss)]
+    fn draw_trace(
+        cr: &cairo::Context,
+        fft_data: &[f32],
+        w: f64,
+        h: f64,
+        db_range: f32,
+        min_db: f32,
+    ) {
         let bin_count = fft_data.len();
-        self.trace_vertices.clear();
-
-        for (i, &db) in fft_data.iter().take(bin_count).enumerate() {
-            let x = -1.0 + 2.0 * (i as f32 / (bin_count - 1).max(1) as f32);
-            let y = -1.0 + 2.0 * ((db - min_db) / db_range).clamp(0.0, 1.0);
-            self.trace_vertices.extend_from_slice(&[x, y]);
+        if bin_count == 0 {
+            return;
         }
 
-        let bytes = f32_slice_as_bytes(&self.trace_vertices);
-        let vertex_count = self.trace_vertices.len() / 2;
+        let db_range_f64 = f64::from(db_range);
+        let min_db_f64 = f64::from(min_db);
 
-        unsafe {
-            gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
-
-            gl.uniform_4_f32(
-                Some(&self.color_location),
-                TRACE_COLOR[0],
-                TRACE_COLOR[1],
-                TRACE_COLOR[2],
-                TRACE_COLOR[3],
-            );
-
-            gl.draw_arrays(glow::LINE_STRIP, 0, vertex_count as i32);
+        for (i, &db) in fft_data.iter().enumerate() {
+            let x = w * i as f64 / (bin_count - 1).max(1) as f64;
+            let y = h * (1.0 - ((f64::from(db) - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
+            if i == 0 {
+                cr.move_to(x, y);
+            } else {
+                cr.line_to(x, y);
+            }
         }
-    }
 
-    /// Release GL resources.
-    #[allow(unsafe_code)]
-    pub fn destroy(&self, gl: &glow::Context) {
-        unsafe {
-            gl.delete_buffer(self.vbo);
-            gl.delete_vertex_array(self.vao);
-            gl.delete_program(self.program);
-        }
+        cr.set_source_rgba(
+            TRACE_COLOR[0],
+            TRACE_COLOR[1],
+            TRACE_COLOR[2],
+            TRACE_COLOR[3],
+        );
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
     }
 }
