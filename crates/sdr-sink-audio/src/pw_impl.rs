@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 
 use sdr_pipeline::sink_manager::Sink;
 use sdr_types::{SinkError, Stereo};
@@ -13,10 +12,9 @@ const AUDIO_SAMPLE_RATE: u32 = 48_000;
 /// Number of audio channels (stereo).
 const AUDIO_CHANNELS: u32 = 2;
 
-/// Bounded channel capacity in chunks.
-/// Large enough to absorb USB timing jitter at high sample rates.
-/// At WFM rates (~393 samples/chunk, ~8ms per chunk), 128 chunks = ~1 second.
-const CHANNEL_BOUND: usize = 128;
+/// Audio ring buffer capacity in f32 samples (interleaved stereo).
+/// ~1 second at 48 kHz stereo = 96,000 samples.
+const RING_CAPACITY: usize = 96_000;
 
 /// Bytes per sample frame (2 channels x 4 bytes per f32).
 const FRAME_SIZE: usize = (AUDIO_CHANNELS as usize) * std::mem::size_of::<f32>();
@@ -24,15 +22,87 @@ const FRAME_SIZE: usize = (AUDIO_CHANNELS as usize) * std::mem::size_of::<f32>()
 /// Sentinel message sent via the PipeWire channel to request shutdown.
 struct Quit;
 
+/// Lock-based SPSC ring buffer for interleaved audio samples.
+///
+/// Pre-allocated at startup — zero allocation during streaming.
+/// The Mutex is held only for memcpy duration (microseconds).
+struct AudioRingBuffer {
+    buf: std::sync::Mutex<AudioRingInner>,
+}
+
+struct AudioRingInner {
+    data: Vec<f32>,
+    read_pos: usize,
+    write_pos: usize,
+    count: usize,
+    capacity: usize,
+}
+
+impl AudioRingBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buf: std::sync::Mutex::new(AudioRingInner {
+                data: vec![0.0; capacity],
+                read_pos: 0,
+                write_pos: 0,
+                count: 0,
+                capacity,
+            }),
+        }
+    }
+
+    /// Write samples into the ring buffer. Drops oldest data if full.
+    fn write(&self, samples: &[f32]) {
+        let Ok(mut inner) = self.buf.lock() else {
+            return;
+        };
+        let cap = inner.capacity;
+        let mut wp = inner.write_pos;
+        let mut rp = inner.read_pos;
+        let mut cnt = inner.count;
+        for &s in samples {
+            inner.data[wp] = s;
+            wp = (wp + 1) % cap;
+            if cnt < cap {
+                cnt += 1;
+            } else {
+                rp = (rp + 1) % cap;
+            }
+        }
+        inner.write_pos = wp;
+        inner.read_pos = rp;
+        inner.count = cnt;
+    }
+
+    /// Read up to `output.len()` samples. Returns count read.
+    fn read(&self, output: &mut [f32]) -> usize {
+        let Ok(mut inner) = self.buf.lock() else {
+            return 0;
+        };
+        let to_read = output.len().min(inner.count);
+        let mut rp = inner.read_pos;
+        let cap = inner.capacity;
+        for out in output.iter_mut().take(to_read) {
+            *out = inner.data[rp];
+            rp = (rp + 1) % cap;
+        }
+        inner.read_pos = rp;
+        inner.count -= to_read;
+        to_read
+    }
+}
+
 /// Audio output sink backed by PipeWire.
 pub struct AudioSink {
     sample_rate: f64,
     running: Arc<AtomicBool>,
-    tx: Option<mpsc::SyncSender<Vec<f32>>>,
+    ring: Arc<AudioRingBuffer>,
     quit_tx: Option<pipewire::channel::Sender<Quit>>,
     pw_thread: Option<std::thread::JoinHandle<()>>,
     /// Target PipeWire node name for routing (empty = system default).
     target_node: String,
+    /// Pre-allocated interleave buffer for write_samples (avoids per-call alloc).
+    interleave_buf: Vec<f32>,
 }
 
 /// An audio sink device with display name and PipeWire node name.
@@ -144,10 +214,11 @@ impl AudioSink {
         Self {
             sample_rate: f64::from(AUDIO_SAMPLE_RATE),
             running: Arc::new(AtomicBool::new(false)),
-            tx: None,
+            ring: Arc::new(AudioRingBuffer::new(RING_CAPACITY)),
             quit_tx: None,
             pw_thread: None,
             target_node: String::new(),
+            interleave_buf: Vec::with_capacity(1024),
         }
     }
 
@@ -158,9 +229,7 @@ impl AudioSink {
     ///
     /// Pass an empty string for the system default sink.
     pub fn set_target(&mut self, node_name: &str) -> Result<(), SinkError> {
-        // Check owned state (tx/thread) rather than the atomic flag, which
-        // the worker thread may clear before cleanup finishes.
-        let had_state = self.tx.is_some() || self.pw_thread.is_some();
+        let had_state = self.pw_thread.is_some();
         if had_state {
             self.stop()?;
         }
@@ -178,22 +247,19 @@ impl AudioSink {
     ///
     /// Returns `SinkError::NotRunning` if the sink has not been started.
     /// Returns `SinkError::Disconnected` if the PipeWire thread has exited.
-    pub fn write_samples(&self, samples: &[Stereo]) -> Result<(), SinkError> {
-        let tx = self.tx.as_ref().ok_or(SinkError::NotRunning)?;
+    pub fn write_samples(&mut self, samples: &[Stereo]) -> Result<(), SinkError> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(SinkError::NotRunning);
+        }
 
-        let mut buf = Vec::with_capacity(samples.len() * 2);
+        // Interleave stereo into pre-allocated buffer (zero allocation).
+        self.interleave_buf.clear();
         for s in samples {
-            buf.push(s.l);
-            buf.push(s.r);
+            self.interleave_buf.push(s.l);
+            self.interleave_buf.push(s.r);
         }
 
-        match tx.send(buf) {
-            Ok(()) => {}
-            Err(mpsc::SendError(_)) => {
-                return Err(SinkError::Disconnected);
-            }
-        }
-
+        self.ring.write(&self.interleave_buf);
         Ok(())
     }
 }
@@ -214,16 +280,16 @@ impl Sink for AudioSink {
             return Err(SinkError::AlreadyRunning);
         }
 
-        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(CHANNEL_BOUND);
         let (quit_tx, quit_rx) = pipewire::channel::channel::<Quit>();
 
         let running = Arc::clone(&self.running);
+        let ring = Arc::clone(&self.ring);
         let target = self.target_node.clone();
 
         let handle = std::thread::Builder::new()
             .name("pw-audio".into())
             .spawn(move || {
-                if let Err(e) = pipewire_thread(rx, quit_rx, &target) {
+                if let Err(e) = pipewire_thread(ring, quit_rx, &target) {
                     tracing::error!("PipeWire thread failed: {e}");
                 }
                 running.store(false, Ordering::Release);
@@ -231,7 +297,6 @@ impl Sink for AudioSink {
             .map_err(|e| SinkError::OpenFailed(format!("spawn PipeWire thread: {e}")))?;
 
         // Commit state only after spawn succeeds.
-        self.tx = Some(tx);
         self.quit_tx = Some(quit_tx);
         self.running.store(true, Ordering::Release);
         self.pw_thread = Some(handle);
@@ -243,12 +308,11 @@ impl Sink for AudioSink {
         // Always clean up if handles exist, regardless of `running` flag.
         // The worker thread may have exited on its own (setting running=false),
         // but we still need to join and drop channels.
-        let had_state = self.tx.is_some() || self.pw_thread.is_some();
+        let had_state = self.pw_thread.is_some();
 
         if let Some(quit_tx) = self.quit_tx.take() {
             let _ = quit_tx.send(Quit);
         }
-        self.tx = None;
         if let Some(handle) = self.pw_thread.take() {
             let _ = handle.join();
         }
@@ -290,7 +354,6 @@ impl Drop for AudioSink {
             if let Some(quit_tx) = self.quit_tx.take() {
                 let _ = quit_tx.send(Quit);
             }
-            self.tx = None;
             if let Some(handle) = self.pw_thread.take() {
                 let _ = handle.join();
             }
@@ -303,7 +366,7 @@ impl Drop for AudioSink {
 // ---------------------------------------------------------------------------
 
 fn pipewire_thread(
-    rx: mpsc::Receiver<Vec<f32>>,
+    ring: Arc<AudioRingBuffer>,
     quit_rx: pipewire::channel::Receiver<Quit>,
     target_node: &str,
 ) -> Result<(), SinkError> {
@@ -341,7 +404,7 @@ fn pipewire_thread(
         .map_err(|e| SinkError::OpenFailed(format!("Stream::new: {e}")))?;
 
     let _listener = stream
-        .add_local_listener_with_user_data(AudioCallbackData::new(rx))
+        .add_local_listener_with_user_data(AudioCallbackData::new(ring))
         .process(process_callback)
         .register()
         .map_err(|e| SinkError::OpenFailed(format!("stream listener: {e}")))?;
@@ -384,15 +447,16 @@ fn pipewire_thread(
 }
 
 struct AudioCallbackData {
-    rx: mpsc::Receiver<Vec<f32>>,
-    remainder: Vec<f32>,
+    ring: Arc<AudioRingBuffer>,
+    /// Pre-allocated read buffer — sized for PipeWire's largest request.
+    read_buf: Vec<f32>,
 }
 
 impl AudioCallbackData {
-    fn new(rx: mpsc::Receiver<Vec<f32>>) -> Self {
+    fn new(ring: Arc<AudioRingBuffer>) -> Self {
         Self {
-            rx,
-            remainder: Vec::new(),
+            ring,
+            read_buf: vec![0.0; 4096],
         }
     }
 }
@@ -415,13 +479,11 @@ fn process_callback(stream: &pipewire::stream::Stream, data: &mut AudioCallbackD
     let n_frames = slice.len() / FRAME_SIZE;
     let n_samples = n_frames * (AUDIO_CHANNELS as usize);
 
-    while let Ok(chunk) = data.rx.try_recv() {
-        data.remainder.extend_from_slice(&chunk);
-    }
+    // Read from ring buffer into pre-allocated buffer (zero allocation).
+    data.read_buf.resize(n_samples, 0.0);
+    let available = data.ring.read(&mut data.read_buf[..n_samples]);
 
-    let available = data.remainder.len().min(n_samples);
-
-    for (i, &sample) in data.remainder[..available].iter().enumerate() {
+    for (i, &sample) in data.read_buf[..available].iter().enumerate() {
         let offset = i * std::mem::size_of::<f32>();
         let end = offset + std::mem::size_of::<f32>();
         if end <= slice.len() {
@@ -436,10 +498,6 @@ fn process_callback(stream: &pipewire::stream::Stream, data: &mut AudioCallbackD
             *byte = 0;
         }
     }
-
-    let leftover_len = data.remainder.len() - available;
-    data.remainder.copy_within(available.., 0);
-    data.remainder.truncate(leftover_len);
 
     let chunk = buf_data.chunk_mut();
     *chunk.offset_mut() = 0;
@@ -464,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_write_before_start_returns_not_running() {
-        let sink = AudioSink::new();
+        let mut sink = AudioSink::new();
         let samples = [Stereo::new(0.0, 0.0)];
         assert!(
             matches!(sink.write_samples(&samples), Err(SinkError::NotRunning)),

@@ -112,6 +112,8 @@ pub struct SpectrumHandle {
     fill_enabled: Rc<Cell<bool>>,
     averaging_mode: Rc<Cell<AveragingMode>>,
     avg_buffer: Rc<RefCell<Vec<f32>>>,
+    /// Pre-allocated buffer for fftshift of waterfall data (avoids per-frame alloc).
+    shift_buffer: Rc<RefCell<Vec<f32>>>,
     cursor_callback: CursorCallback,
 }
 
@@ -180,7 +182,9 @@ impl SpectrumHandle {
             if target_width != s.renderer.texture_width() {
                 s.renderer.resize(&s.gl, data.len());
             }
-            let mut shifted = data.to_vec();
+            let mut shifted = self.shift_buffer.borrow_mut();
+            shifted.resize(data.len(), 0.0);
+            shifted.copy_from_slice(data);
             fftshift_in_place(&mut shifted);
             s.renderer.push_line(&s.gl, &shifted);
         }
@@ -353,6 +357,7 @@ pub fn build_spectrum_view(
         fill_enabled,
         averaging_mode: Rc::new(Cell::new(AveragingMode::default())),
         avg_buffer: Rc::new(RefCell::new(Vec::new())),
+        shift_buffer: Rc::new(RefCell::new(Vec::new())),
         cursor_callback,
     };
 

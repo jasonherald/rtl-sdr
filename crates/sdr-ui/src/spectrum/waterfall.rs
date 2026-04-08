@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(buf.len(), 3);
         assert!((buf[0] - 3.0).abs() < f32::EPSILON); // max(1, 2, 3)
         assert!((buf[1] - 5.0).abs() < f32::EPSILON); // max(3, 4, 5)
-        assert!((buf[2] - 7.0).abs() < f32::EPSILON); // max(6, 7)
+        assert!((buf[2] - 7.0).abs() < f32::EPSILON); // max(5, 6, 7)
     }
 
     #[test]

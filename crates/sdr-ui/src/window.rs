@@ -150,15 +150,21 @@ pub fn build_window(app: &adw::Application) {
     });
 
     // --- Spawn DSP thread ---
-    dsp_controller::spawn_dsp_thread(dsp_tx, ui_rx);
+    let fft_shared = std::sync::Arc::new(dsp_controller::SharedFftBuffer::new(2048));
+    dsp_controller::spawn_dsp_thread(dsp_tx, ui_rx, std::sync::Arc::clone(&fft_shared));
 
-    // --- Poll DspToUi channel from the GTK main loop ---
+    // --- Poll DspToUi channel and shared FFT buffer from the GTK main loop ---
     let play_button_weak = play_button.downgrade();
     let state_rx = Rc::clone(&state);
     let toast_overlay_weak = toast_overlay.downgrade();
 
     let gain_row_for_dsp = panels.source.gain_row.clone();
     glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
+        // Check for new FFT data from the shared buffer (zero-alloc path).
+        fft_shared.take_if_ready(|data| {
+            spectrum_handle.push_fft_data(data);
+        });
+
         // Drain all pending DSP messages.
         loop {
             match dsp_rx.try_recv() {
@@ -197,8 +203,10 @@ fn handle_dsp_message(
     gain_row: &adw::SpinRow,
 ) {
     match msg {
-        DspToUi::FftData(data) => {
-            spectrum_handle.push_fft_data(&data);
+        DspToUi::FftData(_) => {
+            // FFT data now comes via SharedFftBuffer, not the channel.
+            // This variant is kept for backward compatibility but shouldn't
+            // be sent in normal operation.
         }
         DspToUi::SignalLevel(level) => {
             status_bar.update_signal_level(level);

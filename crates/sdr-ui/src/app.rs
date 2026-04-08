@@ -25,17 +25,11 @@ pub fn build_app() -> adw::Application {
             icon_theme.add_search_path("data");
         }
 
-        tracing::info!("sdr-rs UI starting");
-    });
-
-    app.connect_activate(|app| {
-        window::build_window(app);
-
         // Periodically trim the glibc heap to return freed pages to the OS.
-        // Without this, freed allocations (especially from per-frame FFT clones)
-        // accumulate in malloc arenas and RSS grows indefinitely.
-        #[cfg(target_os = "linux")]
-        glib::timeout_add_local(Duration::from_mins(1), || {
+        // Registered in startup (not activate) since activate can fire
+        // multiple times on re-activation.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        glib::timeout_add_local(Duration::from_secs(10), || {
             #[allow(unsafe_code)]
             unsafe {
                 unsafe extern "C" {
@@ -45,6 +39,12 @@ pub fn build_app() -> adw::Application {
             }
             glib::ControlFlow::Continue
         });
+
+        tracing::info!("sdr-rs UI starting");
+    });
+
+    app.connect_activate(|app| {
+        window::build_window(app);
     });
 
     app

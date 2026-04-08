@@ -96,6 +96,10 @@ pub struct FftPlotRenderer {
     color_location: glow::UniformLocation,
     /// Pre-allocated buffer for downsampling large FFT data.
     downsample_buf: Vec<f32>,
+    // Pre-allocated vertex staging buffers to avoid per-frame allocation.
+    grid_vertices: Vec<f32>,
+    fill_vertices: Vec<f32>,
+    trace_vertices: Vec<f32>,
 }
 
 impl FftPlotRenderer {
@@ -157,6 +161,9 @@ impl FftPlotRenderer {
             vbo,
             color_location,
             downsample_buf: Vec::with_capacity(MAX_DISPLAY_BINS),
+            grid_vertices: Vec::with_capacity(MAX_GRID_VERTICES * 2),
+            fill_vertices: Vec::with_capacity(MAX_DISPLAY_BINS * 4),
+            trace_vertices: Vec::with_capacity(MAX_DISPLAY_BINS * 2),
         })
     }
 
@@ -244,27 +251,23 @@ impl FftPlotRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    fn draw_grid(&self, gl: &glow::Context) {
-        let mut vertices = Vec::with_capacity(MAX_GRID_VERTICES * 2);
+    fn draw_grid(&mut self, gl: &glow::Context) {
+        self.grid_vertices.clear();
 
-        // Horizontal dB grid lines.
         for i in 0..=DB_GRID_LINE_COUNT {
             let frac = i as f32 / DB_GRID_LINE_COUNT as f32;
             let y = -1.0 + 2.0 * frac;
-            // Full-width horizontal line.
-            vertices.extend_from_slice(&[-1.0, y, 1.0, y]);
+            self.grid_vertices.extend_from_slice(&[-1.0, y, 1.0, y]);
         }
 
-        // Vertical frequency grid lines.
         for i in 0..=FREQ_GRID_LINE_COUNT {
             let frac = i as f32 / FREQ_GRID_LINE_COUNT as f32;
             let x = -1.0 + 2.0 * frac;
-            // Full-height vertical line.
-            vertices.extend_from_slice(&[x, -1.0, x, 1.0]);
+            self.grid_vertices.extend_from_slice(&[x, -1.0, x, 1.0]);
         }
 
-        let bytes = f32_slice_as_bytes(&vertices);
-        let vertex_count = vertices.len() / 2;
+        let bytes = f32_slice_as_bytes(&self.grid_vertices);
+        let vertex_count = self.grid_vertices.len() / 2;
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
@@ -288,20 +291,18 @@ impl FftPlotRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    fn draw_fill(&self, gl: &glow::Context, fft_data: &[f32], db_range: f32, min_db: f32) {
+    fn draw_fill(&mut self, gl: &glow::Context, fft_data: &[f32], db_range: f32, min_db: f32) {
         let bin_count = fft_data.len();
-        let mut vertices = Vec::with_capacity(bin_count * 4);
+        self.fill_vertices.clear();
 
         for (i, &db) in fft_data.iter().take(bin_count).enumerate() {
             let x = -1.0 + 2.0 * (i as f32 / (bin_count - 1).max(1) as f32);
             let y = -1.0 + 2.0 * ((db - min_db) / db_range).clamp(0.0, 1.0);
-
-            // Bottom vertex (y = -1) then top vertex (y = spectrum value).
-            vertices.extend_from_slice(&[x, -1.0, x, y]);
+            self.fill_vertices.extend_from_slice(&[x, -1.0, x, y]);
         }
 
-        let bytes = f32_slice_as_bytes(&vertices);
-        let vertex_count = vertices.len() / 2;
+        let bytes = f32_slice_as_bytes(&self.fill_vertices);
+        let vertex_count = self.fill_vertices.len() / 2;
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
@@ -325,18 +326,18 @@ impl FftPlotRenderer {
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
-    fn draw_trace(&self, gl: &glow::Context, fft_data: &[f32], db_range: f32, min_db: f32) {
+    fn draw_trace(&mut self, gl: &glow::Context, fft_data: &[f32], db_range: f32, min_db: f32) {
         let bin_count = fft_data.len();
-        let mut vertices = Vec::with_capacity(bin_count * 2);
+        self.trace_vertices.clear();
 
         for (i, &db) in fft_data.iter().take(bin_count).enumerate() {
             let x = -1.0 + 2.0 * (i as f32 / (bin_count - 1).max(1) as f32);
             let y = -1.0 + 2.0 * ((db - min_db) / db_range).clamp(0.0, 1.0);
-            vertices.extend_from_slice(&[x, y]);
+            self.trace_vertices.extend_from_slice(&[x, y]);
         }
 
-        let bytes = f32_slice_as_bytes(&vertices);
-        let vertex_count = vertices.len() / 2;
+        let bytes = f32_slice_as_bytes(&self.trace_vertices);
+        let vertex_count = self.trace_vertices.len() / 2;
 
         unsafe {
             gl.buffer_sub_data_u8_slice(glow::ARRAY_BUFFER, 0, bytes);
