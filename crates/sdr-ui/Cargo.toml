@@ -24,7 +24,6 @@ sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
-glow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
