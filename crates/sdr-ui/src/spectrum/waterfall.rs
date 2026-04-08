@@ -377,19 +377,23 @@ impl WaterfallRenderer {
     )]
     pub fn resize(&mut self, gl: &glow::Context, new_width: usize) {
         let capped_width = new_width.min(MAX_TEXTURE_WIDTH);
-        if capped_width == self.texture_width {
-            return;
-        }
-        unsafe {
-            gl.delete_texture(self.data_texture);
-        }
+        // Always reset history (even at same width) to clear mixed-resolution data.
+        // Create replacement texture BEFORE deleting the old one so a failed
+        // allocation doesn't leave a dangling handle.
         match create_data_texture(gl, capped_width) {
             Ok(tex) => {
-                self.data_texture = tex;
-                self.texture_width = capped_width;
-                self.row_buffer = vec![0u8; capped_width];
+                let old_tex = std::mem::replace(&mut self.data_texture, tex);
+                unsafe {
+                    gl.delete_texture(old_tex);
+                }
+                if capped_width == self.texture_width {
+                    self.row_buffer.fill(0);
+                } else {
+                    self.texture_width = capped_width;
+                    self.row_buffer = vec![0u8; capped_width];
+                }
                 self.write_row = 0;
-                tracing::debug!(width = capped_width, "waterfall texture resized");
+                tracing::debug!(width = capped_width, "waterfall texture reset");
             }
             Err(e) => {
                 tracing::warn!("failed to resize waterfall texture: {e}");

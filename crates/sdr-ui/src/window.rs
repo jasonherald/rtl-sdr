@@ -31,8 +31,8 @@ const DEFAULT_HEIGHT: i32 = 800;
 /// Sidebar collapse breakpoint width in pixels.
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
-/// FFT sizes available in the display panel dropdown (must match panel order).
-const FFT_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+/// FFT sizes — re-exported from display panel (single source of truth).
+use crate::sidebar::display_panel::FFT_SIZES;
 
 /// Decimation factors available in the source panel dropdown (must match panel order).
 const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];

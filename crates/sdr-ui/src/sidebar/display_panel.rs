@@ -11,6 +11,9 @@ const MIN_FPS: f64 = 1.0;
 /// Maximum frame rate in FPS.
 const MAX_FPS: f64 = 60.0;
 
+/// Available FFT sizes — single source of truth for dropdown and DSP mapping.
+pub const FFT_SIZES: &[usize] = &[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+
 /// Default FFT size selector index (2048 = index 2).
 const DEFAULT_FFT_SIZE_INDEX: u32 = 2;
 
@@ -59,9 +62,9 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- FFT Size ---
-    let fft_size_model = gtk4::StringList::new(&[
-        "512", "1024", "2048", "4096", "8192", "16384", "32768", "65536",
-    ]);
+    let fft_labels: Vec<String> = FFT_SIZES.iter().map(usize::to_string).collect();
+    let fft_label_refs: Vec<&str> = fft_labels.iter().map(String::as_str).collect();
+    let fft_size_model = gtk4::StringList::new(&fft_label_refs);
     let fft_size_row = adw::ComboRow::builder()
         .title("FFT Size")
         .model(&fft_size_model)
