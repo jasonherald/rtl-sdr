@@ -301,19 +301,26 @@ impl Sink for AudioSink {
         let ring = Arc::clone(&self.ring);
         let target = self.target_node.clone();
 
-        let handle = std::thread::Builder::new()
+        // Set running BEFORE spawn so write_samples can start queueing.
+        // Roll back on spawn failure.
+        self.running.store(true, Ordering::Release);
+
+        let handle = match std::thread::Builder::new()
             .name("pw-audio".into())
             .spawn(move || {
                 if let Err(e) = pipewire_thread(ring, quit_rx, &target) {
                     tracing::error!("PipeWire thread failed: {e}");
                 }
                 running.store(false, Ordering::Release);
-            })
-            .map_err(|e| SinkError::OpenFailed(format!("spawn PipeWire thread: {e}")))?;
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                self.running.store(false, Ordering::Release);
+                return Err(SinkError::OpenFailed(format!("spawn PipeWire thread: {e}")));
+            }
+        };
 
-        // Commit state only after spawn succeeds.
         self.quit_tx = Some(quit_tx);
-        self.running.store(true, Ordering::Release);
         self.pw_thread = Some(handle);
         tracing::info!("audio sink started (PipeWire, {AUDIO_SAMPLE_RATE} Hz stereo f32)");
         Ok(())
@@ -472,7 +479,10 @@ impl AudioCallbackData {
     fn new(ring: Arc<AudioRingBuffer>) -> Self {
         Self {
             ring,
-            read_buf: vec![0.0; 4096],
+            // 48 kHz stereo = 96,000 samples/sec. Typical PipeWire quantum is
+            // 1024 frames = 2048 samples. Allocate for 4x that to handle any
+            // reasonable quantum size without RT reallocation.
+            read_buf: vec![0.0; 8192],
         }
     }
 }
@@ -495,8 +505,12 @@ fn process_callback(stream: &pipewire::stream::Stream, data: &mut AudioCallbackD
     let n_frames = slice.len() / FRAME_SIZE;
     let n_samples = n_frames * (AUDIO_CHANNELS as usize);
 
-    // Read from ring buffer into pre-allocated buffer (zero allocation).
-    data.read_buf.resize(n_samples, 0.0);
+    // Read from ring buffer into pre-allocated buffer.
+    // Grow the buffer if PipeWire requests more than expected (rare, only
+    // happens once per new quantum size — not a per-frame allocation).
+    if data.read_buf.len() < n_samples {
+        data.read_buf.resize(n_samples, 0.0);
+    }
     let available = data.ring.read(&mut data.read_buf[..n_samples]);
 
     for (i, &sample) in data.read_buf[..available].iter().enumerate() {
