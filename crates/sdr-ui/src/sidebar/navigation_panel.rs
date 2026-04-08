@@ -140,6 +140,13 @@ pub struct Bookmark {
     pub wfm_stereo: Option<bool>,
     #[serde(default)]
     pub high_pass: Option<bool>,
+    /// RadioReference category (e.g., "Law Dispatch"). Metadata for future
+    /// bookmark tree organization.
+    #[serde(default)]
+    pub rr_category: Option<String>,
+    /// RadioReference frequency ID for duplicate detection and future sync.
+    #[serde(default)]
+    pub rr_import_id: Option<String>,
 }
 
 impl Bookmark {
@@ -161,6 +168,8 @@ impl Bookmark {
             fm_if_nr: None,
             wfm_stereo: None,
             high_pass: None,
+            rr_category: None,
+            rr_import_id: None,
         }
     }
 
@@ -188,6 +197,8 @@ impl Bookmark {
             fm_if_nr: Some(profile.fm_if_nr),
             wfm_stereo: Some(profile.wfm_stereo),
             high_pass: profile.high_pass,
+            rr_category: None,
+            rr_import_id: None,
         }
     }
 
