@@ -29,8 +29,10 @@ const IQ_PAIRS_PER_READ: usize = 16_384;
 /// Default FFT size for spectrum display.
 const DEFAULT_FFT_SIZE: usize = 2048;
 
-/// Default FFT display rate in FPS.
-const DEFAULT_FFT_RATE: f64 = 60.0;
+/// Default FFT display rate in FPS (matches SDR++ default of 20).
+/// Lower rate reduces Mesa GL driver memory pressure from per-frame
+/// buffer uploads.
+const DEFAULT_FFT_RATE: f64 = 20.0;
 
 /// Default sample rate in Hz (2.0 Msps).
 /// With decimation 8, effective rate = 250 kHz, matching WFM IF exactly.

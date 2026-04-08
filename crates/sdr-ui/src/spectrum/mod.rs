@@ -187,6 +187,12 @@ impl SpectrumHandle {
             shifted.copy_from_slice(data);
             fftshift_in_place(&mut shifted);
             s.renderer.push_line(&s.gl, &shifted);
+
+            // Flush after texture upload so Mesa reclaims staging buffers.
+            #[allow(unsafe_code)]
+            unsafe {
+                glow::HasContext::flush(&s.gl);
+            }
         }
         self.waterfall_area.queue_render();
     }
@@ -433,6 +439,13 @@ fn build_fft_area(
 
             let vfo = vfo_render.borrow();
             s.vfo_renderer.render(&s.gl, &vfo, phys_w, phys_h);
+
+            // Flush the GL pipeline so Mesa reclaims staging buffers
+            // instead of accumulating them indefinitely.
+            #[allow(unsafe_code)]
+            unsafe {
+                glow::HasContext::flush(&s.gl);
+            }
         }
         glib::Propagation::Stop
     });
@@ -539,6 +552,11 @@ fn build_waterfall_area(
 
             let vfo = vfo_state.borrow();
             s.vfo_renderer.render(&s.gl, &vfo, phys_w, phys_h);
+
+            #[allow(unsafe_code)]
+            unsafe {
+                glow::HasContext::flush(&s.gl);
+            }
         }
         glib::Propagation::Stop
     });
@@ -604,6 +622,11 @@ fn build_signal_history_area(
                 min_db_render.get(),
                 max_db_render.get(),
             );
+
+            #[allow(unsafe_code)]
+            unsafe {
+                glow::HasContext::flush(&s.gl);
+            }
         }
         glib::Propagation::Stop
     });

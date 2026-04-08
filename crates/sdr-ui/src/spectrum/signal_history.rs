@@ -92,7 +92,7 @@ impl SignalHistoryRenderer {
 
             // Pre-allocate buffer for the largest usage (2 floats per vertex).
             let max_bytes = MAX_VERTICES * 2 * std::mem::size_of::<f32>();
-            gl.buffer_data_size(glow::ARRAY_BUFFER, max_bytes as i32, glow::DYNAMIC_DRAW);
+            gl.buffer_data_size(glow::ARRAY_BUFFER, max_bytes as i32, glow::STREAM_DRAW);
 
             // Vertex attribute: vec2 at location 0.
             gl.enable_vertex_attrib_array(0);

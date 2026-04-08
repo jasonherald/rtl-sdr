@@ -284,7 +284,7 @@ impl VfoOverlayRenderer {
 
             // Pre-allocate for the overlay geometry.
             let max_bytes = MAX_OVERLAY_FLOATS * std::mem::size_of::<f32>();
-            gl.buffer_data_size(glow::ARRAY_BUFFER, max_bytes as i32, glow::DYNAMIC_DRAW);
+            gl.buffer_data_size(glow::ARRAY_BUFFER, max_bytes as i32, glow::STREAM_DRAW);
 
             // Vertex attribute: vec2 at location 0.
             gl.enable_vertex_attrib_array(0);
