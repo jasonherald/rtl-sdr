@@ -57,7 +57,7 @@ pub fn build_window(app: &adw::Application) {
     let (split_view, panels, spectrum_handle_raw, status_bar) = build_split_view(&state);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
-    let (header, play_button, demod_dropdown, freq_selector) =
+    let (header, play_button, demod_dropdown, freq_selector, screenshot_button) =
         build_header_bar(&sidebar_toggle, &state);
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
@@ -114,6 +114,32 @@ pub fn build_window(app: &adw::Application) {
         &demod_dropdown,
         &status_bar_demod,
     );
+
+    // Wire waterfall screenshot button.
+    let spectrum_screenshot = Rc::clone(&spectrum_handle);
+    screenshot_button.connect_clicked(move |_| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let dir = glib::user_special_dir(glib::UserDirectory::Pictures)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = dir.join(format!("sdr-rs-waterfall-{timestamp}.png"));
+        match spectrum_screenshot.export_waterfall_png(&path) {
+            Ok(()) => {
+                tracing::info!(?path, "waterfall exported");
+                crate::notify::send(
+                    "Waterfall Exported",
+                    &format!("Saved to {}", path.display()),
+                    Some(&path),
+                );
+            }
+            Err(e) => {
+                tracing::warn!("waterfall export failed: {e}");
+                crate::notify::send("Export Failed", &e, None);
+            }
+        }
+    });
 
     // Wire cursor readout from spectrum to status bar.
     let status_bar_for_cursor = Rc::clone(&status_bar_demod);
@@ -376,6 +402,7 @@ fn build_header_bar(
     gtk4::ToggleButton,
     gtk4::DropDown,
     header::frequency_selector::FrequencySelector,
+    gtk4::Button,
 ) {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()
@@ -444,10 +471,23 @@ fn build_header_bar(
     header.pack_start(sidebar_toggle);
     header.pack_start(&play_button);
     header.pack_start(&demod_dropdown);
+    // Waterfall screenshot button
+    let screenshot_button = gtk4::Button::builder()
+        .icon_name("camera-photo-symbolic")
+        .tooltip_text("Export waterfall to PNG")
+        .build();
+
     header.pack_end(&menu_button);
     header.pack_end(&volume_button);
+    header.pack_end(&screenshot_button);
 
-    (header, play_button, demod_dropdown.clone(), freq_selector)
+    (
+        header,
+        play_button,
+        demod_dropdown.clone(),
+        freq_selector,
+        screenshot_button,
+    )
 }
 
 /// Build the app menu button with Keyboard Shortcuts / About / Quit actions.
@@ -800,6 +840,7 @@ const AVERAGING_MODES: [spectrum::AveragingMode; 4] = [
 ];
 
 /// Connect display panel controls to DSP commands.
+#[allow(clippy::too_many_lines)]
 fn connect_display_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,

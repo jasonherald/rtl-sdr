@@ -290,6 +290,51 @@ impl WaterfallRenderer {
         }
     }
 
+    /// Export the waterfall display to a PNG file.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.display_width == 0 {
+            return Err("no waterfall data".to_string());
+        }
+        let stride = cairo::Format::ARgb32
+            .stride_for_width(self.display_width as u32)
+            .map_err(|e| format!("stride: {e}"))?;
+        let expected = (self.display_width * 4) as i32;
+        let buf = if stride == expected {
+            self.pixel_buf.clone()
+        } else {
+            let mut padded = vec![0u8; stride as usize * HISTORY_LINES];
+            for row in 0..HISTORY_LINES {
+                let src = row * self.display_width * 4;
+                let dst = row * stride as usize;
+                padded[dst..dst + self.display_width * 4]
+                    .copy_from_slice(&self.pixel_buf[src..src + self.display_width * 4]);
+            }
+            padded
+        };
+        let surface = cairo::ImageSurface::create_for_data(
+            buf,
+            cairo::Format::ARgb32,
+            self.display_width as i32,
+            HISTORY_LINES as i32,
+            stride,
+        )
+        .map_err(|e| format!("surface: {e}"))?;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut file = std::fs::File::create(path).map_err(|e| format!("file: {e}"))?;
+        surface
+            .write_to_png(&mut file)
+            .map_err(|e| format!("png: {e}"))?;
+        tracing::info!(?path, "waterfall exported to PNG");
+        Ok(())
+    }
+
     /// Current display width in bins.
     pub fn texture_width(&self) -> usize {
         self.display_width

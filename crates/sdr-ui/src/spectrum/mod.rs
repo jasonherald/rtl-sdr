@@ -244,6 +244,15 @@ impl SpectrumHandle {
         self.waterfall_area.queue_draw();
     }
 
+    /// Export the current waterfall display as a PNG file.
+    pub fn export_waterfall_png(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(s) = self.waterfall_state.borrow().as_ref() {
+            s.renderer.export_png(path)
+        } else {
+            Err("waterfall not initialized".to_string())
+        }
+    }
+
     /// Update the tuner center frequency for frequency axis labels.
     pub fn set_center_frequency(&self, freq_hz: f64) {
         self.center_freq.set(freq_hz);

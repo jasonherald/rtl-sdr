@@ -52,6 +52,8 @@ pub struct DisplayPanel {
     pub averaging_row: adw::ComboRow,
     /// Theme selector (System / Dark / Light).
     pub theme_row: adw::ComboRow,
+    /// Export waterfall to PNG button.
+    pub export_waterfall_btn: gtk4::Button,
 }
 
 /// Build the display settings panel.
@@ -143,6 +145,9 @@ pub fn build_display_panel() -> DisplayPanel {
     group.add(&averaging_row);
     group.add(&theme_row);
 
+    // Export button is in the header bar, not here.
+    let export_waterfall_btn = gtk4::Button::new();
+
     // FFT size and window function connected via window.rs
 
     DisplayPanel {
@@ -156,6 +161,7 @@ pub fn build_display_panel() -> DisplayPanel {
         fill_mode_row,
         averaging_row,
         theme_row,
+        export_waterfall_btn,
     }
 }
 

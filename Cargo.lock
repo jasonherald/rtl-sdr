@@ -1054,6 +1054,7 @@ dependencies = [
 name = "sdr-ui"
 version = "0.1.0"
 dependencies = [
+ "cairo-rs",
  "gtk4",
  "libadwaita",
  "sdr-config",
