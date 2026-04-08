@@ -1073,7 +1073,7 @@ fn connect_navigation_panel(
     let save_source_gain = panels.source.gain_row.clone();
     let save_source_agc = panels.source.agc_row.clone();
     nav.connect_save(move || {
-        let active = save_active.borrow();
+        let active = save_active.borrow().clone();
         if active.name.is_empty() && active.frequency == 0 {
             return; // No active bookmark to save.
         }
@@ -1117,6 +1117,11 @@ fn connect_navigation_panel(
             bm.fm_if_nr = Some(profile.fm_if_nr);
             bm.wfm_stereo = Some(profile.wfm_stereo);
             bm.high_pass = profile.high_pass;
+            // Keep ActiveBookmark in sync with the updated frequency.
+            *save_active.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
+                name: active.name.clone(),
+                frequency: freq_u64,
+            };
         }
         sidebar::navigation_panel::save_bookmarks(&bms);
         drop(bms);

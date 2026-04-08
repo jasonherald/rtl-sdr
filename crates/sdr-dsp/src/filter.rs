@@ -433,7 +433,7 @@ impl DeemphasisFilter {
 const DEFAULT_NOTCH_Q: f32 = 30.0;
 
 /// Default notch filter frequency in Hz (US power line hum).
-const DEFAULT_NOTCH_FREQ_HZ: f32 = 60.0;
+pub const DEFAULT_NOTCH_FREQ_HZ: f32 = 60.0;
 
 /// IIR notch (band-reject) filter — second-order biquad.
 ///

@@ -106,7 +106,7 @@ impl RadioModule {
             deemp_mode: DeemphasisMode::None,
             high_pass_enabled: false,
             notch_enabled: false,
-            notch_frequency: 60.0,
+            notch_frequency: sdr_dsp::filter::DEFAULT_NOTCH_FREQ_HZ,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
