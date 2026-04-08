@@ -10,6 +10,7 @@ pub mod sidebar;
 pub mod spectrum;
 pub mod state;
 pub mod status_bar;
+pub mod wav_writer;
 pub mod window;
 
 use gtk4::glib;

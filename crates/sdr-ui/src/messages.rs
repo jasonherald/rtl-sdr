@@ -22,6 +22,14 @@ pub enum DspToUi {
     GainList(Vec<f64>),
     /// Raw (pre-decimation) sample rate for spectrum display bandwidth.
     DisplayBandwidth(f64),
+    /// Audio recording started (contains the file path for display).
+    AudioRecordingStarted(std::path::PathBuf),
+    /// Audio recording stopped.
+    AudioRecordingStopped,
+    /// IQ recording started (contains the file path for display).
+    IqRecordingStarted(std::path::PathBuf),
+    /// IQ recording stopped.
+    IqRecordingStopped,
 }
 
 /// Available source types for IQ input.
@@ -106,6 +114,14 @@ pub enum UiToDsp {
     SetFilePath(std::path::PathBuf),
     /// Set PPM frequency correction for RTL-SDR crystal offset.
     SetPpmCorrection(i32),
+    /// Start recording demodulated audio to a WAV file.
+    StartAudioRecording(std::path::PathBuf),
+    /// Stop audio recording and finalize the WAV file.
+    StopAudioRecording,
+    /// Start recording raw IQ samples to a WAV file.
+    StartIqRecording(std::path::PathBuf),
+    /// Stop IQ recording and finalize the WAV file.
+    StopIqRecording,
 }
 
 #[cfg(test)]
@@ -133,9 +149,22 @@ mod tests {
 
         let info = DspToUi::DeviceInfo("RTL2838UHIDIR".to_string());
         assert!(matches!(info, DspToUi::DeviceInfo(ref s) if s == "RTL2838UHIDIR"));
+
+        let audio_rec = DspToUi::AudioRecordingStarted(std::path::PathBuf::from("/tmp/test.wav"));
+        assert!(matches!(audio_rec, DspToUi::AudioRecordingStarted(_)));
+
+        let audio_stop = DspToUi::AudioRecordingStopped;
+        assert!(matches!(audio_stop, DspToUi::AudioRecordingStopped));
+
+        let iq_rec = DspToUi::IqRecordingStarted(std::path::PathBuf::from("/tmp/iq.wav"));
+        assert!(matches!(iq_rec, DspToUi::IqRecordingStarted(_)));
+
+        let iq_stop = DspToUi::IqRecordingStopped;
+        assert!(matches!(iq_stop, DspToUi::IqRecordingStopped));
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_ui_to_dsp_variants() {
         let start = UiToDsp::Start;
         assert!(matches!(start, UiToDsp::Start));
@@ -262,6 +291,18 @@ mod tests {
 
         let ppm = UiToDsp::SetPpmCorrection(42);
         assert!(matches!(ppm, UiToDsp::SetPpmCorrection(42)));
+
+        let audio_rec = UiToDsp::StartAudioRecording(std::path::PathBuf::from("/tmp/audio.wav"));
+        assert!(matches!(audio_rec, UiToDsp::StartAudioRecording(_)));
+
+        let audio_stop = UiToDsp::StopAudioRecording;
+        assert!(matches!(audio_stop, UiToDsp::StopAudioRecording));
+
+        let iq_rec = UiToDsp::StartIqRecording(std::path::PathBuf::from("/tmp/iq.wav"));
+        assert!(matches!(iq_rec, UiToDsp::StartIqRecording(_)));
+
+        let iq_stop = UiToDsp::StopIqRecording;
+        assert!(matches!(iq_stop, UiToDsp::StopIqRecording));
     }
 
     #[test]

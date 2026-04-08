@@ -22,6 +22,7 @@ use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, SinkError, Stereo};
 
 use crate::messages::{DspToUi, SourceType, UiToDsp};
+use crate::wav_writer::WavWriter;
 
 /// Number of IQ sample pairs per USB bulk read.
 const IQ_PAIRS_PER_READ: usize = 16_384;
@@ -53,6 +54,15 @@ const VFO_OUTPUT_PADDING: usize = 64;
 
 /// RTL-SDR device index to open.
 const DEVICE_INDEX: u32 = 0;
+
+/// Audio recording sample rate in Hz (matches `PipeWire` output).
+const AUDIO_SAMPLE_RATE: u32 = 48_000;
+
+/// Audio recording channel count (stereo).
+const AUDIO_CHANNELS: u16 = 2;
+
+/// IQ recording channel count (I + Q).
+const IQ_CHANNELS: u16 = 2;
 
 /// Spawn the DSP controller thread.
 ///
@@ -207,6 +217,10 @@ struct DspState {
     processed_buf: Vec<Complex>,
     fft_buf: Vec<f32>,
     audio_buf: Vec<Stereo>,
+
+    // Recording state
+    audio_writer: Option<WavWriter>,
+    iq_writer: Option<WavWriter>,
 }
 
 impl DspState {
@@ -254,6 +268,8 @@ impl DspState {
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
             audio_buf: Vec::new(),
+            audio_writer: None,
+            iq_writer: None,
         })
     }
 }
@@ -696,6 +712,49 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::Error(format!("PPM correction failed: {e}")));
             }
         }
+
+        UiToDsp::StartAudioRecording(path) => {
+            tracing::info!(?path, "start audio recording");
+            match WavWriter::new(&path, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS) {
+                Ok(writer) => {
+                    state.audio_writer = Some(writer);
+                    let _ = dsp_tx.send(DspToUi::AudioRecordingStarted(path));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to start audio recording: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Audio record failed: {e}")));
+                }
+            }
+        }
+
+        UiToDsp::StopAudioRecording => {
+            tracing::info!("stop audio recording");
+            // Drop the writer — `Drop` finalizes the WAV header.
+            state.audio_writer = None;
+            let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
+        }
+
+        UiToDsp::StartIqRecording(path) => {
+            tracing::info!(?path, "start IQ recording");
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let iq_rate = state.sample_rate as u32;
+            match WavWriter::new(&path, iq_rate, IQ_CHANNELS) {
+                Ok(writer) => {
+                    state.iq_writer = Some(writer);
+                    let _ = dsp_tx.send(DspToUi::IqRecordingStarted(path));
+                }
+                Err(e) => {
+                    tracing::warn!("failed to start IQ recording: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("IQ record failed: {e}")));
+                }
+            }
+        }
+
+        UiToDsp::StopIqRecording => {
+            tracing::info!("stop IQ recording");
+            state.iq_writer = None;
+            let _ = dsp_tx.send(DspToUi::IqRecordingStopped);
+        }
     }
 }
 
@@ -761,6 +820,14 @@ fn cleanup(state: &mut DspState) {
     // Stop the audio sink so it doesn't try to read stale data.
     if let Err(e) = state.audio_sink.stop() {
         tracing::debug!("audio sink stop: {e}");
+    }
+
+    // Finalize any active recordings (Drop patches the WAV header sizes).
+    if state.audio_writer.take().is_some() {
+        tracing::info!("audio recording finalized on cleanup");
+    }
+    if state.iq_writer.take().is_some() {
+        tracing::info!("IQ recording finalized on cleanup");
     }
 
     state.source = None;
@@ -879,6 +946,16 @@ fn process_iq_block(
         }
     };
 
+    // Write raw IQ samples to recording file (before any processing).
+    if let Some(writer) = &mut state.iq_writer
+        && let Err(e) = writer.write_iq(&state.iq_buf[..iq_count])
+    {
+        tracing::warn!("IQ recording write error: {e}");
+        state.iq_writer = None;
+        let _ = dsp_tx.send(DspToUi::Error("IQ recording write failed".to_string()));
+        let _ = dsp_tx.send(DspToUi::IqRecordingStopped);
+    }
+
     // Process through IQ frontend (decimation, DC blocking, FFT).
     match state.frontend.process(
         &state.iq_buf[..iq_count],
@@ -943,6 +1020,17 @@ fn process_iq_block(
                         for s in &mut state.audio_buf[..audio_count] {
                             s.l *= vol;
                             s.r *= vol;
+                        }
+
+                        // Write to audio recording file (post-volume).
+                        if let Some(writer) = &mut state.audio_writer
+                            && let Err(e) = writer.write_stereo(&state.audio_buf[..audio_count])
+                        {
+                            tracing::warn!("audio recording write error: {e}");
+                            state.audio_writer = None;
+                            let _ = dsp_tx
+                                .send(DspToUi::Error("Audio recording write failed".to_string()));
+                            let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
                         }
 
                         // Send to PipeWire for playback.
