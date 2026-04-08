@@ -173,6 +173,7 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
                             return Err(format!("keyring error: {e}"));
                         }
                         if let Err(e) = store.set(KEY_RR_PASSWORD, &password) {
+                            let _ = store.delete(KEY_RR_USERNAME);
                             return Err(format!("keyring error: {e}"));
                         }
                     }

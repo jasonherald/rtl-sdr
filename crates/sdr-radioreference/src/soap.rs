@@ -436,10 +436,13 @@ impl FreqBuilder {
             b"fid" => self.fid = Some(read_text_content(reader)?.into_owned()),
             b"out" => {
                 let t = read_text_content(reader)?;
-                self.freq_mhz = Some(
-                    t.parse::<f64>()
-                        .map_err(|e| SoapError::Unexpected(format!("bad frequency: {e}")))?,
-                );
+                let mhz = t
+                    .parse::<f64>()
+                    .map_err(|e| SoapError::Unexpected(format!("bad frequency: {e}")))?;
+                if !mhz.is_finite() || mhz <= 0.0 {
+                    return Err(SoapError::Unexpected(format!("invalid frequency: {mhz}")));
+                }
+                self.freq_mhz = Some(mhz);
             }
             b"mode" => self.mode = Some(read_text_content(reader)?.into_owned()),
             b"tone" => {

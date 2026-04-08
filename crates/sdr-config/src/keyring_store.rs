@@ -61,13 +61,9 @@ impl KeyringStore {
     }
 
     fn entry(&self, key: &str) -> Result<keyring::Entry, KeyringError> {
-        keyring::Entry::new(&self.service, key).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("no default") || msg.contains("platform") {
-                KeyringError::NoBackend
-            } else {
-                KeyringError::Platform(msg)
-            }
+        keyring::Entry::new(&self.service, key).map_err(|e| match e {
+            keyring::Error::NoStorageAccess(_) => KeyringError::NoBackend,
+            other => KeyringError::Platform(other.to_string()),
         })
     }
 }
