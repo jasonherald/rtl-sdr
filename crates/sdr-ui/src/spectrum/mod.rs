@@ -171,9 +171,15 @@ impl SpectrumHandle {
         self.fft_area.queue_render();
 
         // Push a new line to the waterfall (also needs fftshift).
+        // Auto-resize the waterfall texture when the FFT size changes —
+        // driven by the first matching-size frame rather than synchronously
+        // from the UI, avoiding races with queued old-size frames.
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
             self.waterfall_area.make_current();
-            // Apply fftshift to waterfall data too.
+            let target_width = data.len().min(waterfall::MAX_TEXTURE_WIDTH);
+            if target_width != s.renderer.texture_width() {
+                s.renderer.resize(&s.gl, data.len());
+            }
             let mut shifted = data.to_vec();
             fftshift_in_place(&mut shifted);
             s.renderer.push_line(&s.gl, &shifted);
@@ -218,22 +224,6 @@ impl SpectrumHandle {
         // Reset the averaging buffer so stale data doesn't persist.
         self.avg_buffer.borrow_mut().clear();
         tracing::debug!(?mode, "averaging mode changed");
-    }
-
-    /// Resize the waterfall texture for a new FFT size.
-    ///
-    /// Called when the user changes the FFT size in the display panel.
-    /// The texture width is capped at `waterfall::MAX_TEXTURE_WIDTH` to stay
-    /// within safe GPU limits; the waterfall renderer downsamples wider FFTs.
-    pub fn set_fft_size(&self, size: usize) {
-        if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
-            self.waterfall_area.make_current();
-            let texture_width = size.min(waterfall::MAX_TEXTURE_WIDTH);
-            s.renderer.resize(&s.gl, texture_width);
-        }
-        // Reset averaging buffer since bin count changed.
-        self.avg_buffer.borrow_mut().clear();
-        self.waterfall_area.queue_render();
     }
 
     /// Update the VFO display range to match the effective FFT bandwidth.

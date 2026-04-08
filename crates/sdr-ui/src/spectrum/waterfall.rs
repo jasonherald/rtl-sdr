@@ -101,6 +101,13 @@ fn downsample_to(data: &[f32], buf: &mut Vec<f32>, target_width: usize) {
     }
 }
 
+/// Clamp texture width to both the app limit and the GPU's `GL_MAX_TEXTURE_SIZE`.
+#[allow(unsafe_code, clippy::cast_sign_loss)]
+fn supported_texture_width(gl: &glow::Context, requested: usize) -> usize {
+    let gpu_limit = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) as usize };
+    requested.min(MAX_TEXTURE_WIDTH).min(gpu_limit.max(1))
+}
+
 /// OpenGL renderer for the scrolling waterfall spectrogram.
 pub struct WaterfallRenderer {
     program: glow::Program,
@@ -143,7 +150,7 @@ impl WaterfallRenderer {
         clippy::cast_possible_wrap
     )]
     pub fn new(gl: &glow::Context, requested_width: usize) -> Result<Self, GlError> {
-        let width = requested_width.min(MAX_TEXTURE_WIDTH);
+        let width = supported_texture_width(gl, requested_width);
         let vert = gl_renderer::compile_shader(gl, glow::VERTEX_SHADER, VERT_SHADER)?;
         let frag = gl_renderer::compile_shader(gl, glow::FRAGMENT_SHADER, FRAG_SHADER)?;
         let program = gl_renderer::link_program(gl, vert, frag)?;
@@ -366,17 +373,23 @@ impl WaterfallRenderer {
         }
     }
 
+    /// Current texture width in bins.
+    pub fn texture_width(&self) -> usize {
+        self.texture_width
+    }
+
     /// Resize the waterfall texture for a new FFT size.
     ///
-    /// Deletes the old data texture and creates a new one at the given width
-    /// (capped at `MAX_TEXTURE_WIDTH`). Resets the ring buffer write position.
+    /// Creates replacement texture before deleting the old one so a failed
+    /// allocation doesn't leave a dangling handle. Resets history on every
+    /// call to clear mixed-resolution data.
     #[allow(
         unsafe_code,
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap
     )]
     pub fn resize(&mut self, gl: &glow::Context, new_width: usize) {
-        let capped_width = new_width.min(MAX_TEXTURE_WIDTH);
+        let capped_width = supported_texture_width(gl, new_width);
         // Always reset history (even at same width) to clear mixed-resolution data.
         // Create replacement texture BEFORE deleting the old one so a failed
         // allocation doesn't leave a dangling handle.

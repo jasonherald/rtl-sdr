@@ -706,7 +706,6 @@ fn connect_display_panel(
 ) {
     // FFT size
     let state_fft = Rc::clone(state);
-    let spectrum_fft = Rc::clone(spectrum_handle);
     panels
         .display
         .fft_size_row
@@ -714,7 +713,8 @@ fn connect_display_panel(
             let idx = row.selected() as usize;
             if let Some(&size) = FFT_SIZES.get(idx) {
                 state_fft.send_dsp(UiToDsp::SetFftSize(size));
-                spectrum_fft.set_fft_size(size);
+                // Waterfall resize happens in push_fft_data when the first
+                // new-size frame arrives — avoids race with queued old-size frames.
             }
         });
 
