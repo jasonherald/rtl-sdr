@@ -429,8 +429,155 @@ impl DeemphasisFilter {
     }
 }
 
+/// Default notch filter quality factor (narrow notch).
+const DEFAULT_NOTCH_Q: f32 = 30.0;
+
+/// Default notch filter frequency in Hz (US power line hum).
+pub const DEFAULT_NOTCH_FREQ_HZ: f32 = 60.0;
+
+/// IIR notch (band-reject) filter — second-order biquad.
+///
+/// Removes a narrow frequency band from the signal. Useful for eliminating
+/// interference tones such as 50/60 Hz power line hum or carrier tones.
+///
+/// Coefficients follow the Audio EQ Cookbook (Robert Bristow-Johnson):
+/// ```text
+/// w0 = 2*pi*freq/sample_rate
+/// alpha = sin(w0) / (2*Q)
+/// b0 = 1,  b1 = -2*cos(w0),  b2 = 1
+/// a0 = 1 + alpha,  a1 = -2*cos(w0),  a2 = 1 - alpha
+/// ```
+/// All coefficients are normalized by `a0`.
+pub struct NotchFilter {
+    // Normalized biquad coefficients (divided by a0).
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    // Filter state (Direct Form I).
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+    // Configuration.
+    enabled: bool,
+    frequency: f32,
+    sample_rate: f32,
+    q: f32,
+}
+
+impl NotchFilter {
+    /// Create a new disabled notch filter for the given sample rate.
+    ///
+    /// Default frequency is 60 Hz (US power line hum), Q = 30.
+    pub fn new(sample_rate: f32) -> Self {
+        let mut filter = Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+            enabled: false,
+            frequency: DEFAULT_NOTCH_FREQ_HZ,
+            sample_rate,
+            q: DEFAULT_NOTCH_Q,
+        };
+        filter.recalculate_coefficients();
+        filter
+    }
+
+    /// Set the notch frequency in Hz and recalculate coefficients.
+    pub fn set_frequency(&mut self, freq: f32) {
+        self.frequency = freq;
+        self.recalculate_coefficients();
+        self.reset();
+    }
+
+    /// Enable or disable the notch filter. Resets biquad state on re-enable
+    /// to prevent pops from stale history.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled && !self.enabled {
+            self.reset();
+        }
+        self.enabled = enabled;
+    }
+
+    /// Returns whether the notch filter is currently enabled.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Returns the current notch frequency in Hz.
+    pub fn frequency(&self) -> f32 {
+        self.frequency
+    }
+
+    /// Reset the filter state (delay elements) to zero.
+    pub fn reset(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
+    }
+
+    /// Process f32 samples through the notch filter.
+    ///
+    /// When disabled, copies input to output unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::BufferTooSmall` if `output.len() < input.len()`.
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<usize, DspError> {
+        if output.len() < input.len() {
+            return Err(DspError::BufferTooSmall {
+                need: input.len(),
+                got: output.len(),
+            });
+        }
+
+        if !self.enabled {
+            output[..input.len()].copy_from_slice(input);
+            return Ok(input.len());
+        }
+
+        for (i, &x) in input.iter().enumerate() {
+            let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+                - self.a1 * self.y1
+                - self.a2 * self.y2;
+            self.x2 = self.x1;
+            self.x1 = x;
+            self.y2 = self.y1;
+            self.y1 = y;
+            output[i] = y;
+        }
+
+        Ok(input.len())
+    }
+
+    /// Recalculate biquad coefficients from frequency, sample rate, and Q.
+    fn recalculate_coefficients(&mut self) {
+        let w0 = core::f32::consts::TAU * self.frequency / self.sample_rate;
+        let (sin_w0, cos_w0) = w0.sin_cos();
+        let alpha = sin_w0 / (2.0 * self.q);
+
+        let a0 = 1.0 + alpha;
+
+        // Normalize all coefficients by a0.
+        self.b0 = 1.0 / a0;
+        self.b1 = (-2.0 * cos_w0) / a0;
+        self.b2 = 1.0 / a0;
+        self.a1 = (-2.0 * cos_w0) / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::float_cmp)]
+#[allow(clippy::unwrap_used, clippy::float_cmp, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
 
@@ -697,5 +844,160 @@ mod tests {
         let input = [1.0_f32; 10];
         let mut output = [0.0_f32; 5];
         assert!(deemph.process(&input, &mut output).is_err());
+    }
+
+    // --- Notch filter tests ---
+
+    #[test]
+    fn test_notch_new_defaults() {
+        let notch = NotchFilter::new(48_000.0);
+        assert!(!notch.enabled());
+        assert!((notch.frequency() - 60.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_notch_disabled_passthrough() {
+        let mut notch = NotchFilter::new(48_000.0);
+        // Filter is disabled by default
+        let input = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let mut output = [0.0_f32; 5];
+        let count = notch.process(&input, &mut output).unwrap();
+        assert_eq!(count, 5);
+        for i in 0..5 {
+            assert!(
+                (output[i] - input[i]).abs() < 1e-6,
+                "disabled notch should passthrough: output[{i}] = {}, expected {}",
+                output[i],
+                input[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_notch_buffer_too_small() {
+        let mut notch = NotchFilter::new(48_000.0);
+        notch.set_enabled(true);
+        let input = [1.0_f32; 10];
+        let mut output = [0.0_f32; 5];
+        assert!(notch.process(&input, &mut output).is_err());
+    }
+
+    #[test]
+    fn test_notch_coefficients_symmetry() {
+        // For a notch filter, b0 == b2 and b1 == a1 (before normalization).
+        // After normalization by a0: b0 = 1/a0, b2 = 1/a0, b1 = -2cos(w0)/a0, a1 = -2cos(w0)/a0.
+        let notch = NotchFilter::new(48_000.0);
+        assert!(
+            (notch.b0 - notch.b2).abs() < 1e-6,
+            "b0 ({}) should equal b2 ({})",
+            notch.b0,
+            notch.b2
+        );
+        assert!(
+            (notch.b1 - notch.a1).abs() < 1e-6,
+            "b1 ({}) should equal a1 ({})",
+            notch.b1,
+            notch.a1
+        );
+    }
+
+    #[test]
+    fn test_notch_attenuates_target_frequency() {
+        // Generate a 60 Hz sine wave at 48 kHz sample rate.
+        let sample_rate = 48_000.0_f32;
+        let freq = 60.0_f32;
+        let num_samples = 48_000; // 1 second of audio
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (core::f32::consts::TAU * freq * (i as f32) / sample_rate).sin())
+            .collect();
+        let mut output = vec![0.0_f32; num_samples];
+
+        let mut notch = NotchFilter::new(sample_rate);
+        notch.set_frequency(freq);
+        notch.set_enabled(true);
+        notch.process(&input, &mut output).unwrap();
+
+        // Measure RMS of the last half (after settling)
+        let rms_in: f32 = (input[num_samples / 2..].iter().map(|x| x * x).sum::<f32>()
+            / (num_samples / 2) as f32)
+            .sqrt();
+        let rms_out: f32 = (output[num_samples / 2..].iter().map(|x| x * x).sum::<f32>()
+            / (num_samples / 2) as f32)
+            .sqrt();
+
+        // The notch should attenuate the target frequency by at least 25 dB.
+        // At Q=30, 60 Hz, 48 kHz sample rate, the biquad achieves ~32 dB rejection.
+        let attenuation_db = 20.0 * (rms_out / rms_in).log10();
+        assert!(
+            attenuation_db < -25.0,
+            "60 Hz should be attenuated by >25 dB, got {attenuation_db:.1} dB"
+        );
+    }
+
+    #[test]
+    fn test_notch_passes_other_frequencies() {
+        // Generate a 1000 Hz sine wave — should NOT be attenuated by a 60 Hz notch.
+        let sample_rate = 48_000.0_f32;
+        let freq = 1000.0_f32;
+        let num_samples = 48_000;
+        let input: Vec<f32> = (0..num_samples)
+            .map(|i| (core::f32::consts::TAU * freq * (i as f32) / sample_rate).sin())
+            .collect();
+        let mut output = vec![0.0_f32; num_samples];
+
+        let mut notch = NotchFilter::new(sample_rate);
+        notch.set_frequency(60.0);
+        notch.set_enabled(true);
+        notch.process(&input, &mut output).unwrap();
+
+        // Measure RMS of the last half
+        let rms_in: f32 = (input[num_samples / 2..].iter().map(|x| x * x).sum::<f32>()
+            / (num_samples / 2) as f32)
+            .sqrt();
+        let rms_out: f32 = (output[num_samples / 2..].iter().map(|x| x * x).sum::<f32>()
+            / (num_samples / 2) as f32)
+            .sqrt();
+
+        // 1000 Hz should pass through with minimal attenuation (< 1 dB)
+        let attenuation_db = 20.0 * (rms_out / rms_in).log10();
+        assert!(
+            attenuation_db > -1.0,
+            "1000 Hz should pass with < 1 dB loss, got {attenuation_db:.2} dB"
+        );
+    }
+
+    #[test]
+    fn test_notch_reset_clears_state() {
+        let mut notch = NotchFilter::new(48_000.0);
+        notch.set_enabled(true);
+        // Process some data to build up state
+        let input = [1.0_f32; 100];
+        let mut output = [0.0_f32; 100];
+        notch.process(&input, &mut output).unwrap();
+
+        notch.reset();
+        // After reset, processing zeros should produce zeros
+        let zeros = [0.0_f32; 10];
+        let mut out2 = [0.0_f32; 10];
+        notch.process(&zeros, &mut out2).unwrap();
+        for (i, &v) in out2.iter().enumerate() {
+            assert!(
+                v.abs() < 1e-6,
+                "after reset, output[{i}] should be ~0, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_notch_set_frequency_updates_coefficients() {
+        let mut notch = NotchFilter::new(48_000.0);
+        let old_b1 = notch.b1;
+        notch.set_frequency(1000.0);
+        // Coefficients should change when frequency changes
+        assert!(
+            (notch.b1 - old_b1).abs() > 1e-6,
+            "b1 should change after set_frequency"
+        );
+        assert!((notch.frequency() - 1000.0).abs() < f32::EPSILON);
     }
 }

@@ -608,6 +608,16 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.radio.set_high_pass_enabled(enabled);
         }
 
+        UiToDsp::SetNotchEnabled(enabled) => {
+            tracing::debug!(enabled, "set notch filter");
+            state.radio.set_notch_enabled(enabled);
+        }
+
+        UiToDsp::SetNotchFrequency(freq) => {
+            tracing::debug!(freq, "set notch frequency");
+            state.radio.set_notch_frequency(freq);
+        }
+
         UiToDsp::SetAudioDevice(node_name) => {
             tracing::info!(target_node = %node_name, "set audio device");
             if let Err(e) = state.audio_sink.set_target(&node_name) {

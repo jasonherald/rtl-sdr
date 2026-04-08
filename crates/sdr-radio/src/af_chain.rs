@@ -3,7 +3,7 @@
 //! Applies optional deemphasis filtering and sample rate conversion
 //! to stereo audio samples after demodulation.
 
-use sdr_dsp::filter::DeemphasisFilter;
+use sdr_dsp::filter::{DeemphasisFilter, NotchFilter};
 use sdr_dsp::multirate::RationalResampler;
 use sdr_types::{Complex, DspError, Stereo};
 
@@ -66,6 +66,8 @@ pub struct AfChain {
     hp_l: Option<HighPassFilter>,
     hp_r: Option<HighPassFilter>,
     hp_enabled: bool,
+    notch_l: NotchFilter,
+    notch_r: NotchFilter,
     resampler: Option<RationalResampler>,
     af_sample_rate: f64,
     audio_sample_rate: f64,
@@ -81,6 +83,11 @@ pub struct AfChain {
     resamp_in: Vec<Complex>,
     /// Scratch buffer for complex resampler output.
     resamp_out: Vec<Complex>,
+    /// Scratch buffers for notch filter (L/R split processing).
+    notch_buf_l: Vec<f32>,
+    notch_buf_r: Vec<f32>,
+    notch_out_l: Vec<f32>,
+    notch_out_r: Vec<f32>,
 }
 
 impl AfChain {
@@ -100,6 +107,9 @@ impl AfChain {
             None
         };
 
+        #[allow(clippy::cast_possible_truncation)]
+        let audio_rate_f32 = audio_sample_rate as f32;
+
         Ok(Self {
             deemp_l: None,
             deemp_r: None,
@@ -107,6 +117,8 @@ impl AfChain {
             hp_l: None,
             hp_r: None,
             hp_enabled: false,
+            notch_l: NotchFilter::new(audio_rate_f32),
+            notch_r: NotchFilter::new(audio_rate_f32),
             resampler,
             af_sample_rate,
             audio_sample_rate,
@@ -116,6 +128,10 @@ impl AfChain {
             deemp_buf_r: Vec::new(),
             resamp_in: Vec::new(),
             resamp_out: Vec::new(),
+            notch_buf_l: Vec::new(),
+            notch_buf_r: Vec::new(),
+            notch_out_l: Vec::new(),
+            notch_out_r: Vec::new(),
         })
     }
 
@@ -172,6 +188,28 @@ impl AfChain {
     /// Returns whether the high-pass filter is enabled.
     pub fn high_pass_enabled(&self) -> bool {
         self.hp_enabled
+    }
+
+    /// Enable or disable the notch filter.
+    pub fn set_notch_enabled(&mut self, enabled: bool) {
+        self.notch_l.set_enabled(enabled);
+        self.notch_r.set_enabled(enabled);
+    }
+
+    /// Set the notch filter frequency in Hz.
+    pub fn set_notch_frequency(&mut self, freq: f32) {
+        self.notch_l.set_frequency(freq);
+        self.notch_r.set_frequency(freq);
+    }
+
+    /// Returns whether the notch filter is enabled.
+    pub fn notch_enabled(&self) -> bool {
+        self.notch_l.enabled()
+    }
+
+    /// Returns the current notch filter frequency in Hz.
+    pub fn notch_frequency(&self) -> f32 {
+        self.notch_l.frequency()
     }
 
     /// Returns whether deemphasis is enabled.
@@ -284,6 +322,36 @@ impl AfChain {
             for s in &mut output[..resamp_count] {
                 s.l = hp_l.process_sample(s.l);
                 s.r = hp_r.process_sample(s.r);
+            }
+        }
+
+        // Stage 4: Notch filter at audio output rate.
+        // Removes specific interference tones (e.g., 50/60 Hz hum, carrier tones).
+        if self.notch_l.enabled() {
+            self.notch_buf_l.resize(resamp_count, 0.0);
+            self.notch_buf_r.resize(resamp_count, 0.0);
+            for (i, s) in output[..resamp_count].iter().enumerate() {
+                self.notch_buf_l[i] = s.l;
+                self.notch_buf_r[i] = s.r;
+            }
+
+            self.notch_out_l.resize(resamp_count, 0.0);
+            self.notch_out_r.resize(resamp_count, 0.0);
+            self.notch_l.process(
+                &self.notch_buf_l[..resamp_count],
+                &mut self.notch_out_l[..resamp_count],
+            )?;
+            self.notch_r.process(
+                &self.notch_buf_r[..resamp_count],
+                &mut self.notch_out_r[..resamp_count],
+            )?;
+
+            for (out, (&l, &r)) in output[..resamp_count].iter_mut().zip(
+                self.notch_out_l[..resamp_count]
+                    .iter()
+                    .zip(self.notch_out_r[..resamp_count].iter()),
+            ) {
+                *out = Stereo::new(l, r);
             }
         }
 
