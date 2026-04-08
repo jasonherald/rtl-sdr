@@ -3,6 +3,9 @@
 //! Ports SDR++ `ConfigManager`. Provides thread-safe JSON configuration
 //! with load, save, and auto-save functionality.
 
+pub mod keyring_store;
+pub use keyring_store::KeyringStore;
+
 use sdr_types::ConfigError;
 use serde_json::Value;
 use std::path::{Path, PathBuf};

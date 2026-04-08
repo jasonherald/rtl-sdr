@@ -75,6 +75,9 @@ sdr-ui = { path = "crates/sdr-ui" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 quick-xml = "0.37"
 
+# Secure credential storage
+keyring = { version = "3", features = ["sync-secret-service"] }
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
