@@ -110,6 +110,11 @@ pub struct SpectrumHandle {
     /// Pre-allocated buffer for fftshift of waterfall data (avoids per-frame alloc).
     shift_buffer: Rc<RefCell<Vec<f32>>>,
     cursor_callback: CursorCallback,
+    /// Full (unzoomed) FFT bandwidth in Hz, set by `set_display_bandwidth()`.
+    /// Used by the FFT plot and waterfall renderers for zoom mapping.
+    full_bandwidth: Rc<Cell<f64>>,
+    /// Tuner center frequency in Hz (for absolute frequency labels).
+    center_freq: Rc<Cell<f64>>,
 }
 
 impl SpectrumHandle {
@@ -226,14 +231,23 @@ impl SpectrumHandle {
     /// Update the VFO display range to match the effective FFT bandwidth.
     ///
     /// Called when the sample rate changes (mode switch, decimation change,
-    /// source switch). Sets the display to show +/-bandwidth/2 centered on DC.
+    /// source switch). Sets the display to show +/-bandwidth/2 centered on DC
+    /// and stores the full bandwidth for zoom calculations.
     pub fn set_display_bandwidth(&self, effective_sample_rate: f64) {
         let half = effective_sample_rate / 2.0;
         let mut vfo = self.vfo_state.borrow_mut();
         vfo.display_start_hz = -half;
         vfo.display_end_hz = half;
+        vfo.max_span_hz = effective_sample_rate;
+        self.full_bandwidth.set(effective_sample_rate);
         self.fft_area.queue_draw();
         self.waterfall_area.queue_draw();
+    }
+
+    /// Update the tuner center frequency for frequency axis labels.
+    pub fn set_center_frequency(&self, freq_hz: f64) {
+        self.center_freq.set(freq_hz);
+        self.fft_area.queue_draw();
     }
 
     /// Push a signal level sample (in dB) into the history graph.
@@ -275,6 +289,8 @@ pub fn build_spectrum_view(
     let max_db: Rc<Cell<f32>> = Rc::new(Cell::new(DEFAULT_MAX_DB));
     let fill_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(true));
     let cursor_callback: CursorCallback = Rc::new(RefCell::new(None));
+    let full_bandwidth: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+    let center_freq: Rc<Cell<f64>> = Rc::new(Cell::new(100_000_000.0)); // default 100 MHz
 
     // Initialize renderer state eagerly (no GL context needed).
     *fft_state.borrow_mut() = Some(FftPlotState {
@@ -302,8 +318,14 @@ pub fn build_spectrum_view(
         &max_db,
         &fill_enabled,
         &cursor_callback,
+        &full_bandwidth,
+        &center_freq,
     );
-    let waterfall_area = build_waterfall_area(Rc::clone(&waterfall_state), Rc::clone(&vfo_state));
+    let waterfall_area = build_waterfall_area(
+        Rc::clone(&waterfall_state),
+        Rc::clone(&vfo_state),
+        Rc::clone(&full_bandwidth),
+    );
     let signal_history_area =
         build_signal_history_area(Rc::clone(&signal_history_state), &min_db, &max_db);
 
@@ -366,12 +388,15 @@ pub fn build_spectrum_view(
         avg_buffer: Rc::new(RefCell::new(Vec::new())),
         shift_buffer: Rc::new(RefCell::new(Vec::new())),
         cursor_callback,
+        full_bandwidth,
+        center_freq,
     };
 
     (outer_box, handle)
 }
 
 /// Build the `DrawingArea` for the FFT power spectrum plot.
+#[allow(clippy::too_many_arguments)]
 fn build_fft_area(
     state: Rc<RefCell<Option<FftPlotState>>>,
     vfo_state: &Rc<RefCell<VfoState>>,
@@ -379,6 +404,8 @@ fn build_fft_area(
     max_db: &Rc<Cell<f32>>,
     fill_enabled: &Rc<Cell<bool>>,
     cursor_callback: &CursorCallback,
+    full_bandwidth: &Rc<Cell<f64>>,
+    center_freq: &Rc<Cell<f64>>,
 ) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::builder()
         .hexpand(true)
@@ -390,8 +417,11 @@ fn build_fft_area(
     let max_db_render = Rc::clone(max_db);
     let fill_render = Rc::clone(fill_enabled);
     let vfo_render = Rc::clone(vfo_state);
+    let full_bw_render = Rc::clone(full_bandwidth);
+    let center_freq_render = Rc::clone(center_freq);
     area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow_mut().as_mut() {
+            let vfo = vfo_render.borrow();
             s.renderer.render(
                 cr,
                 &s.current_data,
@@ -400,9 +430,12 @@ fn build_fft_area(
                 min_db_render.get(),
                 max_db_render.get(),
                 fill_render.get(),
+                vfo.display_start_hz,
+                vfo.display_end_hz,
+                full_bw_render.get(),
+                center_freq_render.get(),
             );
 
-            let vfo = vfo_render.borrow();
             s.vfo_renderer.render(cr, &vfo, width, height);
         }
     });
@@ -456,6 +489,7 @@ fn build_fft_area(
 fn build_waterfall_area(
     state: Rc<RefCell<Option<WaterfallState>>>,
     vfo_state: Rc<RefCell<VfoState>>,
+    full_bandwidth: Rc<Cell<f64>>,
 ) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::builder()
         .hexpand(true)
@@ -464,9 +498,16 @@ fn build_waterfall_area(
 
     area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow().as_ref() {
-            s.renderer.render(cr, width, height);
-
             let vfo = vfo_state.borrow();
+            s.renderer.render(
+                cr,
+                width,
+                height,
+                vfo.display_start_hz,
+                vfo.display_end_hz,
+                full_bandwidth.get(),
+            );
+
             s.vfo_renderer.render(cr, &vfo, width, height);
         }
     });

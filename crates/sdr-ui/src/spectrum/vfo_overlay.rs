@@ -42,9 +42,6 @@ const ZOOM_FACTOR: f64 = 1.2;
 /// Minimum display span in Hz to prevent zooming into nothing.
 const MIN_DISPLAY_SPAN_HZ: f64 = 1_000.0;
 
-/// Maximum display span in Hz.
-const MAX_DISPLAY_SPAN_HZ: f64 = 50_000_000.0;
-
 // ---------------------------------------------------------------------------
 // VFO state
 // ---------------------------------------------------------------------------
@@ -75,6 +72,8 @@ pub struct VfoState {
     pub dragging: bool,
     /// Whether a bandwidth handle is being dragged.
     pub bw_dragging: Option<BwHandle>,
+    /// Maximum zoom-out span in Hz (= full FFT bandwidth).
+    pub max_span_hz: f64,
 }
 
 impl Default for VfoState {
@@ -87,6 +86,7 @@ impl Default for VfoState {
             color: VFO_COLOR,
             dragging: false,
             bw_dragging: None,
+            max_span_hz: DEFAULT_DISPLAY_SPAN_HZ,
         }
     }
 }
@@ -199,7 +199,7 @@ impl VfoState {
         };
 
         let span = self.display_end_hz - self.display_start_hz;
-        let new_span = (span * factor).clamp(MIN_DISPLAY_SPAN_HZ, MAX_DISPLAY_SPAN_HZ);
+        let new_span = (span * factor).clamp(MIN_DISPLAY_SPAN_HZ, self.max_span_hz);
 
         // Keep the cursor frequency at the same relative position.
         let frac = if span > 0.0 {
@@ -359,6 +359,7 @@ mod tests {
             color: VFO_COLOR,
             dragging: false,
             bw_dragging: None,
+            max_span_hz: 1_000_000.0,
         }
     }
 
@@ -479,6 +480,8 @@ mod tests {
     #[test]
     fn zoom_out_widens_span() {
         let mut vfo = test_vfo();
+        // Zoom in first so there's room to zoom back out.
+        vfo.zoom(0.0, 1.0);
         let span_before = vfo.display_end_hz - vfo.display_start_hz;
         vfo.zoom(0.0, -1.0); // negative = zoom out
         let span_after = vfo.display_end_hz - vfo.display_start_hz;
@@ -511,8 +514,8 @@ mod tests {
         }
         let span = vfo.display_end_hz - vfo.display_start_hz;
         assert!(
-            span <= MAX_DISPLAY_SPAN_HZ,
-            "span should not exceed maximum: {span}"
+            span <= vfo.max_span_hz + 1.0, // +1 for float rounding
+            "span should not exceed max_span_hz: {span}"
         );
     }
 

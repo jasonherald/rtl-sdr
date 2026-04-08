@@ -19,6 +19,10 @@ const RING_CAPACITY: usize = 96_000;
 /// Initial capacity for the stereo interleave buffer in `write_samples`.
 const INTERLEAVE_BUF_INITIAL_CAP: usize = 1024;
 
+/// Initial sample capacity for the PipeWire callback read buffer.
+/// 4x typical quantum (1024 frames x 2 channels) to avoid RT reallocation.
+const READ_BUF_INITIAL_SAMPLES: usize = 8_192;
+
 /// Bytes per sample frame (2 channels x 4 bytes per f32).
 const FRAME_SIZE: usize = (AUDIO_CHANNELS as usize) * std::mem::size_of::<f32>();
 
@@ -482,7 +486,7 @@ impl AudioCallbackData {
             // 48 kHz stereo = 96,000 samples/sec. Typical PipeWire quantum is
             // 1024 frames = 2048 samples. Allocate for 4x that to handle any
             // reasonable quantum size without RT reallocation.
-            read_buf: vec![0.0; 8192],
+            read_buf: vec![0.0; READ_BUF_INITIAL_SAMPLES],
         }
     }
 }
