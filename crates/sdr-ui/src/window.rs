@@ -45,7 +45,7 @@ const DSP_POLL_INTERVAL_MS: u64 = 16;
 
 /// Build and present the main application window.
 #[allow(clippy::too_many_lines)]
-pub fn build_window(app: &adw::Application) {
+pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::ConfigManager>) {
     // --- Channel setup ---
     let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiToDsp>();
@@ -57,7 +57,7 @@ pub fn build_window(app: &adw::Application) {
     let (split_view, panels, spectrum_handle_raw, status_bar) = build_split_view(&state);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
-    let (header, play_button, demod_dropdown, freq_selector, screenshot_button) =
+    let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
         build_header_bar(&sidebar_toggle, &state);
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
@@ -87,7 +87,7 @@ pub fn build_window(app: &adw::Application) {
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
 
-    setup_app_actions(app, &window);
+    setup_app_actions(app, &window, config, &rr_button);
 
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
@@ -140,6 +140,41 @@ pub fn build_window(app: &adw::Application) {
             }
         }
     });
+
+    // Wire RadioReference browse button.
+    {
+        let bm_list = panels.navigation.bookmark_list.clone();
+        let bm_scroll = panels.navigation.bookmark_scroll.clone();
+        let bm_rc = panels.navigation.bookmarks.clone();
+        let on_nav = panels.navigation.on_navigate.clone();
+        let active_bm = panels.navigation.active_bookmark.clone();
+        let name_entry = panels.navigation.name_entry.clone();
+        let on_save = panels.navigation.on_save.clone();
+
+        rr_button.connect_clicked(move |btn| {
+            let bm_list = bm_list.clone();
+            let bm_scroll = bm_scroll.clone();
+            let bm_rc = bm_rc.clone();
+            let on_nav = on_nav.clone();
+            let active_bm = active_bm.clone();
+            let name_entry = name_entry.clone();
+            let on_save = on_save.clone();
+
+            crate::radioreference::show_browse_dialog(btn, move || {
+                // Reload bookmarks from disk and rebuild the sidebar list.
+                *bm_rc.borrow_mut() = sidebar::navigation_panel::load_bookmarks();
+                sidebar::navigation_panel::rebuild_bookmark_list(
+                    &bm_list,
+                    &bm_scroll,
+                    &bm_rc,
+                    &on_nav,
+                    &active_bm,
+                    &name_entry,
+                    &on_save,
+                );
+            });
+        });
+    }
 
     // Wire cursor readout from spectrum to status bar.
     let status_bar_for_cursor = Rc::clone(&status_bar_demod);
@@ -403,6 +438,7 @@ fn build_header_bar(
     gtk4::DropDown,
     header::frequency_selector::FrequencySelector,
     gtk4::Button,
+    gtk4::Button,
 ) {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()
@@ -477,8 +513,16 @@ fn build_header_bar(
         .tooltip_text("Export waterfall to PNG")
         .build();
 
+    // RadioReference frequency browser button
+    let rr_button = gtk4::Button::builder()
+        .icon_name("network-wireless-symbolic")
+        .tooltip_text("RadioReference Frequency Browser")
+        .visible(crate::preferences::accounts_page::has_rr_credentials())
+        .build();
+
     header.pack_end(&menu_button);
     header.pack_end(&volume_button);
+    header.pack_end(&rr_button);
     header.pack_end(&screenshot_button);
 
     (
@@ -487,12 +531,14 @@ fn build_header_bar(
         demod_dropdown.clone(),
         freq_selector,
         screenshot_button,
+        rr_button,
     )
 }
 
-/// Build the app menu button with Keyboard Shortcuts / About / Quit actions.
+/// Build the app menu button with Preferences / Keyboard Shortcuts / About / Quit actions.
 fn build_menu_button() -> gtk4::MenuButton {
     let menu = gio::Menu::new();
+    menu.append(Some("_Preferences"), Some("app.preferences"));
     menu.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
     menu.append(Some("_About SDR-RS"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
@@ -1274,8 +1320,13 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         });
 }
 
-/// Register application-level actions (About, Quit).
-fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
+/// Register application-level actions (Preferences, About, Quit).
+fn setup_app_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    rr_button: &gtk4::Button,
+) {
     // Quit action
     let quit_action = gio::SimpleAction::new("quit", None);
     quit_action.connect_activate(glib::clone!(
@@ -1287,6 +1338,28 @@ fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
     ));
     app.add_action(&quit_action);
     app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
+
+    // Preferences action
+    let prefs_action = gio::SimpleAction::new("preferences", None);
+    let config_for_prefs = std::sync::Arc::clone(config);
+    let rr_button_prefs = rr_button.clone();
+    prefs_action.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            let prefs_window =
+                crate::preferences::build_preferences_window(&window, &config_for_prefs);
+            // Update RR button visibility when preferences window closes
+            let rr_btn = rr_button_prefs.clone();
+            prefs_window.connect_close_request(move |_| {
+                rr_btn.set_visible(crate::preferences::accounts_page::has_rr_credentials());
+                glib::Propagation::Proceed
+            });
+            prefs_window.present();
+        }
+    ));
+    app.add_action(&prefs_action);
+    app.set_accels_for_action("app.preferences", &["<Ctrl>comma"]);
 
     // About action
     let about_action = gio::SimpleAction::new("about", None);

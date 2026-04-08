@@ -1,18 +1,18 @@
 [package]
-name = "sdr-config"
+name = "sdr-radioreference"
 version = "0.1.0"
-description = "JSON configuration persistence"
+description = "RadioReference.com SOAP API client"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 sdr-types.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+reqwest.workspace = true
+quick-xml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-keyring.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true
