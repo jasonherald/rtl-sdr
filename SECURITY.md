@@ -34,7 +34,7 @@ This project uses automated security scanning across multiple layers:
 | Tool | Integration | Coverage |
 |------|-------------|----------|
 | [cargo-audit](https://rustsec.org/) | GitHub Actions (PR + weekly) | Known CVEs in Rust dependencies (RustSec advisory database) |
-| [cargo-deny](https://embarkstudios.github.io/cargo-deny/) | GitHub Actions (PR + weekly) | License compliance, duplicate crates, source restrictions |
+| [cargo-deny](https://embarkstudios.github.io/cargo-deny/) | GitHub Actions (PR + weekly) | License compliance, duplicate crates (warn-only), source restrictions |
 | [CodeRabbit](https://coderabbit.ai/) | GitHub App (PR review) | AI-assisted code review with OSV dependency scanning |
 
 ## Scope
