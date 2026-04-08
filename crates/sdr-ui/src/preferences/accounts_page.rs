@@ -236,18 +236,4 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
     (page, has_credentials)
 }
 
-/// Show the status label with appropriate color.
-fn show_status(label: &gtk4::Label, text: &str, success: bool) {
-    label.set_visible(true);
-    if success {
-        label.set_markup(&format!(
-            "<span foreground=\"#2ec27e\">{}</span>",
-            glib::markup_escape_text(text)
-        ));
-    } else {
-        label.set_markup(&format!(
-            "<span foreground=\"#e01b24\">{}</span>",
-            glib::markup_escape_text(text)
-        ));
-    }
-}
+use crate::ui_helpers::show_status;

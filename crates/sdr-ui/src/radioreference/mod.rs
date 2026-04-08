@@ -374,15 +374,7 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Show the status label with success (green) or error (red) styling.
-fn show_status(label: &gtk4::Label, text: &str, success: bool) {
-    label.set_visible(true);
-    let color = if success { "#2ec27e" } else { "#e01b24" };
-    label.set_markup(&format!(
-        "<span foreground=\"{color}\">{}</span>",
-        glib::markup_escape_text(text)
-    ));
-}
+use crate::ui_helpers::show_status;
 
 /// Read the string at the given index from a `DropDown`'s `StringList` model.
 fn selected_string(model: &gtk4::StringList, index: u32) -> String {

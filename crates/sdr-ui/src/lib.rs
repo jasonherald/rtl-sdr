@@ -13,6 +13,7 @@ pub mod sidebar;
 pub mod spectrum;
 pub mod state;
 pub mod status_bar;
+pub mod ui_helpers;
 pub mod wav_writer;
 pub mod window;
 

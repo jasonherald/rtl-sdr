@@ -391,26 +391,31 @@ impl FreqBuilder {
     }
 
     /// Consumes accumulated fields and returns a finished `RrFrequency`.
-    fn finish(&mut self) -> RrFrequency {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let hz = self
-            .freq_mhz
-            .map_or(0, |mhz| (mhz * 1_000_000.0).round() as u64);
+    ///
+    /// Returns `None` if required fields (`fid`, `out`, `mode`) are missing,
+    /// logging a warning rather than producing a bogus entry.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn finish(&mut self) -> Option<RrFrequency> {
+        let fid = self.fid.take()?;
+        let freq_mhz = self.freq_mhz?;
+        let mode = self.mode.take()?;
+
+        let hz = (freq_mhz * 1_000_000.0).round() as u64;
 
         let tone = self.tone_val.and_then(|t| {
             #[allow(clippy::float_cmp)]
             if t == 0.0 { None } else { Some(t) }
         });
 
-        RrFrequency {
-            id: self.fid.take().unwrap_or_default(),
+        Some(RrFrequency {
+            id: fid,
             freq_hz: hz,
-            mode: self.mode.take().unwrap_or_default(),
+            mode,
             tone,
             description: self.description.take().unwrap_or_default(),
             alpha_tag: self.alpha_tag.take().unwrap_or_default(),
             tags: std::mem::take(&mut self.tags),
-        }
+        })
     }
 
     /// Pushes the current tag accumulator into the tags list.
@@ -525,7 +530,11 @@ pub fn parse_frequencies(xml: &str) -> Result<Vec<RrFrequency>, SoapError> {
                         state = FreqParseState::InFreqItem;
                     }
                     FreqParseState::InFreqItem if local == b"item" => {
-                        frequencies.push(builder.finish());
+                        if let Some(freq) = builder.finish() {
+                            frequencies.push(freq);
+                        } else {
+                            tracing::warn!("skipping frequency item with missing required fields");
+                        }
                         state = FreqParseState::TopLevel;
                     }
                     _ => {}
