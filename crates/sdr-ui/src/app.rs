@@ -15,6 +15,9 @@ const APP_ID: &str = "com.sdr.rs";
 pub fn build_app() -> adw::Application {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
+    // Register notification click action before any notifications are sent.
+    crate::notify::register_actions(&app);
+
     app.connect_startup(|_| {
         css::load_css();
 

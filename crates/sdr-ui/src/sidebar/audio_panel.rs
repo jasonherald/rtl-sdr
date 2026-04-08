@@ -13,6 +13,8 @@ pub struct AudioPanel {
     pub sink_type_row: adw::ComboRow,
     /// Node names corresponding to device dropdown indices (for routing).
     pub device_node_names: Vec<String>,
+    /// Toggle to start/stop audio recording.
+    pub record_audio_row: adw::SwitchRow,
 }
 
 /// Build the audio output configuration panel.
@@ -41,13 +43,20 @@ pub fn build_audio_panel() -> AudioPanel {
         .model(&sink_model)
         .build();
 
+    let record_audio_row = adw::SwitchRow::builder()
+        .title("Record Audio")
+        .subtitle("48 kHz stereo WAV")
+        .build();
+
     group.add(&device_row);
     group.add(&sink_type_row);
+    group.add(&record_audio_row);
 
     AudioPanel {
         widget: group,
         device_row,
         sink_type_row,
         device_node_names: node_names,
+        record_audio_row,
     }
 }

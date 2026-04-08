@@ -75,6 +75,8 @@ pub struct SourcePanel {
     pub iq_inversion_row: adw::SwitchRow,
     /// Decimation factor selector (always visible).
     pub decimation_row: adw::ComboRow,
+    /// Toggle to start/stop IQ recording.
+    pub record_iq_row: adw::SwitchRow,
 }
 
 /// Default sample rate selector index (2.4 MHz = index 7).
@@ -261,6 +263,11 @@ pub fn build_source_panel() -> SourcePanel {
     let (dc_blocking_row, iq_correction_row, iq_inversion_row, decimation_row) =
         build_common_rows();
 
+    let record_iq_row = adw::SwitchRow::builder()
+        .title("Record IQ")
+        .subtitle("Raw IQ samples to WAV")
+        .build();
+
     // Add all rows to the group.
     group.add(&device_row);
     group.add(&sample_rate_row);
@@ -275,6 +282,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&iq_correction_row);
     group.add(&iq_inversion_row);
     group.add(&decimation_row);
+    group.add(&record_iq_row);
 
     // Derive initial visibility from the selected device.
     let selected = device_row.selected();
@@ -319,6 +327,7 @@ pub fn build_source_panel() -> SourcePanel {
         iq_correction_row,
         iq_inversion_row,
         decimation_row,
+        record_iq_row,
     }
 }
 

@@ -24,6 +24,9 @@ use crate::spectrum;
 use crate::state::AppState;
 use crate::status_bar::{self, StatusBar};
 
+/// Default recording directory under the user's home.
+const RECORDING_DIR_NAME: &str = "sdr-recordings";
+
 /// Default window width in pixels.
 const DEFAULT_WIDTH: i32 = 1200;
 /// Default window height in pixels.
@@ -54,7 +57,7 @@ pub fn build_window(app: &adw::Application) {
     let (split_view, panels, spectrum_handle_raw, status_bar) = build_split_view(&state);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
-    let (header, play_button, demod_dropdown, freq_selector) =
+    let (header, play_button, demod_dropdown, freq_selector, screenshot_button) =
         build_header_bar(&sidebar_toggle, &state);
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
@@ -112,6 +115,32 @@ pub fn build_window(app: &adw::Application) {
         &status_bar_demod,
     );
 
+    // Wire waterfall screenshot button.
+    let spectrum_screenshot = Rc::clone(&spectrum_handle);
+    screenshot_button.connect_clicked(move |_| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let dir = glib::user_special_dir(glib::UserDirectory::Pictures)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = dir.join(format!("sdr-rs-waterfall-{timestamp}.png"));
+        match spectrum_screenshot.export_waterfall_png(&path) {
+            Ok(()) => {
+                tracing::info!(?path, "waterfall exported");
+                crate::notify::send(
+                    "Waterfall Exported",
+                    &format!("Saved to {}", path.display()),
+                    Some(&path),
+                );
+            }
+            Err(e) => {
+                tracing::warn!("waterfall export failed: {e}");
+                crate::notify::send("Export Failed", &e, None);
+            }
+        }
+    });
+
     // Wire cursor readout from spectrum to status bar.
     let status_bar_for_cursor = Rc::clone(&status_bar_demod);
     spectrum_handle.connect_cursor_moved(move |freq_hz, power_db| {
@@ -161,6 +190,8 @@ pub fn build_window(app: &adw::Application) {
     let toast_overlay_weak = toast_overlay.downgrade();
 
     let gain_row_for_dsp = panels.source.gain_row.clone();
+    let record_audio_for_dsp = panels.audio.record_audio_row.clone();
+    let record_iq_for_dsp = panels.source.record_iq_row.clone();
     glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
         // Check for new FFT data from the shared buffer (zero-alloc path).
         fft_shared.take_if_ready(|data| {
@@ -179,6 +210,8 @@ pub fn build_window(app: &adw::Application) {
                         &toast_overlay_weak,
                         &status_bar_demod,
                         &gain_row_for_dsp,
+                        &record_audio_for_dsp,
+                        &record_iq_for_dsp,
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -195,6 +228,7 @@ pub fn build_window(app: &adw::Application) {
 }
 
 /// Handle a single message from the DSP thread.
+#[allow(clippy::too_many_arguments)]
 fn handle_dsp_message(
     msg: DspToUi,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
@@ -203,6 +237,8 @@ fn handle_dsp_message(
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
     status_bar: &Rc<StatusBar>,
     gain_row: &adw::SpinRow,
+    record_audio_row: &adw::SwitchRow,
+    record_iq_row: &adw::SwitchRow,
 ) {
     match msg {
         DspToUi::FftData(_) => {
@@ -228,6 +264,9 @@ fn handle_dsp_message(
                 btn.set_active(false);
                 btn.set_icon_name("media-playback-start-symbolic");
             }
+            // Reset recording toggles when the source stops.
+            record_audio_row.set_active(false);
+            record_iq_row.set_active(false);
         }
         DspToUi::SampleRateChanged(rate) => {
             tracing::info!(effective_sample_rate = rate, "sample rate changed");
@@ -251,6 +290,42 @@ fn handle_dsp_message(
                 // Update the gain slider range to match the device's actual capabilities
                 gain_row.adjustment().set_lower(min);
                 gain_row.adjustment().set_upper(max);
+            }
+        }
+        DspToUi::AudioRecordingStarted(path) => {
+            tracing::info!(?path, "audio recording started");
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                let name = path
+                    .file_name()
+                    .map_or("file".to_string(), |n| n.to_string_lossy().to_string());
+                let toast = adw::Toast::new(&format!("Recording audio: {name}"));
+                overlay.add_toast(toast);
+            }
+        }
+        DspToUi::AudioRecordingStopped => {
+            tracing::info!("audio recording stopped");
+            record_audio_row.set_active(false);
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                let toast = adw::Toast::new("Audio recording saved");
+                overlay.add_toast(toast);
+            }
+        }
+        DspToUi::IqRecordingStarted(path) => {
+            tracing::info!(?path, "IQ recording started");
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                let name = path
+                    .file_name()
+                    .map_or("file".to_string(), |n| n.to_string_lossy().to_string());
+                let toast = adw::Toast::new(&format!("Recording IQ: {name}"));
+                overlay.add_toast(toast);
+            }
+        }
+        DspToUi::IqRecordingStopped => {
+            tracing::info!("IQ recording stopped");
+            record_iq_row.set_active(false);
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                let toast = adw::Toast::new("IQ recording saved");
+                overlay.add_toast(toast);
             }
         }
     }
@@ -327,6 +402,7 @@ fn build_header_bar(
     gtk4::ToggleButton,
     gtk4::DropDown,
     header::frequency_selector::FrequencySelector,
+    gtk4::Button,
 ) {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()
@@ -395,10 +471,23 @@ fn build_header_bar(
     header.pack_start(sidebar_toggle);
     header.pack_start(&play_button);
     header.pack_start(&demod_dropdown);
+    // Waterfall screenshot button
+    let screenshot_button = gtk4::Button::builder()
+        .icon_name("camera-photo-symbolic")
+        .tooltip_text("Export waterfall to PNG")
+        .build();
+
     header.pack_end(&menu_button);
     header.pack_end(&volume_button);
+    header.pack_end(&screenshot_button);
 
-    (header, play_button, demod_dropdown.clone(), freq_selector)
+    (
+        header,
+        play_button,
+        demod_dropdown.clone(),
+        freq_selector,
+        screenshot_button,
+    )
 }
 
 /// Build the app menu button with Keyboard Shortcuts / About / Quit actions.
@@ -620,6 +709,22 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         let path = std::path::PathBuf::from(row.text().to_string());
         state_file.send_dsp(UiToDsp::SetFilePath(path));
     });
+
+    // IQ recording toggle
+    let state_iq_rec = Rc::clone(state);
+    panels
+        .source
+        .record_iq_row
+        .connect_active_notify(move |row| {
+            if row.is_active() {
+                let path = recording_path("iq");
+                tracing::info!(?path, "starting IQ recording");
+                state_iq_rec.send_dsp(UiToDsp::StartIqRecording(path));
+            } else {
+                tracing::info!("stopping IQ recording");
+                state_iq_rec.send_dsp(UiToDsp::StopIqRecording);
+            }
+        });
 }
 
 /// Connect radio panel controls to DSP commands.
@@ -735,6 +840,7 @@ const AVERAGING_MODES: [spectrum::AveragingMode; 4] = [
 ];
 
 /// Connect display panel controls to DSP commands.
+#[allow(clippy::too_many_lines)]
 fn connect_display_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -1150,6 +1256,22 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             state_dev.send_dsp(UiToDsp::SetAudioDevice(node_name.clone()));
         }
     });
+
+    // Audio recording toggle
+    let state_rec = Rc::clone(state);
+    panels
+        .audio
+        .record_audio_row
+        .connect_active_notify(move |row| {
+            if row.is_active() {
+                let path = recording_path("audio");
+                tracing::info!(?path, "starting audio recording");
+                state_rec.send_dsp(UiToDsp::StartAudioRecording(path));
+            } else {
+                tracing::info!("stopping audio recording");
+                state_rec.send_dsp(UiToDsp::StopAudioRecording);
+            }
+        });
 }
 
 /// Register application-level actions (About, Quit).
@@ -1199,4 +1321,20 @@ fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
     ));
     app.add_action(&about_action);
     app.set_accels_for_action("app.about", &["F1"]);
+}
+
+/// Generate a timestamped recording file path.
+///
+/// Creates the recording directory if it doesn't exist.
+/// Returns a path like `~/sdr-recordings/audio-2026-04-08-173001.wav`.
+fn recording_path(prefix: &str) -> std::path::PathBuf {
+    let base = glib::home_dir().join(RECORDING_DIR_NAME);
+    if let Err(e) = std::fs::create_dir_all(&base) {
+        tracing::warn!("failed to create recording directory: {e}");
+    }
+    let now = glib::DateTime::now_local();
+    let timestamp = now
+        .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
+        .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
+    base.join(format!("{prefix}-{timestamp}.wav"))
 }
