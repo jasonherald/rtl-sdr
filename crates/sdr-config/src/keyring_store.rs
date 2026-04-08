@@ -52,7 +52,13 @@ impl KeyringStore {
     }
 
     pub fn has(&self, key: &str) -> bool {
-        self.get(key).ok().flatten().is_some()
+        match self.get(key) {
+            Ok(val) => val.is_some(),
+            Err(e) => {
+                tracing::warn!(key, "keyring check failed: {e}");
+                false
+            }
+        }
     }
 
     fn entry(&self, key: &str) -> Result<keyring::Entry, KeyringError> {

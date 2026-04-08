@@ -72,7 +72,7 @@ impl From<quick_xml::events::attributes::AttrError> for SoapError {
 // ---------------------------------------------------------------------------
 
 /// Credentials used for every `RadioReference` API call.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SoapAuth {
     /// `RadioReference` username.
     pub username: String,
@@ -80,6 +80,16 @@ pub struct SoapAuth {
     pub password: String,
     /// Application key issued by `RadioReference`.
     pub app_key: String,
+}
+
+impl std::fmt::Debug for SoapAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SoapAuth")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("app_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

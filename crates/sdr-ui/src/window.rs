@@ -87,7 +87,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
 
-    setup_app_actions(app, &window, config);
+    setup_app_actions(app, &window, config, &rr_button);
 
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
@@ -1325,6 +1325,7 @@ fn setup_app_actions(
     app: &adw::Application,
     window: &adw::ApplicationWindow,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    rr_button: &gtk4::Button,
 ) {
     // Quit action
     let quit_action = gio::SimpleAction::new("quit", None);
@@ -1341,12 +1342,19 @@ fn setup_app_actions(
     // Preferences action
     let prefs_action = gio::SimpleAction::new("preferences", None);
     let config_for_prefs = std::sync::Arc::clone(config);
+    let rr_button_prefs = rr_button.clone();
     prefs_action.connect_activate(glib::clone!(
         #[weak]
         window,
         move |_, _| {
             let prefs_window =
                 crate::preferences::build_preferences_window(&window, &config_for_prefs);
+            // Update RR button visibility when preferences window closes
+            let rr_btn = rr_button_prefs.clone();
+            prefs_window.connect_close_request(move |_| {
+                rr_btn.set_visible(crate::preferences::accounts_page::has_rr_credentials());
+                glib::Propagation::Proceed
+            });
             prefs_window.present();
         }
     ));
