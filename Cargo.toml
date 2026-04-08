@@ -46,6 +46,7 @@ members = [
     "crates/sdr-sink-network",
     "crates/sdr-radio",
     "crates/sdr-config",
+    "crates/sdr-radioreference",
     "crates/sdr-ui",
 ]
 
@@ -67,7 +68,12 @@ sdr-sink-audio = { path = "crates/sdr-sink-audio" }
 sdr-sink-network = { path = "crates/sdr-sink-network" }
 sdr-radio = { path = "crates/sdr-radio" }
 sdr-config = { path = "crates/sdr-config" }
+sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-ui = { path = "crates/sdr-ui" }
+
+# HTTP / XML (RadioReference)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+quick-xml = "0.37"
 
 # Error handling
 thiserror = "2"
