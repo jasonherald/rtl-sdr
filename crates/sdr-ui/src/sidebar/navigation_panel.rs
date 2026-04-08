@@ -347,7 +347,7 @@ pub fn build_navigation_panel() -> NavigationPanel {
 }
 
 /// Approximate height of one `AdwActionRow` with subtitle in pixels.
-const BOOKMARK_ROW_HEIGHT: i32 = 64;
+const BOOKMARK_ROW_HEIGHT: i32 = 56;
 /// Maximum visible bookmark rows before scrolling.
 const MAX_VISIBLE_BOOKMARKS: i32 = 3;
 

@@ -1,5 +1,8 @@
 //! Application setup — creates the `AdwApplication` and connects signals.
 
+use std::time::Duration;
+
+use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
@@ -21,6 +24,21 @@ pub fn build_app() -> adw::Application {
             let icon_theme = gtk4::IconTheme::for_display(&display);
             icon_theme.add_search_path("data");
         }
+
+        // Periodically trim the glibc heap to return freed pages to the OS.
+        // Registered in startup (not activate) since activate can fire
+        // multiple times on re-activation.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        glib::timeout_add_local(Duration::from_secs(10), || {
+            #[allow(unsafe_code)]
+            unsafe {
+                unsafe extern "C" {
+                    fn malloc_trim(pad: usize) -> i32;
+                }
+                malloc_trim(0);
+            }
+            glib::ControlFlow::Continue
+        });
 
         tracing::info!("sdr-rs UI starting");
     });

@@ -13,10 +13,10 @@ use super::gl_renderer::{self, GlError, f32_slice_as_bytes};
 // ---------------------------------------------------------------------------
 
 /// Default VFO passband fill color (semi-transparent blue).
-const VFO_COLOR: [f32; 4] = [0.2, 0.6, 1.0, 0.3];
+const VFO_COLOR: [f32; 4] = [0.2, 0.6, 1.0, 0.15];
 
 /// VFO center frequency line color (brighter blue).
-const VFO_CENTER_COLOR: [f32; 4] = [0.3, 0.7, 1.0, 0.9];
+const VFO_CENTER_COLOR: [f32; 4] = [0.3, 0.7, 1.0, 0.5];
 
 /// VFO bandwidth handle edge color.
 const VFO_EDGE_COLOR: [f32; 4] = [0.5, 0.8, 1.0, 0.6];
@@ -406,9 +406,9 @@ impl VfoOverlayRenderer {
         #[allow(clippy::cast_precision_loss)]
         let cx = vfo.center_clip_x() as f32;
 
-        // 2px wide quad in clip space.
+        // 1px wide quad in clip space — thin enough to see the signal behind it.
         #[allow(clippy::cast_precision_loss)]
-        let half_w = if width > 0 { 2.0 / width as f32 } else { 0.002 };
+        let half_w = if width > 0 { 1.0 / width as f32 } else { 0.001 };
         let vertices: [f32; 8] = [
             cx - half_w,
             -1.0,

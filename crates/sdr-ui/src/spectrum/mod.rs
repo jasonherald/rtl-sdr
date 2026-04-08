@@ -45,7 +45,7 @@ use crate::messages::UiToDsp;
 type CursorCallback = Rc<RefCell<Option<Box<dyn Fn(f64, f32)>>>>;
 
 /// Number of FFT bins for the display (used for initial buffer sizing).
-const FFT_SIZE: usize = 1024;
+const FFT_SIZE: usize = 2048;
 
 /// Default FFT plot pane height fraction (30% of total).
 const FFT_PANE_FRACTION: f64 = 0.30;
@@ -112,6 +112,8 @@ pub struct SpectrumHandle {
     fill_enabled: Rc<Cell<bool>>,
     averaging_mode: Rc<Cell<AveragingMode>>,
     avg_buffer: Rc<RefCell<Vec<f32>>>,
+    /// Pre-allocated buffer for fftshift of waterfall data (avoids per-frame alloc).
+    shift_buffer: Rc<RefCell<Vec<f32>>>,
     cursor_callback: CursorCallback,
 }
 
@@ -171,10 +173,18 @@ impl SpectrumHandle {
         self.fft_area.queue_render();
 
         // Push a new line to the waterfall (also needs fftshift).
+        // Auto-resize the waterfall texture when the FFT size changes —
+        // driven by the first matching-size frame rather than synchronously
+        // from the UI, avoiding races with queued old-size frames.
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
             self.waterfall_area.make_current();
-            // Apply fftshift to waterfall data too.
-            let mut shifted = data.to_vec();
+            let target_width = waterfall::supported_texture_width_for(&s.gl, data.len());
+            if target_width != s.renderer.texture_width() {
+                s.renderer.resize(&s.gl, data.len());
+            }
+            let mut shifted = self.shift_buffer.borrow_mut();
+            shifted.resize(data.len(), 0.0);
+            shifted.copy_from_slice(data);
             fftshift_in_place(&mut shifted);
             s.renderer.push_line(&s.gl, &shifted);
         }
@@ -347,6 +357,7 @@ pub fn build_spectrum_view(
         fill_enabled,
         averaging_mode: Rc::new(Cell::new(AveragingMode::default())),
         avg_buffer: Rc::new(RefCell::new(Vec::new())),
+        shift_buffer: Rc::new(RefCell::new(Vec::new())),
         cursor_callback,
     };
 
@@ -403,7 +414,7 @@ fn build_fft_area(
     let fill_render = Rc::clone(fill_enabled);
     let vfo_render = Rc::clone(vfo_state);
     area.connect_render(move |area, _ctx| {
-        if let Some(s) = state.borrow().as_ref() {
+        if let Some(s) = state.borrow_mut().as_mut() {
             let width = area.width();
             let height = area.height();
             let scale = area.scale_factor();

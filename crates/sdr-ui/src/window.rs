@@ -31,8 +31,8 @@ const DEFAULT_HEIGHT: i32 = 800;
 /// Sidebar collapse breakpoint width in pixels.
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
-/// FFT sizes available in the display panel dropdown (must match panel order).
-const FFT_SIZES: &[usize] = &[512, 1024, 2048];
+/// FFT sizes — re-exported from display panel (single source of truth).
+use crate::sidebar::display_panel::FFT_SIZES;
 
 /// Decimation factors available in the source panel dropdown (must match panel order).
 const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
@@ -150,15 +150,21 @@ pub fn build_window(app: &adw::Application) {
     });
 
     // --- Spawn DSP thread ---
-    dsp_controller::spawn_dsp_thread(dsp_tx, ui_rx);
+    let fft_shared = std::sync::Arc::new(dsp_controller::SharedFftBuffer::new(2048));
+    dsp_controller::spawn_dsp_thread(dsp_tx, ui_rx, std::sync::Arc::clone(&fft_shared));
 
-    // --- Poll DspToUi channel from the GTK main loop ---
+    // --- Poll DspToUi channel and shared FFT buffer from the GTK main loop ---
     let play_button_weak = play_button.downgrade();
     let state_rx = Rc::clone(&state);
     let toast_overlay_weak = toast_overlay.downgrade();
 
     let gain_row_for_dsp = panels.source.gain_row.clone();
     glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
+        // Check for new FFT data from the shared buffer (zero-alloc path).
+        fft_shared.take_if_ready(|data| {
+            spectrum_handle.push_fft_data(data);
+        });
+
         // Drain all pending DSP messages.
         loop {
             match dsp_rx.try_recv() {
@@ -197,8 +203,10 @@ fn handle_dsp_message(
     gain_row: &adw::SpinRow,
 ) {
     match msg {
-        DspToUi::FftData(data) => {
-            spectrum_handle.push_fft_data(&data);
+        DspToUi::FftData(_) => {
+            // FFT data now comes via SharedFftBuffer, not the channel.
+            // This variant is kept for backward compatibility but shouldn't
+            // be sent in normal operation.
         }
         DspToUi::SignalLevel(level) => {
             status_bar.update_signal_level(level);
@@ -713,6 +721,8 @@ fn connect_display_panel(
             let idx = row.selected() as usize;
             if let Some(&size) = FFT_SIZES.get(idx) {
                 state_fft.send_dsp(UiToDsp::SetFftSize(size));
+                // Waterfall resize happens in push_fft_data when the first
+                // new-size frame arrives — avoids race with queued old-size frames.
             }
         });
 

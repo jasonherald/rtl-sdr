@@ -59,11 +59,54 @@ const DEVICE_INDEX: u32 = 0;
 ///
 /// This function returns immediately; the DSP work happens on a background
 /// thread that runs until the UI channel is dropped.
-pub fn spawn_dsp_thread(dsp_tx: mpsc::Sender<DspToUi>, ui_rx: mpsc::Receiver<UiToDsp>) {
+/// Shared FFT display buffer — written by DSP thread, read by UI thread.
+/// Avoids per-frame Vec allocation that causes glibc arena fragmentation
+/// from cross-thread alloc/free patterns.
+pub struct SharedFftBuffer {
+    buf: std::sync::Mutex<Vec<f32>>,
+    ready: std::sync::atomic::AtomicBool,
+}
+
+impl SharedFftBuffer {
+    /// Create a new shared buffer with the given initial size.
+    pub fn new(size: usize) -> Self {
+        Self {
+            buf: std::sync::Mutex::new(vec![0.0; size]),
+            ready: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// DSP thread: write FFT data and mark as ready.
+    fn write(&self, data: &[f32]) {
+        if let Ok(mut buf) = self.buf.lock() {
+            buf.resize(data.len(), 0.0);
+            buf.copy_from_slice(data);
+            self.ready.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// UI thread: read FFT data if a new frame is ready.
+    /// Returns None if no new frame, or the data slice via callback.
+    pub fn take_if_ready<F: FnOnce(&[f32])>(&self, f: F) -> bool {
+        if !self.ready.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return false;
+        }
+        if let Ok(buf) = self.buf.lock() {
+            f(&buf);
+        }
+        true
+    }
+}
+
+pub fn spawn_dsp_thread(
+    dsp_tx: mpsc::Sender<DspToUi>,
+    ui_rx: mpsc::Receiver<UiToDsp>,
+    fft_shared: std::sync::Arc<SharedFftBuffer>,
+) {
     match std::thread::Builder::new()
         .name("dsp-controller".into())
         .spawn(move || {
-            dsp_thread_main(dsp_tx, ui_rx);
+            dsp_thread_main(dsp_tx, ui_rx, fft_shared);
         }) {
         Ok(_) => {}
         Err(e) => {
@@ -77,7 +120,11 @@ pub fn spawn_dsp_thread(dsp_tx: mpsc::Sender<DspToUi>, ui_rx: mpsc::Receiver<UiT
 ///
 /// Runs until the `ui_rx` channel is disconnected (UI closed).
 #[allow(clippy::needless_pass_by_value)]
-fn dsp_thread_main(dsp_tx: mpsc::Sender<DspToUi>, ui_rx: mpsc::Receiver<UiToDsp>) {
+fn dsp_thread_main(
+    dsp_tx: mpsc::Sender<DspToUi>,
+    ui_rx: mpsc::Receiver<UiToDsp>,
+    fft_shared: std::sync::Arc<SharedFftBuffer>,
+) {
     tracing::info!("DSP controller thread started");
 
     let mut state = match DspState::new() {
@@ -105,7 +152,7 @@ fn dsp_thread_main(dsp_tx: mpsc::Sender<DspToUi>, ui_rx: mpsc::Receiver<UiToDsp>
             }
 
             // Read and process one IQ block.
-            process_iq_block(&mut state, &dsp_tx);
+            process_iq_block(&mut state, &dsp_tx, &fft_shared);
         } else {
             // Pipeline stopped — block with timeout to avoid busy-waiting.
             match ui_rx.recv_timeout(Duration::from_millis(RECV_TIMEOUT_MS)) {
@@ -777,7 +824,11 @@ fn auto_decimation_ratio(sample_rate: f64, if_rate: f64) -> u32 {
 /// Read one block of IQ data from the source, process it, and send FFT data
 /// to the UI.
 #[allow(clippy::too_many_lines)]
-fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+fn process_iq_block(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    fft_shared: &SharedFftBuffer,
+) {
     let Some(source) = &mut state.source else {
         tracing::warn!("process_iq_block called without source");
         state.running = false;
@@ -823,12 +874,10 @@ fn process_iq_block(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
         &mut state.fft_buf,
     ) {
         Ok((processed_count, fft_ready)) => {
-            // Send FFT data to UI if a new frame is ready.
-            // Clone the buffer and zero in-place to avoid per-frame Vec
-            // allocation (the clone reuses allocator memory; zeroing is
-            // a memset with no allocation).
+            // Write FFT data to shared buffer (zero allocation — no Vec
+            // cloned across threads, avoiding glibc arena fragmentation).
             if fft_ready {
-                let _ = dsp_tx.send(DspToUi::FftData(state.fft_buf.clone()));
+                fft_shared.write(&state.fft_buf);
                 state.fft_buf.fill(0.0);
             }
 
