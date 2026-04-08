@@ -555,13 +555,14 @@ mod tests {
 
     #[test]
     fn downsample_non_divisible() {
+        // 7 bins → 3: ratio 2.333, buckets [0..3), [2..5), [5..7)
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
         let mut buf = Vec::new();
         downsample_to(&data, &mut buf, 3);
         assert_eq!(buf.len(), 3);
-        assert!(buf[0] >= 2.0);
-        assert!(buf[1] >= 4.0);
-        assert!(buf[2] >= 7.0);
+        assert!((buf[0] - 3.0).abs() < f32::EPSILON); // max(1, 2, 3)
+        assert!((buf[1] - 5.0).abs() < f32::EPSILON); // max(3, 4, 5)
+        assert!((buf[2] - 7.0).abs() < f32::EPSILON); // max(6, 7)
     }
 
     #[test]
