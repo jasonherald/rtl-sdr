@@ -14,6 +14,17 @@ const BANDWIDTH_STEP_HZ: f64 = 100.0;
 /// Bandwidth page increment in Hz (scroll/page-up/down).
 const BANDWIDTH_PAGE_HZ: f64 = 1_000.0;
 
+/// Default notch filter frequency in Hz (US power line hum).
+const DEFAULT_NOTCH_FREQ_HZ: f64 = 60.0;
+/// Minimum notch filter frequency in Hz.
+const MIN_NOTCH_FREQ_HZ: f64 = 20.0;
+/// Maximum notch filter frequency in Hz.
+const MAX_NOTCH_FREQ_HZ: f64 = 20_000.0;
+/// Notch frequency step in Hz.
+const NOTCH_FREQ_STEP_HZ: f64 = 10.0;
+/// Notch frequency page increment in Hz.
+const NOTCH_FREQ_PAGE_HZ: f64 = 100.0;
+
 /// Default noise blanker level (threshold multiplier).
 const DEFAULT_NB_LEVEL: f64 = 5.0;
 /// Minimum noise blanker level.
@@ -57,6 +68,10 @@ pub struct RadioPanel {
     pub fm_if_nr_row: adw::SwitchRow,
     /// WFM stereo decode toggle (visible only for WFM mode).
     pub stereo_row: adw::SwitchRow,
+    /// Notch filter enable toggle.
+    pub notch_enabled_row: adw::SwitchRow,
+    /// Notch filter frequency control.
+    pub notch_freq_row: adw::SpinRow,
 }
 
 impl RadioPanel {
@@ -74,6 +89,7 @@ impl RadioPanel {
 }
 
 /// Build the radio / demodulator configuration panel.
+#[allow(clippy::too_many_lines)]
 pub fn build_radio_panel() -> RadioPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Radio")
@@ -154,6 +170,27 @@ pub fn build_radio_panel() -> RadioPanel {
         .visible(false) // Only shown in WFM mode
         .build();
 
+    // --- Notch Filter ---
+    let notch_enabled_row = adw::SwitchRow::builder()
+        .title("Notch Filter")
+        .subtitle("Remove interference tones")
+        .build();
+
+    let notch_freq_adj = gtk4::Adjustment::new(
+        DEFAULT_NOTCH_FREQ_HZ,
+        MIN_NOTCH_FREQ_HZ,
+        MAX_NOTCH_FREQ_HZ,
+        NOTCH_FREQ_STEP_HZ,
+        NOTCH_FREQ_PAGE_HZ,
+        0.0,
+    );
+    let notch_freq_row = adw::SpinRow::builder()
+        .title("Notch Frequency")
+        .subtitle("Hz")
+        .adjustment(&notch_freq_adj)
+        .digits(0)
+        .build();
+
     group.add(&bandwidth_row);
     group.add(&squelch_enabled_row);
     group.add(&squelch_level_row);
@@ -162,6 +199,8 @@ pub fn build_radio_panel() -> RadioPanel {
     group.add(&nb_level_row);
     group.add(&fm_if_nr_row);
     group.add(&stereo_row);
+    group.add(&notch_enabled_row);
+    group.add(&notch_freq_row);
 
     // All rows connected to DSP pipeline via window.rs
 
@@ -175,6 +214,8 @@ pub fn build_radio_panel() -> RadioPanel {
         nb_level_row,
         fm_if_nr_row,
         stereo_row,
+        notch_enabled_row,
+        notch_freq_row,
     }
 }
 
@@ -204,5 +245,14 @@ mod tests {
         assert!(super::DEFAULT_NB_LEVEL <= super::MAX_NB_LEVEL);
         assert!(super::NB_LEVEL_STEP > 0.0);
         assert!(super::NB_LEVEL_PAGE > 0.0);
+    };
+
+    /// Compile-time validation that notch frequency constants are consistent.
+    const _: () = {
+        assert!(super::MIN_NOTCH_FREQ_HZ <= super::MAX_NOTCH_FREQ_HZ);
+        assert!(super::DEFAULT_NOTCH_FREQ_HZ >= super::MIN_NOTCH_FREQ_HZ);
+        assert!(super::DEFAULT_NOTCH_FREQ_HZ <= super::MAX_NOTCH_FREQ_HZ);
+        assert!(super::NOTCH_FREQ_STEP_HZ > 0.0);
+        assert!(super::NOTCH_FREQ_PAGE_HZ > 0.0);
     };
 }

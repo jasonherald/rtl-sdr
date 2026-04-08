@@ -690,6 +690,25 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     panels.radio.stereo_row.connect_active_notify(move |row| {
         state_stereo.send_dsp(UiToDsp::SetWfmStereo(row.is_active()));
     });
+
+    // Notch filter enable
+    let state_notch_en = Rc::clone(state);
+    panels
+        .radio
+        .notch_enabled_row
+        .connect_active_notify(move |row| {
+            state_notch_en.send_dsp(UiToDsp::SetNotchEnabled(row.is_active()));
+        });
+
+    // Notch filter frequency
+    let state_notch_freq = Rc::clone(state);
+    panels
+        .radio
+        .notch_freq_row
+        .connect_value_notify(move |row| {
+            #[allow(clippy::cast_possible_truncation)]
+            state_notch_freq.send_dsp(UiToDsp::SetNotchFrequency(row.value() as f32));
+        });
 }
 
 /// FFT window function options matching the display panel combo.
@@ -839,8 +858,67 @@ fn connect_display_panel(
         });
 }
 
+/// Restore optional tuning-profile settings from a bookmark to DSP and UI.
+fn restore_bookmark_profile(
+    bookmark: &sidebar::navigation_panel::Bookmark,
+    state: &AppState,
+    radio: &sidebar::RadioPanel,
+    gain_row: &adw::SpinRow,
+    agc_row: &adw::SwitchRow,
+) {
+    if let Some(sq_en) = bookmark.squelch_enabled {
+        state.send_dsp(UiToDsp::SetSquelchEnabled(sq_en));
+        radio.squelch_enabled_row.set_active(sq_en);
+    }
+    if let Some(sq_lvl) = bookmark.squelch_level {
+        state.send_dsp(UiToDsp::SetSquelch(sq_lvl));
+        #[allow(clippy::cast_lossless)]
+        radio.squelch_level_row.set_value(sq_lvl as f64);
+    }
+    if let Some(gain) = bookmark.gain {
+        state.send_dsp(UiToDsp::SetGain(gain));
+        gain_row.set_value(gain);
+    }
+    if let Some(agc) = bookmark.agc {
+        state.send_dsp(UiToDsp::SetAgc(agc));
+        agc_row.set_active(agc);
+    }
+    if let Some(vol) = bookmark.volume {
+        state.send_dsp(UiToDsp::SetVolume(vol));
+    }
+    if let Some(de_idx) = bookmark.deemphasis {
+        let deemp = match de_idx {
+            1 => DeemphasisMode::Eu50,
+            2 => DeemphasisMode::Us75,
+            _ => DeemphasisMode::None,
+        };
+        state.send_dsp(UiToDsp::SetDeemphasis(deemp));
+        radio.deemphasis_row.set_selected(de_idx);
+    }
+    if let Some(nb_en) = bookmark.nb_enabled {
+        state.send_dsp(UiToDsp::SetNbEnabled(nb_en));
+        radio.noise_blanker_row.set_active(nb_en);
+    }
+    if let Some(nb_lvl) = bookmark.nb_level {
+        state.send_dsp(UiToDsp::SetNbLevel(nb_lvl));
+        #[allow(clippy::cast_lossless)]
+        radio.nb_level_row.set_value(nb_lvl as f64);
+    }
+    if let Some(fm_nr) = bookmark.fm_if_nr {
+        state.send_dsp(UiToDsp::SetFmIfNrEnabled(fm_nr));
+        radio.fm_if_nr_row.set_active(fm_nr);
+    }
+    if let Some(stereo) = bookmark.wfm_stereo {
+        state.send_dsp(UiToDsp::SetWfmStereo(stereo));
+        radio.stereo_row.set_active(stereo);
+    }
+    if let Some(hp) = bookmark.high_pass {
+        state.send_dsp(UiToDsp::SetHighPass(hp));
+    }
+}
+
 /// Connect navigation panel (band presets + bookmarks) to DSP commands.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_navigation_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -849,14 +927,21 @@ fn connect_navigation_panel(
     status_bar: &Rc<StatusBar>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
 ) {
-    // Navigation callback: tune + set mode + set bandwidth, update UI widgets.
+    // Navigation callback: restore full tuning profile from bookmark.
     let state_nav = Rc::clone(state);
     let fs = freq_selector.clone();
     let dd_weak = demod_dropdown.downgrade();
     let sb = Rc::clone(status_bar);
     let spectrum_nav = Rc::clone(spectrum_handle);
+    let radio_nav = panels.radio.clone();
+    let source_nav_gain = panels.source.gain_row.clone();
+    let source_nav_agc = panels.source.agc_row.clone();
 
-    panels.navigation.connect_navigate(move |freq, mode, bw| {
+    panels.navigation.connect_navigate(move |bookmark| {
+        let freq = bookmark.frequency;
+        let mode = sidebar::navigation_panel::parse_demod_mode(&bookmark.demod_mode);
+        let bw = bookmark.bandwidth;
+
         #[allow(clippy::cast_precision_loss)]
         let freq_f64 = freq as f64;
         state_nav.center_frequency.set(freq_f64);
@@ -878,6 +963,21 @@ fn connect_navigation_panel(
             dd.set_selected(idx);
         }
 
+        // Update bandwidth widget (fires its own DSP callback).
+        radio_nav.bandwidth_row.set_value(bw);
+
+        // Restore optional tuning-profile settings (squelch, gain, etc.).
+        restore_bookmark_profile(
+            bookmark,
+            &state_nav,
+            &radio_nav,
+            &source_nav_gain,
+            &source_nav_agc,
+        );
+
+        // Update mode-specific control visibility for the restored mode.
+        radio_nav.apply_demod_visibility(mode);
+
         // Update status bar
         sb.update_frequency(freq_f64);
         let label = header::demod_mode_label(mode);
@@ -891,21 +991,24 @@ fn connect_navigation_panel(
         );
     });
 
-    // "Add Bookmark" button
+    // "Add Bookmark" button — capture full tuning profile from current UI state.
     let state_bm = Rc::clone(state);
-    let radio_bw = panels.radio.bandwidth_row.clone();
+    let radio_bm = panels.radio.clone();
+    let source_gain_bm = panels.source.gain_row.clone();
+    let source_agc_bm = panels.source.agc_row.clone();
     let nav = &panels.navigation;
     let bm_rc = nav.bookmarks.clone();
     let bm_list = nav.bookmark_list.clone();
     let bm_scroll = nav.bookmark_scroll.clone();
     let on_nav = nav.on_navigate.clone();
     let active_bm = nav.active_bookmark.clone();
+    let on_save_bm = nav.on_save.clone();
     let name_entry = nav.name_entry.clone();
 
     nav.add_button.connect_clicked(move |_| {
         let freq = state_bm.center_frequency.get();
         let mode = state_bm.demod_mode.get();
-        let bw = radio_bw.value();
+        let bw = radio_bm.bandwidth_row.value();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let freq_u64 = freq as u64;
         let entered = name_entry.text();
@@ -914,7 +1017,24 @@ fn connect_navigation_panel(
         } else {
             entered.to_string()
         };
-        let bookmark = sidebar::navigation_panel::Bookmark::new(&name, freq_u64, mode, bw);
+
+        // Capture full tuning profile from current UI widget state.
+        #[allow(clippy::cast_possible_truncation)]
+        let profile = sidebar::navigation_panel::TuningProfile {
+            squelch_enabled: radio_bm.squelch_enabled_row.is_active(),
+            squelch_level: radio_bm.squelch_level_row.value() as f32,
+            gain: source_gain_bm.value(),
+            agc: source_agc_bm.is_active(),
+            volume: 1.0, // Volume ScaleButton is not in sidebar; default full.
+            deemphasis: radio_bm.deemphasis_row.selected(),
+            nb_enabled: radio_bm.noise_blanker_row.is_active(),
+            nb_level: radio_bm.nb_level_row.value() as f32,
+            fm_if_nr: radio_bm.fm_if_nr_row.is_active(),
+            wfm_stereo: radio_bm.stereo_row.is_active(),
+            high_pass: false, // No UI widget yet.
+        };
+        let bookmark =
+            sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
         bm_rc.borrow_mut().push(bookmark);
         sidebar::navigation_panel::save_bookmarks(&bm_rc.borrow());
         sidebar::navigation_panel::rebuild_bookmark_list(
@@ -924,8 +1044,89 @@ fn connect_navigation_panel(
             &on_nav,
             &active_bm,
             &name_entry,
+            &on_save_bm,
         );
         name_entry.set_text("");
+    });
+
+    // Save button — update the active bookmark with current settings.
+    let save_bm_rc = nav.bookmarks.clone();
+    let save_active = nav.active_bookmark.clone();
+    let save_bm_list = nav.bookmark_list.clone();
+    let save_bm_scroll = nav.bookmark_scroll.clone();
+    let save_on_nav = nav.on_navigate.clone();
+    let save_on_save = nav.on_save.clone();
+    let save_name_entry = nav.name_entry.clone();
+    let save_state = Rc::clone(state);
+    let save_radio_bw = panels.radio.bandwidth_row.clone();
+    let save_radio_sq_en = panels.radio.squelch_enabled_row.clone();
+    let save_radio_sq_lvl = panels.radio.squelch_level_row.clone();
+    let save_radio_deemp = panels.radio.deemphasis_row.clone();
+    let save_radio_nben = panels.radio.noise_blanker_row.clone();
+    let save_radio_nben_lvl = panels.radio.nb_level_row.clone();
+    let save_radio_nr = panels.radio.fm_if_nr_row.clone();
+    let save_radio_stereo = panels.radio.stereo_row.clone();
+    let save_source_gain = panels.source.gain_row.clone();
+    let save_source_agc = panels.source.agc_row.clone();
+    nav.connect_save(move || {
+        let active = save_active.borrow();
+        if active.name.is_empty() && active.frequency == 0 {
+            return; // No active bookmark to save.
+        }
+        let freq = save_state.center_frequency.get();
+        let mode = save_state.demod_mode.get();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let freq_u64 = freq as u64;
+        let bw = save_radio_bw.value();
+        let profile = sidebar::navigation_panel::TuningProfile {
+            squelch_enabled: save_radio_sq_en.is_active(),
+            #[allow(clippy::cast_possible_truncation)]
+            squelch_level: save_radio_sq_lvl.value() as f32,
+            gain: save_source_gain.value(),
+            agc: save_source_agc.is_active(),
+            volume: 1.0,
+            deemphasis: save_radio_deemp.selected(),
+            nb_enabled: save_radio_nben.is_active(),
+            #[allow(clippy::cast_possible_truncation)]
+            nb_level: save_radio_nben_lvl.value() as f32,
+            fm_if_nr: save_radio_nr.is_active(),
+            wfm_stereo: save_radio_stereo.is_active(),
+            high_pass: false,
+        };
+        // Find and update the active bookmark in the list.
+        let mut bms = save_bm_rc.borrow_mut();
+        if let Some(bm) = bms
+            .iter_mut()
+            .find(|b| b.name == active.name && b.frequency == active.frequency)
+        {
+            bm.frequency = freq_u64;
+            bm.demod_mode = sidebar::navigation_panel::demod_mode_to_string(mode);
+            bm.bandwidth = bw;
+            bm.squelch_enabled = Some(profile.squelch_enabled);
+            bm.squelch_level = Some(profile.squelch_level);
+            bm.gain = Some(profile.gain);
+            bm.agc = Some(profile.agc);
+            bm.volume = Some(profile.volume);
+            bm.deemphasis = Some(profile.deemphasis);
+            bm.nb_enabled = Some(profile.nb_enabled);
+            bm.nb_level = Some(profile.nb_level);
+            bm.fm_if_nr = Some(profile.fm_if_nr);
+            bm.wfm_stereo = Some(profile.wfm_stereo);
+            bm.high_pass = Some(profile.high_pass);
+        }
+        sidebar::navigation_panel::save_bookmarks(&bms);
+        drop(bms);
+        // Rebuild to update subtitle.
+        sidebar::navigation_panel::rebuild_bookmark_list(
+            &save_bm_list,
+            &save_bm_scroll,
+            &save_bm_rc,
+            &save_on_nav,
+            &save_active,
+            &save_name_entry,
+            &save_on_save,
+        );
+        tracing::info!("bookmark saved: {}", active.name);
     });
 }
 

@@ -69,6 +69,8 @@ pub struct RadioModule {
     af_chain: AfChain,
     deemp_mode: DeemphasisMode,
     high_pass_enabled: bool,
+    notch_enabled: bool,
+    notch_frequency: f32,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -103,6 +105,8 @@ impl RadioModule {
             af_chain,
             deemp_mode: DeemphasisMode::None,
             high_pass_enabled: false,
+            notch_enabled: false,
+            notch_frequency: 60.0,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -163,6 +167,10 @@ impl RadioModule {
         }
         if self.high_pass_enabled && high_pass_allowed {
             af_chain.set_high_pass_enabled(true);
+        }
+        if self.notch_enabled {
+            af_chain.set_notch_enabled(true);
+            af_chain.set_notch_frequency(self.notch_frequency);
         }
 
         // Update IF chain feature flags based on new mode capabilities
@@ -337,6 +345,22 @@ impl RadioModule {
     pub fn set_high_pass_enabled(&mut self, enabled: bool) {
         self.high_pass_enabled = enabled;
         self.af_chain.set_high_pass_enabled(enabled);
+    }
+
+    /// Enable or disable the audio notch filter.
+    ///
+    /// Persists across mode changes — reapplied when the AF chain is rebuilt.
+    pub fn set_notch_enabled(&mut self, enabled: bool) {
+        self.notch_enabled = enabled;
+        self.af_chain.set_notch_enabled(enabled);
+    }
+
+    /// Set the audio notch filter frequency in Hz.
+    ///
+    /// Persists across mode changes — reapplied when the AF chain is rebuilt.
+    pub fn set_notch_frequency(&mut self, freq: f32) {
+        self.notch_frequency = freq;
+        self.af_chain.set_notch_frequency(freq);
     }
 
     /// Enable or disable WFM stereo decode.

@@ -88,6 +88,10 @@ pub enum UiToDsp {
     SetFftRate(f64),
     /// Enable or disable the audio high-pass filter (voice modes).
     SetHighPass(bool),
+    /// Enable or disable the audio notch filter.
+    SetNotchEnabled(bool),
+    /// Set the audio notch filter frequency in Hz.
+    SetNotchFrequency(f32),
     /// Set the audio output device by `PipeWire` node name.
     SetAudioDevice(String),
     /// Switch the source type (stops current source if running).
@@ -213,6 +217,14 @@ mod tests {
 
         let hp = UiToDsp::SetHighPass(true);
         assert!(matches!(hp, UiToDsp::SetHighPass(true)));
+
+        let notch_en = UiToDsp::SetNotchEnabled(true);
+        assert!(matches!(notch_en, UiToDsp::SetNotchEnabled(true)));
+
+        let notch_freq = UiToDsp::SetNotchFrequency(60.0);
+        assert!(
+            matches!(notch_freq, UiToDsp::SetNotchFrequency(f) if (f - 60.0).abs() < f32::EPSILON)
+        );
 
         let device = UiToDsp::SetAudioDevice("default".to_string());
         assert!(matches!(device, UiToDsp::SetAudioDevice(ref s) if s == "default"));
