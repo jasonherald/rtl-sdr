@@ -120,6 +120,7 @@ pub fn build_window(app: &adw::Application) {
 
     let status_bar_for_freq = Rc::clone(&status_bar_demod);
     let state_freq = Rc::clone(&state);
+    let spectrum_for_freq = Rc::clone(&spectrum_handle);
     freq_selector.connect_frequency_changed(move |freq| {
         tracing::debug!(frequency_hz = freq, "frequency changed");
         #[allow(clippy::cast_precision_loss)]
@@ -127,6 +128,7 @@ pub fn build_window(app: &adw::Application) {
         state_freq.center_frequency.set(freq_f64);
         state_freq.send_dsp(UiToDsp::Tune(freq_f64));
         status_bar_for_freq.update_frequency(freq_f64);
+        spectrum_for_freq.set_center_frequency(freq_f64);
     });
     let status_bar_for_demod = Rc::clone(&status_bar_demod);
     let bw_row_for_demod = panels.radio.bandwidth_row.clone();
@@ -451,7 +453,14 @@ fn connect_sidebar_panels(
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
-    connect_navigation_panel(panels, state, freq_selector, demod_dropdown, status_bar);
+    connect_navigation_panel(
+        panels,
+        state,
+        freq_selector,
+        demod_dropdown,
+        status_bar,
+        spectrum_handle,
+    );
 }
 
 /// Connect source panel controls to DSP commands.
@@ -831,18 +840,21 @@ fn connect_display_panel(
 }
 
 /// Connect navigation panel (band presets + bookmarks) to DSP commands.
+#[allow(clippy::too_many_arguments)]
 fn connect_navigation_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     freq_selector: &header::frequency_selector::FrequencySelector,
     demod_dropdown: &gtk4::DropDown,
     status_bar: &Rc<StatusBar>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
 ) {
     // Navigation callback: tune + set mode + set bandwidth, update UI widgets.
     let state_nav = Rc::clone(state);
     let fs = freq_selector.clone();
     let dd_weak = demod_dropdown.downgrade();
     let sb = Rc::clone(status_bar);
+    let spectrum_nav = Rc::clone(spectrum_handle);
 
     panels.navigation.connect_navigate(move |freq, mode, bw| {
         #[allow(clippy::cast_precision_loss)]
@@ -857,6 +869,7 @@ fn connect_navigation_panel(
 
         // Update frequency selector display (does NOT fire callback — no duplicate Tune).
         fs.set_frequency(freq);
+        spectrum_nav.set_center_frequency(freq_f64);
 
         // Update demod dropdown — its callback sends SetDemodMode to DSP.
         if let Some(dd) = dd_weak.upgrade()

@@ -158,14 +158,23 @@ impl WaterfallRenderer {
     /// Render the waterfall display to the given Cairo context.
     ///
     /// Blits the pixel buffer as a Cairo `ImageSurface` scaled to the
-    /// requested output size.
+    /// requested output size. When zoomed in, only the visible frequency
+    /// portion is shown by translating and scaling the source surface.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
         clippy::cast_precision_loss,
         clippy::cast_sign_loss
     )]
-    pub fn render(&self, cr: &cairo::Context, width: i32, height: i32) {
+    pub fn render(
+        &self,
+        cr: &cairo::Context,
+        width: i32,
+        height: i32,
+        display_start_hz: f64,
+        display_end_hz: f64,
+        full_bandwidth: f64,
+    ) {
         if width <= 0 || height <= 0 || self.display_width == 0 {
             return;
         }
@@ -216,16 +225,52 @@ impl WaterfallRenderer {
 
         let Ok(surface) = surface else { return };
 
-        // Scale the surface to fill the output area.
-        let _ = cr.save();
-        cr.scale(
-            f64::from(width) / self.display_width as f64,
-            f64::from(height) / HISTORY_LINES as f64,
-        );
-        let _ = cr.set_source_surface(&surface, 0.0, 0.0);
+        // Compute the visible portion of the full-bandwidth surface.
+        // The pixel buffer spans -full_bw/2 .. +full_bw/2.
+        // The display range is display_start_hz .. display_end_hz.
+        let effective_full_bw = if full_bandwidth > 0.0 {
+            full_bandwidth
+        } else {
+            display_end_hz - display_start_hz
+        };
 
-        // Use NEAREST filtering for crisp bin boundaries (matching the old GL
-        // NEAREST filter), or BILINEAR for smoother appearance.
+        let full_start_hz = -effective_full_bw / 2.0;
+
+        // Fractional position of the visible range within the full surface.
+        let visible_start_frac = if effective_full_bw > 0.0 {
+            (display_start_hz - full_start_hz) / effective_full_bw
+        } else {
+            0.0
+        };
+        let visible_end_frac = if effective_full_bw > 0.0 {
+            (display_end_hz - full_start_hz) / effective_full_bw
+        } else {
+            1.0
+        };
+
+        let visible_width_frac = visible_end_frac - visible_start_frac;
+
+        // Scale and translate the surface so only the visible portion fills
+        // the output area.
+        let _ = cr.save();
+
+        // Y scale: stretch history lines to fill output height.
+        let y_scale = f64::from(height) / HISTORY_LINES as f64;
+
+        // X scale: the visible fraction of the surface width maps to output width.
+        let x_scale = if visible_width_frac > 0.0 {
+            f64::from(width) / (self.display_width as f64 * visible_width_frac)
+        } else {
+            f64::from(width) / self.display_width as f64
+        };
+
+        cr.scale(x_scale, y_scale);
+
+        // Offset the surface so the visible start aligns with x=0.
+        let src_offset_x = -(visible_start_frac * self.display_width as f64);
+        let _ = cr.set_source_surface(&surface, src_offset_x, 0.0);
+
+        // Use NEAREST filtering for crisp bin boundaries.
         cr.source().set_filter(cairo::Filter::Nearest);
 
         let _ = cr.paint();

@@ -1,10 +1,13 @@
 //! FFT spectrum plot renderer using Cairo.
 //!
 //! Draws the power spectrum as a filled area with a line trace on top,
-//! plus horizontal dB grid lines and vertical frequency grid lines.
+//! plus horizontal dB grid lines with labels and vertical frequency grid
+//! lines with frequency labels. Supports zoom via display range parameters.
 //! Renders directly via Cairo draw calls — no OpenGL, no pixel buffers.
 
 use gtk4::cairo;
+
+use super::frequency_axis;
 
 /// Maximum bins for display rendering.
 /// FFT data wider than this is max-pooled down before drawing.
@@ -15,6 +18,15 @@ const DB_GRID_LINE_COUNT: usize = 8;
 
 /// Number of vertical frequency grid lines.
 const FREQ_GRID_LINE_COUNT: usize = 10;
+
+/// Font size for axis labels in Cairo units.
+const LABEL_FONT_SIZE: f64 = 10.0;
+
+/// Label color — light gray, semi-transparent.
+const LABEL_COLOR: [f64; 4] = [0.6, 0.6, 0.6, 0.8];
+
+/// Top margin in pixels reserved for frequency labels.
+const FREQ_LABEL_TOP_MARGIN: f64 = 14.0;
 
 // Colors (RGBA, 0.0..1.0)
 /// Spectrum trace line color — accent blue.
@@ -87,12 +99,16 @@ impl FftPlotRenderer {
     /// # Arguments
     ///
     /// * `cr` — The Cairo drawing context.
-    /// * `fft_data` — Power spectrum values in dB (one per frequency bin).
+    /// * `fft_data` — Power spectrum values in dB (one per frequency bin, full bandwidth).
     /// * `width` — Viewport width in pixels.
     /// * `height` — Viewport height in pixels.
     /// * `min_db` — Bottom of the display range in dB.
     /// * `max_db` — Top of the display range in dB.
     /// * `fill_enabled` — Whether to draw the filled area under the trace.
+    /// * `display_start_hz` — Left edge of the visible frequency range (relative to center).
+    /// * `display_end_hz` — Right edge of the visible frequency range (relative to center).
+    /// * `full_bandwidth` — Total FFT bandwidth in Hz (unzoomed span).
+    /// * `center_freq_hz` — Tuner center frequency in Hz (for absolute frequency labels).
     #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -103,6 +119,10 @@ impl FftPlotRenderer {
         min_db: f32,
         max_db: f32,
         fill_enabled: bool,
+        display_start_hz: f64,
+        display_end_hz: f64,
+        full_bandwidth: f64,
+        center_freq_hz: f64,
     ) {
         if fft_data.is_empty() || width <= 0 || height <= 0 {
             return;
@@ -129,113 +149,42 @@ impl FftPlotRenderer {
         );
         let _ = cr.paint();
 
-        // Grid lines.
-        Self::draw_grid(cr, w, h);
+        // Frequency-aware grid lines with labels.
+        Self::draw_grid(
+            cr,
+            w,
+            h,
+            min_db,
+            max_db,
+            display_start_hz,
+            display_end_hz,
+            center_freq_hz,
+        );
 
-        // Filled area under the spectrum curve.
+        // Build the trace path once, reuse for fill and stroke.
+        // Uses frequency-to-pixel mapping for zoom support.
+        Self::build_trace_path(
+            cr,
+            display_data,
+            w,
+            h,
+            db_range,
+            min_db,
+            display_start_hz,
+            display_end_hz,
+            full_bandwidth,
+        );
+
         if fill_enabled {
-            Self::draw_fill(cr, display_data, w, h, db_range, min_db);
+            // Close along bottom edge and fill.
+            cr.line_to(w, h);
+            cr.line_to(0.0, h);
+            cr.close_path();
+            cr.set_source_rgba(FILL_COLOR[0], FILL_COLOR[1], FILL_COLOR[2], FILL_COLOR[3]);
+            let _ = cr.fill_preserve();
         }
 
-        // Spectrum line trace on top.
-        Self::draw_trace(cr, display_data, w, h, db_range, min_db);
-
-        // Return the downsample buffer to self for reuse next frame.
-        let _ = display_data;
-        self.downsample_buf = ds_buf;
-    }
-
-    /// Draw horizontal dB grid lines and vertical frequency grid lines.
-    #[allow(clippy::cast_precision_loss)]
-    fn draw_grid(cr: &cairo::Context, w: f64, h: f64) {
-        cr.set_source_rgba(GRID_COLOR[0], GRID_COLOR[1], GRID_COLOR[2], GRID_COLOR[3]);
-        cr.set_line_width(1.0);
-
-        // Horizontal dB grid lines.
-        for i in 0..=DB_GRID_LINE_COUNT {
-            let frac = i as f64 / DB_GRID_LINE_COUNT as f64;
-            let y = (h * frac).floor() + 0.5; // snap to pixel center for crisp 1px lines
-            cr.move_to(0.0, y);
-            cr.line_to(w, y);
-        }
-
-        // Vertical frequency grid lines.
-        for i in 0..=FREQ_GRID_LINE_COUNT {
-            let frac = i as f64 / FREQ_GRID_LINE_COUNT as f64;
-            let x = (w * frac).floor() + 0.5;
-            cr.move_to(x, 0.0);
-            cr.line_to(x, h);
-        }
-
-        let _ = cr.stroke();
-    }
-
-    /// Draw the filled area under the spectrum curve.
-    #[allow(clippy::cast_precision_loss)]
-    fn draw_fill(
-        cr: &cairo::Context,
-        fft_data: &[f32],
-        w: f64,
-        h: f64,
-        db_range: f32,
-        min_db: f32,
-    ) {
-        let bin_count = fft_data.len();
-        if bin_count == 0 {
-            return;
-        }
-
-        let db_range_f64 = f64::from(db_range);
-        let min_db_f64 = f64::from(min_db);
-
-        // Build a path: trace line, then close along the bottom edge.
-        let first_db = f64::from(fft_data[0]);
-        let first_y = h * (1.0 - ((first_db - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
-        cr.move_to(0.0, first_y);
-
-        for (i, &db) in fft_data.iter().enumerate().skip(1) {
-            let x = w * i as f64 / (bin_count - 1).max(1) as f64;
-            let y = h * (1.0 - ((f64::from(db) - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
-            cr.line_to(x, y);
-        }
-
-        // Close along the bottom edge.
-        cr.line_to(w, h);
-        cr.line_to(0.0, h);
-        cr.close_path();
-
-        cr.set_source_rgba(FILL_COLOR[0], FILL_COLOR[1], FILL_COLOR[2], FILL_COLOR[3]);
-        let _ = cr.fill();
-    }
-
-    /// Draw the spectrum line trace.
-    #[allow(clippy::cast_precision_loss)]
-    fn draw_trace(
-        cr: &cairo::Context,
-        fft_data: &[f32],
-        w: f64,
-        h: f64,
-        db_range: f32,
-        min_db: f32,
-    ) {
-        let bin_count = fft_data.len();
-        if bin_count == 0 {
-            return;
-        }
-
-        let db_range_f64 = f64::from(db_range);
-        let min_db_f64 = f64::from(min_db);
-
-        for (i, &db) in fft_data.iter().enumerate() {
-            let x = w * i as f64 / (bin_count - 1).max(1) as f64;
-            let y = h * (1.0 - ((f64::from(db) - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
-            if i == 0 {
-                cr.move_to(x, y);
-            } else {
-                cr.line_to(x, y);
-            }
-        }
-
+        // Stroke the trace line on top.
         cr.set_source_rgba(
             TRACE_COLOR[0],
             TRACE_COLOR[1],
@@ -244,5 +193,145 @@ impl FftPlotRenderer {
         );
         cr.set_line_width(1.0);
         let _ = cr.stroke();
+
+        // Return the downsample buffer to self for reuse next frame.
+        let _ = display_data;
+        self.downsample_buf = ds_buf;
+    }
+
+    /// Draw horizontal dB grid lines with labels and vertical frequency grid
+    /// lines with frequency labels.
+    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::too_many_arguments)]
+    fn draw_grid(
+        cr: &cairo::Context,
+        w: f64,
+        h: f64,
+        min_db: f32,
+        max_db: f32,
+        display_start_hz: f64,
+        display_end_hz: f64,
+        center_freq_hz: f64,
+    ) {
+        let display_span = display_end_hz - display_start_hz;
+
+        // --- Grid lines (drawn first, behind labels) ---
+        cr.set_source_rgba(GRID_COLOR[0], GRID_COLOR[1], GRID_COLOR[2], GRID_COLOR[3]);
+        cr.set_line_width(1.0);
+
+        let db_range = f64::from(max_db - min_db);
+
+        // Horizontal dB grid lines.
+        for i in 0..=DB_GRID_LINE_COUNT {
+            let frac = i as f64 / DB_GRID_LINE_COUNT as f64;
+            let y = (h * frac).floor() + 0.5;
+            cr.move_to(0.0, y);
+            cr.line_to(w, y);
+        }
+
+        // Vertical frequency grid lines at computed positions.
+        // Use absolute frequencies (center + offset) for labels.
+        let abs_start = center_freq_hz + display_start_hz;
+        let abs_end = center_freq_hz + display_end_hz;
+        let grid_lines = if display_span > 0.0 {
+            frequency_axis::compute_grid_lines(abs_start, abs_end, FREQ_GRID_LINE_COUNT)
+        } else {
+            Vec::new()
+        };
+
+        for &(freq_hz, _) in &grid_lines {
+            let frac = (freq_hz - abs_start) / display_span;
+            let x = (w * frac).floor() + 0.5;
+            cr.move_to(x, 0.0);
+            cr.line_to(x, h);
+        }
+
+        let _ = cr.stroke();
+
+        // --- Labels (drawn on top of grid lines) ---
+        cr.set_font_size(LABEL_FONT_SIZE);
+        cr.set_source_rgba(
+            LABEL_COLOR[0],
+            LABEL_COLOR[1],
+            LABEL_COLOR[2],
+            LABEL_COLOR[3],
+        );
+
+        // Frequency labels at the top of each vertical grid line.
+        for (freq_hz, label) in &grid_lines {
+            let frac = (freq_hz - abs_start) / display_span;
+            let x = w * frac;
+            cr.move_to(x + 2.0, FREQ_LABEL_TOP_MARGIN - 2.0);
+            cr.show_text(label).ok();
+        }
+
+        // dB labels at each horizontal grid line.
+        if db_range > 0.0 {
+            for i in 0..=DB_GRID_LINE_COUNT {
+                let frac = i as f64 / DB_GRID_LINE_COUNT as f64;
+                let y = h * frac;
+                // frac 0 = top = max_db, frac 1 = bottom = min_db.
+                let db_val = f64::from(max_db) - frac * db_range;
+                let label = format!("{db_val:.0} dB");
+                cr.move_to(2.0, y - 2.0);
+                cr.show_text(&label).ok();
+            }
+        }
+    }
+
+    /// Build the spectrum trace path on the Cairo context (no fill or stroke).
+    ///
+    /// Maps each FFT bin to a frequency in Hz, then to a pixel X coordinate
+    /// using the current display range. When zoomed in, bins outside the
+    /// visible range map to offscreen positions and Cairo clips them.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+    fn build_trace_path(
+        cr: &cairo::Context,
+        fft_data: &[f32],
+        w: f64,
+        h: f64,
+        db_range: f32,
+        min_db: f32,
+        display_start_hz: f64,
+        display_end_hz: f64,
+        full_bandwidth: f64,
+    ) {
+        let bin_count = fft_data.len();
+        if bin_count == 0 {
+            return;
+        }
+
+        let db_range_f64 = f64::from(db_range);
+        let min_db_f64 = f64::from(min_db);
+        let display_span = display_end_hz - display_start_hz;
+
+        // If full_bandwidth is not set (0), fall back to the display span
+        // (no zoom effect).
+        let effective_full_bw = if full_bandwidth > 0.0 {
+            full_bandwidth
+        } else {
+            display_span
+        };
+
+        for (i, &db) in fft_data.iter().enumerate() {
+            // Map bin index to frequency: after fftshift, bin 0 = -full_bw/2,
+            // bin N-1 = +full_bw/2.
+            let bin_freq = -effective_full_bw / 2.0
+                + (i as f64 / (bin_count - 1).max(1) as f64) * effective_full_bw;
+
+            // Map frequency to pixel X within the current display range.
+            let x = if display_span > 0.0 {
+                w * (bin_freq - display_start_hz) / display_span
+            } else {
+                w * i as f64 / (bin_count - 1).max(1) as f64
+            };
+
+            let y = h * (1.0 - ((f64::from(db) - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
+            if i == 0 {
+                cr.move_to(x, y);
+            } else {
+                cr.line_to(x, y);
+            }
+        }
     }
 }
