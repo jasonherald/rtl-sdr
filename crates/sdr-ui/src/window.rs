@@ -45,7 +45,7 @@ const DSP_POLL_INTERVAL_MS: u64 = 16;
 
 /// Build and present the main application window.
 #[allow(clippy::too_many_lines)]
-pub fn build_window(app: &adw::Application) {
+pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::ConfigManager>) {
     // --- Channel setup ---
     let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiToDsp>();
@@ -87,7 +87,7 @@ pub fn build_window(app: &adw::Application) {
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
 
-    setup_app_actions(app, &window);
+    setup_app_actions(app, &window, config);
 
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
@@ -490,9 +490,10 @@ fn build_header_bar(
     )
 }
 
-/// Build the app menu button with Keyboard Shortcuts / About / Quit actions.
+/// Build the app menu button with Preferences / Keyboard Shortcuts / About / Quit actions.
 fn build_menu_button() -> gtk4::MenuButton {
     let menu = gio::Menu::new();
+    menu.append(Some("_Preferences"), Some("app.preferences"));
     menu.append(Some("_Keyboard Shortcuts"), Some("win.show-help-overlay"));
     menu.append(Some("_About SDR-RS"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
@@ -1274,8 +1275,12 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         });
 }
 
-/// Register application-level actions (About, Quit).
-fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
+/// Register application-level actions (Preferences, About, Quit).
+fn setup_app_actions(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Quit action
     let quit_action = gio::SimpleAction::new("quit", None);
     quit_action.connect_activate(glib::clone!(
@@ -1287,6 +1292,21 @@ fn setup_app_actions(app: &adw::Application, window: &adw::ApplicationWindow) {
     ));
     app.add_action(&quit_action);
     app.set_accels_for_action("app.quit", &["<Ctrl>q"]);
+
+    // Preferences action
+    let prefs_action = gio::SimpleAction::new("preferences", None);
+    let config_for_prefs = std::sync::Arc::clone(config);
+    prefs_action.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            let prefs_window =
+                crate::preferences::build_preferences_window(&window, &config_for_prefs);
+            prefs_window.present();
+        }
+    ));
+    app.add_action(&prefs_action);
+    app.set_accels_for_action("app.preferences", &["<Ctrl>comma"]);
 
     // About action
     let about_action = gio::SimpleAction::new("about", None);

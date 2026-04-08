@@ -140,11 +140,11 @@ pub struct Bookmark {
     pub wfm_stereo: Option<bool>,
     #[serde(default)]
     pub high_pass: Option<bool>,
-    /// RadioReference category (e.g., "Law Dispatch"). Metadata for future
+    /// `RadioReference` category (e.g., "Law Dispatch"). Metadata for future
     /// bookmark tree organization.
     #[serde(default)]
     pub rr_category: Option<String>,
-    /// RadioReference frequency ID for duplicate detection and future sync.
+    /// `RadioReference` frequency ID for duplicate detection and future sync.
     #[serde(default)]
     pub rr_import_id: Option<String>,
 }
