@@ -19,7 +19,7 @@ pub fn send(summary: &str, body: &str, open_path: Option<&std::path::Path>) {
     notification.set_body(Some(body));
 
     if let Some(path) = open_path {
-        let uri = format!("file://{}", path.display());
+        let uri = gio::File::for_path(path).uri();
         notification.set_default_action_and_target_value("app.open-uri", Some(&uri.to_variant()));
     }
 
