@@ -2,7 +2,7 @@
 
 Software-defined radio application in Rust -- a port of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus) with a GTK4/libadwaita UI.
 
-<!-- TODO: add screenshot (#195) -->
+![SDR-RS](screenshots/sdr-rs.png)
 
 ## Features
 
