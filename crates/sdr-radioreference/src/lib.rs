@@ -105,13 +105,21 @@ impl RrClient {
                             count = freqs.len(),
                             "fetched subcategory frequencies"
                         );
-                        // Attach category/subcategory as a tag if none present
+                        // Always set the category tag from the county hierarchy
+                        // we fetched — the API's own tags are often empty strings.
+                        let cat_tag = RrTag {
+                            id: subcat.scid,
+                            description: subcat.name.clone(),
+                        };
                         for freq in &mut freqs {
-                            if freq.tags.is_empty() {
-                                freq.tags.push(RrTag {
-                                    id: subcat.scid,
-                                    description: format!("{} - {}", cat.name, subcat.name),
-                                });
+                            // Replace empty/useless API tags with our category tag
+                            let has_useful_tags = freq
+                                .tags
+                                .iter()
+                                .any(|t| !t.description.is_empty());
+                            if !has_useful_tags {
+                                freq.tags.clear();
+                                freq.tags.push(cat_tag.clone());
                             }
                         }
                         all_freqs.extend(freqs);
