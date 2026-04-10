@@ -309,8 +309,8 @@ pub fn parse_zip_info(xml: &str) -> Result<ZipInfo, SoapError> {
     let mut county_id: Option<u32> = None;
     let mut state_id: Option<u32> = None;
     let mut city: Option<String> = None;
-    let mut county_name: Option<String> = None;
-    let mut state_name: Option<String> = None;
+    let mut lat: Option<String> = None;
+    let mut lon: Option<String> = None;
 
     loop {
         match reader.read_event() {
@@ -335,11 +335,11 @@ pub fn parse_zip_info(xml: &str) -> Result<ZipInfo, SoapError> {
                     b"city" => {
                         city = Some(read_text_content(&mut reader)?.into_owned());
                     }
-                    b"countyName" => {
-                        county_name = Some(read_text_content(&mut reader)?.into_owned());
+                    b"lat" => {
+                        lat = Some(read_text_content(&mut reader)?.into_owned());
                     }
-                    b"stateName" => {
-                        state_name = Some(read_text_content(&mut reader)?.into_owned());
+                    b"lon" => {
+                        lon = Some(read_text_content(&mut reader)?.into_owned());
                     }
                     _ => {}
                 }
@@ -354,9 +354,8 @@ pub fn parse_zip_info(xml: &str) -> Result<ZipInfo, SoapError> {
         county_id: county_id.ok_or_else(|| SoapError::Unexpected("missing ctid".into()))?,
         state_id: state_id.ok_or_else(|| SoapError::Unexpected("missing stid".into()))?,
         city: city.ok_or_else(|| SoapError::Unexpected("missing city".into()))?,
-        county_name: county_name
-            .ok_or_else(|| SoapError::Unexpected("missing countyName".into()))?,
-        state_name: state_name.ok_or_else(|| SoapError::Unexpected("missing stateName".into()))?,
+        lat: lat.unwrap_or_default(),
+        lon: lon.unwrap_or_default(),
     })
 }
 
@@ -570,11 +569,12 @@ mod tests {
   <SOAP-ENV:Body>
     <ns1:getZipcodeInfoResponse>
       <return xsi:type="ns1:ZipcodeInfo">
-        <ctid xsi:type="xsd:int">277</ctid>
-        <stid xsi:type="xsd:int">6</stid>
+        <zipCode xsi:type="xsd:int">90210</zipCode>
+        <lat xsi:type="xsd:string">34.0901</lat>
+        <lon xsi:type="xsd:string">-118.4065</lon>
         <city xsi:type="xsd:string">Beverly Hills</city>
-        <countyName xsi:type="xsd:string">Los Angeles</countyName>
-        <stateName xsi:type="xsd:string">California</stateName>
+        <stid xsi:type="xsd:int">6</stid>
+        <ctid xsi:type="xsd:int">277</ctid>
       </return>
     </ns1:getZipcodeInfoResponse>
   </SOAP-ENV:Body>
@@ -643,8 +643,8 @@ mod tests {
         assert_eq!(info.county_id, 277);
         assert_eq!(info.state_id, 6);
         assert_eq!(info.city, "Beverly Hills");
-        assert_eq!(info.county_name, "Los Angeles");
-        assert_eq!(info.state_name, "California");
+        assert_eq!(info.lat, "34.0901");
+        assert_eq!(info.lon, "-118.4065");
     }
 
     #[test]

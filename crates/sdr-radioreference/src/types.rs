@@ -1,6 +1,9 @@
 //! Response types returned by the `RadioReference` SOAP API.
 
 /// Information about a US ZIP code, including its county and state.
+///
+/// The API returns county/state as numeric IDs only — names are not available
+/// from `getZipcodeInfo`.
 #[derive(Debug, Clone)]
 pub struct ZipInfo {
     /// County ID on `RadioReference`.
@@ -9,10 +12,10 @@ pub struct ZipInfo {
     pub state_id: u32,
     /// City name.
     pub city: String,
-    /// County name.
-    pub county_name: String,
-    /// State name.
-    pub state_name: String,
+    /// Latitude.
+    pub lat: String,
+    /// Longitude.
+    pub lon: String,
 }
 
 /// A tag (category) applied to a `RadioReference` frequency entry.

@@ -238,9 +238,8 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
                 match result {
                     Ok((zip_info, freqs)) => {
                         let msg = format!(
-                            "{}, {} \u{2014} {} frequencies",
-                            zip_info.county_name,
-                            zip_info.state_name,
+                            "{} \u{2014} {} frequencies",
+                            zip_info.city,
                             freqs.len()
                         );
                         show_status(&status_label, &msg, true);
