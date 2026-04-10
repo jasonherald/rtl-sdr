@@ -81,17 +81,30 @@ impl RrClient {
         let info = self.get_county_info(county_id)?;
         let county_name = info.county_name.clone();
 
+        tracing::info!(
+            county = %info.county_name,
+            categories = info.categories.len(),
+            subcategories = info.categories.iter().map(|c| c.subcategories.len()).sum::<usize>(),
+            "county structure loaded"
+        );
+
         let mut all_freqs: Vec<RrFrequency> = Vec::new();
         for cat in &info.categories {
+            tracing::debug!(
+                category = %cat.name,
+                subcategories = cat.subcategories.len(),
+                "processing category"
+            );
             for subcat in &cat.subcategories {
-                tracing::debug!(
-                    scid = subcat.scid,
-                    name = %subcat.name,
-                    category = %cat.name,
-                    "fetching subcategory frequencies"
-                );
                 match soap::get_subcat_freqs(&self.http, &self.auth, subcat.scid) {
                     Ok(mut freqs) => {
+                        tracing::debug!(
+                            scid = subcat.scid,
+                            name = %subcat.name,
+                            category = %cat.name,
+                            count = freqs.len(),
+                            "fetched subcategory frequencies"
+                        );
                         // Attach category/subcategory as a tag if none present
                         for freq in &mut freqs {
                             if freq.tags.is_empty() {

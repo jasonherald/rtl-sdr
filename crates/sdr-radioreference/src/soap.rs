@@ -622,10 +622,11 @@ impl FreqBuilder {
             b"mode" => self.mode = Some(read_text_content(reader)?.into_owned()),
             b"tone" => {
                 let t = read_text_content(reader)?;
-                self.tone_val = Some(
-                    t.parse::<f32>()
-                        .map_err(|e| SoapError::Unexpected(format!("bad tone: {e}")))?,
-                );
+                // Tone field is xsd:string — may be a float ("110.9"), empty,
+                // or text like "CSQ". Parse as float, ignore failures.
+                if let Ok(val) = t.parse::<f32>() {
+                    self.tone_val = Some(val);
+                }
             }
             b"descr" => self.description = Some(read_text_content(reader)?.into_owned()),
             b"alpha" => self.alpha_tag = Some(read_text_content(reader)?.into_owned()),
@@ -708,10 +709,19 @@ pub fn parse_frequencies(xml: &str) -> Result<Vec<RrFrequency>, SoapError> {
                         state = FreqParseState::InFreqItem;
                     }
                     FreqParseState::InFreqItem if local == b"item" => {
+                        // Log before finish() consumes fields
+                        let fid_dbg = builder.fid.clone();
+                        let has_freq = builder.freq_mhz.is_some();
+                        let has_mode = builder.mode.is_some();
                         if let Some(freq) = builder.finish() {
                             frequencies.push(freq);
                         } else {
-                            tracing::warn!("skipping frequency item with missing required fields");
+                            tracing::warn!(
+                                fid = ?fid_dbg,
+                                has_freq,
+                                has_mode,
+                                "skipping frequency item with missing required fields"
+                            );
                         }
                         state = FreqParseState::TopLevel;
                     }
