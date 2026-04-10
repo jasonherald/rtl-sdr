@@ -70,11 +70,14 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
     zip_entry.add_suffix(&search_button);
 
     search_group.add(&zip_entry);
+    content.append(&search_group);
 
-    // Spinner + status row
+    // Spinner + status row — outside the preferences group for better alignment
     let status_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
+        .margin_start(4)
+        .margin_top(4)
         .build();
 
     let spinner = gtk4::Spinner::builder().visible(false).build();
@@ -88,9 +91,7 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
 
     status_box.append(&spinner);
     status_box.append(&status_label);
-    search_group.add(&status_box);
-
-    content.append(&search_group);
+    content.append(&status_box);
 
     // -----------------------------------------------------------------------
     // Results section (hidden until search succeeds)
