@@ -11,13 +11,12 @@ pub use soap::SoapError;
 pub use types::{RrFrequency, RrTag, ZipInfo};
 
 /// Application API key — identifies the SDR-RS app to `RadioReference`.
-/// This is not a secret; it's distributed with the application.
+/// This is not a secret; it identifies the application, not the user.
 ///
-/// Set via `RADIOREFERENCE_APP_KEY` env var at build time, or defaults to a
-/// placeholder that will fail at runtime with an auth error.
+/// Override via `RADIOREFERENCE_APP_KEY` env var at build time if needed.
 const APP_KEY: &str = match option_env!("RADIOREFERENCE_APP_KEY") {
     Some(key) => key,
-    None => "PENDING_API_KEY",
+    None => "2e4b8c24-341a-11f1-bb32-0ef97433b5f9",
 };
 
 /// `RadioReference` SOAP API client.
