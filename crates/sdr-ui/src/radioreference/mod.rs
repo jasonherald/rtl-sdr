@@ -10,8 +10,6 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use sdr_radioreference::RrFrequency;
-
 use crate::preferences::accounts_page::load_rr_credentials;
 use crate::sidebar::navigation_panel::{
     Bookmark, format_frequency, load_bookmarks, parse_demod_mode, save_bookmarks,
@@ -220,10 +218,9 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
                 let result = gio::spawn_blocking(move || {
                     let client = sdr_radioreference::RrClient::new(&username, &password)?;
                     let zip_info = client.get_zip_info(&zip)?;
-                    let freqs = client.get_county_frequencies(zip_info.county_id)?;
-                    Ok::<(sdr_radioreference::ZipInfo, Vec<RrFrequency>), sdr_radioreference::SoapError>(
-                        (zip_info, freqs),
-                    )
+                    let (county_name, freqs) =
+                        client.get_county_frequencies(zip_info.county_id)?;
+                    Ok::<_, sdr_radioreference::SoapError>((zip_info, county_name, freqs))
                 })
                 .await
                 .unwrap_or_else(|_| Err(sdr_radioreference::SoapError::Fault(
@@ -236,10 +233,14 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
                 search_button_ref.set_sensitive(true);
 
                 match result {
-                    Ok((zip_info, freqs)) => {
+                    Ok((zip_info, county_name, freqs)) => {
+                        let location = if county_name.is_empty() {
+                            zip_info.city.clone()
+                        } else {
+                            format!("{}, {}", zip_info.city, county_name)
+                        };
                         let msg = format!(
-                            "{} \u{2014} {} frequencies",
-                            zip_info.city,
+                            "{location} \u{2014} {} frequencies",
                             freqs.len()
                         );
                         show_status(&status_label, &msg, true);

@@ -8,7 +8,7 @@ pub mod soap;
 pub mod types;
 
 pub use soap::SoapError;
-pub use types::{RrFrequency, RrTag, ZipInfo};
+pub use types::{CountyInfo, RrCategory, RrFrequency, RrSubcategory, RrTag, ZipInfo};
 
 /// Application API key — identifies the SDR-RS app to `RadioReference`.
 /// This is not a secret; it identifies the application, not the user.
@@ -63,11 +63,65 @@ impl RrClient {
         soap::get_zipcode_info(&self.http, &self.auth, zipcode)
     }
 
-    /// Get all frequencies for a county.
+    /// Get detailed county info including categories and subcategories.
+    pub fn get_county_info(&self, county_id: u32) -> Result<CountyInfo, SoapError> {
+        tracing::debug!(county_id, "querying RadioReference county info");
+        soap::get_county_info(&self.http, &self.auth, county_id)
+    }
+
+    /// Get all frequencies for a county by fetching each subcategory.
     ///
-    /// Calls `getCountyFreqsByTag` with `tag=0` to request all categories.
-    pub fn get_county_frequencies(&self, county_id: u32) -> Result<Vec<RrFrequency>, SoapError> {
-        tracing::debug!(county_id, "querying RadioReference county frequencies");
-        soap::get_county_freqs_by_tag(&self.http, &self.auth, county_id, 0)
+    /// Returns `(county_name, frequencies)`. Calls `getCountyInfo` to discover
+    /// subcategories, then `getSubcatFreqs` for each one. Attaches the
+    /// category/subcategory name as a tag on each frequency for UI filtering.
+    pub fn get_county_frequencies(
+        &self,
+        county_id: u32,
+    ) -> Result<(String, Vec<RrFrequency>), SoapError> {
+        let info = self.get_county_info(county_id)?;
+        let county_name = info.county_name.clone();
+
+        let mut all_freqs: Vec<RrFrequency> = Vec::new();
+        for cat in &info.categories {
+            for subcat in &cat.subcategories {
+                tracing::debug!(
+                    scid = subcat.scid,
+                    name = %subcat.name,
+                    category = %cat.name,
+                    "fetching subcategory frequencies"
+                );
+                match soap::get_subcat_freqs(&self.http, &self.auth, subcat.scid) {
+                    Ok(mut freqs) => {
+                        // Attach category/subcategory as a tag if none present
+                        for freq in &mut freqs {
+                            if freq.tags.is_empty() {
+                                freq.tags.push(RrTag {
+                                    id: subcat.scid,
+                                    description: format!("{} - {}", cat.name, subcat.name),
+                                });
+                            }
+                        }
+                        all_freqs.extend(freqs);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            scid = subcat.scid,
+                            name = %subcat.name,
+                            "failed to fetch subcategory: {e}"
+                        );
+                        // Continue with other subcategories
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            county_id,
+            county = %info.county_name,
+            total = all_freqs.len(),
+            "fetched county frequencies"
+        );
+
+        Ok((county_name, all_freqs))
     }
 }

@@ -18,6 +18,39 @@ pub struct ZipInfo {
     pub lon: String,
 }
 
+/// Detailed county information from `getCountyInfo`.
+#[derive(Debug, Clone)]
+pub struct CountyInfo {
+    /// County ID.
+    pub county_id: u32,
+    /// County name.
+    pub county_name: String,
+    /// State ID.
+    pub state_id: u32,
+    /// Categories containing subcategories with frequency data.
+    pub categories: Vec<RrCategory>,
+}
+
+/// A frequency category (e.g. "Public Safety", "Business").
+#[derive(Debug, Clone)]
+pub struct RrCategory {
+    /// Category ID.
+    pub id: u32,
+    /// Category name.
+    pub name: String,
+    /// Subcategories within this category.
+    pub subcategories: Vec<RrSubcategory>,
+}
+
+/// A subcategory within a category (e.g. "Police", "Fire").
+#[derive(Debug, Clone)]
+pub struct RrSubcategory {
+    /// Subcategory ID — used with `getSubcatFreqs`.
+    pub scid: u32,
+    /// Subcategory name.
+    pub name: String,
+}
+
 /// A tag (category) applied to a `RadioReference` frequency entry.
 #[derive(Debug, Clone)]
 pub struct RrTag {

@@ -9,7 +9,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesText, Event};
 use reqwest::blocking::Client;
 
-use crate::types::{RrFrequency, RrTag, ZipInfo};
+use crate::types::{CountyInfo, RrCategory, RrFrequency, RrSubcategory, RrTag, ZipInfo};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -266,6 +266,41 @@ pub fn get_county_freqs_by_tag(
     parse_frequencies(&body)
 }
 
+/// Fetches detailed county information including categories and subcategories
+/// via the `getCountyInfo` SOAP method.
+pub fn get_county_info(
+    client: &Client,
+    auth: &SoapAuth,
+    county_id: u32,
+) -> Result<CountyInfo, SoapError> {
+    let county_str = county_id.to_string();
+
+    let envelope = build_envelope("getCountyInfo", auth, |w| {
+        write_typed_element(w, "ctid", "xsd:int", &county_str)?;
+        Ok(())
+    })?;
+
+    let body = send_request(client, &envelope)?;
+    parse_county_info(&body, county_id)
+}
+
+/// Fetches frequencies for a subcategory via the `getSubcatFreqs` SOAP method.
+pub fn get_subcat_freqs(
+    client: &Client,
+    auth: &SoapAuth,
+    scid: u32,
+) -> Result<Vec<RrFrequency>, SoapError> {
+    let scid_str = scid.to_string();
+
+    let envelope = build_envelope("getSubcatFreqs", auth, |w| {
+        write_typed_element(w, "scid", "xsd:int", &scid_str)?;
+        Ok(())
+    })?;
+
+    let body = send_request(client, &envelope)?;
+    parse_frequencies(&body)
+}
+
 // ---------------------------------------------------------------------------
 // XML parsers
 // ---------------------------------------------------------------------------
@@ -356,6 +391,147 @@ pub fn parse_zip_info(xml: &str) -> Result<ZipInfo, SoapError> {
         city: city.ok_or_else(|| SoapError::Unexpected("missing city".into()))?,
         lat: lat.unwrap_or_default(),
         lon: lon.unwrap_or_default(),
+    })
+}
+
+/// Nesting state for `parse_county_info`.
+#[derive(PartialEq, Eq)]
+enum CountyParseState {
+    Top,
+    InCats,
+    InCat,
+    InSubcats,
+    InSubcat,
+}
+
+/// Parses a `getCountyInfo` response, extracting county name and
+/// category/subcategory hierarchy.
+#[allow(clippy::too_many_lines)]
+pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapError> {
+    use CountyParseState::{InCat, InCats, InSubcat, InSubcats, Top};
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut county_name = String::new();
+    let mut state_id: u32 = 0;
+    let mut categories: Vec<RrCategory> = Vec::new();
+
+    let mut state = Top;
+    let mut current_cat_id: u32 = 0;
+    let mut current_cat_name = String::new();
+    let mut current_subcats: Vec<RrSubcategory> = Vec::new();
+    let mut current_scid: u32 = 0;
+    let mut current_sc_name = String::new();
+    let mut current_field = String::new();
+
+    // Nesting: return > cats > item(cat) > subcats > item(subcat)
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let name = e.name();
+                let name_ref = name.as_ref();
+                let local = local_name(name_ref);
+                match (&state, local) {
+                    (Top, b"countyName" | b"stid")
+                    | (InCat, b"cid" | b"cName")
+                    | (InSubcat, b"scid" | b"scName") => {
+                        current_field =
+                            String::from_utf8_lossy(local).into_owned();
+                    }
+                    (Top, b"cats") => state = InCats,
+                    (InCats, b"item") => {
+                        state = InCat;
+                        current_cat_id = 0;
+                        current_cat_name.clear();
+                        current_subcats.clear();
+                    }
+                    (InCat, b"subcats") => state = InSubcats,
+                    (InSubcats, b"item") => {
+                        state = InSubcat;
+                        current_scid = 0;
+                        current_sc_name.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(ref e)) => {
+                if let Ok(text) = e.unescape() {
+                    match current_field.as_str() {
+                        "countyName" => {
+                            county_name = text.into_owned();
+                            current_field.clear();
+                        }
+                        "stid" if state == Top => {
+                            state_id = text.parse().unwrap_or(0);
+                            current_field.clear();
+                        }
+                        "cid" => {
+                            current_cat_id = text.parse().unwrap_or(0);
+                            current_field.clear();
+                        }
+                        "cName" => {
+                            current_cat_name = text.into_owned();
+                            current_field.clear();
+                        }
+                        "scid" => {
+                            current_scid = text.parse().unwrap_or(0);
+                            current_field.clear();
+                        }
+                        "scName" => {
+                            current_sc_name = text.into_owned();
+                            current_field.clear();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let name = e.name();
+                let name_ref = name.as_ref();
+                let local = local_name(name_ref);
+                match (&state, local) {
+                    (InSubcat, b"item") => {
+                        if current_scid > 0 {
+                            current_subcats.push(RrSubcategory {
+                                scid: current_scid,
+                                name: std::mem::take(&mut current_sc_name),
+                            });
+                        }
+                        state = InSubcats;
+                    }
+                    (InSubcats, b"subcats") => state = InCat,
+                    (InCat, b"item") => {
+                        categories.push(RrCategory {
+                            id: current_cat_id,
+                            name: std::mem::take(&mut current_cat_name),
+                            subcategories: std::mem::take(&mut current_subcats),
+                        });
+                        state = InCats;
+                    }
+                    (InCats, b"cats") => state = Top,
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(SoapError::Xml(e)),
+            _ => {}
+        }
+    }
+
+    tracing::debug!(
+        county_id,
+        %county_name,
+        categories = categories.len(),
+        subcategories = categories.iter().map(|c| c.subcategories.len()).sum::<usize>(),
+        "parsed county info"
+    );
+
+    Ok(CountyInfo {
+        county_id,
+        county_name,
+        state_id,
+        categories,
     })
 }
 
