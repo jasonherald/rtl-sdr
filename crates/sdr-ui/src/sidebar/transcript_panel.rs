@@ -1,8 +1,14 @@
 //! Transcript sidebar panel — displays live transcription results.
 
+use std::sync::Arc;
+
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_config::ConfigManager;
+
+/// Config key for the persisted Whisper model index.
+const KEY_MODEL: &str = "transcription_model";
 
 /// Transcript panel with toggle switch, model picker, status label,
 /// progress bar, scrolling transcript log, and clear button.
@@ -26,7 +32,7 @@ pub struct TranscriptPanel {
 }
 
 /// Build the transcript sidebar panel.
-pub fn build_transcript_panel() -> TranscriptPanel {
+pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Transcript")
         .description("Live speech-to-text")
@@ -43,12 +49,29 @@ pub fn build_transcript_panel() -> TranscriptPanel {
         .map(|m| m.label())
         .collect();
     let model_list = gtk4::StringList::new(&model_labels);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let saved_model_idx = config.read(|v| {
+        v.get(KEY_MODEL)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32
+    });
+
     let model_row = adw::ComboRow::builder()
         .title("Model")
         .model(&model_list)
-        .selected(0)
+        .selected(saved_model_idx)
         .build();
     group.add(&model_row);
+
+    // Persist model selection on change.
+    let config_model = Arc::clone(config);
+    model_row.connect_selected_notify(move |row| {
+        let idx = row.selected();
+        config_model.write(|v| {
+            v[KEY_MODEL] = serde_json::json!(idx);
+        });
+    });
 
     let status_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)

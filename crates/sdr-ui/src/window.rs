@@ -62,7 +62,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar,
         transcript_panel,
         transcript_revealer,
-    ) = build_split_view(&state);
+    ) = build_split_view(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
     let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
@@ -402,6 +402,7 @@ fn handle_dsp_message(
 /// Returns the split view, sidebar panels, spectrum display handle, and status bar.
 fn build_split_view(
     state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) -> (
     adw::OverlaySplitView,
     SidebarPanels,
@@ -429,7 +430,7 @@ fn build_split_view(
     content_box.append(&status_bar.widget);
 
     // Transcript panel — slides out from the right.
-    let transcript_panel = sidebar::transcript_panel::build_transcript_panel();
+    let transcript_panel = sidebar::transcript_panel::build_transcript_panel(config);
     let transcript_scroll = gtk4::ScrolledWindow::builder()
         .child(&transcript_panel.widget)
         .hscrollbar_policy(gtk4::PolicyType::Never)
