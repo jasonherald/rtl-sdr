@@ -70,6 +70,21 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
         )
         .build();
 
+    // --- Sign up link ---
+    let signup_row = adw::ActionRow::builder()
+        .title("Don't have an account?")
+        .subtitle("Sign up at radioreference.com")
+        .activatable(true)
+        .build();
+    signup_row.add_suffix(&gtk4::Image::from_icon_name("external-link-symbolic"));
+    signup_row.connect_activated(|_| {
+        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+            "https://www.radioreference.com/premium/",
+            gtk4::gio::AppLaunchContext::NONE,
+        );
+    });
+    group.add(&signup_row);
+
     // --- Username row ---
     let username_row = adw::EntryRow::builder().title("Username").build();
 
