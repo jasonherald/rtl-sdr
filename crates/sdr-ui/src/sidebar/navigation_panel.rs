@@ -594,10 +594,11 @@ pub fn rebuild_bookmark_list(
                 cb(&recall_bookmark);
             }
 
-            // Rebuild list to update active highlighting
+            // Rebuild list to update active highlighting, preserving scroll position.
             if let Some(lb) = list_recall.upgrade()
                 && let Some(sc) = scroll_recall.upgrade()
             {
+                let saved_scroll = sc.vadjustment().value();
                 rebuild_bookmark_list(
                     &lb,
                     &sc,
@@ -607,6 +608,13 @@ pub fn rebuild_bookmark_list(
                     &entry_recall,
                     &save_recall,
                 );
+                // Restore scroll position after GTK finishes re-laying out the
+                // rebuilt list — an idle callback ensures the adjustment range
+                // has been recalculated.
+                let adj = sc.vadjustment();
+                glib::idle_add_local_once(move || {
+                    adj.set_value(saved_scroll);
+                });
             }
         });
 
