@@ -413,8 +413,8 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    let mut county_name = String::new();
-    let mut state_id: u32 = 0;
+    let mut county_name: Option<String> = None;
+    let mut state_id: Option<u32> = None;
     let mut categories: Vec<RrCategory> = Vec::new();
 
     let mut state = Top;
@@ -458,13 +458,14 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                 if let Ok(text) = e.unescape() {
                     match current_field.as_str() {
                         "countyName" => {
-                            county_name = text.into_owned();
+                            county_name = Some(text.into_owned());
                             current_field.clear();
                         }
                         "stid" if state == Top => {
-                            state_id = text
-                                .parse()
-                                .map_err(|e| SoapError::Unexpected(format!("bad stid: {e}")))?;
+                            state_id = Some(
+                                text.parse()
+                                    .map_err(|e| SoapError::Unexpected(format!("bad stid: {e}")))?,
+                            );
                             current_field.clear();
                         }
                         "cid" => {
@@ -526,7 +527,7 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
 
     tracing::debug!(
         county_id,
-        %county_name,
+        county_name = ?county_name,
         categories = categories.len(),
         subcategories = categories.iter().map(|c| c.subcategories.len()).sum::<usize>(),
         "parsed county info"
@@ -534,8 +535,9 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
 
     Ok(CountyInfo {
         county_id,
-        county_name,
-        state_id,
+        county_name: county_name
+            .ok_or_else(|| SoapError::Unexpected("missing countyName".into()))?,
+        state_id: state_id.ok_or_else(|| SoapError::Unexpected("missing stid".into()))?,
         categories,
     })
 }
