@@ -508,11 +508,15 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                     }
                     (InSubcats, b"subcats") => state = InCat,
                     (InCat, b"item") => {
-                        categories.push(RrCategory {
-                            id: current_cat_id,
-                            name: std::mem::take(&mut current_cat_name),
-                            subcategories: std::mem::take(&mut current_subcats),
-                        });
+                        if current_cat_id > 0 {
+                            categories.push(RrCategory {
+                                id: current_cat_id,
+                                name: std::mem::take(&mut current_cat_name),
+                                subcategories: std::mem::take(&mut current_subcats),
+                            });
+                        } else {
+                            tracing::warn!("skipping category with missing/zero cid");
+                        }
                         state = InCats;
                     }
                     (InCats, b"cats") => state = Top,

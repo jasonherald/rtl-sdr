@@ -78,10 +78,12 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
         .build();
     signup_row.add_suffix(&gtk4::Image::from_icon_name("external-link-symbolic"));
     signup_row.connect_activated(|_| {
-        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+        if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
             "https://www.radioreference.com/premium/",
             gtk4::gio::AppLaunchContext::NONE,
-        );
+        ) {
+            tracing::warn!("failed to open RadioReference signup URL: {e}");
+        }
     });
     group.add(&signup_row);
 
