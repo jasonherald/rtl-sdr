@@ -52,7 +52,10 @@ pub fn build_app() -> adw::Application {
             .join("config.json");
         let defaults = serde_json::json!({});
         let config = match sdr_config::ConfigManager::load(&config_path, &defaults) {
-            Ok(c) => std::sync::Arc::new(c),
+            Ok(mut c) => {
+                c.enable_auto_save();
+                std::sync::Arc::new(c)
+            }
             Err(e) => {
                 tracing::warn!("config load failed, using in-memory defaults: {e}");
                 // Fall back to in-memory config so the app still launches.
