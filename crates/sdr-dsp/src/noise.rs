@@ -8,14 +8,51 @@ use std::sync::Arc;
 
 use sdr_types::{Complex, DspError};
 
+/// Exponential moving average alpha for noise floor tracking.
+///
+/// Small values track slowly, avoiding false adaptation to transient signals.
+const NOISE_FLOOR_ALPHA: f32 = 0.02;
+
+/// Fast alpha used during the initial convergence period.
+///
+/// Allows the noise floor to quickly reach the actual noise level from the
+/// default initial estimate.
+const NOISE_FLOOR_FAST_ALPHA: f32 = 0.3;
+
+/// Initial noise floor estimate in dB (very low so squelch starts open
+/// until enough samples have been observed).
+const NOISE_FLOOR_INITIAL_DB: f32 = -120.0;
+
+/// Number of blocks required before the noise floor estimate is considered
+/// settled and the slow alpha is used.
+const NOISE_FLOOR_SETTLE_BLOCKS: u32 = 50;
+
+/// Margin above the noise floor (dB) for squelch-open threshold.
+const AUTO_SQUELCH_OPEN_MARGIN_DB: f32 = 10.0;
+
+/// Margin above the noise floor (dB) for squelch-close threshold (hysteresis).
+///
+/// Lower than the open margin so that once a signal opens the squelch,
+/// it stays open until it drops closer to the noise floor.
+const AUTO_SQUELCH_CLOSE_MARGIN_DB: f32 = 6.0;
+
 /// Power squelch — gates signal based on average power level.
 ///
 /// Ports SDR++ `dsp::noise_reduction::PowerSquelch`. Computes the mean
 /// power of the input block and compares against a threshold in dB.
 /// If below threshold, the entire block is zeroed.
+///
+/// Supports an auto-squelch mode that tracks the noise floor with an
+/// exponential moving average and applies hysteresis margins.
 pub struct PowerSquelch {
     level_db: f32,
     open: bool,
+    auto_squelch: bool,
+    /// Running noise floor estimate in dB (EMA-filtered).
+    noise_floor_db: f32,
+    /// Number of blocks processed since auto-squelch was enabled.
+    /// Used to detect the initial convergence period.
+    settle_count: u32,
 }
 
 impl PowerSquelch {
@@ -26,6 +63,9 @@ impl PowerSquelch {
         Self {
             level_db,
             open: false,
+            auto_squelch: false,
+            noise_floor_db: NOISE_FLOOR_INITIAL_DB,
+            settle_count: 0,
         }
     }
 
@@ -37,6 +77,29 @@ impl PowerSquelch {
     /// Update the squelch threshold.
     pub fn set_level(&mut self, level_db: f32) {
         self.level_db = level_db;
+    }
+
+    /// Enable or disable auto-squelch (noise floor tracking).
+    ///
+    /// When enabled, the manual `level_db` is ignored and the threshold
+    /// is derived from the tracked noise floor plus a margin.
+    pub fn set_auto_squelch(&mut self, enabled: bool) {
+        self.auto_squelch = enabled;
+        if enabled {
+            // Reset the noise floor estimate so it adapts to the current band.
+            self.noise_floor_db = NOISE_FLOOR_INITIAL_DB;
+            self.settle_count = 0;
+        }
+    }
+
+    /// Returns whether auto-squelch is enabled.
+    pub fn auto_squelch_enabled(&self) -> bool {
+        self.auto_squelch
+    }
+
+    /// Returns the current noise floor estimate in dB.
+    pub fn noise_floor_db(&self) -> f32 {
+        self.noise_floor_db
     }
 
     /// Process complex samples. Passes or zeros the entire block.
@@ -72,7 +135,39 @@ impl PowerSquelch {
         // This matches the standard dBFS convention used by most SDR tools.
         let measured_db = 20.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
 
-        if measured_db >= self.level_db {
+        let threshold_db = if self.auto_squelch {
+            // During the initial settling period, use a fast alpha so the
+            // noise floor converges quickly from the default initial value.
+            // After settling, use the slow alpha and only update when the
+            // squelch is closed or the level is below the close margin,
+            // preventing active signals from corrupting the estimate.
+            let settling = self.settle_count < NOISE_FLOOR_SETTLE_BLOCKS;
+            if settling {
+                self.settle_count = self.settle_count.saturating_add(1);
+                self.noise_floor_db = NOISE_FLOOR_FAST_ALPHA
+                    .mul_add(measured_db, (1.0 - NOISE_FLOOR_FAST_ALPHA) * self.noise_floor_db);
+            } else if !self.open
+                || measured_db < self.noise_floor_db + AUTO_SQUELCH_CLOSE_MARGIN_DB
+            {
+                self.noise_floor_db = NOISE_FLOOR_ALPHA
+                    .mul_add(measured_db, (1.0 - NOISE_FLOOR_ALPHA) * self.noise_floor_db);
+            }
+
+            // During settling, keep squelch open (pass audio through) so
+            // users don't experience a silent startup period.
+            if settling {
+                f32::NEG_INFINITY
+            } else if self.open {
+                // Apply hysteresis: close threshold is lower than open threshold.
+                self.noise_floor_db + AUTO_SQUELCH_CLOSE_MARGIN_DB
+            } else {
+                self.noise_floor_db + AUTO_SQUELCH_OPEN_MARGIN_DB
+            }
+        } else {
+            self.level_db
+        };
+
+        if measured_db >= threshold_db {
             output[..input.len()].copy_from_slice(input);
             self.open = true;
         } else {
@@ -595,5 +690,121 @@ mod tests {
         let input = [Complex::default(); 10];
         let mut output = [Complex::default(); 5];
         assert!(squelch.process(&input, &mut output).is_err());
+    }
+
+    // --- Auto-squelch tests ---
+
+    #[test]
+    fn test_auto_squelch_tracks_noise_floor() {
+        let mut squelch = PowerSquelch::new(-100.0);
+        squelch.set_auto_squelch(true);
+        assert!(squelch.auto_squelch_enabled());
+
+        // Feed many blocks of low-level noise to settle the noise floor estimate.
+        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let mut output = vec![Complex::default(); 100];
+        for _ in 0..200 {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+
+        // Noise floor should have settled near the noise level (-60 dBFS for 0.001).
+        let floor = squelch.noise_floor_db();
+        assert!(
+            floor > -70.0 && floor < -50.0,
+            "noise floor should be near -60 dB, got {floor}"
+        );
+    }
+
+    #[test]
+    fn test_auto_squelch_opens_on_signal() {
+        let mut squelch = PowerSquelch::new(-100.0);
+        squelch.set_auto_squelch(true);
+
+        // Settle noise floor with weak signal.
+        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let mut output = vec![Complex::default(); 100];
+        for _ in 0..200 {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+        assert!(!squelch.is_open(), "should be closed on noise-only");
+
+        // Inject a strong signal — should open.
+        let signal = vec![Complex::new(1.0, 0.0); 100];
+        squelch.process(&signal, &mut output).unwrap();
+        assert!(squelch.is_open(), "should open on strong signal");
+    }
+
+    #[test]
+    fn test_auto_squelch_hysteresis() {
+        let mut squelch = PowerSquelch::new(-100.0);
+        squelch.set_auto_squelch(true);
+
+        // Settle noise floor.
+        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let mut output = vec![Complex::default(); 100];
+        for _ in 0..200 {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+
+        // Open squelch with a strong signal.
+        let strong = vec![Complex::new(1.0, 0.0); 100];
+        squelch.process(&strong, &mut output).unwrap();
+        assert!(squelch.is_open());
+
+        // A borderline signal just above the close margin should stay open
+        // (hysteresis: close margin is lower than open margin).
+        // Noise floor is ~-60 dB, close margin is +6 dB = -54 dB.
+        // Amplitude of 0.003 ≈ -50.5 dB, which is above -54 dB.
+        let borderline = vec![Complex::new(0.003, 0.0); 100];
+        squelch.process(&borderline, &mut output).unwrap();
+        assert!(
+            squelch.is_open(),
+            "borderline signal should keep squelch open due to hysteresis"
+        );
+    }
+
+    #[test]
+    fn test_auto_squelch_ignores_manual_level() {
+        let mut squelch = PowerSquelch::new(100.0); // impossibly high manual threshold
+        squelch.set_auto_squelch(true);
+
+        // Settle noise floor.
+        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let mut output = vec![Complex::default(); 100];
+        for _ in 0..200 {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+
+        // Strong signal should still open despite manual level of 100 dB.
+        let strong = vec![Complex::new(1.0, 0.0); 100];
+        squelch.process(&strong, &mut output).unwrap();
+        assert!(
+            squelch.is_open(),
+            "auto-squelch should ignore manual level"
+        );
+    }
+
+    #[test]
+    fn test_auto_squelch_disable_reverts_to_manual() {
+        let mut squelch = PowerSquelch::new(100.0); // impossibly high manual threshold
+        squelch.set_auto_squelch(true);
+
+        // Settle noise floor and open with signal.
+        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let mut output = vec![Complex::default(); 100];
+        for _ in 0..200 {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+        let strong = vec![Complex::new(1.0, 0.0); 100];
+        squelch.process(&strong, &mut output).unwrap();
+        assert!(squelch.is_open());
+
+        // Disable auto-squelch — should revert to manual 100 dB threshold.
+        squelch.set_auto_squelch(false);
+        squelch.process(&strong, &mut output).unwrap();
+        assert!(
+            !squelch.is_open(),
+            "with auto-squelch off, manual 100 dB threshold should close squelch"
+        );
     }
 }

@@ -408,6 +408,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.radio.set_squelch_enabled(enabled);
         }
 
+        UiToDsp::SetAutoSquelch(enabled) => {
+            tracing::debug!(enabled, "set auto-squelch");
+            state.radio.set_auto_squelch_enabled(enabled);
+        }
+
         UiToDsp::SetVolume(vol) => {
             tracing::debug!(volume = vol, "set volume");
             state.volume = vol;

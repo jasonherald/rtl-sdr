@@ -883,6 +883,15 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             state_squelch_lvl.send_dsp(UiToDsp::SetSquelch(row.value() as f32));
         });
 
+    // Auto-squelch
+    let state_auto_sq = Rc::clone(state);
+    panels
+        .radio
+        .auto_squelch_row
+        .connect_active_notify(move |row| {
+            state_auto_sq.send_dsp(UiToDsp::SetAutoSquelch(row.is_active()));
+        });
+
     // Deemphasis
     let state_de = Rc::clone(state);
     panels

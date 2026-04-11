@@ -88,6 +88,19 @@ impl IfChain {
         self.squelch.set_level(db);
     }
 
+    /// Enable or disable auto-squelch (noise floor tracking).
+    ///
+    /// When enabled, the squelch threshold is automatically derived from
+    /// the tracked noise floor. The manual squelch level is ignored.
+    pub fn set_auto_squelch_enabled(&mut self, enabled: bool) {
+        self.squelch.set_auto_squelch(enabled);
+    }
+
+    /// Returns whether auto-squelch is enabled.
+    pub fn auto_squelch_enabled(&self) -> bool {
+        self.squelch.auto_squelch_enabled()
+    }
+
     /// Returns whether the squelch is currently open (signal above threshold).
     pub fn squelch_open(&self) -> bool {
         !self.squelch_enabled || self.squelch.is_open()
