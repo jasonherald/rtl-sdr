@@ -462,11 +462,15 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                             current_field.clear();
                         }
                         "stid" if state == Top => {
-                            state_id = text.parse().unwrap_or(0);
+                            state_id = text
+                                .parse()
+                                .map_err(|e| SoapError::Unexpected(format!("bad stid: {e}")))?;
                             current_field.clear();
                         }
                         "cid" => {
-                            current_cat_id = text.parse().unwrap_or(0);
+                            current_cat_id = text
+                                .parse()
+                                .map_err(|e| SoapError::Unexpected(format!("bad cid: {e}")))?;
                             current_field.clear();
                         }
                         "cName" => {
@@ -474,7 +478,9 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                             current_field.clear();
                         }
                         "scid" => {
-                            current_scid = text.parse().unwrap_or(0);
+                            current_scid = text
+                                .parse()
+                                .map_err(|e| SoapError::Unexpected(format!("bad scid: {e}")))?;
                             current_field.clear();
                         }
                         "scName" => {
