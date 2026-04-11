@@ -60,6 +60,8 @@ pub enum UiToDsp {
     SetSquelch(f32),
     /// Enable or disable the squelch gate.
     SetSquelchEnabled(bool),
+    /// Enable or disable auto-squelch (noise floor tracking).
+    SetAutoSquelch(bool),
     /// Set the audio output volume (0.0..=1.0).
     SetVolume(f32),
     /// Set the FM deemphasis mode.
@@ -190,6 +192,9 @@ mod tests {
 
         let sqe = UiToDsp::SetSquelchEnabled(true);
         assert!(matches!(sqe, UiToDsp::SetSquelchEnabled(true)));
+
+        let auto_sq = UiToDsp::SetAutoSquelch(true);
+        assert!(matches!(auto_sq, UiToDsp::SetAutoSquelch(true)));
 
         let vol = UiToDsp::SetVolume(0.75);
         assert!(matches!(vol, UiToDsp::SetVolume(v) if (v - 0.75).abs() < f32::EPSILON));

@@ -3,7 +3,9 @@
 //! Receives interleaved stereo f32 audio at 48 kHz, resamples to 16 kHz mono,
 //! accumulates 5-second chunks, and runs Whisper inference on non-silent chunks.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -14,6 +16,9 @@ const CHUNK_SECONDS: usize = 5;
 
 /// Number of 16 kHz mono samples per chunk (16000 * 5 = 80000).
 const CHUNK_SAMPLES: usize = 16_000 * CHUNK_SECONDS;
+
+/// Polling interval for the audio receive loop when checking for cancellation.
+const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Events emitted by the transcription worker.
 #[derive(Debug, Clone)]
@@ -37,17 +42,20 @@ pub enum TranscriptionEvent {
 }
 
 /// Main worker loop. Blocks the calling thread and exits when `audio_rx` is
-/// closed (all senders dropped). Should be spawned on a dedicated thread.
+/// closed (all senders dropped) or the cancellation token is set.
+/// Should be spawned on a dedicated thread.
 ///
 /// # Arguments
 /// * `audio_rx` — receives interleaved stereo f32 audio at 48 kHz
 /// * `event_tx` — sends transcription events to the UI/consumer
+/// * `cancel` — cancellation token; when set to `true`, the worker exits promptly
 /// * `model` — which Whisper model to load
 /// * `silence_threshold` — RMS below which a chunk is skipped
 /// * `noise_gate_ratio` — spectral gate multiplier over noise floor
 pub fn run_worker(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
+    cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
@@ -55,6 +63,7 @@ pub fn run_worker(
     if let Err(e) = run_worker_inner(
         audio_rx,
         event_tx,
+        cancel,
         model,
         silence_threshold,
         noise_gate_ratio,
@@ -65,9 +74,11 @@ pub fn run_worker(
 
 /// Inner implementation that returns errors as strings so the outer function
 /// can forward them as `TranscriptionEvent::Error`.
+#[allow(clippy::too_many_lines)]
 fn run_worker_inner(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
+    cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
@@ -122,17 +133,37 @@ fn run_worker_inner(
     // --- Audio loop ---
     let mut mono_buf: Vec<f32> = Vec::with_capacity(CHUNK_SAMPLES * 2);
 
-    while let Ok(interleaved) = audio_rx.recv() {
-        // Process the first buffer we received via blocking recv().
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            tracing::info!("transcription cancelled, worker exiting");
+            return Ok(());
+        }
+
+        let interleaved = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
+            Ok(data) => data,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Process the first buffer we received.
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
 
         // Drain any additional queued buffers to minimize frame drops
-        // during long inference passes.
+        // during long inference passes. Check cancel between drains.
         while let Ok(extra) = audio_rx.try_recv() {
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!("transcription cancelled, worker exiting");
+                return Ok(());
+            }
             resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
         }
 
         while mono_buf.len() >= CHUNK_SAMPLES {
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!("transcription cancelled, worker exiting");
+                return Ok(());
+            }
+
             let mut chunk: Vec<f32> = mono_buf.drain(..CHUNK_SAMPLES).collect();
 
             // Spectral noise gate — remove broadband static and hiss

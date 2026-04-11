@@ -88,9 +88,23 @@ impl IfChain {
         self.squelch.set_level(db);
     }
 
+    /// Enable or disable auto-squelch (noise floor tracking).
+    ///
+    /// When enabled, the squelch threshold is automatically derived from
+    /// the tracked noise floor. The manual squelch level is ignored.
+    pub fn set_auto_squelch_enabled(&mut self, enabled: bool) {
+        self.squelch.set_auto_squelch(enabled);
+    }
+
+    /// Returns whether auto-squelch is enabled.
+    pub fn auto_squelch_enabled(&self) -> bool {
+        self.squelch.auto_squelch_enabled()
+    }
+
     /// Returns whether the squelch is currently open (signal above threshold).
     pub fn squelch_open(&self) -> bool {
-        !self.squelch_enabled || self.squelch.is_open()
+        let active = self.squelch_enabled || self.squelch.auto_squelch_enabled();
+        !active || self.squelch.is_open()
     }
 
     /// Enable or disable FM IF noise reduction.
@@ -123,7 +137,8 @@ impl IfChain {
             });
         }
 
-        let any_enabled = self.nb_enabled || self.squelch_enabled || self.fm_if_nr_enabled;
+        let squelch_active = self.squelch_enabled || self.squelch.auto_squelch_enabled();
+        let any_enabled = self.nb_enabled || squelch_active || self.fm_if_nr_enabled;
         if !any_enabled {
             output[..input.len()].copy_from_slice(input);
             return Ok(input.len());
@@ -148,8 +163,8 @@ impl IfChain {
             current_is_a = !current_is_a;
         }
 
-        // Stage 2: Squelch
-        if self.squelch_enabled {
+        // Stage 2: Squelch (manual or auto)
+        if squelch_active {
             if current_is_a {
                 self.squelch
                     .process(&self.buf_a[..n], &mut self.buf_b[..n])?;

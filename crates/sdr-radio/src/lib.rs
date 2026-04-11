@@ -323,6 +323,15 @@ impl RadioModule {
         self.if_chain.set_squelch_enabled(enabled);
     }
 
+    /// Enable or disable auto-squelch (noise floor tracking).
+    ///
+    /// When enabled, the squelch threshold is automatically derived from
+    /// the tracked noise floor with hysteresis. The manual squelch level
+    /// is ignored while auto-squelch is active.
+    pub fn set_auto_squelch_enabled(&mut self, enabled: bool) {
+        self.if_chain.set_auto_squelch_enabled(enabled);
+    }
+
     /// Set the deemphasis mode.
     ///
     /// # Errors
@@ -561,6 +570,20 @@ mod tests {
         let err = RadioError::ModeSwitchFailed("test".to_string());
         let msg = format!("{err}");
         assert!(msg.contains("mode switch failed"));
+    }
+
+    #[test]
+    fn test_radio_module_auto_squelch() {
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_squelch_enabled(true);
+        radio.set_auto_squelch_enabled(true);
+
+        // Verify auto-squelch is enabled on the IF chain
+        assert!(radio.if_chain().auto_squelch_enabled());
+
+        // Disable and verify
+        radio.set_auto_squelch_enabled(false);
+        assert!(!radio.if_chain().auto_squelch_enabled());
     }
 
     #[test]

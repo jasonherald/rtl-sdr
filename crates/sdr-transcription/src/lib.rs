@@ -12,7 +12,8 @@ pub mod worker;
 pub use model::WhisperModel;
 pub use worker::TranscriptionEvent;
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 /// Bounded channel capacity for audio buffers from DSP → transcription.
 /// Each buffer is ~1024-4096 stereo samples (~20-80ms). At 48 kHz with
@@ -35,6 +36,7 @@ pub enum TranscriptionError {
 pub struct TranscriptionEngine {
     audio_tx: Option<mpsc::SyncSender<Vec<f32>>>,
     worker_thread: Option<std::thread::JoinHandle<()>>,
+    cancel_token: Arc<AtomicBool>,
 }
 
 impl Default for TranscriptionEngine {
@@ -48,6 +50,7 @@ impl TranscriptionEngine {
         Self {
             audio_tx: None,
             worker_thread: None,
+            cancel_token: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -68,15 +71,19 @@ impl TranscriptionEngine {
             return Err(TranscriptionError::AlreadyRunning);
         }
 
+        self.cancel_token.store(false, Ordering::Relaxed);
+
         let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
 
+        let cancel = Arc::clone(&self.cancel_token);
         let handle = std::thread::Builder::new()
             .name("transcription-worker".into())
             .spawn(move || {
                 worker::run_worker(
                     &audio_rx,
                     &event_tx,
+                    &cancel,
                     whisper_model,
                     silence_threshold,
                     noise_gate_ratio,
@@ -95,6 +102,7 @@ impl TranscriptionEngine {
     /// This may block if Whisper inference is in progress. Use
     /// [`shutdown_nonblocking`] during app exit to avoid freezing the UI.
     pub fn stop(&mut self) {
+        self.cancel_token.store(true, Ordering::Relaxed);
         self.audio_tx.take();
         if let Some(handle) = self.worker_thread.take() {
             let _ = handle.join();
@@ -108,6 +116,7 @@ impl TranscriptionEngine {
     /// inference completes. The thread is detached — the process can
     /// exit without joining it.
     pub fn shutdown_nonblocking(&mut self) {
+        self.cancel_token.store(true, Ordering::Relaxed);
         self.audio_tx.take();
         self.worker_thread.take(); // detach — don't join
         tracing::info!("transcription engine shutdown (non-blocking)");

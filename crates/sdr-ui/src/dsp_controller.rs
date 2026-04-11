@@ -331,6 +331,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 return;
             }
             tracing::info!("stopping DSP pipeline");
+            // Disconnect transcription tap so the worker stops receiving audio.
+            state.transcription_tx = None;
             cleanup(state);
             state.running = false;
             let _ = dsp_tx.send(DspToUi::SourceStopped);
@@ -406,6 +408,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetSquelchEnabled(enabled) => {
             tracing::debug!(enabled, "set squelch enabled");
             state.radio.set_squelch_enabled(enabled);
+        }
+
+        UiToDsp::SetAutoSquelch(enabled) => {
+            tracing::debug!(enabled, "set auto-squelch");
+            state.radio.set_auto_squelch_enabled(enabled);
         }
 
         UiToDsp::SetVolume(vol) => {

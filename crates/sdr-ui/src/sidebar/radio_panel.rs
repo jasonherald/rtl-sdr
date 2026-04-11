@@ -58,6 +58,8 @@ pub struct RadioPanel {
     pub squelch_enabled_row: adw::SwitchRow,
     /// Squelch level control.
     pub squelch_level_row: adw::SpinRow,
+    /// Auto-squelch toggle (noise floor tracking).
+    pub auto_squelch_row: adw::SwitchRow,
     /// De-emphasis filter selector.
     pub deemphasis_row: adw::ComboRow,
     /// Noise blanker toggle.
@@ -130,6 +132,12 @@ pub fn build_radio_panel() -> RadioPanel {
         .digits(0)
         .build();
 
+    // --- Auto-squelch ---
+    let auto_squelch_row = adw::SwitchRow::builder()
+        .title("Auto Squelch")
+        .subtitle("Track noise floor automatically")
+        .build();
+
     // --- De-emphasis ---
     let deemphasis_model =
         gtk4::StringList::new(&["None", "50 \u{00b5}s (EU)", "75 \u{00b5}s (US)"]);
@@ -194,6 +202,7 @@ pub fn build_radio_panel() -> RadioPanel {
     group.add(&bandwidth_row);
     group.add(&squelch_enabled_row);
     group.add(&squelch_level_row);
+    group.add(&auto_squelch_row);
     group.add(&deemphasis_row);
     group.add(&noise_blanker_row);
     group.add(&nb_level_row);
@@ -209,6 +218,7 @@ pub fn build_radio_panel() -> RadioPanel {
         bandwidth_row,
         squelch_enabled_row,
         squelch_level_row,
+        auto_squelch_row,
         deemphasis_row,
         noise_blanker_row,
         nb_level_row,

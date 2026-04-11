@@ -271,6 +271,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let gain_row_for_dsp = panels.source.gain_row.clone();
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
+    let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
     glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
         // Check for new FFT data from the shared buffer (zero-alloc path).
         fft_shared.take_if_ready(|data| {
@@ -291,6 +292,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &gain_row_for_dsp,
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
+                        &transcription_enable_for_dsp,
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -318,6 +320,7 @@ fn handle_dsp_message(
     gain_row: &adw::SpinRow,
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
+    transcription_enable_row: &adw::SwitchRow,
 ) {
     match msg {
         DspToUi::FftData(_) => {
@@ -343,9 +346,10 @@ fn handle_dsp_message(
                 btn.set_active(false);
                 btn.set_icon_name("media-playback-start-symbolic");
             }
-            // Reset recording toggles when the source stops.
+            // Reset recording and transcription toggles when the source stops.
             record_audio_row.set_active(false);
             record_iq_row.set_active(false);
+            transcription_enable_row.set_active(false);
         }
         DspToUi::SampleRateChanged(rate) => {
             tracing::info!(effective_sample_rate = rate, "sample rate changed");
@@ -881,6 +885,15 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .connect_value_notify(move |row| {
             #[allow(clippy::cast_possible_truncation)]
             state_squelch_lvl.send_dsp(UiToDsp::SetSquelch(row.value() as f32));
+        });
+
+    // Auto-squelch
+    let state_auto_sq = Rc::clone(state);
+    panels
+        .radio
+        .auto_squelch_row
+        .connect_active_notify(move |row| {
+            state_auto_sq.send_dsp(UiToDsp::SetAutoSquelch(row.is_active()));
         });
 
     // Deemphasis
