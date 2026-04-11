@@ -108,6 +108,7 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let saved_silence = config.read(|v| {
         v.get(KEY_SILENCE_THRESHOLD)
             .and_then(serde_json::Value::as_f64)
+            .map(|val| val.clamp(SILENCE_THRESHOLD_MIN, SILENCE_THRESHOLD_MAX))
             .unwrap_or(DEFAULT_SILENCE_THRESHOLD)
     });
 
@@ -136,6 +137,7 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let saved_noise_gate = config.read(|v| {
         v.get(KEY_NOISE_GATE)
             .and_then(serde_json::Value::as_f64)
+            .map(|val| val.clamp(NOISE_GATE_MIN, NOISE_GATE_MAX))
             .unwrap_or(DEFAULT_NOISE_GATE)
     });
 
