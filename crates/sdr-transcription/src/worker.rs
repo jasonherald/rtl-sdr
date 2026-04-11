@@ -16,7 +16,8 @@ const CHUNK_SECONDS: usize = 5;
 const CHUNK_SAMPLES: usize = 16_000 * CHUNK_SECONDS;
 
 /// RMS threshold below which a chunk is treated as silence and skipped.
-const SILENCE_THRESHOLD: f32 = 0.005;
+/// Radio noise typically has RMS 0.01-0.03; speech is 0.05+.
+const SILENCE_THRESHOLD: f32 = 0.02;
 
 /// Events emitted by the transcription worker.
 #[derive(Debug, Clone)]
@@ -150,7 +151,7 @@ fn run_worker_inner(
                 }
             }
 
-            if !combined.is_empty() {
+            if !combined.is_empty() && !is_hallucination(&combined) {
                 let timestamp = chrono_timestamp();
                 tracing::debug!(%timestamp, %combined, "transcribed chunk");
                 let _ = event_tx.send(TranscriptionEvent::Text {
@@ -163,6 +164,37 @@ fn run_worker_inner(
 
     tracing::info!("audio channel closed, worker exiting");
     Ok(())
+}
+
+/// Common hallucination phrases Whisper produces on silence/noise.
+const HALLUCINATIONS: &[&str] = &[
+    "thank you",
+    "thanks for watching",
+    "subscribe",
+    "like and subscribe",
+    "see you next time",
+    "bye",
+    "you",
+    "the end",
+];
+
+/// Check if Whisper output is a known hallucination pattern.
+///
+/// Whisper tends to produce these when fed non-speech audio (radio static,
+/// tones, data bursts). We filter them out to keep the transcript clean.
+fn is_hallucination(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    // Bracketed/parenthesized annotations Whisper generates for non-speech.
+    if (lower.starts_with('[') && lower.ends_with(']'))
+        || (lower.starts_with('(') && lower.ends_with(')'))
+    {
+        return true;
+    }
+
+    HALLUCINATIONS
+        .iter()
+        .any(|h| lower.trim().eq_ignore_ascii_case(h))
 }
 
 /// Compute the root-mean-square of a sample buffer.
