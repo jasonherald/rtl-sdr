@@ -9,9 +9,13 @@ use sdr_config::ConfigManager;
 
 /// Config key for the persisted Whisper model index.
 const KEY_MODEL: &str = "transcription_model";
+/// Config key for the silence threshold after spectral denoising.
+const KEY_SILENCE_THRESHOLD: &str = "transcription_silence_threshold";
+/// Config key for the spectral noise gate ratio.
+const KEY_NOISE_GATE: &str = "transcription_noise_gate";
 
-/// Transcript panel with toggle switch, model picker, status label,
-/// progress bar, scrolling transcript log, and clear button.
+/// Transcript panel with toggle switch, model picker, tuning sliders,
+/// status label, progress bar, scrolling transcript log, and clear button.
 pub struct TranscriptPanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
     pub widget: adw::PreferencesGroup,
@@ -19,6 +23,10 @@ pub struct TranscriptPanel {
     pub enable_row: adw::SwitchRow,
     /// Model size selector.
     pub model_row: adw::ComboRow,
+    /// Silence threshold spin row.
+    pub silence_row: adw::SpinRow,
+    /// Noise gate spin row.
+    pub noise_gate_row: adw::SpinRow,
     /// Status label (downloading, listening, error).
     pub status_label: gtk4::Label,
     /// Model download progress bar.
@@ -32,6 +40,7 @@ pub struct TranscriptPanel {
 }
 
 /// Build the transcript sidebar panel.
+#[allow(clippy::too_many_lines)]
 pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Transcript")
@@ -70,6 +79,65 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         let idx = row.selected();
         config_model.write(|v| {
             v[KEY_MODEL] = serde_json::json!(idx);
+        });
+    });
+
+    // --- Tuning sliders ---
+
+    let saved_silence = config.read(|v| {
+        v.get(KEY_SILENCE_THRESHOLD)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.007)
+    });
+
+    let silence_row = adw::SpinRow::builder()
+        .title("Silence threshold")
+        .adjustment(&gtk4::Adjustment::new(
+            saved_silence,
+            0.001,
+            0.1,
+            0.001,
+            0.01,
+            0.0,
+        ))
+        .digits(3)
+        .build();
+    group.add(&silence_row);
+
+    let config_silence = Arc::clone(config);
+    silence_row.connect_value_notify(move |row| {
+        let val = row.value();
+        config_silence.write(|v| {
+            v[KEY_SILENCE_THRESHOLD] = serde_json::json!(val);
+        });
+    });
+
+    let saved_noise_gate = config.read(|v| {
+        v.get(KEY_NOISE_GATE)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(3.0)
+    });
+
+    let noise_gate_row = adw::SpinRow::builder()
+        .title("Noise gate")
+        .subtitle("Spectral gate ratio")
+        .adjustment(&gtk4::Adjustment::new(
+            saved_noise_gate,
+            1.0,
+            10.0,
+            0.5,
+            1.0,
+            0.0,
+        ))
+        .digits(1)
+        .build();
+    group.add(&noise_gate_row);
+
+    let config_noise = Arc::clone(config);
+    noise_gate_row.connect_value_notify(move |row| {
+        let val = row.value();
+        config_noise.write(|v| {
+            v[KEY_NOISE_GATE] = serde_json::json!(val);
         });
     });
 
@@ -133,6 +201,8 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         widget: group,
         enable_row,
         model_row,
+        silence_row,
+        noise_gate_row,
         status_label,
         progress_bar,
         text_view,

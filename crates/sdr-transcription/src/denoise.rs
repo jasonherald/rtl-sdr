@@ -10,9 +10,10 @@
 
 use rustfft::{FftPlanner, num_complex::Complex};
 
-/// Margin above the estimated noise floor in linear magnitude.
-/// Bins below `noise_floor * GATE_RATIO` are zeroed.
-/// A ratio of 3.0 means bins must be 3x the noise floor to survive (~9.5 dB).
+/// Default gate ratio — bins must exceed `noise_floor * GATE_RATIO` to survive.
+/// A ratio of 3.0 means bins must be 3x the noise floor (~9.5 dB above).
+/// Used as the default in tests; the runtime value is user-configurable.
+#[cfg(test)]
 const GATE_RATIO: f32 = 3.0;
 
 /// Percentile of magnitude-sorted bins used to estimate the noise floor.
@@ -23,12 +24,16 @@ const NOISE_FLOOR_PERCENTILE: f32 = 0.20;
 ///
 /// The buffer is FFT'd, noise floor is estimated from the quietest bins,
 /// bins below the threshold are zeroed, then IFFT'd back to time domain.
+///
+/// `gate_ratio` controls how aggressive the gate is — bins must exceed
+/// `noise_floor * gate_ratio` to survive. Higher values remove more noise
+/// but may clip speech transients.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-pub fn spectral_denoise(samples: &mut [f32]) {
+pub fn spectral_denoise(samples: &mut [f32], gate_ratio: f32) {
     let n = samples.len();
     if n < 64 {
         return; // too short for meaningful FFT
@@ -55,7 +60,7 @@ pub fn spectral_denoise(samples: &mut [f32]) {
     let noise_floor = sorted_mags[percentile_idx];
 
     // Gate threshold: bins must exceed noise_floor * ratio to survive.
-    let threshold = noise_floor * GATE_RATIO;
+    let threshold = noise_floor * gate_ratio;
 
     // Zero out bins below threshold (spectral gate).
     for (i, mag) in magnitudes.iter().enumerate() {
@@ -82,7 +87,7 @@ mod tests {
     #[test]
     fn silence_stays_silent() {
         let mut buf = vec![0.0_f32; 256];
-        spectral_denoise(&mut buf);
+        spectral_denoise(&mut buf, GATE_RATIO);
         for s in &buf {
             assert!(s.abs() < 1e-6, "expected silence, got {s}");
         }
@@ -92,7 +97,7 @@ mod tests {
     fn short_buffer_is_noop() {
         let mut buf = vec![0.5_f32; 32];
         let original = buf.clone();
-        spectral_denoise(&mut buf);
+        spectral_denoise(&mut buf, GATE_RATIO);
         assert_eq!(buf, original);
     }
 
@@ -114,7 +119,7 @@ mod tests {
 
         let pre_energy: f32 = buf.iter().map(|s| s * s).sum();
 
-        spectral_denoise(&mut buf);
+        spectral_denoise(&mut buf, GATE_RATIO);
 
         let post_energy: f32 = buf.iter().map(|s| s * s).sum();
 

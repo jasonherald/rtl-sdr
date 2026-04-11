@@ -1407,6 +1407,8 @@ fn connect_transcript_panel(
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
     let model_row = transcript.model_row.clone();
+    let silence_row = transcript.silence_row.clone();
+    let noise_gate_row = transcript.noise_gate_row.clone();
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
@@ -1420,9 +1422,18 @@ fn connect_transcript_panel(
                 .copied()
                 .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
 
+            // Read tuning slider values.
+            #[allow(clippy::cast_possible_truncation)]
+            let silence_threshold = silence_row.value() as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let noise_gate_ratio = noise_gate_row.value() as f32;
+
             // Scope the borrow so it's dropped before any potential re-entry
             // from row.set_active(false) on error.
-            let start_result = engine_clone.borrow_mut().start(whisper_model);
+            let start_result =
+                engine_clone
+                    .borrow_mut()
+                    .start(whisper_model, silence_threshold, noise_gate_ratio);
             match start_result {
                 Ok(event_rx) => {
                     if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
