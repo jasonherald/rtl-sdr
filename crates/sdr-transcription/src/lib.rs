@@ -23,6 +23,8 @@ pub enum TranscriptionError {
     AlreadyRunning,
     #[error("transcription is not running")]
     NotRunning,
+    #[error("failed to spawn worker thread: {0}")]
+    Spawn(#[from] std::io::Error),
 }
 
 /// Live audio transcription engine.
@@ -59,8 +61,7 @@ impl TranscriptionEngine {
             .name("transcription-worker".into())
             .spawn(move || {
                 worker::run_worker(&audio_rx, &event_tx);
-            })
-            .expect("failed to spawn transcription worker thread");
+            })?;
 
         self.audio_tx = Some(audio_tx);
         self.worker_thread = Some(handle);

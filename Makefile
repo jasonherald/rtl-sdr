@@ -114,7 +114,7 @@ lint: fmt-check clippy test deny audit
 
 scan:
 	@if [ -f .env ]; then \
-		eval $$(grep SONAR_APP_TOKEN .env) && \
+		SONAR_APP_TOKEN=$$(sed -n 's/^SONAR_APP_TOKEN=//p' .env | head -n 1) && \
 		SONAR_TOKEN=$$SONAR_APP_TOKEN /opt/sonar-scanner/bin/sonar-scanner \
 			-Dsonar.host.url=https://sonar.aaru.network \
 			-Dsonar.scanner.truststorePath=/tmp/sonar-truststore.jks \

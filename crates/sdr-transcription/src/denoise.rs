@@ -8,7 +8,7 @@
 //! Tariq & Khan (2023), "Mathematical Approach for Enhancing Audio Signal
 //! Quality: Theory, Insights, and Applications."
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 
 /// Margin above the estimated noise floor in linear magnitude.
 /// Bins below `noise_floor * GATE_RATIO` are zeroed.
@@ -39,10 +39,7 @@ pub fn spectral_denoise(samples: &mut [f32]) {
     let fft_inv = planner.plan_fft_inverse(n);
 
     // Convert to complex for FFT.
-    let mut spectrum: Vec<Complex<f32>> = samples
-        .iter()
-        .map(|&s| Complex::new(s, 0.0))
-        .collect();
+    let mut spectrum: Vec<Complex<f32>> = samples.iter().map(|&s| Complex::new(s, 0.0)).collect();
 
     // Forward FFT.
     fft_fwd.process(&mut spectrum);

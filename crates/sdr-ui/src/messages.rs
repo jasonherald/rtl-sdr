@@ -307,6 +307,13 @@ mod tests {
 
         let iq_stop = UiToDsp::StopIqRecording;
         assert!(matches!(iq_stop, UiToDsp::StopIqRecording));
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let enable = UiToDsp::EnableTranscription(tx);
+        assert!(matches!(enable, UiToDsp::EnableTranscription(_)));
+
+        let disable = UiToDsp::DisableTranscription;
+        assert!(matches!(disable, UiToDsp::DisableTranscription));
     }
 
     #[test]

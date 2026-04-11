@@ -46,12 +46,17 @@ pub fn download_model(progress_tx: &mpsc::Sender<u8>) -> Result<PathBuf, ModelEr
     std::fs::create_dir_all(&dir)?;
 
     let dest = dir.join(MODEL_FILENAME);
+    let part = dir.join(format!("{MODEL_FILENAME}.part"));
     tracing::info!(?dest, "downloading Whisper model");
 
-    let response = reqwest::blocking::get(MODEL_URL)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_mins(2))
+        .build()?;
+
+    let response = client.get(MODEL_URL).send()?.error_for_status()?;
     let total_size = response.content_length().unwrap_or(0);
 
-    let mut file = std::fs::File::create(&dest)?;
+    let mut file = std::fs::File::create(&part)?;
     let mut downloaded: u64 = 0;
     let mut last_pct: u8 = 0;
 
@@ -76,6 +81,8 @@ pub fn download_model(progress_tx: &mpsc::Sender<u8>) -> Result<PathBuf, ModelEr
     }
 
     file.flush()?;
+    drop(file);
+    std::fs::rename(&part, &dest)?;
     tracing::info!(?dest, bytes = downloaded, "model download complete");
 
     Ok(dest)

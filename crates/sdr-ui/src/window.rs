@@ -55,8 +55,14 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let state = AppState::new_shared(ui_tx);
 
     // --- Build UI ---
-    let (split_view, panels, spectrum_handle_raw, status_bar, transcript_panel, transcript_revealer) =
-        build_split_view(&state);
+    let (
+        split_view,
+        panels,
+        spectrum_handle_raw,
+        status_bar,
+        transcript_panel,
+        transcript_revealer,
+    ) = build_split_view(&state);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
     let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
@@ -456,7 +462,14 @@ fn build_split_view(
         .show_sidebar(true)
         .build();
 
-    (split_view, panels, spectrum_handle, status_bar, transcript_panel, transcript_revealer)
+    (
+        split_view,
+        panels,
+        spectrum_handle,
+        status_bar,
+        transcript_panel,
+        transcript_revealer,
+    )
 }
 
 /// Build the sidebar toggle button bound to the split view.
@@ -1394,26 +1407,27 @@ fn connect_transcript_panel(
     let text_view = transcript.text_view.clone();
 
     transcript.enable_row.connect_active_notify(move |row| {
-            let mut eng = engine_clone.borrow_mut();
+        let mut eng = engine_clone.borrow_mut();
 
-            if row.is_active() {
-                match eng.start() {
-                    Ok(event_rx) => {
-                        if let Some(audio_tx) = eng.audio_sender() {
-                            state_clone
-                                .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
-                        }
+        if row.is_active() {
+            match eng.start() {
+                Ok(event_rx) => {
+                    if let Some(audio_tx) = eng.audio_sender() {
+                        state_clone
+                            .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
+                    }
 
-                        status_label.set_text("Starting...");
-                        status_label.set_visible(true);
+                    status_label.set_text("Starting...");
+                    status_label.set_visible(true);
 
-                        let status = status_label.clone();
-                        let progress = progress_bar.clone();
-                        let tv = text_view.clone();
+                    let status = status_label.clone();
+                    let progress = progress_bar.clone();
+                    let tv = text_view.clone();
 
-                        glib::timeout_add_local(Duration::from_millis(100), move || {
-                            while let Ok(event) = event_rx.try_recv() {
-                                match event {
+                    glib::timeout_add_local(Duration::from_millis(100), move || {
+                        loop {
+                            match event_rx.try_recv() {
+                                Ok(event) => match event {
                                     TranscriptionEvent::Downloading { progress_pct } => {
                                         status.set_text(&format!(
                                             "Downloading model ({progress_pct}%)..."
@@ -1440,24 +1454,29 @@ fn connect_transcript_panel(
                                         status.set_text(&msg);
                                         status.set_css_classes(&["error"]);
                                     }
+                                },
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    return glib::ControlFlow::Break;
                                 }
                             }
-                            glib::ControlFlow::Continue
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to start transcription: {e}");
-                        row.set_active(false);
-                    }
+                        }
+                        glib::ControlFlow::Continue
+                    });
                 }
-            } else {
-                state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
-                eng.stop();
-                status_label.set_text("");
-                status_label.set_visible(false);
-                progress_bar.set_visible(false);
+                Err(e) => {
+                    tracing::warn!("failed to start transcription: {e}");
+                    row.set_active(false);
+                }
             }
-        });
+        } else {
+            state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
+            eng.shutdown_nonblocking();
+            status_label.set_text("");
+            status_label.set_visible(false);
+            progress_bar.set_visible(false);
+        }
+    });
 
     engine
 }

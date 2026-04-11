@@ -47,7 +47,7 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 ### Under the Hood
 
-- 14-crate workspace with clear dependency boundaries
+- 15-crate workspace with clear dependency boundaries
 - Pure DSP functions (no threading, no I/O, no side effects)
 - Zero per-frame heap allocations on hot paths
 - Lock-based SPSC audio ring buffer between DSP and audio threads

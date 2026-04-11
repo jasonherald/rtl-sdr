@@ -231,9 +231,14 @@ fn chrono_timestamp() -> String {
 
     // SAFETY: `localtime_r` is the reentrant (thread-safe) variant.
     // We provide a valid `time_t` and a valid output buffer.
+    // Returns null on failure, in which case we fall back to UTC via `gmtime_r`.
     #[allow(unsafe_code)]
     let tm = unsafe {
-        libc::localtime_r(&raw const epoch, tm.as_mut_ptr());
+        let result = libc::localtime_r(&raw const epoch, tm.as_mut_ptr());
+        if result.is_null() {
+            // localtime_r failed — fall back to UTC.
+            libc::gmtime_r(&raw const epoch, tm.as_mut_ptr());
+        }
         tm.assume_init()
     };
 
