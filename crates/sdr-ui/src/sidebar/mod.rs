@@ -1,4 +1,6 @@
 //! Sidebar configuration panels — source, audio, radio, display, navigation.
+//!
+//! The transcript panel lives in a separate right-side revealer, not here.
 
 use gtk4::prelude::*;
 
@@ -7,12 +9,14 @@ pub mod display_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
 pub mod source_panel;
+pub mod transcript_panel;
 
 pub use audio_panel::{AudioPanel, build_audio_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
+pub use transcript_panel::{TranscriptPanel, build_transcript_panel};
 
 /// Spacing between sidebar preference groups in pixels.
 const SIDEBAR_SPACING: i32 = 12;
@@ -43,7 +47,6 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let radio = build_radio_panel();
     let display = build_display_panel();
     let navigation = build_navigation_panel();
-
     let sidebar_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(SIDEBAR_SPACING)

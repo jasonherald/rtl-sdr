@@ -221,6 +221,9 @@ struct DspState {
     // Recording state
     audio_writer: Option<WavWriter>,
     iq_writer: Option<WavWriter>,
+
+    /// Transcription audio tap — when Some, audio is copied to this channel.
+    transcription_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 }
 
 impl DspState {
@@ -270,6 +273,7 @@ impl DspState {
             audio_buf: Vec::new(),
             audio_writer: None,
             iq_writer: None,
+            transcription_tx: None,
         })
     }
 }
@@ -755,6 +759,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.iq_writer = None;
             let _ = dsp_tx.send(DspToUi::IqRecordingStopped);
         }
+
+        UiToDsp::EnableTranscription(tx) => {
+            state.transcription_tx = Some(tx);
+            tracing::info!("transcription audio tap enabled");
+        }
+        UiToDsp::DisableTranscription => {
+            state.transcription_tx = None;
+            tracing::info!("transcription audio tap disabled");
+        }
     }
 }
 
@@ -1012,6 +1025,24 @@ fn process_iq_block(
                             let rms = (sum_sq / (2.0 * audio_count as f32)).sqrt();
                             let level_db = 20.0 * rms.max(f32::MIN_POSITIVE).log10();
                             let _ = dsp_tx.send(DspToUi::SignalLevel(level_db));
+                        }
+
+                        // Send audio copy to transcription worker BEFORE volume
+                        // scaling so recognition isn't affected by the volume knob.
+                        if let Some(ref tx) = state.transcription_tx {
+                            let mut interleaved = Vec::with_capacity(audio_count * 2);
+                            for s in &state.audio_buf[..audio_count] {
+                                interleaved.push(s.l);
+                                interleaved.push(s.r);
+                            }
+                            if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
+                                tx.try_send(interleaved)
+                            {
+                                state.transcription_tx = None;
+                                tracing::info!(
+                                    "transcription receiver disconnected, disabling tap"
+                                );
+                            }
                         }
 
                         // Apply volume with perceptual (power-law) scaling.

@@ -9,7 +9,7 @@ CARGO       ?= cargo
 CARGO_FLAGS ?= --release
 
 .PHONY: all build install install-bin install-icon install-desktop \
-        uninstall test clippy fmt fmt-check lint deny audit clean help
+        uninstall test clippy fmt fmt-check lint deny audit scan clean help
 
 # ─────────────────────────────────────────────────────────────────────
 # Default
@@ -26,6 +26,7 @@ help:
 	@echo "  make build        Build release binary only"
 	@echo "  make test         Run all workspace tests"
 	@echo "  make lint         Run all checks (fmt, clippy, test, deny, audit)"
+	@echo "  make scan         Run SonarQube scan"
 	@echo "  make clean        Remove build artifacts"
 	@echo ""
 	@echo "Variables:"
@@ -106,6 +107,21 @@ audit:
 	$(CARGO) audit
 
 lint: fmt-check clippy test deny audit
+
+# ─────────────────────────────────────────────────────────────────────
+# SonarQube
+# ─────────────────────────────────────────────────────────────────────
+
+scan:
+	@if [ -f .env ]; then \
+		SONAR_APP_TOKEN=$$(sed -n 's/^SONAR_APP_TOKEN=//p' .env | head -n 1) && \
+		SONAR_TOKEN=$$SONAR_APP_TOKEN /opt/sonar-scanner/bin/sonar-scanner \
+			-Dsonar.host.url=https://sonar.aaru.network \
+			-Dsonar.scanner.truststorePath=/tmp/sonar-truststore.jks \
+			-Dsonar.scanner.truststorePassword=changeit; \
+	else \
+		echo "No .env file found. Create one with SONAR_APP_TOKEN=<token>"; \
+	fi
 
 clean:
 	$(CARGO) clean

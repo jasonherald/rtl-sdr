@@ -1,5 +1,6 @@
 //! Main window construction — header bar, split view, breakpoints, DSP bridge.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -54,11 +55,31 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let state = AppState::new_shared(ui_tx);
 
     // --- Build UI ---
-    let (split_view, panels, spectrum_handle_raw, status_bar) = build_split_view(&state);
+    let (
+        split_view,
+        panels,
+        spectrum_handle_raw,
+        status_bar,
+        transcript_panel,
+        transcript_revealer,
+    ) = build_split_view(&state);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
     let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
         build_header_bar(&sidebar_toggle, &state);
+
+    // Transcript toggle button in header bar.
+    let transcript_button = gtk4::ToggleButton::builder()
+        .icon_name("document-page-setup-symbolic")
+        .tooltip_text("Toggle transcript panel")
+        .build();
+    header.pack_end(&transcript_button);
+
+    let revealer_clone = transcript_revealer.clone();
+    transcript_button.connect_toggled(move |btn| {
+        revealer_clone.set_reveal_child(btn.is_active());
+    });
+
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
 
@@ -88,6 +109,15 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     status_bar.update_frequency(freq_selector.frequency() as f64);
 
     setup_app_actions(app, &window, config, &rr_button);
+
+    // Wire transcript panel (separate from sidebar panels).
+    let transcription_engine = connect_transcript_panel(&transcript_panel, &state);
+
+    // On window close, signal the worker to stop without blocking.
+    window.connect_close_request(move |_| {
+        transcription_engine.borrow_mut().shutdown_nonblocking();
+        glib::Propagation::Proceed
+    });
 
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
@@ -377,6 +407,8 @@ fn build_split_view(
     SidebarPanels,
     spectrum::SpectrumHandle,
     StatusBar,
+    sidebar::transcript_panel::TranscriptPanel,
+    gtk4::Revealer,
 ) {
     // Sidebar — configuration panels.
     let (sidebar_scroll, panels) = sidebar::build_sidebar();
@@ -396,13 +428,48 @@ fn build_split_view(
     content_box.append(&spectrum_view);
     content_box.append(&status_bar.widget);
 
+    // Transcript panel — slides out from the right.
+    let transcript_panel = sidebar::transcript_panel::build_transcript_panel();
+    let transcript_scroll = gtk4::ScrolledWindow::builder()
+        .child(&transcript_panel.widget)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .width_request(320)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let transcript_revealer = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
+        .transition_duration(200)
+        .reveal_child(false)
+        .child(&transcript_scroll)
+        .hexpand(false)
+        .build();
+
+    // Wrap content + transcript revealer in an HBox.
+    let content_with_transcript = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .build();
+    content_with_transcript.append(&content_box);
+    content_with_transcript.append(&transcript_revealer);
+
     let split_view = adw::OverlaySplitView::builder()
         .sidebar(&sidebar_scroll)
-        .content(&content_box)
+        .content(&content_with_transcript)
         .show_sidebar(true)
         .build();
 
-    (split_view, panels, spectrum_handle, status_bar)
+    (
+        split_view,
+        panels,
+        spectrum_handle,
+        status_bar,
+        transcript_panel,
+        transcript_revealer,
+    )
 }
 
 /// Build the sidebar toggle button bound to the split view.
@@ -588,6 +655,7 @@ fn connect_sidebar_panels(
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
+    // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
         state,
@@ -1318,6 +1386,99 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
                 state_rec.send_dsp(UiToDsp::StopAudioRecording);
             }
         });
+}
+
+/// Connect transcript panel controls to DSP commands.
+///
+/// Returns the engine handle so it can be stopped on window close.
+fn connect_transcript_panel(
+    transcript: &sidebar::transcript_panel::TranscriptPanel,
+    state: &Rc<AppState>,
+) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
+    use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
+
+    let engine: Rc<RefCell<TranscriptionEngine>> =
+        Rc::new(RefCell::new(TranscriptionEngine::new()));
+
+    let state_clone = Rc::clone(state);
+    let engine_clone = Rc::clone(&engine);
+    let status_label = transcript.status_label.clone();
+    let progress_bar = transcript.progress_bar.clone();
+    let text_view = transcript.text_view.clone();
+
+    transcript.enable_row.connect_active_notify(move |row| {
+        if row.is_active() {
+            // Scope the borrow so it's dropped before any potential re-entry
+            // from row.set_active(false) on error.
+            let start_result = engine_clone.borrow_mut().start();
+            match start_result {
+                Ok(event_rx) => {
+                    if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
+                        state_clone
+                            .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
+                    }
+
+                    status_label.set_text("Starting...");
+                    status_label.set_visible(true);
+
+                    let status = status_label.clone();
+                    let progress = progress_bar.clone();
+                    let tv = text_view.clone();
+
+                    glib::timeout_add_local(Duration::from_millis(100), move || {
+                        loop {
+                            match event_rx.try_recv() {
+                                Ok(event) => match event {
+                                    TranscriptionEvent::Downloading { progress_pct } => {
+                                        status.set_text(&format!(
+                                            "Downloading model ({progress_pct}%)..."
+                                        ));
+                                        status.set_visible(true);
+                                        progress.set_fraction(f64::from(progress_pct) / 100.0);
+                                        progress.set_visible(true);
+                                    }
+                                    TranscriptionEvent::Ready => {
+                                        status.set_text("Listening...");
+                                        status.set_css_classes(&["success"]);
+                                        progress.set_visible(false);
+                                    }
+                                    TranscriptionEvent::Text { timestamp, text } => {
+                                        let buf = tv.buffer();
+                                        let mut end = buf.end_iter();
+                                        buf.insert(&mut end, &format!("[{timestamp}] {text}\n"));
+                                        let mark = buf.create_mark(None, &buf.end_iter(), false);
+                                        tv.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
+                                        buf.delete_mark(&mark);
+                                    }
+                                    TranscriptionEvent::Error(msg) => {
+                                        status.set_text(&msg);
+                                        status.set_css_classes(&["error"]);
+                                    }
+                                },
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    return glib::ControlFlow::Break;
+                                }
+                            }
+                        }
+                        glib::ControlFlow::Continue
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("failed to start transcription: {e}");
+                    row.set_active(false);
+                }
+            }
+        } else {
+            state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
+            engine_clone.borrow_mut().shutdown_nonblocking();
+            status_label.set_text("");
+            status_label.set_visible(false);
+            progress_bar.set_visible(false);
+        }
+    });
+
+    engine
 }
 
 /// Register application-level actions (Preferences, About, Quit).

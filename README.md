@@ -29,6 +29,14 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 - IQ WAV recording (raw pre-decimation samples)
 - Waterfall PNG export with desktop notification and click-to-open
 
+### Transcription
+
+- Live speech-to-text via Whisper (tiny English model, ~75 MB)
+- Slide-out transcript panel with timestamped log
+- FFT-based spectral noise gate preprocessor for cleaner recognition
+- Auto-downloads model on first use
+- Volume-independent audio tap (transcription unaffected by volume knob)
+
 ### Integration
 
 - [RadioReference.com](https://www.radioreference.com) frequency database browser — search by ZIP code, browse by category/agency, import as bookmarks (requires RadioReference premium account)
@@ -39,7 +47,7 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 ### Under the Hood
 
-- 14-crate workspace with clear dependency boundaries
+- 15-crate workspace with clear dependency boundaries
 - Pure DSP functions (no threading, no I/O, no side effects)
 - Zero per-frame heap allocations on hot paths
 - Lock-based SPSC audio ring buffer between DSP and audio threads
@@ -55,25 +63,26 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 - **PipeWire** development libraries (Linux audio)
 - **libusb** (for RTL-SDR USB access)
 - **libdbus** (for secure credential storage)
+- **cmake** + **C++ compiler** (build-time, for whisper.cpp)
 - **libclang** (build-time, for bindgen if needed)
 
 #### Arch Linux
 
 ```bash
-sudo pacman -S gtk4 libadwaita pipewire libusb dbus clang
+sudo pacman -S gtk4 libadwaita pipewire libusb dbus clang cmake
 ```
 
 #### Ubuntu / Debian
 
 ```bash
 sudo apt install libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev \
-  libusb-1.0-0-dev libdbus-1-dev libclang-dev
+  libusb-1.0-0-dev libdbus-1-dev libclang-dev cmake g++
 ```
 
 #### macOS
 
 ```bash
-brew install gtk4 libadwaita libusb llvm
+brew install gtk4 libadwaita libusb llvm cmake
 ```
 
 ### Compile
@@ -127,7 +136,7 @@ sdr-rs
 
 ## Architecture
 
-14-crate workspace with clear dependency boundaries:
+15-crate workspace with clear dependency boundaries:
 
 ```text
 sdr (binary)              Entry point
@@ -139,6 +148,7 @@ sdr-types                 Foundation types, errors, constants
 sdr-config                JSON config persistence + OS keyring access
 sdr-rtlsdr                Pure Rust RTL-SDR USB driver (5 tuner chips)
 sdr-radioreference        RadioReference.com SOAP API client
+sdr-transcription         Live speech-to-text via Whisper + spectral denoiser
 sdr-source-rtlsdr         RTL-SDR source module
 sdr-source-network        TCP/UDP IQ source
 sdr-source-file           WAV file playback source

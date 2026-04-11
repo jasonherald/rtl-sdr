@@ -1,0 +1,20 @@
+[package]
+name = "sdr-transcription"
+version = "0.1.0"
+description = "Live audio transcription via Whisper"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whisper-rs.workspace = true
+reqwest.workspace = true
+rustfft.workspace = true
+sdr-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dirs-next.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

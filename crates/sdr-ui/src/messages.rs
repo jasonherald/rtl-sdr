@@ -122,6 +122,10 @@ pub enum UiToDsp {
     StartIqRecording(std::path::PathBuf),
     /// Stop IQ recording and finalize the WAV file.
     StopIqRecording,
+    /// Start sending audio to the transcription engine.
+    EnableTranscription(std::sync::mpsc::SyncSender<Vec<f32>>),
+    /// Stop sending audio to the transcription engine.
+    DisableTranscription,
 }
 
 #[cfg(test)]
@@ -303,6 +307,13 @@ mod tests {
 
         let iq_stop = UiToDsp::StopIqRecording;
         assert!(matches!(iq_stop, UiToDsp::StopIqRecording));
+
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let enable = UiToDsp::EnableTranscription(tx);
+        assert!(matches!(enable, UiToDsp::EnableTranscription(_)));
+
+        let disable = UiToDsp::DisableTranscription;
+        assert!(matches!(disable, UiToDsp::DisableTranscription));
     }
 
     #[test]
