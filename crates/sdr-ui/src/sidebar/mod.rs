@@ -1,4 +1,6 @@
-//! Sidebar configuration panels — source, audio, radio, display, navigation, transcript.
+//! Sidebar configuration panels — source, audio, radio, display, navigation.
+//!
+//! The transcript panel lives in a separate right-side revealer, not here.
 
 use gtk4::prelude::*;
 
@@ -33,8 +35,6 @@ pub struct SidebarPanels {
     pub display: DisplayPanel,
     /// Navigation — band presets and bookmarks.
     pub navigation: NavigationPanel,
-    /// Live transcription display.
-    pub transcript: TranscriptPanel,
 }
 
 /// Build the complete sidebar `ScrolledWindow` containing all configuration panels.
@@ -47,8 +47,6 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let radio = build_radio_panel();
     let display = build_display_panel();
     let navigation = build_navigation_panel();
-    let transcript = build_transcript_panel();
-
     let sidebar_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(SIDEBAR_SPACING)
@@ -64,7 +62,6 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     sidebar_box.append(&audio.widget);
     sidebar_box.append(&radio.widget);
     sidebar_box.append(&display.widget);
-    sidebar_box.append(&transcript.widget);
 
     let scroll = gtk4::ScrolledWindow::builder()
         .child(&sidebar_box)
@@ -77,7 +74,6 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         radio,
         display,
         navigation,
-        transcript,
     };
 
     (scroll, panels)
