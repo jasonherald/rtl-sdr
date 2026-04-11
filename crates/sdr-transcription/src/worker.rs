@@ -17,6 +17,9 @@ const CHUNK_SECONDS: usize = 5;
 /// Number of 16 kHz mono samples per chunk (16000 * 5 = 80000).
 const CHUNK_SAMPLES: usize = 16_000 * CHUNK_SECONDS;
 
+/// Polling interval for the audio receive loop when checking for cancellation.
+const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Events emitted by the transcription worker.
 #[derive(Debug, Clone)]
 pub enum TranscriptionEvent {
@@ -71,6 +74,7 @@ pub fn run_worker(
 
 /// Inner implementation that returns errors as strings so the outer function
 /// can forward them as `TranscriptionEvent::Error`.
+#[allow(clippy::too_many_lines)]
 fn run_worker_inner(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
@@ -131,10 +135,11 @@ fn run_worker_inner(
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            break;
+            tracing::info!("transcription cancelled, worker exiting");
+            return Ok(());
         }
 
-        let interleaved = match audio_rx.recv_timeout(Duration::from_millis(100)) {
+        let interleaved = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
             Ok(data) => data,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -144,12 +149,21 @@ fn run_worker_inner(
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
 
         // Drain any additional queued buffers to minimize frame drops
-        // during long inference passes.
+        // during long inference passes. Check cancel between drains.
         while let Ok(extra) = audio_rx.try_recv() {
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!("transcription cancelled, worker exiting");
+                return Ok(());
+            }
             resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
         }
 
         while mono_buf.len() >= CHUNK_SAMPLES {
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!("transcription cancelled, worker exiting");
+                return Ok(());
+            }
+
             let mut chunk: Vec<f32> = mono_buf.drain(..CHUNK_SAMPLES).collect();
 
             // Spectral noise gate — remove broadband static and hiss
