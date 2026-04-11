@@ -331,6 +331,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 return;
             }
             tracing::info!("stopping DSP pipeline");
+            // Disconnect transcription tap so the worker stops receiving audio.
+            state.transcription_tx = None;
             cleanup(state);
             state.running = false;
             let _ = dsp_tx.send(DspToUi::SourceStopped);
