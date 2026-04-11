@@ -183,6 +183,8 @@ Your credentials are stored in your system keyring (GNOME Keyring / macOS Keycha
 
 ## Responsible Use
 
+> **Disclaimer:** This section provides general information and is **not legal advice**. Consult a qualified attorney for guidance specific to your situation and jurisdiction.
+
 SDR-RS is a personal listening tool for unencrypted radio transmissions. Listening to public safety, amateur, and commercial radio is legal in most jurisdictions, but please use it responsibly:
 
 **It's legal to:**
@@ -206,7 +208,7 @@ Public safety broadcasts may include personally identifiable information — nam
 - The Whisper model runs entirely on your machine
 - Audio recordings are saved locally only when you explicitly enable them
 
-If you're using SDR-RS in a shared space, be mindful that others may see the transcript on your screen. Future versions may add automatic redaction of PII patterns and a "lock transcript" mode (see issues #219, #220, #221).
+If you're using SDR-RS in a shared space, be mindful that others may see the transcript on your screen. Future versions may add automatic redaction of PII patterns and a "lock transcript" mode (see [#219](https://github.com/jasonherald/rtl-sdr/issues/219), [#220](https://github.com/jasonherald/rtl-sdr/issues/220), [#221](https://github.com/jasonherald/rtl-sdr/issues/221)).
 
 **Know your local laws:** Scanner laws vary by jurisdiction. Some US states restrict scanner use in vehicles. Some countries prohibit listening to certain frequencies entirely. It's your responsibility to know and follow the laws where you live.
 
