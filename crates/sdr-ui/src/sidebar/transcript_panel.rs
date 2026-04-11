@@ -108,8 +108,9 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let saved_silence = config.read(|v| {
         v.get(KEY_SILENCE_THRESHOLD)
             .and_then(serde_json::Value::as_f64)
-            .map(|val| val.clamp(SILENCE_THRESHOLD_MIN, SILENCE_THRESHOLD_MAX))
-            .unwrap_or(DEFAULT_SILENCE_THRESHOLD)
+            .map_or(DEFAULT_SILENCE_THRESHOLD, |val| {
+                val.clamp(SILENCE_THRESHOLD_MIN, SILENCE_THRESHOLD_MAX)
+            })
     });
 
     let silence_row = adw::SpinRow::builder()
@@ -137,8 +138,9 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let saved_noise_gate = config.read(|v| {
         v.get(KEY_NOISE_GATE)
             .and_then(serde_json::Value::as_f64)
-            .map(|val| val.clamp(NOISE_GATE_MIN, NOISE_GATE_MAX))
-            .unwrap_or(DEFAULT_NOISE_GATE)
+            .map_or(DEFAULT_NOISE_GATE, |val| {
+                val.clamp(NOISE_GATE_MIN, NOISE_GATE_MAX)
+            })
     });
 
     let noise_gate_row = adw::SpinRow::builder()
