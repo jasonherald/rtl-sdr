@@ -3,7 +3,9 @@
 //! Receives interleaved stereo f32 audio at 48 kHz, resamples to 16 kHz mono,
 //! accumulates 5-second chunks, and runs Whisper inference on non-silent chunks.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -37,17 +39,20 @@ pub enum TranscriptionEvent {
 }
 
 /// Main worker loop. Blocks the calling thread and exits when `audio_rx` is
-/// closed (all senders dropped). Should be spawned on a dedicated thread.
+/// closed (all senders dropped) or the cancellation token is set.
+/// Should be spawned on a dedicated thread.
 ///
 /// # Arguments
 /// * `audio_rx` — receives interleaved stereo f32 audio at 48 kHz
 /// * `event_tx` — sends transcription events to the UI/consumer
+/// * `cancel` — cancellation token; when set to `true`, the worker exits promptly
 /// * `model` — which Whisper model to load
 /// * `silence_threshold` — RMS below which a chunk is skipped
 /// * `noise_gate_ratio` — spectral gate multiplier over noise floor
 pub fn run_worker(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
+    cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
@@ -55,6 +60,7 @@ pub fn run_worker(
     if let Err(e) = run_worker_inner(
         audio_rx,
         event_tx,
+        cancel,
         model,
         silence_threshold,
         noise_gate_ratio,
@@ -68,6 +74,7 @@ pub fn run_worker(
 fn run_worker_inner(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
+    cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
@@ -122,8 +129,18 @@ fn run_worker_inner(
     // --- Audio loop ---
     let mut mono_buf: Vec<f32> = Vec::with_capacity(CHUNK_SAMPLES * 2);
 
-    while let Ok(interleaved) = audio_rx.recv() {
-        // Process the first buffer we received via blocking recv().
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let interleaved = match audio_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(data) => data,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        // Process the first buffer we received.
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
 
         // Drain any additional queued buffers to minimize frame drops
