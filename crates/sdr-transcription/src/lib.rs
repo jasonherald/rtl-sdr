@@ -4,6 +4,7 @@
 //! speech-to-text. Audio samples are fed from the DSP thread via a bounded
 //! channel; transcription results are returned via an event channel.
 
+pub mod denoise;
 pub mod model;
 pub mod resampler;
 pub mod worker;
@@ -68,13 +69,27 @@ impl TranscriptionEngine {
         Ok(event_rx)
     }
 
-    /// Stop the transcription worker.
+    /// Stop the transcription worker, waiting for it to finish.
+    ///
+    /// This may block if Whisper inference is in progress. Use
+    /// [`shutdown_nonblocking`] during app exit to avoid freezing the UI.
     pub fn stop(&mut self) {
         self.audio_tx.take();
         if let Some(handle) = self.worker_thread.take() {
             let _ = handle.join();
         }
         tracing::info!("transcription engine stopped");
+    }
+
+    /// Signal the worker to stop without waiting for it to finish.
+    ///
+    /// Drops the audio sender so the worker exits after its current
+    /// inference completes. The thread is detached — the process can
+    /// exit without joining it.
+    pub fn shutdown_nonblocking(&mut self) {
+        self.audio_tx.take();
+        self.worker_thread.take(); // detach — don't join
+        tracing::info!("transcription engine shutdown (non-blocking)");
     }
 
     /// Get a clone of the audio sender for feeding samples from the DSP thread.
@@ -90,6 +105,6 @@ impl TranscriptionEngine {
 
 impl Drop for TranscriptionEngine {
     fn drop(&mut self) {
-        self.stop();
+        self.shutdown_nonblocking();
     }
 }

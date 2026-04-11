@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 whisper-rs.workspace = true
 reqwest.workspace = true
+rustfft.workspace = true
 sdr-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
