@@ -13,7 +13,7 @@ pub use model::WhisperModel;
 pub use worker::TranscriptionEvent;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 /// Bounded channel capacity for audio buffers from DSP → transcription.
 /// Each buffer is ~1024-4096 stereo samples (~20-80ms). At 48 kHz with

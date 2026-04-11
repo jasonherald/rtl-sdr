@@ -144,10 +144,11 @@ impl PowerSquelch {
             let settling = self.settle_count < NOISE_FLOOR_SETTLE_BLOCKS;
             if settling {
                 self.settle_count = self.settle_count.saturating_add(1);
-                self.noise_floor_db = NOISE_FLOOR_FAST_ALPHA
-                    .mul_add(measured_db, (1.0 - NOISE_FLOOR_FAST_ALPHA) * self.noise_floor_db);
-            } else if !self.open
-                || measured_db < self.noise_floor_db + AUTO_SQUELCH_CLOSE_MARGIN_DB
+                self.noise_floor_db = NOISE_FLOOR_FAST_ALPHA.mul_add(
+                    measured_db,
+                    (1.0 - NOISE_FLOOR_FAST_ALPHA) * self.noise_floor_db,
+                );
+            } else if !self.open || measured_db < self.noise_floor_db + AUTO_SQUELCH_CLOSE_MARGIN_DB
             {
                 self.noise_floor_db = NOISE_FLOOR_ALPHA
                     .mul_add(measured_db, (1.0 - NOISE_FLOOR_ALPHA) * self.noise_floor_db);
@@ -778,10 +779,7 @@ mod tests {
         // Strong signal should still open despite manual level of 100 dB.
         let strong = vec![Complex::new(1.0, 0.0); 100];
         squelch.process(&strong, &mut output).unwrap();
-        assert!(
-            squelch.is_open(),
-            "auto-squelch should ignore manual level"
-        );
+        assert!(squelch.is_open(), "auto-squelch should ignore manual level");
     }
 
     #[test]
