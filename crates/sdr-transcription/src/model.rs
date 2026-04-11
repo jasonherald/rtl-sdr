@@ -94,7 +94,10 @@ mod tests {
     #[test]
     fn model_path_includes_filename() {
         let path = model_path();
-        assert_eq!(path.file_name().and_then(|f| f.to_str()), Some(MODEL_FILENAME));
+        assert_eq!(
+            path.file_name().and_then(|f| f.to_str()),
+            Some(MODEL_FILENAME)
+        );
     }
 
     #[test]

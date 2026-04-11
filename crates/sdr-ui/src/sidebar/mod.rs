@@ -1,4 +1,4 @@
-//! Sidebar configuration panels — source, audio, radio, display, navigation.
+//! Sidebar configuration panels — source, audio, radio, display, navigation, transcript.
 
 use gtk4::prelude::*;
 
@@ -7,12 +7,14 @@ pub mod display_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
 pub mod source_panel;
+pub mod transcript_panel;
 
 pub use audio_panel::{AudioPanel, build_audio_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
+pub use transcript_panel::{TranscriptPanel, build_transcript_panel};
 
 /// Spacing between sidebar preference groups in pixels.
 const SIDEBAR_SPACING: i32 = 12;
@@ -31,6 +33,8 @@ pub struct SidebarPanels {
     pub display: DisplayPanel,
     /// Navigation — band presets and bookmarks.
     pub navigation: NavigationPanel,
+    /// Live transcription display.
+    pub transcript: TranscriptPanel,
 }
 
 /// Build the complete sidebar `ScrolledWindow` containing all configuration panels.
@@ -43,6 +47,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let radio = build_radio_panel();
     let display = build_display_panel();
     let navigation = build_navigation_panel();
+    let transcript = build_transcript_panel();
 
     let sidebar_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -59,6 +64,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     sidebar_box.append(&audio.widget);
     sidebar_box.append(&radio.widget);
     sidebar_box.append(&display.widget);
+    sidebar_box.append(&transcript.widget);
 
     let scroll = gtk4::ScrolledWindow::builder()
         .child(&sidebar_box)
@@ -71,6 +77,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         radio,
         display,
         navigation,
+        transcript,
     };
 
     (scroll, panels)

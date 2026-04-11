@@ -46,9 +46,7 @@ impl TranscriptionEngine {
 
     /// Start the transcription worker thread.
     /// Returns a receiver for `TranscriptionEvent`.
-    pub fn start(
-        &mut self,
-    ) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
+    pub fn start(&mut self) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
         if self.worker_thread.is_some() {
             return Err(TranscriptionError::AlreadyRunning);
         }
