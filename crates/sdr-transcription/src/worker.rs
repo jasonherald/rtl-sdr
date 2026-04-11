@@ -235,9 +235,13 @@ fn chrono_timestamp() -> String {
     #[allow(unsafe_code)]
     let tm = unsafe {
         let result = libc::localtime_r(&raw const epoch, tm.as_mut_ptr());
+        let result = if result.is_null() {
+            libc::gmtime_r(&raw const epoch, tm.as_mut_ptr())
+        } else {
+            result
+        };
         if result.is_null() {
-            // localtime_r failed — fall back to UTC.
-            libc::gmtime_r(&raw const epoch, tm.as_mut_ptr());
+            return "00:00:00".to_owned();
         }
         tm.assume_init()
     };

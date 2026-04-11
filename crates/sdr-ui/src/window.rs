@@ -1407,12 +1407,13 @@ fn connect_transcript_panel(
     let text_view = transcript.text_view.clone();
 
     transcript.enable_row.connect_active_notify(move |row| {
-        let mut eng = engine_clone.borrow_mut();
-
         if row.is_active() {
-            match eng.start() {
+            // Scope the borrow so it's dropped before any potential re-entry
+            // from row.set_active(false) on error.
+            let start_result = engine_clone.borrow_mut().start();
+            match start_result {
                 Ok(event_rx) => {
-                    if let Some(audio_tx) = eng.audio_sender() {
+                    if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
                         state_clone
                             .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
                     }
@@ -1445,7 +1446,6 @@ fn connect_transcript_panel(
                                         let buf = tv.buffer();
                                         let mut end = buf.end_iter();
                                         buf.insert(&mut end, &format!("[{timestamp}] {text}\n"));
-                                        // Auto-scroll to bottom
                                         let mark = buf.create_mark(None, &buf.end_iter(), false);
                                         tv.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
                                         buf.delete_mark(&mark);
@@ -1471,7 +1471,7 @@ fn connect_transcript_panel(
             }
         } else {
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
-            eng.shutdown_nonblocking();
+            engine_clone.borrow_mut().shutdown_nonblocking();
             status_label.set_text("");
             status_label.set_visible(false);
             progress_bar.set_visible(false);

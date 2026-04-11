@@ -1035,7 +1035,14 @@ fn process_iq_block(
                                 interleaved.push(s.l);
                                 interleaved.push(s.r);
                             }
-                            let _ = tx.try_send(interleaved);
+                            if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
+                                tx.try_send(interleaved)
+                            {
+                                state.transcription_tx = None;
+                                tracing::info!(
+                                    "transcription receiver disconnected, disabling tap"
+                                );
+                            }
                         }
 
                         // Apply volume with perceptual (power-law) scaling.
