@@ -65,7 +65,7 @@ pub fn build_transcript_panel() -> TranscriptPanel {
     let scroll = gtk4::ScrolledWindow::builder()
         .child(&text_view)
         .min_content_height(150)
-        .max_content_height(300)
+        .vexpand(true)
         .css_classes(["card"])
         .margin_top(8)
         .build();
@@ -84,6 +84,7 @@ pub fn build_transcript_panel() -> TranscriptPanel {
     let content_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(4)
+        .vexpand(true)
         .build();
     content_box.append(&status_label);
     content_box.append(&progress_bar);

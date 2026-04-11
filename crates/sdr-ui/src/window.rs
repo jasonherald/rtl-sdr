@@ -105,7 +105,13 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     setup_app_actions(app, &window, config, &rr_button);
 
     // Wire transcript panel (separate from sidebar panels).
-    connect_transcript_panel(&transcript_panel, &state);
+    let transcription_engine = connect_transcript_panel(&transcript_panel, &state);
+
+    // On window close, signal the worker to stop without blocking.
+    window.connect_close_request(move |_| {
+        transcription_engine.borrow_mut().shutdown_nonblocking();
+        glib::Propagation::Proceed
+    });
 
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
@@ -421,6 +427,7 @@ fn build_split_view(
     let transcript_scroll = gtk4::ScrolledWindow::builder()
         .child(&transcript_panel.widget)
         .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
         .width_request(320)
         .margin_top(12)
         .margin_bottom(12)
@@ -433,6 +440,7 @@ fn build_split_view(
         .transition_duration(200)
         .reveal_child(false)
         .child(&transcript_scroll)
+        .hexpand(false)
         .build();
 
     // Wrap content + transcript revealer in an HBox.
@@ -1368,10 +1376,12 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
 }
 
 /// Connect transcript panel controls to DSP commands.
+///
+/// Returns the engine handle so it can be stopped on window close.
 fn connect_transcript_panel(
     transcript: &sidebar::transcript_panel::TranscriptPanel,
     state: &Rc<AppState>,
-) {
+) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
     use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
 
     let engine: Rc<RefCell<TranscriptionEngine>> =
@@ -1448,6 +1458,8 @@ fn connect_transcript_panel(
                 progress_bar.set_visible(false);
             }
         });
+
+    engine
 }
 
 /// Register application-level actions (Preferences, About, Quit).

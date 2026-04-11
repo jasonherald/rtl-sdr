@@ -1750,6 +1750,7 @@ dependencies = [
  "dirs-next",
  "libc",
  "reqwest",
+ "rustfft",
  "sdr-types",
  "thiserror 2.0.18",
  "tracing",

@@ -1027,6 +1027,17 @@ fn process_iq_block(
                             let _ = dsp_tx.send(DspToUi::SignalLevel(level_db));
                         }
 
+                        // Send audio copy to transcription worker BEFORE volume
+                        // scaling so recognition isn't affected by the volume knob.
+                        if let Some(ref tx) = state.transcription_tx {
+                            let mut interleaved = Vec::with_capacity(audio_count * 2);
+                            for s in &state.audio_buf[..audio_count] {
+                                interleaved.push(s.l);
+                                interleaved.push(s.r);
+                            }
+                            let _ = tx.try_send(interleaved);
+                        }
+
                         // Apply volume with perceptual (power-law) scaling.
                         // Quadratic curve maps the linear slider to perceived loudness.
                         let vol = state.volume * state.volume;
@@ -1044,16 +1055,6 @@ fn process_iq_block(
                             let _ = dsp_tx
                                 .send(DspToUi::Error("Audio recording write failed".to_string()));
                             let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
-                        }
-
-                        // Send audio copy to transcription worker (non-blocking).
-                        if let Some(ref tx) = state.transcription_tx {
-                            let mut interleaved = Vec::with_capacity(audio_count * 2);
-                            for s in &state.audio_buf[..audio_count] {
-                                interleaved.push(s.l);
-                                interleaved.push(s.r);
-                            }
-                            let _ = tx.try_send(interleaved);
                         }
 
                         // Send to PipeWire for playback.
