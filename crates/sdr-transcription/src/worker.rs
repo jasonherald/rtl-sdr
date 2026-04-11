@@ -92,8 +92,14 @@ fn run_worker_inner(
         path
     };
 
+    tracing::info!(?model_path, "loading Whisper model");
     let ctx = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-        .map_err(|e| format!("failed to load whisper model: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to load model: {e}. If using a GPU, try a smaller model — \
+                 the selected model may exceed available VRAM."
+            )
+        })?;
 
     let mut state = ctx
         .create_state()
