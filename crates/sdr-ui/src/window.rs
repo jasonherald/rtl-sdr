@@ -1410,6 +1410,9 @@ fn connect_transcript_panel(
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
             // Read selected model from dropdown.
+            // Lock model selection while transcription is active.
+            model_row.set_sensitive(false);
+
             let model_idx = model_row.selected() as usize;
             let whisper_model = sdr_transcription::WhisperModel::ALL
                 .get(model_idx)
@@ -1474,10 +1477,12 @@ fn connect_transcript_panel(
                 }
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
+                    model_row.set_sensitive(true);
                     row.set_active(false);
                 }
             }
         } else {
+            model_row.set_sensitive(true);
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();
             status_label.set_text("");
