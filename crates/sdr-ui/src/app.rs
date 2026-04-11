@@ -54,8 +54,10 @@ pub fn build_app() -> adw::Application {
         let config = match sdr_config::ConfigManager::load(&config_path, &defaults) {
             Ok(c) => std::sync::Arc::new(c),
             Err(e) => {
-                tracing::warn!("config load failed: {e}");
-                return;
+                tracing::warn!("config load failed, using in-memory defaults: {e}");
+                // Fall back to in-memory config so the app still launches.
+                // Settings won't persist but the app is functional.
+                std::sync::Arc::new(sdr_config::ConfigManager::in_memory(&defaults))
             }
         };
         window::build_window(app, &config);

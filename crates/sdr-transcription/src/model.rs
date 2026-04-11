@@ -37,11 +37,11 @@ impl WhisperModel {
     /// Human-readable display label.
     pub fn label(self) -> &'static str {
         match self {
-            Self::TinyEn => "Tiny (English, ~75 MB)",
-            Self::BaseEn => "Base (English, ~142 MB)",
-            Self::SmallEn => "Small (English, ~466 MB)",
-            Self::MediumEn => "Medium (English, ~1.5 GB)",
-            Self::LargeV3 => "Large v3 (Multilingual, ~3.1 GB)",
+            Self::TinyEn => "Tiny — 75 MB",
+            Self::BaseEn => "Base — 142 MB",
+            Self::SmallEn => "Small — 466 MB",
+            Self::MediumEn => "Medium — 1.5 GB (GPU)",
+            Self::LargeV3 => "Large v3 — 3.1 GB (GPU)",
         }
     }
 

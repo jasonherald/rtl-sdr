@@ -25,6 +25,15 @@ anyhow.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
 
+[features]
+default = []
+cuda = ["sdr-ui/cuda"]
+hipblas = ["sdr-ui/hipblas"]
+vulkan = ["sdr-ui/vulkan"]
+metal = ["sdr-ui/metal"]
+intel-sycl = ["sdr-ui/intel-sycl"]
+openblas = ["sdr-ui/openblas"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-ui = { workspace = true, features = ["pipewire"] }
 

@@ -70,6 +70,22 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
         )
         .build();
 
+    // --- Keyring availability check ---
+    let keyring_available = {
+        let store = KeyringStore::new(KEYRING_SERVICE);
+        store.has(KEY_RR_USERNAME).is_ok()
+    };
+
+    if !keyring_available {
+        let banner = adw::ActionRow::builder()
+            .title("Secure storage unavailable")
+            .subtitle("Install GNOME Keyring or KeePassXC to store credentials")
+            .css_classes(["error"])
+            .build();
+        banner.add_prefix(&gtk4::Image::from_icon_name("dialog-warning-symbolic"));
+        group.add(&banner);
+    }
+
     // --- Sign up link ---
     let signup_row = adw::ActionRow::builder()
         .title("Don't have an account?")
@@ -94,8 +110,14 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
     let password_row = adw::PasswordEntryRow::builder().title("Password").build();
 
     // Pre-fill username if credentials already exist
-    if let Some((stored_user, _)) = load_rr_credentials() {
-        username_row.set_text(&stored_user);
+    if keyring_available {
+        if let Some((stored_user, _)) = load_rr_credentials() {
+            username_row.set_text(&stored_user);
+        }
+    } else {
+        // Disable credential entry when keyring is unavailable.
+        username_row.set_sensitive(false);
+        password_row.set_sensitive(false);
     }
 
     group.add(&username_row);
@@ -121,12 +143,14 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
     let test_button = gtk4::Button::builder()
         .label("Test & Save")
         .css_classes(["suggested-action"])
+        .sensitive(keyring_available)
         .build();
 
     let remove_button = gtk4::Button::builder()
         .label("Remove Credentials")
         .css_classes(["destructive-action"])
         .visible(has_credentials.get())
+        .sensitive(keyring_available)
         .build();
 
     button_box.append(&test_button);

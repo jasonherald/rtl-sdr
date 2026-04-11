@@ -100,12 +100,29 @@ impl ConfigManager {
         Ok(mgr)
     }
 
+    /// Create an in-memory configuration that won't persist to disk.
+    ///
+    /// Used as a fallback when the config file can't be loaded (permissions,
+    /// disk full, etc.). The app remains functional with default settings.
+    pub fn in_memory(defaults: &Value) -> Self {
+        Self {
+            path: PathBuf::new(),
+            data: Arc::new(RwLock::new(defaults.clone())),
+            modified: Arc::new(Mutex::new(false)),
+            auto_save_handle: None,
+        }
+    }
+
     /// Save configuration to disk.
     ///
     /// # Errors
     ///
     /// Returns `ConfigError::Io` on write failure.
     pub fn save(&self) -> Result<(), ConfigError> {
+        // In-memory configs have no path — skip saving.
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let data = self.data.read().unwrap_or_else(PoisonError::into_inner);
         let content =
             serde_json::to_string_pretty(&*data).map_err(|e| ConfigError::Json(e.to_string()))?;
@@ -146,6 +163,10 @@ impl ConfigManager {
     ///
     /// Checks for modifications every second and saves if needed.
     pub fn enable_auto_save(&mut self) {
+        // In-memory configs have no path — nothing to auto-save.
+        if self.path.as_os_str().is_empty() {
+            return;
+        }
         if self.auto_save_handle.is_some() {
             return;
         }
@@ -408,5 +429,29 @@ mod tests {
         let mgr = ConfigManager::load(&path, &json!({})).unwrap();
         assert_eq!(mgr.path(), path);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn in_memory_save_is_noop() {
+        let mgr = ConfigManager::in_memory(&json!({"key": "value"}));
+        // save() should succeed without creating any file.
+        mgr.save().unwrap();
+        assert!(mgr.path().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn in_memory_enable_auto_save_is_noop() {
+        let mut mgr = ConfigManager::in_memory(&json!({}));
+        mgr.enable_auto_save();
+        // No auto-save handle should be created for in-memory configs.
+        assert!(mgr.auto_save_handle.is_none());
+    }
+
+    #[test]
+    fn in_memory_read_write_works() {
+        let mgr = ConfigManager::in_memory(&json!({"volume": 0.5}));
+        mgr.read(|v| assert_eq!(v["volume"], 0.5));
+        mgr.write(|v| v["volume"] = json!(0.8));
+        mgr.read(|v| assert_eq!(v["volume"], 0.8));
     }
 }

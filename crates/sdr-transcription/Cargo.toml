@@ -6,6 +6,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+cuda = ["whisper-rs/cuda"]
+hipblas = ["whisper-rs/hipblas"]
+vulkan = ["whisper-rs/vulkan"]
+metal = ["whisper-rs/metal"]
+intel-sycl = ["whisper-rs/intel-sycl"]
+openblas = ["whisper-rs/openblas"]
+
 [dependencies]
 whisper-rs.workspace = true
 reqwest.workspace = true
