@@ -100,12 +100,29 @@ impl ConfigManager {
         Ok(mgr)
     }
 
+    /// Create an in-memory configuration that won't persist to disk.
+    ///
+    /// Used as a fallback when the config file can't be loaded (permissions,
+    /// disk full, etc.). The app remains functional with default settings.
+    pub fn in_memory(defaults: &Value) -> Self {
+        Self {
+            path: PathBuf::new(),
+            data: Arc::new(RwLock::new(defaults.clone())),
+            modified: Arc::new(Mutex::new(false)),
+            auto_save_handle: None,
+        }
+    }
+
     /// Save configuration to disk.
     ///
     /// # Errors
     ///
     /// Returns `ConfigError::Io` on write failure.
     pub fn save(&self) -> Result<(), ConfigError> {
+        // In-memory configs have no path — skip saving.
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let data = self.data.read().unwrap_or_else(PoisonError::into_inner);
         let content =
             serde_json::to_string_pretty(&*data).map_err(|e| ConfigError::Json(e.to_string()))?;
