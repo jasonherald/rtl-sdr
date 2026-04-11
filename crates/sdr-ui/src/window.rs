@@ -1,5 +1,6 @@
 //! Main window construction — header bar, split view, breakpoints, DSP bridge.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -588,6 +589,7 @@ fn connect_sidebar_panels(
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
+    connect_transcript_panel(panels, state);
     connect_navigation_panel(
         panels,
         state,
@@ -1316,6 +1318,89 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             } else {
                 tracing::info!("stopping audio recording");
                 state_rec.send_dsp(UiToDsp::StopAudioRecording);
+            }
+        });
+}
+
+/// Connect transcript panel controls to DSP commands.
+fn connect_transcript_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
+    use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
+
+    let engine: Rc<RefCell<TranscriptionEngine>> =
+        Rc::new(RefCell::new(TranscriptionEngine::new()));
+
+    let state_clone = Rc::clone(state);
+    let engine_clone = Rc::clone(&engine);
+    let status_label = panels.transcript.status_label.clone();
+    let progress_bar = panels.transcript.progress_bar.clone();
+    let text_view = panels.transcript.text_view.clone();
+
+    panels
+        .transcript
+        .enable_row
+        .connect_active_notify(move |row| {
+            let mut eng = engine_clone.borrow_mut();
+
+            if row.is_active() {
+                match eng.start() {
+                    Ok(event_rx) => {
+                        if let Some(audio_tx) = eng.audio_sender() {
+                            state_clone
+                                .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
+                        }
+
+                        status_label.set_text("Starting...");
+                        status_label.set_visible(true);
+
+                        let status = status_label.clone();
+                        let progress = progress_bar.clone();
+                        let tv = text_view.clone();
+
+                        glib::timeout_add_local(Duration::from_millis(100), move || {
+                            while let Ok(event) = event_rx.try_recv() {
+                                match event {
+                                    TranscriptionEvent::Downloading { progress_pct } => {
+                                        status.set_text(&format!(
+                                            "Downloading model ({progress_pct}%)..."
+                                        ));
+                                        status.set_visible(true);
+                                        progress.set_fraction(f64::from(progress_pct) / 100.0);
+                                        progress.set_visible(true);
+                                    }
+                                    TranscriptionEvent::Ready => {
+                                        status.set_text("Listening...");
+                                        status.set_css_classes(&["success"]);
+                                        progress.set_visible(false);
+                                    }
+                                    TranscriptionEvent::Text { timestamp, text } => {
+                                        let buf = tv.buffer();
+                                        let mut end = buf.end_iter();
+                                        buf.insert(&mut end, &format!("[{timestamp}] {text}\n"));
+                                        // Auto-scroll to bottom
+                                        let mark = buf.create_mark(None, &buf.end_iter(), false);
+                                        tv.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
+                                        buf.delete_mark(&mark);
+                                    }
+                                    TranscriptionEvent::Error(msg) => {
+                                        status.set_text(&msg);
+                                        status.set_css_classes(&["error"]);
+                                    }
+                                }
+                            }
+                            glib::ControlFlow::Continue
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to start transcription: {e}");
+                        row.set_active(false);
+                    }
+                }
+            } else {
+                state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
+                eng.stop();
+                status_label.set_text("");
+                status_label.set_visible(false);
+                progress_bar.set_visible(false);
             }
         });
 }
