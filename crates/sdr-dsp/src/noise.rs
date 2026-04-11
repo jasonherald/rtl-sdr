@@ -154,15 +154,16 @@ impl PowerSquelch {
                 // that are likely strong signals rather than noise. Only cap
                 // when the measurement is far above the current estimate
                 // (more than 2x the open margin).
-                let extreme_threshold =
-                    self.noise_floor_db + AUTO_SQUELCH_OPEN_MARGIN_DB * 2.0;
+                let extreme_threshold = self.noise_floor_db + AUTO_SQUELCH_OPEN_MARGIN_DB * 2.0;
                 let capped_db = if measured_db > extreme_threshold {
                     self.noise_floor_db + NOISE_FLOOR_MAX_RISE_DB_PER_BLOCK
                 } else {
                     measured_db
                 };
-                self.noise_floor_db = NOISE_FLOOR_FAST_ALPHA
-                    .mul_add(capped_db, (1.0 - NOISE_FLOOR_FAST_ALPHA) * self.noise_floor_db);
+                self.noise_floor_db = NOISE_FLOOR_FAST_ALPHA.mul_add(
+                    capped_db,
+                    (1.0 - NOISE_FLOOR_FAST_ALPHA) * self.noise_floor_db,
+                );
             } else if !self.open || measured_db < self.noise_floor_db + AUTO_SQUELCH_CLOSE_MARGIN_DB
             {
                 self.noise_floor_db = NOISE_FLOOR_ALPHA
