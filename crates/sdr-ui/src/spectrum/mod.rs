@@ -43,6 +43,10 @@ use crate::messages::UiToDsp;
 /// Shared cursor callback type — invoked with `(frequency_hz, power_db)`.
 type CursorCallback = Rc<RefCell<Option<Box<dyn Fn(f64, f32)>>>>;
 
+/// Shared VFO-offset callback type — invoked with `(offset_hz)` when the
+/// user click-to-tunes or drags the VFO to a new frequency offset.
+type VfoOffsetCallback = Rc<RefCell<Option<Box<dyn Fn(f64)>>>>;
+
 /// Number of FFT bins for the display (used for initial buffer sizing).
 const FFT_SIZE: usize = 2048;
 
@@ -110,6 +114,10 @@ pub struct SpectrumHandle {
     /// Pre-allocated buffer for fftshift of waterfall data (avoids per-frame alloc).
     shift_buffer: Rc<RefCell<Vec<f32>>>,
     cursor_callback: CursorCallback,
+    /// Callback invoked when the VFO offset changes from user interaction
+    /// (click-to-tune or drag). Used by `window.rs` to update the frequency
+    /// display and status bar.
+    vfo_offset_callback: VfoOffsetCallback,
     /// Full (unzoomed) FFT bandwidth in Hz, set by `set_display_bandwidth()`.
     /// Used by the FFT plot and waterfall renderers for zoom mapping.
     full_bandwidth: Rc<Cell<f64>>,
@@ -276,6 +284,15 @@ impl SpectrumHandle {
     pub fn connect_cursor_moved<F: Fn(f64, f32) + 'static>(&self, f: F) {
         *self.cursor_callback.borrow_mut() = Some(Box::new(f));
     }
+
+    /// Register a callback invoked when the VFO offset changes from user
+    /// interaction (click-to-tune or drag).
+    ///
+    /// The callback receives `offset_hz` — the new VFO offset from center.
+    /// Use this to update the frequency display and status bar.
+    pub fn connect_vfo_offset_changed<F: Fn(f64) + 'static>(&self, f: F) {
+        *self.vfo_offset_callback.borrow_mut() = Some(Box::new(f));
+    }
 }
 
 /// Height in pixels for the collapsible signal history area.
@@ -286,6 +303,7 @@ const SIGNAL_HISTORY_HEIGHT: i32 = 100;
 ///
 /// Returns a `(gtk4::Box, SpectrumHandle)` — the box widget for layout,
 /// and a handle for pushing real FFT/signal data into the display.
+#[allow(clippy::too_many_lines)]
 pub fn build_spectrum_view(
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
 ) -> (gtk4::Box, SpectrumHandle) {
@@ -298,6 +316,7 @@ pub fn build_spectrum_view(
     let max_db: Rc<Cell<f32>> = Rc::new(Cell::new(DEFAULT_MAX_DB));
     let fill_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(true));
     let cursor_callback: CursorCallback = Rc::new(RefCell::new(None));
+    let vfo_offset_callback: VfoOffsetCallback = Rc::new(RefCell::new(None));
     let full_bandwidth: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
     let center_freq: Rc<Cell<f64>> = Rc::new(Cell::new(100_000_000.0)); // default 100 MHz
 
@@ -339,8 +358,13 @@ pub fn build_spectrum_view(
         build_signal_history_area(Rc::clone(&signal_history_state), &min_db, &max_db);
 
     // Attach interaction gestures to both the waterfall and FFT areas.
-    attach_click_gesture(&waterfall_area, &vfo_state, dsp_tx.clone());
-    attach_drag_gesture(&waterfall_area, &vfo_state, dsp_tx);
+    attach_click_gesture(
+        &waterfall_area,
+        &vfo_state,
+        dsp_tx.clone(),
+        &vfo_offset_callback,
+    );
+    attach_drag_gesture(&waterfall_area, &vfo_state, dsp_tx, &vfo_offset_callback);
     attach_scroll_gesture(&waterfall_area, &vfo_state);
 
     // Also attach scroll-to-zoom on the FFT area for convenience.
@@ -397,6 +421,7 @@ pub fn build_spectrum_view(
         avg_buffer: Rc::new(RefCell::new(Vec::new())),
         shift_buffer: Rc::new(RefCell::new(Vec::new())),
         cursor_callback,
+        vfo_offset_callback,
         full_bandwidth,
         center_freq,
     };
@@ -555,11 +580,13 @@ fn attach_click_gesture(
     area: &gtk4::DrawingArea,
     vfo_state: &Rc<RefCell<VfoState>>,
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
+    vfo_offset_callback: &VfoOffsetCallback,
 ) {
     let click = gtk4::GestureClick::new();
 
     let vfo_state = Rc::clone(vfo_state);
     let area_weak = area.downgrade();
+    let offset_cb = Rc::clone(vfo_offset_callback);
     click.connect_pressed(move |_gesture, _n_press, x, _y| {
         let Some(area) = area_weak.upgrade() else {
             return;
@@ -577,6 +604,11 @@ fn attach_click_gesture(
             tracing::warn!("click-to-tune DSP send failed: {e}");
         }
 
+        // Notify the UI so the frequency display and status bar update.
+        if let Some(cb) = offset_cb.borrow().as_ref() {
+            cb(offset);
+        }
+
         area.queue_draw();
     });
 
@@ -589,6 +621,7 @@ fn attach_drag_gesture(
     area: &gtk4::DrawingArea,
     vfo_state: &Rc<RefCell<VfoState>>,
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
+    vfo_offset_callback: &VfoOffsetCallback,
 ) {
     let drag = gtk4::GestureDrag::new();
 
@@ -640,6 +673,7 @@ fn attach_drag_gesture(
     let start_bw_update = Rc::clone(&drag_start_bw_hz);
     let area_weak_update = area.downgrade();
     let dsp_tx_update = dsp_tx.clone();
+    let offset_cb = Rc::clone(vfo_offset_callback);
     drag.connect_drag_update(move |_gesture, offset_x, _offset_y| {
         let Some(area) = area_weak_update.upgrade() else {
             return;
@@ -650,7 +684,12 @@ fn attach_drag_gesture(
         if vfo.dragging {
             let delta_hz = vfo.pixels_to_hz(offset_x, width);
             vfo.offset_hz = start_offset_update.get() + delta_hz;
-            let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(vfo.offset_hz));
+            let offset = vfo.offset_hz;
+            let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(offset));
+            drop(vfo);
+            if let Some(cb) = offset_cb.borrow().as_ref() {
+                cb(offset);
+            }
             area.queue_draw();
         } else if let Some(handle) = vfo.bw_dragging {
             let delta_hz = vfo.pixels_to_hz(offset_x, width);
@@ -684,8 +723,13 @@ fn attach_drag_gesture(
                     }
                 }
             }
-            let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(vfo.offset_hz));
+            let offset = vfo.offset_hz;
+            let _ = dsp_tx_update.send(UiToDsp::SetVfoOffset(offset));
             let _ = dsp_tx_update.send(UiToDsp::SetBandwidth(vfo.bandwidth_hz));
+            drop(vfo);
+            if let Some(cb) = offset_cb.borrow().as_ref() {
+                cb(offset);
+            }
             area.queue_draw();
         }
     });
