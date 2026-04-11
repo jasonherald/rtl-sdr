@@ -49,8 +49,9 @@ pub enum TranscriptionEvent {
 pub fn run_worker(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
+    model: model::WhisperModel,
 ) {
-    if let Err(e) = run_worker_inner(audio_rx, event_tx) {
+    if let Err(e) = run_worker_inner(audio_rx, event_tx, model) {
         let _ = event_tx.send(TranscriptionEvent::Error(e));
     }
 }
@@ -60,11 +61,12 @@ pub fn run_worker(
 fn run_worker_inner(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
+    model: model::WhisperModel,
 ) -> Result<(), String> {
     // --- Model download / load ---
-    let model_path = if model::model_exists() {
-        tracing::info!("whisper model already present");
-        model::model_path()
+    let model_path = if model::model_exists(model) {
+        tracing::info!(?model, "whisper model already present");
+        model::model_path(model)
     } else {
         tracing::info!("whisper model not found, downloading");
         let (progress_tx, progress_rx) = mpsc::channel::<u8>();
@@ -80,7 +82,7 @@ fn run_worker_inner(
             })
             .map_err(|e| format!("failed to spawn progress thread: {e}"))?;
 
-        let path = model::download_model(&progress_tx)
+        let path = model::download_model(model, &progress_tx)
             .map_err(|e| format!("model download failed: {e}"))?;
 
         // Drop the sender so the progress thread exits.
@@ -106,7 +108,14 @@ fn run_worker_inner(
     let mut mono_buf: Vec<f32> = Vec::with_capacity(CHUNK_SAMPLES * 2);
 
     while let Ok(interleaved) = audio_rx.recv() {
+        // Process the first buffer we received via blocking recv().
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
+
+        // Drain any additional queued buffers to minimize frame drops
+        // during long inference passes.
+        while let Ok(extra) = audio_rx.try_recv() {
+            resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
+        }
 
         while mono_buf.len() >= CHUNK_SAMPLES {
             let mut chunk: Vec<f32> = mono_buf.drain(..CHUNK_SAMPLES).collect();
