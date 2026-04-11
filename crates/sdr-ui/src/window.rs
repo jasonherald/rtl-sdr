@@ -1405,12 +1405,23 @@ fn connect_transcript_panel(
     let status_label = transcript.status_label.clone();
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
+    let model_row = transcript.model_row.clone();
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
+            // Read selected model from dropdown.
+            // Lock model selection while transcription is active.
+            model_row.set_sensitive(false);
+
+            let model_idx = model_row.selected() as usize;
+            let whisper_model = sdr_transcription::WhisperModel::ALL
+                .get(model_idx)
+                .copied()
+                .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
+
             // Scope the borrow so it's dropped before any potential re-entry
             // from row.set_active(false) on error.
-            let start_result = engine_clone.borrow_mut().start();
+            let start_result = engine_clone.borrow_mut().start(whisper_model);
             match start_result {
                 Ok(event_rx) => {
                     if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
@@ -1466,10 +1477,12 @@ fn connect_transcript_panel(
                 }
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
+                    model_row.set_sensitive(true);
                     row.set_active(false);
                 }
             }
         } else {
+            model_row.set_sensitive(true);
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();
             status_label.set_text("");

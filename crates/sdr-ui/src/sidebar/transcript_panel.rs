@@ -4,13 +4,15 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-/// Transcript panel with toggle switch, status label, progress bar,
-/// scrolling transcript log, and clear button.
+/// Transcript panel with toggle switch, model picker, status label,
+/// progress bar, scrolling transcript log, and clear button.
 pub struct TranscriptPanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
     pub widget: adw::PreferencesGroup,
     /// Toggle to enable/disable live transcription.
     pub enable_row: adw::SwitchRow,
+    /// Model size selector.
+    pub model_row: adw::ComboRow,
     /// Status label (downloading, listening, error).
     pub status_label: gtk4::Label,
     /// Model download progress bar.
@@ -32,9 +34,21 @@ pub fn build_transcript_panel() -> TranscriptPanel {
 
     let enable_row = adw::SwitchRow::builder()
         .title("Enable Transcription")
-        .subtitle("Whisper tiny (English)")
         .build();
     group.add(&enable_row);
+
+    // Model selector
+    let model_labels: Vec<&str> = sdr_transcription::WhisperModel::ALL
+        .iter()
+        .map(|m| m.label())
+        .collect();
+    let model_list = gtk4::StringList::new(&model_labels);
+    let model_row = adw::ComboRow::builder()
+        .title("Model")
+        .model(&model_list)
+        .selected(0)
+        .build();
+    group.add(&model_row);
 
     let status_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
@@ -95,6 +109,7 @@ pub fn build_transcript_panel() -> TranscriptPanel {
     TranscriptPanel {
         widget: group,
         enable_row,
+        model_row,
         status_label,
         progress_bar,
         text_view,

@@ -4,12 +4,56 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-/// Whisper tiny English GGML model URL.
-const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
+/// Base URL for Whisper GGML models on `HuggingFace`.
+const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
-/// Model filename.
-const MODEL_FILENAME: &str = "ggml-tiny.en.bin";
+/// Available Whisper model variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhisperModel {
+    TinyEn,
+    BaseEn,
+    SmallEn,
+    MediumEn,
+    LargeV3,
+}
+
+impl WhisperModel {
+    /// GGML filename for this model variant.
+    pub fn filename(self) -> &'static str {
+        match self {
+            Self::TinyEn => "ggml-tiny.en.bin",
+            Self::BaseEn => "ggml-base.en.bin",
+            Self::SmallEn => "ggml-small.en.bin",
+            Self::MediumEn => "ggml-medium.en.bin",
+            Self::LargeV3 => "ggml-large-v3.bin",
+        }
+    }
+
+    /// Download URL for this model variant.
+    pub fn url(self) -> String {
+        format!("{MODEL_BASE_URL}/{}", self.filename())
+    }
+
+    /// Human-readable display label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TinyEn => "Tiny (English, ~75 MB)",
+            Self::BaseEn => "Base (English, ~142 MB)",
+            Self::SmallEn => "Small (English, ~466 MB)",
+            Self::MediumEn => "Medium (English, ~1.5 GB)",
+            Self::LargeV3 => "Large v3 (Multilingual, ~3.1 GB)",
+        }
+    }
+
+    /// All available variants in order.
+    pub const ALL: &[Self] = &[
+        Self::TinyEn,
+        Self::BaseEn,
+        Self::SmallEn,
+        Self::MediumEn,
+        Self::LargeV3,
+    ];
+}
 
 /// Errors from model download and path management.
 #[derive(Debug, thiserror::Error)]
@@ -28,32 +72,36 @@ pub fn models_dir() -> PathBuf {
         .join("models")
 }
 
-/// Returns the full path to the Whisper tiny English model.
-pub fn model_path() -> PathBuf {
-    models_dir().join(MODEL_FILENAME)
+/// Returns the full path for a given model variant.
+pub fn model_path(model: WhisperModel) -> PathBuf {
+    models_dir().join(model.filename())
 }
 
-/// Check if the model file exists.
-pub fn model_exists() -> bool {
-    model_path().is_file()
+/// Check if a model file exists locally.
+pub fn model_exists(model: WhisperModel) -> bool {
+    model_path(model).is_file()
 }
 
-/// Download the Whisper tiny English model, sending progress events.
+/// Download a Whisper model, sending progress events.
 /// Blocks until download completes.
 #[allow(clippy::cast_possible_truncation)]
-pub fn download_model(progress_tx: &mpsc::Sender<u8>) -> Result<PathBuf, ModelError> {
+pub fn download_model(
+    model: WhisperModel,
+    progress_tx: &mpsc::Sender<u8>,
+) -> Result<PathBuf, ModelError> {
     let dir = models_dir();
     std::fs::create_dir_all(&dir)?;
 
-    let dest = dir.join(MODEL_FILENAME);
-    let part = dir.join(format!("{MODEL_FILENAME}.part"));
-    tracing::info!(?dest, "downloading Whisper model");
+    let filename = model.filename();
+    let dest = dir.join(filename);
+    let part = dir.join(format!("{filename}.part"));
+    tracing::info!(?dest, model = ?model, "downloading Whisper model");
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_mins(2))
         .build()?;
 
-    let response = client.get(MODEL_URL).send()?.error_for_status()?;
+    let response = client.get(model.url()).send()?.error_for_status()?;
     let total_size = response.content_length().unwrap_or(0);
 
     let mut file = std::fs::File::create(&part)?;
@@ -100,16 +148,24 @@ mod tests {
 
     #[test]
     fn model_path_includes_filename() {
-        let path = model_path();
+        let path = model_path(WhisperModel::TinyEn);
         assert_eq!(
             path.file_name().and_then(|f| f.to_str()),
-            Some(MODEL_FILENAME)
+            Some("ggml-tiny.en.bin")
         );
     }
 
     #[test]
-    fn model_exists_returns_false_when_no_file() {
-        // The model file should not exist in the test environment.
-        assert!(!model_exists());
+    fn all_models_have_unique_filenames() {
+        let filenames: Vec<_> = WhisperModel::ALL.iter().map(|m| m.filename()).collect();
+        let unique: std::collections::HashSet<_> = filenames.iter().collect();
+        assert_eq!(filenames.len(), unique.len());
+    }
+
+    #[test]
+    fn model_url_contains_filename() {
+        for model in WhisperModel::ALL {
+            assert!(model.url().contains(model.filename()));
+        }
     }
 }

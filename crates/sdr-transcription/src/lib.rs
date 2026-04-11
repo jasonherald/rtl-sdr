@@ -9,12 +9,16 @@ pub mod model;
 pub mod resampler;
 pub mod worker;
 
+pub use model::WhisperModel;
 pub use worker::TranscriptionEvent;
 
 use std::sync::mpsc;
 
 /// Bounded channel capacity for audio buffers from DSP → transcription.
-const AUDIO_CHANNEL_CAPACITY: usize = 10;
+/// Each buffer is ~1024-4096 stereo samples (~20-80ms). At 48 kHz with
+/// 5-second inference chunks, we need ~250 buffers to avoid drops during
+/// a single inference pass. 512 gives comfortable headroom.
+const AUDIO_CHANNEL_CAPACITY: usize = 512;
 
 /// Error type for transcription operations.
 #[derive(Debug, thiserror::Error)]
@@ -47,9 +51,12 @@ impl TranscriptionEngine {
         }
     }
 
-    /// Start the transcription worker thread.
+    /// Start the transcription worker thread with the given model.
     /// Returns a receiver for `TranscriptionEvent`.
-    pub fn start(&mut self) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
+    pub fn start(
+        &mut self,
+        whisper_model: WhisperModel,
+    ) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
         if self.worker_thread.is_some() {
             return Err(TranscriptionError::AlreadyRunning);
         }
@@ -60,7 +67,7 @@ impl TranscriptionEngine {
         let handle = std::thread::Builder::new()
             .name("transcription-worker".into())
             .spawn(move || {
-                worker::run_worker(&audio_rx, &event_tx);
+                worker::run_worker(&audio_rx, &event_tx, whisper_model);
             })?;
 
         self.audio_tx = Some(audio_tx);
