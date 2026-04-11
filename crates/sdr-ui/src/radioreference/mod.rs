@@ -5,18 +5,16 @@ mod frequency_list;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4::gio;
-use gtk4::glib;
-use gtk4::prelude::*;
-use libadwaita as adw;
-use libadwaita::prelude::*;
-use sdr_radioreference::RrFrequency;
-
 use crate::preferences::accounts_page::load_rr_credentials;
 use crate::sidebar::navigation_panel::{
     Bookmark, format_frequency, load_bookmarks, parse_demod_mode, save_bookmarks,
 };
 use frequency_list::FrequencyRow;
+use gtk4::gio;
+use gtk4::glib;
+use gtk4::prelude::*;
+use libadwaita as adw;
+use libadwaita::prelude::*;
 
 /// Dialog content width in pixels.
 const DIALOG_WIDTH: i32 = 700;
@@ -59,7 +57,7 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
     // -----------------------------------------------------------------------
     let search_group = adw::PreferencesGroup::builder()
         .title("Search")
-        .description("Enter a US ZIP code to find local frequencies")
+        .description("Enter a US ZIP code to find local frequencies (US only)")
         .build();
 
     let zip_entry = adw::EntryRow::builder().title("ZIP Code").build();
@@ -72,11 +70,14 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
     zip_entry.add_suffix(&search_button);
 
     search_group.add(&zip_entry);
+    content.append(&search_group);
 
-    // Spinner + status row
+    // Spinner + status row — outside the preferences group for better alignment
     let status_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .spacing(8)
+        .margin_start(4)
+        .margin_top(4)
         .build();
 
     let spinner = gtk4::Spinner::builder().visible(false).build();
@@ -90,9 +91,7 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
 
     status_box.append(&spinner);
     status_box.append(&status_label);
-    search_group.add(&status_box);
-
-    content.append(&search_group);
+    content.append(&status_box);
 
     // -----------------------------------------------------------------------
     // Results section (hidden until search succeeds)
@@ -220,10 +219,9 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
                 let result = gio::spawn_blocking(move || {
                     let client = sdr_radioreference::RrClient::new(&username, &password)?;
                     let zip_info = client.get_zip_info(&zip)?;
-                    let freqs = client.get_county_frequencies(zip_info.county_id)?;
-                    Ok::<(sdr_radioreference::ZipInfo, Vec<RrFrequency>), sdr_radioreference::SoapError>(
-                        (zip_info, freqs),
-                    )
+                    let (county_name, freqs) =
+                        client.get_county_frequencies(zip_info.county_id)?;
+                    Ok::<_, sdr_radioreference::SoapError>((zip_info, county_name, freqs))
                 })
                 .await
                 .unwrap_or_else(|_| Err(sdr_radioreference::SoapError::Fault(
@@ -236,11 +234,14 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
                 search_button_ref.set_sensitive(true);
 
                 match result {
-                    Ok((zip_info, freqs)) => {
+                    Ok((zip_info, county_name, freqs)) => {
+                        let location = if county_name.is_empty() {
+                            zip_info.city.clone()
+                        } else {
+                            format!("{}, {}", zip_info.city, county_name)
+                        };
                         let msg = format!(
-                            "{}, {} \u{2014} {} frequencies",
-                            zip_info.county_name,
-                            zip_info.state_name,
+                            "{location} \u{2014} {} frequencies",
                             freqs.len()
                         );
                         show_status(&status_label, &msg, true);

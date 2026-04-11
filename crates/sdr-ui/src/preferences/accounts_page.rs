@@ -62,8 +62,30 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
 
     let group = adw::PreferencesGroup::builder()
         .title("RadioReference")
-        .description("Premium account required for frequency database access")
+        .description(
+            "Premium account required for frequency database access. \
+             Your credentials are stored securely in your system keyring \
+             (GNOME Keyring / macOS Keychain) and are never sent anywhere \
+             other than RadioReference.com.",
+        )
         .build();
+
+    // --- Sign up link ---
+    let signup_row = adw::ActionRow::builder()
+        .title("Don't have an account?")
+        .subtitle("Sign up at radioreference.com")
+        .activatable(true)
+        .build();
+    signup_row.add_suffix(&gtk4::Image::from_icon_name("external-link-symbolic"));
+    signup_row.connect_activated(|_| {
+        if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
+            "https://www.radioreference.com/premium/",
+            gtk4::gio::AppLaunchContext::NONE,
+        ) {
+            tracing::warn!("failed to open RadioReference signup URL: {e}");
+        }
+    });
+    group.add(&signup_row);
 
     // --- Username row ---
     let username_row = adw::EntryRow::builder().title("Username").build();

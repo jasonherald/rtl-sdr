@@ -90,8 +90,24 @@ pub fn populate_frequencies(
     for row_model in &rows {
         let rm = row_model.borrow();
         let freq_label = format_frequency(rm.freq.freq_hz);
-        let title = format!("{freq_label}  {}", rm.freq.mode);
-        let subtitle = rm.freq.description.clone();
+        let mapped = sdr_radioreference::mode_map::map_rr_mode(&rm.freq.mode);
+
+        // Title: alpha tag if available, otherwise description
+        let title = if rm.freq.alpha_tag.is_empty() {
+            rm.freq.description.clone()
+        } else {
+            rm.freq.alpha_tag.clone()
+        };
+
+        // Subtitle: frequency, mapped mode, tone, description (if not in title)
+        let mut parts = vec![format!("{freq_label}  {}", mapped.demod_mode)];
+        if let Some(tone) = rm.freq.tone {
+            parts.push(format!("PL {tone:.1}"));
+        }
+        if !rm.freq.alpha_tag.is_empty() && !rm.freq.description.is_empty() {
+            parts.push(rm.freq.description.clone());
+        }
+        let subtitle = parts.join("  \u{00b7}  "); // middle dot separator
 
         let action_row = adw::ActionRow::builder()
             .title(&title)

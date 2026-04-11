@@ -1,6 +1,9 @@
 //! Response types returned by the `RadioReference` SOAP API.
 
 /// Information about a US ZIP code, including its county and state.
+///
+/// The API returns county/state as numeric IDs only — names are not available
+/// from `getZipcodeInfo`.
 #[derive(Debug, Clone)]
 pub struct ZipInfo {
     /// County ID on `RadioReference`.
@@ -9,10 +12,43 @@ pub struct ZipInfo {
     pub state_id: u32,
     /// City name.
     pub city: String,
+    /// Latitude.
+    pub lat: String,
+    /// Longitude.
+    pub lon: String,
+}
+
+/// Detailed county information from `getCountyInfo`.
+#[derive(Debug, Clone)]
+pub struct CountyInfo {
+    /// County ID.
+    pub county_id: u32,
     /// County name.
     pub county_name: String,
-    /// State name.
-    pub state_name: String,
+    /// State ID.
+    pub state_id: u32,
+    /// Categories containing subcategories with frequency data.
+    pub categories: Vec<RrCategory>,
+}
+
+/// A frequency category (e.g. "Public Safety", "Business").
+#[derive(Debug, Clone)]
+pub struct RrCategory {
+    /// Category ID.
+    pub id: u32,
+    /// Category name.
+    pub name: String,
+    /// Subcategories within this category.
+    pub subcategories: Vec<RrSubcategory>,
+}
+
+/// A subcategory within a category (e.g. "Police", "Fire").
+#[derive(Debug, Clone)]
+pub struct RrSubcategory {
+    /// Subcategory ID — used with `getSubcatFreqs`.
+    pub scid: u32,
+    /// Subcategory name.
+    pub name: String,
 }
 
 /// A tag (category) applied to a `RadioReference` frequency entry.
