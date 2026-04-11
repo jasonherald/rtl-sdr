@@ -436,8 +436,7 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                     (Top, b"countyName" | b"stid")
                     | (InCat, b"cid" | b"cName")
                     | (InSubcat, b"scid" | b"scName") => {
-                        current_field =
-                            String::from_utf8_lossy(local).into_owned();
+                        current_field = String::from_utf8_lossy(local).into_owned();
                     }
                     (Top, b"cats") => state = InCats,
                     (InCats, b"item") => {

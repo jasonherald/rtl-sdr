@@ -113,10 +113,8 @@ impl RrClient {
                         };
                         for freq in &mut freqs {
                             // Replace empty/useless API tags with our category tag
-                            let has_useful_tags = freq
-                                .tags
-                                .iter()
-                                .any(|t| !t.description.is_empty());
+                            let has_useful_tags =
+                                freq.tags.iter().any(|t| !t.description.is_empty());
                             if !has_useful_tags {
                                 freq.tags.clear();
                                 freq.tags.push(cat_tag.clone());

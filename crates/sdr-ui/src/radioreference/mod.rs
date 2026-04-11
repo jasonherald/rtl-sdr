@@ -5,16 +5,16 @@ mod frequency_list;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4::gio;
-use gtk4::glib;
-use gtk4::prelude::*;
-use libadwaita as adw;
-use libadwaita::prelude::*;
 use crate::preferences::accounts_page::load_rr_credentials;
 use crate::sidebar::navigation_panel::{
     Bookmark, format_frequency, load_bookmarks, parse_demod_mode, save_bookmarks,
 };
 use frequency_list::FrequencyRow;
+use gtk4::gio;
+use gtk4::glib;
+use gtk4::prelude::*;
+use libadwaita as adw;
+use libadwaita::prelude::*;
 
 /// Dialog content width in pixels.
 const DIALOG_WIDTH: i32 = 700;
