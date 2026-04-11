@@ -27,6 +27,12 @@ const NOISE_FLOOR_INITIAL_DB: f32 = -120.0;
 /// settled and the slow alpha is used.
 const NOISE_FLOOR_SETTLE_BLOCKS: u32 = 50;
 
+/// Maximum allowed rise in the noise floor estimate per block during settling (dB).
+/// Prevents strong signals at startup from biasing the floor estimate high.
+/// Must be large enough that the floor can converge from `NOISE_FLOOR_INITIAL_DB`
+/// to a typical noise floor (~-60 dB) within `NOISE_FLOOR_SETTLE_BLOCKS`.
+const NOISE_FLOOR_MAX_RISE_DB_PER_BLOCK: f32 = 3.0;
+
 /// Margin above the noise floor (dB) for squelch-open threshold.
 const AUTO_SQUELCH_OPEN_MARGIN_DB: f32 = 10.0;
 
@@ -144,10 +150,19 @@ impl PowerSquelch {
             let settling = self.settle_count < NOISE_FLOOR_SETTLE_BLOCKS;
             if settling {
                 self.settle_count = self.settle_count.saturating_add(1);
-                self.noise_floor_db = NOISE_FLOOR_FAST_ALPHA.mul_add(
-                    measured_db,
-                    (1.0 - NOISE_FLOOR_FAST_ALPHA) * self.noise_floor_db,
-                );
+                // During settling, use fast alpha but cap extreme upward jumps
+                // that are likely strong signals rather than noise. Only cap
+                // when the measurement is far above the current estimate
+                // (more than 2x the open margin).
+                let extreme_threshold =
+                    self.noise_floor_db + AUTO_SQUELCH_OPEN_MARGIN_DB * 2.0;
+                let capped_db = if measured_db > extreme_threshold {
+                    self.noise_floor_db + NOISE_FLOOR_MAX_RISE_DB_PER_BLOCK
+                } else {
+                    measured_db
+                };
+                self.noise_floor_db = NOISE_FLOOR_FAST_ALPHA
+                    .mul_add(capped_db, (1.0 - NOISE_FLOOR_FAST_ALPHA) * self.noise_floor_db);
             } else if !self.open || measured_db < self.noise_floor_db + AUTO_SQUELCH_CLOSE_MARGIN_DB
             {
                 self.noise_floor_db = NOISE_FLOOR_ALPHA
@@ -695,6 +710,13 @@ mod tests {
 
     // --- Auto-squelch tests ---
 
+    // Auto-squelch test constants.
+    const AUTO_SETTLE_ITERS: usize = 200;
+    const TEST_BLOCK_LEN: usize = 100;
+    const NOISE_AMP: f32 = 0.001;
+    const STRONG_AMP: f32 = 1.0;
+    const BORDERLINE_AMP: f32 = 0.003;
+
     #[test]
     fn test_auto_squelch_tracks_noise_floor() {
         let mut squelch = PowerSquelch::new(-100.0);
@@ -702,9 +724,9 @@ mod tests {
         assert!(squelch.auto_squelch_enabled());
 
         // Feed many blocks of low-level noise to settle the noise floor estimate.
-        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
         let mut output = vec![Complex::default(); 100];
-        for _ in 0..200 {
+        for _ in 0..AUTO_SETTLE_ITERS {
             squelch.process(&noise, &mut output).unwrap();
         }
 
@@ -722,15 +744,15 @@ mod tests {
         squelch.set_auto_squelch(true);
 
         // Settle noise floor with weak signal.
-        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
         let mut output = vec![Complex::default(); 100];
-        for _ in 0..200 {
+        for _ in 0..AUTO_SETTLE_ITERS {
             squelch.process(&noise, &mut output).unwrap();
         }
         assert!(!squelch.is_open(), "should be closed on noise-only");
 
         // Inject a strong signal — should open.
-        let signal = vec![Complex::new(1.0, 0.0); 100];
+        let signal = vec![Complex::new(STRONG_AMP, 0.0); TEST_BLOCK_LEN];
         squelch.process(&signal, &mut output).unwrap();
         assert!(squelch.is_open(), "should open on strong signal");
     }
@@ -741,14 +763,14 @@ mod tests {
         squelch.set_auto_squelch(true);
 
         // Settle noise floor.
-        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
         let mut output = vec![Complex::default(); 100];
-        for _ in 0..200 {
+        for _ in 0..AUTO_SETTLE_ITERS {
             squelch.process(&noise, &mut output).unwrap();
         }
 
         // Open squelch with a strong signal.
-        let strong = vec![Complex::new(1.0, 0.0); 100];
+        let strong = vec![Complex::new(STRONG_AMP, 0.0); TEST_BLOCK_LEN];
         squelch.process(&strong, &mut output).unwrap();
         assert!(squelch.is_open());
 
@@ -756,7 +778,7 @@ mod tests {
         // (hysteresis: close margin is lower than open margin).
         // Noise floor is ~-60 dB, close margin is +6 dB = -54 dB.
         // Amplitude of 0.003 ≈ -50.5 dB, which is above -54 dB.
-        let borderline = vec![Complex::new(0.003, 0.0); 100];
+        let borderline = vec![Complex::new(BORDERLINE_AMP, 0.0); TEST_BLOCK_LEN];
         squelch.process(&borderline, &mut output).unwrap();
         assert!(
             squelch.is_open(),
@@ -770,14 +792,14 @@ mod tests {
         squelch.set_auto_squelch(true);
 
         // Settle noise floor.
-        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
         let mut output = vec![Complex::default(); 100];
-        for _ in 0..200 {
+        for _ in 0..AUTO_SETTLE_ITERS {
             squelch.process(&noise, &mut output).unwrap();
         }
 
         // Strong signal should still open despite manual level of 100 dB.
-        let strong = vec![Complex::new(1.0, 0.0); 100];
+        let strong = vec![Complex::new(STRONG_AMP, 0.0); TEST_BLOCK_LEN];
         squelch.process(&strong, &mut output).unwrap();
         assert!(squelch.is_open(), "auto-squelch should ignore manual level");
     }
@@ -788,12 +810,12 @@ mod tests {
         squelch.set_auto_squelch(true);
 
         // Settle noise floor and open with signal.
-        let noise = vec![Complex::new(0.001, 0.0); 100];
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
         let mut output = vec![Complex::default(); 100];
-        for _ in 0..200 {
+        for _ in 0..AUTO_SETTLE_ITERS {
             squelch.process(&noise, &mut output).unwrap();
         }
-        let strong = vec![Complex::new(1.0, 0.0); 100];
+        let strong = vec![Complex::new(STRONG_AMP, 0.0); TEST_BLOCK_LEN];
         squelch.process(&strong, &mut output).unwrap();
         assert!(squelch.is_open());
 
