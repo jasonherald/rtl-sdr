@@ -221,6 +221,9 @@ struct DspState {
     // Recording state
     audio_writer: Option<WavWriter>,
     iq_writer: Option<WavWriter>,
+
+    /// Transcription audio tap — when Some, audio is copied to this channel.
+    transcription_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 }
 
 impl DspState {
@@ -270,6 +273,7 @@ impl DspState {
             audio_buf: Vec::new(),
             audio_writer: None,
             iq_writer: None,
+            transcription_tx: None,
         })
     }
 }
@@ -755,6 +759,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.iq_writer = None;
             let _ = dsp_tx.send(DspToUi::IqRecordingStopped);
         }
+
+        UiToDsp::EnableTranscription(tx) => {
+            state.transcription_tx = Some(tx);
+            tracing::info!("transcription audio tap enabled");
+        }
+        UiToDsp::DisableTranscription => {
+            state.transcription_tx = None;
+            tracing::info!("transcription audio tap disabled");
+        }
     }
 }
 
@@ -1031,6 +1044,16 @@ fn process_iq_block(
                             let _ = dsp_tx
                                 .send(DspToUi::Error("Audio recording write failed".to_string()));
                             let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
+                        }
+
+                        // Send audio copy to transcription worker (non-blocking).
+                        if let Some(ref tx) = state.transcription_tx {
+                            let mut interleaved = Vec::with_capacity(audio_count * 2);
+                            for s in &state.audio_buf[..audio_count] {
+                                interleaved.push(s.l);
+                                interleaved.push(s.r);
+                            }
+                            let _ = tx.try_send(interleaved);
                         }
 
                         // Send to PipeWire for playback.

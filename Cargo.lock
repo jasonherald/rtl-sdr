@@ -1783,6 +1783,7 @@ dependencies = [
  "sdr-source-file",
  "sdr-source-network",
  "sdr-source-rtlsdr",
+ "sdr-transcription",
  "sdr-types",
  "serde",
  "serde_json",

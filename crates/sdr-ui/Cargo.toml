@@ -23,6 +23,7 @@ sdr-source-file.workspace = true
 sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
 sdr-radioreference.workspace = true
+sdr-transcription.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
 thiserror.workspace = true
