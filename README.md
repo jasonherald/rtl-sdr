@@ -150,6 +150,16 @@ sdr-sink-network          TCP/UDP audio output
 
 DSP functions are pure (no threading, no I/O). Threading and streaming live in `sdr-pipeline`.
 
+## RadioReference Integration
+
+SDR-RS can browse and import frequencies from [RadioReference.com](https://www.radioreference.com), the largest radio communications reference source in the US.
+
+**Setup:** Open Preferences (Ctrl+,) > Accounts > enter your RadioReference credentials > Test & Save. A [premium account](https://www.radioreference.com/premium/) is required for API access.
+
+**Usage:** Click the antenna icon in the header bar > enter a US ZIP code > browse frequencies by category and agency > check the ones you want > Import. Frequencies are saved as bookmarks with auto-mapped demod mode and bandwidth.
+
+Your credentials are stored in your system keyring (GNOME Keyring / macOS Keychain) and are only sent to RadioReference.com.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting and security scanning details.

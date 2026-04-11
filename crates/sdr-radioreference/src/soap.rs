@@ -462,10 +462,10 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                             current_field.clear();
                         }
                         "stid" if state == Top => {
-                            state_id = Some(
-                                text.parse()
-                                    .map_err(|e| SoapError::Unexpected(format!("bad stid: {e}")))?,
-                            );
+                            state_id =
+                                Some(text.parse().map_err(|e| {
+                                    SoapError::Unexpected(format!("bad stid: {e}"))
+                                })?);
                             current_field.clear();
                         }
                         "cid" => {
