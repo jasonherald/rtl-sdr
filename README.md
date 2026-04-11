@@ -31,7 +31,7 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 ### Integration
 
-- RadioReference.com frequency database browser (SOAP API client)
+- [RadioReference.com](https://www.radioreference.com) frequency database browser — search by ZIP code, browse by category/agency, import as bookmarks (requires RadioReference premium account)
 - Secure credential storage via OS keyring (GNOME Keyring / macOS Keychain)
 - Preferences window with directory settings and account management
 - PipeWire audio output (Linux), CoreAudio planned (macOS)
