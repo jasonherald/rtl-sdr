@@ -46,23 +46,24 @@ pub fn build_app() -> adw::Application {
         tracing::info!("sdr-rs UI starting");
     });
 
-    app.connect_activate(|app| {
-        let config_path = gtk4::glib::user_config_dir()
-            .join("sdr-rs")
-            .join("config.json");
-        let defaults = serde_json::json!({});
-        let config = match sdr_config::ConfigManager::load(&config_path, &defaults) {
-            Ok(mut c) => {
-                c.enable_auto_save();
-                std::sync::Arc::new(c)
-            }
-            Err(e) => {
-                tracing::warn!("config load failed, using in-memory defaults: {e}");
-                // Fall back to in-memory config so the app still launches.
-                // Settings won't persist but the app is functional.
-                std::sync::Arc::new(sdr_config::ConfigManager::in_memory(&defaults))
-            }
-        };
+    // Load config once and share across activations (connect_activate can
+    // fire more than once on re-activation).
+    let config_path = gtk4::glib::user_config_dir()
+        .join("sdr-rs")
+        .join("config.json");
+    let defaults = serde_json::json!({});
+    let config = match sdr_config::ConfigManager::load(&config_path, &defaults) {
+        Ok(mut c) => {
+            c.enable_auto_save();
+            std::sync::Arc::new(c)
+        }
+        Err(e) => {
+            tracing::warn!("config load failed, using in-memory defaults: {e}");
+            std::sync::Arc::new(sdr_config::ConfigManager::in_memory(&defaults))
+        }
+    };
+
+    app.connect_activate(move |app| {
         window::build_window(app, &config);
     });
 

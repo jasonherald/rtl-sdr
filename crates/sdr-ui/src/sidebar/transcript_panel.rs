@@ -60,10 +60,15 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let model_list = gtk4::StringList::new(&model_labels);
 
     #[allow(clippy::cast_possible_truncation)]
+    let max_model_idx = sdr_transcription::WhisperModel::ALL.len() as u32;
+
+    #[allow(clippy::cast_possible_truncation)]
     let saved_model_idx = config.read(|v| {
         v.get(KEY_MODEL)
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as u32
+            .and_then(|idx| u32::try_from(idx).ok())
+            .filter(|&idx| idx < max_model_idx)
+            .unwrap_or(0)
     });
 
     let model_row = adw::ComboRow::builder()
@@ -73,13 +78,15 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .build();
     group.add(&model_row);
 
-    // Persist model selection on change.
+    // Persist model selection on change (ignore transient out-of-range indices).
     let config_model = Arc::clone(config);
     model_row.connect_selected_notify(move |row| {
         let idx = row.selected();
-        config_model.write(|v| {
-            v[KEY_MODEL] = serde_json::json!(idx);
-        });
+        if idx < max_model_idx {
+            config_model.write(|v| {
+                v[KEY_MODEL] = serde_json::json!(idx);
+            });
+        }
     });
 
     // --- Tuning sliders ---
