@@ -62,7 +62,12 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
 
     let group = adw::PreferencesGroup::builder()
         .title("RadioReference")
-        .description("Premium account required for frequency database access")
+        .description(
+            "Premium account required for frequency database access. \
+             Your credentials are stored securely in your system keyring \
+             (GNOME Keyring / macOS Keychain) and are never sent anywhere \
+             other than RadioReference.com.",
+        )
         .build();
 
     // --- Username row ---

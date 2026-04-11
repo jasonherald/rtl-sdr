@@ -57,7 +57,7 @@ pub fn show_browse_dialog<F: Fn() + 'static>(parent: &impl IsA<gtk4::Widget>, on
     // -----------------------------------------------------------------------
     let search_group = adw::PreferencesGroup::builder()
         .title("Search")
-        .description("Enter a US ZIP code to find local frequencies")
+        .description("Enter a US ZIP code to find local frequencies (US only)")
         .build();
 
     let zip_entry = adw::EntryRow::builder().title("ZIP Code").build();
