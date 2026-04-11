@@ -14,6 +14,20 @@ const KEY_SILENCE_THRESHOLD: &str = "transcription_silence_threshold";
 /// Config key for the spectral noise gate ratio.
 const KEY_NOISE_GATE: &str = "transcription_noise_gate";
 
+// Silence threshold slider defaults and range.
+const DEFAULT_SILENCE_THRESHOLD: f64 = 0.007;
+const SILENCE_THRESHOLD_MIN: f64 = 0.001;
+const SILENCE_THRESHOLD_MAX: f64 = 0.100;
+const SILENCE_THRESHOLD_STEP: f64 = 0.001;
+const SILENCE_THRESHOLD_PAGE: f64 = 0.01;
+
+// Noise gate slider defaults and range.
+const DEFAULT_NOISE_GATE: f64 = 3.0;
+const NOISE_GATE_MIN: f64 = 1.0;
+const NOISE_GATE_MAX: f64 = 10.0;
+const NOISE_GATE_STEP: f64 = 0.5;
+const NOISE_GATE_PAGE: f64 = 1.0;
+
 /// Transcript panel with toggle switch, model picker, tuning sliders,
 /// status label, progress bar, scrolling transcript log, and clear button.
 pub struct TranscriptPanel {
@@ -94,17 +108,17 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let saved_silence = config.read(|v| {
         v.get(KEY_SILENCE_THRESHOLD)
             .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.007)
+            .unwrap_or(DEFAULT_SILENCE_THRESHOLD)
     });
 
     let silence_row = adw::SpinRow::builder()
         .title("Silence threshold")
         .adjustment(&gtk4::Adjustment::new(
             saved_silence,
-            0.001,
-            0.1,
-            0.001,
-            0.01,
+            SILENCE_THRESHOLD_MIN,
+            SILENCE_THRESHOLD_MAX,
+            SILENCE_THRESHOLD_STEP,
+            SILENCE_THRESHOLD_PAGE,
             0.0,
         ))
         .digits(3)
@@ -122,7 +136,7 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let saved_noise_gate = config.read(|v| {
         v.get(KEY_NOISE_GATE)
             .and_then(serde_json::Value::as_f64)
-            .unwrap_or(3.0)
+            .unwrap_or(DEFAULT_NOISE_GATE)
     });
 
     let noise_gate_row = adw::SpinRow::builder()
@@ -130,10 +144,10 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .subtitle("Spectral gate ratio")
         .adjustment(&gtk4::Adjustment::new(
             saved_noise_gate,
-            1.0,
-            10.0,
-            0.5,
-            1.0,
+            NOISE_GATE_MIN,
+            NOISE_GATE_MAX,
+            NOISE_GATE_STEP,
+            NOISE_GATE_PAGE,
             0.0,
         ))
         .digits(1)
