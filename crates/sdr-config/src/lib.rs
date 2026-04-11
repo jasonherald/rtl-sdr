@@ -430,4 +430,28 @@ mod tests {
         assert_eq!(mgr.path(), path);
         let _ = fs::remove_file(&path);
     }
+
+    #[test]
+    fn in_memory_save_is_noop() {
+        let mgr = ConfigManager::in_memory(&json!({"key": "value"}));
+        // save() should succeed without creating any file.
+        mgr.save().unwrap();
+        assert!(mgr.path().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn in_memory_enable_auto_save_is_noop() {
+        let mut mgr = ConfigManager::in_memory(&json!({}));
+        mgr.enable_auto_save();
+        // No auto-save handle should be created for in-memory configs.
+        assert!(mgr.auto_save_handle.is_none());
+    }
+
+    #[test]
+    fn in_memory_read_write_works() {
+        let mgr = ConfigManager::in_memory(&json!({"volume": 0.5}));
+        mgr.read(|v| assert_eq!(v["volume"], 0.5));
+        mgr.write(|v| v["volume"] = json!(0.8));
+        mgr.read(|v| assert_eq!(v["volume"], 0.8));
+    }
 }
