@@ -143,12 +143,14 @@ pub fn build_accounts_page() -> (adw::PreferencesPage, Rc<Cell<bool>>) {
     let test_button = gtk4::Button::builder()
         .label("Test & Save")
         .css_classes(["suggested-action"])
+        .sensitive(keyring_available)
         .build();
 
     let remove_button = gtk4::Button::builder()
         .label("Remove Credentials")
         .css_classes(["destructive-action"])
         .visible(has_credentials.get())
+        .sensitive(keyring_available)
         .build();
 
     button_box.append(&test_button);

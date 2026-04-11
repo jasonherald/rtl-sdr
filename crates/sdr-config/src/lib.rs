@@ -163,6 +163,10 @@ impl ConfigManager {
     ///
     /// Checks for modifications every second and saves if needed.
     pub fn enable_auto_save(&mut self) {
+        // In-memory configs have no path — nothing to auto-save.
+        if self.path.as_os_str().is_empty() {
+            return;
+        }
         if self.auto_save_handle.is_some() {
             return;
         }
