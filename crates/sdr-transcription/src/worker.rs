@@ -16,8 +16,8 @@ const CHUNK_SECONDS: usize = 5;
 const CHUNK_SAMPLES: usize = 16_000 * CHUNK_SECONDS;
 
 /// RMS threshold below which a chunk is treated as silence and skipped.
-/// Radio noise typically has RMS 0.01-0.03; speech is 0.05+.
-const SILENCE_THRESHOLD: f32 = 0.02;
+/// Measured AFTER the spectral noise gate, so this catches residual noise.
+const SILENCE_THRESHOLD: f32 = 0.007;
 
 /// Events emitted by the transcription worker.
 #[derive(Debug, Clone)]
