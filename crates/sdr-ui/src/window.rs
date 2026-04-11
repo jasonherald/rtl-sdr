@@ -212,6 +212,20 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar_for_cursor.update_cursor(freq_hz, power_db);
     });
 
+    // Wire VFO offset changes (click-to-tune / drag) to the frequency display
+    // and status bar so the header shows the actual tuned frequency.
+    let status_bar_for_vfo = Rc::clone(&status_bar_demod);
+    let state_for_vfo = Rc::clone(&state);
+    let fs_for_vfo = freq_selector.clone();
+    spectrum_handle.connect_vfo_offset_changed(move |offset_hz| {
+        let center = state_for_vfo.center_frequency.get();
+        let tuned = center + offset_hz;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let tuned_u64 = tuned.max(0.0) as u64;
+        fs_for_vfo.set_frequency(tuned_u64);
+        status_bar_for_vfo.update_frequency(tuned);
+    });
+
     let status_bar_for_freq = Rc::clone(&status_bar_demod);
     let state_freq = Rc::clone(&state);
     let spectrum_for_freq = Rc::clone(&spectrum_handle);
