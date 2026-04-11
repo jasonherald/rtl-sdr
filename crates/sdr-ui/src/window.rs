@@ -62,7 +62,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar,
         transcript_panel,
         transcript_revealer,
-    ) = build_split_view(&state);
+    ) = build_split_view(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
     let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
@@ -402,6 +402,7 @@ fn handle_dsp_message(
 /// Returns the split view, sidebar panels, spectrum display handle, and status bar.
 fn build_split_view(
     state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) -> (
     adw::OverlaySplitView,
     SidebarPanels,
@@ -429,7 +430,7 @@ fn build_split_view(
     content_box.append(&status_bar.widget);
 
     // Transcript panel — slides out from the right.
-    let transcript_panel = sidebar::transcript_panel::build_transcript_panel();
+    let transcript_panel = sidebar::transcript_panel::build_transcript_panel(config);
     let transcript_scroll = gtk4::ScrolledWindow::builder()
         .child(&transcript_panel.widget)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -1406,12 +1407,16 @@ fn connect_transcript_panel(
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
     let model_row = transcript.model_row.clone();
+    let silence_row = transcript.silence_row.clone();
+    let noise_gate_row = transcript.noise_gate_row.clone();
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
             // Read selected model from dropdown.
-            // Lock model selection while transcription is active.
+            // Lock model and tuning controls while transcription is active.
             model_row.set_sensitive(false);
+            silence_row.set_sensitive(false);
+            noise_gate_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
             let whisper_model = sdr_transcription::WhisperModel::ALL
@@ -1419,9 +1424,18 @@ fn connect_transcript_panel(
                 .copied()
                 .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
 
+            // Read tuning slider values.
+            #[allow(clippy::cast_possible_truncation)]
+            let silence_threshold = silence_row.value() as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let noise_gate_ratio = noise_gate_row.value() as f32;
+
             // Scope the borrow so it's dropped before any potential re-entry
             // from row.set_active(false) on error.
-            let start_result = engine_clone.borrow_mut().start(whisper_model);
+            let start_result =
+                engine_clone
+                    .borrow_mut()
+                    .start(whisper_model, silence_threshold, noise_gate_ratio);
             match start_result {
                 Ok(event_rx) => {
                     if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
@@ -1478,11 +1492,15 @@ fn connect_transcript_panel(
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
                     model_row.set_sensitive(true);
+                    silence_row.set_sensitive(true);
+                    noise_gate_row.set_sensitive(true);
                     row.set_active(false);
                 }
             }
         } else {
             model_row.set_sensitive(true);
+            silence_row.set_sensitive(true);
+            noise_gate_row.set_sensitive(true);
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();
             status_label.set_text("");

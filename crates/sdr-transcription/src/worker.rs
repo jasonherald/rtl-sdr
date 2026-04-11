@@ -15,10 +15,6 @@ const CHUNK_SECONDS: usize = 5;
 /// Number of 16 kHz mono samples per chunk (16000 * 5 = 80000).
 const CHUNK_SAMPLES: usize = 16_000 * CHUNK_SECONDS;
 
-/// RMS threshold below which a chunk is treated as silence and skipped.
-/// Measured AFTER the spectral noise gate, so this catches residual noise.
-const SILENCE_THRESHOLD: f32 = 0.007;
-
 /// Events emitted by the transcription worker.
 #[derive(Debug, Clone)]
 pub enum TranscriptionEvent {
@@ -46,12 +42,23 @@ pub enum TranscriptionEvent {
 /// # Arguments
 /// * `audio_rx` — receives interleaved stereo f32 audio at 48 kHz
 /// * `event_tx` — sends transcription events to the UI/consumer
+/// * `model` — which Whisper model to load
+/// * `silence_threshold` — RMS below which a chunk is skipped
+/// * `noise_gate_ratio` — spectral gate multiplier over noise floor
 pub fn run_worker(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     model: model::WhisperModel,
+    silence_threshold: f32,
+    noise_gate_ratio: f32,
 ) {
-    if let Err(e) = run_worker_inner(audio_rx, event_tx, model) {
+    if let Err(e) = run_worker_inner(
+        audio_rx,
+        event_tx,
+        model,
+        silence_threshold,
+        noise_gate_ratio,
+    ) {
         let _ = event_tx.send(TranscriptionEvent::Error(e));
     }
 }
@@ -62,6 +69,8 @@ fn run_worker_inner(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     model: model::WhisperModel,
+    silence_threshold: f32,
+    noise_gate_ratio: f32,
 ) -> Result<(), String> {
     // --- Model download / load ---
     let model_path = if model::model_exists(model) {
@@ -92,8 +101,14 @@ fn run_worker_inner(
         path
     };
 
+    tracing::info!(?model_path, "loading Whisper model");
     let ctx = WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-        .map_err(|e| format!("failed to load whisper model: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "Failed to load model: {e}. If using a GPU, try a smaller model — \
+                 the selected model may exceed available VRAM."
+            )
+        })?;
 
     let mut state = ctx
         .create_state()
@@ -122,10 +137,10 @@ fn run_worker_inner(
 
             // Spectral noise gate — remove broadband static and hiss
             // before Whisper sees the audio.
-            denoise::spectral_denoise(&mut chunk);
+            denoise::spectral_denoise(&mut chunk, noise_gate_ratio);
 
             let rms = compute_rms(&chunk);
-            if rms < SILENCE_THRESHOLD {
+            if rms < silence_threshold {
                 tracing::debug!(rms, "chunk below silence threshold, skipping");
                 continue;
             }

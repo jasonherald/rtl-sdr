@@ -53,9 +53,16 @@ impl TranscriptionEngine {
 
     /// Start the transcription worker thread with the given model.
     /// Returns a receiver for `TranscriptionEvent`.
+    ///
+    /// # Arguments
+    /// * `whisper_model` — which Whisper model to load
+    /// * `silence_threshold` — RMS below which a chunk is skipped
+    /// * `noise_gate_ratio` — spectral gate multiplier over noise floor
     pub fn start(
         &mut self,
         whisper_model: WhisperModel,
+        silence_threshold: f32,
+        noise_gate_ratio: f32,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
         if self.worker_thread.is_some() {
             return Err(TranscriptionError::AlreadyRunning);
@@ -67,7 +74,13 @@ impl TranscriptionEngine {
         let handle = std::thread::Builder::new()
             .name("transcription-worker".into())
             .spawn(move || {
-                worker::run_worker(&audio_rx, &event_tx, whisper_model);
+                worker::run_worker(
+                    &audio_rx,
+                    &event_tx,
+                    whisper_model,
+                    silence_threshold,
+                    noise_gate_ratio,
+                );
             })?;
 
         self.audio_tx = Some(audio_tx);
