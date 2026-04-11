@@ -31,10 +31,11 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 ### Transcription
 
-- Live speech-to-text via Whisper (tiny English model, ~75 MB)
-- Slide-out transcript panel with timestamped log
+- Live speech-to-text via Whisper — 5 model sizes from tiny (75 MB) to large-v3 (3.1 GB)
+- Optional GPU acceleration: CUDA (NVIDIA), ROCm/HIP (AMD), Vulkan, Metal (macOS)
+- Slide-out transcript panel with timestamped log and model selector
 - FFT-based spectral noise gate preprocessor for cleaner recognition
-- Auto-downloads model on first use
+- Auto-downloads selected model on first use
 - Volume-independent audio tap (transcription unaffected by volume knob)
 
 ### Integration
@@ -98,6 +99,16 @@ make install
 ```
 
 Installs the binary, desktop entry, and icon for app launcher integration.
+
+### GPU-accelerated transcription (optional)
+
+```bash
+make install CARGO_FLAGS="--release --features cuda"      # NVIDIA
+make install CARGO_FLAGS="--release --features hipblas"    # AMD ROCm
+make install CARGO_FLAGS="--release --features vulkan"     # Cross-vendor
+```
+
+Requires the corresponding GPU toolkit (CUDA toolkit, ROCm, Vulkan SDK).
 
 ### Run tests
 
