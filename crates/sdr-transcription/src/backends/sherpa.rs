@@ -336,9 +336,11 @@ impl TranscriptionBackend for SherpaBackend {
     }
 
     fn start(&mut self, config: BackendConfig) -> Result<BackendHandle, BackendError> {
-        let ModelChoice::Sherpa(_) = config.model else {
-            return Err(BackendError::WrongModelKind);
-        };
+        match config.model {
+            ModelChoice::Sherpa(_) => {}
+            #[cfg(feature = "whisper")]
+            ModelChoice::Whisper(_) => return Err(BackendError::WrongModelKind),
+        }
 
         let host = match global_sherpa_host() {
             Some(Ok(h)) => h,

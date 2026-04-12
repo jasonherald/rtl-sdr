@@ -8,19 +8,30 @@ repository.workspace = true
 
 [features]
 default = []
-cuda = ["whisper-rs/cuda"]
-hipblas = ["whisper-rs/hipblas"]
-vulkan = ["whisper-rs/vulkan"]
-metal = ["whisper-rs/metal"]
-intel-sycl = ["whisper-rs/intel-sycl"]
-openblas = ["whisper-rs/openblas"]
+
+# Mutually exclusive transcription backend selection. Exactly one of
+# `whisper` or `sherpa` must be enabled. Building with both, or neither,
+# triggers a compile_error in lib.rs.
+whisper = ["dep:whisper-rs"]
+sherpa = ["dep:sherpa-onnx"]
+
+# GPU acceleration features for the Whisper backend.
+# Each implies `whisper` so users who pass --features cuda still get a
+# whisper build. Users who want sherpa must pass
+# --no-default-features --features sherpa.
+cuda = ["whisper", "whisper-rs/cuda"]
+hipblas = ["whisper", "whisper-rs/hipblas"]
+vulkan = ["whisper", "whisper-rs/vulkan"]
+metal = ["whisper", "whisper-rs/metal"]
+intel-sycl = ["whisper", "whisper-rs/intel-sycl"]
+openblas = ["whisper", "whisper-rs/openblas"]
 
 [dependencies]
-whisper-rs.workspace = true
+whisper-rs = { workspace = true, optional = true }
+sherpa-onnx = { version = "1.12", optional = true }
 reqwest.workspace = true
 rustfft.workspace = true
 sdr-types.workspace = true
-sherpa-onnx = "1.12"
 thiserror.workspace = true
 tracing.workspace = true
 dirs-next.workspace = true

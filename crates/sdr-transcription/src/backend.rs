@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 
+#[cfg(feature = "whisper")]
 use crate::model::WhisperModel;
 
 /// Configuration handed to a backend at `start` time.
@@ -24,9 +25,14 @@ pub struct BackendConfig {
 /// User-facing model selection.
 ///
 /// The variant determines which backend the engine instantiates internally.
+/// At any given build, exactly one variant exists — the `whisper` and
+/// `sherpa` features are mutually exclusive (see `lib.rs` `compile_error`
+/// guards).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChoice {
+    #[cfg(feature = "whisper")]
     Whisper(WhisperModel),
+    #[cfg(feature = "sherpa")]
     Sherpa(crate::sherpa_model::SherpaModel),
 }
 
@@ -76,6 +82,10 @@ pub enum BackendError {
         "model files not found at {path}; download the bundle and place its contents in this directory"
     )]
     ModelNotFound { path: PathBuf },
+    // Retained for when whisper+sherpa are re-unified. In single-feature
+    // builds the cfg-gated match arms below are never both present, so
+    // this variant is never constructed — silence the lint.
+    #[allow(dead_code)]
     #[error("backend received the wrong model kind in BackendConfig — engine bug")]
     WrongModelKind,
     #[error("backend initialization failed: {0}")]

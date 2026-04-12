@@ -63,8 +63,15 @@ impl TranscriptionBackend for WhisperBackend {
     }
 
     fn start(&mut self, config: BackendConfig) -> Result<BackendHandle, BackendError> {
-        let ModelChoice::Whisper(whisper_model) = config.model else {
-            return Err(BackendError::WrongModelKind);
+        // The cfg-gated Sherpa arm exists only when both features are
+        // enabled (which compile_error prevents). In whisper-only builds
+        // this match has one arm — allow clippy's infallible_destructuring_match
+        // warning rather than hiding the intent of the guard.
+        #[allow(clippy::infallible_destructuring_match)]
+        let whisper_model = match config.model {
+            ModelChoice::Whisper(m) => m,
+            #[cfg(feature = "sherpa")]
+            ModelChoice::Sherpa(_) => return Err(BackendError::WrongModelKind),
         };
 
         self.cancel.store(false, Ordering::Relaxed);

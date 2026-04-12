@@ -23,13 +23,9 @@ fn main() -> glib::ExitCode {
     }
     tracing::info!("sdr-rs starting");
 
-    // Initialize the sherpa-onnx host BEFORE GTK is loaded. The host's
-    // worker thread creates the OnlineRecognizer which initializes ONNX
-    // Runtime's C++ runtime state. Doing this before sdr_ui::run() (which
-    // loads GTK4 and its transitive C++ deps) avoids a static-initializer
-    // collision that causes free() corruption inside libstdc++ regex code.
-    // If init fails (e.g. model files not downloaded), the failure is
-    // stashed and reported in-app when the user toggles Sherpa on.
+    // Initialize the sherpa-onnx host BEFORE GTK is loaded.
+    // Only present in builds with the `sherpa` feature.
+    #[cfg(feature = "sherpa")]
     sdr_transcription::init_sherpa_host(sdr_transcription::SherpaModel::StreamingZipformerEn);
 
     sdr_ui::run()

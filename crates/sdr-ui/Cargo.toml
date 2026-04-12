@@ -9,12 +9,16 @@ repository.workspace = true
 [features]
 default = []
 pipewire = ["sdr-sink-audio/pipewire"]
-cuda = ["sdr-transcription/cuda"]
-hipblas = ["sdr-transcription/hipblas"]
-vulkan = ["sdr-transcription/vulkan"]
-metal = ["sdr-transcription/metal"]
-intel-sycl = ["sdr-transcription/intel-sycl"]
-openblas = ["sdr-transcription/openblas"]
+
+whisper = ["sdr-transcription/whisper"]
+sherpa = ["sdr-transcription/sherpa"]
+
+cuda = ["whisper", "sdr-transcription/cuda"]
+hipblas = ["whisper", "sdr-transcription/hipblas"]
+vulkan = ["whisper", "sdr-transcription/vulkan"]
+metal = ["whisper", "sdr-transcription/metal"]
+intel-sycl = ["whisper", "sdr-transcription/intel-sycl"]
+openblas = ["whisper", "sdr-transcription/openblas"]
 
 [dependencies]
 sdr-types.workspace = true

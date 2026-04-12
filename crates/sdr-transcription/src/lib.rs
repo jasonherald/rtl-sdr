@@ -7,25 +7,55 @@
 //! Two backends are currently implemented: [`backends::whisper::WhisperBackend`]
 //! (file-based, chunked inference via whisper-rs) and
 //! [`backends::sherpa::SherpaBackend`] (true streaming via sherpa-onnx).
+//!
+//! The `whisper` and `sherpa` cargo features are mutually exclusive. Exactly
+//! one must be enabled at build time (see the `compile_error` guards below).
+
+#[cfg(all(feature = "whisper", feature = "sherpa"))]
+compile_error!(
+    "features `whisper` and `sherpa` are mutually exclusive. \
+     Pick exactly one. For Whisper: `--features cuda` (or hipblas/vulkan/metal/etc) \
+     or `--features whisper`. For Sherpa: `--no-default-features --features sherpa`."
+);
+
+#[cfg(not(any(feature = "whisper", feature = "sherpa")))]
+compile_error!(
+    "exactly one of the `whisper` or `sherpa` features must be enabled. \
+     The default is `whisper`. For Sherpa: `--no-default-features --features sherpa`."
+);
 
 pub mod backend;
 pub mod backends;
 pub mod denoise;
-pub mod model;
 pub mod resampler;
+
+#[cfg(feature = "whisper")]
+pub mod model;
+
+#[cfg(feature = "sherpa")]
 pub mod sherpa_model;
 
 pub use backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
     TranscriptionEvent,
 };
-pub use backends::sherpa::init_sherpa_host;
+
+#[cfg(feature = "whisper")]
 pub use model::WhisperModel;
+
+#[cfg(feature = "sherpa")]
+pub use backends::sherpa::init_sherpa_host;
+
+#[cfg(feature = "sherpa")]
 pub use sherpa_model::SherpaModel;
 
 use std::sync::mpsc;
 
+#[cfg(feature = "whisper")]
 use crate::backends::whisper::WhisperBackend;
+
+#[cfg(feature = "sherpa")]
+use crate::backends::sherpa::SherpaBackend;
 
 /// Error type for engine-level operations.
 #[derive(Debug, thiserror::Error)]
@@ -71,8 +101,10 @@ impl TranscriptionEngine {
         config: BackendConfig,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
         let backend: Box<dyn TranscriptionBackend> = match config.model {
+            #[cfg(feature = "whisper")]
             ModelChoice::Whisper(_) => Box::new(WhisperBackend::new()),
-            ModelChoice::Sherpa(_) => Box::new(backends::sherpa::SherpaBackend::new()),
+            #[cfg(feature = "sherpa")]
+            ModelChoice::Sherpa(_) => Box::new(SherpaBackend::new()),
         };
         self.start_with_backend(backend, config)
     }
@@ -153,8 +185,12 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn dummy_config() -> BackendConfig {
+        #[cfg(feature = "whisper")]
+        let model = ModelChoice::Whisper(WhisperModel::TinyEn);
+        #[cfg(feature = "sherpa")]
+        let model = ModelChoice::Sherpa(crate::SherpaModel::StreamingZipformerEn);
         BackendConfig {
-            model: ModelChoice::Whisper(WhisperModel::TinyEn),
+            model,
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
         }

@@ -1434,7 +1434,6 @@ fn connect_transcript_panel(
     let status_label = transcript.status_label.clone();
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
-    let backend_row = transcript.backend_row.clone();
     let model_row = transcript.model_row.clone();
     let silence_row = transcript.silence_row.clone();
     let noise_gate_row = transcript.noise_gate_row.clone();
@@ -1442,14 +1441,12 @@ fn connect_transcript_panel(
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
             // Read selected model from dropdown.
-            // Lock model, backend, and tuning controls while transcription is active.
-            backend_row.set_sensitive(false);
+            // Lock model and tuning controls while transcription is active.
             model_row.set_sensitive(false);
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
-            let backend_idx = backend_row.selected();
 
             // Read tuning slider values.
             #[allow(clippy::cast_possible_truncation)]
@@ -1457,20 +1454,23 @@ fn connect_transcript_panel(
             #[allow(clippy::cast_possible_truncation)]
             let noise_gate_ratio = noise_gate_row.value() as f32;
 
-            // Build BackendConfig from the panel state. Backend index
-            // 1 = Sherpa; everything else = Whisper.
-            let model = if backend_idx == 1 {
-                let sherpa_model = sdr_transcription::SherpaModel::ALL
-                    .get(model_idx)
-                    .copied()
-                    .unwrap_or(sdr_transcription::SherpaModel::StreamingZipformerEn);
-                sdr_transcription::ModelChoice::Sherpa(sherpa_model)
-            } else {
+            // Build BackendConfig — Whisper and Sherpa are mutually exclusive
+            // cargo features, so exactly one variant is compiled in.
+            #[cfg(feature = "whisper")]
+            let model = {
                 let whisper_model = sdr_transcription::WhisperModel::ALL
                     .get(model_idx)
                     .copied()
                     .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
                 sdr_transcription::ModelChoice::Whisper(whisper_model)
+            };
+            #[cfg(feature = "sherpa")]
+            let model = {
+                let sherpa_model = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .unwrap_or(sdr_transcription::SherpaModel::StreamingZipformerEn);
+                sdr_transcription::ModelChoice::Sherpa(sherpa_model)
             };
 
             let config = sdr_transcription::BackendConfig {
@@ -1542,7 +1542,6 @@ fn connect_transcript_panel(
                 }
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
-                    backend_row.set_sensitive(true);
                     model_row.set_sensitive(true);
                     silence_row.set_sensitive(true);
                     noise_gate_row.set_sensitive(true);
@@ -1550,7 +1549,6 @@ fn connect_transcript_panel(
                 }
             }
         } else {
-            backend_row.set_sensitive(true);
             model_row.set_sensitive(true);
             silence_row.set_sensitive(true);
             noise_gate_row.set_sensitive(true);

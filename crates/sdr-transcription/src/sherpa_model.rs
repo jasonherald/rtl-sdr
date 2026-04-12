@@ -10,6 +10,17 @@
 
 use std::path::PathBuf;
 
+/// Returns the base directory for storing models (`~/.local/share/sdr-rs/models/`).
+///
+/// Duplicated from `model::models_dir` so that `sherpa_model` has no
+/// dependency on the `whisper`-gated `model` module.
+fn models_dir() -> PathBuf {
+    dirs_next::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("sdr-rs")
+        .join("models")
+}
+
 /// Available sherpa-onnx model variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SherpaModel {
@@ -68,7 +79,7 @@ impl SherpaModel {
 /// Returns the sherpa subdirectory under the shared models dir
 /// (`~/.local/share/sdr-rs/models/sherpa/`).
 pub fn sherpa_models_dir() -> PathBuf {
-    crate::model::models_dir().join("sherpa")
+    models_dir().join("sherpa")
 }
 
 /// Returns the directory containing all files for a given sherpa model
