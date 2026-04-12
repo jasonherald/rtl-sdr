@@ -284,26 +284,53 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     //
     // The DSP thread itself was already spawned by `Engine::new` above;
     // we just hook the GTK main loop into the channels and FFT buffer it
-    // exposed. `engine` is captured by the closure as an `Rc<Engine>` so
-    // it lives for as long as the timeout is registered (i.e., the
-    // window's lifetime); when the closure is dropped on window close,
-    // the Engine drops and the DSP thread sees the channel disconnect.
+    // exposed. The closure captures an `Rc<Engine>` clone, which is what
+    // keeps the engine alive while the timeout is registered. To make
+    // the lifetime self-cleaning, the closure also captures a `Weak`
+    // reference to the window: when the window drops (i.e., on close),
+    // the next timeout tick fails to upgrade the weak ref, calls
+    // `engine.shutdown()` to send a final `Stop`, and returns
+    // `ControlFlow::Break`. Returning Break removes this source from the
+    // GLib main context, which drops the closure and the captured
+    // `Rc<Engine>` clone — at which point the engine itself drops (its
+    // last Rc), closing the command channel and letting the detached
+    // controller thread exit naturally on its next `recv_timeout` tick.
+    //
+    // Without this Weak check the closure would outlive the window
+    // (`glib::timeout_add_local` attaches to the *global* main context,
+    // not to the window) and the engine would persist as a headless
+    // background DSP process for as long as the application stayed
+    // alive. CodeRabbit caught that one in PR #251.
     let play_button_weak = play_button.downgrade();
     let state_rx = Rc::clone(&state);
     let toast_overlay_weak = toast_overlay.downgrade();
+    let window_weak = window.downgrade();
 
     let gain_row_for_dsp = panels.source.gain_row.clone();
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
     let engine_for_dsp = Rc::clone(&engine);
-    glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
-        // Hold the engine alive for the lifetime of this closure. Without
-        // this reference, `move` would not capture `engine_for_dsp` at
-        // all (it's never methods-called inside the closure body) and
-        // the engine would drop at the end of `build_window`, taking
-        // the DSP thread down with it before the window even opens.
-        let _engine_anchor = &engine_for_dsp;
+    // We deliberately discard the SourceId returned by `timeout_add_local`:
+    // the window-lifecycle gate at the top of the closure returns
+    // `ControlFlow::Break` when the window is dropped, which is GLib's
+    // idiomatic "remove this source" signal. There's no other code path
+    // that needs to remove the source explicitly.
+    let _ = glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
+        // Window-lifecycle gate. If the window is gone, send the engine
+        // an explicit Stop and ask GLib to drop this source. The
+        // shutdown call is best-effort: if the engine has already torn
+        // itself down (e.g., the controller panicked) the channel is
+        // closed and we just log-and-continue.
+        if window_weak.upgrade().is_none() {
+            if let Err(err) = engine_for_dsp.shutdown() {
+                tracing::debug!(
+                    ?err,
+                    "engine.shutdown() during window close (channel may already be closed)"
+                );
+            }
+            return glib::ControlFlow::Break;
+        }
 
         // Check for new FFT data from the shared buffer (zero-alloc path).
         fft_shared.take_if_ready(|data| {

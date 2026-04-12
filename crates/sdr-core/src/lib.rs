@@ -29,7 +29,13 @@
 //!   commands cross via `mpsc::Sender<UiToDsp>`. Async consumers (the
 //!   eventual `SwiftUI` app) wrap their side; the engine stays sync.
 
-pub mod controller;
+// `controller` is **private** on purpose. The DSP thread spawn helper and
+// the channel surface live behind the `Engine` facade so consumers can't
+// bypass it; if downstream code starts needing direct access, that's a
+// signal to extend `Engine`'s public API rather than re-export the
+// controller module.
+mod controller;
+
 pub mod engine;
 pub mod fft_buffer;
 pub mod messages;

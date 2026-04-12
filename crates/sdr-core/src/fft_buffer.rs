@@ -52,30 +52,67 @@ impl SharedFftBuffer {
     ///
     /// Crate-private: only the controller calls this. External consumers
     /// produce data through the controller, never directly.
+    ///
+    /// Mutex poisoning is recovered via `into_inner()` rather than dropped
+    /// silently — a panic in a previous holder of the lock should not
+    /// silently lose every subsequent FFT frame.
     pub(crate) fn write(&self, data: &[f32]) {
-        if let Ok(mut buf) = self.buf.lock() {
-            buf.resize(data.len(), 0.0);
-            buf.copy_from_slice(data);
-            self.ready.store(true, std::sync::atomic::Ordering::Release);
-        }
+        let mut buf = match self.buf.lock() {
+            Ok(buf) => buf,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        buf.resize(data.len(), 0.0);
+        buf.copy_from_slice(data);
+        self.ready.store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Consumer: read the latest FFT frame if a new one is ready.
     ///
     /// Returns `false` and does not invoke `f` when no new frame has been
-    /// published since the previous call (lock-free fast path). Returns
-    /// `true` and synchronously invokes `f` with a borrow of the current
-    /// buffer when a new frame is available.
+    /// published since the previous call (lock-free fast path on the
+    /// no-new-frame case). Returns `true` and synchronously invokes `f`
+    /// with a borrow of the current buffer when a new frame is available.
     ///
     /// The borrow handed to `f` is valid only for the duration of the
     /// callback — copy out what you need.
+    ///
+    /// ## Race avoidance
+    ///
+    /// The `ready` flag is cleared **after** the buffer mutex is held, not
+    /// before. If we cleared `ready` first and then locked, a writer could
+    /// slip in between and publish a brand-new frame; we would then read
+    /// the new buffer but leave `ready = false`, so the next poll would
+    /// see no new data and the just-published frame would be redelivered
+    /// as "fresh" only on the *following* tick. By clearing under the
+    /// lock, the `write → set ready` and `lock → clear ready → read`
+    /// sequences are linearizable: the consumer either sees the writer's
+    /// frame and clears the flag, or it sees no frame and leaves the flag
+    /// for the next call.
+    ///
+    /// Mutex poisoning is recovered via `into_inner()` so a panic in the
+    /// writer cannot cause `take_if_ready` to silently return `true`
+    /// without ever calling `f`.
     pub fn take_if_ready<F: FnOnce(&[f32])>(&self, f: F) -> bool {
+        // Lock-free fast path: skip the mutex if there's clearly nothing
+        // to read. A spurious "ready=true" here is fine — we recheck
+        // under the lock below.
+        if !self.ready.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+
+        let buf = match self.buf.lock() {
+            Ok(buf) => buf,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // Recheck-and-clear under the mutex. If a racing reader (or
+        // some other coincidence) cleared the flag between our `load`
+        // above and this `swap`, bail out cleanly without invoking `f`.
         if !self.ready.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
-        if let Ok(buf) = self.buf.lock() {
-            f(&buf);
-        }
+
+        f(&buf);
         true
     }
 }

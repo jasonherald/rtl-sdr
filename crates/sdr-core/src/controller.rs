@@ -80,7 +80,10 @@ const IQ_CHANNELS: u16 = 2;
 ///
 /// Returns the spawned [`std::thread::JoinHandle`] so callers can join on
 /// shutdown. The DSP thread exits when `ui_rx` is dropped.
-pub fn spawn_dsp_thread(
+///
+/// `pub(crate)`: only [`crate::engine::Engine`] calls this. External
+/// consumers go through the `Engine` facade.
+pub(crate) fn spawn_dsp_thread(
     dsp_tx: mpsc::Sender<DspToUi>,
     ui_rx: mpsc::Receiver<UiToDsp>,
     fft_shared: std::sync::Arc<SharedFftBuffer>,
