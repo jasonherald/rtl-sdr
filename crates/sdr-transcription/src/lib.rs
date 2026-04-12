@@ -13,15 +13,17 @@
 
 #[cfg(all(feature = "whisper", feature = "sherpa"))]
 compile_error!(
-    "features `whisper` and `sherpa` are mutually exclusive. \
-     Pick exactly one. For Whisper: `--features cuda` (or hipblas/vulkan/metal/etc) \
-     or `--features whisper`. For Sherpa: `--no-default-features --features sherpa`."
+    "the whisper and sherpa transcription backends are mutually exclusive. \
+     Pick exactly one user-facing feature: \
+     `whisper-cpu` (default), `whisper-cuda`, `whisper-hipblas`, \
+     `whisper-vulkan`, `whisper-metal`, `whisper-intel-sycl`, `whisper-openblas`, \
+     or `sherpa-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
 );
 
 #[cfg(not(any(feature = "whisper", feature = "sherpa")))]
 compile_error!(
-    "exactly one of the `whisper` or `sherpa` features must be enabled. \
-     The default is `whisper`. For Sherpa: `--no-default-features --features sherpa`."
+    "exactly one transcription backend must be enabled. The default is \
+     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
 );
 
 pub mod backend;
