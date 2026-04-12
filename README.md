@@ -181,6 +181,37 @@ SDR-RS can browse and import frequencies from [RadioReference.com](https://www.r
 
 Your credentials are stored in your system keyring (GNOME Keyring / macOS Keychain) and are only sent to RadioReference.com.
 
+## Responsible Use
+
+> **Disclaimer:** This section provides general information and is **not legal advice**. Consult a qualified attorney for guidance specific to your situation and jurisdiction.
+
+SDR-RS is a personal listening tool for unencrypted radio transmissions. Listening to public safety, amateur, and commercial radio is legal in most jurisdictions, but please use it responsibly:
+
+**It's legal to:**
+- Listen to unencrypted radio for personal interest, education, or amateur radio activities
+- Take notes for your own reference
+- Use the transcription feature to convert audio to text on your local machine
+
+**It's not OK to:**
+- Publish or share transcripts of intercepted public safety communications (US Communications Act §605 prohibits divulging or publishing intercepted communications)
+- Aggregate or sell information overheard on the radio
+- Use information obtained from radio listening to identify, track, harass, or harm individuals
+- Decrypt encrypted transmissions
+- Listen to cellular phone communications (illegal under ECPA)
+
+**Privacy considerations:**
+
+Public safety broadcasts may include personally identifiable information — names, addresses, license plates, phone numbers. SDR-RS keeps everything local:
+
+- Transcripts live in memory only and are cleared when the app closes
+- No data is uploaded anywhere
+- The Whisper model runs entirely on your machine
+- Audio recordings are saved locally only when you explicitly enable them
+
+If you're using SDR-RS in a shared space, be mindful that others may see the transcript on your screen. Future versions may add automatic redaction of PII patterns and a "lock transcript" mode (see [#219](https://github.com/jasonherald/rtl-sdr/issues/219), [#220](https://github.com/jasonherald/rtl-sdr/issues/220), [#221](https://github.com/jasonherald/rtl-sdr/issues/221)).
+
+**Know your local laws:** Scanner laws vary by jurisdiction. Some US states restrict scanner use in vehicles. Some countries prohibit listening to certain frequencies entirely. It's your responsibility to know and follow the laws where you live.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting and security scanning details.
