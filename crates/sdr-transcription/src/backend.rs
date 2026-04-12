@@ -98,7 +98,12 @@ pub trait TranscriptionBackend: Send {
 
     /// Signal the backend to stop without waiting for it to finish.
     ///
-    /// Drops the audio sender so the worker exits after its current
-    /// inference completes; detaches the thread so the caller never blocks.
+    /// The backend should set its cancellation flag and detach (not join)
+    /// any worker threads so the caller never blocks. The backend does NOT
+    /// own the [`BackendHandle::audio_tx`] returned from `start` — the
+    /// caller (`TranscriptionEngine::shutdown_nonblocking`) drops that
+    /// sender separately, which is what eventually causes the worker's
+    /// `recv` to see `Disconnected` if the cancel flag hasn't already
+    /// short-circuited the loop.
     fn shutdown_nonblocking(&mut self);
 }

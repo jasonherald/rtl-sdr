@@ -945,12 +945,16 @@ impl TranscriptionEngine {
         Ok(event_rx)
     }
 
-    /// Stop the engine, signalling the backend to shut down.
+    /// Stop the engine, blocking until the backend's worker has finished.
     ///
-    /// Non-blocking — does not wait for the backend's worker thread to
-    /// finish, so it's safe to call from the UI thread or during app exit.
+    /// May block for the duration of one inference pass. Use
+    /// [`Self::shutdown_nonblocking`] from the UI thread or during app exit.
     pub fn stop(&mut self) {
-        self.shutdown_nonblocking();
+        self.audio_tx.take();
+        if let Some(mut backend) = self.backend.take() {
+            backend.stop();
+            tracing::info!("transcription engine stopped");
+        }
     }
 
     /// Signal the backend to shut down without waiting.
