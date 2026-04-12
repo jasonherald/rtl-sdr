@@ -365,9 +365,7 @@ mod tests {
                 // locally, skip this test rather than fail. Tearing down
                 // the running backend is fine because it's just a thread.
                 backend.shutdown_nonblocking();
-                eprintln!(
-                    "skipping test: streaming-zipformer-en model is present locally"
-                );
+                eprintln!("skipping test: streaming-zipformer-en model is present locally");
             }
             Err(e) => panic!("expected ModelNotFound, got {e:?}"),
         }

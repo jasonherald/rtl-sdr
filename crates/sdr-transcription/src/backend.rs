@@ -72,7 +72,9 @@ pub struct BackendHandle {
 pub enum BackendError {
     #[error("failed to spawn worker thread: {0}")]
     Spawn(#[from] std::io::Error),
-    #[error("model files not found at {path}; download the bundle and place its contents in this directory")]
+    #[error(
+        "model files not found at {path}; download the bundle and place its contents in this directory"
+    )]
     ModelNotFound { path: PathBuf },
     #[error("backend received the wrong model kind in BackendConfig — engine bug")]
     WrongModelKind,

@@ -36,27 +36,21 @@ impl SherpaModel {
     /// Filename of the encoder ONNX file inside the model directory.
     pub fn encoder_filename(self) -> &'static str {
         match self {
-            Self::StreamingZipformerEn => {
-                "encoder-epoch-99-avg-1-chunk-16-left-128.onnx"
-            }
+            Self::StreamingZipformerEn => "encoder-epoch-99-avg-1-chunk-16-left-128.onnx",
         }
     }
 
     /// Filename of the decoder ONNX file inside the model directory.
     pub fn decoder_filename(self) -> &'static str {
         match self {
-            Self::StreamingZipformerEn => {
-                "decoder-epoch-99-avg-1-chunk-16-left-128.onnx"
-            }
+            Self::StreamingZipformerEn => "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
         }
     }
 
     /// Filename of the joiner ONNX file inside the model directory.
     pub fn joiner_filename(self) -> &'static str {
         match self {
-            Self::StreamingZipformerEn => {
-                "joiner-epoch-99-avg-1-chunk-16-left-128.onnx"
-            }
+            Self::StreamingZipformerEn => "joiner-epoch-99-avg-1-chunk-16-left-128.onnx",
         }
     }
 
