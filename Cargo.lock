@@ -1748,6 +1748,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "sdr-config",
+ "sdr-dsp",
+ "sdr-pipeline",
+ "sdr-radio",
+ "sdr-rtlsdr",
+ "sdr-sink-audio",
+ "sdr-sink-network",
+ "sdr-source-file",
+ "sdr-source-network",
+ "sdr-source-rtlsdr",
+ "sdr-types",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "sdr-dsp"
 version = "0.1.0"
 dependencies = [
@@ -1890,15 +1910,13 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "sdr-config",
+ "sdr-core",
  "sdr-dsp",
  "sdr-pipeline",
  "sdr-radio",
  "sdr-radioreference",
  "sdr-rtlsdr",
  "sdr-sink-audio",
- "sdr-sink-network",
- "sdr-source-file",
- "sdr-source-network",
  "sdr-source-rtlsdr",
  "sdr-transcription",
  "sdr-types",

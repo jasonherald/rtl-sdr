@@ -7,9 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Cross-platform engine deps. The `sdr` binary itself is currently
+# Linux-only (it links the GTK frontend), but we keep the engine deps
+# unconditional so the workspace dep graph stays consistent across
+# platforms and `cargo metadata` returns the same shape everywhere.
 sdr-types.workspace = true
 sdr-dsp.workspace = true
-sdr-ui.workspace = true
 sdr-pipeline.workspace = true
 sdr-config.workspace = true
 sdr-radio.workspace = true
@@ -23,37 +26,55 @@ sdr-transcription.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
-gtk4.workspace = true
-libadwaita.workspace = true
 
 [features]
-default = ["whisper-cpu"]
+# Default Linux build = GTK frontend + Whisper-CPU transcription backend.
+# On macOS / Windows the `gtk-frontend` feature is enabled but does nothing
+# (sdr-ui is a target-conditional optional dep that only resolves on Linux),
+# so `cargo build` produces just the stub `main()` from src/main.rs that
+# points users at the macOS app issue. The Whisper-CPU backend still
+# compiles via sdr-transcription, which is cross-platform.
+default = ["whisper-cpu", "gtk-frontend"]
+
+# Pulls sdr-ui into the binary on Linux. On other targets the `dep:` is
+# a no-op because sdr-ui is gated to `[target.'cfg(target_os = "linux")']`
+# and marked optional below.
+gtk-frontend = ["dep:sdr-ui"]
 
 # Internal cfg flags. Source code uses #[cfg(feature = "whisper")] /
 # #[cfg(feature = "sherpa")] to gate per-backend code. These are pulled
 # in by the user-facing whisper-* / sherpa-* features below — users
-# should not enable them directly.
-whisper = ["sdr-transcription/whisper", "sdr-ui/whisper"]
-sherpa = ["sdr-transcription/sherpa", "sdr-ui/sherpa"]
+# should not enable them directly. The `sdr-ui?/...` weak-feature syntax
+# is required because sdr-ui is now an optional target-conditional dep;
+# on macOS the forwarded sdr-ui feature is silently dropped instead of
+# producing a "feature references non-existent dep" parse error.
+whisper = ["sdr-transcription/whisper", "sdr-ui?/whisper"]
+sherpa = ["sdr-transcription/sherpa", "sdr-ui?/sherpa"]
 
 # User-facing build targets. Pick exactly one. Whisper and Sherpa are
 # mutually exclusive at the source level (see compile_error in
 # crates/sdr-transcription/src/lib.rs).
 #
 # Whisper backend with various accelerator backends:
-whisper-cpu = ["whisper", "sdr-transcription/whisper-cpu", "sdr-ui/whisper-cpu"]
-whisper-cuda = ["whisper", "sdr-transcription/whisper-cuda", "sdr-ui/whisper-cuda"]
-whisper-hipblas = ["whisper", "sdr-transcription/whisper-hipblas", "sdr-ui/whisper-hipblas"]
-whisper-vulkan = ["whisper", "sdr-transcription/whisper-vulkan", "sdr-ui/whisper-vulkan"]
-whisper-metal = ["whisper", "sdr-transcription/whisper-metal", "sdr-ui/whisper-metal"]
-whisper-intel-sycl = ["whisper", "sdr-transcription/whisper-intel-sycl", "sdr-ui/whisper-intel-sycl"]
-whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas", "sdr-ui/whisper-openblas"]
+whisper-cpu = ["whisper", "sdr-transcription/whisper-cpu", "sdr-ui?/whisper-cpu"]
+whisper-cuda = ["whisper", "sdr-transcription/whisper-cuda", "sdr-ui?/whisper-cuda"]
+whisper-hipblas = ["whisper", "sdr-transcription/whisper-hipblas", "sdr-ui?/whisper-hipblas"]
+whisper-vulkan = ["whisper", "sdr-transcription/whisper-vulkan", "sdr-ui?/whisper-vulkan"]
+whisper-metal = ["whisper", "sdr-transcription/whisper-metal", "sdr-ui?/whisper-metal"]
+whisper-intel-sycl = ["whisper", "sdr-transcription/whisper-intel-sycl", "sdr-ui?/whisper-intel-sycl"]
+whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas", "sdr-ui?/whisper-openblas"]
 
 # Sherpa backend (CPU only for now — GPU support tracked separately):
-sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu", "sdr-ui/sherpa-cpu"]
+sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu", "sdr-ui?/sherpa-cpu"]
 
+# GTK frontend stack — Linux only. The `sdr` binary on non-Linux targets
+# falls back to a stub `main()` (see src/main.rs) that prints a message
+# pointing at the macOS app and exits non-zero. `sdr-ui` is marked optional
+# so the features above can use the `dep:` / `?/` syntax cleanly.
 [target.'cfg(target_os = "linux")'.dependencies]
-sdr-ui = { workspace = true, features = ["pipewire"] }
+sdr-ui = { workspace = true, features = ["pipewire"], optional = true }
+gtk4.workspace = true
+libadwaita.workspace = true
 
 [lints]
 workspace = true
@@ -75,6 +96,7 @@ members = [
     "crates/sdr-config",
     "crates/sdr-radioreference",
     "crates/sdr-transcription",
+    "crates/sdr-core",
     "crates/sdr-ui",
 ]
 
@@ -98,6 +120,7 @@ sdr-radio = { path = "crates/sdr-radio" }
 sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-transcription = { path = "crates/sdr-transcription" }
+sdr-core = { path = "crates/sdr-core" }
 sdr-ui = { path = "crates/sdr-ui" }
 
 # HTTP / XML (RadioReference)
