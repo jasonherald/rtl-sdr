@@ -13,7 +13,7 @@ use crate::model::WhisperModel;
 ///
 /// `model` selects which ASR model the backend should load. Additional
 /// fields are preprocessing parameters shared across all backends.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BackendConfig {
     pub model: ModelChoice,
     pub silence_threshold: f32,
@@ -24,7 +24,7 @@ pub struct BackendConfig {
 ///
 /// The variant determines which backend the engine instantiates internally.
 /// Currently only `Whisper` is implemented; `Sherpa` lands in PR 2.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChoice {
     Whisper(WhisperModel),
 }
