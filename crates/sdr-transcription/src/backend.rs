@@ -5,6 +5,7 @@
 //! This file defines the trait, the handle returned by `start`, the config
 //! passed in, and the event type emitted to consumers.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 use crate::model::WhisperModel;
@@ -23,10 +24,10 @@ pub struct BackendConfig {
 /// User-facing model selection.
 ///
 /// The variant determines which backend the engine instantiates internally.
-/// Currently only `Whisper` is implemented; `Sherpa` lands in PR 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelChoice {
     Whisper(WhisperModel),
+    Sherpa(crate::sherpa_model::SherpaModel),
 }
 
 /// Events emitted by a backend during its lifecycle.
@@ -38,7 +39,12 @@ pub enum TranscriptionEvent {
     Downloading { progress_pct: u8 },
     /// Model loaded and ready for inference.
     Ready,
-    /// Transcribed text from one inference pass.
+    /// Incremental hypothesis from a streaming backend. May be replaced
+    /// by another `Partial` before being committed as a `Text`. Backends
+    /// that return `false` from `supports_partials()` never emit this.
+    Partial { text: String },
+    /// Transcribed text from one inference pass (or one committed
+    /// streaming utterance).
     Text {
         /// Wall-clock timestamp in "HH:MM:SS" format.
         timestamp: String,
@@ -66,6 +72,12 @@ pub struct BackendHandle {
 pub enum BackendError {
     #[error("failed to spawn worker thread: {0}")]
     Spawn(#[from] std::io::Error),
+    #[error("model files not found at {path}; download the bundle and place its contents in this directory")]
+    ModelNotFound { path: PathBuf },
+    #[error("backend received the wrong model kind in BackendConfig — engine bug")]
+    WrongModelKind,
+    #[error("backend initialization failed: {0}")]
+    Init(String),
 }
 
 /// Trait every transcription backend must implement.

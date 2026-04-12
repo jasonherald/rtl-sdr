@@ -12,12 +12,14 @@ pub mod backends;
 pub mod denoise;
 pub mod model;
 pub mod resampler;
+pub mod sherpa_model;
 
 pub use backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
     TranscriptionEvent,
 };
 pub use model::WhisperModel;
+pub use sherpa_model::SherpaModel;
 
 use std::sync::mpsc;
 

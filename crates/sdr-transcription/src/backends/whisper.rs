@@ -63,7 +63,9 @@ impl TranscriptionBackend for WhisperBackend {
     }
 
     fn start(&mut self, config: BackendConfig) -> Result<BackendHandle, BackendError> {
-        let ModelChoice::Whisper(whisper_model) = config.model;
+        let ModelChoice::Whisper(whisper_model) = config.model else {
+            return Err(BackendError::WrongModelKind);
+        };
 
         self.cancel.store(false, Ordering::Relaxed);
 
