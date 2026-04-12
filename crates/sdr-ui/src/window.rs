@@ -1494,6 +1494,11 @@ fn connect_transcript_panel(
                                         status.set_css_classes(&["success"]);
                                         progress.set_visible(false);
                                     }
+                                    TranscriptionEvent::Partial { text } => {
+                                        // PR 4 will render this as a live caption line.
+                                        // For the PR 2 spike, log only.
+                                        tracing::debug!(target: "transcription", partial = %text);
+                                    }
                                     TranscriptionEvent::Text { timestamp, text } => {
                                         let buf = tv.buffer();
                                         let mut end = buf.end_iter();
