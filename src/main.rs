@@ -1,14 +1,16 @@
 // The `sdr` binary is the GTK4 + libadwaita frontend, which is currently
-// Linux-only. On non-Linux platforms (macOS, Windows) we provide a stub
-// `main()` that prints a message and exits non-zero so the workspace still
-// builds end-to-end on every platform without surprising linker failures.
-// The macOS native frontend lives in `apps/macos/` (SwiftUI) and runs
-// against the `sdr-core` engine via the `sdr-ffi` C ABI.
+// Linux-only and gated behind the `gtk-frontend` cargo feature. On
+// non-Linux platforms (macOS, Windows) — or on Linux without the
+// `gtk-frontend` feature — we provide a stub `main()` that prints a
+// message and exits non-zero so the workspace still builds end-to-end
+// on every platform without surprising linker failures. The macOS
+// native frontend lives in `apps/macos/` (SwiftUI) and runs against
+// the `sdr-core` engine via the `sdr-ffi` C ABI.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 use gtk4::glib;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 fn main() -> glib::ExitCode {
     // Limit glibc malloc arenas before any threads spawn.
     // Without this, glibc creates up to 8*cores arenas that each keep
@@ -40,13 +42,14 @@ fn main() -> glib::ExitCode {
     sdr_ui::run()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(not(target_os = "linux"), not(feature = "gtk-frontend")))]
 fn main() -> std::process::ExitCode {
     eprintln!("sdr-rs: the GTK4 frontend is currently Linux-only.");
     eprintln!();
     eprintln!("macOS support via a native SwiftUI app is in progress");
     eprintln!("(see https://github.com/jasonherald/rtl-sdr/issues/228).");
     eprintln!();
-    eprintln!("On Linux, install GTK4 + libadwaita and run `cargo run --release`.");
+    eprintln!("On Linux, install GTK4 + libadwaita and run `cargo run --release`");
+    eprintln!("(the `gtk-frontend` feature is enabled by default).");
     std::process::ExitCode::from(1)
 }

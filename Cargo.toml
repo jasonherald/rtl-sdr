@@ -28,13 +28,19 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
 
 [features]
-# Default Linux build = GTK frontend + Whisper-CPU transcription backend.
-# On macOS / Windows the `gtk-frontend` feature is enabled but does nothing
-# (sdr-ui is a target-conditional optional dep that only resolves on Linux),
-# so `cargo build` produces just the stub `main()` from src/main.rs that
-# points users at the macOS app issue. The Whisper-CPU backend still
-# compiles via sdr-transcription, which is cross-platform.
-default = ["whisper-cpu", "gtk-frontend"]
+# Default Linux build = Whisper-CPU transcription backend with the GTK
+# frontend. The `gtk-frontend` feature is implied by every user-facing
+# transcription feature (whisper-* / sherpa-cpu) so users don't have to
+# remember to enable it explicitly when overriding defaults — i.e.
+# `cargo build --no-default-features --features sherpa-cpu` Just Works
+# instead of falling through to the no-frontend stub main.
+#
+# On macOS / Windows, `gtk-frontend` activates `dep:sdr-ui` which is a
+# target-conditional optional dep that only resolves on Linux, so the
+# activation is silently a no-op and `cargo build` produces just the
+# stub `main()` from src/main.rs that points users at the macOS app.
+# The transcription crate is cross-platform and still compiles.
+default = ["whisper-cpu"]
 
 # Pulls sdr-ui into the binary on Linux. On other targets the `dep:` is
 # a no-op because sdr-ui is gated to `[target.'cfg(target_os = "linux")']`
@@ -53,19 +59,21 @@ sherpa = ["sdr-transcription/sherpa", "sdr-ui?/sherpa"]
 
 # User-facing build targets. Pick exactly one. Whisper and Sherpa are
 # mutually exclusive at the source level (see compile_error in
-# crates/sdr-transcription/src/lib.rs).
+# crates/sdr-transcription/src/lib.rs). Each implies `gtk-frontend` so
+# the user gets a working GTK build with a single feature flag, with
+# no need for `--features sherpa-cpu,gtk-frontend` etc.
 #
 # Whisper backend with various accelerator backends:
-whisper-cpu = ["whisper", "sdr-transcription/whisper-cpu", "sdr-ui?/whisper-cpu"]
-whisper-cuda = ["whisper", "sdr-transcription/whisper-cuda", "sdr-ui?/whisper-cuda"]
-whisper-hipblas = ["whisper", "sdr-transcription/whisper-hipblas", "sdr-ui?/whisper-hipblas"]
-whisper-vulkan = ["whisper", "sdr-transcription/whisper-vulkan", "sdr-ui?/whisper-vulkan"]
-whisper-metal = ["whisper", "sdr-transcription/whisper-metal", "sdr-ui?/whisper-metal"]
-whisper-intel-sycl = ["whisper", "sdr-transcription/whisper-intel-sycl", "sdr-ui?/whisper-intel-sycl"]
-whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas", "sdr-ui?/whisper-openblas"]
+whisper-cpu = ["whisper", "gtk-frontend", "sdr-transcription/whisper-cpu", "sdr-ui?/whisper-cpu"]
+whisper-cuda = ["whisper", "gtk-frontend", "sdr-transcription/whisper-cuda", "sdr-ui?/whisper-cuda"]
+whisper-hipblas = ["whisper", "gtk-frontend", "sdr-transcription/whisper-hipblas", "sdr-ui?/whisper-hipblas"]
+whisper-vulkan = ["whisper", "gtk-frontend", "sdr-transcription/whisper-vulkan", "sdr-ui?/whisper-vulkan"]
+whisper-metal = ["whisper", "gtk-frontend", "sdr-transcription/whisper-metal", "sdr-ui?/whisper-metal"]
+whisper-intel-sycl = ["whisper", "gtk-frontend", "sdr-transcription/whisper-intel-sycl", "sdr-ui?/whisper-intel-sycl"]
+whisper-openblas = ["whisper", "gtk-frontend", "sdr-transcription/whisper-openblas", "sdr-ui?/whisper-openblas"]
 
 # Sherpa backend (CPU only for now — GPU support tracked separately):
-sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu", "sdr-ui?/sherpa-cpu"]
+sherpa-cpu = ["sherpa", "gtk-frontend", "sdr-transcription/sherpa-cpu", "sdr-ui?/sherpa-cpu"]
 
 # GTK frontend stack — Linux only. The `sdr` binary on non-Linux targets
 # falls back to a stub `main()` (see src/main.rs) that prints a message
