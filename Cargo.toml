@@ -19,6 +19,7 @@ sdr-source-network.workspace = true
 sdr-source-file.workspace = true
 sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
+sdr-transcription.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
@@ -26,13 +27,30 @@ gtk4.workspace = true
 libadwaita.workspace = true
 
 [features]
-default = []
-cuda = ["sdr-ui/cuda"]
-hipblas = ["sdr-ui/hipblas"]
-vulkan = ["sdr-ui/vulkan"]
-metal = ["sdr-ui/metal"]
-intel-sycl = ["sdr-ui/intel-sycl"]
-openblas = ["sdr-ui/openblas"]
+default = ["whisper-cpu"]
+
+# Internal cfg flags. Source code uses #[cfg(feature = "whisper")] /
+# #[cfg(feature = "sherpa")] to gate per-backend code. These are pulled
+# in by the user-facing whisper-* / sherpa-* features below — users
+# should not enable them directly.
+whisper = ["sdr-transcription/whisper", "sdr-ui/whisper"]
+sherpa = ["sdr-transcription/sherpa", "sdr-ui/sherpa"]
+
+# User-facing build targets. Pick exactly one. Whisper and Sherpa are
+# mutually exclusive at the source level (see compile_error in
+# crates/sdr-transcription/src/lib.rs).
+#
+# Whisper backend with various accelerator backends:
+whisper-cpu = ["whisper", "sdr-transcription/whisper-cpu", "sdr-ui/whisper-cpu"]
+whisper-cuda = ["whisper", "sdr-transcription/whisper-cuda", "sdr-ui/whisper-cuda"]
+whisper-hipblas = ["whisper", "sdr-transcription/whisper-hipblas", "sdr-ui/whisper-hipblas"]
+whisper-vulkan = ["whisper", "sdr-transcription/whisper-vulkan", "sdr-ui/whisper-vulkan"]
+whisper-metal = ["whisper", "sdr-transcription/whisper-metal", "sdr-ui/whisper-metal"]
+whisper-intel-sycl = ["whisper", "sdr-transcription/whisper-intel-sycl", "sdr-ui/whisper-intel-sycl"]
+whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas", "sdr-ui/whisper-openblas"]
+
+# Sherpa backend (CPU only for now — GPU support tracked separately):
+sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu", "sdr-ui/sherpa-cpu"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-ui = { workspace = true, features = ["pipewire"] }
@@ -91,6 +109,9 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 
 # Whisper speech-to-text
 whisper-rs = "0.16"
+
+# Sherpa-onnx streaming ASR
+sherpa-onnx = "1.12"
 
 # System directories / libc
 dirs-next = "2"

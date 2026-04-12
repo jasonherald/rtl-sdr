@@ -63,7 +63,16 @@ impl TranscriptionBackend for WhisperBackend {
     }
 
     fn start(&mut self, config: BackendConfig) -> Result<BackendHandle, BackendError> {
-        let ModelChoice::Whisper(whisper_model) = config.model;
+        // The cfg-gated Sherpa arm exists only when both features are
+        // enabled (which compile_error prevents). In whisper-only builds
+        // this match has one arm — allow clippy's infallible_destructuring_match
+        // warning rather than hiding the intent of the guard.
+        #[allow(clippy::infallible_destructuring_match)]
+        let whisper_model = match config.model {
+            ModelChoice::Whisper(m) => m,
+            #[cfg(feature = "sherpa")]
+            ModelChoice::Sherpa(_) => return Err(BackendError::WrongModelKind),
+        };
 
         self.cancel.store(false, Ordering::Relaxed);
 
@@ -270,7 +279,7 @@ fn run_worker_inner(
             }
 
             if !combined.is_empty() && !is_hallucination(&combined) {
-                let timestamp = chrono_timestamp();
+                let timestamp = crate::util::wall_clock_timestamp();
                 tracing::debug!(%timestamp, %combined, "transcribed chunk");
                 let _ = event_tx.send(TranscriptionEvent::Text {
                     timestamp,
@@ -323,47 +332,6 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     #[allow(clippy::cast_precision_loss)]
     let mean = sum_sq / samples.len() as f32;
     mean.sqrt()
-}
-
-/// Return the current wall-clock time formatted as "HH:MM:SS" in local time.
-///
-/// Uses `libc::localtime_r` for timezone-aware formatting without pulling in
-/// the `chrono` crate.
-#[allow(unsafe_code)]
-fn chrono_timestamp() -> String {
-    let mut tv = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-
-    // SAFETY: `gettimeofday` writes into the provided buffer and is
-    // thread-safe. We pass null for the timezone (deprecated parameter).
-    #[allow(unsafe_code)]
-    let epoch = unsafe {
-        libc::gettimeofday(&raw mut tv, std::ptr::null_mut());
-        tv.tv_sec
-    };
-
-    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
-
-    // SAFETY: `localtime_r` is the reentrant (thread-safe) variant.
-    // We provide a valid `time_t` and a valid output buffer.
-    // Returns null on failure, in which case we fall back to UTC via `gmtime_r`.
-    #[allow(unsafe_code)]
-    let tm = unsafe {
-        let result = libc::localtime_r(&raw const epoch, tm.as_mut_ptr());
-        let result = if result.is_null() {
-            libc::gmtime_r(&raw const epoch, tm.as_mut_ptr())
-        } else {
-            result
-        };
-        if result.is_null() {
-            return "00:00:00".to_owned();
-        }
-        tm.assume_init()
-    };
-
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 #[cfg(test)]

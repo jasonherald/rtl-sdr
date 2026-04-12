@@ -87,11 +87,16 @@ impl TranscriptionBackend for MockBackend {
 mod tests {
     use super::*;
     use crate::backend::ModelChoice;
+    #[cfg(feature = "whisper")]
     use crate::model::WhisperModel;
 
     fn dummy_config() -> BackendConfig {
+        #[cfg(feature = "whisper")]
+        let model = ModelChoice::Whisper(WhisperModel::TinyEn);
+        #[cfg(feature = "sherpa")]
+        let model = ModelChoice::Sherpa(crate::SherpaModel::StreamingZipformerEn);
         BackendConfig {
-            model: ModelChoice::Whisper(WhisperModel::TinyEn),
+            model,
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
         }

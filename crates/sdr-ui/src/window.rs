@@ -1419,6 +1419,7 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
 /// Connect transcript panel controls to DSP commands.
 ///
 /// Returns the engine handle so it can be stopped on window close.
+#[allow(clippy::too_many_lines)]
 fn connect_transcript_panel(
     transcript: &sidebar::transcript_panel::TranscriptPanel,
     state: &Rc<AppState>,
@@ -1434,35 +1435,69 @@ fn connect_transcript_panel(
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
     let model_row = transcript.model_row.clone();
+    #[cfg(feature = "whisper")]
     let silence_row = transcript.silence_row.clone();
     let noise_gate_row = transcript.noise_gate_row.clone();
+    // Weak refs used by the async event-loop closure to drive the same
+    // teardown the synchronous error path does (see below) when the
+    // backend fires TranscriptionEvent::Error mid-session. Weak so the
+    // timeout closure doesn't keep widgets alive past their UI lifetime.
+    let enable_row_weak = transcript.enable_row.downgrade();
+    let model_row_weak = model_row.downgrade();
+    #[cfg(feature = "whisper")]
+    let silence_row_weak = silence_row.downgrade();
+    let noise_gate_row_weak = noise_gate_row.downgrade();
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
             // Read selected model from dropdown.
             // Lock model and tuning controls while transcription is active.
             model_row.set_sensitive(false);
+            #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
-            let whisper_model = sdr_transcription::WhisperModel::ALL
-                .get(model_idx)
-                .copied()
-                .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
 
             // Read tuning slider values.
+            #[cfg(feature = "whisper")]
             #[allow(clippy::cast_possible_truncation)]
             let silence_threshold = silence_row.value() as f32;
+            // Sherpa builds: silence_threshold is unused by SherpaBackend
+            // (see build_recognizer_config doc comment). Pass a sentinel.
+            #[cfg(feature = "sherpa")]
+            let silence_threshold: f32 = 0.0;
             #[allow(clippy::cast_possible_truncation)]
             let noise_gate_ratio = noise_gate_row.value() as f32;
 
+            // Build BackendConfig — Whisper and Sherpa are mutually exclusive
+            // cargo features, so exactly one variant is compiled in.
+            #[cfg(feature = "whisper")]
+            let model = {
+                let whisper_model = sdr_transcription::WhisperModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
+                sdr_transcription::ModelChoice::Whisper(whisper_model)
+            };
+            #[cfg(feature = "sherpa")]
+            let model = {
+                let sherpa_model = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .unwrap_or(sdr_transcription::SherpaModel::StreamingZipformerEn);
+                sdr_transcription::ModelChoice::Sherpa(sherpa_model)
+            };
+
+            let config = sdr_transcription::BackendConfig {
+                model,
+                silence_threshold,
+                noise_gate_ratio,
+            };
+
             // Scope the borrow so it's dropped before any potential re-entry
             // from row.set_active(false) on error.
-            let start_result =
-                engine_clone
-                    .borrow_mut()
-                    .start(whisper_model, silence_threshold, noise_gate_ratio);
+            let start_result = engine_clone.borrow_mut().start(config);
             match start_result {
                 Ok(event_rx) => {
                     if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
@@ -1473,11 +1508,33 @@ fn connect_transcript_panel(
                     status_label.set_text("Starting...");
                     status_label.set_visible(true);
 
-                    let status = status_label.clone();
-                    let progress = progress_bar.clone();
-                    let tv = text_view.clone();
+                    // Weak refs for the entire timeout source — see the
+                    // weak-ref decl block at the top of connect_transcript_panel
+                    // for the rationale (don't keep widgets alive past their
+                    // UI lifetime through the glib timeout source).
+                    let status_weak = status_label.downgrade();
+                    let progress_weak = progress_bar.downgrade();
+                    let tv_weak = text_view.downgrade();
+                    let enable_row_weak = enable_row_weak.clone();
+                    let model_row_weak = model_row_weak.clone();
+                    #[cfg(feature = "whisper")]
+                    let silence_row_weak = silence_row_weak.clone();
+                    let noise_gate_row_weak = noise_gate_row_weak.clone();
 
                     glib::timeout_add_local(Duration::from_millis(100), move || {
+                        // Upgrade once per tick. If any widget has been
+                        // dropped (e.g. window closed), stop the timeout
+                        // immediately so we don't resurrect dead UI.
+                        let Some(status) = status_weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        let Some(progress) = progress_weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        let Some(tv) = tv_weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+
                         loop {
                             match event_rx.try_recv() {
                                 Ok(event) => match event {
@@ -1494,6 +1551,18 @@ fn connect_transcript_panel(
                                         status.set_css_classes(&["success"]);
                                         progress.set_visible(false);
                                     }
+                                    TranscriptionEvent::Partial { text } => {
+                                        // PR 4 will render this as a live
+                                        // caption line. For the PR 2 spike,
+                                        // log only the length — never the
+                                        // raw text. Public safety scanner
+                                        // content does not belong in logs.
+                                        tracing::debug!(
+                                            target: "transcription",
+                                            partial_chars = text.chars().count(),
+                                            "sherpa partial received"
+                                        );
+                                    }
                                     TranscriptionEvent::Text { timestamp, text } => {
                                         let buf = tv.buffer();
                                         let mut end = buf.end_iter();
@@ -1503,8 +1572,28 @@ fn connect_transcript_panel(
                                         buf.delete_mark(&mark);
                                     }
                                     TranscriptionEvent::Error(msg) => {
+                                        // Fatal — backend has exited.
+                                        // Mirror the synchronous start()
+                                        // failure teardown so the UI
+                                        // isn't left locked.
+                                        if let Some(model) = model_row_weak.upgrade() {
+                                            model.set_sensitive(true);
+                                        }
+                                        #[cfg(feature = "whisper")]
+                                        if let Some(silence) = silence_row_weak.upgrade() {
+                                            silence.set_sensitive(true);
+                                        }
+                                        if let Some(noise) = noise_gate_row_weak.upgrade() {
+                                            noise.set_sensitive(true);
+                                        }
+                                        if let Some(enable) = enable_row_weak.upgrade() {
+                                            enable.set_active(false);
+                                        }
                                         status.set_text(&msg);
                                         status.set_css_classes(&["error"]);
+                                        status.set_visible(true);
+                                        progress.set_visible(false);
+                                        return glib::ControlFlow::Break;
                                     }
                                 },
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1519,13 +1608,23 @@ fn connect_transcript_panel(
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
                     model_row.set_sensitive(true);
+                    #[cfg(feature = "whisper")]
                     silence_row.set_sensitive(true);
                     noise_gate_row.set_sensitive(true);
+                    // Reset the toggle FIRST (the else branch clears
+                    // status_label as part of its normal teardown), then
+                    // set the error text so the user actually sees it.
+                    // Otherwise the failure is silent — only in stderr.
                     row.set_active(false);
+                    status_label.set_text(&e.to_string());
+                    status_label.set_css_classes(&["error"]);
+                    status_label.set_visible(true);
+                    progress_bar.set_visible(false);
                 }
             }
         } else {
             model_row.set_sensitive(true);
+            #[cfg(feature = "whisper")]
             silence_row.set_sensitive(true);
             noise_gate_row.set_sensitive(true);
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);

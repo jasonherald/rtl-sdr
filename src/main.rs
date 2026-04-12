@@ -22,5 +22,11 @@ fn main() -> glib::ExitCode {
         tracing::warn!("mallopt(M_ARENA_MAX, 4) failed — arena cap not applied");
     }
     tracing::info!("sdr-rs starting");
+
+    // Initialize the sherpa-onnx host BEFORE GTK is loaded.
+    // Only present in builds with the `sherpa` feature.
+    #[cfg(feature = "sherpa")]
+    sdr_transcription::init_sherpa_host(sdr_transcription::SherpaModel::StreamingZipformerEn);
+
     sdr_ui::run()
 }

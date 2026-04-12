@@ -4,24 +4,61 @@
 //! [`backend::TranscriptionBackend`] implementations. The engine owns
 //! one backend at a time and delegates lifecycle to it.
 //!
-//! Currently only the Whisper backend is implemented; sherpa-onnx
-//! lands in PR 2.
+//! Two backends are currently implemented: [`backends::whisper::WhisperBackend`]
+//! (file-based, chunked inference via whisper-rs) and
+//! [`backends::sherpa::SherpaBackend`] (true streaming via sherpa-onnx).
+//!
+//! The `whisper` and `sherpa` cargo features are mutually exclusive. Exactly
+//! one must be enabled at build time (see the `compile_error` guards below).
+
+#[cfg(all(feature = "whisper", feature = "sherpa"))]
+compile_error!(
+    "the whisper and sherpa transcription backends are mutually exclusive. \
+     Pick exactly one user-facing feature: \
+     `whisper-cpu` (default), `whisper-cuda`, `whisper-hipblas`, \
+     `whisper-vulkan`, `whisper-metal`, `whisper-intel-sycl`, `whisper-openblas`, \
+     or `sherpa-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+);
+
+#[cfg(not(any(feature = "whisper", feature = "sherpa")))]
+compile_error!(
+    "exactly one transcription backend must be enabled. The default is \
+     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+);
 
 pub mod backend;
 pub mod backends;
 pub mod denoise;
-pub mod model;
 pub mod resampler;
+pub mod util;
+
+#[cfg(feature = "whisper")]
+pub mod model;
+
+#[cfg(feature = "sherpa")]
+pub mod sherpa_model;
 
 pub use backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
     TranscriptionEvent,
 };
+
+#[cfg(feature = "whisper")]
 pub use model::WhisperModel;
+
+#[cfg(feature = "sherpa")]
+pub use backends::sherpa::init_sherpa_host;
+
+#[cfg(feature = "sherpa")]
+pub use sherpa_model::SherpaModel;
 
 use std::sync::mpsc;
 
+#[cfg(feature = "whisper")]
 use crate::backends::whisper::WhisperBackend;
+
+#[cfg(feature = "sherpa")]
+use crate::backends::sherpa::SherpaBackend;
 
 /// Error type for engine-level operations.
 #[derive(Debug, thiserror::Error)]
@@ -58,22 +95,19 @@ impl TranscriptionEngine {
         }
     }
 
-    /// Start the Whisper backend with the given model and parameters.
-    /// Returns a receiver for [`TranscriptionEvent`].
+    /// Start a transcription backend selected by `config.model`.
     ///
-    /// Kept for API compatibility with the pre-refactor engine.
-    /// Internally constructs a [`WhisperBackend`] and delegates.
+    /// Constructs the right backend (Whisper or Sherpa) for the chosen
+    /// model and returns a receiver for [`TranscriptionEvent`].
     pub fn start(
         &mut self,
-        whisper_model: WhisperModel,
-        silence_threshold: f32,
-        noise_gate_ratio: f32,
+        config: BackendConfig,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
-        let backend: Box<dyn TranscriptionBackend> = Box::new(WhisperBackend::new());
-        let config = BackendConfig {
-            model: ModelChoice::Whisper(whisper_model),
-            silence_threshold,
-            noise_gate_ratio,
+        let backend: Box<dyn TranscriptionBackend> = match config.model {
+            #[cfg(feature = "whisper")]
+            ModelChoice::Whisper(_) => Box::new(WhisperBackend::new()),
+            #[cfg(feature = "sherpa")]
+            ModelChoice::Sherpa(_) => Box::new(SherpaBackend::new()),
         };
         self.start_with_backend(backend, config)
     }
@@ -154,8 +188,12 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn dummy_config() -> BackendConfig {
+        #[cfg(feature = "whisper")]
+        let model = ModelChoice::Whisper(WhisperModel::TinyEn);
+        #[cfg(feature = "sherpa")]
+        let model = ModelChoice::Sherpa(crate::SherpaModel::StreamingZipformerEn);
         BackendConfig {
-            model: ModelChoice::Whisper(WhisperModel::TinyEn),
+            model,
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
         }

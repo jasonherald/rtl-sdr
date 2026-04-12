@@ -7,18 +7,30 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
 
+#[cfg(feature = "whisper")]
 /// Config key for the persisted Whisper model index.
 const KEY_MODEL: &str = "transcription_model";
+#[cfg(feature = "whisper")]
 /// Config key for the silence threshold after spectral denoising.
+/// Whisper-only — Sherpa uses native endpoint detection.
 const KEY_SILENCE_THRESHOLD: &str = "transcription_silence_threshold";
 /// Config key for the spectral noise gate ratio.
 const KEY_NOISE_GATE: &str = "transcription_noise_gate";
+#[cfg(feature = "sherpa")]
+/// Config key for the persisted Sherpa model index.
+const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
 
-// Silence threshold slider defaults and range.
+// Silence threshold slider defaults and range. Whisper-only — Sherpa
+// uses native endpoint detection so the slider isn't shown.
+#[cfg(feature = "whisper")]
 const DEFAULT_SILENCE_THRESHOLD: f64 = 0.007;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_MIN: f64 = 0.001;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_MAX: f64 = 0.100;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_STEP: f64 = 0.001;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_PAGE: f64 = 0.01;
 
 // Noise gate slider defaults and range.
@@ -35,9 +47,12 @@ pub struct TranscriptPanel {
     pub widget: adw::PreferencesGroup,
     /// Toggle to enable/disable live transcription.
     pub enable_row: adw::SwitchRow,
-    /// Model size selector.
+    /// Model size selector — shows Whisper or Sherpa models based on
+    /// which cargo feature was compiled in.
     pub model_row: adw::ComboRow,
-    /// Silence threshold spin row.
+    /// Silence threshold spin row. Whisper-only — Sherpa hides this
+    /// because it uses native endpoint detection.
+    #[cfg(feature = "whisper")]
     pub silence_row: adw::SpinRow,
     /// Noise gate spin row.
     pub noise_gate_row: adw::SpinRow,
@@ -66,74 +81,107 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .build();
     group.add(&enable_row);
 
-    // Model selector
-    let model_labels: Vec<&str> = sdr_transcription::WhisperModel::ALL
-        .iter()
-        .map(|m| m.label())
-        .collect();
+    // --- Model selector ---
+    //
+    // Whisper and Sherpa are mutually exclusive cargo features (see
+    // sdr-transcription/src/lib.rs compile_error guards). The model picker
+    // shows whichever backend was compiled in. The user picks the build
+    // they want at install time:
+    //
+    //   make install CARGO_FLAGS="--release --features whisper-cuda"     # Whisper + CUDA
+    //   make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"  # Sherpa CPU
+    #[cfg(feature = "whisper")]
+    let (model_labels, max_model_idx, key_for_persistence): (Vec<&'static str>, u32, &str) = {
+        let labels: Vec<&'static str> = sdr_transcription::WhisperModel::ALL
+            .iter()
+            .map(|m| m.label())
+            .collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let max = sdr_transcription::WhisperModel::ALL.len() as u32;
+        (labels, max, KEY_MODEL)
+    };
+    #[cfg(feature = "sherpa")]
+    let (model_labels, max_model_idx, key_for_persistence): (Vec<&'static str>, u32, &str) = {
+        let labels: Vec<&'static str> = sdr_transcription::SherpaModel::ALL
+            .iter()
+            .map(|m| m.label())
+            .collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let max = sdr_transcription::SherpaModel::ALL.len() as u32;
+        (labels, max, KEY_SHERPA_MODEL)
+    };
+
     let model_list = gtk4::StringList::new(&model_labels);
 
-    #[allow(clippy::cast_possible_truncation)]
-    let max_model_idx = sdr_transcription::WhisperModel::ALL.len() as u32;
-
-    #[allow(clippy::cast_possible_truncation)]
     let saved_model_idx = config.read(|v| {
-        v.get(KEY_MODEL)
+        v.get(key_for_persistence)
             .and_then(serde_json::Value::as_u64)
             .and_then(|idx| u32::try_from(idx).ok())
             .filter(|&idx| idx < max_model_idx)
             .unwrap_or(0)
     });
 
+    #[cfg(feature = "whisper")]
+    let model_title = "Whisper Model";
+    #[cfg(feature = "sherpa")]
+    let model_title = "Sherpa Model";
+
     let model_row = adw::ComboRow::builder()
-        .title("Model")
+        .title(model_title)
         .model(&model_list)
         .selected(saved_model_idx)
         .build();
     group.add(&model_row);
 
-    // Persist model selection on change (ignore transient out-of-range indices).
+    // Persist model selection on change.
     let config_model = Arc::clone(config);
     model_row.connect_selected_notify(move |row| {
         let idx = row.selected();
         if idx < max_model_idx {
             config_model.write(|v| {
-                v[KEY_MODEL] = serde_json::json!(idx);
+                v[key_for_persistence] = serde_json::json!(idx);
             });
         }
     });
 
     // --- Tuning sliders ---
 
-    let saved_silence = config.read(|v| {
-        v.get(KEY_SILENCE_THRESHOLD)
-            .and_then(serde_json::Value::as_f64)
-            .map_or(DEFAULT_SILENCE_THRESHOLD, |val| {
-                val.clamp(SILENCE_THRESHOLD_MIN, SILENCE_THRESHOLD_MAX)
-            })
-    });
-
-    let silence_row = adw::SpinRow::builder()
-        .title("Silence threshold")
-        .adjustment(&gtk4::Adjustment::new(
-            saved_silence,
-            SILENCE_THRESHOLD_MIN,
-            SILENCE_THRESHOLD_MAX,
-            SILENCE_THRESHOLD_STEP,
-            SILENCE_THRESHOLD_PAGE,
-            0.0,
-        ))
-        .digits(3)
-        .build();
-    group.add(&silence_row);
-
-    let config_silence = Arc::clone(config);
-    silence_row.connect_value_notify(move |row| {
-        let val = row.value();
-        config_silence.write(|v| {
-            v[KEY_SILENCE_THRESHOLD] = serde_json::json!(val);
+    // Silence threshold slider — Whisper-only because Sherpa has
+    // native endpoint detection (see SherpaBackend::build_recognizer_config).
+    #[cfg(feature = "whisper")]
+    let silence_row = {
+        let saved_silence = config.read(|v| {
+            v.get(KEY_SILENCE_THRESHOLD)
+                .and_then(serde_json::Value::as_f64)
+                .map_or(DEFAULT_SILENCE_THRESHOLD, |val| {
+                    val.clamp(SILENCE_THRESHOLD_MIN, SILENCE_THRESHOLD_MAX)
+                })
         });
-    });
+
+        let row = adw::SpinRow::builder()
+            .title("Silence threshold")
+            .adjustment(&gtk4::Adjustment::new(
+                saved_silence,
+                SILENCE_THRESHOLD_MIN,
+                SILENCE_THRESHOLD_MAX,
+                SILENCE_THRESHOLD_STEP,
+                SILENCE_THRESHOLD_PAGE,
+                0.0,
+            ))
+            .digits(3)
+            .build();
+        group.add(&row);
+
+        let config_silence = Arc::clone(config);
+        row.connect_value_notify(move |r| {
+            let val = r.value();
+            config_silence.write(|v| {
+                v[KEY_SILENCE_THRESHOLD] = serde_json::json!(val);
+            });
+        });
+
+        row
+    };
 
     let saved_noise_gate = config.read(|v| {
         v.get(KEY_NOISE_GATE)
@@ -226,6 +274,7 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         widget: group,
         enable_row,
         model_row,
+        #[cfg(feature = "whisper")]
         silence_row,
         noise_gate_row,
         status_label,
