@@ -1,7 +1,9 @@
-//! Background worker thread for Whisper-based live transcription.
+//! Whisper backend — `whisper-rs` powered transcription.
 //!
-//! Receives interleaved stereo f32 audio at 48 kHz, resamples to 16 kHz mono,
-//! accumulates 5-second chunks, and runs Whisper inference on non-silent chunks.
+//! Implements [`TranscriptionBackend`] for the [`crate::model::WhisperModel`]
+//! family. Receives interleaved stereo f32 audio at 48 kHz, resamples to
+//! 16 kHz mono, accumulates 5-second chunks, and runs Whisper inference on
+//! non-silent chunks.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -9,7 +11,17 @@ use std::time::Duration;
 
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+use crate::backend::{
+    BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
+    TranscriptionEvent,
+};
 use crate::{denoise, model, resampler};
+
+/// Bounded channel capacity for audio buffers from DSP → backend.
+/// Each buffer is ~1024-4096 stereo samples (~20-80 ms). At 48 kHz with
+/// 5-second inference chunks, we need ~250 buffers to avoid drops during
+/// a single inference pass. 512 gives comfortable headroom.
+const AUDIO_CHANNEL_CAPACITY: usize = 512;
 
 /// Seconds of audio per transcription chunk.
 const CHUNK_SECONDS: usize = 5;
@@ -20,25 +32,80 @@ const CHUNK_SAMPLES: usize = 16_000 * CHUNK_SECONDS;
 /// Polling interval for the audio receive loop when checking for cancellation.
 const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Events emitted by the transcription worker.
-#[derive(Debug, Clone)]
-pub enum TranscriptionEvent {
-    /// Model download in progress.
-    Downloading {
-        /// 0..=100
-        progress_pct: u8,
-    },
-    /// Model loaded and ready for inference.
-    Ready,
-    /// Transcribed text from one chunk.
-    Text {
-        /// Wall-clock timestamp in "HH:MM:SS" format.
-        timestamp: String,
-        /// Transcribed text (trimmed, non-empty).
-        text: String,
-    },
-    /// Fatal error — worker will exit after sending this.
-    Error(String),
+/// `TranscriptionBackend` implementation backed by `whisper-rs`.
+pub struct WhisperBackend {
+    cancel: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Default for WhisperBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WhisperBackend {
+    pub fn new() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
+    }
+}
+
+impl TranscriptionBackend for WhisperBackend {
+    fn name(&self) -> &'static str {
+        "whisper"
+    }
+
+    fn supports_partials(&self) -> bool {
+        false
+    }
+
+    fn start(&mut self, config: BackendConfig) -> Result<BackendHandle, BackendError> {
+        let ModelChoice::Whisper(whisper_model) = config.model;
+
+        self.cancel.store(false, Ordering::Relaxed);
+
+        let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let cancel = Arc::clone(&self.cancel);
+        let silence_threshold = config.silence_threshold;
+        let noise_gate_ratio = config.noise_gate_ratio;
+
+        let handle = std::thread::Builder::new()
+            .name("whisper-worker".into())
+            .spawn(move || {
+                run_worker(
+                    &audio_rx,
+                    &event_tx,
+                    &cancel,
+                    whisper_model,
+                    silence_threshold,
+                    noise_gate_ratio,
+                );
+            })?;
+
+        self.worker = Some(handle);
+        tracing::info!("whisper backend started");
+
+        Ok(BackendHandle { audio_tx, event_rx })
+    }
+
+    fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+        tracing::info!("whisper backend stopped");
+    }
+
+    fn shutdown_nonblocking(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.worker.take(); // detach — don't join
+        tracing::info!("whisper backend shutdown (non-blocking)");
+    }
 }
 
 /// Main worker loop. Blocks the calling thread and exits when `audio_rx` is
@@ -52,7 +119,7 @@ pub enum TranscriptionEvent {
 /// * `model` — which Whisper model to load
 /// * `silence_threshold` — RMS below which a chunk is skipped
 /// * `noise_gate_ratio` — spectral gate multiplier over noise floor
-pub fn run_worker(
+fn run_worker(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     cancel: &Arc<AtomicBool>,
@@ -92,7 +159,6 @@ fn run_worker_inner(
         let (progress_tx, progress_rx) = mpsc::channel::<u8>();
         let event_tx_dl = event_tx.clone();
 
-        // Forward download progress as TranscriptionEvent::Downloading.
         let progress_thread = std::thread::Builder::new()
             .name("whisper-dl-progress".into())
             .spawn(move || {
@@ -105,7 +171,6 @@ fn run_worker_inner(
         let path = model::download_model(model, &progress_tx)
             .map_err(|e| format!("model download failed: {e}"))?;
 
-        // Drop the sender so the progress thread exits.
         drop(progress_tx);
         let _ = progress_thread.join();
 
@@ -145,7 +210,6 @@ fn run_worker_inner(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
-        // Process the first buffer we received.
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
 
         // Drain any additional queued buffers to minimize frame drops
@@ -176,7 +240,6 @@ fn run_worker_inner(
                 continue;
             }
 
-            // Run Whisper inference.
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
             params.set_language(Some("en"));
             params.set_print_progress(false);
@@ -240,7 +303,6 @@ const HALLUCINATIONS: &[&str] = &[
 fn is_hallucination(text: &str) -> bool {
     let lower = text.to_lowercase();
 
-    // Bracketed/parenthesized annotations Whisper generates for non-speech.
     if (lower.starts_with('[') && lower.ends_with(']'))
         || (lower.starts_with('(') && lower.ends_with(')'))
     {
@@ -253,7 +315,7 @@ fn is_hallucination(text: &str) -> bool {
 }
 
 /// Compute the root-mean-square of a sample buffer.
-pub fn compute_rms(samples: &[f32]) -> f32 {
+pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -326,5 +388,17 @@ mod tests {
     fn rms_of_empty_is_zero() {
         let rms = compute_rms(&[]);
         assert!((rms - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn whisper_backend_does_not_support_partials() {
+        let backend = WhisperBackend::new();
+        assert!(!backend.supports_partials());
+    }
+
+    #[test]
+    fn whisper_backend_name_is_stable() {
+        let backend = WhisperBackend::new();
+        assert_eq!(backend.name(), "whisper");
     }
 }
