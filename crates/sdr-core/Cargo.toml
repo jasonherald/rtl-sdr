@@ -30,11 +30,23 @@ sdr-rtlsdr.workspace = true
 sdr-source-rtlsdr.workspace = true
 sdr-source-network.workspace = true
 sdr-source-file.workspace = true
-sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
+
+# Audio sink: pulled in with the right backend feature per target_os.
+# On Linux we want PipeWire; on macOS we want CoreAudio. Without these
+# target-conditional overrides, the workspace baseline build would fall
+# through to the no-backend stub. The stub still exists for unusual
+# build configurations (e.g., Windows, or macOS+Linux cross-builds
+# with no default features) — see the cfg dispatch in
+# crates/sdr-sink-audio/src/lib.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+sdr-sink-audio = { workspace = true, features = ["pipewire"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdr-sink-audio = { workspace = true, features = ["coreaudio"] }
 
 [lints]
 workspace = true

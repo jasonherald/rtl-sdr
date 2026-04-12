@@ -169,6 +169,11 @@ rusb = "0.9"
 # Audio (PipeWire on Linux)
 pipewire = "0.9"
 
+# Audio (CoreAudio / AUHAL on macOS). Spec called for 0.12, but 0.14 is
+# the current maintained release; same surface, no breaking changes that
+# affect us.
+coreaudio-rs = "0.14"
+
 # WAV files
 hound = "3"
 

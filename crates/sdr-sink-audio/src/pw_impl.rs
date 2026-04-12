@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sdr_pipeline::sink_manager::Sink;
 use sdr_types::{SinkError, Stereo};
 
+use crate::ring::AudioRingBuffer;
+
 /// Audio sample rate in Hz.
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
@@ -28,87 +30,6 @@ const FRAME_SIZE: usize = (AUDIO_CHANNELS as usize) * std::mem::size_of::<f32>()
 
 /// Sentinel message sent via the PipeWire channel to request shutdown.
 struct Quit;
-
-/// Lock-based SPSC ring buffer for interleaved audio samples.
-///
-/// Pre-allocated at startup — zero allocation during streaming.
-/// The Mutex is held only for memcpy duration (microseconds).
-struct AudioRingBuffer {
-    buf: std::sync::Mutex<AudioRingInner>,
-}
-
-struct AudioRingInner {
-    data: Vec<f32>,
-    read_pos: usize,
-    write_pos: usize,
-    count: usize,
-    capacity: usize,
-}
-
-impl AudioRingBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            buf: std::sync::Mutex::new(AudioRingInner {
-                data: vec![0.0; capacity],
-                read_pos: 0,
-                write_pos: 0,
-                count: 0,
-                capacity,
-            }),
-        }
-    }
-
-    /// Write samples into the ring buffer. Drops oldest data if full.
-    fn write(&self, samples: &[f32]) {
-        let Ok(mut inner) = self.buf.lock() else {
-            return;
-        };
-        let cap = inner.capacity;
-        let mut wp = inner.write_pos;
-        let mut rp = inner.read_pos;
-        let mut cnt = inner.count;
-        for &s in samples {
-            inner.data[wp] = s;
-            wp = (wp + 1) % cap;
-            if cnt < cap {
-                cnt += 1;
-            } else {
-                rp = (rp + 1) % cap;
-            }
-        }
-        inner.write_pos = wp;
-        inner.read_pos = rp;
-        inner.count = cnt;
-    }
-
-    /// Clear the ring buffer (used on start/stop to avoid replaying stale audio).
-    fn clear(&self) {
-        let Ok(mut inner) = self.buf.lock() else {
-            return;
-        };
-        inner.read_pos = 0;
-        inner.write_pos = 0;
-        inner.count = 0;
-    }
-
-    /// Read up to `output.len()` samples. Returns count read.
-    /// Uses `try_lock` to avoid blocking the PipeWire RT callback thread.
-    fn read(&self, output: &mut [f32]) -> usize {
-        let Ok(mut inner) = self.buf.try_lock() else {
-            return 0; // Contended — return silence this cycle.
-        };
-        let to_read = output.len().min(inner.count);
-        let mut rp = inner.read_pos;
-        let cap = inner.capacity;
-        for out in output.iter_mut().take(to_read) {
-            *out = inner.data[rp];
-            rp = (rp + 1) % cap;
-        }
-        inner.read_pos = rp;
-        inner.count -= to_read;
-        to_read
-    }
-}
 
 /// Audio output sink backed by PipeWire.
 pub struct AudioSink {
