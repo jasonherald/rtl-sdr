@@ -10,11 +10,11 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_core::Engine;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
 use sdr_source_rtlsdr::SAMPLE_RATES;
 
-use crate::dsp_controller;
 use crate::header;
 use crate::header::demod_selector;
 use crate::messages::{DspToUi, SourceType, UiToDsp};
@@ -47,9 +47,30 @@ const DSP_POLL_INTERVAL_MS: u64 = 16;
 /// Build and present the main application window.
 #[allow(clippy::too_many_lines)]
 pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::ConfigManager>) {
-    // --- Channel setup ---
-    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
-    let (ui_tx, ui_rx) = mpsc::channel::<UiToDsp>();
+    // --- Engine bootstrap ---
+    //
+    // The headless engine (sdr-core) owns the DSP controller thread, the
+    // command/event channels, and the shared FFT buffer. The GTK side
+    // consumes those pieces through the Engine facade — `command_sender`
+    // and `fft_buffer` are migration helpers that hand back the same raw
+    // channel-and-Arc plumbing the previous `dsp_controller::spawn_dsp_thread`
+    // call assembled inline. The Engine itself is wrapped in `Rc` and
+    // captured by the DSP-poll closure below so it lives for the lifetime
+    // of this window. When the window closes, the closure (and therefore
+    // the Engine) is dropped, the command channel disconnects, and the
+    // detached DSP thread exits naturally.
+    //
+    // We `expect` on `Engine::new` because the only failure mode is the
+    // OS rejecting `std::thread::Builder::spawn`, which previously caused
+    // the process to exit anyway via `std::process::exit(1)` inside the
+    // old `spawn_dsp_thread`. Keeping the same panic-on-spawn-failure
+    // semantics for now; the FFI side will surface this as an error code.
+    let engine = Rc::new(Engine::new().expect("DSP engine should spawn"));
+    let ui_tx = engine.command_sender();
+    let dsp_rx = engine
+        .subscribe()
+        .expect("Engine::subscribe must return Some on its first call");
+    let fft_shared = engine.fft_buffer();
 
     // Shared application state with DSP sender.
     let state = AppState::new_shared(ui_tx);
@@ -259,11 +280,14 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar_for_bw.update_demod(label, row.value());
     });
 
-    // --- Spawn DSP thread ---
-    let fft_shared = std::sync::Arc::new(dsp_controller::SharedFftBuffer::new(2048));
-    dsp_controller::spawn_dsp_thread(dsp_tx, ui_rx, std::sync::Arc::clone(&fft_shared));
-
     // --- Poll DspToUi channel and shared FFT buffer from the GTK main loop ---
+    //
+    // The DSP thread itself was already spawned by `Engine::new` above;
+    // we just hook the GTK main loop into the channels and FFT buffer it
+    // exposed. `engine` is captured by the closure as an `Rc<Engine>` so
+    // it lives for as long as the timeout is registered (i.e., the
+    // window's lifetime); when the closure is dropped on window close,
+    // the Engine drops and the DSP thread sees the channel disconnect.
     let play_button_weak = play_button.downgrade();
     let state_rx = Rc::clone(&state);
     let toast_overlay_weak = toast_overlay.downgrade();
@@ -272,7 +296,15 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
+    let engine_for_dsp = Rc::clone(&engine);
     glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
+        // Hold the engine alive for the lifetime of this closure. Without
+        // this reference, `move` would not capture `engine_for_dsp` at
+        // all (it's never methods-called inside the closure body) and
+        // the engine would drop at the end of `build_window`, taking
+        // the DSP thread down with it before the window even opens.
+        let _engine_anchor = &engine_for_dsp;
+
         // Check for new FFT data from the shared buffer (zero-alloc path).
         fft_shared.take_if_ready(|data| {
             spectrum_handle.push_fft_data(data);

@@ -1,5 +1,11 @@
-//! DSP thread bridge — owns all backend DSP objects and communicates with the
-//! GTK UI via message channels.
+//! DSP thread bridge — owns all backend DSP objects and routes commands /
+//! events between the UI consumer and the signal pipeline.
+//!
+//! Moved verbatim from `crates/sdr-ui/src/dsp_controller.rs` as part of the
+//! `sdr-core` extraction (M1, see `docs/superpowers/specs/2026-04-12-sdr-core-extraction-design.md`).
+//! The previous in-tree path is now owned here; the GTK UI consumes this
+//! module through the [`crate::engine::Engine`] facade rather than calling
+//! `spawn_dsp_thread` directly.
 //!
 //! The DSP thread runs a loop that:
 //! 1. Checks for UI commands (non-blocking when running, blocking when stopped).
@@ -7,7 +13,7 @@
 //! 3. Processes samples through `IqFrontend` (decimation, DC blocking, FFT).
 //! 4. Processes through `RxVfo` (frequency translation, resampling, channel filter).
 //! 5. Processes through `RadioModule` (IF chain, demod, AF chain).
-//! 6. Sends FFT data back to the UI for display.
+//! 6. Publishes FFT data into the [`crate::fft_buffer::SharedFftBuffer`].
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -21,6 +27,7 @@ use sdr_sink_audio::AudioSink;
 use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, SinkError, Stereo};
 
+use crate::fft_buffer::SharedFftBuffer;
 use crate::messages::{DspToUi, SourceType, UiToDsp};
 use crate::wav_writer::WavWriter;
 
@@ -67,65 +74,22 @@ const IQ_CHANNELS: u16 = 2;
 /// Spawn the DSP controller thread.
 ///
 /// The thread owns all backend DSP objects and communicates with the UI
-/// via `ui_rx` (commands from UI) and `dsp_tx` (data/status to UI).
+/// via `ui_rx` (commands from UI) and `dsp_tx` (data/status to UI). FFT
+/// frames are published into `fft_shared` directly to avoid per-frame
+/// allocation across thread boundaries.
 ///
-/// This function returns immediately; the DSP work happens on a background
-/// thread that runs until the UI channel is dropped.
-/// Shared FFT display buffer — written by DSP thread, read by UI thread.
-/// Avoids per-frame Vec allocation that causes glibc arena fragmentation
-/// from cross-thread alloc/free patterns.
-pub struct SharedFftBuffer {
-    buf: std::sync::Mutex<Vec<f32>>,
-    ready: std::sync::atomic::AtomicBool,
-}
-
-impl SharedFftBuffer {
-    /// Create a new shared buffer with the given initial size.
-    pub fn new(size: usize) -> Self {
-        Self {
-            buf: std::sync::Mutex::new(vec![0.0; size]),
-            ready: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    /// DSP thread: write FFT data and mark as ready.
-    fn write(&self, data: &[f32]) {
-        if let Ok(mut buf) = self.buf.lock() {
-            buf.resize(data.len(), 0.0);
-            buf.copy_from_slice(data);
-            self.ready.store(true, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    /// UI thread: read FFT data if a new frame is ready.
-    /// Returns None if no new frame, or the data slice via callback.
-    pub fn take_if_ready<F: FnOnce(&[f32])>(&self, f: F) -> bool {
-        if !self.ready.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            return false;
-        }
-        if let Ok(buf) = self.buf.lock() {
-            f(&buf);
-        }
-        true
-    }
-}
-
+/// Returns the spawned [`std::thread::JoinHandle`] so callers can join on
+/// shutdown. The DSP thread exits when `ui_rx` is dropped.
 pub fn spawn_dsp_thread(
     dsp_tx: mpsc::Sender<DspToUi>,
     ui_rx: mpsc::Receiver<UiToDsp>,
     fft_shared: std::sync::Arc<SharedFftBuffer>,
-) {
-    match std::thread::Builder::new()
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
         .name("dsp-controller".into())
         .spawn(move || {
             dsp_thread_main(dsp_tx, ui_rx, fft_shared);
-        }) {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!("failed to spawn DSP controller thread: {e}");
-            std::process::exit(1);
-        }
-    }
+        })
 }
 
 /// Main function for the DSP controller thread.

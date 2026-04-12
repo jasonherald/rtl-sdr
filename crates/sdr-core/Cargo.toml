@@ -1,0 +1,40 @@
+[package]
+name = "sdr-core"
+version = "0.1.0"
+description = "Headless SDR engine — owns the DSP controller and exposes a single Rust API consumed by both the GTK frontend and the planned macOS SwiftUI app via sdr-ffi."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# sdr-core is the headless engine facade. It owns:
+#   • the DSP controller thread (controller.rs — moved verbatim from
+#     sdr-ui::dsp_controller, now consumed via the Engine struct)
+#   • the source/sink instantiation that used to live inline in the GTK
+#     UI's startup path
+#   • the message enums (UiToDsp / DspToUi) and the SharedFftBuffer
+#     primitives that both consumers (GTK now, SwiftUI via sdr-ffi later)
+#     pull events through
+#
+# Both UI consumers depend on sdr-core. sdr-core depends on no UI code.
+# It is fully cross-platform (compiles on macOS today as part of the
+# workspace baseline, even though the audio sink it links is the stub
+# until M3 lands the CoreAudio backend).
+
+[dependencies]
+sdr-types.workspace = true
+sdr-config.workspace = true
+sdr-dsp.workspace = true
+sdr-pipeline.workspace = true
+sdr-radio.workspace = true
+sdr-rtlsdr.workspace = true
+sdr-source-rtlsdr.workspace = true
+sdr-source-network.workspace = true
+sdr-source-file.workspace = true
+sdr-sink-audio.workspace = true
+sdr-sink-network.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+
+[lints]
+workspace = true

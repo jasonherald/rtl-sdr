@@ -1,12 +1,21 @@
+// The `sdr` binary is the GTK4 + libadwaita frontend, which is currently
+// Linux-only. On non-Linux platforms (macOS, Windows) we provide a stub
+// `main()` that prints a message and exits non-zero so the workspace still
+// builds end-to-end on every platform without surprising linker failures.
+// The macOS native frontend lives in `apps/macos/` (SwiftUI) and runs
+// against the `sdr-core` engine via the `sdr-ffi` C ABI.
+
+#[cfg(target_os = "linux")]
 use gtk4::glib;
 
+#[cfg(target_os = "linux")]
 fn main() -> glib::ExitCode {
     // Limit glibc malloc arenas before any threads spawn.
     // Without this, glibc creates up to 8*cores arenas that each keep
     // their high-water mark, causing RSS to grow indefinitely with 40+ threads.
     // Uses mallopt() instead of env var — glibc reads MALLOC_ARENA_MAX
     // at allocator init (before main), so set_var is too late.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(target_env = "gnu")]
     #[allow(unsafe_code)]
     let arena_ok = unsafe {
         unsafe extern "C" {
@@ -17,7 +26,7 @@ fn main() -> glib::ExitCode {
     };
 
     tracing_subscriber::fmt::init();
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(target_env = "gnu")]
     if !arena_ok {
         tracing::warn!("mallopt(M_ARENA_MAX, 4) failed — arena cap not applied");
     }
@@ -29,4 +38,15 @@ fn main() -> glib::ExitCode {
     sdr_transcription::init_sherpa_host(sdr_transcription::SherpaModel::StreamingZipformerEn);
 
     sdr_ui::run()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> std::process::ExitCode {
+    eprintln!("sdr-rs: the GTK4 frontend is currently Linux-only.");
+    eprintln!();
+    eprintln!("macOS support via a native SwiftUI app is in progress");
+    eprintln!("(see https://github.com/jasonherald/rtl-sdr/issues/228).");
+    eprintln!();
+    eprintln!("On Linux, install GTK4 + libadwaita and run `cargo run --release`.");
+    std::process::ExitCode::from(1)
 }
