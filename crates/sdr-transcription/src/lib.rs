@@ -4,8 +4,9 @@
 //! [`backend::TranscriptionBackend`] implementations. The engine owns
 //! one backend at a time and delegates lifecycle to it.
 //!
-//! Currently only the Whisper backend is implemented; sherpa-onnx
-//! lands in PR 2.
+//! Two backends are currently implemented: [`backends::whisper::WhisperBackend`]
+//! (file-based, chunked inference via whisper-rs) and
+//! [`backends::sherpa::SherpaBackend`] (true streaming via sherpa-onnx).
 
 pub mod backend;
 pub mod backends;

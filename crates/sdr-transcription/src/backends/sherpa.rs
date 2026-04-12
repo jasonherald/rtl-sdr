@@ -27,7 +27,7 @@ use crate::{denoise, resampler};
 
 /// Bounded channel capacity for audio buffers from DSP → backend.
 /// Sherpa accepts much smaller chunks than Whisper (per-frame, not
-/// 5-second windows), so we don't need the same headroom WhisperBackend
+/// 5-second windows), so we don't need the same headroom `WhisperBackend`
 /// does. 256 still gives plenty of buffer.
 const AUDIO_CHANNEL_CAPACITY: usize = 256;
 
@@ -89,6 +89,8 @@ impl TranscriptionBackend for SherpaBackend {
         let (event_tx, event_rx) = mpsc::channel();
 
         let cancel = Arc::clone(&self.cancel);
+        // silence_threshold is unused: sherpa's endpoint detection
+        // handles silence natively.
         let noise_gate_ratio = config.noise_gate_ratio;
 
         let handle = std::thread::Builder::new()
@@ -243,29 +245,39 @@ fn run_worker_inner(
 
         // Pull the current hypothesis. Emit a Partial event if it
         // changed since the last one (avoid flooding the UI thread).
-        if let Some(result) = recognizer.get_result(&stream) {
-            let trimmed = result.text.trim();
+        // We capture the trimmed text so it can be reused for the
+        // committed Text event below if the stream reaches an endpoint.
+        let current_text = if let Some(result) = recognizer.get_result(&stream) {
+            let trimmed = result.text.trim().to_owned();
             if !trimmed.is_empty() && trimmed != last_partial {
-                last_partial = trimmed.to_owned();
+                last_partial.clone_from(&trimmed);
                 let _ = event_tx.send(TranscriptionEvent::Partial {
-                    text: trimmed.to_owned(),
+                    text: trimmed.clone(),
                 });
             }
+            trimmed
+        } else {
+            // get_result can return None on a serde failure inside the C
+            // layer. We must NOT skip the endpoint check below in that
+            // case — otherwise the stream can get stuck in endpoint state
+            // and silently stop transcribing.
+            String::new()
+        };
 
-            // On endpoint, commit the utterance as Text and reset the
-            // stream so the next utterance starts fresh.
-            if recognizer.is_endpoint(&stream) {
-                if !trimmed.is_empty() {
-                    let timestamp = wall_clock_timestamp();
-                    tracing::debug!(%timestamp, %trimmed, "sherpa committed utterance");
-                    let _ = event_tx.send(TranscriptionEvent::Text {
-                        timestamp,
-                        text: trimmed.to_owned(),
-                    });
-                }
-                recognizer.reset(&stream);
-                last_partial.clear();
+        // Endpoint check is independent of get_result and must always
+        // run so reset() fires when the recognizer says the utterance
+        // is over.
+        if recognizer.is_endpoint(&stream) {
+            if !current_text.is_empty() {
+                let timestamp = wall_clock_timestamp();
+                tracing::debug!(%timestamp, text = %current_text, "sherpa committed utterance");
+                let _ = event_tx.send(TranscriptionEvent::Text {
+                    timestamp,
+                    text: current_text,
+                });
             }
+            recognizer.reset(&stream);
+            last_partial.clear();
         }
     }
 
@@ -276,7 +288,6 @@ fn run_worker_inner(
 /// Wall-clock "HH:MM:SS" string. Same implementation as
 /// [`crate::backends::whisper`] but kept local to avoid a public
 /// re-export of an internal helper.
-#[allow(unsafe_code)]
 fn wall_clock_timestamp() -> String {
     let mut tv = libc::timeval {
         tv_sec: 0,
@@ -324,5 +335,41 @@ mod tests {
     fn sherpa_backend_name_is_stable() {
         let backend = SherpaBackend::new();
         assert_eq!(backend.name(), "sherpa");
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn sherpa_backend_start_returns_model_not_found_when_files_missing() {
+        // The test environment has no sherpa model files in
+        // ~/.local/share/sdr-rs/models/sherpa/, so start() should
+        // synchronously return ModelNotFound before spawning the worker.
+        // This exercises the synchronous error path without needing a
+        // real model bundle.
+        //
+        // Note: this test would fail if the developer running it has
+        // actually downloaded the Streaming Zipformer model. That's
+        // acceptable — CI runs in a clean environment.
+        let mut backend = SherpaBackend::new();
+        let config = BackendConfig {
+            model: ModelChoice::Sherpa(SherpaModel::StreamingZipformerEn),
+            silence_threshold: 0.007,
+            noise_gate_ratio: 3.0,
+        };
+        let result = backend.start(config);
+        match result {
+            Err(BackendError::ModelNotFound { path }) => {
+                assert!(path.ends_with("sherpa/streaming-zipformer-en"));
+            }
+            Ok(_) => {
+                // If the developer happens to have the model downloaded
+                // locally, skip this test rather than fail. Tearing down
+                // the running backend is fine because it's just a thread.
+                backend.shutdown_nonblocking();
+                eprintln!(
+                    "skipping test: streaming-zipformer-en model is present locally"
+                );
+            }
+            Err(e) => panic!("expected ModelNotFound, got {e:?}"),
+        }
     }
 }
