@@ -19,6 +19,7 @@ pub use backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
     TranscriptionEvent,
 };
+pub use backends::sherpa::init_sherpa_host;
 pub use model::WhisperModel;
 pub use sherpa_model::SherpaModel;
 

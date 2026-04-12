@@ -19,6 +19,7 @@ sdr-source-network.workspace = true
 sdr-source-file.workspace = true
 sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
+sdr-transcription.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
