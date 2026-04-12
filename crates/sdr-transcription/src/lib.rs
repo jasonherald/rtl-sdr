@@ -100,12 +100,16 @@ impl TranscriptionEngine {
         Ok(event_rx)
     }
 
-    /// Stop the engine, signalling the backend to shut down.
+    /// Stop the engine, blocking until the backend's worker has finished.
     ///
-    /// Non-blocking — does not wait for the backend's worker thread to
-    /// finish, so it's safe to call from the UI thread or during app exit.
+    /// May block for the duration of one inference pass. Use
+    /// [`Self::shutdown_nonblocking`] from the UI thread or during app exit.
     pub fn stop(&mut self) {
-        self.shutdown_nonblocking();
+        self.audio_tx.take();
+        if let Some(mut backend) = self.backend.take() {
+            backend.stop();
+            tracing::info!("transcription engine stopped");
+        }
     }
 
     /// Signal the backend to shut down without waiting.
@@ -116,8 +120,8 @@ impl TranscriptionEngine {
         self.audio_tx.take();
         if let Some(mut backend) = self.backend.take() {
             backend.shutdown_nonblocking();
+            tracing::info!("transcription engine stopped");
         }
-        tracing::info!("transcription engine stopped");
     }
 
     /// Get a clone of the audio sender for feeding samples from the DSP thread.
@@ -237,6 +241,25 @@ mod tests {
                 .expect("start ok");
         }
         // Engine dropped here.
+        assert_eq!(state.shutdown_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn engine_stop_clears_state() {
+        let mut engine = TranscriptionEngine::new();
+        let backend = Box::new(MockBackend::new());
+        let state = backend.state();
+
+        engine
+            .start_with_backend(backend, dummy_config())
+            .expect("start ok");
+
+        engine.stop();
+
+        assert!(!engine.is_running());
+        assert!(engine.audio_sender().is_none());
+        // Mock inherits the default stop() impl which delegates to
+        // shutdown_nonblocking, so the shutdown counter should fire.
         assert_eq!(state.shutdown_count.load(Ordering::Relaxed), 1);
     }
 }

@@ -38,6 +38,7 @@ impl MockBackend {
     }
 
     /// Configure what `supports_partials` returns.
+    #[must_use]
     pub fn with_supports_partials(self, value: bool) -> Self {
         self.state
             .supports_partials_value

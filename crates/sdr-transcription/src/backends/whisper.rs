@@ -93,6 +93,14 @@ impl TranscriptionBackend for WhisperBackend {
         Ok(BackendHandle { audio_tx, event_rx })
     }
 
+    fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+        tracing::info!("whisper backend stopped");
+    }
+
     fn shutdown_nonblocking(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         self.worker.take(); // detach — don't join

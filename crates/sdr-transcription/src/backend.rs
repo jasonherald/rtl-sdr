@@ -86,6 +86,16 @@ pub trait TranscriptionBackend: Send {
     /// Must emit [`TranscriptionEvent::Ready`] once the model is loaded.
     fn start(&mut self, config: BackendConfig) -> Result<BackendHandle, BackendError>;
 
+    /// Stop the backend, waiting for any in-flight inference to finish.
+    ///
+    /// Default impl delegates to [`Self::shutdown_nonblocking`]; backends
+    /// that own a worker thread should override this to join it. May block
+    /// for the duration of one inference pass — do not call from the UI
+    /// thread or during app exit. Use [`Self::shutdown_nonblocking`] there.
+    fn stop(&mut self) {
+        self.shutdown_nonblocking();
+    }
+
     /// Signal the backend to stop without waiting for it to finish.
     ///
     /// Drops the audio sender so the worker exits after its current
