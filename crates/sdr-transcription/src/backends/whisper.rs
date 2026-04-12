@@ -102,6 +102,15 @@ impl TranscriptionBackend for WhisperBackend {
 
 /// Main worker loop. Blocks the calling thread and exits when `audio_rx` is
 /// closed (all senders dropped) or the cancellation token is set.
+/// Should be spawned on a dedicated thread.
+///
+/// # Arguments
+/// * `audio_rx` — receives interleaved stereo f32 audio at 48 kHz
+/// * `event_tx` — sends transcription events to the UI/consumer
+/// * `cancel` — cancellation token; when set to `true`, the worker exits promptly
+/// * `model` — which Whisper model to load
+/// * `silence_threshold` — RMS below which a chunk is skipped
+/// * `noise_gate_ratio` — spectral gate multiplier over noise floor
 fn run_worker(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
@@ -122,6 +131,8 @@ fn run_worker(
     }
 }
 
+/// Inner implementation that returns errors as strings so the outer function
+/// can forward them as `TranscriptionEvent::Error`.
 #[allow(clippy::too_many_lines)]
 fn run_worker_inner(
     audio_rx: &mpsc::Receiver<Vec<f32>>,
@@ -193,6 +204,8 @@ fn run_worker_inner(
 
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
 
+        // Drain any additional queued buffers to minimize frame drops
+        // during long inference passes. Check cancel between drains.
         while let Ok(extra) = audio_rx.try_recv() {
             if cancel.load(Ordering::Relaxed) {
                 tracing::info!("transcription cancelled, worker exiting");
@@ -209,6 +222,8 @@ fn run_worker_inner(
 
             let mut chunk: Vec<f32> = mono_buf.drain(..CHUNK_SAMPLES).collect();
 
+            // Spectral noise gate — remove broadband static and hiss
+            // before Whisper sees the audio.
             denoise::spectral_denoise(&mut chunk, noise_gate_ratio);
 
             let rms = compute_rms(&chunk);
@@ -303,6 +318,9 @@ pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
 }
 
 /// Return the current wall-clock time formatted as "HH:MM:SS" in local time.
+///
+/// Uses `libc::localtime_r` for timezone-aware formatting without pulling in
+/// the `chrono` crate.
 #[allow(unsafe_code)]
 fn chrono_timestamp() -> String {
     let mut tv = libc::timeval {
