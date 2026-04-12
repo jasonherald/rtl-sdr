@@ -1435,6 +1435,7 @@ fn connect_transcript_panel(
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
     let model_row = transcript.model_row.clone();
+    #[cfg(feature = "whisper")]
     let silence_row = transcript.silence_row.clone();
     let noise_gate_row = transcript.noise_gate_row.clone();
 
@@ -1443,14 +1444,20 @@ fn connect_transcript_panel(
             // Read selected model from dropdown.
             // Lock model and tuning controls while transcription is active.
             model_row.set_sensitive(false);
+            #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
 
             // Read tuning slider values.
+            #[cfg(feature = "whisper")]
             #[allow(clippy::cast_possible_truncation)]
             let silence_threshold = silence_row.value() as f32;
+            // Sherpa builds: silence_threshold is unused by SherpaBackend
+            // (see build_recognizer_config doc comment). Pass a sentinel.
+            #[cfg(feature = "sherpa")]
+            let silence_threshold: f32 = 0.0;
             #[allow(clippy::cast_possible_truncation)]
             let noise_gate_ratio = noise_gate_row.value() as f32;
 
@@ -1543,6 +1550,7 @@ fn connect_transcript_panel(
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
                     model_row.set_sensitive(true);
+                    #[cfg(feature = "whisper")]
                     silence_row.set_sensitive(true);
                     noise_gate_row.set_sensitive(true);
                     row.set_active(false);
@@ -1550,6 +1558,7 @@ fn connect_transcript_panel(
             }
         } else {
             model_row.set_sensitive(true);
+            #[cfg(feature = "whisper")]
             silence_row.set_sensitive(true);
             noise_gate_row.set_sensitive(true);
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);

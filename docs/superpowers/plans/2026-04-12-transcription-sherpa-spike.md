@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a working `SherpaBackend` powered by the official `sherpa-onnx` Rust crate, prove streaming-native ASR works end-to-end on a real radio source (Streaming Zipformer English, CPU and CUDA), and add a UI backend selector so the user can switch between Whisper and Sherpa from the transcript panel.
+**Goal:** Add a working `SherpaBackend` powered by the official `sherpa-onnx` Rust crate, prove streaming-native ASR works end-to-end on a real radio source (Streaming Zipformer English), and ship Whisper / Sherpa as **mutually exclusive cargo features** picked at build time. The original plan called for a runtime backend selector ComboRow in the UI, but we hit an unresolved heap corruption when sherpa-onnx's bundled ONNX Runtime initializes inside the sdr-rs binary. The build-time mutex sidesteps it definitively — see PR #249 for the full debugging trail.
 
-**Architecture:** New `backends/sherpa.rs` implements `TranscriptionBackend` using `sherpa_onnx::OnlineRecognizer`. The backend owns its worker thread (same pattern as `WhisperBackend`) and lives entirely on that thread to avoid the recognizer's `!Send` constraint. The `TranscriptionEngine::start` API is widened to take a `BackendConfig` directly so the UI can pick which backend to instantiate. `ModelChoice` gets a `Sherpa(SherpaModel)` variant; `TranscriptionEvent` gets a new `Partial { text }` variant. The transcript panel UI grows a backend selector `AdwComboRow` above the existing model picker, and the model picker becomes contextual to the selected backend. For this PR, partial events are routed to `tracing::debug!` only — full live-captions UI rendering lands in PR 4.
+**Architecture:** New `backends/sherpa.rs` implements `TranscriptionBackend` using `sherpa_onnx::OnlineRecognizer`. A long-lived `SherpaHost` worker thread (spawned from `main()` before `sdr_ui::run()`) owns the recognizer for the entire process lifetime; per-session `OnlineStream`s are created inside the host's event loop. The recognizer is `!Send`, so it lives entirely on the host thread; the host wraps its command sender in a `Mutex` to satisfy `OnceLock<Sync>`. The `TranscriptionEngine::start` API is widened to take a `BackendConfig` directly. `ModelChoice` and `TranscriptionEvent::Partial` variants are cfg-gated on the `whisper` / `sherpa` features. The transcript panel's model picker becomes contextual to whichever backend was compiled in, with no runtime selector. For this PR, partial events are routed to `tracing::debug!` only — full live-captions UI rendering lands in PR 4.
 
 **Tech Stack:** Rust 2024, `sherpa-onnx 1.12`, GTK4/libadwaita ComboRow + StringList, `mpsc` channels, `Arc<AtomicBool>` cancellation, `thiserror`.
 
@@ -26,7 +26,7 @@
 - `crates/sdr-transcription/src/backend.rs` — add `Sherpa(SherpaModel)` to `ModelChoice`, add `Partial { text }` to `TranscriptionEvent`, add `BackendError::ModelNotFound { path: PathBuf }` and `BackendError::WrongModelKind`
 - `crates/sdr-transcription/src/backends/whisper.rs` — `start()` returns `WrongModelKind` if a non-Whisper `ModelChoice` is passed
 - `crates/sdr-transcription/src/backends/mock.rs` — accept any `ModelChoice` (mock is testing the engine, not the backend dispatch)
-- `crates/sdr-ui/src/sidebar/transcript_panel.rs` — add `backend_row` field, build the backend selector ComboRow, swap model picker contents on backend change, persist backend + sherpa model selection
+- `crates/sdr-ui/src/sidebar/transcript_panel.rs` — model picker becomes contextual to whichever backend was compiled in; silence_threshold slider cfg-gated on `whisper` feature (Note: the original `backend_row` ComboRow design was superseded by the build-time mutex feature flag — see PR #249.)
 - `crates/sdr-ui/src/window.rs` — construct `BackendConfig` from the panel state, call new `engine.start(config)`, add `Partial { text }` match arm that routes to `tracing::debug!`
 - `crates/sdr-ui/src/dsp_controller.rs` — no changes expected (just verify nothing in the audio tap path depends on the engine API shape)
 - `Cargo.lock` — auto-updated by cargo
@@ -922,9 +922,10 @@ Find this section in `crates/sdr-ui/src/window.rs` (around line 1448-1466):
             #[allow(clippy::cast_possible_truncation)]
             let noise_gate_ratio = noise_gate_row.value() as f32;
 
-            // Build BackendConfig. For Task 6 we hardcode Whisper —
-            // Task 8 wires the backend selector ComboRow that provides
-            // ModelChoice::Sherpa(...) when the user picks it.
+            // Build BackendConfig. Backend is selected at compile time via
+            // cargo features (whisper / sherpa are mutually exclusive).
+            // Note: the original Task 8 runtime backend selector ComboRow
+            // design was superseded by the build-time mutex — see PR #249.
             let config = sdr_transcription::BackendConfig {
                 model: sdr_transcription::ModelChoice::Whisper(whisper_model),
                 silence_threshold,
@@ -1369,7 +1370,9 @@ EOF
 
 ## Task 8: Add backend selector ComboRow to the transcript panel
 
-The user-facing UI work. Adds a "Backend" `AdwComboRow` above the existing "Model" picker, swaps the model picker contents based on the selected backend, and persists both selections.
+> **Note:** The runtime backend selector ComboRow design described below was superseded by the build-time mutex feature flag (`whisper` / `sherpa` are mutually exclusive cargo features) — see PR #249. The actual shipped implementation cfg-gates the model picker and silence_threshold slider rather than adding a `backend_row` ComboRow.
+
+The original plan: Adds a "Backend" `AdwComboRow` above the existing "Model" picker, swaps the model picker contents based on the selected backend, and persists both selections.
 
 **Files:**
 - Modify: `crates/sdr-ui/src/sidebar/transcript_panel.rs`
@@ -1593,9 +1596,10 @@ In `crates/sdr-ui/src/window.rs`, find the section (in `connect_transcript_panel
             #[allow(clippy::cast_possible_truncation)]
             let noise_gate_ratio = noise_gate_row.value() as f32;
 
-            // Build BackendConfig. For Task 6 we hardcode Whisper —
-            // Task 8 wires the backend selector ComboRow that provides
-            // ModelChoice::Sherpa(...) when the user picks it.
+            // Build BackendConfig. Backend is selected at compile time via
+            // cargo features (whisper / sherpa are mutually exclusive).
+            // Note: the original Task 8 runtime backend selector ComboRow
+            // design was superseded by the build-time mutex — see PR #249.
             let config = sdr_transcription::BackendConfig {
                 model: sdr_transcription::ModelChoice::Whisper(whisper_model),
                 silence_threshold,
@@ -1873,7 +1877,7 @@ Use this template, customizing the CUDA section based on what the smoke test fou
 gh pr create --title "Sherpa-onnx streaming backend + UI selector (PR 2 of 5 for #204)" --body "$(cat <<'EOF'
 ## Summary
 
-Adds a working `SherpaBackend` powered by the official `sherpa-onnx` Rust crate (k2-fsa, 1.12), proves streaming-native ASR works end-to-end on a real radio source with Streaming Zipformer English, and adds a UI backend selector so the user can switch between Whisper and Sherpa from the transcript panel.
+Adds a working `SherpaBackend` powered by the official `sherpa-onnx` Rust crate (k2-fsa, 1.12), proves streaming-native ASR works end-to-end on a real radio source with Streaming Zipformer English. Ships Whisper and Sherpa as mutually exclusive build-time cargo features rather than a runtime backend selector (the original design was superseded — see PR #249 for details on the heap corruption that motivated the build-time mutex approach).
 
 This is **PR 2 of 5** for #204. PR 1 (the trait refactor) made this possible.
 
@@ -1890,10 +1894,9 @@ This is **PR 2 of 5** for #204. PR 1 (the trait refactor) made this possible.
 - `TranscriptionEngine::start(BackendConfig)` — signature changed to take a single config struct (was `start(WhisperModel, f32, f32)`)
 
 **UI:**
-- Backend selector `AdwComboRow` above the existing model picker
-- Model picker contents now contextual to the selected backend
-- Backend row locks during transcription alongside model + sliders
-- Persistence: `transcription_backend` (string) + `transcription_sherpa_model` (u32 index) config keys
+- Model picker contents contextual to whichever backend was compiled in (no runtime selector — superseded by build-time mutex, see PR #249)
+- Silence threshold slider cfg-gated on `whisper` feature (Sherpa uses native endpoint detection)
+- Persistence: `transcription_sherpa_model` (u32 index) config key for Sherpa builds
 - `Partial` event variant routed to `tracing::debug!` for the spike (PR 4 will render proper live captions)
 
 **Dependency added:**
@@ -1922,8 +1925,8 @@ This is **PR 2 of 5** for #204. PR 1 (the trait refactor) made this possible.
 - [x] `make lint` clean
 - [x] Manual: Whisper regression — still transcribes as before
 - [x] Manual: Sherpa flow — model loads, live transcription works, partials visible in tracing logs
-- [x] Manual: backend switch mid-session works, model picker repopulates correctly
-- [x] Manual: persistence across app restart for backend + sherpa model selection
+- [x] Manual: Sherpa flow — model loads, live transcription works, partials visible in tracing logs (Note: runtime backend switch test N/A — design superseded by build-time mutex)
+- [x] Manual: persistence across app restart for sherpa model selection
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
@@ -1941,5 +1944,5 @@ Per project workflow: don't merge until CodeRabbit has reviewed and any inline c
 After PR 2 merges, the user has a working dual-backend transcription system. Next PRs:
 
 - **PR 3** — Auto-download for sherpa model bundles (`tar` + `bzip2-rs`, mirror Whisper UX)
-- **PR 4** — Display mode toggle + live captions two-line rendering (now smaller scope since the backend selector is already done)
+- **PR 4** — Display mode toggle + live captions two-line rendering
 - **PR 5+** — Additional sherpa models (Parakeet, Moonshine — one PR each)

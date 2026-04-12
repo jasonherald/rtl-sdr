@@ -9,6 +9,16 @@
 /// Uses `libc::localtime_r` for timezone-aware formatting without pulling in
 /// the `chrono` crate. Both `WhisperBackend` and `SherpaBackend` call this
 /// to timestamp committed transcription events.
+///
+/// # Safety
+///
+/// This function contains the only `unsafe` blocks in `sdr-transcription`.
+/// The intentional exception to the workspace `unsafe_code = "deny"` lint
+/// is tracked in <https://github.com/jasonherald/rtl-sdr/issues/250> — the
+/// rationale is that pulling in `chrono` or `time` for one `strftime` call
+/// is overkill for a 200 KB-plus dep tree, and the libc shim has detailed
+/// SAFETY comments on each unsafe block. Re-evaluate if we ever add chrono
+/// transitively for another reason.
 #[allow(unsafe_code)]
 pub fn wall_clock_timestamp() -> String {
     let mut tv = libc::timeval {

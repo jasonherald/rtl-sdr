@@ -10,7 +10,9 @@ use sdr_config::ConfigManager;
 #[cfg(feature = "whisper")]
 /// Config key for the persisted Whisper model index.
 const KEY_MODEL: &str = "transcription_model";
+#[cfg(feature = "whisper")]
 /// Config key for the silence threshold after spectral denoising.
+/// Whisper-only — Sherpa uses native endpoint detection.
 const KEY_SILENCE_THRESHOLD: &str = "transcription_silence_threshold";
 /// Config key for the spectral noise gate ratio.
 const KEY_NOISE_GATE: &str = "transcription_noise_gate";
@@ -18,11 +20,17 @@ const KEY_NOISE_GATE: &str = "transcription_noise_gate";
 /// Config key for the persisted Sherpa model index.
 const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
 
-// Silence threshold slider defaults and range.
+// Silence threshold slider defaults and range. Whisper-only — Sherpa
+// uses native endpoint detection so the slider isn't shown.
+#[cfg(feature = "whisper")]
 const DEFAULT_SILENCE_THRESHOLD: f64 = 0.007;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_MIN: f64 = 0.001;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_MAX: f64 = 0.100;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_STEP: f64 = 0.001;
+#[cfg(feature = "whisper")]
 const SILENCE_THRESHOLD_PAGE: f64 = 0.01;
 
 // Noise gate slider defaults and range.
@@ -42,7 +50,9 @@ pub struct TranscriptPanel {
     /// Model size selector — shows Whisper or Sherpa models based on
     /// which cargo feature was compiled in.
     pub model_row: adw::ComboRow,
-    /// Silence threshold spin row.
+    /// Silence threshold spin row. Whisper-only — Sherpa hides this
+    /// because it uses native endpoint detection.
+    #[cfg(feature = "whisper")]
     pub silence_row: adw::SpinRow,
     /// Noise gate spin row.
     pub noise_gate_row: adw::SpinRow,
@@ -136,35 +146,42 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
 
     // --- Tuning sliders ---
 
-    let saved_silence = config.read(|v| {
-        v.get(KEY_SILENCE_THRESHOLD)
-            .and_then(serde_json::Value::as_f64)
-            .map_or(DEFAULT_SILENCE_THRESHOLD, |val| {
-                val.clamp(SILENCE_THRESHOLD_MIN, SILENCE_THRESHOLD_MAX)
-            })
-    });
-
-    let silence_row = adw::SpinRow::builder()
-        .title("Silence threshold")
-        .adjustment(&gtk4::Adjustment::new(
-            saved_silence,
-            SILENCE_THRESHOLD_MIN,
-            SILENCE_THRESHOLD_MAX,
-            SILENCE_THRESHOLD_STEP,
-            SILENCE_THRESHOLD_PAGE,
-            0.0,
-        ))
-        .digits(3)
-        .build();
-    group.add(&silence_row);
-
-    let config_silence = Arc::clone(config);
-    silence_row.connect_value_notify(move |row| {
-        let val = row.value();
-        config_silence.write(|v| {
-            v[KEY_SILENCE_THRESHOLD] = serde_json::json!(val);
+    // Silence threshold slider — Whisper-only because Sherpa has
+    // native endpoint detection (see SherpaBackend::build_recognizer_config).
+    #[cfg(feature = "whisper")]
+    let silence_row = {
+        let saved_silence = config.read(|v| {
+            v.get(KEY_SILENCE_THRESHOLD)
+                .and_then(serde_json::Value::as_f64)
+                .map_or(DEFAULT_SILENCE_THRESHOLD, |val| {
+                    val.clamp(SILENCE_THRESHOLD_MIN, SILENCE_THRESHOLD_MAX)
+                })
         });
-    });
+
+        let row = adw::SpinRow::builder()
+            .title("Silence threshold")
+            .adjustment(&gtk4::Adjustment::new(
+                saved_silence,
+                SILENCE_THRESHOLD_MIN,
+                SILENCE_THRESHOLD_MAX,
+                SILENCE_THRESHOLD_STEP,
+                SILENCE_THRESHOLD_PAGE,
+                0.0,
+            ))
+            .digits(3)
+            .build();
+        group.add(&row);
+
+        let config_silence = Arc::clone(config);
+        row.connect_value_notify(move |r| {
+            let val = r.value();
+            config_silence.write(|v| {
+                v[KEY_SILENCE_THRESHOLD] = serde_json::json!(val);
+            });
+        });
+
+        row
+    };
 
     let saved_noise_gate = config.read(|v| {
         v.get(KEY_NOISE_GATE)
@@ -257,6 +274,7 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         widget: group,
         enable_row,
         model_row,
+        #[cfg(feature = "whisper")]
         silence_row,
         noise_gate_row,
         status_label,

@@ -48,6 +48,15 @@ const RULE3_MIN_UTTERANCE_LENGTH: f32 = 20.0;
 /// success or failure before giving up. Recognizer load is typically <1s.
 const HOST_INIT_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Sample rate sherpa-onnx expects from `accept_waveform`.
+const SHERPA_SAMPLE_RATE_HZ: i32 = 16_000;
+/// Initial capacity for the per-session resampled-mono scratch buffer.
+const SESSION_MONO_BUFFER_CAPACITY: usize = 16_000;
+/// ONNX Runtime threads per recognizer. Sherpa is fast enough on CPU
+/// that one thread is sufficient and avoids competing with the audio
+/// pipeline.
+const SHERPA_NUM_THREADS: i32 = 1;
+
 /// Process-wide singleton for the sherpa-onnx host. Stores either a ready
 /// host or the error message from a failed initialization. Set exactly once
 /// by [`init_sherpa_host`]; subsequent calls are no-ops.
@@ -206,7 +215,7 @@ fn build_recognizer_config(model: SherpaModel, provider: &str) -> OnlineRecogniz
     config.model_config.transducer.joiner = Some(joiner.to_string_lossy().into_owned());
     config.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
     config.model_config.provider = Some(provider.to_owned());
-    config.model_config.num_threads = 1;
+    config.model_config.num_threads = SHERPA_NUM_THREADS;
     config.enable_endpoint = true;
     config.decoding_method = Some("greedy_search".to_owned());
     config.rule1_min_trailing_silence = RULE1_MIN_TRAILING_SILENCE;
@@ -232,7 +241,7 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
         return;
     }
 
-    let mut mono_buf: Vec<f32> = Vec::with_capacity(16_000);
+    let mut mono_buf: Vec<f32> = Vec::with_capacity(SESSION_MONO_BUFFER_CAPACITY);
     let mut last_partial = String::new();
 
     loop {
@@ -268,7 +277,7 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
 
         denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
 
-        stream.accept_waveform(16_000_i32, &mono_buf);
+        stream.accept_waveform(SHERPA_SAMPLE_RATE_HZ, &mono_buf);
 
         while recognizer.is_ready(&stream) {
             if cancel.load(Ordering::Relaxed) {
@@ -300,12 +309,19 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
         // Endpoint check is independent of get_result and must always run
         // so reset() fires when the recognizer says the utterance is over.
         if recognizer.is_endpoint(&stream) {
-            if !current_text.is_empty() {
+            // If get_result returned empty, fall back to last_partial so
+            // we don't drop the utterance. Mirrors finalize_session.
+            let committed_text = if current_text.is_empty() {
+                last_partial.clone()
+            } else {
+                current_text
+            };
+            if !committed_text.is_empty() {
                 let timestamp = crate::util::wall_clock_timestamp();
-                tracing::debug!(%timestamp, text = %current_text, "sherpa committed utterance");
+                tracing::debug!(%timestamp, text = %committed_text, "sherpa committed utterance");
                 let _ = event_tx.send(TranscriptionEvent::Text {
                     timestamp,
-                    text: current_text,
+                    text: committed_text,
                 });
             }
             recognizer.reset(&stream);
