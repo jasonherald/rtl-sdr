@@ -69,7 +69,11 @@ impl TranscriptionBackend for MockBackend {
         let (event_tx, event_rx) = mpsc::channel();
 
         // Stash the event_tx so tests can push events through it.
-        *self.state.last_event_tx.lock().expect("mock state poisoned") = Some(event_tx);
+        *self
+            .state
+            .last_event_tx
+            .lock()
+            .expect("mock state poisoned") = Some(event_tx);
 
         Ok(BackendHandle { audio_tx, event_rx })
     }

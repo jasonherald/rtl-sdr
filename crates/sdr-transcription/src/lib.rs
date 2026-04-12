@@ -137,9 +137,7 @@ impl TranscriptionEngine {
     /// True if the active backend can emit partial hypotheses.
     /// Returns `false` if no backend is running.
     pub fn supports_partials(&self) -> bool {
-        self.backend
-            .as_ref()
-            .is_some_and(|b| b.supports_partials())
+        self.backend.as_ref().is_some_and(|b| b.supports_partials())
     }
 }
 
