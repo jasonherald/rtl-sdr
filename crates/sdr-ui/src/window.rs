@@ -1508,13 +1508,13 @@ fn connect_transcript_panel(
                     status_label.set_text("Starting...");
                     status_label.set_visible(true);
 
-                    let status = status_label.clone();
-                    let progress = progress_bar.clone();
-                    let tv = text_view.clone();
-                    // Clone weak refs into the closure so we can drive
-                    // the full teardown on a fatal Error event without
-                    // creating a strong reference cycle through the
-                    // glib timeout source.
+                    // Weak refs for the entire timeout source — see the
+                    // weak-ref decl block at the top of connect_transcript_panel
+                    // for the rationale (don't keep widgets alive past their
+                    // UI lifetime through the glib timeout source).
+                    let status_weak = status_label.downgrade();
+                    let progress_weak = progress_bar.downgrade();
+                    let tv_weak = text_view.downgrade();
                     let enable_row_weak = enable_row_weak.clone();
                     let model_row_weak = model_row_weak.clone();
                     #[cfg(feature = "whisper")]
@@ -1522,6 +1522,19 @@ fn connect_transcript_panel(
                     let noise_gate_row_weak = noise_gate_row_weak.clone();
 
                     glib::timeout_add_local(Duration::from_millis(100), move || {
+                        // Upgrade once per tick. If any widget has been
+                        // dropped (e.g. window closed), stop the timeout
+                        // immediately so we don't resurrect dead UI.
+                        let Some(status) = status_weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        let Some(progress) = progress_weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+                        let Some(tv) = tv_weak.upgrade() else {
+                            return glib::ControlFlow::Break;
+                        };
+
                         loop {
                             match event_rx.try_recv() {
                                 Ok(event) => match event {
@@ -1539,9 +1552,16 @@ fn connect_transcript_panel(
                                         progress.set_visible(false);
                                     }
                                     TranscriptionEvent::Partial { text } => {
-                                        // PR 4 will render this as a live caption line.
-                                        // For the PR 2 spike, log only.
-                                        tracing::debug!(target: "transcription", partial = %text);
+                                        // PR 4 will render this as a live
+                                        // caption line. For the PR 2 spike,
+                                        // log only the length — never the
+                                        // raw text. Public safety scanner
+                                        // content does not belong in logs.
+                                        tracing::debug!(
+                                            target: "transcription",
+                                            partial_chars = text.chars().count(),
+                                            "sherpa partial received"
+                                        );
                                     }
                                     TranscriptionEvent::Text { timestamp, text } => {
                                         let buf = tv.buffer();
