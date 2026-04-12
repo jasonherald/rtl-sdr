@@ -110,6 +110,9 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 # Whisper speech-to-text
 whisper-rs = "0.16"
 
+# Sherpa-onnx streaming ASR
+sherpa-onnx = "1.12"
+
 # System directories / libc
 dirs-next = "2"
 libc = "0.2"

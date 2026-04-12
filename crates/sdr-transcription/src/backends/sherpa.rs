@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
-use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig};
+use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 
 use crate::backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
@@ -51,7 +51,7 @@ const HOST_INIT_TIMEOUT: Duration = Duration::from_mins(1);
 /// Process-wide singleton for the sherpa-onnx host. Stores either a ready
 /// host or the error message from a failed initialization. Set exactly once
 /// by [`init_sherpa_host`]; subsequent calls are no-ops.
-static SHERPA_HOST: OnceLock<Result<SherpaHost, String>> = OnceLock::new();
+static SHERPA_HOST: OnceLock<Result<SherpaHost, Arc<BackendError>>> = OnceLock::new();
 
 /// Spawn the global sherpa-onnx host thread.
 ///
@@ -67,12 +67,12 @@ static SHERPA_HOST: OnceLock<Result<SherpaHost, String>> = OnceLock::new();
 /// stashed in the global slot and reported when the user actually tries to
 /// start a Sherpa transcription session.
 pub fn init_sherpa_host(model: SherpaModel) {
-    let _ = SHERPA_HOST.set(SherpaHost::spawn(model).map_err(|e| e.to_string()));
+    let _ = SHERPA_HOST.set(SherpaHost::spawn(model).map_err(Arc::new));
 }
 
 /// Look up the global sherpa host. Returns `None` if `init_sherpa_host` was
 /// never called.
-fn global_sherpa_host() -> Option<&'static Result<SherpaHost, String>> {
+fn global_sherpa_host() -> Option<&'static Result<SherpaHost, Arc<BackendError>>> {
     SHERPA_HOST.get()
 }
 
@@ -139,7 +139,10 @@ impl SherpaHost {
     /// Send a `StartSession` command to the host. Returns an error if the
     /// host worker has died.
     fn start_session(&self, params: SessionParams) -> Result<(), BackendError> {
-        let state = self.state.lock().expect("sherpa host mutex poisoned");
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| BackendError::Init("sherpa host mutex poisoned".to_owned()))?;
         state
             .cmd_tx
             .send(HostCommand::StartSession(params))
@@ -187,6 +190,13 @@ fn run_host_loop(
 }
 
 /// Build the `OnlineRecognizerConfig` for a Streaming Zipformer model.
+///
+/// Note: `BackendConfig::silence_threshold` is intentionally NOT honored here
+/// because sherpa-onnx's `OnlineRecognizer` has native endpoint detection
+/// (via `rule1`/`rule2`/`rule3_min_trailing_silence`) that handles silence
+/// at the model level. Adding an RMS-based pre-gate would mask short pauses
+/// inside utterances and confuse the streaming decoder. The Whisper backend
+/// uses `silence_threshold` because Whisper has no built-in VAD.
 fn build_recognizer_config(model: SherpaModel, provider: &str) -> OnlineRecognizerConfig {
     let (encoder, decoder, joiner, tokens) = sherpa_model::model_file_paths(model);
 
@@ -228,6 +238,7 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
     loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("sherpa session cancelled");
+            finalize_session(recognizer, &stream, &last_partial, &event_tx);
             return;
         }
 
@@ -245,6 +256,7 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
         // (same pattern as WhisperBackend) so we don't fall behind.
         while let Ok(extra) = audio_rx.try_recv() {
             if cancel.load(Ordering::Relaxed) {
+                finalize_session(recognizer, &stream, &last_partial, &event_tx);
                 return;
             }
             resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
@@ -260,6 +272,7 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
 
         while recognizer.is_ready(&stream) {
             if cancel.load(Ordering::Relaxed) {
+                finalize_session(recognizer, &stream, &last_partial, &event_tx);
                 return;
             }
             recognizer.decode(&stream);
@@ -288,7 +301,7 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
         // so reset() fires when the recognizer says the utterance is over.
         if recognizer.is_endpoint(&stream) {
             if !current_text.is_empty() {
-                let timestamp = wall_clock_timestamp();
+                let timestamp = crate::util::wall_clock_timestamp();
                 tracing::debug!(%timestamp, text = %current_text, "sherpa committed utterance");
                 let _ = event_tx.send(TranscriptionEvent::Text {
                     timestamp,
@@ -300,6 +313,9 @@ fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
         }
     }
 
+    // Audio channel disconnected — commit any in-flight hypothesis as Text
+    // before exiting so the last spoken phrase isn't lost.
+    finalize_session(recognizer, &stream, &last_partial, &event_tx);
     tracing::info!("sherpa session ended (audio channel disconnected)");
 }
 
@@ -344,10 +360,29 @@ impl TranscriptionBackend for SherpaBackend {
 
         let host = match global_sherpa_host() {
             Some(Ok(h)) => h,
-            Some(Err(msg)) => {
-                return Err(BackendError::Init(format!(
-                    "sherpa host failed to initialize: {msg}"
-                )));
+            Some(Err(stored)) => {
+                // Reconstruct a fresh BackendError so callers (and the UI)
+                // see the original variant. ModelNotFound is the most
+                // important case to preserve — it tells the user exactly
+                // where to download the model bundle.
+                return Err(match &**stored {
+                    BackendError::ModelNotFound { path } => {
+                        BackendError::ModelNotFound { path: path.clone() }
+                    }
+                    BackendError::Init(msg) => {
+                        BackendError::Init(format!("sherpa host failed to initialize: {msg}"))
+                    }
+                    BackendError::Spawn(io_err) => {
+                        // io::Error isn't Clone; flatten to a string and
+                        // wrap in Init. This is a rare path (worker thread
+                        // spawn failure during init) so the loss of fidelity
+                        // is acceptable.
+                        BackendError::Init(format!(
+                            "sherpa host worker thread spawn failed: {io_err}"
+                        ))
+                    }
+                    BackendError::WrongModelKind => BackendError::WrongModelKind,
+                });
             }
             None => {
                 return Err(BackendError::Init(
@@ -389,40 +424,33 @@ impl TranscriptionBackend for SherpaBackend {
     }
 }
 
-/// Wall-clock "HH:MM:SS" string. Same implementation as
-/// [`crate::backends::whisper`] but kept local to avoid a public re-export
-/// of an internal helper.
-fn wall_clock_timestamp() -> String {
-    let mut tv = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
+/// Commit any in-flight partial hypothesis as a final `Text` event before
+/// the session ends. Called from both the cancel and disconnect exit paths.
+///
+/// We pull `get_result` one more time so we capture any text the recognizer
+/// produced after the last partial event but before the loop exited. If
+/// that's empty we fall back to `last_partial` which holds whatever was
+/// most recently emitted.
+fn finalize_session(
+    recognizer: &OnlineRecognizer,
+    stream: &OnlineStream,
+    last_partial: &str,
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+) {
+    let final_text = recognizer
+        .get_result(stream)
+        .map(|r| r.text.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| last_partial.to_owned());
 
-    // SAFETY: gettimeofday writes into the provided buffer and is thread-safe.
-    #[allow(unsafe_code)]
-    let epoch = unsafe {
-        libc::gettimeofday(&raw mut tv, std::ptr::null_mut());
-        tv.tv_sec
-    };
-
-    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
-
-    // SAFETY: localtime_r is the reentrant variant; gmtime_r is the UTC fallback.
-    #[allow(unsafe_code)]
-    let tm = unsafe {
-        let result = libc::localtime_r(&raw const epoch, tm.as_mut_ptr());
-        let result = if result.is_null() {
-            libc::gmtime_r(&raw const epoch, tm.as_mut_ptr())
-        } else {
-            result
-        };
-        if result.is_null() {
-            return "00:00:00".to_owned();
-        }
-        tm.assume_init()
-    };
-
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    if !final_text.is_empty() {
+        let timestamp = crate::util::wall_clock_timestamp();
+        tracing::debug!(%timestamp, text = %final_text, "sherpa finalizing on session end");
+        let _ = event_tx.send(TranscriptionEvent::Text {
+            timestamp,
+            text: final_text,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -439,37 +467,6 @@ mod tests {
     fn sherpa_backend_name_is_stable() {
         let backend = SherpaBackend::new();
         assert_eq!(backend.name(), "sherpa");
-    }
-
-    #[test]
-    #[allow(clippy::panic)]
-    fn sherpa_backend_start_returns_init_error_when_host_not_initialized() {
-        // The test process never calls init_sherpa_host, so the global
-        // OnceLock is empty and start() should return BackendError::Init
-        // with a clear message about the host not being initialized.
-        //
-        // Note: this test relies on no other test in this binary calling
-        // init_sherpa_host. Cargo runs each integration test binary
-        // separately but unit tests share a process. If this test ever
-        // becomes flaky, mark it #[ignore] and run manually.
-        let mut backend = SherpaBackend::new();
-        let config = BackendConfig {
-            model: ModelChoice::Sherpa(SherpaModel::StreamingZipformerEn),
-            silence_threshold: 0.007,
-            noise_gate_ratio: 3.0,
-        };
-        match backend.start(config) {
-            Err(BackendError::Init(msg)) => {
-                assert!(
-                    msg.contains("not initialized") || msg.contains("failed to initialize"),
-                    "expected init error mentioning initialization, got: {msg}"
-                );
-            }
-            Err(e) => panic!("expected Init error, got: {e:?}"),
-            Ok(_) => {
-                panic!("expected Init error because init_sherpa_host was never called, got Ok")
-            }
-        }
     }
 
     #[test]

@@ -1793,7 +1793,7 @@ If `git status` is clean, skip this step.
 
 ```bash
 cd /data/source/rtl-sdr
-make install CARGO_FLAGS="--release --features cuda" 2>&1 | tail -20
+make install CARGO_FLAGS="--release --features whisper-cuda" 2>&1 | tail -20
 ```
 
 **Expected:** clean build, binary installed.

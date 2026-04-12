@@ -30,6 +30,7 @@ pub mod backend;
 pub mod backends;
 pub mod denoise;
 pub mod resampler;
+pub mod util;
 
 #[cfg(feature = "whisper")]
 pub mod model;

@@ -78,8 +78,8 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     // shows whichever backend was compiled in. The user picks the build
     // they want at install time:
     //
-    //   make install CARGO_FLAGS="--release --features cuda"     # Whisper + CUDA
-    //   make install CARGO_FLAGS="--release --no-default-features --features sherpa"  # Sherpa CPU
+    //   make install CARGO_FLAGS="--release --features whisper-cuda"     # Whisper + CUDA
+    //   make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"  # Sherpa CPU
     #[cfg(feature = "whisper")]
     let (model_labels, max_model_idx, key_for_persistence): (Vec<&'static str>, u32, &str) = {
         let labels: Vec<&'static str> = sdr_transcription::WhisperModel::ALL
