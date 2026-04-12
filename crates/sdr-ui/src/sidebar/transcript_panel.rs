@@ -13,6 +13,15 @@ const KEY_MODEL: &str = "transcription_model";
 const KEY_SILENCE_THRESHOLD: &str = "transcription_silence_threshold";
 /// Config key for the spectral noise gate ratio.
 const KEY_NOISE_GATE: &str = "transcription_noise_gate";
+/// Config key for the persisted backend selection ("whisper" or "sherpa").
+const KEY_BACKEND: &str = "transcription_backend";
+/// Config key for the persisted Sherpa model index.
+const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
+
+/// Backend index for Whisper in the backend selector `ComboRow`.
+const BACKEND_IDX_WHISPER: u32 = 0;
+/// Backend index for Sherpa in the backend selector `ComboRow`.
+const BACKEND_IDX_SHERPA: u32 = 1;
 
 // Silence threshold slider defaults and range.
 const DEFAULT_SILENCE_THRESHOLD: f64 = 0.007;
@@ -35,7 +44,9 @@ pub struct TranscriptPanel {
     pub widget: adw::PreferencesGroup,
     /// Toggle to enable/disable live transcription.
     pub enable_row: adw::SwitchRow,
-    /// Model size selector.
+    /// Backend selector (Whisper / Sherpa).
+    pub backend_row: adw::ComboRow,
+    /// Model size selector — contents change based on backend selection.
     pub model_row: adw::ComboRow,
     /// Silence threshold spin row.
     pub silence_row: adw::SpinRow,
@@ -66,41 +77,138 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .build();
     group.add(&enable_row);
 
-    // Model selector
-    let model_labels: Vec<&str> = sdr_transcription::WhisperModel::ALL
+    // --- Backend selector ---
+    let backend_labels = ["Whisper", "Sherpa (streaming)"];
+    let backend_list = gtk4::StringList::new(&backend_labels);
+
+    let saved_backend_idx = config.read(|v| {
+        v.get(KEY_BACKEND)
+            .and_then(serde_json::Value::as_str)
+            .map_or(BACKEND_IDX_WHISPER, |s| match s {
+                "sherpa" => BACKEND_IDX_SHERPA,
+                _ => BACKEND_IDX_WHISPER,
+            })
+    });
+
+    let backend_row = adw::ComboRow::builder()
+        .title("Backend")
+        .model(&backend_list)
+        .selected(saved_backend_idx)
+        .build();
+    group.add(&backend_row);
+
+    // --- Model selector ---
+    //
+    // Contents are populated based on the active backend. We rebuild the
+    // string list each time the backend changes; the selected index
+    // resets to whichever value was last persisted for that backend.
+    let whisper_model_labels: Vec<&'static str> = sdr_transcription::WhisperModel::ALL
         .iter()
         .map(|m| m.label())
         .collect();
-    let model_list = gtk4::StringList::new(&model_labels);
+    let sherpa_model_labels: Vec<&'static str> = sdr_transcription::SherpaModel::ALL
+        .iter()
+        .map(|m| m.label())
+        .collect();
 
     #[allow(clippy::cast_possible_truncation)]
-    let max_model_idx = sdr_transcription::WhisperModel::ALL.len() as u32;
-
+    let max_whisper_idx = sdr_transcription::WhisperModel::ALL.len() as u32;
     #[allow(clippy::cast_possible_truncation)]
-    let saved_model_idx = config.read(|v| {
+    let max_sherpa_idx = sdr_transcription::SherpaModel::ALL.len() as u32;
+
+    let saved_whisper_model_idx = config.read(|v| {
         v.get(KEY_MODEL)
             .and_then(serde_json::Value::as_u64)
             .and_then(|idx| u32::try_from(idx).ok())
-            .filter(|&idx| idx < max_model_idx)
+            .filter(|&idx| idx < max_whisper_idx)
+            .unwrap_or(0)
+    });
+    let saved_sherpa_model_idx = config.read(|v| {
+        v.get(KEY_SHERPA_MODEL)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|idx| u32::try_from(idx).ok())
+            .filter(|&idx| idx < max_sherpa_idx)
             .unwrap_or(0)
     });
 
+    let initial_model_list = if saved_backend_idx == BACKEND_IDX_SHERPA {
+        gtk4::StringList::new(&sherpa_model_labels)
+    } else {
+        gtk4::StringList::new(&whisper_model_labels)
+    };
+    let initial_model_idx = if saved_backend_idx == BACKEND_IDX_SHERPA {
+        saved_sherpa_model_idx
+    } else {
+        saved_whisper_model_idx
+    };
+
     let model_row = adw::ComboRow::builder()
         .title("Model")
-        .model(&model_list)
-        .selected(saved_model_idx)
+        .model(&initial_model_list)
+        .selected(initial_model_idx)
         .build();
     group.add(&model_row);
 
-    // Persist model selection on change (ignore transient out-of-range indices).
+    // --- Backend change handler ---
+    //
+    // Rebuilds the model picker contents and persists the new backend.
+    let config_backend = Arc::clone(config);
+    let model_row_for_backend_change = model_row.clone();
+    let whisper_labels_for_backend = whisper_model_labels.clone();
+    let sherpa_labels_for_backend = sherpa_model_labels.clone();
+    backend_row.connect_selected_notify(move |row| {
+        let idx = row.selected();
+        let (backend_str, new_list, new_idx) = if idx == BACKEND_IDX_SHERPA {
+            (
+                "sherpa",
+                gtk4::StringList::new(&sherpa_labels_for_backend),
+                config_backend.read(|v| {
+                    v.get(KEY_SHERPA_MODEL)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&i| i < max_sherpa_idx)
+                        .unwrap_or(0)
+                }),
+            )
+        } else {
+            (
+                "whisper",
+                gtk4::StringList::new(&whisper_labels_for_backend),
+                config_backend.read(|v| {
+                    v.get(KEY_MODEL)
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|i| u32::try_from(i).ok())
+                        .filter(|&i| i < max_whisper_idx)
+                        .unwrap_or(0)
+                }),
+            )
+        };
+
+        model_row_for_backend_change.set_model(Some(&new_list));
+        model_row_for_backend_change.set_selected(new_idx);
+
+        config_backend.write(|v| {
+            v[KEY_BACKEND] = serde_json::json!(backend_str);
+        });
+    });
+
+    // --- Model change handler ---
+    //
+    // Persists to KEY_MODEL or KEY_SHERPA_MODEL depending on which
+    // backend is currently selected.
     let config_model = Arc::clone(config);
+    let backend_row_for_model_change = backend_row.clone();
     model_row.connect_selected_notify(move |row| {
         let idx = row.selected();
-        if idx < max_model_idx {
-            config_model.write(|v| {
-                v[KEY_MODEL] = serde_json::json!(idx);
-            });
-        }
+        let backend_idx = backend_row_for_model_change.selected();
+        let key = if backend_idx == BACKEND_IDX_SHERPA {
+            KEY_SHERPA_MODEL
+        } else {
+            KEY_MODEL
+        };
+        config_model.write(|v| {
+            v[key] = serde_json::json!(idx);
+        });
     });
 
     // --- Tuning sliders ---
@@ -225,6 +333,7 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     TranscriptPanel {
         widget: group,
         enable_row,
+        backend_row,
         model_row,
         silence_row,
         noise_gate_row,
