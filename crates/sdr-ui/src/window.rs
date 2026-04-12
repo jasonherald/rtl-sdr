@@ -1553,7 +1553,15 @@ fn connect_transcript_panel(
                     #[cfg(feature = "whisper")]
                     silence_row.set_sensitive(true);
                     noise_gate_row.set_sensitive(true);
+                    // Reset the toggle FIRST (the else branch clears
+                    // status_label as part of its normal teardown), then
+                    // set the error text so the user actually sees it.
+                    // Otherwise the failure is silent — only in stderr.
                     row.set_active(false);
+                    status_label.set_text(&e.to_string());
+                    status_label.set_css_classes(&["error"]);
+                    status_label.set_visible(true);
+                    progress_bar.set_visible(false);
                 }
             }
         } else {
