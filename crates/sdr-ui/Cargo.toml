@@ -13,12 +13,15 @@ pipewire = ["sdr-sink-audio/pipewire"]
 whisper = ["sdr-transcription/whisper"]
 sherpa = ["sdr-transcription/sherpa"]
 
-cuda = ["whisper", "sdr-transcription/cuda"]
-hipblas = ["whisper", "sdr-transcription/hipblas"]
-vulkan = ["whisper", "sdr-transcription/vulkan"]
-metal = ["whisper", "sdr-transcription/metal"]
-intel-sycl = ["whisper", "sdr-transcription/intel-sycl"]
-openblas = ["whisper", "sdr-transcription/openblas"]
+whisper-cpu = ["whisper", "sdr-transcription/whisper-cpu"]
+whisper-cuda = ["whisper", "sdr-transcription/whisper-cuda"]
+whisper-hipblas = ["whisper", "sdr-transcription/whisper-hipblas"]
+whisper-vulkan = ["whisper", "sdr-transcription/whisper-vulkan"]
+whisper-metal = ["whisper", "sdr-transcription/whisper-metal"]
+whisper-intel-sycl = ["whisper", "sdr-transcription/whisper-intel-sycl"]
+whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas"]
+
+sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu"]
 
 [dependencies]
 sdr-types.workspace = true

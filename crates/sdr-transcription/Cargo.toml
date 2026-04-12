@@ -9,22 +9,25 @@ repository.workspace = true
 [features]
 default = []
 
-# Mutually exclusive transcription backend selection. Exactly one of
-# `whisper` or `sherpa` must be enabled. Building with both, or neither,
-# triggers a compile_error in lib.rs.
+# Internal cfg flags. Source code uses #[cfg(feature = "whisper")] /
+# #[cfg(feature = "sherpa")] to gate per-backend code. Pulled in by the
+# user-facing whisper-* / sherpa-* features below.
 whisper = ["dep:whisper-rs"]
 sherpa = ["dep:sherpa-onnx"]
 
-# GPU acceleration features for the Whisper backend.
-# Each implies `whisper` so users who pass --features cuda still get a
-# whisper build. Users who want sherpa must pass
-# --no-default-features --features sherpa.
-cuda = ["whisper", "whisper-rs/cuda"]
-hipblas = ["whisper", "whisper-rs/hipblas"]
-vulkan = ["whisper", "whisper-rs/vulkan"]
-metal = ["whisper", "whisper-rs/metal"]
-intel-sycl = ["whisper", "whisper-rs/intel-sycl"]
-openblas = ["whisper", "whisper-rs/openblas"]
+# User-facing build targets — pick exactly one.
+#
+# Whisper backend with accelerator variants:
+whisper-cpu = ["whisper"]
+whisper-cuda = ["whisper", "whisper-rs/cuda"]
+whisper-hipblas = ["whisper", "whisper-rs/hipblas"]
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
+whisper-metal = ["whisper", "whisper-rs/metal"]
+whisper-intel-sycl = ["whisper", "whisper-rs/intel-sycl"]
+whisper-openblas = ["whisper", "whisper-rs/openblas"]
+
+# Sherpa backend (CPU only for now):
+sherpa-cpu = ["sherpa"]
 
 [dependencies]
 whisper-rs = { workspace = true, optional = true }

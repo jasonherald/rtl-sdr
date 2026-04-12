@@ -100,12 +100,14 @@ make install
 
 Installs the binary, desktop entry, and icon for app launcher integration.
 
-### GPU-accelerated transcription (optional)
+### Transcription backend (optional)
 
 ```bash
-make install CARGO_FLAGS="--release --features cuda"      # NVIDIA
-make install CARGO_FLAGS="--release --features hipblas"    # AMD ROCm
-make install CARGO_FLAGS="--release --features vulkan"     # Cross-vendor
+make install CARGO_FLAGS="--release --features whisper-cuda"      # NVIDIA
+make install CARGO_FLAGS="--release --features whisper-hipblas"   # AMD ROCm
+make install CARGO_FLAGS="--release --features whisper-vulkan"    # Cross-vendor
+make install CARGO_FLAGS="--release"                               # Whisper CPU (default)
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"  # Sherpa CPU
 ```
 
 Requires the corresponding GPU toolkit (CUDA toolkit, ROCm, Vulkan SDK).

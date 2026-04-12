@@ -27,20 +27,30 @@ gtk4.workspace = true
 libadwaita.workspace = true
 
 [features]
-default = ["whisper"]
+default = ["whisper-cpu"]
 
-# Mutually exclusive transcription backends. Pick exactly one.
+# Internal cfg flags. Source code uses #[cfg(feature = "whisper")] /
+# #[cfg(feature = "sherpa")] to gate per-backend code. These are pulled
+# in by the user-facing whisper-* / sherpa-* features below — users
+# should not enable them directly.
 whisper = ["sdr-transcription/whisper", "sdr-ui/whisper"]
 sherpa = ["sdr-transcription/sherpa", "sdr-ui/sherpa"]
 
-# GPU acceleration features for the Whisper backend.
-# These imply `whisper` automatically.
-cuda = ["whisper", "sdr-ui/cuda"]
-hipblas = ["whisper", "sdr-ui/hipblas"]
-vulkan = ["whisper", "sdr-ui/vulkan"]
-metal = ["whisper", "sdr-ui/metal"]
-intel-sycl = ["whisper", "sdr-ui/intel-sycl"]
-openblas = ["whisper", "sdr-ui/openblas"]
+# User-facing build targets. Pick exactly one. Whisper and Sherpa are
+# mutually exclusive at the source level (see compile_error in
+# crates/sdr-transcription/src/lib.rs).
+#
+# Whisper backend with various accelerator backends:
+whisper-cpu = ["whisper", "sdr-transcription/whisper-cpu", "sdr-ui/whisper-cpu"]
+whisper-cuda = ["whisper", "sdr-transcription/whisper-cuda", "sdr-ui/whisper-cuda"]
+whisper-hipblas = ["whisper", "sdr-transcription/whisper-hipblas", "sdr-ui/whisper-hipblas"]
+whisper-vulkan = ["whisper", "sdr-transcription/whisper-vulkan", "sdr-ui/whisper-vulkan"]
+whisper-metal = ["whisper", "sdr-transcription/whisper-metal", "sdr-ui/whisper-metal"]
+whisper-intel-sycl = ["whisper", "sdr-transcription/whisper-intel-sycl", "sdr-ui/whisper-intel-sycl"]
+whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas", "sdr-ui/whisper-openblas"]
+
+# Sherpa backend (CPU only for now — GPU support tracked separately):
+sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu", "sdr-ui/sherpa-cpu"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-ui = { workspace = true, features = ["pipewire"] }
