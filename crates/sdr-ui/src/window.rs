@@ -1438,6 +1438,15 @@ fn connect_transcript_panel(
     #[cfg(feature = "whisper")]
     let silence_row = transcript.silence_row.clone();
     let noise_gate_row = transcript.noise_gate_row.clone();
+    // Weak refs used by the async event-loop closure to drive the same
+    // teardown the synchronous error path does (see below) when the
+    // backend fires TranscriptionEvent::Error mid-session. Weak so the
+    // timeout closure doesn't keep widgets alive past their UI lifetime.
+    let enable_row_weak = transcript.enable_row.downgrade();
+    let model_row_weak = model_row.downgrade();
+    #[cfg(feature = "whisper")]
+    let silence_row_weak = silence_row.downgrade();
+    let noise_gate_row_weak = noise_gate_row.downgrade();
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
@@ -1502,6 +1511,15 @@ fn connect_transcript_panel(
                     let status = status_label.clone();
                     let progress = progress_bar.clone();
                     let tv = text_view.clone();
+                    // Clone weak refs into the closure so we can drive
+                    // the full teardown on a fatal Error event without
+                    // creating a strong reference cycle through the
+                    // glib timeout source.
+                    let enable_row_weak = enable_row_weak.clone();
+                    let model_row_weak = model_row_weak.clone();
+                    #[cfg(feature = "whisper")]
+                    let silence_row_weak = silence_row_weak.clone();
+                    let noise_gate_row_weak = noise_gate_row_weak.clone();
 
                     glib::timeout_add_local(Duration::from_millis(100), move || {
                         loop {
@@ -1534,8 +1552,28 @@ fn connect_transcript_panel(
                                         buf.delete_mark(&mark);
                                     }
                                     TranscriptionEvent::Error(msg) => {
+                                        // Fatal — backend has exited.
+                                        // Mirror the synchronous start()
+                                        // failure teardown so the UI
+                                        // isn't left locked.
+                                        if let Some(model) = model_row_weak.upgrade() {
+                                            model.set_sensitive(true);
+                                        }
+                                        #[cfg(feature = "whisper")]
+                                        if let Some(silence) = silence_row_weak.upgrade() {
+                                            silence.set_sensitive(true);
+                                        }
+                                        if let Some(noise) = noise_gate_row_weak.upgrade() {
+                                            noise.set_sensitive(true);
+                                        }
+                                        if let Some(enable) = enable_row_weak.upgrade() {
+                                            enable.set_active(false);
+                                        }
                                         status.set_text(&msg);
                                         status.set_css_classes(&["error"]);
+                                        status.set_visible(true);
+                                        progress.set_visible(false);
+                                        return glib::ControlFlow::Break;
                                     }
                                 },
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
