@@ -411,15 +411,24 @@ public final class SdrCore {
 
     /// Render-tick FFT pull. Calls `body` synchronously with a borrowed view.
     public func withLatestFftFrame(_ body: (UnsafeBufferPointer<Float>, Double, Double) -> Void) -> Bool {
-        var captured = false
-        let opaque = Unmanaged.passUnretained(BodyBox(body)).toOpaque()
-        let got = sdr_core_pull_fft(handle, { frame, user in
-            guard let frame, let user else { return }
-            let box = Unmanaged<BodyBox>.fromOpaque(user).takeUnretainedValue()
-            let buf = UnsafeBufferPointer(start: frame.pointee.magnitudes_db, count: frame.pointee.len)
-            box.body(buf, frame.pointee.sample_rate_hz, frame.pointee.center_freq_hz)
-        }, opaque)
-        return got
+        // BodyBox MUST be bound to a local `let` before passing its pointer
+        // across the FFI boundary. `Unmanaged.passUnretained(BodyBox(body))`
+        // would deallocate the temporary box before the callback runs and
+        // hand the C side a dangling pointer. `withExtendedLifetime` keeps
+        // `box` alive for the duration of the call.
+        let box = BodyBox(body)
+        let opaque = Unmanaged.passUnretained(box).toOpaque()
+        return withExtendedLifetime(box) {
+            sdr_core_pull_fft(handle, { frame, user in
+                guard let frame, let user else { return }
+                let box = Unmanaged<BodyBox>.fromOpaque(user).takeUnretainedValue()
+                let buf = UnsafeBufferPointer(
+                    start: frame.pointee.magnitudes_db,
+                    count: frame.pointee.len
+                )
+                box.body(buf, frame.pointee.sample_rate_hz, frame.pointee.center_freq_hz)
+            }, opaque)
+        }
     }
 }
 ```
@@ -429,7 +438,7 @@ The Swift wrapper turns:
 - The C pull into a closure-style API used inside Metal `draw(in:)`.
 - Error codes into Swift `throws`.
 
-Note that `BodyBox` is a temporary heap allocation per FFT frame. We accept this for v1 (one alloc/free per frame at 20 fps is negligible). If profiling shows it matters at high FFT rates, replace with a per-`SdrCore`-instance reusable box.
+Note that `BodyBox` is a small heap allocation per FFT pull. We accept this for v1 (one alloc/free per frame at 20 fps is negligible). If profiling shows it matters at high FFT rates, hold a single reusable `BodyBox` on the `SdrCore` instance and overwrite its `body` field on each call instead of allocating.
 
 ## ABI Versioning
 

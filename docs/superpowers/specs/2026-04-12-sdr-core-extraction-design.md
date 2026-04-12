@@ -109,21 +109,26 @@ adw = "..."
 
 ## Public API
 
-The `Engine` struct is the entire public surface. It is `Send + Sync` (commands and event reads can come from any thread).
+The `Engine` struct is the entire public surface. It is `Send + Sync` so consumers can hold it in an `Arc` and call commands from any thread.
+
+`std::sync::mpsc::Receiver<T>` is `Send` but **not** `Sync`, so the receiver can't sit naked in a field on a `Sync` type. We wrap it in `Mutex<Option<...>>`: the option lets `subscribe` *take* the receiver out (it's a one-shot — only one consumer drains it), and the mutex satisfies `Sync` while the option is still occupied. After `subscribe` returns the receiver to the caller, all subsequent calls return `None`.
 
 ```rust
 // crates/sdr-core/src/engine.rs
 
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use crate::fft_buffer::SharedFftBuffer;
 use crate::messages::{DspToUi, UiToDsp};
 
-/// The headless SDR engine. One instance per app.
+/// The headless SDR engine. One instance per app. Send + Sync — consumers
+/// can hold it in an Arc and dispatch commands from any thread.
 pub struct Engine {
     cmd_tx: mpsc::Sender<UiToDsp>,
-    evt_rx: mpsc::Receiver<DspToUi>,           // sole owner; see `subscribe`
+    /// One-shot subscription slot. `subscribe()` takes the receiver out.
+    /// Wrapped in Mutex<Option<...>> because mpsc::Receiver is !Sync.
+    evt_rx: Mutex<Option<mpsc::Receiver<DspToUi>>>,
     fft: Arc<SharedFftBuffer>,
-    join: Option<std::thread::JoinHandle<()>>,
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Engine {
@@ -135,12 +140,15 @@ impl Engine {
     /// on Linux it's `$XDG_CONFIG_HOME/sdr-rs/config.json`. The host decides.
     pub fn new(config_path: std::path::PathBuf) -> Result<Self, EngineError> { ... }
 
-    /// Send a command to the DSP thread. Non-blocking.
+    /// Send a command to the DSP thread. Non-blocking. Safe from any thread.
     pub fn send_command(&self, cmd: UiToDsp) -> Result<(), EngineError> { ... }
 
-    /// Take the event receiver. Can only be called once.
-    /// The caller chooses how to drain it (GTK timeout, FFI callback, async task, ...).
-    pub fn subscribe(&mut self) -> Option<mpsc::Receiver<DspToUi>> { ... }
+    /// Take the event receiver. Returns `Some(_)` exactly once per Engine;
+    /// every subsequent call returns `None`. The caller chooses how to drain
+    /// it (GTK timeout, FFI dispatcher thread, async task, …).
+    pub fn subscribe(&self) -> Option<mpsc::Receiver<DspToUi>> {
+        self.evt_rx.lock().ok()?.take()
+    }
 
     /// Pull a snapshot of the latest FFT frame, if a new one is ready since
     /// the last call. Lock-free check; locks only when reading the buffer.
@@ -149,9 +157,17 @@ impl Engine {
         self.fft.take_if_ready(f)
     }
 
-    /// Block-and-stop. Idempotent.
-    pub fn shutdown(self) -> Result<(), EngineError> { ... }
+    /// Block-and-stop. Idempotent. Joins the DSP thread; safe to call from
+    /// any thread, but NOT from within the event-receiver loop (would deadlock).
+    pub fn shutdown(&self) -> Result<(), EngineError> { ... }
 }
+
+// SAFETY: All fields are Send + Sync:
+//  - mpsc::Sender<T> is Send + Sync
+//  - Mutex<Option<...>> is Send + Sync when T: Send
+//  - Arc<SharedFftBuffer> is Send + Sync (SharedFftBuffer uses internal Mutex+Atomic)
+// So Engine: Send + Sync is auto-derived; this comment exists to justify the
+// public claim if a future field threatens it.
 ```
 
 **Event flow remains channel-based.** `subscribe()` hands the receiver to whoever wants it: GTK polls it from a `glib::timeout_add_local`; the FFI crate spawns its own dispatcher thread that calls a C callback. Neither model is hard-coded into `sdr-core`.

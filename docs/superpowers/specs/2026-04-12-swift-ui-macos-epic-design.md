@@ -74,14 +74,16 @@ A parallel session is rebuilding `sdr-transcription` around a `TranscriptionBack
 │     • AsyncStream<CoreEvent>  (events from Rust → Swift)        │
 │     • FftFrame (zero-copy view over Rust-owned buffer)          │
 └─────────────────────────────┬───────────────────────────────────┘
-                              │ C ABI (sdr_core.h)
-                              │ • sdr_core_create / destroy
-                              │ • sdr_core_send_command
+                              │ C ABI (include/sdr_core.h)
+                              │ • sdr_core_create / sdr_core_destroy
+                              │ • typed command fns: sdr_core_tune,
+                              │   sdr_core_set_demod_mode,
+                              │   sdr_core_set_gain, ... (~25 total)
                               │ • sdr_core_set_event_callback
-                              │ • sdr_core_pull_fft_frame
+                              │ • sdr_core_pull_fft
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│  sdr-ffi (new crate, cdylib + staticlib)                        │
+│  sdr-ffi (new crate, staticlib for v1)                          │
 │  Translates C structs ↔ sdr-core Rust types.                    │
 │  Owns no state — just a thin shim around Box<sdr_core::Engine>. │
 └─────────────────────────────┬───────────────────────────────────┘
@@ -89,7 +91,8 @@ A parallel session is rebuilding `sdr-transcription` around a `TranscriptionBack
 ┌─────────────────────────────────────────────────────────────────┐
 │  sdr-core (new crate) — headless facade                         │
 │  • Owns DspController + SourceManager + SinkManager             │
-│  • Public Rust API: Engine::new, send_command, subscribe, ...   │
+│  • Public Rust API: Engine::new, send_command, subscribe,       │
+│    pull_fft, shutdown                                           │
 │  • Consumed by BOTH sdr-ffi (Swift) AND sdr-ui (GTK)            │
 └─────────────────────────────┬───────────────────────────────────┘
                               ↓

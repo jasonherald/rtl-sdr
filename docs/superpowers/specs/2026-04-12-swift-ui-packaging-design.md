@@ -187,11 +187,9 @@ The `-lc++` is required because some `coreaudio-rs` symbols pull in C++ runtime 
 <string>NSApplication</string>
 <key>NSHighResolutionCapable</key>
 <true/>
-
-<!-- USB hot-plug requires this on hardened runtime: -->
-<key>NSAppleEventsUsageDescription</key>
-<string>SDRMac uses hardware events for RTL-SDR USB device access.</string>
 ```
+
+No USB-specific Info.plist key is required. `NSAppleEventsUsageDescription` controls Apple Events automation (cross-app scripting), not USB device access — it would be wrong here. There is no `NSUSBUsageDescription` key in the macOS API; USB device access for non-sandboxed apps doesn't go through a usage-description prompt at all.
 
 ### `SDRMac.entitlements`
 
@@ -200,31 +198,25 @@ The `-lc++` is required because some `coreaudio-rs` symbols pull in C++ runtime 
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Hardened runtime: required for notarization -->
-    <key>com.apple.security.cs.allow-jit</key>
-    <false/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <false/>
-    <key>com.apple.security.cs.disable-library-validation</key>
-    <false/>
-
-    <!-- USB device access for RTL-SDR (libusb via rusb) -->
-    <key>com.apple.security.device.usb</key>
-    <true/>
-
     <!-- We are NOT sandboxed in v1. -->
     <!-- (No <com.apple.security.app-sandbox/> entry.) -->
-
-    <!-- Audio output: not needed for non-sandboxed apps; CoreAudio works as-is. -->
 </dict>
 </plist>
 ```
 
-**Why not sandboxed:** sandbox + USB device access is a deep rabbit hole on macOS. Apps that need raw libusb access typically either go unsandboxed (our v1 choice) or use the `IOUSBHost` framework (Apple's modern alternative, requires reworking `rusb` usage). For v1 we ship unsandboxed; v2 considers IOUSBHost.
+The entitlements file is **deliberately empty** for v1. Reasoning:
 
-**Why hardened runtime is on:** notarization requires it. `com.apple.security.cs.allow-jit = false` is the default; we don't JIT.
+- **`com.apple.security.device.usb`** is a *sandbox* entitlement. It only does anything when paired with `com.apple.security.app-sandbox`. We are not sandboxed in v1, so requesting it would be cargo-cult: it grants nothing additional and adds noise to the entitlement audit. We omit it.
+- **`com.apple.security.cs.allow-jit`**, **`allow-unsigned-executable-memory`**, **`disable-library-validation`** all default to `false` under the hardened runtime. Spelling them out as `<false/>` is a no-op — Apple's documentation is explicit that the absence of these keys is the secure default, and adding `<false/>` entries doesn't strengthen anything. We omit them too.
+- **Hardened runtime itself** is not an entitlements-file thing — it's a `codesign --options runtime` flag. The entitlements file does not need to declare it. The signing script (`scripts/sign-mac.sh` below) sets it.
 
-**USB validation spike (must run before M5 starts):** confirm that an unsandboxed, hardened-runtime, codesigned, notarized "hello world" app can call `rusb` to enumerate USB devices and open an RTL-SDR. Done as a 1-day spike on a real macOS box. If it fails, the entire epic blocks until we either (a) figure out the right entitlement combo, or (b) switch to `IOUSBHost`. The risk is real but manageable — many open-source SDR apps on macOS have already proven this works.
+If a future feature actually needs an entitlement (e.g., the v2 Mac App Store path needs `com.apple.security.app-sandbox` + `com.apple.security.device.usb`; or loading external dylibs at runtime would need `disable-library-validation`), it gets added then with a comment explaining the specific requirement. Until then, the file stays empty.
+
+**Why not sandboxed:** sandbox + USB device access is a deep rabbit hole on macOS. Apps that need raw libusb access typically either go unsandboxed (our v1 choice) or use the `IOUSBHost` framework (Apple's modern alternative, requires reworking `rusb` usage). For v1 we ship unsandboxed; v2 considers IOUSBHost if and when we want App Store distribution.
+
+**Why hardened runtime is on:** notarization requires it. The signing flag (`--options runtime`) enables it; the entitlements file does not need any keys to support a non-sandboxed, non-JIT app under the hardened runtime — that's the default secure configuration.
+
+**USB validation spike (must run before M5 starts):** confirm that an unsandboxed, hardened-runtime, codesigned, notarized "hello world" app statically linked against `libsdr_core.a` (which embeds `rusb`/libusb via the static lib) can enumerate USB devices and open an RTL-SDR. Done as a 1-day spike on a real macOS box. The expected outcome is "yes, with no entitlements" — many open-source SDR apps on macOS have proven this works. If the spike fails, we revisit (likely candidate: `com.apple.security.cs.disable-library-validation` if the linking pulls in a runtime dylib we didn't expect, or `IOUSBHost` if we have to leave libusb behind entirely). The risk is real but bounded.
 
 ## Code Signing
 

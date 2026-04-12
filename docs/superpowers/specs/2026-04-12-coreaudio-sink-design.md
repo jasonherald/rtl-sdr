@@ -143,7 +143,11 @@ The CoreAudio impl exposes **exactly** the same surface as `pw_impl.rs`:
 pub struct AudioSink { /* CoreAudio-internal state */ }
 pub struct AudioDevice {
     pub display_name: String,
-    pub node_name: String,         // we re-purpose this for AudioObjectID hex on macOS
+    /// Caller-opaque device identifier.
+    /// • Linux/PipeWire: PipeWire `node.name`
+    /// • macOS/CoreAudio: CoreAudio device UID (`kAudioDevicePropertyDeviceUID`)
+    /// Empty string ("") always means "system default output", on every platform.
+    pub node_name: String,
 }
 
 impl AudioSink {
@@ -224,15 +228,40 @@ The engine never sees the device rate. `Sink::sample_rate()` always returns 48 k
 The render callback signature is roughly:
 
 ```rust
+/// Maximum frames per render callback we are willing to service from the
+/// stack scratch buffer. CoreAudio quanta are typically 256 or 512 frames;
+/// 4096 is a generous ceiling that covers any aggregate device or pro-audio
+/// device the user might have configured.
+const MAX_CB_FRAMES: usize = 4096;
+
 unit.set_render_callback(move |args: render_callback::Args<f32, NonInterleaved>| {
     let frames = args.num_frames;
     // args.data is &mut [&mut [f32]] — one slice per channel
     let mut left  = args.data[0];
     let mut right = args.data[1];
 
+    // Stack-only scratch. No heap allocation on the audio thread, ever.
+    // Buffer holds `MAX_CB_FRAMES` interleaved stereo frames = 2× that many f32s.
     let mut interleaved = [0.0f32; MAX_CB_FRAMES * 2];
-    let to_read = frames * 2;
-    let read = ring.read(&mut interleaved[..to_read]);
+
+    if frames > MAX_CB_FRAMES {
+        // Can't service this quantum from the stack scratch. Output silence
+        // for the whole callback rather than risk reading uninitialized
+        // memory or partially filling the buffers. This is the only branch
+        // that should ever fire — if it does, MAX_CB_FRAMES needs raising,
+        // but we degrade safely instead of allocating on the RT thread.
+        for i in 0..frames {
+            left[i]  = 0.0;
+            right[i] = 0.0;
+        }
+        // Best-effort log once per minute via an atomic rate-limit; no
+        // formatting allocations on the audio thread.
+        rt_log::warn_throttled("coreaudio render quantum exceeded scratch buffer");
+        return Ok(());
+    }
+
+    let want_samples = frames * 2;
+    let read = ring.read(&mut interleaved[..want_samples]);
 
     for i in 0..frames {
         if i * 2 + 1 < read {
@@ -247,7 +276,7 @@ unit.set_render_callback(move |args: render_callback::Args<f32, NonInterleaved>|
 });
 ```
 
-(Real code uses a stack-allocated `[f32; N]` sized to a known max and asserts on overflow; CoreAudio quanta are typically 256 or 512 frames.)
+The audio thread allocates **nothing**, in any build configuration. Debug builds add a `debug_assert!(frames <= MAX_CB_FRAMES)` so the overflow path is impossible-by-construction during development; release builds keep the runtime check and degrade to silence rather than allocate. The previous draft of this doc proposed a heap fallback in release — that was wrong. Heap allocation on the CoreAudio render thread can block on the system allocator and miss a deadline; silence is the correct safe degradation.
 
 ### `AudioSink::stop() -> Result<(), SinkError>`
 
@@ -259,7 +288,9 @@ unit.set_render_callback(move |args: render_callback::Args<f32, NonInterleaved>|
 
 ### `AudioSink::set_target(node_name: &str) -> Result<(), SinkError>`
 
-In v1: parse `node_name` as a hex `AudioObjectID`. If empty, route to the default output device. If non-empty, set `kAudioOutputUnitProperty_CurrentDevice` on the AudioUnit before initialization. Restart the unit if it was already running, just like the PipeWire impl does.
+`node_name` is a CoreAudio device UID — the same string returned in `AudioDevice::node_name` from `list_audio_sinks`. Empty string means "system default output".
+
+For non-empty values: translate the UID to an `AudioObjectID` via `AudioObjectGetPropertyData` with `kAudioHardwarePropertyTranslateUIDToDevice`, then set `kAudioOutputUnitProperty_CurrentDevice` on the AudioUnit before initialization. If the unit is already running, stop, reconfigure, and restart — same pattern as the PipeWire impl.
 
 The v1 SwiftUI MVP never calls this — it always uses default output. The implementation is here so the v2 device picker has nothing to add to the sink.
 
@@ -271,9 +302,13 @@ Enumerate output devices via:
 2. `AudioObjectGetPropertyData(...)` to get the `[AudioObjectID]`.
 3. For each device, query `kAudioDevicePropertyStreamConfiguration` (output scope) — keep only devices with at least one output channel.
 4. For each kept device, query `kAudioObjectPropertyName` for the display name.
-5. Always prepend a "Default" entry with empty `node_name`, matching the PipeWire impl's contract.
+5. For each kept device, query `kAudioDevicePropertyDeviceUID` and store it as `AudioDevice::node_name`. Device UIDs are stable across reboots and device add/remove cycles, unlike `AudioObjectID`s which are session-scoped.
+6. Always prepend a "Default" entry with `node_name = ""` (empty string), matching the contract that empty means "system default output" on every platform.
+7. Deduplicate: if the system default device's UID also appears in the enumerated list, skip the enumerated entry — it's already represented by the "Default" entry. Mirrors what `pw_impl.rs` does for PipeWire.
 
 This is one short function (~60 lines). It runs synchronously on the calling thread; CoreAudio property queries are cheap (no main loop needed, unlike PipeWire's enumerate-and-quit dance).
+
+`set_target` consumes the same UID strings: pass `""` for default, or any UID returned by `list_audio_sinks` to route to a specific device. The implementation translates the UID back to an `AudioObjectID` via `kAudioHardwarePropertyTranslateUIDToDevice` and sets `kAudioOutputUnitProperty_CurrentDevice` on the AudioUnit.
 
 ### `Sink::write_samples(&[Stereo]) -> Result<(), SinkError>`
 
@@ -302,15 +337,13 @@ CoreAudio is hardware-touching, so the test surface is split:
 | `coreaudio-rs` adds noticeable build time via `bindgen` | Accepted. It's a one-time cost; the alternative (raw `coreaudio-sys` + hand-rolled wrappers) is more code to own. |
 | Default output device changes mid-stream (user plugs in headphones) | `kAudioHardwarePropertyDefaultOutputDevice` listener triggers a stop+restart on the sink thread. Same UX as every other macOS app. v2-quality polish — for v1 the user reselects manually if they care. |
 | AURenderCallback fires before `running` flag is set | Set `running = true` *before* `audio_unit.start()`. Same ordering rule as the PipeWire impl. |
-| Stack-allocated render scratch buffer overflows for unusual quanta | Assert `args.num_frames * 2 <= MAX_CB_FRAMES` in debug, fall back to a heap allocation in release. CoreAudio default output rarely exceeds 1024 frames. |
+| Stack-allocated render scratch buffer overflows for unusual quanta | `MAX_CB_FRAMES = 4096` (8 KB scratch); `debug_assert!(frames <= MAX_CB_FRAMES)` in debug; release degrades to silence + a throttled tracing warn. **Never allocates on the RT thread**, even in release. CoreAudio default output rarely exceeds 1024 frames; 4096 covers aggregate/pro-audio devices. |
 | Linking against `AudioUnit.framework` and `CoreAudio.framework` requires special build flags | `coreaudio-rs` declares them via `#[link(name = "AudioUnit", kind = "framework")]`. Verified in PR 1 spike before this design is committed. |
 | Universal binary build (arm64 + x86_64) — `coreaudio-rs` cross-compiles cleanly? | Yes, the bindgen step takes the target triple from cargo. CI matrix builds both. |
 
 ## Open Questions
 
 - **Resampler choice when device rate ≠ 48 kHz:** `coreaudio-rs` exposes `audio_unit::render_callback::Resampler`, but it's `kAudioUnitType_FormatConverter` — adds another AudioUnit in the chain. Alternative: use `sdr-dsp`'s existing rational resampler upstream, in the sink, before writing to the ring. **Lean: use `sdr-dsp` resampler** because it's already in the dependency tree, well-tested, and we control its quality settings. The format converter AU adds an opaque box.
-- **What does `node_name` look like for CoreAudio devices?** Hex AudioObjectID ("0x42"), or device UID string ("BuiltInSpeakerDevice")? The UID is more stable across reboots and device-add/remove. **Lean: device UID via `kAudioDevicePropertyDeviceUID`.** AudioDevice's `node_name` field becomes the UID on macOS, the PipeWire node name on Linux. Both are caller-opaque strings.
-- **Should `list_audio_sinks` include "Default" twice if the user's actual default device shows up in the enumeration?** The PipeWire impl deduplicates by node name. We do the same on macOS by checking the default device's UID against the list and skipping it from the enumerated entries (it's already represented by the "Default" entry).
 
 ## Implementation Sequencing
 

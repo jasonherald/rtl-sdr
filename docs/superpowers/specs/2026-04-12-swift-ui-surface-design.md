@@ -173,26 +173,68 @@ final class CoreModel {
         }
     }
 
-    // Command-issuing methods, one per UI control. Each one swallows errors
-    // into `lastError` so the view layer never has to handle them.
-    func start()                       { try? core?.start();             isRunning = true  }
-    func stop()                        { try? core?.stop();              isRunning = false }
-    func setCenter(_ hz: Double)       { centerFrequencyHz = hz; try? core?.tune(hz) }
-    func setVfoOffset(_ hz: Double)    { vfoOffsetHz = hz; try? core?.setVfoOffset(hz) }
-    func setDemodMode(_ m: DemodMode)  { demodMode = m; try? core?.setDemodMode(m) }
-    func setBandwidth(_ hz: Double)    { bandwidthHz = hz; try? core?.setBandwidth(hz) }
-    func setGain(_ db: Double)         { gainDb = db; try? core?.setGain(db) }
-    func setAgc(_ on: Bool)            { agcEnabled = on; try? core?.setAgc(on) }
-    func setSquelch(_ db: Float)       { squelchDb = db; try? core?.setSquelchDb(db) }
-    func setSquelchEnabled(_ on: Bool) { squelchEnabled = on; try? core?.setSquelchEnabled(on) }
-    func setDeemphasis(_ m: Deemphasis){ deemphasis = m; try? core?.setDeemphasis(m) }
-    func setVolume(_ v: Float)         { volume = v; try? core?.setVolume(v) }
-    func setMinDb(_ db: Float)         { minDb = db }     // pure UI
-    func setMaxDb(_ db: Float)         { maxDb = db }     // pure UI
-    func setFftSize(_ n: Int)          { fftSize = n; try? core?.setFftSize(n) }
-    func setFftWindow(_ w: FftWindow)  { fftWindow = w; try? core?.setFftWindow(w) }
-    func setFftRate(_ fps: Double)     { fftRateFps = fps; try? core?.setFftRate(fps) }
-    func setPpm(_ ppm: Int)            { ppmCorrection = ppm; try? core?.setPpmCorrection(ppm) }
+    // Command dispatch
+    // ---------------------------------------------------------------
+    // Two patterns:
+    //
+    // 1. **Lifecycle** (start/stop) — *strict*: only mutate UI state if the
+    //    engine accepts the command. A failed start() must NOT leave
+    //    isRunning=true. Errors land in `lastError`.
+    //
+    // 2. **Setters** (frequency/gain/squelch/etc.) — *optimistic*: mutate
+    //    the UI binding immediately for input responsiveness, then forward
+    //    to the engine. The engine processes commands asynchronously over
+    //    its mpsc channel, so a successful return only means "queued", not
+    //    "applied". Real engine-side rejections come back via the event
+    //    stream and surface as state corrections in `consumeEvents`.
+    //    Synchronous FFI failures (e.g., engine handle dropped) still
+    //    capture into `lastError`.
+    //
+    // Neither pattern uses `try?`. Errors are never silently dropped.
+
+    private func capture(_ work: () throws -> Void) {
+        do { try work() }
+        catch { lastError = "\(error)" }
+    }
+
+    // --- Strict / lifecycle ---
+    func start() {
+        guard let core else { lastError = "engine not initialized"; return }
+        do {
+            try core.start()
+            isRunning = true
+            lastError = nil
+        } catch {
+            lastError = "start failed: \(error)"
+        }
+    }
+    func stop() {
+        guard let core else { return }
+        do {
+            try core.stop()
+            isRunning = false
+        } catch {
+            lastError = "stop failed: \(error)"
+        }
+    }
+
+    // --- Optimistic setters ---
+    func setCenter(_ hz: Double)       { centerFrequencyHz = hz; capture { try core?.tune(hz) } }
+    func setVfoOffset(_ hz: Double)    { vfoOffsetHz = hz;       capture { try core?.setVfoOffset(hz) } }
+    func setDemodMode(_ m: DemodMode)  { demodMode = m;          capture { try core?.setDemodMode(m) } }
+    func setBandwidth(_ hz: Double)    { bandwidthHz = hz;       capture { try core?.setBandwidth(hz) } }
+    func setGain(_ db: Double)         { gainDb = db;            capture { try core?.setGain(db) } }
+    func setAgc(_ on: Bool)            { agcEnabled = on;        capture { try core?.setAgc(on) } }
+    func setSquelch(_ db: Float)       { squelchDb = db;         capture { try core?.setSquelchDb(db) } }
+    func setSquelchEnabled(_ on: Bool) { squelchEnabled = on;    capture { try core?.setSquelchEnabled(on) } }
+    func setDeemphasis(_ m: Deemphasis){ deemphasis = m;         capture { try core?.setDeemphasis(m) } }
+    func setVolume(_ v: Float)         { volume = v;             capture { try core?.setVolume(v) } }
+    func setMinDb(_ db: Float)         { minDb = db }     // pure UI, no engine call
+    func setMaxDb(_ db: Float)         { maxDb = db }     // pure UI, no engine call
+    func setFftSize(_ n: Int)          { fftSize = n;             capture { try core?.setFftSize(n) } }
+    func setFftWindow(_ w: FftWindow)  { fftWindow = w;           capture { try core?.setFftWindow(w) } }
+    func setFftRate(_ fps: Double)     { fftRateFps = fps;        capture { try core?.setFftRate(fps) } }
+    func setPpm(_ ppm: Int)            { ppmCorrection = ppm;     capture { try core?.setPpmCorrection(ppm) } }
 
     // Renderer pulls FFT through this — see rendering spec
     var sdrCore: SdrCore? { core }
