@@ -4,6 +4,7 @@
 //! constructs one based on the [`crate::backend::ModelChoice`] variant
 //! and delegates lifecycle to it.
 
+pub mod sherpa;
 pub mod whisper;
 
 #[cfg(test)]

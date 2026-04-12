@@ -60,22 +60,17 @@ impl TranscriptionEngine {
         }
     }
 
-    /// Start the Whisper backend with the given model and parameters.
-    /// Returns a receiver for [`TranscriptionEvent`].
+    /// Start a transcription backend selected by `config.model`.
     ///
-    /// Kept for API compatibility with the pre-refactor engine.
-    /// Internally constructs a [`WhisperBackend`] and delegates.
+    /// Constructs the right backend (Whisper or Sherpa) for the chosen
+    /// model and returns a receiver for [`TranscriptionEvent`].
     pub fn start(
         &mut self,
-        whisper_model: WhisperModel,
-        silence_threshold: f32,
-        noise_gate_ratio: f32,
+        config: BackendConfig,
     ) -> Result<mpsc::Receiver<TranscriptionEvent>, TranscriptionError> {
-        let backend: Box<dyn TranscriptionBackend> = Box::new(WhisperBackend::new());
-        let config = BackendConfig {
-            model: ModelChoice::Whisper(whisper_model),
-            silence_threshold,
-            noise_gate_ratio,
+        let backend: Box<dyn TranscriptionBackend> = match config.model {
+            ModelChoice::Whisper(_) => Box::new(WhisperBackend::new()),
+            ModelChoice::Sherpa(_) => Box::new(backends::sherpa::SherpaBackend::new()),
         };
         self.start_with_backend(backend, config)
     }
