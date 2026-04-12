@@ -1457,12 +1457,18 @@ fn connect_transcript_panel(
             #[allow(clippy::cast_possible_truncation)]
             let noise_gate_ratio = noise_gate_row.value() as f32;
 
+            // Build BackendConfig. For Task 6 we hardcode Whisper —
+            // Task 8 wires the backend selector ComboRow that provides
+            // ModelChoice::Sherpa(...) when the user picks it.
+            let config = sdr_transcription::BackendConfig {
+                model: sdr_transcription::ModelChoice::Whisper(whisper_model),
+                silence_threshold,
+                noise_gate_ratio,
+            };
+
             // Scope the borrow so it's dropped before any potential re-entry
             // from row.set_active(false) on error.
-            let start_result =
-                engine_clone
-                    .borrow_mut()
-                    .start(whisper_model, silence_threshold, noise_gate_ratio);
+            let start_result = engine_clone.borrow_mut().start(config);
             match start_result {
                 Ok(event_rx) => {
                     if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
