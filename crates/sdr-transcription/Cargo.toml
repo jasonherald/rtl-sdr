@@ -20,6 +20,7 @@ whisper-rs.workspace = true
 reqwest.workspace = true
 rustfft.workspace = true
 sdr-types.workspace = true
+sherpa-onnx = "1.12"
 thiserror.workspace = true
 tracing.workspace = true
 dirs-next.workspace = true
