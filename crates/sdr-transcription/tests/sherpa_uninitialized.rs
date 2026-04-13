@@ -24,6 +24,7 @@ fn sherpa_backend_start_returns_init_error_when_host_not_initialized() {
         silence_threshold: 0.007,
         noise_gate_ratio: 3.0,
         vad_threshold: sdr_transcription::VAD_THRESHOLD_DEFAULT,
+        segmentation_mode: sdr_transcription::SegmentationMode::Vad,
     };
     let result = backend.start(config);
     match result {

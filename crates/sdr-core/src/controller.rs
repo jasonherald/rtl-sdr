@@ -147,6 +147,14 @@ fn dsp_thread_main(
 }
 
 /// Mutable state owned by the DSP thread.
+///
+/// This is a god-struct that holds every piece of DSP-thread state by
+/// design — the DSP thread owns everything exclusively. The
+/// `struct_excessive_bools` lint triggers at 4 bools (`running`,
+/// `dc_blocking`, `invert_iq`, `squelch_was_open`); splitting them
+/// into an enum state machine would be a significant refactor for
+/// zero runtime benefit, so suppress locally.
+#[allow(clippy::struct_excessive_bools)]
 struct DspState {
     source: Option<Box<dyn Source>>,
     frontend: IqFrontend,
@@ -191,6 +199,12 @@ struct DspState {
 
     /// Transcription audio tap — when Some, audio is copied to this channel.
     transcription_tx: Option<std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>>,
+
+    /// Last known squelch gate state, used to detect open/close edge
+    /// transitions so we only emit one `SquelchOpened` / `SquelchClosed`
+    /// event per transition instead of one per audio chunk. Initialized
+    /// to `false` (matches `IfChain`'s initial closed state).
+    squelch_was_open: bool,
 }
 
 impl DspState {
@@ -241,6 +255,7 @@ impl DspState {
             audio_writer: None,
             iq_writer: None,
             transcription_tx: None,
+            squelch_was_open: false,
         })
     }
 }
@@ -1002,16 +1017,47 @@ fn process_iq_block(
                         }
 
                         // Send audio copy to transcription worker BEFORE volume
-                        // scaling so recognition isn't affected by the volume knob.
+                        // scaling so recognition isn't affected by the volume knob. Also
+                        // emit squelch edge events on open/close transitions so offline
+                        // sherpa backends can use them as Auto Break segmentation
+                        // boundaries. Edge events are NFM-only — WFM and other modes
+                        // don't have meaningful squelch transitions for speech.
                         if let Some(ref tx) = state.transcription_tx {
-                            let mut interleaved = Vec::with_capacity(audio_count * 2);
-                            for s in &state.audio_buf[..audio_count] {
-                                interleaved.push(s.l);
-                                interleaved.push(s.r);
-                            }
-                            if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
-                                tx.try_send(sdr_transcription::TranscriptionInput::Samples(interleaved))
+                            let now_open = state.radio.if_chain().squelch_open();
+                            let mut send_error = false;
+
+                            if now_open != state.squelch_was_open
+                                && state.radio.current_mode() == sdr_types::DemodMode::Nfm
                             {
+                                let edge = if now_open {
+                                    sdr_transcription::TranscriptionInput::SquelchOpened
+                                } else {
+                                    sdr_transcription::TranscriptionInput::SquelchClosed
+                                };
+                                if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
+                                    tx.try_send(edge)
+                                {
+                                    send_error = true;
+                                }
+                            }
+                            state.squelch_was_open = now_open;
+
+                            if !send_error {
+                                let mut interleaved = Vec::with_capacity(audio_count * 2);
+                                for s in &state.audio_buf[..audio_count] {
+                                    interleaved.push(s.l);
+                                    interleaved.push(s.r);
+                                }
+                                if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
+                                    tx.try_send(sdr_transcription::TranscriptionInput::Samples(
+                                        interleaved,
+                                    ))
+                                {
+                                    send_error = true;
+                                }
+                            }
+
+                            if send_error {
                                 state.transcription_tx = None;
                                 tracing::info!(
                                     "transcription receiver disconnected, disabling tap"

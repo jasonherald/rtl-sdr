@@ -204,9 +204,18 @@ mod tests {
 
     #[test]
     fn transcription_input_variants_construct() {
-        let _samples = TranscriptionInput::Samples(vec![0.0_f32; 16]);
-        let _opened = TranscriptionInput::SquelchOpened;
-        let _closed = TranscriptionInput::SquelchClosed;
+        assert!(matches!(
+            TranscriptionInput::Samples(vec![0.0_f32; 16]),
+            TranscriptionInput::Samples(_)
+        ));
+        assert!(matches!(
+            TranscriptionInput::SquelchOpened,
+            TranscriptionInput::SquelchOpened
+        ));
+        assert!(matches!(
+            TranscriptionInput::SquelchClosed,
+            TranscriptionInput::SquelchClosed
+        ));
     }
 
     #[test]
