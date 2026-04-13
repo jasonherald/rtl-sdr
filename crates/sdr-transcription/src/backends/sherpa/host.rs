@@ -132,6 +132,10 @@ pub(super) struct SessionParams {
     pub audio_rx: mpsc::Receiver<Vec<f32>>,
     pub event_tx: mpsc::Sender<TranscriptionEvent>,
     pub noise_gate_ratio: f32,
+    /// Silero VAD threshold requested for this session (offline models only).
+    /// The worker rebuilds the VAD if this differs from the currently-held
+    /// VAD's threshold.
+    pub vad_threshold: f32,
 }
 
 /// Commands sent to the host worker thread.
@@ -291,6 +295,33 @@ fn run_host_loop(
                         super::streaming::run_session(recognizer, params);
                     }
                     RecognizerState::Offline { recognizer, vad } => {
+                        // Check if the user's requested VAD threshold differs
+                        // from the currently-held VAD's threshold. If so,
+                        // rebuild the VAD before starting the session. The
+                        // rebuild is ~50-100ms of ONNX model load — only
+                        // happens when the slider value actually changed.
+                        let requested = params.vad_threshold;
+                        // Treat differences smaller than the slider step as
+                        // "same" to avoid pointless rebuilds from float drift.
+                        if (vad.current_threshold() - requested).abs() > 0.01 {
+                            tracing::info!(
+                                old = vad.current_threshold(),
+                                new = requested,
+                                "rebuilding Silero VAD with new threshold"
+                            );
+                            let vad_path = sherpa_model::silero_vad_path();
+                            match super::silero_vad::SherpaSileroVad::new(&vad_path, requested) {
+                                Ok(new_vad) => {
+                                    *vad = new_vad;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "VAD rebuild failed; reusing existing VAD"
+                                    );
+                                }
+                            }
+                        }
                         super::offline::run_session(recognizer, vad, params);
                     }
                 }
@@ -425,8 +456,11 @@ fn init_offline(
     tracing::info!("OfflineRecognizer created successfully");
 
     // --- Build SherpaSileroVad ---
+    // Use the default threshold at startup (Option A): if the user has a
+    // persisted non-default threshold, it will cause a ~50-100ms VAD
+    // rebuild on the first session start (in the StartSession handler below).
     let vad_path = sherpa_model::silero_vad_path();
-    let vad = match SherpaSileroVad::new(&vad_path) {
+    let vad = match SherpaSileroVad::new(&vad_path, super::silero_vad::SILERO_THRESHOLD) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("Silero VAD creation failed: {e}");

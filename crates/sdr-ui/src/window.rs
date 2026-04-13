@@ -1501,6 +1501,7 @@ fn unlock_transcription_session_rows(
     #[cfg(feature = "whisper")] silence_row: &glib::WeakRef<adw::SpinRow>,
     noise_gate_row: &glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
+    #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
 ) {
     if let Some(row) = model_row.upgrade() {
         row.set_sensitive(true);
@@ -1514,6 +1515,10 @@ fn unlock_transcription_session_rows(
     }
     #[cfg(feature = "sherpa")]
     if let Some(row) = display_mode_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = vad_threshold_row.upgrade() {
         row.set_sensitive(true);
     }
 }
@@ -1552,9 +1557,13 @@ fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let display_mode_row = transcript.display_mode_row.clone();
     #[cfg(feature = "sherpa")]
+    let vad_threshold_row = transcript.vad_threshold_row.clone();
+    #[cfg(feature = "sherpa")]
     let live_line_label = transcript.live_line_label.clone();
     #[cfg(feature = "sherpa")]
     let display_mode_row_weak = display_mode_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let vad_threshold_row_weak = vad_threshold_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -1697,6 +1706,8 @@ fn connect_transcript_panel(
             // exception. User stops, changes, starts.
             #[cfg(feature = "sherpa")]
             display_mode_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            vad_threshold_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
 
@@ -1730,10 +1741,18 @@ fn connect_transcript_panel(
                 sdr_transcription::ModelChoice::Sherpa(sherpa_model)
             };
 
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation)]
+            let vad_threshold = vad_threshold_row.value() as f32;
+            // Whisper builds compile the field but ignore it (no Silero VAD).
+            #[cfg(feature = "whisper")]
+            let vad_threshold: f32 = 0.5;
+
             let config = sdr_transcription::BackendConfig {
                 model,
                 silence_threshold,
                 noise_gate_ratio,
+                vad_threshold,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
@@ -1763,6 +1782,8 @@ fn connect_transcript_panel(
                     let noise_gate_row_weak = noise_gate_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let display_mode_row_weak = display_mode_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let vad_threshold_row_weak = vad_threshold_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let live_line_weak = live_line_weak.clone();
 
@@ -1799,12 +1820,37 @@ fn connect_transcript_panel(
                                     TranscriptionEvent::Partial { text } => {
                                         #[cfg(feature = "sherpa")]
                                         {
-                                            // Read the current display mode
-                                            // from the combo row (the user may
-                                            // have changed it mid-session; we
-                                            // deliberately don't lock it).
-                                            let show_live =
-                                                display_mode_row_weak.upgrade().is_some_and(
+                                            // Belt-and-suspenders: only paint
+                                            // the live line if (a) the current
+                                            // model actually supports partials
+                                            // and (b) display mode is Live.
+                                            //
+                                            // (a) defends against a future bug
+                                            // where an offline model accidentally
+                                            // emits a Partial event — today the
+                                            // offline session loop never does,
+                                            // but the UI shouldn't trust that.
+                                            // Without this check, italics would
+                                            // appear on Moonshine/Parakeet on
+                                            // any spurious Partial.
+                                            //
+                                            // (b) honors the user's display-mode
+                                            // preference for partial-emitting
+                                            // models. Re-read on every event so
+                                            // mid-session toggle takes effect.
+                                            let model_supports_partials = model_row_weak
+                                                .upgrade()
+                                                .is_some_and(|row| {
+                                                    let idx = row.selected() as usize;
+                                                    sdr_transcription::SherpaModel::ALL
+                                                        .get(idx)
+                                                        .copied()
+                                                        .is_some_and(
+                                                            sdr_transcription::SherpaModel::supports_partials,
+                                                        )
+                                                });
+                                            let show_live = model_supports_partials
+                                                && display_mode_row_weak.upgrade().is_some_and(
                                                     |row| row.selected() != DISPLAY_MODE_FINAL_IDX,
                                                 );
                                             if show_live
@@ -1857,6 +1903,8 @@ fn connect_transcript_panel(
                                             &noise_gate_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &display_mode_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &vad_threshold_row_weak,
                                         );
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
@@ -1922,6 +1970,8 @@ fn connect_transcript_panel(
                                         &noise_gate_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &display_mode_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &vad_threshold_row_weak,
                                     );
                                     if let Some(enable) = enable_row_weak.upgrade() {
                                         enable.set_active(false);
@@ -1951,6 +2001,8 @@ fn connect_transcript_panel(
                         &noise_gate_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &display_mode_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &vad_threshold_row.downgrade(),
                     );
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
@@ -1971,6 +2023,8 @@ fn connect_transcript_panel(
                 &noise_gate_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &display_mode_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &vad_threshold_row.downgrade(),
             );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();

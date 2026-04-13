@@ -74,6 +74,7 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         audio_rx,
         event_tx,
         noise_gate_ratio,
+        vad_threshold: _,
     } = params;
 
     let stream = recognizer.create_stream();

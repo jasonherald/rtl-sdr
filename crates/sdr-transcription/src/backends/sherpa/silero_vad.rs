@@ -23,7 +23,10 @@ use super::host::SHERPA_SAMPLE_RATE_HZ;
 /// Silero VAD default hyperparameters. These match the sherpa-onnx
 /// upstream `moonshine_v2.rs` example and are appropriate for radio
 /// audio (short bursts, occasional long silences).
-const SILERO_THRESHOLD: f32 = 0.5;
+///
+/// Exposed as `pub(super)` so `host.rs::init_offline` can use it as
+/// the initial threshold before any user-configured session runs.
+pub(super) const SILERO_THRESHOLD: f32 = 0.5;
 const SILERO_MIN_SILENCE_DURATION: f32 = 0.25;
 const SILERO_MIN_SPEECH_DURATION: f32 = 0.25;
 const SILERO_MAX_SPEECH_DURATION: f32 = 20.0;
@@ -38,15 +41,22 @@ const VAD_BUFFER_SIZE_SECONDS: f32 = 30.0;
 /// Sherpa-onnx-backed Silero VAD.
 pub struct SherpaSileroVad {
     inner: SherpaVad,
+    /// The threshold this VAD was created with. Used by the host worker to
+    /// detect when a new session requests a different threshold so it can
+    /// rebuild the VAD before starting.
+    current_threshold: f32,
 }
 
 impl SherpaSileroVad {
-    /// Create a new Silero VAD using the ONNX file at `model_path`.
+    /// Create a new Silero VAD using the ONNX file at `model_path` and
+    /// the given `threshold` (0.10..=0.90).
+    ///
+    /// Use [`SILERO_THRESHOLD`] as `threshold` for the default value.
     /// The file is typically installed by [`crate::sherpa_model::download_silero_vad`].
-    pub fn new(model_path: &Path) -> Result<Self, BackendError> {
+    pub fn new(model_path: &Path, threshold: f32) -> Result<Self, BackendError> {
         let silero_config = SileroVadModelConfig {
             model: Some(model_path.to_string_lossy().into_owned()),
-            threshold: SILERO_THRESHOLD,
+            threshold,
             min_silence_duration: SILERO_MIN_SILENCE_DURATION,
             min_speech_duration: SILERO_MIN_SPEECH_DURATION,
             max_speech_duration: SILERO_MAX_SPEECH_DURATION,
@@ -69,7 +79,15 @@ impl SherpaSileroVad {
             ))
         })?;
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            current_threshold: threshold,
+        })
+    }
+
+    /// The threshold this VAD was built with.
+    pub fn current_threshold(&self) -> f32 {
+        self.current_threshold
     }
 }
 

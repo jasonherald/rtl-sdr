@@ -20,6 +20,11 @@ pub struct BackendConfig {
     pub model: ModelChoice,
     pub silence_threshold: f32,
     pub noise_gate_ratio: f32,
+    /// Silero VAD speech detection threshold (offline models only).
+    /// Range 0.10..=0.90. Default 0.50.
+    /// Lower catches quieter audio (NFM/scanner); higher is stricter
+    /// (talk radio). Ignored by Whisper (no Silero VAD).
+    pub vad_threshold: f32,
 }
 
 /// User-facing model selection.

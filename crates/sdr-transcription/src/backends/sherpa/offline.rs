@@ -148,6 +148,7 @@ pub(super) fn run_session(
         audio_rx,
         event_tx,
         noise_gate_ratio,
+        vad_threshold: _,
     } = params;
 
     // Clear any residual state from a previous session.

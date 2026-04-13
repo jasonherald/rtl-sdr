@@ -23,6 +23,10 @@ const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
 /// Config key for the persisted transcript display mode.
 /// Values: `"live"` (default) or `"final"`.
 const KEY_DISPLAY_MODE: &str = "transcription_display_mode";
+#[cfg(feature = "sherpa")]
+/// Config key for the persisted Silero VAD threshold.
+/// Sherpa-only — only meaningful for offline models (Moonshine, Parakeet).
+const KEY_SHERPA_VAD_THRESHOLD: &str = "sherpa_vad_threshold";
 
 #[cfg(feature = "sherpa")]
 const DISPLAY_MODE_LIVE_IDX: u32 = 0;
@@ -47,6 +51,22 @@ const SILENCE_THRESHOLD_PAGE: f64 = 0.01;
 
 // Noise gate slider defaults and range.
 const DEFAULT_NOISE_GATE: f64 = 3.0;
+
+// VAD threshold slider defaults and range. Sherpa-only — only matters
+// for offline models (Moonshine, Parakeet) which use Silero VAD to
+// detect utterance boundaries. Default 0.5 matches sherpa-onnx's
+// upstream Silero default. Lower for noisy NFM/scanner audio; higher
+// for clean broadcast.
+#[cfg(feature = "sherpa")]
+const DEFAULT_SHERPA_VAD_THRESHOLD: f64 = 0.50;
+#[cfg(feature = "sherpa")]
+const SHERPA_VAD_THRESHOLD_MIN: f64 = 0.10;
+#[cfg(feature = "sherpa")]
+const SHERPA_VAD_THRESHOLD_MAX: f64 = 0.90;
+#[cfg(feature = "sherpa")]
+const SHERPA_VAD_THRESHOLD_STEP: f64 = 0.05;
+#[cfg(feature = "sherpa")]
+const SHERPA_VAD_THRESHOLD_PAGE: f64 = 0.10;
 const NOISE_GATE_MIN: f64 = 1.0;
 const NOISE_GATE_MAX: f64 = 10.0;
 const NOISE_GATE_STEP: f64 = 0.5;
@@ -72,6 +92,11 @@ pub struct TranscriptPanel {
     /// Whisper has no `Partial` events to render.
     #[cfg(feature = "sherpa")]
     pub display_mode_row: adw::ComboRow,
+    /// VAD threshold spin row. Sherpa-only — only visible when an
+    /// offline model (Moonshine, Parakeet) is selected. Online
+    /// models (Zipformer) don't use Silero VAD.
+    #[cfg(feature = "sherpa")]
+    pub vad_threshold_row: adw::SpinRow,
     /// Dimmed italic label below the text view that renders in-progress
     /// Sherpa partials. Sherpa-only.
     #[cfg(feature = "sherpa")]
@@ -234,6 +259,48 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         });
     });
 
+    // --- VAD threshold slider (Sherpa + offline models only) ---
+    //
+    // Only visible when an offline model (Moonshine, Parakeet) is selected.
+    // The Silero VAD's default 0.5 threshold is too strict for noisy NFM
+    // scanner audio — this slider lets the user tune it per source.
+    // Visibility is toggled in the sherpa block below alongside display_mode_row.
+    #[cfg(feature = "sherpa")]
+    let vad_threshold_row = {
+        let saved_vad_threshold = config.read(|v| {
+            v.get(KEY_SHERPA_VAD_THRESHOLD)
+                .and_then(serde_json::Value::as_f64)
+                .map_or(DEFAULT_SHERPA_VAD_THRESHOLD, |val| {
+                    val.clamp(SHERPA_VAD_THRESHOLD_MIN, SHERPA_VAD_THRESHOLD_MAX)
+                })
+        });
+
+        let row = adw::SpinRow::builder()
+            .title("VAD threshold")
+            .subtitle("Lower catches quieter audio (NFM); higher is stricter (talk radio)")
+            .adjustment(&gtk4::Adjustment::new(
+                saved_vad_threshold,
+                SHERPA_VAD_THRESHOLD_MIN,
+                SHERPA_VAD_THRESHOLD_MAX,
+                SHERPA_VAD_THRESHOLD_STEP,
+                SHERPA_VAD_THRESHOLD_PAGE,
+                0.0,
+            ))
+            .digits(2)
+            .build();
+        group.add(&row);
+
+        let config_vad = Arc::clone(config);
+        row.connect_value_notify(move |r| {
+            let val = r.value();
+            config_vad.write(|v| {
+                v[KEY_SHERPA_VAD_THRESHOLD] = serde_json::json!(val);
+            });
+        });
+
+        row
+    };
+
     // --- Display mode selector (Sherpa only) ---
     //
     // Whisper builds never compile this in — Whisper does not emit
@@ -276,27 +343,34 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         row
     };
 
-    // Toggle display_mode_row visibility based on whether the selected
-    // model emits partial hypotheses. Models like Moonshine are offline
-    // and decode once per utterance — the Live/Final distinction is
-    // meaningless and the row is hidden entirely. Initial visibility
-    // is set here based on the currently-saved model index.
+    // Toggle display_mode_row and vad_threshold_row visibility based on
+    // whether the selected model emits partial hypotheses:
+    //   - display_mode_row: visible for online models (supports_partials)
+    //   - vad_threshold_row: visible for offline models (!supports_partials)
+    // Models like Moonshine/Parakeet are offline — the Live/Final distinction
+    // is meaningless so display_mode_row is hidden; but they DO use Silero
+    // VAD so vad_threshold_row is shown. Zipformer is streaming so
+    // display_mode_row is shown and vad_threshold_row is hidden.
+    // Initial visibility is set here based on the currently-saved model index.
     #[cfg(feature = "sherpa")]
     {
-        let initial_visible = sdr_transcription::SherpaModel::ALL
+        let initial_supports_partials = sdr_transcription::SherpaModel::ALL
             .get(saved_model_idx as usize)
             .copied()
             .is_some_and(sdr_transcription::SherpaModel::supports_partials);
-        display_mode_row.set_visible(initial_visible);
+        display_mode_row.set_visible(initial_supports_partials);
+        vad_threshold_row.set_visible(!initial_supports_partials);
 
         let display_mode_row_for_visibility = display_mode_row.clone();
+        let vad_threshold_row_for_visibility = vad_threshold_row.clone();
         model_row.connect_selected_notify(move |r| {
             let idx = r.selected() as usize;
-            let visible = sdr_transcription::SherpaModel::ALL
+            let supports_partials = sdr_transcription::SherpaModel::ALL
                 .get(idx)
                 .copied()
                 .is_some_and(sdr_transcription::SherpaModel::supports_partials);
-            display_mode_row_for_visibility.set_visible(visible);
+            display_mode_row_for_visibility.set_visible(supports_partials);
+            vad_threshold_row_for_visibility.set_visible(!supports_partials);
         });
     }
 
@@ -437,6 +511,8 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         noise_gate_row,
         #[cfg(feature = "sherpa")]
         display_mode_row,
+        #[cfg(feature = "sherpa")]
+        vad_threshold_row,
         #[cfg(feature = "sherpa")]
         live_line_label,
         status_label,
