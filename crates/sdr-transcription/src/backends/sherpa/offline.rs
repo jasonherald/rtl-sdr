@@ -14,6 +14,7 @@ use std::sync::mpsc;
 
 use sherpa_onnx::{
     OfflineModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineTransducerModelConfig,
 };
 
 use crate::backend::TranscriptionEvent;
@@ -67,6 +68,55 @@ pub(super) fn build_moonshine_recognizer_config(
         tokens: Some(tokens.to_string_lossy().into_owned()),
         provider: Some(provider.to_owned()),
         num_threads: SHERPA_NUM_THREADS,
+        ..OfflineModelConfig::default()
+    };
+
+    OfflineRecognizerConfig {
+        model_config,
+        ..OfflineRecognizerConfig::default()
+    }
+}
+
+/// Build the `OfflineRecognizerConfig` for a NeMo Parakeet-TDT model.
+///
+/// Uses sherpa-onnx's offline transducer config (4 files: encoder,
+/// decoder, joiner, tokens) with `model_type = "nemo_transducer"`.
+/// The model_type field is required — without it, sherpa-onnx tries
+/// to use the generic transducer decode loop which doesn't understand
+/// NeMo's TDT (Token-and-Duration Transducer) joiner output shape.
+///
+/// Mirrors the upstream `rust-api-examples/examples/nemo_parakeet.rs`
+/// example.
+pub(super) fn build_nemo_transducer_recognizer_config(
+    model: SherpaModel,
+    provider: &str,
+) -> OfflineRecognizerConfig {
+    let ModelFilePaths::Transducer {
+        encoder,
+        decoder,
+        joiner,
+        tokens,
+    } = sherpa_model::model_file_paths(model)
+    else {
+        unreachable!(
+            "offline::build_nemo_transducer_recognizer_config called with non-Transducer layout"
+        )
+    };
+
+    let transducer = OfflineTransducerModelConfig {
+        encoder: Some(encoder.to_string_lossy().into_owned()),
+        decoder: Some(decoder.to_string_lossy().into_owned()),
+        joiner: Some(joiner.to_string_lossy().into_owned()),
+    };
+
+    let model_config = OfflineModelConfig {
+        transducer,
+        tokens: Some(tokens.to_string_lossy().into_owned()),
+        provider: Some(provider.to_owned()),
+        num_threads: SHERPA_NUM_THREADS,
+        // Required — tells sherpa-onnx to use NeMo's TDT decode loop
+        // instead of the generic transducer path.
+        model_type: Some("nemo_transducer".to_owned()),
         ..OfflineModelConfig::default()
     };
 
