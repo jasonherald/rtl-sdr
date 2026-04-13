@@ -107,99 +107,6 @@ impl SherpaModel {
         }
     }
 
-    /// Filename of the encoder ONNX file inside the model directory.
-    pub fn encoder_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "encoder-epoch-99-avg-1-chunk-16-left-128.onnx",
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
-                "encoder_filename called on a Moonshine variant; use moonshine_encoder_filename"
-            ),
-        }
-    }
-
-    /// Filename of the decoder ONNX file inside the model directory.
-    pub fn decoder_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => {
-                unreachable!("decoder_filename called on a Moonshine variant")
-            }
-        }
-    }
-
-    /// Filename of the joiner ONNX file inside the model directory.
-    pub fn joiner_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "joiner-epoch-99-avg-1-chunk-16-left-128.onnx",
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => {
-                unreachable!("joiner_filename called on a Moonshine variant")
-            }
-        }
-    }
-
-    /// Filename of the tokens file inside the model directory.
-    pub fn tokens_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "tokens.txt",
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
-                "tokens_filename called on a Moonshine variant; use moonshine_tokens_filename"
-            ),
-        }
-    }
-
-    /// Filename of Moonshine v1's preprocessor ONNX file. Note: the
-    /// preprocessor is NOT quantized (plain `.onnx`, not `.int8.onnx`).
-    pub fn moonshine_preprocessor_filename(self) -> &'static str {
-        match self {
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "preprocess.onnx",
-            Self::StreamingZipformerEn => {
-                unreachable!("moonshine_preprocessor_filename called on non-Moonshine variant")
-            }
-        }
-    }
-
-    /// Filename of Moonshine v1's encoder ONNX file. Panics if called on
-    /// a non-Moonshine variant — callers should match on
-    /// [`SherpaModel::kind`] first.
-    pub fn moonshine_encoder_filename(self) -> &'static str {
-        match self {
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "encode.int8.onnx",
-            Self::StreamingZipformerEn => {
-                unreachable!("moonshine_encoder_filename called on non-Moonshine variant")
-            }
-        }
-    }
-
-    /// Filename of Moonshine v1's uncached-decoder ONNX file.
-    pub fn moonshine_uncached_decoder_filename(self) -> &'static str {
-        match self {
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "uncached_decode.int8.onnx",
-            Self::StreamingZipformerEn => {
-                unreachable!("moonshine_uncached_decoder_filename called on non-Moonshine variant")
-            }
-        }
-    }
-
-    /// Filename of Moonshine v1's cached-decoder ONNX file.
-    pub fn moonshine_cached_decoder_filename(self) -> &'static str {
-        match self {
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "cached_decode.int8.onnx",
-            Self::StreamingZipformerEn => {
-                unreachable!("moonshine_cached_decoder_filename called on non-Moonshine variant")
-            }
-        }
-    }
-
-    /// Filename of Moonshine's tokens file.
-    pub fn moonshine_tokens_filename(self) -> &'static str {
-        match self {
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "tokens.txt",
-            Self::StreamingZipformerEn => {
-                unreachable!("moonshine_tokens_filename called on non-Moonshine variant")
-            }
-        }
-    }
-
     /// Filename of the upstream `.tar.bz2` archive on the k2-fsa GitHub
     /// releases page. Used by `download_sherpa_model` to construct the
     /// download URL and to name the local `.part` file during fetch.
@@ -320,11 +227,10 @@ pub fn silero_vad_exists() -> bool {
 pub fn download_silero_vad(
     progress_tx: &std::sync::mpsc::Sender<u8>,
 ) -> Result<PathBuf, SherpaModelError> {
-    let final_path = silero_vad_path();
-    let dir = final_path
-        .parent()
-        .expect("silero_vad_path always has a parent")
-        .to_path_buf();
+    // Compose the destination directly so there's no `.parent().expect()`
+    // dance — library code must not panic on shape assumptions.
+    let dir = sherpa_models_dir().join(SILERO_VAD_DIR_NAME);
+    let final_path = dir.join(SILERO_VAD_FILENAME);
     std::fs::create_dir_all(&dir)?;
 
     let part_path = dir.join(format!("{SILERO_VAD_FILENAME}.part"));
@@ -420,27 +326,28 @@ pub enum ModelFilePaths {
 /// The returned variant matches the model's [`ModelKind`]. The caller
 /// is expected to pattern-match on the variant and pass the paths into
 /// the right `sherpa_onnx` config (transducer vs moonshine).
+///
+/// All filename literals live in this single function so that adding a
+/// new model variant means updating exactly one match — no per-file
+/// helpers to forget.
 pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
-    match model.kind() {
-        ModelKind::OnlineTransducer => {
-            let dir = model_directory(model);
-            ModelFilePaths::Transducer {
-                encoder: dir.join(model.encoder_filename()),
-                decoder: dir.join(model.decoder_filename()),
-                joiner: dir.join(model.joiner_filename()),
-                tokens: dir.join(model.tokens_filename()),
-            }
-        }
-        ModelKind::OfflineMoonshine => {
-            let dir = model_directory(model);
-            ModelFilePaths::Moonshine {
-                preprocessor: dir.join(model.moonshine_preprocessor_filename()),
-                encoder: dir.join(model.moonshine_encoder_filename()),
-                uncached_decoder: dir.join(model.moonshine_uncached_decoder_filename()),
-                cached_decoder: dir.join(model.moonshine_cached_decoder_filename()),
-                tokens: dir.join(model.moonshine_tokens_filename()),
-            }
-        }
+    let dir = model_directory(model);
+    match model {
+        SherpaModel::StreamingZipformerEn => ModelFilePaths::Transducer {
+            encoder: dir.join("encoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            decoder: dir.join("decoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            joiner: dir.join("joiner-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
+        // Moonshine v1 five-file layout (k2-fsa int8 releases): the
+        // preprocessor is NOT quantized (`preprocess.onnx`, not `.int8.onnx`).
+        SherpaModel::MoonshineTinyEn | SherpaModel::MoonshineBaseEn => ModelFilePaths::Moonshine {
+            preprocessor: dir.join("preprocess.onnx"),
+            encoder: dir.join("encode.int8.onnx"),
+            uncached_decoder: dir.join("uncached_decode.int8.onnx"),
+            cached_decoder: dir.join("cached_decode.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
     }
 }
 

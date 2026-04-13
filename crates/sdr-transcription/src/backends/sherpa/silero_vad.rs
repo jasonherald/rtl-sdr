@@ -89,6 +89,12 @@ impl VoiceActivityDetector for SherpaSileroVad {
         Some(samples)
     }
 
+    fn flush(&mut self) {
+        // Forces Silero to finalize whatever partial utterance it was
+        // still evaluating so the next `pop_segment` can return it.
+        self.inner.flush();
+    }
+
     fn reset(&mut self) {
         self.inner.reset();
     }

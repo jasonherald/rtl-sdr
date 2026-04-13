@@ -125,31 +125,35 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
             recognizer.decode(&stream);
         }
 
-        let current_text = if let Some(result) = recognizer.get_result(&stream) {
-            let trimmed = result.text.trim().to_owned();
-            if !trimmed.is_empty() && trimmed != last_partial {
-                last_partial.clone_from(&trimmed);
+        // Pull the current hypothesis. Compare as &str first so the
+        // hot-loop no-change path (most ticks) allocates zero bytes.
+        // Only update `last_partial` and clone once for the Partial
+        // event when the hypothesis actually changed. `get_result` can
+        // return None on a C-layer serde failure — in that case we
+        // fall through so the endpoint check below still runs and
+        // `last_partial` retains the most recent non-empty text for
+        // the commit fallback.
+        if let Some(result) = recognizer.get_result(&stream) {
+            let trimmed = result.text.trim();
+            if !trimmed.is_empty() && trimmed != last_partial.as_str() {
+                last_partial.clear();
+                last_partial.push_str(trimmed);
                 let _ = event_tx.send(TranscriptionEvent::Partial {
-                    text: trimmed.clone(),
+                    text: last_partial.clone(),
                 });
             }
-            trimmed
-        } else {
-            String::new()
-        };
+        }
 
         if recognizer.is_endpoint(&stream) {
-            let committed_text = if current_text.is_empty() {
-                last_partial.clone()
-            } else {
-                current_text
-            };
-            if !committed_text.is_empty() {
+            // Commit whatever `last_partial` currently holds — it's
+            // the most recent non-empty hypothesis we saw, equivalent
+            // to the previous `current_text or last_partial` fallback.
+            if !last_partial.is_empty() {
                 let timestamp = crate::util::wall_clock_timestamp();
-                tracing::debug!(%timestamp, text = %committed_text, "sherpa committed utterance");
+                tracing::debug!(%timestamp, text = %last_partial, "sherpa committed utterance");
                 let _ = event_tx.send(TranscriptionEvent::Text {
                     timestamp,
-                    text: committed_text,
+                    text: last_partial.clone(),
                 });
             }
             recognizer.reset(&stream);

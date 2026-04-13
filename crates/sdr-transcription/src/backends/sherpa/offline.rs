@@ -170,14 +170,21 @@ fn decode_segment(
     }
 }
 
-/// Flush the VAD on session exit — any completed segment in the queue
-/// gets decoded and emitted as a final `Text`. Reset the VAD afterward
-/// so the next session starts clean.
+/// Flush the VAD on session exit and drain every remaining segment —
+/// including any in-flight utterance Silero hadn't yet finalized.
+///
+/// Without the explicit `flush` call, a user stopping transcription
+/// mid-speech would lose the last utterance because `pop_segment`
+/// only returns segments that VAD already marked complete. `flush`
+/// forces finalization so the final `while let` sees that segment.
+///
+/// Resets the VAD afterward so the next session starts clean.
 fn drain_vad_on_exit(
     recognizer: &OfflineRecognizer,
     vad: &mut SherpaSileroVad,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
 ) {
+    vad.flush();
     while let Some(segment) = vad.pop_segment() {
         decode_segment(recognizer, &segment, event_tx);
     }

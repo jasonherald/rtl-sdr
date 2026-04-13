@@ -5,6 +5,7 @@
 //! The worker populates the process-wide `SHERPA_HOST` `OnceLock`
 //! then sits on a command channel waiting for session requests.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
@@ -27,8 +28,13 @@ pub(super) const SHERPA_SAMPLE_RATE_HZ: i32 = 16_000;
 
 /// Process-wide singleton for the sherpa-onnx host. Stores either a ready
 /// host or the error message from a failed initialization. Set exactly once
-/// by [`init_sherpa_host`]; subsequent calls are no-ops.
+/// by the first successful worker thread.
 static SHERPA_HOST: OnceLock<Result<SherpaHost, Arc<BackendError>>> = OnceLock::new();
+
+/// Flag that atomically ensures the worker thread is spawned at most once.
+/// Paired with `SHERPA_HOST` to give [`init_sherpa_host`] true idempotency:
+/// a second call after init is in flight won't race to spawn another worker.
+static INIT_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Spawn the global sherpa-onnx host thread and return a channel that
 /// streams initialization progress events.
@@ -40,7 +46,39 @@ static SHERPA_HOST: OnceLock<Result<SherpaHost, Arc<BackendError>>> = OnceLock::
 /// `OnceLock` itself before emitting the final event, but `main()` needs
 /// to block until that's done so the recognizer creation completes
 /// before GTK loads.
+///
+/// Idempotent: if called more than once, the second and subsequent calls
+/// return a pre-filled channel reflecting the current host state
+/// (`Ready`, `Failed`, or "already in progress") without spawning another
+/// worker.
 pub fn init_sherpa_host(model: SherpaModel) -> mpsc::Receiver<InitEvent> {
+    // Atomic compare-and-swap: first caller transitions false → true and
+    // proceeds to spawn. Later callers see the flag already set and fall
+    // through to the pre-filled channel path.
+    if INIT_STARTED.swap(true, Ordering::AcqRel) {
+        let (event_tx, event_rx) = mpsc::channel::<InitEvent>();
+        match SHERPA_HOST.get() {
+            Some(Ok(_)) => {
+                tracing::debug!("init_sherpa_host called after host is already initialized");
+                let _ = event_tx.send(InitEvent::Ready);
+            }
+            Some(Err(err)) => {
+                let _ = event_tx.send(InitEvent::Failed {
+                    message: format!("sherpa host was previously initialized with an error: {err}"),
+                });
+            }
+            None => {
+                // Init already in flight on another caller; return a stub
+                // receiver so this caller doesn't block forever. Callers
+                // should serialize their init on the first returned channel.
+                let _ = event_tx.send(InitEvent::Failed {
+                    message: "sherpa host initialization is already in progress".to_owned(),
+                });
+            }
+        }
+        return event_rx;
+    }
+
     SherpaHost::spawn(model)
 }
 
@@ -133,16 +171,30 @@ pub(super) struct SherpaHost {
 
 impl SherpaHost {
     /// Spawn the host worker thread and return immediately.
+    ///
+    /// On thread-spawn failure (a rare OS-level error), routes the failure
+    /// through the normal `InitEvent::Failed` + `SHERPA_HOST` error path
+    /// instead of panicking — library crates are not allowed to abort.
     pub(super) fn spawn(model: SherpaModel) -> mpsc::Receiver<InitEvent> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<HostCommand>();
         let (event_tx, event_rx) = mpsc::channel::<InitEvent>();
 
-        std::thread::Builder::new()
+        // Keep a clone for the failure branch — the happy-path closure
+        // moves the original `event_tx` into the worker thread.
+        let event_tx_for_failure = event_tx.clone();
+
+        let spawn_result = std::thread::Builder::new()
             .name("sherpa-host".into())
             .spawn(move || {
                 run_host_loop(model, &cmd_rx, cmd_tx, event_tx);
-            })
-            .expect("failed to spawn sherpa-host worker thread");
+            });
+
+        if let Err(io_err) = spawn_result {
+            let msg = format!("failed to spawn sherpa-host worker thread: {io_err}");
+            tracing::error!(%msg);
+            store_init_failure(BackendError::Spawn(io_err));
+            let _ = event_tx_for_failure.send(InitEvent::Failed { message: msg });
+        }
 
         event_rx
     }

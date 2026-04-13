@@ -1529,6 +1529,15 @@ fn connect_transcript_panel(
 
             tracing::info!(?new_model, "user changed model — triggering runtime reload");
 
+            // Disable the model row while the reload is in flight so the
+            // user can't queue up multiple reloads by rapid switching —
+            // each change would otherwise enqueue another ReloadRecognizer
+            // command and render stale progress for the intermediate picks.
+            // Re-enabled from the timeout closure on Ready / Failed /
+            // channel disconnect.
+            row.set_sensitive(false);
+            let model_row_reload_weak = row.downgrade();
+
             // Show the status area.
             status_label_reload.set_text(&format!("Reloading {}...", new_model.label()));
             status_label_reload.set_css_classes(&["dim-label"]);
@@ -1544,6 +1553,8 @@ fn connect_transcript_panel(
             let mut current_component: String = new_model.label().to_owned();
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 let Some(status) = status_weak.upgrade() else {
+                    // Widgets are gone (window closing); model row is too,
+                    // so no need to re-enable it.
                     return glib::ControlFlow::Break;
                 };
                 let Some(progress) = progress_weak.upgrade() else {
@@ -1574,6 +1585,9 @@ fn connect_transcript_panel(
                             status.set_text("");
                             status.set_visible(false);
                             progress.set_visible(false);
+                            if let Some(model_row) = model_row_reload_weak.upgrade() {
+                                model_row.set_sensitive(true);
+                            }
                             return glib::ControlFlow::Break;
                         }
                         Ok(sdr_transcription::InitEvent::Failed { message }) => {
@@ -1582,10 +1596,18 @@ fn connect_transcript_panel(
                             status.set_css_classes(&["error"]);
                             status.set_visible(true);
                             progress.set_visible(false);
+                            if let Some(model_row) = model_row_reload_weak.upgrade() {
+                                model_row.set_sensitive(true);
+                            }
                             return glib::ControlFlow::Break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            // Worker dropped its sender without sending Ready
+                            // or Failed — unusual but don't strand the UI.
+                            if let Some(model_row) = model_row_reload_weak.upgrade() {
+                                model_row.set_sensitive(true);
+                            }
                             return glib::ControlFlow::Break;
                         }
                     }

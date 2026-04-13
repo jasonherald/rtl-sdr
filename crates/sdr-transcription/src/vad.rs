@@ -25,6 +25,12 @@ pub trait VoiceActivityDetector {
     /// Returns `None` when the internal queue is empty.
     fn pop_segment(&mut self) -> Option<Vec<f32>>;
 
+    /// Force the detector to finalize any in-flight speech segment so
+    /// the next [`Self::pop_segment`] call can return it. Called at
+    /// session end to prevent the last utterance being dropped if the
+    /// user stops transcription mid-speech.
+    fn flush(&mut self);
+
     /// Drop all buffered audio and reset detector state.
     /// Called between transcription sessions.
     fn reset(&mut self);
@@ -47,6 +53,7 @@ mod tests {
             fn pop_segment(&mut self) -> Option<Vec<f32>> {
                 None
             }
+            fn flush(&mut self) {}
             fn reset(&mut self) {}
         }
         let mut noop = Noop;
