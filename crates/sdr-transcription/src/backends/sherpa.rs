@@ -199,14 +199,31 @@ fn run_host_loop(
             }
         };
 
-        let download_result = sherpa_model::download_sherpa_model(model, &dl_tx);
+        let archive_result = sherpa_model::download_sherpa_archive(model, &dl_tx);
 
         // Drop the sender so the forwarder thread exits when it drains.
         drop(dl_tx);
         let _ = dl_forwarder.join();
 
-        if let Err(e) = download_result {
-            let msg = format!("sherpa model download failed: {e}");
+        let archive_path = match archive_result {
+            Ok(path) => path,
+            Err(e) => {
+                let msg = format!("sherpa model download failed: {e}");
+                tracing::error!(%msg);
+                store_init_failure(BackendError::Init(msg.clone()));
+                let _ = event_tx.send(InitEvent::Failed { message: msg });
+                return;
+            }
+        };
+
+        // Now fire the Extracting event BEFORE actually extracting, so
+        // the splash label updates while extraction is happening (~1-2
+        // seconds for the 256 MB archive).
+        tracing::info!("sherpa archive download complete, extracting");
+        let _ = event_tx.send(InitEvent::Extracting);
+
+        if let Err(e) = sherpa_model::extract_sherpa_archive(model, &archive_path) {
+            let msg = format!("sherpa model extraction failed: {e}");
             tracing::error!(%msg);
             store_init_failure(BackendError::Init(msg.clone()));
             let _ = event_tx.send(InitEvent::Failed { message: msg });
@@ -214,12 +231,6 @@ fn run_host_loop(
         }
 
         tracing::info!("sherpa model installed, proceeding to recognizer init");
-        // Note: download_sherpa_model emits the Extracting phase
-        // implicitly (extraction happens inside the function before
-        // it returns). We fire the explicit event here so the splash
-        // can update its label, even though by the time it sees this
-        // the extraction is already done.
-        let _ = event_tx.send(InitEvent::Extracting);
     }
 
     // --- Phase 2: create the recognizer ---

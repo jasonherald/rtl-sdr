@@ -173,26 +173,22 @@ pub fn model_exists(model: SherpaModel) -> bool {
     e.is_file() && d.is_file() && j.is_file() && t.is_file()
 }
 
-/// Download and extract a sherpa-onnx model bundle from the k2-fsa
-/// GitHub releases page.
-///
-/// Mirrors [`crate::model::download_model`] for Whisper, but with an
-/// extra extraction step because sherpa models ship as `.tar.bz2`
-/// bundles containing multiple ONNX files instead of a single GGML
-/// blob.
+/// Download a sherpa-onnx model bundle from the k2-fsa GitHub releases
+/// page. Does NOT extract — call [`extract_sherpa_archive`] separately
+/// to perform the extraction phase. Splitting download and extract lets
+/// the caller (e.g. `SherpaHost::run_host_loop`) emit a separate UI
+/// progress event when transitioning into extraction.
 ///
 /// # Arguments
 ///
 /// * `model` — which sherpa model to download
 /// * `progress_tx` — receives integer percent values (0..=100) as the
-///   download streams. Only the download phase reports progress —
-///   extraction is fast (~1 second on modern disks) and doesn't fire
-///   any events.
+///   download streams.
 ///
 /// # Returns
 ///
-/// On success, the absolute path to the final extracted model directory
-/// (the same path that [`model_directory`] returns).
+/// On success, the absolute path to the downloaded `.tar.bz2.part` file.
+/// Pass this to [`extract_sherpa_archive`] to complete installation.
 ///
 /// # Behavior
 ///
@@ -200,17 +196,8 @@ pub fn model_exists(model: SherpaModel) -> bool {
 ///    directory from a previous failed attempt.
 /// 2. Downloads the `.tar.bz2` to `<archive_filename>.part` in
 ///    [`sherpa_models_dir`], streaming progress through `progress_tx`.
-/// 3. Extracts the archive to `<dir_name>.partdir` (a sibling of the
-///    final location).
-/// 4. Removes any existing target directory, then renames the extracted
-///    top-level directory to the final `dir_name()` location. The rename
-///    itself is atomic, but the remove-then-rename sequence is not — if
-///    the process is killed between the two syscalls, the model is in
-///    "not installed" state and the next launch will trigger a fresh
-///    download. Acceptable failure mode.
-/// 5. Cleans up the `.part` file and `.partdir` directory.
 #[allow(clippy::cast_possible_truncation)]
-pub fn download_sherpa_model(
+pub fn download_sherpa_archive(
     model: SherpaModel,
     progress_tx: &mpsc::Sender<u8>,
 ) -> Result<PathBuf, SherpaModelError> {
@@ -220,8 +207,6 @@ pub fn download_sherpa_model(
     let archive_filename = model.archive_filename();
     let archive_part_path = dir.join(format!("{archive_filename}.part"));
     let archive_url = model.archive_url();
-    let final_dir = model_directory(model);
-    let temp_extract_dir = dir.join(format!("{}.partdir", model.dir_name()));
 
     // Clean up any leftover state from a previous failed attempt.
     cleanup_scratch_state(model)?;
@@ -277,15 +262,50 @@ pub fn download_sherpa_model(
 
     std::io::Write::flush(&mut file)?;
     drop(file);
-    tracing::info!(
-        bytes = downloaded,
-        "sherpa-onnx archive download complete, extracting"
-    );
+    tracing::info!(bytes = downloaded, "sherpa-onnx archive download complete");
+
+    Ok(archive_part_path)
+}
+
+/// Extract a previously-downloaded sherpa-onnx archive into the final
+/// model directory.
+///
+/// # Arguments
+///
+/// * `model` — which sherpa model the archive is for
+/// * `archive_path` — path to the downloaded `.tar.bz2.part` file (the
+///   return value of [`download_sherpa_archive`])
+///
+/// # Returns
+///
+/// On success, the absolute path to the final extracted model directory
+/// (the same path that [`model_directory`] returns).
+///
+/// # Behavior
+///
+/// 1. Extracts the archive to `<dir_name>.partdir` (a sibling of the
+///    final location).
+/// 2. Removes any existing target directory, then renames the extracted
+///    top-level directory to the final `dir_name()` location. The rename
+///    itself is atomic, but the remove-then-rename sequence is not — if
+///    the process is killed between the two syscalls, the model is in
+///    "not installed" state and the next launch will trigger a fresh
+///    download. Acceptable failure mode.
+/// 3. Cleans up the `.part` file and `.partdir` directory.
+pub fn extract_sherpa_archive(
+    model: SherpaModel,
+    archive_path: &std::path::Path,
+) -> Result<PathBuf, SherpaModelError> {
+    let dir = sherpa_models_dir();
+    let final_dir = model_directory(model);
+    let temp_extract_dir = dir.join(format!("{}.partdir", model.dir_name()));
+
+    tracing::info!(?archive_path, ?temp_extract_dir, "extracting sherpa-onnx archive");
 
     // Extract via tar + bzip2 into a temp directory adjacent to the
     // final location.
     std::fs::create_dir_all(&temp_extract_dir)?;
-    let archive_file = std::fs::File::open(&archive_part_path)?;
+    let archive_file = std::fs::File::open(archive_path)?;
     let bz_reader = bzip2::read::BzDecoder::new(archive_file);
     let mut tar_archive = tar::Archive::new(bz_reader);
     tar_archive
@@ -313,7 +333,7 @@ pub fn download_sherpa_model(
 
     // Clean up scratch state.
     std::fs::remove_dir_all(&temp_extract_dir)?;
-    std::fs::remove_file(&archive_part_path)?;
+    std::fs::remove_file(archive_path)?;
 
     tracing::info!(?final_dir, "sherpa-onnx model installed");
     Ok(final_dir)
