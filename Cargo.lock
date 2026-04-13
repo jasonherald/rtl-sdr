@@ -1879,6 +1879,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-splash"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "sdr-transcription"
 version = "0.1.0"
 dependencies = [
