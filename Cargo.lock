@@ -1878,6 +1878,8 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "sdr-core",
+ "sdr-pipeline",
+ "sdr-radio",
  "sdr-types",
  "tracing",
  "tracing-subscriber",

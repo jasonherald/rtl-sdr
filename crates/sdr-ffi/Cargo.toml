@@ -24,6 +24,13 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 sdr-core.workspace = true
 sdr-types.workspace = true
+# sdr-pipeline and sdr-radio are needed for the enum types the
+# command module translates at the FFI boundary (FftWindow,
+# DeemphasisMode). Both are pulled in transitively via sdr-core
+# anyway, but declaring them explicitly means we don't get burned
+# by a future sdr-core refactor that drops the transitive edge.
+sdr-pipeline.workspace = true
+sdr-radio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 libc.workspace = true

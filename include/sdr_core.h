@@ -183,6 +183,116 @@ int32_t sdr_core_create(const char* config_path_utf8, SdrCore** out_handle);
  */
 void sdr_core_destroy(SdrCore* handle);
 
+/* ================================================================ */
+/*  Commands                                                        */
+/* ================================================================ */
+
+/*
+ * Every function in this section:
+ *
+ *   - Returns `int32_t`: `SDR_CORE_OK` on success, a negative
+ *     `SdrCoreError` on failure. The matching message is on the
+ *     thread-local last-error buffer.
+ *
+ *   - Is safe to call from any thread. Commands are delivered to
+ *     the DSP thread via an mpsc channel; this call just enqueues
+ *     the command and returns. Actual effect on the running
+ *     pipeline is asynchronous — the event callback reports the
+ *     new state when it takes effect.
+ *
+ *   - Is safe to call from within the event callback (reentrant)
+ *     with one exception: `sdr_core_destroy`, which would deadlock.
+ *
+ *   - Returns `SDR_CORE_ERR_INVALID_HANDLE` if `handle` is null or
+ *     has been destroyed.
+ *
+ *   - Returns `SDR_CORE_ERR_INVALID_ARG` for malformed arguments
+ *     (non-finite floats, out-of-range enums, zero or non-power-of-
+ *     two counts where a power of two is required, etc.).
+ *
+ *   - Returns `SDR_CORE_ERR_NOT_RUNNING` if the DSP thread's command
+ *     channel has already been closed (engine was torn down behind
+ *     the host's back, e.g., a panic earlier in the controller).
+ */
+
+/* --- Lifecycle ---------------------------------------------------- */
+
+int32_t sdr_core_start(SdrCore* handle);
+int32_t sdr_core_stop(SdrCore* handle);
+
+/* --- Tuning ------------------------------------------------------- */
+
+int32_t sdr_core_tune(SdrCore* handle, double freq_hz);
+int32_t sdr_core_set_vfo_offset(SdrCore* handle, double offset_hz);
+int32_t sdr_core_set_sample_rate(SdrCore* handle, double rate_hz);
+int32_t sdr_core_set_decimation(SdrCore* handle, uint32_t factor);
+int32_t sdr_core_set_ppm_correction(SdrCore* handle, int32_t ppm);
+
+/* --- Tuner gain --------------------------------------------------- */
+
+int32_t sdr_core_set_gain(SdrCore* handle, double gain_db);
+int32_t sdr_core_set_agc(SdrCore* handle, bool enabled);
+
+/* --- Demodulation ------------------------------------------------- */
+
+typedef enum SdrDemodMode {
+    SDR_DEMOD_WFM = 0,
+    SDR_DEMOD_NFM = 1,
+    SDR_DEMOD_AM  = 2,
+    SDR_DEMOD_USB = 3,
+    SDR_DEMOD_LSB = 4,
+    SDR_DEMOD_DSB = 5,
+    SDR_DEMOD_CW  = 6,
+    SDR_DEMOD_RAW = 7,
+} SdrDemodMode;
+
+int32_t sdr_core_set_demod_mode(SdrCore* handle, int32_t mode);
+int32_t sdr_core_set_bandwidth(SdrCore* handle, double bw_hz);
+int32_t sdr_core_set_squelch_enabled(SdrCore* handle, bool enabled);
+int32_t sdr_core_set_squelch_db(SdrCore* handle, float db);
+
+typedef enum SdrDeemphasis {
+    SDR_DEEMPH_NONE = 0,
+    SDR_DEEMPH_US75 = 1,
+    SDR_DEEMPH_EU50 = 2,
+} SdrDeemphasis;
+
+int32_t sdr_core_set_deemphasis(SdrCore* handle, int32_t mode);
+
+/* --- Audio -------------------------------------------------------- */
+
+/*
+ * `volume_0_1` is clamped to [0.0, 1.0] internally; passing a value
+ * outside that range is NOT an error. NaN/infinity values are an
+ * error (returns `SDR_CORE_ERR_INVALID_ARG`).
+ */
+int32_t sdr_core_set_volume(SdrCore* handle, float volume_0_1);
+
+/* --- IQ frontend -------------------------------------------------- */
+
+int32_t sdr_core_set_dc_blocking(SdrCore* handle, bool enabled);
+int32_t sdr_core_set_iq_inversion(SdrCore* handle, bool enabled);
+int32_t sdr_core_set_iq_correction(SdrCore* handle, bool enabled);
+
+/* --- Spectrum display --------------------------------------------- */
+
+/*
+ * The `sdr-pipeline::iq_frontend::FftWindow` enum currently has
+ * three variants. Hann/Hamming are not exposed because the Rust
+ * engine doesn't implement them; they can be added later with a
+ * minor ABI bump if we grow the upstream enum.
+ */
+typedef enum SdrFftWindow {
+    SDR_FFT_WIN_RECT     = 0,
+    SDR_FFT_WIN_BLACKMAN = 1,
+    SDR_FFT_WIN_NUTTALL  = 2,
+} SdrFftWindow;
+
+/* `n` must be a nonzero power of two. */
+int32_t sdr_core_set_fft_size(SdrCore* handle, size_t n);
+int32_t sdr_core_set_fft_window(SdrCore* handle, int32_t window);
+int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
+
 #ifdef __cplusplus
 }
 #endif
