@@ -9,7 +9,8 @@ CARGO       ?= cargo
 CARGO_FLAGS ?= --release
 
 .PHONY: all build install install-bin install-icon install-desktop \
-        uninstall test clippy fmt fmt-check lint deny audit scan clean help
+        uninstall test clippy fmt fmt-check lint deny audit scan clean help \
+        ffi-header-check ffi-header-regen
 
 # ─────────────────────────────────────────────────────────────────────
 # Default
@@ -106,7 +107,66 @@ deny:
 audit:
 	$(CARGO) audit
 
-lint: fmt-check clippy test deny audit
+lint: fmt-check clippy test deny audit ffi-header-check
+
+# ─────────────────────────────────────────────────────────────────────
+# sdr-ffi header drift check
+# ─────────────────────────────────────────────────────────────────────
+#
+# `include/sdr_core.h` is the **hand-written** source of truth for the
+# C ABI. `cbindgen` is NOT used to generate it — the hand-written file
+# can carry explanatory comments, section dividers, and
+# human-friendly ordering that a generator would flatten.
+#
+# However, we still want a machine-checked safety net against drift
+# between the Rust source (`crates/sdr-ffi/src/`) and the header.
+# `make ffi-header-check` runs cbindgen in check mode against the
+# Rust sources and diffs the generated signatures against the
+# hand-written header. The check is signature-only — it ignores
+# comments and formatting, so the human-friendly structure of the
+# hand-written header doesn't break the lint.
+#
+# cbindgen is an optional developer tool, installed via:
+#   cargo install cbindgen
+#
+# If cbindgen is not available, the target prints a skip warning
+# and exits 0. CI installs cbindgen explicitly so the check is
+# meaningful there.
+
+CBINDGEN ?= cbindgen
+FFI_HEADER := include/sdr_core.h
+FFI_GENERATED := target/sdr_core.h.generated
+
+ffi-header-check:
+	@if ! command -v $(CBINDGEN) >/dev/null 2>&1; then \
+		echo "cbindgen not installed — skipping ffi-header-check"; \
+		echo "(install with 'cargo install cbindgen' to enable)"; \
+	else \
+		echo "==> cbindgen sdr-ffi → $(FFI_GENERATED)"; \
+		mkdir -p $(dir $(FFI_GENERATED)); \
+		$(CBINDGEN) --config crates/sdr-ffi/cbindgen.toml \
+			--crate sdr-ffi \
+			--output $(FFI_GENERATED) 2>&1 | \
+			grep -v '^WARN:' || true; \
+		echo "==> diff $(FFI_HEADER) vs $(FFI_GENERATED) (signature-only)"; \
+		./scripts/ffi-header-diff.sh $(FFI_HEADER) $(FFI_GENERATED); \
+	fi
+
+# Regenerate the hand-written header from cbindgen output. This is a
+# **manual** starting point for writing a new hand-written header,
+# not a build step — you'd run this once when adding a new batch of
+# FFI functions, then hand-edit the output into the real header.
+ffi-header-regen:
+	@if ! command -v $(CBINDGEN) >/dev/null 2>&1; then \
+		echo "cbindgen not installed — install with 'cargo install cbindgen'"; \
+		exit 1; \
+	fi
+	@mkdir -p $(dir $(FFI_GENERATED))
+	@$(CBINDGEN) --config crates/sdr-ffi/cbindgen.toml \
+		--crate sdr-ffi \
+		--output $(FFI_GENERATED)
+	@echo "Regenerated → $(FFI_GENERATED)"
+	@echo "(Copy signatures by hand into $(FFI_HEADER); do not commit $(FFI_GENERATED).)"
 
 # ─────────────────────────────────────────────────────────────────────
 # SonarQube

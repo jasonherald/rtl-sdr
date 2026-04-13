@@ -269,6 +269,41 @@ pub(crate) fn panic_message(payload: &Box<dyn std::any::Any + Send + 'static>) -
     }
 }
 
+/// Test-only FFI entry point that deliberately panics with a
+/// well-known message. Used by the panic-safety test to verify
+/// that `catch_unwind` converts a Rust panic crossing the FFI
+/// boundary into `SDR_CORE_ERR_INTERNAL` instead of UB.
+///
+/// Only compiled when running `cargo test`. This function has no
+/// presence in release builds and is NOT declared in
+/// `include/sdr_core.h` — it exists solely to exercise the
+/// panic-catch path from the test harness.
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub extern "C" fn sdr_core_panic_for_test() -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        // clippy::panic is denied workspace-wide but the whole
+        // purpose of this function is to exercise the panic-catch
+        // path, so the lint has to be turned off here. This is
+        // the only `panic!` call in the crate.
+        #[allow(clippy::panic)]
+        {
+            panic!("deliberate test panic: please do not propagate this across the FFI");
+        }
+    });
+
+    match result {
+        Ok(()) => SdrCoreError::Ok.as_int(),
+        Err(payload) => {
+            set_last_error(format!(
+                "sdr_core_panic_for_test: panic: {}",
+                panic_message(&payload)
+            ));
+            SdrCoreError::Internal.as_int()
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -370,5 +405,37 @@ mod tests {
 
         // And destroy should return cleanly.
         unsafe { sdr_core_destroy(handle) };
+    }
+
+    #[test]
+    fn panic_inside_ffi_returns_internal_error_and_sets_last_error() {
+        // This is the big panic-safety gate. If catch_unwind is
+        // ever removed from an FFI entry point (or if a panic
+        // path escapes one), this test fails loudly at
+        // `cargo test` time instead of silently producing UB
+        // the first time an end user's Swift app triggers it.
+        let rc = sdr_core_panic_for_test();
+        assert_eq!(
+            rc,
+            SdrCoreError::Internal.as_int(),
+            "panic should map to SDR_CORE_ERR_INTERNAL"
+        );
+
+        // And the thread-local last-error message should contain
+        // the panic text, so Swift (or any other host) can surface
+        // a useful diagnostic.
+        let p = crate::error::sdr_core_last_error_message();
+        assert!(!p.is_null(), "last-error should be set after a panic");
+        let msg = unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            msg.contains("deliberate test panic"),
+            "last-error should contain the panic message, got {msg:?}"
+        );
+        assert!(
+            msg.contains("sdr_core_panic_for_test"),
+            "last-error should name the function that panicked, got {msg:?}"
+        );
     }
 }
