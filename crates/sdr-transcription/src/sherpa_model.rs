@@ -204,8 +204,12 @@ pub fn model_exists(model: SherpaModel) -> bool {
 ///    [`sherpa_models_dir`], streaming progress through `progress_tx`.
 /// 3. Extracts the archive to `<dir_name>.partdir` (a sibling of the
 ///    final location).
-/// 4. Renames the extracted top-level directory to the final
-///    `dir_name()` location atomically.
+/// 4. Removes any existing target directory, then renames the extracted
+///    top-level directory to the final `dir_name()` location. The rename
+///    itself is atomic, but the remove-then-rename sequence is not — if
+///    the process is killed between the two syscalls, the model is in
+///    "not installed" state and the next launch will trigger a fresh
+///    download. Acceptable failure mode.
 /// 5. Cleans up the `.part` file and `.partdir` directory.
 #[allow(clippy::cast_possible_truncation)]
 pub fn download_sherpa_model(
@@ -230,12 +234,25 @@ pub fn download_sherpa_model(
         "downloading sherpa-onnx model bundle"
     );
 
+    // 30-second connection timeout (fail fast if the server is unreachable),
+    // 60-minute total body timeout (256 MB at ~70 KB/s — slow but still
+    // legitimate for users on rural broadband or hotel WiFi).
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_mins(10))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_mins(60))
         .build()?;
 
     let response = client.get(&archive_url).send()?.error_for_status()?;
     let total_size = response.content_length().unwrap_or(0);
+
+    // If the server didn't return Content-Length, we can't compute a
+    // percent. Send a single 0 sentinel so the caller knows the download
+    // has started — without it, the splash label would never update from
+    // its initial state until the download finished. GitHub's CDN
+    // reliably sets Content-Length so this path is rarely hit in practice.
+    if total_size == 0 {
+        let _ = progress_tx.send(0);
+    }
 
     let mut file = std::fs::File::create(&archive_part_path)?;
     let mut downloaded: u64 = 0;
