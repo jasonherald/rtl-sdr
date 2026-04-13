@@ -30,6 +30,7 @@ use crate::backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
     TranscriptionEvent,
 };
+use crate::init_event::InitEvent;
 use crate::sherpa_model::{self, SherpaModel};
 use crate::{denoise, resampler};
 
@@ -43,10 +44,6 @@ const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const RULE1_MIN_TRAILING_SILENCE: f32 = 2.4;
 const RULE2_MIN_TRAILING_SILENCE: f32 = 1.2;
 const RULE3_MIN_UTTERANCE_LENGTH: f32 = 20.0;
-
-/// Maximum time we wait for the host worker thread to report initialization
-/// success or failure before giving up. Recognizer load is typically <1s.
-const HOST_INIT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Sample rate sherpa-onnx expects from `accept_waveform`.
 const SHERPA_SAMPLE_RATE_HZ: i32 = 16_000;
@@ -62,21 +59,23 @@ const SHERPA_NUM_THREADS: i32 = 1;
 /// by [`init_sherpa_host`]; subsequent calls are no-ops.
 static SHERPA_HOST: OnceLock<Result<SherpaHost, Arc<BackendError>>> = OnceLock::new();
 
-/// Spawn the global sherpa-onnx host thread.
+/// Spawn the global sherpa-onnx host thread and return a channel that
+/// streams initialization progress events.
 ///
 /// **MUST be called from `main()` BEFORE GTK is initialized** (before
-/// `sdr_ui::run()`). The host's worker thread creates the
-/// [`OnlineRecognizer`] once at startup, which initializes ONNX Runtime's
-/// C++ runtime state. Doing this before GTK loads avoids a static-initializer
-/// collision that causes `free(): invalid pointer` corruption inside
-/// libstdc++ regex code on the first decode call.
+/// `sdr_ui::run()`). The returned `Receiver<InitEvent>` MUST be drained
+/// by the caller until it produces either `InitEvent::Ready` or
+/// `InitEvent::Failed` — the worker populates the global `SHERPA_HOST`
+/// `OnceLock` itself before emitting the final event, but `main()` needs
+/// to block until that's done so the recognizer creation completes
+/// before GTK loads.
 ///
-/// Idempotent — safe to call multiple times; only the first call has effect.
-/// If initialization fails (model files missing, ONNX error), the error is
-/// stashed in the global slot and reported when the user actually tries to
-/// start a Sherpa transcription session.
-pub fn init_sherpa_host(model: SherpaModel) {
-    let _ = SHERPA_HOST.set(SherpaHost::spawn(model).map_err(Arc::new));
+/// The previous synchronous variant returned `Result<(), String>`; the
+/// event channel replaces that. Failures route through
+/// `InitEvent::Failed` AND through `SHERPA_HOST.get() -> Some(Err(_))`,
+/// so the existing `SherpaBackend::start` error path is unchanged.
+pub fn init_sherpa_host(model: SherpaModel) -> std::sync::mpsc::Receiver<InitEvent> {
+    SherpaHost::spawn(model)
 }
 
 /// Look up the global sherpa host. Returns `None` if `init_sherpa_host` was
@@ -112,37 +111,31 @@ pub struct SherpaHost {
 }
 
 impl SherpaHost {
-    /// Spawn the host worker thread and block until the recognizer is
-    /// either ready or initialization has failed.
+    /// Spawn the host worker thread and return immediately.
     ///
-    /// Returns `BackendError::ModelNotFound` if the model files for `model`
-    /// are not present on disk, or `BackendError::Init(_)` if the
-    /// recognizer creation fails.
-    pub fn spawn(model: SherpaModel) -> Result<Self, BackendError> {
-        if !sherpa_model::model_exists(model) {
-            return Err(BackendError::ModelNotFound {
-                path: sherpa_model::model_directory(model),
-            });
-        }
-
+    /// Returns a `Receiver<InitEvent>` that streams progress events as
+    /// the worker downloads (if needed) + creates the recognizer. The
+    /// caller is responsible for draining the receiver until it sees
+    /// `InitEvent::Ready` or `InitEvent::Failed` — the worker populates
+    /// the global `SHERPA_HOST` `OnceLock` itself before emitting the
+    /// final event.
+    ///
+    /// The signature is intentionally non-`Result` because failures
+    /// surface through the event channel as `InitEvent::Failed`. This
+    /// keeps the synchronous path (no immediate Result) consistent
+    /// with the async event-driven model.
+    pub fn spawn(model: SherpaModel) -> std::sync::mpsc::Receiver<InitEvent> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<HostCommand>();
-        let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let (event_tx, event_rx) = mpsc::channel::<InitEvent>();
 
         std::thread::Builder::new()
             .name("sherpa-host".into())
             .spawn(move || {
-                run_host_loop(model, &cmd_rx, init_tx);
-            })?;
+                run_host_loop(model, &cmd_rx, cmd_tx, event_tx);
+            })
+            .expect("failed to spawn sherpa-host worker thread");
 
-        match init_rx.recv_timeout(HOST_INIT_TIMEOUT) {
-            Ok(Ok(())) => Ok(Self {
-                state: Mutex::new(SherpaHostState { cmd_tx }),
-            }),
-            Ok(Err(msg)) => Err(BackendError::Init(msg)),
-            Err(_) => Err(BackendError::Init(
-                "sherpa host worker timed out during initialization".to_owned(),
-            )),
-        }
+        event_rx
     }
 
     /// Send a `StartSession` command to the host. Returns an error if the
@@ -159,33 +152,104 @@ impl SherpaHost {
     }
 }
 
-/// Worker thread entry point. Creates the [`OnlineRecognizer`] once and
-/// signals success/failure on `init_tx`, then loops processing
-/// `StartSession` commands until the command channel disconnects (which
-/// happens at process exit when the global host is dropped).
+/// Worker thread entry point. Owns the recognizer for the entire
+/// process lifetime and handles both initialization and command
+/// processing.
+///
+/// Phase 1: download the model bundle if it's missing locally
+/// Phase 2: create the `OnlineRecognizer`
+/// Phase 3: store the `SherpaHost` in `SHERPA_HOST` and emit Ready
+/// Phase 4: process `StartSession` commands forever
+///
+/// Failures during phases 1 or 2 store an error in `SHERPA_HOST` and
+/// emit `InitEvent::Failed` before returning early.
 fn run_host_loop(
     model: SherpaModel,
     cmd_rx: &mpsc::Receiver<HostCommand>,
-    init_tx: mpsc::SyncSender<Result<(), String>>,
+    cmd_tx: mpsc::Sender<HostCommand>,
+    event_tx: mpsc::Sender<InitEvent>,
 ) {
+    // --- Phase 1: download if needed ---
+    if !sherpa_model::model_exists(model) {
+        tracing::info!(
+            ?model,
+            "sherpa model not found locally, downloading bundle (~256 MB)"
+        );
+        let _ = event_tx.send(InitEvent::DownloadStart);
+
+        let (dl_tx, dl_rx) = mpsc::channel::<u8>();
+        let event_tx_dl = event_tx.clone();
+
+        // Forwarder thread translates u8 progress percents into
+        // InitEvent::DownloadProgress messages.
+        let dl_forwarder = match std::thread::Builder::new()
+            .name("sherpa-dl-progress".into())
+            .spawn(move || {
+                while let Ok(pct) = dl_rx.recv() {
+                    let _ = event_tx_dl.send(InitEvent::DownloadProgress { pct });
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                let msg = format!("failed to spawn sherpa-dl-progress thread: {e}");
+                tracing::error!(%msg);
+                store_init_failure(BackendError::Init(msg.clone()));
+                let _ = event_tx.send(InitEvent::Failed { message: msg });
+                return;
+            }
+        };
+
+        let download_result = sherpa_model::download_sherpa_model(model, &dl_tx);
+
+        // Drop the sender so the forwarder thread exits when it drains.
+        drop(dl_tx);
+        let _ = dl_forwarder.join();
+
+        if let Err(e) = download_result {
+            let msg = format!("sherpa model download failed: {e}");
+            tracing::error!(%msg);
+            store_init_failure(BackendError::Init(msg.clone()));
+            let _ = event_tx.send(InitEvent::Failed { message: msg });
+            return;
+        }
+
+        tracing::info!("sherpa model installed, proceeding to recognizer init");
+        // Note: download_sherpa_model emits the Extracting phase
+        // implicitly (extraction happens inside the function before
+        // it returns). We fire the explicit event here so the splash
+        // can update its label, even though by the time it sees this
+        // the extraction is already done.
+        let _ = event_tx.send(InitEvent::Extracting);
+    }
+
+    // --- Phase 2: create the recognizer ---
+    let _ = event_tx.send(InitEvent::CreatingRecognizer);
     let recognizer_config = build_recognizer_config(model, "cpu");
     tracing::info!(?model, "creating sherpa-onnx recognizer (host init)");
 
     let Some(recognizer) = OnlineRecognizer::create(&recognizer_config) else {
         let msg = "OnlineRecognizer::create returned None — check model file paths".to_owned();
         tracing::error!(%msg);
-        let _ = init_tx.send(Err(msg));
+        store_init_failure(BackendError::Init(msg.clone()));
+        let _ = event_tx.send(InitEvent::Failed { message: msg });
         return;
     };
     tracing::info!("sherpa-onnx recognizer created successfully");
 
-    if init_tx.send(Ok(())).is_err() {
-        tracing::warn!("sherpa host init channel closed before send — controller dropped");
-        return;
+    // --- Phase 3: build SherpaHost and store in SHERPA_HOST ---
+    let host = SherpaHost {
+        state: Mutex::new(SherpaHostState { cmd_tx }),
+    };
+    if SHERPA_HOST.set(Ok(host)).is_err() {
+        // Someone else already set it — shouldn't happen because the
+        // worker is the only writer, but be defensive.
+        tracing::error!("sherpa host onceLock was already set");
     }
-    drop(init_tx);
+    tracing::info!("sherpa-host ready, signaling Ready event");
+    let _ = event_tx.send(InitEvent::Ready);
+    drop(event_tx);
 
-    tracing::info!("sherpa-host ready, waiting for sessions");
+    // --- Phase 4: command loop ---
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             HostCommand::StartSession(params) => {
@@ -196,6 +260,13 @@ fn run_host_loop(
         }
     }
     tracing::info!("sherpa-host worker exiting");
+}
+
+/// Helper to store an initialization failure in the global `OnceLock`.
+/// The error gets wrapped in `Arc` to satisfy the
+/// `OnceLock<Result<..., Arc<BackendError>>>` type.
+fn store_init_failure(err: BackendError) {
+    let _ = SHERPA_HOST.set(Err(std::sync::Arc::new(err)));
 }
 
 /// Build the `OnlineRecognizerConfig` for a Streaming Zipformer model.
@@ -486,28 +557,29 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::panic)]
-    fn sherpa_host_spawn_returns_model_not_found_when_files_missing() {
-        // SherpaHost::spawn checks for model files synchronously before
-        // spawning the worker thread. In an environment without the
-        // model bundle, this should return ModelNotFound. If the dev
-        // happens to have the model installed, gracefully skip without
-        // calling spawn() — spawning and then dropping a live host
-        // would trigger ONNX Runtime cleanup that races with other tests.
+    fn sherpa_host_spawn_emits_download_start_when_files_missing() {
+        // SherpaHost::spawn now spawns the worker immediately and returns
+        // a Receiver<InitEvent>. When the model is absent, the first event
+        // must be DownloadStart. We drop the receiver immediately after
+        // verifying this — subsequent sends from the worker will silently
+        // fail (disconnected channel), which is the expected behavior when
+        // a caller drops the channel early.
+        //
+        // If the model IS installed, skip so we don't accidentally spawn a
+        // live host (ONNX Runtime cleanup can race with other tests).
         if sherpa_model::model_exists(SherpaModel::StreamingZipformerEn) {
             eprintln!("skipping test: streaming-zipformer-en model is present locally");
             return;
         }
-        match SherpaHost::spawn(SherpaModel::StreamingZipformerEn) {
-            Err(BackendError::ModelNotFound { path }) => {
-                assert!(path.ends_with("sherpa/streaming-zipformer-en"));
-            }
-            Ok(_host) => {
-                // model_exists() returned false above, so spawn() returning
-                // Ok here would be a logic error in model_exists.
-                panic!("model_exists returned false but spawn succeeded — inconsistent state");
-            }
-            Err(e) => panic!("expected ModelNotFound, got {e:?}"),
-        }
+        let event_rx = SherpaHost::spawn(SherpaModel::StreamingZipformerEn);
+        let first_event = event_rx
+            .recv()
+            .expect("worker should send at least one event");
+        assert!(
+            matches!(first_event, InitEvent::DownloadStart),
+            "expected DownloadStart when model is missing, got {first_event:?}"
+        );
+        // Drop the receiver — the worker will silently discard further events.
+        drop(event_rx);
     }
 }

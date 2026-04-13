@@ -35,9 +35,42 @@ fn main() -> glib::ExitCode {
     tracing::info!("sdr-rs starting");
 
     // Initialize the sherpa-onnx host BEFORE GTK is loaded.
-    // Only present in builds with the `sherpa` feature.
+    // Drain the event channel until we see Ready or Failed (or the
+    // channel disconnects, which means the worker died unexpectedly).
+    // The splash window from sdr-splash will be wired into this loop
+    // in a later task — for now we just drain quietly.
     #[cfg(feature = "sherpa")]
-    sdr_transcription::init_sherpa_host(sdr_transcription::SherpaModel::StreamingZipformerEn);
+    {
+        use sdr_transcription::InitEvent;
+        let event_rx = sdr_transcription::init_sherpa_host(
+            sdr_transcription::SherpaModel::StreamingZipformerEn,
+        );
+        loop {
+            match event_rx.recv() {
+                Ok(InitEvent::Ready) => break,
+                Ok(InitEvent::Failed { message }) => {
+                    tracing::warn!(%message, "sherpa init failed");
+                    break;
+                }
+                Ok(InitEvent::DownloadStart) => {
+                    tracing::info!("sherpa download starting");
+                }
+                Ok(InitEvent::DownloadProgress { pct }) => {
+                    tracing::info!(progress_pct = pct, "sherpa download progress");
+                }
+                Ok(InitEvent::Extracting) => {
+                    tracing::info!("sherpa extracting archive");
+                }
+                Ok(InitEvent::CreatingRecognizer) => {
+                    tracing::info!("sherpa creating recognizer");
+                }
+                Err(_) => {
+                    tracing::warn!("sherpa init event channel disconnected");
+                    break;
+                }
+            }
+        }
+    }
 
     sdr_ui::run()
 }
