@@ -1477,6 +1477,47 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         });
 }
 
+/// Re-enable every transcription settings row that gets locked during
+/// an active session.
+///
+/// Single source of truth for the row-unlock side of the four
+/// session-end paths in [`connect_transcript_panel`]:
+///
+/// 1. `TranscriptionEvent::Error` arm in the timeout closure
+/// 2. `TryRecvError::Disconnected` arm in the timeout closure
+/// 3. Synchronous `engine.start()` failure in `connect_active_notify`
+/// 4. Normal stop (off branch of `connect_active_notify`)
+///
+/// Takes weak refs so paths 1 and 2 (which hold weak refs to avoid
+/// keeping widgets alive past their UI lifetime) can call it directly.
+/// Paths 3 and 4 hold strong refs and pass `&strong.downgrade()` —
+/// the temporary lives through the function call.
+///
+/// Tolerant of any individual weak ref failing to upgrade (window close
+/// race) — each row is checked independently so a partially-dropped UI
+/// still recovers what it can.
+fn unlock_transcription_session_rows(
+    model_row: &glib::WeakRef<adw::ComboRow>,
+    #[cfg(feature = "whisper")] silence_row: &glib::WeakRef<adw::SpinRow>,
+    noise_gate_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
+) {
+    if let Some(row) = model_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "whisper")]
+    if let Some(row) = silence_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    if let Some(row) = noise_gate_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = display_mode_row.upgrade() {
+        row.set_sensitive(true);
+    }
+}
+
 /// Connect transcript panel controls to DSP commands.
 ///
 /// Returns the engine handle so it can be stopped on window close.
@@ -1517,6 +1558,132 @@ fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
+    #[cfg(feature = "sherpa")]
+    {
+        let status_label_reload = status_label.clone();
+        let progress_bar_reload = progress_bar.clone();
+        let enable_row_reload = transcript.enable_row.clone();
+        transcript.model_row.connect_selected_notify(move |row| {
+            let idx = row.selected() as usize;
+            let Some(new_model) = sdr_transcription::SherpaModel::ALL.get(idx).copied() else {
+                return;
+            };
+
+            tracing::info!(?new_model, "user changed model — triggering runtime reload");
+
+            // Disable BOTH rows while the reload is in flight:
+            // - model_row so the user can't queue up multiple reloads
+            //   via rapid switching
+            // - enable_row so the user can't start/stop transcription
+            //   on top of an in-flight recognizer swap. Without this,
+            //   the stop-path teardown would re-enable model_row before
+            //   the reload finishes, reopening the queued-reload window
+            //   this block is closing.
+            // Both are re-enabled from the timeout closure on Ready /
+            // Failed / channel disconnect.
+            row.set_sensitive(false);
+            enable_row_reload.set_sensitive(false);
+            let model_row_reload_weak = row.downgrade();
+            let enable_row_reload_weak = enable_row_reload.downgrade();
+
+            // Show the status area.
+            status_label_reload.set_text(&format!("Reloading {}...", new_model.label()));
+            status_label_reload.set_css_classes(&["dim-label"]);
+            status_label_reload.set_visible(true);
+            progress_bar_reload.set_fraction(0.0);
+            progress_bar_reload.set_visible(true);
+
+            let event_rx = sdr_transcription::reload_sherpa_host(new_model);
+
+            // Drain progress events on the main thread via a periodic timeout.
+            let status_weak = status_label_reload.downgrade();
+            let progress_weak = progress_bar_reload.downgrade();
+            let mut current_component: String = new_model.label().to_owned();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                let Some(status) = status_weak.upgrade() else {
+                    // Widgets are gone (window closing); model row is too,
+                    // so no need to re-enable it.
+                    return glib::ControlFlow::Break;
+                };
+                let Some(progress) = progress_weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+
+                loop {
+                    match event_rx.try_recv() {
+                        Ok(sdr_transcription::InitEvent::DownloadStart { component }) => {
+                            component.clone_into(&mut current_component);
+                            status.set_text(&format!("Downloading {component}..."));
+                            progress.set_fraction(0.0);
+                        }
+                        Ok(sdr_transcription::InitEvent::DownloadProgress { pct }) => {
+                            status.set_text(&format!("Downloading {current_component}... {pct}%"));
+                            progress.set_fraction(f64::from(pct) / 100.0);
+                        }
+                        Ok(sdr_transcription::InitEvent::Extracting { component }) => {
+                            component.clone_into(&mut current_component);
+                            status.set_text(&format!("Extracting {component}..."));
+                        }
+                        Ok(sdr_transcription::InitEvent::CreatingRecognizer) => {
+                            status.set_text("Creating recognizer...");
+                            progress.set_visible(false);
+                        }
+                        Ok(sdr_transcription::InitEvent::Ready) => {
+                            tracing::info!("sherpa host reload complete");
+                            status.set_text("");
+                            status.set_visible(false);
+                            progress.set_visible(false);
+                            if let Some(model_row) = model_row_reload_weak.upgrade() {
+                                model_row.set_sensitive(true);
+                            }
+                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                                enable_row.set_sensitive(true);
+                            }
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(sdr_transcription::InitEvent::Failed { message }) => {
+                            tracing::warn!(%message, "sherpa host reload failed");
+                            status.set_text(&format!("Reload failed: {message}"));
+                            status.set_css_classes(&["error"]);
+                            status.set_visible(true);
+                            progress.set_visible(false);
+                            if let Some(model_row) = model_row_reload_weak.upgrade() {
+                                model_row.set_sensitive(true);
+                            }
+                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                                enable_row.set_sensitive(true);
+                            }
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            // Worker dropped its sender without sending Ready
+                            // or Failed — unusual but don't strand the UI in
+                            // a "Reloading..." state. Surface the disconnect
+                            // as an error and re-enable the controls so the
+                            // user can try a different model.
+                            tracing::warn!(
+                                "sherpa host reload event channel disconnected unexpectedly"
+                            );
+                            status.set_text("Reload failed: recognizer worker disconnected");
+                            status.set_css_classes(&["error"]);
+                            status.set_visible(true);
+                            progress.set_visible(false);
+                            if let Some(model_row) = model_row_reload_weak.upgrade() {
+                                model_row.set_sensitive(true);
+                            }
+                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                                enable_row.set_sensitive(true);
+                            }
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        });
+    }
+
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
             // Read selected model from dropdown.
@@ -1525,9 +1692,11 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
-            // display_mode_row is intentionally NOT locked — the Partial
-            // handler re-reads it on every event, so flipping it mid-session
-            // is safe and desirable (user sees effect immediately).
+            // All settings lock during a session for mid-session fault
+            // tolerance — walks back PR 4's earlier display_mode_row
+            // exception. User stops, changes, starts.
+            #[cfg(feature = "sherpa")]
+            display_mode_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
 
@@ -1681,16 +1850,14 @@ fn connect_transcript_panel(
                                         // Mirror the synchronous start()
                                         // failure teardown so the UI
                                         // isn't left locked.
-                                        if let Some(model) = model_row_weak.upgrade() {
-                                            model.set_sensitive(true);
-                                        }
-                                        #[cfg(feature = "whisper")]
-                                        if let Some(silence) = silence_row_weak.upgrade() {
-                                            silence.set_sensitive(true);
-                                        }
-                                        if let Some(noise) = noise_gate_row_weak.upgrade() {
-                                            noise.set_sensitive(true);
-                                        }
+                                        unlock_transcription_session_rows(
+                                            &model_row_weak,
+                                            #[cfg(feature = "whisper")]
+                                            &silence_row_weak,
+                                            &noise_gate_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &display_mode_row_weak,
+                                        );
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
                                         }
@@ -1710,6 +1877,35 @@ fn connect_transcript_panel(
                                 },
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    // Backend channel dropped without a
+                                    // terminal Error event. Mirror the Error
+                                    // arm's teardown so the locked controls
+                                    // (model_row, silence_row, noise_gate_row,
+                                    // display_mode_row, enable_row) all
+                                    // recover instead of staying frozen.
+                                    tracing::warn!(
+                                        "transcription event channel disconnected without terminal event"
+                                    );
+                                    unlock_transcription_session_rows(
+                                        &model_row_weak,
+                                        #[cfg(feature = "whisper")]
+                                        &silence_row_weak,
+                                        &noise_gate_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &display_mode_row_weak,
+                                    );
+                                    if let Some(enable) = enable_row_weak.upgrade() {
+                                        enable.set_active(false);
+                                    }
+                                    status.set_text("Transcription stopped unexpectedly");
+                                    status.set_css_classes(&["error"]);
+                                    status.set_visible(true);
+                                    progress.set_visible(false);
+                                    #[cfg(feature = "sherpa")]
+                                    if let Some(label) = live_line_weak.upgrade() {
+                                        label.set_text("");
+                                        label.set_visible(false);
+                                    }
                                     return glib::ControlFlow::Break;
                                 }
                             }
@@ -1719,10 +1915,14 @@ fn connect_transcript_panel(
                 }
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
-                    model_row.set_sensitive(true);
-                    #[cfg(feature = "whisper")]
-                    silence_row.set_sensitive(true);
-                    noise_gate_row.set_sensitive(true);
+                    unlock_transcription_session_rows(
+                        &model_row.downgrade(),
+                        #[cfg(feature = "whisper")]
+                        &silence_row.downgrade(),
+                        &noise_gate_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &display_mode_row.downgrade(),
+                    );
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
                     // set the error text so the user actually sees it.
@@ -1735,10 +1935,14 @@ fn connect_transcript_panel(
                 }
             }
         } else {
-            model_row.set_sensitive(true);
-            #[cfg(feature = "whisper")]
-            silence_row.set_sensitive(true);
-            noise_gate_row.set_sensitive(true);
+            unlock_transcription_session_rows(
+                &model_row.downgrade(),
+                #[cfg(feature = "whisper")]
+                &silence_row.downgrade(),
+                &noise_gate_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &display_mode_row.downgrade(),
+            );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();
             status_label.set_text("");
