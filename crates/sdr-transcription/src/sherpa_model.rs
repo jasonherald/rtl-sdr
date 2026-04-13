@@ -147,9 +147,20 @@ impl SherpaModel {
         }
     }
 
-    /// Filename of Moonshine's encoder ONNX file inside the model
-    /// directory. Panics if called on a non-Moonshine variant — callers
-    /// should match on [`SherpaModel::kind`] first.
+    /// Filename of Moonshine v1's preprocessor ONNX file. Note: the
+    /// preprocessor is NOT quantized (plain `.onnx`, not `.int8.onnx`).
+    pub fn moonshine_preprocessor_filename(self) -> &'static str {
+        match self {
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "preprocess.onnx",
+            Self::StreamingZipformerEn => {
+                unreachable!("moonshine_preprocessor_filename called on non-Moonshine variant")
+            }
+        }
+    }
+
+    /// Filename of Moonshine v1's encoder ONNX file. Panics if called on
+    /// a non-Moonshine variant — callers should match on
+    /// [`SherpaModel::kind`] first.
     pub fn moonshine_encoder_filename(self) -> &'static str {
         match self {
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => "encode.int8.onnx",
@@ -159,12 +170,22 @@ impl SherpaModel {
         }
     }
 
-    /// Filename of Moonshine v2's merged-decoder ONNX file.
-    pub fn moonshine_merged_decoder_filename(self) -> &'static str {
+    /// Filename of Moonshine v1's uncached-decoder ONNX file.
+    pub fn moonshine_uncached_decoder_filename(self) -> &'static str {
         match self {
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "decode.int8.onnx",
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "uncached_decode.int8.onnx",
             Self::StreamingZipformerEn => {
-                unreachable!("moonshine_merged_decoder_filename called on non-Moonshine variant")
+                unreachable!("moonshine_uncached_decoder_filename called on non-Moonshine variant")
+            }
+        }
+    }
+
+    /// Filename of Moonshine v1's cached-decoder ONNX file.
+    pub fn moonshine_cached_decoder_filename(self) -> &'static str {
+        match self {
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "cached_decode.int8.onnx",
+            Self::StreamingZipformerEn => {
+                unreachable!("moonshine_cached_decoder_filename called on non-Moonshine variant")
             }
         }
     }
@@ -374,7 +395,9 @@ pub fn model_directory(model: SherpaModel) -> PathBuf {
 ///
 /// Each recognizer family has a different layout. The enum variants
 /// match the families in [`ModelKind`]: transducer models (Zipformer,
-/// Parakeet-TDT) ship four files, Moonshine v2 ships three.
+/// Parakeet-TDT) ship four files; Moonshine v1 ships five (preprocessor,
+/// encoder, uncached decoder, cached decoder, tokens). The k2-fsa int8
+/// release bundles use the v1 layout despite v2 being supported upstream.
 #[derive(Debug, Clone)]
 pub enum ModelFilePaths {
     Transducer {
@@ -384,8 +407,10 @@ pub enum ModelFilePaths {
         tokens: PathBuf,
     },
     Moonshine {
+        preprocessor: PathBuf,
         encoder: PathBuf,
-        merged_decoder: PathBuf,
+        uncached_decoder: PathBuf,
+        cached_decoder: PathBuf,
         tokens: PathBuf,
     },
 }
@@ -409,8 +434,10 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
         ModelKind::OfflineMoonshine => {
             let dir = model_directory(model);
             ModelFilePaths::Moonshine {
+                preprocessor: dir.join(model.moonshine_preprocessor_filename()),
                 encoder: dir.join(model.moonshine_encoder_filename()),
-                merged_decoder: dir.join(model.moonshine_merged_decoder_filename()),
+                uncached_decoder: dir.join(model.moonshine_uncached_decoder_filename()),
+                cached_decoder: dir.join(model.moonshine_cached_decoder_filename()),
                 tokens: dir.join(model.moonshine_tokens_filename()),
             }
         }
@@ -427,10 +454,18 @@ pub fn model_exists(model: SherpaModel) -> bool {
             tokens,
         } => encoder.is_file() && decoder.is_file() && joiner.is_file() && tokens.is_file(),
         ModelFilePaths::Moonshine {
+            preprocessor,
             encoder,
-            merged_decoder,
+            uncached_decoder,
+            cached_decoder,
             tokens,
-        } => encoder.is_file() && merged_decoder.is_file() && tokens.is_file(),
+        } => {
+            preprocessor.is_file()
+                && encoder.is_file()
+                && uncached_decoder.is_file()
+                && cached_decoder.is_file()
+                && tokens.is_file()
+        }
     }
 }
 
@@ -744,20 +779,25 @@ mod tests {
 
     #[test]
     #[allow(clippy::panic)]
-    fn moonshine_tiny_has_three_file_layout() {
+    fn moonshine_tiny_has_five_file_layout() {
         let paths = model_file_paths(SherpaModel::MoonshineTinyEn);
         let ModelFilePaths::Moonshine {
+            preprocessor,
             encoder,
-            merged_decoder,
+            uncached_decoder,
+            cached_decoder,
             tokens,
         } = paths
         else {
             panic!("MoonshineTinyEn should be a Moonshine layout");
         };
+        assert!(preprocessor.ends_with("preprocess.onnx"));
         assert!(encoder.ends_with("encode.int8.onnx"));
-        assert!(merged_decoder.ends_with("decode.int8.onnx"));
+        assert!(uncached_decoder.ends_with("uncached_decode.int8.onnx"));
+        assert!(cached_decoder.ends_with("cached_decode.int8.onnx"));
         assert!(tokens.ends_with("tokens.txt"));
-        assert_ne!(encoder, merged_decoder);
+        assert_ne!(encoder, uncached_decoder);
+        assert_ne!(uncached_decoder, cached_decoder);
     }
 
     #[test]

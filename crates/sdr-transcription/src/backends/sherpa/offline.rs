@@ -32,14 +32,22 @@ const SESSION_MONO_BUFFER_CAPACITY: usize = 16_000;
 /// pipeline.
 const SHERPA_NUM_THREADS: i32 = 1;
 
-/// Build the `OfflineRecognizerConfig` for a Moonshine model.
+/// Build the `OfflineRecognizerConfig` for a Moonshine v1 model.
+///
+/// k2-fsa's int8 Moonshine releases use the v1 layout with five files:
+/// preprocessor (not quantized), encoder, uncached decoder, cached
+/// decoder, and tokens. The v2 two-file layout (encoder plus merged
+/// decoder) exists in `OfflineMoonshineModelConfig` but is not what
+/// the releases actually ship.
 pub(super) fn build_moonshine_recognizer_config(
     model: SherpaModel,
     provider: &str,
 ) -> OfflineRecognizerConfig {
     let ModelFilePaths::Moonshine {
+        preprocessor,
         encoder,
-        merged_decoder,
+        uncached_decoder,
+        cached_decoder,
         tokens,
     } = sherpa_model::model_file_paths(model)
     else {
@@ -47,8 +55,10 @@ pub(super) fn build_moonshine_recognizer_config(
     };
 
     let moonshine = OfflineMoonshineModelConfig {
+        preprocessor: Some(preprocessor.to_string_lossy().into_owned()),
         encoder: Some(encoder.to_string_lossy().into_owned()),
-        merged_decoder: Some(merged_decoder.to_string_lossy().into_owned()),
+        uncached_decoder: Some(uncached_decoder.to_string_lossy().into_owned()),
+        cached_decoder: Some(cached_decoder.to_string_lossy().into_owned()),
         ..OfflineMoonshineModelConfig::default()
     };
 
