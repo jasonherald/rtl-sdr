@@ -23,6 +23,48 @@ pub const VAD_THRESHOLD_MAX: f32 = 0.90;
 /// scanner/NFM sources.
 pub const VAD_THRESHOLD_DEFAULT: f32 = 0.50;
 
+/// Frames sent from the DSP controller into a transcription backend.
+///
+/// Carries both raw audio samples and segmentation-boundary hints. The
+/// boundary variants are emitted by `sdr-core::controller` only when the
+/// current demod mode is NFM — backends never need to gate on mode
+/// themselves.
+///
+/// Backends that don't care about squelch-based segmentation (Whisper,
+/// streaming Zipformer, offline sherpa in `SegmentationMode::Vad`)
+/// pattern-match on `Samples` and drop the other variants.
+#[derive(Debug, Clone)]
+pub enum TranscriptionInput {
+    /// Interleaved-stereo f32 PCM at 48 kHz. Always emitted, gap-free.
+    Samples(Vec<f32>),
+
+    /// Radio squelch just opened. Edge event, emitted exactly once per
+    /// close→open transition. NFM demod only.
+    SquelchOpened,
+
+    /// Radio squelch just closed. Edge event, emitted exactly once per
+    /// open→close transition. NFM demod only.
+    SquelchClosed,
+}
+
+/// Which segmentation engine drives utterance boundaries for an offline
+/// sherpa transcription session.
+///
+/// Mutex: exactly one is active per session. Streaming Zipformer always
+/// uses `Vad` (its own endpoint detection handles the rest).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SegmentationMode {
+    /// Silero VAD drives segmentation. Default for backward compatibility
+    /// and the only valid mode for streaming Zipformer.
+    #[default]
+    Vad,
+
+    /// Auto Break: the radio's squelch gate drives segmentation. Valid
+    /// only for offline sherpa models on NFM demod. See the Auto Break
+    /// state machine in `backends/sherpa/offline.rs`.
+    AutoBreak,
+}
+
 /// Configuration handed to a backend at `start` time.
 ///
 /// `model` selects which ASR model the backend should load. Additional
@@ -36,8 +78,13 @@ pub struct BackendConfig {
     /// Clamp to `VAD_THRESHOLD_MIN..=VAD_THRESHOLD_MAX`.
     /// Default `VAD_THRESHOLD_DEFAULT`. Lower catches quieter audio
     /// (NFM/scanner); higher is stricter (talk radio). Ignored by
-    /// Whisper (no Silero VAD).
+    /// Whisper (no Silero VAD) and ignored when
+    /// `segmentation_mode == SegmentationMode::AutoBreak`.
     pub vad_threshold: f32,
+    /// How utterance boundaries are detected in an offline sherpa
+    /// session. See `SegmentationMode` for valid values. Streaming
+    /// Zipformer rejects `AutoBreak` at session start.
+    pub segmentation_mode: SegmentationMode,
 }
 
 /// User-facing model selection.
@@ -82,8 +129,9 @@ pub enum TranscriptionEvent {
 /// Returned by [`TranscriptionBackend::start`]. Carries the channels the
 /// engine wires through to its caller.
 pub struct BackendHandle {
-    /// Push 48 kHz interleaved stereo f32 samples into the backend.
-    pub audio_tx: mpsc::SyncSender<Vec<f32>>,
+    /// Push audio frames + squelch edge events into the backend. See
+    /// [`TranscriptionInput`] for the wire format.
+    pub audio_tx: mpsc::SyncSender<TranscriptionInput>,
     /// Receive transcription events from the backend.
     pub event_rx: mpsc::Receiver<TranscriptionEvent>,
 }
@@ -148,4 +196,21 @@ pub trait TranscriptionBackend: Send {
     /// `recv` to see `Disconnected` if the cancel flag hasn't already
     /// short-circuited the loop.
     fn shutdown_nonblocking(&mut self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_input_variants_construct() {
+        let _samples = TranscriptionInput::Samples(vec![0.0_f32; 16]);
+        let _opened = TranscriptionInput::SquelchOpened;
+        let _closed = TranscriptionInput::SquelchClosed;
+    }
+
+    #[test]
+    fn segmentation_mode_default_is_vad() {
+        assert_eq!(SegmentationMode::default(), SegmentationMode::Vad);
+    }
 }

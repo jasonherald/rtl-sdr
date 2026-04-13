@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use sherpa_onnx::{OfflineRecognizer, OnlineRecognizer};
 
-use crate::backend::{BackendError, TranscriptionEvent};
+use crate::backend::{BackendError, TranscriptionEvent, TranscriptionInput};
 use crate::init_event::InitEvent;
 use crate::sherpa_model::{self, SherpaModel};
 
@@ -136,7 +136,7 @@ pub(super) fn global_sherpa_host() -> Option<&'static Result<SherpaHost, Arc<Bac
 /// Parameters handed to the host worker for one transcription session.
 pub(super) struct SessionParams {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
-    pub audio_rx: mpsc::Receiver<Vec<f32>>,
+    pub audio_rx: mpsc::Receiver<TranscriptionInput>,
     pub event_tx: mpsc::Sender<TranscriptionEvent>,
     pub noise_gate_ratio: f32,
     /// Silero VAD threshold requested for this session (offline models only).

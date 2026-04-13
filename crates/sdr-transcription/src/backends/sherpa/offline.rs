@@ -17,7 +17,7 @@ use sherpa_onnx::{
     OfflineTransducerModelConfig,
 };
 
-use crate::backend::TranscriptionEvent;
+use crate::backend::{TranscriptionEvent, TranscriptionInput};
 use crate::sherpa_model::{self, ModelFilePaths, SherpaModel};
 use crate::vad::VoiceActivityDetector;
 use crate::{denoise, resampler};
@@ -179,10 +179,14 @@ pub(super) fn run_session(
             return;
         }
 
-        let interleaved = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
+        let input = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
             Ok(d) => d,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let interleaved = match input {
+            TranscriptionInput::Samples(s) => s,
+            TranscriptionInput::SquelchOpened | TranscriptionInput::SquelchClosed => continue,
         };
 
         // Resample 48 kHz stereo → 16 kHz mono.
@@ -194,7 +198,9 @@ pub(super) fn run_session(
                 drain_vad_on_exit(recognizer, vad, &event_tx);
                 return;
             }
-            resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
+            if let TranscriptionInput::Samples(s) = extra {
+                resampler::downsample_stereo_to_mono_16k(&s, &mut mono_buf);
+            }
         }
 
         if mono_buf.is_empty() {

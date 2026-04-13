@@ -13,7 +13,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
-    TranscriptionEvent,
+    TranscriptionEvent, TranscriptionInput,
 };
 use crate::{denoise, model, resampler};
 
@@ -76,7 +76,7 @@ impl TranscriptionBackend for WhisperBackend {
 
         self.cancel.store(false, Ordering::Relaxed);
 
-        let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
+        let (audio_tx, audio_rx) = mpsc::sync_channel::<TranscriptionInput>(AUDIO_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
 
         let cancel = Arc::clone(&self.cancel);
@@ -129,7 +129,7 @@ impl TranscriptionBackend for WhisperBackend {
 /// * `silence_threshold` — RMS below which a chunk is skipped
 /// * `noise_gate_ratio` — spectral gate multiplier over noise floor
 fn run_worker(
-    audio_rx: &mpsc::Receiver<Vec<f32>>,
+    audio_rx: &mpsc::Receiver<TranscriptionInput>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
@@ -152,7 +152,7 @@ fn run_worker(
 /// can forward them as `TranscriptionEvent::Error`.
 #[allow(clippy::too_many_lines)]
 fn run_worker_inner(
-    audio_rx: &mpsc::Receiver<Vec<f32>>,
+    audio_rx: &mpsc::Receiver<TranscriptionInput>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
@@ -213,10 +213,14 @@ fn run_worker_inner(
             return Ok(());
         }
 
-        let interleaved = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
+        let input = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
             Ok(data) => data,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let interleaved = match input {
+            TranscriptionInput::Samples(s) => s,
+            TranscriptionInput::SquelchOpened | TranscriptionInput::SquelchClosed => continue,
         };
 
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
@@ -228,7 +232,9 @@ fn run_worker_inner(
                 tracing::info!("transcription cancelled, worker exiting");
                 return Ok(());
             }
-            resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
+            if let TranscriptionInput::Samples(s) = extra {
+                resampler::downsample_stereo_to_mono_16k(&s, &mut mono_buf);
+            }
         }
 
         while mono_buf.len() >= CHUNK_SAMPLES {
