@@ -647,10 +647,21 @@ pub fn list_audio_sinks() -> Vec<AudioDevice> {
 
     let default_id = get_default_device_id(false);
 
-    let Ok(all_ids) = get_audio_device_ids_for_scope(Scope::Global) else {
-        // Could not enumerate — return just the default entry. The
-        // caller can still route audio.
-        return sinks;
+    let all_ids = match get_audio_device_ids_for_scope(Scope::Global) {
+        Ok(ids) => ids,
+        Err(err) => {
+            // Could not enumerate. Return just the default entry —
+            // the caller can still route audio to system default —
+            // but log the failure so CI / user reports can tell the
+            // difference between "no other devices attached" and
+            // "CoreAudio enumeration broke."
+            tracing::warn!(
+                error = ?err,
+                "list_audio_sinks: get_audio_device_ids_for_scope(Global) failed; \
+                 returning only the system default entry"
+            );
+            return sinks;
+        }
     };
 
     for device_id in all_ids {
