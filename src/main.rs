@@ -47,32 +47,55 @@ fn main() -> glib::ExitCode {
     // Initialize the sherpa-onnx host BEFORE GTK is loaded.
     // Drain the event channel until we see Ready or Failed (or the
     // channel disconnects, which means the worker died unexpectedly).
-    // The splash window from sdr-splash will be wired into this loop
-    // in a later task — for now we just drain quietly.
+    // A SplashController shows the user live progress for the duration.
     #[cfg(feature = "sherpa")]
     {
+        use sdr_splash::SplashController;
         use sdr_transcription::InitEvent;
+
+        // Spawn the splash subprocess BEFORE init_sherpa_host. If the
+        // model is already cached, the recognizer creation takes ~1-2
+        // seconds and the splash flickers briefly; if it has to
+        // download (~30 seconds for the 256 MB bundle), the splash
+        // shows live progress for the duration. Falls back to a no-op
+        // controller if the subprocess can't spawn — see
+        // SplashController::try_spawn for the failure modes.
+        let mut splash = SplashController::try_spawn("Initializing sherpa-onnx...");
+
         let event_rx = sdr_transcription::init_sherpa_host(
             sdr_transcription::SherpaModel::StreamingZipformerEn,
         );
+
         loop {
             match event_rx.recv() {
-                Ok(InitEvent::Ready) => break,
-                Ok(InitEvent::Failed { message }) => {
-                    tracing::warn!(%message, "sherpa init failed");
-                    break;
-                }
                 Ok(InitEvent::DownloadStart) => {
                     tracing::info!("sherpa download starting");
+                    splash.update_text("Downloading sherpa-onnx model...");
                 }
                 Ok(InitEvent::DownloadProgress { pct }) => {
                     tracing::info!(progress_pct = pct, "sherpa download progress");
+                    splash.update_text(&format!(
+                        "Downloading sherpa-onnx model... {pct}%"
+                    ));
                 }
                 Ok(InitEvent::Extracting) => {
                     tracing::info!("sherpa extracting archive");
+                    splash.update_text("Extracting sherpa-onnx model...");
                 }
                 Ok(InitEvent::CreatingRecognizer) => {
                     tracing::info!("sherpa creating recognizer");
+                    splash.update_text("Loading sherpa-onnx recognizer...");
+                }
+                Ok(InitEvent::Ready) => {
+                    tracing::info!("sherpa ready");
+                    break;
+                }
+                Ok(InitEvent::Failed { message }) => {
+                    tracing::warn!(%message, "sherpa init failed");
+                    // Don't update splash text — we're about to drop it.
+                    // The error will surface in status_label when the
+                    // user toggles Sherpa transcription.
+                    break;
                 }
                 Err(_) => {
                     tracing::warn!("sherpa init event channel disconnected");
@@ -80,6 +103,9 @@ fn main() -> glib::ExitCode {
                 }
             }
         }
+
+        // Drop the splash controller — closes the subprocess.
+        drop(splash);
     }
 
     sdr_ui::run()
