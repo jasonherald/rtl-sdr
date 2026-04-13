@@ -42,6 +42,27 @@ const SHERPA_NUM_THREADS: i32 = 1;
 /// Mirrors the upstream `rust-api-examples/examples/nemo_parakeet.rs` example.
 const NEMO_TRANSDUCER_MODEL_TYPE: &str = "nemo_transducer";
 
+/// Squelch openings shorter than this are treated as noise spikes and
+/// produce no segment. Chosen to exclude sub-syllable blips while still
+/// catching short single-word transmissions ("copy").
+const AUTO_BREAK_MIN_OPEN_MS: u32 = 100;
+
+/// Continue buffering audio for this long after the squelch closes, so
+/// the last syllable isn't chopped by a tight squelch-close timing.
+/// Covers typical `PowerSquelch` fall time plus ~100 ms of spoken tail.
+const AUTO_BREAK_TAIL_MS: u32 = 200;
+
+/// Segments shorter than this are discarded instead of decoded.
+/// Moonshine and Parakeet both hallucinate on sub-word fragments, so
+/// dropping them is an accuracy improvement, not a loss.
+const AUTO_BREAK_MIN_SEGMENT_MS: u32 = 400;
+
+/// Safety cap: if squelch stays open longer than this, flush anyway.
+/// Protects against pathological stuck-open situations (bad auto-squelch,
+/// carrier jam, band opening) that would otherwise cause unbounded
+/// memory growth in the segment buffer.
+const AUTO_BREAK_MAX_SEGMENT_MS: u32 = 30_000;
+
 /// Build the `OfflineRecognizerConfig` for a Moonshine v1 model.
 ///
 /// k2-fsa's int8 Moonshine releases use the v1 layout with five files:
