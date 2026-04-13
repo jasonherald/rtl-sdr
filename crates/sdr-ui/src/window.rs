@@ -1902,9 +1902,8 @@ fn connect_transcript_panel(
                                     //   UI doesn't strand the user with locked
                                     //   controls and a stale "Listening..."
                                     //   status.
-                                    let was_user_stop = enable_row_weak
-                                        .upgrade()
-                                        .is_none_or(|e| !e.is_active());
+                                    let was_user_stop =
+                                        enable_row_weak.upgrade().is_none_or(|e| !e.is_active());
 
                                     if was_user_stop {
                                         tracing::debug!(

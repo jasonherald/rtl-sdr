@@ -346,6 +346,23 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         });
     }
 
+    // Always clear the live line on model change. The visibility-toggle
+    // handler earlier hides display_mode_row when switching to a
+    // non-partial-emitting model, but it can't see live_line_label
+    // (which is built after that handler runs) so it leaves any stale
+    // live-line content visible. Without this third chained handler, a
+    // user who ran a Zipformer session and then switched to Moonshine
+    // or Parakeet would see leftover italic text dangling under the
+    // text view.
+    #[cfg(feature = "sherpa")]
+    {
+        let live_line_for_model_change = live_line_label.clone();
+        model_row.connect_selected_notify(move |_| {
+            live_line_for_model_change.set_text("");
+            live_line_for_model_change.set_visible(false);
+        });
+    }
+
     let status_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
         .css_classes(["dim-label"])
