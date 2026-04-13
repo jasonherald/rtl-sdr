@@ -650,14 +650,20 @@ mod tests {
     }
 
     #[test]
-    fn streaming_zipformer_archive_inner_dir_matches_filename_stem() {
-        let model = SherpaModel::StreamingZipformerEn;
-        let archive = model.archive_filename();
-        let inner = model.archive_inner_directory();
+    fn all_archives_have_inner_dir_matching_filename_stem() {
         // Inner directory name should equal the archive filename minus
         // the .tar.bz2 suffix — sanity check that we'll find the right
-        // directory after extraction.
-        assert_eq!(format!("{inner}.tar.bz2"), archive);
+        // directory after extraction. Loops over every variant in ALL
+        // so adding a new model auto-extends this protection.
+        for model in SherpaModel::ALL {
+            let archive = model.archive_filename();
+            let inner = model.archive_inner_directory();
+            assert_eq!(
+                format!("{inner}.tar.bz2"),
+                archive,
+                "archive_inner_directory + .tar.bz2 != archive_filename for {model:?}"
+            );
+        }
     }
 
     #[test]

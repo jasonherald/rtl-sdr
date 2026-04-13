@@ -33,6 +33,15 @@ const SESSION_MONO_BUFFER_CAPACITY: usize = 16_000;
 /// pipeline.
 const SHERPA_NUM_THREADS: i32 = 1;
 
+/// sherpa-onnx `model_type` field value that selects `NeMo`'s Token-and-Duration
+/// Transducer decode loop. Without this exact string, sherpa-onnx falls back
+/// to the generic transducer decode path which doesn't understand TDT's
+/// joiner output shape, and `OfflineRecognizer::create` returns `None` at
+/// runtime — silent failure mode.
+///
+/// Mirrors the upstream `rust-api-examples/examples/nemo_parakeet.rs` example.
+const NEMO_TRANSDUCER_MODEL_TYPE: &str = "nemo_transducer";
+
 /// Build the `OfflineRecognizerConfig` for a Moonshine v1 model.
 ///
 /// k2-fsa's int8 Moonshine releases use the v1 layout with five files:
@@ -116,7 +125,7 @@ pub(super) fn build_nemo_transducer_recognizer_config(
         num_threads: SHERPA_NUM_THREADS,
         // Required — tells sherpa-onnx to use NeMo's TDT decode loop
         // instead of the generic transducer path.
-        model_type: Some("nemo_transducer".to_owned()),
+        model_type: Some(NEMO_TRANSDUCER_MODEL_TYPE.to_owned()),
         ..OfflineModelConfig::default()
     };
 
