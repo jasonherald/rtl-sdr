@@ -44,6 +44,44 @@ pub fn init_sherpa_host(model: SherpaModel) -> mpsc::Receiver<InitEvent> {
     SherpaHost::spawn(model)
 }
 
+/// Reload the sherpa-onnx host with a different model.
+///
+/// Returns a `Receiver<InitEvent>` that streams progress events the same
+/// way `init_sherpa_host` does. The caller should drain it until it produces
+/// either `InitEvent::Ready` or `InitEvent::Failed`.
+///
+/// Prerequisite: [`init_sherpa_host`] must have been called successfully
+/// earlier in the process. Returns an error `InitEvent::Failed` via the
+/// returned channel if the host was never initialized.
+pub fn reload_sherpa_host(new_model: SherpaModel) -> mpsc::Receiver<InitEvent> {
+    let (event_tx, event_rx) = mpsc::channel::<InitEvent>();
+
+    let Some(stored) = SHERPA_HOST.get() else {
+        let _ = event_tx.send(InitEvent::Failed {
+            message: "sherpa host not initialized — cannot reload".to_owned(),
+        });
+        return event_rx;
+    };
+
+    let host = match stored {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = event_tx.send(InitEvent::Failed {
+                message: format!("sherpa host is in a failed state: {e}"),
+            });
+            return event_rx;
+        }
+    };
+
+    if let Err(e) = host.reload(new_model, event_tx.clone()) {
+        let _ = event_tx.send(InitEvent::Failed {
+            message: format!("failed to send reload command: {e}"),
+        });
+    }
+
+    event_rx
+}
+
 /// Look up the global sherpa host. Returns `None` if `init_sherpa_host` was
 /// never called.
 pub(super) fn global_sherpa_host() -> Option<&'static Result<SherpaHost, Arc<BackendError>>> {
@@ -61,6 +99,10 @@ pub(super) struct SessionParams {
 /// Commands sent to the host worker thread.
 enum HostCommand {
     StartSession(SessionParams),
+    ReloadRecognizer {
+        model: SherpaModel,
+        event_tx: mpsc::Sender<InitEvent>,
+    },
 }
 
 /// Which recognizer (and optional VAD) the host worker owns.
@@ -116,6 +158,26 @@ impl SherpaHost {
             .send(HostCommand::StartSession(params))
             .map_err(|_| BackendError::Init("sherpa host worker is no longer running".to_owned()))
     }
+
+    /// Request the host to drop its current recognizer and build a new one
+    /// for `new_model`. Returns an error if the worker thread has died.
+    pub(super) fn reload(
+        &self,
+        new_model: SherpaModel,
+        event_tx: mpsc::Sender<InitEvent>,
+    ) -> Result<(), BackendError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| BackendError::Init("sherpa host mutex poisoned".to_owned()))?;
+        state
+            .cmd_tx
+            .send(HostCommand::ReloadRecognizer {
+                model: new_model,
+                event_tx,
+            })
+            .map_err(|_| BackendError::Init("sherpa host worker is no longer running".to_owned()))
+    }
 }
 
 /// Worker thread entry point. Owns the recognizer for the entire
@@ -155,12 +217,19 @@ fn run_host_loop(
     drop(event_tx);
 
     // --- Phase 4: command loop ---
-    let mut recognizer_state = recognizer_state;
+    let mut recognizer_state = Some(recognizer_state);
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             HostCommand::StartSession(params) => {
+                let Some(state) = recognizer_state.as_mut() else {
+                    tracing::warn!("sherpa-host: StartSession rejected, no recognizer loaded");
+                    let _ = params.event_tx.send(TranscriptionEvent::Error(
+                        "no recognizer loaded — a previous model reload failed".to_owned(),
+                    ));
+                    continue;
+                };
                 tracing::info!("sherpa-host: starting session");
-                match &mut recognizer_state {
+                match state {
                     RecognizerState::Online(recognizer) => {
                         super::streaming::run_session(recognizer, params);
                     }
@@ -169,6 +238,40 @@ fn run_host_loop(
                     }
                 }
                 tracing::info!("sherpa-host: session ended");
+            }
+            HostCommand::ReloadRecognizer {
+                model: new_model,
+                event_tx,
+            } => {
+                tracing::info!(?new_model, "sherpa-host: reloading recognizer");
+                // Drop the old recognizer (and VAD if offline) BEFORE building
+                // the new one — we can't hold two at once because they share
+                // the ONNX Runtime singleton and memory budget.
+                recognizer_state = None;
+
+                let new_state = match new_model.kind() {
+                    crate::sherpa_model::ModelKind::OnlineTransducer => {
+                        init_online(new_model, &event_tx)
+                    }
+                    crate::sherpa_model::ModelKind::OfflineMoonshine => {
+                        init_offline(new_model, &event_tx)
+                    }
+                };
+
+                match new_state {
+                    Ok(state) => {
+                        tracing::info!(?new_model, "sherpa-host: reload complete");
+                        recognizer_state = Some(state);
+                        let _ = event_tx.send(InitEvent::Ready);
+                    }
+                    Err(()) => {
+                        // init_online/init_offline already emitted Failed through
+                        // event_tx AND stored the error in SHERPA_HOST (via
+                        // store_init_failure). Leave recognizer_state as None so
+                        // the next StartSession returns the error above.
+                        tracing::warn!(?new_model, "sherpa-host: reload failed");
+                    }
+                }
             }
         }
     }

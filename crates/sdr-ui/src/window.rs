@@ -1517,6 +1517,84 @@ fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
+    #[cfg(feature = "sherpa")]
+    {
+        let status_label_reload = status_label.clone();
+        let progress_bar_reload = progress_bar.clone();
+        transcript.model_row.connect_selected_notify(move |row| {
+            let idx = row.selected() as usize;
+            let Some(new_model) = sdr_transcription::SherpaModel::ALL.get(idx).copied() else {
+                return;
+            };
+
+            tracing::info!(?new_model, "user changed model — triggering runtime reload");
+
+            // Show the status area.
+            status_label_reload.set_text(&format!("Reloading {}...", new_model.label()));
+            status_label_reload.set_css_classes(&["dim-label"]);
+            status_label_reload.set_visible(true);
+            progress_bar_reload.set_fraction(0.0);
+            progress_bar_reload.set_visible(true);
+
+            let event_rx = sdr_transcription::reload_sherpa_host(new_model);
+
+            // Drain progress events on the main thread via a periodic timeout.
+            let status_weak = status_label_reload.downgrade();
+            let progress_weak = progress_bar_reload.downgrade();
+            let mut current_component: String = new_model.label().to_owned();
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                let Some(status) = status_weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let Some(progress) = progress_weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+
+                loop {
+                    match event_rx.try_recv() {
+                        Ok(sdr_transcription::InitEvent::DownloadStart { component }) => {
+                            component.clone_into(&mut current_component);
+                            status.set_text(&format!("Downloading {component}..."));
+                            progress.set_fraction(0.0);
+                        }
+                        Ok(sdr_transcription::InitEvent::DownloadProgress { pct }) => {
+                            status.set_text(&format!("Downloading {current_component}... {pct}%"));
+                            progress.set_fraction(f64::from(pct) / 100.0);
+                        }
+                        Ok(sdr_transcription::InitEvent::Extracting { component }) => {
+                            component.clone_into(&mut current_component);
+                            status.set_text(&format!("Extracting {component}..."));
+                        }
+                        Ok(sdr_transcription::InitEvent::CreatingRecognizer) => {
+                            status.set_text("Creating recognizer...");
+                            progress.set_visible(false);
+                        }
+                        Ok(sdr_transcription::InitEvent::Ready) => {
+                            tracing::info!("sherpa host reload complete");
+                            status.set_text("");
+                            status.set_visible(false);
+                            progress.set_visible(false);
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(sdr_transcription::InitEvent::Failed { message }) => {
+                            tracing::warn!(%message, "sherpa host reload failed");
+                            status.set_text(&format!("Reload failed: {message}"));
+                            status.set_css_classes(&["error"]);
+                            status.set_visible(true);
+                            progress.set_visible(false);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            return glib::ControlFlow::Break;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        });
+    }
+
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
             // Read selected model from dropdown.

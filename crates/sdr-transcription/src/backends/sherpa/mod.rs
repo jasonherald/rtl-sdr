@@ -28,7 +28,7 @@ mod offline;
 mod silero_vad;
 mod streaming;
 
-pub use host::init_sherpa_host;
+pub use host::{init_sherpa_host, reload_sherpa_host};
 pub use silero_vad::SherpaSileroVad;
 
 use std::sync::atomic::{AtomicBool, Ordering};
