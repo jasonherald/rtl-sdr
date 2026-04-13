@@ -36,6 +36,9 @@ pub mod util;
 pub mod model;
 
 #[cfg(feature = "sherpa")]
+pub mod init_event;
+
+#[cfg(feature = "sherpa")]
 pub mod sherpa_model;
 
 pub use backend::{
@@ -48,6 +51,9 @@ pub use model::WhisperModel;
 
 #[cfg(feature = "sherpa")]
 pub use backends::sherpa::init_sherpa_host;
+
+#[cfg(feature = "sherpa")]
+pub use init_event::InitEvent;
 
 #[cfg(feature = "sherpa")]
 pub use sherpa_model::SherpaModel;

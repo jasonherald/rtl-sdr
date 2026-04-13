@@ -1824,6 +1824,8 @@ dependencies = [
  "sdr-source-file",
  "sdr-source-network",
  "sdr-source-rtlsdr",
+ "sdr-splash",
+ "sdr-splash-gtk",
  "sdr-transcription",
  "sdr-types",
  "sdr-ui",
@@ -1989,15 +1991,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-splash"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
+name = "sdr-splash-gtk"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "libadwaita",
+ "tracing",
+]
+
+[[package]]
 name = "sdr-transcription"
 version = "0.1.0"
 dependencies = [
+ "bzip2",
  "dirs-next",
  "libc",
  "reqwest",
  "rustfft",
  "sdr-types",
  "sherpa-onnx",
+ "tar",
  "thiserror 2.0.18",
  "tracing",
  "whisper-rs",

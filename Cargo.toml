@@ -22,6 +22,7 @@ sdr-source-network.workspace = true
 sdr-source-file.workspace = true
 sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
+sdr-splash.workspace = true
 sdr-transcription.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
@@ -81,6 +82,7 @@ sherpa-cpu = ["sherpa", "gtk-frontend", "sdr-transcription/sherpa-cpu", "sdr-ui?
 # so the features above can use the `dep:` / `?/` syntax cleanly.
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-ui = { workspace = true, features = ["pipewire"], optional = true }
+sdr-splash-gtk.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
 
@@ -106,6 +108,8 @@ members = [
     "crates/sdr-transcription",
     "crates/sdr-core",
     "crates/sdr-ffi",
+    "crates/sdr-splash",
+    "crates/sdr-splash-gtk",
     "crates/sdr-ui",
 ]
 
@@ -131,6 +135,8 @@ sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
 sdr-ffi = { path = "crates/sdr-ffi" }
+sdr-splash = { path = "crates/sdr-splash" }
+sdr-splash-gtk = { path = "crates/sdr-splash-gtk" }
 sdr-ui = { path = "crates/sdr-ui" }
 
 # HTTP / XML (RadioReference)
