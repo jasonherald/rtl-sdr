@@ -45,7 +45,11 @@ make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
 ```
 
-**`sherpa-cuda` requires CUDA 12.x + cuDNN 9.x installed system-wide** (onnxruntime dlopens `libcudnn.so.9` / `libcublas.so.12` at startup). Linux x86_64 only. The first build downloads a ~235 MB CUDA prebuilt archive from k2-fsa releases. During the PR window the sherpa-onnx dep is pinned to the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork on branch `feat/rust-sys-cuda-support`; swap back to a crates.io version pin once the upstream PR merges and releases.
+**`sherpa-cuda` needs CUDA 12.x + cuDNN 9.x runtime libraries** because sherpa-onnx's CUDA prebuilt is pinned to onnxruntime 1.23.2 built against that toolchain. CUDA majors are not ABI-compatible, and Arch ships CUDA 13 today, so we **sideload the exact set of CUDA 12 runtime libs** NVIDIA publishes as a developer redistributable rather than requiring a parallel system install.
+
+`make install CARGO_FLAGS="... --features sherpa-cuda"` automatically runs `scripts/fetch-cuda-redist.sh`, which downloads ~1.83 GB of NVIDIA tarballs (cudart, cublas, cufft, curand, cudnn) into `$HOME/.cache/sdr-rs/cuda-redist/`, verifies SHA-256, extracts the runtime `.so` files while preserving the symlink chain, and installs them into `$(BINDIR)/sdr-rs-libs/` alongside the binary. The binary's `DT_RPATH` — forced to old-style via `-Wl,--disable-new-dtags` in `build.rs` so it cascades to libraries loaded via `dlopen` — resolves them at runtime.
+
+The only system-level requirement is a working NVIDIA kernel driver (`libcuda.so.1`, packaged with `nvidia`/`nvidia-utils` on Arch); everything in userspace is self-contained. Linux x86_64 only. The first build also downloads a ~235 MB sherpa-onnx CUDA prebuilt from k2-fsa. During the PR window the sherpa-onnx dep is pinned to the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork on branch `feat/rust-sys-cuda-support`; swap back to a crates.io version pin once the upstream PR merges and releases.
 
 **Triple-build testing rule:** any change to `sdr-transcription` or its callers MUST be tested with `whisper-cuda`, `sherpa-cpu`, AND `sherpa-cuda` builds sequentially before pushing. The cfg gates make it easy to break one without noticing. CI runs `cargo check` on sherpa-cpu and sherpa-cuda (adding CUDA toolkit to CI runners is not worth the minutes, so whisper-cuda is user-verified locally).
 

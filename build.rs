@@ -15,8 +15,14 @@
 // The fix is to have the BINARY crate (this one) inject the rpath at
 // its own link step. `$ORIGIN` is resolved by the loader to the
 // directory of the running executable, so as long as the `.so` files
-// are copied alongside the installed binary (see the `install` target
-// in Makefile for the sherpa-cuda branch), everything Just Works.
+// live either next to the binary (the cargo target/release layout
+// that `cargo run` uses) or in an adjacent `sdr-rs-libs/` subdirectory
+// (the `make install` layout that keeps `~/.cargo/bin/` uncluttered),
+// everything Just Works.
+//
+// Multi-entry rpath with `:` separator is standard ELF semantics. The
+// loader walks entries left to right; the first one catches cargo run
+// builds, the second one catches installed builds.
 //
 // This is feature-gated so static-linked builds (`sherpa-cpu`,
 // `whisper-*`) get no extra link args — they don't need an rpath
@@ -27,8 +33,33 @@ fn main() {
 
     #[cfg(all(feature = "sherpa-cuda", target_os = "linux"))]
     {
-        // `\$ORIGIN` must reach ld as a literal dollar sign; cargo
-        // passes the value straight through, so we escape nothing here.
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        // `$ORIGIN` must reach `ld` as a literal dollar sign; cargo
+        // passes `rustc-link-arg` values straight through without
+        // shell expansion, so we escape nothing here.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN:$ORIGIN/sdr-rs-libs");
+
+        // Use the old-style DT_RPATH tag instead of the modern
+        // DT_RUNPATH. This matters because onnxruntime calls
+        // `dlopen("libonnxruntime_providers_cuda.so")` at recognizer
+        // creation time, and the provider .so's own NEEDED entries
+        // (libcublasLt.so.12, libcudnn.so.9, etc.) then have to be
+        // resolved by the dynamic loader.
+        //
+        // DT_RUNPATH (the default modern tag) is ONLY consulted when
+        // resolving the direct NEEDED deps of the ELF object that
+        // declares it; it does not cascade to libraries opened via
+        // dlopen or to their transitive NEEDED entries. DT_RPATH on
+        // the executable, by contrast, IS consulted for every library
+        // load regardless of how it was triggered, which is exactly
+        // the behavior we want: sdr-rs-libs/ contains both the
+        // directly-linked sherpa+onnxruntime libs and the CUDA
+        // runtime libs that onnxruntime's dlopen'd providers need,
+        // and we want a single rpath entry to cover both.
+        //
+        // `--disable-new-dtags` is widely supported on GNU ld and
+        // lld. DT_RPATH is deprecated for new ELF but still honored
+        // by every glibc-based loader, so the ergonomic cost of
+        // using it here is basically nil.
+        println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     }
 }

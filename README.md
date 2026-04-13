@@ -145,10 +145,11 @@ With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base
 
 **Sherpa CUDA notes:**
 
-- `sherpa-cuda` is currently linux-x86_64 only. The first build downloads a ~235 MB CUDA prebuilt archive from the k2-fsa releases page.
-- Requires CUDA 12.x and cuDNN 9.x system libraries at runtime — onnxruntime dlopens `libcudnn.so.9`, `libcublas.so.12`, and related libraries at process startup.
-- On Arch Linux: `sudo pacman -S cuda cudnn`
-- On Ubuntu/Debian: install the NVIDIA CUDA 12 toolkit and cuDNN 9 packages from NVIDIA's repo. The Ubuntu-packaged `libcudnn9-cuda-12` is also fine.
+- `sherpa-cuda` is currently linux-x86_64 only. It builds against the k2-fsa sherpa-onnx prebuilt, which is hard-pinned to an internal onnxruntime 1.23.2 build compiled against CUDA 12.x + cuDNN 9.x. CUDA major versions are not ABI-compatible, so hosts running CUDA 13 (e.g. current Arch Linux) cannot use their system libraries.
+- **You do NOT need to install CUDA 12 or cuDNN 9 on your system.** `make install` with the `sherpa-cuda` feature automatically downloads the minimum set of NVIDIA CUDA 12 runtime libraries (cudart, cublas, cufft, curand, cudnn) from NVIDIA's developer redist server and packages them alongside the binary. Your system CUDA install — if any — is untouched.
+- **First-build cost:** ~1.83 GB download, ~1.2 GB extracted. Downloads are cached in `$HOME/.cache/sdr-rs/cuda-redist/` (survives `cargo clean`); re-installs are instant. Plus the one-time ~235 MB sherpa-onnx CUDA prebuilt from k2-fsa under `target/sherpa-onnx-prebuilt/`.
+- **Install layout:** the binary lives at `~/.cargo/bin/sdr-rs`; the runtime libraries live in an adjacent `~/.cargo/bin/sdr-rs-libs/` subdirectory so they don't clutter `$BINDIR`. The binary's ELF `DT_RPATH` resolves them automatically. Nothing is installed system-wide.
+- You still need a working NVIDIA driver installed (`nvidia` / `nvidia-utils` on Arch) — the userspace driver library `libcuda.so.1` comes from the kernel driver package and cannot be redistributed, and it must match your installed GPU hardware.
 - During the PR stabilization window the sherpa-onnx crate is pulled from the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork (branch `feat/rust-sys-cuda-support`), which adds a `cuda` cargo feature to the upstream sys crate. An upstream PR to k2-fsa is planned; once it merges and a release ships, the fork dependency will be swapped back to a crates.io version pin.
 
 ### Run tests
