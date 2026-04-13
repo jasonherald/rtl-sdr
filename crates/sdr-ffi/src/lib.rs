@@ -44,6 +44,7 @@
 pub mod command;
 pub mod error;
 pub mod event;
+pub mod fft;
 pub mod handle;
 pub mod lifecycle;
 
@@ -63,6 +64,7 @@ pub use event::{
     SdrEvent, SdrEventCallback, SdrEventDeviceInfo, SdrEventError, SdrEventGainList,
     SdrEventPayload, sdr_core_set_event_callback,
 };
+pub use fft::{SdrFftCallback, SdrFftFrame, sdr_core_pull_fft};
 pub use handle::SdrCore;
 pub use lifecycle::{
     sdr_core_abi_version, sdr_core_create, sdr_core_destroy, sdr_core_init_logging,

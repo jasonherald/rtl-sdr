@@ -422,6 +422,88 @@ int32_t sdr_core_set_event_callback(
     void*            user_data
 );
 
+/* ================================================================ */
+/*  FFT frame pull                                                  */
+/* ================================================================ */
+
+/*
+ * Unlike the per-event callback surface above, FFT frames are
+ * delivered on the host's render tick via a **pull** function:
+ * the host calls `sdr_core_pull_fft` from inside its render loop
+ * (SwiftUI `MTKView::draw(in:)` on the Metal path; GTK's
+ * `glib::timeout_add_local` on the Linux path) and the call
+ * synchronously hands the most recent FFT frame to a host
+ * callback — or returns `false` without calling anything when no
+ * new frame has arrived since the previous pull.
+ *
+ * Rationale: rendering happens at display rate (usually 60 fps)
+ * and FFT generation happens at the engine's internal rate
+ * (default 20 fps). Pushing every frame through the event
+ * callback would force a full struct-translation + mutex-hold +
+ * allocation for data that might be discarded before the
+ * renderer gets to it. Pulling means zero work on any tick
+ * where no new frame is ready, and zero cross-thread traffic on
+ * the hot path.
+ */
+
+/*
+ * FFT frame descriptor. `magnitudes_db` points into the engine's
+ * shared FFT buffer and is valid only for the duration of the
+ * callback. `len` is the current FFT bin count.
+ *
+ * `sample_rate_hz` is the effective (post-decimation) sample
+ * rate and `center_freq_hz` is the tuner center frequency as
+ * observed when the frame was published. In v1 both are set to
+ * 0.0 because the engine does not yet thread this context
+ * alongside the FFT frame; hosts should correlate with the
+ * `SDR_EVT_SAMPLE_RATE_CHANGED` event until the thread-through
+ * lands. The fields are exposed in the struct so adding the
+ * data later does not require an ABI change.
+ */
+typedef struct SdrFftFrame {
+    const float* magnitudes_db;
+    size_t       len;
+    double       sample_rate_hz;
+    double       center_freq_hz;
+} SdrFftFrame;
+
+/*
+ * Callback signature. Fires synchronously from within
+ * `sdr_core_pull_fft` when a new frame is available. The
+ * `frame` pointer (and the `magnitudes_db` slice inside it) are
+ * valid only for the duration of this call — copy the data out
+ * if you need it later.
+ */
+typedef void (*SdrFftCallback)(const SdrFftFrame* frame, void* user_data);
+
+/*
+ * Pull the latest FFT frame, if a new one is available.
+ *
+ * Returns `true` and invokes `callback` synchronously when a new
+ * frame has been published since the previous pull. Returns
+ * `false` without calling `callback` when no new frame is
+ * ready — hosts render the previous frame again (or skip
+ * rendering) in that case.
+ *
+ * Lock-free fast path when no new frame is available; acquires
+ * the shared FFT buffer's mutex only for the short `memcpy`
+ * window when a frame is being handed to the host.
+ *
+ * Safe from any thread, but in practice hosts call this from
+ * their render loop (which is on the main / display-linked
+ * thread). The FFI imposes no threading constraint on the
+ * call site itself.
+ *
+ * Passing a null `callback` is allowed and means "probe
+ * only" — returns whether a frame is available without handing
+ * it to anyone.
+ */
+bool sdr_core_pull_fft(
+    SdrCore*        handle,
+    SdrFftCallback  callback,
+    void*           user_data
+);
+
 #ifdef __cplusplus
 }
 #endif
