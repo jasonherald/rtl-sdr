@@ -351,7 +351,9 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
 
         let row = adw::SwitchRow::builder()
             .title("Auto Break")
-            .subtitle("Use the radio's squelch as the transcription boundary instead of VAD. NFM only.")
+            .subtitle(
+                "Use the radio's squelch as the transcription boundary instead of VAD. NFM only.",
+            )
             .active(saved)
             .build();
         group.add(&row);

@@ -470,12 +470,7 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
                     );
                     let stereo_buf = machine.take_buffer();
                     machine.reset_after_force_flush();
-                    flush_auto_break_segment(
-                        recognizer,
-                        &stereo_buf,
-                        noise_gate_ratio,
-                        &event_tx,
-                    );
+                    flush_auto_break_segment(recognizer, &stereo_buf, noise_gate_ratio, &event_tx);
                     pending_flush_deadline = None;
                 }
             }

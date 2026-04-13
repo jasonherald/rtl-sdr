@@ -70,8 +70,8 @@ pub mod sherpa_model;
 
 pub use backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, SegmentationMode,
-    TranscriptionBackend, TranscriptionEvent, TranscriptionInput,
-    VAD_THRESHOLD_DEFAULT, VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
+    TranscriptionBackend, TranscriptionEvent, TranscriptionInput, VAD_THRESHOLD_DEFAULT,
+    VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
 };
 
 #[cfg(feature = "whisper")]

@@ -1056,8 +1056,8 @@ fn process_iq_block(
                                     interleaved.push(s.l);
                                     interleaved.push(s.r);
                                 }
-                                if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
-                                    tx.try_send(sdr_transcription::TranscriptionInput::Samples(
+                                if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = tx
+                                    .try_send(sdr_transcription::TranscriptionInput::Samples(
                                         interleaved,
                                     ))
                                 {

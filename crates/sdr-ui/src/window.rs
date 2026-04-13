@@ -1595,8 +1595,7 @@ fn connect_transcript_panel(
     >,
     #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))]
     squelch_enabled_row: &adw::SwitchRow,
-    #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))]
-    toast_overlay: &adw::ToastOverlay,
+    #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] toast_overlay: &adw::ToastOverlay,
 ) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
     use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
 
