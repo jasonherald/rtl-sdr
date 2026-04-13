@@ -1664,6 +1664,15 @@ fn connect_transcript_panel(
                                         let mark = buf.create_mark(None, &buf.end_iter(), false);
                                         tv.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
                                         buf.delete_mark(&mark);
+
+                                        // An utterance committed — the live
+                                        // line is now stale. Clear and hide
+                                        // it so the next Partial starts fresh.
+                                        #[cfg(feature = "sherpa")]
+                                        if let Some(label) = live_line_weak.upgrade() {
+                                            label.set_text("");
+                                            label.set_visible(false);
+                                        }
                                     }
                                     TranscriptionEvent::Error(msg) => {
                                         // Fatal — backend has exited.
