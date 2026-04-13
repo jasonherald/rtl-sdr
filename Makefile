@@ -10,7 +10,7 @@ CARGO_FLAGS ?= --release
 
 .PHONY: all build install install-bin install-icon install-desktop \
         uninstall test clippy fmt fmt-check lint deny audit scan clean help \
-        ffi-header-check ffi-header-regen
+        ffi-header-check ffi-header-regen swift-test
 
 # ─────────────────────────────────────────────────────────────────────
 # Default
@@ -167,6 +167,37 @@ ffi-header-regen:
 		--output $(FFI_GENERATED)
 	@echo "Regenerated → $(FFI_GENERATED)"
 	@echo "(Copy signatures by hand into $(FFI_HEADER); do not commit $(FFI_GENERATED).)"
+
+# ─────────────────────────────────────────────────────────────────────
+# SwiftPM (SdrCoreKit) tests
+# ─────────────────────────────────────────────────────────────────────
+#
+# `swift test` in `apps/macos/Packages/SdrCoreKit` needs
+# `target/debug/libsdr_ffi.a` to exist before it can link. `make
+# swift-test` does both in the right order: build the Rust static
+# lib first, then invoke `swift test` with cwd set to the
+# SdrCoreKit package directory.
+#
+# Only meaningful on macOS — Linux users don't have the
+# Xcode/SwiftPM toolchain and the target would skip with a
+# friendly message there.
+
+SWIFT ?= swift
+SDR_CORE_KIT := apps/macos/Packages/SdrCoreKit
+
+swift-test:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "swift-test: skipping (not macOS)"; \
+		exit 0; \
+	fi
+	@if ! command -v $(SWIFT) >/dev/null 2>&1; then \
+		echo "swift-test: $(SWIFT) not found — install Xcode or Swift toolchain"; \
+		exit 1; \
+	fi
+	@echo "==> cargo build --package sdr-ffi (debug)"
+	@$(CARGO) build --package sdr-ffi
+	@echo "==> cd $(SDR_CORE_KIT) && swift test"
+	@cd $(SDR_CORE_KIT) && $(SWIFT) test
 
 # ─────────────────────────────────────────────────────────────────────
 # SonarQube

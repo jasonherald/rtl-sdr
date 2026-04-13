@@ -127,6 +127,11 @@ typedef enum SdrLogLevel {
  * output. On macOS (eventual v2) this will route to `os_log`; for
  * v1 it routes to stderr via `tracing_subscriber::fmt`.
  *
+ * `min_level` is one of the `SDR_LOG_*` constants. It's passed
+ * as an `int32_t` rather than the typed `SdrLogLevel` so Swift
+ * callers can pass `Int32` directly without a cast through the
+ * Clang-imported enum wrapper.
+ *
  * Calling this more than once is a no-op after the first
  * successful init (the tracing subscriber is a process-global).
  *
@@ -134,7 +139,7 @@ typedef enum SdrLogLevel {
  * reason the function logs a diagnostic to stderr and returns,
  * leaving any previously-installed subscriber intact.
  */
-void sdr_core_init_logging(SdrLogLevel min_level);
+void sdr_core_init_logging(int32_t min_level);
 
 /*
  * Create a new engine instance.

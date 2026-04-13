@@ -1,0 +1,12 @@
+// C module shim for the sdr-ffi C ABI. Imports the hand-written
+// include/sdr_core.h as a Clang module so Swift code in
+// SdrCoreKit can `import sdr_core_c` and see the full surface.
+//
+// The header file is a symlink to the repo-root `include/sdr_core.h`
+// (see ../include/sdr_core.h). Editing the real header at the repo
+// root automatically flows through here — the symlink keeps the
+// two in lockstep without a copy-and-drift hazard.
+module sdr_core_c [system] {
+    header "include/sdr_core.h"
+    export *
+}
