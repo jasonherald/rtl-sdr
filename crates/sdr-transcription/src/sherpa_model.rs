@@ -72,6 +72,37 @@ impl SherpaModel {
         }
     }
 
+    /// Filename of the upstream `.tar.bz2` archive on the k2-fsa GitHub
+    /// releases page. Used by `download_sherpa_model` to construct the
+    /// download URL and to name the local `.part` file during fetch.
+    pub fn archive_filename(self) -> &'static str {
+        match self {
+            Self::StreamingZipformerEn => {
+                "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2"
+            }
+        }
+    }
+
+    /// Name of the top-level directory inside the extracted archive.
+    /// Sherpa archives unpack to a directory named like
+    /// `sherpa-onnx-streaming-zipformer-en-2023-06-26/`. After extraction
+    /// we rename it to `dir_name()` so the path layout matches what
+    /// `model_directory()` expects.
+    pub fn archive_inner_directory(self) -> &'static str {
+        match self {
+            Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+        }
+    }
+
+    /// Full HTTPS URL to the upstream `.tar.bz2` archive on the k2-fsa
+    /// GitHub releases page.
+    pub fn archive_url(self) -> String {
+        format!(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{}",
+            self.archive_filename()
+        )
+    }
+
     /// All available variants in order — used to populate the UI dropdown.
     pub const ALL: &[Self] = &[Self::StreamingZipformerEn];
 }
@@ -134,5 +165,24 @@ mod tests {
         assert_ne!(d, j);
         assert_ne!(d, t);
         assert_ne!(j, t);
+    }
+
+    #[test]
+    fn streaming_zipformer_archive_url_is_well_formed() {
+        let url = SherpaModel::StreamingZipformerEn.archive_url();
+        assert!(url.starts_with("https://github.com/k2-fsa/sherpa-onnx/"));
+        assert!(url.ends_with(".tar.bz2"));
+        assert!(url.contains("streaming-zipformer-en"));
+    }
+
+    #[test]
+    fn streaming_zipformer_archive_inner_dir_matches_filename_stem() {
+        let model = SherpaModel::StreamingZipformerEn;
+        let archive = model.archive_filename();
+        let inner = model.archive_inner_directory();
+        // Inner directory name should equal the archive filename minus
+        // the .tar.bz2 suffix — sanity check that we'll find the right
+        // directory after extraction.
+        assert_eq!(format!("{inner}.tar.bz2"), archive);
     }
 }
