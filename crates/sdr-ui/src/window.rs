@@ -1521,6 +1521,7 @@ fn connect_transcript_panel(
     {
         let status_label_reload = status_label.clone();
         let progress_bar_reload = progress_bar.clone();
+        let enable_row_reload = transcript.enable_row.clone();
         transcript.model_row.connect_selected_notify(move |row| {
             let idx = row.selected() as usize;
             let Some(new_model) = sdr_transcription::SherpaModel::ALL.get(idx).copied() else {
@@ -1529,14 +1530,20 @@ fn connect_transcript_panel(
 
             tracing::info!(?new_model, "user changed model — triggering runtime reload");
 
-            // Disable the model row while the reload is in flight so the
-            // user can't queue up multiple reloads by rapid switching —
-            // each change would otherwise enqueue another ReloadRecognizer
-            // command and render stale progress for the intermediate picks.
-            // Re-enabled from the timeout closure on Ready / Failed /
-            // channel disconnect.
+            // Disable BOTH rows while the reload is in flight:
+            // - model_row so the user can't queue up multiple reloads
+            //   via rapid switching
+            // - enable_row so the user can't start/stop transcription
+            //   on top of an in-flight recognizer swap. Without this,
+            //   the stop-path teardown would re-enable model_row before
+            //   the reload finishes, reopening the queued-reload window
+            //   this block is closing.
+            // Both are re-enabled from the timeout closure on Ready /
+            // Failed / channel disconnect.
             row.set_sensitive(false);
+            enable_row_reload.set_sensitive(false);
             let model_row_reload_weak = row.downgrade();
+            let enable_row_reload_weak = enable_row_reload.downgrade();
 
             // Show the status area.
             status_label_reload.set_text(&format!("Reloading {}...", new_model.label()));
@@ -1588,6 +1595,9 @@ fn connect_transcript_panel(
                             if let Some(model_row) = model_row_reload_weak.upgrade() {
                                 model_row.set_sensitive(true);
                             }
+                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                                enable_row.set_sensitive(true);
+                            }
                             return glib::ControlFlow::Break;
                         }
                         Ok(sdr_transcription::InitEvent::Failed { message }) => {
@@ -1599,6 +1609,9 @@ fn connect_transcript_panel(
                             if let Some(model_row) = model_row_reload_weak.upgrade() {
                                 model_row.set_sensitive(true);
                             }
+                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                                enable_row.set_sensitive(true);
+                            }
                             return glib::ControlFlow::Break;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1607,6 +1620,9 @@ fn connect_transcript_panel(
                             // or Failed — unusual but don't strand the UI.
                             if let Some(model_row) = model_row_reload_weak.upgrade() {
                                 model_row.set_sensitive(true);
+                            }
+                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                                enable_row.set_sensitive(true);
                             }
                             return glib::ControlFlow::Break;
                         }
