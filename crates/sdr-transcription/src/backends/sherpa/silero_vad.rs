@@ -24,9 +24,11 @@ use super::host::SHERPA_SAMPLE_RATE_HZ;
 /// upstream `moonshine_v2.rs` example and are appropriate for radio
 /// audio (short bursts, occasional long silences).
 ///
-/// Exposed as `pub(super)` so `host.rs::init_offline` can use it as
-/// the initial threshold before any user-configured session runs.
-pub(super) const SILERO_THRESHOLD: f32 = 0.5;
+/// Aliased to the canonical `backend::VAD_THRESHOLD_DEFAULT` — the
+/// two represent the same value, this alias exists so `host.rs::init_offline`
+/// has a `pub(super)` name to reach for without dragging the public
+/// backend module into scope.
+pub(super) const SILERO_THRESHOLD: f32 = crate::backend::VAD_THRESHOLD_DEFAULT;
 const SILERO_MIN_SILENCE_DURATION: f32 = 0.25;
 const SILERO_MIN_SPEECH_DURATION: f32 = 0.25;
 const SILERO_MAX_SPEECH_DURATION: f32 = 20.0;

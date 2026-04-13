@@ -26,6 +26,13 @@ pub(super) const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// Sample rate sherpa-onnx expects from `accept_waveform`.
 pub(super) const SHERPA_SAMPLE_RATE_HZ: i32 = 16_000;
 
+/// Absolute-difference tolerance for VAD threshold rebuild comparison.
+/// If the requested threshold differs from the currently-held VAD's
+/// threshold by more than this, the worker rebuilds Silero at session
+/// start. Keeps the rebuild policy in sync with the UI's slider step
+/// (0.05) — anything smaller than a slider step is just float drift.
+const VAD_THRESHOLD_REBUILD_EPSILON: f32 = 0.01;
+
 /// Process-wide singleton for the sherpa-onnx host. Stores either a ready
 /// host or the error message from a failed initialization. Set exactly once
 /// by the first successful worker thread.
@@ -303,7 +310,9 @@ fn run_host_loop(
                         let requested = params.vad_threshold;
                         // Treat differences smaller than the slider step as
                         // "same" to avoid pointless rebuilds from float drift.
-                        if (vad.current_threshold() - requested).abs() > 0.01 {
+                        if (vad.current_threshold() - requested).abs()
+                            > VAD_THRESHOLD_REBUILD_EPSILON
+                        {
                             tracing::info!(
                                 old = vad.current_threshold(),
                                 new = requested,

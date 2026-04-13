@@ -100,6 +100,18 @@ pub(super) fn build_nemo_transducer_recognizer_config(
     model: SherpaModel,
     provider: &str,
 ) -> OfflineRecognizerConfig {
+    // `ModelFilePaths::Transducer` also matches `StreamingZipformerEn`
+    // (same 4-file layout), so the destructuring alone wouldn't catch
+    // a caller that passed the online Zipformer variant by mistake.
+    // Guard on kind at the boundary so misuse fails loudly here
+    // rather than silently building a NeMo config around Zipformer
+    // files at runtime.
+    debug_assert_eq!(
+        model.kind(),
+        crate::sherpa_model::ModelKind::OfflineNemoTransducer,
+        "build_nemo_transducer_recognizer_config called with non-OfflineNemoTransducer model"
+    );
+
     let ModelFilePaths::Transducer {
         encoder,
         decoder,

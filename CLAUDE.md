@@ -4,7 +4,7 @@ Rust port of SDR++ — software-defined radio application with GTK4 UI.
 
 ## Architecture
 
-17-crate workspace with clear dependency boundaries:
+18-member workspace (root binary + 17 library crates) with clear dependency boundaries:
 
 ```text
 sdr-types           → Foundation types, errors, constants (no internal deps)

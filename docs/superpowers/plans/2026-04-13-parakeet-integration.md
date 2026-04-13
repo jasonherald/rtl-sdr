@@ -12,13 +12,39 @@
 
 ## File Structure
 
-**Modified files only — no new files:**
+### As originally planned (Tasks 1-4 + sherpa-cuda follow-up issue)
+
+Modified files only — no new files. PR 5 built every piece of infrastructure Parakeet needs:
 
 - `crates/sdr-transcription/src/sherpa_model.rs` — add `OfflineNemoTransducer` to `ModelKind`, add `ParakeetTdt06bV3En` to `SherpaModel`, extend all match arms (`label`, `dir_name`, `archive_filename`, `archive_inner_directory`, `kind`, `supports_partials`), extend `model_file_paths`, extend `ALL`, update existing `all_contains_three_variants` test → four, add new Parakeet unit tests
 - `crates/sdr-transcription/src/backends/sherpa/offline.rs` — add `build_nemo_transducer_recognizer_config` function alongside the existing `build_moonshine_recognizer_config`
 - `crates/sdr-transcription/src/backends/sherpa/host.rs` — extend three `match model.kind()` locations (initial dispatch in `run_host_loop`, `ReloadRecognizer` arm, recognizer config selection inside `init_offline`); update `init_offline` doc comment to be generic across offline kinds; update `ModelKind` doc comments to mention the new variant
 
-That's it. No new files, no new modules. PR 5 already built every piece of infrastructure Parakeet needs.
+### Added mid-PR during manual smoke test (scope creep but necessary)
+
+Manual smoke testing surfaced bugs and one scope-creep-but-necessary feature. These files were also modified before the PR landed:
+
+- `crates/sdr-transcription/src/backend.rs` — add `vad_threshold: f32` field to `BackendConfig` + `VAD_THRESHOLD_MIN/MAX/DEFAULT` pub constants
+- `crates/sdr-transcription/src/backends/sherpa/silero_vad.rs` — `SherpaSileroVad` tracks `current_threshold`, `new()` takes a threshold parameter, `current_threshold()` getter, `SILERO_THRESHOLD` aliased to the canonical `backend::VAD_THRESHOLD_DEFAULT`
+- `crates/sdr-transcription/src/backends/sherpa/mod.rs` — threads `config.vad_threshold` through `SessionParams`
+- `crates/sdr-transcription/src/backends/sherpa/streaming.rs` — destructures the new `SessionParams.vad_threshold` field (ignored, streaming path uses `OnlineRecognizer`'s own endpoint detection)
+- `crates/sdr-transcription/src/backends/mock.rs` + `src/lib.rs` tests + `tests/sherpa_uninitialized.rs` — test fixtures updated for the new `BackendConfig` field
+- `crates/sdr-ui/src/sidebar/transcript_panel.rs` — `vad_threshold_row` SpinRow (sherpa, offline models only), visibility toggle, persistence via new `KEY_SHERPA_VAD_THRESHOLD` config key, a third GLib-chained handler on `model_row` that clears the live caption line on every selection change (addresses the "stale italics on Zipformer → Parakeet swap" bug)
+- `crates/sdr-ui/src/window.rs` — `connect_transcript_panel` now takes `&Arc<ConfigManager>` so the sherpa reload handler can defer `KEY_SHERPA_MODEL` persistence until `InitEvent::Ready` fires (prevents failed reloads from wedging next startup); extended `unlock_transcription_session_rows` helper with the new `vad_threshold_row`; distinguishes user-stop from spontaneous backend death in the session timeout's Disconnect arm (via `enable_row.is_active()`); defensive `model.supports_partials()` check in the `TranscriptionEvent::Partial` handler
+- `src/main.rs` — reads the persisted sherpa model from config before calling `init_sherpa_host` instead of hardcoding `StreamingZipformerEn` (was a latent bug from PR 5 — UI showed saved selection but host was always Zipformer)
+- `Cargo.toml` — adds `serde_json` as a workspace dependency on the root binary so `main.rs` can access `ConfigManager::load` with a defaults value
+
+### New artifact files also committed
+
+- `docs/superpowers/specs/2026-04-13-parakeet-integration-design.md` — design spec (this plan's companion)
+- `docs/superpowers/plans/2026-04-13-parakeet-integration.md` — this file
+
+### Follow-up issues filed during the PR
+
+- **#262** — Add sherpa-onnx CUDA provider support for large offline models
+- **#263** — Auto-tune Silero VAD threshold per demod type
+- **#264** — Bookmark doesn't persist auto-squelch state (unrelated pre-existing bug found during testing)
+- **#265** — Squelch-gate the transcription audio feed (skip noise floor + flush VAD on close)
 
 ---
 

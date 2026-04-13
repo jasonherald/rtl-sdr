@@ -64,7 +64,7 @@ Two mutually exclusive backends, selected at build time (see the install section
 
 ### Under the Hood
 
-- 17-crate workspace with clear dependency boundaries
+- 18-member workspace (root binary + 17 library crates) with clear dependency boundaries
 - Pure DSP functions (no threading, no I/O, no side effects)
 - Zero per-frame heap allocations on hot paths
 - Lock-based SPSC audio ring buffer between DSP and audio threads
@@ -179,7 +179,7 @@ sdr-rs
 
 ## Architecture
 
-17-crate workspace with clear dependency boundaries:
+18-member workspace (root binary + 17 library crates) with clear dependency boundaries:
 
 ```text
 sdr (binary)              Entry point

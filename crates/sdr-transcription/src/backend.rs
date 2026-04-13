@@ -11,6 +11,18 @@ use std::sync::mpsc;
 #[cfg(feature = "whisper")]
 use crate::model::WhisperModel;
 
+/// Minimum allowed value for [`BackendConfig::vad_threshold`].
+pub const VAD_THRESHOLD_MIN: f32 = 0.10;
+
+/// Maximum allowed value for [`BackendConfig::vad_threshold`].
+pub const VAD_THRESHOLD_MAX: f32 = 0.90;
+
+/// Default value for [`BackendConfig::vad_threshold`]. Matches
+/// sherpa-onnx's upstream Silero VAD default and works well on clean
+/// broadcast audio (WFM talk radio). Drop to ~0.25-0.30 for noisy
+/// scanner/NFM sources.
+pub const VAD_THRESHOLD_DEFAULT: f32 = 0.50;
+
 /// Configuration handed to a backend at `start` time.
 ///
 /// `model` selects which ASR model the backend should load. Additional
@@ -21,9 +33,10 @@ pub struct BackendConfig {
     pub silence_threshold: f32,
     pub noise_gate_ratio: f32,
     /// Silero VAD speech detection threshold (offline models only).
-    /// Range 0.10..=0.90. Default 0.50.
-    /// Lower catches quieter audio (NFM/scanner); higher is stricter
-    /// (talk radio). Ignored by Whisper (no Silero VAD).
+    /// Clamp to `VAD_THRESHOLD_MIN..=VAD_THRESHOLD_MAX`.
+    /// Default `VAD_THRESHOLD_DEFAULT`. Lower catches quieter audio
+    /// (NFM/scanner); higher is stricter (talk radio). Ignored by
+    /// Whisper (no Silero VAD).
     pub vad_threshold: f32,
 }
 

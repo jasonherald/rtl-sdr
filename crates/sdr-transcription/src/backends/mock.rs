@@ -99,7 +99,7 @@ mod tests {
             model,
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
-            vad_threshold: 0.5,
+            vad_threshold: crate::VAD_THRESHOLD_DEFAULT,
         }
     }
 

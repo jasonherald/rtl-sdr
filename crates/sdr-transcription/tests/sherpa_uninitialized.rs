@@ -23,7 +23,7 @@ fn sherpa_backend_start_returns_init_error_when_host_not_initialized() {
         model: ModelChoice::Sherpa(SherpaModel::StreamingZipformerEn),
         silence_threshold: 0.007,
         noise_gate_ratio: 3.0,
-        vad_threshold: 0.5,
+        vad_threshold: sdr_transcription::VAD_THRESHOLD_DEFAULT,
     };
     let result = backend.start(config);
     match result {

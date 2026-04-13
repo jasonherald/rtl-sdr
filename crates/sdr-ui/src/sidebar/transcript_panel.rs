@@ -18,7 +18,13 @@ const KEY_SILENCE_THRESHOLD: &str = "transcription_silence_threshold";
 const KEY_NOISE_GATE: &str = "transcription_noise_gate";
 #[cfg(feature = "sherpa")]
 /// Config key for the persisted Sherpa model index.
-const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
+///
+/// `pub(crate)` so `window.rs` can write to it from the reload
+/// handler's `InitEvent::Ready` branch — sherpa persistence is
+/// deferred until the recognizer swap succeeds, so a failed reload
+/// can't leave a broken model index in config and wedge next
+/// startup's `init_sherpa_host`.
+pub(crate) const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
 #[cfg(feature = "sherpa")]
 /// Config key for the persisted transcript display mode.
 /// Values: `"live"` (default) or `"final"`.
@@ -57,12 +63,15 @@ const DEFAULT_NOISE_GATE: f64 = 3.0;
 // detect utterance boundaries. Default 0.5 matches sherpa-onnx's
 // upstream Silero default. Lower for noisy NFM/scanner audio; higher
 // for clean broadcast.
+// UI slider values are f64 (adw::SpinRow takes f64). The canonical
+// f32 constants live in `sdr_transcription::backend` — these are
+// widened casts so the slider can't drift from the backend defaults.
 #[cfg(feature = "sherpa")]
-const DEFAULT_SHERPA_VAD_THRESHOLD: f64 = 0.50;
+const DEFAULT_SHERPA_VAD_THRESHOLD: f64 = sdr_transcription::VAD_THRESHOLD_DEFAULT as f64;
 #[cfg(feature = "sherpa")]
-const SHERPA_VAD_THRESHOLD_MIN: f64 = 0.10;
+const SHERPA_VAD_THRESHOLD_MIN: f64 = sdr_transcription::VAD_THRESHOLD_MIN as f64;
 #[cfg(feature = "sherpa")]
-const SHERPA_VAD_THRESHOLD_MAX: f64 = 0.90;
+const SHERPA_VAD_THRESHOLD_MAX: f64 = sdr_transcription::VAD_THRESHOLD_MAX as f64;
 #[cfg(feature = "sherpa")]
 const SHERPA_VAD_THRESHOLD_STEP: f64 = 0.05;
 #[cfg(feature = "sherpa")]
@@ -179,15 +188,36 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     group.add(&model_row);
 
     // Persist model selection on change.
-    let config_model = Arc::clone(config);
-    model_row.connect_selected_notify(move |row| {
-        let idx = row.selected();
-        if idx < max_model_idx {
-            config_model.write(|v| {
-                v[key_for_persistence] = serde_json::json!(idx);
-            });
-        }
-    });
+    //
+    // Whisper persists immediately: Whisper has no runtime model swap,
+    // so the selection only matters at next launch. Saving it now is
+    // harmless even if the user later picks a broken model.
+    //
+    // Sherpa does NOT persist here. The reload handler in `window.rs`
+    // writes `KEY_SHERPA_MODEL` to config only after `InitEvent::Ready`
+    // fires — deferring persistence until the recognizer swap actually
+    // succeeds. If the reload fails, the previous (working) model
+    // stays in config, and next startup's `init_sherpa_host` won't
+    // retry a known-broken selection.
+    #[cfg(feature = "whisper")]
+    {
+        let config_model = Arc::clone(config);
+        model_row.connect_selected_notify(move |row| {
+            let idx = row.selected();
+            if idx < max_model_idx {
+                config_model.write(|v| {
+                    v[key_for_persistence] = serde_json::json!(idx);
+                });
+            }
+        });
+    }
+    #[cfg(feature = "sherpa")]
+    {
+        // Reference the local so it's not flagged as unused in sherpa
+        // builds — the sherpa reload handler in window.rs owns the
+        // persistence logic for this key.
+        let _ = key_for_persistence;
+    }
 
     // --- Tuning sliders ---
 

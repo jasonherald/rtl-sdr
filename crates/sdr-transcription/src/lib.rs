@@ -44,7 +44,7 @@ pub mod sherpa_model;
 
 pub use backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
-    TranscriptionEvent,
+    TranscriptionEvent, VAD_THRESHOLD_DEFAULT, VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
 };
 
 #[cfg(feature = "whisper")]
@@ -203,7 +203,7 @@ mod tests {
             model,
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
-            vad_threshold: 0.5,
+            vad_threshold: crate::VAD_THRESHOLD_DEFAULT,
         }
     }
 
