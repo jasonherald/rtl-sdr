@@ -13,7 +13,7 @@ default = []
 # #[cfg(feature = "sherpa")] to gate per-backend code. Pulled in by the
 # user-facing whisper-* / sherpa-* features below.
 whisper = ["dep:whisper-rs"]
-sherpa = ["dep:sherpa-onnx"]
+sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
 
 # User-facing build targets — pick exactly one.
 #
@@ -39,6 +39,8 @@ thiserror.workspace = true
 tracing.workspace = true
 dirs-next.workspace = true
 libc.workspace = true
+tar = { version = "0.4", optional = true }
+bzip2 = { version = "0.4", optional = true }
 
 [lints]
 workspace = true
