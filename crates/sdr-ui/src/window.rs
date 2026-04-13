@@ -1842,6 +1842,41 @@ fn connect_transcript_panel(
                                 },
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    // Backend channel dropped without a
+                                    // terminal Error event. Mirror the Error
+                                    // arm's teardown so the locked controls
+                                    // (model_row, silence_row, noise_gate_row,
+                                    // display_mode_row, enable_row) all
+                                    // recover instead of staying frozen.
+                                    tracing::warn!(
+                                        "transcription event channel disconnected without terminal event"
+                                    );
+                                    if let Some(model) = model_row_weak.upgrade() {
+                                        model.set_sensitive(true);
+                                    }
+                                    #[cfg(feature = "whisper")]
+                                    if let Some(silence) = silence_row_weak.upgrade() {
+                                        silence.set_sensitive(true);
+                                    }
+                                    if let Some(noise) = noise_gate_row_weak.upgrade() {
+                                        noise.set_sensitive(true);
+                                    }
+                                    #[cfg(feature = "sherpa")]
+                                    if let Some(display) = display_mode_row_weak.upgrade() {
+                                        display.set_sensitive(true);
+                                    }
+                                    if let Some(enable) = enable_row_weak.upgrade() {
+                                        enable.set_active(false);
+                                    }
+                                    status.set_text("Transcription stopped unexpectedly");
+                                    status.set_css_classes(&["error"]);
+                                    status.set_visible(true);
+                                    progress.set_visible(false);
+                                    #[cfg(feature = "sherpa")]
+                                    if let Some(label) = live_line_weak.upgrade() {
+                                        label.set_text("");
+                                        label.set_visible(false);
+                                    }
                                     return glib::ControlFlow::Break;
                                 }
                             }
