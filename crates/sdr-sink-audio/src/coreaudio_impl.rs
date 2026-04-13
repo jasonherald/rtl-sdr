@@ -14,7 +14,7 @@
 //!                                          AURenderCallback
 //!                                                  │
 //!                                                  ▼
-//!                                  Default output device (or `set_target` UID)
+//!                                  Default output device (or `set_target` AudioDeviceID)
 //! ```
 //!
 //! - Uses the **default output unit** (`kAudioUnitSubType_DefaultOutput`) from
@@ -226,6 +226,15 @@ impl AudioSink {
         // unit. Catches the easy class of failures (typos, garbage,
         // wrong-type values) without any teardown.
         parse_target_device(node_name)?;
+
+        // Idempotent fast path: if the requested target matches the
+        // current one, do nothing. Avoids a stop/start cycle (and the
+        // audible glitch + failure surface that comes with it) when
+        // callers re-set the same device, e.g., after a settings
+        // window confirms its current selection.
+        if self.target_device == node_name {
+            return Ok(());
+        }
 
         let was_running = self.audio_unit.is_some();
 
@@ -781,6 +790,28 @@ mod tests {
             sink.target_device, "7",
             "failed pre-validation must not disturb the previous target"
         );
+    }
+
+    #[test]
+    fn set_target_is_idempotent_for_unchanged_target() {
+        // Re-setting the same target should be a no-op fast path —
+        // no stop/start cycle, no audible glitch, no failure surface
+        // expansion. We can't observe the lack of a stop/start
+        // directly here (no real AudioUnit involved on an idle
+        // sink), but we can prove that the call returns Ok and
+        // leaves target_device exactly equal to what was already
+        // there.
+        let mut sink = AudioSink::new();
+        sink.set_target("42").expect("baseline");
+        sink.set_target("42")
+            .expect("re-setting the same target should succeed as a no-op");
+        assert_eq!(sink.target_device, "42");
+
+        // Same for the empty-string ("default device") case.
+        sink.set_target("").expect("switch to default");
+        sink.set_target("")
+            .expect("re-setting empty should succeed as a no-op");
+        assert!(sink.target_device.is_empty());
     }
 
     #[test]
