@@ -195,36 +195,94 @@ impl AudioSink {
     ///
     /// `node_name` is interpreted as a CoreAudio `AudioDeviceID`
     /// formatted as a decimal string (matching what
-    /// [`list_audio_sinks`] returns). The string is parsed lazily on
-    /// the next [`Sink::start`] call so that an invalid value reports
-    /// the failure through the normal start error path rather than
-    /// surprising callers from inside `set_target` itself.
+    /// [`list_audio_sinks`] returns). The format is **pre-validated
+    /// up front** before touching the running AudioUnit, so a
+    /// completely invalid string returns [`SinkError::InvalidParameter`]
+    /// without disturbing audio playback. In v2 (issue #237)
+    /// `node_name` will become the device's CoreAudio UID instead,
+    /// but the pre-validate-then-swap contract stays the same.
     ///
-    /// In v2 (issue #237) `node_name` will become the device's
-    /// CoreAudio UID instead, but the parse-lazy-on-start contract
-    /// stays the same.
-    ///
-    /// If the sink is already running, it is stopped, reconfigured,
-    /// and restarted — same pattern as the PipeWire backend.
+    /// If the sink is already running, the swap is **transactional**:
+    /// the old `target_device` is preserved, the unit is stopped, the
+    /// new target is installed, and `start()` is called. If the start
+    /// fails (e.g., the new ID is stale after a plug/unplug, or the
+    /// device disappeared between `list_audio_sinks` and now), the old
+    /// `target_device` is restored and `start()` is called a second
+    /// time to bring the previous working route back. Only if both
+    /// the swap **and** the rollback fail does the sink end up
+    /// stopped — and in that case the function returns the original
+    /// swap error so the caller knows what was attempted, with a
+    /// `tracing::error` covering the rollback failure.
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::InvalidParameter`] (via the next `start`
-    /// call) if `node_name` cannot be parsed as a `u32`, or
-    /// [`SinkError::DeviceNotFound`] if the parsed ID does not name
-    /// a valid output device. Also propagates any error from
-    /// `start` / `stop` if the sink was running.
+    /// Returns [`SinkError::InvalidParameter`] if `node_name` cannot
+    /// be parsed as a `u32`, [`SinkError::DeviceNotFound`] if the
+    /// parsed ID does not name a valid output device when `start()`
+    /// runs, or any error from `stop` / `start`. On failure to swap
+    /// AND failure to roll back, the original swap error is returned.
     pub fn set_target(&mut self, node_name: &str) -> Result<(), SinkError> {
+        // Pre-validate the new target *before* touching the running
+        // unit. Catches the easy class of failures (typos, garbage,
+        // wrong-type values) without any teardown.
+        parse_target_device(node_name)?;
+
         let was_running = self.audio_unit.is_some();
-        if was_running {
-            self.stop()?;
+
+        if !was_running {
+            // Idle sink: store and return. The next `start()` call
+            // will run open_unit and surface any device-resolution
+            // failure.
+            self.target_device.clear();
+            self.target_device.push_str(node_name);
+            return Ok(());
         }
+
+        // Running sink: transactional swap with rollback on failure.
+        let old_target = std::mem::take(&mut self.target_device);
+
+        if let Err(stop_err) = self.stop() {
+            // Could not even stop the old unit cleanly. Put the old
+            // target back so subsequent calls see consistent state and
+            // bail; the sink may or may not still be running depending
+            // on what stop() actually did.
+            self.target_device = old_target;
+            return Err(stop_err);
+        }
+
         self.target_device.clear();
         self.target_device.push_str(node_name);
-        if was_running {
-            self.start()?;
+
+        match self.start() {
+            Ok(()) => Ok(()),
+            Err(swap_err) => {
+                // Rollback path: the new target failed to start.
+                // Restore the old target_device and try to bring the
+                // previous working route back so audio playback
+                // resumes instead of staying dead.
+                tracing::warn!(
+                    error = %swap_err,
+                    new_target = node_name,
+                    old_target = old_target.as_str(),
+                    "set_target failed; rolling back to previous device"
+                );
+                self.target_device.clear();
+                self.target_device.push_str(&old_target);
+
+                if let Err(rollback_err) = self.start() {
+                    // Both the swap and the rollback failed. The sink
+                    // is now stopped. Surface the original error so
+                    // the caller sees what they tried to do; the
+                    // rollback error gets a tracing::error of its own.
+                    tracing::error!(
+                        swap_error = %swap_err,
+                        rollback_error = %rollback_err,
+                        "set_target rollback also failed; sink is now stopped"
+                    );
+                }
+                Err(swap_err)
+            }
         }
-        Ok(())
     }
 
     /// Send stereo audio samples to CoreAudio for playback.
@@ -276,16 +334,10 @@ impl AudioSink {
         // Pick the device. Empty target_device means "system default
         // output"; any non-empty value is parsed as a decimal
         // AudioDeviceID (the same format `list_audio_sinks` emits).
-        let device_id = if self.target_device.is_empty() {
-            get_default_device_id(false)
-                .ok_or_else(|| SinkError::DeviceNotFound("system default output".to_string()))?
-        } else {
-            self.target_device.parse::<u32>().map_err(|_| {
-                SinkError::InvalidParameter(format!(
-                    "CoreAudio target_device must be a decimal AudioDeviceID, got {:?}",
-                    self.target_device
-                ))
-            })?
+        let device_id = match parse_target_device(&self.target_device)? {
+            Some(id) => id,
+            None => get_default_device_id(false)
+                .ok_or_else(|| SinkError::DeviceNotFound("system default output".to_string()))?,
         };
 
         // Build the AUHAL output unit bound to this device.
@@ -440,6 +492,28 @@ impl Sink for AudioSink {
     fn sample_rate(&self) -> f64 {
         self.sample_rate
     }
+}
+
+/// Parse a `target_device` string into an [`AudioDeviceID`] selection.
+///
+/// - Empty string → `Ok(None)` (caller resolves the system default).
+/// - Decimal `u32` string → `Ok(Some(id))`.
+/// - Anything else → `Err(SinkError::InvalidParameter)`.
+///
+/// Extracted from [`AudioSink::open_unit`] so it can be unit-tested in
+/// isolation and so [`AudioSink::set_target`] can pre-validate a new
+/// target before tearing down the running AudioUnit (avoiding the
+/// "stop-and-fail leaves the sink dead" hazard CodeRabbit caught on
+/// PR #253).
+fn parse_target_device(target_device: &str) -> Result<Option<u32>, SinkError> {
+    if target_device.is_empty() {
+        return Ok(None);
+    }
+    target_device.parse::<u32>().map(Some).map_err(|_| {
+        SinkError::InvalidParameter(format!(
+            "CoreAudio target_device must be a decimal AudioDeviceID, got {target_device:?}"
+        ))
+    })
 }
 
 /// Render callback body — extracted from the closure so it has a
@@ -668,17 +742,86 @@ mod tests {
     }
 
     #[test]
-    fn set_target_with_invalid_id_fails_on_start() {
-        // set_target itself succeeds (lazy parse) but the next start()
-        // surfaces InvalidParameter. We can't actually call start()
-        // without tearing down a real AU, so just verify the parse
-        // path that open_unit takes for a non-empty target.
+    fn set_target_stores_valid_id_when_idle() {
+        // On an idle sink (audio_unit = None), set_target pre-validates
+        // the format and then stores the string. No AudioUnit work
+        // happens because there's nothing to swap; the next start()
+        // will call open_unit and surface any device-resolution
+        // failure (stale ID, etc.).
         let mut sink = AudioSink::new();
-        sink.set_target("not-a-number")
-            .expect("set_target stores the string without parsing");
-        // open_unit is private; the parse failure surfaces via start()
-        // which we don't exercise here. The contract is enforced via
-        // the parse::<u32>() call in open_unit.
-        assert_eq!(sink.target_device, "not-a-number");
+        sink.set_target("42")
+            .expect("set_target with a valid id should succeed on an idle sink");
+        assert_eq!(sink.target_device, "42");
+    }
+
+    #[test]
+    fn set_target_pre_validation_rejects_garbage_without_disturbing_state() {
+        // The pre-validation step in set_target catches malformed
+        // strings BEFORE touching the running AudioUnit (or, on an
+        // idle sink, before mutating target_device). This is the
+        // "doesn't take down a working sink for a typo" guarantee
+        // CodeRabbit caught on PR #253.
+        let mut sink = AudioSink::new();
+
+        // Establish a known target so we can prove it survives the
+        // failed call.
+        sink.set_target("7").expect("baseline set_target");
+        assert_eq!(sink.target_device, "7");
+
+        let err = sink
+            .set_target("not-a-number")
+            .expect_err("set_target with garbage should fail pre-validation");
+        assert!(
+            matches!(err, SinkError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}",
+        );
+
+        // target_device must NOT have been touched.
+        assert_eq!(
+            sink.target_device, "7",
+            "failed pre-validation must not disturb the previous target"
+        );
+    }
+
+    #[test]
+    fn set_target_empty_string_clears_to_default() {
+        // Empty string = "system default output". The pre-validation
+        // path treats it as Ok(None), so set_target accepts it and
+        // clears the stored target.
+        let mut sink = AudioSink::new();
+        sink.set_target("42").expect("baseline");
+        sink.set_target("")
+            .expect("empty string should resolve to default device");
+        assert!(sink.target_device.is_empty());
+    }
+
+    #[test]
+    fn parse_target_device_empty_means_default() {
+        assert_eq!(parse_target_device("").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_target_device_decimal_id_round_trips() {
+        assert_eq!(parse_target_device("0").unwrap(), Some(0));
+        assert_eq!(parse_target_device("42").unwrap(), Some(42));
+        assert_eq!(
+            parse_target_device(&u32::MAX.to_string()).unwrap(),
+            Some(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn parse_target_device_rejects_garbage() {
+        // Anything that isn't an empty string and isn't a decimal u32
+        // surfaces InvalidParameter — both via the helper directly and
+        // via open_unit when start() runs.
+        for bad in ["not-a-number", "1.5", "0x42", "-1", "  ", "42abc"] {
+            let err = parse_target_device(bad)
+                .expect_err(&format!("expected parse_target_device({bad:?}) to fail"));
+            assert!(
+                matches!(err, SinkError::InvalidParameter(_)),
+                "expected InvalidParameter for {bad:?}, got {err:?}"
+            );
+        }
     }
 }
