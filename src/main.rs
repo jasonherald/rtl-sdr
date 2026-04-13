@@ -74,9 +74,7 @@ fn main() -> glib::ExitCode {
                 }
                 Ok(InitEvent::DownloadProgress { pct }) => {
                     tracing::info!(progress_pct = pct, "sherpa download progress");
-                    splash.update_text(&format!(
-                        "Downloading sherpa-onnx model... {pct}%"
-                    ));
+                    splash.update_text(&format!("Downloading sherpa-onnx model... {pct}%"));
                 }
                 Ok(InitEvent::Extracting) => {
                     tracing::info!("sherpa extracting archive");

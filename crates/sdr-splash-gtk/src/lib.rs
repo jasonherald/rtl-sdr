@@ -99,9 +99,8 @@ mod linux_impl {
             // they cannot be touched from the stdin thread directly.
             let label_cell = Rc::clone(&label_cell_for_activate);
             let app_clone = app.clone();
-            let _ = glib::timeout_add_local(
-                Duration::from_millis(STDIN_POLL_INTERVAL_MS),
-                move || {
+            let _ =
+                glib::timeout_add_local(Duration::from_millis(STDIN_POLL_INTERVAL_MS), move || {
                     loop {
                         match cmd_rx.try_recv() {
                             Ok(StdinCommand::SetText(text)) => {
@@ -117,8 +116,7 @@ mod linux_impl {
                         }
                     }
                     glib::ControlFlow::Continue
-                },
-            );
+                });
         });
 
         // Pass empty argv to GTK so it does not try to parse --splash.
@@ -126,10 +124,7 @@ mod linux_impl {
         app.run_with_args(&no_args)
     }
 
-    fn build_window(
-        app: &libadwaita::Application,
-        label_cell: &Rc<RefCell<Option<gtk4::Label>>>,
-    ) {
+    fn build_window(app: &libadwaita::Application, label_cell: &Rc<RefCell<Option<gtk4::Label>>>) {
         let label = gtk4::Label::builder()
             .label("Initializing...")
             .wrap(true)

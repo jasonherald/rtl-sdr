@@ -113,9 +113,7 @@ impl SherpaModel {
     /// download URL and to name the local `.part` file during fetch.
     pub fn archive_filename(self) -> &'static str {
         match self {
-            Self::StreamingZipformerEn => {
-                "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2"
-            }
+            Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
         }
     }
 
@@ -290,9 +288,9 @@ pub fn download_sherpa_model(
     let archive_file = std::fs::File::open(&archive_part_path)?;
     let bz_reader = bzip2::read::BzDecoder::new(archive_file);
     let mut tar_archive = tar::Archive::new(bz_reader);
-    tar_archive.unpack(&temp_extract_dir).map_err(|e| {
-        SherpaModelError::Extract(format!("tar/bzip2 unpack failed: {e}"))
-    })?;
+    tar_archive
+        .unpack(&temp_extract_dir)
+        .map_err(|e| SherpaModelError::Extract(format!("tar/bzip2 unpack failed: {e}")))?;
 
     // The tarball contains a single top-level directory whose name we
     // know via `archive_inner_directory()`. Move it to the final location.
@@ -305,7 +303,10 @@ pub fn download_sherpa_model(
     }
 
     if final_dir.exists() {
-        tracing::info!(?final_dir, "removing existing final directory before rename");
+        tracing::info!(
+            ?final_dir,
+            "removing existing final directory before rename"
+        );
         std::fs::remove_dir_all(&final_dir)?;
     }
     std::fs::rename(&extracted_inner, &final_dir)?;
