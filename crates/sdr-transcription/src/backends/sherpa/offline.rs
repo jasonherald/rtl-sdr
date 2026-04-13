@@ -168,10 +168,27 @@ pub(super) fn build_nemo_transducer_recognizer_config(
     }
 }
 
-/// One offline transcription session. Feeds audio through the VAD,
-/// batch-decodes each detected speech segment, and emits `Text` events.
-/// Never emits `Partial`.
+/// One offline transcription session. Dispatches to the VAD or Auto Break
+/// implementation based on `params.segmentation_mode`.
 pub(super) fn run_session(
+    recognizer: &OfflineRecognizer,
+    vad: &mut SherpaSileroVad,
+    params: SessionParams,
+) {
+    match params.segmentation_mode {
+        crate::backend::SegmentationMode::Vad => {
+            run_session_vad(recognizer, vad, params);
+        }
+        crate::backend::SegmentationMode::AutoBreak => {
+            run_session_auto_break(recognizer, params);
+        }
+    }
+}
+
+/// VAD-driven offline session (unchanged from the pre-Auto-Break behavior).
+/// Feeds audio through the VAD, batch-decodes each detected speech segment,
+/// and emits `Text` events. Never emits `Partial`.
+fn run_session_vad(
     recognizer: &OfflineRecognizer,
     vad: &mut SherpaSileroVad,
     params: SessionParams,
@@ -270,6 +287,260 @@ fn decode_segment(
     }
 }
 
+/// The three possible outcomes of a `HoldingOff` tail-timer expiration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushDecision {
+    /// Buffer is a valid utterance — decode and emit.
+    Decode,
+    /// Buffer is too short to decode reliably (sub-word fragment).
+    DiscardShort,
+    /// Buffer is too short to even be a real transmission (phantom open).
+    DiscardPhantom,
+}
+
+/// Internal state of the Auto Break segmentation machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoBreakState {
+    /// No transmission in progress. Samples are discarded.
+    Idle,
+    /// Squelch is open, buffering the active transmission.
+    Recording,
+    /// Squelch recently closed; still buffering trailing audio until
+    /// the tail timer expires, at which point we flush.
+    HoldingOff,
+}
+
+/// Pure state machine for Auto Break segmentation. Holds no I/O handles
+/// so it can be unit-tested. The real session loop owns one of these
+/// and drives it from the `TranscriptionInput` channel + a `recv_timeout`
+/// tail timer — on flush, the loop calls `take_buffer` and hands the
+/// audio off to `decode_segment`.
+struct AutoBreakMachine {
+    state: AutoBreakState,
+    /// Accumulated stereo interleaved f32 samples at 48 kHz.
+    buffer: Vec<f32>,
+}
+
+impl AutoBreakMachine {
+    fn new() -> Self {
+        Self {
+            state: AutoBreakState::Idle,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Current buffer duration in ms, assuming 48 kHz stereo interleaved.
+    #[allow(clippy::cast_possible_truncation)]
+    fn buffer_duration_ms(&self) -> u32 {
+        let frames = self.buffer.len() / 2;
+        ((frames as u64 * 1000) / 48_000) as u32
+    }
+
+    fn on_samples(&mut self, samples: &[f32]) {
+        if matches!(
+            self.state,
+            AutoBreakState::Recording | AutoBreakState::HoldingOff
+        ) {
+            self.buffer.extend_from_slice(samples);
+        }
+        // Idle: discard
+    }
+
+    fn on_squelch_opened(&mut self) {
+        match self.state {
+            AutoBreakState::Idle => {
+                self.buffer.clear();
+                self.state = AutoBreakState::Recording;
+            }
+            AutoBreakState::HoldingOff => {
+                // Hysteresis blip — cancel deferred flush, stay with same buffer.
+                self.state = AutoBreakState::Recording;
+            }
+            AutoBreakState::Recording => {
+                // Redundant; ignore.
+            }
+        }
+    }
+
+    fn on_squelch_closed(&mut self) {
+        if matches!(self.state, AutoBreakState::Recording) {
+            self.state = AutoBreakState::HoldingOff;
+        }
+    }
+
+    /// Called when the tail timer expires while in `HoldingOff`. Returns
+    /// the flush decision based on the buffer duration, and resets to
+    /// `Idle`. Returns `None` if called outside `HoldingOff` (no-op).
+    fn on_tail_timeout(&mut self) -> Option<FlushDecision> {
+        if !matches!(self.state, AutoBreakState::HoldingOff) {
+            return None;
+        }
+        let duration = self.buffer_duration_ms();
+        let decision = if duration < AUTO_BREAK_MIN_OPEN_MS {
+            FlushDecision::DiscardPhantom
+        } else if duration < AUTO_BREAK_MIN_SEGMENT_MS {
+            FlushDecision::DiscardShort
+        } else {
+            FlushDecision::Decode
+        };
+        // Note: the caller is responsible for taking the buffer for
+        // decoding AFTER this call, if the decision is Decode.
+        // We reset to Idle here but leave the buffer alone so the
+        // caller can still `take_buffer` for Decode cases.
+        self.state = AutoBreakState::Idle;
+        if !matches!(decision, FlushDecision::Decode) {
+            self.buffer.clear();
+        }
+        Some(decision)
+    }
+
+    /// Take ownership of the current buffer, leaving the machine's
+    /// internal buffer empty. Used by the session loop to hand audio
+    /// to the recognizer on flush.
+    fn take_buffer(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.buffer)
+    }
+
+    /// Return current state (used by the session loop to decide
+    /// whether to trigger the max-segment safety flush).
+    fn state(&self) -> AutoBreakState {
+        self.state
+    }
+
+    /// Force-reset to Idle and clear the buffer. Used by the
+    /// max-segment safety flush path: the session loop takes the
+    /// buffer via `take_buffer` and then calls `reset_after_force_flush`.
+    fn reset_after_force_flush(&mut self) {
+        self.state = AutoBreakState::Idle;
+    }
+}
+
+/// Auto Break offline session. Drives an `AutoBreakMachine` from the
+/// transcription input channel and a hold-off timer implemented via
+/// `recv_timeout`. Buffers stereo 48 kHz interleaved samples during
+/// `Recording` / `HoldingOff` states; on flush, resamples to 16 kHz mono,
+/// applies the spectral denoiser, and decodes through the recognizer.
+fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams) {
+    let SessionParams {
+        cancel,
+        audio_rx,
+        event_tx,
+        noise_gate_ratio,
+        vad_threshold: _,
+        segmentation_mode: _,
+    } = params;
+
+    if event_tx.send(TranscriptionEvent::Ready).is_err() {
+        return;
+    }
+
+    let tail_duration = std::time::Duration::from_millis(u64::from(AUTO_BREAK_TAIL_MS));
+    let mut machine = AutoBreakMachine::new();
+    // When Some, we're in HoldingOff and waiting until this instant before flushing.
+    let mut pending_flush_deadline: Option<std::time::Instant> = None;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            tracing::info!("sherpa Auto Break session cancelled");
+            return;
+        }
+
+        // Choose recv timeout: if we're holding off, use the remaining
+        // tail duration so we wake up on time to flush. Otherwise use
+        // the standard audio polling interval so we can check `cancel`.
+        let timeout = match pending_flush_deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(std::time::Instant::now())
+                .unwrap_or_else(|| std::time::Duration::from_millis(0)),
+            None => AUDIO_RECV_TIMEOUT,
+        };
+
+        match audio_rx.recv_timeout(timeout) {
+            Ok(crate::backend::TranscriptionInput::Samples(samples)) => {
+                machine.on_samples(&samples);
+                // Max-segment safety check: if buffer has grown past the
+                // cap, force-flush regardless of squelch state.
+                if !matches!(machine.state(), AutoBreakState::Idle)
+                    && machine.buffer_duration_ms() >= AUTO_BREAK_MAX_SEGMENT_MS
+                {
+                    tracing::warn!(
+                        ms = machine.buffer_duration_ms(),
+                        cap = AUTO_BREAK_MAX_SEGMENT_MS,
+                        "Auto Break buffer exceeded max segment cap — forcing flush (check squelch configuration)"
+                    );
+                    let stereo_buf = machine.take_buffer();
+                    machine.reset_after_force_flush();
+                    flush_auto_break_segment(
+                        recognizer,
+                        &stereo_buf,
+                        noise_gate_ratio,
+                        &event_tx,
+                    );
+                    pending_flush_deadline = None;
+                }
+            }
+            Ok(crate::backend::TranscriptionInput::SquelchOpened) => {
+                machine.on_squelch_opened();
+                pending_flush_deadline = None;
+            }
+            Ok(crate::backend::TranscriptionInput::SquelchClosed) => {
+                machine.on_squelch_closed();
+                pending_flush_deadline = Some(std::time::Instant::now() + tail_duration);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Check if the tail deadline has expired.
+                if let Some(deadline) = pending_flush_deadline
+                    && std::time::Instant::now() >= deadline
+                {
+                    match machine.on_tail_timeout() {
+                        Some(FlushDecision::Decode) => {
+                            let stereo_buf = machine.take_buffer();
+                            flush_auto_break_segment(
+                                recognizer,
+                                &stereo_buf,
+                                noise_gate_ratio,
+                                &event_tx,
+                            );
+                        }
+                        Some(FlushDecision::DiscardPhantom) => {
+                            tracing::debug!("Auto Break: discarded phantom open");
+                        }
+                        Some(FlushDecision::DiscardShort) => {
+                            tracing::debug!("Auto Break: discarded sub-min segment");
+                        }
+                        None => {
+                            // Not in HoldingOff anymore — nothing to do.
+                        }
+                    }
+                    pending_flush_deadline = None;
+                }
+                // Otherwise just loop back and recv again.
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::info!("sherpa Auto Break session ended (channel disconnected)");
+                return;
+            }
+        }
+    }
+}
+
+/// Resample + denoise + decode a completed Auto Break segment, emit
+/// a `Text` event if the recognizer produced non-empty output.
+fn flush_auto_break_segment(
+    recognizer: &OfflineRecognizer,
+    stereo_buf: &[f32],
+    noise_gate_ratio: f32,
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+) {
+    if stereo_buf.is_empty() {
+        return;
+    }
+    let mut mono_buf: Vec<f32> = Vec::with_capacity(stereo_buf.len() / 6);
+    resampler::downsample_stereo_to_mono_16k(stereo_buf, &mut mono_buf);
+    denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
+    decode_segment(recognizer, &mono_buf, event_tx);
+}
+
 /// Flush the VAD on session exit and drain every remaining segment —
 /// including any in-flight utterance Silero hadn't yet finalized.
 ///
@@ -289,4 +560,126 @@ fn drain_vad_on_exit(
         decode_segment(recognizer, &segment, event_tx);
     }
     vad.reset();
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AutoBreakFlushCounts {
+    decodes_flushed: u32,
+    discarded_short: u32,
+    discarded_phantom: u32,
+}
+
+#[cfg(test)]
+impl AutoBreakFlushCounts {
+    fn record(&mut self, decision: FlushDecision) {
+        match decision {
+            FlushDecision::Decode => self.decodes_flushed += 1,
+            FlushDecision::DiscardShort => self.discarded_short += 1,
+            FlushDecision::DiscardPhantom => self.discarded_phantom += 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod auto_break_tests {
+    use super::*;
+
+    // 48 kHz stereo interleaved → a `ms` duration requires `frames = 48 * ms`
+    // and `2 * frames` samples.
+    fn samples_for_ms(ms: u32) -> Vec<f32> {
+        let frames = (48 * ms) as usize;
+        vec![0.5_f32; frames * 2]
+    }
+
+    #[test]
+    fn clean_utterance_produces_one_decode() {
+        let mut machine = AutoBreakMachine::new();
+        let mut counts = AutoBreakFlushCounts::default();
+
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(1_000));
+        machine.on_squelch_closed();
+        if let Some(decision) = machine.on_tail_timeout() {
+            counts.record(decision);
+        }
+
+        assert_eq!(counts.decodes_flushed, 1);
+        assert_eq!(counts.discarded_short, 0);
+        assert_eq!(counts.discarded_phantom, 0);
+    }
+
+    #[test]
+    fn hysteresis_blip_single_utterance() {
+        let mut machine = AutoBreakMachine::new();
+        let mut counts = AutoBreakFlushCounts::default();
+
+        // Open, record, close, re-open before tail timeout, record more, close, timeout.
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(500));
+        machine.on_squelch_closed();
+        // Hysteresis blip: squelch re-opens before tail fires.
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(500));
+        machine.on_squelch_closed();
+        if let Some(decision) = machine.on_tail_timeout() {
+            counts.record(decision);
+        }
+
+        // One decode, not two — the blip should be absorbed into a single utterance.
+        assert_eq!(counts.decodes_flushed, 1);
+    }
+
+    #[test]
+    fn phantom_open_below_min_open_ms_discarded() {
+        let mut machine = AutoBreakMachine::new();
+        let mut counts = AutoBreakFlushCounts::default();
+
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(50)); // < MIN_OPEN_MS (100)
+        machine.on_squelch_closed();
+        if let Some(decision) = machine.on_tail_timeout() {
+            counts.record(decision);
+        }
+
+        assert_eq!(counts.decodes_flushed, 0);
+        assert_eq!(counts.discarded_phantom, 1);
+    }
+
+    #[test]
+    fn sub_min_segment_discarded() {
+        let mut machine = AutoBreakMachine::new();
+        let mut counts = AutoBreakFlushCounts::default();
+
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(300)); // > MIN_OPEN (100) but < MIN_SEGMENT (400)
+        machine.on_squelch_closed();
+        if let Some(decision) = machine.on_tail_timeout() {
+            counts.record(decision);
+        }
+
+        assert_eq!(counts.decodes_flushed, 0);
+        assert_eq!(counts.discarded_short, 1);
+    }
+
+    #[test]
+    fn max_segment_safety_cap_triggers_flush() {
+        let mut machine = AutoBreakMachine::new();
+
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(31_000)); // > MAX_SEGMENT_MS (30_000)
+
+        // At this point the machine should have buffer_duration_ms >= MAX,
+        // so the external loop (or a check inside the state machine) should
+        // treat it as a force-flush condition. We verify via the public API:
+        assert!(machine.buffer_duration_ms() >= AUTO_BREAK_MAX_SEGMENT_MS);
+        // The state machine itself doesn't flush on sample receipt — the
+        // session loop driver checks the buffer duration after each
+        // `on_samples` call and force-flushes. Test the take_buffer path.
+        let buf = machine.take_buffer();
+        assert!(
+            !buf.is_empty(),
+            "take_buffer should return the captured samples"
+        );
+    }
 }
