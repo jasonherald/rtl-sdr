@@ -19,7 +19,7 @@ sdr-sink-audio      → PipeWire/CoreAudio output (depends on: types, pipeline, 
 sdr-sink-network    → TCP/UDP audio output (depends on: types, pipeline, config)
 sdr-radio           → Radio decoder, demod, IF/AF chains (depends on: types, dsp, pipeline)
 sdr-radioreference  → RadioReference.com SOAP client (depends on: types, config)
-sdr-transcription   → Whisper OR sherpa-onnx backend, Silero VAD, spectral denoiser
+sdr-transcription   → Whisper OR Sherpa-onnx backend, Silero VAD, spectral denoiser
 sdr-core            → Headless cross-platform engine facade (macOS port path)
 sdr-splash          → Cross-platform splash subprocess controller (stdin wire protocol)
 sdr-splash-gtk      → Linux GTK4 splash window implementation
@@ -32,6 +32,7 @@ sdr (binary)        → Entry point (depends on: ui, core, splash, transcription
 **Whisper and Sherpa-onnx are mutually exclusive cargo features.** The `sdr-transcription` crate has `compile_error!` guards enforcing exactly one. This was a PR 2-era workaround for a heap corruption between whisper-rs's libstdc++ state and ONNX Runtime's `ParseSemVerVersion` regex constructors that only manifests when both C++ dep trees are in the same binary.
 
 **Build flavors:**
+
 ```bash
 # Whisper (default) — multilingual, mature GPU acceleration
 make install CARGO_FLAGS="--release"                                # Whisper CPU

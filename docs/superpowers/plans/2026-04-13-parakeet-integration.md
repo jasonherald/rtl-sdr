@@ -394,9 +394,11 @@ In the same `#[cfg(test)] mod tests` block, add these four tests right after `al
 - [ ] **Step 12: Verify sherpa_model.rs compiles cleanly in isolation**
 
 Run:
+
 ```bash
 cargo build -p sdr-transcription --no-default-features --features sherpa-cpu 2>&1 | tail -20
 ```
+
 Expected: FAIL with errors only in `backends/sherpa/host.rs` — specifically the three exhaustive matches on `ModelKind` and the `init_offline` body referencing `build_moonshine_recognizer_config`. NO errors should appear in `sherpa_model.rs` itself. If there are errors in `sherpa_model.rs`, STOP and report BLOCKED.
 
 - [ ] **Step 13: Commit**
@@ -508,9 +510,11 @@ pub(super) fn build_nemo_transducer_recognizer_config(
 - [ ] **Step 3: Verify offline.rs compiles cleanly in isolation**
 
 Run:
+
 ```bash
 cargo build -p sdr-transcription --no-default-features --features sherpa-cpu 2>&1 | tail -20
 ```
+
 Expected: still FAILS, but the failure should now be ONLY about `host.rs` exhaustive matches. NO errors should mention `offline.rs`. If there are errors in `offline.rs`, STOP and report BLOCKED.
 
 Common failure modes to watch:
@@ -689,6 +693,7 @@ fn init_offline(
 - [ ] **Step 5: Verify both builds compile + clippy clean**
 
 Run:
+
 ```bash
 cargo build --workspace --no-default-features --features sherpa-cpu 2>&1 | tail -10
 cargo build --workspace 2>&1 | tail -10
@@ -696,6 +701,7 @@ cargo clippy --all-targets --workspace --no-default-features --features sherpa-c
 cargo clippy --all-targets --workspace -- -D warnings 2>&1 | tail -10
 cargo test -p sdr-transcription --no-default-features --features sherpa-cpu 2>&1 | tail -25
 ```
+
 Expected: all PASS. The build was broken from Task 1 through Task 3; this is the commit that closes it.
 
 If clippy complains about `match self.kind() { ... | ... => false, _ => true }` style issues in `supports_partials` from Task 2, normalize using whatever pattern clippy prefers and report the adjustment.

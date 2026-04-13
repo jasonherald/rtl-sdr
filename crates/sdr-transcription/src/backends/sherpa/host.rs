@@ -340,40 +340,67 @@ fn run_host_loop(
                 model: new_model,
                 event_tx,
             } => {
-                tracing::info!(?new_model, "sherpa-host: reloading recognizer");
-                // Drop the old recognizer (and VAD if offline) BEFORE building
-                // the new one — we can't hold two at once because they share
-                // the ONNX Runtime singleton and memory budget.
-                recognizer_state = None;
-
-                let new_state = match new_model.kind() {
-                    crate::sherpa_model::ModelKind::OnlineTransducer => {
-                        init_online(new_model, &event_tx)
-                    }
-                    crate::sherpa_model::ModelKind::OfflineMoonshine
-                    | crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
-                        init_offline(new_model, &event_tx)
-                    }
-                };
-
-                match new_state {
-                    Ok(state) => {
-                        tracing::info!(?new_model, "sherpa-host: reload complete");
-                        recognizer_state = Some(state);
-                        let _ = event_tx.send(InitEvent::Ready);
-                    }
-                    Err(()) => {
-                        // init_online/init_offline already emitted Failed through
-                        // event_tx AND stored the error in SHERPA_HOST (via
-                        // store_init_failure). Leave recognizer_state as None so
-                        // the next StartSession returns the error above.
-                        tracing::warn!(?new_model, "sherpa-host: reload failed");
-                    }
-                }
+                handle_reload_recognizer(new_model, &event_tx, &mut recognizer_state);
             }
         }
     }
     tracing::info!("sherpa-host worker exiting");
+}
+
+/// Handle a `HostCommand::ReloadRecognizer` by building the new
+/// recognizer WITHOUT dropping the current one first, then swapping
+/// only if the new recognizer is ready.
+///
+/// If the new recognizer fails to build (transient download error,
+/// missing files, `model_type` mismatch, etc.) the existing
+/// `*recognizer_state` is left untouched so `StartSession` continues
+/// to find the previous working recognizer.
+///
+/// Previous implementation dropped the current state up front which
+/// stranded the host on any init failure — every subsequent session
+/// until the next manual reload was rejected with "no recognizer
+/// loaded". The brief double-RAM footprint during the transition
+/// (~2x the model size; worst case ~1.2 GB for a Parakeet-to-Parakeet
+/// swap) is tolerable on personal-use hardware.
+fn handle_reload_recognizer(
+    new_model: SherpaModel,
+    event_tx: &mpsc::Sender<InitEvent>,
+    recognizer_state: &mut Option<RecognizerState>,
+) {
+    tracing::info!(?new_model, "sherpa-host: reloading recognizer");
+
+    let new_state = match new_model.kind() {
+        crate::sherpa_model::ModelKind::OnlineTransducer => init_online(new_model, event_tx),
+        crate::sherpa_model::ModelKind::OfflineMoonshine
+        | crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
+            init_offline(new_model, event_tx)
+        }
+    };
+
+    match new_state {
+        Ok(state) => {
+            tracing::info!(
+                ?new_model,
+                "sherpa-host: reload complete, replacing old recognizer"
+            );
+            // Assignment drops the old recognizer at end of statement.
+            // Both recognizers exist in memory for exactly one
+            // expression evaluation.
+            *recognizer_state = Some(state);
+            let _ = event_tx.send(InitEvent::Ready);
+        }
+        Err(()) => {
+            // init_online/init_offline already emitted
+            // InitEvent::Failed through event_tx. The old
+            // `recognizer_state` is left untouched so StartSession
+            // continues to find the previous recognizer. No
+            // host-stranding.
+            tracing::warn!(
+                ?new_model,
+                "sherpa-host: reload failed, keeping previous recognizer"
+            );
+        }
+    }
 }
 
 /// Phase 1-2 for the `OnlineTransducer` path: download the bundle if
@@ -439,6 +466,13 @@ fn init_offline(
     // Both offline kinds use OfflineRecognizer but with different config
     // builders. Branch here so init_offline's Phase 1-2 (download VAD +
     // bundle) stays generic across all offline models.
+    //
+    // The `OnlineTransducer` arm should be unreachable in practice —
+    // every caller of `init_offline` (the two places in `run_host_loop`
+    // that dispatch on `model.kind()`) only routes `OfflineMoonshine`
+    // and `OfflineNemoTransducer` here. Still, library crates forbid
+    // `panic!` / `unreachable!` so we route through the normal init
+    // failure path instead of aborting the process.
     let recognizer_config = match model.kind() {
         crate::sherpa_model::ModelKind::OfflineMoonshine => {
             super::offline::build_moonshine_recognizer_config(model, "cpu")
@@ -447,7 +481,14 @@ fn init_offline(
             super::offline::build_nemo_transducer_recognizer_config(model, "cpu")
         }
         crate::sherpa_model::ModelKind::OnlineTransducer => {
-            unreachable!("init_offline called with an online model")
+            let msg = format!(
+                "init_offline called with online model {} — engine routing bug",
+                model.label()
+            );
+            tracing::error!(%msg);
+            store_init_failure(BackendError::Init(msg.clone()));
+            let _ = event_tx.send(InitEvent::Failed { message: msg });
+            return Err(());
         }
     };
     tracing::info!(?model, "creating sherpa-onnx OfflineRecognizer");
