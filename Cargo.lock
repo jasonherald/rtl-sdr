@@ -1886,6 +1886,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-splash-gtk"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "libadwaita",
+ "tracing",
+]
+
+[[package]]
 name = "sdr-transcription"
 version = "0.1.0"
 dependencies = [
