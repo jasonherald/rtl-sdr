@@ -1877,14 +1877,44 @@ fn connect_transcript_panel(
                                 },
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    // Backend channel dropped without a
-                                    // terminal Error event. Mirror the Error
-                                    // arm's teardown so the locked controls
-                                    // (model_row, silence_row, noise_gate_row,
-                                    // display_mode_row, enable_row) all
-                                    // recover instead of staying frozen.
+                                    // Distinguish a normal user-initiated stop
+                                    // from a spontaneous backend death:
+                                    //
+                                    // - User stop: the off branch of
+                                    //   enable_row.connect_active_notify already
+                                    //   ran (it dropped audio_tx, which is what
+                                    //   caused the worker to exit and drop
+                                    //   event_tx, which we're now seeing as
+                                    //   Disconnected). The toggle is already
+                                    //   inactive and all the rows have been
+                                    //   re-enabled. Nothing to do here — the
+                                    //   off branch did the cleanup. Without
+                                    //   this check the disconnect arm overwrote
+                                    //   the off branch's clean state with a
+                                    //   spurious "Transcription stopped
+                                    //   unexpectedly" error message on every
+                                    //   normal stop.
+                                    //
+                                    // - Spontaneous death: the worker dropped
+                                    //   event_tx without the user clicking
+                                    //   anything. The toggle is still active.
+                                    //   Mirror the Error arm's teardown so the
+                                    //   UI doesn't strand the user with locked
+                                    //   controls and a stale "Listening..."
+                                    //   status.
+                                    let was_user_stop = enable_row_weak
+                                        .upgrade()
+                                        .is_none_or(|e| !e.is_active());
+
+                                    if was_user_stop {
+                                        tracing::debug!(
+                                            "transcription event channel closed (user stop)"
+                                        );
+                                        return glib::ControlFlow::Break;
+                                    }
+
                                     tracing::warn!(
-                                        "transcription event channel disconnected without terminal event"
+                                        "transcription event channel disconnected unexpectedly"
                                     );
                                     unlock_transcription_session_rows(
                                         &model_row_weak,
