@@ -1634,11 +1634,10 @@ fn connect_transcript_panel(
                                             // from the combo row (the user may
                                             // have changed it mid-session; we
                                             // deliberately don't lock it).
-                                            let show_live = display_mode_row_weak
-                                                .upgrade()
-                                                .is_some_and(|row| {
-                                                    row.selected() != DISPLAY_MODE_FINAL_IDX
-                                                });
+                                            let show_live =
+                                                display_mode_row_weak.upgrade().is_some_and(
+                                                    |row| row.selected() != DISPLAY_MODE_FINAL_IDX,
+                                                );
                                             if show_live
                                                 && let Some(label) = live_line_weak.upgrade()
                                             {
