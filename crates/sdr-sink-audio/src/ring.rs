@@ -41,7 +41,18 @@ struct AudioRingInner {
 impl AudioRingBuffer {
     /// Create a new ring buffer with the given capacity in `f32` samples.
     /// For interleaved stereo audio, capacity should be `frames * 2`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero. The write/read paths use `% capacity`
+    /// arithmetic and would panic on the first call against a zero-cap
+    /// ring; failing fast at construction surfaces the bug at the call
+    /// site instead of inside the audio I/O thread later. The constant
+    /// callers (`pw_impl::RING_CAPACITY`, `coreaudio_impl::RING_CAPACITY`)
+    /// always pass non-zero values, so in practice this assert only
+    /// fires for tests or future callers that compute capacity dynamically.
     pub(crate) fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "AudioRingBuffer capacity must be non-zero");
         Self {
             buf: std::sync::Mutex::new(AudioRingInner {
                 data: vec![0.0; capacity],
@@ -222,5 +233,14 @@ mod tests {
         let n = ring.read(&mut out);
         assert_eq!(n, 4);
         assert_eq!(out, [10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "capacity must be non-zero")]
+    fn zero_capacity_panics_at_construction() {
+        // Surfaces the bug at the call site instead of letting an
+        // invalid ring survive until the first write tries to do
+        // `% 0` on the audio I/O thread.
+        let _ = AudioRingBuffer::new(0);
     }
 }

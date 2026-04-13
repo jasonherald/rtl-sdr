@@ -87,8 +87,17 @@ const AUDIO_CHANNELS: u32 = 2;
 /// ~1 second at 48 kHz stereo = 96,000 samples.
 const RING_CAPACITY: usize = 96_000;
 
-/// Initial capacity for the stereo interleave buffer in `write_samples`.
-const INTERLEAVE_BUF_INITIAL_CAP: usize = 1024;
+/// Capacity for the stereo interleave buffer in `write_samples`.
+///
+/// Sized to match the ring buffer (the largest write that could ever
+/// fit in the ring without dropping data) so the hot path **never**
+/// reallocates: the buffer is `clear()`ed and re-pushed each call,
+/// but never grows beyond its initial capacity for any input within
+/// the ring's natural ceiling. The previous value of 1024 was a
+/// historical artifact from `pw_impl.rs` and silently grew the Vec
+/// for any write larger than 512 stereo frames — caught by
+/// CodeRabbit on PR #253.
+const INTERLEAVE_BUF_CAPACITY: usize = RING_CAPACITY;
 
 /// Maximum frames per render callback we are willing to service from the
 /// stack scratch buffer. CoreAudio quanta are typically 256 or 512 frames;
@@ -138,7 +147,7 @@ impl AudioSink {
             ring: Arc::new(AudioRingBuffer::new(RING_CAPACITY)),
             audio_unit: None,
             target_device: String::new(),
-            interleave_buf: Vec::with_capacity(INTERLEAVE_BUF_INITIAL_CAP),
+            interleave_buf: Vec::with_capacity(INTERLEAVE_BUF_CAPACITY),
         }
     }
 
@@ -172,6 +181,18 @@ impl AudioSink {
 
     /// Send stereo audio samples to CoreAudio for playback.
     ///
+    /// The interleave buffer is pre-sized to [`INTERLEAVE_BUF_CAPACITY`]
+    /// (= [`RING_CAPACITY`] f32s = ~48,000 stereo frames). For any input
+    /// up to that ceiling the call is **allocation-free** — the buffer
+    /// is `clear()`ed (which only resets `len`, leaving `capacity`
+    /// alone) and then `push()`ed back up to the new size without ever
+    /// calling the allocator. Inputs larger than that ceiling would
+    /// also overflow the ring buffer itself, so they're a contract
+    /// violation; debug builds `debug_assert!` to catch this loudly,
+    /// release builds let `Vec::push` reallocate once and then proceed
+    /// with the larger capacity (a one-time cost we accept as a graceful
+    /// degradation rather than dropping samples).
+    ///
     /// # Errors
     ///
     /// Returns [`SinkError::NotRunning`] if the sink has not been started.
@@ -180,9 +201,17 @@ impl AudioSink {
             return Err(SinkError::NotRunning);
         }
 
+        debug_assert!(
+            samples.len() * 2 <= INTERLEAVE_BUF_CAPACITY,
+            "write_samples called with {} stereo frames, exceeds interleave buffer capacity {} (would overflow the ring buffer too)",
+            samples.len(),
+            INTERLEAVE_BUF_CAPACITY / 2
+        );
+
         // Interleave stereo into the pre-allocated scratch buffer (zero
-        // allocation on the hot path) and push it to the ring. The
-        // render callback de-interleaves on the audio thread.
+        // allocation on the hot path under normal sizing) and push it
+        // to the ring. The render callback de-interleaves on the audio
+        // thread.
         self.interleave_buf.clear();
         for s in samples {
             self.interleave_buf.push(s.l);
