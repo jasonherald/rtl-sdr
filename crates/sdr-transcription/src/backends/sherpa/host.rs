@@ -26,6 +26,13 @@ pub(super) const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// Sample rate sherpa-onnx expects from `accept_waveform`.
 pub(super) const SHERPA_SAMPLE_RATE_HZ: i32 = 16_000;
 
+/// Absolute-difference tolerance for VAD threshold rebuild comparison.
+/// If the requested threshold differs from the currently-held VAD's
+/// threshold by more than this, the worker rebuilds Silero at session
+/// start. Keeps the rebuild policy in sync with the UI's slider step
+/// (0.05) — anything smaller than a slider step is just float drift.
+const VAD_THRESHOLD_REBUILD_EPSILON: f32 = 0.01;
+
 /// Process-wide singleton for the sherpa-onnx host. Stores either a ready
 /// host or the error message from a failed initialization. Set exactly once
 /// by the first successful worker thread.
@@ -132,6 +139,10 @@ pub(super) struct SessionParams {
     pub audio_rx: mpsc::Receiver<Vec<f32>>,
     pub event_tx: mpsc::Sender<TranscriptionEvent>,
     pub noise_gate_ratio: f32,
+    /// Silero VAD threshold requested for this session (offline models only).
+    /// The worker rebuilds the VAD if this differs from the currently-held
+    /// VAD's threshold.
+    pub vad_threshold: f32,
 }
 
 /// Commands sent to the host worker thread.
@@ -248,10 +259,15 @@ fn run_host_loop(
             Ok(state) => state,
             Err(()) => return, // init_online already published Failed and stored the error
         },
-        ModelKind::OfflineMoonshine => match init_offline(model, &event_tx) {
-            Ok(state) => state,
-            Err(()) => return,
-        },
+        // Both offline kinds share init_offline — only the recognizer
+        // config builder differs, and that branching happens inside
+        // init_offline based on model.kind() again.
+        ModelKind::OfflineMoonshine | ModelKind::OfflineNemoTransducer => {
+            match init_offline(model, &event_tx) {
+                Ok(state) => state,
+                Err(()) => return,
+            }
+        }
     };
 
     // --- Phase 3: build SherpaHost and store in SHERPA_HOST ---
@@ -286,6 +302,35 @@ fn run_host_loop(
                         super::streaming::run_session(recognizer, params);
                     }
                     RecognizerState::Offline { recognizer, vad } => {
+                        // Check if the user's requested VAD threshold differs
+                        // from the currently-held VAD's threshold. If so,
+                        // rebuild the VAD before starting the session. The
+                        // rebuild is ~50-100ms of ONNX model load — only
+                        // happens when the slider value actually changed.
+                        let requested = params.vad_threshold;
+                        // Treat differences smaller than the slider step as
+                        // "same" to avoid pointless rebuilds from float drift.
+                        if (vad.current_threshold() - requested).abs()
+                            > VAD_THRESHOLD_REBUILD_EPSILON
+                        {
+                            tracing::info!(
+                                old = vad.current_threshold(),
+                                new = requested,
+                                "rebuilding Silero VAD with new threshold"
+                            );
+                            let vad_path = sherpa_model::silero_vad_path();
+                            match super::silero_vad::SherpaSileroVad::new(&vad_path, requested) {
+                                Ok(new_vad) => {
+                                    *vad = new_vad;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "VAD rebuild failed; reusing existing VAD"
+                                    );
+                                }
+                            }
+                        }
                         super::offline::run_session(recognizer, vad, params);
                     }
                 }
@@ -295,39 +340,67 @@ fn run_host_loop(
                 model: new_model,
                 event_tx,
             } => {
-                tracing::info!(?new_model, "sherpa-host: reloading recognizer");
-                // Drop the old recognizer (and VAD if offline) BEFORE building
-                // the new one — we can't hold two at once because they share
-                // the ONNX Runtime singleton and memory budget.
-                recognizer_state = None;
-
-                let new_state = match new_model.kind() {
-                    crate::sherpa_model::ModelKind::OnlineTransducer => {
-                        init_online(new_model, &event_tx)
-                    }
-                    crate::sherpa_model::ModelKind::OfflineMoonshine => {
-                        init_offline(new_model, &event_tx)
-                    }
-                };
-
-                match new_state {
-                    Ok(state) => {
-                        tracing::info!(?new_model, "sherpa-host: reload complete");
-                        recognizer_state = Some(state);
-                        let _ = event_tx.send(InitEvent::Ready);
-                    }
-                    Err(()) => {
-                        // init_online/init_offline already emitted Failed through
-                        // event_tx AND stored the error in SHERPA_HOST (via
-                        // store_init_failure). Leave recognizer_state as None so
-                        // the next StartSession returns the error above.
-                        tracing::warn!(?new_model, "sherpa-host: reload failed");
-                    }
-                }
+                handle_reload_recognizer(new_model, &event_tx, &mut recognizer_state);
             }
         }
     }
     tracing::info!("sherpa-host worker exiting");
+}
+
+/// Handle a `HostCommand::ReloadRecognizer` by building the new
+/// recognizer WITHOUT dropping the current one first, then swapping
+/// only if the new recognizer is ready.
+///
+/// If the new recognizer fails to build (transient download error,
+/// missing files, `model_type` mismatch, etc.) the existing
+/// `*recognizer_state` is left untouched so `StartSession` continues
+/// to find the previous working recognizer.
+///
+/// Previous implementation dropped the current state up front which
+/// stranded the host on any init failure — every subsequent session
+/// until the next manual reload was rejected with "no recognizer
+/// loaded". The brief double-RAM footprint during the transition
+/// (~2x the model size; worst case ~1.2 GB for a Parakeet-to-Parakeet
+/// swap) is tolerable on personal-use hardware.
+fn handle_reload_recognizer(
+    new_model: SherpaModel,
+    event_tx: &mpsc::Sender<InitEvent>,
+    recognizer_state: &mut Option<RecognizerState>,
+) {
+    tracing::info!(?new_model, "sherpa-host: reloading recognizer");
+
+    let new_state = match new_model.kind() {
+        crate::sherpa_model::ModelKind::OnlineTransducer => init_online(new_model, event_tx),
+        crate::sherpa_model::ModelKind::OfflineMoonshine
+        | crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
+            init_offline(new_model, event_tx)
+        }
+    };
+
+    match new_state {
+        Ok(state) => {
+            tracing::info!(
+                ?new_model,
+                "sherpa-host: reload complete, replacing old recognizer"
+            );
+            // Assignment drops the old recognizer at end of statement.
+            // Both recognizers exist in memory for exactly one
+            // expression evaluation.
+            *recognizer_state = Some(state);
+            let _ = event_tx.send(InitEvent::Ready);
+        }
+        Err(()) => {
+            // init_online/init_offline already emitted
+            // InitEvent::Failed through event_tx. The old
+            // `recognizer_state` is left untouched so StartSession
+            // continues to find the previous recognizer. No
+            // host-stranding.
+            tracing::warn!(
+                ?new_model,
+                "sherpa-host: reload failed, keeping previous recognizer"
+            );
+        }
+    }
 }
 
 /// Phase 1-2 for the `OnlineTransducer` path: download the bundle if
@@ -359,11 +432,16 @@ fn init_online(
     Ok(RecognizerState::Online(recognizer))
 }
 
-/// Phase 1-2 for the `OfflineMoonshine` path: download the Silero VAD
-/// model if missing, download the Moonshine bundle if missing, then
-/// create the `OfflineRecognizer` + `SherpaSileroVad`. Returns `Err(())`
-/// on any failure — the error has already been stored in `SHERPA_HOST`
-/// and emitted as `InitEvent::Failed`.
+/// Phase 1-2 for any offline model (`OfflineMoonshine` or
+/// `OfflineNemoTransducer`): download the Silero VAD if missing,
+/// download the model bundle if missing, then build the right
+/// `OfflineRecognizerConfig` for the model's kind and create the
+/// `OfflineRecognizer` + `SherpaSileroVad`.
+///
+/// The recognizer config builder is selected via `model.kind()` so
+/// callers don't need to know which offline family they're using.
+/// Returns `Err(())` on any failure — the error has already been
+/// stored in `SHERPA_HOST` and emitted as `InitEvent::Failed`.
 fn init_offline(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
@@ -385,12 +463,41 @@ fn init_offline(
 
     // --- Build OfflineRecognizer ---
     let _ = event_tx.send(InitEvent::CreatingRecognizer);
-    let recognizer_config = super::offline::build_moonshine_recognizer_config(model, "cpu");
-    tracing::info!(?model, "creating sherpa-onnx OfflineRecognizer (Moonshine)");
+    // Both offline kinds use OfflineRecognizer but with different config
+    // builders. Branch here so init_offline's Phase 1-2 (download VAD +
+    // bundle) stays generic across all offline models.
+    //
+    // The `OnlineTransducer` arm should be unreachable in practice —
+    // every caller of `init_offline` (the two places in `run_host_loop`
+    // that dispatch on `model.kind()`) only routes `OfflineMoonshine`
+    // and `OfflineNemoTransducer` here. Still, library crates forbid
+    // `panic!` / `unreachable!` so we route through the normal init
+    // failure path instead of aborting the process.
+    let recognizer_config = match model.kind() {
+        crate::sherpa_model::ModelKind::OfflineMoonshine => {
+            super::offline::build_moonshine_recognizer_config(model, "cpu")
+        }
+        crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
+            super::offline::build_nemo_transducer_recognizer_config(model, "cpu")
+        }
+        crate::sherpa_model::ModelKind::OnlineTransducer => {
+            let msg = format!(
+                "init_offline called with online model {} — engine routing bug",
+                model.label()
+            );
+            tracing::error!(%msg);
+            store_init_failure(BackendError::Init(msg.clone()));
+            let _ = event_tx.send(InitEvent::Failed { message: msg });
+            return Err(());
+        }
+    };
+    tracing::info!(?model, "creating sherpa-onnx OfflineRecognizer");
 
     let Some(recognizer) = OfflineRecognizer::create(&recognizer_config) else {
-        let msg =
-            "OfflineRecognizer::create returned None — check Moonshine model files".to_owned();
+        let msg = format!(
+            "OfflineRecognizer::create returned None for {} — check model files and model_type",
+            model.label()
+        );
         tracing::error!(%msg);
         store_init_failure(BackendError::Init(msg.clone()));
         let _ = event_tx.send(InitEvent::Failed { message: msg });
@@ -399,8 +506,11 @@ fn init_offline(
     tracing::info!("OfflineRecognizer created successfully");
 
     // --- Build SherpaSileroVad ---
+    // Use the default threshold at startup (Option A): if the user has a
+    // persisted non-default threshold, it will cause a ~50-100ms VAD
+    // rebuild on the first session start (in the StartSession handler below).
     let vad_path = sherpa_model::silero_vad_path();
-    let vad = match SherpaSileroVad::new(&vad_path) {
+    let vad = match SherpaSileroVad::new(&vad_path, super::silero_vad::SILERO_THRESHOLD) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("Silero VAD creation failed: {e}");

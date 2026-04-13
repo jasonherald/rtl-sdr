@@ -1829,6 +1829,7 @@ dependencies = [
  "sdr-transcription",
  "sdr-types",
  "sdr-ui",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

@@ -134,7 +134,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     setup_app_actions(app, &window, config, &rr_button);
 
     // Wire transcript panel (separate from sidebar panels).
-    let transcription_engine = connect_transcript_panel(&transcript_panel, &state);
+    let transcription_engine = connect_transcript_panel(&transcript_panel, &state, config);
 
     // On window close, signal the worker to stop without blocking.
     window.connect_close_request(move |_| {
@@ -1501,6 +1501,7 @@ fn unlock_transcription_session_rows(
     #[cfg(feature = "whisper")] silence_row: &glib::WeakRef<adw::SpinRow>,
     noise_gate_row: &glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
+    #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
 ) {
     if let Some(row) = model_row.upgrade() {
         row.set_sensitive(true);
@@ -1516,6 +1517,10 @@ fn unlock_transcription_session_rows(
     if let Some(row) = display_mode_row.upgrade() {
         row.set_sensitive(true);
     }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = vad_threshold_row.upgrade() {
+        row.set_sensitive(true);
+    }
 }
 
 /// Connect transcript panel controls to DSP commands.
@@ -1525,6 +1530,9 @@ fn unlock_transcription_session_rows(
 fn connect_transcript_panel(
     transcript: &sidebar::transcript_panel::TranscriptPanel,
     state: &Rc<AppState>,
+    #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] config: &std::sync::Arc<
+        sdr_config::ConfigManager,
+    >,
 ) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
     use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
 
@@ -1552,9 +1560,13 @@ fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let display_mode_row = transcript.display_mode_row.clone();
     #[cfg(feature = "sherpa")]
+    let vad_threshold_row = transcript.vad_threshold_row.clone();
+    #[cfg(feature = "sherpa")]
     let live_line_label = transcript.live_line_label.clone();
     #[cfg(feature = "sherpa")]
     let display_mode_row_weak = display_mode_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let vad_threshold_row_weak = vad_threshold_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -1563,6 +1575,11 @@ fn connect_transcript_panel(
         let status_label_reload = status_label.clone();
         let progress_bar_reload = progress_bar.clone();
         let enable_row_reload = transcript.enable_row.clone();
+        // Config handle for the deferred-persistence path. We write
+        // KEY_SHERPA_MODEL only after InitEvent::Ready fires so a
+        // failed recognizer swap can't leave a broken model idx in
+        // config that would wedge next startup's init_sherpa_host.
+        let config_for_reload_persist = std::sync::Arc::clone(config);
         transcript.model_row.connect_selected_notify(move |row| {
             let idx = row.selected() as usize;
             let Some(new_model) = sdr_transcription::SherpaModel::ALL.get(idx).copied() else {
@@ -1599,6 +1616,11 @@ fn connect_transcript_panel(
             let status_weak = status_label_reload.downgrade();
             let progress_weak = progress_bar_reload.downgrade();
             let mut current_component: String = new_model.label().to_owned();
+            // Capture an Arc clone + the new idx for the deferred
+            // persistence path — written to config on Ready, dropped
+            // silently on Failed/Disconnected.
+            let config_for_this_reload = std::sync::Arc::clone(&config_for_reload_persist);
+            let persist_idx = idx;
             glib::timeout_add_local(Duration::from_millis(100), move || {
                 let Some(status) = status_weak.upgrade() else {
                     // Widgets are gone (window closing); model row is too,
@@ -1639,6 +1661,16 @@ fn connect_transcript_panel(
                             if let Some(enable_row) = enable_row_reload_weak.upgrade() {
                                 enable_row.set_sensitive(true);
                             }
+                            // Deferred persistence: the recognizer swap
+                            // succeeded, so it's now safe to save the
+                            // new selection to config. If this Ready
+                            // arm never fires (reload failed), config
+                            // keeps the previous model idx and next
+                            // startup gets a known-working recognizer.
+                            config_for_this_reload.write(|v| {
+                                v[crate::sidebar::transcript_panel::KEY_SHERPA_MODEL] =
+                                    serde_json::json!(persist_idx);
+                            });
                             return glib::ControlFlow::Break;
                         }
                         Ok(sdr_transcription::InitEvent::Failed { message }) => {
@@ -1697,6 +1729,8 @@ fn connect_transcript_panel(
             // exception. User stops, changes, starts.
             #[cfg(feature = "sherpa")]
             display_mode_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            vad_threshold_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
 
@@ -1730,10 +1764,18 @@ fn connect_transcript_panel(
                 sdr_transcription::ModelChoice::Sherpa(sherpa_model)
             };
 
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation)]
+            let vad_threshold = vad_threshold_row.value() as f32;
+            // Whisper builds compile the field but ignore it (no Silero VAD).
+            #[cfg(feature = "whisper")]
+            let vad_threshold: f32 = sdr_transcription::VAD_THRESHOLD_DEFAULT;
+
             let config = sdr_transcription::BackendConfig {
                 model,
                 silence_threshold,
                 noise_gate_ratio,
+                vad_threshold,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
@@ -1763,6 +1805,8 @@ fn connect_transcript_panel(
                     let noise_gate_row_weak = noise_gate_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let display_mode_row_weak = display_mode_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let vad_threshold_row_weak = vad_threshold_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let live_line_weak = live_line_weak.clone();
 
@@ -1799,12 +1843,37 @@ fn connect_transcript_panel(
                                     TranscriptionEvent::Partial { text } => {
                                         #[cfg(feature = "sherpa")]
                                         {
-                                            // Read the current display mode
-                                            // from the combo row (the user may
-                                            // have changed it mid-session; we
-                                            // deliberately don't lock it).
-                                            let show_live =
-                                                display_mode_row_weak.upgrade().is_some_and(
+                                            // Belt-and-suspenders: only paint
+                                            // the live line if (a) the current
+                                            // model actually supports partials
+                                            // and (b) display mode is Live.
+                                            //
+                                            // (a) defends against a future bug
+                                            // where an offline model accidentally
+                                            // emits a Partial event — today the
+                                            // offline session loop never does,
+                                            // but the UI shouldn't trust that.
+                                            // Without this check, italics would
+                                            // appear on Moonshine/Parakeet on
+                                            // any spurious Partial.
+                                            //
+                                            // (b) honors the user's display-mode
+                                            // preference for partial-emitting
+                                            // models. Re-read on every event so
+                                            // mid-session toggle takes effect.
+                                            let model_supports_partials = model_row_weak
+                                                .upgrade()
+                                                .is_some_and(|row| {
+                                                    let idx = row.selected() as usize;
+                                                    sdr_transcription::SherpaModel::ALL
+                                                        .get(idx)
+                                                        .copied()
+                                                        .is_some_and(
+                                                            sdr_transcription::SherpaModel::supports_partials,
+                                                        )
+                                                });
+                                            let show_live = model_supports_partials
+                                                && display_mode_row_weak.upgrade().is_some_and(
                                                     |row| row.selected() != DISPLAY_MODE_FINAL_IDX,
                                                 );
                                             if show_live
@@ -1857,6 +1926,8 @@ fn connect_transcript_panel(
                                             &noise_gate_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &display_mode_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &vad_threshold_row_weak,
                                         );
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
@@ -1877,14 +1948,43 @@ fn connect_transcript_panel(
                                 },
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    // Backend channel dropped without a
-                                    // terminal Error event. Mirror the Error
-                                    // arm's teardown so the locked controls
-                                    // (model_row, silence_row, noise_gate_row,
-                                    // display_mode_row, enable_row) all
-                                    // recover instead of staying frozen.
+                                    // Distinguish a normal user-initiated stop
+                                    // from a spontaneous backend death:
+                                    //
+                                    // - User stop: the off branch of
+                                    //   enable_row.connect_active_notify already
+                                    //   ran (it dropped audio_tx, which is what
+                                    //   caused the worker to exit and drop
+                                    //   event_tx, which we're now seeing as
+                                    //   Disconnected). The toggle is already
+                                    //   inactive and all the rows have been
+                                    //   re-enabled. Nothing to do here — the
+                                    //   off branch did the cleanup. Without
+                                    //   this check the disconnect arm overwrote
+                                    //   the off branch's clean state with a
+                                    //   spurious "Transcription stopped
+                                    //   unexpectedly" error message on every
+                                    //   normal stop.
+                                    //
+                                    // - Spontaneous death: the worker dropped
+                                    //   event_tx without the user clicking
+                                    //   anything. The toggle is still active.
+                                    //   Mirror the Error arm's teardown so the
+                                    //   UI doesn't strand the user with locked
+                                    //   controls and a stale "Listening..."
+                                    //   status.
+                                    let was_user_stop =
+                                        enable_row_weak.upgrade().is_none_or(|e| !e.is_active());
+
+                                    if was_user_stop {
+                                        tracing::debug!(
+                                            "transcription event channel closed (user stop)"
+                                        );
+                                        return glib::ControlFlow::Break;
+                                    }
+
                                     tracing::warn!(
-                                        "transcription event channel disconnected without terminal event"
+                                        "transcription event channel disconnected unexpectedly"
                                     );
                                     unlock_transcription_session_rows(
                                         &model_row_weak,
@@ -1893,6 +1993,8 @@ fn connect_transcript_panel(
                                         &noise_gate_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &display_mode_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &vad_threshold_row_weak,
                                     );
                                     if let Some(enable) = enable_row_weak.upgrade() {
                                         enable.set_active(false);
@@ -1922,6 +2024,8 @@ fn connect_transcript_panel(
                         &noise_gate_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &display_mode_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &vad_threshold_row.downgrade(),
                     );
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
@@ -1942,6 +2046,8 @@ fn connect_transcript_panel(
                 &noise_gate_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &display_mode_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &vad_threshold_row.downgrade(),
             );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();

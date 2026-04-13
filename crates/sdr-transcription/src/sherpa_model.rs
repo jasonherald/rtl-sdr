@@ -64,12 +64,20 @@ fn cleanup_scratch_state(model: SherpaModel) -> Result<(), SherpaModelError> {
 /// offline models run through `OfflineRecognizer` + external VAD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelKind {
-    /// Streaming transducer: Zipformer today, Parakeet-TDT in a future PR.
-    /// Uses `OnlineRecognizer` + streaming session loop.
+    /// Streaming transducer: Zipformer today. Uses `OnlineRecognizer`
+    /// + streaming session loop in `backends/sherpa/streaming.rs`.
     OnlineTransducer,
-    /// Offline encoder-decoder: Moonshine v2. Requires external VAD
-    /// to detect utterance boundaries before batch decoding.
+    /// Offline encoder-decoder: Moonshine v1. Requires external VAD
+    /// (Silero) to detect utterance boundaries before batch decoding.
+    /// Uses `OfflineRecognizer` with `OfflineMoonshineModelConfig`
+    /// + the offline session loop in `backends/sherpa/offline.rs`.
     OfflineMoonshine,
+    /// Offline transducer-style model from NVIDIA `NeMo`: Parakeet-TDT
+    /// today. Uses `OfflineRecognizer` with `OfflineTransducerModelConfig`
+    /// and `model_type = "nemo_transducer"`. Shares the same VAD-gated
+    /// offline session loop as `OfflineMoonshine`; only the recognizer
+    /// config builder differs.
+    OfflineNemoTransducer,
 }
 
 /// Available sherpa-onnx model variants.
@@ -85,6 +93,11 @@ pub enum SherpaModel {
     /// ~380MB bundle. More accurate than Tiny, higher per-utterance
     /// latency. Offline (VAD-gated) decode.
     MoonshineBaseEn,
+    /// NVIDIA Parakeet-TDT-0.6b v3 (English, int8). ~600M params,
+    /// ~600MB bundle. Highest accuracy — currently #1 on the `OpenASR`
+    /// leaderboard. CPU-only today (sherpa-cuda follow-up tracked).
+    /// Offline (VAD-gated) batch decode through a `NeMo` transducer.
+    ParakeetTdt06bV3En,
 }
 
 impl SherpaModel {
@@ -94,6 +107,7 @@ impl SherpaModel {
             Self::StreamingZipformerEn => "Streaming Zipformer (English)",
             Self::MoonshineTinyEn => "Moonshine Tiny (English)",
             Self::MoonshineBaseEn => "Moonshine Base (English)",
+            Self::ParakeetTdt06bV3En => "Parakeet TDT 0.6b v3 (English)",
         }
     }
 
@@ -104,6 +118,7 @@ impl SherpaModel {
             Self::StreamingZipformerEn => "streaming-zipformer-en",
             Self::MoonshineTinyEn => "moonshine-tiny-en",
             Self::MoonshineBaseEn => "moonshine-base-en",
+            Self::ParakeetTdt06bV3En => "parakeet-tdt-0.6b-v3-en",
         }
     }
 
@@ -115,6 +130,7 @@ impl SherpaModel {
             Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
             Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8.tar.bz2",
             Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8.tar.bz2",
+            Self::ParakeetTdt06bV3En => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
         }
     }
 
@@ -128,6 +144,7 @@ impl SherpaModel {
             Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26",
             Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8",
             Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8",
+            Self::ParakeetTdt06bV3En => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
         }
     }
 
@@ -148,6 +165,7 @@ impl SherpaModel {
         match self {
             Self::StreamingZipformerEn => ModelKind::OnlineTransducer,
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => ModelKind::OfflineMoonshine,
+            Self::ParakeetTdt06bV3En => ModelKind::OfflineNemoTransducer,
         }
     }
 
@@ -161,7 +179,7 @@ impl SherpaModel {
     pub fn supports_partials(self) -> bool {
         match self.kind() {
             ModelKind::OnlineTransducer => true,
-            ModelKind::OfflineMoonshine => false,
+            ModelKind::OfflineMoonshine | ModelKind::OfflineNemoTransducer => false,
         }
     }
 
@@ -170,6 +188,7 @@ impl SherpaModel {
         Self::StreamingZipformerEn,
         Self::MoonshineTinyEn,
         Self::MoonshineBaseEn,
+        Self::ParakeetTdt06bV3En,
     ];
 }
 
@@ -346,6 +365,17 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
             encoder: dir.join("encode.int8.onnx"),
             uncached_decoder: dir.join("uncached_decode.int8.onnx"),
             cached_decoder: dir.join("cached_decode.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
+        // Parakeet-TDT v3 int8 layout: standard 4-file transducer
+        // (encoder + decoder + joiner + tokens), structurally identical
+        // to Zipformer. The `Transducer` ModelFilePaths variant is
+        // reused — kind() tells the host which recognizer API to feed
+        // them into (online for Zipformer vs offline for Parakeet).
+        SherpaModel::ParakeetTdt06bV3En => ModelFilePaths::Transducer {
+            encoder: dir.join("encoder.int8.onnx"),
+            decoder: dir.join("decoder.int8.onnx"),
+            joiner: dir.join("joiner.int8.onnx"),
             tokens: dir.join("tokens.txt"),
         },
     }
@@ -620,14 +650,20 @@ mod tests {
     }
 
     #[test]
-    fn streaming_zipformer_archive_inner_dir_matches_filename_stem() {
-        let model = SherpaModel::StreamingZipformerEn;
-        let archive = model.archive_filename();
-        let inner = model.archive_inner_directory();
+    fn all_archives_have_inner_dir_matching_filename_stem() {
         // Inner directory name should equal the archive filename minus
         // the .tar.bz2 suffix — sanity check that we'll find the right
-        // directory after extraction.
-        assert_eq!(format!("{inner}.tar.bz2"), archive);
+        // directory after extraction. Loops over every variant in ALL
+        // so adding a new model auto-extends this protection.
+        for model in SherpaModel::ALL {
+            let archive = model.archive_filename();
+            let inner = model.archive_inner_directory();
+            assert_eq!(
+                format!("{inner}.tar.bz2"),
+                archive,
+                "archive_inner_directory + .tar.bz2 != archive_filename for {model:?}"
+            );
+        }
     }
 
     #[test]
@@ -718,8 +754,52 @@ mod tests {
     }
 
     #[test]
-    fn all_contains_three_variants() {
-        assert_eq!(SherpaModel::ALL.len(), 3);
+    fn all_contains_four_variants() {
+        assert_eq!(SherpaModel::ALL.len(), 4);
+    }
+
+    #[test]
+    fn parakeet_is_offline_nemo_transducer_kind() {
+        assert_eq!(
+            SherpaModel::ParakeetTdt06bV3En.kind(),
+            ModelKind::OfflineNemoTransducer
+        );
+    }
+
+    #[test]
+    fn parakeet_does_not_support_partials() {
+        assert!(!SherpaModel::ParakeetTdt06bV3En.supports_partials());
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn parakeet_has_transducer_file_layout() {
+        let paths = model_file_paths(SherpaModel::ParakeetTdt06bV3En);
+        let ModelFilePaths::Transducer {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } = paths
+        else {
+            panic!("ParakeetTdt06bV3En should be a Transducer layout");
+        };
+        assert!(encoder.ends_with("encoder.int8.onnx"));
+        assert!(decoder.ends_with("decoder.int8.onnx"));
+        assert!(joiner.ends_with("joiner.int8.onnx"));
+        assert!(tokens.ends_with("tokens.txt"));
+        assert_ne!(encoder, decoder);
+        assert_ne!(decoder, joiner);
+    }
+
+    #[test]
+    fn parakeet_archive_url_is_well_formed() {
+        let url = SherpaModel::ParakeetTdt06bV3En.archive_url();
+        assert!(url.starts_with("https://github.com/k2-fsa/sherpa-onnx/"));
+        assert!(url.ends_with(".tar.bz2"));
+        assert!(url.contains("parakeet"));
+        assert!(url.contains("tdt"));
+        assert!(url.contains("v3"));
     }
 
     #[test]
