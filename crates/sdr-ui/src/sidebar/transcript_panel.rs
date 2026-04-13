@@ -306,6 +306,22 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         live_line_label.set_attributes(Some(&attrs));
     }
 
+    // Mid-session mode flip: if the user switches to "Final only" while a
+    // partial is visible, clear and hide it immediately. Without this, a
+    // stale live line would linger until the next commit or Clear press.
+    // Persistence is handled by the first connect_selected_notify above;
+    // GLib chains handlers, so both fire on every selection change.
+    #[cfg(feature = "sherpa")]
+    {
+        let live_line_for_mode = live_line_label.clone();
+        display_mode_row.connect_selected_notify(move |r| {
+            if r.selected() == DISPLAY_MODE_FINAL_IDX {
+                live_line_for_mode.set_text("");
+                live_line_for_mode.set_visible(false);
+            }
+        });
+    }
+
     let status_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
         .css_classes(["dim-label"])

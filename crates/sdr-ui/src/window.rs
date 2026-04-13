@@ -1698,6 +1698,13 @@ fn connect_transcript_panel(
                                         status.set_css_classes(&["error"]);
                                         status.set_visible(true);
                                         progress.set_visible(false);
+                                        // Clear any stale partial so it
+                                        // doesn't linger into the next session.
+                                        #[cfg(feature = "sherpa")]
+                                        if let Some(label) = live_line_weak.upgrade() {
+                                            label.set_text("");
+                                            label.set_visible(false);
+                                        }
                                         return glib::ControlFlow::Break;
                                     }
                                 },
@@ -1737,6 +1744,13 @@ fn connect_transcript_panel(
             status_label.set_text("");
             status_label.set_visible(false);
             progress_bar.set_visible(false);
+            // Clear any stale partial on stop so the previous session's
+            // last in-progress text doesn't linger on screen.
+            #[cfg(feature = "sherpa")]
+            {
+                live_line_label.set_text("");
+                live_line_label.set_visible(false);
+            }
         }
     });
 
