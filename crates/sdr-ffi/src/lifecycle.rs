@@ -6,11 +6,12 @@
 
 use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sdr_core::Engine;
 
 use crate::error::{SdrCoreError, clear_last_error, set_last_error};
+use crate::event::spawn_dispatcher;
 use crate::handle::SdrCore;
 
 /// ABI version packed as `(major << 16) | minor`.
@@ -131,7 +132,38 @@ pub unsafe extern "C" fn sdr_core_create(
             }
         };
 
-        let core = Box::new(SdrCore::new(engine, config_path));
+        // Take the one-shot event receiver from the engine. If
+        // something else already subscribed (shouldn't happen
+        // for an FFI-created engine but the API is technically
+        // contested), bail rather than silently run without an
+        // event dispatcher.
+        let Some(evt_rx) = engine.subscribe() else {
+            set_last_error(
+                "sdr_core_create: Engine::subscribe returned None — event receiver already taken",
+            );
+            return SdrCoreError::Internal.as_int();
+        };
+
+        // Shared callback slot + dispatcher. The Arc clone on
+        // the dispatcher side and the copy on the SdrCore side
+        // both hand back to the same Mutex<Option<_>>, so
+        // `sdr_core_set_event_callback` and the dispatcher see
+        // the same registration.
+        let event_callback = Arc::new(Mutex::new(None));
+        let dispatcher_handle = match spawn_dispatcher(evt_rx, Arc::clone(&event_callback)) {
+            Ok(h) => h,
+            Err(err) => {
+                set_last_error(format!("sdr_core_create: spawn_dispatcher failed: {err}"));
+                return SdrCoreError::Internal.as_int();
+            }
+        };
+
+        let core = Box::new(SdrCore::new(
+            engine,
+            config_path,
+            event_callback,
+            dispatcher_handle,
+        ));
         let raw = Box::into_raw(core);
         // SAFETY: out_handle non-null checked above; writable
         // storage is the caller's contract.
@@ -166,23 +198,55 @@ pub unsafe extern "C" fn sdr_core_destroy(handle: *mut SdrCore) {
     }
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Reclaim the Box so it drops at the end of this block,
-        // which runs Engine::drop, which detaches the DSP thread.
+        // Reclaim the Box so the inner fields can be teared down
+        // in the right order. We don't want to just let the Box
+        // drop implicitly — we need explicit control over the
+        // dispatcher-join / Engine-drop ordering.
         //
         // SAFETY: Caller contract guarantees `handle` is a
         // pointer previously returned by sdr_core_create and not
         // yet destroyed. Box::from_raw takes ownership back.
         let core: Box<SdrCore> = unsafe { Box::from_raw(handle) };
 
-        // Best-effort Stop before drop so the controller stops
-        // the active source cleanly. If the channel is already
-        // closed (engine in a weird state), just proceed.
+        // Best-effort Stop so the controller stops the active
+        // source cleanly. If the channel is already closed
+        // (engine in a weird state), just proceed.
         let _ = core.engine.shutdown();
 
-        // TODO (next checkpoint): join the dispatcher thread if
-        // one was started. For now there's no dispatcher, so the
-        // Box drop is sufficient to tear everything down.
+        // Pull the dispatcher join handle out *before* dropping
+        // the engine. We want to:
+        //   1. Drop the Engine (closes cmd_tx → DSP thread exits
+        //      → evt_tx drops → dispatcher's recv() returns Err).
+        //   2. Join the dispatcher thread (it's already exiting
+        //      or about to).
+        //
+        // Taking the JoinHandle out of its Mutex<Option<_>>
+        // decouples it from the `drop(core)` that follows; if we
+        // tried to join *while* `core` was still owned, we'd
+        // need to hold the Mutex across the drop, which is
+        // awkward. Easier to just lift it out.
+        let dispatcher_handle = core
+            .dispatcher_handle
+            .lock()
+            .map(|mut guard| guard.take())
+            .unwrap_or(None);
+
+        // Drop the Engine explicitly before the join so the
+        // event channel closes and the dispatcher's `recv()`
+        // unblocks. The rest of `core` (the Arc<Mutex> for the
+        // callback slot, the config_path PathBuf) drops with
+        // it; that's fine because the dispatcher already has
+        // its own Arc clone of the callback slot.
         drop(core);
+
+        // Now join the dispatcher. With the Engine dropped, the
+        // event channel is closed and the dispatcher's recv
+        // loop should exit immediately.
+        if let Some(handle) = dispatcher_handle
+            && handle.join().is_err()
+        {
+            eprintln!("sdr_core_destroy: dispatcher thread panicked during teardown");
+        }
     }));
 
     if result.is_err() {

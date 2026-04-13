@@ -59,6 +59,10 @@ pub use command::{
     sdr_core_set_volume, sdr_core_start, sdr_core_stop, sdr_core_tune,
 };
 pub use error::sdr_core_last_error_message;
+pub use event::{
+    SdrEvent, SdrEventCallback, SdrEventDeviceInfo, SdrEventError, SdrEventGainList,
+    SdrEventPayload, sdr_core_set_event_callback,
+};
 pub use handle::SdrCore;
 pub use lifecycle::{
     sdr_core_abi_version, sdr_core_create, sdr_core_destroy, sdr_core_init_logging,

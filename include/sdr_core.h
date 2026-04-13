@@ -293,6 +293,135 @@ int32_t sdr_core_set_fft_size(SdrCore* handle, size_t n);
 int32_t sdr_core_set_fft_window(SdrCore* handle, int32_t window);
 int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
 
+/* ================================================================ */
+/*  Events                                                          */
+/* ================================================================ */
+
+/*
+ * Event delivery model:
+ *
+ *   - The FFI starts a dedicated "event dispatcher" thread at
+ *     `sdr_core_create` time. That thread owns the engine's event
+ *     receiver and loops reading from it.
+ *
+ *   - Hosts register a callback via `sdr_core_set_event_callback`.
+ *     The callback fires on the dispatcher thread — NOT on the
+ *     host's main thread — so hosts are responsible for marshaling
+ *     to whatever thread they want to do UI work on.
+ *
+ *   - Events that arrive before a callback is registered are
+ *     silently dropped. Hosts should register a callback
+ *     immediately after `sdr_core_create` and before
+ *     `sdr_core_start` to avoid missing the initial DeviceInfo /
+ *     GainList / DisplayBandwidth events the pipeline fires when
+ *     the source opens.
+ *
+ *   - Borrowed pointers inside the event (`device_info.utf8`,
+ *     `gain_list.values`, `error.utf8`) are valid only for the
+ *     duration of the callback call. Hosts that want to persist
+ *     the data must copy it out before returning.
+ *
+ *   - The callback is safe to be reentrant with other
+ *     `sdr_core_*` calls except for `sdr_core_destroy` — calling
+ *     destroy from inside the callback would deadlock against the
+ *     dispatcher join.
+ */
+
+typedef enum SdrEventKind {
+    SDR_EVT_SOURCE_STOPPED        = 1,
+    SDR_EVT_SAMPLE_RATE_CHANGED   = 2,
+    SDR_EVT_SIGNAL_LEVEL          = 3,
+    SDR_EVT_DEVICE_INFO           = 4,
+    SDR_EVT_GAIN_LIST             = 5,
+    SDR_EVT_DISPLAY_BANDWIDTH     = 6,
+    SDR_EVT_ERROR                 = 7,
+} SdrEventKind;
+
+/*
+ * Payload for SDR_EVT_DEVICE_INFO. `utf8` is a NUL-terminated
+ * UTF-8 string borrowed from dispatcher-owned storage; valid only
+ * for the duration of the callback.
+ */
+typedef struct SdrEventDeviceInfo {
+    const char* utf8;
+} SdrEventDeviceInfo;
+
+/*
+ * Payload for SDR_EVT_GAIN_LIST. `values` is a borrowed pointer
+ * to `len` contiguous `double` gain values in dB, ordered as the
+ * tuner reports them. Valid only for the duration of the callback.
+ */
+typedef struct SdrEventGainList {
+    const double* values;
+    size_t len;
+} SdrEventGainList;
+
+/*
+ * Payload for SDR_EVT_ERROR. `utf8` is a NUL-terminated UTF-8
+ * error message borrowed from dispatcher-owned storage.
+ */
+typedef struct SdrEventError {
+    const char* utf8;
+} SdrEventError;
+
+/*
+ * Tagged union of all event payloads. Which union field is valid
+ * is determined by the `kind` discriminant on the enclosing
+ * SdrEvent (see the table below).
+ *
+ * Kind                              -> Valid field
+ * ---------------------------------   ---------------------------
+ * SDR_EVT_SOURCE_STOPPED              none (all-zero payload)
+ * SDR_EVT_SAMPLE_RATE_CHANGED         sample_rate_hz
+ * SDR_EVT_SIGNAL_LEVEL                signal_level_db
+ * SDR_EVT_DISPLAY_BANDWIDTH           display_bandwidth_hz
+ * SDR_EVT_DEVICE_INFO                 device_info.utf8
+ * SDR_EVT_GAIN_LIST                   gain_list.{values,len}
+ * SDR_EVT_ERROR                       error.utf8
+ */
+typedef union SdrEventPayload {
+    double sample_rate_hz;
+    float  signal_level_db;
+    double display_bandwidth_hz;
+    SdrEventDeviceInfo device_info;
+    SdrEventGainList   gain_list;
+    SdrEventError      error;
+    /* Placeholder so kinds with no payload (SOURCE_STOPPED) have
+     * a well-defined zero-byte default. */
+    uint64_t _placeholder;
+} SdrEventPayload;
+
+typedef struct SdrEvent {
+    int32_t         kind;
+    SdrEventPayload payload;
+} SdrEvent;
+
+/*
+ * Host-supplied callback signature. `event` is a borrowed pointer
+ * valid only for the duration of the call. `user_data` is the
+ * same opaque pointer the host passed to
+ * `sdr_core_set_event_callback`.
+ */
+typedef void (*SdrEventCallback)(const SdrEvent* event, void* user_data);
+
+/*
+ * Register (or clear) the host's event callback.
+ *
+ * Passing a non-null `callback` registers it with the given
+ * `user_data`; passing a null `callback` clears any previously-
+ * registered callback (events that arrive subsequently are
+ * silently dropped).
+ *
+ * Thread-safe. Safe from any thread. Not safe from inside the
+ * callback itself (the implementation takes the callback-slot
+ * mutex).
+ */
+int32_t sdr_core_set_event_callback(
+    SdrCore*         handle,
+    SdrEventCallback callback,
+    void*            user_data
+);
+
 #ifdef __cplusplus
 }
 #endif

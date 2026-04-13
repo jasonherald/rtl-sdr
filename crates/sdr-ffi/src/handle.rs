@@ -10,7 +10,7 @@
 //! on `sdr_core_destroy`. Between those two calls the host owns the
 //! pointer (in the C sense — the Rust `Box` is leaked into raw form).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use sdr_core::Engine;
 
@@ -25,15 +25,13 @@ pub struct SdrCore {
     pub(crate) engine: Engine,
 
     /// Registered event callback + user_data, set by
-    /// `sdr_core_set_event_callback`. Wrapped in `Mutex<Option<_>>`
-    /// because the dispatcher thread reads it from another thread.
+    /// `sdr_core_set_event_callback`. Wrapped in `Arc<Mutex<_>>`
+    /// so the dispatcher thread can hold a clone of the Arc and
+    /// read the slot under the mutex without having to go through
+    /// the `SdrCore` handle (which we never give the dispatcher a
+    /// borrow of — the dispatcher lives independently).
     /// `None` until the host registers a callback.
-    ///
-    /// `#[allow(dead_code)]`: not yet read in this checkpoint —
-    /// lands when the event dispatcher module is added later in
-    /// this PR.
-    #[allow(dead_code)]
-    pub(crate) event_callback: Mutex<Option<EventCallbackSlot>>,
+    pub(crate) event_callback: Arc<Mutex<Option<EventCallbackSlot>>>,
 
     /// Path the host provided to `sdr_core_create`. Stored for future
     /// config-persistence wiring (the v1 engine doesn't load it yet —
@@ -48,6 +46,13 @@ pub struct SdrCore {
     /// off once a production call site exists.
     #[allow(dead_code)]
     pub(crate) config_path: std::path::PathBuf,
+
+    /// FFI event dispatcher thread join handle. Spawned at
+    /// `sdr_core_create` time, joined at `sdr_core_destroy` so the
+    /// teardown is deterministic. Stored in a `Mutex<Option<_>>` so
+    /// destroy can `take()` the handle out for joining without
+    /// needing a `&mut SdrCore`.
+    pub(crate) dispatcher_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// Bundle of `(callback fn pointer, user_data void*)` so the
@@ -72,13 +77,20 @@ pub(crate) struct EventCallbackSlot {
 unsafe impl Send for EventCallbackSlot {}
 
 impl SdrCore {
-    /// Construct from a successfully-built [`Engine`] and the
-    /// host-provided config path.
-    pub(crate) fn new(engine: Engine, config_path: std::path::PathBuf) -> Self {
+    /// Construct from a successfully-built [`Engine`], the
+    /// host-provided config path, and the spawned dispatcher
+    /// thread handle.
+    pub(crate) fn new(
+        engine: Engine,
+        config_path: std::path::PathBuf,
+        event_callback: Arc<Mutex<Option<EventCallbackSlot>>>,
+        dispatcher_handle: std::thread::JoinHandle<()>,
+    ) -> Self {
         Self {
             engine,
-            event_callback: Mutex::new(None),
+            event_callback,
             config_path,
+            dispatcher_handle: Mutex::new(Some(dispatcher_handle)),
         }
     }
 
