@@ -72,9 +72,9 @@ pub enum ModelKind {
     /// Uses `OfflineRecognizer` with `OfflineMoonshineModelConfig`
     /// + the offline session loop in `backends/sherpa/offline.rs`.
     OfflineMoonshine,
-    /// Offline transducer-style model from NVIDIA NeMo: Parakeet-TDT
+    /// Offline transducer-style model from NVIDIA `NeMo`: Parakeet-TDT
     /// today. Uses `OfflineRecognizer` with `OfflineTransducerModelConfig`
-    /// + `model_type = "nemo_transducer"`. Shares the same VAD-gated
+    /// and `model_type = "nemo_transducer"`. Shares the same VAD-gated
     /// offline session loop as `OfflineMoonshine`; only the recognizer
     /// config builder differs.
     OfflineNemoTransducer,
@@ -94,9 +94,9 @@ pub enum SherpaModel {
     /// latency. Offline (VAD-gated) decode.
     MoonshineBaseEn,
     /// NVIDIA Parakeet-TDT-0.6b v3 (English, int8). ~600M params,
-    /// ~600MB bundle. Highest accuracy — currently #1 on the OpenASR
+    /// ~600MB bundle. Highest accuracy — currently #1 on the `OpenASR`
     /// leaderboard. CPU-only today (sherpa-cuda follow-up tracked).
-    /// Offline (VAD-gated) batch decode through a NeMo transducer.
+    /// Offline (VAD-gated) batch decode through a `NeMo` transducer.
     ParakeetTdt06bV3En,
 }
 

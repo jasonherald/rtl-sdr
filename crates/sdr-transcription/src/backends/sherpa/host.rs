@@ -248,10 +248,15 @@ fn run_host_loop(
             Ok(state) => state,
             Err(()) => return, // init_online already published Failed and stored the error
         },
-        ModelKind::OfflineMoonshine => match init_offline(model, &event_tx) {
-            Ok(state) => state,
-            Err(()) => return,
-        },
+        // Both offline kinds share init_offline — only the recognizer
+        // config builder differs, and that branching happens inside
+        // init_offline based on model.kind() again.
+        ModelKind::OfflineMoonshine | ModelKind::OfflineNemoTransducer => {
+            match init_offline(model, &event_tx) {
+                Ok(state) => state,
+                Err(()) => return,
+            }
+        }
     };
 
     // --- Phase 3: build SherpaHost and store in SHERPA_HOST ---
@@ -305,7 +310,8 @@ fn run_host_loop(
                     crate::sherpa_model::ModelKind::OnlineTransducer => {
                         init_online(new_model, &event_tx)
                     }
-                    crate::sherpa_model::ModelKind::OfflineMoonshine => {
+                    crate::sherpa_model::ModelKind::OfflineMoonshine
+                    | crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
                         init_offline(new_model, &event_tx)
                     }
                 };
@@ -359,11 +365,16 @@ fn init_online(
     Ok(RecognizerState::Online(recognizer))
 }
 
-/// Phase 1-2 for the `OfflineMoonshine` path: download the Silero VAD
-/// model if missing, download the Moonshine bundle if missing, then
-/// create the `OfflineRecognizer` + `SherpaSileroVad`. Returns `Err(())`
-/// on any failure — the error has already been stored in `SHERPA_HOST`
-/// and emitted as `InitEvent::Failed`.
+/// Phase 1-2 for any offline model (`OfflineMoonshine` or
+/// `OfflineNemoTransducer`): download the Silero VAD if missing,
+/// download the model bundle if missing, then build the right
+/// `OfflineRecognizerConfig` for the model's kind and create the
+/// `OfflineRecognizer` + `SherpaSileroVad`.
+///
+/// The recognizer config builder is selected via `model.kind()` so
+/// callers don't need to know which offline family they're using.
+/// Returns `Err(())` on any failure — the error has already been
+/// stored in `SHERPA_HOST` and emitted as `InitEvent::Failed`.
 fn init_offline(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
@@ -385,12 +396,27 @@ fn init_offline(
 
     // --- Build OfflineRecognizer ---
     let _ = event_tx.send(InitEvent::CreatingRecognizer);
-    let recognizer_config = super::offline::build_moonshine_recognizer_config(model, "cpu");
-    tracing::info!(?model, "creating sherpa-onnx OfflineRecognizer (Moonshine)");
+    // Both offline kinds use OfflineRecognizer but with different config
+    // builders. Branch here so init_offline's Phase 1-2 (download VAD +
+    // bundle) stays generic across all offline models.
+    let recognizer_config = match model.kind() {
+        crate::sherpa_model::ModelKind::OfflineMoonshine => {
+            super::offline::build_moonshine_recognizer_config(model, "cpu")
+        }
+        crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
+            super::offline::build_nemo_transducer_recognizer_config(model, "cpu")
+        }
+        crate::sherpa_model::ModelKind::OnlineTransducer => {
+            unreachable!("init_offline called with an online model")
+        }
+    };
+    tracing::info!(?model, "creating sherpa-onnx OfflineRecognizer");
 
     let Some(recognizer) = OfflineRecognizer::create(&recognizer_config) else {
-        let msg =
-            "OfflineRecognizer::create returned None — check Moonshine model files".to_owned();
+        let msg = format!(
+            "OfflineRecognizer::create returned None for {} — check model files and model_type",
+            model.label()
+        );
         tracing::error!(%msg);
         store_init_failure(BackendError::Init(msg.clone()));
         let _ = event_tx.send(InitEvent::Failed { message: msg });

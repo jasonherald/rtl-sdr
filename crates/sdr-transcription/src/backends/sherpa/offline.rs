@@ -77,13 +77,13 @@ pub(super) fn build_moonshine_recognizer_config(
     }
 }
 
-/// Build the `OfflineRecognizerConfig` for a NeMo Parakeet-TDT model.
+/// Build the `OfflineRecognizerConfig` for a `NeMo` Parakeet-TDT model.
 ///
 /// Uses sherpa-onnx's offline transducer config (4 files: encoder,
 /// decoder, joiner, tokens) with `model_type = "nemo_transducer"`.
-/// The model_type field is required — without it, sherpa-onnx tries
+/// The `model_type` field is required — without it, sherpa-onnx tries
 /// to use the generic transducer decode loop which doesn't understand
-/// NeMo's TDT (Token-and-Duration Transducer) joiner output shape.
+/// `NeMo`'s TDT (Token-and-Duration Transducer) joiner output shape.
 ///
 /// Mirrors the upstream `rust-api-examples/examples/nemo_parakeet.rs`
 /// example.
