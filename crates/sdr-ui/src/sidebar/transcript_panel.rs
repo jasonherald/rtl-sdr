@@ -276,6 +276,36 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         row
     };
 
+    // --- Live caption line (Sherpa only) ---
+    //
+    // Dimmed italic label that renders in-progress Sherpa partials.
+    // Initially hidden; becomes visible once a Partial event arrives
+    // and the current display mode is "Live captions". When display
+    // mode is "Final only" the label stays hidden entirely.
+    #[cfg(feature = "sherpa")]
+    let live_line_label = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+        .css_classes(["dim-label"])
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(2)
+        .margin_bottom(4)
+        .visible(false)
+        .build();
+
+    // Italicize via Pango markup attribute list so we don't need a
+    // custom CSS rule. The text is set via set_text() later; the
+    // attributes persist across text changes.
+    #[cfg(feature = "sherpa")]
+    {
+        let attrs = gtk4::pango::AttrList::new();
+        attrs.insert(gtk4::pango::AttrInt::new_style(gtk4::pango::Style::Italic));
+        live_line_label.set_attributes(Some(&attrs));
+    }
+
     let status_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
         .css_classes(["dim-label"])
@@ -317,8 +347,15 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .build();
 
     let text_view_clear = text_view.clone();
+    #[cfg(feature = "sherpa")]
+    let live_line_for_clear = live_line_label.clone();
     clear_button.connect_clicked(move |_| {
         text_view_clear.buffer().set_text("");
+        #[cfg(feature = "sherpa")]
+        {
+            live_line_for_clear.set_text("");
+            live_line_for_clear.set_visible(false);
+        }
     });
 
     let content_box = gtk4::Box::builder()
@@ -329,6 +366,8 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     content_box.append(&status_label);
     content_box.append(&progress_bar);
     content_box.append(&scroll);
+    #[cfg(feature = "sherpa")]
+    content_box.append(&live_line_label);
     content_box.append(&clear_button);
     group.add(&content_box);
 
@@ -339,6 +378,10 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         #[cfg(feature = "whisper")]
         silence_row,
         noise_gate_row,
+        #[cfg(feature = "sherpa")]
+        display_mode_row,
+        #[cfg(feature = "sherpa")]
+        live_line_label,
         status_label,
         progress_bar,
         text_view,
