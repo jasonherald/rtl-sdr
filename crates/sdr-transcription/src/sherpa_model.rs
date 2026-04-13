@@ -196,6 +196,18 @@ pub fn model_exists(model: SherpaModel) -> bool {
 ///    directory from a previous failed attempt.
 /// 2. Downloads the `.tar.bz2` to `<archive_filename>.part` in
 ///    [`sherpa_models_dir`], streaming progress through `progress_tx`.
+///
+/// # Concurrent instances (known limitation)
+///
+/// This function does not take a per-model filesystem lock. If two
+/// `sdr-rs` instances start simultaneously on a first-run machine, they
+/// can race on the scratch `.part` and `.partdir` paths and leave the
+/// install corrupted. In practice this is a rare edge case — `sdr-rs`
+/// is a personal-use app with one user, and the model is cached after
+/// the first successful download, so subsequent launches skip this
+/// function entirely. A proper fix (flock on a sentinel file via
+/// `fs2` or `fslock`) is tracked in
+/// <https://github.com/jasonherald/rtl-sdr/issues/255>.
 #[allow(clippy::cast_possible_truncation)]
 pub fn download_sherpa_archive(
     model: SherpaModel,
@@ -335,9 +347,25 @@ pub fn extract_sherpa_archive(
     }
     std::fs::rename(&extracted_inner, &final_dir)?;
 
-    // Clean up scratch state.
-    std::fs::remove_dir_all(&temp_extract_dir)?;
-    std::fs::remove_file(archive_path)?;
+    // Post-install scratch cleanup. If these fail AFTER the model is
+    // already renamed into place, we log but don't downgrade a
+    // successful install into Err — the model is installed, the
+    // scratch state is recoverable by cleanup_scratch_state on next
+    // launch.
+    if let Err(e) = std::fs::remove_dir_all(&temp_extract_dir) {
+        tracing::warn!(
+            error = %e,
+            ?temp_extract_dir,
+            "failed to remove sherpa scratch dir (install succeeded)"
+        );
+    }
+    if let Err(e) = std::fs::remove_file(archive_path) {
+        tracing::warn!(
+            error = %e,
+            ?archive_path,
+            "failed to remove downloaded sherpa archive (install succeeded)"
+        );
+    }
 
     tracing::info!(?final_dir, "sherpa-onnx model installed");
     Ok(final_dir)

@@ -252,9 +252,15 @@ fn run_host_loop(
         state: Mutex::new(SherpaHostState { cmd_tx }),
     };
     if SHERPA_HOST.set(Ok(host)).is_err() {
-        // Someone else already set it — shouldn't happen because the
-        // worker is the only writer, but be defensive.
-        tracing::error!("sherpa host onceLock was already set");
+        // Someone else already set it — this worker is unreachable.
+        // Don't emit Ready because the caller expects Ready to mean
+        // "SHERPA_HOST now points at a live host constructed by this
+        // worker"; the previous set is whatever the caller gets when
+        // they look up the global.
+        let msg = "sherpa host OnceLock was already set; this worker is unreachable".to_owned();
+        tracing::error!(%msg);
+        let _ = event_tx.send(InitEvent::Failed { message: msg });
+        return;
     }
     tracing::info!("sherpa-host ready, signaling Ready event");
     let _ = event_tx.send(InitEvent::Ready);
@@ -567,17 +573,25 @@ mod tests {
         assert_eq!(backend.name(), "sherpa");
     }
 
+    /// **Manual-only test.** Kicks off the real worker — which, if the
+    /// model files are absent, proceeds past the first `DownloadStart`
+    /// event into the full 256 MB download + extract path. That makes
+    /// the test network-dependent, machine-state-dependent, and has
+    /// cross-test leakage concerns (the worker populates `SHERPA_HOST`
+    /// `OnceLock` for the rest of the process lifetime, affecting
+    /// subsequent unit tests in the same binary).
+    ///
+    /// Marked `#[ignore]` so it doesn't run on `cargo test`. Run
+    /// manually with `cargo test ... -- --ignored` to exercise the
+    /// `DownloadStart` path explicitly.
+    ///
+    /// Proper hermetic coverage (injectable model paths, mocked spawn,
+    /// etc.) is tracked as a follow-up refactor that would require
+    /// threading a base-dir parameter through `sherpa_models_dir()`
+    /// and friends — out of scope for PR #254.
     #[test]
+    #[ignore = "spawns the real download worker; run manually with --ignored"]
     fn sherpa_host_spawn_emits_download_start_when_files_missing() {
-        // SherpaHost::spawn now spawns the worker immediately and returns
-        // a Receiver<InitEvent>. When the model is absent, the first event
-        // must be DownloadStart. We drop the receiver immediately after
-        // verifying this — subsequent sends from the worker will silently
-        // fail (disconnected channel), which is the expected behavior when
-        // a caller drops the channel early.
-        //
-        // If the model IS installed, skip so we don't accidentally spawn a
-        // live host (ONNX Runtime cleanup can race with other tests).
         if sherpa_model::model_exists(SherpaModel::StreamingZipformerEn) {
             eprintln!("skipping test: streaming-zipformer-en model is present locally");
             return;

@@ -180,6 +180,6 @@ pub fn run() -> i32 {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run() -> i32 {
-    eprintln!("sdr-splash-gtk: GTK splash window is currently Linux-only");
+    tracing::error!("sdr-splash-gtk: GTK splash window is currently Linux-only");
     1
 }

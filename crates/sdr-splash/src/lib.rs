@@ -102,16 +102,28 @@ impl SplashController {
     /// Update the label text on the splash window. No-op if the
     /// controller is inactive (subprocess didn't spawn).
     pub fn update_text(&mut self, text: &str) {
-        let Some(inner) = self.inner.as_mut() else {
+        // Take ownership of `inner` so we can explicitly reap the child
+        // on the failure path. If we used `as_mut` and set `self.inner =
+        // None` on error, the `Child` handle would drop without the
+        // `Drop` impl ever reaping it.
+        let Some(mut inner) = self.inner.take() else {
             return;
         };
-        if writeln!(inner.stdin, "text:{text}").is_err() {
-            // The subprocess died — drop our state so future calls are no-ops.
+        if writeln!(inner.stdin, "text:{text}")
+            .and_then(|()| inner.stdin.flush())
+            .is_err()
+        {
             tracing::warn!("SplashController: stdin write failed; subprocess may have died");
-            self.inner = None;
+            // Reap the child explicitly since Drop won't run on the
+            // half-moved inner. Dropping stdin first signals EOF so
+            // a still-alive child exits cleanly.
+            drop(inner.stdin);
+            let _ = inner.child.kill();
+            let _ = inner.child.wait();
             return;
         }
-        let _ = inner.stdin.flush();
+        // Write succeeded — put `inner` back.
+        self.inner = Some(inner);
     }
 }
 
