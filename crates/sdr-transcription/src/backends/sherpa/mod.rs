@@ -129,6 +129,7 @@ impl TranscriptionBackend for SherpaBackend {
             event_tx,
             noise_gate_ratio: config.noise_gate_ratio,
             vad_threshold: config.vad_threshold,
+            segmentation_mode: config.segmentation_mode,
         })?;
 
         tracing::info!("sherpa backend session requested");

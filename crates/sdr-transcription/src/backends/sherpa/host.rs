@@ -139,10 +139,15 @@ pub(super) struct SessionParams {
     pub audio_rx: mpsc::Receiver<TranscriptionInput>,
     pub event_tx: mpsc::Sender<TranscriptionEvent>,
     pub noise_gate_ratio: f32,
-    /// Silero VAD threshold requested for this session (offline models only).
+    /// Silero VAD threshold requested for this session (offline VAD mode only).
     /// The worker rebuilds the VAD if this differs from the currently-held
-    /// VAD's threshold.
+    /// VAD's threshold. Ignored when `segmentation_mode == AutoBreak`.
     pub vad_threshold: f32,
+    /// Which segmentation engine drives utterance boundaries. Validated
+    /// against the model kind at the top of the session runner — streaming
+    /// online models reject `AutoBreak` (Task 4), and the offline session
+    /// loop dispatches VAD vs Auto Break on this field (Task 11).
+    pub segmentation_mode: crate::backend::SegmentationMode,
 }
 
 /// Commands sent to the host worker thread.

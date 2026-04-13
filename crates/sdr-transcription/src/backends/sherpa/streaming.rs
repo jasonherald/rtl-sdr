@@ -75,6 +75,7 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         event_tx,
         noise_gate_ratio,
         vad_threshold: _,
+        segmentation_mode: _,
     } = params;
 
     let stream = recognizer.create_stream();

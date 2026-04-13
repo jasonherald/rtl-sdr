@@ -161,6 +161,7 @@ pub(super) fn run_session(
         event_tx,
         noise_gate_ratio,
         vad_threshold: _,
+        segmentation_mode: _,
     } = params;
 
     // Clear any residual state from a previous session.
