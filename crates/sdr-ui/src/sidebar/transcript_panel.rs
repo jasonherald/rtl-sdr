@@ -19,6 +19,18 @@ const KEY_NOISE_GATE: &str = "transcription_noise_gate";
 #[cfg(feature = "sherpa")]
 /// Config key for the persisted Sherpa model index.
 const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
+#[cfg(feature = "sherpa")]
+/// Config key for the persisted transcript display mode.
+/// Values: `"live"` (default) or `"final"`.
+const KEY_DISPLAY_MODE: &str = "transcription_display_mode";
+
+#[cfg(feature = "sherpa")]
+const DISPLAY_MODE_LIVE_IDX: u32 = 0;
+/// `pub(crate)` so `window.rs` can gate the `Partial` handler on it.
+#[cfg(feature = "sherpa")]
+pub(crate) const DISPLAY_MODE_FINAL_IDX: u32 = 1;
+#[cfg(feature = "sherpa")]
+const DISPLAY_MODE_LABELS: &[&str] = &["Live captions", "Final only"];
 
 // Silence threshold slider defaults and range. Whisper-only — Sherpa
 // uses native endpoint detection so the slider isn't shown.
@@ -56,6 +68,14 @@ pub struct TranscriptPanel {
     pub silence_row: adw::SpinRow,
     /// Noise gate spin row.
     pub noise_gate_row: adw::SpinRow,
+    /// Display-mode selector (Live captions vs Final only). Sherpa-only —
+    /// Whisper has no `Partial` events to render.
+    #[cfg(feature = "sherpa")]
+    pub display_mode_row: adw::ComboRow,
+    /// Dimmed italic label below the text view that renders in-progress
+    /// Sherpa partials. Sherpa-only.
+    #[cfg(feature = "sherpa")]
+    pub live_line_label: gtk4::Label,
     /// Status label (downloading, listening, error).
     pub status_label: gtk4::Label,
     /// Model download progress bar.
@@ -214,6 +234,94 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         });
     });
 
+    // --- Display mode selector (Sherpa only) ---
+    //
+    // Whisper builds never compile this in — Whisper does not emit
+    // `TranscriptionEvent::Partial`, so there's nothing to render in a
+    // "live line". Sherpa builds default to "Live captions" because
+    // streaming is the whole point; users can switch to "Final only"
+    // if the in-place updates are visually distracting.
+    #[cfg(feature = "sherpa")]
+    let display_mode_row = {
+        let list = gtk4::StringList::new(DISPLAY_MODE_LABELS);
+
+        let saved_idx = config.read(|v| {
+            v.get(KEY_DISPLAY_MODE)
+                .and_then(serde_json::Value::as_str)
+                .map_or(DISPLAY_MODE_LIVE_IDX, |s| match s {
+                    "final" => DISPLAY_MODE_FINAL_IDX,
+                    _ => DISPLAY_MODE_LIVE_IDX,
+                })
+        });
+
+        let row = adw::ComboRow::builder()
+            .title("Display mode")
+            .subtitle("Live captions update in place; Final only shows committed text")
+            .model(&list)
+            .selected(saved_idx)
+            .build();
+        group.add(&row);
+
+        let config_display = Arc::clone(config);
+        row.connect_selected_notify(move |r| {
+            let value = match r.selected() {
+                DISPLAY_MODE_FINAL_IDX => "final",
+                _ => "live",
+            };
+            config_display.write(|v| {
+                v[KEY_DISPLAY_MODE] = serde_json::json!(value);
+            });
+        });
+
+        row
+    };
+
+    // --- Live caption line (Sherpa only) ---
+    //
+    // Dimmed italic label that renders in-progress Sherpa partials.
+    // Initially hidden; becomes visible once a Partial event arrives
+    // and the current display mode is "Live captions". When display
+    // mode is "Final only" the label stays hidden entirely.
+    #[cfg(feature = "sherpa")]
+    let live_line_label = gtk4::Label::builder()
+        .halign(gtk4::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+        .css_classes(["dim-label"])
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(2)
+        .margin_bottom(4)
+        .visible(false)
+        .build();
+
+    // Italicize via Pango markup attribute list so we don't need a
+    // custom CSS rule. The text is set via set_text() later; the
+    // attributes persist across text changes.
+    #[cfg(feature = "sherpa")]
+    {
+        let attrs = gtk4::pango::AttrList::new();
+        attrs.insert(gtk4::pango::AttrInt::new_style(gtk4::pango::Style::Italic));
+        live_line_label.set_attributes(Some(&attrs));
+    }
+
+    // Mid-session mode flip: if the user switches to "Final only" while a
+    // partial is visible, clear and hide it immediately. Without this, a
+    // stale live line would linger until the next commit or Clear press.
+    // Persistence is handled by the first connect_selected_notify above;
+    // GLib chains handlers, so both fire on every selection change.
+    #[cfg(feature = "sherpa")]
+    {
+        let live_line_for_mode = live_line_label.clone();
+        display_mode_row.connect_selected_notify(move |r| {
+            if r.selected() == DISPLAY_MODE_FINAL_IDX {
+                live_line_for_mode.set_text("");
+                live_line_for_mode.set_visible(false);
+            }
+        });
+    }
+
     let status_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
         .css_classes(["dim-label"])
@@ -255,8 +363,15 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .build();
 
     let text_view_clear = text_view.clone();
+    #[cfg(feature = "sherpa")]
+    let live_line_for_clear = live_line_label.clone();
     clear_button.connect_clicked(move |_| {
         text_view_clear.buffer().set_text("");
+        #[cfg(feature = "sherpa")]
+        {
+            live_line_for_clear.set_text("");
+            live_line_for_clear.set_visible(false);
+        }
     });
 
     let content_box = gtk4::Box::builder()
@@ -267,6 +382,8 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     content_box.append(&status_label);
     content_box.append(&progress_bar);
     content_box.append(&scroll);
+    #[cfg(feature = "sherpa")]
+    content_box.append(&live_line_label);
     content_box.append(&clear_button);
     group.add(&content_box);
 
@@ -277,6 +394,10 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         #[cfg(feature = "whisper")]
         silence_row,
         noise_gate_row,
+        #[cfg(feature = "sherpa")]
+        display_mode_row,
+        #[cfg(feature = "sherpa")]
+        live_line_label,
         status_label,
         progress_bar,
         text_view,

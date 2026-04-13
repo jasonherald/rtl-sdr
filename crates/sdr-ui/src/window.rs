@@ -37,6 +37,8 @@ const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
 /// FFT sizes — re-exported from display panel (single source of truth).
 use crate::sidebar::display_panel::FFT_SIZES;
+#[cfg(feature = "sherpa")]
+use crate::sidebar::transcript_panel::DISPLAY_MODE_FINAL_IDX;
 
 /// Decimation factors available in the source panel dropdown (must match panel order).
 const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
@@ -1506,6 +1508,14 @@ fn connect_transcript_panel(
     #[cfg(feature = "whisper")]
     let silence_row_weak = silence_row.downgrade();
     let noise_gate_row_weak = noise_gate_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let display_mode_row = transcript.display_mode_row.clone();
+    #[cfg(feature = "sherpa")]
+    let live_line_label = transcript.live_line_label.clone();
+    #[cfg(feature = "sherpa")]
+    let display_mode_row_weak = display_mode_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let live_line_weak = live_line_label.downgrade();
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
@@ -1515,6 +1525,9 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
+            // display_mode_row is intentionally NOT locked — the Partial
+            // handler re-reads it on every event, so flipping it mid-session
+            // is safe and desirable (user sees effect immediately).
 
             let model_idx = model_row.selected() as usize;
 
@@ -1579,6 +1592,10 @@ fn connect_transcript_panel(
                     #[cfg(feature = "whisper")]
                     let silence_row_weak = silence_row_weak.clone();
                     let noise_gate_row_weak = noise_gate_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let display_mode_row_weak = display_mode_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let live_line_weak = live_line_weak.clone();
 
                     glib::timeout_add_local(Duration::from_millis(100), move || {
                         // Upgrade once per tick. If any widget has been
@@ -1611,16 +1628,36 @@ fn connect_transcript_panel(
                                         progress.set_visible(false);
                                     }
                                     TranscriptionEvent::Partial { text } => {
-                                        // PR 4 will render this as a live
-                                        // caption line. For the PR 2 spike,
-                                        // log only the length — never the
-                                        // raw text. Public safety scanner
-                                        // content does not belong in logs.
-                                        tracing::debug!(
-                                            target: "transcription",
-                                            partial_chars = text.chars().count(),
-                                            "sherpa partial received"
-                                        );
+                                        #[cfg(feature = "sherpa")]
+                                        {
+                                            // Read the current display mode
+                                            // from the combo row (the user may
+                                            // have changed it mid-session; we
+                                            // deliberately don't lock it).
+                                            let show_live =
+                                                display_mode_row_weak.upgrade().is_some_and(
+                                                    |row| row.selected() != DISPLAY_MODE_FINAL_IDX,
+                                                );
+                                            if show_live
+                                                && let Some(label) = live_line_weak.upgrade()
+                                            {
+                                                label.set_text(&text);
+                                                label.set_visible(true);
+                                            }
+                                            // Privacy: never log the raw text.
+                                            tracing::debug!(
+                                                target: "transcription",
+                                                partial_chars = text.chars().count(),
+                                                "sherpa partial received"
+                                            );
+                                        }
+                                        #[cfg(not(feature = "sherpa"))]
+                                        {
+                                            // Whisper never emits Partial, but
+                                            // the enum variant is compiled in.
+                                            // Defensive no-op.
+                                            let _ = text;
+                                        }
                                     }
                                     TranscriptionEvent::Text { timestamp, text } => {
                                         let buf = tv.buffer();
@@ -1629,6 +1666,15 @@ fn connect_transcript_panel(
                                         let mark = buf.create_mark(None, &buf.end_iter(), false);
                                         tv.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
                                         buf.delete_mark(&mark);
+
+                                        // An utterance committed — the live
+                                        // line is now stale. Clear and hide
+                                        // it so the next Partial starts fresh.
+                                        #[cfg(feature = "sherpa")]
+                                        if let Some(label) = live_line_weak.upgrade() {
+                                            label.set_text("");
+                                            label.set_visible(false);
+                                        }
                                     }
                                     TranscriptionEvent::Error(msg) => {
                                         // Fatal — backend has exited.
@@ -1652,6 +1698,13 @@ fn connect_transcript_panel(
                                         status.set_css_classes(&["error"]);
                                         status.set_visible(true);
                                         progress.set_visible(false);
+                                        // Clear any stale partial so it
+                                        // doesn't linger into the next session.
+                                        #[cfg(feature = "sherpa")]
+                                        if let Some(label) = live_line_weak.upgrade() {
+                                            label.set_text("");
+                                            label.set_visible(false);
+                                        }
                                         return glib::ControlFlow::Break;
                                     }
                                 },
@@ -1691,6 +1744,13 @@ fn connect_transcript_panel(
             status_label.set_text("");
             status_label.set_visible(false);
             progress_bar.set_visible(false);
+            // Clear any stale partial on stop so the previous session's
+            // last in-progress text doesn't linger on screen.
+            #[cfg(feature = "sherpa")]
+            {
+                live_line_label.set_text("");
+                live_line_label.set_visible(false);
+            }
         }
     });
 
