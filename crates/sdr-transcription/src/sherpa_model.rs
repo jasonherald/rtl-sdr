@@ -300,7 +300,11 @@ pub fn extract_sherpa_archive(
     let final_dir = model_directory(model);
     let temp_extract_dir = dir.join(format!("{}.partdir", model.dir_name()));
 
-    tracing::info!(?archive_path, ?temp_extract_dir, "extracting sherpa-onnx archive");
+    tracing::info!(
+        ?archive_path,
+        ?temp_extract_dir,
+        "extracting sherpa-onnx archive"
+    );
 
     // Extract via tar + bzip2 into a temp directory adjacent to the
     // final location.
