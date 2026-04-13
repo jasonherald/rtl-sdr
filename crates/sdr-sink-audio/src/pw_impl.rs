@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sdr_pipeline::sink_manager::Sink;
 use sdr_types::{SinkError, Stereo};
 
+use crate::ring::AudioRingBuffer;
+
 /// Audio sample rate in Hz.
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
@@ -16,8 +18,17 @@ const AUDIO_CHANNELS: u32 = 2;
 /// ~1 second at 48 kHz stereo = 96,000 samples.
 const RING_CAPACITY: usize = 96_000;
 
-/// Initial capacity for the stereo interleave buffer in `write_samples`.
-const INTERLEAVE_BUF_INITIAL_CAP: usize = 1024;
+/// Capacity for the stereo interleave buffer in `write_samples`.
+///
+/// Sized to match the ring buffer (the largest write that could ever
+/// fit in the ring without dropping data) so the hot path **never**
+/// reallocates: the buffer is `clear()`ed and re-pushed each call but
+/// never grows beyond its initial capacity for any input within the
+/// ring's natural ceiling. The previous value of 1024 silently grew
+/// the Vec for any write larger than 512 stereo frames — caught by
+/// CodeRabbit on PR #253 (against the parallel CoreAudio backend
+/// which inherited the same constant from this file).
+const INTERLEAVE_BUF_CAPACITY: usize = RING_CAPACITY;
 
 /// Initial sample capacity for the PipeWire callback read buffer.
 /// 4x typical quantum (1024 frames x 2 channels) to avoid RT reallocation.
@@ -28,87 +39,6 @@ const FRAME_SIZE: usize = (AUDIO_CHANNELS as usize) * std::mem::size_of::<f32>()
 
 /// Sentinel message sent via the PipeWire channel to request shutdown.
 struct Quit;
-
-/// Lock-based SPSC ring buffer for interleaved audio samples.
-///
-/// Pre-allocated at startup — zero allocation during streaming.
-/// The Mutex is held only for memcpy duration (microseconds).
-struct AudioRingBuffer {
-    buf: std::sync::Mutex<AudioRingInner>,
-}
-
-struct AudioRingInner {
-    data: Vec<f32>,
-    read_pos: usize,
-    write_pos: usize,
-    count: usize,
-    capacity: usize,
-}
-
-impl AudioRingBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            buf: std::sync::Mutex::new(AudioRingInner {
-                data: vec![0.0; capacity],
-                read_pos: 0,
-                write_pos: 0,
-                count: 0,
-                capacity,
-            }),
-        }
-    }
-
-    /// Write samples into the ring buffer. Drops oldest data if full.
-    fn write(&self, samples: &[f32]) {
-        let Ok(mut inner) = self.buf.lock() else {
-            return;
-        };
-        let cap = inner.capacity;
-        let mut wp = inner.write_pos;
-        let mut rp = inner.read_pos;
-        let mut cnt = inner.count;
-        for &s in samples {
-            inner.data[wp] = s;
-            wp = (wp + 1) % cap;
-            if cnt < cap {
-                cnt += 1;
-            } else {
-                rp = (rp + 1) % cap;
-            }
-        }
-        inner.write_pos = wp;
-        inner.read_pos = rp;
-        inner.count = cnt;
-    }
-
-    /// Clear the ring buffer (used on start/stop to avoid replaying stale audio).
-    fn clear(&self) {
-        let Ok(mut inner) = self.buf.lock() else {
-            return;
-        };
-        inner.read_pos = 0;
-        inner.write_pos = 0;
-        inner.count = 0;
-    }
-
-    /// Read up to `output.len()` samples. Returns count read.
-    /// Uses `try_lock` to avoid blocking the PipeWire RT callback thread.
-    fn read(&self, output: &mut [f32]) -> usize {
-        let Ok(mut inner) = self.buf.try_lock() else {
-            return 0; // Contended — return silence this cycle.
-        };
-        let to_read = output.len().min(inner.count);
-        let mut rp = inner.read_pos;
-        let cap = inner.capacity;
-        for out in output.iter_mut().take(to_read) {
-            *out = inner.data[rp];
-            rp = (rp + 1) % cap;
-        }
-        inner.read_pos = rp;
-        inner.count -= to_read;
-        to_read
-    }
-}
 
 /// Audio output sink backed by PipeWire.
 pub struct AudioSink {
@@ -236,7 +166,7 @@ impl AudioSink {
             quit_tx: None,
             pw_thread: None,
             target_node: String::new(),
-            interleave_buf: Vec::with_capacity(INTERLEAVE_BUF_INITIAL_CAP),
+            interleave_buf: Vec::with_capacity(INTERLEAVE_BUF_CAPACITY),
         }
     }
 
@@ -261,6 +191,16 @@ impl AudioSink {
 
     /// Send stereo audio samples to PipeWire for playback.
     ///
+    /// The interleave buffer is pre-sized to `INTERLEAVE_BUF_CAPACITY`
+    /// (= `RING_CAPACITY` f32s = ~48,000 stereo frames). For any input
+    /// up to that ceiling the call is **allocation-free**. Inputs
+    /// larger than that ceiling would also overflow the ring buffer
+    /// itself, so they're a contract violation; debug builds
+    /// `debug_assert!` to catch this loudly, release builds let
+    /// `Vec::push` reallocate once and then proceed with the larger
+    /// capacity (a one-time cost we accept as graceful degradation
+    /// rather than dropping samples).
+    ///
     /// # Errors
     ///
     /// Returns `SinkError::NotRunning` if the sink has not been started.
@@ -270,7 +210,15 @@ impl AudioSink {
             return Err(SinkError::NotRunning);
         }
 
-        // Interleave stereo into pre-allocated buffer (zero allocation).
+        debug_assert!(
+            samples.len() * 2 <= INTERLEAVE_BUF_CAPACITY,
+            "write_samples called with {} stereo frames, exceeds interleave buffer capacity {} (would overflow the ring buffer too)",
+            samples.len(),
+            INTERLEAVE_BUF_CAPACITY / 2
+        );
+
+        // Interleave stereo into pre-allocated buffer (zero allocation
+        // under normal sizing).
         self.interleave_buf.clear();
         for s in samples {
             self.interleave_buf.push(s.l);

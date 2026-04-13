@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 default = []
 pipewire = ["dep:pipewire"]
+coreaudio = ["dep:coreaudio-rs"]
 
 [dependencies]
 sdr-types.workspace = true
@@ -17,6 +18,13 @@ sdr-config.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 pipewire = { workspace = true, optional = true }
+
+# CoreAudio is a macOS-only system framework. Declared at the workspace
+# level (root Cargo.toml), pulled in here only on macOS so a Linux build
+# never tries to bind to a non-existent framework even if the `coreaudio`
+# feature is somehow flipped on by mistake.
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = { workspace = true, optional = true }
 
 [lints]
 workspace = true
