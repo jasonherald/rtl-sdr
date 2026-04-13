@@ -64,12 +64,20 @@ fn cleanup_scratch_state(model: SherpaModel) -> Result<(), SherpaModelError> {
 /// offline models run through `OfflineRecognizer` + external VAD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelKind {
-    /// Streaming transducer: Zipformer today, Parakeet-TDT in a future PR.
-    /// Uses `OnlineRecognizer` + streaming session loop.
+    /// Streaming transducer: Zipformer today. Uses `OnlineRecognizer`
+    /// + streaming session loop in `backends/sherpa/streaming.rs`.
     OnlineTransducer,
-    /// Offline encoder-decoder: Moonshine v2. Requires external VAD
-    /// to detect utterance boundaries before batch decoding.
+    /// Offline encoder-decoder: Moonshine v1. Requires external VAD
+    /// (Silero) to detect utterance boundaries before batch decoding.
+    /// Uses `OfflineRecognizer` with `OfflineMoonshineModelConfig`
+    /// + the offline session loop in `backends/sherpa/offline.rs`.
     OfflineMoonshine,
+    /// Offline transducer-style model from NVIDIA NeMo: Parakeet-TDT
+    /// today. Uses `OfflineRecognizer` with `OfflineTransducerModelConfig`
+    /// + `model_type = "nemo_transducer"`. Shares the same VAD-gated
+    /// offline session loop as `OfflineMoonshine`; only the recognizer
+    /// config builder differs.
+    OfflineNemoTransducer,
 }
 
 /// Available sherpa-onnx model variants.
