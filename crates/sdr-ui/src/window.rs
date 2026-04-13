@@ -312,6 +312,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
+    #[cfg(feature = "sherpa")]
+    let model_row_for_dsp = transcript_panel.model_row.clone();
     let engine_for_dsp = Rc::clone(&engine);
     // We deliberately discard the SourceId returned by `timeout_add_local`:
     // the window-lifecycle gate at the top of the closure returns
@@ -354,6 +358,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
                         &transcription_enable_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &model_row_for_dsp,
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -370,7 +378,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 }
 
 /// Handle a single message from the DSP thread.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_dsp_message(
     msg: DspToUi,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
@@ -382,6 +390,8 @@ fn handle_dsp_message(
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
     transcription_enable_row: &adw::SwitchRow,
+    #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
+    #[cfg(feature = "sherpa")] model_row: &adw::ComboRow,
 ) {
     match msg {
         DspToUi::FftData(_) => {
@@ -472,10 +482,44 @@ fn handle_dsp_message(
                 overlay.add_toast(toast);
             }
         }
-        // Task 16 will wire up the full UI response (stop transcription session,
-        // re-run Auto Break row visibility rules). For now just log the event.
-        DspToUi::DemodModeChanged(mode) => {
-            tracing::debug!(?mode, "demod mode changed (Task 16 handler pending)");
+        DspToUi::DemodModeChanged(new_mode) => {
+            tracing::info!(?new_mode, "demod mode changed");
+
+            // Re-run Auto Break row visibility rules with the new mode.
+            // The row is only visible when the current mode is NFM AND an
+            // offline sherpa model is selected. Task 13 installed the
+            // "offline model" check as a signal-chain reaction to model_row
+            // changes; this layer adds the NFM gate on top, fired by the
+            // demod-mode-change event.
+            #[cfg(feature = "sherpa")]
+            {
+                let is_nfm = new_mode == sdr_types::DemodMode::Nfm;
+                let model_idx = model_row.selected() as usize;
+                let selected_is_offline = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .is_some_and(|m| !m.supports_partials());
+                auto_break_row.set_visible(is_nfm && selected_is_offline);
+            }
+
+            // If a transcription session is currently active, stop it and
+            // surface a toast. The band has conceptually changed, so the
+            // session must restart from scratch — session config (model,
+            // VAD threshold, Auto Break toggle) is preserved; the user
+            // clicks Start to resume on the new band.
+            if transcription_enable_row.is_active() {
+                tracing::info!("stopping active transcription due to demod mode change");
+                // Toggling enable_row off triggers the existing stop path
+                // (connect_active_notify handler wired elsewhere in window.rs).
+                transcription_enable_row.set_active(false);
+
+                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                    let toast = adw::Toast::new(
+                        "Transcription stopped — demod mode changed. Press Start to resume.",
+                    );
+                    overlay.add_toast(toast);
+                }
+            }
         }
     }
 }
