@@ -29,22 +29,25 @@ sdr (binary)        → Entry point (depends on: ui, core, splash, transcription
 
 ## Transcription backend feature mutex
 
-**Whisper and Sherpa-onnx are mutually exclusive cargo features.** The `sdr-transcription` crate has `compile_error!` guards enforcing exactly one. This was a PR 2-era workaround for a heap corruption between whisper-rs's libstdc++ state and ONNX Runtime's `ParseSemVerVersion` regex constructors that only manifests when both C++ dep trees are in the same binary.
+**Whisper and Sherpa-onnx are mutually exclusive cargo features**, and within Sherpa, `sherpa-cpu` and `sherpa-cuda` are also mutually exclusive. The `sdr-transcription` crate has `compile_error!` guards enforcing exactly one. This was originally a PR 2-era workaround for a heap corruption between whisper-rs's libstdc++ state and ONNX Runtime's `ParseSemVerVersion` regex constructors that only manifests when both C++ dep trees are in the same binary; the sherpa-cpu/sherpa-cuda split additionally reflects that the sys crate's CUDA feature rebuilds against a different upstream prebuilt archive.
 
 **Build flavors:**
 
 ```bash
-# Whisper (default) — multilingual, mature GPU acceleration
-make install CARGO_FLAGS="--release"                                # Whisper CPU
+# Whisper — multilingual, mature GPU acceleration
+make install CARGO_FLAGS="--release"                                # Whisper CPU (default)
 make install CARGO_FLAGS="--release --features whisper-cuda"        # User's daily driver (RTX 4080 Super)
 make install CARGO_FLAGS="--release --features whisper-hipblas"     # AMD ROCm
 make install CARGO_FLAGS="--release --features whisper-vulkan"      # Cross-vendor GPU
 
-# Sherpa-onnx — Zipformer / Moonshine / Parakeet, English-only, CPU today
-make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"
+# Sherpa-onnx — Zipformer / Moonshine / Parakeet, English-only
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
 ```
 
-**Dual-build testing rule:** any change to `sdr-transcription` or its callers MUST be tested with BOTH `whisper-cuda` AND `sherpa-cpu` builds sequentially. The cfg gates make it easy to break one without noticing. CI runs both flavors.
+**`sherpa-cuda` requires CUDA 12.x + cuDNN 9.x installed system-wide** (onnxruntime dlopens `libcudnn.so.9` / `libcublas.so.12` at startup). Linux x86_64 only. The first build downloads a ~235 MB CUDA prebuilt archive from k2-fsa releases. During the PR window the sherpa-onnx dep is pinned to the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork on branch `feat/rust-sys-cuda-support`; swap back to a crates.io version pin once the upstream PR merges and releases.
+
+**Triple-build testing rule:** any change to `sdr-transcription` or its callers MUST be tested with `whisper-cuda`, `sherpa-cpu`, AND `sherpa-cuda` builds sequentially before pushing. The cfg gates make it easy to break one without noticing. CI runs `cargo check` on sherpa-cpu and sherpa-cuda (adding CUDA toolkit to CI runners is not worth the minutes, so whisper-cuda is user-verified locally).
 
 Runtime model selection for Sherpa builds is in-place (drop-old-recognizer-build-new) and does NOT require a restart — PR 5 architecture. The PR 2 "pre-GTK init" half of the heap-corruption workaround turned out to be unnecessary once the feature mutex was in place; only the first recognizer needs pre-GTK creation, and subsequent swaps post-GTK work fine.
 

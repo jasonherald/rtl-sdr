@@ -26,8 +26,17 @@ whisper-metal = ["whisper", "whisper-rs/metal"]
 whisper-intel-sycl = ["whisper", "whisper-rs/intel-sycl"]
 whisper-openblas = ["whisper", "whisper-rs/openblas"]
 
-# Sherpa backend (CPU only for now):
-sherpa-cpu = ["sherpa"]
+# Sherpa backend — pick exactly one:
+#
+#   sherpa-cpu  — CPU-only, static link against k2-fsa's CPU prebuilt
+#   sherpa-cuda — NVIDIA GPU via CUDA 12.x + cuDNN 9.x prebuilt. Downloads
+#                 a ~235MB archive on first build. Linux x86_64 only.
+#                 Requires libcudnn.so.9 / libcublas.so.12 installed
+#                 system-wide; onnxruntime dlopens them at startup.
+#
+# These are mutually exclusive (see the `compile_error!` guards in lib.rs).
+sherpa-cpu = ["sherpa", "sherpa-onnx/static"]
+sherpa-cuda = ["sherpa", "sherpa-onnx/cuda"]
 
 [dependencies]
 whisper-rs = { workspace = true, optional = true }

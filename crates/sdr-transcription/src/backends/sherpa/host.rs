@@ -418,8 +418,13 @@ fn init_online(
     }
 
     let _ = event_tx.send(InitEvent::CreatingRecognizer);
-    let recognizer_config = super::streaming::build_recognizer_config(model, "cpu");
-    tracing::info!(?model, "creating sherpa-onnx OnlineRecognizer");
+    let recognizer_config =
+        super::streaming::build_recognizer_config(model, super::SHERPA_PROVIDER);
+    tracing::info!(
+        ?model,
+        provider = super::SHERPA_PROVIDER,
+        "creating sherpa-onnx OnlineRecognizer"
+    );
 
     let Some(recognizer) = OnlineRecognizer::create(&recognizer_config) else {
         let msg = "OnlineRecognizer::create returned None — check model file paths".to_owned();
@@ -475,10 +480,10 @@ fn init_offline(
     // failure path instead of aborting the process.
     let recognizer_config = match model.kind() {
         crate::sherpa_model::ModelKind::OfflineMoonshine => {
-            super::offline::build_moonshine_recognizer_config(model, "cpu")
+            super::offline::build_moonshine_recognizer_config(model, super::SHERPA_PROVIDER)
         }
         crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
-            super::offline::build_nemo_transducer_recognizer_config(model, "cpu")
+            super::offline::build_nemo_transducer_recognizer_config(model, super::SHERPA_PROVIDER)
         }
         crate::sherpa_model::ModelKind::OnlineTransducer => {
             let msg = format!(
@@ -491,7 +496,11 @@ fn init_offline(
             return Err(());
         }
     };
-    tracing::info!(?model, "creating sherpa-onnx OfflineRecognizer");
+    tracing::info!(
+        ?model,
+        provider = super::SHERPA_PROVIDER,
+        "creating sherpa-onnx OfflineRecognizer"
+    );
 
     let Some(recognizer) = OfflineRecognizer::create(&recognizer_config) else {
         let msg = format!(

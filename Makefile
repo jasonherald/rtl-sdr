@@ -8,8 +8,9 @@ DESKTOPDIR  ?= $(DATADIR)/applications
 CARGO       ?= cargo
 CARGO_FLAGS ?= --release
 
-.PHONY: all build install install-bin install-icon install-desktop \
-        uninstall test clippy fmt fmt-check lint deny audit scan clean help
+.PHONY: all build install install-bin install-sherpa-runtime-libs \
+        install-icon install-desktop uninstall test clippy fmt fmt-check \
+        lint deny audit scan clean help
 
 # ─────────────────────────────────────────────────────────────────────
 # Default
@@ -44,7 +45,7 @@ build:
 # Install
 # ─────────────────────────────────────────────────────────────────────
 
-install: build install-bin install-icon install-desktop
+install: build install-bin install-sherpa-runtime-libs install-icon install-desktop
 	@echo ""
 	@echo "SDR-RS installed successfully!"
 	@echo "  Binary:   $(BINDIR)/sdr-rs"
@@ -57,6 +58,28 @@ install: build install-bin install-icon install-desktop
 install-bin:
 	@mkdir -p $(BINDIR)
 	install -m 755 target/release/sdr $(BINDIR)/sdr-rs
+
+# When a sherpa-cuda build is active, sherpa-onnx is linked as a shared
+# library (the CUDA prebuilt doesn't ship a static archive). The sys
+# crate drops the runtime .so files next to the binary in target/release/
+# at build time, and the binary crate's build.rs injects -rpath=$$ORIGIN
+# so the dynamic loader finds them relative to the installed binary.
+# This target copies those .so files into BINDIR alongside the binary;
+# it's a no-op for static-linked builds (sherpa-cpu, whisper-*) because
+# the glob matches nothing.
+install-sherpa-runtime-libs:
+	@mkdir -p $(BINDIR)
+	@for so in target/release/libsherpa-onnx-c-api.so \
+	           target/release/libsherpa-onnx-cxx-api.so \
+	           target/release/libonnxruntime.so \
+	           target/release/libonnxruntime_providers_cuda.so \
+	           target/release/libonnxruntime_providers_shared.so \
+	           target/release/libonnxruntime_providers_tensorrt.so; do \
+		if [ -f "$$so" ]; then \
+			install -m 644 "$$so" $(BINDIR)/; \
+			echo "  installed $$(basename $$so)"; \
+		fi; \
+	done
 
 install-icon:
 	@mkdir -p $(ICONDIR)
@@ -79,6 +102,12 @@ install-desktop:
 
 uninstall:
 	rm -f $(BINDIR)/sdr-rs
+	rm -f $(BINDIR)/libsherpa-onnx-c-api.so
+	rm -f $(BINDIR)/libsherpa-onnx-cxx-api.so
+	rm -f $(BINDIR)/libonnxruntime.so
+	rm -f $(BINDIR)/libonnxruntime_providers_cuda.so
+	rm -f $(BINDIR)/libonnxruntime_providers_shared.so
+	rm -f $(BINDIR)/libonnxruntime_providers_tensorrt.so
 	rm -f $(ICONDIR)/com.sdr.rs.svg
 	rm -f $(DESKTOPDIR)/com.sdr.rs.desktop
 	@update-desktop-database $(DESKTOPDIR) 2>/dev/null || true

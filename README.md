@@ -127,7 +127,7 @@ Installs the binary, desktop entry, and icon for app launcher integration.
 
 ### Transcription backend (pick one)
 
-Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. Whisper GPU builds require the corresponding toolkit (CUDA, ROCm, Vulkan SDK).
+Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. GPU builds require the corresponding toolkit (CUDA, ROCm, Vulkan SDK).
 
 ```bash
 # Whisper backend (default) — multilingual, mature GPU acceleration
@@ -136,11 +136,20 @@ make install CARGO_FLAGS="--release --features whisper-cuda"       # NVIDIA GPU
 make install CARGO_FLAGS="--release --features whisper-hipblas"    # AMD ROCm
 make install CARGO_FLAGS="--release --features whisper-vulkan"     # Cross-vendor GPU
 
-# Sherpa-onnx backend — Zipformer / Moonshine / Parakeet, English-only, CPU today
-make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"
+# Sherpa-onnx backend — Zipformer / Moonshine / Parakeet, English-only
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
 ```
 
 With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, or Parakeet) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap.
+
+**Sherpa CUDA notes:**
+
+- `sherpa-cuda` is currently linux-x86_64 only. The first build downloads a ~235 MB CUDA prebuilt archive from the k2-fsa releases page.
+- Requires CUDA 12.x and cuDNN 9.x system libraries at runtime — onnxruntime dlopens `libcudnn.so.9`, `libcublas.so.12`, and related libraries at process startup.
+- On Arch Linux: `sudo pacman -S cuda cudnn`
+- On Ubuntu/Debian: install the NVIDIA CUDA 12 toolkit and cuDNN 9 packages from NVIDIA's repo. The Ubuntu-packaged `libcudnn9-cuda-12` is also fine.
+- During the PR stabilization window the sherpa-onnx crate is pulled from the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork (branch `feat/rust-sys-cuda-support`), which adds a `cuda` cargo feature to the upstream sys crate. An upstream PR to k2-fsa is planned; once it merges and a release ships, the fork dependency will be swapped back to a crates.io version pin.
 
 ### Run tests
 

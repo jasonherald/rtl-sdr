@@ -70,10 +70,25 @@ skip = []
 skip-tree = []
 
 # =============================================================================
-# Sources — only allow crates from crates.io
+# Sources — only allow crates from crates.io, plus explicitly-pinned
+# git deps that are tracked as temporary overrides in workspace
+# Cargo.toml (see the `sherpa-onnx` comment in the root Cargo.toml for
+# the re-unification plan once upstream merges).
 # =============================================================================
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = [
+    # `sherpa-onnx` is pinned to jasonherald/sherpa-onnx while the `cuda`
+    # feature awaits upstream merge into k2-fsa/sherpa-onnx. Switch back
+    # to a crates.io version pin once upstream ships a release with the
+    # cuda feature, and remove this entry at that time.
+    #
+    # This allowlist entry is only exercised by cargo-deny runs under
+    # sherpa-* feature graphs (see the sherpa-check job in ci.yml); the
+    # default `check` job uses the whisper-cpu graph and will not see
+    # this git source, so an "unmatched-source" warning there is
+    # expected and harmless.
+    "https://github.com/jasonherald/sherpa-onnx",
+]

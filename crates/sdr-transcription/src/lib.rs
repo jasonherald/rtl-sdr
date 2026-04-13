@@ -17,13 +17,23 @@ compile_error!(
      Pick exactly one user-facing feature: \
      `whisper-cpu` (default), `whisper-cuda`, `whisper-hipblas`, \
      `whisper-vulkan`, `whisper-metal`, `whisper-intel-sycl`, `whisper-openblas`, \
-     or `sherpa-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+     `sherpa-cpu`, or `sherpa-cuda`. \
+     For sherpa, pass `--no-default-features --features sherpa-cpu` (or `sherpa-cuda`)."
+);
+
+#[cfg(all(feature = "sherpa-cpu", feature = "sherpa-cuda"))]
+compile_error!(
+    "the `sherpa-cpu` and `sherpa-cuda` features are mutually exclusive. \
+     Pick exactly one link mode for the sherpa-onnx prebuilt: \
+     `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link against \
+     the CUDA 12.x + cuDNN 9.x prebuilt)."
 );
 
 #[cfg(not(any(feature = "whisper", feature = "sherpa")))]
 compile_error!(
     "exactly one transcription backend must be enabled. The default is \
-     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu` \
+     (or `sherpa-cuda` for NVIDIA GPU acceleration)."
 );
 
 pub mod backend;
