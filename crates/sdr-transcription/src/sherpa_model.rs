@@ -9,6 +9,8 @@
 //! auto-download.
 
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
 /// Returns the base directory for storing models (`~/.local/share/sdr-rs/models/`).
 ///
@@ -19,6 +21,40 @@ fn models_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sdr-rs")
         .join("models")
+}
+
+/// Errors from sherpa-onnx model download and extraction.
+///
+/// Mirrors `crate::model::ModelError` from the Whisper side; we don't
+/// share that type because the `model` module is `#[cfg(feature = "whisper")]`
+/// gated and `sherpa_model` lives behind `#[cfg(feature = "sherpa")]`.
+#[derive(Debug, thiserror::Error)]
+pub enum SherpaModelError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("archive extraction failed: {0}")]
+    Extract(String),
+}
+
+/// Remove any leftover scratch files/directories from a previous failed
+/// download attempt for `model`. Returns Ok if no scratch existed or
+/// cleanup succeeded; Err only if removal failed (e.g. permission denied).
+///
+/// Idempotent — safe to call when the model has never been downloaded.
+fn cleanup_scratch_state(model: SherpaModel) -> Result<(), SherpaModelError> {
+    let dir = sherpa_models_dir();
+    let archive_part_path = dir.join(format!("{}.part", model.archive_filename()));
+    let temp_extract_dir = dir.join(format!("{}.partdir", model.dir_name()));
+
+    if archive_part_path.exists() {
+        std::fs::remove_file(&archive_part_path)?;
+    }
+    if temp_extract_dir.exists() {
+        std::fs::remove_dir_all(&temp_extract_dir)?;
+    }
+    Ok(())
 }
 
 /// Available sherpa-onnx model variants.
@@ -139,6 +175,132 @@ pub fn model_exists(model: SherpaModel) -> bool {
     e.is_file() && d.is_file() && j.is_file() && t.is_file()
 }
 
+/// Download and extract a sherpa-onnx model bundle from the k2-fsa
+/// GitHub releases page.
+///
+/// Mirrors [`crate::model::download_model`] for Whisper, but with an
+/// extra extraction step because sherpa models ship as `.tar.bz2`
+/// bundles containing multiple ONNX files instead of a single GGML
+/// blob.
+///
+/// # Arguments
+///
+/// * `model` — which sherpa model to download
+/// * `progress_tx` — receives integer percent values (0..=100) as the
+///   download streams. Only the download phase reports progress —
+///   extraction is fast (~1 second on modern disks) and doesn't fire
+///   any events.
+///
+/// # Returns
+///
+/// On success, the absolute path to the final extracted model directory
+/// (the same path that [`model_directory`] returns).
+///
+/// # Behavior
+///
+/// 1. Cleans up any leftover `.part` archive or `.partdir` extraction
+///    directory from a previous failed attempt.
+/// 2. Downloads the `.tar.bz2` to `<archive_filename>.part` in
+///    [`sherpa_models_dir`], streaming progress through `progress_tx`.
+/// 3. Extracts the archive to `<dir_name>.partdir` (a sibling of the
+///    final location).
+/// 4. Renames the extracted top-level directory to the final
+///    `dir_name()` location atomically.
+/// 5. Cleans up the `.part` file and `.partdir` directory.
+#[allow(clippy::cast_possible_truncation)]
+pub fn download_sherpa_model(
+    model: SherpaModel,
+    progress_tx: &mpsc::Sender<u8>,
+) -> Result<PathBuf, SherpaModelError> {
+    let dir = sherpa_models_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    let archive_filename = model.archive_filename();
+    let archive_part_path = dir.join(format!("{archive_filename}.part"));
+    let archive_url = model.archive_url();
+    let final_dir = model_directory(model);
+    let temp_extract_dir = dir.join(format!("{}.partdir", model.dir_name()));
+
+    // Clean up any leftover state from a previous failed attempt.
+    cleanup_scratch_state(model)?;
+
+    tracing::info!(
+        url = %archive_url,
+        ?archive_part_path,
+        "downloading sherpa-onnx model bundle"
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_mins(10))
+        .build()?;
+
+    let response = client.get(&archive_url).send()?.error_for_status()?;
+    let total_size = response.content_length().unwrap_or(0);
+
+    let mut file = std::fs::File::create(&archive_part_path)?;
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u8 = 0;
+    let mut reader = response;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let bytes_read = std::io::Read::read(&mut reader, &mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut file, &buf[..bytes_read])?;
+        downloaded += bytes_read as u64;
+
+        if let Some(pct) = (downloaded * 100).checked_div(total_size) {
+            let pct = pct.min(100) as u8;
+            if pct != last_pct {
+                last_pct = pct;
+                let _ = progress_tx.send(pct);
+            }
+        }
+    }
+
+    std::io::Write::flush(&mut file)?;
+    drop(file);
+    tracing::info!(
+        bytes = downloaded,
+        "sherpa-onnx archive download complete, extracting"
+    );
+
+    // Extract via tar + bzip2 into a temp directory adjacent to the
+    // final location.
+    std::fs::create_dir_all(&temp_extract_dir)?;
+    let archive_file = std::fs::File::open(&archive_part_path)?;
+    let bz_reader = bzip2::read::BzDecoder::new(archive_file);
+    let mut tar_archive = tar::Archive::new(bz_reader);
+    tar_archive.unpack(&temp_extract_dir).map_err(|e| {
+        SherpaModelError::Extract(format!("tar/bzip2 unpack failed: {e}"))
+    })?;
+
+    // The tarball contains a single top-level directory whose name we
+    // know via `archive_inner_directory()`. Move it to the final location.
+    let extracted_inner = temp_extract_dir.join(model.archive_inner_directory());
+    if !extracted_inner.is_dir() {
+        return Err(SherpaModelError::Extract(format!(
+            "expected directory {} not found inside extracted archive",
+            extracted_inner.display()
+        )));
+    }
+
+    if final_dir.exists() {
+        tracing::info!(?final_dir, "removing existing final directory before rename");
+        std::fs::remove_dir_all(&final_dir)?;
+    }
+    std::fs::rename(&extracted_inner, &final_dir)?;
+
+    // Clean up scratch state.
+    std::fs::remove_dir_all(&temp_extract_dir)?;
+    std::fs::remove_file(&archive_part_path)?;
+
+    tracing::info!(?final_dir, "sherpa-onnx model installed");
+    Ok(final_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +346,19 @@ mod tests {
         // the .tar.bz2 suffix — sanity check that we'll find the right
         // directory after extraction.
         assert_eq!(format!("{inner}.tar.bz2"), archive);
+    }
+
+    #[test]
+    fn cleanup_scratch_state_is_idempotent_when_nothing_exists() {
+        // Ensures the helper handles the no-leftover case without error.
+        // Relies on the developer's environment being in a sane state
+        // (no leftover .part files in ~/.local/share/sdr-rs/models/sherpa/).
+        // If the dev has scratch lying around, the test still passes —
+        // it just removes them, which is the function's job.
+        let result = cleanup_scratch_state(SherpaModel::StreamingZipformerEn);
+        assert!(
+            result.is_ok(),
+            "expected Ok on fresh/missing state, got {result:?}"
+        );
     }
 }
