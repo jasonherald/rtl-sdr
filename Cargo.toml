@@ -105,6 +105,7 @@ members = [
     "crates/sdr-radioreference",
     "crates/sdr-transcription",
     "crates/sdr-core",
+    "crates/sdr-ffi",
     "crates/sdr-ui",
 ]
 
@@ -129,6 +130,7 @@ sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
+sdr-ffi = { path = "crates/sdr-ffi" }
 sdr-ui = { path = "crates/sdr-ui" }
 
 # HTTP / XML (RadioReference)

@@ -1873,6 +1873,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-ffi"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sdr-core",
+ "sdr-types",
+ "tracing",
+]
+
+[[package]]
 name = "sdr-pipeline"
 version = "0.1.0"
 dependencies = [

@@ -452,7 +452,7 @@ For v1 we are at `0.1`. We bump to `0.2` when we add transcription events, netwo
 
 ## Build Integration
 
-The Rust side produces `libsdr_core.a` (staticlib). Xcode is told about it via a SwiftPM `binaryTarget` *or* a build phase that runs `cargo build --release -p sdr-ffi --target <triple>` for both `aarch64-apple-darwin` and `x86_64-apple-darwin`, then `lipo`s them into a universal `libsdr_core.a`. Details in `2026-04-12-swift-ui-packaging-design.md`.
+The Rust side produces `libsdr_ffi.a` (staticlib). Xcode is told about it via a SwiftPM `binaryTarget` *or* a build phase that runs `cargo build --release -p sdr-ffi --target <triple>` for both `aarch64-apple-darwin` and `x86_64-apple-darwin`, then `lipo`s them into a universal `libsdr_ffi.a`. Details in `2026-04-12-swift-ui-packaging-design.md`.
 
 The header `include/sdr_core.h` is exposed as a SwiftPM systemModule:
 
