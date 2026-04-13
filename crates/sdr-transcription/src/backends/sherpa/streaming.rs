@@ -37,12 +37,10 @@ const SHERPA_NUM_THREADS: i32 = 1;
 /// inside utterances and confuse the streaming decoder. The Whisper backend
 /// uses `silence_threshold` because Whisper has no built-in VAD.
 pub(super) fn build_recognizer_config(model: SherpaModel, provider: &str) -> OnlineRecognizerConfig {
-    // Irrefutable today — will become refutable when Moonshine variant lands (plan Task 6).
-    #[allow(irrefutable_let_patterns)]
     let ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } =
         sherpa_model::model_file_paths(model)
     else {
-        unreachable!("StreamingZipformerEn is always a Transducer")
+        unreachable!("streaming::build_recognizer_config called with non-Transducer model")
     };
 
     let mut config = OnlineRecognizerConfig::default();

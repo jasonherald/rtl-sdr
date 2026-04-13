@@ -77,6 +77,14 @@ pub enum ModelKind {
 pub enum SherpaModel {
     /// Streaming Zipformer English (k2-fsa, 2023-06-26).
     StreamingZipformerEn,
+    /// Moonshine Tiny (`UsefulSensors`, English, int8). ~27M params,
+    /// ~170MB bundle. Fastest Moonshine variant — best for CPU-only
+    /// and low-end hardware. Offline (VAD-gated) decode.
+    MoonshineTinyEn,
+    /// Moonshine Base (`UsefulSensors`, English, int8). ~61M params,
+    /// ~380MB bundle. More accurate than Tiny, higher per-utterance
+    /// latency. Offline (VAD-gated) decode.
+    MoonshineBaseEn,
 }
 
 impl SherpaModel {
@@ -84,6 +92,8 @@ impl SherpaModel {
     pub fn label(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "Streaming Zipformer (English)",
+            Self::MoonshineTinyEn => "Moonshine Tiny (English)",
+            Self::MoonshineBaseEn => "Moonshine Base (English)",
         }
     }
 
@@ -92,6 +102,8 @@ impl SherpaModel {
     pub fn dir_name(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "streaming-zipformer-en",
+            Self::MoonshineTinyEn => "moonshine-tiny-en",
+            Self::MoonshineBaseEn => "moonshine-base-en",
         }
     }
 
@@ -99,6 +111,9 @@ impl SherpaModel {
     pub fn encoder_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "encoder-epoch-99-avg-1-chunk-16-left-128.onnx",
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
+                "encoder_filename called on a Moonshine variant; use moonshine_encoder_filename"
+            ),
         }
     }
 
@@ -106,6 +121,9 @@ impl SherpaModel {
     pub fn decoder_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
+                "decoder_filename called on a Moonshine variant"
+            ),
         }
     }
 
@@ -113,6 +131,9 @@ impl SherpaModel {
     pub fn joiner_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "joiner-epoch-99-avg-1-chunk-16-left-128.onnx",
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
+                "joiner_filename called on a Moonshine variant"
+            ),
         }
     }
 
@@ -120,6 +141,41 @@ impl SherpaModel {
     pub fn tokens_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "tokens.txt",
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
+                "tokens_filename called on a Moonshine variant; use moonshine_tokens_filename"
+            ),
+        }
+    }
+
+    /// Filename of Moonshine's encoder ONNX file inside the model
+    /// directory. Panics if called on a non-Moonshine variant — callers
+    /// should match on [`SherpaModel::kind`] first.
+    pub fn moonshine_encoder_filename(self) -> &'static str {
+        match self {
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "encode.int8.onnx",
+            Self::StreamingZipformerEn => unreachable!(
+                "moonshine_encoder_filename called on non-Moonshine variant"
+            ),
+        }
+    }
+
+    /// Filename of Moonshine v2's merged-decoder ONNX file.
+    pub fn moonshine_merged_decoder_filename(self) -> &'static str {
+        match self {
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "decode.int8.onnx",
+            Self::StreamingZipformerEn => unreachable!(
+                "moonshine_merged_decoder_filename called on non-Moonshine variant"
+            ),
+        }
+    }
+
+    /// Filename of Moonshine's tokens file.
+    pub fn moonshine_tokens_filename(self) -> &'static str {
+        match self {
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => "tokens.txt",
+            Self::StreamingZipformerEn => unreachable!(
+                "moonshine_tokens_filename called on non-Moonshine variant"
+            ),
         }
     }
 
@@ -129,6 +185,8 @@ impl SherpaModel {
     pub fn archive_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+            Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8.tar.bz2",
+            Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8.tar.bz2",
         }
     }
 
@@ -140,6 +198,8 @@ impl SherpaModel {
     pub fn archive_inner_directory(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+            Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8",
+            Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8",
         }
     }
 
@@ -159,6 +219,7 @@ impl SherpaModel {
     pub fn kind(self) -> ModelKind {
         match self {
             Self::StreamingZipformerEn => ModelKind::OnlineTransducer,
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => ModelKind::OfflineMoonshine,
         }
     }
 
@@ -177,7 +238,11 @@ impl SherpaModel {
     }
 
     /// All available variants in order — used to populate the UI dropdown.
-    pub const ALL: &[Self] = &[Self::StreamingZipformerEn];
+    pub const ALL: &[Self] = &[
+        Self::StreamingZipformerEn,
+        Self::MoonshineTinyEn,
+        Self::MoonshineBaseEn,
+    ];
 }
 
 /// Returns the sherpa subdirectory under the shared models dir
@@ -205,6 +270,11 @@ pub enum ModelFilePaths {
         joiner: PathBuf,
         tokens: PathBuf,
     },
+    Moonshine {
+        encoder: PathBuf,
+        merged_decoder: PathBuf,
+        tokens: PathBuf,
+    },
 }
 
 /// Returns the full paths for all files needed by a sherpa model.
@@ -224,10 +294,12 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
             }
         }
         ModelKind::OfflineMoonshine => {
-            // Added in a later task when Moonshine variants exist.
-            // This arm is unreachable today because no SherpaModel
-            // variant returns ModelKind::OfflineMoonshine yet.
-            unreachable!("OfflineMoonshine has no variants yet — see plan Task 6")
+            let dir = model_directory(model);
+            ModelFilePaths::Moonshine {
+                encoder: dir.join(model.moonshine_encoder_filename()),
+                merged_decoder: dir.join(model.moonshine_merged_decoder_filename()),
+                tokens: dir.join(model.moonshine_tokens_filename()),
+            }
         }
     }
 }
@@ -237,6 +309,9 @@ pub fn model_exists(model: SherpaModel) -> bool {
     match model_file_paths(model) {
         ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } => {
             encoder.is_file() && decoder.is_file() && joiner.is_file() && tokens.is_file()
+        }
+        ModelFilePaths::Moonshine { encoder, merged_decoder, tokens } => {
+            encoder.is_file() && merged_decoder.is_file() && tokens.is_file()
         }
     }
 }
@@ -457,9 +532,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::panic)]
     fn transducer_model_file_paths_returns_four_distinct_files() {
-        #[allow(irrefutable_let_patterns)]
-        #[allow(clippy::panic)]
         let ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } =
             model_file_paths(SherpaModel::StreamingZipformerEn)
         else {
@@ -523,4 +597,44 @@ mod tests {
     // requires threading a base-dir parameter through `sherpa_models_dir`
     // and its callers; that refactor is tracked as part of the hermetic
     // testing follow-up mentioned on #255 / discussed in PR #254.
+
+    #[test]
+    fn moonshine_variants_are_offline_moonshine_kind() {
+        assert_eq!(SherpaModel::MoonshineTinyEn.kind(), ModelKind::OfflineMoonshine);
+        assert_eq!(SherpaModel::MoonshineBaseEn.kind(), ModelKind::OfflineMoonshine);
+    }
+
+    #[test]
+    fn moonshine_variants_do_not_support_partials() {
+        assert!(!SherpaModel::MoonshineTinyEn.supports_partials());
+        assert!(!SherpaModel::MoonshineBaseEn.supports_partials());
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn moonshine_tiny_has_three_file_layout() {
+        let paths = model_file_paths(SherpaModel::MoonshineTinyEn);
+        let ModelFilePaths::Moonshine { encoder, merged_decoder, tokens } = paths else {
+            panic!("MoonshineTinyEn should be a Moonshine layout");
+        };
+        assert!(encoder.ends_with("encode.int8.onnx"));
+        assert!(merged_decoder.ends_with("decode.int8.onnx"));
+        assert!(tokens.ends_with("tokens.txt"));
+        assert_ne!(encoder, merged_decoder);
+    }
+
+    #[test]
+    fn moonshine_archive_urls_are_well_formed() {
+        for model in [SherpaModel::MoonshineTinyEn, SherpaModel::MoonshineBaseEn] {
+            let url = model.archive_url();
+            assert!(url.starts_with("https://github.com/k2-fsa/sherpa-onnx/"));
+            assert!(url.ends_with(".tar.bz2"));
+            assert!(url.contains("moonshine"));
+        }
+    }
+
+    #[test]
+    fn all_contains_three_variants() {
+        assert_eq!(SherpaModel::ALL.len(), 3);
+    }
 }
