@@ -251,6 +251,115 @@ pub fn sherpa_models_dir() -> PathBuf {
     models_dir().join("sherpa")
 }
 
+/// Filename of the Silero VAD ONNX model when stored locally.
+const SILERO_VAD_FILENAME: &str = "silero_vad.onnx";
+
+/// Directory under `sherpa_models_dir` where the Silero VAD model lives.
+const SILERO_VAD_DIR_NAME: &str = "silero-vad";
+
+/// Full HTTPS URL to the Silero VAD ONNX file on the k2-fsa GitHub
+/// releases page. Single-file artifact — no tarball, no extraction.
+const SILERO_VAD_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+
+/// Full path to the Silero VAD ONNX file on disk.
+pub fn silero_vad_path() -> PathBuf {
+    sherpa_models_dir()
+        .join(SILERO_VAD_DIR_NAME)
+        .join(SILERO_VAD_FILENAME)
+}
+
+/// True if the Silero VAD model exists on disk.
+pub fn silero_vad_exists() -> bool {
+    silero_vad_path().is_file()
+}
+
+/// Download the Silero VAD ONNX model from the k2-fsa releases page.
+///
+/// # Arguments
+///
+/// * `progress_tx` — receives integer percent values (0..=100) as the
+///   download streams. The file is ~2 MB so this usually only fires
+///   a handful of times.
+///
+/// # Returns
+///
+/// On success, the absolute path to the downloaded `silero_vad.onnx`.
+///
+/// # Behavior
+///
+/// 1. Creates the parent directory if needed.
+/// 2. Downloads to `silero_vad.onnx.part` in the same directory.
+/// 3. Renames `.part` → final path on successful completion.
+///
+/// Unlike model bundles, the VAD is a single `.onnx` file — no
+/// extraction step. The atomic rename is sufficient to avoid leaving
+/// a partially-written model in place if the process dies mid-download.
+#[allow(clippy::cast_possible_truncation)]
+pub fn download_silero_vad(
+    progress_tx: &std::sync::mpsc::Sender<u8>,
+) -> Result<PathBuf, SherpaModelError> {
+    let final_path = silero_vad_path();
+    let dir = final_path
+        .parent()
+        .expect("silero_vad_path always has a parent")
+        .to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+
+    let part_path = dir.join(format!("{SILERO_VAD_FILENAME}.part"));
+
+    // Clean up leftover scratch from a previous failed attempt.
+    if part_path.exists() {
+        std::fs::remove_file(&part_path)?;
+    }
+
+    tracing::info!(url = %SILERO_VAD_URL, ?part_path, "downloading silero VAD");
+
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
+        .build()?;
+
+    let response = client.get(SILERO_VAD_URL).send()?.error_for_status()?;
+    let total_size = response.content_length().unwrap_or(0);
+
+    if total_size == 0 {
+        let _ = progress_tx.send(0);
+    }
+
+    let mut file = std::fs::File::create(&part_path)?;
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u8 = 0;
+    let mut reader = response;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let bytes_read = std::io::Read::read(&mut reader, &mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut file, &buf[..bytes_read])?;
+        downloaded += bytes_read as u64;
+
+        if let Some(pct) = (downloaded * 100).checked_div(total_size) {
+            let pct = pct.min(100) as u8;
+            if pct != last_pct {
+                last_pct = pct;
+                let _ = progress_tx.send(pct);
+            }
+        }
+    }
+
+    std::io::Write::flush(&mut file)?;
+    drop(file);
+
+    // Atomic rename into place.
+    std::fs::rename(&part_path, &final_path)?;
+
+    tracing::info!(bytes = downloaded, ?final_path, "silero VAD download complete");
+    Ok(final_path)
+}
+
 /// Returns the directory containing all files for a given sherpa model
 /// (`~/.local/share/sdr-rs/models/sherpa/<dir_name>/`).
 pub fn model_directory(model: SherpaModel) -> PathBuf {
@@ -636,5 +745,11 @@ mod tests {
     #[test]
     fn all_contains_three_variants() {
         assert_eq!(SherpaModel::ALL.len(), 3);
+    }
+
+    #[test]
+    fn silero_vad_path_is_under_sherpa_models_dir() {
+        let path = silero_vad_path();
+        assert!(path.ends_with("silero-vad/silero_vad.onnx"));
     }
 }
