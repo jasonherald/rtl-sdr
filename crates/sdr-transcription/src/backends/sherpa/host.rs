@@ -14,7 +14,6 @@ use crate::backend::{BackendError, TranscriptionEvent};
 use crate::init_event::InitEvent;
 use crate::sherpa_model::{self, SherpaModel};
 
-use super::streaming;
 use super::silero_vad::SherpaSileroVad;
 
 /// Bounded channel capacity for audio buffers from DSP → backend.
@@ -176,9 +175,9 @@ fn run_host_loop(
     tracing::info!("sherpa-host worker exiting");
 }
 
-/// Phase 1-2 for the OnlineTransducer path: download the bundle if
+/// Phase 1-2 for the `OnlineTransducer` path: download the bundle if
 /// needed, then create the `OnlineRecognizer`. Returns `Err(())` on
-/// any failure — the error has already been stored in SHERPA_HOST and
+/// any failure — the error has already been stored in `SHERPA_HOST` and
 /// emitted as `InitEvent::Failed`.
 fn init_online(
     model: SherpaModel,
@@ -203,10 +202,10 @@ fn init_online(
     Ok(RecognizerState::Online(recognizer))
 }
 
-/// Phase 1-2 for the OfflineMoonshine path: download the Silero VAD
+/// Phase 1-2 for the `OfflineMoonshine` path: download the Silero VAD
 /// model if missing, download the Moonshine bundle if missing, then
 /// create the `OfflineRecognizer` + `SherpaSileroVad`. Returns `Err(())`
-/// on any failure — the error has already been stored in SHERPA_HOST
+/// on any failure — the error has already been stored in `SHERPA_HOST`
 /// and emitted as `InitEvent::Failed`.
 fn init_offline(
     model: SherpaModel,
@@ -262,7 +261,7 @@ fn store_init_failure(err: BackendError) {
 }
 
 /// Download + extract a sherpa model bundle. Returns `false` on any
-/// failure (error already stored + InitEvent::Failed emitted).
+/// failure (error already stored + `InitEvent::Failed` emitted).
 fn download_and_extract_bundle(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
@@ -322,7 +321,7 @@ fn download_and_extract_bundle(
 }
 
 /// Download the Silero VAD ONNX file. Returns `false` on any failure
-/// (error already stored + InitEvent::Failed emitted).
+/// (error already stored + `InitEvent::Failed` emitted).
 fn download_silero_vad_with_progress(event_tx: &mpsc::Sender<InitEvent>) -> bool {
     const VAD_COMPONENT: &str = "Silero VAD";
     let _ = event_tx.send(InitEvent::DownloadStart {

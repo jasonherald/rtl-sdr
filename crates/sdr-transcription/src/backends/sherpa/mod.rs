@@ -24,6 +24,7 @@
 //!   by Zipformer (and future transducer models like Parakeet).
 
 mod host;
+mod offline;
 mod silero_vad;
 mod streaming;
 
