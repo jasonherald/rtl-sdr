@@ -1525,6 +1525,9 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
+            // display_mode_row is intentionally NOT locked — the Partial
+            // handler re-reads it on every event, so flipping it mid-session
+            // is safe and desirable (user sees effect immediately).
 
             let model_idx = model_row.selected() as usize;
 
