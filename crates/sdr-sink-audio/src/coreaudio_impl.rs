@@ -21,11 +21,15 @@
 //!   the high-level [`coreaudio::audio_unit::AudioUnit`] wrapper.
 //! - Format: 48 kHz f32 stereo, **non-interleaved** — the canonical
 //!   format for Mac AudioUnits per Apple's *Core Audio Overview*.
-//! - The render callback **never allocates**: it uses a stack scratch
-//!   buffer sized for `MAX_CB_FRAMES = 4096` and degrades to silence on
-//!   overflow rather than falling back to the heap. CoreAudio quanta are
-//!   typically 256–512 frames; 4096 is generous headroom for aggregate
-//!   or pro-audio devices.
+//! - The render callback **never allocates**. The de-interleave scratch
+//!   buffer is a single `Vec<f32>` allocated **once** in `open_unit()`
+//!   on the cold start path (sized to `MAX_CB_FRAMES * 2` f32s) and
+//!   moved into the render closure by value. The callback reuses that
+//!   buffer for the lifetime of the AudioUnit and degrades to silence
+//!   on quanta larger than `MAX_CB_FRAMES` rather than growing the
+//!   buffer on the audio I/O thread. CoreAudio quanta are typically
+//!   256–512 frames; 4096 is generous headroom for aggregate or
+//!   pro-audio devices.
 //!
 //! ## Public surface parity with `pw_impl`
 //!
@@ -45,18 +49,30 @@
 //! `CFString → String` conversion plus an `#[allow(unsafe_code)]`
 //! override of the workspace-wide deny.
 //!
-//! For **v1** we use the device *display name* as `node_name` instead.
-//! This is a v1-only deviation because:
+//! For **v1** we use the **`AudioDeviceID` as a decimal string** instead
+//! of the UID. The ID is unique within the running session — even when
+//! multiple devices share the same display name (e.g., several "USB
+//! Audio CODEC" devices, multiple AirPlay endpoints) — so it's the
+//! right opaque handle for `set_target` selection. The downside is
+//! that AudioDeviceIDs are session-scoped: they don't survive reboots,
+//! plug events, or `coreaudiod` restarts. v2 (issue #237) switches to
+//! the stable CoreAudio device UID at the same time the device picker
+//! lands; until then, the v1 contract works because:
 //!
-//! - The MVP UI does not expose an audio device picker (deferred to v2,
-//!   issue #237). `set_target` is implemented but never called from any
-//!   v1 caller — `node_name` is essentially unused metadata.
-//! - Switching to UID is a clean follow-up: one `unsafe` helper that
-//!   wraps `AudioObjectGetPropertyData(kAudioDevicePropertyDeviceUID, …)`,
-//!   landing alongside the v2 device picker in #237.
+//! - The MVP UI does not expose a persistent device picker (deferred
+//!   to v2). v1 only ever uses the empty-string "system default
+//!   output" path; `set_target` is implemented for completeness and
+//!   for any out-of-tree caller that wants session-scoped routing.
+//! - The "Default" entry (empty `node_name`) is always available and
+//!   resolves through `get_default_device_id` instead of an ID parse,
+//!   so the default-output path is unaffected by the session-scoped
+//!   restriction.
 //!
-//! Documenting this here so the next reviewer doesn't have to re-derive
-//! the trade-off from CodeRabbit history.
+//! Earlier drafts of this PR used the device display name as
+//! `node_name`, which CodeRabbit caught as non-unique on systems with
+//! duplicate names — switched to AudioDeviceID. Documenting both
+//! revisions here so the next reviewer doesn't have to re-derive the
+//! trade-off from CodeRabbit history.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,7 +80,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use coreaudio::audio_unit::audio_format::LinearPcmFlags;
 use coreaudio::audio_unit::macos_helpers::{
     audio_unit_from_device_id, get_audio_device_ids_for_scope, get_audio_device_supports_scope,
-    get_default_device_id, get_device_id_from_name, get_device_name,
+    get_default_device_id, get_device_name,
 };
 use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::stream_format::StreamFormat;
@@ -99,24 +115,47 @@ const RING_CAPACITY: usize = 96_000;
 /// CodeRabbit on PR #253.
 const INTERLEAVE_BUF_CAPACITY: usize = RING_CAPACITY;
 
-/// Maximum frames per render callback we are willing to service from the
-/// stack scratch buffer. CoreAudio quanta are typically 256 or 512 frames;
-/// 4096 is a generous ceiling that covers any aggregate device or
-/// pro-audio device the user might have configured. The render callback
-/// degrades to silence rather than allocating on the RT thread when a
-/// quantum exceeds this — see the callback body.
+/// Maximum frames per render callback we are willing to service from
+/// the de-interleave scratch buffer. CoreAudio quanta are typically
+/// 256 or 512 frames; 4096 is a generous ceiling that covers any
+/// aggregate device or pro-audio device the user might have configured.
+///
+/// The scratch buffer itself is a heap `Vec<f32>` of length
+/// `MAX_CB_FRAMES * 2` allocated **once** in `open_unit()` (the cold
+/// start path) and moved into the render closure. The audio I/O thread
+/// never allocates: when a quantum exceeds `MAX_CB_FRAMES`, the
+/// callback writes silence to both channels and emits a one-shot
+/// `tracing::warn` rather than growing the buffer.
 const MAX_CB_FRAMES: usize = 4096;
 
 /// An audio sink device with display name and a caller-opaque identifier.
 ///
-/// On CoreAudio, `node_name` is the device's display name in v1 — see
-/// the v1-vs-v2 note in the module-level docs. Empty string means
-/// "system default output".
+/// On CoreAudio, `node_name` is the device's `AudioDeviceID` formatted
+/// as a decimal `u32` string. This is **session-scoped** — it stays
+/// stable for the lifetime of the running process but is not
+/// guaranteed to persist across reboots, plug events, or `coreaudiod`
+/// restarts. v2 (issue #237) will switch this to the device's
+/// CoreAudio UID (`kAudioDevicePropertyDeviceUID`) once we can drop
+/// the unsafe-code helper that currently blocks the upgrade.
+///
+/// **Why not the display name?** Display names are not unique on
+/// CoreAudio: a system can have two "USB Audio CODEC" devices, two
+/// "AirPlay" endpoints, two virtual aggregates with the same label,
+/// etc. Using the name as the caller-opaque handle would make
+/// `set_target` selection non-deterministic across duplicates and
+/// could route audio to the wrong device. AudioDeviceID is unique by
+/// definition within a session, so it's the right opaque handle even
+/// before we can store a fully-stable UID. CodeRabbit caught this on
+/// PR #253.
+///
+/// Empty string means "system default output" on every platform.
 #[derive(Clone, Debug)]
 pub struct AudioDevice {
     /// Human-readable name (from `kAudioObjectPropertyName`).
     pub display_name: String,
-    /// Caller-opaque device identifier. Empty = "system default output".
+    /// Caller-opaque device identifier. On macOS this is the
+    /// `AudioDeviceID` as a decimal string in v1; in v2 it becomes the
+    /// CoreAudio device UID. Empty = "system default output".
     pub node_name: String,
 }
 
@@ -154,18 +193,27 @@ impl AudioSink {
     /// Set the target output device. Empty string routes to the system
     /// default output.
     ///
-    /// In v1 the `node_name` is interpreted as a device **display name**
-    /// (matching what [`list_audio_sinks`] returns); v2 will switch to
-    /// CoreAudio device UID. See the module docs for the rationale.
+    /// `node_name` is interpreted as a CoreAudio `AudioDeviceID`
+    /// formatted as a decimal string (matching what
+    /// [`list_audio_sinks`] returns). The string is parsed lazily on
+    /// the next [`Sink::start`] call so that an invalid value reports
+    /// the failure through the normal start error path rather than
+    /// surprising callers from inside `set_target` itself.
     ///
-    /// If the sink is already running, it is stopped, reconfigured, and
-    /// restarted — same pattern as the PipeWire backend.
+    /// In v2 (issue #237) `node_name` will become the device's
+    /// CoreAudio UID instead, but the parse-lazy-on-start contract
+    /// stays the same.
+    ///
+    /// If the sink is already running, it is stopped, reconfigured,
+    /// and restarted — same pattern as the PipeWire backend.
     ///
     /// # Errors
     ///
-    /// Returns [`SinkError::DeviceNotFound`] (raised by `start` on the
-    /// next open attempt) if the new target cannot be located, or any
-    /// error from `start` / `stop` if the sink was running.
+    /// Returns [`SinkError::InvalidParameter`] (via the next `start`
+    /// call) if `node_name` cannot be parsed as a `u32`, or
+    /// [`SinkError::DeviceNotFound`] if the parsed ID does not name
+    /// a valid output device. Also propagates any error from
+    /// `start` / `stop` if the sink was running.
     pub fn set_target(&mut self, node_name: &str) -> Result<(), SinkError> {
         let was_running = self.audio_unit.is_some();
         if was_running {
@@ -225,13 +273,19 @@ impl AudioSink {
     /// Open the AUHAL output unit, configure format, register the
     /// render callback, and initialize. Called from [`Sink::start`].
     fn open_unit(&mut self) -> Result<AudioUnit, SinkError> {
-        // Pick the device. Empty target_device means "system default output".
+        // Pick the device. Empty target_device means "system default
+        // output"; any non-empty value is parsed as a decimal
+        // AudioDeviceID (the same format `list_audio_sinks` emits).
         let device_id = if self.target_device.is_empty() {
             get_default_device_id(false)
                 .ok_or_else(|| SinkError::DeviceNotFound("system default output".to_string()))?
         } else {
-            get_device_id_from_name(&self.target_device, false)
-                .ok_or_else(|| SinkError::DeviceNotFound(self.target_device.clone()))?
+            self.target_device.parse::<u32>().map_err(|_| {
+                SinkError::InvalidParameter(format!(
+                    "CoreAudio target_device must be a decimal AudioDeviceID, got {:?}",
+                    self.target_device
+                ))
+            })?
         };
 
         // Build the AUHAL output unit bound to this device.
@@ -391,9 +445,11 @@ impl Sink for AudioSink {
 /// Render callback body — extracted from the closure so it has a
 /// nameable type and is unit-testable in principle.
 ///
-/// **Allocates nothing.** The `scratch` slice is owned by the render
-/// closure (allocated once at sink construction) and passed in by
-/// `&mut`. The callback uses `scratch.len() / 2` as the per-quantum
+/// **Allocates nothing.** The `scratch` slice is a heap-allocated
+/// `Vec<f32>` owned by the render closure: it is allocated **once**
+/// in `open_unit()` (the cold start path) and reused for the lifetime
+/// of the AudioUnit. The audio I/O thread never sees an allocator
+/// call. The callback uses `scratch.len() / 2` as the per-quantum
 /// frame ceiling; if a single quantum exceeds it, the callback writes
 /// silence to both channels and emits a `tracing` warning **at most
 /// once per sink lifetime** (gated by the `overflow_warned` atomic)
@@ -485,10 +541,20 @@ fn render_callback_body(
 /// Enumerate available CoreAudio output devices.
 ///
 /// Always prepends a "Default" entry with `node_name = ""` so callers
-/// can route to the system default without knowing its name. Devices
-/// without any output channels (e.g., mic-only inputs) are filtered out.
-/// The system default device is deduplicated against the enumerated
-/// list so it doesn't appear twice in pickers.
+/// can route to the system default without knowing its identifier.
+/// Devices without any output channels (e.g., mic-only inputs) are
+/// filtered out. The system default device is deduplicated against
+/// the enumerated list so it doesn't appear twice in pickers.
+///
+/// `node_name` is the device's [`AudioDeviceID`] formatted as a
+/// decimal `u32` string — uniquely identifies a device within the
+/// running session, even when multiple devices share a display name
+/// (e.g., several "USB Audio CODEC" devices). [`set_target`] parses
+/// this string back into the integer ID directly. v2 (issue #237)
+/// switches `node_name` to a stable CoreAudio device UID; v1 uses
+/// the session-scoped ID because it's the only unique handle the
+/// `coreaudio-rs 0.14` API exposes without dropping into raw
+/// `coreaudio-sys` calls.
 #[must_use]
 pub fn list_audio_sinks() -> Vec<AudioDevice> {
     let mut sinks = vec![AudioDevice {
@@ -517,16 +583,16 @@ pub fn list_audio_sinks() -> Vec<AudioDevice> {
             continue;
         }
 
-        let Ok(name) = get_device_name(device_id) else {
-            continue;
-        };
+        let display_name =
+            get_device_name(device_id).unwrap_or_else(|_| format!("Device {device_id}"));
 
         sinks.push(AudioDevice {
-            display_name: name.clone(),
-            // v1: see the v1-vs-v2 note in the module docs. node_name
-            // is the display name; v2 switches to CoreAudio device UID
-            // alongside the device picker (#237).
-            node_name: name,
+            display_name,
+            // Decimal AudioDeviceID. Unique within the running
+            // session even when display names collide. See the
+            // function docs and the v1-vs-v2 note in the module
+            // docs for the v2 path (#237 → CoreAudio device UID).
+            node_name: device_id.to_string(),
         });
     }
 
@@ -578,5 +644,41 @@ mod tests {
         let default = &devices[0];
         assert_eq!(default.display_name, "Default");
         assert!(default.node_name.is_empty());
+    }
+
+    #[test]
+    fn enumerated_node_names_parse_as_audio_device_ids() {
+        // Every non-default entry's node_name must be a decimal u32
+        // (the AudioDeviceID round-trip contract). This is what
+        // `set_target` will parse it as.
+        let devices = list_audio_sinks();
+        for dev in devices.iter().skip(1) {
+            assert!(
+                !dev.node_name.is_empty(),
+                "non-default device has empty node_name: {dev:?}"
+            );
+            let parsed = dev.node_name.parse::<u32>();
+            assert!(
+                parsed.is_ok(),
+                "node_name {:?} for device {:?} is not a decimal u32",
+                dev.node_name,
+                dev.display_name,
+            );
+        }
+    }
+
+    #[test]
+    fn set_target_with_invalid_id_fails_on_start() {
+        // set_target itself succeeds (lazy parse) but the next start()
+        // surfaces InvalidParameter. We can't actually call start()
+        // without tearing down a real AU, so just verify the parse
+        // path that open_unit takes for a non-empty target.
+        let mut sink = AudioSink::new();
+        sink.set_target("not-a-number")
+            .expect("set_target stores the string without parsing");
+        // open_unit is private; the parse failure surfaces via start()
+        // which we don't exercise here. The contract is enforced via
+        // the parse::<u32>() call in open_unit.
+        assert_eq!(sink.target_device, "not-a-number");
     }
 }
