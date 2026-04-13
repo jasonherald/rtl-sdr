@@ -30,11 +30,27 @@ sdr-rtlsdr.workspace = true
 sdr-source-rtlsdr.workspace = true
 sdr-source-network.workspace = true
 sdr-source-file.workspace = true
-sdr-sink-audio.workspace = true
 sdr-sink-network.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
+
+# Audio sink. The base dep is unconditional so `controller.rs`'s
+# `use sdr_sink_audio::AudioSink;` resolves on every target — including
+# Windows / BSD / etc. that fall through to the no-backend stub. The
+# target-specific entries below ADD the right backend feature on Linux
+# (PipeWire) and macOS (CoreAudio); Cargo merges per-target dep entries
+# into the base dep, so on Linux the effective entry is
+# `sdr-sink-audio = { ..., features = ["pipewire"] }`, on macOS it's
+# `["coreaudio"]`, and on every other target the feature list is empty
+# and the crate's `lib.rs` cfg dispatch resolves to the stub backend.
+sdr-sink-audio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sdr-sink-audio = { workspace = true, features = ["pipewire"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdr-sink-audio = { workspace = true, features = ["coreaudio"] }
 
 [lints]
 workspace = true
