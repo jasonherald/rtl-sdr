@@ -25,6 +25,7 @@ crate-type = ["staticlib", "rlib"]
 sdr-core.workspace = true
 sdr-types.workspace = true
 tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 libc.workspace = true
 
 [lints]

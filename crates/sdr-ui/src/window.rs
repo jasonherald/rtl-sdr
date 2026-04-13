@@ -65,7 +65,8 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // the process to exit anyway via `std::process::exit(1)` inside the
     // old `spawn_dsp_thread`. Keeping the same panic-on-spawn-failure
     // semantics for now; the FFI side will surface this as an error code.
-    let engine = Rc::new(Engine::new().expect("DSP engine should spawn"));
+    let engine =
+        Rc::new(Engine::new(config.path().to_path_buf()).expect("DSP engine should spawn"));
     let ui_tx = engine.command_sender();
     let dsp_rx = engine
         .subscribe()

@@ -44,9 +44,13 @@
 pub mod error;
 pub mod event;
 pub mod handle;
+pub mod lifecycle;
 
 // Re-export the FFI symbols at the crate root so consumers that link
 // the rlib (in-tree integration tests) can reference them via
-// `sdr_core::sdr_core_*`.
+// `sdr_ffi::sdr_core_*`.
 pub use error::sdr_core_last_error_message;
 pub use handle::SdrCore;
+pub use lifecycle::{
+    sdr_core_abi_version, sdr_core_create, sdr_core_destroy, sdr_core_init_logging,
+};

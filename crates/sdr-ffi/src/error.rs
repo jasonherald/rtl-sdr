@@ -74,12 +74,14 @@ thread_local! {
 /// Replaces any previously stored message on this thread.
 pub fn set_last_error(msg: impl Into<String>) {
     let owned = msg.into();
-    // CString::new fails on interior NULs. If the message has any,
-    // strip them defensively rather than dropping the report — the
-    // alternative is silently losing diagnostic info.
+    // CString::new fails on interior NULs. We already replaced them
+    // above so construction should always succeed — but fall back to
+    // a static message just in case so we never panic on the error
+    // path (which would be ironic).
     let sanitized = owned.replace('\0', "?");
-    let cstring =
-        CString::new(sanitized).unwrap_or_else(|_| CString::new("(unrepresentable error)").unwrap());
+    let cstring = CString::new(sanitized).unwrap_or_else(|_| {
+        CString::new("(unrepresentable error)").expect("static ASCII has no interior NUL")
+    });
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = Some(cstring);
     });

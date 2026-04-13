@@ -28,6 +28,11 @@ pub struct SdrCore {
     /// `sdr_core_set_event_callback`. Wrapped in `Mutex<Option<_>>`
     /// because the dispatcher thread reads it from another thread.
     /// `None` until the host registers a callback.
+    ///
+    /// `#[allow(dead_code)]`: not yet read in this checkpoint —
+    /// lands when the event dispatcher module is added later in
+    /// this PR.
+    #[allow(dead_code)]
     pub(crate) event_callback: Mutex<Option<EventCallbackSlot>>,
 
     /// Path the host provided to `sdr_core_create`. Stored for future
@@ -37,6 +42,11 @@ pub struct SdrCore {
     /// path threads through the FFI surface in v1 even before the
     /// engine consumes it, so adding persistence in a follow-up PR
     /// doesn't require an ABI change.
+    ///
+    /// `#[allow(dead_code)]`: read by the `#[cfg(test)]` integration
+    /// tests in `lifecycle.rs` but not by non-test code yet. Comes
+    /// off once a production call site exists.
+    #[allow(dead_code)]
     pub(crate) config_path: std::path::PathBuf,
 }
 
@@ -46,6 +56,7 @@ pub struct SdrCore {
 /// `user_data` is treated as opaque on our side: we never deref it,
 /// just hand it back to the callback. Wrapping in a struct lets us
 /// derive `Send`-by-construction (see the unsafe impl below).
+#[allow(dead_code)] // fields read in the event-dispatcher checkpoint (later in this PR)
 pub(crate) struct EventCallbackSlot {
     pub callback: crate::event::SdrEventCallback,
     pub user_data: *mut std::ffi::c_void,
@@ -75,17 +86,30 @@ impl SdrCore {
     /// reference. Returns `None` (caller maps to `InvalidHandle`)
     /// when the pointer is null.
     ///
+    /// Not yet called in production code — the command-function
+    /// checkpoint later in this PR is the first consumer. Kept
+    /// here (with `allow(dead_code)`) so the next checkpoint is a
+    /// pure add rather than needing to introduce the helper at
+    /// the same time as its first caller.
+    ///
     /// # Safety
     ///
     /// The caller asserts that `ptr` either points to a valid
     /// `SdrCore` produced by `sdr_core_create` and not yet destroyed,
     /// or is null. Use-after-free or double-free is on the C-side
     /// caller, not on us.
+    #[allow(dead_code)]
     pub(crate) unsafe fn from_raw<'a>(ptr: *const SdrCore) -> Option<&'a SdrCore> {
-        if ptr.is_null() { None } else { unsafe { Some(&*ptr) } }
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { Some(&*ptr) }
+        }
     }
 
-    /// Mutable variant of [`Self::from_raw`].
+    /// Mutable variant of [`Self::from_raw`]. See that function for
+    /// the safety contract and the "not yet used in production code"
+    /// note.
     ///
     /// # Safety
     ///
@@ -94,7 +118,12 @@ impl SdrCore {
     /// a `&mut SdrCore` across an FFI boundary, so concurrency is
     /// the host's responsibility — this is the standard "C side
     /// owns aliasing rules" model.
+    #[allow(dead_code)]
     pub(crate) unsafe fn from_raw_mut<'a>(ptr: *mut SdrCore) -> Option<&'a mut SdrCore> {
-        if ptr.is_null() { None } else { unsafe { Some(&mut *ptr) } }
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { Some(&mut *ptr) }
+        }
     }
 }

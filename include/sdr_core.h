@@ -1,0 +1,190 @@
+/*
+ * sdr_core.h — Hand-written C ABI for the sdr-core SDR engine.
+ *
+ * This file is the **source of truth** for the C interface between
+ * `sdr-ffi` (Rust) and any native host (Swift / C / C++). The Rust
+ * side in `crates/sdr-ffi/` MUST match this header byte-for-byte —
+ * the `make ffi-header-check` CI lint enforces the match by running
+ * `cbindgen` against the Rust source and diffing the result.
+ *
+ * Spec: docs/superpowers/specs/2026-04-12-sdr-ffi-c-abi-design.md
+ *
+ * Threading model summary (full contract in the spec):
+ *   - Commands can be called from any thread.
+ *   - The event callback fires on the FFI dispatcher thread, NOT
+ *     the host's main thread. The host is responsible for marshaling
+ *     to its UI thread.
+ *   - `sdr_core_destroy` must NOT be called from inside the event
+ *     callback — it joins the dispatcher thread and would deadlock.
+ *   - Errors go through a thread-local last-error message; call
+ *     `sdr_core_last_error_message()` from the same thread that
+ *     observed the error code.
+ *
+ * ABI versioning:
+ *   - Minor bump = additive (new function, new event variant, new
+ *     error code). Old hosts keep working; they just don't see new
+ *     things.
+ *   - Major bump = breaking (signature change, struct layout, etc.).
+ *     Old hosts must fail to start against a newer library.
+ *   - Hosts should call `sdr_core_abi_version()` once at startup and
+ *     abort cleanly on a major mismatch.
+ */
+
+#ifndef SDR_CORE_H
+#define SDR_CORE_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ================================================================ */
+/*  ABI versioning                                                  */
+/* ================================================================ */
+
+#define SDR_CORE_ABI_VERSION_MAJOR 0
+#define SDR_CORE_ABI_VERSION_MINOR 1
+
+/*
+ * Return the ABI version the library was built with, packed as
+ * `(major << 16) | minor`. Hosts call this once at startup and
+ * abort (or show a "library mismatch" dialog) on a major mismatch
+ * against what they were compiled against.
+ */
+uint32_t sdr_core_abi_version(void);
+
+/* ================================================================ */
+/*  Error model                                                     */
+/* ================================================================ */
+
+/*
+ * Functions that can fail return an `int32_t` carrying one of these
+ * values. `SDR_CORE_OK` (0) is success; negative values are errors.
+ *
+ * The matching human-readable error message is stashed in a
+ * thread-local and can be fetched via `sdr_core_last_error_message()`
+ * from the same thread that observed the error code.
+ *
+ * Never reorder or renumber — these discriminants are part of the
+ * ABI. New variants go at the end (and require a minor ABI bump).
+ */
+typedef enum SdrCoreError {
+    SDR_CORE_OK             =  0,
+    SDR_CORE_ERR_INTERNAL   = -1, /* Rust panic caught by catch_unwind. */
+    SDR_CORE_ERR_INVALID_HANDLE = -2, /* Null or destroyed handle.       */
+    SDR_CORE_ERR_INVALID_ARG    = -3, /* Malformed argument.             */
+    SDR_CORE_ERR_NOT_RUNNING    = -4, /* Wrong state for this command.  */
+    SDR_CORE_ERR_DEVICE         = -5, /* USB / source backend error.    */
+    SDR_CORE_ERR_AUDIO          = -6, /* Audio backend error.           */
+    SDR_CORE_ERR_IO             = -7, /* File / network I/O error.      */
+    SDR_CORE_ERR_CONFIG         = -8, /* Config load/save error.        */
+} SdrCoreError;
+
+/*
+ * Return a pointer to the thread-local last-error message set by
+ * the most recent `sdr_core_*` call on this thread, or NULL if no
+ * error has been recorded on this thread.
+ *
+ * The returned pointer is owned by thread-local storage. It is
+ * valid until the next `sdr_core_*` call on the same thread, which
+ * may overwrite or clear the buffer. Callers that want to persist
+ * the message should copy it immediately.
+ *
+ * Safe to call at any time, on any thread, including from inside
+ * the event callback. Does not produce its own errors.
+ */
+const char* sdr_core_last_error_message(void);
+
+/* ================================================================ */
+/*  Lifecycle                                                       */
+/* ================================================================ */
+
+/*
+ * Opaque handle. The Rust definition lives in
+ * `crates/sdr-ffi/src/handle.rs` — the host only ever holds a
+ * `SdrCore *` and passes it back to FFI functions.
+ */
+typedef struct SdrCore SdrCore;
+
+/*
+ * Log level for `sdr_core_init_logging`. Numerically increasing =
+ * more verbose.
+ */
+typedef enum SdrLogLevel {
+    SDR_LOG_ERROR = 0,
+    SDR_LOG_WARN  = 1,
+    SDR_LOG_INFO  = 2,
+    SDR_LOG_DEBUG = 3,
+    SDR_LOG_TRACE = 4,
+} SdrLogLevel;
+
+/*
+ * Initialize Rust `tracing` log routing. Optional — call once
+ * before `sdr_core_create` if you want to see the engine's log
+ * output. On macOS (eventual v2) this will route to `os_log`; for
+ * v1 it routes to stderr via `tracing_subscriber::fmt`.
+ *
+ * Calling this more than once is a no-op after the first
+ * successful init (the tracing subscriber is a process-global).
+ *
+ * Does not return an error: if subscriber setup fails for any
+ * reason the function logs a diagnostic to stderr and returns,
+ * leaving any previously-installed subscriber intact.
+ */
+void sdr_core_init_logging(SdrLogLevel min_level);
+
+/*
+ * Create a new engine instance.
+ *
+ * `config_path_utf8` is the on-disk config file the engine should
+ * eventually load from and persist to. Must be a NUL-terminated
+ * UTF-8 string. Pass an empty string ("") to run with in-memory
+ * defaults and no persistence. v1 engines accept the path and
+ * store it for future use but do not yet read or write through it
+ * — passing a valid path now means persistence can land in a
+ * follow-up without an ABI change.
+ *
+ * On success: writes the opaque handle to `*out_handle` and
+ * returns `SDR_CORE_OK`. The handle must eventually be released
+ * via `sdr_core_destroy`.
+ *
+ * On failure: leaves `*out_handle` untouched (still null if that's
+ * how the caller initialized it), returns a negative error code,
+ * and stashes a human-readable message retrievable via
+ * `sdr_core_last_error_message`.
+ *
+ * Possible errors:
+ *   SDR_CORE_ERR_INVALID_ARG     — null pointer arguments, or
+ *                                 `config_path_utf8` is not valid
+ *                                 UTF-8.
+ *   SDR_CORE_ERR_INTERNAL        — DSP thread spawn failed, or a
+ *                                 Rust panic crossed the boundary.
+ */
+int32_t sdr_core_create(const char* config_path_utf8, SdrCore** out_handle);
+
+/*
+ * Destroy an engine instance.
+ *
+ * Sends a final `Stop` command, drops the Rust handle (which
+ * closes the command channel and lets the detached DSP controller
+ * thread exit naturally), and joins the FFI dispatcher thread if
+ * one was started. After this call the `handle` pointer is
+ * invalid — do not use it again.
+ *
+ * Safe to pass a null pointer (no-op). Idempotent only in the
+ * sense that passing null is OK; passing the same non-null handle
+ * twice is use-after-free and will probably crash.
+ *
+ * Must NOT be called from inside the event callback — joining the
+ * dispatcher thread from its own thread would deadlock.
+ */
+void sdr_core_destroy(SdrCore* handle);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SDR_CORE_H */
