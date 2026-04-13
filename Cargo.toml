@@ -81,6 +81,7 @@ sherpa-cpu = ["sherpa", "gtk-frontend", "sdr-transcription/sherpa-cpu", "sdr-ui?
 # so the features above can use the `dep:` / `?/` syntax cleanly.
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-ui = { workspace = true, features = ["pipewire"], optional = true }
+sdr-splash-gtk.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
 

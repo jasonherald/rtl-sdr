@@ -12,6 +12,16 @@ use gtk4::glib;
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 fn main() -> glib::ExitCode {
+    // Splash subprocess mode. The sdr-splash controller re-execs us
+    // with `--splash` as argv[1] to render a tiny GTK splash window
+    // during the otherwise-blocking sherpa init phase. Dispatch BEFORE
+    // any mallopt or sherpa init — this is a separate process that
+    // does its own GTK setup, completely independent of the parent.
+    if std::env::args().nth(1).as_deref() == Some("--splash") {
+        let exit_code: i32 = sdr_splash_gtk::run();
+        return glib::ExitCode::from(u8::try_from(exit_code).unwrap_or(1));
+    }
+
     // Limit glibc malloc arenas before any threads spawn.
     // Without this, glibc creates up to 8*cores arenas that each keep
     // their high-water mark, causing RSS to grow indefinitely with 40+ threads.
