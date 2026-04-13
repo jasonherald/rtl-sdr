@@ -225,19 +225,35 @@ impl AudioSink {
         unit.set_stream_format(format, Scope::Input, Element::Output)
             .map_err(|e| SinkError::OpenFailed(format!("set_stream_format: {e}")))?;
 
-        // Register the render callback. The callback captures an Arc to
-        // the ring buffer plus a heap-allocated scratch buffer used to
-        // de-interleave samples for each quantum. The scratch buffer is
-        // allocated **here** (the cold start path) and reused for the
-        // lifetime of the AudioUnit — the audio I/O thread never
-        // allocates. Ring buffer reads are non-blocking via `try_lock`
-        // so contention with the writer never blocks the callback
-        // thread either.
+        // Register the render callback. The callback captures three
+        // pieces of state by move:
+        //
+        //   1. `ring_for_cb`: Arc clone of the audio ring buffer.
+        //      Reads are non-blocking via `try_lock` so contention with
+        //      the producer never blocks the audio I/O thread.
+        //
+        //   2. `scratch_buf`: a heap-allocated de-interleave scratch
+        //      buffer, allocated **here** (the cold start path) and
+        //      reused for the lifetime of the AudioUnit. The audio I/O
+        //      thread never allocates.
+        //
+        //   3. `overflow_warned`: a one-shot atomic flag used by
+        //      `render_callback_body` to throttle the "render quantum
+        //      exceeded scratch buffer" warning to exactly **one log
+        //      line per sink lifetime**. Without this, a device whose
+        //      quantum is consistently above MAX_CB_FRAMES would
+        //      generate hundreds of `tracing::warn!` calls per second
+        //      from the RT thread — turning the silence fallback into
+        //      its own dropout source. The flag resets on every
+        //      `start()` call (because a fresh closure is constructed)
+        //      so users who fix their device config and restart get a
+        //      fresh warning if the issue recurs.
         let ring_for_cb = Arc::clone(&self.ring);
         let mut scratch_buf: Vec<f32> = vec![0.0; MAX_CB_FRAMES * 2];
+        let overflow_warned = AtomicBool::new(false);
         unit.set_render_callback(
             move |args: render_callback::Args<data::NonInterleaved<f32>>| {
-                render_callback_body(&ring_for_cb, &mut scratch_buf, args);
+                render_callback_body(&ring_for_cb, &overflow_warned, &mut scratch_buf, args);
                 // The inner function is infallible by construction —
                 // every code path in it writes silence on degraded
                 // quanta rather than returning an error. The Result
@@ -350,13 +366,16 @@ impl Sink for AudioSink {
 /// closure (allocated once at sink construction) and passed in by
 /// `&mut`. The callback uses `scratch.len() / 2` as the per-quantum
 /// frame ceiling; if a single quantum exceeds it, the callback writes
-/// silence to both channels and emits a `tracing` warning rather than
-/// growing the scratch on the audio thread. Heap allocation on the
-/// CoreAudio render thread can block on the system allocator and miss
-/// a deadline; silence is the correct safe degradation. Debug builds
-/// also `debug_assert!` so the overflow path fires loudly during dev.
+/// silence to both channels and emits a `tracing` warning **at most
+/// once per sink lifetime** (gated by the `overflow_warned` atomic)
+/// rather than growing the scratch on the audio thread. Heap
+/// allocation on the CoreAudio render thread can block on the system
+/// allocator and miss a deadline; silence is the correct safe
+/// degradation. Debug builds also `debug_assert!` so the overflow
+/// path fires loudly during dev.
 fn render_callback_body(
     ring: &AudioRingBuffer,
+    overflow_warned: &AtomicBool,
     scratch: &mut [f32],
     mut args: render_callback::Args<data::NonInterleaved<f32>>,
 ) {
@@ -386,14 +405,26 @@ fn render_callback_body(
     );
 
     if frames > max_frames {
-        // Release-build degradation: write silence to both channels and
-        // log once. Cannot allocate on the RT thread; cannot panic on
-        // the RT thread either. Silence is the correct safe fallback.
-        tracing::warn!(
-            frames,
-            max_frames,
-            "CoreAudio render quantum exceeded scratch buffer; rendering silence"
-        );
+        // Release-build degradation: write silence to both channels.
+        // Emit the warning at most ONCE per sink lifetime via the
+        // `overflow_warned` flag — without this gate the warning would
+        // fire on every oversized quantum from the RT thread, which
+        // would itself become a dropout source (each tracing::warn! is
+        // a syscall + format work). Once-per-lifetime means the user
+        // sees the issue, observes the silence symptom, and has the
+        // info to act; the `start()` path constructs a fresh atomic
+        // so a stop-and-restart after fixing the device gets a fresh
+        // warning if the issue recurs.
+        //
+        // `swap(true)` is a single atomic write — Relaxed is fine
+        // because we don't need to synchronize anything else.
+        if !overflow_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                frames,
+                max_frames,
+                "CoreAudio render quantum exceeded scratch buffer; rendering silence (further occurrences will be silenced)"
+            );
+        }
         for v in left.iter_mut().take(frames) {
             *v = 0.0;
         }

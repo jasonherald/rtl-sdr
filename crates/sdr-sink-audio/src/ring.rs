@@ -55,14 +55,14 @@ impl AudioRingBuffer {
 
     /// Write samples into the ring buffer. Drops oldest data if full.
     ///
-    /// Mutex poisoning is silently dropped on the producer side: a panic
-    /// in a previous holder of the lock should not propagate into the
-    /// DSP thread, which has no useful recovery action. The frame is
-    /// lost; the next frame will succeed (the lock is released even on
-    /// poison).
+    /// Mutex poisoning is recovered via [`PoisonError::into_inner`]
+    /// rather than dropped silently. A panic in a previous holder of
+    /// the lock should not permanently mute the buffer for the rest
+    /// of the process — the next frame must still get through.
     pub(crate) fn write(&self, samples: &[f32]) {
-        let Ok(mut inner) = self.buf.lock() else {
-            return;
+        let mut inner = match self.buf.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
         };
         let cap = inner.capacity;
         let mut wp = inner.write_pos;
@@ -83,9 +83,12 @@ impl AudioRingBuffer {
     }
 
     /// Clear the ring buffer (used on start/stop to avoid replaying stale audio).
+    ///
+    /// Mutex poisoning is recovered the same way as [`Self::write`].
     pub(crate) fn clear(&self) {
-        let Ok(mut inner) = self.buf.lock() else {
-            return;
+        let mut inner = match self.buf.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
         };
         inner.read_pos = 0;
         inner.write_pos = 0;
@@ -95,11 +98,17 @@ impl AudioRingBuffer {
     /// Read up to `output.len()` samples. Returns count read.
     ///
     /// Uses `try_lock` to avoid blocking the audio I/O callback thread.
-    /// Returns 0 on contention; the caller renders silence for that
-    /// quantum and tries again on the next callback.
+    /// Returns 0 on contention (`WouldBlock`); the caller renders
+    /// silence for that quantum and tries again on the next callback.
+    /// Mutex poisoning is recovered via `into_inner()` so a previous
+    /// panic does not permanently mute the audio path.
     pub(crate) fn read(&self, output: &mut [f32]) -> usize {
-        let Ok(mut inner) = self.buf.try_lock() else {
-            return 0; // Contended — return silence this cycle.
+        use std::sync::TryLockError;
+
+        let mut inner = match self.buf.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::WouldBlock) => return 0, // Contended this cycle.
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
         let to_read = output.len().min(inner.count);
         let mut rp = inner.read_pos;

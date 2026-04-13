@@ -35,13 +35,17 @@ thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
 
-# Audio sink: pulled in with the right backend feature per target_os.
-# On Linux we want PipeWire; on macOS we want CoreAudio. Without these
-# target-conditional overrides, the workspace baseline build would fall
-# through to the no-backend stub. The stub still exists for unusual
-# build configurations (e.g., Windows, or macOS+Linux cross-builds
-# with no default features) — see the cfg dispatch in
-# crates/sdr-sink-audio/src/lib.rs.
+# Audio sink. The base dep is unconditional so `controller.rs`'s
+# `use sdr_sink_audio::AudioSink;` resolves on every target — including
+# Windows / BSD / etc. that fall through to the no-backend stub. The
+# target-specific entries below ADD the right backend feature on Linux
+# (PipeWire) and macOS (CoreAudio); Cargo merges per-target dep entries
+# into the base dep, so on Linux the effective entry is
+# `sdr-sink-audio = { ..., features = ["pipewire"] }`, on macOS it's
+# `["coreaudio"]`, and on every other target the feature list is empty
+# and the crate's `lib.rs` cfg dispatch resolves to the stub backend.
+sdr-sink-audio.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-sink-audio = { workspace = true, features = ["pipewire"] }
 
