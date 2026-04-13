@@ -4,23 +4,48 @@ Rust port of SDR++ — software-defined radio application with GTK4 UI.
 
 ## Architecture
 
-13-crate workspace with clear dependency boundaries:
+17-crate workspace with clear dependency boundaries:
 
 ```text
 sdr-types           → Foundation types, errors, constants (no internal deps)
 sdr-dsp             → Pure DSP: math, filters, FFT, demod, resampling (depends on: types)
-sdr-config          → JSON configuration persistence (depends on: types)
+sdr-config          → JSON configuration persistence + OS keyring (depends on: types)
 sdr-pipeline        → Threading, streaming, signal path (depends on: types, dsp, config)
-sdr-rtlsdr          → Pure Rust librtlsdr port — USB, tuner drivers (no internal deps)
+sdr-rtlsdr          → Rust port of librtlsdr over rusb — 5 tuner families (no internal deps)
 sdr-source-rtlsdr   → RTL-SDR source module (depends on: types, pipeline, rtlsdr, config)
 sdr-source-network  → TCP/UDP IQ source (depends on: types, pipeline, config)
 sdr-source-file     → WAV file playback source (depends on: types, pipeline, config)
 sdr-sink-audio      → PipeWire/CoreAudio output (depends on: types, pipeline, config)
 sdr-sink-network    → TCP/UDP audio output (depends on: types, pipeline, config)
 sdr-radio           → Radio decoder, demod, IF/AF chains (depends on: types, dsp, pipeline)
-sdr-ui              → GTK4/libadwaita UI (depends on: all above)
-sdr (binary)        → Entry point (depends on: ui, pipeline, config, sources, sinks)
+sdr-radioreference  → RadioReference.com SOAP client (depends on: types, config)
+sdr-transcription   → Whisper OR sherpa-onnx backend, Silero VAD, spectral denoiser
+sdr-core            → Headless cross-platform engine facade (macOS port path)
+sdr-splash          → Cross-platform splash subprocess controller (stdin wire protocol)
+sdr-splash-gtk      → Linux GTK4 splash window implementation
+sdr-ui              → GTK4/libadwaita UI — Linux-only (depends on: all above)
+sdr (binary)        → Entry point (depends on: ui, core, splash, transcription, …)
 ```
+
+## Transcription backend feature mutex
+
+**Whisper and Sherpa-onnx are mutually exclusive cargo features.** The `sdr-transcription` crate has `compile_error!` guards enforcing exactly one. This was a PR 2-era workaround for a heap corruption between whisper-rs's libstdc++ state and ONNX Runtime's `ParseSemVerVersion` regex constructors that only manifests when both C++ dep trees are in the same binary.
+
+**Build flavors:**
+```bash
+# Whisper (default) — multilingual, mature GPU acceleration
+make install CARGO_FLAGS="--release"                                # Whisper CPU
+make install CARGO_FLAGS="--release --features whisper-cuda"        # User's daily driver (RTX 4080 Super)
+make install CARGO_FLAGS="--release --features whisper-hipblas"     # AMD ROCm
+make install CARGO_FLAGS="--release --features whisper-vulkan"      # Cross-vendor GPU
+
+# Sherpa-onnx — Zipformer / Moonshine / Parakeet, English-only, CPU today
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"
+```
+
+**Dual-build testing rule:** any change to `sdr-transcription` or its callers MUST be tested with BOTH `whisper-cuda` AND `sherpa-cpu` builds sequentially. The cfg gates make it easy to break one without noticing. CI runs both flavors.
+
+Runtime model selection for Sherpa builds is in-place (drop-old-recognizer-build-new) and does NOT require a restart — PR 5 architecture. The PR 2 "pre-GTK init" half of the heap-corruption workaround turned out to be unnecessary once the feature mutex was in place; only the first recognizer needs pre-GTK creation, and subsequent swaps post-GTK work fine.
 
 ## Build & Test
 
