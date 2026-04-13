@@ -33,6 +33,12 @@ const KEY_DISPLAY_MODE: &str = "transcription_display_mode";
 /// Config key for the persisted Silero VAD threshold.
 /// Sherpa-only — only meaningful for offline models (Moonshine, Parakeet).
 const KEY_SHERPA_VAD_THRESHOLD: &str = "sherpa_vad_threshold";
+#[cfg(feature = "sherpa")]
+/// Config key for persisting the Auto Break segmentation preference.
+/// When true, offline sherpa sessions use squelch edges as utterance
+/// boundaries instead of Silero VAD. Default false (preserve existing
+/// behavior for existing config files).
+pub(crate) const KEY_AUTO_BREAK_ENABLED: &str = "transcription_auto_break_enabled";
 
 #[cfg(feature = "sherpa")]
 const DISPLAY_MODE_LIVE_IDX: u32 = 0;
@@ -106,6 +112,10 @@ pub struct TranscriptPanel {
     /// models (Zipformer) don't use Silero VAD.
     #[cfg(feature = "sherpa")]
     pub vad_threshold_row: adw::SpinRow,
+    /// Auto Break toggle. Sherpa-only — when enabled, uses squelch
+    /// edges as utterance boundaries instead of Silero VAD. NFM only.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_row: adw::SwitchRow,
     /// Dimmed italic label below the text view that renders in-progress
     /// Sherpa partials. Sherpa-only.
     #[cfg(feature = "sherpa")]
@@ -331,6 +341,32 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         row
     };
 
+    #[cfg(feature = "sherpa")]
+    let auto_break_row = {
+        let saved = config.read(|v| {
+            v.get(KEY_AUTO_BREAK_ENABLED)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
+
+        let row = adw::SwitchRow::builder()
+            .title("Auto Break")
+            .subtitle("Use the radio's squelch as the transcription boundary instead of VAD. NFM only.")
+            .active(saved)
+            .build();
+        group.add(&row);
+
+        let config_ab = Arc::clone(config);
+        row.connect_active_notify(move |r| {
+            let active = r.is_active();
+            config_ab.write(|v| {
+                v[KEY_AUTO_BREAK_ENABLED] = serde_json::json!(active);
+            });
+        });
+
+        row
+    };
+
     // --- Display mode selector (Sherpa only) ---
     //
     // Whisper builds never compile this in — Whisper does not emit
@@ -543,6 +579,8 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         display_mode_row,
         #[cfg(feature = "sherpa")]
         vad_threshold_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_row,
         #[cfg(feature = "sherpa")]
         live_line_label,
         status_label,
