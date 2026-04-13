@@ -31,7 +31,7 @@ use crate::backend::{
     TranscriptionEvent,
 };
 use crate::init_event::InitEvent;
-use crate::sherpa_model::{self, SherpaModel};
+use crate::sherpa_model::{self, ModelFilePaths, SherpaModel};
 use crate::{denoise, resampler};
 
 /// Bounded channel capacity for audio buffers from DSP → backend.
@@ -295,7 +295,13 @@ fn store_init_failure(err: BackendError) {
 /// inside utterances and confuse the streaming decoder. The Whisper backend
 /// uses `silence_threshold` because Whisper has no built-in VAD.
 fn build_recognizer_config(model: SherpaModel, provider: &str) -> OnlineRecognizerConfig {
-    let (encoder, decoder, joiner, tokens) = sherpa_model::model_file_paths(model);
+    // Irrefutable today — will become refutable when Moonshine variant lands (plan Task 6).
+    #[allow(irrefutable_let_patterns)]
+    let ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } =
+        sherpa_model::model_file_paths(model)
+    else {
+        unreachable!("StreamingZipformerEn is always a Transducer")
+    };
 
     let mut config = OnlineRecognizerConfig::default();
     config.model_config.transducer.encoder = Some(encoder.to_string_lossy().into_owned());

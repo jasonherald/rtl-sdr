@@ -192,24 +192,53 @@ pub fn model_directory(model: SherpaModel) -> PathBuf {
     sherpa_models_dir().join(model.dir_name())
 }
 
-/// Returns the full paths for all files needed by a sherpa model.
+/// Concrete filesystem paths for every file a sherpa model needs on disk.
 ///
-/// Order: (encoder, decoder, joiner, tokens). The caller checks each path
-/// for existence and emits a helpful error if any are missing.
-pub fn model_file_paths(model: SherpaModel) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    let dir = model_directory(model);
-    (
-        dir.join(model.encoder_filename()),
-        dir.join(model.decoder_filename()),
-        dir.join(model.joiner_filename()),
-        dir.join(model.tokens_filename()),
-    )
+/// Each recognizer family has a different layout. The enum variants
+/// match the families in [`ModelKind`]: transducer models (Zipformer,
+/// Parakeet-TDT) ship four files, Moonshine v2 ships three.
+#[derive(Debug, Clone)]
+pub enum ModelFilePaths {
+    Transducer {
+        encoder: PathBuf,
+        decoder: PathBuf,
+        joiner: PathBuf,
+        tokens: PathBuf,
+    },
 }
 
-/// True if all four required files for `model` exist on disk.
+/// Returns the full paths for all files needed by a sherpa model.
+///
+/// The returned variant matches the model's [`ModelKind`]. The caller
+/// is expected to pattern-match on the variant and pass the paths into
+/// the right `sherpa_onnx` config (transducer vs moonshine).
+pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
+    match model.kind() {
+        ModelKind::OnlineTransducer => {
+            let dir = model_directory(model);
+            ModelFilePaths::Transducer {
+                encoder: dir.join(model.encoder_filename()),
+                decoder: dir.join(model.decoder_filename()),
+                joiner: dir.join(model.joiner_filename()),
+                tokens: dir.join(model.tokens_filename()),
+            }
+        }
+        ModelKind::OfflineMoonshine => {
+            // Added in a later task when Moonshine variants exist.
+            // This arm is unreachable today because no SherpaModel
+            // variant returns ModelKind::OfflineMoonshine yet.
+            unreachable!("OfflineMoonshine has no variants yet — see plan Task 6")
+        }
+    }
+}
+
+/// True if every file required by `model` exists on disk.
 pub fn model_exists(model: SherpaModel) -> bool {
-    let (e, d, j, t) = model_file_paths(model);
-    e.is_file() && d.is_file() && j.is_file() && t.is_file()
+    match model_file_paths(model) {
+        ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } => {
+            encoder.is_file() && decoder.is_file() && joiner.is_file() && tokens.is_file()
+        }
+    }
 }
 
 /// Download a sherpa-onnx model bundle from the k2-fsa GitHub releases
@@ -428,14 +457,20 @@ mod tests {
     }
 
     #[test]
-    fn model_file_paths_returns_four_distinct_files() {
-        let (e, d, j, t) = model_file_paths(SherpaModel::StreamingZipformerEn);
-        assert_ne!(e, d);
-        assert_ne!(e, j);
-        assert_ne!(e, t);
-        assert_ne!(d, j);
-        assert_ne!(d, t);
-        assert_ne!(j, t);
+    fn transducer_model_file_paths_returns_four_distinct_files() {
+        #[allow(irrefutable_let_patterns)]
+        #[allow(clippy::panic)]
+        let ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } =
+            model_file_paths(SherpaModel::StreamingZipformerEn)
+        else {
+            panic!("StreamingZipformerEn should be a Transducer layout");
+        };
+        assert_ne!(encoder, decoder);
+        assert_ne!(encoder, joiner);
+        assert_ne!(encoder, tokens);
+        assert_ne!(decoder, joiner);
+        assert_ne!(decoder, tokens);
+        assert_ne!(joiner, tokens);
     }
 
     #[test]
