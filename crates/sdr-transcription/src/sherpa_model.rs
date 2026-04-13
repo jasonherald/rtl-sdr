@@ -57,6 +57,21 @@ fn cleanup_scratch_state(model: SherpaModel) -> Result<(), SherpaModelError> {
     Ok(())
 }
 
+/// Which sherpa-onnx recognizer family a model belongs to.
+///
+/// Drives host init branching and session loop dispatch. Online
+/// models run through `OnlineRecognizer` + streaming chunks;
+/// offline models run through `OfflineRecognizer` + external VAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    /// Streaming transducer: Zipformer today, Parakeet-TDT in a future PR.
+    /// Uses `OnlineRecognizer` + streaming session loop.
+    OnlineTransducer,
+    /// Offline encoder-decoder: Moonshine v2. Requires external VAD
+    /// to detect utterance boundaries before batch decoding.
+    OfflineMoonshine,
+}
+
 /// Available sherpa-onnx model variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SherpaModel {
@@ -135,6 +150,30 @@ impl SherpaModel {
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{}",
             self.archive_filename()
         )
+    }
+
+    /// Which recognizer family this model uses.
+    ///
+    /// The host worker branches on this at init time to pick the
+    /// right recognizer type and session loop.
+    pub fn kind(self) -> ModelKind {
+        match self {
+            Self::StreamingZipformerEn => ModelKind::OnlineTransducer,
+        }
+    }
+
+    /// True if this model emits intermediate hypothesis updates
+    /// (`TranscriptionEvent::Partial`) during speech.
+    ///
+    /// Drives contextual UI: the "Display mode" (Live/Final) toggle
+    /// only appears for models that return `true` here. Offline
+    /// models decode once per utterance so partials are not
+    /// meaningful.
+    pub fn supports_partials(self) -> bool {
+        match self.kind() {
+            ModelKind::OnlineTransducer => true,
+            ModelKind::OfflineMoonshine => false,
+        }
     }
 
     /// All available variants in order — used to populate the UI dropdown.
@@ -416,6 +455,30 @@ mod tests {
         // the .tar.bz2 suffix — sanity check that we'll find the right
         // directory after extraction.
         assert_eq!(format!("{inner}.tar.bz2"), archive);
+    }
+
+    #[test]
+    fn zipformer_is_online_transducer() {
+        assert_eq!(
+            SherpaModel::StreamingZipformerEn.kind(),
+            ModelKind::OnlineTransducer
+        );
+    }
+
+    #[test]
+    fn online_transducer_supports_partials() {
+        assert!(SherpaModel::StreamingZipformerEn.supports_partials());
+    }
+
+    #[test]
+    fn supports_partials_is_derived_from_kind() {
+        // Sanity check that supports_partials mirrors the kind match —
+        // if anyone adds a new ModelKind variant they have to update
+        // supports_partials too, and this test locks that relationship.
+        for model in SherpaModel::ALL {
+            let expected = matches!(model.kind(), ModelKind::OnlineTransducer);
+            assert_eq!(model.supports_partials(), expected, "mismatch for {model:?}");
+        }
     }
 
     // NOTE: there's no unit test for `cleanup_scratch_state` because the
