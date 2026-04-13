@@ -94,6 +94,16 @@ mod linux_impl {
             Rc::new(RefCell::new(Some(cmd_rx)));
 
         app.connect_activate(move |app| {
+            // Re-activation (rare, but can happen if the splash process
+            // receives a second activate signal): present the existing
+            // window instead of building a new one.
+            if label_cell_for_activate.borrow().is_some() {
+                if let Some(window) = app.active_window() {
+                    window.present();
+                }
+                return;
+            }
+
             build_window(app, &label_cell_for_activate);
 
             // Install a periodic timeout on first activation only.

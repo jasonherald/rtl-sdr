@@ -93,13 +93,23 @@ impl SplashController {
         };
 
         let mut inner = SplashInner { child, stdin };
-        // Send the initial text. If this fails the controller stays
-        // active but won't render anything until the next update.
+        // Send the initial text. A broken pipe here means the child
+        // exited before we could talk to it (e.g. spawn succeeded but
+        // GTK init failed), so we need to reap it and return an
+        // inactive controller rather than leaving a zombie Some(inner)
+        // around waiting for update_text to discover it.
         let sanitized = sanitize_protocol_text(initial_text);
-        if let Err(e) = writeln!(inner.stdin, "text:{sanitized}") {
-            tracing::warn!(error = %e, "SplashController: initial text write failed");
+        if let Err(e) = writeln!(inner.stdin, "text:{sanitized}").and_then(|()| inner.stdin.flush())
+        {
+            tracing::warn!(
+                error = %e,
+                "SplashController: initial text write failed; disabling splash"
+            );
+            drop(inner.stdin);
+            let _ = inner.child.kill();
+            let _ = inner.child.wait();
+            return Self { inner: None };
         }
-        let _ = inner.stdin.flush();
 
         Self { inner: Some(inner) }
     }
