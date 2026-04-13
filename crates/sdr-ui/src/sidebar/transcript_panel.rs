@@ -276,6 +276,30 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         row
     };
 
+    // Toggle display_mode_row visibility based on whether the selected
+    // model emits partial hypotheses. Models like Moonshine are offline
+    // and decode once per utterance — the Live/Final distinction is
+    // meaningless and the row is hidden entirely. Initial visibility
+    // is set here based on the currently-saved model index.
+    #[cfg(feature = "sherpa")]
+    {
+        let initial_visible = sdr_transcription::SherpaModel::ALL
+            .get(saved_model_idx as usize)
+            .copied()
+            .is_some_and(sdr_transcription::SherpaModel::supports_partials);
+        display_mode_row.set_visible(initial_visible);
+
+        let display_mode_row_for_visibility = display_mode_row.clone();
+        model_row.connect_selected_notify(move |r| {
+            let idx = r.selected() as usize;
+            let visible = sdr_transcription::SherpaModel::ALL
+                .get(idx)
+                .copied()
+                .is_some_and(sdr_transcription::SherpaModel::supports_partials);
+            display_mode_row_for_visibility.set_visible(visible);
+        });
+    }
+
     // --- Live caption line (Sherpa only) ---
     //
     // Dimmed italic label that renders in-progress Sherpa partials.
