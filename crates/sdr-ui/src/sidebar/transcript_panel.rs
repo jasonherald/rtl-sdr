@@ -234,6 +234,48 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         });
     });
 
+    // --- Display mode selector (Sherpa only) ---
+    //
+    // Whisper builds never compile this in — Whisper does not emit
+    // `TranscriptionEvent::Partial`, so there's nothing to render in a
+    // "live line". Sherpa builds default to "Live captions" because
+    // streaming is the whole point; users can switch to "Final only"
+    // if the in-place updates are visually distracting.
+    #[cfg(feature = "sherpa")]
+    let display_mode_row = {
+        let list = gtk4::StringList::new(DISPLAY_MODE_LABELS);
+
+        let saved_idx = config.read(|v| {
+            v.get(KEY_DISPLAY_MODE)
+                .and_then(serde_json::Value::as_str)
+                .map_or(DISPLAY_MODE_LIVE_IDX, |s| match s {
+                    "final" => DISPLAY_MODE_FINAL_IDX,
+                    _ => DISPLAY_MODE_LIVE_IDX,
+                })
+        });
+
+        let row = adw::ComboRow::builder()
+            .title("Display mode")
+            .subtitle("Live captions update in place; Final only shows committed text")
+            .model(&list)
+            .selected(saved_idx)
+            .build();
+        group.add(&row);
+
+        let config_display = Arc::clone(config);
+        row.connect_selected_notify(move |r| {
+            let value = match r.selected() {
+                DISPLAY_MODE_FINAL_IDX => "final",
+                _ => "live",
+            };
+            config_display.write(|v| {
+                v[KEY_DISPLAY_MODE] = serde_json::json!(value);
+            });
+        });
+
+        row
+    };
+
     let status_label = gtk4::Label::builder()
         .halign(gtk4::Align::Start)
         .css_classes(["dim-label"])
