@@ -66,19 +66,22 @@ fn main() -> glib::ExitCode {
             sdr_transcription::SherpaModel::StreamingZipformerEn,
         );
 
+        let mut current_component: &'static str = "sherpa-onnx";
         loop {
             match event_rx.recv() {
-                Ok(InitEvent::DownloadStart) => {
-                    tracing::info!("sherpa download starting");
-                    splash.update_text("Downloading sherpa-onnx model...");
+                Ok(InitEvent::DownloadStart { component }) => {
+                    tracing::info!(%component, "sherpa download starting");
+                    current_component = component;
+                    splash.update_text(&format!("Downloading {component}..."));
                 }
                 Ok(InitEvent::DownloadProgress { pct }) => {
                     tracing::info!(progress_pct = pct, "sherpa download progress");
-                    splash.update_text(&format!("Downloading sherpa-onnx model... {pct}%"));
+                    splash.update_text(&format!("Downloading {current_component}... {pct}%"));
                 }
-                Ok(InitEvent::Extracting) => {
-                    tracing::info!("sherpa extracting archive");
-                    splash.update_text("Extracting sherpa-onnx model...");
+                Ok(InitEvent::Extracting { component }) => {
+                    tracing::info!(%component, "sherpa extracting archive");
+                    current_component = component;
+                    splash.update_text(&format!("Extracting {component}..."));
                 }
                 Ok(InitEvent::CreatingRecognizer) => {
                     tracing::info!("sherpa creating recognizer");

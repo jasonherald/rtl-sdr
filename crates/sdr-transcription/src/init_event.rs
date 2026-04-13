@@ -12,15 +12,21 @@
 /// Progress events from the sherpa-onnx host worker thread during
 /// initialization. The worker emits these in order; the final event
 /// is always either `Ready` or `Failed`.
+///
+/// `DownloadStart` and `Extracting` carry a `component` label so the
+/// splash window can show which artifact is currently being processed
+/// (e.g. "Silero VAD", "Streaming Zipformer (English)", "Moonshine Tiny").
 #[derive(Debug, Clone)]
 pub enum InitEvent {
-    /// The sherpa model bundle is missing locally; download is starting.
-    DownloadStart,
+    /// A sherpa artifact is missing locally; download is starting.
+    /// `component` is a human-readable name rendered on the splash.
+    DownloadStart { component: &'static str },
     /// Download progress (0..=100). Only fired during the download phase.
     DownloadProgress { pct: u8 },
-    /// Download complete; extracting the .tar.bz2 archive.
-    Extracting,
-    /// Extraction complete; constructing the `OnlineRecognizer`.
+    /// Download complete; extracting the archive.
+    /// `component` matches the most recent `DownloadStart` payload.
+    Extracting { component: &'static str },
+    /// Extraction complete; constructing the recognizer.
     /// This is the longest step on the cached path (~1-2 seconds).
     CreatingRecognizer,
     /// The host is fully initialized and ready to accept sessions.

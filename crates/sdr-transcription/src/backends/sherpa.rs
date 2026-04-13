@@ -175,7 +175,9 @@ fn run_host_loop(
             ?model,
             "sherpa model not found locally, downloading bundle (~256 MB)"
         );
-        let _ = event_tx.send(InitEvent::DownloadStart);
+        let _ = event_tx.send(InitEvent::DownloadStart {
+            component: model.label(),
+        });
 
         let (dl_tx, dl_rx) = mpsc::channel::<u8>();
         let event_tx_dl = event_tx.clone();
@@ -220,7 +222,9 @@ fn run_host_loop(
         // the splash label updates while extraction is happening (~1-2
         // seconds for the 256 MB archive).
         tracing::info!("sherpa archive download complete, extracting");
-        let _ = event_tx.send(InitEvent::Extracting);
+        let _ = event_tx.send(InitEvent::Extracting {
+            component: model.label(),
+        });
 
         if let Err(e) = sherpa_model::extract_sherpa_archive(model, &archive_path) {
             let msg = format!("sherpa model extraction failed: {e}");
@@ -607,7 +611,7 @@ mod tests {
             .recv()
             .expect("worker should send at least one event");
         assert!(
-            matches!(first_event, InitEvent::DownloadStart),
+            matches!(first_event, InitEvent::DownloadStart { .. }),
             "expected DownloadStart when model is missing, got {first_event:?}"
         );
         // Drop the receiver — the worker will silently discard further events.
