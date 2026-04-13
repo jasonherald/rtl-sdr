@@ -1617,7 +1617,17 @@ fn connect_transcript_panel(
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                             // Worker dropped its sender without sending Ready
-                            // or Failed — unusual but don't strand the UI.
+                            // or Failed — unusual but don't strand the UI in
+                            // a "Reloading..." state. Surface the disconnect
+                            // as an error and re-enable the controls so the
+                            // user can try a different model.
+                            tracing::warn!(
+                                "sherpa host reload event channel disconnected unexpectedly"
+                            );
+                            status.set_text("Reload failed: recognizer worker disconnected");
+                            status.set_css_classes(&["error"]);
+                            status.set_visible(true);
+                            progress.set_visible(false);
                             if let Some(model_row) = model_row_reload_weak.upgrade() {
                                 model_row.set_sensitive(true);
                             }
