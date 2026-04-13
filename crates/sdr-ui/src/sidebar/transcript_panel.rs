@@ -19,6 +19,18 @@ const KEY_NOISE_GATE: &str = "transcription_noise_gate";
 #[cfg(feature = "sherpa")]
 /// Config key for the persisted Sherpa model index.
 const KEY_SHERPA_MODEL: &str = "transcription_sherpa_model";
+#[cfg(feature = "sherpa")]
+/// Config key for the persisted transcript display mode.
+/// Values: `"live"` (default) or `"final"`.
+const KEY_DISPLAY_MODE: &str = "transcription_display_mode";
+
+#[cfg(feature = "sherpa")]
+const DISPLAY_MODE_LIVE_IDX: u32 = 0;
+/// `pub(crate)` so `window.rs` can gate the `Partial` handler on it.
+#[cfg(feature = "sherpa")]
+pub(crate) const DISPLAY_MODE_FINAL_IDX: u32 = 1;
+#[cfg(feature = "sherpa")]
+const DISPLAY_MODE_LABELS: &[&str] = &["Live captions", "Final only"];
 
 // Silence threshold slider defaults and range. Whisper-only — Sherpa
 // uses native endpoint detection so the slider isn't shown.
@@ -56,6 +68,14 @@ pub struct TranscriptPanel {
     pub silence_row: adw::SpinRow,
     /// Noise gate spin row.
     pub noise_gate_row: adw::SpinRow,
+    /// Display-mode selector (Live captions vs Final only). Sherpa-only —
+    /// Whisper has no `Partial` events to render.
+    #[cfg(feature = "sherpa")]
+    pub display_mode_row: adw::ComboRow,
+    /// Dimmed italic label below the text view that renders in-progress
+    /// Sherpa partials. Sherpa-only.
+    #[cfg(feature = "sherpa")]
+    pub live_line_label: gtk4::Label,
     /// Status label (downloading, listening, error).
     pub status_label: gtk4::Label,
     /// Model download progress bar.
