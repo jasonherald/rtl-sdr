@@ -1525,9 +1525,11 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
-            // display_mode_row is intentionally NOT locked — the Partial
-            // handler re-reads it on every event, so flipping it mid-session
-            // is safe and desirable (user sees effect immediately).
+            // All settings lock during a session for mid-session fault
+            // tolerance — walks back PR 4's earlier display_mode_row
+            // exception. User stops, changes, starts.
+            #[cfg(feature = "sherpa")]
+            display_mode_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
 
@@ -1691,6 +1693,10 @@ fn connect_transcript_panel(
                                         if let Some(noise) = noise_gate_row_weak.upgrade() {
                                             noise.set_sensitive(true);
                                         }
+                                        #[cfg(feature = "sherpa")]
+                                        if let Some(display) = display_mode_row_weak.upgrade() {
+                                            display.set_sensitive(true);
+                                        }
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
                                         }
@@ -1723,6 +1729,8 @@ fn connect_transcript_panel(
                     #[cfg(feature = "whisper")]
                     silence_row.set_sensitive(true);
                     noise_gate_row.set_sensitive(true);
+                    #[cfg(feature = "sherpa")]
+                    display_mode_row.set_sensitive(true);
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
                     // set the error text so the user actually sees it.
@@ -1739,6 +1747,8 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             silence_row.set_sensitive(true);
             noise_gate_row.set_sensitive(true);
+            #[cfg(feature = "sherpa")]
+            display_mode_row.set_sensitive(true);
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();
             status_label.set_text("");
