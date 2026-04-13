@@ -1507,6 +1507,7 @@ fn unlock_transcription_session_rows(
     noise_gate_row: &glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] auto_break_row: &glib::WeakRef<adw::SwitchRow>,
 ) {
     if let Some(row) = model_row.upgrade() {
         row.set_sensitive(true);
@@ -1524,6 +1525,10 @@ fn unlock_transcription_session_rows(
     }
     #[cfg(feature = "sherpa")]
     if let Some(row) = vad_threshold_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_row.upgrade() {
         row.set_sensitive(true);
     }
 }
@@ -1567,11 +1572,15 @@ fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let vad_threshold_row = transcript.vad_threshold_row.clone();
     #[cfg(feature = "sherpa")]
+    let auto_break_row = transcript.auto_break_row.clone();
+    #[cfg(feature = "sherpa")]
     let live_line_label = transcript.live_line_label.clone();
     #[cfg(feature = "sherpa")]
     let display_mode_row_weak = display_mode_row.downgrade();
     #[cfg(feature = "sherpa")]
     let vad_threshold_row_weak = vad_threshold_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_row_weak = auto_break_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -1736,6 +1745,8 @@ fn connect_transcript_panel(
             display_mode_row.set_sensitive(false);
             #[cfg(feature = "sherpa")]
             vad_threshold_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            auto_break_row.set_sensitive(false);
 
             let model_idx = model_row.selected() as usize;
 
@@ -1776,15 +1787,21 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             let vad_threshold: f32 = sdr_transcription::VAD_THRESHOLD_DEFAULT;
 
+            #[cfg(feature = "sherpa")]
+            let segmentation_mode = if auto_break_row.is_active() {
+                sdr_transcription::SegmentationMode::AutoBreak
+            } else {
+                sdr_transcription::SegmentationMode::Vad
+            };
+            #[cfg(feature = "whisper")]
+            let segmentation_mode = sdr_transcription::SegmentationMode::Vad;
+
             let config = sdr_transcription::BackendConfig {
                 model,
                 silence_threshold,
                 noise_gate_ratio,
                 vad_threshold,
-                // Task 14 replaces this hardcoded default with a read
-                // from the auto_break_row toggle. For now, default to
-                // Vad so Tasks 7-13 can build the workspace.
-                segmentation_mode: sdr_transcription::SegmentationMode::Vad,
+                segmentation_mode,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
@@ -1816,6 +1833,8 @@ fn connect_transcript_panel(
                     let display_mode_row_weak = display_mode_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let vad_threshold_row_weak = vad_threshold_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_row_weak = auto_break_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let live_line_weak = live_line_weak.clone();
 
@@ -1937,6 +1956,8 @@ fn connect_transcript_panel(
                                             &display_mode_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &vad_threshold_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_row_weak,
                                         );
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
@@ -2004,6 +2025,8 @@ fn connect_transcript_panel(
                                         &display_mode_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &vad_threshold_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_row_weak,
                                     );
                                     if let Some(enable) = enable_row_weak.upgrade() {
                                         enable.set_active(false);
@@ -2035,6 +2058,8 @@ fn connect_transcript_panel(
                         &display_mode_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &vad_threshold_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_row.downgrade(),
                     );
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
@@ -2057,6 +2082,8 @@ fn connect_transcript_panel(
                 &display_mode_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &vad_threshold_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_row.downgrade(),
             );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();
