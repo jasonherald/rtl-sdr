@@ -31,6 +31,16 @@
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+/// Replace any embedded `\n` / `\r` characters with spaces. The splash
+/// subprocess protocol is one command per line, so embedded newlines
+/// in a label update would split into extra frames and a later line
+/// could be interpreted as `done`. Callers currently pass static
+/// strings with interpolated percent values so this is defensive, but
+/// cheap enough to do unconditionally.
+fn sanitize_protocol_text(text: &str) -> String {
+    text.replace(['\r', '\n'], " ")
+}
+
 /// Controller for the sdr-rs splash subprocess.
 pub struct SplashController {
     inner: Option<SplashInner>,
@@ -85,7 +95,8 @@ impl SplashController {
         let mut inner = SplashInner { child, stdin };
         // Send the initial text. If this fails the controller stays
         // active but won't render anything until the next update.
-        if let Err(e) = writeln!(inner.stdin, "text:{initial_text}") {
+        let sanitized = sanitize_protocol_text(initial_text);
+        if let Err(e) = writeln!(inner.stdin, "text:{sanitized}") {
             tracing::warn!(error = %e, "SplashController: initial text write failed");
         }
         let _ = inner.stdin.flush();
@@ -109,7 +120,8 @@ impl SplashController {
         let Some(mut inner) = self.inner.take() else {
             return;
         };
-        if writeln!(inner.stdin, "text:{text}")
+        let sanitized = sanitize_protocol_text(text);
+        if writeln!(inner.stdin, "text:{sanitized}")
             .and_then(|()| inner.stdin.flush())
             .is_err()
         {

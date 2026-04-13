@@ -47,8 +47,10 @@ mod linux_impl {
         let (cmd_tx, cmd_rx) = mpsc::channel::<StdinCommand>();
 
         // Spawn the stdin reader thread BEFORE app.run() so it is ready
-        // when the activate signal fires.
-        std::thread::Builder::new()
+        // when the activate signal fires. If thread creation fails,
+        // log and return a non-zero exit cleanly — the controller in
+        // sdr-splash degrades gracefully when the subprocess exits.
+        if let Err(e) = std::thread::Builder::new()
             .name("sdr-splash-stdin".into())
             .spawn(move || {
                 let stdin = std::io::stdin();
@@ -69,7 +71,13 @@ mod linux_impl {
                 // EOF on stdin → tell main thread to quit.
                 let _ = cmd_tx.send(StdinCommand::Done);
             })
-            .expect("failed to spawn sdr-splash-stdin reader thread");
+        {
+            tracing::error!(
+                error = %e,
+                "sdr-splash-gtk: failed to spawn stdin reader thread"
+            );
+            return glib::ExitCode::from(1);
+        }
 
         // Hold the label widget in a RefCell so the timeout closure can
         // update it. The cell is populated in build_window() during

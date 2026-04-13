@@ -418,17 +418,11 @@ mod tests {
         assert_eq!(format!("{inner}.tar.bz2"), archive);
     }
 
-    #[test]
-    fn cleanup_scratch_state_is_idempotent_when_nothing_exists() {
-        // Ensures the helper handles the no-leftover case without error.
-        // Relies on the developer's environment being in a sane state
-        // (no leftover .part files in ~/.local/share/sdr-rs/models/sherpa/).
-        // If the dev has scratch lying around, the test still passes —
-        // it just removes them, which is the function's job.
-        let result = cleanup_scratch_state(SherpaModel::StreamingZipformerEn);
-        assert!(
-            result.is_ok(),
-            "expected Ok on fresh/missing state, got {result:?}"
-        );
-    }
+    // NOTE: there's no unit test for `cleanup_scratch_state` because the
+    // function resolves paths via `dirs_next::data_dir()` — any test that
+    // called it would touch the real user's `~/.local/share/sdr-rs/models/sherpa/`
+    // and could delete in-progress download state. Hermetic coverage
+    // requires threading a base-dir parameter through `sherpa_models_dir`
+    // and its callers; that refactor is tracked as part of the hermetic
+    // testing follow-up mentioned on #255 / discussed in PR #254.
 }
