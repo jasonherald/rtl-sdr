@@ -190,7 +190,7 @@ struct DspState {
     iq_writer: Option<WavWriter>,
 
     /// Transcription audio tap — when Some, audio is copied to this channel.
-    transcription_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+    transcription_tx: Option<std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>>,
 }
 
 impl DspState {
@@ -1010,7 +1010,7 @@ fn process_iq_block(
                                 interleaved.push(s.r);
                             }
                             if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
-                                tx.try_send(interleaved)
+                                tx.try_send(sdr_transcription::TranscriptionInput::Samples(interleaved))
                             {
                                 state.transcription_tx = None;
                                 tracing::info!(

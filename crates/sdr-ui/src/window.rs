@@ -1776,6 +1776,10 @@ fn connect_transcript_panel(
                 silence_threshold,
                 noise_gate_ratio,
                 vad_threshold,
+                // Task 14 replaces this hardcoded default with a read
+                // from the auto_break_row toggle. For now, default to
+                // Vad so Tasks 7-13 can build the workspace.
+                segmentation_mode: sdr_transcription::SegmentationMode::Vad,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
