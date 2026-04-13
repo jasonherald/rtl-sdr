@@ -203,7 +203,7 @@ git rev of your fork:
 1. Workspace `Cargo.toml`: replace `sherpa-onnx = "1.12"` with a `git =` dep pointing at your fork + pinned rev.
 2. `crates/sdr-transcription/Cargo.toml`: add `sherpa-cuda = ["sherpa", "sherpa-onnx/cuda"]` feature alongside `sherpa-cpu`. The `sherpa-onnx/cuda` passthrough requires `sherpa-onnx`'s own `Cargo.toml` to re-export the feature (may need a micro-patch there too — TBD during implementation).
 3. `backends/sherpa/host.rs:421`, `:478`, `:481`: replace hardcoded `"cpu"` with a const that switches on `cfg(feature = "sherpa-cuda")`.
-4. `backends/sherpa/silero_vad.rs:72`: same treatment for the VAD provider string.
+4. `backends/sherpa/silero_vad.rs:72`: **no change** — Silero VAD intentionally stays on CPU even in `sherpa-cuda` builds. Per-chunk inference on a ~2 MB model is trivial, and sending every 32 ms window across the PCIe bus to the GPU would cost more than the compute itself. Keeping it pinned to `"cpu"` also avoids any cross-provider onnxruntime state we don't otherwise need.
 5. Makefile: document the new build flavor.
 6. README.md / CLAUDE.md: document the CUDA 12.x + cuDNN 9.x runtime requirement, install commands for Arch/Ubuntu.
 7. CI: add a `sherpa-cuda` build job (cargo check only — runners don't have GPUs, but the link step and archive download still get exercised).

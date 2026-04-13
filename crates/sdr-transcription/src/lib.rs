@@ -29,6 +29,22 @@ compile_error!(
      the CUDA 12.x + cuDNN 9.x prebuilt)."
 );
 
+// `sherpa` is an internal umbrella feature activated by the two
+// user-facing link-mode features (`sherpa-cpu`, `sherpa-cuda`). If a
+// caller enables `sherpa` directly without picking a link mode, the
+// sherpa-onnx dependency would be pulled in with no link configured
+// and fail at link time with a confusing error. Catch it here with a
+// clear actionable message.
+#[cfg(all(
+    feature = "sherpa",
+    not(any(feature = "sherpa-cpu", feature = "sherpa-cuda"))
+))]
+compile_error!(
+    "the internal `sherpa` feature requires exactly one user-facing link mode. \
+     Enable either `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link \
+     against the CUDA 12.x + cuDNN 9.x prebuilt) instead of `sherpa` directly."
+);
+
 #[cfg(not(any(feature = "whisper", feature = "sherpa")))]
 compile_error!(
     "exactly one transcription backend must be enabled. The default is \

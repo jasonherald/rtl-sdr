@@ -53,8 +53,18 @@ DOWNLOADS_DIR="$1"
 STAGING_DIR="$2"
 SENTINEL="$3"
 
-if [ -f "$SENTINEL" ]; then
-    echo "  [cached] NVIDIA CUDA redist libs already fetched"
+# The sentinel file alone isn't enough to short-circuit — if the
+# staging directory got wiped (e.g. the user ran `rm -rf ~/.cache/sdr-rs`
+# selectively, or a distro upgrade pruned XDG caches) while the
+# sentinel survived, we'd skip the extract step and leave install-
+# cuda-redist-libs with nothing to copy. Validate that staging still
+# has at least one library file before trusting the cache; otherwise
+# fall through to the fetch/extract path, which itself is idempotent
+# on the already-downloaded archives.
+if [ -f "$SENTINEL" ] \
+    && [ -d "$STAGING_DIR" ] \
+    && [ -n "$(find "$STAGING_DIR" -maxdepth 1 \( -type f -o -type l \) -name 'lib*.so*' -print -quit 2>/dev/null)" ]; then
+    echo "  [cached] NVIDIA CUDA redist libs already fetched and staged"
     exit 0
 fi
 

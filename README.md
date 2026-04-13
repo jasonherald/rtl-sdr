@@ -127,7 +127,7 @@ Installs the binary, desktop entry, and icon for app launcher integration.
 
 ### Transcription backend (pick one)
 
-Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. GPU builds require the corresponding toolkit (CUDA, ROCm, Vulkan SDK).
+Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. **Whisper** GPU builds require the corresponding toolkit installed on the build host (CUDA, ROCm, Vulkan SDK), because `whisper-rs` compiles its own kernels at build time. **Sherpa-cuda** is different: `make install` sideloads the required CUDA 12 / cuDNN 9 runtime libraries automatically into `~/.cargo/bin/sdr-rs-libs/` and only needs the NVIDIA kernel driver present on the host — see the Sherpa CUDA notes below.
 
 ```bash
 # Whisper backend (default) — multilingual, mature GPU acceleration

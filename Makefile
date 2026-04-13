@@ -22,18 +22,30 @@ CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v1
         fetch-cuda-redist test clippy fmt fmt-check \
         lint deny audit scan clean help
 
-# Conditionally chain the NVIDIA redist fetch into the install flow
-# when the user asked for a sherpa-cuda build. `findstring` returns
-# the matched substring on hit, empty on miss, so `ifneq (,...)` is
-# "if the flag is present". Whisper and sherpa-cpu builds skip the
-# download path entirely and never touch the ~1.8 GB cache.
+# Runtime library copy targets are conditionally chained into `install`
+# only when the user asked for a sherpa-cuda build. This is important
+# because cargo does NOT clean `target/release/*.so*` or the persistent
+# NVIDIA redist staging cache when switching feature sets — so if a
+# user built with sherpa-cuda once, then later ran
 #
-# The dep is added to `install-cuda-redist-libs` (not to `install`
-# directly) so that the fetch is guaranteed to happen BEFORE the copy
-# from staging into $(LIBDIR). Adding it to `install` would just
-# append it to the existing prereq list, running the fetch after the
-# copy — which is the bug that bit us the first time around.
+#     make install CARGO_FLAGS="--release --features whisper-cuda"
+#
+# an unconditional copy step would happily repopulate $(LIBDIR) from
+# the stale sherpa/CUDA artifacts left behind in target/release/ and
+# ~/.cache/sdr-rs/cuda-redist/staging/, producing a whisper binary
+# with a 2 GB subdirectory of dead CUDA libraries sitting next to it.
+#
+# `findstring` returns the matched substring on hit, empty on miss,
+# so `ifneq (,...)` is "if the flag is present". Whisper and
+# sherpa-cpu builds skip the runtime-lib plumbing entirely.
+INSTALL_RUNTIME_LIB_TARGETS :=
 ifneq (,$(findstring sherpa-cuda,$(CARGO_FLAGS)))
+INSTALL_RUNTIME_LIB_TARGETS += install-sherpa-runtime-libs install-cuda-redist-libs
+# Chain the fetch dep onto install-cuda-redist-libs (NOT onto `install`
+# directly) so the fetch runs BEFORE the copy from staging into
+# $(LIBDIR). Adding it to `install` would just append it to the
+# existing prereq list and run the fetch after the copy — which is
+# the bug that bit us the first time around.
 install-cuda-redist-libs: fetch-cuda-redist
 endif
 
@@ -70,7 +82,7 @@ build:
 # Install
 # ─────────────────────────────────────────────────────────────────────
 
-install: build install-bin install-sherpa-runtime-libs install-cuda-redist-libs install-icon install-desktop
+install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-desktop
 	@echo ""
 	@echo "SDR-RS installed successfully!"
 	@echo "  Binary:   $(BINDIR)/sdr-rs"

@@ -30,9 +30,20 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SHERPA_CUDA");
 
-    #[cfg(all(feature = "sherpa-cuda", target_os = "linux"))]
-    {
+    // Read build *target* state from cargo env vars rather than
+    // `#[cfg(target_os = ...)]` / `#[cfg(feature = ...)]`. The `cfg`
+    // form would reflect the HOST that's running `build.rs`, not the
+    // architecture we're compiling for — wrong for any future
+    // cross-compilation setup. CARGO_CFG_TARGET_OS and
+    // CARGO_FEATURE_* are the canonical cargo-provided values for
+    // the build-target state.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let sherpa_cuda = std::env::var_os("CARGO_FEATURE_SHERPA_CUDA").is_some();
+
+    if sherpa_cuda && target_os == "linux" {
         // `$ORIGIN` must reach `ld` as a literal dollar sign; cargo
         // passes `rustc-link-arg` values straight through without
         // shell expansion, so we escape nothing here.

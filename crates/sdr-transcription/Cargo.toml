@@ -29,10 +29,15 @@ whisper-openblas = ["whisper", "whisper-rs/openblas"]
 # Sherpa backend — pick exactly one:
 #
 #   sherpa-cpu  — CPU-only, static link against k2-fsa's CPU prebuilt
-#   sherpa-cuda — NVIDIA GPU via CUDA 12.x + cuDNN 9.x prebuilt. Downloads
-#                 a ~235MB archive on first build. Linux x86_64 only.
-#                 Requires libcudnn.so.9 / libcublas.so.12 installed
-#                 system-wide; onnxruntime dlopens them at startup.
+#   sherpa-cuda — NVIDIA GPU via CUDA 12.x + cuDNN 9.x prebuilt. Linux
+#                 x86_64 only. First build downloads a ~235 MB sherpa
+#                 CUDA archive from k2-fsa plus ~1.83 GB of NVIDIA
+#                 CUDA 12 / cuDNN 9 runtime libraries — the latter are
+#                 vendored into `$(BINDIR)/sdr-rs-libs/` by
+#                 `make install`, so no parallel system-wide CUDA 12
+#                 install is required. Only the NVIDIA kernel driver
+#                 has to come from the host. See the README's Sherpa
+#                 CUDA section for the full install story.
 #
 # These are mutually exclusive (see the `compile_error!` guards in lib.rs).
 sherpa-cpu = ["sherpa", "sherpa-onnx/static"]
