@@ -30,6 +30,13 @@ pub enum DspToUi {
     IqRecordingStarted(std::path::PathBuf),
     /// IQ recording stopped.
     IqRecordingStopped,
+    /// Demodulator mode changed. Emitted when `UiToDsp::SetDemodMode`
+    /// actually changes the active demod mode (edge detection — not
+    /// emitted if the requested mode matches the current mode). The
+    /// transcript panel subscribes to this to stop any active
+    /// transcription session (band change = new session boundary) and
+    /// to re-run Auto Break row visibility rules.
+    DemodModeChanged(DemodMode),
 }
 
 /// Available source types for IQ input.
@@ -167,6 +174,12 @@ mod tests {
 
         let iq_stop = DspToUi::IqRecordingStopped;
         assert!(matches!(iq_stop, DspToUi::IqRecordingStopped));
+    }
+
+    #[test]
+    fn demod_mode_changed_message_constructs() {
+        let m = DspToUi::DemodModeChanged(DemodMode::Nfm);
+        assert!(matches!(m, DspToUi::DemodModeChanged(DemodMode::Nfm)));
     }
 
     #[test]

@@ -333,6 +333,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetDemodMode(mode) => {
             tracing::debug!(?mode, "set demod mode");
+            let old_mode = state.radio.current_mode();
             if let Err(e) = state.radio.set_mode(mode) {
                 tracing::warn!("set demod mode failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Mode switch failed: {e}")));
@@ -361,6 +362,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
                     state.frontend.effective_sample_rate(),
                 ));
+
+                // Notify the UI of the mode transition (edge detection — only
+                // when the mode actually changed so idempotent refreshes do not
+                // trigger the transcript-session boundary logic in Task 16).
+                if old_mode != mode {
+                    let _ = dsp_tx.send(DspToUi::DemodModeChanged(mode));
+                }
             }
         }
 

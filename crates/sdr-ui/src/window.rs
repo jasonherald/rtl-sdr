@@ -472,6 +472,11 @@ fn handle_dsp_message(
                 overlay.add_toast(toast);
             }
         }
+        // Task 16 will wire up the full UI response (stop transcription session,
+        // re-run Auto Break row visibility rules). For now just log the event.
+        DspToUi::DemodModeChanged(mode) => {
+            tracing::debug!(?mode, "demod mode changed (Task 16 handler pending)");
+        }
     }
 }
 
