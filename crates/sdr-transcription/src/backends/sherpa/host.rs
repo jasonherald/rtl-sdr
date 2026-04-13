@@ -183,7 +183,9 @@ fn init_online(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
 ) -> Result<RecognizerState, ()> {
-    if !sherpa_model::model_exists(model) && !download_and_extract_bundle(model, event_tx, model.label()) {
+    if !sherpa_model::model_exists(model)
+        && !download_and_extract_bundle(model, event_tx, model.label())
+    {
         return Err(());
     }
 
@@ -220,7 +222,9 @@ fn init_offline(
     }
 
     // --- Moonshine model bundle ---
-    if !sherpa_model::model_exists(model) && !download_and_extract_bundle(model, event_tx, model.label()) {
+    if !sherpa_model::model_exists(model)
+        && !download_and_extract_bundle(model, event_tx, model.label())
+    {
         return Err(());
     }
 
@@ -230,7 +234,8 @@ fn init_offline(
     tracing::info!(?model, "creating sherpa-onnx OfflineRecognizer (Moonshine)");
 
     let Some(recognizer) = OfflineRecognizer::create(&recognizer_config) else {
-        let msg = "OfflineRecognizer::create returned None — check Moonshine model files".to_owned();
+        let msg =
+            "OfflineRecognizer::create returned None — check Moonshine model files".to_owned();
         tracing::error!(%msg);
         store_init_failure(BackendError::Init(msg.clone()));
         let _ = event_tx.send(InitEvent::Failed { message: msg });

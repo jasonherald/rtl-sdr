@@ -44,7 +44,9 @@ mod tests {
         struct Noop;
         impl VoiceActivityDetector for Noop {
             fn accept(&mut self, _: &[f32]) {}
-            fn pop_segment(&mut self) -> Option<Vec<f32>> { None }
+            fn pop_segment(&mut self) -> Option<Vec<f32>> {
+                None
+            }
             fn reset(&mut self) {}
         }
         let mut noop = Noop;

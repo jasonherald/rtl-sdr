@@ -121,9 +121,9 @@ impl SherpaModel {
     pub fn decoder_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
-                "decoder_filename called on a Moonshine variant"
-            ),
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => {
+                unreachable!("decoder_filename called on a Moonshine variant")
+            }
         }
     }
 
@@ -131,9 +131,9 @@ impl SherpaModel {
     pub fn joiner_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "joiner-epoch-99-avg-1-chunk-16-left-128.onnx",
-            Self::MoonshineTinyEn | Self::MoonshineBaseEn => unreachable!(
-                "joiner_filename called on a Moonshine variant"
-            ),
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => {
+                unreachable!("joiner_filename called on a Moonshine variant")
+            }
         }
     }
 
@@ -153,9 +153,9 @@ impl SherpaModel {
     pub fn moonshine_encoder_filename(self) -> &'static str {
         match self {
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => "encode.int8.onnx",
-            Self::StreamingZipformerEn => unreachable!(
-                "moonshine_encoder_filename called on non-Moonshine variant"
-            ),
+            Self::StreamingZipformerEn => {
+                unreachable!("moonshine_encoder_filename called on non-Moonshine variant")
+            }
         }
     }
 
@@ -163,9 +163,9 @@ impl SherpaModel {
     pub fn moonshine_merged_decoder_filename(self) -> &'static str {
         match self {
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => "decode.int8.onnx",
-            Self::StreamingZipformerEn => unreachable!(
-                "moonshine_merged_decoder_filename called on non-Moonshine variant"
-            ),
+            Self::StreamingZipformerEn => {
+                unreachable!("moonshine_merged_decoder_filename called on non-Moonshine variant")
+            }
         }
     }
 
@@ -173,9 +173,9 @@ impl SherpaModel {
     pub fn moonshine_tokens_filename(self) -> &'static str {
         match self {
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => "tokens.txt",
-            Self::StreamingZipformerEn => unreachable!(
-                "moonshine_tokens_filename called on non-Moonshine variant"
-            ),
+            Self::StreamingZipformerEn => {
+                unreachable!("moonshine_tokens_filename called on non-Moonshine variant")
+            }
         }
     }
 
@@ -356,7 +356,11 @@ pub fn download_silero_vad(
     // Atomic rename into place.
     std::fs::rename(&part_path, &final_path)?;
 
-    tracing::info!(bytes = downloaded, ?final_path, "silero VAD download complete");
+    tracing::info!(
+        bytes = downloaded,
+        ?final_path,
+        "silero VAD download complete"
+    );
     Ok(final_path)
 }
 
@@ -416,12 +420,17 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
 /// True if every file required by `model` exists on disk.
 pub fn model_exists(model: SherpaModel) -> bool {
     match model_file_paths(model) {
-        ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } => {
-            encoder.is_file() && decoder.is_file() && joiner.is_file() && tokens.is_file()
-        }
-        ModelFilePaths::Moonshine { encoder, merged_decoder, tokens } => {
-            encoder.is_file() && merged_decoder.is_file() && tokens.is_file()
-        }
+        ModelFilePaths::Transducer {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } => encoder.is_file() && decoder.is_file() && joiner.is_file() && tokens.is_file(),
+        ModelFilePaths::Moonshine {
+            encoder,
+            merged_decoder,
+            tokens,
+        } => encoder.is_file() && merged_decoder.is_file() && tokens.is_file(),
     }
 }
 
@@ -643,8 +652,12 @@ mod tests {
     #[test]
     #[allow(clippy::panic)]
     fn transducer_model_file_paths_returns_four_distinct_files() {
-        let ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } =
-            model_file_paths(SherpaModel::StreamingZipformerEn)
+        let ModelFilePaths::Transducer {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } = model_file_paths(SherpaModel::StreamingZipformerEn)
         else {
             panic!("StreamingZipformerEn should be a Transducer layout");
         };
@@ -695,7 +708,11 @@ mod tests {
         // supports_partials too, and this test locks that relationship.
         for model in SherpaModel::ALL {
             let expected = matches!(model.kind(), ModelKind::OnlineTransducer);
-            assert_eq!(model.supports_partials(), expected, "mismatch for {model:?}");
+            assert_eq!(
+                model.supports_partials(),
+                expected,
+                "mismatch for {model:?}"
+            );
         }
     }
 
@@ -709,8 +726,14 @@ mod tests {
 
     #[test]
     fn moonshine_variants_are_offline_moonshine_kind() {
-        assert_eq!(SherpaModel::MoonshineTinyEn.kind(), ModelKind::OfflineMoonshine);
-        assert_eq!(SherpaModel::MoonshineBaseEn.kind(), ModelKind::OfflineMoonshine);
+        assert_eq!(
+            SherpaModel::MoonshineTinyEn.kind(),
+            ModelKind::OfflineMoonshine
+        );
+        assert_eq!(
+            SherpaModel::MoonshineBaseEn.kind(),
+            ModelKind::OfflineMoonshine
+        );
     }
 
     #[test]
@@ -723,7 +746,12 @@ mod tests {
     #[allow(clippy::panic)]
     fn moonshine_tiny_has_three_file_layout() {
         let paths = model_file_paths(SherpaModel::MoonshineTinyEn);
-        let ModelFilePaths::Moonshine { encoder, merged_decoder, tokens } = paths else {
+        let ModelFilePaths::Moonshine {
+            encoder,
+            merged_decoder,
+            tokens,
+        } = paths
+        else {
             panic!("MoonshineTinyEn should be a Moonshine layout");
         };
         assert!(encoder.ends_with("encode.int8.onnx"));

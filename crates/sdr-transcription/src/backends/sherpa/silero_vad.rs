@@ -13,9 +13,7 @@
 
 use std::path::Path;
 
-use sherpa_onnx::{
-    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector as SherpaVad,
-};
+use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector as SherpaVad};
 
 use crate::backend::BackendError;
 use crate::vad::VoiceActivityDetector;
@@ -64,13 +62,12 @@ impl SherpaSileroVad {
             ..Default::default()
         };
 
-        let inner =
-            SherpaVad::create(&vad_config, VAD_BUFFER_SIZE_SECONDS).ok_or_else(|| {
-                BackendError::Init(format!(
-                    "Silero VAD creation failed — check model at {}",
-                    model_path.display()
-                ))
-            })?;
+        let inner = SherpaVad::create(&vad_config, VAD_BUFFER_SIZE_SECONDS).ok_or_else(|| {
+            BackendError::Init(format!(
+                "Silero VAD creation failed — check model at {}",
+                model_path.display()
+            ))
+        })?;
 
         Ok(Self { inner })
     }

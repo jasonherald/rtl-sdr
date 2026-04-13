@@ -88,11 +88,9 @@ impl TranscriptionBackend for SherpaBackend {
                     BackendError::Init(msg) => {
                         BackendError::Init(format!("sherpa host failed to initialize: {msg}"))
                     }
-                    BackendError::Spawn(io_err) => {
-                        BackendError::Init(format!(
-                            "sherpa host worker thread spawn failed: {io_err}"
-                        ))
-                    }
+                    BackendError::Spawn(io_err) => BackendError::Init(format!(
+                        "sherpa host worker thread spawn failed: {io_err}"
+                    )),
                     BackendError::WrongModelKind => BackendError::WrongModelKind,
                 });
             }

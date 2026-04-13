@@ -36,9 +36,16 @@ const SHERPA_NUM_THREADS: i32 = 1;
 /// at the model level. Adding an RMS-based pre-gate would mask short pauses
 /// inside utterances and confuse the streaming decoder. The Whisper backend
 /// uses `silence_threshold` because Whisper has no built-in VAD.
-pub(super) fn build_recognizer_config(model: SherpaModel, provider: &str) -> OnlineRecognizerConfig {
-    let ModelFilePaths::Transducer { encoder, decoder, joiner, tokens } =
-        sherpa_model::model_file_paths(model)
+pub(super) fn build_recognizer_config(
+    model: SherpaModel,
+    provider: &str,
+) -> OnlineRecognizerConfig {
+    let ModelFilePaths::Transducer {
+        encoder,
+        decoder,
+        joiner,
+        tokens,
+    } = sherpa_model::model_file_paths(model)
     else {
         unreachable!("streaming::build_recognizer_config called with non-Transducer model")
     };

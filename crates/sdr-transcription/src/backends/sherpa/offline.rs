@@ -13,8 +13,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 use sherpa_onnx::{
-    OfflineMoonshineModelConfig, OfflineModelConfig, OfflineRecognizer,
-    OfflineRecognizerConfig,
+    OfflineModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
 };
 
 use crate::backend::TranscriptionEvent;
@@ -38,8 +37,11 @@ pub(super) fn build_moonshine_recognizer_config(
     model: SherpaModel,
     provider: &str,
 ) -> OfflineRecognizerConfig {
-    let ModelFilePaths::Moonshine { encoder, merged_decoder, tokens } =
-        sherpa_model::model_file_paths(model)
+    let ModelFilePaths::Moonshine {
+        encoder,
+        merged_decoder,
+        tokens,
+    } = sherpa_model::model_file_paths(model)
     else {
         unreachable!("offline::build_moonshine_recognizer_config called with non-Moonshine model")
     };
