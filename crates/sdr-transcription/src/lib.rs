@@ -17,13 +17,39 @@ compile_error!(
      Pick exactly one user-facing feature: \
      `whisper-cpu` (default), `whisper-cuda`, `whisper-hipblas`, \
      `whisper-vulkan`, `whisper-metal`, `whisper-intel-sycl`, `whisper-openblas`, \
-     or `sherpa-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+     `sherpa-cpu`, or `sherpa-cuda`. \
+     For sherpa, pass `--no-default-features --features sherpa-cpu` (or `sherpa-cuda`)."
+);
+
+#[cfg(all(feature = "sherpa-cpu", feature = "sherpa-cuda"))]
+compile_error!(
+    "the `sherpa-cpu` and `sherpa-cuda` features are mutually exclusive. \
+     Pick exactly one link mode for the sherpa-onnx prebuilt: \
+     `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link against \
+     the CUDA 12.x + cuDNN 9.x prebuilt)."
+);
+
+// `sherpa` is an internal umbrella feature activated by the two
+// user-facing link-mode features (`sherpa-cpu`, `sherpa-cuda`). If a
+// caller enables `sherpa` directly without picking a link mode, the
+// sherpa-onnx dependency would be pulled in with no link configured
+// and fail at link time with a confusing error. Catch it here with a
+// clear actionable message.
+#[cfg(all(
+    feature = "sherpa",
+    not(any(feature = "sherpa-cpu", feature = "sherpa-cuda"))
+))]
+compile_error!(
+    "the internal `sherpa` feature requires exactly one user-facing link mode. \
+     Enable either `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link \
+     against the CUDA 12.x + cuDNN 9.x prebuilt) instead of `sherpa` directly."
 );
 
 #[cfg(not(any(feature = "whisper", feature = "sherpa")))]
 compile_error!(
     "exactly one transcription backend must be enabled. The default is \
-     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu` \
+     (or `sherpa-cuda` for NVIDIA GPU acceleration)."
 );
 
 pub mod backend;

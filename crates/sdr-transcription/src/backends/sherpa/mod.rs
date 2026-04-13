@@ -31,6 +31,21 @@ mod streaming;
 pub use host::{init_sherpa_host, reload_sherpa_host};
 pub use silero_vad::SherpaSileroVad;
 
+/// ONNX Runtime execution provider string passed to sherpa-onnx
+/// **recognizer** configs built by this backend (online streaming,
+/// offline Moonshine, offline NeMo Parakeet). The Silero VAD stays
+/// on CPU regardless — see `silero_vad.rs` for that rationale.
+///
+/// Selected at compile time by the `sherpa-cpu` / `sherpa-cuda` cargo
+/// feature mutex (enforced in `lib.rs`). `"cuda"` is only valid when the
+/// sys crate was built against the CUDA prebuilt — otherwise onnxruntime
+/// falls back to CPU silently, which would waste a bunch of binary and
+/// disk for no benefit, so we gate it behind the dedicated feature.
+#[cfg(feature = "sherpa-cuda")]
+pub(crate) const SHERPA_PROVIDER: &str = "cuda";
+#[cfg(not(feature = "sherpa-cuda"))]
+pub(crate) const SHERPA_PROVIDER: &str = "cpu";
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 

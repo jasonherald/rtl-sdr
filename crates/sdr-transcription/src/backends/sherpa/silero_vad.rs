@@ -65,6 +65,11 @@ impl SherpaSileroVad {
             window_size: SILERO_WINDOW_SIZE,
         };
 
+        // Silero VAD is ~2 MB and per-chunk inference is trivial; always
+        // run it on CPU regardless of `SHERPA_PROVIDER`. Sending every
+        // 32 ms window across the PCIe bus to the GPU would cost more
+        // than the compute itself, and it avoids cross-provider
+        // onnxruntime state that we don't otherwise need.
         let vad_config = VadModelConfig {
             silero_vad: silero_config,
             sample_rate: SHERPA_SAMPLE_RATE_HZ,

@@ -26,8 +26,22 @@ whisper-metal = ["whisper", "whisper-rs/metal"]
 whisper-intel-sycl = ["whisper", "whisper-rs/intel-sycl"]
 whisper-openblas = ["whisper", "whisper-rs/openblas"]
 
-# Sherpa backend (CPU only for now):
-sherpa-cpu = ["sherpa"]
+# Sherpa backend — pick exactly one:
+#
+#   sherpa-cpu  — CPU-only, static link against k2-fsa's CPU prebuilt
+#   sherpa-cuda — NVIDIA GPU via CUDA 12.x + cuDNN 9.x prebuilt. Linux
+#                 x86_64 only. First build downloads a ~235 MB sherpa
+#                 CUDA archive from k2-fsa plus ~1.83 GB of NVIDIA
+#                 CUDA 12 / cuDNN 9 runtime libraries — the latter are
+#                 vendored into `$(BINDIR)/sdr-rs-libs/` by
+#                 `make install`, so no parallel system-wide CUDA 12
+#                 install is required. Only the NVIDIA kernel driver
+#                 has to come from the host. See the README's Sherpa
+#                 CUDA section for the full install story.
+#
+# These are mutually exclusive (see the `compile_error!` guards in lib.rs).
+sherpa-cpu = ["sherpa", "sherpa-onnx/static"]
+sherpa-cuda = ["sherpa", "sherpa-onnx/cuda"]
 
 [dependencies]
 whisper-rs = { workspace = true, optional = true }
