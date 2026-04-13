@@ -51,7 +51,43 @@ fn main() -> glib::ExitCode {
     #[cfg(feature = "sherpa")]
     {
         use sdr_splash::SplashController;
-        use sdr_transcription::InitEvent;
+        use sdr_transcription::{InitEvent, SherpaModel};
+
+        // Read the persisted sherpa model selection from the user's
+        // config so we initialize the recognizer they actually want.
+        // Without this, init_sherpa_host always built Zipformer and
+        // any other selection in the dropdown only took effect after
+        // the user manually round-tripped the dropdown to trigger
+        // the runtime reload from PR 5. Confusing UX — the dropdown
+        // would show e.g. Parakeet but the recognizer was Zipformer
+        // until the user clicked away and back.
+        let saved_model = {
+            let config_path = gtk4::glib::user_config_dir()
+                .join("sdr-rs")
+                .join("config.json");
+            let defaults = serde_json::json!({});
+            let mgr =
+                sdr_config::ConfigManager::load(&config_path, &defaults).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "config load failed for sherpa model selection, using default: {e}"
+                    );
+                    sdr_config::ConfigManager::in_memory(&defaults)
+                });
+            let saved_idx = mgr.read(|v| {
+                v.get("transcription_sherpa_model")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|idx| usize::try_from(idx).ok())
+                    .unwrap_or(0)
+            });
+            SherpaModel::ALL
+                .get(saved_idx)
+                .copied()
+                .unwrap_or(SherpaModel::StreamingZipformerEn)
+        };
+        tracing::info!(
+            ?saved_model,
+            "initializing sherpa host with persisted model"
+        );
 
         // Spawn the splash subprocess BEFORE init_sherpa_host. If the
         // model is already cached, the recognizer creation takes ~1-2
@@ -62,23 +98,24 @@ fn main() -> glib::ExitCode {
         // SplashController::try_spawn for the failure modes.
         let mut splash = SplashController::try_spawn("Initializing sherpa-onnx...");
 
-        let event_rx = sdr_transcription::init_sherpa_host(
-            sdr_transcription::SherpaModel::StreamingZipformerEn,
-        );
+        let event_rx = sdr_transcription::init_sherpa_host(saved_model);
 
+        let mut current_component: &'static str = "sherpa-onnx";
         loop {
             match event_rx.recv() {
-                Ok(InitEvent::DownloadStart) => {
-                    tracing::info!("sherpa download starting");
-                    splash.update_text("Downloading sherpa-onnx model...");
+                Ok(InitEvent::DownloadStart { component }) => {
+                    tracing::info!(%component, "sherpa download starting");
+                    current_component = component;
+                    splash.update_text(&format!("Downloading {component}..."));
                 }
                 Ok(InitEvent::DownloadProgress { pct }) => {
                     tracing::info!(progress_pct = pct, "sherpa download progress");
-                    splash.update_text(&format!("Downloading sherpa-onnx model... {pct}%"));
+                    splash.update_text(&format!("Downloading {current_component}... {pct}%"));
                 }
-                Ok(InitEvent::Extracting) => {
-                    tracing::info!("sherpa extracting archive");
-                    splash.update_text("Extracting sherpa-onnx model...");
+                Ok(InitEvent::Extracting { component }) => {
+                    tracing::info!(%component, "sherpa extracting archive");
+                    current_component = component;
+                    splash.update_text(&format!("Extracting {component}..."));
                 }
                 Ok(InitEvent::CreatingRecognizer) => {
                     tracing::info!("sherpa creating recognizer");

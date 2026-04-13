@@ -57,11 +57,47 @@ fn cleanup_scratch_state(model: SherpaModel) -> Result<(), SherpaModelError> {
     Ok(())
 }
 
+/// Which sherpa-onnx recognizer family a model belongs to.
+///
+/// Drives host init branching and session loop dispatch. Online
+/// models run through `OnlineRecognizer` + streaming chunks;
+/// offline models run through `OfflineRecognizer` + external VAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    /// Streaming transducer: Zipformer today. Uses `OnlineRecognizer`
+    /// + streaming session loop in `backends/sherpa/streaming.rs`.
+    OnlineTransducer,
+    /// Offline encoder-decoder: Moonshine v1. Requires external VAD
+    /// (Silero) to detect utterance boundaries before batch decoding.
+    /// Uses `OfflineRecognizer` with `OfflineMoonshineModelConfig`
+    /// + the offline session loop in `backends/sherpa/offline.rs`.
+    OfflineMoonshine,
+    /// Offline transducer-style model from NVIDIA `NeMo`: Parakeet-TDT
+    /// today. Uses `OfflineRecognizer` with `OfflineTransducerModelConfig`
+    /// and `model_type = "nemo_transducer"`. Shares the same VAD-gated
+    /// offline session loop as `OfflineMoonshine`; only the recognizer
+    /// config builder differs.
+    OfflineNemoTransducer,
+}
+
 /// Available sherpa-onnx model variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SherpaModel {
     /// Streaming Zipformer English (k2-fsa, 2023-06-26).
     StreamingZipformerEn,
+    /// Moonshine Tiny (`UsefulSensors`, English, int8). ~27M params,
+    /// ~170MB bundle. Fastest Moonshine variant — best for CPU-only
+    /// and low-end hardware. Offline (VAD-gated) decode.
+    MoonshineTinyEn,
+    /// Moonshine Base (`UsefulSensors`, English, int8). ~61M params,
+    /// ~380MB bundle. More accurate than Tiny, higher per-utterance
+    /// latency. Offline (VAD-gated) decode.
+    MoonshineBaseEn,
+    /// NVIDIA Parakeet-TDT-0.6b v3 (English, int8). ~600M params,
+    /// ~600MB bundle. Highest accuracy — currently #1 on the `OpenASR`
+    /// leaderboard. CPU-only today (sherpa-cuda follow-up tracked).
+    /// Offline (VAD-gated) batch decode through a `NeMo` transducer.
+    ParakeetTdt06bV3En,
 }
 
 impl SherpaModel {
@@ -69,6 +105,9 @@ impl SherpaModel {
     pub fn label(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "Streaming Zipformer (English)",
+            Self::MoonshineTinyEn => "Moonshine Tiny (English)",
+            Self::MoonshineBaseEn => "Moonshine Base (English)",
+            Self::ParakeetTdt06bV3En => "Parakeet TDT 0.6b v3 (English)",
         }
     }
 
@@ -77,34 +116,9 @@ impl SherpaModel {
     pub fn dir_name(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "streaming-zipformer-en",
-        }
-    }
-
-    /// Filename of the encoder ONNX file inside the model directory.
-    pub fn encoder_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "encoder-epoch-99-avg-1-chunk-16-left-128.onnx",
-        }
-    }
-
-    /// Filename of the decoder ONNX file inside the model directory.
-    pub fn decoder_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
-        }
-    }
-
-    /// Filename of the joiner ONNX file inside the model directory.
-    pub fn joiner_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "joiner-epoch-99-avg-1-chunk-16-left-128.onnx",
-        }
-    }
-
-    /// Filename of the tokens file inside the model directory.
-    pub fn tokens_filename(self) -> &'static str {
-        match self {
-            Self::StreamingZipformerEn => "tokens.txt",
+            Self::MoonshineTinyEn => "moonshine-tiny-en",
+            Self::MoonshineBaseEn => "moonshine-base-en",
+            Self::ParakeetTdt06bV3En => "parakeet-tdt-0.6b-v3-en",
         }
     }
 
@@ -114,6 +128,9 @@ impl SherpaModel {
     pub fn archive_filename(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+            Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8.tar.bz2",
+            Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8.tar.bz2",
+            Self::ParakeetTdt06bV3En => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
         }
     }
 
@@ -125,6 +142,9 @@ impl SherpaModel {
     pub fn archive_inner_directory(self) -> &'static str {
         match self {
             Self::StreamingZipformerEn => "sherpa-onnx-streaming-zipformer-en-2023-06-26",
+            Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8",
+            Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8",
+            Self::ParakeetTdt06bV3En => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
         }
     }
 
@@ -137,8 +157,39 @@ impl SherpaModel {
         )
     }
 
+    /// Which recognizer family this model uses.
+    ///
+    /// The host worker branches on this at init time to pick the
+    /// right recognizer type and session loop.
+    pub fn kind(self) -> ModelKind {
+        match self {
+            Self::StreamingZipformerEn => ModelKind::OnlineTransducer,
+            Self::MoonshineTinyEn | Self::MoonshineBaseEn => ModelKind::OfflineMoonshine,
+            Self::ParakeetTdt06bV3En => ModelKind::OfflineNemoTransducer,
+        }
+    }
+
+    /// True if this model emits intermediate hypothesis updates
+    /// (`TranscriptionEvent::Partial`) during speech.
+    ///
+    /// Drives contextual UI: the "Display mode" (Live/Final) toggle
+    /// only appears for models that return `true` here. Offline
+    /// models decode once per utterance so partials are not
+    /// meaningful.
+    pub fn supports_partials(self) -> bool {
+        match self.kind() {
+            ModelKind::OnlineTransducer => true,
+            ModelKind::OfflineMoonshine | ModelKind::OfflineNemoTransducer => false,
+        }
+    }
+
     /// All available variants in order — used to populate the UI dropdown.
-    pub const ALL: &[Self] = &[Self::StreamingZipformerEn];
+    pub const ALL: &[Self] = &[
+        Self::StreamingZipformerEn,
+        Self::MoonshineTinyEn,
+        Self::MoonshineBaseEn,
+        Self::ParakeetTdt06bV3En,
+    ];
 }
 
 /// Returns the sherpa subdirectory under the shared models dir
@@ -147,30 +198,212 @@ pub fn sherpa_models_dir() -> PathBuf {
     models_dir().join("sherpa")
 }
 
+/// Filename of the Silero VAD ONNX model when stored locally.
+const SILERO_VAD_FILENAME: &str = "silero_vad.onnx";
+
+/// Directory under `sherpa_models_dir` where the Silero VAD model lives.
+const SILERO_VAD_DIR_NAME: &str = "silero-vad";
+
+/// Full HTTPS URL to the Silero VAD ONNX file on the k2-fsa GitHub
+/// releases page. Single-file artifact — no tarball, no extraction.
+const SILERO_VAD_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+
+/// Full path to the Silero VAD ONNX file on disk.
+pub fn silero_vad_path() -> PathBuf {
+    sherpa_models_dir()
+        .join(SILERO_VAD_DIR_NAME)
+        .join(SILERO_VAD_FILENAME)
+}
+
+/// True if the Silero VAD model exists on disk.
+pub fn silero_vad_exists() -> bool {
+    silero_vad_path().is_file()
+}
+
+/// Download the Silero VAD ONNX model from the k2-fsa releases page.
+///
+/// # Arguments
+///
+/// * `progress_tx` — receives integer percent values (0..=100) as the
+///   download streams. The file is ~2 MB so this usually only fires
+///   a handful of times.
+///
+/// # Returns
+///
+/// On success, the absolute path to the downloaded `silero_vad.onnx`.
+///
+/// # Behavior
+///
+/// 1. Creates the parent directory if needed.
+/// 2. Downloads to `silero_vad.onnx.part` in the same directory.
+/// 3. Renames `.part` → final path on successful completion.
+///
+/// Unlike model bundles, the VAD is a single `.onnx` file — no
+/// extraction step. The atomic rename is sufficient to avoid leaving
+/// a partially-written model in place if the process dies mid-download.
+#[allow(clippy::cast_possible_truncation)]
+pub fn download_silero_vad(
+    progress_tx: &std::sync::mpsc::Sender<u8>,
+) -> Result<PathBuf, SherpaModelError> {
+    // Compose the destination directly so there's no `.parent().expect()`
+    // dance — library code must not panic on shape assumptions.
+    let dir = sherpa_models_dir().join(SILERO_VAD_DIR_NAME);
+    let final_path = dir.join(SILERO_VAD_FILENAME);
+    std::fs::create_dir_all(&dir)?;
+
+    let part_path = dir.join(format!("{SILERO_VAD_FILENAME}.part"));
+
+    // Clean up leftover scratch from a previous failed attempt.
+    if part_path.exists() {
+        std::fs::remove_file(&part_path)?;
+    }
+
+    tracing::info!(url = %SILERO_VAD_URL, ?part_path, "downloading silero VAD");
+
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
+        .build()?;
+
+    let response = client.get(SILERO_VAD_URL).send()?.error_for_status()?;
+    let total_size = response.content_length().unwrap_or(0);
+
+    if total_size == 0 {
+        let _ = progress_tx.send(0);
+    }
+
+    let mut file = std::fs::File::create(&part_path)?;
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u8 = 0;
+    let mut reader = response;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let bytes_read = std::io::Read::read(&mut reader, &mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut file, &buf[..bytes_read])?;
+        downloaded += bytes_read as u64;
+
+        if let Some(pct) = (downloaded * 100).checked_div(total_size) {
+            let pct = pct.min(100) as u8;
+            if pct != last_pct {
+                last_pct = pct;
+                let _ = progress_tx.send(pct);
+            }
+        }
+    }
+
+    std::io::Write::flush(&mut file)?;
+    drop(file);
+
+    // Atomic rename into place.
+    std::fs::rename(&part_path, &final_path)?;
+
+    tracing::info!(
+        bytes = downloaded,
+        ?final_path,
+        "silero VAD download complete"
+    );
+    Ok(final_path)
+}
+
 /// Returns the directory containing all files for a given sherpa model
 /// (`~/.local/share/sdr-rs/models/sherpa/<dir_name>/`).
 pub fn model_directory(model: SherpaModel) -> PathBuf {
     sherpa_models_dir().join(model.dir_name())
 }
 
-/// Returns the full paths for all files needed by a sherpa model.
+/// Concrete filesystem paths for every file a sherpa model needs on disk.
 ///
-/// Order: (encoder, decoder, joiner, tokens). The caller checks each path
-/// for existence and emits a helpful error if any are missing.
-pub fn model_file_paths(model: SherpaModel) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    let dir = model_directory(model);
-    (
-        dir.join(model.encoder_filename()),
-        dir.join(model.decoder_filename()),
-        dir.join(model.joiner_filename()),
-        dir.join(model.tokens_filename()),
-    )
+/// Each recognizer family has a different layout. The enum variants
+/// match the families in [`ModelKind`]: transducer models (Zipformer,
+/// Parakeet-TDT) ship four files; Moonshine v1 ships five (preprocessor,
+/// encoder, uncached decoder, cached decoder, tokens). The k2-fsa int8
+/// release bundles use the v1 layout despite v2 being supported upstream.
+#[derive(Debug, Clone)]
+pub enum ModelFilePaths {
+    Transducer {
+        encoder: PathBuf,
+        decoder: PathBuf,
+        joiner: PathBuf,
+        tokens: PathBuf,
+    },
+    Moonshine {
+        preprocessor: PathBuf,
+        encoder: PathBuf,
+        uncached_decoder: PathBuf,
+        cached_decoder: PathBuf,
+        tokens: PathBuf,
+    },
 }
 
-/// True if all four required files for `model` exist on disk.
+/// Returns the full paths for all files needed by a sherpa model.
+///
+/// The returned variant matches the model's [`ModelKind`]. The caller
+/// is expected to pattern-match on the variant and pass the paths into
+/// the right `sherpa_onnx` config (transducer vs moonshine).
+///
+/// All filename literals live in this single function so that adding a
+/// new model variant means updating exactly one match — no per-file
+/// helpers to forget.
+pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
+    let dir = model_directory(model);
+    match model {
+        SherpaModel::StreamingZipformerEn => ModelFilePaths::Transducer {
+            encoder: dir.join("encoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            decoder: dir.join("decoder-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            joiner: dir.join("joiner-epoch-99-avg-1-chunk-16-left-128.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
+        // Moonshine v1 five-file layout (k2-fsa int8 releases): the
+        // preprocessor is NOT quantized (`preprocess.onnx`, not `.int8.onnx`).
+        SherpaModel::MoonshineTinyEn | SherpaModel::MoonshineBaseEn => ModelFilePaths::Moonshine {
+            preprocessor: dir.join("preprocess.onnx"),
+            encoder: dir.join("encode.int8.onnx"),
+            uncached_decoder: dir.join("uncached_decode.int8.onnx"),
+            cached_decoder: dir.join("cached_decode.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
+        // Parakeet-TDT v3 int8 layout: standard 4-file transducer
+        // (encoder + decoder + joiner + tokens), structurally identical
+        // to Zipformer. The `Transducer` ModelFilePaths variant is
+        // reused — kind() tells the host which recognizer API to feed
+        // them into (online for Zipformer vs offline for Parakeet).
+        SherpaModel::ParakeetTdt06bV3En => ModelFilePaths::Transducer {
+            encoder: dir.join("encoder.int8.onnx"),
+            decoder: dir.join("decoder.int8.onnx"),
+            joiner: dir.join("joiner.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
+    }
+}
+
+/// True if every file required by `model` exists on disk.
 pub fn model_exists(model: SherpaModel) -> bool {
-    let (e, d, j, t) = model_file_paths(model);
-    e.is_file() && d.is_file() && j.is_file() && t.is_file()
+    match model_file_paths(model) {
+        ModelFilePaths::Transducer {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } => encoder.is_file() && decoder.is_file() && joiner.is_file() && tokens.is_file(),
+        ModelFilePaths::Moonshine {
+            preprocessor,
+            encoder,
+            uncached_decoder,
+            cached_decoder,
+            tokens,
+        } => {
+            preprocessor.is_file()
+                && encoder.is_file()
+                && uncached_decoder.is_file()
+                && cached_decoder.is_file()
+                && tokens.is_file()
+        }
+    }
 }
 
 /// Download a sherpa-onnx model bundle from the k2-fsa GitHub releases
@@ -389,14 +622,23 @@ mod tests {
     }
 
     #[test]
-    fn model_file_paths_returns_four_distinct_files() {
-        let (e, d, j, t) = model_file_paths(SherpaModel::StreamingZipformerEn);
-        assert_ne!(e, d);
-        assert_ne!(e, j);
-        assert_ne!(e, t);
-        assert_ne!(d, j);
-        assert_ne!(d, t);
-        assert_ne!(j, t);
+    #[allow(clippy::panic)]
+    fn transducer_model_file_paths_returns_four_distinct_files() {
+        let ModelFilePaths::Transducer {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } = model_file_paths(SherpaModel::StreamingZipformerEn)
+        else {
+            panic!("StreamingZipformerEn should be a Transducer layout");
+        };
+        assert_ne!(encoder, decoder);
+        assert_ne!(encoder, joiner);
+        assert_ne!(encoder, tokens);
+        assert_ne!(decoder, joiner);
+        assert_ne!(decoder, tokens);
+        assert_ne!(joiner, tokens);
     }
 
     #[test]
@@ -408,14 +650,48 @@ mod tests {
     }
 
     #[test]
-    fn streaming_zipformer_archive_inner_dir_matches_filename_stem() {
-        let model = SherpaModel::StreamingZipformerEn;
-        let archive = model.archive_filename();
-        let inner = model.archive_inner_directory();
+    fn all_archives_have_inner_dir_matching_filename_stem() {
         // Inner directory name should equal the archive filename minus
         // the .tar.bz2 suffix — sanity check that we'll find the right
-        // directory after extraction.
-        assert_eq!(format!("{inner}.tar.bz2"), archive);
+        // directory after extraction. Loops over every variant in ALL
+        // so adding a new model auto-extends this protection.
+        for model in SherpaModel::ALL {
+            let archive = model.archive_filename();
+            let inner = model.archive_inner_directory();
+            assert_eq!(
+                format!("{inner}.tar.bz2"),
+                archive,
+                "archive_inner_directory + .tar.bz2 != archive_filename for {model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zipformer_is_online_transducer() {
+        assert_eq!(
+            SherpaModel::StreamingZipformerEn.kind(),
+            ModelKind::OnlineTransducer
+        );
+    }
+
+    #[test]
+    fn online_transducer_supports_partials() {
+        assert!(SherpaModel::StreamingZipformerEn.supports_partials());
+    }
+
+    #[test]
+    fn supports_partials_is_derived_from_kind() {
+        // Sanity check that supports_partials mirrors the kind match —
+        // if anyone adds a new ModelKind variant they have to update
+        // supports_partials too, and this test locks that relationship.
+        for model in SherpaModel::ALL {
+            let expected = matches!(model.kind(), ModelKind::OnlineTransducer);
+            assert_eq!(
+                model.supports_partials(),
+                expected,
+                "mismatch for {model:?}"
+            );
+        }
     }
 
     // NOTE: there's no unit test for `cleanup_scratch_state` because the
@@ -425,4 +701,110 @@ mod tests {
     // requires threading a base-dir parameter through `sherpa_models_dir`
     // and its callers; that refactor is tracked as part of the hermetic
     // testing follow-up mentioned on #255 / discussed in PR #254.
+
+    #[test]
+    fn moonshine_variants_are_offline_moonshine_kind() {
+        assert_eq!(
+            SherpaModel::MoonshineTinyEn.kind(),
+            ModelKind::OfflineMoonshine
+        );
+        assert_eq!(
+            SherpaModel::MoonshineBaseEn.kind(),
+            ModelKind::OfflineMoonshine
+        );
+    }
+
+    #[test]
+    fn moonshine_variants_do_not_support_partials() {
+        assert!(!SherpaModel::MoonshineTinyEn.supports_partials());
+        assert!(!SherpaModel::MoonshineBaseEn.supports_partials());
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn moonshine_tiny_has_five_file_layout() {
+        let paths = model_file_paths(SherpaModel::MoonshineTinyEn);
+        let ModelFilePaths::Moonshine {
+            preprocessor,
+            encoder,
+            uncached_decoder,
+            cached_decoder,
+            tokens,
+        } = paths
+        else {
+            panic!("MoonshineTinyEn should be a Moonshine layout");
+        };
+        assert!(preprocessor.ends_with("preprocess.onnx"));
+        assert!(encoder.ends_with("encode.int8.onnx"));
+        assert!(uncached_decoder.ends_with("uncached_decode.int8.onnx"));
+        assert!(cached_decoder.ends_with("cached_decode.int8.onnx"));
+        assert!(tokens.ends_with("tokens.txt"));
+        assert_ne!(encoder, uncached_decoder);
+        assert_ne!(uncached_decoder, cached_decoder);
+    }
+
+    #[test]
+    fn moonshine_archive_urls_are_well_formed() {
+        for model in [SherpaModel::MoonshineTinyEn, SherpaModel::MoonshineBaseEn] {
+            let url = model.archive_url();
+            assert!(url.starts_with("https://github.com/k2-fsa/sherpa-onnx/"));
+            assert!(url.ends_with(".tar.bz2"));
+            assert!(url.contains("moonshine"));
+        }
+    }
+
+    #[test]
+    fn all_contains_four_variants() {
+        assert_eq!(SherpaModel::ALL.len(), 4);
+    }
+
+    #[test]
+    fn parakeet_is_offline_nemo_transducer_kind() {
+        assert_eq!(
+            SherpaModel::ParakeetTdt06bV3En.kind(),
+            ModelKind::OfflineNemoTransducer
+        );
+    }
+
+    #[test]
+    fn parakeet_does_not_support_partials() {
+        assert!(!SherpaModel::ParakeetTdt06bV3En.supports_partials());
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn parakeet_has_transducer_file_layout() {
+        let paths = model_file_paths(SherpaModel::ParakeetTdt06bV3En);
+        let ModelFilePaths::Transducer {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } = paths
+        else {
+            panic!("ParakeetTdt06bV3En should be a Transducer layout");
+        };
+        assert!(encoder.ends_with("encoder.int8.onnx"));
+        assert!(decoder.ends_with("decoder.int8.onnx"));
+        assert!(joiner.ends_with("joiner.int8.onnx"));
+        assert!(tokens.ends_with("tokens.txt"));
+        assert_ne!(encoder, decoder);
+        assert_ne!(decoder, joiner);
+    }
+
+    #[test]
+    fn parakeet_archive_url_is_well_formed() {
+        let url = SherpaModel::ParakeetTdt06bV3En.archive_url();
+        assert!(url.starts_with("https://github.com/k2-fsa/sherpa-onnx/"));
+        assert!(url.ends_with(".tar.bz2"));
+        assert!(url.contains("parakeet"));
+        assert!(url.contains("tdt"));
+        assert!(url.contains("v3"));
+    }
+
+    #[test]
+    fn silero_vad_path_is_under_sherpa_models_dir() {
+        let path = silero_vad_path();
+        assert!(path.ends_with("silero-vad/silero_vad.onnx"));
+    }
 }

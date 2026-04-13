@@ -9,10 +9,11 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 ### Radio
 
 - 8 demodulation modes: WFM, NFM, AM, DSB, USB, LSB, CW, RAW
-- RTL-SDR hardware support (pure Rust USB driver, no C library needed)
+- RTL-SDR hardware support — pure Rust port of `librtlsdr` (all 5 tuner families) over `rusb` (libusb wrapper)
 - TCP/UDP network IQ source and sink
 - WAV file IQ playback with looping
 - Audio notch filter (biquad IIR, 20-20,000 Hz)
+- Auto-squelch with noise floor tracking
 - Bookmark tuning profiles with full state capture/restore
 
 ### Display
@@ -31,12 +32,27 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 ### Transcription
 
-- Live speech-to-text via Whisper — 5 model sizes from tiny (75 MB) to large-v3 (3.1 GB)
-- Optional GPU acceleration: CUDA (NVIDIA), ROCm/HIP (AMD), Vulkan, Metal (macOS)
-- Slide-out transcript panel with timestamped log and model selector
+Two mutually exclusive backends, selected at build time (see the install section below):
+
+**Whisper backend** — OpenAI's Whisper via `whisper-rs`, multilingual, mature GPU support
+- 5 model sizes from tiny (75 MB) to large-v3 (3.1 GB)
+- Optional GPU acceleration: CUDA (NVIDIA), ROCm/HIP (AMD), Vulkan, Metal
+- RMS-gated chunked inference with configurable silence threshold
+
+**Sherpa-onnx backend** — k2-fsa's sherpa-onnx, English only (today), streaming + offline
+- **Streaming Zipformer** — true real-time transcription with word-by-word live captions
+- **Moonshine Tiny / Base** — UsefulSensors' edge-optimized offline models (27M / 61M params)
+- **Parakeet-TDT 0.6b v3** — NVIDIA, #1 on the OpenASR leaderboard (600M params, highest accuracy)
+- **Runtime model swap** — change models from the dropdown without restarting the app
+- **Live captions with display mode toggle** — streaming models render an in-place italic line below the commit log; user can switch to "Final only" mode
+- **Silero VAD** — offline models use Silero voice activity detection with a user-tunable threshold slider for noisy RF audio (NFM/scanner)
+- Auto-downloads models and VAD on first use with a bundled progress splash
+
+**Both backends share:**
+- Slide-out transcript panel with timestamped commit log
 - FFT-based spectral noise gate preprocessor for cleaner recognition
-- Auto-downloads selected model on first use
 - Volume-independent audio tap (transcription unaffected by volume knob)
+- Settings lock during active session to prevent mid-session configuration races
 
 ### Integration
 
@@ -48,7 +64,7 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 ### Under the Hood
 
-- 15-crate workspace with clear dependency boundaries
+- 18-member workspace (root binary + 17 library crates) with clear dependency boundaries
 - Pure DSP functions (no threading, no I/O, no side effects)
 - Zero per-frame heap allocations on hot paths
 - Lock-based SPSC audio ring buffer between DSP and audio threads
@@ -59,31 +75,40 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 ### Dependencies
 
+**Always required:**
 - **Rust** 1.85+ (2024 edition)
 - **GTK 4.10+** and **libadwaita 1.5+**
 - **PipeWire** development libraries (Linux audio)
 - **libusb** (for RTL-SDR USB access)
 - **libdbus** (for secure credential storage)
+
+**Whisper backend only** (not needed for Sherpa builds):
 - **cmake** + **C++ compiler** (build-time, for whisper.cpp)
-- **libclang** (build-time, for bindgen if needed)
+- **libclang** (build-time, for bindgen)
 
 #### Arch Linux
 
 ```bash
-sudo pacman -S gtk4 libadwaita pipewire libusb dbus clang cmake
+sudo pacman -S gtk4 libadwaita pipewire libusb dbus
+# Whisper builds also need:
+sudo pacman -S clang cmake
 ```
 
 #### Ubuntu / Debian
 
 ```bash
 sudo apt install libgtk-4-dev libadwaita-1-dev libpipewire-0.3-dev \
-  libusb-1.0-0-dev libdbus-1-dev libclang-dev cmake g++
+  libusb-1.0-0-dev libdbus-1-dev
+# Whisper builds also need:
+sudo apt install libclang-dev cmake g++
 ```
 
 #### macOS
 
 ```bash
-brew install gtk4 libadwaita libusb llvm cmake
+brew install gtk4 libadwaita libusb
+# Whisper builds also need:
+brew install llvm cmake
 ```
 
 ### Compile
@@ -100,17 +125,22 @@ make install
 
 Installs the binary, desktop entry, and icon for app launcher integration.
 
-### Transcription backend (optional)
+### Transcription backend (pick one)
+
+Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. Whisper GPU builds require the corresponding toolkit (CUDA, ROCm, Vulkan SDK).
 
 ```bash
-make install CARGO_FLAGS="--release --features whisper-cuda"      # NVIDIA
-make install CARGO_FLAGS="--release --features whisper-hipblas"   # AMD ROCm
-make install CARGO_FLAGS="--release --features whisper-vulkan"    # Cross-vendor
+# Whisper backend (default) — multilingual, mature GPU acceleration
 make install CARGO_FLAGS="--release"                               # Whisper CPU (default)
-make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"  # Sherpa CPU
+make install CARGO_FLAGS="--release --features whisper-cuda"       # NVIDIA GPU
+make install CARGO_FLAGS="--release --features whisper-hipblas"    # AMD ROCm
+make install CARGO_FLAGS="--release --features whisper-vulkan"     # Cross-vendor GPU
+
+# Sherpa-onnx backend — Zipformer / Moonshine / Parakeet, English-only, CPU today
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"
 ```
 
-Requires the corresponding GPU toolkit (CUDA toolkit, ROCm, Vulkan SDK).
+With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, or Parakeet) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap.
 
 ### Run tests
 
@@ -149,19 +179,22 @@ sdr-rs
 
 ## Architecture
 
-15-crate workspace with clear dependency boundaries:
+18-member workspace (root binary + 17 library crates) with clear dependency boundaries:
 
 ```text
 sdr (binary)              Entry point
-sdr-ui                    GTK4/libadwaita UI
+sdr-ui                    GTK4/libadwaita UI (Linux-only)
+sdr-core                  Headless engine facade — cross-platform (macOS port)
 sdr-radio                 Radio decoder, demod, IF/AF chains
 sdr-pipeline              Threading, streaming, signal path
 sdr-dsp                   Pure DSP: math, filters, FFT, demod, resampling
 sdr-types                 Foundation types, errors, constants
 sdr-config                JSON config persistence + OS keyring access
-sdr-rtlsdr                Pure Rust RTL-SDR USB driver (5 tuner chips)
+sdr-rtlsdr                Rust port of librtlsdr (5 tuner families) over rusb
 sdr-radioreference        RadioReference.com SOAP API client
-sdr-transcription         Live speech-to-text via Whisper + spectral denoiser
+sdr-transcription         Whisper / Sherpa-onnx backends + spectral denoiser + Silero VAD
+sdr-splash                Cross-platform splash controller (subprocess driver)
+sdr-splash-gtk            Linux GTK4 splash window implementation
 sdr-source-rtlsdr         RTL-SDR source module
 sdr-source-network        TCP/UDP IQ source
 sdr-source-file           WAV file playback source
@@ -169,7 +202,9 @@ sdr-sink-audio            PipeWire/CoreAudio audio output
 sdr-sink-network          TCP/UDP audio output
 ```
 
-**Signal chain:** Source -> Decimation -> Channel filter -> Demodulator -> AF filter -> Audio sink
+**Signal chain:** Source → Decimation → Channel filter → Demodulator → IF chain (squelch) → AF chain → Audio sink
+
+**Transcription tap:** branches off AFTER the demodulator and AF filter but BEFORE volume scaling, so the recognizer always sees full-amplitude audio regardless of what the speaker side is doing.
 
 DSP functions are pure (no threading, no I/O). Threading and streaming live in `sdr-pipeline`.
 

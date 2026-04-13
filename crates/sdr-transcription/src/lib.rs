@@ -31,6 +31,7 @@ pub mod backends;
 pub mod denoise;
 pub mod resampler;
 pub mod util;
+pub mod vad;
 
 #[cfg(feature = "whisper")]
 pub mod model;
@@ -43,14 +44,14 @@ pub mod sherpa_model;
 
 pub use backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
-    TranscriptionEvent,
+    TranscriptionEvent, VAD_THRESHOLD_DEFAULT, VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
 };
 
 #[cfg(feature = "whisper")]
 pub use model::WhisperModel;
 
 #[cfg(feature = "sherpa")]
-pub use backends::sherpa::init_sherpa_host;
+pub use backends::sherpa::{init_sherpa_host, reload_sherpa_host};
 
 #[cfg(feature = "sherpa")]
 pub use init_event::InitEvent;
@@ -202,6 +203,7 @@ mod tests {
             model,
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
+            vad_threshold: crate::VAD_THRESHOLD_DEFAULT,
         }
     }
 
