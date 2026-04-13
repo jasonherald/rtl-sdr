@@ -24,9 +24,11 @@
 //!   by Zipformer (and future transducer models like Parakeet).
 
 mod host;
+mod silero_vad;
 mod streaming;
 
 pub use host::init_sherpa_host;
+pub use silero_vad::SherpaSileroVad;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
