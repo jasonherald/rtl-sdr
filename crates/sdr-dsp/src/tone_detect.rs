@@ -572,33 +572,44 @@ impl CtcssDetector {
             return None;
         }
 
-        // Split the pending buffer into "ready" and "leftover" in
-        // one shot, then iterate via `chunks_exact` without
-        // per-window allocation or tail memmoves.
+        // Zero-allocation processing path. `mem::take` swaps a
+        // fresh empty Vec into `self.pending_samples` and hands
+        // back the original as a local — preserving both its data
+        // AND its reserved capacity. We can then iterate the ready
+        // prefix with `chunks_exact` and call `&mut self` methods
+        // inside the loop without borrow-checker conflicts, since
+        // `pending` is now a separate local variable from `self`.
         //
-        // `split_off(ready_len)` returns the tail (leftover
-        // samples < CTCSS_WINDOW_SAMPLES, so this tail Vec is
-        // always tiny) and leaves the ready prefix in place inside
-        // `self.pending_samples`. `mem::replace` then swaps the
-        // tail into `self.pending_samples` and hands us back the
-        // original Vec — now holding only the window-aligned ready
-        // prefix — to iterate over.
+        // After iteration, `drain(..ready_len)` shifts the leftover
+        // samples to the front of the Vec with a single memmove
+        // and preserves the Vec's reserved capacity — no
+        // allocation. The Vec is then put back into
+        // `self.pending_samples` so the next call extends into
+        // the preserved big-capacity buffer without reallocating.
         //
-        // Net cost per call: one `split_off` allocation (for the
-        // small leftover Vec) and one memmove of ≤ WINDOW-1
-        // samples, regardless of how many windows complete during
-        // this call. The previous `drain(..WINDOW).collect()` loop
-        // did an allocation + a front-compaction memmove per
-        // window, which added up to unnecessary allocator / memcpy
-        // churn on a real-time DSP path — no unnecessary
-        // allocations is a crate-level invariant for `sdr-dsp`.
-        let tail = self.pending_samples.split_off(ready_len);
-        let ready = core::mem::replace(&mut self.pending_samples, tail);
+        // Net cost per call: ZERO allocations + ONE memmove of
+        // ≤ `CTCSS_WINDOW_SAMPLES` - 1 leftover samples,
+        // regardless of how many windows complete. The previous
+        // `drain(..WINDOW).collect()` loop allocated N times per
+        // call, and an interim `split_off` approach allocated once
+        // per call AND discarded the original Vec's big reserved
+        // capacity (forcing the next call to reallocate when
+        // `extend_from_slice` grew the small-cap leftover Vec).
+        // This path avoids the allocator entirely, which is the
+        // crate-level invariant for `sdr-dsp`.
+        let mut pending = core::mem::take(&mut self.pending_samples);
 
         let mut last_decision = None;
-        for window in ready.chunks_exact(CTCSS_WINDOW_SAMPLES) {
+        for window in pending[..ready_len].chunks_exact(CTCSS_WINDOW_SAMPLES) {
             last_decision = Some(self.process_window(window));
         }
+
+        // Drop the ready prefix (shift leftover to the front,
+        // preserving reserved capacity) and restore the Vec into
+        // `self.pending_samples` for the next call.
+        pending.drain(..ready_len);
+        self.pending_samples = pending;
+
         last_decision
     }
 
