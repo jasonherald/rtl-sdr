@@ -315,18 +315,30 @@ pub struct CtcssDetector {
     /// Target-vs-neighbor dominance ratio required for a hit. See
     /// [`CTCSS_DOMINANCE_RATIO`].
     dominance_ratio: f32,
-    /// Number of consecutive above-threshold windows required to
-    /// open / close the sustained gate.
+    /// Number of consecutive detected windows required to open the
+    /// sustained gate, and the number of consecutive non-detected
+    /// windows required to close it again. Same value for both
+    /// directions — symmetric hysteresis. See [`CTCSS_MIN_HITS`]
+    /// for the rationale behind the default.
     min_hits: usize,
 
-    /// Current state of the sustained gate. Flipped only when the
-    /// hit/miss counter crosses `min_hits`.
+    /// Current state of the sustained gate: `true` means the target
+    /// tone has been confirmed present for at least `min_hits`
+    /// consecutive windows and downstream squelch wiring should be
+    /// open. Flipped in `process_window` when whichever of `hit_run`
+    /// / `miss_run` is currently counting reaches `min_hits`.
     sustained: bool,
-    /// Consecutive above-threshold windows since the last flip.
-    /// Counter resets on a miss when the gate is closed.
+    /// Consecutive detected windows since the last non-detected
+    /// window. Resets to 0 on any non-detected window, regardless
+    /// of whether the sustained gate is currently open or closed —
+    /// so this counter tracks the length of the current unbroken
+    /// hit run, not time since the last gate flip.
     hit_run: usize,
-    /// Consecutive below-threshold windows since the last flip.
-    /// Counter resets on a hit when the gate is open.
+    /// Consecutive non-detected windows since the last detected
+    /// window. Resets to 0 on any detected window, regardless of
+    /// whether the sustained gate is currently open or closed — so
+    /// this counter tracks the length of the current unbroken miss
+    /// run, not time since the last gate flip.
     miss_run: usize,
 
     /// Sub-window tail left over after [`Self::accept_samples`]
