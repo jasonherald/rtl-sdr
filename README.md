@@ -151,6 +151,7 @@ With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base
 - **Install layout:** the binary lives at `~/.cargo/bin/sdr-rs`; the runtime libraries live in an adjacent `~/.cargo/bin/sdr-rs-libs/` subdirectory so they don't clutter `$BINDIR`. The binary's ELF `DT_RPATH` resolves them automatically. Nothing is installed system-wide.
 - You still need a working NVIDIA driver installed (`nvidia` / `nvidia-utils` on Arch) — the userspace driver library `libcuda.so.1` comes from the kernel driver package and cannot be redistributed, and it must match your installed GPU hardware.
 - During the PR stabilization window the sherpa-onnx crate is pulled from the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork (branch `feat/rust-sys-cuda-support`), which adds a `cuda` cargo feature to the upstream sys crate. An upstream PR to k2-fsa is planned; once it merges and a release ships, the fork dependency will be swapped back to a crates.io version pin.
+- **Deep dive:** see [`docs/cuda-sideload.md`](docs/cuda-sideload.md) for the full rationale, the exact NVIDIA tarballs and versions we pull, how `DT_RPATH` makes the sideload work through `dlopen`, the disk cost breakdown, and the re-unification plan for when upstream catches up. Pre-populate the download cache without running the full install with `make fetch-cuda-redist`.
 
 ### Run tests
 
