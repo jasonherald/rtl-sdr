@@ -41,18 +41,21 @@ const KEY_SHERPA_VAD_THRESHOLD: &str = "sherpa_vad_threshold";
 pub(crate) const KEY_AUTO_BREAK_ENABLED: &str = "transcription_auto_break_enabled";
 /// Config key for the persisted Auto Break "minimum open duration"
 /// threshold. Squelch opens shorter than this are discarded as noise
-/// spikes. Stored as u32 milliseconds.
+/// spikes. Persisted in config as `u64` milliseconds (the on-disk
+/// JSON representation widens `BackendConfig`'s u32 field through the
+/// `SpinRow`'s f64 adjustment).
 #[cfg(feature = "sherpa")]
 const KEY_AUTO_BREAK_MIN_OPEN_MS: &str = "transcription_auto_break_min_open_ms";
 /// Config key for the persisted Auto Break tail-capture window.
 /// Continue buffering audio for this long after squelch closes so
-/// the last syllable isn't chopped. Stored as u32 milliseconds.
+/// the last syllable isn't chopped. Persisted in config as `u64`
+/// milliseconds.
 #[cfg(feature = "sherpa")]
 const KEY_AUTO_BREAK_TAIL_MS: &str = "transcription_auto_break_tail_ms";
 /// Config key for the persisted Auto Break minimum segment length.
 /// Segments shorter than this are discarded instead of decoded (sub-
-/// word fragments make offline sherpa models hallucinate). Stored as
-/// u32 milliseconds.
+/// word fragments make offline sherpa models hallucinate). Persisted
+/// in config as `u64` milliseconds.
 #[cfg(feature = "sherpa")]
 const KEY_AUTO_BREAK_MIN_SEGMENT_MS: &str = "transcription_auto_break_min_segment_ms";
 
@@ -194,19 +197,80 @@ pub struct TranscriptPanel {
     pub clear_button: gtk4::Button,
 }
 
-/// Build the transcript sidebar panel.
+/// Specification for a persisted-millisecond `AdwSpinRow`. Used by
+/// [`build_persisted_ms_slider`] to construct the three Auto Break
+/// timing sliders from one code path.
+#[cfg(feature = "sherpa")]
+struct MsSliderSpec {
+    /// Config-file JSON key where the value is persisted (`u64` ms).
+    key: &'static str,
+    /// User-visible row title (e.g. "Auto Break: min open (ms)").
+    title: &'static str,
+    /// User-visible row subtitle explaining what the knob does.
+    subtitle: &'static str,
+    /// Inclusive minimum allowed slider value.
+    min: f64,
+    /// Inclusive maximum allowed slider value.
+    max: f64,
+    /// Default value shown when the config key is missing or invalid.
+    default: f64,
+}
+
+/// Build a sherpa-only persisted-milliseconds `AdwSpinRow` from a
+/// [`MsSliderSpec`]. Shared shape for the three Auto Break timing
+/// sliders (`min_open`, `tail`, `min_segment`) which all follow the
+/// same load/clamp/build/persist pattern.
 ///
-/// The cast allows cover the Auto Break timing slider blocks: they
-/// read `u32` config values as `f64` for the `AdwSpinRow` adjustment,
-/// and write the `f64` row value back as `u64` for persistence. All
-/// values are bounded by the `AUTO_BREAK_*_MS_MIN`/`_MAX` constants —
-/// well under 2^52 — so the casts are lossless in practice.
+/// The `u64 ↔ f64` casts are bounded by `spec.min`/`spec.max` (both
+/// well under 2^52 for any realistic slider range) so the conversions
+/// are lossless in practice. Allows are scoped tight to this helper.
+#[cfg(feature = "sherpa")]
 #[allow(
-    clippy::too_many_lines,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+fn build_persisted_ms_slider(
+    group: &adw::PreferencesGroup,
+    config: &Arc<ConfigManager>,
+    spec: &MsSliderSpec,
+) -> adw::SpinRow {
+    let saved = config.read(|v| {
+        v.get(spec.key)
+            .and_then(serde_json::Value::as_u64)
+            .map_or(spec.default, |val| (val as f64).clamp(spec.min, spec.max))
+    });
+
+    let row = adw::SpinRow::builder()
+        .title(spec.title)
+        .subtitle(spec.subtitle)
+        .adjustment(&gtk4::Adjustment::new(
+            saved,
+            spec.min,
+            spec.max,
+            AUTO_BREAK_MS_STEP,
+            AUTO_BREAK_MS_PAGE,
+            0.0,
+        ))
+        .digits(0)
+        .build();
+    group.add(&row);
+
+    // Capture `spec.key` by Copy (it's `&'static str`) so the
+    // GLib closure can own it without borrowing the spec.
+    let cfg_clone = Arc::clone(config);
+    let key = spec.key;
+    row.connect_value_notify(move |r| {
+        let val = r.value() as u64;
+        cfg_clone.write(|v| {
+            v[key] = serde_json::json!(val);
+        });
+    });
+    row
+}
+
+/// Build the transcript sidebar panel.
+#[allow(clippy::too_many_lines)]
 pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Transcript")
@@ -448,105 +512,50 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     // when Auto Break itself is visible (offline sherpa model + NFM)
     // AND Auto Break is ON — mirroring the mutex with `vad_threshold_row`.
     // Defaults match the PR 8 hardcoded values; user overrides are
-    // persisted as u32 milliseconds in config.
+    // persisted as u64 milliseconds in config. Construction is
+    // delegated to `build_persisted_ms_slider` so the three rows
+    // share one load/clamp/build/persist code path.
     #[cfg(feature = "sherpa")]
-    let auto_break_min_open_row = {
-        let saved = config.read(|v| {
-            v.get(KEY_AUTO_BREAK_MIN_OPEN_MS)
-                .and_then(serde_json::Value::as_u64)
-                .map_or(AUTO_BREAK_MIN_OPEN_MS_DEFAULT, |val| {
-                    (val as f64).clamp(AUTO_BREAK_MIN_OPEN_MS_MIN, AUTO_BREAK_MIN_OPEN_MS_MAX)
-                })
-        });
-        let row = adw::SpinRow::builder()
-            .title("Auto Break: min open (ms)")
-            .subtitle("Transmissions shorter than this are discarded as noise spikes")
-            .adjustment(&gtk4::Adjustment::new(
-                saved,
-                AUTO_BREAK_MIN_OPEN_MS_MIN,
-                AUTO_BREAK_MIN_OPEN_MS_MAX,
-                AUTO_BREAK_MS_STEP,
-                AUTO_BREAK_MS_PAGE,
-                0.0,
-            ))
-            .digits(0)
-            .build();
-        group.add(&row);
-        let config_abmo = Arc::clone(config);
-        row.connect_value_notify(move |r| {
-            let val = r.value() as u64;
-            config_abmo.write(|v| {
-                v[KEY_AUTO_BREAK_MIN_OPEN_MS] = serde_json::json!(val);
-            });
-        });
-        row
-    };
+    let auto_break_min_open_row = build_persisted_ms_slider(
+        &group,
+        config,
+        &MsSliderSpec {
+            key: KEY_AUTO_BREAK_MIN_OPEN_MS,
+            title: "Auto Break: min open (ms)",
+            subtitle: "Transmissions shorter than this are discarded as noise spikes",
+            min: AUTO_BREAK_MIN_OPEN_MS_MIN,
+            max: AUTO_BREAK_MIN_OPEN_MS_MAX,
+            default: AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
+        },
+    );
 
     #[cfg(feature = "sherpa")]
-    let auto_break_tail_row = {
-        let saved = config.read(|v| {
-            v.get(KEY_AUTO_BREAK_TAIL_MS)
-                .and_then(serde_json::Value::as_u64)
-                .map_or(AUTO_BREAK_TAIL_MS_DEFAULT, |val| {
-                    (val as f64).clamp(AUTO_BREAK_TAIL_MS_MIN, AUTO_BREAK_TAIL_MS_MAX)
-                })
-        });
-        let row = adw::SpinRow::builder()
-            .title("Auto Break: tail (ms)")
-            .subtitle("Continue buffering audio this long after squelch closes")
-            .adjustment(&gtk4::Adjustment::new(
-                saved,
-                AUTO_BREAK_TAIL_MS_MIN,
-                AUTO_BREAK_TAIL_MS_MAX,
-                AUTO_BREAK_MS_STEP,
-                AUTO_BREAK_MS_PAGE,
-                0.0,
-            ))
-            .digits(0)
-            .build();
-        group.add(&row);
-        let config_abt = Arc::clone(config);
-        row.connect_value_notify(move |r| {
-            let val = r.value() as u64;
-            config_abt.write(|v| {
-                v[KEY_AUTO_BREAK_TAIL_MS] = serde_json::json!(val);
-            });
-        });
-        row
-    };
+    let auto_break_tail_row = build_persisted_ms_slider(
+        &group,
+        config,
+        &MsSliderSpec {
+            key: KEY_AUTO_BREAK_TAIL_MS,
+            title: "Auto Break: tail (ms)",
+            subtitle: "Continue buffering audio this long after squelch closes",
+            min: AUTO_BREAK_TAIL_MS_MIN,
+            max: AUTO_BREAK_TAIL_MS_MAX,
+            default: AUTO_BREAK_TAIL_MS_DEFAULT,
+        },
+    );
 
     #[cfg(feature = "sherpa")]
-    let auto_break_min_segment_row = {
-        let saved = config.read(|v| {
-            v.get(KEY_AUTO_BREAK_MIN_SEGMENT_MS)
-                .and_then(serde_json::Value::as_u64)
-                .map_or(AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT, |val| {
-                    (val as f64).clamp(AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_MIN_SEGMENT_MS_MAX)
-                })
-        });
-        let row = adw::SpinRow::builder()
-            .title("Auto Break: min segment (ms)")
-            .subtitle("Segments shorter than this are discarded instead of decoded")
-            .adjustment(&gtk4::Adjustment::new(
-                saved,
-                AUTO_BREAK_MIN_SEGMENT_MS_MIN,
-                AUTO_BREAK_MIN_SEGMENT_MS_MAX,
-                AUTO_BREAK_MS_STEP,
-                AUTO_BREAK_MS_PAGE,
-                0.0,
-            ))
-            .digits(0)
-            .build();
-        group.add(&row);
-        let config_abms = Arc::clone(config);
-        row.connect_value_notify(move |r| {
-            let val = r.value() as u64;
-            config_abms.write(|v| {
-                v[KEY_AUTO_BREAK_MIN_SEGMENT_MS] = serde_json::json!(val);
-            });
-        });
-        row
-    };
+    let auto_break_min_segment_row = build_persisted_ms_slider(
+        &group,
+        config,
+        &MsSliderSpec {
+            key: KEY_AUTO_BREAK_MIN_SEGMENT_MS,
+            title: "Auto Break: min segment (ms)",
+            subtitle: "Segments shorter than this are discarded instead of decoded",
+            min: AUTO_BREAK_MIN_SEGMENT_MS_MIN,
+            max: AUTO_BREAK_MIN_SEGMENT_MS_MAX,
+            default: AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+        },
+    );
 
     // --- Display mode selector (Sherpa only) ---
     //
