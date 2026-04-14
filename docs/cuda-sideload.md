@@ -32,7 +32,7 @@ CUDA major versions are **not ABI-compatible**. `libcublasLt.so.12` and
 binary linked against CUDA 12 cannot run against CUDA 13 libraries and
 vice versa.
 
-Arch Linux's `cuda` package is at **13.2.0** as of this writing. cuDNN is
+Arch Linux's `cuda` package is at **13.2.0** (as of April 2026). cuDNN is
 not in the main repo at all. So on a current Arch install, a naive
 `sherpa-cuda` binary fails at recognizer creation with:
 
@@ -105,13 +105,21 @@ When `make install CARGO_FLAGS="... --features sherpa-cuda"` runs:
    alongside the installed binary.
 6. **The binary's `DT_RPATH` is `$ORIGIN:$ORIGIN/sdr-rs-libs`** — set
    in the root `build.rs` and forced to old-style `DT_RPATH` (not
-   `DT_RUNPATH`) via `-Wl,--disable-new-dtags` so it **cascades to
-   libraries loaded via `dlopen`**. This is critical: `onnxruntime`
-   calls `dlopen("libonnxruntime_providers_cuda.so")` at recognizer
-   creation, and the provider's own `NEEDED libcublasLt.so.12` lookup
-   only consults `DT_RPATH` of the executable, never `DT_RUNPATH`.
-   The `--disable-new-dtags` flag is the entire reason the sideload
-   works.
+   the modern-linker-default `DT_RUNPATH`) via
+   `-Wl,--disable-new-dtags`. This is load-bearing for the specific
+   way `onnxruntime` resolves its provider stack: it calls
+   `dlopen("libonnxruntime_providers_cuda.so")` at recognizer
+   creation, and the provider library's own
+   `NEEDED libcublasLt.so.12` search has to reach our sideloaded
+   libs in `$ORIGIN/sdr-rs-libs`. In this load path the executable's
+   `DT_RPATH` is the mechanism that reliably resolves those
+   transitive dependencies — the glibc loader inherits the
+   executable's `DT_RPATH` into the dependency lookups of
+   `dlopen`'d libraries, whereas `DT_RUNPATH` (what modern linkers
+   default to) is treated differently and did not resolve the
+   provider's CUDA deps in our testing. The `--disable-new-dtags`
+   flag is the entire reason the sideload works for this
+   deployment model.
 
 ## What we ship and why
 
@@ -195,14 +203,14 @@ constraints. The exit ramp is cleanest when any one of them resolves:
 
 1. **k2-fsa ships `sherpa-onnx` CUDA 13 prebuilts.** Then
    `scripts/fetch-cuda-redist.sh` becomes unnecessary and we delete it.
-   Today (as of `sherpa-onnx` v1.12.38) they only ship CUDA 12.x builds;
-   we watch the
+   As of April 2026 (`sherpa-onnx` v1.12.38) they only ship CUDA 12.x
+   builds; we watch the
    [k2-fsa/sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases)
    page for a CUDA 13 tag.
 2. **`csukuangfj` bumps `onnxruntime` to a version with native CUDA 13
    support.** This is harder because `microsoft/onnxruntime` itself has
-   to ship CUDA 13 first, and that hasn't landed in a released ORT
-   version yet as of this writing.
+   to ship CUDA 13 first, and that hadn't landed in a released ORT
+   version as of April 2026.
 3. **Arch downgrades `cuda` back to 12.x.** Won't happen — Arch is
    bleeding-edge by policy.
 
