@@ -69,9 +69,12 @@ pub mod init_event;
 pub mod sherpa_model;
 
 pub use backend::{
-    BackendConfig, BackendError, BackendHandle, ModelChoice, SegmentationMode,
-    TranscriptionBackend, TranscriptionEvent, TranscriptionInput, VAD_THRESHOLD_DEFAULT,
-    VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
+    AUTO_BREAK_MIN_OPEN_MS_DEFAULT, AUTO_BREAK_MIN_OPEN_MS_MAX, AUTO_BREAK_MIN_OPEN_MS_MIN,
+    AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT, AUTO_BREAK_MIN_SEGMENT_MS_MAX,
+    AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_TAIL_MS_DEFAULT, AUTO_BREAK_TAIL_MS_MAX,
+    AUTO_BREAK_TAIL_MS_MIN, BackendConfig, BackendError, BackendHandle, ModelChoice,
+    SegmentationMode, TranscriptionBackend, TranscriptionEvent, TranscriptionInput,
+    VAD_THRESHOLD_DEFAULT, VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
 };
 
 #[cfg(feature = "whisper")]
@@ -232,6 +235,9 @@ mod tests {
             noise_gate_ratio: 3.0,
             vad_threshold: crate::VAD_THRESHOLD_DEFAULT,
             segmentation_mode: SegmentationMode::default(),
+            auto_break_min_open_ms: crate::AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
+            auto_break_tail_ms: crate::AUTO_BREAK_TAIL_MS_DEFAULT,
+            auto_break_min_segment_ms: crate::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
         }
     }
 

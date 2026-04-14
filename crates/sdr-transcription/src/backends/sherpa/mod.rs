@@ -52,7 +52,7 @@ use std::sync::{Arc, mpsc};
 use crate::backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
 };
-use host::{AUDIO_CHANNEL_CAPACITY, SessionParams, global_sherpa_host};
+use host::{AUDIO_CHANNEL_CAPACITY, AutoBreakThresholds, SessionParams, global_sherpa_host};
 
 /// `TranscriptionBackend` implementation backed by the global sherpa host.
 ///
@@ -130,6 +130,11 @@ impl TranscriptionBackend for SherpaBackend {
             noise_gate_ratio: config.noise_gate_ratio,
             vad_threshold: config.vad_threshold,
             segmentation_mode: config.segmentation_mode,
+            auto_break_thresholds: AutoBreakThresholds {
+                min_open_ms: config.auto_break_min_open_ms,
+                tail_ms: config.auto_break_tail_ms,
+                min_segment_ms: config.auto_break_min_segment_ms,
+            },
         })?;
 
         tracing::info!("sherpa backend session requested");

@@ -145,9 +145,46 @@ pub(super) struct SessionParams {
     pub vad_threshold: f32,
     /// Which segmentation engine drives utterance boundaries. Validated
     /// against the model kind at the top of the session runner — streaming
-    /// online models reject `AutoBreak` (Task 4), and the offline session
-    /// loop dispatches VAD vs Auto Break on this field (Task 11).
+    /// online models reject `AutoBreak`, and the offline session loop
+    /// dispatches VAD vs Auto Break on this field.
     pub segmentation_mode: crate::backend::SegmentationMode,
+    /// Auto Break timing parameters, read by `run_session_auto_break`.
+    /// Ignored in VAD mode and by the streaming path.
+    pub auto_break_thresholds: AutoBreakThresholds,
+}
+
+/// Auto Break timing parameters consumed by the state machine in
+/// `backends/sherpa/offline.rs`. Bundled into a `Copy` struct so the
+/// machine can own its configuration via one field instead of three.
+///
+/// The `_ms` suffix on every field is a deliberate unit marker, not
+/// redundant naming — dropping it would make the struct easier to
+/// misread as "these are sample counts" or "these are seconds" when
+/// the callers mix raw u32 values with the rest of the timing math.
+/// Clippy's `struct_field_names` lint would normally flag the shared
+/// postfix; we allow it locally to keep the unit clarity.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_field_names)]
+pub(super) struct AutoBreakThresholds {
+    pub min_open_ms: u32,
+    pub tail_ms: u32,
+    pub min_segment_ms: u32,
+}
+
+impl AutoBreakThresholds {
+    /// Default values matching the hardcoded constants from PR 8.
+    /// Currently only used by unit tests in `offline.rs`; the
+    /// production path always receives thresholds from
+    /// `BackendConfig` via `SherpaBackend::start`, so the
+    /// production code never calls this.
+    #[cfg(test)]
+    pub(super) const fn defaults() -> Self {
+        Self {
+            min_open_ms: crate::backend::AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
+            tail_ms: crate::backend::AUTO_BREAK_TAIL_MS_DEFAULT,
+            min_segment_ms: crate::backend::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+        }
+    }
 }
 
 /// Commands sent to the host worker thread.

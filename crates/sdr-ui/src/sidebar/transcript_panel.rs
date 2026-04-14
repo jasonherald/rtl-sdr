@@ -39,6 +39,22 @@ const KEY_SHERPA_VAD_THRESHOLD: &str = "sherpa_vad_threshold";
 /// boundaries instead of Silero VAD. Default false (preserve existing
 /// behavior for existing config files).
 pub(crate) const KEY_AUTO_BREAK_ENABLED: &str = "transcription_auto_break_enabled";
+/// Config key for the persisted Auto Break "minimum open duration"
+/// threshold. Squelch opens shorter than this are discarded as noise
+/// spikes. Stored as u32 milliseconds.
+#[cfg(feature = "sherpa")]
+const KEY_AUTO_BREAK_MIN_OPEN_MS: &str = "transcription_auto_break_min_open_ms";
+/// Config key for the persisted Auto Break tail-capture window.
+/// Continue buffering audio for this long after squelch closes so
+/// the last syllable isn't chopped. Stored as u32 milliseconds.
+#[cfg(feature = "sherpa")]
+const KEY_AUTO_BREAK_TAIL_MS: &str = "transcription_auto_break_tail_ms";
+/// Config key for the persisted Auto Break minimum segment length.
+/// Segments shorter than this are discarded instead of decoded (sub-
+/// word fragments make offline sherpa models hallucinate). Stored as
+/// u32 milliseconds.
+#[cfg(feature = "sherpa")]
+const KEY_AUTO_BREAK_MIN_SEGMENT_MS: &str = "transcription_auto_break_min_segment_ms";
 
 #[cfg(feature = "sherpa")]
 const DISPLAY_MODE_LIVE_IDX: u32 = 0;
@@ -82,6 +98,39 @@ const SHERPA_VAD_THRESHOLD_MAX: f64 = sdr_transcription::VAD_THRESHOLD_MAX as f6
 const SHERPA_VAD_THRESHOLD_STEP: f64 = 0.05;
 #[cfg(feature = "sherpa")]
 const SHERPA_VAD_THRESHOLD_PAGE: f64 = 0.10;
+
+// Auto Break timing parameters (sherpa-only, offline-only, NFM-only).
+// Defaults and bounds come from `sdr_transcription::backend` as u32
+// constants; the UI widens them to f64 because `adw::SpinRow` takes
+// f64 adjustments. All three sliders are integer-step (1 ms) because
+// sub-millisecond precision is meaningless for the underlying timing.
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_OPEN_MS_MIN: f64 = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_MIN as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_OPEN_MS_MAX: f64 = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_MAX as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_OPEN_MS_DEFAULT: f64 =
+    sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_DEFAULT as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_TAIL_MS_MIN: f64 = sdr_transcription::AUTO_BREAK_TAIL_MS_MIN as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_TAIL_MS_MAX: f64 = sdr_transcription::AUTO_BREAK_TAIL_MS_MAX as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_TAIL_MS_DEFAULT: f64 = sdr_transcription::AUTO_BREAK_TAIL_MS_DEFAULT as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_SEGMENT_MS_MIN: f64 = sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_MIN as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_SEGMENT_MS_MAX: f64 = sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_MAX as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT: f64 =
+    sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT as f64;
+/// All three Auto Break sliders step in 10 ms increments. Sub-10 ms
+/// tuning has no perceptible effect on segmentation behavior.
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MS_STEP: f64 = 10.0;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MS_PAGE: f64 = 50.0;
+
 const NOISE_GATE_MIN: f64 = 1.0;
 const NOISE_GATE_MAX: f64 = 10.0;
 const NOISE_GATE_STEP: f64 = 0.5;
@@ -116,6 +165,18 @@ pub struct TranscriptPanel {
     /// edges as utterance boundaries instead of Silero VAD. NFM only.
     #[cfg(feature = "sherpa")]
     pub auto_break_row: adw::SwitchRow,
+    /// Auto Break minimum-open-duration slider. Sherpa-only — only
+    /// visible alongside the Auto Break toggle when Auto Break is on.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_min_open_row: adw::SpinRow,
+    /// Auto Break tail-capture slider. Sherpa-only — only visible
+    /// alongside the Auto Break toggle when Auto Break is on.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_tail_row: adw::SpinRow,
+    /// Auto Break minimum-segment-length slider. Sherpa-only — only
+    /// visible alongside the Auto Break toggle when Auto Break is on.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_min_segment_row: adw::SpinRow,
     /// Dimmed italic label below the text view that renders in-progress
     /// Sherpa partials. Sherpa-only.
     #[cfg(feature = "sherpa")]
@@ -133,7 +194,18 @@ pub struct TranscriptPanel {
 }
 
 /// Build the transcript sidebar panel.
-#[allow(clippy::too_many_lines)]
+///
+/// The cast allows cover the Auto Break timing slider blocks: they
+/// read `u32` config values as `f64` for the `AdwSpinRow` adjustment,
+/// and write the `f64` row value back as `u64` for persistence. All
+/// values are bounded by the `AUTO_BREAK_*_MS_MIN`/`_MAX` constants —
+/// well under 2^52 — so the casts are lossless in practice.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Transcript")
@@ -369,6 +441,112 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         row
     };
 
+    // --- Auto Break timing sliders (Sherpa only) ---
+    //
+    // Three SpinRows for the tunable hold-off constants. Only visible
+    // when Auto Break itself is visible (offline sherpa model + NFM)
+    // AND Auto Break is ON — mirroring the mutex with `vad_threshold_row`.
+    // Defaults match the PR 8 hardcoded values; user overrides are
+    // persisted as u32 milliseconds in config.
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row = {
+        let saved = config.read(|v| {
+            v.get(KEY_AUTO_BREAK_MIN_OPEN_MS)
+                .and_then(serde_json::Value::as_u64)
+                .map_or(AUTO_BREAK_MIN_OPEN_MS_DEFAULT, |val| {
+                    (val as f64).clamp(AUTO_BREAK_MIN_OPEN_MS_MIN, AUTO_BREAK_MIN_OPEN_MS_MAX)
+                })
+        });
+        let row = adw::SpinRow::builder()
+            .title("Auto Break: min open (ms)")
+            .subtitle("Transmissions shorter than this are discarded as noise spikes")
+            .adjustment(&gtk4::Adjustment::new(
+                saved,
+                AUTO_BREAK_MIN_OPEN_MS_MIN,
+                AUTO_BREAK_MIN_OPEN_MS_MAX,
+                AUTO_BREAK_MS_STEP,
+                AUTO_BREAK_MS_PAGE,
+                0.0,
+            ))
+            .digits(0)
+            .build();
+        group.add(&row);
+        let config_abmo = Arc::clone(config);
+        row.connect_value_notify(move |r| {
+            let val = r.value() as u64;
+            config_abmo.write(|v| {
+                v[KEY_AUTO_BREAK_MIN_OPEN_MS] = serde_json::json!(val);
+            });
+        });
+        row
+    };
+
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row = {
+        let saved = config.read(|v| {
+            v.get(KEY_AUTO_BREAK_TAIL_MS)
+                .and_then(serde_json::Value::as_u64)
+                .map_or(AUTO_BREAK_TAIL_MS_DEFAULT, |val| {
+                    (val as f64).clamp(AUTO_BREAK_TAIL_MS_MIN, AUTO_BREAK_TAIL_MS_MAX)
+                })
+        });
+        let row = adw::SpinRow::builder()
+            .title("Auto Break: tail (ms)")
+            .subtitle("Continue buffering audio this long after squelch closes")
+            .adjustment(&gtk4::Adjustment::new(
+                saved,
+                AUTO_BREAK_TAIL_MS_MIN,
+                AUTO_BREAK_TAIL_MS_MAX,
+                AUTO_BREAK_MS_STEP,
+                AUTO_BREAK_MS_PAGE,
+                0.0,
+            ))
+            .digits(0)
+            .build();
+        group.add(&row);
+        let config_abt = Arc::clone(config);
+        row.connect_value_notify(move |r| {
+            let val = r.value() as u64;
+            config_abt.write(|v| {
+                v[KEY_AUTO_BREAK_TAIL_MS] = serde_json::json!(val);
+            });
+        });
+        row
+    };
+
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row = {
+        let saved = config.read(|v| {
+            v.get(KEY_AUTO_BREAK_MIN_SEGMENT_MS)
+                .and_then(serde_json::Value::as_u64)
+                .map_or(AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT, |val| {
+                    (val as f64).clamp(AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_MIN_SEGMENT_MS_MAX)
+                })
+        });
+        let row = adw::SpinRow::builder()
+            .title("Auto Break: min segment (ms)")
+            .subtitle("Segments shorter than this are discarded instead of decoded")
+            .adjustment(&gtk4::Adjustment::new(
+                saved,
+                AUTO_BREAK_MIN_SEGMENT_MS_MIN,
+                AUTO_BREAK_MIN_SEGMENT_MS_MAX,
+                AUTO_BREAK_MS_STEP,
+                AUTO_BREAK_MS_PAGE,
+                0.0,
+            ))
+            .digits(0)
+            .build();
+        group.add(&row);
+        let config_abms = Arc::clone(config);
+        row.connect_value_notify(move |r| {
+            let val = r.value() as u64;
+            config_abms.write(|v| {
+                v[KEY_AUTO_BREAK_MIN_SEGMENT_MS] = serde_json::json!(val);
+            });
+        });
+        row
+    };
+
     // --- Display mode selector (Sherpa only) ---
     //
     // Whisper builds never compile this in — Whisper does not emit
@@ -437,13 +615,25 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         vad_threshold_row.set_visible(initial_is_offline && !initial_auto_break_active);
         // Auto Break toggle visible only when an offline model is selected.
         // The additional NFM demod-mode gate is applied by window.rs's
-        // DemodModeChanged handler (Task 16) — at widget-build time we
-        // don't yet know the demod mode and assume NFM is the common case.
+        // DemodModeChanged handler — at widget-build time we don't yet
+        // know the demod mode and assume NFM is the common case.
         auto_break_row.set_visible(initial_is_offline);
+        // Auto Break timing sliders are the mirror of the VAD slider:
+        // visible when offline model AND Auto Break is ON. Together
+        // with `vad_threshold_row` they form a mutex visible triplet
+        // — exactly one of (VAD slider) or (Auto Break sliders) is
+        // shown at any time for an offline model.
+        let ab_sliders_visible = initial_is_offline && initial_auto_break_active;
+        auto_break_min_open_row.set_visible(ab_sliders_visible);
+        auto_break_tail_row.set_visible(ab_sliders_visible);
+        auto_break_min_segment_row.set_visible(ab_sliders_visible);
 
         let display_mode_row_for_visibility = display_mode_row.clone();
         let vad_threshold_row_for_visibility = vad_threshold_row.clone();
         let auto_break_row_for_model_change = auto_break_row.clone();
+        let ab_min_open_for_model_change = auto_break_min_open_row.clone();
+        let ab_tail_for_model_change = auto_break_tail_row.clone();
+        let ab_min_segment_for_model_change = auto_break_min_segment_row.clone();
         model_row.connect_selected_notify(move |r| {
             let idx = r.selected() as usize;
             let supports_partials = sdr_transcription::SherpaModel::ALL
@@ -452,22 +642,34 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
                 .is_some_and(sdr_transcription::SherpaModel::supports_partials);
             let is_offline = !supports_partials;
             let ab_active = auto_break_row_for_model_change.is_active();
+            let ab_sliders = is_offline && ab_active;
 
             display_mode_row_for_visibility.set_visible(supports_partials);
             vad_threshold_row_for_visibility.set_visible(is_offline && !ab_active);
             auto_break_row_for_model_change.set_visible(is_offline);
+            ab_min_open_for_model_change.set_visible(ab_sliders);
+            ab_tail_for_model_change.set_visible(ab_sliders);
+            ab_min_segment_for_model_change.set_visible(ab_sliders);
         });
 
-        // Mutex: toggling Auto Break hides/shows the VAD threshold slider.
-        // Only applies when Auto Break itself is currently visible (i.e., an
-        // offline model is selected). If the row is hidden — streaming
-        // Zipformer is selected — the mutex doesn't apply because the VAD
-        // slider is already hidden by the offline-model check.
+        // Mutex: toggling Auto Break hides/shows the VAD threshold slider
+        // AND the Auto Break timing sliders. Only applies when Auto Break
+        // itself is currently visible (an offline model is selected). If
+        // the row is hidden (streaming Zipformer), the mutex doesn't
+        // apply because the VAD slider is already hidden by the
+        // offline-model check and the AB sliders follow.
         let vad_threshold_row_for_mutex = vad_threshold_row.clone();
         let auto_break_row_for_mutex = auto_break_row.clone();
+        let ab_min_open_for_mutex = auto_break_min_open_row.clone();
+        let ab_tail_for_mutex = auto_break_tail_row.clone();
+        let ab_min_segment_for_mutex = auto_break_min_segment_row.clone();
         auto_break_row.connect_active_notify(move |r| {
             if auto_break_row_for_mutex.is_visible() {
-                vad_threshold_row_for_mutex.set_visible(!r.is_active());
+                let ab_on = r.is_active();
+                vad_threshold_row_for_mutex.set_visible(!ab_on);
+                ab_min_open_for_mutex.set_visible(ab_on);
+                ab_tail_for_mutex.set_visible(ab_on);
+                ab_min_segment_for_mutex.set_visible(ab_on);
             }
         });
     }
@@ -613,6 +815,12 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         vad_threshold_row,
         #[cfg(feature = "sherpa")]
         auto_break_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_min_open_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_tail_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_min_segment_row,
         #[cfg(feature = "sherpa")]
         live_line_label,
         status_label,

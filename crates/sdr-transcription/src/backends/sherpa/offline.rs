@@ -42,26 +42,22 @@ const SHERPA_NUM_THREADS: i32 = 1;
 /// Mirrors the upstream `rust-api-examples/examples/nemo_parakeet.rs` example.
 const NEMO_TRANSDUCER_MODEL_TYPE: &str = "nemo_transducer";
 
-/// Squelch openings shorter than this are treated as noise spikes and
-/// produce no segment. Chosen to exclude sub-syllable blips while still
-/// catching short single-word transmissions ("copy").
-const AUTO_BREAK_MIN_OPEN_MS: u32 = 100;
-
-/// Continue buffering audio for this long after the squelch closes, so
-/// the last syllable isn't chopped by a tight squelch-close timing.
-/// Covers typical `PowerSquelch` fall time plus ~100 ms of spoken tail.
-const AUTO_BREAK_TAIL_MS: u32 = 200;
-
-/// Segments shorter than this are discarded instead of decoded.
-/// Moonshine and Parakeet both hallucinate on sub-word fragments, so
-/// dropping them is an accuracy improvement, not a loss.
-const AUTO_BREAK_MIN_SEGMENT_MS: u32 = 400;
-
 /// Safety cap: if squelch stays open longer than this, flush anyway.
 /// Protects against pathological stuck-open situations (bad auto-squelch,
 /// carrier jam, band opening) that would otherwise cause unbounded
 /// memory growth in the segment buffer.
+///
+/// NOTE: unlike the other Auto Break constants, this one is NOT user
+/// tunable. It's a hard OOM safety guard, not a segmentation preference,
+/// and exposing it would invite users to disable the protection.
 const AUTO_BREAK_MAX_SEGMENT_MS: u32 = 30_000;
+
+// The previously-hardcoded `AUTO_BREAK_MIN_OPEN_MS`, `AUTO_BREAK_TAIL_MS`,
+// and `AUTO_BREAK_MIN_SEGMENT_MS` constants were moved to per-session
+// values on `SessionParams::auto_break_thresholds` (issue #272). Defaults
+// live as `pub const AUTO_BREAK_*_MS_DEFAULT` in `crate::backend`; the UI
+// reads the user-tuned values from config and passes them through
+// `BackendConfig`.
 
 /// Sample rate of incoming `TranscriptionInput::Samples` frames. The DSP
 /// controller emits interleaved stereo f32 at 48 kHz (see
@@ -226,6 +222,7 @@ fn run_session_vad(
         noise_gate_ratio,
         vad_threshold: _,
         segmentation_mode: _,
+        auto_break_thresholds: _,
     } = params;
 
     // Clear any residual state from a previous session.
@@ -355,14 +352,20 @@ struct AutoBreakMachine {
     /// applies during `HoldingOff`; reset to 0 in every other state
     /// transition.
     closed_len_samples: usize,
+    /// Per-session timing parameters read from `SessionParams`.
+    /// Previously hardcoded as module constants in PR 8; now threaded
+    /// through from `BackendConfig` so the UI can tune them per-session
+    /// (see issue #272).
+    thresholds: super::host::AutoBreakThresholds,
 }
 
 impl AutoBreakMachine {
-    fn new() -> Self {
+    fn new(thresholds: super::host::AutoBreakThresholds) -> Self {
         Self {
             state: AutoBreakState::Idle,
             buffer: Vec::new(),
             closed_len_samples: 0,
+            thresholds,
         }
     }
 
@@ -456,9 +459,9 @@ impl AutoBreakMachine {
         // Evaluate against the snapshot, not the current (tail-extended)
         // buffer. See the `closed_len_samples` docstring for why.
         let duration = self.transmission_duration_ms();
-        let decision = if duration < AUTO_BREAK_MIN_OPEN_MS {
+        let decision = if duration < self.thresholds.min_open_ms {
             FlushDecision::DiscardPhantom
-        } else if duration < AUTO_BREAK_MIN_SEGMENT_MS {
+        } else if duration < self.thresholds.min_segment_ms {
             FlushDecision::DiscardShort
         } else {
             FlushDecision::Decode
@@ -528,14 +531,15 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
         noise_gate_ratio,
         vad_threshold: _,
         segmentation_mode: _,
+        auto_break_thresholds,
     } = params;
 
     if event_tx.send(TranscriptionEvent::Ready).is_err() {
         return;
     }
 
-    let tail_duration = std::time::Duration::from_millis(u64::from(AUTO_BREAK_TAIL_MS));
-    let mut machine = AutoBreakMachine::new();
+    let tail_duration = std::time::Duration::from_millis(u64::from(auto_break_thresholds.tail_ms));
+    let mut machine = AutoBreakMachine::new(auto_break_thresholds);
     // When Some, we're in HoldingOff and waiting until this instant before flushing.
     let mut pending_flush_deadline: Option<std::time::Instant> = None;
 
@@ -673,12 +677,12 @@ fn drain_auto_break_on_exit(
     // same reasoning as `on_tail_timeout`. In Recording state the
     // snapshot is unused and this falls back to the full buffer length.
     let duration = machine.transmission_duration_ms();
-    if duration < AUTO_BREAK_MIN_OPEN_MS {
+    if duration < machine.thresholds.min_open_ms {
         tracing::debug!(
             ms = duration,
             "Auto Break: discarded phantom open on session exit"
         );
-    } else if duration < AUTO_BREAK_MIN_SEGMENT_MS {
+    } else if duration < machine.thresholds.min_segment_ms {
         tracing::debug!(
             ms = duration,
             "Auto Break: discarded sub-min segment on session exit"
@@ -750,9 +754,22 @@ mod auto_break_tests {
         vec![0.5_f32; frames * TRANSCRIPTION_INPUT_CHANNELS]
     }
 
+    // Default-threshold machine so the PR 8 test expectations around
+    // the 100/200/400 ms thresholds still hold after the constants
+    // moved to per-session fields in issue #272.
+    fn default_machine() -> AutoBreakMachine {
+        AutoBreakMachine::new(super::super::host::AutoBreakThresholds::defaults())
+    }
+
+    // Default-threshold alias so tests can phrase the intent as
+    // "buffer should be ≥ MIN_OPEN" without reaching for the
+    // session-level `crate::backend::AUTO_BREAK_*` re-exports each
+    // time. Matches `AutoBreakThresholds::defaults().min_open_ms`.
+    const TEST_MIN_OPEN_MS: u32 = crate::backend::AUTO_BREAK_MIN_OPEN_MS_DEFAULT;
+
     #[test]
     fn clean_utterance_produces_one_decode() {
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
         let mut counts = AutoBreakFlushCounts::default();
 
         machine.on_squelch_opened();
@@ -769,7 +786,7 @@ mod auto_break_tests {
 
     #[test]
     fn hysteresis_blip_single_utterance() {
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
         let mut counts = AutoBreakFlushCounts::default();
 
         // Open, record, close, re-open before tail timeout, record more, close, timeout.
@@ -790,7 +807,7 @@ mod auto_break_tests {
 
     #[test]
     fn phantom_open_below_min_open_ms_discarded() {
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
         let mut counts = AutoBreakFlushCounts::default();
 
         machine.on_squelch_opened();
@@ -806,7 +823,7 @@ mod auto_break_tests {
 
     #[test]
     fn sub_min_segment_discarded() {
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
         let mut counts = AutoBreakFlushCounts::default();
 
         machine.on_squelch_opened();
@@ -822,7 +839,7 @@ mod auto_break_tests {
 
     #[test]
     fn max_segment_safety_cap_triggers_flush() {
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
 
         machine.on_squelch_opened();
         machine.on_samples(&samples_for_ms(31_000)); // > MAX_SEGMENT_MS (30_000)
@@ -850,7 +867,7 @@ mod auto_break_tests {
         // which would cross the 400 ms MIN_SEGMENT threshold. The
         // decision MUST still be DiscardShort because the actual
         // transmission was only 300 ms.
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
         let mut counts = AutoBreakFlushCounts::default();
 
         machine.on_squelch_opened();
@@ -887,7 +904,7 @@ mod auto_break_tests {
         // Matching regression for the phantom-open lower bound. A 50 ms
         // open + 200 ms tail = 250 ms raw buffer, which would cross
         // MIN_OPEN_MS (100). The decision MUST still be DiscardPhantom.
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
         let mut counts = AutoBreakFlushCounts::default();
 
         machine.on_squelch_opened();
@@ -896,7 +913,7 @@ mod auto_break_tests {
         machine.on_samples(&samples_for_ms(200)); // 200 ms tail
 
         assert_eq!(machine.transmission_duration_ms(), 50);
-        assert!(machine.buffer_duration_ms() >= AUTO_BREAK_MIN_OPEN_MS);
+        assert!(machine.buffer_duration_ms() >= TEST_MIN_OPEN_MS);
 
         if let Some(decision) = machine.on_tail_timeout() {
             counts.record(decision);
@@ -916,7 +933,7 @@ mod auto_break_tests {
         // subsequent samples continue to buffer and the next cap splits
         // the transmission) rather than Idle (which would silently drop
         // all samples until the next close→open edge that never comes).
-        let mut machine = AutoBreakMachine::new();
+        let mut machine = default_machine();
         machine.on_squelch_opened();
         machine.on_samples(&samples_for_ms(31_000)); // trigger safety cap
 

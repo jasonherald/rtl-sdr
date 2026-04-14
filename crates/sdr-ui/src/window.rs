@@ -321,6 +321,12 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     #[cfg(feature = "sherpa")]
     let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
     #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row_for_dsp = transcript_panel.auto_break_min_open_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row_for_dsp = transcript_panel.auto_break_tail_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row_for_dsp = transcript_panel.auto_break_min_segment_row.clone();
+    #[cfg(feature = "sherpa")]
     let model_row_for_dsp = transcript_panel.model_row.clone();
     let engine_for_dsp = Rc::clone(&engine);
     // We deliberately discard the SourceId returned by `timeout_add_local`:
@@ -367,6 +373,12 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         #[cfg(feature = "sherpa")]
                         &auto_break_row_for_dsp,
                         #[cfg(feature = "sherpa")]
+                        &auto_break_min_open_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_tail_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_min_segment_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
                         &model_row_for_dsp,
                     );
                 }
@@ -397,6 +409,9 @@ fn handle_dsp_message(
     record_iq_row: &adw::SwitchRow,
     transcription_enable_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
+    #[cfg(feature = "sherpa")] auto_break_min_open_row: &adw::SpinRow,
+    #[cfg(feature = "sherpa")] auto_break_tail_row: &adw::SpinRow,
+    #[cfg(feature = "sherpa")] auto_break_min_segment_row: &adw::SpinRow,
     #[cfg(feature = "sherpa")] model_row: &adw::ComboRow,
 ) {
     match msg {
@@ -505,7 +520,16 @@ fn handle_dsp_message(
                     .get(model_idx)
                     .copied()
                     .is_some_and(|m| !m.supports_partials());
-                auto_break_row.set_visible(is_nfm && selected_is_offline);
+                let toggle_visible = is_nfm && selected_is_offline;
+                auto_break_row.set_visible(toggle_visible);
+                // Timing sliders follow the toggle's visibility AND
+                // the "Auto Break is actually ON" mutex. If the toggle
+                // itself just got hidden (switched out of NFM), the
+                // sliders must hide too.
+                let sliders_visible = toggle_visible && auto_break_row.is_active();
+                auto_break_min_open_row.set_visible(sliders_visible);
+                auto_break_tail_row.set_visible(sliders_visible);
+                auto_break_min_segment_row.set_visible(sliders_visible);
             }
 
             // If a transcription session is currently active, stop it and
@@ -1551,6 +1575,7 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
 /// Tolerant of any individual weak ref failing to upgrade (window close
 /// race) — each row is checked independently so a partially-dropped UI
 /// still recovers what it can.
+#[allow(clippy::too_many_arguments)]
 fn unlock_transcription_session_rows(
     model_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "whisper")] silence_row: &glib::WeakRef<adw::SpinRow>,
@@ -1558,6 +1583,9 @@ fn unlock_transcription_session_rows(
     #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")] auto_break_row: &glib::WeakRef<adw::SwitchRow>,
+    #[cfg(feature = "sherpa")] auto_break_min_open_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] auto_break_tail_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] auto_break_min_segment_row: &glib::WeakRef<adw::SpinRow>,
 ) {
     if let Some(row) = model_row.upgrade() {
         row.set_sensitive(true);
@@ -1579,6 +1607,18 @@ fn unlock_transcription_session_rows(
     }
     #[cfg(feature = "sherpa")]
     if let Some(row) = auto_break_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_min_open_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_tail_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_min_segment_row.upgrade() {
         row.set_sensitive(true);
     }
 }
@@ -1627,6 +1667,12 @@ fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let auto_break_row = transcript.auto_break_row.clone();
     #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row = transcript.auto_break_min_open_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row = transcript.auto_break_tail_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row = transcript.auto_break_min_segment_row.clone();
+    #[cfg(feature = "sherpa")]
     let squelch_enabled_row_for_session = squelch_enabled_row.clone();
     #[cfg(feature = "sherpa")]
     let toast_overlay_for_session = toast_overlay.downgrade();
@@ -1638,6 +1684,12 @@ fn connect_transcript_panel(
     let vad_threshold_row_weak = vad_threshold_row.downgrade();
     #[cfg(feature = "sherpa")]
     let auto_break_row_weak = auto_break_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row_weak = auto_break_min_open_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row_weak = auto_break_tail_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row_weak = auto_break_min_segment_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -1855,6 +1907,12 @@ fn connect_transcript_panel(
             vad_threshold_row.set_sensitive(false);
             #[cfg(feature = "sherpa")]
             auto_break_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            auto_break_min_open_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            auto_break_tail_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            auto_break_min_segment_row.set_sensitive(false);
 
             // Read tuning slider values.
             #[cfg(feature = "whisper")]
@@ -1902,12 +1960,35 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             let segmentation_mode = sdr_transcription::SegmentationMode::Vad;
 
+            // Auto Break timing parameters read from the session sliders.
+            // Whisper builds hardcode the defaults (these fields are
+            // never consumed because Whisper uses a different backend).
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let auto_break_min_open_ms = auto_break_min_open_row.value() as u32;
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let auto_break_tail_ms = auto_break_tail_row.value() as u32;
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let auto_break_min_segment_ms = auto_break_min_segment_row.value() as u32;
+            #[cfg(feature = "whisper")]
+            let auto_break_min_open_ms = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_DEFAULT;
+            #[cfg(feature = "whisper")]
+            let auto_break_tail_ms = sdr_transcription::AUTO_BREAK_TAIL_MS_DEFAULT;
+            #[cfg(feature = "whisper")]
+            let auto_break_min_segment_ms =
+                sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT;
+
             let config = sdr_transcription::BackendConfig {
                 model,
                 silence_threshold,
                 noise_gate_ratio,
                 vad_threshold,
                 segmentation_mode,
+                auto_break_min_open_ms,
+                auto_break_tail_ms,
+                auto_break_min_segment_ms,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
@@ -1941,6 +2022,13 @@ fn connect_transcript_panel(
                     let vad_threshold_row_weak = vad_threshold_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let auto_break_row_weak = auto_break_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_min_open_row_weak = auto_break_min_open_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_tail_row_weak = auto_break_tail_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_min_segment_row_weak =
+                        auto_break_min_segment_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let live_line_weak = live_line_weak.clone();
 
@@ -2064,6 +2152,12 @@ fn connect_transcript_panel(
                                             &vad_threshold_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &auto_break_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_min_open_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_tail_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_min_segment_row_weak,
                                         );
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
@@ -2133,6 +2227,12 @@ fn connect_transcript_panel(
                                         &vad_threshold_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &auto_break_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_min_open_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_tail_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_min_segment_row_weak,
                                     );
                                     if let Some(enable) = enable_row_weak.upgrade() {
                                         enable.set_active(false);
@@ -2166,6 +2266,12 @@ fn connect_transcript_panel(
                         &vad_threshold_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &auto_break_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_min_open_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_tail_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_min_segment_row.downgrade(),
                     );
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
@@ -2190,6 +2296,12 @@ fn connect_transcript_panel(
                 &vad_threshold_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &auto_break_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_min_open_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_tail_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_min_segment_row.downgrade(),
             );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();
