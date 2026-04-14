@@ -545,14 +545,44 @@ mod tests {
 
     #[test]
     fn short_burst_is_discarded_as_noise() {
-        // A single voiced frame (< min_speech_frames) should be
-        // dropped entirely. Use 1 frame of synthetic voice surrounded
-        // by silence so the segment ends but fails the length gate.
+        // Regression for the `min_speech_frames` discard gate.
+        // Drives the state machine directly so we can guarantee the
+        // discard path is exercised — feeding synthetic voice through
+        // `accept()` is ambiguous because earshot might never score
+        // the burst above threshold (its 3-frame context window is
+        // unreliable for 1-frame inputs) in which case the VAD would
+        // stay in `Idle` and `pop_segment()` would return `None` for
+        // the wrong reason, silently green-lighting a regression.
+        //
+        // Instead: manually seed the VAD into `Speaking` with a
+        // sub-gate voiced-frame count, then let `accept()` drive it
+        // through to finalization via trailing silence.
         let mut vad = EarshotVad::new();
-        vad.accept(&synthetic_voice(1));
+        vad.state = State::Speaking;
+        let voiced_count = DEFAULT_MIN_SPEECH_FRAMES - 1;
+        vad.speech_frames_in_segment = voiced_count;
+        vad.current_segment
+            .extend(std::iter::repeat_n(0.1_f32, voiced_count * FRAME_SIZE));
+
+        // Before the trailing silence: state is Speaking, segment has
+        // real audio, voice-frame count is sub-gate. This is the
+        // precondition that makes the assertion meaningful.
+        assert_eq!(vad.state, State::Speaking);
+        assert_eq!(vad.speech_frames_in_segment, voiced_count);
+        assert!(!vad.current_segment.is_empty());
+
+        // Feed enough silence to drive HoldingOff → finalize.
         vad.accept(&silence_frames(DEFAULT_MIN_SILENCE_FRAMES + 5));
         vad.flush();
-        assert!(vad.pop_segment().is_none());
+
+        // Segment discarded by the min_speech_frames gate: nothing
+        // popped, state back to Idle, counters cleared.
+        assert!(
+            vad.pop_segment().is_none(),
+            "sub-gate segment should be discarded, not emitted"
+        );
+        assert_eq!(vad.state, State::Idle);
+        assert_eq!(vad.speech_frames_in_segment, 0);
     }
 
     #[test]
