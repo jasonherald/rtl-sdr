@@ -329,12 +329,19 @@ pub struct CtcssDetector {
     /// Counter resets on a hit when the gate is open.
     miss_run: usize,
 
-    /// Samples waiting to fill the next full [`CTCSS_WINDOW_SAMPLES`]
-    /// window. Callers to [`Self::accept_samples`] may feed
+    /// Sub-window tail left over after [`Self::accept_samples`]
+    /// consumes every full [`CTCSS_WINDOW_SAMPLES`]-sized window
+    /// currently available in the input. Callers may feed
     /// arbitrary-length slices (whatever their audio callback
-    /// produces); the detector buffers them here and only runs the
-    /// Goertzel filters when it has exactly one window's worth of
-    /// audio. Empty between windows; drained on [`Self::reset`].
+    /// produces); the detector appends them here, runs the three
+    /// parallel Goertzel filters on each completed window in order
+    /// — updating the sustained-gate state (`hit_run` / `miss_run`
+    /// / `sustained`) on every window — and leaves only the
+    /// remaining `< CTCSS_WINDOW_SAMPLES` tail in this buffer.
+    /// Only the latest [`CtcssDecision`] is returned to the caller
+    /// even when multiple windows complete in one call. Empty only
+    /// when the input happens to be an exact multiple of the
+    /// window size; cleared on [`Self::reset`].
     ///
     /// Buffering at this layer rather than the caller layer is
     /// important because the 400 ms window duration is load-bearing
