@@ -140,16 +140,37 @@ We do **not** ship:
 
 ## Disk cost
 
-- **~1.83 GB download**, cached persistently at
-  `$HOME/.cache/sdr-rs/cuda-redist/`. This cache survives `cargo clean`
-  and branch switches, so the slow download only happens once per
-  machine.
-- **~2.1 GB staged + installed** in `$(BINDIR)/sdr-rs-libs/` with
-  symlink preservation. Without symlink preservation this was 5.6 GB
-  due to 3× content duplication (base / soname / versioned).
-- `make uninstall` removes the lib dir. The download cache is preserved
-  intentionally so the next install is instant; the uninstall target
-  prints instructions for deleting the cache manually if you want.
+Three distinct locations hold CUDA sideload bytes — they're not
+additive in the sense of "total RAM use" but each one shows up
+independently on `df`:
+
+1. **Download cache — ~1.83 GB** at
+   `$HOME/.cache/sdr-rs/cuda-redist/downloads/`. Raw NVIDIA tarballs
+   (`.tar.xz`), pre-extraction. Populated once on first build,
+   survives `cargo clean` and branch switches.
+2. **Staging cache — ~2.1 GB** at
+   `$HOME/.cache/sdr-rs/cuda-redist/staging/`. Extracted `.so` files
+   and symlink chains, ready to be copied verbatim into the install
+   location. Populated once per CUDA redist version bump (gated by
+   `$HOME/.cache/sdr-rs/cuda-redist/.sentinel-v1`).
+3. **Installed runtime libs — ~2.1 GB** at `$(BINDIR)/sdr-rs-libs/`.
+   A direct `cp -a` of the staging cache. This is what the installed
+   binary's `DT_RPATH` actually loads from at runtime.
+
+Without symlink preservation each of staging and install would bloat
+to **5.6 GB** because cuDNN and cuBLAS ship three copies of their
+content for the
+`libfoo.so → libfoo.so.N → libfoo.so.N.M.P` chain. `cp -a` preserves
+the symlinks so the content lives once and the sonames point at it.
+
+**Total first-run cost: ~6 GB of disk** across download + staging +
+install. **Subsequent installs: ~2.1 GB** (only the install location
+gets rewritten; download + staging are sentinel-gated).
+
+`make uninstall` removes the install location (`$(BINDIR)/sdr-rs-libs/`)
+but intentionally preserves `$HOME/.cache/sdr-rs/cuda-redist/` so the
+next install is instant. The uninstall target prints instructions for
+deleting the cache manually if you want to reclaim those ~3.9 GB.
 
 ## Pre-populating the cache
 
