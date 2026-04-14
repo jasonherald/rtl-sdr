@@ -20,15 +20,9 @@ use crate::vad::VoiceActivityDetector;
 
 use super::host::SHERPA_SAMPLE_RATE_HZ;
 
-/// Silero VAD default hyperparameters. These match the sherpa-onnx
-/// upstream `moonshine_v2.rs` example and are appropriate for radio
-/// audio (short bursts, occasional long silences).
-///
-/// Aliased to the canonical `backend::VAD_THRESHOLD_DEFAULT` — the
-/// two represent the same value, this alias exists so `host.rs::init_offline`
-/// has a `pub(super)` name to reach for without dragging the public
-/// backend module into scope.
-pub(super) const SILERO_THRESHOLD: f32 = crate::backend::VAD_THRESHOLD_DEFAULT;
+// Silero VAD default hyperparameters. These match the sherpa-onnx
+// upstream `moonshine_v2.rs` example and are appropriate for radio
+// audio (short bursts, occasional long silences).
 const SILERO_MIN_SILENCE_DURATION: f32 = 0.25;
 const SILERO_MIN_SPEECH_DURATION: f32 = 0.25;
 const SILERO_MAX_SPEECH_DURATION: f32 = 20.0;
@@ -53,8 +47,9 @@ impl SherpaSileroVad {
     /// Create a new Silero VAD using the ONNX file at `model_path` and
     /// the given `threshold` (0.10..=0.90).
     ///
-    /// Use [`SILERO_THRESHOLD`] as `threshold` for the default value.
-    /// The file is typically installed by [`crate::sherpa_model::download_silero_vad`].
+    /// Use `crate::backend::VAD_THRESHOLD_DEFAULT` as `threshold` for
+    /// the default value. The file is typically installed by
+    /// [`crate::sherpa_model::download_silero_vad`].
     pub fn new(model_path: &Path, threshold: f32) -> Result<Self, BackendError> {
         let silero_config = SileroVadModelConfig {
             model: Some(model_path.to_string_lossy().into_owned()),

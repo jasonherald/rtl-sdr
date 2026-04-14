@@ -15,7 +15,6 @@ use crate::backend::{BackendError, TranscriptionEvent, TranscriptionInput};
 use crate::init_event::InitEvent;
 use crate::sherpa_model::{self, SherpaModel};
 
-use super::silero_vad::SherpaSileroVad;
 
 /// Bounded channel capacity for audio buffers from DSP → backend.
 pub(super) const AUDIO_CHANNEL_CAPACITY: usize = 256;
@@ -25,13 +24,6 @@ pub(super) const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Sample rate sherpa-onnx expects from `accept_waveform`.
 pub(super) const SHERPA_SAMPLE_RATE_HZ: i32 = 16_000;
-
-/// Absolute-difference tolerance for VAD threshold rebuild comparison.
-/// If the requested threshold differs from the currently-held VAD's
-/// threshold by more than this, the worker rebuilds Silero at session
-/// start. Keeps the rebuild policy in sync with the UI's slider step
-/// (0.05) — anything smaller than a slider step is just float drift.
-const VAD_THRESHOLD_REBUILD_EPSILON: f32 = 0.01;
 
 /// Process-wide singleton for the sherpa-onnx host. Stores either a ready
 /// host or the error message from a failed initialization. Set exactly once
@@ -196,17 +188,20 @@ enum HostCommand {
     },
 }
 
-/// Which recognizer (and optional VAD) the host worker owns.
+/// Which recognizer the host worker owns.
 ///
 /// Set once in `run_host_loop` based on `SherpaModel::kind()`. The
 /// command loop pattern-matches on this to dispatch to the right
 /// session runner.
+///
+/// Offline sessions no longer carry a long-lived `SherpaSileroVad`
+/// here — per issue #275 the VAD is built fresh on the session I/O
+/// thread each start so the recognizer and the VAD live on different
+/// threads. The VAD onnx file is still downloaded at host init via
+/// `init_offline` so the first session doesn't pay the download cost.
 pub(super) enum RecognizerState {
     Online(OnlineRecognizer),
-    Offline {
-        recognizer: OfflineRecognizer,
-        vad: SherpaSileroVad,
-    },
+    Offline { recognizer: OfflineRecognizer },
 }
 
 /// Internal state of a sherpa host. Wrapped in a `Mutex` inside `SherpaHost`
@@ -343,48 +338,15 @@ fn run_host_loop(
                     RecognizerState::Online(recognizer) => {
                         super::streaming::run_session(recognizer, params);
                     }
-                    RecognizerState::Offline { recognizer, vad } => {
-                        // Check if the user's requested VAD threshold differs
-                        // from the currently-held VAD's threshold. If so,
-                        // rebuild the VAD before starting the session. The
-                        // rebuild is ~50-100ms of ONNX model load — only
-                        // happens when the slider value actually changed.
-                        //
-                        // Skip the rebuild entirely when Auto Break mode is
-                        // selected — the Silero VAD is unused in that path
-                        // (the squelch gate drives segmentation), so paying
-                        // the rebuild cost is pure waste. The rebuild still
-                        // runs on the next Vad-mode session if the threshold
-                        // has drifted.
-                        if params.segmentation_mode == crate::backend::SegmentationMode::Vad {
-                            let requested = params.vad_threshold;
-                            // Treat differences smaller than the slider step
-                            // as "same" to avoid pointless rebuilds from
-                            // float drift.
-                            if (vad.current_threshold() - requested).abs()
-                                > VAD_THRESHOLD_REBUILD_EPSILON
-                            {
-                                tracing::info!(
-                                    old = vad.current_threshold(),
-                                    new = requested,
-                                    "rebuilding Silero VAD with new threshold"
-                                );
-                                let vad_path = sherpa_model::silero_vad_path();
-                                match super::silero_vad::SherpaSileroVad::new(&vad_path, requested)
-                                {
-                                    Ok(new_vad) => {
-                                        *vad = new_vad;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "VAD rebuild failed; reusing existing VAD"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        super::offline::run_session(recognizer, vad, params);
+                    RecognizerState::Offline { recognizer } => {
+                        // VAD is built fresh on the session I/O thread (see
+                        // `session_io_loop_vad` in offline.rs). No threshold
+                        // rebuild dance here — the I/O thread reads the
+                        // current `params.vad_threshold` when it constructs
+                        // its VAD, so threshold changes just take effect on
+                        // the next session start. Auto Break mode skips VAD
+                        // construction entirely.
+                        super::offline::run_session(recognizer, params);
                     }
                 }
                 tracing::info!("sherpa-host: session ended");
@@ -567,24 +529,13 @@ fn init_offline(
     };
     tracing::info!("OfflineRecognizer created successfully");
 
-    // --- Build SherpaSileroVad ---
-    // Use the default threshold at startup (Option A): if the user has a
-    // persisted non-default threshold, it will cause a ~50-100ms VAD
-    // rebuild on the first session start (in the StartSession handler below).
-    let vad_path = sherpa_model::silero_vad_path();
-    let vad = match SherpaSileroVad::new(&vad_path, super::silero_vad::SILERO_THRESHOLD) {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = format!("Silero VAD creation failed: {e}");
-            tracing::error!(%msg);
-            store_init_failure(BackendError::Init(msg.clone()));
-            let _ = event_tx.send(InitEvent::Failed { message: msg });
-            return Err(());
-        }
-    };
-    tracing::info!("SherpaSileroVad created successfully");
+    // VAD is NOT constructed here — per #275 it's built on the session
+    // I/O thread each time a VAD-mode session starts, so the recognizer
+    // (host thread) and the VAD (session I/O thread) never have to live
+    // on the same thread. The download step above still runs so the
+    // first session doesn't pay the download cost.
 
-    Ok(RecognizerState::Offline { recognizer, vad })
+    Ok(RecognizerState::Offline { recognizer })
 }
 
 /// Helper to store an initialization failure in the global `OnceLock`.

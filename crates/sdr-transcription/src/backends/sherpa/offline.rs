@@ -9,7 +9,8 @@
 //! the Live/Final display-mode toggle when a Moonshine model is selected
 //! (see `SherpaModel::supports_partials`).
 
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use sherpa_onnx::{
@@ -24,6 +25,83 @@ use crate::{denoise, resampler};
 
 use super::host::{AUDIO_RECV_TIMEOUT, SHERPA_SAMPLE_RATE_HZ, SessionParams};
 use super::silero_vad::SherpaSileroVad;
+
+/// One segment handed from the session I/O thread to the decoder worker
+/// (the sherpa-host thread). Already resampled to 16 kHz mono and
+/// denoised — the host thread only has to feed it to the recognizer.
+///
+/// The I/O thread does all the audio prep so the decoder worker stays
+/// cold-path-free: a `DecodeRequest` is the minimum data needed to
+/// produce a transcription event.
+pub(super) struct DecodeRequest {
+    pub mono: Vec<f32>,
+}
+
+/// Decoder service loop — runs on the sherpa-host thread alongside a
+/// spawned session I/O thread. Owns the `&OfflineRecognizer` reference
+/// (never crosses threads) and drains `decode_rx` until the I/O thread
+/// drops its sender (clean session end) or `cancel` fires.
+///
+/// On cancellation, the loop counts any remaining requests in the
+/// channel, drops them, and emits a single `Text` event noting the
+/// stop time and discard count so the user sees why the transcript
+/// ended mid-flight.
+///
+/// Returns nothing — results are pushed directly to `event_tx` as
+/// `TranscriptionEvent::Text`.
+fn decoder_service_loop(
+    recognizer: &OfflineRecognizer,
+    decode_rx: &mpsc::Receiver<DecodeRequest>,
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+    cancel: &Arc<AtomicBool>,
+) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            emit_stop_notification(decode_rx, event_tx);
+            return;
+        }
+        // Block on the next request but wake periodically to check
+        // cancel — AUDIO_RECV_TIMEOUT is short enough for a
+        // responsive stop without burning CPU.
+        match decode_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
+            Ok(request) => {
+                if cancel.load(Ordering::Relaxed) {
+                    emit_stop_notification(decode_rx, event_tx);
+                    return;
+                }
+                decode_segment(recognizer, &request.mono, event_tx);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Drain any queued `DecodeRequest`s from `decode_rx` without decoding
+/// them and emit a single `Text` event describing the stop. Called
+/// from [`decoder_service_loop`] when the user cancels mid-session.
+///
+/// If the queue had pending segments, the transcript shows how many
+/// were discarded so the operator understands why audio between the
+/// last committed utterance and the stop time is missing — useful
+/// when reviewing a recording later.
+fn emit_stop_notification(
+    decode_rx: &mpsc::Receiver<DecodeRequest>,
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+) {
+    let mut dropped: usize = 0;
+    while decode_rx.try_recv().is_ok() {
+        dropped += 1;
+    }
+    let timestamp = crate::util::wall_clock_timestamp();
+    let text = if dropped == 0 {
+        "[transcription stopped]".to_owned()
+    } else {
+        format!("[transcription stopped — {dropped} pending segment(s) discarded]")
+    };
+    tracing::info!(%timestamp, dropped, "sherpa offline session stop notification");
+    let _ = event_tx.send(TranscriptionEvent::Text { timestamp, text });
+}
 
 /// Initial capacity for the per-session resampled-mono scratch buffer.
 const SESSION_MONO_BUFFER_CAPACITY: usize = 16_000;
@@ -192,14 +270,18 @@ pub(super) fn build_nemo_transducer_recognizer_config(
 
 /// One offline transcription session. Dispatches to the VAD or Auto Break
 /// implementation based on `params.segmentation_mode`.
-pub(super) fn run_session(
-    recognizer: &OfflineRecognizer,
-    vad: &mut SherpaSileroVad,
-    params: SessionParams,
-) {
+///
+/// Runs on the sherpa-host worker thread. The session spawns a second
+/// "session I/O" thread that owns the audio channel, the state machine,
+/// and (for VAD mode) a freshly-constructed Silero. The host thread then
+/// drains a decode-request channel and runs `OfflineRecognizer::decode`
+/// on each segment the I/O thread forwards. This decouples inference
+/// latency from audio intake so a slow decode never backpressures the
+/// DSP → transcription channel (issue #275).
+pub(super) fn run_session(recognizer: &OfflineRecognizer, params: SessionParams) {
     match params.segmentation_mode {
         crate::backend::SegmentationMode::Vad => {
-            run_session_vad(recognizer, vad, params);
+            run_session_vad(recognizer, params);
         }
         crate::backend::SegmentationMode::AutoBreak => {
             run_session_auto_break(recognizer, params);
@@ -207,26 +289,108 @@ pub(super) fn run_session(
     }
 }
 
-/// VAD-driven offline session (unchanged from the pre-Auto-Break behavior).
-/// Feeds audio through the VAD, batch-decodes each detected speech segment,
-/// and emits `Text` events. Never emits `Partial`.
-fn run_session_vad(
-    recognizer: &OfflineRecognizer,
-    vad: &mut SherpaSileroVad,
-    params: SessionParams,
-) {
+/// VAD-driven offline session. Spawns a session I/O thread that builds
+/// its own Silero and runs the VAD state machine; the current (host)
+/// thread runs [`decoder_service_loop`] and performs the actual
+/// `OfflineRecognizer::decode` calls for each segment the I/O thread
+/// forwards.
+///
+/// Silero is built on the I/O thread (not the host thread) because
+/// `SherpaSileroVad` is `!Send`, so owning it per-thread is simpler
+/// than smuggling an `&mut` across the thread boundary. The ~50 ms
+/// construction cost per session start is imperceptible next to the
+/// model's own init time.
+fn run_session_vad(recognizer: &OfflineRecognizer, params: SessionParams) {
     let SessionParams {
         cancel,
         audio_rx,
         event_tx,
         noise_gate_ratio,
-        vad_threshold: _,
+        vad_threshold,
         segmentation_mode: _,
         auto_break_thresholds: _,
     } = params;
 
-    // Clear any residual state from a previous session.
-    vad.reset();
+    let (decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
+
+    // Spawn the session I/O thread. Owns the audio channel, builds its
+    // own Silero VAD, and forwards ready-to-decode segments to the
+    // decoder via `decode_tx`.
+    let cancel_io = Arc::clone(&cancel);
+    let event_tx_io = event_tx.clone();
+    let io_thread = std::thread::Builder::new()
+        .name("sherpa-session-io".into())
+        .spawn(move || {
+            session_io_loop_vad(SessionIoVadParams {
+                cancel: cancel_io,
+                audio_rx,
+                event_tx: event_tx_io,
+                decode_tx,
+                noise_gate_ratio,
+                vad_threshold,
+            });
+        });
+    let io_thread = match io_thread {
+        Ok(handle) => handle,
+        Err(e) => {
+            let msg = format!("failed to spawn sherpa session I/O thread: {e}");
+            tracing::error!(%msg);
+            let _ = event_tx.send(TranscriptionEvent::Error(msg));
+            return;
+        }
+    };
+
+    // Host thread: drain decode_rx and run `recognizer.decode` for each.
+    // Returns when the I/O thread drops `decode_tx` (audio channel
+    // disconnected or user cancelled).
+    decoder_service_loop(recognizer, &decode_rx, &event_tx, &cancel);
+
+    // The I/O thread is exiting or has exited. Join to avoid leaving a
+    // detached worker behind; log on join failure but don't propagate
+    // further since the session is ending anyway.
+    if let Err(e) = io_thread.join() {
+        tracing::warn!("sherpa session I/O thread panicked during join: {e:?}");
+    }
+    tracing::info!("sherpa offline session ended");
+}
+
+/// Parameters for the VAD-mode session I/O thread.
+struct SessionIoVadParams {
+    cancel: Arc<AtomicBool>,
+    audio_rx: mpsc::Receiver<TranscriptionInput>,
+    event_tx: mpsc::Sender<TranscriptionEvent>,
+    decode_tx: mpsc::Sender<DecodeRequest>,
+    noise_gate_ratio: f32,
+    vad_threshold: f32,
+}
+
+/// Session I/O loop for VAD segmentation. Runs on the spawned I/O
+/// thread — owns the Silero VAD and drains the audio channel, pushing
+/// each completed segment onto `decode_tx` for the host-thread
+/// decoder service.
+fn session_io_loop_vad(params: SessionIoVadParams) {
+    let SessionIoVadParams {
+        cancel,
+        audio_rx,
+        event_tx,
+        decode_tx,
+        noise_gate_ratio,
+        vad_threshold,
+    } = params;
+
+    // Build Silero on this thread. `SherpaSileroVad` holds an onnxruntime
+    // session handle that is !Send by default, so we construct it here
+    // rather than passing it in from the host thread.
+    let vad_path = sherpa_model::silero_vad_path();
+    let mut vad = match SherpaSileroVad::new(&vad_path, vad_threshold) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("Silero VAD creation failed on session start: {e}");
+            tracing::error!(%msg);
+            let _ = event_tx.send(TranscriptionEvent::Error(msg));
+            return;
+        }
+    };
 
     if event_tx.send(TranscriptionEvent::Ready).is_err() {
         return;
@@ -236,8 +400,8 @@ fn run_session_vad(
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            tracing::info!("sherpa offline session cancelled");
-            drain_vad_on_exit(recognizer, vad, &event_tx);
+            tracing::info!("sherpa offline session I/O thread cancelled");
+            drain_vad_on_exit(&mut vad, &decode_tx);
             return;
         }
 
@@ -251,13 +415,12 @@ fn run_session_vad(
             TranscriptionInput::SquelchOpened | TranscriptionInput::SquelchClosed => continue,
         };
 
-        // Resample 48 kHz stereo → 16 kHz mono.
         mono_buf.clear();
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
 
         while let Ok(extra) = audio_rx.try_recv() {
             if cancel.load(Ordering::Relaxed) {
-                drain_vad_on_exit(recognizer, vad, &event_tx);
+                drain_vad_on_exit(&mut vad, &decode_tx);
                 return;
             }
             if let TranscriptionInput::Samples(s) = extra {
@@ -269,28 +432,33 @@ fn run_session_vad(
             continue;
         }
 
-        // Spectral denoise BEFORE VAD — RTL-SDR squelch tails confuse
-        // Silero just as much as they confuse decoders.
         denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
 
         vad.accept(&mono_buf);
 
         while let Some(segment) = vad.pop_segment() {
             if cancel.load(Ordering::Relaxed) {
-                drain_vad_on_exit(recognizer, vad, &event_tx);
+                drain_vad_on_exit(&mut vad, &decode_tx);
                 return;
             }
-            decode_segment(recognizer, &segment, &event_tx);
+            // Send non-blocking-wise: the decode channel is unbounded so
+            // this never blocks — worst case the decoder falls behind
+            // and memory grows, but the real-world queue depth is tiny
+            // (one in-flight decode + a handful queued).
+            if decode_tx.send(DecodeRequest { mono: segment }).is_err() {
+                // Host thread exited early — nothing more to do.
+                return;
+            }
         }
     }
 
-    // Audio channel disconnected — flush any in-flight segment.
-    drain_vad_on_exit(recognizer, vad, &event_tx);
-    tracing::info!("sherpa offline session ended (audio channel disconnected)");
+    drain_vad_on_exit(&mut vad, &decode_tx);
+    tracing::info!("sherpa offline session I/O thread ended (audio channel disconnected)");
 }
 
 /// Batch-decode a single speech segment and emit a `Text` event if
-/// the recognizer produced any text.
+/// the recognizer produced any text. Called by [`decoder_service_loop`]
+/// on the sherpa-host thread — never on the session I/O thread.
 fn decode_segment(
     recognizer: &OfflineRecognizer,
     segment: &[f32],
@@ -518,11 +686,10 @@ impl AutoBreakMachine {
     }
 }
 
-/// Auto Break offline session. Drives an `AutoBreakMachine` from the
-/// transcription input channel and a hold-off timer implemented via
-/// `recv_timeout`. Buffers stereo 48 kHz interleaved samples during
-/// `Recording` / `HoldingOff` states; on flush, resamples to 16 kHz mono,
-/// applies the spectral denoiser, and decodes through the recognizer.
+/// Auto Break offline session. Spawns a session I/O thread that runs
+/// the `AutoBreakMachine` against the audio channel; the current (host)
+/// thread drains a decode-request channel and runs
+/// `OfflineRecognizer::decode` on each flushed segment.
 fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams) {
     let SessionParams {
         cancel,
@@ -534,25 +701,79 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
         auto_break_thresholds,
     } = params;
 
+    let (decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
+
+    let cancel_io = Arc::clone(&cancel);
+    let event_tx_io = event_tx.clone();
+    let io_thread = std::thread::Builder::new()
+        .name("sherpa-session-io".into())
+        .spawn(move || {
+            session_io_loop_auto_break(SessionIoAutoBreakParams {
+                cancel: cancel_io,
+                audio_rx,
+                event_tx: event_tx_io,
+                decode_tx,
+                noise_gate_ratio,
+                auto_break_thresholds,
+            });
+        });
+    let io_thread = match io_thread {
+        Ok(handle) => handle,
+        Err(e) => {
+            let msg = format!("failed to spawn sherpa session I/O thread: {e}");
+            tracing::error!(%msg);
+            let _ = event_tx.send(TranscriptionEvent::Error(msg));
+            return;
+        }
+    };
+
+    decoder_service_loop(recognizer, &decode_rx, &event_tx, &cancel);
+
+    if let Err(e) = io_thread.join() {
+        tracing::warn!("sherpa session I/O thread panicked during join: {e:?}");
+    }
+    tracing::info!("sherpa Auto Break session ended");
+}
+
+/// Parameters for the Auto-Break-mode session I/O thread.
+struct SessionIoAutoBreakParams {
+    cancel: Arc<AtomicBool>,
+    audio_rx: mpsc::Receiver<TranscriptionInput>,
+    event_tx: mpsc::Sender<TranscriptionEvent>,
+    decode_tx: mpsc::Sender<DecodeRequest>,
+    noise_gate_ratio: f32,
+    auto_break_thresholds: super::host::AutoBreakThresholds,
+}
+
+/// Session I/O loop for Auto Break segmentation. Runs on the spawned
+/// I/O thread — drives an `AutoBreakMachine` from the audio channel and
+/// forwards flushed segments to `decode_tx` (resampled + denoised
+/// before the send so the decoder thread stays zero-prep).
+fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
+    let SessionIoAutoBreakParams {
+        cancel,
+        audio_rx,
+        event_tx,
+        decode_tx,
+        noise_gate_ratio,
+        auto_break_thresholds,
+    } = params;
+
     if event_tx.send(TranscriptionEvent::Ready).is_err() {
         return;
     }
 
     let tail_duration = std::time::Duration::from_millis(u64::from(auto_break_thresholds.tail_ms));
     let mut machine = AutoBreakMachine::new(auto_break_thresholds);
-    // When Some, we're in HoldingOff and waiting until this instant before flushing.
     let mut pending_flush_deadline: Option<std::time::Instant> = None;
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            tracing::info!("sherpa Auto Break session cancelled");
-            drain_auto_break_on_exit(recognizer, &mut machine, noise_gate_ratio, &event_tx);
+            tracing::info!("sherpa Auto Break I/O thread cancelled");
+            drain_auto_break_on_exit(&mut machine, noise_gate_ratio, &decode_tx);
             return;
         }
 
-        // Choose recv timeout: if we're holding off, use the remaining
-        // tail duration so we wake up on time to flush. Otherwise use
-        // the standard audio polling interval so we can check `cancel`.
         let timeout = match pending_flush_deadline {
             Some(deadline) => deadline
                 .checked_duration_since(std::time::Instant::now())
@@ -563,16 +784,9 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
         match audio_rx.recv_timeout(timeout) {
             Ok(crate::backend::TranscriptionInput::Samples(samples)) => {
                 machine.on_samples(&samples);
-                // Max-segment safety check: if buffer has grown past the
-                // cap, force-flush regardless of squelch state.
-                //
-                // Resume in `Recording`, NOT `Idle`. The controller only
-                // emits `SquelchOpened` on state transitions, so if the
-                // carrier stays up past the 30 s cap and we transitioned
-                // to Idle, the remainder of that same transmission would
-                // be silently dropped until the next close→open edge.
-                // Staying in Recording splits a long transmission into
-                // 30 s chunks rather than truncating it.
+                // Max-segment safety check: see pre-refactor comment
+                // above — resume in Recording, not Idle, so a long
+                // transmission is split rather than truncated.
                 if !matches!(machine.state(), AutoBreakState::Idle)
                     && machine.buffer_duration_ms() >= AUTO_BREAK_MAX_SEGMENT_MS
                 {
@@ -583,7 +797,11 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
                     );
                     let stereo_buf = machine.take_buffer();
                     machine.reset_after_force_flush(AutoBreakState::Recording);
-                    flush_auto_break_segment(recognizer, &stereo_buf, noise_gate_ratio, &event_tx);
+                    if dispatch_auto_break_segment(&stereo_buf, noise_gate_ratio, &decode_tx)
+                        .is_err()
+                    {
+                        return;
+                    }
                     pending_flush_deadline = None;
                 }
             }
@@ -596,19 +814,21 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
                 pending_flush_deadline = Some(std::time::Instant::now() + tail_duration);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Check if the tail deadline has expired.
                 if let Some(deadline) = pending_flush_deadline
                     && std::time::Instant::now() >= deadline
                 {
                     match machine.on_tail_timeout() {
                         Some(FlushDecision::Decode) => {
                             let stereo_buf = machine.take_buffer();
-                            flush_auto_break_segment(
-                                recognizer,
+                            if dispatch_auto_break_segment(
                                 &stereo_buf,
                                 noise_gate_ratio,
-                                &event_tx,
-                            );
+                                &decode_tx,
+                            )
+                            .is_err()
+                            {
+                                return;
+                            }
                         }
                         Some(FlushDecision::DiscardPhantom) => {
                             tracing::debug!("Auto Break: discarded phantom open");
@@ -616,39 +836,39 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
                         Some(FlushDecision::DiscardShort) => {
                             tracing::debug!("Auto Break: discarded sub-min segment");
                         }
-                        None => {
-                            // Not in HoldingOff anymore — nothing to do.
-                        }
+                        None => {}
                     }
                     pending_flush_deadline = None;
                 }
-                // Otherwise just loop back and recv again.
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::info!("sherpa Auto Break session ended (channel disconnected)");
-                drain_auto_break_on_exit(recognizer, &mut machine, noise_gate_ratio, &event_tx);
+                tracing::info!("sherpa Auto Break I/O thread ended (channel disconnected)");
+                drain_auto_break_on_exit(&mut machine, noise_gate_ratio, &decode_tx);
                 return;
             }
         }
     }
 }
 
-/// Resample + denoise + decode a completed Auto Break segment, emit
-/// a `Text` event if the recognizer produced non-empty output.
-fn flush_auto_break_segment(
-    recognizer: &OfflineRecognizer,
+/// Resample + denoise a completed Auto Break segment and hand it to
+/// the decoder via `decode_tx`. Returns `Err(())` if the decoder
+/// channel has hung up (host thread exited early) so the I/O loop
+/// can stop cleanly instead of spinning on dead sends.
+fn dispatch_auto_break_segment(
     stereo_buf: &[f32],
     noise_gate_ratio: f32,
-    event_tx: &mpsc::Sender<TranscriptionEvent>,
-) {
+    decode_tx: &mpsc::Sender<DecodeRequest>,
+) -> Result<(), ()> {
     if stereo_buf.is_empty() {
-        return;
+        return Ok(());
     }
     let mut mono_buf: Vec<f32> =
         Vec::with_capacity(stereo_buf.len() / STEREO_48K_TO_MONO_16K_CAPACITY_DIVISOR);
     resampler::downsample_stereo_to_mono_16k(stereo_buf, &mut mono_buf);
     denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
-    decode_segment(recognizer, &mono_buf, event_tx);
+    decode_tx
+        .send(DecodeRequest { mono: mono_buf })
+        .map_err(|_| ())
 }
 
 /// Finalize an Auto Break session on cancellation or channel disconnect.
@@ -656,26 +876,23 @@ fn flush_auto_break_segment(
 /// Mirrors the `drain_vad_on_exit` semantics from the VAD path: if the
 /// user stops transcription mid-transmission (including the hard stop
 /// triggered by a demod mode change), whatever is in the buffer is
-/// either decoded as a legitimate final utterance or discarded as a
-/// sub-threshold fragment, applying the same length-gate rules the tail
-/// timeout path uses. Without this, the final utterance was silently
-/// thrown away whenever the session ended during `Recording` or
-/// `HoldingOff`.
+/// either forwarded as a legitimate final utterance or discarded as a
+/// sub-threshold fragment, applying the same length-gate rules the
+/// tail timeout path uses. Without this, the final utterance was
+/// silently thrown away whenever the session ended during `Recording`
+/// or `HoldingOff`.
+///
+/// Runs on the session I/O thread — forwards via `decode_tx` for the
+/// host thread to decode.
 fn drain_auto_break_on_exit(
-    recognizer: &OfflineRecognizer,
     machine: &mut AutoBreakMachine,
     noise_gate_ratio: f32,
-    event_tx: &mpsc::Sender<TranscriptionEvent>,
+    decode_tx: &mpsc::Sender<DecodeRequest>,
 ) {
     if matches!(machine.state(), AutoBreakState::Idle) {
-        // Nothing captured — nothing to drain.
         return;
     }
 
-    // Use `transmission_duration_ms` here so the pre-close snapshot
-    // governs the discard decision when we're caught in HoldingOff —
-    // same reasoning as `on_tail_timeout`. In Recording state the
-    // snapshot is unused and this falls back to the full buffer length.
     let duration = machine.transmission_duration_ms();
     if duration < machine.thresholds.min_open_ms {
         tracing::debug!(
@@ -693,14 +910,12 @@ fn drain_auto_break_on_exit(
             "Auto Break: flushing in-flight segment on session exit"
         );
         let stereo_buf = machine.take_buffer();
-        flush_auto_break_segment(recognizer, &stereo_buf, noise_gate_ratio, event_tx);
+        let _ = dispatch_auto_break_segment(&stereo_buf, noise_gate_ratio, decode_tx);
     }
-    // Session is ending — go back to Idle, not Recording, so a fresh
-    // session starts from a clean state.
     machine.reset_after_force_flush(AutoBreakState::Idle);
 }
 
-/// Flush the VAD on session exit and drain every remaining segment —
+/// Flush the VAD on session exit and forward every remaining segment —
 /// including any in-flight utterance Silero hadn't yet finalized.
 ///
 /// Without the explicit `flush` call, a user stopping transcription
@@ -708,15 +923,14 @@ fn drain_auto_break_on_exit(
 /// only returns segments that VAD already marked complete. `flush`
 /// forces finalization so the final `while let` sees that segment.
 ///
-/// Resets the VAD afterward so the next session starts clean.
-fn drain_vad_on_exit(
-    recognizer: &OfflineRecognizer,
-    vad: &mut SherpaSileroVad,
-    event_tx: &mpsc::Sender<TranscriptionEvent>,
-) {
+/// Runs on the session I/O thread — forwards via `decode_tx` for the
+/// host thread to decode.
+fn drain_vad_on_exit(vad: &mut SherpaSileroVad, decode_tx: &mpsc::Sender<DecodeRequest>) {
     vad.flush();
     while let Some(segment) = vad.pop_segment() {
-        decode_segment(recognizer, &segment, event_tx);
+        if decode_tx.send(DecodeRequest { mono: segment }).is_err() {
+            return;
+        }
     }
     vad.reset();
 }
