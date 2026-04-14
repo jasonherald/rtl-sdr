@@ -226,12 +226,20 @@ pub fn enhance_speech(samples: &mut [f32], gate_ratio: f32) {
         .zip(weights.iter())
         .filter_map(|(&m, &w)| (w > 0.0).then_some(m))
         .collect();
-    voice_band_mags.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let noise_floor = if voice_band_mags.is_empty() {
         0.0
     } else {
+        // `select_nth_unstable_by` partitions the slice in O(n) average
+        // time so the element at `idx` ends up in its final sorted
+        // position — strictly cheaper than a full O(n log n) sort when
+        // we only need one percentile. `enhance_speech` runs on every
+        // decoded segment so the hot path matters.
         let idx = ((voice_band_mags.len() as f32) * NOISE_FLOOR_PERCENTILE) as usize;
-        voice_band_mags[idx.min(voice_band_mags.len() - 1)]
+        let idx = idx.min(voice_band_mags.len() - 1);
+        let (_, nth, _) = voice_band_mags.select_nth_unstable_by(idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        *nth
     };
 
     let threshold = noise_floor * gate_ratio;
@@ -309,6 +317,51 @@ mod tests {
     }
 
     // --- Voice-band weight + enhance_speech tests (issue #274) ---
+
+    // Assertion thresholds for the enhance_speech test suite. Centralized
+    // here so tuning the weight shape or the gate ratio only requires
+    // touching one set of numbers. The thresholds themselves encode
+    // invariants of the voice-band algorithm, not implementation details,
+    // so they should change only when the algorithm's guarantees change.
+
+    /// Minimum fraction of input energy an in-band tone must retain
+    /// after `enhance_speech`. At weight 1.0 and a survivable noise
+    /// floor the output should be nearly the full input; 0.8 gives
+    /// slack for FFT numerical bleed and the 1% random noise added in
+    /// the test to avoid an all-peak-one-bin pathological case.
+    const IN_BAND_ENERGY_RETENTION_MIN: f32 = 0.8;
+
+    /// Maximum fraction of input energy an out-of-band tone may leave
+    /// in the output. Out-of-band weights are 0 so the ideal is
+    /// exactly zero; 0.01 tolerates numerical FFT bleed from the
+    /// nominal zeroing.
+    const OUT_OF_BAND_ENERGY_MAX_FRACTION: f32 = 0.01;
+
+    /// Minimum pre-enhancement energy required for a test input to
+    /// count as "real signal" rather than numerical dust. Used as a
+    /// setup sanity check in the kill tests.
+    const MIN_SETUP_INPUT_ENERGY: f32 = 0.1;
+
+    /// In the masking regression, the 1 kHz formant must retain at
+    /// least this fraction of its pre-enhancement power. With weight
+    /// 1.0 in the formant band and the voice-prior noise floor
+    /// excluding the rumble, the formant should survive largely
+    /// unattenuated; 0.5 is the generous lower bound.
+    const FORMANT_POWER_RETENTION_MIN: f32 = 0.5;
+
+    /// In the masking regression, the post-enhancement 1 kHz formant
+    /// must dominate residual 50 Hz rumble by at least this factor.
+    /// 5× is well above the 1:1 crossover and comfortably below the
+    /// theoretical ∞:1 (rumble at weight 0 should be fully zeroed).
+    const FORMANT_TO_RUMBLE_DOMINANCE_MIN: f32 = 5.0;
+
+    /// Pre-check: the masking test's input buffer must have rumble
+    /// genuinely dominating the formant component so the test's
+    /// "masked" premise is real. Input is rumble amp 1.0 + formant
+    /// amp 0.1, so power ratio is 100× — 50× gives slack for the
+    /// Goertzel projection's numerical precision at a specific
+    /// frequency vs. a general FFT bin.
+    const SETUP_RUMBLE_DOMINANCE_MIN: f32 = 50.0;
 
     /// Generate `n` samples of a unit-amplitude sine at `freq_hz` at 16 kHz.
     fn tone(freq_hz: f32, n: usize) -> Vec<f32> {
@@ -391,7 +444,7 @@ mod tests {
         let post = energy(&buf);
 
         assert!(
-            post > pre * 0.8,
+            post > pre * IN_BAND_ENERGY_RETENTION_MIN,
             "formant-band tone lost too much energy: pre={pre}, post={post}"
         );
     }
@@ -403,7 +456,10 @@ mod tests {
         let n = 1600;
         let mut buf = tone(50.0, n);
         let pre = energy(&buf);
-        assert!(pre > 0.1, "setup: input should have real energy");
+        assert!(
+            pre > MIN_SETUP_INPUT_ENERGY,
+            "setup: input should have real energy"
+        );
 
         enhance_speech(&mut buf, GATE_RATIO);
         let post = energy(&buf);
@@ -411,7 +467,7 @@ mod tests {
         // Output should be near-zero. Use a tolerant bound to allow
         // FFT numerical bleed.
         assert!(
-            post < pre * 0.01,
+            post < pre * OUT_OF_BAND_ENERGY_MAX_FRACTION,
             "sub-80Hz rumble should be killed: pre={pre}, post={post}"
         );
     }
@@ -423,13 +479,16 @@ mod tests {
         let n = 1600;
         let mut buf = tone(7_800.0, n);
         let pre = energy(&buf);
-        assert!(pre > 0.1, "setup: input should have real energy");
+        assert!(
+            pre > MIN_SETUP_INPUT_ENERGY,
+            "setup: input should have real energy"
+        );
 
         enhance_speech(&mut buf, GATE_RATIO);
         let post = energy(&buf);
 
         assert!(
-            post < pre * 0.01,
+            post < pre * OUT_OF_BAND_ENERGY_MAX_FRACTION,
             "above-7500Hz hiss should be killed: pre={pre}, post={post}"
         );
     }
@@ -475,8 +534,8 @@ mod tests {
         let p_rumble_pre = power_at(&buf, 50.0);
         let p_formant_pre = power_at(&buf, 1_000.0);
         assert!(
-            p_rumble_pre > p_formant_pre * 50.0,
-            "setup: rumble should initially dominate formant by >50x (rumble amp=1.0 vs formant amp=0.1 → 100x power)"
+            p_rumble_pre > p_formant_pre * SETUP_RUMBLE_DOMINANCE_MIN,
+            "setup: rumble should initially dominate formant by >{SETUP_RUMBLE_DOMINANCE_MIN}x (rumble amp=1.0 vs formant amp=0.1 → 100x power)"
         );
 
         enhance_speech(&mut buf, GATE_RATIO);
@@ -484,19 +543,19 @@ mod tests {
         // Post-enhancement: the 1 kHz formant must survive AND
         // dominate the residual 50 Hz rumble. Goertzel projection
         // gives us the exact power at each frequency, so we can
-        // assert both that the formant survived (>50% of its
-        // original power) and that the spectral dominance flipped
-        // (formant now exceeds residual rumble by a large margin).
+        // assert both that the formant survived and that the
+        // spectral dominance flipped.
         let p_rumble_post = power_at(&buf, 50.0);
         let p_formant_post = power_at(&buf, 1_000.0);
 
         assert!(
-            p_formant_post > p_formant_pre * 0.5,
-            "1 kHz formant should retain >50% of its input power after voice-band gating: pre={p_formant_pre}, post={p_formant_post}"
+            p_formant_post > p_formant_pre * FORMANT_POWER_RETENTION_MIN,
+            "1 kHz formant should retain >{}% of its input power after voice-band gating: pre={p_formant_pre}, post={p_formant_post}",
+            FORMANT_POWER_RETENTION_MIN * 100.0
         );
         assert!(
-            p_formant_post > p_rumble_post * 5.0,
-            "1 kHz formant should dominate residual 50 Hz rumble by >5x after enhancement: p_formant={p_formant_post}, p_rumble={p_rumble_post}"
+            p_formant_post > p_rumble_post * FORMANT_TO_RUMBLE_DOMINANCE_MIN,
+            "1 kHz formant should dominate residual 50 Hz rumble by >{FORMANT_TO_RUMBLE_DOMINANCE_MIN}x after enhancement: p_formant={p_formant_post}, p_rumble={p_rumble_post}"
         );
     }
 }
