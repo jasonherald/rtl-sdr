@@ -5,7 +5,7 @@
 
 use sdr_dsp::filter::{DeemphasisFilter, NotchFilter};
 use sdr_dsp::multirate::RationalResampler;
-use sdr_dsp::tone_detect::{CTCSS_SAMPLE_RATE_HZ, CtcssDetector, ctcss_tone_index};
+use sdr_dsp::tone_detect::{CtcssDetector, ctcss_tone_index};
 use sdr_types::{Complex, DspError, Stereo};
 
 /// Default audio output sample rate (Hz).
@@ -303,7 +303,18 @@ impl AfChain {
                         "CTCSS frequency {hz} Hz is not a known tone"
                     )));
                 }
-                let detector = CtcssDetector::new(hz, CTCSS_SAMPLE_RATE_HZ)?;
+                // Pass the instance's actual audio_sample_rate (not
+                // the CTCSS_SAMPLE_RATE_HZ constant) so the
+                // detector's internal rate-validation catches a
+                // misconfigured AF chain at setter time rather than
+                // silently running 19200-sample windows at the
+                // wrong duration. CtcssDetector::new enforces
+                // equality with CTCSS_SAMPLE_RATE_HZ within a
+                // 0.5 Hz tolerance and returns
+                // DspError::InvalidParameter on mismatch — that's
+                // exactly the contract we want here.
+                #[allow(clippy::cast_possible_truncation)]
+                let detector = CtcssDetector::new(hz, self.audio_sample_rate as f32)?;
                 self.ctcss_mode = CtcssMode::Tone(hz);
                 self.ctcss_detector = Some(detector);
             }
