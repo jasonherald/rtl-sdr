@@ -312,27 +312,38 @@ fn run_host_loop(
                         // rebuild the VAD before starting the session. The
                         // rebuild is ~50-100ms of ONNX model load — only
                         // happens when the slider value actually changed.
-                        let requested = params.vad_threshold;
-                        // Treat differences smaller than the slider step as
-                        // "same" to avoid pointless rebuilds from float drift.
-                        if (vad.current_threshold() - requested).abs()
-                            > VAD_THRESHOLD_REBUILD_EPSILON
-                        {
-                            tracing::info!(
-                                old = vad.current_threshold(),
-                                new = requested,
-                                "rebuilding Silero VAD with new threshold"
-                            );
-                            let vad_path = sherpa_model::silero_vad_path();
-                            match super::silero_vad::SherpaSileroVad::new(&vad_path, requested) {
-                                Ok(new_vad) => {
-                                    *vad = new_vad;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "VAD rebuild failed; reusing existing VAD"
-                                    );
+                        //
+                        // Skip the rebuild entirely when Auto Break mode is
+                        // selected — the Silero VAD is unused in that path
+                        // (the squelch gate drives segmentation), so paying
+                        // the rebuild cost is pure waste. The rebuild still
+                        // runs on the next Vad-mode session if the threshold
+                        // has drifted.
+                        if params.segmentation_mode == crate::backend::SegmentationMode::Vad {
+                            let requested = params.vad_threshold;
+                            // Treat differences smaller than the slider step
+                            // as "same" to avoid pointless rebuilds from
+                            // float drift.
+                            if (vad.current_threshold() - requested).abs()
+                                > VAD_THRESHOLD_REBUILD_EPSILON
+                            {
+                                tracing::info!(
+                                    old = vad.current_threshold(),
+                                    new = requested,
+                                    "rebuilding Silero VAD with new threshold"
+                                );
+                                let vad_path = sherpa_model::silero_vad_path();
+                                match super::silero_vad::SherpaSileroVad::new(&vad_path, requested)
+                                {
+                                    Ok(new_vad) => {
+                                        *vad = new_vad;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "VAD rebuild failed; reusing existing VAD"
+                                        );
+                                    }
                                 }
                             }
                         }

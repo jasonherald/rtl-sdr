@@ -1789,13 +1789,44 @@ fn connect_transcript_panel(
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
-            // Auto Break precondition: squelch must be enabled so the radio
-            // produces the open/close transitions the state machine needs
-            // for segmentation. Without squelch enabled, the session would
-            // sit in Idle indefinitely producing zero transcripts — silent
-            // failure mode. Block session start with an actionable toast.
+            // Read the selected model index once at the top of the
+            // session-start branch; the Auto Break eligibility check
+            // below needs it, and the BackendConfig construction
+            // below reuses it.
+            let model_idx = model_row.selected() as usize;
+
+            // Auto Break is eligible ONLY when all three conditions
+            // hold: (1) the toggle itself is on, (2) the current demod
+            // mode is NFM, and (3) the selected sherpa model is offline
+            // (Moonshine, Parakeet). The toggle is persisted, so
+            // without this computed gate it would still report "on"
+            // after a restart into WFM, or after the user switched to
+            // streaming Zipformer and the row went invisible — either
+            // of which would produce an unsupported session
+            // (streaming Zipformer rejects AutoBreak at session start;
+            // non-NFM modes never emit squelch edges so the state
+            // machine sits in Idle forever). Compute the effective
+            // value once here and use it for both the precondition
+            // check and the BackendConfig assignment.
             #[cfg(feature = "sherpa")]
-            if auto_break_row.is_active() && !squelch_enabled_row_for_session.is_active() {
+            let auto_break_enabled = {
+                let selected_is_offline = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .is_some_and(|m| !m.supports_partials());
+                auto_break_row.is_active()
+                    && state_clone.demod_mode.get() == sdr_types::DemodMode::Nfm
+                    && selected_is_offline
+            };
+
+            // Auto Break precondition: squelch must be enabled so the
+            // radio produces the open/close transitions the state
+            // machine needs for segmentation. Without squelch enabled,
+            // the session would sit in Idle indefinitely producing
+            // zero transcripts — silent failure mode. Block session
+            // start with an actionable toast.
+            #[cfg(feature = "sherpa")]
+            if auto_break_enabled && !squelch_enabled_row_for_session.is_active() {
                 let toast = adw::Toast::new(
                     "Auto Break needs squelch enabled to detect transmission boundaries. \
                      Enable squelch in the radio panel, or turn off Auto Break to use VAD.",
@@ -1810,7 +1841,6 @@ fn connect_transcript_panel(
                 return;
             }
 
-            // Read selected model from dropdown.
             // Lock model and tuning controls while transcription is active.
             model_row.set_sensitive(false);
             #[cfg(feature = "whisper")]
@@ -1825,8 +1855,6 @@ fn connect_transcript_panel(
             vad_threshold_row.set_sensitive(false);
             #[cfg(feature = "sherpa")]
             auto_break_row.set_sensitive(false);
-
-            let model_idx = model_row.selected() as usize;
 
             // Read tuning slider values.
             #[cfg(feature = "whisper")]
@@ -1866,7 +1894,7 @@ fn connect_transcript_panel(
             let vad_threshold: f32 = sdr_transcription::VAD_THRESHOLD_DEFAULT;
 
             #[cfg(feature = "sherpa")]
-            let segmentation_mode = if auto_break_row.is_active() {
+            let segmentation_mode = if auto_break_enabled {
                 sdr_transcription::SegmentationMode::AutoBreak
             } else {
                 sdr_transcription::SegmentationMode::Vad

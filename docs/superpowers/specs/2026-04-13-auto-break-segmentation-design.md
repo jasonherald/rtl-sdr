@@ -139,7 +139,7 @@ pub struct BackendConfig {
    - Emit `SquelchOpened` or `SquelchClosed` to the transcription channel
 4. Update `squelch_was_open = now_open`
 
-Gating on `current_mode == DemodMode::Nfm` means a mid-session mode switch to WFM simply stops the squelch event stream. The transcription session in Auto Break mode sees `Samples` continue to flow but no more boundary events — which rolls cleanly into the fallback behavior described below.
+Gating on `current_mode == DemodMode::Nfm` means the DSP controller only emits squelch events on NFM; WFM / AM / other modes never see them. Mid-session mode changes are handled separately by the universal stop-on-mode-change behavior described below — when the user switches band, transcription stops cleanly before any cross-mode sample leakage can reach the session loop.
 
 ### Offline session loop state machine
 
@@ -303,7 +303,7 @@ One new `AdwSwitchRow` added to the transcript panel below the VAD threshold Spi
 
 **Precondition check at session start**: if the user has Auto Break enabled AND the radio has squelch fully disabled (not auto-squelch, not manual threshold — literally off), session start is blocked with a toast:
 
-```
+```text
 Auto Break needs squelch enabled to detect transmission boundaries.
 Enable squelch in the radio panel, or turn off Auto Break to use VAD.
 ```

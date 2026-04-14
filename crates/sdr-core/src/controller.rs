@@ -365,8 +365,22 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
                 // Notify the UI of the mode transition (edge detection — only
                 // when the mode actually changed so idempotent refreshes do not
-                // trigger the transcript-session boundary logic in Task 16).
+                // trigger the transcript-session boundary logic).
+                //
+                // The UI layer's response to `DemodModeChanged` is to toggle
+                // the transcription enable row off, which eventually drops
+                // the transcription channel via `DisableTranscription`. That
+                // round-trip is async — until it completes the DSP thread
+                // would otherwise keep pushing post-switch audio into the old
+                // session, violating the "band change = hard session
+                // boundary" contract in the Auto Break design spec. Drop the
+                // tap locally FIRST so no post-switch samples leak into the
+                // old backend, then notify the UI. The UI's eventual
+                // `DisableTranscription` is idempotent on an already-cleared
+                // tap.
                 if old_mode != mode {
+                    state.transcription_tx = None;
+                    state.squelch_was_open = false;
                     let _ = dsp_tx.send(DspToUi::DemodModeChanged(mode));
                 }
             }
@@ -758,11 +772,22 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::EnableTranscription(tx) => {
+            // Reset the squelch edge tracker when a new tap is wired up.
+            // Without this, a previous session that ended with squelch open
+            // leaves `squelch_was_open == true`, so the first chunk of the
+            // new session sees `now_open == was_open` and no SquelchOpened
+            // edge is emitted — the offline Auto Break state machine would
+            // stay in Idle and drop the entire current transmission until
+            // the next open/close cycle.
+            state.squelch_was_open = false;
             state.transcription_tx = Some(tx);
             tracing::info!("transcription audio tap enabled");
         }
         UiToDsp::DisableTranscription => {
             state.transcription_tx = None;
+            // Mirror the reset on disable so a subsequent EnableTranscription
+            // always starts from a known state.
+            state.squelch_was_open = false;
             tracing::info!("transcription audio tap disabled");
         }
     }
@@ -1033,6 +1058,15 @@ fn process_iq_block(
                         if let Some(ref tx) = state.transcription_tx {
                             let now_open = state.radio.if_chain().squelch_open();
                             let mut send_error = false;
+                            // True unless we tried to send an edge event and hit
+                            // `TrySendError::Full`. Squelch edges are one-shot
+                            // state transitions — if we advance `squelch_was_open`
+                            // without the downstream having received the edge,
+                            // the Auto Break state machine misses the transition
+                            // entirely and gets stuck in Idle/Recording until the
+                            // 30s safety flush fires. Retry on the next block by
+                            // leaving the tracker unchanged.
+                            let mut advance_tracker = true;
 
                             if now_open != state.squelch_was_open
                                 && state.radio.current_mode() == sdr_types::DemodMode::Nfm
@@ -1042,13 +1076,28 @@ fn process_iq_block(
                                 } else {
                                     sdr_transcription::TranscriptionInput::SquelchClosed
                                 };
-                                if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) =
-                                    tx.try_send(edge)
-                                {
-                                    send_error = true;
+                                match tx.try_send(edge) {
+                                    Ok(()) => {}
+                                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                        send_error = true;
+                                    }
+                                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                        // Backend is busy (likely decoding an
+                                        // earlier segment). Don't advance the
+                                        // tracker so we retry this edge on the
+                                        // next audio block instead of silently
+                                        // dropping it.
+                                        advance_tracker = false;
+                                        tracing::warn!(
+                                            ?now_open,
+                                            "transcription channel full; retrying squelch edge next block"
+                                        );
+                                    }
                                 }
                             }
-                            state.squelch_was_open = now_open;
+                            if advance_tracker {
+                                state.squelch_was_open = now_open;
+                            }
 
                             if !send_error {
                                 let mut interleaved = Vec::with_capacity(audio_count * 2);

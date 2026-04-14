@@ -63,6 +63,32 @@ const AUTO_BREAK_MIN_SEGMENT_MS: u32 = 400;
 /// memory growth in the segment buffer.
 const AUTO_BREAK_MAX_SEGMENT_MS: u32 = 30_000;
 
+/// Sample rate of incoming `TranscriptionInput::Samples` frames. The DSP
+/// controller emits interleaved stereo f32 at 48 kHz (see
+/// `sdr-core::controller::process_iq_block`). Extracted as a named
+/// constant so the Auto Break buffer-duration math stays in sync if the
+/// wire format ever changes.
+const TRANSCRIPTION_INPUT_SAMPLE_RATE_HZ: u64 = 48_000;
+
+/// Channel count of incoming `TranscriptionInput::Samples` frames
+/// (interleaved stereo = 2 f32 values per audio frame).
+const TRANSCRIPTION_INPUT_CHANNELS: usize = 2;
+
+/// Target sample rate of the mono buffer handed to the recognizer, as a
+/// `usize` for capacity math. `SHERPA_SAMPLE_RATE_HZ` in `host.rs` is an
+/// `i32` that sherpa-onnx wants for its `accept_waveform` API; this
+/// mirror lives here in usize form so the capacity divisor below stays
+/// pure integer math without casts.
+const RECOGNIZER_SAMPLE_RATE_HZ_USIZE: usize = 16_000;
+
+/// Mono-16k capacity heuristic for converting a stereo-48k buffer. The
+/// target size is `len / CHANNELS / (48_000 / 16_000)` = `len / 6`, used
+/// as the `Vec::with_capacity` hint when resampling Auto Break segments.
+/// All integer math in usize to keep clippy's
+/// `cast_possible_truncation` quiet on 32-bit targets.
+const STEREO_48K_TO_MONO_16K_CAPACITY_DIVISOR: usize =
+    TRANSCRIPTION_INPUT_CHANNELS * (48_000 / RECOGNIZER_SAMPLE_RATE_HZ_USIZE);
+
 /// Build the `OfflineRecognizerConfig` for a Moonshine v1 model.
 ///
 /// k2-fsa's int8 Moonshine releases use the v1 layout with five files:
@@ -329,11 +355,13 @@ impl AutoBreakMachine {
         }
     }
 
-    /// Current buffer duration in ms, assuming 48 kHz stereo interleaved.
+    /// Current buffer duration in ms, assuming the wire format is
+    /// `TRANSCRIPTION_INPUT_CHANNELS`-interleaved f32 at
+    /// `TRANSCRIPTION_INPUT_SAMPLE_RATE_HZ`.
     #[allow(clippy::cast_possible_truncation)]
     fn buffer_duration_ms(&self) -> u32 {
-        let frames = self.buffer.len() / 2;
-        ((frames as u64 * 1000) / 48_000) as u32
+        let frames = self.buffer.len() / TRANSCRIPTION_INPUT_CHANNELS;
+        ((frames as u64 * 1000) / TRANSCRIPTION_INPUT_SAMPLE_RATE_HZ) as u32
     }
 
     fn on_samples(&mut self, samples: &[f32]) {
@@ -442,6 +470,7 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
     loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("sherpa Auto Break session cancelled");
+            drain_auto_break_on_exit(recognizer, &mut machine, noise_gate_ratio, &event_tx);
             return;
         }
 
@@ -513,6 +542,7 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::info!("sherpa Auto Break session ended (channel disconnected)");
+                drain_auto_break_on_exit(recognizer, &mut machine, noise_gate_ratio, &event_tx);
                 return;
             }
         }
@@ -530,10 +560,54 @@ fn flush_auto_break_segment(
     if stereo_buf.is_empty() {
         return;
     }
-    let mut mono_buf: Vec<f32> = Vec::with_capacity(stereo_buf.len() / 6);
+    let mut mono_buf: Vec<f32> =
+        Vec::with_capacity(stereo_buf.len() / STEREO_48K_TO_MONO_16K_CAPACITY_DIVISOR);
     resampler::downsample_stereo_to_mono_16k(stereo_buf, &mut mono_buf);
     denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
     decode_segment(recognizer, &mono_buf, event_tx);
+}
+
+/// Finalize an Auto Break session on cancellation or channel disconnect.
+///
+/// Mirrors the `drain_vad_on_exit` semantics from the VAD path: if the
+/// user stops transcription mid-transmission (including the hard stop
+/// triggered by a demod mode change), whatever is in the buffer is
+/// either decoded as a legitimate final utterance or discarded as a
+/// sub-threshold fragment, applying the same length-gate rules the tail
+/// timeout path uses. Without this, the final utterance was silently
+/// thrown away whenever the session ended during `Recording` or
+/// `HoldingOff`.
+fn drain_auto_break_on_exit(
+    recognizer: &OfflineRecognizer,
+    machine: &mut AutoBreakMachine,
+    noise_gate_ratio: f32,
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+) {
+    if matches!(machine.state(), AutoBreakState::Idle) {
+        // Nothing captured — nothing to drain.
+        return;
+    }
+
+    let duration = machine.buffer_duration_ms();
+    if duration < AUTO_BREAK_MIN_OPEN_MS {
+        tracing::debug!(
+            ms = duration,
+            "Auto Break: discarded phantom open on session exit"
+        );
+    } else if duration < AUTO_BREAK_MIN_SEGMENT_MS {
+        tracing::debug!(
+            ms = duration,
+            "Auto Break: discarded sub-min segment on session exit"
+        );
+    } else {
+        tracing::info!(
+            ms = duration,
+            "Auto Break: flushing in-flight segment on session exit"
+        );
+        let stereo_buf = machine.take_buffer();
+        flush_auto_break_segment(recognizer, &stereo_buf, noise_gate_ratio, event_tx);
+    }
+    machine.reset_after_force_flush();
 }
 
 /// Flush the VAD on session exit and drain every remaining segment —
