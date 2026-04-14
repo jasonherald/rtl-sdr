@@ -70,10 +70,16 @@ const DEFAULT_VOICE_THRESHOLD: f32 = 0.5;
 const DEFAULT_MIN_SILENCE_FRAMES: usize = (250 * SAMPLE_RATE_HZ) / (FRAME_SIZE * 1000);
 
 /// Minimum voiced frames a segment must contain to be emitted. Shorter
-/// segments are treated as noise spikes and dropped. 15 frames × 16 ms
-/// = 240 ms — again matching sherpa-onnx's Silero default for
-/// `min_speech_duration`.
-const DEFAULT_MIN_SPEECH_FRAMES: usize = (250 * SAMPLE_RATE_HZ) / (FRAME_SIZE * 1000);
+/// segments are treated as noise spikes and dropped.
+///
+/// Tuned empirically against live scanner traffic: the original value
+/// of 250 ms (matching sherpa-onnx's Silero `min_speech_duration`
+/// default) dropped brisk short transmissions like "10-4" whose
+/// voiced portion is ~150–200 ms when spoken quickly. 100 ms is
+/// Silero's absolute speech-duration floor (anything below isn't a
+/// detectable word) and catches two-syllable radio brevity codes
+/// without admitting single-frame noise spikes.
+const DEFAULT_MIN_SPEECH_FRAMES: usize = (100 * SAMPLE_RATE_HZ) / (FRAME_SIZE * 1000);
 
 /// Maximum segment length before a forced flush. 20 seconds at 16 kHz
 /// = 1250 frames. Prevents a pathologically long transmission from
@@ -398,21 +404,27 @@ mod tests {
     fn finalize_segment_respects_min_speech_gate() {
         // Directly test the state machine gate without going through
         // earshot's scoring — append frames to current_segment and
-        // call finalize.
+        // call finalize. Frame counts are expressed relative to the
+        // default so a future retune of `DEFAULT_MIN_SPEECH_FRAMES`
+        // doesn't accidentally land this test in "happens to cross"
+        // territory.
+        let below_gate = DEFAULT_MIN_SPEECH_FRAMES - 1;
+        let above_gate = DEFAULT_MIN_SPEECH_FRAMES + 1;
+
         let mut vad = EarshotVad::new();
         vad.state = State::Speaking;
-        vad.speech_frames_in_segment = 5; // below DEFAULT_MIN_SPEECH_FRAMES
+        vad.speech_frames_in_segment = below_gate;
         vad.current_segment
-            .extend_from_slice(&vec![0.1_f32; 5 * FRAME_SIZE]);
+            .extend_from_slice(&vec![0.1_f32; below_gate * FRAME_SIZE]);
         vad.finalize_segment();
         assert!(vad.completed.is_empty(), "short segment should be dropped");
         assert_eq!(vad.state, State::Idle);
 
         // And a segment above the gate should survive.
         vad.state = State::Speaking;
-        vad.speech_frames_in_segment = DEFAULT_MIN_SPEECH_FRAMES + 1;
+        vad.speech_frames_in_segment = above_gate;
         vad.current_segment
-            .extend_from_slice(&vec![0.1_f32; 16 * FRAME_SIZE]);
+            .extend_from_slice(&vec![0.1_f32; above_gate * FRAME_SIZE]);
         vad.finalize_segment();
         assert_eq!(vad.completed.len(), 1, "segment above gate should emit");
     }
