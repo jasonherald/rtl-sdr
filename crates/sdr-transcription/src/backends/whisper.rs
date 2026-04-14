@@ -245,9 +245,10 @@ fn run_worker_inner(
 
             let mut chunk: Vec<f32> = mono_buf.drain(..CHUNK_SAMPLES).collect();
 
-            // Spectral noise gate — remove broadband static and hiss
-            // before Whisper sees the audio.
-            denoise::spectral_denoise(&mut chunk, noise_gate_ratio);
+            // Voice-band shaped spectral gate (#274) — remove broadband
+            // static, rumble, PL tones, and above-voice hiss before
+            // Whisper sees the audio.
+            denoise::enhance_speech(&mut chunk, noise_gate_ratio);
 
             let rms = compute_rms(&chunk);
             if rms < silence_threshold {
