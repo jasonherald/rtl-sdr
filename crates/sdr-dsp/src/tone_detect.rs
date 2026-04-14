@@ -564,18 +564,40 @@ impl CtcssDetector {
         }
         self.pending_samples.extend_from_slice(samples);
 
+        // How many complete windows can we process right now? The
+        // answer is the largest multiple of CTCSS_WINDOW_SAMPLES
+        // that fits into the pending buffer.
+        let ready_len = (self.pending_samples.len() / CTCSS_WINDOW_SAMPLES) * CTCSS_WINDOW_SAMPLES;
+        if ready_len == 0 {
+            return None;
+        }
+
+        // Split the pending buffer into "ready" and "leftover" in
+        // one shot, then iterate via `chunks_exact` without
+        // per-window allocation or tail memmoves.
+        //
+        // `split_off(ready_len)` returns the tail (leftover
+        // samples < CTCSS_WINDOW_SAMPLES, so this tail Vec is
+        // always tiny) and leaves the ready prefix in place inside
+        // `self.pending_samples`. `mem::replace` then swaps the
+        // tail into `self.pending_samples` and hands us back the
+        // original Vec — now holding only the window-aligned ready
+        // prefix — to iterate over.
+        //
+        // Net cost per call: one `split_off` allocation (for the
+        // small leftover Vec) and one memmove of ≤ WINDOW-1
+        // samples, regardless of how many windows complete during
+        // this call. The previous `drain(..WINDOW).collect()` loop
+        // did an allocation + a front-compaction memmove per
+        // window, which added up to unnecessary allocator / memcpy
+        // churn on a real-time DSP path — no unnecessary
+        // allocations is a crate-level invariant for `sdr-dsp`.
+        let tail = self.pending_samples.split_off(ready_len);
+        let ready = core::mem::replace(&mut self.pending_samples, tail);
+
         let mut last_decision = None;
-        while self.pending_samples.len() >= CTCSS_WINDOW_SAMPLES {
-            // Drain one full window into a local Vec. We collect
-            // into a temporary so `process_window` can take an
-            // immutable `&[f32]` without fighting the borrow
-            // checker over aliasing between `pending_samples` and
-            // `&self`. The allocation is ~76 KB per 400 ms of
-            // audio — trivial for the modern allocator at this
-            // rate, and can be revisited if it shows up in a
-            // profile.
-            let window: Vec<f32> = self.pending_samples.drain(..CTCSS_WINDOW_SAMPLES).collect();
-            last_decision = Some(self.process_window(&window));
+        for window in ready.chunks_exact(CTCSS_WINDOW_SAMPLES) {
+            last_decision = Some(self.process_window(window));
         }
         last_decision
     }
