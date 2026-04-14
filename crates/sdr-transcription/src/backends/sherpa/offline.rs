@@ -432,7 +432,7 @@ fn session_io_loop_vad(params: SessionIoVadParams) {
             continue;
         }
 
-        denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
+        denoise::enhance_speech(&mut mono_buf, noise_gate_ratio);
 
         vad.accept(&mono_buf);
 
@@ -865,7 +865,7 @@ fn dispatch_auto_break_segment(
     let mut mono_buf: Vec<f32> =
         Vec::with_capacity(stereo_buf.len() / STEREO_48K_TO_MONO_16K_CAPACITY_DIVISOR);
     resampler::downsample_stereo_to_mono_16k(stereo_buf, &mut mono_buf);
-    denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
+    denoise::enhance_speech(&mut mono_buf, noise_gate_ratio);
     decode_tx
         .send(DecodeRequest { mono: mono_buf })
         .map_err(|_| ())

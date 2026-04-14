@@ -130,7 +130,7 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
             continue;
         }
 
-        denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
+        denoise::enhance_speech(&mut mono_buf, noise_gate_ratio);
 
         stream.accept_waveform(SHERPA_SAMPLE_RATE_HZ, &mono_buf);
 
