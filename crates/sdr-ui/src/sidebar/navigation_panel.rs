@@ -94,6 +94,7 @@ const BAND_PRESETS: &[BandPreset] = &[
 #[allow(clippy::struct_excessive_bools)]
 pub struct TuningProfile {
     pub squelch_enabled: bool,
+    pub auto_squelch_enabled: bool,
     pub squelch_level: f32,
     pub gain: f64,
     pub agc: bool,
@@ -120,6 +121,8 @@ pub struct Bookmark {
     // --- Full tuning profile (all optional for backward compat) ---
     #[serde(default)]
     pub squelch_enabled: Option<bool>,
+    #[serde(default)]
+    pub auto_squelch_enabled: Option<bool>,
     #[serde(default)]
     pub squelch_level: Option<f32>,
     #[serde(default)]
@@ -158,6 +161,7 @@ impl Bookmark {
             demod_mode: demod_mode_to_string(demod_mode),
             bandwidth,
             squelch_enabled: None,
+            auto_squelch_enabled: None,
             squelch_level: None,
             gain: None,
             agc: None,
@@ -187,6 +191,7 @@ impl Bookmark {
             demod_mode: demod_mode_to_string(demod_mode),
             bandwidth,
             squelch_enabled: Some(profile.squelch_enabled),
+            auto_squelch_enabled: Some(profile.auto_squelch_enabled),
             squelch_level: Some(profile.squelch_level),
             gain: Some(profile.gain),
             agc: Some(profile.agc),
@@ -701,6 +706,7 @@ mod tests {
     fn bookmark_full_roundtrip() {
         let profile = TuningProfile {
             squelch_enabled: true,
+            auto_squelch_enabled: true,
             squelch_level: -40.0,
             gain: 33.8,
             agc: false,
@@ -716,6 +722,7 @@ mod tests {
         let json = serde_json::to_string(&bm).unwrap();
         let back: Bookmark = serde_json::from_str(&json).unwrap();
         assert_eq!(back.squelch_enabled, Some(true));
+        assert_eq!(back.auto_squelch_enabled, Some(true));
         assert_eq!(back.squelch_level, Some(-40.0));
         assert_eq!(back.gain, Some(33.8));
         assert_eq!(back.agc, Some(false));
@@ -737,6 +744,7 @@ mod tests {
         assert_eq!(bm.name, "Old");
         assert_eq!(bm.frequency, 162_550_000);
         assert!(bm.squelch_enabled.is_none());
+        assert!(bm.auto_squelch_enabled.is_none());
         assert!(bm.gain.is_none());
         assert!(bm.volume.is_none());
     }
