@@ -90,8 +90,10 @@
 //! CTCSS band. To reject these transients we require [`CTCSS_MIN_HITS`]
 //! consecutive detection windows above threshold before the gate
 //! opens, and [`CTCSS_MIN_HITS`] consecutive below-threshold windows
-//! before it closes (hysteresis). At 200 ms per window that's ~600 ms
-//! of confirmation latency — matching real-scanner behavior.
+//! before it closes (hysteresis). At 400 ms per window (see
+//! [`CTCSS_WINDOW_MS`]) and [`CTCSS_MIN_HITS`] = 3, that's ~1.2 s of
+//! confirmation latency — slightly slower than consumer-grade
+//! scanners but much more specific for adjacent-tone rejection.
 //!
 //! # What this PR is NOT
 //!
@@ -175,8 +177,9 @@ const CTCSS_TONE_MATCH_EPSILON_HZ: f32 = 0.01;
 /// Number of consecutive above-threshold windows required before the
 /// sustained-detection gate opens, and number of consecutive
 /// below-threshold windows required before it closes. Three windows
-/// at 200 ms each give a 600 ms confirmation time, which matches
-/// standard scanner behavior.
+/// at [`CTCSS_WINDOW_MS`] = 400 ms each give a 1.2 s confirmation
+/// time — slightly slower than consumer-grade scanners but much
+/// more specific for adjacent-tone rejection in return.
 pub const CTCSS_MIN_HITS: usize = 3;
 
 /// Default detection threshold: target-tone magnitude must exceed
@@ -234,7 +237,9 @@ pub struct CtcssDecision {
     /// detector's threshold to recover the raw per-window decision.
     pub normalized_magnitude: f32,
     /// This window's threshold comparison: the target tone is
-    /// present in THIS single 200 ms window. May flap on transients.
+    /// present in THIS single [`CTCSS_WINDOW_MS`]-long window
+    /// (400 ms by default). May flap on transients; consume
+    /// [`CtcssDecision::sustained`] for the debounced value.
     pub detected: bool,
     /// The sustained-detection gate: the target tone has been
     /// present for at least [`CTCSS_MIN_HITS`] consecutive windows
