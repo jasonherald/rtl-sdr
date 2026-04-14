@@ -217,14 +217,19 @@ pub fn enhance_speech(samples: &mut [f32], gate_ratio: f32) {
         })
         .collect();
 
-    // Voice-prior noise floor: percentile over voice-band bins only.
-    // Out-of-band bins (weight == 0) contribute nothing — a strong PL
-    // tone at 100 Hz or a birdie at 9 kHz can't lift the floor that
-    // gates the formant band.
+    // Voice-prior noise floor: percentile over voice-band bins only,
+    // in *weighted* units (`m * w`). The gate decision below compares
+    // `effective = mag * weight` against `threshold = floor * gate_ratio`,
+    // so the floor MUST be computed in the same units — otherwise a
+    // loud 100-250 Hz PL/hum tone (weight 0.5) contributes its full
+    // raw magnitude to the percentile but is only half-weighted at
+    // gate time, creating a mismatch that can suppress weaker formants
+    // unnecessarily. Out-of-band bins (weight == 0) still contribute
+    // nothing because their weighted magnitude is zero.
     let mut voice_band_mags: Vec<f32> = magnitudes
         .iter()
         .zip(weights.iter())
-        .filter_map(|(&m, &w)| (w > 0.0).then_some(m))
+        .filter_map(|(&m, &w)| (w > 0.0).then_some(m * w))
         .collect();
     let noise_floor = if voice_band_mags.is_empty() {
         0.0
@@ -363,6 +368,20 @@ mod tests {
     /// frequency vs. a general FFT bin.
     const SETUP_RUMBLE_DOMINANCE_MIN: f32 = 50.0;
 
+    /// Equality tolerance for `voice_band_weight` breakpoint tests.
+    /// The function is piecewise linear with f32 arithmetic so a
+    /// strict `==` comparison would be brittle under compiler
+    /// reordering; 1e-6 is several orders of magnitude below any
+    /// weight the function produces.
+    const WEIGHT_EQ_EPS: f32 = 1e-6;
+
+    /// Sub-Hz offset used to probe the "just below a breakpoint"
+    /// side of each piecewise boundary. The `voice_band_weight`
+    /// function has no internal snap-to-zero behavior so any
+    /// offset smaller than the width of the narrowest region
+    /// works; 0.1 Hz is visually obvious in assertion messages.
+    const BREAKPOINT_OFFSET_HZ: f32 = 0.1;
+
     /// Generate `n` samples of a unit-amplitude sine at `freq_hz` at 16 kHz.
     fn tone(freq_hz: f32, n: usize) -> Vec<f32> {
         (0..n)
@@ -399,32 +418,49 @@ mod tests {
 
     #[test]
     fn voice_band_weight_at_breakpoints() {
+        // All breakpoint tests reference the production `VOICE_F_*`
+        // constants so a future retune can't leave this test
+        // validating a stale policy. Fixed literals (20.0, 200.0,
+        // 1_000.0, 8_000.0) are interior probes that stay valid
+        // regardless of where the boundaries move, as long as the
+        // band structure keeps at least: one sub-cut interior, one
+        // fundamentals interior, one formant interior, one above-
+        // sibilance interior.
+
         // Below sub-cut: hard zero.
-        assert!((voice_band_weight(20.0) - 0.0).abs() < 1e-6);
-        assert!((voice_band_weight(79.9) - 0.0).abs() < 1e-6);
+        assert!((voice_band_weight(20.0) - 0.0).abs() < WEIGHT_EQ_EPS);
+        assert!(
+            (voice_band_weight(VOICE_F_SUB_HZ - BREAKPOINT_OFFSET_HZ) - 0.0).abs() < WEIGHT_EQ_EPS
+        );
 
         // Fundamentals region: constant VOICE_W_FUND.
-        assert!((voice_band_weight(80.0) - VOICE_W_FUND).abs() < 1e-6);
-        assert!((voice_band_weight(200.0) - VOICE_W_FUND).abs() < 1e-6);
-        assert!((voice_band_weight(299.9) - VOICE_W_FUND).abs() < 1e-6);
+        assert!((voice_band_weight(VOICE_F_SUB_HZ) - VOICE_W_FUND).abs() < WEIGHT_EQ_EPS);
+        assert!((voice_band_weight(200.0) - VOICE_W_FUND).abs() < WEIGHT_EQ_EPS);
+        assert!(
+            (voice_band_weight(VOICE_F_FUND_HZ - BREAKPOINT_OFFSET_HZ) - VOICE_W_FUND).abs()
+                < WEIGHT_EQ_EPS
+        );
 
         // Formant band: full weight.
-        assert!((voice_band_weight(300.0) - 1.0).abs() < 1e-6);
-        assert!((voice_band_weight(1_000.0) - 1.0).abs() < 1e-6);
-        assert!((voice_band_weight(3_399.9) - 1.0).abs() < 1e-6);
+        assert!((voice_band_weight(VOICE_F_FUND_HZ) - 1.0).abs() < WEIGHT_EQ_EPS);
+        assert!((voice_band_weight(1_000.0) - 1.0).abs() < WEIGHT_EQ_EPS);
+        assert!(
+            (voice_band_weight(VOICE_F_FORMANT_HI_HZ - BREAKPOINT_OFFSET_HZ) - 1.0).abs()
+                < WEIGHT_EQ_EPS
+        );
 
         // Sibilance ramp: linear 1.0 → VOICE_W_SIB_END.
-        assert!((voice_band_weight(3_400.0) - 1.0).abs() < 1e-5);
+        assert!((voice_band_weight(VOICE_F_FORMANT_HI_HZ) - 1.0).abs() < WEIGHT_EQ_EPS);
         let midpoint = 0.5_f32.mul_add(VOICE_W_SIB_END - 1.0, 1.0);
         let mid_freq = (VOICE_F_FORMANT_HI_HZ + VOICE_F_SIB_HI_HZ) * 0.5;
         assert!(
-            (voice_band_weight(mid_freq) - midpoint).abs() < 1e-5,
+            (voice_band_weight(mid_freq) - midpoint).abs() < WEIGHT_EQ_EPS,
             "mid-ramp should be halfway between 1.0 and VOICE_W_SIB_END"
         );
 
         // Above sibilance cutoff: hard zero.
-        assert!((voice_band_weight(7_500.0) - 0.0).abs() < 1e-6);
-        assert!((voice_band_weight(8_000.0) - 0.0).abs() < 1e-6);
+        assert!((voice_band_weight(VOICE_F_SIB_HI_HZ) - 0.0).abs() < WEIGHT_EQ_EPS);
+        assert!((voice_band_weight(8_000.0) - 0.0).abs() < WEIGHT_EQ_EPS);
     }
 
     #[test]
