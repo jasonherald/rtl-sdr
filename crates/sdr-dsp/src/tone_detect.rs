@@ -1143,6 +1143,16 @@ mod tests {
         // arrived to fill a full CTCSS_WINDOW_SAMPLES block.
         let mut det =
             CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
+        // Pin the hot-path invariant that the detector keeps its
+        // reusable sample buffer across partial/full-window calls.
+        // A future refactor that replaced `pending_samples` with a
+        // fresh Vec (e.g. via `split_off`) would silently reintroduce
+        // allocator churn in the real-time DSP path.
+        let initial_capacity = det.pending_samples.capacity();
+        assert!(
+            initial_capacity >= CTCSS_WINDOW_SAMPLES,
+            "constructor should pre-reserve at least one full window"
+        );
         let block = tone(100.0, window_samples(), 1.0);
 
         // Feed the first half of a window. No decision yet.
@@ -1150,6 +1160,11 @@ mod tests {
         assert!(det.accept_samples(&block[..half]).is_none());
         assert_eq!(det.pending_samples.len(), half);
         assert!(!det.is_sustained());
+        assert_eq!(
+            det.pending_samples.capacity(),
+            initial_capacity,
+            "partial-window feed must not reallocate the pending buffer"
+        );
 
         // Feed the second half. Should complete the window and
         // return Some(decision).
@@ -1166,6 +1181,11 @@ mod tests {
             0,
             "pending buffer should be empty after a complete window"
         );
+        assert_eq!(
+            det.pending_samples.capacity(),
+            initial_capacity,
+            "window-completion must preserve the pending buffer's reserved capacity"
+        );
     }
 
     #[test]
@@ -1177,6 +1197,7 @@ mod tests {
         // caller only invoked `accept_samples` once.
         let mut det =
             CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
+        let initial_capacity = det.pending_samples.capacity();
         let single_window = tone(100.0, window_samples(), 1.0);
         let mut batched: Vec<f32> = Vec::with_capacity(CTCSS_WINDOW_SAMPLES * CTCSS_MIN_HITS);
         for _ in 0..CTCSS_MIN_HITS {
@@ -1191,6 +1212,16 @@ mod tests {
             "sustained gate should open after processing CTCSS_MIN_HITS windows in one call"
         );
         assert!(det.is_sustained());
+        // The batched input is an exact multiple of CTCSS_WINDOW_SAMPLES,
+        // so `pending_samples` ends empty; its reserved capacity must
+        // still be at least the initial reservation so the next call
+        // starts from a warm allocation. `>=` (not `==`) because a
+        // caller feeding an oversized block may have legitimately
+        // grown the buffer — we only require that growth is not lost.
+        assert!(
+            det.pending_samples.capacity() >= initial_capacity,
+            "multi-window batched call must not shrink the pending buffer below its initial reservation"
+        );
     }
 
     #[test]
@@ -1200,11 +1231,20 @@ mod tests {
         // with sample alignment carried over from the previous one.
         let mut det =
             CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
+        let initial_capacity = det.pending_samples.capacity();
         let partial = vec![0.5_f32; CTCSS_WINDOW_SAMPLES / 3];
         det.accept_samples(&partial);
         assert_eq!(det.pending_samples.len(), partial.len());
 
         det.reset();
         assert_eq!(det.pending_samples.len(), 0);
+        // reset() must clear contents but must not drop the reserved
+        // capacity — otherwise the first post-reset `accept_samples`
+        // call would have to re-allocate on the real-time path.
+        assert_eq!(
+            det.pending_samples.capacity(),
+            initial_capacity,
+            "reset() must preserve the pending buffer's reserved capacity"
+        );
     }
 }
