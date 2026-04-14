@@ -345,6 +345,16 @@ struct AutoBreakMachine {
     state: AutoBreakState,
     /// Accumulated stereo interleaved f32 samples at 48 kHz.
     buffer: Vec<f32>,
+    /// Snapshot of `buffer.len()` at the instant the squelch transitioned
+    /// from `Recording` → `HoldingOff`. Used by `on_tail_timeout` to
+    /// evaluate the phantom/short/decode thresholds against the *actual*
+    /// transmission length, NOT the tail-extended buffer — otherwise a
+    /// 200–399 ms transmission would cross the 400 ms `MIN_SEGMENT`
+    /// threshold once the fixed 200 ms tail is included, and a sub-100 ms
+    /// phantom open would cross `MIN_OPEN_MS`. Semantic meaning only
+    /// applies during `HoldingOff`; reset to 0 in every other state
+    /// transition.
+    closed_len_samples: usize,
 }
 
 impl AutoBreakMachine {
@@ -352,15 +362,43 @@ impl AutoBreakMachine {
         Self {
             state: AutoBreakState::Idle,
             buffer: Vec::new(),
+            closed_len_samples: 0,
         }
     }
 
-    /// Current buffer duration in ms, assuming the wire format is
+    /// Raw buffer duration in ms, assuming the wire format is
     /// `TRANSCRIPTION_INPUT_CHANNELS`-interleaved f32 at
     /// `TRANSCRIPTION_INPUT_SAMPLE_RATE_HZ`.
+    ///
+    /// Used by the max-segment safety cap check in the session loop
+    /// (which cares about actual buffered memory, not semantic
+    /// transmission length). For the phantom/short/decode decisions in
+    /// `on_tail_timeout` and the drain-on-exit helper, use
+    /// [`Self::transmission_duration_ms`] instead.
     #[allow(clippy::cast_possible_truncation)]
     fn buffer_duration_ms(&self) -> u32 {
         let frames = self.buffer.len() / TRANSCRIPTION_INPUT_CHANNELS;
+        ((frames as u64 * 1000) / TRANSCRIPTION_INPUT_SAMPLE_RATE_HZ) as u32
+    }
+
+    /// Semantic "how long was the transmission" in ms — the length of
+    /// the audio the recognizer SHOULD see as one utterance, ignoring
+    /// the tail-capture window that's applied after the squelch closes.
+    ///
+    ///   - `Idle`: 0 (no transmission)
+    ///   - `Recording`: full buffer (the close event hasn't fired yet
+    ///     so the snapshot doesn't exist; the current buffer IS the
+    ///     transmission length so far)
+    ///   - `HoldingOff`: pre-close snapshot (`closed_len_samples`) so
+    ///     the 200 ms tail doesn't inflate the count past a threshold
+    #[allow(clippy::cast_possible_truncation)]
+    fn transmission_duration_ms(&self) -> u32 {
+        let samples = match self.state {
+            AutoBreakState::Idle => 0,
+            AutoBreakState::Recording => self.buffer.len(),
+            AutoBreakState::HoldingOff => self.closed_len_samples,
+        };
+        let frames = samples / TRANSCRIPTION_INPUT_CHANNELS;
         ((frames as u64 * 1000) / TRANSCRIPTION_INPUT_SAMPLE_RATE_HZ) as u32
     }
 
@@ -378,10 +416,16 @@ impl AutoBreakMachine {
         match self.state {
             AutoBreakState::Idle => {
                 self.buffer.clear();
+                self.closed_len_samples = 0;
                 self.state = AutoBreakState::Recording;
             }
             AutoBreakState::HoldingOff => {
-                // Hysteresis blip — cancel deferred flush, stay with same buffer.
+                // Hysteresis blip — cancel deferred flush, stay with
+                // the same buffer. Clear the snapshot so the NEXT
+                // close event captures the full "has been continuously
+                // open since this blip" length rather than inheriting
+                // a stale value from the previous close.
+                self.closed_len_samples = 0;
                 self.state = AutoBreakState::Recording;
             }
             AutoBreakState::Recording => {
@@ -392,18 +436,26 @@ impl AutoBreakMachine {
 
     fn on_squelch_closed(&mut self) {
         if matches!(self.state, AutoBreakState::Recording) {
+            // Snapshot buffer length at the moment the squelch closed.
+            // `on_tail_timeout` uses this to evaluate discard
+            // thresholds against the actual transmission length, not
+            // the tail-extended buffer length.
+            self.closed_len_samples = self.buffer.len();
             self.state = AutoBreakState::HoldingOff;
         }
     }
 
     /// Called when the tail timer expires while in `HoldingOff`. Returns
-    /// the flush decision based on the buffer duration, and resets to
-    /// `Idle`. Returns `None` if called outside `HoldingOff` (no-op).
+    /// the flush decision based on the *pre-close* transmission length,
+    /// and resets to `Idle`. Returns `None` if called outside
+    /// `HoldingOff` (no-op).
     fn on_tail_timeout(&mut self) -> Option<FlushDecision> {
         if !matches!(self.state, AutoBreakState::HoldingOff) {
             return None;
         }
-        let duration = self.buffer_duration_ms();
+        // Evaluate against the snapshot, not the current (tail-extended)
+        // buffer. See the `closed_len_samples` docstring for why.
+        let duration = self.transmission_duration_ms();
         let decision = if duration < AUTO_BREAK_MIN_OPEN_MS {
             FlushDecision::DiscardPhantom
         } else if duration < AUTO_BREAK_MIN_SEGMENT_MS {
@@ -412,10 +464,14 @@ impl AutoBreakMachine {
             FlushDecision::Decode
         };
         // Note: the caller is responsible for taking the buffer for
-        // decoding AFTER this call, if the decision is Decode.
-        // We reset to Idle here but leave the buffer alone so the
-        // caller can still `take_buffer` for Decode cases.
+        // decoding AFTER this call, if the decision is Decode. The
+        // caller gets the FULL (tail-extended) buffer even though the
+        // decision was made against the pre-close snapshot — that's
+        // deliberate: the 200 ms tail is captured audio we want the
+        // recognizer to see, we just don't want it counted toward the
+        // length gate.
         self.state = AutoBreakState::Idle;
+        self.closed_len_samples = 0;
         if !matches!(decision, FlushDecision::Decode) {
             self.buffer.clear();
         }
@@ -435,11 +491,27 @@ impl AutoBreakMachine {
         self.state
     }
 
-    /// Force-reset to Idle and clear the buffer. Used by the
-    /// max-segment safety flush path: the session loop takes the
-    /// buffer via `take_buffer` and then calls `reset_after_force_flush`.
-    fn reset_after_force_flush(&mut self) {
-        self.state = AutoBreakState::Idle;
+    /// Clear the buffer and transition to `next_state` after a forced
+    /// flush. Used by the max-segment safety cap path: the session loop
+    /// takes the buffer via `take_buffer`, calls this to resume in the
+    /// appropriate state, and then hands the taken buffer to the
+    /// recognizer.
+    ///
+    /// **The caller chooses the next state deliberately**:
+    ///
+    ///   - Pass `AutoBreakState::Recording` from the max-segment safety
+    ///     cap in the session loop's `Samples` handler — the squelch is
+    ///     still open, the transmission is continuing, and we want the
+    ///     30 s cap to SPLIT the transmission rather than truncate it.
+    ///     Passing `Idle` here would strand the remainder of the
+    ///     transmission until the next close→open edge, silently
+    ///     dropping everything after the 30 s mark.
+    ///   - Pass `AutoBreakState::Idle` from shutdown/drain paths where
+    ///     the session is ending.
+    fn reset_after_force_flush(&mut self, next_state: AutoBreakState) {
+        self.buffer.clear();
+        self.closed_len_samples = 0;
+        self.state = next_state;
     }
 }
 
@@ -489,6 +561,14 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
                 machine.on_samples(&samples);
                 // Max-segment safety check: if buffer has grown past the
                 // cap, force-flush regardless of squelch state.
+                //
+                // Resume in `Recording`, NOT `Idle`. The controller only
+                // emits `SquelchOpened` on state transitions, so if the
+                // carrier stays up past the 30 s cap and we transitioned
+                // to Idle, the remainder of that same transmission would
+                // be silently dropped until the next close→open edge.
+                // Staying in Recording splits a long transmission into
+                // 30 s chunks rather than truncating it.
                 if !matches!(machine.state(), AutoBreakState::Idle)
                     && machine.buffer_duration_ms() >= AUTO_BREAK_MAX_SEGMENT_MS
                 {
@@ -498,7 +578,7 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
                         "Auto Break buffer exceeded max segment cap — forcing flush (check squelch configuration)"
                     );
                     let stereo_buf = machine.take_buffer();
-                    machine.reset_after_force_flush();
+                    machine.reset_after_force_flush(AutoBreakState::Recording);
                     flush_auto_break_segment(recognizer, &stereo_buf, noise_gate_ratio, &event_tx);
                     pending_flush_deadline = None;
                 }
@@ -588,7 +668,11 @@ fn drain_auto_break_on_exit(
         return;
     }
 
-    let duration = machine.buffer_duration_ms();
+    // Use `transmission_duration_ms` here so the pre-close snapshot
+    // governs the discard decision when we're caught in HoldingOff —
+    // same reasoning as `on_tail_timeout`. In Recording state the
+    // snapshot is unused and this falls back to the full buffer length.
+    let duration = machine.transmission_duration_ms();
     if duration < AUTO_BREAK_MIN_OPEN_MS {
         tracing::debug!(
             ms = duration,
@@ -607,7 +691,9 @@ fn drain_auto_break_on_exit(
         let stereo_buf = machine.take_buffer();
         flush_auto_break_segment(recognizer, &stereo_buf, noise_gate_ratio, event_tx);
     }
-    machine.reset_after_force_flush();
+    // Session is ending — go back to Idle, not Recording, so a fresh
+    // session starts from a clean state.
+    machine.reset_after_force_flush(AutoBreakState::Idle);
 }
 
 /// Flush the VAD on session exit and drain every remaining segment —
@@ -753,5 +839,105 @@ mod auto_break_tests {
             !buf.is_empty(),
             "take_buffer should return the captured samples"
         );
+    }
+
+    #[test]
+    fn tail_extension_does_not_inflate_discard_decision() {
+        // Regression: a 300 ms transmission + 200 ms of tail-capture
+        // samples (simulating the ~AUTO_BREAK_TAIL_MS of audio the
+        // session loop buffers between SquelchClosed and the tail
+        // timer expiration) pushes the raw buffer duration to 500 ms,
+        // which would cross the 400 ms MIN_SEGMENT threshold. The
+        // decision MUST still be DiscardShort because the actual
+        // transmission was only 300 ms.
+        let mut machine = AutoBreakMachine::new();
+        let mut counts = AutoBreakFlushCounts::default();
+
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(300)); // 300 ms of open transmission
+        machine.on_squelch_closed(); // Snapshot should fire here
+        machine.on_samples(&samples_for_ms(200)); // 200 ms tail during HoldingOff
+
+        // Raw buffer is now 500 ms, BUT transmission_duration_ms
+        // should be the pre-close snapshot of 300 ms.
+        assert_eq!(
+            machine.buffer_duration_ms(),
+            500,
+            "raw buffer includes the tail-capture audio"
+        );
+        assert_eq!(
+            machine.transmission_duration_ms(),
+            300,
+            "transmission duration reflects only the pre-close samples"
+        );
+
+        if let Some(decision) = machine.on_tail_timeout() {
+            counts.record(decision);
+        }
+
+        assert_eq!(
+            counts.decodes_flushed, 0,
+            "sub-min transmission must NOT be decoded even though tail-extended buffer crossed the threshold"
+        );
+        assert_eq!(counts.discarded_short, 1);
+    }
+
+    #[test]
+    fn phantom_open_with_tail_does_not_cross_min_open_threshold() {
+        // Matching regression for the phantom-open lower bound. A 50 ms
+        // open + 200 ms tail = 250 ms raw buffer, which would cross
+        // MIN_OPEN_MS (100). The decision MUST still be DiscardPhantom.
+        let mut machine = AutoBreakMachine::new();
+        let mut counts = AutoBreakFlushCounts::default();
+
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(50)); // 50 ms open (phantom)
+        machine.on_squelch_closed();
+        machine.on_samples(&samples_for_ms(200)); // 200 ms tail
+
+        assert_eq!(machine.transmission_duration_ms(), 50);
+        assert!(machine.buffer_duration_ms() >= AUTO_BREAK_MIN_OPEN_MS);
+
+        if let Some(decision) = machine.on_tail_timeout() {
+            counts.record(decision);
+        }
+
+        assert_eq!(counts.decodes_flushed, 0);
+        assert_eq!(
+            counts.discarded_phantom, 1,
+            "phantom open must still be discarded even with tail-inflated buffer"
+        );
+    }
+
+    #[test]
+    fn max_segment_safety_flush_resumes_recording_not_idle() {
+        // Regression: after the 30 s safety cap fires on a carrier that
+        // stays open, the state machine MUST resume in Recording (so
+        // subsequent samples continue to buffer and the next cap splits
+        // the transmission) rather than Idle (which would silently drop
+        // all samples until the next close→open edge that never comes).
+        let mut machine = AutoBreakMachine::new();
+        machine.on_squelch_opened();
+        machine.on_samples(&samples_for_ms(31_000)); // trigger safety cap
+
+        // Simulate the session loop's force-flush path.
+        let _ = machine.take_buffer();
+        machine.reset_after_force_flush(AutoBreakState::Recording);
+
+        assert_eq!(
+            machine.state(),
+            AutoBreakState::Recording,
+            "safety cap must resume in Recording to split a long transmission"
+        );
+        assert_eq!(
+            machine.buffer_duration_ms(),
+            0,
+            "buffer must be empty after reset"
+        );
+
+        // And subsequent samples should still be captured (proving the
+        // resume state is effective, not just nominal).
+        machine.on_samples(&samples_for_ms(1_000));
+        assert_eq!(machine.buffer_duration_ms(), 1_000);
     }
 }

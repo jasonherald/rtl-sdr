@@ -308,24 +308,28 @@ Auto Break needs squelch enabled to detect transmission boundaries.
 Enable squelch in the radio panel, or turn off Auto Break to use VAD.
 ```
 
-The user clears the error by either enabling squelch or turning off Auto Break, then re-clicks Start. The precondition check reads a new public accessor `IfChain::is_squelch_configured() -> bool` which returns `true` when either auto-squelch is enabled OR a manual threshold is set, and `false` only when squelch is fully disabled. `sdr-radio` currently exposes `squelch_open() -> bool` (runtime gate state) but not the configuration state, so this is a small API addition: two lines in `PowerSquelch` to track the "enabled" flag and one forwarding method on `IfChain`.
+The user clears the error by either enabling squelch or turning off Auto Break, then re-clicks Start. The precondition check lives entirely in the UI layer (the transcription enable handler in `crates/sdr-ui/src/window.rs`): it reads the existing radio-panel state via `panels.radio.squelch_enabled_row.is_active()`, which is the same switch that dispatches `UiToDsp::SetSquelchEnabled(bool)` on user toggle. No new accessor is needed on `IfChain` — `squelch_enabled()` already exists there and reflects the same flag, and `auto_squelch_enabled()` is orthogonal (auto-squelch is a tracking mode for the threshold, not a separate enable gate). The "squelch fully off" condition is exactly `!squelch_enabled`.
 
 ### Backend selection guard
 
-`backends/sherpa/offline.rs::run_session` validates at entry:
+`SegmentationMode::AutoBreak` + streaming Zipformer is rejected in the streaming session entry point (`backends/sherpa/streaming.rs::run_session`), not in the offline dispatcher. The offline `run_session` in `backends/sherpa/offline.rs` is a unit-return match that dispatches on `segmentation_mode` to either `run_session_vad` or `run_session_auto_break` — model-kind validation happens one layer up, where the sherpa host worker selects the session runner based on the recognizer state:
 
 ```rust
-if config.segmentation_mode == SegmentationMode::AutoBreak
-    && !matches!(model.kind(), ModelKind::OfflineMoonshine | ModelKind::OfflineNemoTransducer)
-{
-    return Err(BackendError::Init(
-        "Auto Break is only supported for offline sherpa models \
-         (Moonshine, Parakeet). Streaming Zipformer must use Vad.".to_owned()
-    ));
+// In crates/sdr-transcription/src/backends/sherpa/streaming.rs:
+pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) {
+    let SessionParams { segmentation_mode, event_tx, .. } = params;
+    if segmentation_mode == crate::backend::SegmentationMode::AutoBreak {
+        let msg = "streaming Zipformer does not support Auto Break segmentation \
+                   — it has its own endpoint detection. Use SegmentationMode::Vad.";
+        tracing::error!(%msg);
+        let _ = event_tx.send(TranscriptionEvent::Error(msg.to_owned()));
+        return;
+    }
+    // ... normal streaming session ...
 }
 ```
 
-Streaming Zipformer's session loop asserts the same precondition but in `run_session_online` — rejects `SegmentationMode::AutoBreak` with a clear error. Should never fire because UI prevents the combination, but defensive guard protects against config file corruption or API misuse.
+Should never fire because the UI layer prevents the combination via the `auto_break_enabled = switch && is_nfm && model_is_offline` eligibility gate computed at session start in `window.rs`, but the defensive guard protects against config file corruption or API misuse.
 
 ## Error handling
 
