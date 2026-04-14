@@ -175,6 +175,7 @@ mod linux_impl {
             .default_width(420)
             .default_height(180)
             .resizable(false)
+            .icon_name("com.sdr.rs")
             .content(&vbox)
             .build();
 
