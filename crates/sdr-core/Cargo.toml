@@ -45,6 +45,7 @@ bytemuck.workspace = true
 # `["coreaudio"]`, and on every other target the feature list is empty
 # and the crate's `lib.rs` cfg dispatch resolves to the stub backend.
 sdr-sink-audio.workspace = true
+sdr-transcription.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-sink-audio = { workspace = true, features = ["pipewire"] }

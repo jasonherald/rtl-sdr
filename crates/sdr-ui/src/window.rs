@@ -134,7 +134,13 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     setup_app_actions(app, &window, config, &rr_button);
 
     // Wire transcript panel (separate from sidebar panels).
-    let transcription_engine = connect_transcript_panel(&transcript_panel, &state, config);
+    let transcription_engine = connect_transcript_panel(
+        &transcript_panel,
+        &state,
+        config,
+        &panels.radio.squelch_enabled_row,
+        &toast_overlay,
+    );
 
     // On window close, signal the worker to stop without blocking.
     window.connect_close_request(move |_| {
@@ -312,6 +318,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
+    #[cfg(feature = "sherpa")]
+    let model_row_for_dsp = transcript_panel.model_row.clone();
     let engine_for_dsp = Rc::clone(&engine);
     // We deliberately discard the SourceId returned by `timeout_add_local`:
     // the window-lifecycle gate at the top of the closure returns
@@ -354,6 +364,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
                         &transcription_enable_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &model_row_for_dsp,
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -370,7 +384,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 }
 
 /// Handle a single message from the DSP thread.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_dsp_message(
     msg: DspToUi,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
@@ -382,6 +396,8 @@ fn handle_dsp_message(
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
     transcription_enable_row: &adw::SwitchRow,
+    #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
+    #[cfg(feature = "sherpa")] model_row: &adw::ComboRow,
 ) {
     match msg {
         DspToUi::FftData(_) => {
@@ -470,6 +486,45 @@ fn handle_dsp_message(
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let toast = adw::Toast::new("IQ recording saved");
                 overlay.add_toast(toast);
+            }
+        }
+        DspToUi::DemodModeChanged(new_mode) => {
+            tracing::info!(?new_mode, "demod mode changed");
+
+            // Re-run Auto Break row visibility rules with the new mode.
+            // The row is only visible when the current mode is NFM AND an
+            // offline sherpa model is selected. Task 13 installed the
+            // "offline model" check as a signal-chain reaction to model_row
+            // changes; this layer adds the NFM gate on top, fired by the
+            // demod-mode-change event.
+            #[cfg(feature = "sherpa")]
+            {
+                let is_nfm = new_mode == sdr_types::DemodMode::Nfm;
+                let model_idx = model_row.selected() as usize;
+                let selected_is_offline = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .is_some_and(|m| !m.supports_partials());
+                auto_break_row.set_visible(is_nfm && selected_is_offline);
+            }
+
+            // If a transcription session is currently active, stop it and
+            // surface a toast. The band has conceptually changed, so the
+            // session must restart from scratch — session config (model,
+            // VAD threshold, Auto Break toggle) is preserved; the user
+            // clicks Start to resume on the new band.
+            if transcription_enable_row.is_active() {
+                tracing::info!("stopping active transcription due to demod mode change");
+                // Toggling enable_row off triggers the existing stop path
+                // (connect_active_notify handler wired elsewhere in window.rs).
+                transcription_enable_row.set_active(false);
+
+                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                    let toast = adw::Toast::new(
+                        "Transcription stopped — demod mode changed. Press Start to resume.",
+                    );
+                    overlay.add_toast(toast);
+                }
             }
         }
     }
@@ -1502,6 +1557,7 @@ fn unlock_transcription_session_rows(
     noise_gate_row: &glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] auto_break_row: &glib::WeakRef<adw::SwitchRow>,
 ) {
     if let Some(row) = model_row.upgrade() {
         row.set_sensitive(true);
@@ -1521,6 +1577,10 @@ fn unlock_transcription_session_rows(
     if let Some(row) = vad_threshold_row.upgrade() {
         row.set_sensitive(true);
     }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_row.upgrade() {
+        row.set_sensitive(true);
+    }
 }
 
 /// Connect transcript panel controls to DSP commands.
@@ -1533,6 +1593,9 @@ fn connect_transcript_panel(
     #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] config: &std::sync::Arc<
         sdr_config::ConfigManager,
     >,
+    #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))]
+    squelch_enabled_row: &adw::SwitchRow,
+    #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] toast_overlay: &adw::ToastOverlay,
 ) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
     use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
 
@@ -1562,11 +1625,19 @@ fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let vad_threshold_row = transcript.vad_threshold_row.clone();
     #[cfg(feature = "sherpa")]
+    let auto_break_row = transcript.auto_break_row.clone();
+    #[cfg(feature = "sherpa")]
+    let squelch_enabled_row_for_session = squelch_enabled_row.clone();
+    #[cfg(feature = "sherpa")]
+    let toast_overlay_for_session = toast_overlay.downgrade();
+    #[cfg(feature = "sherpa")]
     let live_line_label = transcript.live_line_label.clone();
     #[cfg(feature = "sherpa")]
     let display_mode_row_weak = display_mode_row.downgrade();
     #[cfg(feature = "sherpa")]
     let vad_threshold_row_weak = vad_threshold_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_row_weak = auto_break_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -1718,7 +1789,58 @@ fn connect_transcript_panel(
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
-            // Read selected model from dropdown.
+            // Read the selected model index once at the top of the
+            // session-start branch; the Auto Break eligibility check
+            // below needs it, and the BackendConfig construction
+            // below reuses it.
+            let model_idx = model_row.selected() as usize;
+
+            // Auto Break is eligible ONLY when all three conditions
+            // hold: (1) the toggle itself is on, (2) the current demod
+            // mode is NFM, and (3) the selected sherpa model is offline
+            // (Moonshine, Parakeet). The toggle is persisted, so
+            // without this computed gate it would still report "on"
+            // after a restart into WFM, or after the user switched to
+            // streaming Zipformer and the row went invisible — either
+            // of which would produce an unsupported session
+            // (streaming Zipformer rejects AutoBreak at session start;
+            // non-NFM modes never emit squelch edges so the state
+            // machine sits in Idle forever). Compute the effective
+            // value once here and use it for both the precondition
+            // check and the BackendConfig assignment.
+            #[cfg(feature = "sherpa")]
+            let auto_break_enabled = {
+                let selected_is_offline = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .is_some_and(|m| !m.supports_partials());
+                auto_break_row.is_active()
+                    && state_clone.demod_mode.get() == sdr_types::DemodMode::Nfm
+                    && selected_is_offline
+            };
+
+            // Auto Break precondition: squelch must be enabled so the
+            // radio produces the open/close transitions the state
+            // machine needs for segmentation. Without squelch enabled,
+            // the session would sit in Idle indefinitely producing
+            // zero transcripts — silent failure mode. Block session
+            // start with an actionable toast.
+            #[cfg(feature = "sherpa")]
+            if auto_break_enabled && !squelch_enabled_row_for_session.is_active() {
+                let toast = adw::Toast::new(
+                    "Auto Break needs squelch enabled to detect transmission boundaries. \
+                     Enable squelch in the radio panel, or turn off Auto Break to use VAD.",
+                );
+                if let Some(overlay) = toast_overlay_for_session.upgrade() {
+                    overlay.add_toast(toast);
+                }
+                // Revert the enable toggle so the user can take action first.
+                // The OFF branch of the handler is a safe no-op on an
+                // inactive session (it just drops any backend channels).
+                row.set_active(false);
+                return;
+            }
+
             // Lock model and tuning controls while transcription is active.
             model_row.set_sensitive(false);
             #[cfg(feature = "whisper")]
@@ -1731,8 +1853,8 @@ fn connect_transcript_panel(
             display_mode_row.set_sensitive(false);
             #[cfg(feature = "sherpa")]
             vad_threshold_row.set_sensitive(false);
-
-            let model_idx = model_row.selected() as usize;
+            #[cfg(feature = "sherpa")]
+            auto_break_row.set_sensitive(false);
 
             // Read tuning slider values.
             #[cfg(feature = "whisper")]
@@ -1771,11 +1893,21 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             let vad_threshold: f32 = sdr_transcription::VAD_THRESHOLD_DEFAULT;
 
+            #[cfg(feature = "sherpa")]
+            let segmentation_mode = if auto_break_enabled {
+                sdr_transcription::SegmentationMode::AutoBreak
+            } else {
+                sdr_transcription::SegmentationMode::Vad
+            };
+            #[cfg(feature = "whisper")]
+            let segmentation_mode = sdr_transcription::SegmentationMode::Vad;
+
             let config = sdr_transcription::BackendConfig {
                 model,
                 silence_threshold,
                 noise_gate_ratio,
                 vad_threshold,
+                segmentation_mode,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
@@ -1807,6 +1939,8 @@ fn connect_transcript_panel(
                     let display_mode_row_weak = display_mode_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let vad_threshold_row_weak = vad_threshold_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_row_weak = auto_break_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let live_line_weak = live_line_weak.clone();
 
@@ -1928,6 +2062,8 @@ fn connect_transcript_panel(
                                             &display_mode_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &vad_threshold_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_row_weak,
                                         );
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
@@ -1995,6 +2131,8 @@ fn connect_transcript_panel(
                                         &display_mode_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &vad_threshold_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_row_weak,
                                     );
                                     if let Some(enable) = enable_row_weak.upgrade() {
                                         enable.set_active(false);
@@ -2026,6 +2164,8 @@ fn connect_transcript_panel(
                         &display_mode_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &vad_threshold_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_row.downgrade(),
                     );
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
@@ -2048,6 +2188,8 @@ fn connect_transcript_panel(
                 &display_mode_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &vad_threshold_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_row.downgrade(),
             );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();

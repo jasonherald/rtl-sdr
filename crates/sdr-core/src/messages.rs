@@ -30,6 +30,13 @@ pub enum DspToUi {
     IqRecordingStarted(std::path::PathBuf),
     /// IQ recording stopped.
     IqRecordingStopped,
+    /// Demodulator mode changed. Emitted when `UiToDsp::SetDemodMode`
+    /// actually changes the active demod mode (edge detection — not
+    /// emitted if the requested mode matches the current mode). The
+    /// transcript panel subscribes to this to stop any active
+    /// transcription session (band change = new session boundary) and
+    /// to re-run Auto Break row visibility rules.
+    DemodModeChanged(DemodMode),
 }
 
 /// Available source types for IQ input.
@@ -125,7 +132,7 @@ pub enum UiToDsp {
     /// Stop IQ recording and finalize the WAV file.
     StopIqRecording,
     /// Start sending audio to the transcription engine.
-    EnableTranscription(std::sync::mpsc::SyncSender<Vec<f32>>),
+    EnableTranscription(std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>),
     /// Stop sending audio to the transcription engine.
     DisableTranscription,
 }
@@ -167,6 +174,12 @@ mod tests {
 
         let iq_stop = DspToUi::IqRecordingStopped;
         assert!(matches!(iq_stop, DspToUi::IqRecordingStopped));
+    }
+
+    #[test]
+    fn demod_mode_changed_message_constructs() {
+        let m = DspToUi::DemodModeChanged(DemodMode::Nfm);
+        assert!(matches!(m, DspToUi::DemodModeChanged(DemodMode::Nfm)));
     }
 
     #[test]
@@ -313,7 +326,7 @@ mod tests {
         let iq_stop = UiToDsp::StopIqRecording;
         assert!(matches!(iq_stop, UiToDsp::StopIqRecording));
 
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<sdr_transcription::TranscriptionInput>(1);
         let enable = UiToDsp::EnableTranscription(tx);
         assert!(matches!(enable, UiToDsp::EnableTranscription(_)));
 

@@ -69,8 +69,9 @@ pub mod init_event;
 pub mod sherpa_model;
 
 pub use backend::{
-    BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
-    TranscriptionEvent, VAD_THRESHOLD_DEFAULT, VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
+    BackendConfig, BackendError, BackendHandle, ModelChoice, SegmentationMode,
+    TranscriptionBackend, TranscriptionEvent, TranscriptionInput, VAD_THRESHOLD_DEFAULT,
+    VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
 };
 
 #[cfg(feature = "whisper")]
@@ -111,7 +112,7 @@ pub enum TranscriptionError {
 /// `sdr-ui` need no changes.
 pub struct TranscriptionEngine {
     backend: Option<Box<dyn TranscriptionBackend>>,
-    audio_tx: Option<mpsc::SyncSender<Vec<f32>>>,
+    audio_tx: Option<mpsc::SyncSender<TranscriptionInput>>,
 }
 
 impl Default for TranscriptionEngine {
@@ -192,7 +193,7 @@ impl TranscriptionEngine {
     }
 
     /// Get a clone of the audio sender for feeding samples from the DSP thread.
-    pub fn audio_sender(&self) -> Option<mpsc::SyncSender<Vec<f32>>> {
+    pub fn audio_sender(&self) -> Option<mpsc::SyncSender<TranscriptionInput>> {
         self.audio_tx.clone()
     }
 
@@ -230,6 +231,7 @@ mod tests {
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
             vad_threshold: crate::VAD_THRESHOLD_DEFAULT,
+            segmentation_mode: SegmentationMode::default(),
         }
     }
 

@@ -33,6 +33,12 @@ const KEY_DISPLAY_MODE: &str = "transcription_display_mode";
 /// Config key for the persisted Silero VAD threshold.
 /// Sherpa-only — only meaningful for offline models (Moonshine, Parakeet).
 const KEY_SHERPA_VAD_THRESHOLD: &str = "sherpa_vad_threshold";
+#[cfg(feature = "sherpa")]
+/// Config key for persisting the Auto Break segmentation preference.
+/// When true, offline sherpa sessions use squelch edges as utterance
+/// boundaries instead of Silero VAD. Default false (preserve existing
+/// behavior for existing config files).
+pub(crate) const KEY_AUTO_BREAK_ENABLED: &str = "transcription_auto_break_enabled";
 
 #[cfg(feature = "sherpa")]
 const DISPLAY_MODE_LIVE_IDX: u32 = 0;
@@ -106,6 +112,10 @@ pub struct TranscriptPanel {
     /// models (Zipformer) don't use Silero VAD.
     #[cfg(feature = "sherpa")]
     pub vad_threshold_row: adw::SpinRow,
+    /// Auto Break toggle. Sherpa-only — when enabled, uses squelch
+    /// edges as utterance boundaries instead of Silero VAD. NFM only.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_row: adw::SwitchRow,
     /// Dimmed italic label below the text view that renders in-progress
     /// Sherpa partials. Sherpa-only.
     #[cfg(feature = "sherpa")]
@@ -331,6 +341,34 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         row
     };
 
+    #[cfg(feature = "sherpa")]
+    let auto_break_row = {
+        let saved = config.read(|v| {
+            v.get(KEY_AUTO_BREAK_ENABLED)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
+
+        let row = adw::SwitchRow::builder()
+            .title("Auto Break")
+            .subtitle(
+                "Use the radio's squelch as the transcription boundary instead of VAD. NFM only.",
+            )
+            .active(saved)
+            .build();
+        group.add(&row);
+
+        let config_ab = Arc::clone(config);
+        row.connect_active_notify(move |r| {
+            let active = r.is_active();
+            config_ab.write(|v| {
+                v[KEY_AUTO_BREAK_ENABLED] = serde_json::json!(active);
+            });
+        });
+
+        row
+    };
+
     // --- Display mode selector (Sherpa only) ---
     //
     // Whisper builds never compile this in — Whisper does not emit
@@ -388,19 +426,49 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
             .get(saved_model_idx as usize)
             .copied()
             .is_some_and(sdr_transcription::SherpaModel::supports_partials);
+        let initial_is_offline = !initial_supports_partials;
+        let initial_auto_break_active = auto_break_row.is_active();
+
         display_mode_row.set_visible(initial_supports_partials);
-        vad_threshold_row.set_visible(!initial_supports_partials);
+        // VAD slider visible only when offline model AND Auto Break is OFF.
+        // When Auto Break is ON, it replaces the VAD slider functionally so
+        // showing both would confuse the user about which one is driving
+        // segmentation.
+        vad_threshold_row.set_visible(initial_is_offline && !initial_auto_break_active);
+        // Auto Break toggle visible only when an offline model is selected.
+        // The additional NFM demod-mode gate is applied by window.rs's
+        // DemodModeChanged handler (Task 16) — at widget-build time we
+        // don't yet know the demod mode and assume NFM is the common case.
+        auto_break_row.set_visible(initial_is_offline);
 
         let display_mode_row_for_visibility = display_mode_row.clone();
         let vad_threshold_row_for_visibility = vad_threshold_row.clone();
+        let auto_break_row_for_model_change = auto_break_row.clone();
         model_row.connect_selected_notify(move |r| {
             let idx = r.selected() as usize;
             let supports_partials = sdr_transcription::SherpaModel::ALL
                 .get(idx)
                 .copied()
                 .is_some_and(sdr_transcription::SherpaModel::supports_partials);
+            let is_offline = !supports_partials;
+            let ab_active = auto_break_row_for_model_change.is_active();
+
             display_mode_row_for_visibility.set_visible(supports_partials);
-            vad_threshold_row_for_visibility.set_visible(!supports_partials);
+            vad_threshold_row_for_visibility.set_visible(is_offline && !ab_active);
+            auto_break_row_for_model_change.set_visible(is_offline);
+        });
+
+        // Mutex: toggling Auto Break hides/shows the VAD threshold slider.
+        // Only applies when Auto Break itself is currently visible (i.e., an
+        // offline model is selected). If the row is hidden — streaming
+        // Zipformer is selected — the mutex doesn't apply because the VAD
+        // slider is already hidden by the offline-model check.
+        let vad_threshold_row_for_mutex = vad_threshold_row.clone();
+        let auto_break_row_for_mutex = auto_break_row.clone();
+        auto_break_row.connect_active_notify(move |r| {
+            if auto_break_row_for_mutex.is_visible() {
+                vad_threshold_row_for_mutex.set_visible(!r.is_active());
+            }
         });
     }
 
@@ -543,6 +611,8 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         display_mode_row,
         #[cfg(feature = "sherpa")]
         vad_threshold_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_row,
         #[cfg(feature = "sherpa")]
         live_line_label,
         status_label,

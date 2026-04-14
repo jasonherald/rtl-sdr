@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use sherpa_onnx::{OfflineRecognizer, OnlineRecognizer};
 
-use crate::backend::{BackendError, TranscriptionEvent};
+use crate::backend::{BackendError, TranscriptionEvent, TranscriptionInput};
 use crate::init_event::InitEvent;
 use crate::sherpa_model::{self, SherpaModel};
 
@@ -136,13 +136,18 @@ pub(super) fn global_sherpa_host() -> Option<&'static Result<SherpaHost, Arc<Bac
 /// Parameters handed to the host worker for one transcription session.
 pub(super) struct SessionParams {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
-    pub audio_rx: mpsc::Receiver<Vec<f32>>,
+    pub audio_rx: mpsc::Receiver<TranscriptionInput>,
     pub event_tx: mpsc::Sender<TranscriptionEvent>,
     pub noise_gate_ratio: f32,
-    /// Silero VAD threshold requested for this session (offline models only).
+    /// Silero VAD threshold requested for this session (offline VAD mode only).
     /// The worker rebuilds the VAD if this differs from the currently-held
-    /// VAD's threshold.
+    /// VAD's threshold. Ignored when `segmentation_mode == AutoBreak`.
     pub vad_threshold: f32,
+    /// Which segmentation engine drives utterance boundaries. Validated
+    /// against the model kind at the top of the session runner — streaming
+    /// online models reject `AutoBreak` (Task 4), and the offline session
+    /// loop dispatches VAD vs Auto Break on this field (Task 11).
+    pub segmentation_mode: crate::backend::SegmentationMode,
 }
 
 /// Commands sent to the host worker thread.
@@ -307,27 +312,38 @@ fn run_host_loop(
                         // rebuild the VAD before starting the session. The
                         // rebuild is ~50-100ms of ONNX model load — only
                         // happens when the slider value actually changed.
-                        let requested = params.vad_threshold;
-                        // Treat differences smaller than the slider step as
-                        // "same" to avoid pointless rebuilds from float drift.
-                        if (vad.current_threshold() - requested).abs()
-                            > VAD_THRESHOLD_REBUILD_EPSILON
-                        {
-                            tracing::info!(
-                                old = vad.current_threshold(),
-                                new = requested,
-                                "rebuilding Silero VAD with new threshold"
-                            );
-                            let vad_path = sherpa_model::silero_vad_path();
-                            match super::silero_vad::SherpaSileroVad::new(&vad_path, requested) {
-                                Ok(new_vad) => {
-                                    *vad = new_vad;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "VAD rebuild failed; reusing existing VAD"
-                                    );
+                        //
+                        // Skip the rebuild entirely when Auto Break mode is
+                        // selected — the Silero VAD is unused in that path
+                        // (the squelch gate drives segmentation), so paying
+                        // the rebuild cost is pure waste. The rebuild still
+                        // runs on the next Vad-mode session if the threshold
+                        // has drifted.
+                        if params.segmentation_mode == crate::backend::SegmentationMode::Vad {
+                            let requested = params.vad_threshold;
+                            // Treat differences smaller than the slider step
+                            // as "same" to avoid pointless rebuilds from
+                            // float drift.
+                            if (vad.current_threshold() - requested).abs()
+                                > VAD_THRESHOLD_REBUILD_EPSILON
+                            {
+                                tracing::info!(
+                                    old = vad.current_threshold(),
+                                    new = requested,
+                                    "rebuilding Silero VAD with new threshold"
+                                );
+                                let vad_path = sherpa_model::silero_vad_path();
+                                match super::silero_vad::SherpaSileroVad::new(&vad_path, requested)
+                                {
+                                    Ok(new_vad) => {
+                                        *vad = new_vad;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "VAD rebuild failed; reusing existing VAD"
+                                        );
+                                    }
                                 }
                             }
                         }

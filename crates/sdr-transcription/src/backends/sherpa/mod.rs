@@ -33,7 +33,7 @@ pub use silero_vad::SherpaSileroVad;
 
 /// ONNX Runtime execution provider string passed to sherpa-onnx
 /// **recognizer** configs built by this backend (online streaming,
-/// offline Moonshine, offline NeMo Parakeet). The Silero VAD stays
+/// offline Moonshine, offline `NeMo` Parakeet). The Silero VAD stays
 /// on CPU regardless — see `silero_vad.rs` for that rationale.
 ///
 /// Selected at compile time by the `sherpa-cpu` / `sherpa-cuda` cargo
@@ -129,6 +129,7 @@ impl TranscriptionBackend for SherpaBackend {
             event_tx,
             noise_gate_ratio: config.noise_gate_ratio,
             vad_threshold: config.vad_threshold,
+            segmentation_mode: config.segmentation_mode,
         })?;
 
         tracing::info!("sherpa backend session requested");
