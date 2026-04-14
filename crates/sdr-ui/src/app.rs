@@ -64,6 +64,17 @@ pub fn build_app() -> adw::Application {
     };
 
     app.connect_activate(move |app| {
+        // Re-activation (e.g. a second sdr-rs process forwarded its
+        // activate signal to us via GApplication's D-Bus uniqueness
+        // plumbing) should raise the existing window rather than
+        // building a whole new DSP engine + window. Without this
+        // guard the primary would accumulate windows on every remote
+        // launch and the second window would fight the first for the
+        // RTL-SDR device.
+        if let Some(existing) = app.windows().into_iter().next() {
+            existing.present();
+            return;
+        }
         window::build_window(app, &config);
     });
 
