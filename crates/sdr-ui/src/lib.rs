@@ -66,9 +66,7 @@ pub fn register_and_check_primary(app: &adw::Application) -> bool {
         return true;
     }
     if app.is_remote() {
-        tracing::info!(
-            "another sdr-rs instance is already running — activating it and exiting"
-        );
+        tracing::info!("another sdr-rs instance is already running — activating it and exiting");
         app.activate();
         return false;
     }

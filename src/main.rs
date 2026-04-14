@@ -9,6 +9,8 @@
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 use gtk4::glib;
+#[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
+use gtk4::prelude::*;
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 fn main() -> glib::ExitCode {
@@ -156,7 +158,6 @@ fn main() -> glib::ExitCode {
         drop(splash);
     }
 
-    use gtk4::prelude::*;
     app.run()
 }
 
