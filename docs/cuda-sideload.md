@@ -3,10 +3,11 @@
 > **tl;dr** — `make install CARGO_FLAGS="... --features sherpa-cuda"` downloads
 > a ~1.83 GB set of NVIDIA CUDA 12 / cuDNN 9 runtime libraries from the NVIDIA
 > developer redist server, verifies them by SHA-256, and installs them into
-> `~/.cargo/bin/sdr-rs-libs/` alongside the binary. Your system CUDA install
-> (if any) is untouched. You only need a working NVIDIA kernel driver on the
-> host. This doc explains why — and how we get out of the sideload once
-> upstream catches up.
+> `$(BINDIR)/sdr-rs-libs/` alongside the binary (default
+> `~/.cargo/bin/sdr-rs-libs/`; override via `make install BINDIR=<path>`).
+> Your system CUDA install (if any) is untouched. You only need a working
+> NVIDIA kernel driver on the host. This doc explains why — and how we get
+> out of the sideload once upstream catches up.
 
 This document is the deep-dive companion to the short `Sherpa CUDA notes`
 section in the [top-level README](../README.md). Read that first for the
@@ -40,8 +41,8 @@ Failed to load library libonnxruntime_providers_cuda.so with error:
 libcublasLt.so.12: cannot open shared object file
 ```
 
-The exact same binary worked fine on Ubuntu 24.04 (still on CUDA 12), so
-this isn't a project bug — it's a bleeding-edge-distro bug.
+The same binary worked fine on Ubuntu 24.04 (still on CUDA 12), so this
+isn't a project bug — it's a bleeding-edge-distro bug.
 
 ## Options considered
 
