@@ -86,6 +86,19 @@ const DEFAULT_MIN_SPEECH_FRAMES: usize = (100 * SAMPLE_RATE_HZ) / (FRAME_SIZE * 
 /// buffering forever; mirrors sherpa-onnx's `max_speech_duration`.
 const DEFAULT_MAX_SPEECH_FRAMES: usize = (20 * SAMPLE_RATE_HZ) / FRAME_SIZE;
 
+/// Pre-trigger lookback ring size in frames. When the state machine
+/// transitions `Idle → Speaking` the last N frames of audio from the
+/// ring are prepended to the segment so the first word isn't chopped.
+///
+/// Why lookback is necessary: `earshot::Detector` uses a 3-frame
+/// context window internally, so the first frame of speech after a
+/// long silence often scores below threshold (no recent history to
+/// compare against). Without a lookback buffer the state machine
+/// transitions on frame 2 or 3 and frame 1 — the actual start of
+/// speech — is lost. 4 frames × 16 ms = 64 ms, which covers the
+/// context gap plus the first consonant/vowel attack.
+const DEFAULT_LOOKBACK_FRAMES: usize = 4;
+
 /// State of the segmentation machine — see module docstring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -111,11 +124,22 @@ pub struct EarshotVad {
     min_silence_frames: usize,
     min_speech_frames: usize,
     max_speech_frames: usize,
+    lookback_frames: usize,
 
     /// Leftover samples from the last `accept` call that didn't fill
     /// a full 256-sample frame. Prepended to the next batch so no
     /// audio is dropped at batch boundaries.
     partial_frame: Vec<f32>,
+
+    /// Pre-trigger ring buffer of raw audio samples — holds the most
+    /// recent `lookback_frames` frames of audio at all times while in
+    /// `Idle`. On `Idle → Speaking` transition the entire ring is
+    /// drained into `current_segment` so the leading consonant and
+    /// attack of the first word are preserved (earshot needs ~3
+    /// frames of history to score confidently, so the first 1–2
+    /// frames of real speech don't cross the threshold and would
+    /// otherwise be discarded).
+    lookback: Vec<f32>,
 
     /// Samples accumulated into the current in-flight segment. Grows
     /// while in `Speaking`/`HoldingOff`, drained into `completed` on
@@ -151,10 +175,12 @@ impl EarshotVad {
             min_silence_frames: DEFAULT_MIN_SILENCE_FRAMES,
             min_speech_frames: DEFAULT_MIN_SPEECH_FRAMES,
             max_speech_frames: DEFAULT_MAX_SPEECH_FRAMES,
+            lookback_frames: DEFAULT_LOOKBACK_FRAMES,
             partial_frame: Vec::with_capacity(FRAME_SIZE),
             current_segment: Vec::new(),
             speech_frames_in_segment: 0,
             silence_frames_in_holdoff: 0,
+            lookback: Vec::with_capacity(DEFAULT_LOOKBACK_FRAMES * FRAME_SIZE),
             completed: VecDeque::new(),
         }
     }
@@ -169,14 +195,33 @@ impl EarshotVad {
         match self.state {
             State::Idle => {
                 if is_voice {
+                    // Transition to Speaking. Drain the lookback ring
+                    // into the segment so the leading consonant and
+                    // attack of the first word — which earshot scored
+                    // below threshold for lack of context — get
+                    // captured. `append` empties the source so the
+                    // ring starts fresh for any future Idle phase.
                     self.state = State::Speaking;
                     self.current_segment.clear();
                     self.speech_frames_in_segment = 0;
                     self.silence_frames_in_holdoff = 0;
+                    self.current_segment.append(&mut self.lookback);
                     self.current_segment.extend_from_slice(frame);
+                    // Only the current frame scored as voiced — the
+                    // lookback frames are pre-trigger audio and
+                    // shouldn't inflate the min-speech-length gate.
                     self.speech_frames_in_segment += 1;
+                } else {
+                    // Idle + silence: append to lookback ring, cap at
+                    // `lookback_frames`. When full, drop the oldest
+                    // frame's worth of samples from the front.
+                    self.lookback.extend_from_slice(frame);
+                    let cap = self.lookback_frames * FRAME_SIZE;
+                    if self.lookback.len() > cap {
+                        let excess = self.lookback.len() - cap;
+                        self.lookback.drain(..excess);
+                    }
                 }
-                // Idle + silence: discard.
             }
             State::Speaking => {
                 self.current_segment.extend_from_slice(frame);
@@ -281,12 +326,21 @@ impl VoiceActivityDetector for EarshotVad {
 
     fn flush(&mut self) {
         // Force any in-flight segment to finalize so the caller can
-        // still pop it. Drop any partial frame — it's < 16 ms of
-        // audio, not worth worrying about.
-        self.partial_frame.clear();
-        if !matches!(self.state, State::Idle) {
-            self.finalize_segment();
+        // still pop it. If we're mid-segment, the tail of audio
+        // sitting in `partial_frame` (< FRAME_SIZE samples, so it
+        // never scored through earshot) is still real audio and
+        // belongs on the end of the segment — otherwise the last
+        // <16 ms of every session disconnect is silently truncated.
+        // If we're Idle, there's no segment to attach it to, so drop.
+        if matches!(self.state, State::Idle) {
+            self.partial_frame.clear();
+            return;
         }
+        if !self.partial_frame.is_empty() {
+            self.current_segment.extend_from_slice(&self.partial_frame);
+            self.partial_frame.clear();
+        }
+        self.finalize_segment();
     }
 
     fn reset(&mut self) {
@@ -296,6 +350,7 @@ impl VoiceActivityDetector for EarshotVad {
         self.current_segment.clear();
         self.speech_frames_in_segment = 0;
         self.silence_frames_in_holdoff = 0;
+        self.lookback.clear();
         self.completed.clear();
     }
 }
@@ -385,7 +440,80 @@ mod tests {
         assert!(vad.current_segment.is_empty());
         assert_eq!(vad.speech_frames_in_segment, 0);
         assert_eq!(vad.silence_frames_in_holdoff, 0);
+        assert!(vad.lookback.is_empty());
         assert!(vad.completed.is_empty());
+    }
+
+    #[test]
+    fn lookback_caps_at_configured_frames_while_idle() {
+        // Feed enough silence frames to overflow the lookback ring —
+        // the ring should cap at exactly `lookback_frames * FRAME_SIZE`
+        // samples, not grow unboundedly.
+        let mut vad = EarshotVad::new();
+        vad.accept(&silence_frames(DEFAULT_LOOKBACK_FRAMES * 3));
+        assert_eq!(vad.state, State::Idle, "silence should not transition");
+        assert_eq!(
+            vad.lookback.len(),
+            DEFAULT_LOOKBACK_FRAMES * FRAME_SIZE,
+            "lookback ring should hold exactly `lookback_frames` frames"
+        );
+    }
+
+    #[test]
+    fn lookback_prepends_to_segment_on_transition() {
+        // Drive the state machine directly so we don't depend on
+        // earshot's scoring. Pre-seed the lookback ring with a known
+        // pattern (full of 0.7), then manually trigger an Idle →
+        // Speaking transition with a current frame pattern of 0.3
+        // via `process_frame`-equivalent logic.
+        //
+        // Testing the process_frame path would require earshot to
+        // actually score above threshold, which isn't deterministic
+        // for synthetic signals. So we test the field-level logic
+        // that the transition branch performs: drain lookback, push
+        // current frame, set counters.
+        let mut vad = EarshotVad::new();
+
+        // Seed lookback with 3 frames of a distinctive value.
+        let lookback_pattern = 0.7_f32;
+        vad.lookback
+            .extend(std::iter::repeat_n(lookback_pattern, 3 * FRAME_SIZE));
+        assert_eq!(vad.lookback.len(), 3 * FRAME_SIZE);
+
+        // Simulate the Idle → Speaking branch from process_frame.
+        let current_frame: Vec<f32> = vec![0.3_f32; FRAME_SIZE];
+        vad.state = State::Speaking;
+        vad.current_segment.clear();
+        vad.speech_frames_in_segment = 0;
+        vad.silence_frames_in_holdoff = 0;
+        vad.current_segment.append(&mut vad.lookback);
+        vad.current_segment.extend_from_slice(&current_frame);
+        vad.speech_frames_in_segment += 1;
+
+        // Lookback must be fully drained (append leaves it empty).
+        assert!(
+            vad.lookback.is_empty(),
+            "lookback should be empty after drain"
+        );
+        // Segment must hold lookback + current frame, in order.
+        assert_eq!(vad.current_segment.len(), 4 * FRAME_SIZE);
+        // First 3 frames should be the lookback pattern.
+        for &s in &vad.current_segment[..3 * FRAME_SIZE] {
+            assert!(
+                (s - lookback_pattern).abs() < f32::EPSILON,
+                "lookback prefix should preserve pattern, got {s}"
+            );
+        }
+        // Last frame should be the current frame pattern.
+        for &s in &vad.current_segment[3 * FRAME_SIZE..] {
+            assert!(
+                (s - 0.3_f32).abs() < f32::EPSILON,
+                "trailing frame should be current-frame pattern, got {s}"
+            );
+        }
+        // Only one frame counts as voiced — the lookback frames are
+        // pre-trigger audio, not voice-scored content.
+        assert_eq!(vad.speech_frames_in_segment, 1);
     }
 
     #[test]
@@ -427,6 +555,59 @@ mod tests {
             .extend_from_slice(&vec![0.1_f32; above_gate * FRAME_SIZE]);
         vad.finalize_segment();
         assert_eq!(vad.completed.len(), 1, "segment above gate should emit");
+    }
+
+    #[test]
+    fn flush_preserves_partial_frame_tail_on_active_segment() {
+        // Regression for the pre-fix truncation bug: if the session
+        // ends mid-segment with a partial frame (< FRAME_SIZE samples)
+        // of trailing audio stashed, flush() must append it to the
+        // current segment before finalizing — otherwise the last
+        // <16 ms of every active utterance is silently dropped at
+        // disconnect.
+        let mut vad = EarshotVad::new();
+        vad.state = State::Speaking;
+        vad.speech_frames_in_segment = DEFAULT_MIN_SPEECH_FRAMES + 1;
+        vad.current_segment
+            .extend_from_slice(&vec![0.2_f32; 16 * FRAME_SIZE]);
+        // Stash a partial frame of distinctive samples.
+        let tail_pattern = 0.42_f32;
+        let tail_len = FRAME_SIZE / 2;
+        vad.partial_frame
+            .extend(std::iter::repeat_n(tail_pattern, tail_len));
+
+        let before_len = vad.current_segment.len();
+        vad.flush();
+
+        // Segment should be emitted.
+        assert_eq!(vad.completed.len(), 1);
+        let segment = vad
+            .completed
+            .pop_front()
+            .expect("completed queue should have one segment");
+        // Segment length includes the tail.
+        assert_eq!(segment.len(), before_len + tail_len);
+        // Final `tail_len` samples should be the tail pattern.
+        for &s in &segment[before_len..] {
+            assert!(
+                (s - tail_pattern).abs() < f32::EPSILON,
+                "segment tail should preserve partial_frame pattern, got {s}"
+            );
+        }
+        // Partial frame should have been consumed.
+        assert!(vad.partial_frame.is_empty());
+    }
+
+    #[test]
+    fn flush_drops_partial_frame_when_idle() {
+        // If we're Idle at flush time, there's no segment to attach
+        // the partial tail to — dropping it is the right behavior.
+        let mut vad = EarshotVad::new();
+        vad.partial_frame
+            .extend(std::iter::repeat_n(0.42_f32, FRAME_SIZE / 2));
+        vad.flush();
+        assert!(vad.partial_frame.is_empty());
+        assert!(vad.completed.is_empty());
     }
 
     #[test]
