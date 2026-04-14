@@ -115,7 +115,10 @@ const DEFAULT_LOOKBACK_FRAMES: usize = 4;
 /// State of the segmentation machine — see module docstring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// No segment in progress. Silence frames are discarded.
+    /// No segment in progress. Incoming frames are retained in
+    /// `lookback` (the pre-trigger ring, capped at `lookback_frames`
+    /// × `FRAME_SIZE` samples) so the first voiced frame can pull
+    /// its leading context along when it transitions to `Speaking`.
     Idle,
     /// At least one voiced frame has arrived; building a segment.
     Speaking,
@@ -612,6 +615,65 @@ mod tests {
             .extend_from_slice(&vec![0.1_f32; above_gate * FRAME_SIZE]);
         vad.finalize_segment();
         assert_eq!(vad.completed.len(), 1, "segment above gate should emit");
+    }
+
+    #[test]
+    fn max_speech_safety_cap_flushes_during_speaking() {
+        // Regression for the max-speech safety flush branch in
+        // `process_frame`. Without this, a long continuous
+        // transmission (e.g. a stuck mic or a siren) would buffer
+        // forever and eventually OOM — the 20-second cap exists
+        // specifically to split the segment and hand it to the
+        // decoder before memory grows unbounded.
+        //
+        // Strategy: seed the VAD into `Speaking` with a
+        // `current_segment` already at exactly the cap and a
+        // speech-frame count well above the min-speech gate (so the
+        // segment is emitted on finalize rather than discarded).
+        // Drive one more frame through `process_frame`. After the
+        // match arm appends the frame, `current_segment.len()` is
+        // over the cap, so the post-match safety check must detect
+        // it and call `finalize_segment`.
+        //
+        // Use a silent frame so the state machine transitions
+        // `Speaking → HoldingOff` inside the match (rather than
+        // staying Speaking or jumping to a completely different
+        // branch). The silence counter increments to 1, well below
+        // `min_silence_frames`, so the HoldingOff branch doesn't
+        // finalize on its own — the cap check is the only reason
+        // finalize fires, which is exactly what this test pins.
+        let mut vad = EarshotVad::new();
+        vad.state = State::Speaking;
+        vad.speech_frames_in_segment = DEFAULT_MIN_SPEECH_FRAMES + 10;
+        let cap_samples = DEFAULT_MAX_SPEECH_FRAMES * FRAME_SIZE;
+        vad.current_segment
+            .extend(std::iter::repeat_n(0.1_f32, cap_samples));
+
+        // Preconditions: segment is exactly at the cap, state is
+        // Speaking, speech-frame count is above the gate, no
+        // silence has been seen yet.
+        assert_eq!(vad.current_segment.len(), cap_samples);
+        assert_eq!(vad.state, State::Speaking);
+        assert!(vad.speech_frames_in_segment > DEFAULT_MIN_SPEECH_FRAMES);
+        assert_eq!(vad.silence_frames_in_holdoff, 0);
+
+        // Process one silent frame — pushes the segment one frame
+        // over the cap, which the post-match safety check must
+        // detect and flush.
+        let silent = vec![0.0_f32; FRAME_SIZE];
+        vad.process_frame(&silent);
+
+        // Post-conditions: segment emitted, state back to Idle,
+        // counters cleared, buffer empty.
+        assert_eq!(
+            vad.completed.len(),
+            1,
+            "max-speech cap breach should emit the segment"
+        );
+        assert_eq!(vad.state, State::Idle, "finalize_segment → Idle");
+        assert_eq!(vad.speech_frames_in_segment, 0);
+        assert_eq!(vad.silence_frames_in_holdoff, 0);
+        assert!(vad.current_segment.is_empty());
     }
 
     #[test]
