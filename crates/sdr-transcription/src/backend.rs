@@ -23,6 +23,36 @@ pub const VAD_THRESHOLD_MAX: f32 = 0.90;
 /// scanner/NFM sources.
 pub const VAD_THRESHOLD_DEFAULT: f32 = 0.50;
 
+/// Minimum allowed value for [`BackendConfig::auto_break_min_open_ms`].
+pub const AUTO_BREAK_MIN_OPEN_MS_MIN: u32 = 20;
+/// Maximum allowed value for [`BackendConfig::auto_break_min_open_ms`].
+pub const AUTO_BREAK_MIN_OPEN_MS_MAX: u32 = 500;
+/// Default value for [`BackendConfig::auto_break_min_open_ms`]. A
+/// squelch opening shorter than this is treated as a noise spike and
+/// the segment is discarded. Chosen to exclude sub-syllable blips
+/// while still catching short single-word transmissions ("copy").
+pub const AUTO_BREAK_MIN_OPEN_MS_DEFAULT: u32 = 100;
+
+/// Minimum allowed value for [`BackendConfig::auto_break_tail_ms`].
+pub const AUTO_BREAK_TAIL_MS_MIN: u32 = 50;
+/// Maximum allowed value for [`BackendConfig::auto_break_tail_ms`].
+pub const AUTO_BREAK_TAIL_MS_MAX: u32 = 1000;
+/// Default value for [`BackendConfig::auto_break_tail_ms`]. After the
+/// squelch closes, continue buffering for this long so the last
+/// syllable is not chopped by a tight squelch-close timing. Covers
+/// typical `PowerSquelch` fall time plus ~100 ms of spoken tail.
+pub const AUTO_BREAK_TAIL_MS_DEFAULT: u32 = 200;
+
+/// Minimum allowed value for [`BackendConfig::auto_break_min_segment_ms`].
+pub const AUTO_BREAK_MIN_SEGMENT_MS_MIN: u32 = 100;
+/// Maximum allowed value for [`BackendConfig::auto_break_min_segment_ms`].
+pub const AUTO_BREAK_MIN_SEGMENT_MS_MAX: u32 = 2000;
+/// Default value for [`BackendConfig::auto_break_min_segment_ms`].
+/// Segments shorter than this are discarded instead of decoded.
+/// Moonshine and Parakeet both hallucinate on sub-word fragments, so
+/// dropping them is an accuracy improvement, not a loss.
+pub const AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT: u32 = 400;
+
 /// Frames sent from the DSP controller into a transcription backend.
 ///
 /// Carries both raw audio samples and segmentation-boundary hints. The
@@ -85,6 +115,21 @@ pub struct BackendConfig {
     /// session. See `SegmentationMode` for valid values. Streaming
     /// Zipformer rejects `AutoBreak` at session start.
     pub segmentation_mode: SegmentationMode,
+    /// Auto Break: minimum transmission duration (before tail-capture)
+    /// to be considered a real transmission rather than a noise spike.
+    /// Clamp to `AUTO_BREAK_MIN_OPEN_MS_MIN..=AUTO_BREAK_MIN_OPEN_MS_MAX`.
+    /// Only read when `segmentation_mode == AutoBreak`.
+    pub auto_break_min_open_ms: u32,
+    /// Auto Break: how long to continue buffering audio after the
+    /// squelch closes, to capture the trailing syllable. Clamp to
+    /// `AUTO_BREAK_TAIL_MS_MIN..=AUTO_BREAK_TAIL_MS_MAX`. Only read
+    /// when `segmentation_mode == AutoBreak`.
+    pub auto_break_tail_ms: u32,
+    /// Auto Break: minimum segment duration to be fed to the
+    /// recognizer. Segments shorter than this are discarded. Clamp to
+    /// `AUTO_BREAK_MIN_SEGMENT_MS_MIN..=AUTO_BREAK_MIN_SEGMENT_MS_MAX`.
+    /// Only read when `segmentation_mode == AutoBreak`.
+    pub auto_break_min_segment_ms: u32,
 }
 
 /// User-facing model selection.

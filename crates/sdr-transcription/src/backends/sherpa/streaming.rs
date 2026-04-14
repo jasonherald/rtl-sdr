@@ -76,6 +76,7 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         noise_gate_ratio,
         vad_threshold: _,
         segmentation_mode,
+        auto_break_thresholds: _,
     } = params;
 
     if segmentation_mode == crate::backend::SegmentationMode::AutoBreak {

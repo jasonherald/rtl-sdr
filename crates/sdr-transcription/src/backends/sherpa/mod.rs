@@ -50,9 +50,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use crate::backend::{
-    BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
+    AUTO_BREAK_MIN_OPEN_MS_MAX, AUTO_BREAK_MIN_OPEN_MS_MIN, AUTO_BREAK_MIN_SEGMENT_MS_MAX,
+    AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_TAIL_MS_MAX, AUTO_BREAK_TAIL_MS_MIN, BackendConfig,
+    BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
 };
-use host::{AUDIO_CHANNEL_CAPACITY, SessionParams, global_sherpa_host};
+use host::{AUDIO_CHANNEL_CAPACITY, AutoBreakThresholds, SessionParams, global_sherpa_host};
 
 /// `TranscriptionBackend` implementation backed by the global sherpa host.
 ///
@@ -130,6 +132,24 @@ impl TranscriptionBackend for SherpaBackend {
             noise_gate_ratio: config.noise_gate_ratio,
             vad_threshold: config.vad_threshold,
             segmentation_mode: config.segmentation_mode,
+            // Defense-in-depth clamp: the transcript-panel SpinRow
+            // adjustments already bound user input to the same min/max
+            // ranges, but a corrupted persisted config file or a
+            // future non-UI caller could still ship out-of-range
+            // values into `BackendConfig`. Clamp at the session-start
+            // boundary so the state machine never sees a value
+            // outside the documented range.
+            auto_break_thresholds: AutoBreakThresholds {
+                min_open_ms: config
+                    .auto_break_min_open_ms
+                    .clamp(AUTO_BREAK_MIN_OPEN_MS_MIN, AUTO_BREAK_MIN_OPEN_MS_MAX),
+                tail_ms: config
+                    .auto_break_tail_ms
+                    .clamp(AUTO_BREAK_TAIL_MS_MIN, AUTO_BREAK_TAIL_MS_MAX),
+                min_segment_ms: config
+                    .auto_break_min_segment_ms
+                    .clamp(AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_MIN_SEGMENT_MS_MAX),
+            },
         })?;
 
         tracing::info!("sherpa backend session requested");
