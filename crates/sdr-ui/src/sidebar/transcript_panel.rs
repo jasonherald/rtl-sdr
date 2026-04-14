@@ -102,8 +102,9 @@ const SHERPA_VAD_THRESHOLD_PAGE: f64 = 0.10;
 // Auto Break timing parameters (sherpa-only, offline-only, NFM-only).
 // Defaults and bounds come from `sdr_transcription::backend` as u32
 // constants; the UI widens them to f64 because `adw::SpinRow` takes
-// f64 adjustments. All three sliders are integer-step (1 ms) because
-// sub-millisecond precision is meaningless for the underlying timing.
+// f64 adjustments. All three sliders step in 10 ms increments
+// (`AUTO_BREAK_MS_STEP` below) because finer precision has no
+// perceptible effect on segmentation behavior.
 #[cfg(feature = "sherpa")]
 const AUTO_BREAK_MIN_OPEN_MS_MIN: f64 = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_MIN as f64;
 #[cfg(feature = "sherpa")]
