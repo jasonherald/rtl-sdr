@@ -654,11 +654,14 @@ impl AutoBreakFlushCounts {
 mod auto_break_tests {
     use super::*;
 
-    // 48 kHz stereo interleaved → a `ms` duration requires `frames = 48 * ms`
-    // and `2 * frames` samples.
+    // Build a test audio chunk corresponding to `ms` of stereo
+    // interleaved silence at the wire format rate. Uses the same
+    // constants the production buffer-duration math uses so the two
+    // stay in sync if the wire format ever changes.
     fn samples_for_ms(ms: u32) -> Vec<f32> {
-        let frames = (48 * ms) as usize;
-        vec![0.5_f32; frames * 2]
+        let frames_per_ms = (TRANSCRIPTION_INPUT_SAMPLE_RATE_HZ / 1000) as usize;
+        let frames = frames_per_ms * (ms as usize);
+        vec![0.5_f32; frames * TRANSCRIPTION_INPUT_CHANNELS]
     }
 
     #[test]

@@ -45,7 +45,7 @@ sdr-core::controller::DspState
     |  detects edge transitions on squelch_open()
     |  AND gates emission on current_mode == DemodMode::Nfm
     v
-mpsc::Sender<TranscriptionInput>   [type change, previously Sender<Vec<f32>>]
+mpsc::SyncSender<TranscriptionInput>   [type change, previously SyncSender<Vec<f32>>]
     |
     v
 sdr-transcription::backends::sherpa::host::SherpaHost
@@ -96,7 +96,7 @@ pub enum TranscriptionInput {
 }
 ```
 
-The existing `sdr-core::DspState::transcription_tx: Option<mpsc::Sender<Vec<f32>>>` field changes to `Option<mpsc::Sender<TranscriptionInput>>`. All producer and consumer sites update together.
+The existing `sdr-core::DspState::transcription_tx: Option<mpsc::SyncSender<Vec<f32>>>` field changes to `Option<mpsc::SyncSender<TranscriptionInput>>`. All producer and consumer sites update together. Keeping the channel bounded (via `SyncSender` rather than unbounded `Sender`) is deliberate: backpressure on the DSP thread prevents unbounded memory growth if the backend stalls, and the `TrySendError::Full` path on squelch edge events drives the retry-next-block logic in the controller that preserves state-machine transition integrity under load.
 
 #### `sdr-transcription::backend::SegmentationMode`
 
@@ -258,7 +258,7 @@ State machine — implemented as a Rust enum + `recv_timeout` loop, no extra thr
 
 **User-facing explainer**:
 
-- **Proactive**: the demod mode selector row in the radio panel gains a subtitle reading *"Changing band stops active transcription"*. Warns users before they trigger the stop.
+- **Proactive**: the demod mode selector (a `gtk4::DropDown` in the header bar — not an `AdwComboRow`, so it has no subtitle slot) gains an extended `tooltip_text` reading *"Demodulation mode — changing modes stops active transcription"*. Hover-visible warning before the user triggers the stop. This was a late adjustment from an earlier spec draft that assumed the selector was an `AdwComboRow` with a subtitle slot; the tooltip is the closest equivalent on the actual header `DropDown` widget.
 - **Reactive**: when transcription actually stops due to a mode change, the transcript panel (or the main window's toast overlay) shows an `AdwToast` titled *"Transcription stopped — demod mode changed. Press Start to resume."* — 65 characters, one line even in a narrow window.
 
 **What this replaces**: the earlier draft of this spec proposed fallback semantics for Auto Break on non-NFM modes (state machine stays idle indefinitely, transcription silently goes quiet). That approach is now dropped in favor of the universal stop, which produces equivalent behavior with a much clearer user signal (explicit toast vs silent quiet).
@@ -369,7 +369,7 @@ No new `BackendError` variants needed.
 7. **Mode switch with VAD mode on (behavior change regression)** — same as #6 but with Auto Break OFF (plain VAD mode). Verify transcription ALSO stops on mode change and shows the same toast. This is a behavior change from PR 1–6 and needs an explicit confirm-this-is-what-we-want check.
 8. **Squelch-disabled precondition** — disable squelch entirely in the radio panel, try to start transcription with Auto Break on, verify toast appears and session does not start
 9. **VAD regression (within a session)** — disable Auto Break, verify VAD threshold slider reappears and existing PR 6 VAD behavior within a single-mode session is unchanged
-10. **Demod selector subtitle** — verify the demod mode selector row shows the proactive subtitle *"Changing band stops active transcription"* and that it's readable in a narrow window
+10. **Demod selector tooltip** — hover over the demod mode `DropDown` in the header bar and verify the tooltip reads *"Demodulation mode — changing modes stops active transcription"*
 
 **Pre-PR smoke test checklist (user-driven, runs before the PR is opened)**:
 
@@ -410,7 +410,7 @@ This is the structured regression pass that catches anything the unit tests and 
 
 **Universal mode-change stop — new behavior**:
 
-- [ ] Proactive subtitle *"Changing band stops active transcription"* visible on the demod mode selector row, readable in both narrow and wide window sizes
+- [ ] Proactive tooltip *"Demodulation mode — changing modes stops active transcription"* visible on hover over the header-bar demod mode `DropDown`
 - [ ] VAD mode active + switch NFM → WFM: transcription stops, toast appears with exact text *"Transcription stopped — demod mode changed. Press Start to resume."*
 - [ ] Auto Break mode active + switch NFM → WFM: same stop + same toast
 - [ ] After mode-change stop, click Start: transcription resumes on the new band with configuration preserved (model, VAD threshold, Auto Break setting if applicable)
@@ -443,7 +443,7 @@ This is the structured regression pass that catches anything the unit tests and 
 
 4. **Demod mode change plumbing.** We need a `DspToUi::DemodModeChanged` event so the transcript panel can re-run visibility checks AND trigger the stop-on-mode-change behavior. This is net-new message-enum work — small, but the messages crate is shared between several consumers and needs a clean add. Risk: low, but the touch surface grows slightly.
 
-5. **Behavior change vs PRs 1–6.** PRs 1–6 let VAD mode transcription continue across demod mode changes; this PR changes that to a universal stop. The project has one user today (the owner), who confirmed during design that the change is fine and actively preferable — the old behavior was quietly lossy (cross-band noise characteristics break recognition quality) and the new behavior gives a clear explicit signal via toast. No soft-launch / opt-out gate is included. The PR description will still call the change out prominently for CodeRabbit and future readers, and the proactive subtitle on the demod selector acts as a passive explainer.
+5. **Behavior change vs PRs 1–6.** PRs 1–6 let VAD mode transcription continue across demod mode changes; this PR changes that to a universal stop. The project has one user today (the owner), who confirmed during design that the change is fine and actively preferable — the old behavior was quietly lossy (cross-band noise characteristics break recognition quality) and the new behavior gives a clear explicit signal via toast. No soft-launch / opt-out gate is included. The PR description will still call the change out prominently for CodeRabbit and future readers, and the proactive tooltip on the demod selector acts as a passive explainer.
 
 6. **Auto Break follow-up issue for sliders.** User agreed to ship hardcoded constants with a follow-up issue to add sliders once real-world testing is in. The follow-up issue needs to be filed before merge so we don't forget.
 
