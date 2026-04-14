@@ -17,20 +17,33 @@
 //!
 //! The VAD takes 256-sample frames (16 ms at 16 kHz) and returns a
 //! per-frame voice score. This wrapper runs a three-state machine over
-//! those scores to group consecutive voiced frames into segments:
+//! those scores to group voiced frames into segments:
 //!
-//! - **`Idle`** — no speech in flight. Frames below threshold are
-//!   discarded; a frame at or above threshold transitions to
-//!   `Speaking`.
-//! - **`Speaking`** — at least one voiced frame has arrived. Incoming
-//!   frames (voiced or not) are appended to the current segment. A
-//!   voiced frame resets the silence counter; a non-voiced frame
-//!   transitions to `HoldingOff`.
+//! - **`Idle`** — no speech in flight. Each incoming frame is still
+//!   retained in a short (`lookback_frames`) pre-trigger ring so the
+//!   leading consonant of the next utterance isn't clipped — earshot's
+//!   feature extractor needs a few frames of context before its
+//!   scores cross threshold. When a frame at or above threshold
+//!   arrives, the state machine transitions to `Speaking` and drains
+//!   the ring into the new segment before adding the triggering
+//!   frame.
+//! - **`Speaking`** — at least one voiced frame has arrived. Every
+//!   incoming frame (voiced or not) is appended to the current
+//!   segment. A voiced frame increments the voice-frame count; a
+//!   non-voiced frame transitions to `HoldingOff`.
 //! - **`HoldingOff`** — inside a segment but waiting to see if the
 //!   last silence is a pause or a real segment end. Frames are still
-//!   appended (so the decoder sees the trailing audio). Once
-//!   `min_silence_frames` consecutive non-voiced frames accumulate,
-//!   the segment is finalized and pushed onto the completed queue.
+//!   appended (so the decoder sees the trailing audio). A voiced
+//!   frame transitions back to `Speaking`; once `min_silence_frames`
+//!   consecutive non-voiced frames accumulate, the segment is
+//!   finalized and pushed onto the completed queue.
+//!
+//! `speech_frames_in_segment` is a running *total* of voice-scored
+//! frames across the whole segment (not just consecutive ones) —
+//! brief pauses that bounce through `HoldingOff → Speaking` still
+//! contribute to the running count. Lookback frames are pre-trigger
+//! audio and do NOT count toward it, so the min-speech-length gate
+//! measures real voiced content and isn't inflated by pre-roll.
 //!
 //! A `max_speech_frames` cap forces a flush even if the speaker never
 //! pauses, mirroring sherpa-onnx's `rule3_min_utterance_length` —
@@ -139,15 +152,26 @@ pub struct EarshotVad {
     /// frames of history to score confidently, so the first 1–2
     /// frames of real speech don't cross the threshold and would
     /// otherwise be discarded).
-    lookback: Vec<f32>,
+    ///
+    /// Implemented as a `VecDeque` so the hot-path "drop the oldest
+    /// frame when full" operation is O(k) head-advancement rather
+    /// than an O(n) `memmove` over the ring — every additional
+    /// silence frame during a long idle period used to shift the
+    /// whole buffer down with `Vec::drain(..excess)`.
+    lookback: VecDeque<f32>,
 
     /// Samples accumulated into the current in-flight segment. Grows
     /// while in `Speaking`/`HoldingOff`, drained into `completed` on
     /// finalize.
     current_segment: Vec<f32>,
 
-    /// Count of consecutive voiced frames in the current segment —
-    /// drives the min-speech-length discard gate.
+    /// Running total of voice-scored frames across the current
+    /// segment — NOT consecutive. Brief pauses that bounce through
+    /// `HoldingOff → Speaking` keep contributing to this count, and
+    /// lookback (pre-trigger) frames are intentionally excluded so
+    /// the min-speech-length gate only sees real voiced content.
+    /// Drives the `min_speech_frames` discard decision in
+    /// `finalize_segment`.
     speech_frames_in_segment: usize,
 
     /// Count of consecutive non-voiced frames while in `HoldingOff`.
@@ -180,7 +204,7 @@ impl EarshotVad {
             current_segment: Vec::new(),
             speech_frames_in_segment: 0,
             silence_frames_in_holdoff: 0,
-            lookback: Vec::with_capacity(DEFAULT_LOOKBACK_FRAMES * FRAME_SIZE),
+            lookback: VecDeque::with_capacity(DEFAULT_LOOKBACK_FRAMES * FRAME_SIZE),
             completed: VecDeque::new(),
         }
     }
@@ -199,13 +223,13 @@ impl EarshotVad {
                     // into the segment so the leading consonant and
                     // attack of the first word — which earshot scored
                     // below threshold for lack of context — get
-                    // captured. `append` empties the source so the
+                    // captured. `drain(..)` empties the source so the
                     // ring starts fresh for any future Idle phase.
                     self.state = State::Speaking;
                     self.current_segment.clear();
                     self.speech_frames_in_segment = 0;
                     self.silence_frames_in_holdoff = 0;
-                    self.current_segment.append(&mut self.lookback);
+                    self.current_segment.extend(self.lookback.drain(..));
                     self.current_segment.extend_from_slice(frame);
                     // Only the current frame scored as voiced — the
                     // lookback frames are pre-trigger audio and
@@ -213,13 +237,16 @@ impl EarshotVad {
                     self.speech_frames_in_segment += 1;
                 } else {
                     // Idle + silence: append to lookback ring, cap at
-                    // `lookback_frames`. When full, drop the oldest
-                    // frame's worth of samples from the front.
-                    self.lookback.extend_from_slice(frame);
+                    // `lookback_frames` × `FRAME_SIZE` samples. Using
+                    // a `VecDeque` and `pop_front` per excess sample
+                    // keeps this O(excess) with no `memmove` — the
+                    // old `Vec::drain(..excess)` path did an O(n)
+                    // shift per frame which was wasteful during long
+                    // idle periods.
+                    self.lookback.extend(frame.iter().copied());
                     let cap = self.lookback_frames * FRAME_SIZE;
-                    if self.lookback.len() > cap {
-                        let excess = self.lookback.len() - cap;
-                        self.lookback.drain(..excess);
+                    while self.lookback.len() > cap {
+                        self.lookback.pop_front();
                     }
                 }
             }
@@ -486,11 +513,11 @@ mod tests {
         vad.current_segment.clear();
         vad.speech_frames_in_segment = 0;
         vad.silence_frames_in_holdoff = 0;
-        vad.current_segment.append(&mut vad.lookback);
+        vad.current_segment.extend(vad.lookback.drain(..));
         vad.current_segment.extend_from_slice(&current_frame);
         vad.speech_frames_in_segment += 1;
 
-        // Lookback must be fully drained (append leaves it empty).
+        // Lookback must be fully drained.
         assert!(
             vad.lookback.is_empty(),
             "lookback should be empty after drain"
