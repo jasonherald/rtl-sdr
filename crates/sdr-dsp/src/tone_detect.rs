@@ -259,10 +259,18 @@ pub struct CtcssDecision {
     /// test diagnostics and future analytics (e.g. a UI level meter
     /// on the tone band).
     pub normalized_magnitude: f32,
-    /// This window's threshold comparison: the target tone is
-    /// present in THIS single [`CTCSS_WINDOW_MS`]-long window
-    /// (400 ms by default). May flap on transients; consume
-    /// [`CtcssDecision::sustained`] for the debounced value.
+    /// Combined per-window hit decision produced by
+    /// `process_window`: the target tone is present in THIS
+    /// single [`CTCSS_WINDOW_MS`]-long window (400 ms by default).
+    /// True when BOTH the absolute-floor check
+    /// (`normalized_magnitude ≥ threshold`) AND the neighbor-
+    /// dominance check
+    /// (`target_mag ≥ max(neighbor_mags) × CTCSS_DOMINANCE_RATIO`)
+    /// pass — see the `above_floor` and `dominates_neighbors`
+    /// locals in `process_window` for the exact logic. May flap
+    /// on transients over a single window, so squelch wiring
+    /// should consume [`CtcssDecision::sustained`] for the
+    /// debounced value.
     pub detected: bool,
     /// The sustained-detection gate: the target tone has been
     /// present for at least [`CTCSS_MIN_HITS`] consecutive windows
