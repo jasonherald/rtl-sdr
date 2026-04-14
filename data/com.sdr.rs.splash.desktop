@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SDR-RS Splash
+GenericName=Software-Defined Radio (Loading)
+Comment=SDR-RS initialization splash
+Exec=sdr-rs --splash
+Icon=com.sdr.rs
+Terminal=false
+Categories=Audio;HamRadio;Science;
+NoDisplay=true

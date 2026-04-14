@@ -180,6 +180,7 @@ install-icon:
 install-desktop:
 	@mkdir -p $(DESKTOPDIR)
 	cp data/com.sdr.rs.desktop $(DESKTOPDIR)/com.sdr.rs.desktop
+	cp data/com.sdr.rs.splash.desktop $(DESKTOPDIR)/com.sdr.rs.splash.desktop
 	@update-desktop-database $(DESKTOPDIR) 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────
@@ -191,6 +192,7 @@ uninstall:
 	rm -rf $(LIBDIR)
 	rm -f $(ICONDIR)/com.sdr.rs.svg
 	rm -f $(DESKTOPDIR)/com.sdr.rs.desktop
+	rm -f $(DESKTOPDIR)/com.sdr.rs.splash.desktop
 	@update-desktop-database $(DESKTOPDIR) 2>/dev/null || true
 	@echo "SDR-RS uninstalled"
 	@echo "  (NVIDIA redist cache at $(CUDA_REDIST_CACHE) preserved;"
