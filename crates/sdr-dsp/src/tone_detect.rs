@@ -143,26 +143,23 @@ pub const CTCSS_MIN_HITS: usize = 3;
 /// real-world traffic reveals its behavior.
 pub const CTCSS_DEFAULT_THRESHOLD: f32 = 0.1;
 
-/// The 42 standard CTCSS tones in Hz, from EIA/TIA-603 and
-/// Motorola's PL (Private Line) table. Ordered ascending so a
-/// dropdown can use this slice directly as its value list.
+/// The 51 CTCSS tones in Hz recognized by this detector: the 42
+/// standard tones from EIA/TIA-603 / Motorola PL, plus 9 common
+/// non-standard additions (162.2, 167.9, 179.9, 183.5, 189.9,
+/// 196.6, 199.5, 206.5, 254.1) that modern scanners also support.
+/// Ordered strictly ascending so a future UI dropdown can use the
+/// slice directly as its value list.
 ///
-/// The 38 "classical" tones from 67.0 through 250.3 Hz were
-/// standardized first; the four additional tones (159.8, 165.5,
-/// 171.3, 177.3) were added later to reduce adjacent-tone crosstalk
-/// in dense shared-channel environments. All 42 are in use on
-/// modern scanners.
+/// A future UI split could expose a "standard 42" vs "extended 51"
+/// toggle if users want to avoid the non-standard tones, but all
+/// 51 are kept inline today to match what the hardware actually
+/// emits on commercial shared channels.
 pub const CTCSS_TONES_HZ: &[f32] = &[
     67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4, 100.0, 103.5, 107.2,
     110.9, 114.8, 118.8, 123.0, 127.3, 131.8, 136.5, 141.3, 146.2, 150.0, 151.4, 156.7, 159.8,
     162.2, 165.5, 167.9, 171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5,
     203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
 ];
-
-// The 51 entries above extend the classic 42-tone table with the
-// non-standard additions some scanners also support (162.2, 167.9,
-// 179.9, 183.5, 189.9, 196.6, 199.5, 206.5, 254.1). Kept inline so
-// a future UI dropdown can show "standard 42" or "extended 51".
 
 /// Look up the index of `target_hz` in [`CTCSS_TONES_HZ`] using an
 /// exact-equal comparison. Returns `None` if the frequency isn't a
@@ -261,12 +258,25 @@ impl CtcssDetector {
     /// value is [`CTCSS_DEFAULT_THRESHOLD`]; use this when the
     /// default produces too many / too few hits on your specific
     /// audio. Threshold is the ratio of target-frequency magnitude
-    /// to window RMS.
+    /// to window RMS — a dimensionless value in `(0, 1]` under
+    /// normal conditions.
+    ///
+    /// Returns [`DspError::InvalidParameter`] if `threshold <= 0.0`.
+    /// A non-positive threshold would cause every window to count
+    /// as a hit (even pure silence, because the comparison
+    /// `normalized_magnitude >= threshold` would trivially pass
+    /// for any non-negative magnitude) which is almost always a
+    /// wiring bug rather than a legitimate configuration.
     pub fn with_threshold(
         target_hz: f32,
         sample_rate_hz: f32,
         threshold: f32,
     ) -> Result<Self, DspError> {
+        if threshold <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "CTCSS detector threshold must be positive, got {threshold}"
+            )));
+        }
         let mut detector = Self::new(target_hz, sample_rate_hz)?;
         detector.threshold = threshold;
         Ok(detector)
@@ -324,8 +334,12 @@ impl CtcssDetector {
             sum_sq += x * x;
         }
         // Magnitude squared at the target frequency. Algebraically
-        // equivalent to |DFT[f_target]|² over the window.
-        let mag_sq = s1 * s1 + s2 * s2 - self.coeff * s1 * s2;
+        // equivalent to |DFT[f_target]|² over the window, which is
+        // non-negative by definition — but f32 rounding at the
+        // recurrence boundary can produce tiny negative values, so
+        // we clamp to zero before the sqrt below to avoid NaN
+        // propagating into `normalized_magnitude`.
+        let mag_sq = (s1 * s1 + s2 * s2 - self.coeff * s1 * s2).max(0.0);
 
         // Normalize by the RMS of the window so the threshold is
         // "proportion of signal energy in the target bin" rather
@@ -431,6 +445,19 @@ mod tests {
         assert_eq!(ctcss_tone_index(254.1), Some(CTCSS_TONES_HZ.len() - 1));
         assert_eq!(ctcss_tone_index(60.0), None);
         assert_eq!(ctcss_tone_index(68.5), None);
+    }
+
+    #[test]
+    fn with_threshold_rejects_non_positive_threshold() {
+        // Zero / negative thresholds would make every window a
+        // hit (including pure silence), which is almost always a
+        // wiring bug. Guard at construction time.
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 0.0).is_err());
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, -0.1).is_err());
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, -10.0).is_err());
+        // Positive values (including very small ones) are fine.
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 0.001).is_ok());
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 1.0).is_ok());
     }
 
     #[test]
