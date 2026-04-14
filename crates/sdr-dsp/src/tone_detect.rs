@@ -178,6 +178,19 @@ const _: () = {
 /// so a user passing `100.0f32` doesn't miss the `100.0` entry.
 const CTCSS_TONE_MATCH_EPSILON_HZ: f32 = 0.01;
 
+/// Tolerance for matching a caller-supplied `sample_rate_hz`
+/// against [`CTCSS_SAMPLE_RATE_HZ`]. The detector is calibrated
+/// around a hardcoded [`CTCSS_WINDOW_SAMPLES`] block size that
+/// only equals [`CTCSS_WINDOW_MS`] at the canonical 48 kHz AF
+/// chain rate — at any other rate the same block size would give
+/// the wrong effective window duration and re-introduce the
+/// adjacent-tone leakage problem this detector's sinc math was
+/// specifically calibrated to avoid. Future work: if we ever need
+/// multi-rate support, derive [`CTCSS_WINDOW_SAMPLES`] from the
+/// runtime sample rate instead of hardcoding it, then drop this
+/// check.
+const CTCSS_SAMPLE_RATE_MATCH_EPSILON_HZ: f32 = 0.5;
+
 /// Number of consecutive above-threshold windows required before the
 /// sustained-detection gate opens, and number of consecutive
 /// below-threshold windows required before it closes. Three windows
@@ -350,7 +363,13 @@ impl CtcssDetector {
     /// Returns [`DspError::InvalidParameter`] on:
     ///
     /// - `target_hz` or `sample_rate_hz` not finite
-    /// - `sample_rate_hz ≤ 0.0`
+    /// - `sample_rate_hz` not equal to [`CTCSS_SAMPLE_RATE_HZ`]
+    ///   (within [`CTCSS_SAMPLE_RATE_MATCH_EPSILON_HZ`]) — the
+    ///   detector's [`CTCSS_WINDOW_SAMPLES`] block size is
+    ///   calibrated for 48 kHz; at any other rate the effective
+    ///   window duration would change and the adjacent-tone sinc
+    ///   math (see module docstring) would stop holding. Future
+    ///   work: derive the block size from the runtime rate.
     /// - `target_hz` not present in [`CTCSS_TONES_HZ`]
     ///
     /// Uses [`CTCSS_DEFAULT_THRESHOLD`], [`CTCSS_DOMINANCE_RATIO`],
@@ -358,10 +377,28 @@ impl CtcssDetector {
     /// and sustained-gate debounce count. Use [`Self::with_threshold`]
     /// to override the absolute threshold.
     pub fn new(target_hz: f32, sample_rate_hz: f32) -> Result<Self, DspError> {
-        if !target_hz.is_finite() || !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
+        if !target_hz.is_finite() || !sample_rate_hz.is_finite() {
             return Err(DspError::InvalidParameter(format!(
-                "CTCSS detector requires finite target_hz and positive finite \
-                 sample_rate_hz, got target_hz={target_hz}, sample_rate_hz={sample_rate_hz}"
+                "CTCSS detector requires finite target_hz and sample_rate_hz, \
+                 got target_hz={target_hz}, sample_rate_hz={sample_rate_hz}"
+            )));
+        }
+
+        // Pin the detector to the canonical AF-chain rate. Rather
+        // than silently accepting arbitrary rates and producing
+        // wrong-duration windows, reject anything that doesn't
+        // match CTCSS_SAMPLE_RATE_HZ — a mismatch is always a
+        // wiring bug at this layer, and the alternative (derive
+        // `window_samples` at runtime) is a bigger refactor than
+        // this PR wants to do. Tolerance is generous (0.5 Hz)
+        // because the AF chain's rate is configured from an f64
+        // that may round-trip through f32 with small drift.
+        if (sample_rate_hz - CTCSS_SAMPLE_RATE_HZ).abs() > CTCSS_SAMPLE_RATE_MATCH_EPSILON_HZ {
+            return Err(DspError::InvalidParameter(format!(
+                "CTCSS detector is calibrated for {CTCSS_SAMPLE_RATE_HZ} Hz AF \
+                 chain (the canonical rate — the 400 ms window sinc math for \
+                 adjacent-tone rejection breaks at other rates). Got \
+                 sample_rate_hz={sample_rate_hz}"
             )));
         }
 
@@ -406,26 +443,32 @@ impl CtcssDetector {
     /// Build a detector with a custom hit threshold. The default
     /// value is [`CTCSS_DEFAULT_THRESHOLD`]; use this when the
     /// default produces too many / too few hits on your specific
-    /// audio. Threshold is the ratio of target-frequency magnitude
-    /// to window RMS — a dimensionless value in `(0, 1]` under
-    /// normal conditions.
+    /// audio. Threshold is the ratio of target-frequency Goertzel
+    /// magnitude to window RMS — a dimensionless value.
     ///
-    /// Returns [`DspError::InvalidParameter`] if `threshold` is
-    /// non-finite or `<= 0.0`. A non-positive or NaN threshold
-    /// would cause every window to count as a hit (even pure
-    /// silence, because the comparison
-    /// `normalized_magnitude >= threshold` would trivially pass for
-    /// any non-negative magnitude when threshold is non-positive,
-    /// or fail-open under NaN semantics), which is almost always a
-    /// wiring bug rather than a legitimate configuration.
+    /// Valid range is `(0.0, 1.0]`:
+    ///
+    /// - `≤ 0.0`: every window trivially passes
+    ///   `normalized_magnitude ≥ threshold` (including pure silence)
+    ///   and the sustained gate would open after three silent blocks.
+    /// - `> 1.0`: impossible to satisfy in exact arithmetic. The
+    ///   Goertzel magnitude at the target frequency is bounded above
+    ///   by `N · rms`, so `normalized_magnitude = mag / (N · rms)`
+    ///   is bounded above by 1.0. A threshold greater than 1.0
+    ///   means the detector never fires for any input.
+    /// - `NaN` / `±∞`: IEEE-754 ordering comparisons would make
+    ///   every window trivially pass or trivially fail depending on
+    ///   the sign of infinity, which is always a wiring bug.
+    ///
+    /// Returns [`DspError::InvalidParameter`] on any of the above.
     pub fn with_threshold(
         target_hz: f32,
         sample_rate_hz: f32,
         threshold: f32,
     ) -> Result<Self, DspError> {
-        if !threshold.is_finite() || threshold <= 0.0 {
+        if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
             return Err(DspError::InvalidParameter(format!(
-                "CTCSS detector threshold must be finite and positive, got {threshold}"
+                "CTCSS detector threshold must be finite and in (0, 1], got {threshold}"
             )));
         }
         let mut detector = Self::new(target_hz, sample_rate_hz)?;
@@ -595,7 +638,14 @@ mod tests {
     fn tone_table_is_ascending_and_unique() {
         // Sanity: if the table ever grows / shrinks we want a test
         // failure rather than a silent ordering change in the UI
-        // dropdown.
+        // dropdown OR a silent change in the documented surface
+        // (docs currently say "42 standard + 9 extensions = 51
+        // tones").
+        assert_eq!(
+            CTCSS_TONES_HZ.len(),
+            51,
+            "CTCSS_TONES_HZ must match the documented 42 standard + 9 extension count"
+        );
         for w in CTCSS_TONES_HZ.windows(2) {
             assert!(
                 w[0] < w[1],
@@ -616,13 +666,20 @@ mod tests {
     }
 
     #[test]
-    fn with_threshold_rejects_non_positive_or_non_finite_threshold() {
+    fn with_threshold_rejects_out_of_range_or_non_finite_threshold() {
         // Zero / negative thresholds would make every window a
         // hit (including pure silence), which is almost always a
         // wiring bug. Guard at construction time.
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 0.0).is_err());
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, -0.1).is_err());
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, -10.0).is_err());
+        // Thresholds above 1.0 are unreachable because
+        // normalized_magnitude is bounded by 1.0 in exact
+        // arithmetic. Reject them too so a misconfiguration
+        // doesn't silently produce a never-fires detector.
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 1.0001).is_err());
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 2.0).is_err());
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 100.0).is_err());
         // NaN and infinity bypass ordering comparisons under
         // IEEE-754 — must be explicitly rejected.
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, f32::NAN).is_err());
@@ -630,9 +687,26 @@ mod tests {
         assert!(
             CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, f32::NEG_INFINITY).is_err()
         );
-        // Positive finite values (including very small ones) are fine.
+        // Positive finite values in (0, 1] are fine.
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 0.001).is_ok());
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 0.5).is_ok());
+        // Exactly 1.0 is the ceiling and should be accepted.
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 1.0).is_ok());
+    }
+
+    #[test]
+    fn constructor_rejects_non_canonical_sample_rates() {
+        // The detector's window math is calibrated for 48 kHz;
+        // other rates are rejected because CTCSS_WINDOW_SAMPLES is
+        // a hardcoded constant and the effective window duration
+        // would be wrong. Regression guard against a future caller
+        // that thinks it can repurpose this for a 96 kHz or 44.1 kHz
+        // AF chain without the follow-up refactor.
+        assert!(CtcssDetector::new(100.0, 44_100.0).is_err());
+        assert!(CtcssDetector::new(100.0, 48_000.5).is_ok()); // within the 0.5 Hz epsilon
+        assert!(CtcssDetector::new(100.0, 48_001.0).is_err()); // just outside
+        assert!(CtcssDetector::new(100.0, 96_000.0).is_err());
+        assert!(CtcssDetector::new(100.0, 16_000.0).is_err());
     }
 
     #[test]
