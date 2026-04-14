@@ -1,10 +1,14 @@
 //! CTCSS sub-audible tone detector (#269 PR 1 of 3).
 //!
-//! Implements a single-frequency Goertzel filter tuned to one of the
-//! 42 standard CTCSS (Continuous Tone-Coded Squelch System) tones,
-//! plus a sustained-detection gate that prevents false triggers from
-//! short bursts of low-frequency speech energy overlapping the tone
-//! band.
+//! Implements three parallel Goertzel filters — one at the user-
+//! selected CTCSS (Continuous Tone-Coded Squelch System) target
+//! and one each at the two immediate CTCSS-table neighbors — for a
+//! neighbor-dominance gate that rejects adjacent-tone crosstalk,
+//! plus a sustained-detection gate that rejects single-window
+//! false triggers from low-frequency speech energy overlapping the
+//! tone band. Supports all 51 tones in [`CTCSS_TONES_HZ`] (42
+//! standard EIA/TIA-603 / Motorola PL tones plus 9 common non-
+//! standard additions).
 //!
 //! # Where this fits
 //!
