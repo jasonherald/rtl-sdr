@@ -20,4 +20,5 @@ pub mod multirate;
 pub mod noise;
 pub mod stereo;
 pub mod taps;
+pub mod tone_detect;
 pub mod window;
