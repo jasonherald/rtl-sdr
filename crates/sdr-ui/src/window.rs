@@ -1258,6 +1258,10 @@ fn restore_bookmark_profile(
         state.send_dsp(UiToDsp::SetSquelchEnabled(sq_en));
         radio.squelch_enabled_row.set_active(sq_en);
     }
+    if let Some(auto_sq) = bookmark.auto_squelch_enabled {
+        state.send_dsp(UiToDsp::SetAutoSquelch(auto_sq));
+        radio.auto_squelch_row.set_active(auto_sq);
+    }
     if let Some(sq_lvl) = bookmark.squelch_level {
         state.send_dsp(UiToDsp::SetSquelch(sq_lvl));
         #[allow(clippy::cast_lossless)]
@@ -1414,6 +1418,7 @@ fn connect_navigation_panel(
         #[allow(clippy::cast_possible_truncation)]
         let profile = sidebar::navigation_panel::TuningProfile {
             squelch_enabled: radio_bm.squelch_enabled_row.is_active(),
+            auto_squelch_enabled: radio_bm.auto_squelch_row.is_active(),
             squelch_level: radio_bm.squelch_level_row.value() as f32,
             gain: source_gain_bm.value(),
             agc: source_agc_bm.is_active(),
@@ -1452,6 +1457,7 @@ fn connect_navigation_panel(
     let save_state = Rc::clone(state);
     let save_radio_bw = panels.radio.bandwidth_row.clone();
     let save_radio_sq_en = panels.radio.squelch_enabled_row.clone();
+    let save_radio_auto_sq = panels.radio.auto_squelch_row.clone();
     let save_radio_sq_lvl = panels.radio.squelch_level_row.clone();
     let save_radio_deemp = panels.radio.deemphasis_row.clone();
     let save_radio_nben = panels.radio.noise_blanker_row.clone();
@@ -1472,6 +1478,7 @@ fn connect_navigation_panel(
         let bw = save_radio_bw.value();
         let profile = sidebar::navigation_panel::TuningProfile {
             squelch_enabled: save_radio_sq_en.is_active(),
+            auto_squelch_enabled: save_radio_auto_sq.is_active(),
             #[allow(clippy::cast_possible_truncation)]
             squelch_level: save_radio_sq_lvl.value() as f32,
             gain: save_source_gain.value(),
@@ -1495,6 +1502,7 @@ fn connect_navigation_panel(
             bm.demod_mode = sidebar::navigation_panel::demod_mode_to_string(mode);
             bm.bandwidth = bw;
             bm.squelch_enabled = Some(profile.squelch_enabled);
+            bm.auto_squelch_enabled = Some(profile.auto_squelch_enabled);
             bm.squelch_level = Some(profile.squelch_level);
             bm.gain = Some(profile.gain);
             bm.agc = Some(profile.agc);
