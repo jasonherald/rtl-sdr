@@ -44,21 +44,44 @@
 //! integer bin index. CTCSS tones are spaced as finely as 2.5 Hz
 //! (e.g. 67.0 / 69.3 Hz) so this matters.
 //!
-//! # Frequency resolution
+//! # Frequency resolution and neighbor-dominance gating
 //!
 //! The time-frequency uncertainty relation gives roughly `1/T` Hz of
 //! resolution for a window of length `T` seconds — no algorithm can
-//! beat that. To distinguish adjacent CTCSS tones (smallest gap
-//! ~2.5 Hz) we need `T ≥ 400 ms`, which is ~19,200 samples at 48 kHz.
+//! beat that. The **finest** CTCSS spacing is 1.4 Hz
+//! (150.0 / 151.4 Hz), and the Goertzel sinc-leakage response of a
+//! neighbor at distance `Δf` through a rectangular window of length
+//! `T` is `sinc(π·Δf·T)`. At `T = 200 ms` the leakage is
+//! `sinc(π·1.4·0.2) ≈ 0.88` — an interfering neighbor produces
+//! nearly the same magnitude as a correct target, and an absolute
+//! threshold can't distinguish them.
 //!
-//! In practice the detector doesn't need to tell adjacent tones apart
-//! — the user picks ONE target tone, and the detector answers
-//! "present or not". Tightening the window improves response time at
-//! the cost of specificity. [`CTCSS_WINDOW_MS`] is set to 200 ms
-//! (~9600 samples at 48 kHz, ~5 Hz resolution) as a middle ground:
-//! good enough specificity to avoid confusing 67.0 Hz for 69.3 Hz,
-//! fast enough to unblock squelch within a quarter-second of a real
-//! transmission starting.
+//! The fix is two-part:
+//!
+//! 1. **Longer window** — [`CTCSS_WINDOW_MS`] = 400 ms gives
+//!    `sinc(π·1.4·0.4) ≈ 0.56`. Neighbor magnitude drops to ~56% of
+//!    target magnitude for the worst-case close CTCSS pair.
+//! 2. **Neighbor-dominance check** — the detector runs Goertzel
+//!    filters at the TARGET tone **plus its immediate CTCSS-table
+//!    neighbors** (one above and one below, if they exist), and
+//!    requires `target_mag ≥ max(neighbor_mags) · DOMINANCE_RATIO`
+//!    in addition to the absolute threshold. Target must clearly
+//!    beat its neighbors, not just rise above the noise floor.
+//!
+//! [`CTCSS_DOMINANCE_RATIO`] is set to 1.5 (target ≥ 1.5× loudest
+//! neighbor). At 400 ms that rejects the 1.4 Hz-spaced pairs
+//! cleanly:
+//!
+//! - true target: `target_mag = 1.0`, neighbor `= 0.56`, ratio `1.79` ✓
+//! - neighbor as target: `target_mag = 0.56`, neighbor `= 1.0`,
+//!   ratio `0.56`, FAILS the 1.5× test ✓
+//!
+//! The combination (absolute threshold AND relative dominance) is
+//! what real scanners do. Latency rises from 200 ms per window to
+//! 400 ms per window, giving 1.2 s of confirmation time before the
+//! sustained gate opens (three 400 ms hits). Matches standard
+//! scanner behavior — a bit slower than consumer-grade scanners but
+//! much more specific.
 //!
 //! # Sustained-detection gate
 //!
@@ -89,21 +112,39 @@ use sdr_types::DspError;
 pub const CTCSS_SAMPLE_RATE_HZ: f32 = 48_000.0;
 
 /// Detection window length in milliseconds. Drives the frequency
-/// resolution (~1/T Hz) and the base response time. 200 ms gives us
-/// ~5 Hz resolution at 48 kHz — enough to distinguish any of the
-/// standard CTCSS tones cleanly without tanking specificity on voice
-/// fundamentals.
-pub const CTCSS_WINDOW_MS: f32 = 200.0;
+/// resolution of each Goertzel filter — the neighbor leakage through
+/// a rectangular window of length `T` is `sinc(π·Δf·T)`. 400 ms
+/// gives `sinc(π·1.4·0.4) ≈ 0.56` for the worst-case 1.4 Hz-spaced
+/// CTCSS pair (150.0 / 151.4 Hz), which combined with the
+/// [`CTCSS_DOMINANCE_RATIO`] relative check below gives clean
+/// adjacent-tone rejection.
+///
+/// 200 ms was tried first but the `sinc(0.88) ≈ 0.88` leakage at
+/// that window length left adjacent CTCSS tones nearly indistin-
+/// guishable — absolute thresholding alone was a false-positive
+/// machine. See the module docstring for the derivation.
+pub const CTCSS_WINDOW_MS: f32 = 400.0;
 
 /// Window length in samples, derived from [`CTCSS_WINDOW_MS`] and
 /// [`CTCSS_SAMPLE_RATE_HZ`]. Used as the Goertzel block size.
 ///
 /// Integer literal because the const-eval float → usize cast trips
 /// clippy's `cast_possible_truncation` / `cast_sign_loss` lints.
-/// The value is locked in at `200 ms × 48 kHz ÷ 1000 = 9600` and
+/// The value is locked in at `400 ms × 48 kHz ÷ 1000 = 19200` and
 /// there's a compile-time assertion below to catch drift if either
 /// of the two inputs changes.
-pub const CTCSS_WINDOW_SAMPLES: usize = 9_600;
+pub const CTCSS_WINDOW_SAMPLES: usize = 19_200;
+
+/// How much larger the target-tone Goertzel magnitude must be than
+/// the loudest immediate-neighbor Goertzel magnitude for the per-
+/// window decision to count as "target tone present". 1.5 means
+/// the target has to be 50% larger than the max of the two table
+/// neighbors; at [`CTCSS_WINDOW_MS`] = 400 ms this cleanly rejects
+/// the worst-case 1.4 Hz-spaced pair while preserving true targets.
+///
+/// See the module docstring for the leakage math that motivates
+/// this value.
+pub const CTCSS_DOMINANCE_RATIO: f32 = 1.5;
 
 #[allow(
     clippy::cast_possible_truncation,
@@ -123,6 +164,13 @@ const _: () = {
         "CTCSS_WINDOW_SAMPLES out of sync with CTCSS_WINDOW_MS / CTCSS_SAMPLE_RATE_HZ"
     );
 };
+
+/// Tolerance for matching a caller-supplied `target_hz` against an
+/// entry in [`CTCSS_TONES_HZ`]. 0.01 Hz is well below any actual
+/// CTCSS spacing (minimum gap is 1.4 Hz) so this won't confuse two
+/// table entries, but comfortably larger than f32 round-trip error
+/// so a user passing `100.0f32` doesn't miss the `100.0` entry.
+const CTCSS_TONE_MATCH_EPSILON_HZ: f32 = 0.01;
 
 /// Number of consecutive above-threshold windows required before the
 /// sustained-detection gate opens, and number of consecutive
@@ -161,15 +209,17 @@ pub const CTCSS_TONES_HZ: &[f32] = &[
     203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
 ];
 
-/// Look up the index of `target_hz` in [`CTCSS_TONES_HZ`] using an
-/// exact-equal comparison. Returns `None` if the frequency isn't a
-/// known CTCSS tone. Used by the UI / config layer to validate user
-/// input against the table.
+/// Look up the index of `target_hz` in [`CTCSS_TONES_HZ`] using a
+/// small epsilon tolerance ([`CTCSS_TONE_MATCH_EPSILON_HZ`]).
+/// Returns `None` if the frequency isn't a known CTCSS tone. Used
+/// by the UI / config layer to validate user input against the
+/// table and by the detector constructor to find the target's
+/// neighbors for the dominance check.
 #[must_use]
 pub fn ctcss_tone_index(target_hz: f32) -> Option<usize> {
     CTCSS_TONES_HZ
         .iter()
-        .position(|&t| (t - target_hz).abs() < f32::EPSILON)
+        .position(|&t| (t - target_hz).abs() < CTCSS_TONE_MATCH_EPSILON_HZ)
 }
 
 /// Output of [`CtcssDetector::process_block`] — includes both the
@@ -193,21 +243,42 @@ pub struct CtcssDecision {
     pub sustained: bool,
 }
 
-/// Goertzel single-frequency detector tuned to one CTCSS tone, with
-/// a sustained-hit gate for false-trigger rejection.
+/// Goertzel CTCSS tone detector with neighbor-dominance gating and
+/// sustained-hit debouncing.
 ///
-/// Feed blocks of 48 kHz demodulated audio via [`Self::process_block`]
-/// and consume [`CtcssDecision::sustained`] to drive squelch. The
-/// internal state keeps a small counter of consecutive hits / misses
-/// so the gate's latch is stateful across calls — don't construct a
-/// fresh detector per block or you'll lose the hysteresis.
+/// Runs three single-frequency Goertzel filters in parallel: one at
+/// the target CTCSS tone, and one each at the two immediate CTCSS
+/// neighbors (from [`CTCSS_TONES_HZ`]) — that last pair provides
+/// the dominance reference so a 1.4 Hz-offset interferer can't masq-
+/// uerade as a true target. First and last entries in the table
+/// have only one neighbor each; those stay `None`.
+///
+/// Feed blocks of 48 kHz demodulated audio via
+/// [`Self::process_block`] and consume [`CtcssDecision::sustained`]
+/// to drive squelch. The internal state keeps a small counter of
+/// consecutive hits / misses so the gate's latch is stateful across
+/// calls — don't construct a fresh detector per block or you'll
+/// lose the hysteresis.
 pub struct CtcssDetector {
-    /// Target CTCSS frequency in Hz.
+    /// Target CTCSS frequency in Hz (one of the [`CTCSS_TONES_HZ`]
+    /// entries).
     target_hz: f32,
-    /// Goertzel feedback coefficient `2·cos(2π·f_target/fs)`.
-    coeff: f32,
+    /// Goertzel feedback coefficient at the target frequency:
+    /// `2·cos(2π·f_target/fs)`.
+    target_coeff: f32,
+    /// Goertzel coefficient for the CTCSS entry just below the
+    /// target, or `None` if the target is the first entry in the
+    /// table.
+    below_coeff: Option<f32>,
+    /// Goertzel coefficient for the CTCSS entry just above the
+    /// target, or `None` if the target is the last entry in the
+    /// table.
+    above_coeff: Option<f32>,
     /// Magnitude / RMS ratio above which a window counts as a hit.
     threshold: f32,
+    /// Target-vs-neighbor dominance ratio required for a hit. See
+    /// [`CTCSS_DOMINANCE_RATIO`].
+    dominance_ratio: f32,
     /// Number of consecutive above-threshold windows required to
     /// open / close the sustained gate.
     min_hits: usize,
@@ -223,30 +294,99 @@ pub struct CtcssDetector {
     miss_run: usize,
 }
 
+/// Compute the Goertzel coefficient `2·cos(2π·f/fs)` for a given
+/// target frequency. Shared helper so the constructor and any
+/// future sample-rate-change path build coefficients the same way.
+fn goertzel_coeff(target_hz: f32, sample_rate_hz: f32) -> f32 {
+    let omega = core::f32::consts::TAU * target_hz / sample_rate_hz;
+    2.0 * omega.cos()
+}
+
+/// Run one Goertzel recurrence over `samples` using the precomputed
+/// `coeff` and return the un-normalized magnitude (sqrt of the
+/// clamped `|DFT|²`). Factored out so `process_block` can call it
+/// three times — once for the target and once for each neighbor —
+/// without duplicating the inner loop.
+fn goertzel_magnitude(samples: &[f32], coeff: f32) -> f32 {
+    let mut s1: f32 = 0.0;
+    let mut s2: f32 = 0.0;
+    for &x in samples {
+        let s = x + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+    // Magnitude squared is algebraically `|DFT[f_target]|²` which is
+    // non-negative, but f32 rounding at the recurrence boundary can
+    // produce tiny negative values — clamp before sqrt to avoid NaN.
+    (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt()
+}
+
 impl CtcssDetector {
-    /// Build a detector tuned to `target_hz` running on
-    /// `sample_rate_hz` audio. Returns
-    /// [`DspError::InvalidParameter`] if the target frequency is
-    /// zero / negative / above Nyquist — a real CTCSS tone will
-    /// always be well inside the valid range at 48 kHz, so the
-    /// guard exists to catch wiring bugs rather than legitimate
-    /// edge cases.
+    /// Build a detector for one of the standard CTCSS tones.
     ///
-    /// Uses [`CTCSS_DEFAULT_THRESHOLD`] and [`CTCSS_MIN_HITS`] for
-    /// the hit threshold and sustained-gate debounce count. Use
-    /// [`Self::with_threshold`] to override.
+    /// `target_hz` must match an entry in [`CTCSS_TONES_HZ`] within
+    /// [`CTCSS_TONE_MATCH_EPSILON_HZ`] — the lookup determines
+    /// which immediate-neighbor tones get used for the dominance
+    /// gate. Arbitrary non-CTCSS frequencies are rejected at
+    /// construction time rather than silently falling back to
+    /// absolute-threshold-only detection, because the absolute-only
+    /// path is vulnerable to adjacent-tone false triggers.
+    ///
+    /// Also validates finiteness of both float inputs (NaN and
+    /// ±∞ fail all ordering comparisons by IEEE-754 semantics, so
+    /// a `target_hz.is_nan()` would otherwise silently propagate
+    /// to `omega.cos()` and produce a NaN coefficient that makes
+    /// every window's normalized magnitude NaN).
+    ///
+    /// Returns [`DspError::InvalidParameter`] on:
+    ///
+    /// - `target_hz` or `sample_rate_hz` not finite
+    /// - `sample_rate_hz ≤ 0.0`
+    /// - `target_hz` not present in [`CTCSS_TONES_HZ`]
+    ///
+    /// Uses [`CTCSS_DEFAULT_THRESHOLD`], [`CTCSS_DOMINANCE_RATIO`],
+    /// and [`CTCSS_MIN_HITS`] for the threshold, dominance ratio,
+    /// and sustained-gate debounce count. Use [`Self::with_threshold`]
+    /// to override the absolute threshold.
     pub fn new(target_hz: f32, sample_rate_hz: f32) -> Result<Self, DspError> {
-        if target_hz <= 0.0 || target_hz >= sample_rate_hz * 0.5 {
+        if !target_hz.is_finite() || !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
             return Err(DspError::InvalidParameter(format!(
-                "CTCSS target_hz must be in (0, {}), got {target_hz}",
-                sample_rate_hz * 0.5
+                "CTCSS detector requires finite target_hz and positive finite \
+                 sample_rate_hz, got target_hz={target_hz}, sample_rate_hz={sample_rate_hz}"
             )));
         }
-        let omega = core::f32::consts::TAU * target_hz / sample_rate_hz;
+
+        let index = ctcss_tone_index(target_hz).ok_or_else(|| {
+            DspError::InvalidParameter(format!(
+                "CTCSS detector target_hz={target_hz} must match an entry in \
+                 CTCSS_TONES_HZ (42 standard tones + 9 extensions, 67.0 - 254.1 Hz)"
+            ))
+        })?;
+
+        // Look up table neighbors. First tone has no `below`, last
+        // has no `above`. Use the canonical table value rather than
+        // the caller-supplied `target_hz` (which may differ by up
+        // to `CTCSS_TONE_MATCH_EPSILON_HZ`) so the coefficients are
+        // reproducible across calls with slightly different inputs.
+        let canonical_target = CTCSS_TONES_HZ[index];
+        let below_coeff = if index == 0 {
+            None
+        } else {
+            Some(goertzel_coeff(CTCSS_TONES_HZ[index - 1], sample_rate_hz))
+        };
+        let above_coeff = if index + 1 >= CTCSS_TONES_HZ.len() {
+            None
+        } else {
+            Some(goertzel_coeff(CTCSS_TONES_HZ[index + 1], sample_rate_hz))
+        };
+
         Ok(Self {
-            target_hz,
-            coeff: 2.0 * omega.cos(),
+            target_hz: canonical_target,
+            target_coeff: goertzel_coeff(canonical_target, sample_rate_hz),
+            below_coeff,
+            above_coeff,
             threshold: CTCSS_DEFAULT_THRESHOLD,
+            dominance_ratio: CTCSS_DOMINANCE_RATIO,
             min_hits: CTCSS_MIN_HITS,
             sustained: false,
             hit_run: 0,
@@ -261,20 +401,22 @@ impl CtcssDetector {
     /// to window RMS — a dimensionless value in `(0, 1]` under
     /// normal conditions.
     ///
-    /// Returns [`DspError::InvalidParameter`] if `threshold <= 0.0`.
-    /// A non-positive threshold would cause every window to count
-    /// as a hit (even pure silence, because the comparison
-    /// `normalized_magnitude >= threshold` would trivially pass
-    /// for any non-negative magnitude) which is almost always a
+    /// Returns [`DspError::InvalidParameter`] if `threshold` is
+    /// non-finite or `<= 0.0`. A non-positive or NaN threshold
+    /// would cause every window to count as a hit (even pure
+    /// silence, because the comparison
+    /// `normalized_magnitude >= threshold` would trivially pass for
+    /// any non-negative magnitude when threshold is non-positive,
+    /// or fail-open under NaN semantics), which is almost always a
     /// wiring bug rather than a legitimate configuration.
     pub fn with_threshold(
         target_hz: f32,
         sample_rate_hz: f32,
         threshold: f32,
     ) -> Result<Self, DspError> {
-        if threshold <= 0.0 {
+        if !threshold.is_finite() || threshold <= 0.0 {
             return Err(DspError::InvalidParameter(format!(
-                "CTCSS detector threshold must be positive, got {threshold}"
+                "CTCSS detector threshold must be finite and positive, got {threshold}"
             )));
         }
         let mut detector = Self::new(target_hz, sample_rate_hz)?;
@@ -312,8 +454,19 @@ impl CtcssDetector {
     /// degrade the frequency resolution of the Goertzel filter,
     /// longer windows delay the detection.
     ///
-    /// Returns a [`CtcssDecision`] with the normalized magnitude,
-    /// the raw per-window decision, and the sustained gate state.
+    /// Runs three Goertzel filters in parallel: one at the target
+    /// frequency and one each at the two immediate CTCSS-table
+    /// neighbors (if they exist). A per-window hit requires BOTH:
+    ///
+    /// 1. The target's normalized magnitude exceeds the absolute
+    ///    threshold ([`CTCSS_DEFAULT_THRESHOLD`] by default).
+    /// 2. The target's raw magnitude exceeds the loudest neighbor's
+    ///    raw magnitude by at least [`CTCSS_DOMINANCE_RATIO`].
+    ///
+    /// This combination rejects both silence-like noise (via #1)
+    /// and adjacent-tone interference (via #2). The sustained-hit
+    /// gate is driven by the combined decision, not the raw
+    /// magnitude.
     pub fn process_block(&mut self, samples: &[f32]) -> CtcssDecision {
         if samples.is_empty() {
             return CtcssDecision {
@@ -323,42 +476,48 @@ impl CtcssDetector {
             };
         }
 
-        // Goertzel recurrence. s1 is s[n-1], s2 is s[n-2].
-        let mut s1: f32 = 0.0;
-        let mut s2: f32 = 0.0;
-        let mut sum_sq: f32 = 0.0;
-        for &x in samples {
-            let s = x + self.coeff * s1 - s2;
-            s2 = s1;
-            s1 = s;
-            sum_sq += x * x;
-        }
-        // Magnitude squared at the target frequency. Algebraically
-        // equivalent to |DFT[f_target]|² over the window, which is
-        // non-negative by definition — but f32 rounding at the
-        // recurrence boundary can produce tiny negative values, so
-        // we clamp to zero before the sqrt below to avoid NaN
-        // propagating into `normalized_magnitude`.
-        let mag_sq = (s1 * s1 + s2 * s2 - self.coeff * s1 * s2).max(0.0);
+        // Target-frequency Goertzel — this is the one we're really
+        // asking about.
+        let target_mag = goertzel_magnitude(samples, self.target_coeff);
 
-        // Normalize by the RMS of the window so the threshold is
-        // "proportion of signal energy in the target bin" rather
-        // than an absolute magnitude (which would depend on audio
-        // gain). `sum_sq / N` is mean-square; `sqrt` gives RMS.
+        // Neighbor-frequency Goertzels for the dominance check.
+        // First/last tones in the CTCSS table have only one neighbor
+        // each; the other side is `0.0` (a tone that isn't there
+        // can't dominate the target).
+        let below_mag = self
+            .below_coeff
+            .map_or(0.0, |c| goertzel_magnitude(samples, c));
+        let above_mag = self
+            .above_coeff
+            .map_or(0.0, |c| goertzel_magnitude(samples, c));
+        let max_neighbor_mag = below_mag.max(above_mag);
+
+        // Window RMS for normalizing the target magnitude into a
+        // dimensionless "proportion of signal energy in the target
+        // bin" — threshold is then gain-independent.
+        let sum_sq: f32 = samples.iter().map(|x| x * x).sum();
         #[allow(clippy::cast_precision_loss)]
         let rms = (sum_sq / samples.len() as f32).sqrt();
         // Goertzel magnitude is scaled by N for time-domain units,
-        // so divide by N to get it into the same unit as RMS. The
-        // result is a dimensionless "amount of signal at target_hz
-        // per unit of total signal".
+        // so divide by N to get it into the same unit as RMS.
         #[allow(clippy::cast_precision_loss)]
         let normalized_magnitude = if rms > f32::EPSILON {
-            mag_sq.sqrt() / (samples.len() as f32 * rms)
+            target_mag / (samples.len() as f32 * rms)
         } else {
             0.0
         };
 
-        let detected = normalized_magnitude >= self.threshold;
+        // Two-part decision. Absolute threshold rejects silence and
+        // low-level noise; relative dominance rejects adjacent-tone
+        // interference (see module docstring for the leakage math).
+        //
+        // Neighbor dominance is checked on the raw Goertzel
+        // magnitudes (NOT the normalized one) because normalization
+        // is by window RMS — the same for all three bins, so it
+        // would cancel out and contribute nothing.
+        let above_floor = normalized_magnitude >= self.threshold;
+        let dominates_neighbors = target_mag >= max_neighbor_mag * self.dominance_ratio;
+        let detected = above_floor && dominates_neighbors;
 
         // Sustained-gate state machine. `min_hits` controls both
         // the open and close debounce so a brief dropout doesn't
@@ -448,25 +607,108 @@ mod tests {
     }
 
     #[test]
-    fn with_threshold_rejects_non_positive_threshold() {
+    fn with_threshold_rejects_non_positive_or_non_finite_threshold() {
         // Zero / negative thresholds would make every window a
         // hit (including pure silence), which is almost always a
         // wiring bug. Guard at construction time.
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 0.0).is_err());
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, -0.1).is_err());
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, -10.0).is_err());
-        // Positive values (including very small ones) are fine.
+        // NaN and infinity bypass ordering comparisons under
+        // IEEE-754 — must be explicitly rejected.
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, f32::NAN).is_err());
+        assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, f32::INFINITY).is_err());
+        assert!(
+            CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, f32::NEG_INFINITY).is_err()
+        );
+        // Positive finite values (including very small ones) are fine.
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 0.001).is_ok());
         assert!(CtcssDetector::with_threshold(100.0, CTCSS_SAMPLE_RATE_HZ, 1.0).is_ok());
     }
 
     #[test]
-    fn constructor_rejects_out_of_range_frequencies() {
+    fn constructor_rejects_non_ctcss_or_non_finite_frequencies() {
+        // Non-CTCSS frequencies: rejected because the neighbor-
+        // dominance gate needs table neighbors to compare against.
         assert!(CtcssDetector::new(0.0, CTCSS_SAMPLE_RATE_HZ).is_err());
         assert!(CtcssDetector::new(-1.0, CTCSS_SAMPLE_RATE_HZ).is_err());
+        assert!(CtcssDetector::new(500.0, CTCSS_SAMPLE_RATE_HZ).is_err());
         assert!(CtcssDetector::new(30_000.0, CTCSS_SAMPLE_RATE_HZ).is_err());
-        // Nyquist exactly should be rejected.
-        assert!(CtcssDetector::new(24_000.0, CTCSS_SAMPLE_RATE_HZ).is_err());
+        assert!(CtcssDetector::new(68.0, CTCSS_SAMPLE_RATE_HZ).is_err());
+
+        // Non-finite targets and sample rates: NaN and ±∞ fail
+        // ordering comparisons under IEEE-754, so they have to be
+        // caught by an explicit `.is_finite()` guard.
+        assert!(CtcssDetector::new(f32::NAN, CTCSS_SAMPLE_RATE_HZ).is_err());
+        assert!(CtcssDetector::new(f32::INFINITY, CTCSS_SAMPLE_RATE_HZ).is_err());
+        assert!(CtcssDetector::new(f32::NEG_INFINITY, CTCSS_SAMPLE_RATE_HZ).is_err());
+        assert!(CtcssDetector::new(100.0, f32::NAN).is_err());
+        assert!(CtcssDetector::new(100.0, f32::INFINITY).is_err());
+        assert!(CtcssDetector::new(100.0, 0.0).is_err());
+        assert!(CtcssDetector::new(100.0, -48_000.0).is_err());
+
+        // Valid CTCSS tones at the edges of the table are fine.
+        assert!(CtcssDetector::new(67.0, CTCSS_SAMPLE_RATE_HZ).is_ok());
+        assert!(CtcssDetector::new(254.1, CTCSS_SAMPLE_RATE_HZ).is_ok());
+    }
+
+    #[test]
+    fn close_neighbor_tones_are_rejected_by_dominance_gate() {
+        // Regression for CR round 2 on PR #285: at 200 ms window /
+        // 48 kHz sample rate the Goertzel sinc leakage between
+        // adjacent CTCSS tones (e.g. 150.0 / 151.4 Hz, Δf = 1.4 Hz)
+        // was large enough that an absolute-threshold decision
+        // false-fired on the neighbor. Fixed by moving to a 400 ms
+        // window AND requiring target magnitude to dominate the
+        // immediate neighbors.
+        //
+        // This test pins the critical pairs CR identified plus the
+        // symmetric "target itself still works" cases to make sure
+        // the dominance gate didn't overshoot and break real
+        // targets.
+        let pairs = [(150.0_f32, 151.4_f32), (67.0, 69.3), (159.8, 162.2)];
+
+        for &(low, high) in &pairs {
+            // Detector tuned to `low`, fed a pure `high` tone. Must
+            // NOT sustain the gate even over many windows.
+            let mut det =
+                CtcssDetector::new(low, CTCSS_SAMPLE_RATE_HZ).expect("low tone is in table");
+            let interferer = tone(high, window_samples(), 1.0);
+            for _ in 0..(CTCSS_MIN_HITS + 3) {
+                det.process_block(&interferer);
+            }
+            assert!(
+                !det.is_sustained(),
+                "{low} Hz detector sustained on {high} Hz source (adjacent-tone leakage)"
+            );
+
+            // Sanity: the same detector MUST still sustain on its
+            // true target. If it doesn't, the dominance gate is too
+            // strict and we've traded off real detections.
+            let mut det =
+                CtcssDetector::new(low, CTCSS_SAMPLE_RATE_HZ).expect("low tone is in table");
+            let real = tone(low, window_samples(), 1.0);
+            for _ in 0..CTCSS_MIN_HITS {
+                det.process_block(&real);
+            }
+            assert!(
+                det.is_sustained(),
+                "{low} Hz detector failed to sustain on its own target"
+            );
+
+            // And the symmetric case: detector tuned to `high` fed
+            // a pure `low` source must reject.
+            let mut det =
+                CtcssDetector::new(high, CTCSS_SAMPLE_RATE_HZ).expect("high tone is in table");
+            let interferer = tone(low, window_samples(), 1.0);
+            for _ in 0..(CTCSS_MIN_HITS + 3) {
+                det.process_block(&interferer);
+            }
+            assert!(
+                !det.is_sustained(),
+                "{high} Hz detector sustained on {low} Hz source (adjacent-tone leakage)"
+            );
+        }
     }
 
     #[test]
