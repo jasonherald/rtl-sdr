@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn silence_stays_silent() {
-        let mut buf = vec![0.0_f32; 256];
+        let mut buf = vec![0.0_f32; TEST_SILENCE_LEN];
         spectral_denoise(&mut buf, GATE_RATIO);
         for s in &buf {
             assert!(s.abs() < 1e-6, "expected silence, got {s}");
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn strong_tone_survives_gate() {
         // Generate a strong 1 kHz tone at 16 kHz sample rate.
-        let n = 1600; // 100ms
+        let n = TEST_SIGNAL_LEN;
         let mut buf: Vec<f32> = (0..n)
             .map(|i| {
                 let t = i as f32 / 16_000.0;
@@ -385,6 +385,28 @@ mod tests {
     /// offset smaller than the width of the narrowest region
     /// works; 0.1 Hz is visually obvious in assertion messages.
     const BREAKPOINT_OFFSET_HZ: f32 = 0.1;
+
+    /// Default test signal length in samples — 1600 at 16 kHz =
+    /// 100 ms. Long enough to put the FFT bin spacing at ~10 Hz
+    /// (16000/1600), which resolves every voice-band breakpoint
+    /// cleanly while keeping the test suite fast.
+    const TEST_SIGNAL_LEN: usize = 1600;
+
+    /// Test buffer length for the pure-silence pass-through test.
+    /// Just needs to exceed `MIN_FFT_LEN` so `spectral_denoise` /
+    /// `enhance_speech` take the FFT path instead of the short-
+    /// buffer early return.
+    const TEST_SILENCE_LEN: usize = 256;
+
+    /// Window below 1.0 for the non-unity weight regression test.
+    /// Output power at a weighted bin is `w² × input_power`, so a
+    /// weight of 0.5 should produce ~0.25× input power. The window
+    /// is tolerant of FFT numerical bleed.
+    const NON_UNITY_POWER_RATIO_MIN: f32 = 0.20;
+    /// Upper bound on the non-unity power ratio — weight × weight
+    /// plus headroom for the gate's percentile-based floor to not
+    /// over-gate a bin that should pass.
+    const NON_UNITY_POWER_RATIO_MAX: f32 = 0.30;
 
     /// Generate `n` samples of a unit-amplitude sine at `freq_hz` at 16 kHz.
     fn tone(freq_hz: f32, n: usize) -> Vec<f32> {
@@ -472,7 +494,7 @@ mod tests {
         // A 1 kHz tone is smack in the middle of the formant band —
         // weight 1.0, threshold should let it pass, and the output
         // weight is also 1.0 so the magnitude is preserved.
-        let n = 1600;
+        let n = TEST_SIGNAL_LEN;
         let mut buf = tone(1_000.0, n);
         // Add weak noise.
         for (i, s) in buf.iter_mut().enumerate() {
@@ -493,7 +515,7 @@ mod tests {
     fn enhance_speech_kills_sub_80hz_rumble() {
         // A 50 Hz tone (AC hum, HVAC rumble, CTCSS leakage) — weight
         // is zero, should be gated to silence.
-        let n = 1600;
+        let n = TEST_SIGNAL_LEN;
         let mut buf = tone(50.0, n);
         let pre = energy(&buf);
         assert!(
@@ -516,7 +538,7 @@ mod tests {
     fn enhance_speech_kills_above_7500hz_hiss() {
         // A 7.8 kHz tone — above VOICE_F_SIB_HI_HZ, weight is zero,
         // should be gated to silence regardless of amplitude.
-        let n = 1600;
+        let n = TEST_SIGNAL_LEN;
         let mut buf = tone(7_800.0, n);
         let pre = energy(&buf);
         assert!(
@@ -535,7 +557,7 @@ mod tests {
 
     #[test]
     fn enhance_speech_silence_stays_silent() {
-        let mut buf = vec![0.0_f32; 256];
+        let mut buf = vec![0.0_f32; TEST_SILENCE_LEN];
         enhance_speech(&mut buf, GATE_RATIO);
         for s in &buf {
             assert!(s.abs() < 1e-6, "expected silence, got {s}");
@@ -557,7 +579,7 @@ mod tests {
         // much louder 50 Hz rumble is present. The broadband gate
         // (spectral_denoise) would let the rumble drag the noise
         // floor up and could gate the quieter formant tone out.
-        let n = 1600;
+        let n = TEST_SIGNAL_LEN;
         let rumble = tone(50.0, n);
         let formant = tone(1_000.0, n);
 
@@ -596,6 +618,60 @@ mod tests {
         assert!(
             p_formant_post > p_rumble_post * FORMANT_TO_RUMBLE_DOMINANCE_MIN,
             "1 kHz formant should dominate residual 50 Hz rumble by >{FORMANT_TO_RUMBLE_DOMINANCE_MIN}x after enhancement: p_formant={p_formant_post}, p_rumble={p_rumble_post}"
+        );
+    }
+
+    #[test]
+    fn enhance_speech_scales_surviving_fundamental_band_tone_by_weight() {
+        // Regression coverage for the survivor-scaling path at
+        // non-unity weights. A 200 Hz tone is in the fundamentals
+        // band (weight VOICE_W_FUND = 0.5). If it survives the
+        // gate — it should, because it's the only bin in the
+        // buffer and therefore trivially above the percentile
+        // floor — the spectrum bin gets multiplied by the weight.
+        //
+        // Output power at 200 Hz should be approximately
+        // `(VOICE_W_FUND)² * input_power` because:
+        //   - Forward FFT bin magnitude scales linearly with input
+        //     amplitude.
+        //   - We multiply the bin by `weight` before the inverse
+        //     FFT.
+        //   - Output amplitude scales linearly with the scaled
+        //     bin.
+        //   - Output *power* is amplitude squared.
+        //
+        // With `VOICE_W_FUND = 0.5`, the expected ratio is 0.25 ±
+        // tolerance for FFT numerical bleed and percentile-based
+        // threshold interactions.
+        let n = TEST_SIGNAL_LEN;
+        let mut buf = tone(200.0, n);
+        let p_input = power_at(&buf, 200.0);
+        assert!(
+            p_input > MIN_SETUP_INPUT_ENERGY,
+            "setup: input should have real energy at 200 Hz"
+        );
+
+        enhance_speech(&mut buf, GATE_RATIO);
+
+        let p_output = power_at(&buf, 200.0);
+        let ratio = p_output / p_input;
+
+        // Sanity: the tone must not have been gated to zero —
+        // that would be a separate regression, not a scaling one.
+        assert!(
+            p_output > 0.0,
+            "fundamentals-band tone should survive the gate, not be zeroed: p_output={p_output}"
+        );
+
+        // The interesting part: the survivor must have been
+        // scaled by `VOICE_W_FUND` (not left unscaled). A future
+        // change that drops the `spectrum[i] *= *weight` line
+        // would push this ratio to ~1.0 and fail the upper
+        // bound.
+        assert!(
+            (NON_UNITY_POWER_RATIO_MIN..=NON_UNITY_POWER_RATIO_MAX).contains(&ratio),
+            "200 Hz survivor should be scaled to approximately VOICE_W_FUND² = {}× input power, got ratio={ratio} (p_input={p_input}, p_output={p_output})",
+            VOICE_W_FUND * VOICE_W_FUND
         );
     }
 }
