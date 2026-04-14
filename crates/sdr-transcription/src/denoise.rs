@@ -27,9 +27,11 @@
 
 use rustfft::{FftPlanner, num_complex::Complex};
 
-/// Target sample rate of the mono buffer handed to these functions.
-/// Both callers (`offline.rs` and `streaming.rs`) resample to 16 kHz
-/// before denoising, so the bin-frequency math is consistent.
+/// Required sample rate of the mono buffer handed to these functions.
+/// The voice-band weight function keys off absolute frequencies (80 Hz,
+/// 300 Hz, 3.4 kHz, 7.5 kHz), so callers must resample to 16 kHz mono
+/// before invoking the gate — otherwise the bin→frequency math is wrong
+/// and the weights land on the wrong physical bands.
 const SAMPLE_RATE_HZ: f32 = 16_000.0;
 
 // --- Voice-band weight function breakpoints (issue #274) ---
@@ -179,9 +181,11 @@ fn voice_band_weight(freq_hz: f32) -> f32 {
 ///    doubles as a true soft bandpass — out-of-band bins are zeroed,
 ///    fundamental-band bins are halved, sibilance rolls off linearly.
 ///
-/// The weight function is a static prior. Dynamic (per-segment) voice
-/// activity detection lives downstream at the recognizer's VAD stage;
-/// this is purely a spectral tilt.
+/// The weight function is a static prior — purely spectral shaping.
+/// Any dynamic (per-segment) voice-activity / endpoint detection is
+/// the caller's problem and happens downstream, at whatever stage
+/// makes sense for the specific recognizer backend. This function
+/// guarantees nothing about segmentation.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -286,7 +290,7 @@ mod tests {
 
     #[test]
     fn short_buffer_is_noop() {
-        let mut buf = vec![0.5_f32; 32];
+        let mut buf = vec![0.5_f32; MIN_FFT_LEN - 1];
         let original = buf.clone();
         spectral_denoise(&mut buf, GATE_RATIO);
         assert_eq!(buf, original);
@@ -540,7 +544,7 @@ mod tests {
 
     #[test]
     fn enhance_speech_short_buffer_is_noop() {
-        let mut buf = vec![0.5_f32; 32];
+        let mut buf = vec![0.5_f32; MIN_FFT_LEN - 1];
         let original = buf.clone();
         enhance_speech(&mut buf, GATE_RATIO);
         assert_eq!(buf, original);
