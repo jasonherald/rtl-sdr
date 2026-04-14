@@ -15,7 +15,6 @@ use crate::backend::{BackendError, TranscriptionEvent, TranscriptionInput};
 use crate::init_event::InitEvent;
 use crate::sherpa_model::{self, SherpaModel};
 
-
 /// Bounded channel capacity for audio buffers from DSP → backend.
 pub(super) const AUDIO_CHANNEL_CAPACITY: usize = 256;
 

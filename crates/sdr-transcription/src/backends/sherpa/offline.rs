@@ -1141,6 +1141,154 @@ mod auto_break_tests {
     }
 
     #[test]
+    #[allow(clippy::panic)]
+    fn emit_stop_notification_drops_queued_requests_and_emits_text() {
+        // Mock queue with three pending segments. emit_stop_notification
+        // should drain all three and emit exactly one Text event whose
+        // body names the discard count.
+        let (decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
+        let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>();
+
+        for _ in 0..3 {
+            decode_tx
+                .send(DecodeRequest {
+                    mono: vec![0.0_f32; 1600],
+                })
+                .expect("send to live channel");
+        }
+        drop(decode_tx); // Simulate I/O thread exiting.
+
+        emit_stop_notification(&decode_rx, &event_tx);
+
+        // decode_rx should be empty.
+        assert!(decode_rx.try_recv().is_err());
+
+        // event_rx should have exactly one Text event mentioning the count.
+        match event_rx.try_recv() {
+            Ok(TranscriptionEvent::Text { text, timestamp }) => {
+                assert!(
+                    text.contains("3 pending"),
+                    "stop notification text should mention the discard count, got: {text}"
+                );
+                assert_eq!(timestamp.len(), 8, "timestamp should be HH:MM:SS");
+            }
+            other => panic!("expected a Text stop notification, got: {other:?}"),
+        }
+        assert!(
+            event_rx.try_recv().is_err(),
+            "only one event should be emitted"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn emit_stop_notification_empty_queue_still_emits_single_text() {
+        // Zero pending segments — we still emit a stop marker so the
+        // transcript shows when the user stopped, just without a count.
+        let (_decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
+        let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>();
+
+        emit_stop_notification(&decode_rx, &event_tx);
+
+        match event_rx.try_recv() {
+            Ok(TranscriptionEvent::Text { text, .. }) => {
+                assert_eq!(text, "[transcription stopped]");
+            }
+            other => panic!("expected a Text stop notification, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_io_loop_auto_break_forwards_back_to_back_segments() {
+        // Regression for #275: the I/O thread must keep draining audio
+        // and forwarding segments even when no one is consuming
+        // decode_rx yet. Simulates the user's "3 sec audio, stop, 2 sec
+        // audio, stop" scenario: two transmissions back-to-back, both
+        // long enough to pass the MIN_SEGMENT threshold, with the
+        // receiver deliberately not consuming decode_rx until both have
+        // fired. Both DecodeRequests must arrive in order with non-empty
+        // mono buffers.
+        let (audio_tx, audio_rx) = mpsc::channel::<TranscriptionInput>();
+        let (decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
+        let (event_tx, _event_rx) = mpsc::channel::<TranscriptionEvent>();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let handle = std::thread::spawn({
+            let cancel = Arc::clone(&cancel);
+            move || {
+                session_io_loop_auto_break(SessionIoAutoBreakParams {
+                    cancel,
+                    audio_rx,
+                    event_tx,
+                    decode_tx,
+                    noise_gate_ratio: 1.0,
+                    auto_break_thresholds: super::super::host::AutoBreakThresholds::defaults(),
+                });
+            }
+        });
+
+        // Transmission 1: 1 s of audio.
+        audio_tx
+            .send(TranscriptionInput::SquelchOpened)
+            .expect("I/O thread alive");
+        audio_tx
+            .send(TranscriptionInput::Samples(samples_for_ms(1_000)))
+            .expect("I/O thread alive");
+        audio_tx
+            .send(TranscriptionInput::SquelchClosed)
+            .expect("I/O thread alive");
+
+        // Wait for the tail timer to fire and transmission 1 to flush.
+        // `AUTO_BREAK_TAIL_MS_DEFAULT` is the longest we'd have to wait;
+        // double it and add a small margin to avoid flaky CI.
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::from(crate::backend::AUTO_BREAK_TAIL_MS_DEFAULT) * 2 + 100,
+        ));
+
+        // Transmission 2: 700 ms of audio. Send WITHOUT reading
+        // decode_rx — the first DecodeRequest is sitting in the queue
+        // unconsumed. This mimics a backed-up decoder: the I/O thread
+        // must keep forwarding segments regardless of whether anyone
+        // is consuming them yet.
+        audio_tx
+            .send(TranscriptionInput::SquelchOpened)
+            .expect("I/O thread alive");
+        audio_tx
+            .send(TranscriptionInput::Samples(samples_for_ms(700)))
+            .expect("I/O thread alive");
+        audio_tx
+            .send(TranscriptionInput::SquelchClosed)
+            .expect("I/O thread alive");
+
+        // Drop audio_tx so the I/O loop exits after its final tail timeout.
+        drop(audio_tx);
+
+        // Wait for the I/O thread to finish so both tail timeouts have
+        // fired and both DecodeRequests are queued on decode_rx.
+        handle.join().expect("I/O thread should join cleanly");
+
+        // Now drain decode_rx: both requests should be there, in order.
+        let req1 = decode_rx
+            .try_recv()
+            .expect("first DecodeRequest should be queued");
+        let req2 = decode_rx
+            .try_recv()
+            .expect("second DecodeRequest should be queued even though we never read req1");
+        assert!(
+            !req1.mono.is_empty(),
+            "first segment's mono buffer must not be empty"
+        );
+        assert!(
+            !req2.mono.is_empty(),
+            "second segment's mono buffer must not be empty"
+        );
+        assert!(
+            decode_rx.try_recv().is_err(),
+            "no extra phantom requests expected"
+        );
+    }
+
+    #[test]
     fn max_segment_safety_flush_resumes_recording_not_idle() {
         // Regression: after the 30 s safety cap fires on a carrier that
         // stays open, the state machine MUST resume in Recording (so
