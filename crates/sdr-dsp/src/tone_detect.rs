@@ -242,7 +242,7 @@ pub fn ctcss_tone_index(target_hz: f32) -> Option<usize> {
         .position(|&t| (t - target_hz).abs() < CTCSS_TONE_MATCH_EPSILON_HZ)
 }
 
-/// Output of [`CtcssDetector::process_block`] — includes both the
+/// Output of [`CtcssDetector::accept_samples`] — includes both the
 /// raw per-window decision and the sustained-gate state so callers
 /// can choose which one to act on. The squelch wiring in PR 2 will
 /// consume `sustained` only; tests and future analytics can use the
@@ -250,8 +250,14 @@ pub fn ctcss_tone_index(target_hz: f32) -> Option<usize> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CtcssDecision {
     /// Goertzel magnitude at the target frequency, normalized by the
-    /// window's RMS. Always in `[0, ∞)`; compare against the
-    /// detector's threshold to recover the raw per-window decision.
+    /// window's RMS. Always in `[0, 1]` in exact arithmetic (with a
+    /// tiny f32 round-up possible at the boundary). Crossing the
+    /// detector's threshold is only the **absolute-floor** half of
+    /// the per-window decision — [`CtcssDecision::detected`] also
+    /// requires neighbor dominance. This field on its own does not
+    /// tell you whether `detected` is true; it's exposed mainly for
+    /// test diagnostics and future analytics (e.g. a UI level meter
+    /// on the tone band).
     pub normalized_magnitude: f32,
     /// This window's threshold comparison: the target tone is
     /// present in THIS single [`CTCSS_WINDOW_MS`]-long window
@@ -276,7 +282,7 @@ pub struct CtcssDecision {
 /// have only one neighbor each; those stay `None`.
 ///
 /// Feed blocks of 48 kHz demodulated audio via
-/// [`Self::process_block`] and consume [`CtcssDecision::sustained`]
+/// [`Self::accept_samples`] and consume [`CtcssDecision::sustained`]
 /// to drive squelch. The internal state keeps a small counter of
 /// consecutive hits / misses so the gate's latch is stateful across
 /// calls — don't construct a fresh detector per block or you'll
@@ -314,6 +320,20 @@ pub struct CtcssDetector {
     /// Consecutive below-threshold windows since the last flip.
     /// Counter resets on a hit when the gate is open.
     miss_run: usize,
+
+    /// Samples waiting to fill the next full [`CTCSS_WINDOW_SAMPLES`]
+    /// window. Callers to [`Self::accept_samples`] may feed
+    /// arbitrary-length slices (whatever their audio callback
+    /// produces); the detector buffers them here and only runs the
+    /// Goertzel filters when it has exactly one window's worth of
+    /// audio. Empty between windows; drained on [`Self::reset`].
+    ///
+    /// Buffering at this layer rather than the caller layer is
+    /// important because the 400 ms window duration is load-bearing
+    /// for the adjacent-tone sinc math (see module docstring). A
+    /// detector that silently accepted shorter blocks would reopen
+    /// the exact crosstalk bug round 2 fixed.
+    pending_samples: Vec<f32>,
 }
 
 /// Compute the Goertzel coefficient `2·cos(2π·f/fs)` for a given
@@ -326,7 +346,7 @@ fn goertzel_coeff(target_hz: f32, sample_rate_hz: f32) -> f32 {
 
 /// Run one Goertzel recurrence over `samples` using the precomputed
 /// `coeff` and return the un-normalized magnitude (sqrt of the
-/// clamped `|DFT|²`). Factored out so `process_block` can call it
+/// clamped `|DFT|²`). Factored out so `accept_samples` can call it
 /// three times — once for the target and once for each neighbor —
 /// without duplicating the inner loop.
 fn goertzel_magnitude(samples: &[f32], coeff: f32) -> f32 {
@@ -437,6 +457,7 @@ impl CtcssDetector {
             sustained: false,
             hit_run: 0,
             miss_run: 0,
+            pending_samples: Vec::with_capacity(CTCSS_WINDOW_SAMPLES),
         })
     }
 
@@ -484,7 +505,7 @@ impl CtcssDetector {
 
     /// Current state of the sustained-detection gate. Equivalent to
     /// the last [`CtcssDecision::sustained`] returned by
-    /// [`Self::process_block`], except available between blocks if
+    /// [`Self::accept_samples`], except available between blocks if
     /// the caller needs to poll without feeding samples.
     #[must_use]
     pub fn is_sustained(&self) -> bool {
@@ -492,19 +513,72 @@ impl CtcssDetector {
     }
 
     /// Reset the sustained-gate counters and re-close the gate.
+    /// Also drops any samples buffered in `pending_samples` so the
+    /// next `accept_samples` call starts a fresh window alignment.
     /// Called at session start / demod-mode change so stale state
     /// from a previous transmission can't leak into the new one.
     pub fn reset(&mut self) {
         self.sustained = false;
         self.hit_run = 0;
         self.miss_run = 0;
+        self.pending_samples.clear();
     }
 
-    /// Process one window of `samples` and update the sustained-hit
-    /// gate. The caller is responsible for feeding blocks of
-    /// approximately [`CTCSS_WINDOW_SAMPLES`] — shorter windows
-    /// degrade the frequency resolution of the Goertzel filter,
-    /// longer windows delay the detection.
+    /// Feed arbitrary-length samples into the detector. Runs the
+    /// Goertzel filters and updates the sustained-hit gate for
+    /// every full [`CTCSS_WINDOW_SAMPLES`]-long window that fits
+    /// into the pending buffer. Any remaining samples stay buffered
+    /// for the next call so a stream of irregular-size audio
+    /// blocks still land on aligned window boundaries.
+    ///
+    /// Returns `Some(decision)` with the MOST RECENT window's
+    /// decision if at least one full window was processed during
+    /// this call, or `None` if the input was swallowed into the
+    /// pending buffer without completing a window. When multiple
+    /// windows complete in one call (e.g. a caller that batched
+    /// several seconds of audio), the sustained-gate state is
+    /// updated for all of them in order, but only the latest
+    /// per-window decision is returned — the debounced state is
+    /// available via [`Self::is_sustained`] regardless.
+    ///
+    /// Callers that want per-window diagnostics should feed
+    /// exactly [`CTCSS_WINDOW_SAMPLES`]-sized slices, which
+    /// produces one `Some(decision)` per call.
+    ///
+    /// The 400 ms window duration at 48 kHz is load-bearing for
+    /// the adjacent-tone sinc math (see module docstring), so
+    /// this is the ONLY entry point for running Goertzel on
+    /// samples — there is no public API that processes an
+    /// arbitrary-length block directly.
+    pub fn accept_samples(&mut self, samples: &[f32]) -> Option<CtcssDecision> {
+        if samples.is_empty() {
+            return None;
+        }
+        self.pending_samples.extend_from_slice(samples);
+
+        let mut last_decision = None;
+        while self.pending_samples.len() >= CTCSS_WINDOW_SAMPLES {
+            // Drain one full window into a local Vec. We collect
+            // into a temporary so `process_window` can take an
+            // immutable `&[f32]` without fighting the borrow
+            // checker over aliasing between `pending_samples` and
+            // `&self`. The allocation is ~76 KB per 400 ms of
+            // audio — trivial for the modern allocator at this
+            // rate, and can be revisited if it shows up in a
+            // profile.
+            let window: Vec<f32> = self.pending_samples.drain(..CTCSS_WINDOW_SAMPLES).collect();
+            last_decision = Some(self.process_window(&window));
+        }
+        last_decision
+    }
+
+    /// Internal: process one full [`CTCSS_WINDOW_SAMPLES`]-long
+    /// window and update the sustained-hit gate. Called only from
+    /// [`Self::accept_samples`], which is responsible for ensuring
+    /// the slice is exactly one window long. Kept private so
+    /// external callers can't accidentally feed a wrong-length
+    /// block and recreate the adjacent-tone leakage bug that the
+    /// 400 ms window math was specifically calibrated to avoid.
     ///
     /// Runs three Goertzel filters in parallel: one at the target
     /// frequency and one each at the two immediate CTCSS-table
@@ -519,7 +593,12 @@ impl CtcssDetector {
     /// and adjacent-tone interference (via #2). The sustained-hit
     /// gate is driven by the combined decision, not the raw
     /// magnitude.
-    pub fn process_block(&mut self, samples: &[f32]) -> CtcssDecision {
+    fn process_window(&mut self, samples: &[f32]) -> CtcssDecision {
+        debug_assert_eq!(
+            samples.len(),
+            CTCSS_WINDOW_SAMPLES,
+            "process_window must only be called with a full CTCSS window"
+        );
         if samples.is_empty() {
             return CtcssDecision {
                 normalized_magnitude: 0.0,
@@ -758,7 +837,7 @@ mod tests {
                 CtcssDetector::new(low, CTCSS_SAMPLE_RATE_HZ).expect("low tone is in table");
             let interferer = tone(high, window_samples(), 1.0);
             for _ in 0..(CTCSS_MIN_HITS + 3) {
-                det.process_block(&interferer);
+                det.accept_samples(&interferer);
             }
             assert!(
                 !det.is_sustained(),
@@ -772,7 +851,7 @@ mod tests {
                 CtcssDetector::new(low, CTCSS_SAMPLE_RATE_HZ).expect("low tone is in table");
             let real = tone(low, window_samples(), 1.0);
             for _ in 0..CTCSS_MIN_HITS {
-                det.process_block(&real);
+                det.accept_samples(&real);
             }
             assert!(
                 det.is_sustained(),
@@ -785,7 +864,7 @@ mod tests {
                 CtcssDetector::new(high, CTCSS_SAMPLE_RATE_HZ).expect("high tone is in table");
             let interferer = tone(low, window_samples(), 1.0);
             for _ in 0..(CTCSS_MIN_HITS + 3) {
-                det.process_block(&interferer);
+                det.accept_samples(&interferer);
             }
             assert!(
                 !det.is_sustained(),
@@ -800,8 +879,12 @@ mod tests {
             CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
         let block = tone(100.0, window_samples(), 1.0);
 
-        // First block: detected but not yet sustained.
-        let d1 = det.process_block(&block);
+        // First block: detected but not yet sustained. Tests feed
+        // exactly one full window per call, so `accept_samples`
+        // always returns `Some(decision)` — unwrap via `expect`.
+        let d1 = det
+            .accept_samples(&block)
+            .expect("one full window should produce a decision");
         assert!(
             d1.detected,
             "100 Hz tone should be detected in a 100 Hz-tuned window: mag={}",
@@ -812,12 +895,16 @@ mod tests {
         // Second and third blocks: still hitting, not yet sustained
         // until hit count reaches min_hits.
         for _ in 0..(CTCSS_MIN_HITS - 2) {
-            let d = det.process_block(&block);
+            let d = det
+                .accept_samples(&block)
+                .expect("one full window should produce a decision");
             assert!(d.detected && !d.sustained);
         }
 
         // Third hit in a row: sustained gate opens.
-        let dfinal = det.process_block(&block);
+        let dfinal = det
+            .accept_samples(&block)
+            .expect("one full window should produce a decision");
         assert!(
             dfinal.sustained,
             "sustained gate should open after CTCSS_MIN_HITS"
@@ -830,7 +917,9 @@ mod tests {
             CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
         let silence = vec![0.0_f32; window_samples()];
         for _ in 0..10 {
-            let d = det.process_block(&silence);
+            let d = det
+                .accept_samples(&silence)
+                .expect("one full window should produce a decision");
             assert!(!d.detected && !d.sustained);
         }
     }
@@ -844,7 +933,9 @@ mod tests {
         let wrong_tone = tone(67.0, window_samples(), 1.0);
 
         for _ in 0..10 {
-            let d = det.process_block(&wrong_tone);
+            let d = det
+                .accept_samples(&wrong_tone)
+                .expect("one full window should produce a decision");
             assert!(
                 !d.sustained,
                 "67 Hz tone should not trigger a 100 Hz detector (mag={})",
@@ -864,7 +955,7 @@ mod tests {
         let speech = speech_like(window_samples(), 1.0);
 
         for _ in 0..10 {
-            det.process_block(&speech);
+            det.accept_samples(&speech);
         }
         assert!(
             !det.is_sustained(),
@@ -890,7 +981,7 @@ mod tests {
             .collect();
 
         for _ in 0..CTCSS_MIN_HITS {
-            det.process_block(&mixed);
+            det.accept_samples(&mixed);
         }
         assert!(
             det.is_sustained(),
@@ -908,14 +999,14 @@ mod tests {
         let block = tone(100.0, n, 1.0);
 
         for _ in 0..CTCSS_MIN_HITS {
-            det.process_block(&block);
+            det.accept_samples(&block);
         }
         assert!(det.is_sustained());
 
         // Drop the tone.
         let silence = vec![0.0_f32; n];
         for i in 0..CTCSS_MIN_HITS {
-            det.process_block(&silence);
+            det.accept_samples(&silence);
             // Should stay sustained until the miss-run reaches
             // min_hits; can drop on the final iteration.
             if i < CTCSS_MIN_HITS - 1 {
@@ -942,17 +1033,17 @@ mod tests {
         let block = tone(100.0, n, 1.0);
 
         for _ in 0..CTCSS_MIN_HITS {
-            det.process_block(&block);
+            det.accept_samples(&block);
         }
         assert!(det.is_sustained());
 
         // One miss window, then tone resumes.
-        det.process_block(&vec![0.0_f32; n]);
+        det.accept_samples(&vec![0.0_f32; n]);
         assert!(
             det.is_sustained(),
             "single miss below min_hits should not close the sustained gate"
         );
-        det.process_block(&block);
+        det.accept_samples(&block);
         assert!(det.is_sustained());
     }
 
@@ -964,7 +1055,7 @@ mod tests {
         let block = tone(100.0, n, 1.0);
 
         for _ in 0..CTCSS_MIN_HITS {
-            det.process_block(&block);
+            det.accept_samples(&block);
         }
         assert!(det.is_sustained());
 
@@ -973,13 +1064,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_block_is_a_noop_and_returns_current_state() {
+    fn empty_block_returns_none_and_does_not_flip_state() {
+        // An empty input should be a true no-op: no pending-buffer
+        // drift, no state change, and None returned because no
+        // window was completed.
         let mut det =
             CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
-        let d = det.process_block(&[]);
-        assert!(d.normalized_magnitude.abs() < f32::EPSILON);
-        assert!(!d.detected);
-        assert!(!d.sustained);
+        assert!(det.accept_samples(&[]).is_none());
+        assert!(!det.is_sustained());
+        assert_eq!(det.pending_samples.len(), 0);
     }
 
     #[test]
@@ -990,9 +1083,87 @@ mod tests {
             CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
         let block = tone(100.0, window_samples(), 1.0);
         for _ in 0..CTCSS_MIN_HITS {
-            let d = det.process_block(&block);
+            let d = det
+                .accept_samples(&block)
+                .expect("one full window should produce a decision");
             assert_eq!(det.is_sustained(), d.sustained);
         }
         assert!(det.is_sustained());
+    }
+
+    #[test]
+    fn accept_samples_buffers_partial_windows() {
+        // Regression for CR round 6: callers can feed arbitrary-
+        // length chunks (e.g. a 4,096-sample audio-callback block)
+        // and the detector must NOT run Goertzel on a short buffer,
+        // which would change the effective window length and break
+        // the adjacent-tone rejection. Instead it should stash the
+        // partial window and return None until enough samples have
+        // arrived to fill a full CTCSS_WINDOW_SAMPLES block.
+        let mut det =
+            CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
+        let block = tone(100.0, window_samples(), 1.0);
+
+        // Feed the first half of a window. No decision yet.
+        let half = CTCSS_WINDOW_SAMPLES / 2;
+        assert!(det.accept_samples(&block[..half]).is_none());
+        assert_eq!(det.pending_samples.len(), half);
+        assert!(!det.is_sustained());
+
+        // Feed the second half. Should complete the window and
+        // return Some(decision).
+        let d = det
+            .accept_samples(&block[half..])
+            .expect("remaining half of the window should complete a decision");
+        assert!(
+            d.detected,
+            "combined 100 Hz tone window should detect: mag={}",
+            d.normalized_magnitude
+        );
+        assert_eq!(
+            det.pending_samples.len(),
+            0,
+            "pending buffer should be empty after a complete window"
+        );
+    }
+
+    #[test]
+    fn accept_samples_processes_multiple_windows_in_one_call() {
+        // A caller that batches several seconds of audio into one
+        // call should still get proper per-window debounce behavior.
+        // Feed MIN_HITS full windows in a single call — the
+        // sustained gate should open by the end even though the
+        // caller only invoked `accept_samples` once.
+        let mut det =
+            CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
+        let single_window = tone(100.0, window_samples(), 1.0);
+        let mut batched: Vec<f32> = Vec::with_capacity(CTCSS_WINDOW_SAMPLES * CTCSS_MIN_HITS);
+        for _ in 0..CTCSS_MIN_HITS {
+            batched.extend_from_slice(&single_window);
+        }
+
+        let d = det
+            .accept_samples(&batched)
+            .expect("batched multi-window input should produce a latest-window decision");
+        assert!(
+            d.sustained,
+            "sustained gate should open after processing CTCSS_MIN_HITS windows in one call"
+        );
+        assert!(det.is_sustained());
+    }
+
+    #[test]
+    fn reset_clears_pending_sample_buffer() {
+        // Regression guard: reset() must drop buffered partial-
+        // window samples, otherwise the next session would start
+        // with sample alignment carried over from the previous one.
+        let mut det =
+            CtcssDetector::new(100.0, CTCSS_SAMPLE_RATE_HZ).expect("100 Hz is a valid target");
+        let partial = vec![0.5_f32; CTCSS_WINDOW_SAMPLES / 3];
+        det.accept_samples(&partial);
+        assert_eq!(det.pending_samples.len(), partial.len());
+
+        det.reset();
+        assert_eq!(det.pending_samples.len(), 0);
     }
 }
