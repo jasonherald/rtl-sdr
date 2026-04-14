@@ -77,6 +77,15 @@ const GATE_RATIO: f32 = 3.0;
 /// 0.2 means the bottom 20% of bins define the noise level.
 const NOISE_FLOOR_PERCENTILE: f32 = 0.20;
 
+/// Minimum buffer length required for a meaningful FFT-based gate.
+/// Buffers shorter than this (typical at session start when only a
+/// few milliseconds of audio have arrived) are passed through
+/// unchanged — the FFT would have so few bins that the noise-floor
+/// estimate would be pure noise itself. Shared between
+/// [`spectral_denoise`] and [`enhance_speech`] so the policy lives
+/// in one place.
+const MIN_FFT_LEN: usize = 64;
+
 /// Apply spectral noise gating to a mono f32 audio buffer in-place.
 ///
 /// The buffer is FFT'd, noise floor is estimated from the quietest bins,
@@ -92,7 +101,7 @@ const NOISE_FLOOR_PERCENTILE: f32 = 0.20;
 )]
 pub fn spectral_denoise(samples: &mut [f32], gate_ratio: f32) {
     let n = samples.len();
-    if n < 64 {
+    if n < MIN_FFT_LEN {
         return; // too short for meaningful FFT
     }
 
@@ -180,7 +189,7 @@ fn voice_band_weight(freq_hz: f32) -> f32 {
 )]
 pub fn enhance_speech(samples: &mut [f32], gate_ratio: f32) {
     let n = samples.len();
-    if n < 64 {
+    if n < MIN_FFT_LEN {
         return;
     }
 
@@ -316,6 +325,25 @@ mod tests {
         buf.iter().map(|s| s * s).sum()
     }
 
+    /// Goertzel-style power projection onto a single frequency.
+    ///
+    /// Computes `|Σ x[i] * exp(-j 2π f i / fs)|²` without a full FFT,
+    /// so a test can measure the exact power at a specific frequency
+    /// rather than relying on total-energy heuristics. Output is
+    /// proportional to the squared magnitude of the FFT bin nearest
+    /// `freq_hz` — the same physical quantity `enhance_speech` and
+    /// `spectral_denoise` gate against.
+    fn power_at(buf: &[f32], freq_hz: f32) -> f32 {
+        let mut re = 0.0_f32;
+        let mut im = 0.0_f32;
+        for (i, &x) in buf.iter().enumerate() {
+            let phase = 2.0 * std::f32::consts::PI * freq_hz * (i as f32) / SAMPLE_RATE_HZ;
+            re += x * phase.cos();
+            im -= x * phase.sin();
+        }
+        re * re + im * im
+    }
+
     #[test]
     fn voice_band_weight_at_breakpoints() {
         // Below sub-cut: hard zero.
@@ -441,18 +469,34 @@ mod tests {
             .map(|(&r, &f)| r + 0.1 * f)
             .collect();
 
+        // Record the pre-enhancement input power at each frequency
+        // so the post-enhancement assertion can compare against a
+        // real baseline, not just absolute thresholds.
+        let p_rumble_pre = power_at(&buf, 50.0);
+        let p_formant_pre = power_at(&buf, 1_000.0);
+        assert!(
+            p_rumble_pre > p_formant_pre * 50.0,
+            "setup: rumble should initially dominate formant by >50x (rumble amp=1.0 vs formant amp=0.1 → 100x power)"
+        );
+
         enhance_speech(&mut buf, GATE_RATIO);
 
-        // Measure the output energy in the 1 kHz neighborhood via a
-        // narrow FFT and verify the formant component survives. We
-        // approximate by checking the total output energy is
-        // dominated by content at the tone frequency rather than at
-        // 50 Hz — if the rumble had gated out the formant, the
-        // output would be near-silent.
-        let out_energy = energy(&buf);
+        // Post-enhancement: the 1 kHz formant must survive AND
+        // dominate the residual 50 Hz rumble. Goertzel projection
+        // gives us the exact power at each frequency, so we can
+        // assert both that the formant survived (>50% of its
+        // original power) and that the spectral dominance flipped
+        // (formant now exceeds residual rumble by a large margin).
+        let p_rumble_post = power_at(&buf, 50.0);
+        let p_formant_post = power_at(&buf, 1_000.0);
+
         assert!(
-            out_energy > 1e-4,
-            "formant tone should survive voice-band gating even when masked by 10x-louder sub-voice rumble: out_energy={out_energy}"
+            p_formant_post > p_formant_pre * 0.5,
+            "1 kHz formant should retain >50% of its input power after voice-band gating: pre={p_formant_pre}, post={p_formant_post}"
+        );
+        assert!(
+            p_formant_post > p_rumble_post * 5.0,
+            "1 kHz formant should dominate residual 50 Hz rumble by >5x after enhancement: p_formant={p_formant_post}, p_rumble={p_rumble_post}"
         );
     }
 }
