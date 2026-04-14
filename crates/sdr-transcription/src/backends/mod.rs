@@ -10,5 +10,8 @@ pub mod sherpa;
 #[cfg(feature = "whisper")]
 pub mod whisper;
 
+#[cfg(feature = "whisper")]
+pub mod earshot_vad;
+
 #[cfg(test)]
 pub mod mock;

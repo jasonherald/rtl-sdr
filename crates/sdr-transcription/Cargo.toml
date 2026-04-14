@@ -12,7 +12,15 @@ default = []
 # Internal cfg flags. Source code uses #[cfg(feature = "whisper")] /
 # #[cfg(feature = "sherpa")] to gate per-backend code. Pulled in by the
 # user-facing whisper-* / sherpa-* features below.
-whisper = ["dep:whisper-rs"]
+#
+# `earshot` is a tiny (~100 KB binary, ~8 KB runtime) pure-Rust voice
+# activity detector with zero C++ deps — just libm for math. It ships
+# only with whisper builds because whisper-rs has no built-in VAD and
+# was previously using a naive RMS gate. Using a pure-Rust VAD here
+# also side-steps the onnxruntime/libstdc++ state collision that
+# forced the whisper/sherpa feature mutex in the first place (#253) —
+# earshot doesn't need any C++ ONNX runtime.
+whisper = ["dep:whisper-rs", "dep:earshot"]
 sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2"]
 
 # User-facing build targets — pick exactly one.
@@ -46,6 +54,7 @@ sherpa-cuda = ["sherpa", "sherpa-onnx/cuda"]
 [dependencies]
 whisper-rs = { workspace = true, optional = true }
 sherpa-onnx = { workspace = true, optional = true }
+earshot = { version = "1", optional = true }
 reqwest.workspace = true
 rustfft.workspace = true
 sdr-types.workspace = true
