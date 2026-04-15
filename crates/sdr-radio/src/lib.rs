@@ -712,20 +712,54 @@ mod tests {
     #[test]
     fn test_radio_module_ctcss_threshold_rejects_invalid() {
         // Invalid values must fail fast at the RadioModule boundary
-        // (not deep in the DSP layer) and must NOT corrupt the
-        // cached value. The cached value on RadioModule is only
-        // advanced after the AF chain accepts the new value.
+        // (not deep in the DSP layer) and must NOT corrupt either
+        // the cached value OR the live AF-chain detector state.
+        // The RadioModule cache advances only after the AF chain
+        // accepts the new value, so a correctly-ordered setter
+        // leaves both in sync on rejection. Checking both levels
+        // pins that invariant — a regression that mutated one
+        // without the other (e.g. af_chain storing the bad value
+        // before the range check, or cache advancing before
+        // validation) would slip past a cache-only assertion.
         let mut radio = RadioModule::with_default_rate().unwrap();
         radio.set_ctcss_threshold(0.2).unwrap();
 
-        assert!(radio.set_ctcss_threshold(0.0).is_err());
-        assert!(radio.set_ctcss_threshold(-0.1).is_err());
-        assert!(radio.set_ctcss_threshold(1.001).is_err());
-        assert!(radio.set_ctcss_threshold(f32::NAN).is_err());
-        assert!(radio.set_ctcss_threshold(f32::INFINITY).is_err());
-        assert!(radio.set_ctcss_threshold(f32::NEG_INFINITY).is_err());
-
-        // Cached value must still be the last successful one.
-        assert!((radio.ctcss_threshold() - 0.2).abs() < 1e-6);
+        // Match on the exact error variant (not just `is_err`) so
+        // a future refactor can't mask the failure with a wrong
+        // error type (e.g. accidentally promoting to
+        // `RadioError::ModeSwitchFailed`).
+        let invalid = [
+            0.0_f32,
+            -0.1,
+            1.001,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for v in invalid {
+            assert!(
+                matches!(
+                    radio.set_ctcss_threshold(v),
+                    Err(RadioError::Dsp(DspError::InvalidParameter(_)))
+                ),
+                "threshold {v} should produce Err(RadioError::Dsp(DspError::InvalidParameter(_)))"
+            );
+            // After every single rejection, BOTH the cached value
+            // and the AF chain's effective value must still be
+            // the last-good 0.2. Re-asserting inside the loop
+            // (not just after) catches a hypothetical bug where
+            // the first rejected value corrupts one layer and
+            // subsequent rejected values corrupt the other —
+            // a post-loop assertion on the final state would
+            // miss that.
+            assert!(
+                (radio.ctcss_threshold() - 0.2).abs() < 1e-6,
+                "RadioModule cache drifted after rejected value {v}"
+            );
+            assert!(
+                (radio.af_chain().ctcss_threshold() - 0.2).abs() < 1e-6,
+                "AF chain effective threshold drifted after rejected value {v}"
+            );
+        }
     }
 }
