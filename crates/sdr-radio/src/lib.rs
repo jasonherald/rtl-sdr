@@ -500,6 +500,38 @@ mod tests {
     use super::*;
     use core::f32::consts::PI;
 
+    // ─── CTCSS threshold test fixtures ──────────────────────────
+    // Per project convention, test magic numbers (thresholds,
+    // tolerances, invalid-input lists) are named constants. These
+    // feed `test_radio_module_ctcss_threshold_*` — if the DSP
+    // layer's threshold range ever changes, there's one place to
+    // tune the test data.
+
+    /// Float tolerance for CTCSS threshold round-trip equality.
+    /// `1e-6` comfortably exceeds f32 rounding error for the
+    /// single-assignment round-trips the tests exercise.
+    const CTCSS_TEST_EPS: f32 = 1e-6;
+
+    /// Non-default value used by the persistence test. Chosen
+    /// strictly inside the DSP-layer `(0, 1]` range and clearly
+    /// different from the `CTCSS_DEFAULT_THRESHOLD` (0.1) so a
+    /// regression that silently reverts to the default fails
+    /// loudly.
+    const CTCSS_PERSIST_THRESHOLD: f32 = 0.25;
+
+    /// "Last-good" baseline used by the rejection test. Any
+    /// in-range value would work; 0.2 is distinct from both the
+    /// DSP default (0.1) and the persistence test's 0.25 so
+    /// cross-test contamination would be noticeable.
+    const CTCSS_LAST_GOOD_THRESHOLD: f32 = 0.2;
+
+    /// Values that `set_ctcss_threshold` must reject. Covers the
+    /// boundary cases (0.0, just over 1.0), a sub-zero, and all
+    /// three non-finite IEEE-754 values. Used by
+    /// `test_radio_module_ctcss_threshold_rejects_invalid`.
+    const INVALID_CTCSS_THRESHOLDS: [f32; 6] =
+        [0.0, -0.1, 1.001, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
     #[test]
     fn test_radio_module_default_mode() {
         let radio = RadioModule::with_default_rate().unwrap();
@@ -693,20 +725,26 @@ mod tests {
         // a mode change would snap the threshold back to the
         // DSP-layer default and silently un-tune the user's setting.
         let mut radio = RadioModule::with_default_rate().unwrap();
-        radio.set_ctcss_threshold(0.25).unwrap();
-        assert!((radio.ctcss_threshold() - 0.25).abs() < 1e-6);
-        assert!((radio.af_chain().ctcss_threshold() - 0.25).abs() < 1e-6);
+        radio.set_ctcss_threshold(CTCSS_PERSIST_THRESHOLD).unwrap();
+        assert!((radio.ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS);
+        assert!(
+            (radio.af_chain().ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS
+        );
 
         // Mode switch rebuilds the AF chain from scratch. The
         // cached threshold must survive AND be reapplied to the
         // new chain, not just stored on the RadioModule.
         radio.set_mode(DemodMode::Nfm).unwrap();
-        assert!((radio.ctcss_threshold() - 0.25).abs() < 1e-6);
-        assert!((radio.af_chain().ctcss_threshold() - 0.25).abs() < 1e-6);
+        assert!((radio.ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS);
+        assert!(
+            (radio.af_chain().ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS
+        );
 
         radio.set_mode(DemodMode::Am).unwrap();
-        assert!((radio.ctcss_threshold() - 0.25).abs() < 1e-6);
-        assert!((radio.af_chain().ctcss_threshold() - 0.25).abs() < 1e-6);
+        assert!((radio.ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS);
+        assert!(
+            (radio.af_chain().ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS
+        );
     }
 
     #[test]
@@ -722,21 +760,15 @@ mod tests {
         // before the range check, or cache advancing before
         // validation) would slip past a cache-only assertion.
         let mut radio = RadioModule::with_default_rate().unwrap();
-        radio.set_ctcss_threshold(0.2).unwrap();
+        radio
+            .set_ctcss_threshold(CTCSS_LAST_GOOD_THRESHOLD)
+            .unwrap();
 
         // Match on the exact error variant (not just `is_err`) so
         // a future refactor can't mask the failure with a wrong
         // error type (e.g. accidentally promoting to
         // `RadioError::ModeSwitchFailed`).
-        let invalid = [
-            0.0_f32,
-            -0.1,
-            1.001,
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-        ];
-        for v in invalid {
+        for v in INVALID_CTCSS_THRESHOLDS {
             assert!(
                 matches!(
                     radio.set_ctcss_threshold(v),
@@ -746,18 +778,19 @@ mod tests {
             );
             // After every single rejection, BOTH the cached value
             // and the AF chain's effective value must still be
-            // the last-good 0.2. Re-asserting inside the loop
+            // the last-good baseline. Re-asserting inside the loop
             // (not just after) catches a hypothetical bug where
             // the first rejected value corrupts one layer and
             // subsequent rejected values corrupt the other —
             // a post-loop assertion on the final state would
             // miss that.
             assert!(
-                (radio.ctcss_threshold() - 0.2).abs() < 1e-6,
+                (radio.ctcss_threshold() - CTCSS_LAST_GOOD_THRESHOLD).abs() < CTCSS_TEST_EPS,
                 "RadioModule cache drifted after rejected value {v}"
             );
             assert!(
-                (radio.af_chain().ctcss_threshold() - 0.2).abs() < 1e-6,
+                (radio.af_chain().ctcss_threshold() - CTCSS_LAST_GOOD_THRESHOLD).abs()
+                    < CTCSS_TEST_EPS,
                 "AF chain effective threshold drifted after rejected value {v}"
             );
         }
