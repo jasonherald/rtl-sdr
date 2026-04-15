@@ -1908,6 +1908,8 @@ dependencies = [
  "sdr-dsp",
  "sdr-pipeline",
  "sdr-types",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
 ]

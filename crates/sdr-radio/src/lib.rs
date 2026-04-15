@@ -76,6 +76,9 @@ pub struct RadioModule {
     /// rebuilt from scratch, so the CTCSS state has to be restored
     /// the same way deemphasis / notch / high-pass are).
     ctcss_mode: CtcssMode,
+    /// Persisted CTCSS detection threshold, paired with
+    /// `ctcss_mode`. Same reapply-on-rebuild pattern.
+    ctcss_threshold: f32,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -113,6 +116,7 @@ impl RadioModule {
             notch_enabled: false,
             notch_frequency: sdr_dsp::filter::DEFAULT_NOTCH_FREQ_HZ,
             ctcss_mode: CtcssMode::Off,
+            ctcss_threshold: sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -178,13 +182,20 @@ impl RadioModule {
         // correct when the user re-enables after a mode switch.
         af_chain.set_notch_frequency(self.notch_frequency);
         af_chain.set_notch_enabled(self.notch_enabled);
-        // Restore CTCSS mode. The sustained-gate state intentionally
-        // resets to closed on mode switch — a new mode means the
-        // user retuned or changed decode, and holding an old
-        // "tone confirmed" latch across that transition would let
-        // stray audio through before the detector re-confirmed on
-        // the new signal. `set_ctcss_mode` rebuilds the detector
-        // from scratch so this is the natural behavior.
+        // Restore CTCSS threshold FIRST so the detector built by
+        // set_ctcss_mode picks it up instead of the default.
+        // Sustained-gate state intentionally resets to closed on
+        // mode switch — a new mode means the user retuned or
+        // changed decode, and holding an old "tone confirmed"
+        // latch across that transition would let stray audio
+        // through before the detector re-confirmed on the new
+        // signal. `set_ctcss_mode` rebuilds the detector from
+        // scratch so this is the natural behavior.
+        af_chain
+            .set_ctcss_threshold(self.ctcss_threshold)
+            .map_err(|e| {
+                RadioError::ModeSwitchFailed(format!("failed to set CTCSS threshold: {e}"))
+            })?;
         af_chain
             .set_ctcss_mode(self.ctcss_mode)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to set CTCSS mode: {e}")))?;
@@ -424,6 +435,26 @@ impl RadioModule {
         self.af_chain.ctcss_sustained()
     }
 
+    /// Set the CTCSS detection threshold (normalized magnitude
+    /// ratio, `(0, 1]`). Default is
+    /// [`sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD`] (0.1).
+    /// Persists across mode changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RadioError::Dsp`] if the value is non-finite or
+    /// out of range.
+    pub fn set_ctcss_threshold(&mut self, threshold: f32) -> Result<(), RadioError> {
+        self.af_chain.set_ctcss_threshold(threshold)?;
+        self.ctcss_threshold = threshold;
+        Ok(())
+    }
+
+    /// Returns the current CTCSS detection threshold.
+    pub fn ctcss_threshold(&self) -> f32 {
+        self.ctcss_threshold
+    }
+
     /// Enable or disable WFM stereo decode.
     ///
     /// Only has an effect when the current mode is WFM. For other modes this
@@ -468,6 +499,38 @@ impl RadioModule {
 mod tests {
     use super::*;
     use core::f32::consts::PI;
+
+    // ─── CTCSS threshold test fixtures ──────────────────────────
+    // Per project convention, test magic numbers (thresholds,
+    // tolerances, invalid-input lists) are named constants. These
+    // feed `test_radio_module_ctcss_threshold_*` — if the DSP
+    // layer's threshold range ever changes, there's one place to
+    // tune the test data.
+
+    /// Float tolerance for CTCSS threshold round-trip equality.
+    /// `1e-6` comfortably exceeds f32 rounding error for the
+    /// single-assignment round-trips the tests exercise.
+    const CTCSS_TEST_EPS: f32 = 1e-6;
+
+    /// Non-default value used by the persistence test. Chosen
+    /// strictly inside the DSP-layer `(0, 1]` range and clearly
+    /// different from the `CTCSS_DEFAULT_THRESHOLD` (0.1) so a
+    /// regression that silently reverts to the default fails
+    /// loudly.
+    const CTCSS_PERSIST_THRESHOLD: f32 = 0.25;
+
+    /// "Last-good" baseline used by the rejection test. Any
+    /// in-range value would work; 0.2 is distinct from both the
+    /// DSP default (0.1) and the persistence test's 0.25 so
+    /// cross-test contamination would be noticeable.
+    const CTCSS_LAST_GOOD_THRESHOLD: f32 = 0.2;
+
+    /// Values that `set_ctcss_threshold` must reject. Covers the
+    /// boundary cases (0.0, just over 1.0), a sub-zero, and all
+    /// three non-finite IEEE-754 values. Used by
+    /// `test_radio_module_ctcss_threshold_rejects_invalid`.
+    const INVALID_CTCSS_THRESHOLDS: [f32; 6] =
+        [0.0, -0.1, 1.001, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
 
     #[test]
     fn test_radio_module_default_mode() {
@@ -653,5 +716,83 @@ mod tests {
         radio.set_mode(DemodMode::Wfm).unwrap();
         // The deemp mode is still Eu50 in the radio, and WFM allows it
         assert!(radio.af_chain().deemp_enabled());
+    }
+
+    #[test]
+    fn test_radio_module_ctcss_threshold_persists_across_set_mode() {
+        // RadioModule caches ctcss_threshold and reapplies it to
+        // the new AF chain on mode switch. Without the persistence,
+        // a mode change would snap the threshold back to the
+        // DSP-layer default and silently un-tune the user's setting.
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_ctcss_threshold(CTCSS_PERSIST_THRESHOLD).unwrap();
+        assert!((radio.ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS);
+        assert!(
+            (radio.af_chain().ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS
+        );
+
+        // Mode switch rebuilds the AF chain from scratch. The
+        // cached threshold must survive AND be reapplied to the
+        // new chain, not just stored on the RadioModule.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert!((radio.ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS);
+        assert!(
+            (radio.af_chain().ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS
+        );
+
+        radio.set_mode(DemodMode::Am).unwrap();
+        assert!((radio.ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS);
+        assert!(
+            (radio.af_chain().ctcss_threshold() - CTCSS_PERSIST_THRESHOLD).abs() < CTCSS_TEST_EPS
+        );
+    }
+
+    #[test]
+    fn test_radio_module_ctcss_threshold_rejects_invalid() {
+        // Invalid values must fail fast at the RadioModule boundary
+        // (not deep in the DSP layer) and must NOT corrupt either
+        // the cached value OR the live AF-chain detector state.
+        // The RadioModule cache advances only after the AF chain
+        // accepts the new value, so a correctly-ordered setter
+        // leaves both in sync on rejection. Checking both levels
+        // pins that invariant — a regression that mutated one
+        // without the other (e.g. af_chain storing the bad value
+        // before the range check, or cache advancing before
+        // validation) would slip past a cache-only assertion.
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio
+            .set_ctcss_threshold(CTCSS_LAST_GOOD_THRESHOLD)
+            .unwrap();
+
+        // Match on the exact error variant (not just `is_err`) so
+        // a future refactor can't mask the failure with a wrong
+        // error type (e.g. accidentally promoting to
+        // `RadioError::ModeSwitchFailed`).
+        for v in INVALID_CTCSS_THRESHOLDS {
+            assert!(
+                matches!(
+                    radio.set_ctcss_threshold(v),
+                    Err(RadioError::Dsp(DspError::InvalidParameter(_)))
+                ),
+                "threshold {v} should produce Err(RadioError::Dsp(DspError::InvalidParameter(_)))"
+            );
+            // After every single rejection, BOTH the cached value
+            // and the AF chain's effective value must still be
+            // the last-good baseline. Re-asserting inside the loop
+            // (not just after) catches a hypothetical bug where
+            // the first rejected value corrupts one layer and
+            // subsequent rejected values corrupt the other —
+            // a post-loop assertion on the final state would
+            // miss that.
+            assert!(
+                (radio.ctcss_threshold() - CTCSS_LAST_GOOD_THRESHOLD).abs() < CTCSS_TEST_EPS,
+                "RadioModule cache drifted after rejected value {v}"
+            );
+            assert!(
+                (radio.af_chain().ctcss_threshold() - CTCSS_LAST_GOOD_THRESHOLD).abs()
+                    < CTCSS_TEST_EPS,
+                "AF chain effective threshold drifted after rejected value {v}"
+            );
+        }
     }
 }

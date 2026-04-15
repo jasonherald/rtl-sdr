@@ -105,6 +105,14 @@ pub struct TuningProfile {
     pub fm_if_nr: bool,
     pub wfm_stereo: bool,
     pub high_pass: Option<bool>,
+    /// CTCSS sub-audible tone squelch mode. `None` means "don't
+    /// touch the current setting on restore" — bookmarks saved
+    /// before PR 3 are all `None` after deserialization so they
+    /// preserve the user's current CTCSS setting when loaded.
+    pub ctcss_mode: Option<sdr_radio::af_chain::CtcssMode>,
+    /// CTCSS detection threshold (normalized magnitude, `(0, 1]`).
+    /// Same backward-compat semantics as `ctcss_mode`.
+    pub ctcss_threshold: Option<f32>,
 }
 
 /// A user-saved frequency bookmark with optional tuning profile fields.
@@ -150,6 +158,17 @@ pub struct Bookmark {
     /// `RadioReference` frequency ID for duplicate detection and future sync.
     #[serde(default)]
     pub rr_import_id: Option<String>,
+    /// CTCSS sub-audible tone squelch mode. Added in PR 3 of #269.
+    /// Serialized as the tagged form `{"kind":"off"}` or
+    /// `{"kind":"tone","hz":100.0}`. Pre-PR-3 bookmarks lack this
+    /// key and deserialize to `None`, which the restore path
+    /// interprets as "leave the current CTCSS setting alone".
+    #[serde(default)]
+    pub ctcss_mode: Option<sdr_radio::af_chain::CtcssMode>,
+    /// CTCSS detection threshold in `(0, 1]`. Same backward-compat
+    /// semantics as `ctcss_mode`.
+    #[serde(default)]
+    pub ctcss_threshold: Option<f32>,
 }
 
 impl Bookmark {
@@ -174,6 +193,8 @@ impl Bookmark {
             high_pass: None,
             rr_category: None,
             rr_import_id: None,
+            ctcss_mode: None,
+            ctcss_threshold: None,
         }
     }
 
@@ -204,6 +225,8 @@ impl Bookmark {
             high_pass: profile.high_pass,
             rr_category: None,
             rr_import_id: None,
+            ctcss_mode: profile.ctcss_mode,
+            ctcss_threshold: profile.ctcss_threshold,
         }
     }
 
@@ -717,6 +740,8 @@ mod tests {
             fm_if_nr: true,
             wfm_stereo: true,
             high_pass: Some(false),
+            ctcss_mode: Some(sdr_radio::af_chain::CtcssMode::Tone(100.0)),
+            ctcss_threshold: Some(0.15),
         };
         let bm = Bookmark::with_profile("Full", 98_100_000, DemodMode::Wfm, 150_000.0, &profile);
         let json = serde_json::to_string(&bm).unwrap();
@@ -733,6 +758,24 @@ mod tests {
         assert_eq!(back.fm_if_nr, Some(true));
         assert_eq!(back.wfm_stereo, Some(true));
         assert_eq!(back.high_pass, Some(false));
+        assert_eq!(
+            back.ctcss_mode,
+            Some(sdr_radio::af_chain::CtcssMode::Tone(100.0))
+        );
+        assert_eq!(back.ctcss_threshold, Some(0.15));
+    }
+
+    #[test]
+    fn bookmark_backward_compat_ctcss_none() {
+        // Old bookmark JSON (pre-PR-3) has neither ctcss_mode nor
+        // ctcss_threshold. Deserialization must yield None for
+        // both, which restore_bookmark_profile interprets as
+        // "leave the current CTCSS setting alone."
+        let old_json =
+            r#"{"name":"Legacy","frequency":162550000,"demod_mode":"NFM","bandwidth":12500.0}"#;
+        let bm: Bookmark = serde_json::from_str(old_json).unwrap();
+        assert!(bm.ctcss_mode.is_none());
+        assert!(bm.ctcss_threshold.is_none());
     }
 
     #[test]

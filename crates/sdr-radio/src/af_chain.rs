@@ -5,7 +5,7 @@
 
 use sdr_dsp::filter::{DeemphasisFilter, NotchFilter};
 use sdr_dsp::multirate::RationalResampler;
-use sdr_dsp::tone_detect::{CtcssDetector, ctcss_tone_index};
+use sdr_dsp::tone_detect::{CTCSS_DEFAULT_THRESHOLD, CtcssDetector, ctcss_tone_index};
 use sdr_types::{Complex, DspError, Stereo};
 
 /// Default audio output sample rate (Hz).
@@ -33,7 +33,12 @@ const HIGH_PASS_CUTOFF_HZ: f64 = 300.0;
 ///    `sustained == false` (no tone confirmed yet, or tone has
 ///    dropped out for at least `CTCSS_MIN_HITS` consecutive
 ///    windows).
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Serialized form: `{"kind":"off"}` or `{"kind":"tone","hz":100.0}`
+/// — a tagged representation so bookmark JSON is self-describing
+/// and round-trips cleanly through serde.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "hz", rename_all = "lowercase")]
 pub enum CtcssMode {
     /// No CTCSS gating. Audio passes through unchanged.
     Off,
@@ -110,6 +115,13 @@ pub struct AfChain {
     /// detector runs on every block and the output is muted until
     /// the sustained gate opens.
     ctcss_mode: CtcssMode,
+    /// Current CTCSS detection threshold (0, 1]. Used whenever a
+    /// new detector is constructed — either from
+    /// [`Self::set_ctcss_mode`] or from [`Self::set_ctcss_threshold`]
+    /// (which rebuilds the active detector). Persists across
+    /// Off → Tone → Off cycles so a user-tuned value doesn't snap
+    /// back to default on mode switch.
+    ctcss_threshold: f32,
     /// CTCSS detector instance, constructed lazily from
     /// [`Self::set_ctcss_mode`] when the mode flips to `Tone(_)`.
     /// Dropped when the mode flips back to `Off`. The detector
@@ -171,6 +183,7 @@ impl AfChain {
             af_sample_rate,
             audio_sample_rate,
             ctcss_mode: CtcssMode::Off,
+            ctcss_threshold: CTCSS_DEFAULT_THRESHOLD,
             ctcss_detector: None,
             ctcss_mono_buf: Vec::new(),
             deemp_buf_l: Vec::new(),
@@ -308,13 +321,17 @@ impl AfChain {
                 // detector's internal rate-validation catches a
                 // misconfigured AF chain at setter time rather than
                 // silently running 19200-sample windows at the
-                // wrong duration. CtcssDetector::new enforces
-                // equality with CTCSS_SAMPLE_RATE_HZ within a
-                // 0.5 Hz tolerance and returns
+                // wrong duration. CtcssDetector::with_threshold
+                // enforces equality with CTCSS_SAMPLE_RATE_HZ within
+                // a 0.5 Hz tolerance and returns
                 // DspError::InvalidParameter on mismatch — that's
                 // exactly the contract we want here.
                 #[allow(clippy::cast_possible_truncation)]
-                let detector = CtcssDetector::new(hz, self.audio_sample_rate as f32)?;
+                let detector = CtcssDetector::with_threshold(
+                    hz,
+                    self.audio_sample_rate as f32,
+                    self.ctcss_threshold,
+                )?;
                 self.ctcss_mode = CtcssMode::Tone(hz);
                 self.ctcss_detector = Some(detector);
             }
@@ -335,6 +352,43 @@ impl AfChain {
         self.ctcss_detector
             .as_ref()
             .is_some_and(CtcssDetector::is_sustained)
+    }
+
+    /// Set the CTCSS detection threshold (normalized magnitude
+    /// ratio, must be in `(0, 1]`). The default value is
+    /// [`sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD`] (0.1).
+    ///
+    /// If CTCSS is currently `Tone(_)`, the active detector is
+    /// rebuilt with the new threshold — this resets the hysteresis
+    /// run counters so the gate has to re-confirm at the new
+    /// threshold. If CTCSS is `Off`, the value is stored and
+    /// applied the next time [`Self::set_ctcss_mode`] enables a
+    /// tone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DspError::InvalidParameter`] if `threshold` is
+    /// not finite or not in `(0, 1]` (matches
+    /// [`CtcssDetector::with_threshold`]'s contract).
+    pub fn set_ctcss_threshold(&mut self, threshold: f32) -> Result<(), DspError> {
+        if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "CTCSS threshold must be finite and in (0, 1], got {threshold}"
+            )));
+        }
+        self.ctcss_threshold = threshold;
+        if let CtcssMode::Tone(hz) = self.ctcss_mode {
+            #[allow(clippy::cast_possible_truncation)]
+            let detector =
+                CtcssDetector::with_threshold(hz, self.audio_sample_rate as f32, threshold)?;
+            self.ctcss_detector = Some(detector);
+        }
+        Ok(())
+    }
+
+    /// Returns the current CTCSS detection threshold.
+    pub fn ctcss_threshold(&self) -> f32 {
+        self.ctcss_threshold
     }
 
     /// Enable or disable the notch filter.
@@ -814,6 +868,66 @@ mod tests {
             any_nonzero,
             "open gate must pass some signal through (even after HPF)"
         );
+    }
+
+    #[test]
+    fn test_ctcss_mode_serde_round_trip() {
+        // Off → {"kind":"off"}
+        let off = CtcssMode::Off;
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(json, r#"{"kind":"off"}"#);
+        let back: CtcssMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, CtcssMode::Off);
+
+        // Tone(100.0) → {"kind":"tone","hz":100.0}
+        let tone = CtcssMode::Tone(100.0);
+        let json = serde_json::to_string(&tone).unwrap();
+        assert_eq!(json, r#"{"kind":"tone","hz":100.0}"#);
+        let back: CtcssMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, CtcssMode::Tone(100.0));
+    }
+
+    #[test]
+    fn test_ctcss_threshold_roundtrip_and_validation() {
+        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        // Default equals the DSP constant.
+        assert!(
+            (chain.ctcss_threshold() - sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD).abs() < 1e-6
+        );
+
+        // Valid values are accepted and persist.
+        chain.set_ctcss_threshold(0.25).unwrap();
+        assert!((chain.ctcss_threshold() - 0.25).abs() < 1e-6);
+
+        // Out-of-range / non-finite values are rejected and the
+        // existing value is preserved.
+        assert!(chain.set_ctcss_threshold(0.0).is_err());
+        assert!(chain.set_ctcss_threshold(-0.1).is_err());
+        assert!(chain.set_ctcss_threshold(1.001).is_err());
+        assert!(chain.set_ctcss_threshold(f32::NAN).is_err());
+        assert!((chain.ctcss_threshold() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_ctcss_threshold_persists_across_mode_and_rebuilds_detector() {
+        // Set a non-default threshold first, then enable a tone.
+        // The built detector must pick up the stored threshold
+        // rather than snapping back to CTCSS_DEFAULT_THRESHOLD.
+        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        chain.set_ctcss_threshold(0.3).unwrap();
+        chain.set_ctcss_mode(CtcssMode::Tone(100.0)).unwrap();
+
+        // And the reverse order: mode first, then threshold change
+        // should rebuild the active detector.
+        chain.set_ctcss_threshold(0.4).unwrap();
+        assert!((chain.ctcss_threshold() - 0.4).abs() < 1e-6);
+        // Sustained state must be reset after the rebuild.
+        assert!(!chain.ctcss_sustained());
+
+        // Going Off → Tone preserves the user-tuned threshold.
+        chain.set_ctcss_mode(CtcssMode::Off).unwrap();
+        chain.set_ctcss_mode(CtcssMode::Tone(100.0)).unwrap();
+        assert!((chain.ctcss_threshold() - 0.4).abs() < 1e-6);
     }
 
     #[test]
