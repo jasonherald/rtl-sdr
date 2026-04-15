@@ -12,7 +12,7 @@ use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, DEEMPHASIS_TAU_US};
 use sdr_dsp::multirate::RationalResampler;
 use sdr_types::{Complex, DemodMode, DspError, Stereo};
 
-use af_chain::AfChain;
+use af_chain::{AfChain, CtcssMode};
 use demod::{DemodConfig, Demodulator, create_demodulator};
 
 /// Tolerance for considering two sample rates equal (skip resampling).
@@ -71,6 +71,11 @@ pub struct RadioModule {
     high_pass_enabled: bool,
     notch_enabled: bool,
     notch_frequency: f32,
+    /// Persisted CTCSS squelch mode. Reapplied to the new AF chain
+    /// on mode switch (when the demod rate changes the AF chain is
+    /// rebuilt from scratch, so the CTCSS state has to be restored
+    /// the same way deemphasis / notch / high-pass are).
+    ctcss_mode: CtcssMode,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -107,6 +112,7 @@ impl RadioModule {
             high_pass_enabled: false,
             notch_enabled: false,
             notch_frequency: sdr_dsp::filter::DEFAULT_NOTCH_FREQ_HZ,
+            ctcss_mode: CtcssMode::Off,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -172,6 +178,16 @@ impl RadioModule {
         // correct when the user re-enables after a mode switch.
         af_chain.set_notch_frequency(self.notch_frequency);
         af_chain.set_notch_enabled(self.notch_enabled);
+        // Restore CTCSS mode. The sustained-gate state intentionally
+        // resets to closed on mode switch — a new mode means the
+        // user retuned or changed decode, and holding an old
+        // "tone confirmed" latch across that transition would let
+        // stray audio through before the detector re-confirmed on
+        // the new signal. `set_ctcss_mode` rebuilds the detector
+        // from scratch so this is the natural behavior.
+        af_chain
+            .set_ctcss_mode(self.ctcss_mode)
+            .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to set CTCSS mode: {e}")))?;
 
         // Update IF chain feature flags based on new mode capabilities
         if !fm_if_nr_allowed {
@@ -370,6 +386,42 @@ impl RadioModule {
     pub fn set_notch_frequency(&mut self, freq: f32) {
         self.notch_frequency = freq;
         self.af_chain.set_notch_frequency(freq);
+    }
+
+    /// Set the CTCSS sub-audible tone squelch mode.
+    ///
+    /// `CtcssMode::Off` disables the detector and restores the
+    /// user's explicit high-pass preference. `CtcssMode::Tone(hz)`
+    /// validates `hz` against the standard 51-entry CTCSS table,
+    /// constructs a fresh detector at the current audio rate, and
+    /// force-enables the 300 Hz speaker-path high-pass filter so
+    /// the user doesn't hear the sub-audible tone as a low buzz.
+    ///
+    /// Persists across mode changes — reapplied when the AF chain
+    /// is rebuilt. See [`AfChain::set_ctcss_mode`] for details on
+    /// the detector's window / hysteresis behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RadioError::Dsp`] if the frequency isn't a known
+    /// CTCSS tone or the detector constructor rejects it.
+    pub fn set_ctcss_mode(&mut self, mode: CtcssMode) -> Result<(), RadioError> {
+        self.af_chain.set_ctcss_mode(mode)?;
+        self.ctcss_mode = mode;
+        Ok(())
+    }
+
+    /// Returns the current CTCSS squelch mode.
+    pub fn ctcss_mode(&self) -> CtcssMode {
+        self.ctcss_mode
+    }
+
+    /// Returns the CTCSS sustained-gate state: `true` when the
+    /// target tone has been confirmed present for at least
+    /// [`sdr_dsp::tone_detect::CTCSS_MIN_HITS`] consecutive
+    /// windows. Always `false` when CTCSS is `Off`.
+    pub fn ctcss_sustained(&self) -> bool {
+        self.af_chain.ctcss_sustained()
     }
 
     /// Enable or disable WFM stereo decode.
