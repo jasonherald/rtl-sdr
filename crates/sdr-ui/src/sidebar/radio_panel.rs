@@ -288,10 +288,27 @@ impl RadioPanel {
     /// (shouldn't happen with the fixed 3-entry model) fall
     /// back to `Off` — same contract as CTCSS.
     ///
-    /// The caller passes the current threshold so this helper
-    /// doesn't have to know about the spin row; it's shared
-    /// between the save path and the DSP-dispatch path in
-    /// `window.rs`.
+    /// **Important**: the caller must ensure `threshold` is in
+    /// the correct units for the target `index`. Syllabic
+    /// expects a normalized envelope ratio (~0.05–0.50); Snr
+    /// expects a dB value (~0.0–20.0). Passing 0.15 to Snr or
+    /// 6.0 to Syllabic would leave the detector far outside its
+    /// tuning range and either always-open or never-open.
+    ///
+    /// Used by two call sites with different threshold sources:
+    ///
+    /// - **Save path** (bookmark save) — threshold is read from
+    ///   the spin row, which is already in the current mode's
+    ///   units, so the combo index and threshold are in sync.
+    /// - **Restore path** (bookmark load) — threshold is
+    ///   extracted from the persisted [`VoiceSquelchMode`] enum
+    ///   which carries it inline in the correct units.
+    ///
+    /// For the **mode-change** path (user flips the combo), the
+    /// caller must use [`Self::voice_squelch_default_threshold_for_index`]
+    /// to get the target mode's per-variant default, NOT the
+    /// current spin-row value from the previous mode. Otherwise
+    /// the units don't match.
     #[must_use]
     pub fn voice_squelch_mode_from_index(index: u32, threshold: f32) -> VoiceSquelchMode {
         match index {
@@ -300,6 +317,24 @@ impl RadioPanel {
                 threshold_db: threshold,
             },
             _ => VoiceSquelchMode::Off,
+        }
+    }
+
+    /// Return the default threshold for a voice-squelch combo
+    /// index, in the correct units for that variant. Used by
+    /// the combo-change signal handler in `window.rs` to seed
+    /// a mode switch with a sane per-mode default rather than
+    /// carrying the previous mode's threshold (which would be in
+    /// the wrong units).
+    ///
+    /// Returns 0.0 for `Off` because `Off` has no threshold to
+    /// apply — the caller should ignore the value on that path.
+    #[must_use]
+    pub fn voice_squelch_default_threshold_for_index(index: u32) -> f32 {
+        match index {
+            VOICE_SQUELCH_SYLLABIC_IDX => VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            VOICE_SQUELCH_SNR_IDX => VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
+            _ => 0.0,
         }
     }
 

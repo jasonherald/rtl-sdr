@@ -1047,43 +1047,102 @@ mod tests {
         VoiceSquelchMode,
     };
 
+    // Test-only fixture constants. Per CLAUDE.md's "named
+    // constants for all magic numbers" rule, even test values
+    // with load-bearing intent get names + rationale so a
+    // future detector retune can find them in one place.
+
+    /// Sample rate for all voice-squelch AF-chain tests. Matches
+    /// the canonical 48 kHz the DSP layer is calibrated against
+    /// (see `VOICE_SQUELCH_SAMPLE_RATE_HZ`). Passed to
+    /// `AfChain::new` for both `af_sample_rate` and
+    /// `audio_sample_rate` so the tests don't exercise the
+    /// resampler — voice-squelch behavior is the focus.
+    const VS_TEST_SAMPLE_RATE: f64 = 48_000.0;
+
+    /// Length in samples of a 100 ms short-window test block.
+    /// Matches `VOICE_SQUELCH_RMS_WINDOW_MS` so silence-rejection
+    /// tests feed exactly one RMS integration window.
+    const VS_SHORT_BLOCK_SAMPLES: usize = 4_800;
+
+    /// Length in samples of a 2-second long block used by the
+    /// detector-opens tests. Hang time is 500 ms and the RMS
+    /// window is 100 ms, so 2 seconds is comfortably long enough
+    /// for the detector to ring up, the gate to open, and the
+    /// post-warmup tail to have audible signal.
+    const VS_LONG_BLOCK_SAMPLES: usize = 96_000;
+
+    /// Offset into `VS_LONG_BLOCK_SAMPLES` where we check the
+    /// output for post-warmup audible signal. 1 second in — past
+    /// both the HPF warmup transient and the detector ring-up,
+    /// but still inside the long block.
+    const VS_LONG_BLOCK_TAIL_OFFSET: usize = 48_000;
+
+    /// In-voice-band carrier frequency (Hz) used by all the
+    /// "strong tone opens the gate" tests. Chosen to land inside
+    /// both the SNR detector's in-band BPF passband (centered
+    /// at 1 kHz) and the voice-band weight region used by
+    /// `enhance_speech` elsewhere.
+    const VS_TEST_CARRIER_HZ: f32 = 1_000.0;
+
+    /// "Strong signal" amplitude — well above the detector's
+    /// noise floor. 0.8 peak leaves headroom under f32 [-1, 1]
+    /// so a single-channel stereo dupe doesn't clip.
+    const VS_STRONG_AMPLITUDE: f32 = 0.8;
+
+    /// "Normal signal" amplitude used by the Off-mode passthrough
+    /// test where we just need to verify audio reaches the
+    /// output, not open a gate.
+    const VS_NORMAL_AMPLITUDE: f32 = 0.5;
+
+    /// Build a stereo buffer of the given length filled with a
+    /// pure sine tone at `VS_TEST_CARRIER_HZ` and the given
+    /// amplitude, duplicated across both channels. Shared by
+    /// all three "strong tone" tests to avoid the same
+    /// generator being copy-pasted three times.
+    fn stereo_tone(n: usize, amplitude: f32) -> Vec<Stereo> {
+        #[allow(clippy::cast_possible_truncation)]
+        let sample_rate = VS_TEST_SAMPLE_RATE as f32;
+        (0..n)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 / sample_rate;
+                let v = amplitude * (core::f32::consts::TAU * VS_TEST_CARRIER_HZ * t).sin();
+                Stereo::new(v, v)
+            })
+            .collect()
+    }
+
     #[test]
     fn test_voice_squelch_defaults_to_off_and_passes_through() {
-        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
         assert_eq!(chain.voice_squelch_mode(), VoiceSquelchMode::Off);
         assert!(chain.voice_squelch_open(), "Off mode gate must start open");
 
-        // Feed a pure 1 kHz tone — should pass through unchanged
+        // Feed a pure in-band tone — should pass through unchanged
         // because the gate is permanently open in Off mode.
-        let input = (0..4800)
-            .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / 48_000.0_f32;
-                let v = 0.5 * (core::f32::consts::TAU * 1_000.0 * t).sin();
-                Stereo::new(v, v)
-            })
-            .collect::<Vec<_>>();
-        let mut output = vec![Stereo::default(); 4800];
+        let input = stereo_tone(VS_SHORT_BLOCK_SAMPLES, VS_NORMAL_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_SHORT_BLOCK_SAMPLES];
         chain.process(&input, &mut output).unwrap();
-        // First sample of the tone should survive untouched (up
-        // to HPF warmup — we're at sample 0 which hasn't rung
-        // through the HPF yet and HPF is off by default anyway).
+        // Sample 100 should survive untouched (HPF is off by
+        // default and any warmup is well before this point).
         assert!(output[100].l.abs() > 0.01);
     }
 
     #[test]
     fn test_voice_squelch_snr_rejects_silence() {
-        // SNR mode with default threshold fed 100 ms of silence:
-        // gate must stay closed and the output must be zeroed.
-        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        // SNR mode with default threshold fed one 100 ms window
+        // of silence: gate must stay closed and the output must
+        // be zeroed.
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
         chain
             .set_voice_squelch_mode(VoiceSquelchMode::Snr {
                 threshold_db: VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
             })
             .unwrap();
 
-        let input = vec![Stereo::new(0.0, 0.0); 4800];
-        let mut output = vec![Stereo::default(); 4800];
+        let input = vec![Stereo::new(0.0, 0.0); VS_SHORT_BLOCK_SAMPLES];
+        let mut output = vec![Stereo::default(); VS_SHORT_BLOCK_SAMPLES];
         chain.process(&input, &mut output).unwrap();
 
         assert!(!chain.voice_squelch_open());
@@ -1096,42 +1155,30 @@ mod tests {
     #[test]
     fn test_voice_squelch_snr_opens_on_strong_tone() {
         // Strong in-voice-band tone — the SNR detector should
-        // open the gate after ingesting enough audio, and the
-        // output should contain the signal.
-        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        // open the gate after ingesting the 2 s block, and the
+        // post-warmup output must contain audible signal.
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
         chain
             .set_voice_squelch_mode(VoiceSquelchMode::Snr {
                 threshold_db: VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
             })
             .unwrap();
 
-        // 2 seconds of 1 kHz at 0.8 — well above the detector's
-        // noise floor and inside the in-band BPF's passband.
-        let n = 96_000;
-        let input = (0..n)
-            .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / 48_000.0_f32;
-                let v = 0.8 * (core::f32::consts::TAU * 1_000.0 * t).sin();
-                Stereo::new(v, v)
-            })
-            .collect::<Vec<_>>();
-        let mut output = vec![Stereo::default(); n];
+        let input = stereo_tone(VS_LONG_BLOCK_SAMPLES, VS_STRONG_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
         chain.process(&input, &mut output).unwrap();
 
         assert!(
             chain.voice_squelch_open(),
             "SNR gate must open on strong in-band tone"
         );
-        // Output should contain audible signal (beyond the first
-        // RMS window's warmup).
-        let late_window = &output[48_000..];
+        let late_window = &output[VS_LONG_BLOCK_TAIL_OFFSET..];
         assert!(late_window.iter().any(|s| s.l.abs() > 0.01));
     }
 
     #[test]
     fn test_voice_squelch_mode_change_resets_gate() {
-        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
         chain
             .set_voice_squelch_mode(VoiceSquelchMode::Snr {
                 threshold_db: VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
@@ -1139,16 +1186,8 @@ mod tests {
             .unwrap();
 
         // Open on a strong tone.
-        let n = 96_000;
-        let input = (0..n)
-            .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / 48_000.0_f32;
-                let v = 0.8 * (core::f32::consts::TAU * 1_000.0 * t).sin();
-                Stereo::new(v, v)
-            })
-            .collect::<Vec<_>>();
-        let mut output = vec![Stereo::default(); n];
+        let input = stereo_tone(VS_LONG_BLOCK_SAMPLES, VS_STRONG_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
         chain.process(&input, &mut output).unwrap();
         assert!(chain.voice_squelch_open());
 
@@ -1170,7 +1209,7 @@ mod tests {
         // should only pass if both gates agree. Here CTCSS is on
         // a tone that isn't present → CTCSS closed → output
         // muted regardless of voice squelch state.
-        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
         chain.set_ctcss_mode(CtcssMode::Tone(100.0)).unwrap();
         chain
             .set_voice_squelch_mode(VoiceSquelchMode::Snr {
@@ -1178,29 +1217,19 @@ mod tests {
             })
             .unwrap();
 
-        // Feed a strong 1 kHz tone. Voice squelch should open
-        // (strong in-band energy), CTCSS should NOT open (wrong
-        // tone / no sub-audible 100 Hz), so the output must be
-        // zeroed by the CTCSS half of the AND gate.
-        let n = 96_000;
-        let input = (0..n)
-            .map(|i| {
-                #[allow(clippy::cast_precision_loss)]
-                let t = i as f32 / 48_000.0_f32;
-                let v = 0.8 * (core::f32::consts::TAU * 1_000.0 * t).sin();
-                Stereo::new(v, v)
-            })
-            .collect::<Vec<_>>();
-        let mut output = vec![Stereo::default(); n];
+        // Strong in-band tone — voice squelch should open (high
+        // in-band energy) but CTCSS should NOT open (no 100 Hz
+        // sub-audible tone present), so CTCSS wins the AND and
+        // the output must be zeroed.
+        let input = stereo_tone(VS_LONG_BLOCK_SAMPLES, VS_STRONG_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
         chain.process(&input, &mut output).unwrap();
 
         assert!(
             !chain.ctcss_sustained(),
             "CTCSS should stay closed without a 100 Hz sub-audible tone"
         );
-        // The last block should be muted (CTCSS is the
-        // controlling gate here).
-        let tail = &output[48_000..];
+        let tail = &output[VS_LONG_BLOCK_TAIL_OFFSET..];
         assert!(
             tail.iter().all(|s| s.l == 0.0 && s.r == 0.0),
             "CTCSS closed must mute output regardless of voice squelch state"
@@ -1209,7 +1238,7 @@ mod tests {
 
     #[test]
     fn test_voice_squelch_threshold_update_validates() {
-        let mut chain = AfChain::new(48_000.0, 48_000.0).unwrap();
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
         chain
             .set_voice_squelch_mode(VoiceSquelchMode::Syllabic { threshold: 0.15 })
             .unwrap();

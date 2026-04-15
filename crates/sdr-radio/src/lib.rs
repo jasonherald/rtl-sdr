@@ -871,4 +871,97 @@ mod tests {
             );
         }
     }
+
+    // ─── Voice squelch persistence regression tests ─────────
+    //
+    // Mirror the CTCSS dual-level assertion pattern: after each
+    // mode switch, assert both the RadioModule cache AND the
+    // live AfChain value so a broken reapply path (cache
+    // updated but af_chain not) can't hide behind the cached
+    // field alone. Tests three transitions (Off → Syllabic,
+    // Syllabic → Snr, mode switch) to cover the
+    // reconstruct-the-AF-chain-on-set_mode code path.
+
+    #[test]
+    fn test_radio_module_voice_squelch_persists_across_set_mode() {
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        // Baseline: default mode is Off at both levels.
+        assert_eq!(radio.voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
+
+        // Set a non-default Syllabic mode and verify both
+        // layers report it.
+        let syl = VoiceSquelchMode::Syllabic { threshold: 0.22 };
+        radio.set_voice_squelch_mode(syl).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), syl);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+
+        // Mode switch: the AF chain is rebuilt from scratch.
+        // The cached voice-squelch mode must be reapplied by
+        // set_mode's replay block, so both the RadioModule
+        // cache AND the new AF chain instance must still
+        // report Syllabic at the same threshold.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), syl);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+
+        // Another mode switch — same invariant must hold.
+        radio.set_mode(DemodMode::Am).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), syl);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+
+        // Flip to Snr and run the same gauntlet.
+        let snr = VoiceSquelchMode::Snr { threshold_db: 9.0 };
+        radio.set_voice_squelch_mode(snr).unwrap();
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), snr);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), snr);
+
+        // Back to Off — must also round-trip through set_mode.
+        radio.set_voice_squelch_mode(VoiceSquelchMode::Off).unwrap();
+        radio.set_mode(DemodMode::Wfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
+    }
+
+    #[test]
+    fn test_radio_module_voice_squelch_threshold_updates_cached_mode() {
+        // `set_voice_squelch_threshold` has to mirror the new
+        // value into the cached `voice_squelch_mode` variant
+        // so that `set_mode`'s replay carries the tuned value
+        // forward. Regression test: tune a threshold, switch
+        // modes, confirm the tuned value is what gets reapplied.
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio
+            .set_voice_squelch_mode(VoiceSquelchMode::Syllabic { threshold: 0.15 })
+            .unwrap();
+        radio.set_voice_squelch_threshold(0.30).unwrap();
+
+        // Cached mode should now carry the tuned threshold, not
+        // the construction-time default.
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic { threshold: 0.30 }
+        );
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic { threshold: 0.30 }
+        );
+
+        // Mode switch rebuilds the AF chain; the tuned 0.30
+        // must survive through the replay.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic { threshold: 0.30 }
+        );
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic { threshold: 0.30 }
+        );
+    }
 }

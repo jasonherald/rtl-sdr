@@ -45,6 +45,44 @@ pub const VOICE_SQUELCH_SAMPLE_RATE_HZ: f32 = 48_000.0;
 /// rather than lagging by a full second.
 pub const VOICE_SQUELCH_RMS_WINDOW_MS: f32 = 100.0;
 
+/// Hold-open time after the last "strong" detector evaluation
+/// before the gate actually closes. This is the hang time that
+/// keeps brief envelope dips during consonants, pauses between
+/// words, or momentary signal fades from chopping audio mid-
+/// utterance.
+///
+/// 500 ms is a common scanner-radio hang time — long enough to
+/// bridge the inter-word gap in natural speech (typical 200–400
+/// ms) plus a margin for consonants that briefly dip below the
+/// detector threshold, short enough that the gate still closes
+/// within one comfortable beat after a real transmission ends.
+///
+/// Works by decrementing a sample-count counter on every weak
+/// block and resetting it to the full value on every strong
+/// block; the gate only actually flips to closed when the
+/// counter hits zero. See [`VoiceSquelch::accept_samples`] for
+/// the exact state machine.
+pub const VOICE_SQUELCH_HANG_TIME_MS: f32 = 500.0;
+
+/// Hang time in samples at [`VOICE_SQUELCH_SAMPLE_RATE_HZ`].
+/// Integer literal with a compile-time sanity check below so
+/// a future retune of the ms / rate constants can't silently
+/// desync.
+pub const VOICE_SQUELCH_HANG_TIME_SAMPLES: usize = 24_000;
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
+const _: () = {
+    let derived = (VOICE_SQUELCH_HANG_TIME_MS * VOICE_SQUELCH_SAMPLE_RATE_HZ / 1000.0) as usize;
+    assert!(
+        derived == VOICE_SQUELCH_HANG_TIME_SAMPLES,
+        "VOICE_SQUELCH_HANG_TIME_SAMPLES out of sync with MS / SAMPLE_RATE"
+    );
+};
+
 /// Short-window RMS length in samples, derived from
 /// [`VOICE_SQUELCH_RMS_WINDOW_MS`] at
 /// [`VOICE_SQUELCH_SAMPLE_RATE_HZ`].
@@ -482,6 +520,12 @@ pub struct VoiceSquelch {
     syllabic: Option<SyllabicDetector>,
     snr: Option<SnrDetector>,
     open: bool,
+    /// Samples remaining before the gate actually transitions
+    /// from open to closed. Driven by [`VOICE_SQUELCH_HANG_TIME_SAMPLES`]
+    /// — see [`Self::accept_samples`] for the state machine. Zero
+    /// when the gate is closed OR when the mode is `Off` (which
+    /// is always-open anyway).
+    hang_samples_remaining: usize,
 }
 
 impl VoiceSquelch {
@@ -500,7 +544,23 @@ impl VoiceSquelch {
                 "voice squelch sample rate must be finite, got {sample_rate_hz}"
             )));
         }
-        if (sample_rate_hz - VOICE_SQUELCH_SAMPLE_RATE_HZ).abs() > SAMPLE_RATE_MATCH_EPSILON_HZ {
+        // Only enforce the canonical-sample-rate check when the
+        // mode actually builds a detector. `Off` constructs no
+        // filters and never touches the RMS path, so gating it
+        // on the 48 kHz sample rate would break headless or
+        // future non-48-kHz audio pipelines whose `AfChain`
+        // instantiates `VoiceSquelch::new(Off, rate)`
+        // unconditionally at startup — the detector wouldn't be
+        // active but the constructor would still fail. The rate
+        // is baked into each biquad's coefficients at build
+        // time, so when the user does flip to Syllabic or Snr
+        // on a non-48-kHz chain, `set_mode` will surface the
+        // mismatch then (and the AfChain-level rate check has
+        // already rejected non-48-kHz chains at
+        // [`sdr_radio::af_chain::AfChain::new`] in practice).
+        if mode.is_active()
+            && (sample_rate_hz - VOICE_SQUELCH_SAMPLE_RATE_HZ).abs() > SAMPLE_RATE_MATCH_EPSILON_HZ
+        {
             return Err(DspError::InvalidParameter(format!(
                 "voice squelch is calibrated for {VOICE_SQUELCH_SAMPLE_RATE_HZ} Hz, got {sample_rate_hz}"
             )));
@@ -538,6 +598,7 @@ impl VoiceSquelch {
             syllabic,
             snr,
             open,
+            hang_samples_remaining: 0,
         })
     }
 
@@ -564,6 +625,7 @@ impl VoiceSquelch {
             s.reset();
         }
         self.open = matches!(self.mode, VoiceSquelchMode::Off);
+        self.hang_samples_remaining = 0;
     }
 
     /// Swap the mode in place. Drops the previous detector (if
@@ -620,17 +682,73 @@ impl VoiceSquelch {
     /// state. Returns the post-update `is_open` value so callers
     /// that only care about the latest state don't have to follow
     /// up with a separate call.
+    ///
+    /// # Hang-time hysteresis
+    ///
+    /// The gate does NOT flip straight from open to closed on a
+    /// single weak-block evaluation. That would chop audio mid-
+    /// word whenever a consonant or brief pause dips below the
+    /// detector's threshold. Instead:
+    ///
+    /// - Each "strong" block (detector reports open) resets a
+    ///   `hang_samples_remaining` counter to
+    ///   [`VOICE_SQUELCH_HANG_TIME_SAMPLES`] (500 ms by default).
+    /// - Each "weak" block (detector reports closed) decrements
+    ///   the counter by `samples.len()`.
+    /// - The gate only actually transitions to closed when the
+    ///   counter hits zero — i.e. after 500 ms of sustained
+    ///   weakness with no intervening strong block.
+    ///
+    /// Opening is immediate (first strong block after a closed
+    /// state flips the gate open and resets the counter); only
+    /// the close direction is gated by hang time. This is the
+    /// standard scanner-squelch pattern.
+    ///
+    /// `Off` mode bypasses the whole state machine and always
+    /// returns `true`.
     pub fn accept_samples(&mut self, samples: &[f32]) -> bool {
         if samples.is_empty() {
             return self.open;
         }
-        self.open = match self.mode {
-            VoiceSquelchMode::Off => true,
+
+        // Off mode short-circuit: no detector, gate permanently
+        // open, hang counter irrelevant.
+        if matches!(self.mode, VoiceSquelchMode::Off) {
+            self.open = true;
+            return true;
+        }
+
+        let strong = match self.mode {
+            VoiceSquelchMode::Off => unreachable!("handled above"),
             VoiceSquelchMode::Syllabic { .. } => {
                 self.syllabic.as_mut().is_some_and(|d| d.process(samples))
             }
             VoiceSquelchMode::Snr { .. } => self.snr.as_mut().is_some_and(|d| d.process(samples)),
         };
+
+        if strong {
+            // Strong verdict: open the gate immediately and
+            // fully reload the hang counter so the next weak
+            // block has the full 500 ms to elapse before we
+            // consider closing.
+            self.open = true;
+            self.hang_samples_remaining = VOICE_SQUELCH_HANG_TIME_SAMPLES;
+        } else if self.open {
+            // Weak verdict while the gate is open: bleed the
+            // hang counter down by this block's sample length.
+            // `saturating_sub` is important — the final block
+            // before close might carry more samples than the
+            // remaining budget, and we don't want an underflow
+            // panic.
+            self.hang_samples_remaining = self.hang_samples_remaining.saturating_sub(samples.len());
+            if self.hang_samples_remaining == 0 {
+                self.open = false;
+            }
+        }
+        // Weak verdict while already closed: stay closed. No
+        // state change. (Hang counter is already at 0 in this
+        // branch so nothing to decrement anyway.)
+
         self.open
     }
 }
@@ -714,11 +832,32 @@ mod tests {
     }
 
     #[test]
-    fn constructor_rejects_non_canonical_sample_rate() {
-        let err = VoiceSquelch::new(VoiceSquelchMode::Off, 44_100.0);
+    fn constructor_rejects_non_canonical_sample_rate_for_active_modes() {
+        // Active modes (Syllabic / Snr) must reject non-48-kHz
+        // rates because their biquad coefficients are calibrated
+        // to the canonical rate.
+        let err = VoiceSquelch::new(VoiceSquelchMode::Syllabic { threshold: 0.15 }, 44_100.0);
         assert!(err.is_err());
+        let err = VoiceSquelch::new(VoiceSquelchMode::Snr { threshold_db: 6.0 }, 44_100.0);
+        assert!(err.is_err());
+
+        // Non-finite rate is rejected for ANY mode (Off included)
+        // because the finite check comes before the mode dispatch.
         let err = VoiceSquelch::new(VoiceSquelchMode::Off, f32::NAN);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn off_mode_accepts_any_finite_sample_rate() {
+        // Off mode bypasses the sample-rate calibration check
+        // because it constructs no detector and never touches the
+        // biquad path. A headless `AfChain` configured for an
+        // exotic audio sink (e.g. 44.1 kHz CoreAudio) must be
+        // able to construct a `VoiceSquelch` in its default Off
+        // state without failing.
+        assert!(VoiceSquelch::new(VoiceSquelchMode::Off, 44_100.0).is_ok());
+        assert!(VoiceSquelch::new(VoiceSquelchMode::Off, 96_000.0).is_ok());
+        assert!(VoiceSquelch::new(VoiceSquelchMode::Off, 16_000.0).is_ok());
     }
 
     #[test]
@@ -927,6 +1066,68 @@ mod tests {
             let back: VoiceSquelchMode = serde_json::from_str(&json).unwrap();
             assert_eq!(back, m, "serde round-trip failed for {m:?}");
         }
+    }
+
+    #[test]
+    fn syllabic_hang_time_bridges_brief_silence_gap() {
+        // Simulates a "word + consonant pause + word" structure
+        // by concatenating two 1-second syllable-modulated
+        // segments with a 200 ms silence gap in between. The gap
+        // is shorter than VOICE_SQUELCH_HANG_TIME_MS (500 ms),
+        // so the gate should stay open through the whole
+        // sequence instead of chopping on the silence.
+        let mut vs = VoiceSquelch::new(
+            VoiceSquelchMode::Syllabic {
+                threshold: VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            },
+            VOICE_SQUELCH_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+
+        // Word 1 — warm up and open the gate.
+        let word1 = syllable_modulated(1_000.0, 4.0, 1_000);
+        vs.accept_samples(&word1);
+        assert!(vs.is_open(), "gate should open on first word");
+
+        // 200 ms of silence — half the 500 ms hang time. The
+        // gate should stay open because the counter hasn't
+        // decremented all the way to zero yet.
+        let short_gap = vec![0.0_f32; (VOICE_SQUELCH_SAMPLE_RATE_HZ * 0.2) as usize];
+        vs.accept_samples(&short_gap);
+        assert!(
+            vs.is_open(),
+            "200 ms silence gap < 500 ms hang should NOT close the gate mid-word"
+        );
+    }
+
+    #[test]
+    fn syllabic_hang_time_closes_after_sustained_silence() {
+        // Opposite of the bridging test — after the gate opens,
+        // feed sustained silence longer than the hang time and
+        // verify the gate actually closes.
+        let mut vs = VoiceSquelch::new(
+            VoiceSquelchMode::Syllabic {
+                threshold: VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            },
+            VOICE_SQUELCH_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+
+        let word = syllable_modulated(1_000.0, 4.0, 1_000);
+        vs.accept_samples(&word);
+        assert!(vs.is_open(), "gate should open on speech");
+
+        // 1 second of silence — double the 500 ms hang time.
+        // After feeding it in 100 ms chunks the hang counter
+        // must eventually hit zero and close the gate.
+        let silence_chunk = vec![0.0_f32; (VOICE_SQUELCH_SAMPLE_RATE_HZ * 0.1) as usize];
+        for _ in 0..10 {
+            vs.accept_samples(&silence_chunk);
+        }
+        assert!(
+            !vs.is_open(),
+            "1 second of silence must eventually close the gate"
+        );
     }
 
     #[test]

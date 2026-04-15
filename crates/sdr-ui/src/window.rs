@@ -1155,12 +1155,22 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .voice_squelch_row
         .connect_selected_notify(move |row| {
             let idx = row.selected();
-            // Pull the current threshold from the spin row so the
-            // mode-change dispatch carries a sane initial value.
-            // For Off this doesn't matter (the helper ignores it),
-            // for Syllabic/Snr it seeds the detector.
-            #[allow(clippy::cast_possible_truncation)]
-            let threshold = radio_for_vs.voice_squelch_threshold_row.value() as f32;
+            // Use the DEFAULT threshold for the target mode, NOT
+            // the current spin-row value. The previous mode's
+            // threshold is in different units (normalized ratio
+            // for Syllabic, dB for Snr), so forwarding it to the
+            // new variant would land far outside the new
+            // detector's tuning range — e.g. Off → Snr seeding
+            // 0.15 dB, or Snr → Syllabic seeding 6.0 as a
+            // normalized ratio. Both fail the detector.
+            //
+            // `apply_voice_squelch_mode_ui` below reconfigures
+            // the spin row's adjustment range AND seeds its
+            // value from the mode's inline threshold, so the
+            // UI and DSP end up aligned on the same default
+            // value in the same units.
+            let threshold =
+                sidebar::radio_panel::RadioPanel::voice_squelch_default_threshold_for_index(idx);
             let mode =
                 sidebar::radio_panel::RadioPanel::voice_squelch_mode_from_index(idx, threshold);
             state_vs_mode.send_dsp(UiToDsp::SetVoiceSquelchMode(mode));
