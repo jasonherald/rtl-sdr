@@ -192,6 +192,14 @@ mod tests {
     }
 
     #[test]
+    fn ctcss_sustained_changed_message_constructs() {
+        let open = DspToUi::CtcssSustainedChanged(true);
+        assert!(matches!(open, DspToUi::CtcssSustainedChanged(true)));
+        let closed = DspToUi::CtcssSustainedChanged(false);
+        assert!(matches!(closed, DspToUi::CtcssSustainedChanged(false)));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn test_ui_to_dsp_variants() {
         let start = UiToDsp::Start;
@@ -284,6 +292,20 @@ mod tests {
         let notch_freq = UiToDsp::SetNotchFrequency(60.0);
         assert!(
             matches!(notch_freq, UiToDsp::SetNotchFrequency(f) if (f - 60.0).abs() < f32::EPSILON)
+        );
+
+        let ctcss_off = UiToDsp::SetCtcssMode(CtcssMode::Off);
+        assert!(matches!(ctcss_off, UiToDsp::SetCtcssMode(CtcssMode::Off)));
+
+        let ctcss_tone = UiToDsp::SetCtcssMode(CtcssMode::Tone(100.0));
+        assert!(matches!(
+            ctcss_tone,
+            UiToDsp::SetCtcssMode(CtcssMode::Tone(hz)) if (hz - 100.0).abs() < f32::EPSILON
+        ));
+
+        let ctcss_thresh = UiToDsp::SetCtcssThreshold(0.15);
+        assert!(
+            matches!(ctcss_thresh, UiToDsp::SetCtcssThreshold(t) if (t - 0.15).abs() < f32::EPSILON)
         );
 
         let device = UiToDsp::SetAudioDevice("default".to_string());

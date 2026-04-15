@@ -685,4 +685,47 @@ mod tests {
         // The deemp mode is still Eu50 in the radio, and WFM allows it
         assert!(radio.af_chain().deemp_enabled());
     }
+
+    #[test]
+    fn test_radio_module_ctcss_threshold_persists_across_set_mode() {
+        // RadioModule caches ctcss_threshold and reapplies it to
+        // the new AF chain on mode switch. Without the persistence,
+        // a mode change would snap the threshold back to the
+        // DSP-layer default and silently un-tune the user's setting.
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_ctcss_threshold(0.25).unwrap();
+        assert!((radio.ctcss_threshold() - 0.25).abs() < 1e-6);
+        assert!((radio.af_chain().ctcss_threshold() - 0.25).abs() < 1e-6);
+
+        // Mode switch rebuilds the AF chain from scratch. The
+        // cached threshold must survive AND be reapplied to the
+        // new chain, not just stored on the RadioModule.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert!((radio.ctcss_threshold() - 0.25).abs() < 1e-6);
+        assert!((radio.af_chain().ctcss_threshold() - 0.25).abs() < 1e-6);
+
+        radio.set_mode(DemodMode::Am).unwrap();
+        assert!((radio.ctcss_threshold() - 0.25).abs() < 1e-6);
+        assert!((radio.af_chain().ctcss_threshold() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_radio_module_ctcss_threshold_rejects_invalid() {
+        // Invalid values must fail fast at the RadioModule boundary
+        // (not deep in the DSP layer) and must NOT corrupt the
+        // cached value. The cached value on RadioModule is only
+        // advanced after the AF chain accepts the new value.
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_ctcss_threshold(0.2).unwrap();
+
+        assert!(radio.set_ctcss_threshold(0.0).is_err());
+        assert!(radio.set_ctcss_threshold(-0.1).is_err());
+        assert!(radio.set_ctcss_threshold(1.001).is_err());
+        assert!(radio.set_ctcss_threshold(f32::NAN).is_err());
+        assert!(radio.set_ctcss_threshold(f32::INFINITY).is_err());
+        assert!(radio.set_ctcss_threshold(f32::NEG_INFINITY).is_err());
+
+        // Cached value must still be the last successful one.
+        assert!((radio.ctcss_threshold() - 0.2).abs() < 1e-6);
+    }
 }
