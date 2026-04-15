@@ -84,6 +84,7 @@ impl TranscriptionBackend for WhisperBackend {
         let cancel = Arc::clone(&self.cancel);
         let silence_threshold = config.silence_threshold;
         let noise_gate_ratio = config.noise_gate_ratio;
+        let audio_enhancement = config.audio_enhancement;
 
         let handle = std::thread::Builder::new()
             .name("whisper-worker".into())
@@ -95,6 +96,7 @@ impl TranscriptionBackend for WhisperBackend {
                     whisper_model,
                     silence_threshold,
                     noise_gate_ratio,
+                    audio_enhancement,
                 );
             })?;
 
@@ -130,6 +132,7 @@ impl TranscriptionBackend for WhisperBackend {
 /// * `model` — which Whisper model to load
 /// * `silence_threshold` — RMS below which a chunk is skipped
 /// * `noise_gate_ratio` — spectral gate multiplier over noise floor
+/// * `audio_enhancement` — which denoise strategy to apply per segment
 fn run_worker(
     audio_rx: &mpsc::Receiver<TranscriptionInput>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
@@ -137,6 +140,7 @@ fn run_worker(
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
 ) {
     if let Err(e) = run_worker_inner(
         audio_rx,
@@ -145,6 +149,7 @@ fn run_worker(
         model,
         silence_threshold,
         noise_gate_ratio,
+        audio_enhancement,
     ) {
         let _ = event_tx.send(TranscriptionEvent::Error(e));
     }
@@ -160,6 +165,7 @@ fn run_worker_inner(
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
 ) -> Result<(), String> {
     // --- Model download / load ---
     let model_path = if model::model_exists(model) {
@@ -276,7 +282,13 @@ fn run_worker_inner(
                 tracing::info!("transcription cancelled, worker exiting");
                 return Ok(());
             }
-            decode_and_emit_segment(&mut state, &mut segment, event_tx, noise_gate_ratio);
+            decode_and_emit_segment(
+                &mut state,
+                &mut segment,
+                event_tx,
+                noise_gate_ratio,
+                audio_enhancement,
+            );
         }
     }
 
@@ -284,7 +296,13 @@ fn run_worker_inner(
     // VAD so the last utterance isn't silently dropped.
     vad.flush();
     while let Some(mut segment) = vad.pop_segment() {
-        decode_and_emit_segment(&mut state, &mut segment, event_tx, noise_gate_ratio);
+        decode_and_emit_segment(
+            &mut state,
+            &mut segment,
+            event_tx,
+            noise_gate_ratio,
+            audio_enhancement,
+        );
     }
 
     tracing::info!("audio channel closed, worker exiting");
@@ -302,12 +320,15 @@ fn decode_and_emit_segment(
     segment: &mut [f32],
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
 ) {
-    // Voice-band shaped spectral gate (#274) — remove broadband
-    // static, rumble, PL tones, and above-voice hiss before Whisper
-    // sees the audio. Runs per segment rather than per chunk now that
-    // segmentation lives upstream.
-    denoise::enhance_speech(segment, noise_gate_ratio);
+    // Audio enhancement dispatcher (#281) — routes to
+    // `enhance_speech` (default voice-band), `spectral_denoise`
+    // (broadband), or no-op (Off) based on the user-selected
+    // mode threaded through from `BackendConfig`. Runs per
+    // segment rather than per chunk now that segmentation lives
+    // upstream.
+    denoise::apply(segment, audio_enhancement, noise_gate_ratio);
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some("en"));

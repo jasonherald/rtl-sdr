@@ -142,6 +142,13 @@ pub(super) struct SessionParams {
     /// Auto Break timing parameters, read by `run_session_auto_break`.
     /// Ignored in VAD mode and by the streaming path.
     pub auto_break_thresholds: AutoBreakThresholds,
+    /// Audio enhancement mode applied to the mono buffer before
+    /// the recognizer sees it. Read once per session by the I/O
+    /// thread — changing the user's selection takes effect at the
+    /// next session start. See [`crate::denoise::AudioEnhancement`]
+    /// for the three modes and issue #281 for the motivating
+    /// Moonshine-specific workaround.
+    pub audio_enhancement: crate::denoise::AudioEnhancement,
 }
 
 /// Auto Break timing parameters consumed by the state machine in

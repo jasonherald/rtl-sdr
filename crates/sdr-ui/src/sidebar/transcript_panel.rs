@@ -59,6 +59,28 @@ const KEY_AUTO_BREAK_TAIL_MS: &str = "transcription_auto_break_tail_ms";
 #[cfg(feature = "sherpa")]
 const KEY_AUTO_BREAK_MIN_SEGMENT_MS: &str = "transcription_auto_break_min_segment_ms";
 
+/// Config key for the persisted audio-enhancement mode. Values are
+/// the `AudioEnhancement::as_config_str` strings: `"voice_band"`,
+/// `"broadband"`, or `"off"`. Default `"voice_band"`. Applies to
+/// both whisper and sherpa — the audio enhancement dispatcher lives
+/// in `sdr-transcription::denoise` and all four recognizer call
+/// sites route through it. Added in PR for issue #281 so users who
+/// hit voice-band preprocessor issues (notably Moonshine) have a
+/// user-visible workaround without rebuilding.
+const KEY_AUDIO_ENHANCEMENT: &str = "transcription_audio_enhancement";
+
+/// Combo row indices for the audio-enhancement selector. Order
+/// matches [`AUDIO_ENHANCEMENT_LABELS`] below. `pub(crate)` so
+/// `window.rs` can match on them at `BackendConfig` construction
+/// time without re-deriving the parse logic.
+#[allow(dead_code)]
+pub(crate) const AUDIO_ENHANCEMENT_VOICE_BAND_IDX: u32 = 0;
+pub(crate) const AUDIO_ENHANCEMENT_BROADBAND_IDX: u32 = 1;
+pub(crate) const AUDIO_ENHANCEMENT_OFF_IDX: u32 = 2;
+/// User-visible labels for the audio-enhancement combo row. Order
+/// must match the `AUDIO_ENHANCEMENT_*_IDX` constants above.
+const AUDIO_ENHANCEMENT_LABELS: &[&str] = &["Voice-band (default)", "Broadband", "Off"];
+
 #[cfg(feature = "sherpa")]
 const DISPLAY_MODE_LIVE_IDX: u32 = 0;
 /// `pub(crate)` so `window.rs` can gate the `Partial` handler on it.
@@ -156,6 +178,12 @@ pub struct TranscriptPanel {
     pub silence_row: adw::SpinRow,
     /// Noise gate spin row.
     pub noise_gate_row: adw::SpinRow,
+    /// Audio enhancement mode selector (Voice-band / Broadband /
+    /// Off). Applies to both whisper and sherpa backends — the
+    /// dispatcher in `sdr-transcription::denoise` routes every
+    /// recognizer call site through the user's choice. Default is
+    /// Voice-band, which matches the pre-#281 behavior.
+    pub audio_enhancement_row: adw::ComboRow,
     /// Display-mode selector (Live captions vs Final only). Sherpa-only —
     /// Whisper has no `Partial` events to render.
     #[cfg(feature = "sherpa")]
@@ -435,6 +463,70 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
             v[KEY_NOISE_GATE] = serde_json::json!(val);
         });
     });
+
+    // --- Audio enhancement mode selector ---
+    //
+    // Applies to all recognizer backends (whisper + both sherpa
+    // paths). Default Voice-band matches the pre-#281 behavior;
+    // users hitting voice-band preprocessor issues (e.g. Moonshine
+    // silently returning empty text on NFM speech) can switch to
+    // Broadband or Off as a workaround. Persisted as a stable
+    // string id via `AudioEnhancement::as_config_str` so future
+    // schema migrations don't rely on u32 index stability.
+    let audio_enhancement_row = {
+        let list = gtk4::StringList::new(AUDIO_ENHANCEMENT_LABELS);
+
+        let saved_idx = config.read(|v| {
+            let s = v
+                .get(KEY_AUDIO_ENHANCEMENT)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("voice_band");
+            match sdr_transcription::denoise::AudioEnhancement::from_config_str(s) {
+                sdr_transcription::denoise::AudioEnhancement::VoiceBand => {
+                    AUDIO_ENHANCEMENT_VOICE_BAND_IDX
+                }
+                sdr_transcription::denoise::AudioEnhancement::Broadband => {
+                    AUDIO_ENHANCEMENT_BROADBAND_IDX
+                }
+                sdr_transcription::denoise::AudioEnhancement::Off => AUDIO_ENHANCEMENT_OFF_IDX,
+            }
+        });
+
+        let row = adw::ComboRow::builder()
+            .title("Audio enhancement")
+            .subtitle(
+                "Voice-band (recommended) • Broadband if your recognizer returns no text \
+                 • Off for pristine source audio",
+            )
+            .model(&list)
+            .selected(saved_idx)
+            .build();
+        group.add(&row);
+
+        let config_enhancement = Arc::clone(config);
+        row.connect_selected_notify(move |r| {
+            // Map combo index → AudioEnhancement → stable config
+            // string. The round-trip goes through the enum so a
+            // future addition of a fourth mode only has to touch
+            // the enum + labels + one match arm here.
+            let value = match r.selected() {
+                AUDIO_ENHANCEMENT_BROADBAND_IDX => {
+                    sdr_transcription::denoise::AudioEnhancement::Broadband
+                }
+                AUDIO_ENHANCEMENT_OFF_IDX => sdr_transcription::denoise::AudioEnhancement::Off,
+                // VoiceBand and any out-of-range fall through to
+                // the default, mirroring
+                // `AudioEnhancement::from_config_str`'s lenient
+                // parsing contract.
+                _ => sdr_transcription::denoise::AudioEnhancement::VoiceBand,
+            };
+            config_enhancement.write(|v| {
+                v[KEY_AUDIO_ENHANCEMENT] = serde_json::json!(value.as_config_str());
+            });
+        });
+
+        row
+    };
 
     // --- VAD threshold slider (Sherpa + offline models only) ---
     //
@@ -819,6 +911,7 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         #[cfg(feature = "whisper")]
         silence_row,
         noise_gate_row,
+        audio_enhancement_row,
         #[cfg(feature = "sherpa")]
         display_mode_row,
         #[cfg(feature = "sherpa")]

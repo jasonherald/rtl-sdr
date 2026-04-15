@@ -1649,6 +1649,7 @@ fn unlock_transcription_session_rows(
     model_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "whisper")] silence_row: &glib::WeakRef<adw::SpinRow>,
     noise_gate_row: &glib::WeakRef<adw::SpinRow>,
+    audio_enhancement_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")] auto_break_row: &glib::WeakRef<adw::SwitchRow>,
@@ -1664,6 +1665,9 @@ fn unlock_transcription_session_rows(
         row.set_sensitive(true);
     }
     if let Some(row) = noise_gate_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    if let Some(row) = audio_enhancement_row.upgrade() {
         row.set_sensitive(true);
     }
     #[cfg(feature = "sherpa")]
@@ -1720,6 +1724,7 @@ fn connect_transcript_panel(
     #[cfg(feature = "whisper")]
     let silence_row = transcript.silence_row.clone();
     let noise_gate_row = transcript.noise_gate_row.clone();
+    let audio_enhancement_row = transcript.audio_enhancement_row.clone();
     // Weak refs used by the async event-loop closure to drive the same
     // teardown the synchronous error path does (see below) when the
     // backend fires TranscriptionEvent::Error mid-session. Weak so the
@@ -1729,6 +1734,7 @@ fn connect_transcript_panel(
     #[cfg(feature = "whisper")]
     let silence_row_weak = silence_row.downgrade();
     let noise_gate_row_weak = noise_gate_row.downgrade();
+    let audio_enhancement_row_weak = audio_enhancement_row.downgrade();
     #[cfg(feature = "sherpa")]
     let display_mode_row = transcript.display_mode_row.clone();
     #[cfg(feature = "sherpa")]
@@ -1967,6 +1973,7 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
+            audio_enhancement_row.set_sensitive(false);
             // All settings lock during a session for mid-session fault
             // tolerance — walks back PR 4's earlier display_mode_row
             // exception. User stops, changes, starts.
@@ -2049,6 +2056,21 @@ fn connect_transcript_panel(
             let auto_break_min_segment_ms =
                 sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT;
 
+            // Audio enhancement mode from the transcript panel
+            // combo row. The row's persisted index is captured at
+            // session start (not subscribed to — matches the
+            // existing "lock during session" behavior for all
+            // transcription settings).
+            let audio_enhancement = match audio_enhancement_row.selected() {
+                sidebar::transcript_panel::AUDIO_ENHANCEMENT_BROADBAND_IDX => {
+                    sdr_transcription::denoise::AudioEnhancement::Broadband
+                }
+                sidebar::transcript_panel::AUDIO_ENHANCEMENT_OFF_IDX => {
+                    sdr_transcription::denoise::AudioEnhancement::Off
+                }
+                _ => sdr_transcription::denoise::AudioEnhancement::VoiceBand,
+            };
+
             let config = sdr_transcription::BackendConfig {
                 model,
                 silence_threshold,
@@ -2058,6 +2080,7 @@ fn connect_transcript_panel(
                 auto_break_min_open_ms,
                 auto_break_tail_ms,
                 auto_break_min_segment_ms,
+                audio_enhancement,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
@@ -2085,6 +2108,7 @@ fn connect_transcript_panel(
                     #[cfg(feature = "whisper")]
                     let silence_row_weak = silence_row_weak.clone();
                     let noise_gate_row_weak = noise_gate_row_weak.clone();
+                    let audio_enhancement_row_weak = audio_enhancement_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let display_mode_row_weak = display_mode_row_weak.clone();
                     #[cfg(feature = "sherpa")]
@@ -2215,6 +2239,7 @@ fn connect_transcript_panel(
                                             #[cfg(feature = "whisper")]
                                             &silence_row_weak,
                                             &noise_gate_row_weak,
+                                            &audio_enhancement_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &display_mode_row_weak,
                                             #[cfg(feature = "sherpa")]
@@ -2290,6 +2315,7 @@ fn connect_transcript_panel(
                                         #[cfg(feature = "whisper")]
                                         &silence_row_weak,
                                         &noise_gate_row_weak,
+                                        &audio_enhancement_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &display_mode_row_weak,
                                         #[cfg(feature = "sherpa")]
@@ -2329,6 +2355,7 @@ fn connect_transcript_panel(
                         #[cfg(feature = "whisper")]
                         &silence_row.downgrade(),
                         &noise_gate_row.downgrade(),
+                        &audio_enhancement_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &display_mode_row.downgrade(),
                         #[cfg(feature = "sherpa")]
@@ -2359,6 +2386,7 @@ fn connect_transcript_panel(
                 #[cfg(feature = "whisper")]
                 &silence_row.downgrade(),
                 &noise_gate_row.downgrade(),
+                &audio_enhancement_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &display_mode_row.downgrade(),
                 #[cfg(feature = "sherpa")]

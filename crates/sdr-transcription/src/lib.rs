@@ -238,6 +238,7 @@ mod tests {
             auto_break_min_open_ms: crate::AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
             auto_break_tail_ms: crate::AUTO_BREAK_TAIL_MS_DEFAULT,
             auto_break_min_segment_ms: crate::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+            audio_enhancement: crate::denoise::AudioEnhancement::default(),
         }
     }
 
