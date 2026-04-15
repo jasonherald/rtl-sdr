@@ -28,6 +28,7 @@ fn sherpa_backend_start_returns_init_error_when_host_not_initialized() {
         auto_break_min_open_ms: sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
         auto_break_tail_ms: sdr_transcription::AUTO_BREAK_TAIL_MS_DEFAULT,
         auto_break_min_segment_ms: sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+        audio_enhancement: sdr_transcription::denoise::AudioEnhancement::default(),
     };
     let result = backend.start(config);
     match result {

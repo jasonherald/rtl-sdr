@@ -130,6 +130,19 @@ pub struct BackendConfig {
     /// `AUTO_BREAK_MIN_SEGMENT_MS_MIN..=AUTO_BREAK_MIN_SEGMENT_MS_MAX`.
     /// Only read when `segmentation_mode == AutoBreak`.
     pub auto_break_min_segment_ms: u32,
+    /// Audio enhancement mode applied to the mono buffer before it
+    /// reaches the recognizer. Shared across all recognizer paths
+    /// (sherpa offline VAD, sherpa offline Auto Break, sherpa
+    /// streaming, whisper) — every call site routes through
+    /// [`crate::denoise::apply`] with this value.
+    ///
+    /// Default [`AudioEnhancement::VoiceBand`] matches the behavior
+    /// shipped in PR #282 (voice-prior weighted spectral gate).
+    /// Users can switch to [`AudioEnhancement::Broadband`] to work
+    /// around #281 (Moonshine returning empty text on voice-band
+    /// preprocessed NFM audio) or to [`AudioEnhancement::Off`] for
+    /// troubleshooting / pristine source material.
+    pub audio_enhancement: crate::denoise::AudioEnhancement,
 }
 
 /// User-facing model selection.

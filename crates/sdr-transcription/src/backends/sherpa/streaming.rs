@@ -77,6 +77,7 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         vad_threshold: _,
         segmentation_mode,
         auto_break_thresholds: _,
+        audio_enhancement,
     } = params;
 
     if segmentation_mode == crate::backend::SegmentationMode::AutoBreak {
@@ -130,7 +131,7 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
             continue;
         }
 
-        denoise::enhance_speech(&mut mono_buf, noise_gate_ratio);
+        denoise::apply(&mut mono_buf, audio_enhancement, noise_gate_ratio);
 
         stream.accept_waveform(SHERPA_SAMPLE_RATE_HZ, &mono_buf);
 

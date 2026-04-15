@@ -150,6 +150,7 @@ impl TranscriptionBackend for SherpaBackend {
                     .auto_break_min_segment_ms
                     .clamp(AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_MIN_SEGMENT_MS_MAX),
             },
+            audio_enhancement: config.audio_enhancement,
         })?;
 
         tracing::info!("sherpa backend session requested");

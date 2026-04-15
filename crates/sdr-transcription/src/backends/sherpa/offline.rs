@@ -309,6 +309,7 @@ fn run_session_vad(recognizer: &OfflineRecognizer, params: SessionParams) {
         vad_threshold,
         segmentation_mode: _,
         auto_break_thresholds: _,
+        audio_enhancement,
     } = params;
 
     let (decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
@@ -328,6 +329,7 @@ fn run_session_vad(recognizer: &OfflineRecognizer, params: SessionParams) {
                 decode_tx,
                 noise_gate_ratio,
                 vad_threshold,
+                audio_enhancement,
             });
         });
     let io_thread = match io_thread {
@@ -362,6 +364,7 @@ struct SessionIoVadParams {
     decode_tx: mpsc::Sender<DecodeRequest>,
     noise_gate_ratio: f32,
     vad_threshold: f32,
+    audio_enhancement: denoise::AudioEnhancement,
 }
 
 /// Session I/O loop for VAD segmentation. Runs on the spawned I/O
@@ -376,6 +379,7 @@ fn session_io_loop_vad(params: SessionIoVadParams) {
         decode_tx,
         noise_gate_ratio,
         vad_threshold,
+        audio_enhancement,
     } = params;
 
     // Build Silero on this thread. `SherpaSileroVad` holds an onnxruntime
@@ -432,7 +436,7 @@ fn session_io_loop_vad(params: SessionIoVadParams) {
             continue;
         }
 
-        denoise::enhance_speech(&mut mono_buf, noise_gate_ratio);
+        denoise::apply(&mut mono_buf, audio_enhancement, noise_gate_ratio);
 
         vad.accept(&mono_buf);
 
@@ -459,21 +463,72 @@ fn session_io_loop_vad(params: SessionIoVadParams) {
 /// Batch-decode a single speech segment and emit a `Text` event if
 /// the recognizer produced any text. Called by [`decoder_service_loop`]
 /// on the sherpa-host thread — never on the session I/O thread.
+///
+/// Diagnostic tracing added for issue #281 (Moonshine produces no text
+/// while Parakeet produces correct text on the same audio). When run
+/// with `RUST_LOG=sdr_transcription=debug`, every decode call emits a
+/// `decode_segment` log event showing:
+///
+/// - `segment_len` — samples at 16 kHz mono, confirms the I/O thread is
+///   actually forwarding segments to the decoder
+/// - `got_result` — whether `stream.get_result()` returned `Some`
+///   (recognizer produced an output object at all)
+/// - `raw_text_len` — character count of the recognizer's text BEFORE
+///   trim, so we can distinguish between "sherpa returned nothing" and
+///   "sherpa returned whitespace-only output that trim wipes"
+/// - `trimmed_text_len` — post-trim length, the one that actually drives
+///   the `TranscriptionEvent::Text` emission
+///
+/// Once the root cause is nailed down the tracing will be downgraded or
+/// removed — this is an investigation scaffold, not a permanent
+/// observability layer.
 fn decode_segment(
     recognizer: &OfflineRecognizer,
     segment: &[f32],
     event_tx: &mpsc::Sender<TranscriptionEvent>,
 ) {
+    let segment_len = segment.len();
     let stream = recognizer.create_stream();
     stream.accept_waveform(SHERPA_SAMPLE_RATE_HZ, segment);
     recognizer.decode(&stream);
-    let Some(result) = stream.get_result() else {
+
+    let result = stream.get_result();
+    let got_result = result.is_some();
+    let Some(result) = result else {
+        tracing::debug!(
+            segment_len,
+            got_result = false,
+            "decode_segment: recognizer returned None"
+        );
         return;
     };
-    let text = result.text.trim().to_owned();
+
+    let raw_text = result.text;
+    let raw_text_len = raw_text.len();
+    let text = raw_text.trim().to_owned();
+    let trimmed_text_len = text.len();
+
+    tracing::debug!(
+        segment_len,
+        got_result,
+        raw_text_len,
+        trimmed_text_len,
+        "decode_segment: recognizer returned result"
+    );
+
     if !text.is_empty() {
         let timestamp = crate::util::wall_clock_timestamp();
-        tracing::debug!(%timestamp, %text, "moonshine committed utterance");
+        // Log metadata only — the raw transcript stays inside the
+        // recognizer process boundary until the UI renders it. This
+        // matches the established privacy contract for partials and
+        // finals across the crate: we count characters for observability
+        // but never write user speech to a log file that could be
+        // collected by a `RUST_LOG=debug` run.
+        tracing::debug!(
+            %timestamp,
+            text_chars = text.chars().count(),
+            "offline recognizer committed utterance"
+        );
         let _ = event_tx.send(TranscriptionEvent::Text { timestamp, text });
     }
 }
@@ -699,6 +754,7 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
         vad_threshold: _,
         segmentation_mode: _,
         auto_break_thresholds,
+        audio_enhancement,
     } = params;
 
     let (decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
@@ -715,6 +771,7 @@ fn run_session_auto_break(recognizer: &OfflineRecognizer, params: SessionParams)
                 decode_tx,
                 noise_gate_ratio,
                 auto_break_thresholds,
+                audio_enhancement,
             });
         });
     let io_thread = match io_thread {
@@ -743,12 +800,14 @@ struct SessionIoAutoBreakParams {
     decode_tx: mpsc::Sender<DecodeRequest>,
     noise_gate_ratio: f32,
     auto_break_thresholds: super::host::AutoBreakThresholds,
+    audio_enhancement: denoise::AudioEnhancement,
 }
 
 /// Session I/O loop for Auto Break segmentation. Runs on the spawned
 /// I/O thread — drives an `AutoBreakMachine` from the audio channel and
 /// forwards flushed segments to `decode_tx` (resampled + denoised
 /// before the send so the decoder thread stays zero-prep).
+#[allow(clippy::too_many_lines)]
 fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
     let SessionIoAutoBreakParams {
         cancel,
@@ -757,6 +816,7 @@ fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
         decode_tx,
         noise_gate_ratio,
         auto_break_thresholds,
+        audio_enhancement,
     } = params;
 
     if event_tx.send(TranscriptionEvent::Ready).is_err() {
@@ -770,7 +830,12 @@ fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
     loop {
         if cancel.load(Ordering::Relaxed) {
             tracing::info!("sherpa Auto Break I/O thread cancelled");
-            drain_auto_break_on_exit(&mut machine, noise_gate_ratio, &decode_tx);
+            drain_auto_break_on_exit(
+                &mut machine,
+                noise_gate_ratio,
+                audio_enhancement,
+                &decode_tx,
+            );
             return;
         }
 
@@ -797,8 +862,13 @@ fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
                     );
                     let stereo_buf = machine.take_buffer();
                     machine.reset_after_force_flush(AutoBreakState::Recording);
-                    if dispatch_auto_break_segment(&stereo_buf, noise_gate_ratio, &decode_tx)
-                        .is_err()
+                    if dispatch_auto_break_segment(
+                        &stereo_buf,
+                        noise_gate_ratio,
+                        audio_enhancement,
+                        &decode_tx,
+                    )
+                    .is_err()
                     {
                         return;
                     }
@@ -823,6 +893,7 @@ fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
                             if dispatch_auto_break_segment(
                                 &stereo_buf,
                                 noise_gate_ratio,
+                                audio_enhancement,
                                 &decode_tx,
                             )
                             .is_err()
@@ -843,7 +914,12 @@ fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::info!("sherpa Auto Break I/O thread ended (channel disconnected)");
-                drain_auto_break_on_exit(&mut machine, noise_gate_ratio, &decode_tx);
+                drain_auto_break_on_exit(
+                    &mut machine,
+                    noise_gate_ratio,
+                    audio_enhancement,
+                    &decode_tx,
+                );
                 return;
             }
         }
@@ -857,6 +933,7 @@ fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
 fn dispatch_auto_break_segment(
     stereo_buf: &[f32],
     noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
     decode_tx: &mpsc::Sender<DecodeRequest>,
 ) -> Result<(), ()> {
     if stereo_buf.is_empty() {
@@ -865,7 +942,7 @@ fn dispatch_auto_break_segment(
     let mut mono_buf: Vec<f32> =
         Vec::with_capacity(stereo_buf.len() / STEREO_48K_TO_MONO_16K_CAPACITY_DIVISOR);
     resampler::downsample_stereo_to_mono_16k(stereo_buf, &mut mono_buf);
-    denoise::enhance_speech(&mut mono_buf, noise_gate_ratio);
+    denoise::apply(&mut mono_buf, audio_enhancement, noise_gate_ratio);
     decode_tx
         .send(DecodeRequest { mono: mono_buf })
         .map_err(|_| ())
@@ -887,6 +964,7 @@ fn dispatch_auto_break_segment(
 fn drain_auto_break_on_exit(
     machine: &mut AutoBreakMachine,
     noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
     decode_tx: &mpsc::Sender<DecodeRequest>,
 ) {
     if matches!(machine.state(), AutoBreakState::Idle) {
@@ -910,7 +988,12 @@ fn drain_auto_break_on_exit(
             "Auto Break: flushing in-flight segment on session exit"
         );
         let stereo_buf = machine.take_buffer();
-        let _ = dispatch_auto_break_segment(&stereo_buf, noise_gate_ratio, decode_tx);
+        let _ = dispatch_auto_break_segment(
+            &stereo_buf,
+            noise_gate_ratio,
+            audio_enhancement,
+            decode_tx,
+        );
     }
     machine.reset_after_force_flush(AutoBreakState::Idle);
 }
@@ -1223,6 +1306,7 @@ mod auto_break_tests {
                     decode_tx,
                     noise_gate_ratio: 1.0,
                     auto_break_thresholds: super::super::host::AutoBreakThresholds::defaults(),
+                    audio_enhancement: denoise::AudioEnhancement::default(),
                 });
             }
         });

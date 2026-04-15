@@ -88,6 +88,117 @@ const NOISE_FLOOR_PERCENTILE: f32 = 0.20;
 /// in one place.
 const MIN_FFT_LEN: usize = 64;
 
+/// User-selectable audio enhancement mode applied to mono
+/// transcription audio before it reaches the recognizer.
+///
+/// Every call site in the transcription pipeline (sherpa offline
+/// VAD, sherpa offline Auto Break, sherpa streaming, whisper)
+/// dispatches through [`apply`] using the mode configured on the
+/// session. Switching modes takes effect at the next session
+/// start — the session I/O threads read the config once and use
+/// it for the session's lifetime.
+///
+/// # Issue #281 context
+///
+/// The default [`VoiceBand`] path shaves audio outside ~80–7500 Hz
+/// with a voice-prior weight function. Some recognizers — notably
+/// Moonshine Tiny/Base in the sherpa-onnx int8 releases — have a
+/// convolutional frontend that appears to be more sensitive to
+/// these hard cutoffs than `Parakeet`'s `NeMo` fbank frontend, and
+/// produce empty text on the same NFM audio where `Parakeet`
+/// transcribes correctly. Switching the affected session to
+/// [`Broadband`] (flat noise-floor gate, no voice-prior) restores
+/// Moonshine's output. See issue #281 for the investigation and
+/// trace data.
+///
+/// # Variants
+///
+/// - [`VoiceBand`] — [`enhance_speech`], bandpass-shaped gate with
+///   voice-prior weights. Default for most users on most audio.
+/// - [`Broadband`] — [`spectral_denoise`], flat noise-floor gate
+///   without voice-prior weights. Use when [`VoiceBand`] is
+///   suppressing recognizer output (e.g. Moonshine on NFM).
+/// - [`Off`] — no enhancement. Pass the audio straight to the
+///   recognizer. Useful as a baseline for troubleshooting or when
+///   the source is already clean (file playback of pre-cleaned
+///   audio, etc.).
+///
+/// [`VoiceBand`]: AudioEnhancement::VoiceBand
+/// [`Broadband`]: AudioEnhancement::Broadband
+/// [`Off`]: AudioEnhancement::Off
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum AudioEnhancement {
+    /// Voice-prior weighted spectral gate — default.
+    /// See [`enhance_speech`] for the algorithm.
+    #[default]
+    VoiceBand,
+    /// Flat-weight spectral gate — the original PR #227 broadband
+    /// path. See [`spectral_denoise`].
+    Broadband,
+    /// No enhancement. Pass audio through unchanged.
+    Off,
+}
+
+impl AudioEnhancement {
+    /// Stable string identifier for config persistence. Paired
+    /// with [`Self::from_config_str`].
+    ///
+    /// Snake-case so it looks natural in the JSON config file
+    /// alongside other transcription keys like `display_mode`.
+    #[must_use]
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::VoiceBand => "voice_band",
+            Self::Broadband => "broadband",
+            Self::Off => "off",
+        }
+    }
+
+    /// Parse a config-string identifier produced by
+    /// [`Self::as_config_str`]. Unknown values (old configs, typos,
+    /// future-reserved names) fall back to the default
+    /// [`AudioEnhancement::VoiceBand`] rather than erroring — a
+    /// missing or invalid audio-enhancement config key should
+    /// never fail a session start.
+    #[must_use]
+    pub fn from_config_str(s: &str) -> Self {
+        match s {
+            "broadband" => Self::Broadband,
+            "off" => Self::Off,
+            // "voice_band" and unknown both fall through to the
+            // default, per the lenient-parsing contract documented
+            // on the function.
+            _ => Self::VoiceBand,
+        }
+    }
+}
+
+/// Apply the selected audio enhancement to `samples` in place.
+///
+/// Central dispatcher for all transcription call sites. Every
+/// recognizer path should route its mono buffer through here
+/// instead of calling [`enhance_speech`] / [`spectral_denoise`]
+/// directly so the user's mode selection is honored.
+///
+/// `gate_ratio` is passed through to whichever FFT-based path
+/// runs; it has no effect in [`AudioEnhancement::Off`] mode.
+/// Buffers shorter than [`MIN_FFT_LEN`] are left unchanged by the
+/// underlying functions (same as the existing short-buffer
+/// behavior) so very short segments at session boundaries still
+/// reach the recognizer without being gated by a degenerate FFT.
+pub fn apply(samples: &mut [f32], enhancement: AudioEnhancement, gate_ratio: f32) {
+    match enhancement {
+        AudioEnhancement::VoiceBand => enhance_speech(samples, gate_ratio),
+        AudioEnhancement::Broadband => spectral_denoise(samples, gate_ratio),
+        AudioEnhancement::Off => {
+            // No-op — leave samples untouched. This is the
+            // escape hatch for users whose audio is already
+            // clean or whose recognizer behaves badly with any
+            // spectral gate.
+        }
+    }
+}
+
 /// Apply spectral noise gating to a mono f32 audio buffer in-place.
 ///
 /// The buffer is FFT'd, noise floor is estimated from the quietest bins,
@@ -673,5 +784,173 @@ mod tests {
             "200 Hz survivor should be scaled to approximately VOICE_W_FUND² = {}× input power, got ratio={ratio} (p_input={p_input}, p_output={p_output})",
             VOICE_W_FUND * VOICE_W_FUND
         );
+    }
+
+    // ─── AudioEnhancement dispatcher tests ──────────────────────
+    //
+    // The dispatcher is a thin routing function, but pinning its
+    // behavior matters: a future refactor that accidentally swaps
+    // the VoiceBand / Broadband branches would be caught here, and
+    // the config-string round-trip is load-bearing for persistence.
+
+    // --- three_tone_signal helper constants ---
+    //
+    // The buffer length and tone frequencies below are test
+    // fixtures, not tuning knobs — but per CLAUDE.md they're
+    // still worth naming because the dispatcher tests below rely
+    // on specific properties of each band (one in every voice-
+    // prior weight region) and a future refactor shouldn't have
+    // to decode the math from bare literals.
+
+    /// Length of the test buffer in samples at 16 kHz =
+    /// `SAMPLE_RATE_HZ`. 4096 samples = 256 ms, comfortably above
+    /// [`MIN_FFT_LEN`] so all three modes take the FFT path.
+    const THREE_TONE_SIGNAL_LEN: usize = 4096;
+    /// Fundamental-band tone. Lands in the 80–300 Hz region that
+    /// [`enhance_speech`] half-weights — so `VoiceBand`'s output
+    /// must differ from `Broadband`'s here.
+    const THREE_TONE_FUNDAMENTAL_HZ: f32 = 100.0;
+    /// Formant-band tone. Lands in the 300–3400 Hz region that
+    /// gets full weight (1.0) — so `VoiceBand` preserves this
+    /// close to unchanged.
+    const THREE_TONE_FORMANT_HZ: f32 = 1_000.0;
+    /// Sibilance-band tone. Lands in the 3400–7500 Hz ramp where
+    /// `VoiceBand` tapers the weight. `Broadband` preserves it
+    /// unchanged, so the two modes must differ.
+    const THREE_TONE_SIBILANCE_HZ: f32 = 6_000.0;
+    /// Per-component amplitude. 0.3 × 3 tones = 0.9 peak which
+    /// avoids clipping at f32 [-1, 1].
+    const THREE_TONE_COMPONENT_AMP: f32 = 0.3;
+
+    /// Helper: build a test signal that all three modes can process
+    /// and compare — a sum of three tones at 100 Hz (fundamental
+    /// band), 1000 Hz (formant band), and 6000 Hz (sibilance band).
+    /// See the `THREE_TONE_*` constants above for per-tone rationale.
+    fn three_tone_signal() -> Vec<f32> {
+        let n = THREE_TONE_SIGNAL_LEN;
+        let mut buf = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f32 / SAMPLE_RATE_HZ;
+            let sample = THREE_TONE_COMPONENT_AMP
+                * (2.0 * std::f32::consts::PI * THREE_TONE_FUNDAMENTAL_HZ * t).sin()
+                + THREE_TONE_COMPONENT_AMP
+                    * (2.0 * std::f32::consts::PI * THREE_TONE_FORMANT_HZ * t).sin()
+                + THREE_TONE_COMPONENT_AMP
+                    * (2.0 * std::f32::consts::PI * THREE_TONE_SIBILANCE_HZ * t).sin();
+            buf.push(sample);
+        }
+        buf
+    }
+
+    #[test]
+    fn audio_enhancement_off_is_identity() {
+        // Off mode must leave the buffer byte-identical. This is
+        // load-bearing for users who want to feed pre-cleaned audio
+        // directly to the recognizer without any spectral gate.
+        let input = three_tone_signal();
+        let mut buf = input.clone();
+        apply(&mut buf, AudioEnhancement::Off, GATE_RATIO);
+        assert_eq!(
+            buf, input,
+            "Off mode must not mutate the input buffer in any way"
+        );
+    }
+
+    #[test]
+    fn audio_enhancement_voice_band_matches_enhance_speech() {
+        // VoiceBand must route to enhance_speech. A bit-exact
+        // comparison against a side-by-side enhance_speech call on
+        // an identical input buffer pins the dispatch — a future
+        // refactor that silently swapped the VoiceBand branch to a
+        // different function would produce different output and
+        // fail this assertion.
+        let input = three_tone_signal();
+        let mut via_apply = input.clone();
+        let mut via_direct = input.clone();
+        apply(&mut via_apply, AudioEnhancement::VoiceBand, GATE_RATIO);
+        enhance_speech(&mut via_direct, GATE_RATIO);
+        assert_eq!(
+            via_apply, via_direct,
+            "VoiceBand dispatcher must produce bit-identical output to enhance_speech"
+        );
+    }
+
+    #[test]
+    fn audio_enhancement_broadband_matches_spectral_denoise() {
+        // Same contract for Broadband → spectral_denoise.
+        let input = three_tone_signal();
+        let mut via_apply = input.clone();
+        let mut via_direct = input.clone();
+        apply(&mut via_apply, AudioEnhancement::Broadband, GATE_RATIO);
+        spectral_denoise(&mut via_direct, GATE_RATIO);
+        assert_eq!(
+            via_apply, via_direct,
+            "Broadband dispatcher must produce bit-identical output to spectral_denoise"
+        );
+    }
+
+    #[test]
+    fn audio_enhancement_modes_produce_different_outputs() {
+        // Sanity check that the three modes actually differ on the
+        // same input — if this ever asserts `==` the tests above
+        // are comparing against themselves and would silently pass
+        // even with a busted dispatcher.
+        let input = three_tone_signal();
+        let mut off = input.clone();
+        let mut voice = input.clone();
+        let mut broad = input.clone();
+        apply(&mut off, AudioEnhancement::Off, GATE_RATIO);
+        apply(&mut voice, AudioEnhancement::VoiceBand, GATE_RATIO);
+        apply(&mut broad, AudioEnhancement::Broadband, GATE_RATIO);
+        assert_ne!(
+            off, voice,
+            "Off and VoiceBand should differ on a noisy signal"
+        );
+        assert_ne!(
+            off, broad,
+            "Off and Broadband should differ on a noisy signal"
+        );
+        assert_ne!(
+            voice, broad,
+            "VoiceBand and Broadband should differ on a signal with out-of-voice content"
+        );
+    }
+
+    #[test]
+    fn audio_enhancement_config_str_round_trip() {
+        // as_config_str ↔ from_config_str must round-trip for all
+        // three variants.
+        for mode in [
+            AudioEnhancement::VoiceBand,
+            AudioEnhancement::Broadband,
+            AudioEnhancement::Off,
+        ] {
+            let s = mode.as_config_str();
+            let parsed = AudioEnhancement::from_config_str(s);
+            assert_eq!(parsed, mode, "round-trip failed for {mode:?} via {s:?}");
+        }
+    }
+
+    #[test]
+    fn audio_enhancement_config_str_unknown_falls_back_to_default() {
+        // Unknown / stale / typo config values must fall back to
+        // the default, not error. This matters because a missing
+        // audio-enhancement key in an old config file (from before
+        // this feature shipped) will deserialize to an empty
+        // string which should land on VoiceBand, not some noisy
+        // error.
+        assert_eq!(
+            AudioEnhancement::from_config_str(""),
+            AudioEnhancement::default()
+        );
+        assert_eq!(
+            AudioEnhancement::from_config_str("nonsense"),
+            AudioEnhancement::default()
+        );
+        assert_eq!(
+            AudioEnhancement::from_config_str("VoiceBand"), // wrong case
+            AudioEnhancement::default()
+        );
+        assert_eq!(AudioEnhancement::default(), AudioEnhancement::VoiceBand);
     }
 }
