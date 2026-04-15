@@ -793,19 +793,50 @@ mod tests {
     // the VoiceBand / Broadband branches would be caught here, and
     // the config-string round-trip is load-bearing for persistence.
 
+    // --- three_tone_signal helper constants ---
+    //
+    // The buffer length and tone frequencies below are test
+    // fixtures, not tuning knobs — but per CLAUDE.md they're
+    // still worth naming because the dispatcher tests below rely
+    // on specific properties of each band (one in every voice-
+    // prior weight region) and a future refactor shouldn't have
+    // to decode the math from bare literals.
+
+    /// Length of the test buffer in samples at 16 kHz =
+    /// `SAMPLE_RATE_HZ`. 4096 samples = 256 ms, comfortably above
+    /// [`MIN_FFT_LEN`] so all three modes take the FFT path.
+    const THREE_TONE_SIGNAL_LEN: usize = 4096;
+    /// Fundamental-band tone. Lands in the 80–300 Hz region that
+    /// [`enhance_speech`] half-weights — so `VoiceBand`'s output
+    /// must differ from `Broadband`'s here.
+    const THREE_TONE_FUNDAMENTAL_HZ: f32 = 100.0;
+    /// Formant-band tone. Lands in the 300–3400 Hz region that
+    /// gets full weight (1.0) — so `VoiceBand` preserves this
+    /// close to unchanged.
+    const THREE_TONE_FORMANT_HZ: f32 = 1_000.0;
+    /// Sibilance-band tone. Lands in the 3400–7500 Hz ramp where
+    /// `VoiceBand` tapers the weight. `Broadband` preserves it
+    /// unchanged, so the two modes must differ.
+    const THREE_TONE_SIBILANCE_HZ: f32 = 6_000.0;
+    /// Per-component amplitude. 0.3 × 3 tones = 0.9 peak which
+    /// avoids clipping at f32 [-1, 1].
+    const THREE_TONE_COMPONENT_AMP: f32 = 0.3;
+
     /// Helper: build a test signal that all three modes can process
     /// and compare — a sum of three tones at 100 Hz (fundamental
     /// band), 1000 Hz (formant band), and 6000 Hz (sibilance band).
-    /// 4096 samples at 16 kHz = 256 ms, comfortably above
-    /// `MIN_FFT_LEN`.
+    /// See the `THREE_TONE_*` constants above for per-tone rationale.
     fn three_tone_signal() -> Vec<f32> {
-        let n = 4096;
+        let n = THREE_TONE_SIGNAL_LEN;
         let mut buf = Vec::with_capacity(n);
         for i in 0..n {
             let t = i as f32 / SAMPLE_RATE_HZ;
-            let sample = 0.3 * (2.0 * std::f32::consts::PI * 100.0 * t).sin()
-                + 0.3 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
-                + 0.3 * (2.0 * std::f32::consts::PI * 6000.0 * t).sin();
+            let sample = THREE_TONE_COMPONENT_AMP
+                * (2.0 * std::f32::consts::PI * THREE_TONE_FUNDAMENTAL_HZ * t).sin()
+                + THREE_TONE_COMPONENT_AMP
+                    * (2.0 * std::f32::consts::PI * THREE_TONE_FORMANT_HZ * t).sin()
+                + THREE_TONE_COMPONENT_AMP
+                    * (2.0 * std::f32::consts::PI * THREE_TONE_SIBILANCE_HZ * t).sin();
             buf.push(sample);
         }
         buf

@@ -73,7 +73,6 @@ const KEY_AUDIO_ENHANCEMENT: &str = "transcription_audio_enhancement";
 /// matches [`AUDIO_ENHANCEMENT_LABELS`] below. `pub(crate)` so
 /// `window.rs` can match on them at `BackendConfig` construction
 /// time without re-deriving the parse logic.
-#[allow(dead_code)]
 pub(crate) const AUDIO_ENHANCEMENT_VOICE_BAND_IDX: u32 = 0;
 pub(crate) const AUDIO_ENHANCEMENT_BROADBAND_IDX: u32 = 1;
 pub(crate) const AUDIO_ENHANCEMENT_OFF_IDX: u32 = 2;
@@ -506,19 +505,32 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         let config_enhancement = Arc::clone(config);
         row.connect_selected_notify(move |r| {
             // Map combo index → AudioEnhancement → stable config
-            // string. The round-trip goes through the enum so a
-            // future addition of a fourth mode only has to touch
-            // the enum + labels + one match arm here.
-            let value = match r.selected() {
-                AUDIO_ENHANCEMENT_BROADBAND_IDX => {
-                    sdr_transcription::denoise::AudioEnhancement::Broadband
+            // string. Only persist if the index matches one of
+            // the three known-valid values. GTK `ComboRow` emits
+            // `selected-notify` with transient out-of-range
+            // indices during intermediate widget state changes
+            // (e.g. during model repopulation), and the lenient
+            // "fall through to VoiceBand" pattern the ACTIVE
+            // dispatch path uses is dangerous here — it would
+            // silently overwrite a user's Broadband or Off
+            // workaround with the default on a spurious signal.
+            // Runtime dispatch (window.rs BackendConfig build) can
+            // still be lenient because it reads the current value
+            // once at session start; this persistence handler is
+            // the one that cares about transient signals.
+            let Some(value) = (match r.selected() {
+                AUDIO_ENHANCEMENT_VOICE_BAND_IDX => {
+                    Some(sdr_transcription::denoise::AudioEnhancement::VoiceBand)
                 }
-                AUDIO_ENHANCEMENT_OFF_IDX => sdr_transcription::denoise::AudioEnhancement::Off,
-                // VoiceBand and any out-of-range fall through to
-                // the default, mirroring
-                // `AudioEnhancement::from_config_str`'s lenient
-                // parsing contract.
-                _ => sdr_transcription::denoise::AudioEnhancement::VoiceBand,
+                AUDIO_ENHANCEMENT_BROADBAND_IDX => {
+                    Some(sdr_transcription::denoise::AudioEnhancement::Broadband)
+                }
+                AUDIO_ENHANCEMENT_OFF_IDX => {
+                    Some(sdr_transcription::denoise::AudioEnhancement::Off)
+                }
+                _ => None,
+            }) else {
+                return;
             };
             config_enhancement.write(|v| {
                 v[KEY_AUDIO_ENHANCEMENT] = serde_json::json!(value.as_config_str());

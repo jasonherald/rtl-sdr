@@ -518,7 +518,17 @@ fn decode_segment(
 
     if !text.is_empty() {
         let timestamp = crate::util::wall_clock_timestamp();
-        tracing::debug!(%timestamp, %text, "offline recognizer committed utterance");
+        // Log metadata only — the raw transcript stays inside the
+        // recognizer process boundary until the UI renders it. This
+        // matches the established privacy contract for partials and
+        // finals across the crate: we count characters for observability
+        // but never write user speech to a log file that could be
+        // collected by a `RUST_LOG=debug` run.
+        tracing::debug!(
+            %timestamp,
+            text_chars = text.chars().count(),
+            "offline recognizer committed utterance"
+        );
         let _ = event_tx.send(TranscriptionEvent::Text { timestamp, text });
     }
 }
