@@ -76,6 +76,9 @@ pub struct RadioModule {
     /// rebuilt from scratch, so the CTCSS state has to be restored
     /// the same way deemphasis / notch / high-pass are).
     ctcss_mode: CtcssMode,
+    /// Persisted CTCSS detection threshold, paired with
+    /// `ctcss_mode`. Same reapply-on-rebuild pattern.
+    ctcss_threshold: f32,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -113,6 +116,7 @@ impl RadioModule {
             notch_enabled: false,
             notch_frequency: sdr_dsp::filter::DEFAULT_NOTCH_FREQ_HZ,
             ctcss_mode: CtcssMode::Off,
+            ctcss_threshold: sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -178,13 +182,20 @@ impl RadioModule {
         // correct when the user re-enables after a mode switch.
         af_chain.set_notch_frequency(self.notch_frequency);
         af_chain.set_notch_enabled(self.notch_enabled);
-        // Restore CTCSS mode. The sustained-gate state intentionally
-        // resets to closed on mode switch — a new mode means the
-        // user retuned or changed decode, and holding an old
-        // "tone confirmed" latch across that transition would let
-        // stray audio through before the detector re-confirmed on
-        // the new signal. `set_ctcss_mode` rebuilds the detector
-        // from scratch so this is the natural behavior.
+        // Restore CTCSS threshold FIRST so the detector built by
+        // set_ctcss_mode picks it up instead of the default.
+        // Sustained-gate state intentionally resets to closed on
+        // mode switch — a new mode means the user retuned or
+        // changed decode, and holding an old "tone confirmed"
+        // latch across that transition would let stray audio
+        // through before the detector re-confirmed on the new
+        // signal. `set_ctcss_mode` rebuilds the detector from
+        // scratch so this is the natural behavior.
+        af_chain
+            .set_ctcss_threshold(self.ctcss_threshold)
+            .map_err(|e| {
+                RadioError::ModeSwitchFailed(format!("failed to set CTCSS threshold: {e}"))
+            })?;
         af_chain
             .set_ctcss_mode(self.ctcss_mode)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to set CTCSS mode: {e}")))?;
@@ -422,6 +433,26 @@ impl RadioModule {
     /// windows. Always `false` when CTCSS is `Off`.
     pub fn ctcss_sustained(&self) -> bool {
         self.af_chain.ctcss_sustained()
+    }
+
+    /// Set the CTCSS detection threshold (normalized magnitude
+    /// ratio, `(0, 1]`). Default is
+    /// [`sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD`] (0.1).
+    /// Persists across mode changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RadioError::Dsp`] if the value is non-finite or
+    /// out of range.
+    pub fn set_ctcss_threshold(&mut self, threshold: f32) -> Result<(), RadioError> {
+        self.af_chain.set_ctcss_threshold(threshold)?;
+        self.ctcss_threshold = threshold;
+        Ok(())
+    }
+
+    /// Returns the current CTCSS detection threshold.
+    pub fn ctcss_threshold(&self) -> f32 {
+        self.ctcss_threshold
     }
 
     /// Enable or disable WFM stereo decode.

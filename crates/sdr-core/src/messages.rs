@@ -1,6 +1,6 @@
 //! Message types for communication between the DSP thread and the UI thread.
 
-use sdr_radio::DeemphasisMode;
+use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
 use sdr_types::DemodMode;
 
 /// Messages sent from the DSP pipeline thread to the UI main loop.
@@ -37,6 +37,11 @@ pub enum DspToUi {
     /// transcription session (band change = new session boundary) and
     /// to re-run Auto Break row visibility rules.
     DemodModeChanged(DemodMode),
+    /// CTCSS sustained-gate state changed. Emitted only on edges
+    /// (closed → open / open → closed), not per-window, so the UI
+    /// status indicator can subscribe without flooding the channel.
+    /// Always `false` when CTCSS is currently `Off`.
+    CtcssSustainedChanged(bool),
 }
 
 /// Available source types for IQ input.
@@ -109,6 +114,10 @@ pub enum UiToDsp {
     SetNotchEnabled(bool),
     /// Set the audio notch filter frequency in Hz.
     SetNotchFrequency(f32),
+    /// Set the CTCSS sub-audible tone squelch mode.
+    SetCtcssMode(CtcssMode),
+    /// Set the CTCSS detection threshold (normalized magnitude, `(0, 1]`).
+    SetCtcssThreshold(f32),
     /// Set the audio output device by `PipeWire` node name.
     SetAudioDevice(String),
     /// Switch the source type (stops current source if running).

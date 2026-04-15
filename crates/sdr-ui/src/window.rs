@@ -317,6 +317,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let gain_row_for_dsp = panels.source.gain_row.clone();
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
+    let radio_panel_for_dsp = panels.radio.clone();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
     #[cfg(feature = "sherpa")]
     let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
@@ -369,6 +370,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &gain_row_for_dsp,
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
+                        &radio_panel_for_dsp,
                         &transcription_enable_for_dsp,
                         #[cfg(feature = "sherpa")]
                         &auto_break_row_for_dsp,
@@ -407,6 +409,7 @@ fn handle_dsp_message(
     gain_row: &adw::SpinRow,
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
+    radio_panel: &sidebar::radio_panel::RadioPanel,
     transcription_enable_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_min_open_row: &adw::SpinRow,
@@ -550,6 +553,10 @@ fn handle_dsp_message(
                     overlay.add_toast(toast);
                 }
             }
+        }
+        DspToUi::CtcssSustainedChanged(sustained) => {
+            tracing::debug!(sustained, "CTCSS sustained-gate edge");
+            radio_panel.set_ctcss_sustained(sustained);
         }
     }
 }
@@ -1096,6 +1103,31 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             #[allow(clippy::cast_possible_truncation)]
             state_notch_freq.send_dsp(UiToDsp::SetNotchFrequency(row.value() as f32));
         });
+
+    // CTCSS tone selector
+    let state_ctcss = Rc::clone(state);
+    let radio_for_ctcss = panels.radio.clone();
+    panels.radio.ctcss_row.connect_selected_notify(move |row| {
+        let mode = sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(row.selected());
+        state_ctcss.send_dsp(UiToDsp::SetCtcssMode(mode));
+        // Push the status row label immediately — the detector
+        // only emits `CtcssSustainedChanged` on actual gate
+        // edges, so without this the label would lag behind a
+        // mode change (stay on "Tone detected" after flipping to
+        // Off, or stay on "Off" after picking a tone until the
+        // first detector window confirms).
+        radio_for_ctcss.set_ctcss_sustained(false);
+    });
+
+    // CTCSS detection threshold
+    let state_ctcss_thresh = Rc::clone(state);
+    panels
+        .radio
+        .ctcss_threshold_row
+        .connect_value_notify(move |row| {
+            #[allow(clippy::cast_possible_truncation)]
+            state_ctcss_thresh.send_dsp(UiToDsp::SetCtcssThreshold(row.value() as f32));
+        });
 }
 
 /// FFT window function options matching the display panel combo.
@@ -1311,6 +1343,22 @@ fn restore_bookmark_profile(
     if let Some(hp) = bookmark.high_pass {
         state.send_dsp(UiToDsp::SetHighPass(hp));
     }
+    // Restore CTCSS threshold BEFORE mode so the detector the
+    // mode setter builds picks up the saved value instead of
+    // defaulting. Mirrors the RadioModule::set_mode order.
+    if let Some(threshold) = bookmark.ctcss_threshold {
+        state.send_dsp(UiToDsp::SetCtcssThreshold(threshold));
+        #[allow(clippy::cast_lossless)]
+        radio.ctcss_threshold_row.set_value(threshold as f64);
+    }
+    if let Some(mode) = bookmark.ctcss_mode {
+        state.send_dsp(UiToDsp::SetCtcssMode(mode));
+        radio
+            .ctcss_row
+            .set_selected(sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(
+                mode,
+            ));
+    }
 }
 
 /// Connect navigation panel (band presets + bookmarks) to DSP commands.
@@ -1429,6 +1477,10 @@ fn connect_navigation_panel(
             fm_if_nr: radio_bm.fm_if_nr_row.is_active(),
             wfm_stereo: radio_bm.stereo_row.is_active(),
             high_pass: None, // No UI widget yet — don't persist.
+            ctcss_mode: Some(sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
+                radio_bm.ctcss_row.selected(),
+            )),
+            ctcss_threshold: Some(radio_bm.ctcss_threshold_row.value() as f32),
         };
         let bookmark =
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
@@ -1464,6 +1516,8 @@ fn connect_navigation_panel(
     let save_radio_nben_lvl = panels.radio.nb_level_row.clone();
     let save_radio_nr = panels.radio.fm_if_nr_row.clone();
     let save_radio_stereo = panels.radio.stereo_row.clone();
+    let save_radio_ctcss = panels.radio.ctcss_row.clone();
+    let save_radio_ctcss_threshold = panels.radio.ctcss_threshold_row.clone();
     let save_source_gain = panels.source.gain_row.clone();
     let save_source_agc = panels.source.agc_row.clone();
     nav.connect_save(move || {
@@ -1491,6 +1545,11 @@ fn connect_navigation_panel(
             fm_if_nr: save_radio_nr.is_active(),
             wfm_stereo: save_radio_stereo.is_active(),
             high_pass: None,
+            ctcss_mode: Some(sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
+                save_radio_ctcss.selected(),
+            )),
+            #[allow(clippy::cast_possible_truncation)]
+            ctcss_threshold: Some(save_radio_ctcss_threshold.value() as f32),
         };
         // Find and update the active bookmark in the list.
         let mut bms = save_bm_rc.borrow_mut();
@@ -1513,6 +1572,8 @@ fn connect_navigation_panel(
             bm.fm_if_nr = Some(profile.fm_if_nr);
             bm.wfm_stereo = Some(profile.wfm_stereo);
             bm.high_pass = profile.high_pass;
+            bm.ctcss_mode = profile.ctcss_mode;
+            bm.ctcss_threshold = profile.ctcss_threshold;
             // Keep ActiveBookmark in sync with the updated frequency.
             *save_active.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
                 name: active.name.clone(),

@@ -2,6 +2,8 @@
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_dsp::tone_detect::{CTCSS_DEFAULT_THRESHOLD, CTCSS_TONES_HZ};
+use sdr_radio::af_chain::CtcssMode;
 
 /// Default bandwidth in Hz.
 const DEFAULT_BANDWIDTH_HZ: f64 = 12_500.0;
@@ -35,6 +37,20 @@ const MAX_NB_LEVEL: f64 = 20.0;
 const NB_LEVEL_STEP: f64 = 0.5;
 /// Noise blanker page increment.
 const NB_LEVEL_PAGE: f64 = 1.0;
+
+/// Default CTCSS detection threshold (matches
+/// [`sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD`] = 0.1).
+const DEFAULT_CTCSS_THRESHOLD: f64 = 0.1;
+/// Minimum CTCSS threshold.
+const MIN_CTCSS_THRESHOLD: f64 = 0.05;
+/// Maximum CTCSS threshold — the DSP layer accepts up to 1.0 but
+/// anything above ~0.5 is effectively unreachable for real tones,
+/// so we cap the slider at 0.5 to keep the useful range legible.
+const MAX_CTCSS_THRESHOLD: f64 = 0.5;
+/// Step for keyboard increment / page-down.
+const CTCSS_THRESHOLD_STEP: f64 = 0.01;
+/// Page step (scroll / page-down).
+const CTCSS_THRESHOLD_PAGE: f64 = 0.05;
 
 /// Default squelch level in dB.
 const DEFAULT_SQUELCH_DB: f64 = -100.0;
@@ -74,6 +90,20 @@ pub struct RadioPanel {
     pub notch_enabled_row: adw::SwitchRow,
     /// Notch filter frequency control.
     pub notch_freq_row: adw::SpinRow,
+    /// CTCSS tone squelch selector. Entry 0 is "Off"; entries
+    /// 1..=51 map directly to [`CTCSS_TONES_HZ`] one-to-one.
+    /// Visible only when the demod mode is NFM — CTCSS is a
+    /// sub-audible tone-squelch feature used exclusively on
+    /// narrowband FM in practice.
+    pub ctcss_row: adw::ComboRow,
+    /// CTCSS detection threshold (`(0, 1]` normalized magnitude).
+    /// Visible alongside `ctcss_row`.
+    pub ctcss_threshold_row: adw::SpinRow,
+    /// Read-only status indicator row that shows whether the
+    /// detector's sustained gate is currently open. Updated from
+    /// `DspToUi::CtcssSustainedChanged` messages via
+    /// [`Self::set_ctcss_sustained`].
+    pub ctcss_status_row: adw::ActionRow,
 }
 
 impl RadioPanel {
@@ -87,6 +117,94 @@ impl RadioPanel {
         self.fm_if_nr_row.set_visible(is_fm);
         self.stereo_row
             .set_visible(mode == sdr_types::DemodMode::Wfm);
+        // CTCSS is an NFM-only feature — WFM / AM / SSB / CW
+        // either don't carry sub-audible tones or don't use them
+        // as a squelch keying mechanism in practice.
+        let ctcss_allowed = mode == sdr_types::DemodMode::Nfm;
+        self.ctcss_row.set_visible(ctcss_allowed);
+        self.ctcss_threshold_row.set_visible(ctcss_allowed);
+        self.ctcss_status_row.set_visible(ctcss_allowed);
+
+        // Leaving NFM must force the combo back to "Off" (index 0).
+        // Without this, switching from NFM-with-a-tone to WFM would
+        // hide the combo row while the AF chain continues to gate
+        // the speaker path on the now-inapplicable detector — the
+        // user sees "no audio" with no way to clear the state
+        // because the control is hidden. Setting the combo to 0
+        // fires the `selected-notify` signal wired in
+        // `connect_radio_panel`, which sends `SetCtcssMode(Off)`
+        // through to the DSP controller. GTK only emits the signal
+        // on actual value change, so this is a no-op when CTCSS
+        // was already Off.
+        if !ctcss_allowed {
+            self.ctcss_row.set_selected(0);
+        }
+    }
+
+    /// Convert a combo-row selection index to a
+    /// [`CtcssMode`]. Index 0 is `Off`; indices `1..=51` map to
+    /// [`CTCSS_TONES_HZ`] entries. Out-of-range indices
+    /// (shouldn't happen with the fixed 52-entry model) fall back
+    /// to `Off`.
+    #[must_use]
+    pub fn ctcss_mode_from_index(index: u32) -> CtcssMode {
+        if index == 0 {
+            CtcssMode::Off
+        } else if let Some(&hz) = CTCSS_TONES_HZ.get((index - 1) as usize) {
+            CtcssMode::Tone(hz)
+        } else {
+            CtcssMode::Off
+        }
+    }
+
+    /// Convert a [`CtcssMode`] back to a combo-row index. Used by
+    /// the bookmark-restore path. `Tone(_)` with a non-table
+    /// frequency (shouldn't happen, but serde lets anyone build
+    /// the enum) falls back to `Off` (index 0).
+    #[must_use]
+    pub fn ctcss_index_from_mode(mode: CtcssMode) -> u32 {
+        match mode {
+            CtcssMode::Off => 0,
+            CtcssMode::Tone(hz) => CTCSS_TONES_HZ
+                .iter()
+                .position(|&t| (t - hz).abs() < 0.01)
+                .and_then(|i| u32::try_from(i + 1).ok())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Update the CTCSS status row subtitle from the current
+    /// combo selection and an explicit sustained-gate hint.
+    ///
+    /// Three states — in priority order:
+    ///
+    /// 1. **CTCSS combo is "Off"** → `"Off"` regardless of
+    ///    `sustained`. This is load-bearing: the detector can
+    ///    emit a `CtcssSustainedChanged(false)` edge when the
+    ///    mode flips from `Tone` back to `Off` (because the
+    ///    previous state was `true`), and the handler for that
+    ///    edge calls right back into this method. Without the
+    ///    Off-first guard we'd overwrite "Off" with
+    ///    "Waiting for tone" and mislead the user into thinking
+    ///    the detector is still running.
+    /// 2. **Combo names a tone and `sustained == true`** →
+    ///    `"Tone detected — gate open"`.
+    /// 3. **Combo names a tone and `sustained == false`** →
+    ///    `"Waiting for tone"`.
+    ///
+    /// Called from both the combo-change handler (with
+    /// `sustained = false` — mode switches reset the detector)
+    /// and the `DspToUi::CtcssSustainedChanged` edge handler
+    /// (with the actual bool from the message).
+    pub fn set_ctcss_sustained(&self, sustained: bool) {
+        let text = if self.ctcss_row.selected() == 0 {
+            "Off"
+        } else if sustained {
+            "Tone detected — gate open"
+        } else {
+            "Waiting for tone"
+        };
+        self.ctcss_status_row.set_subtitle(text);
     }
 }
 
@@ -199,6 +317,54 @@ pub fn build_radio_panel() -> RadioPanel {
         .digits(0)
         .build();
 
+    // --- CTCSS tone squelch ---
+    // Build the combo model with "Off" followed by the 51 CTCSS
+    // tones. Each tone is labelled to one decimal place (matching
+    // the hardware convention — e.g. "100.0 Hz", "151.4 Hz").
+    let mut ctcss_labels: Vec<String> = Vec::with_capacity(CTCSS_TONES_HZ.len() + 1);
+    ctcss_labels.push("Off".to_string());
+    for &tone in CTCSS_TONES_HZ {
+        ctcss_labels.push(format!("{tone:.1} Hz"));
+    }
+    let ctcss_label_refs: Vec<&str> = ctcss_labels.iter().map(String::as_str).collect();
+    let ctcss_model = gtk4::StringList::new(&ctcss_label_refs);
+    let ctcss_row = adw::ComboRow::builder()
+        .title("CTCSS Tone Squelch")
+        .subtitle("Sub-audible tone required to open squelch")
+        .model(&ctcss_model)
+        .visible(false) // NFM-only; startup mode sets it
+        .build();
+
+    let ctcss_threshold_adj = gtk4::Adjustment::new(
+        DEFAULT_CTCSS_THRESHOLD,
+        MIN_CTCSS_THRESHOLD,
+        MAX_CTCSS_THRESHOLD,
+        CTCSS_THRESHOLD_STEP,
+        CTCSS_THRESHOLD_PAGE,
+        0.0,
+    );
+    let ctcss_threshold_row = adw::SpinRow::builder()
+        .title("CTCSS Threshold")
+        .subtitle("Higher = more conservative (fewer false triggers)")
+        .adjustment(&ctcss_threshold_adj)
+        .digits(2)
+        .visible(false)
+        .build();
+    // Debug assert the default matches the DSP layer at startup —
+    // a future bump to CTCSS_DEFAULT_THRESHOLD should be
+    // accompanied by a bump to DEFAULT_CTCSS_THRESHOLD so the
+    // slider and the detector agree on the un-tuned default.
+    debug_assert!(
+        (DEFAULT_CTCSS_THRESHOLD - f64::from(CTCSS_DEFAULT_THRESHOLD)).abs() < 1e-6,
+        "UI default CTCSS threshold diverged from DSP default"
+    );
+
+    let ctcss_status_row = adw::ActionRow::builder()
+        .title("CTCSS Status")
+        .subtitle("Off")
+        .visible(false)
+        .build();
+
     group.add(&bandwidth_row);
     group.add(&squelch_enabled_row);
     group.add(&squelch_level_row);
@@ -210,6 +376,9 @@ pub fn build_radio_panel() -> RadioPanel {
     group.add(&stereo_row);
     group.add(&notch_enabled_row);
     group.add(&notch_freq_row);
+    group.add(&ctcss_row);
+    group.add(&ctcss_threshold_row);
+    group.add(&ctcss_status_row);
 
     // All rows connected to DSP pipeline via window.rs
 
@@ -226,6 +395,9 @@ pub fn build_radio_panel() -> RadioPanel {
         stereo_row,
         notch_enabled_row,
         notch_freq_row,
+        ctcss_row,
+        ctcss_threshold_row,
+        ctcss_status_row,
     }
 }
 

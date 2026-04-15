@@ -205,6 +205,13 @@ struct DspState {
     /// event per transition instead of one per audio chunk. Initialized
     /// to `false` (matches `IfChain`'s initial closed state).
     squelch_was_open: bool,
+
+    /// Last observed CTCSS sustained-gate state, used to emit
+    /// `DspToUi::CtcssSustainedChanged` only on edges so the UI
+    /// status indicator can subscribe without the channel being
+    /// flooded at detector-window rate. Initialized to `false` to
+    /// match the detector's initial closed state.
+    ctcss_was_sustained: bool,
 }
 
 impl DspState {
@@ -256,6 +263,7 @@ impl DspState {
             iq_writer: None,
             transcription_tx: None,
             squelch_was_open: false,
+            ctcss_was_sustained: false,
         })
     }
 }
@@ -381,6 +389,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 if old_mode != mode {
                     state.transcription_tx = None;
                     state.squelch_was_open = false;
+                    // Mode switch rebuilds the AF chain + CTCSS
+                    // detector — edge tracker must match the new
+                    // closed state.
+                    state.ctcss_was_sustained = false;
                     let _ = dsp_tx.send(DspToUi::DemodModeChanged(mode));
                 }
             }
@@ -647,6 +659,22 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetNotchFrequency(freq) => {
             tracing::debug!(freq, "set notch frequency");
             state.radio.set_notch_frequency(freq);
+        }
+
+        UiToDsp::SetCtcssMode(mode) => {
+            tracing::debug!(?mode, "set CTCSS mode");
+            if let Err(e) = state.radio.set_ctcss_mode(mode) {
+                tracing::warn!("CTCSS mode set failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("CTCSS mode failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetCtcssThreshold(threshold) => {
+            tracing::debug!(threshold, "set CTCSS threshold");
+            if let Err(e) = state.radio.set_ctcss_threshold(threshold) {
+                tracing::warn!("CTCSS threshold set failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("CTCSS threshold failed: {e}")));
+            }
         }
 
         UiToDsp::SetAudioDevice(node_name) => {
@@ -1047,6 +1075,16 @@ fn process_iq_block(
                             let rms = (sum_sq / (2.0 * audio_count as f32)).sqrt();
                             let level_db = 20.0 * rms.max(f32::MIN_POSITIVE).log10();
                             let _ = dsp_tx.send(DspToUi::SignalLevel(level_db));
+                        }
+
+                        // Emit CTCSS sustained-gate edges for the UI
+                        // status indicator. Edge-triggered (not per
+                        // block) so the channel isn't flooded at
+                        // detector-window rate.
+                        let now_ctcss = state.radio.ctcss_sustained();
+                        if now_ctcss != state.ctcss_was_sustained {
+                            let _ = dsp_tx.send(DspToUi::CtcssSustainedChanged(now_ctcss));
+                            state.ctcss_was_sustained = now_ctcss;
                         }
 
                         // Send audio copy to transcription worker BEFORE volume
