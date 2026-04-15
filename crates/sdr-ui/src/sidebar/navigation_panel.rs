@@ -113,6 +113,11 @@ pub struct TuningProfile {
     /// CTCSS detection threshold (normalized magnitude, `(0, 1]`).
     /// Same backward-compat semantics as `ctcss_mode`.
     pub ctcss_threshold: Option<f32>,
+    /// Voice-activity squelch mode — tagged enum carrying its
+    /// threshold inline. Same backward-compat contract as CTCSS:
+    /// `None` on restore means leave the current voice squelch
+    /// setting alone.
+    pub voice_squelch_mode: Option<sdr_dsp::voice_squelch::VoiceSquelchMode>,
 }
 
 /// A user-saved frequency bookmark with optional tuning profile fields.
@@ -169,6 +174,13 @@ pub struct Bookmark {
     /// semantics as `ctcss_mode`.
     #[serde(default)]
     pub ctcss_threshold: Option<f32>,
+    /// Voice-activity squelch mode — tagged `VoiceSquelchMode`
+    /// enum carrying its threshold inline. Added in the voice-
+    /// squelch PR; pre-PR bookmarks deserialize to `None` which
+    /// the restore path interprets as "leave the current voice
+    /// squelch setting alone."
+    #[serde(default)]
+    pub voice_squelch_mode: Option<sdr_dsp::voice_squelch::VoiceSquelchMode>,
 }
 
 impl Bookmark {
@@ -195,6 +207,7 @@ impl Bookmark {
             rr_import_id: None,
             ctcss_mode: None,
             ctcss_threshold: None,
+            voice_squelch_mode: None,
         }
     }
 
@@ -227,6 +240,7 @@ impl Bookmark {
             rr_import_id: None,
             ctcss_mode: profile.ctcss_mode,
             ctcss_threshold: profile.ctcss_threshold,
+            voice_squelch_mode: profile.voice_squelch_mode,
         }
     }
 
@@ -742,6 +756,9 @@ mod tests {
             high_pass: Some(false),
             ctcss_mode: Some(sdr_radio::af_chain::CtcssMode::Tone(100.0)),
             ctcss_threshold: Some(0.15),
+            voice_squelch_mode: Some(sdr_dsp::voice_squelch::VoiceSquelchMode::Snr {
+                threshold_db: 9.0,
+            }),
         };
         let bm = Bookmark::with_profile("Full", 98_100_000, DemodMode::Wfm, 150_000.0, &profile);
         let json = serde_json::to_string(&bm).unwrap();
@@ -763,6 +780,10 @@ mod tests {
             Some(sdr_radio::af_chain::CtcssMode::Tone(100.0))
         );
         assert_eq!(back.ctcss_threshold, Some(0.15));
+        assert_eq!(
+            back.voice_squelch_mode,
+            Some(sdr_dsp::voice_squelch::VoiceSquelchMode::Snr { threshold_db: 9.0 })
+        );
     }
 
     #[test]
@@ -776,6 +797,11 @@ mod tests {
         let bm: Bookmark = serde_json::from_str(old_json).unwrap();
         assert!(bm.ctcss_mode.is_none());
         assert!(bm.ctcss_threshold.is_none());
+        // Voice squelch is newer than CTCSS, so pre-PR bookmarks
+        // also lack this key — must deserialize to None which
+        // restore_bookmark_profile interprets as "leave current
+        // voice squelch setting alone."
+        assert!(bm.voice_squelch_mode.is_none());
     }
 
     #[test]

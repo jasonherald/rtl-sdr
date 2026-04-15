@@ -14,6 +14,7 @@ use sdr_types::{Complex, DemodMode, DspError, Stereo};
 
 use af_chain::{AfChain, CtcssMode};
 use demod::{DemodConfig, Demodulator, create_demodulator};
+use sdr_dsp::voice_squelch::VoiceSquelchMode;
 
 /// Tolerance for considering two sample rates equal (skip resampling).
 const RATE_TOLERANCE: f64 = 1.0;
@@ -79,6 +80,10 @@ pub struct RadioModule {
     /// Persisted CTCSS detection threshold, paired with
     /// `ctcss_mode`. Same reapply-on-rebuild pattern.
     ctcss_threshold: f32,
+    /// Persisted voice-activity squelch mode (Off / Syllabic /
+    /// Snr). Reapplied to the new AF chain on mode switch the
+    /// same way CTCSS is.
+    voice_squelch_mode: VoiceSquelchMode,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -117,6 +122,7 @@ impl RadioModule {
             notch_frequency: sdr_dsp::filter::DEFAULT_NOTCH_FREQ_HZ,
             ctcss_mode: CtcssMode::Off,
             ctcss_threshold: sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD,
+            voice_squelch_mode: VoiceSquelchMode::Off,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -199,6 +205,15 @@ impl RadioModule {
         af_chain
             .set_ctcss_mode(self.ctcss_mode)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to set CTCSS mode: {e}")))?;
+        // Restore voice squelch mode. Like CTCSS, the gate state
+        // intentionally resets to closed on mode switch — the new
+        // AF chain is a fresh detector and has to warm up before
+        // opening.
+        af_chain
+            .set_voice_squelch_mode(self.voice_squelch_mode)
+            .map_err(|e| {
+                RadioError::ModeSwitchFailed(format!("failed to set voice squelch mode: {e}"))
+            })?;
 
         // Update IF chain feature flags based on new mode capabilities
         if !fm_if_nr_allowed {
@@ -453,6 +468,67 @@ impl RadioModule {
     /// Returns the current CTCSS detection threshold.
     pub fn ctcss_threshold(&self) -> f32 {
         self.ctcss_threshold
+    }
+
+    /// Set the voice-activity squelch mode. `Off` is the default
+    /// (audio passes through unchanged). `Syllabic(threshold)` runs
+    /// a ~4 Hz envelope-modulation detector for speech-cadence
+    /// detection. `Snr(threshold_db)` runs a voice-band vs out-of-
+    /// voice-band power ratio detector. Persists across mode
+    /// changes.
+    ///
+    /// See [`sdr_dsp::voice_squelch`] for the underlying DSP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RadioError::Dsp`] if the mode carries a non-
+    /// finite or otherwise invalid threshold.
+    pub fn set_voice_squelch_mode(&mut self, mode: VoiceSquelchMode) -> Result<(), RadioError> {
+        self.af_chain.set_voice_squelch_mode(mode)?;
+        self.voice_squelch_mode = mode;
+        Ok(())
+    }
+
+    /// Returns the current voice-squelch mode.
+    pub fn voice_squelch_mode(&self) -> VoiceSquelchMode {
+        self.voice_squelch_mode
+    }
+
+    /// Returns the voice-squelch gate state: `true` when the
+    /// detector has opened (speech-like content present) or when
+    /// the mode is `Off` (gate permanently open). `false` when
+    /// an active detector has the gate closed.
+    pub fn voice_squelch_open(&self) -> bool {
+        self.af_chain.voice_squelch_open()
+    }
+
+    /// Update the voice-squelch threshold. The interpretation of
+    /// `threshold` depends on the currently active mode: for
+    /// `Syllabic` it's a normalized envelope-ratio value
+    /// (positive, unitless), for `Snr` it's dB. No-op when the
+    /// mode is `Off`.
+    ///
+    /// Updates the persisted mode's inline threshold so
+    /// subsequent mode reloads (e.g. on `set_mode`) carry the
+    /// tuned value forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RadioError::Dsp`] if the threshold is non-finite
+    /// or (for syllabic) non-positive.
+    pub fn set_voice_squelch_threshold(&mut self, threshold: f32) -> Result<(), RadioError> {
+        self.af_chain.set_voice_squelch_threshold(threshold)?;
+        // Mirror the update into the cached mode so set_mode's
+        // reapply picks up the tuned value. `Off` variant has no
+        // threshold to update — no-op, matching the AF chain.
+        self.voice_squelch_mode = match self.voice_squelch_mode {
+            VoiceSquelchMode::Off => VoiceSquelchMode::Off,
+            VoiceSquelchMode::Syllabic { .. } => VoiceSquelchMode::Syllabic { threshold },
+            VoiceSquelchMode::Snr { .. } => VoiceSquelchMode::Snr {
+                threshold_db: threshold,
+            },
+        };
+        Ok(())
     }
 
     /// Enable or disable WFM stereo decode.

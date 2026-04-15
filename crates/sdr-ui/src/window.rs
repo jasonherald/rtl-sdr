@@ -558,6 +558,10 @@ fn handle_dsp_message(
             tracing::debug!(sustained, "CTCSS sustained-gate edge");
             radio_panel.set_ctcss_sustained(sustained);
         }
+        DspToUi::VoiceSquelchOpenChanged(open) => {
+            tracing::debug!(open, "voice squelch gate edge");
+            radio_panel.set_voice_squelch_open(open);
+        }
     }
 }
 
@@ -1008,6 +1012,7 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
 }
 
 /// Connect radio panel controls to DSP commands.
+#[allow(clippy::too_many_lines)]
 fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Bandwidth
     let state_bw = Rc::clone(state);
@@ -1127,6 +1132,50 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .connect_value_notify(move |row| {
             #[allow(clippy::cast_possible_truncation)]
             state_ctcss_thresh.send_dsp(UiToDsp::SetCtcssThreshold(row.value() as f32));
+        });
+
+    // Voice squelch mode
+    //
+    // On mode change: tell the AF chain to rebuild its detector,
+    // reconfigure the threshold spin row (units + range + default
+    // value), and push the status row label to the appropriate
+    // "waiting" / "Off" text so it doesn't lag behind the first
+    // real detector edge.
+    //
+    // The initial startup layout is Off, so nothing else needs
+    // to fire — `apply_voice_squelch_mode_ui(Off)` is called
+    // here too to make the starting state consistent.
+    panels
+        .radio
+        .apply_voice_squelch_mode_ui(sdr_dsp::voice_squelch::VoiceSquelchMode::Off);
+    let state_vs_mode = Rc::clone(state);
+    let radio_for_vs = panels.radio.clone();
+    panels
+        .radio
+        .voice_squelch_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Pull the current threshold from the spin row so the
+            // mode-change dispatch carries a sane initial value.
+            // For Off this doesn't matter (the helper ignores it),
+            // for Syllabic/Snr it seeds the detector.
+            #[allow(clippy::cast_possible_truncation)]
+            let threshold = radio_for_vs.voice_squelch_threshold_row.value() as f32;
+            let mode =
+                sidebar::radio_panel::RadioPanel::voice_squelch_mode_from_index(idx, threshold);
+            state_vs_mode.send_dsp(UiToDsp::SetVoiceSquelchMode(mode));
+            radio_for_vs.apply_voice_squelch_mode_ui(mode);
+            radio_for_vs.set_voice_squelch_open(false);
+        });
+
+    // Voice squelch threshold
+    let state_vs_thresh = Rc::clone(state);
+    panels
+        .radio
+        .voice_squelch_threshold_row
+        .connect_value_notify(move |row| {
+            #[allow(clippy::cast_possible_truncation)]
+            state_vs_thresh.send_dsp(UiToDsp::SetVoiceSquelchThreshold(row.value() as f32));
         });
 }
 
@@ -1359,6 +1408,28 @@ fn restore_bookmark_profile(
                 mode,
             ));
     }
+    // Voice squelch mode — the enum carries its threshold
+    // inline, so a single field captures both. Dispatch to the
+    // DSP first, then update the UI combo + threshold row to
+    // reflect the restored state.
+    if let Some(mode) = bookmark.voice_squelch_mode {
+        state.send_dsp(UiToDsp::SetVoiceSquelchMode(mode));
+        let idx = sidebar::radio_panel::RadioPanel::voice_squelch_index_from_mode(mode);
+        radio.voice_squelch_row.set_selected(idx);
+        let threshold = sidebar::radio_panel::RadioPanel::voice_squelch_threshold_from_mode(mode);
+        #[allow(clippy::cast_lossless)]
+        radio
+            .voice_squelch_threshold_row
+            .set_value(threshold as f64);
+        // Push the threshold over the wire explicitly too —
+        // `SetVoiceSquelchMode` already carries it inline on an
+        // active variant, but sending the dedicated threshold
+        // message keeps the radio module's cached mode variant
+        // in sync in case a future refactor routes the two
+        // updates through different code paths.
+        state.send_dsp(UiToDsp::SetVoiceSquelchThreshold(threshold));
+        radio.apply_voice_squelch_mode_ui(mode);
+    }
 }
 
 /// Connect navigation panel (band presets + bookmarks) to DSP commands.
@@ -1481,6 +1552,12 @@ fn connect_navigation_panel(
                 radio_bm.ctcss_row.selected(),
             )),
             ctcss_threshold: Some(radio_bm.ctcss_threshold_row.value() as f32),
+            voice_squelch_mode: Some(
+                sidebar::radio_panel::RadioPanel::voice_squelch_mode_from_index(
+                    radio_bm.voice_squelch_row.selected(),
+                    radio_bm.voice_squelch_threshold_row.value() as f32,
+                ),
+            ),
         };
         let bookmark =
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
@@ -1518,6 +1595,8 @@ fn connect_navigation_panel(
     let save_radio_stereo = panels.radio.stereo_row.clone();
     let save_radio_ctcss = panels.radio.ctcss_row.clone();
     let save_radio_ctcss_threshold = panels.radio.ctcss_threshold_row.clone();
+    let save_radio_voice_squelch = panels.radio.voice_squelch_row.clone();
+    let save_radio_voice_squelch_threshold = panels.radio.voice_squelch_threshold_row.clone();
     let save_source_gain = panels.source.gain_row.clone();
     let save_source_agc = panels.source.agc_row.clone();
     nav.connect_save(move || {
@@ -1550,6 +1629,14 @@ fn connect_navigation_panel(
             )),
             #[allow(clippy::cast_possible_truncation)]
             ctcss_threshold: Some(save_radio_ctcss_threshold.value() as f32),
+            voice_squelch_mode: Some({
+                #[allow(clippy::cast_possible_truncation)]
+                let t = save_radio_voice_squelch_threshold.value() as f32;
+                sidebar::radio_panel::RadioPanel::voice_squelch_mode_from_index(
+                    save_radio_voice_squelch.selected(),
+                    t,
+                )
+            }),
         };
         // Find and update the active bookmark in the list.
         let mut bms = save_bm_rc.borrow_mut();
@@ -1574,6 +1661,7 @@ fn connect_navigation_panel(
             bm.high_pass = profile.high_pass;
             bm.ctcss_mode = profile.ctcss_mode;
             bm.ctcss_threshold = profile.ctcss_threshold;
+            bm.voice_squelch_mode = profile.voice_squelch_mode;
             // Keep ActiveBookmark in sync with the updated frequency.
             *save_active.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
                 name: active.name.clone(),

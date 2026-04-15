@@ -279,6 +279,7 @@ mod tests {
             rr_import_id: Some("42".to_string()),
             ctcss_mode: None,
             ctcss_threshold: None,
+            voice_squelch_mode: None,
         };
 
         let freq = sample_freq("42", 999_999_999, "FM", "test");
@@ -308,6 +309,7 @@ mod tests {
             rr_import_id: None,
             ctcss_mode: None,
             ctcss_threshold: None,
+            voice_squelch_mode: None,
         };
 
         let freq = sample_freq("99", 155_000_000, "FM", "test");
@@ -337,6 +339,7 @@ mod tests {
             rr_import_id: Some("10".to_string()),
             ctcss_mode: None,
             ctcss_threshold: None,
+            voice_squelch_mode: None,
         };
 
         let freq = sample_freq("99", 155_000_000, "FM", "test");
