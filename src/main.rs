@@ -9,6 +9,8 @@
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 use gtk4::glib;
+#[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
+use gtk4::prelude::*;
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 fn main() -> glib::ExitCode {
@@ -43,6 +45,19 @@ fn main() -> glib::ExitCode {
         tracing::warn!("mallopt(M_ARENA_MAX, 4) failed — arena cap not applied");
     }
     tracing::info!("sdr-rs starting");
+
+    // Single-instance enforcement. Build the AdwApplication and
+    // register it on the session bus BEFORE doing any expensive
+    // startup work (sherpa bundle download, splash subprocess, DSP
+    // engine spawn). If another sdr-rs is already the primary, the
+    // register call marks us remote, we forward an `activate` signal
+    // so the existing window raises, and exit 0 cleanly. This avoids
+    // two processes racing on the RTL-SDR USB device, config file
+    // writes, and sherpa model downloads.
+    let app = sdr_ui::build_app();
+    if !sdr_ui::register_and_check_primary(&app) {
+        return glib::ExitCode::SUCCESS;
+    }
 
     // Initialize the sherpa-onnx host BEFORE GTK is loaded.
     // Drain the event channel until we see Ready or Failed (or the
@@ -143,7 +158,7 @@ fn main() -> glib::ExitCode {
         drop(splash);
     }
 
-    sdr_ui::run()
+    app.run()
 }
 
 #[cfg(any(not(target_os = "linux"), not(feature = "gtk-frontend")))]

@@ -31,13 +31,30 @@ mod streaming;
 pub use host::{init_sherpa_host, reload_sherpa_host};
 pub use silero_vad::SherpaSileroVad;
 
+/// ONNX Runtime execution provider string passed to sherpa-onnx
+/// **recognizer** configs built by this backend (online streaming,
+/// offline Moonshine, offline `NeMo` Parakeet). The Silero VAD stays
+/// on CPU regardless — see `silero_vad.rs` for that rationale.
+///
+/// Selected at compile time by the `sherpa-cpu` / `sherpa-cuda` cargo
+/// feature mutex (enforced in `lib.rs`). `"cuda"` is only valid when the
+/// sys crate was built against the CUDA prebuilt — otherwise onnxruntime
+/// falls back to CPU silently, which would waste a bunch of binary and
+/// disk for no benefit, so we gate it behind the dedicated feature.
+#[cfg(feature = "sherpa-cuda")]
+pub(crate) const SHERPA_PROVIDER: &str = "cuda";
+#[cfg(not(feature = "sherpa-cuda"))]
+pub(crate) const SHERPA_PROVIDER: &str = "cpu";
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use crate::backend::{
-    BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
+    AUTO_BREAK_MIN_OPEN_MS_MAX, AUTO_BREAK_MIN_OPEN_MS_MIN, AUTO_BREAK_MIN_SEGMENT_MS_MAX,
+    AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_TAIL_MS_MAX, AUTO_BREAK_TAIL_MS_MIN, BackendConfig,
+    BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
 };
-use host::{AUDIO_CHANNEL_CAPACITY, SessionParams, global_sherpa_host};
+use host::{AUDIO_CHANNEL_CAPACITY, AutoBreakThresholds, SessionParams, global_sherpa_host};
 
 /// `TranscriptionBackend` implementation backed by the global sherpa host.
 ///
@@ -114,6 +131,26 @@ impl TranscriptionBackend for SherpaBackend {
             event_tx,
             noise_gate_ratio: config.noise_gate_ratio,
             vad_threshold: config.vad_threshold,
+            segmentation_mode: config.segmentation_mode,
+            // Defense-in-depth clamp: the transcript-panel SpinRow
+            // adjustments already bound user input to the same min/max
+            // ranges, but a corrupted persisted config file or a
+            // future non-UI caller could still ship out-of-range
+            // values into `BackendConfig`. Clamp at the session-start
+            // boundary so the state machine never sees a value
+            // outside the documented range.
+            auto_break_thresholds: AutoBreakThresholds {
+                min_open_ms: config
+                    .auto_break_min_open_ms
+                    .clamp(AUTO_BREAK_MIN_OPEN_MS_MIN, AUTO_BREAK_MIN_OPEN_MS_MAX),
+                tail_ms: config
+                    .auto_break_tail_ms
+                    .clamp(AUTO_BREAK_TAIL_MS_MIN, AUTO_BREAK_TAIL_MS_MAX),
+                min_segment_ms: config
+                    .auto_break_min_segment_ms
+                    .clamp(AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_MIN_SEGMENT_MS_MAX),
+            },
+            audio_enhancement: config.audio_enhancement,
         })?;
 
         tracing::info!("sherpa backend session requested");

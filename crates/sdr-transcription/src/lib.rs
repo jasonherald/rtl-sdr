@@ -17,13 +17,39 @@ compile_error!(
      Pick exactly one user-facing feature: \
      `whisper-cpu` (default), `whisper-cuda`, `whisper-hipblas`, \
      `whisper-vulkan`, `whisper-metal`, `whisper-intel-sycl`, `whisper-openblas`, \
-     or `sherpa-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+     `sherpa-cpu`, or `sherpa-cuda`. \
+     For sherpa, pass `--no-default-features --features sherpa-cpu` (or `sherpa-cuda`)."
+);
+
+#[cfg(all(feature = "sherpa-cpu", feature = "sherpa-cuda"))]
+compile_error!(
+    "the `sherpa-cpu` and `sherpa-cuda` features are mutually exclusive. \
+     Pick exactly one link mode for the sherpa-onnx prebuilt: \
+     `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link against \
+     the CUDA 12.x + cuDNN 9.x prebuilt)."
+);
+
+// `sherpa` is an internal umbrella feature activated by the two
+// user-facing link-mode features (`sherpa-cpu`, `sherpa-cuda`). If a
+// caller enables `sherpa` directly without picking a link mode, the
+// sherpa-onnx dependency would be pulled in with no link configured
+// and fail at link time with a confusing error. Catch it here with a
+// clear actionable message.
+#[cfg(all(
+    feature = "sherpa",
+    not(any(feature = "sherpa-cpu", feature = "sherpa-cuda"))
+))]
+compile_error!(
+    "the internal `sherpa` feature requires exactly one user-facing link mode. \
+     Enable either `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link \
+     against the CUDA 12.x + cuDNN 9.x prebuilt) instead of `sherpa` directly."
 );
 
 #[cfg(not(any(feature = "whisper", feature = "sherpa")))]
 compile_error!(
     "exactly one transcription backend must be enabled. The default is \
-     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu`."
+     `whisper-cpu`. For sherpa, pass `--no-default-features --features sherpa-cpu` \
+     (or `sherpa-cuda` for NVIDIA GPU acceleration)."
 );
 
 pub mod backend;
@@ -43,8 +69,12 @@ pub mod init_event;
 pub mod sherpa_model;
 
 pub use backend::{
-    BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
-    TranscriptionEvent, VAD_THRESHOLD_DEFAULT, VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
+    AUTO_BREAK_MIN_OPEN_MS_DEFAULT, AUTO_BREAK_MIN_OPEN_MS_MAX, AUTO_BREAK_MIN_OPEN_MS_MIN,
+    AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT, AUTO_BREAK_MIN_SEGMENT_MS_MAX,
+    AUTO_BREAK_MIN_SEGMENT_MS_MIN, AUTO_BREAK_TAIL_MS_DEFAULT, AUTO_BREAK_TAIL_MS_MAX,
+    AUTO_BREAK_TAIL_MS_MIN, BackendConfig, BackendError, BackendHandle, ModelChoice,
+    SegmentationMode, TranscriptionBackend, TranscriptionEvent, TranscriptionInput,
+    VAD_THRESHOLD_DEFAULT, VAD_THRESHOLD_MAX, VAD_THRESHOLD_MIN,
 };
 
 #[cfg(feature = "whisper")]
@@ -85,7 +115,7 @@ pub enum TranscriptionError {
 /// `sdr-ui` need no changes.
 pub struct TranscriptionEngine {
     backend: Option<Box<dyn TranscriptionBackend>>,
-    audio_tx: Option<mpsc::SyncSender<Vec<f32>>>,
+    audio_tx: Option<mpsc::SyncSender<TranscriptionInput>>,
 }
 
 impl Default for TranscriptionEngine {
@@ -166,7 +196,7 @@ impl TranscriptionEngine {
     }
 
     /// Get a clone of the audio sender for feeding samples from the DSP thread.
-    pub fn audio_sender(&self) -> Option<mpsc::SyncSender<Vec<f32>>> {
+    pub fn audio_sender(&self) -> Option<mpsc::SyncSender<TranscriptionInput>> {
         self.audio_tx.clone()
     }
 
@@ -204,6 +234,11 @@ mod tests {
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
             vad_threshold: crate::VAD_THRESHOLD_DEFAULT,
+            segmentation_mode: SegmentationMode::default(),
+            auto_break_min_open_ms: crate::AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
+            auto_break_tail_ms: crate::AUTO_BREAK_TAIL_MS_DEFAULT,
+            auto_break_min_segment_ms: crate::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+            audio_enhancement: crate::denoise::AudioEnhancement::default(),
         }
     }
 

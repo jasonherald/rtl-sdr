@@ -33,6 +33,52 @@ const KEY_DISPLAY_MODE: &str = "transcription_display_mode";
 /// Config key for the persisted Silero VAD threshold.
 /// Sherpa-only — only meaningful for offline models (Moonshine, Parakeet).
 const KEY_SHERPA_VAD_THRESHOLD: &str = "sherpa_vad_threshold";
+#[cfg(feature = "sherpa")]
+/// Config key for persisting the Auto Break segmentation preference.
+/// When true, offline sherpa sessions use squelch edges as utterance
+/// boundaries instead of Silero VAD. Default false (preserve existing
+/// behavior for existing config files).
+pub(crate) const KEY_AUTO_BREAK_ENABLED: &str = "transcription_auto_break_enabled";
+/// Config key for the persisted Auto Break "minimum open duration"
+/// threshold. Squelch opens shorter than this are discarded as noise
+/// spikes. Persisted in config as `u64` milliseconds (the on-disk
+/// JSON representation widens `BackendConfig`'s u32 field through the
+/// `SpinRow`'s f64 adjustment).
+#[cfg(feature = "sherpa")]
+const KEY_AUTO_BREAK_MIN_OPEN_MS: &str = "transcription_auto_break_min_open_ms";
+/// Config key for the persisted Auto Break tail-capture window.
+/// Continue buffering audio for this long after squelch closes so
+/// the last syllable isn't chopped. Persisted in config as `u64`
+/// milliseconds.
+#[cfg(feature = "sherpa")]
+const KEY_AUTO_BREAK_TAIL_MS: &str = "transcription_auto_break_tail_ms";
+/// Config key for the persisted Auto Break minimum segment length.
+/// Segments shorter than this are discarded instead of decoded (sub-
+/// word fragments make offline sherpa models hallucinate). Persisted
+/// in config as `u64` milliseconds.
+#[cfg(feature = "sherpa")]
+const KEY_AUTO_BREAK_MIN_SEGMENT_MS: &str = "transcription_auto_break_min_segment_ms";
+
+/// Config key for the persisted audio-enhancement mode. Values are
+/// the `AudioEnhancement::as_config_str` strings: `"voice_band"`,
+/// `"broadband"`, or `"off"`. Default `"voice_band"`. Applies to
+/// both whisper and sherpa — the audio enhancement dispatcher lives
+/// in `sdr-transcription::denoise` and all four recognizer call
+/// sites route through it. Added in PR for issue #281 so users who
+/// hit voice-band preprocessor issues (notably Moonshine) have a
+/// user-visible workaround without rebuilding.
+const KEY_AUDIO_ENHANCEMENT: &str = "transcription_audio_enhancement";
+
+/// Combo row indices for the audio-enhancement selector. Order
+/// matches [`AUDIO_ENHANCEMENT_LABELS`] below. `pub(crate)` so
+/// `window.rs` can match on them at `BackendConfig` construction
+/// time without re-deriving the parse logic.
+pub(crate) const AUDIO_ENHANCEMENT_VOICE_BAND_IDX: u32 = 0;
+pub(crate) const AUDIO_ENHANCEMENT_BROADBAND_IDX: u32 = 1;
+pub(crate) const AUDIO_ENHANCEMENT_OFF_IDX: u32 = 2;
+/// User-visible labels for the audio-enhancement combo row. Order
+/// must match the `AUDIO_ENHANCEMENT_*_IDX` constants above.
+const AUDIO_ENHANCEMENT_LABELS: &[&str] = &["Voice-band (default)", "Broadband", "Off"];
 
 #[cfg(feature = "sherpa")]
 const DISPLAY_MODE_LIVE_IDX: u32 = 0;
@@ -76,6 +122,40 @@ const SHERPA_VAD_THRESHOLD_MAX: f64 = sdr_transcription::VAD_THRESHOLD_MAX as f6
 const SHERPA_VAD_THRESHOLD_STEP: f64 = 0.05;
 #[cfg(feature = "sherpa")]
 const SHERPA_VAD_THRESHOLD_PAGE: f64 = 0.10;
+
+// Auto Break timing parameters (sherpa-only, offline-only, NFM-only).
+// Defaults and bounds come from `sdr_transcription::backend` as u32
+// constants; the UI widens them to f64 because `adw::SpinRow` takes
+// f64 adjustments. All three sliders step in 10 ms increments
+// (`AUTO_BREAK_MS_STEP` below) because finer precision has no
+// perceptible effect on segmentation behavior.
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_OPEN_MS_MIN: f64 = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_MIN as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_OPEN_MS_MAX: f64 = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_MAX as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_OPEN_MS_DEFAULT: f64 =
+    sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_DEFAULT as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_TAIL_MS_MIN: f64 = sdr_transcription::AUTO_BREAK_TAIL_MS_MIN as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_TAIL_MS_MAX: f64 = sdr_transcription::AUTO_BREAK_TAIL_MS_MAX as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_TAIL_MS_DEFAULT: f64 = sdr_transcription::AUTO_BREAK_TAIL_MS_DEFAULT as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_SEGMENT_MS_MIN: f64 = sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_MIN as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_SEGMENT_MS_MAX: f64 = sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_MAX as f64;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT: f64 =
+    sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT as f64;
+/// All three Auto Break sliders step in 10 ms increments. Sub-10 ms
+/// tuning has no perceptible effect on segmentation behavior.
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MS_STEP: f64 = 10.0;
+#[cfg(feature = "sherpa")]
+const AUTO_BREAK_MS_PAGE: f64 = 50.0;
+
 const NOISE_GATE_MIN: f64 = 1.0;
 const NOISE_GATE_MAX: f64 = 10.0;
 const NOISE_GATE_STEP: f64 = 0.5;
@@ -97,6 +177,12 @@ pub struct TranscriptPanel {
     pub silence_row: adw::SpinRow,
     /// Noise gate spin row.
     pub noise_gate_row: adw::SpinRow,
+    /// Audio enhancement mode selector (Voice-band / Broadband /
+    /// Off). Applies to both whisper and sherpa backends — the
+    /// dispatcher in `sdr-transcription::denoise` routes every
+    /// recognizer call site through the user's choice. Default is
+    /// Voice-band, which matches the pre-#281 behavior.
+    pub audio_enhancement_row: adw::ComboRow,
     /// Display-mode selector (Live captions vs Final only). Sherpa-only —
     /// Whisper has no `Partial` events to render.
     #[cfg(feature = "sherpa")]
@@ -106,6 +192,22 @@ pub struct TranscriptPanel {
     /// models (Zipformer) don't use Silero VAD.
     #[cfg(feature = "sherpa")]
     pub vad_threshold_row: adw::SpinRow,
+    /// Auto Break toggle. Sherpa-only — when enabled, uses squelch
+    /// edges as utterance boundaries instead of Silero VAD. NFM only.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_row: adw::SwitchRow,
+    /// Auto Break minimum-open-duration slider. Sherpa-only — only
+    /// visible alongside the Auto Break toggle when Auto Break is on.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_min_open_row: adw::SpinRow,
+    /// Auto Break tail-capture slider. Sherpa-only — only visible
+    /// alongside the Auto Break toggle when Auto Break is on.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_tail_row: adw::SpinRow,
+    /// Auto Break minimum-segment-length slider. Sherpa-only — only
+    /// visible alongside the Auto Break toggle when Auto Break is on.
+    #[cfg(feature = "sherpa")]
+    pub auto_break_min_segment_row: adw::SpinRow,
     /// Dimmed italic label below the text view that renders in-progress
     /// Sherpa partials. Sherpa-only.
     #[cfg(feature = "sherpa")]
@@ -120,6 +222,78 @@ pub struct TranscriptPanel {
     pub scroll: gtk4::ScrolledWindow,
     /// Button to clear the transcript log.
     pub clear_button: gtk4::Button,
+}
+
+/// Specification for a persisted-millisecond `AdwSpinRow`. Used by
+/// [`build_persisted_ms_slider`] to construct the three Auto Break
+/// timing sliders from one code path.
+#[cfg(feature = "sherpa")]
+struct MsSliderSpec {
+    /// Config-file JSON key where the value is persisted (`u64` ms).
+    key: &'static str,
+    /// User-visible row title (e.g. "Auto Break: min open (ms)").
+    title: &'static str,
+    /// User-visible row subtitle explaining what the knob does.
+    subtitle: &'static str,
+    /// Inclusive minimum allowed slider value.
+    min: f64,
+    /// Inclusive maximum allowed slider value.
+    max: f64,
+    /// Default value shown when the config key is missing or invalid.
+    default: f64,
+}
+
+/// Build a sherpa-only persisted-milliseconds `AdwSpinRow` from a
+/// [`MsSliderSpec`]. Shared shape for the three Auto Break timing
+/// sliders (`min_open`, `tail`, `min_segment`) which all follow the
+/// same load/clamp/build/persist pattern.
+///
+/// The `u64 ↔ f64` casts are bounded by `spec.min`/`spec.max` (both
+/// well under 2^52 for any realistic slider range) so the conversions
+/// are lossless in practice. Allows are scoped tight to this helper.
+#[cfg(feature = "sherpa")]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn build_persisted_ms_slider(
+    group: &adw::PreferencesGroup,
+    config: &Arc<ConfigManager>,
+    spec: &MsSliderSpec,
+) -> adw::SpinRow {
+    let saved = config.read(|v| {
+        v.get(spec.key)
+            .and_then(serde_json::Value::as_u64)
+            .map_or(spec.default, |val| (val as f64).clamp(spec.min, spec.max))
+    });
+
+    let row = adw::SpinRow::builder()
+        .title(spec.title)
+        .subtitle(spec.subtitle)
+        .adjustment(&gtk4::Adjustment::new(
+            saved,
+            spec.min,
+            spec.max,
+            AUTO_BREAK_MS_STEP,
+            AUTO_BREAK_MS_PAGE,
+            0.0,
+        ))
+        .digits(0)
+        .build();
+    group.add(&row);
+
+    // Capture `spec.key` by Copy (it's `&'static str`) so the
+    // GLib closure can own it without borrowing the spec.
+    let cfg_clone = Arc::clone(config);
+    let key = spec.key;
+    row.connect_value_notify(move |r| {
+        let val = r.value() as u64;
+        cfg_clone.write(|v| {
+            v[key] = serde_json::json!(val);
+        });
+    });
+    row
 }
 
 /// Build the transcript sidebar panel.
@@ -289,6 +463,83 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         });
     });
 
+    // --- Audio enhancement mode selector ---
+    //
+    // Applies to all recognizer backends (whisper + both sherpa
+    // paths). Default Voice-band matches the pre-#281 behavior;
+    // users hitting voice-band preprocessor issues (e.g. Moonshine
+    // silently returning empty text on NFM speech) can switch to
+    // Broadband or Off as a workaround. Persisted as a stable
+    // string id via `AudioEnhancement::as_config_str` so future
+    // schema migrations don't rely on u32 index stability.
+    let audio_enhancement_row = {
+        let list = gtk4::StringList::new(AUDIO_ENHANCEMENT_LABELS);
+
+        let saved_idx = config.read(|v| {
+            let s = v
+                .get(KEY_AUDIO_ENHANCEMENT)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("voice_band");
+            match sdr_transcription::denoise::AudioEnhancement::from_config_str(s) {
+                sdr_transcription::denoise::AudioEnhancement::VoiceBand => {
+                    AUDIO_ENHANCEMENT_VOICE_BAND_IDX
+                }
+                sdr_transcription::denoise::AudioEnhancement::Broadband => {
+                    AUDIO_ENHANCEMENT_BROADBAND_IDX
+                }
+                sdr_transcription::denoise::AudioEnhancement::Off => AUDIO_ENHANCEMENT_OFF_IDX,
+            }
+        });
+
+        let row = adw::ComboRow::builder()
+            .title("Audio enhancement")
+            .subtitle(
+                "Voice-band (recommended) • Broadband if your recognizer returns no text \
+                 • Off for pristine source audio",
+            )
+            .model(&list)
+            .selected(saved_idx)
+            .build();
+        group.add(&row);
+
+        let config_enhancement = Arc::clone(config);
+        row.connect_selected_notify(move |r| {
+            // Map combo index → AudioEnhancement → stable config
+            // string. Only persist if the index matches one of
+            // the three known-valid values. GTK `ComboRow` emits
+            // `selected-notify` with transient out-of-range
+            // indices during intermediate widget state changes
+            // (e.g. during model repopulation), and the lenient
+            // "fall through to VoiceBand" pattern the ACTIVE
+            // dispatch path uses is dangerous here — it would
+            // silently overwrite a user's Broadband or Off
+            // workaround with the default on a spurious signal.
+            // Runtime dispatch (window.rs BackendConfig build) can
+            // still be lenient because it reads the current value
+            // once at session start; this persistence handler is
+            // the one that cares about transient signals.
+            let Some(value) = (match r.selected() {
+                AUDIO_ENHANCEMENT_VOICE_BAND_IDX => {
+                    Some(sdr_transcription::denoise::AudioEnhancement::VoiceBand)
+                }
+                AUDIO_ENHANCEMENT_BROADBAND_IDX => {
+                    Some(sdr_transcription::denoise::AudioEnhancement::Broadband)
+                }
+                AUDIO_ENHANCEMENT_OFF_IDX => {
+                    Some(sdr_transcription::denoise::AudioEnhancement::Off)
+                }
+                _ => None,
+            }) else {
+                return;
+            };
+            config_enhancement.write(|v| {
+                v[KEY_AUDIO_ENHANCEMENT] = serde_json::json!(value.as_config_str());
+            });
+        });
+
+        row
+    };
+
     // --- VAD threshold slider (Sherpa + offline models only) ---
     //
     // Only visible when an offline model (Moonshine, Parakeet) is selected.
@@ -330,6 +581,85 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
 
         row
     };
+
+    #[cfg(feature = "sherpa")]
+    let auto_break_row = {
+        let saved = config.read(|v| {
+            v.get(KEY_AUTO_BREAK_ENABLED)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
+
+        let row = adw::SwitchRow::builder()
+            .title("Auto Break")
+            .subtitle(
+                "Use the radio's squelch as the transcription boundary instead of VAD. NFM only.",
+            )
+            .active(saved)
+            .build();
+        group.add(&row);
+
+        let config_ab = Arc::clone(config);
+        row.connect_active_notify(move |r| {
+            let active = r.is_active();
+            config_ab.write(|v| {
+                v[KEY_AUTO_BREAK_ENABLED] = serde_json::json!(active);
+            });
+        });
+
+        row
+    };
+
+    // --- Auto Break timing sliders (Sherpa only) ---
+    //
+    // Three SpinRows for the tunable hold-off constants. Only visible
+    // when Auto Break itself is visible (offline sherpa model + NFM)
+    // AND Auto Break is ON — mirroring the mutex with `vad_threshold_row`.
+    // Defaults match the PR 8 hardcoded values; user overrides are
+    // persisted as u64 milliseconds in config. Construction is
+    // delegated to `build_persisted_ms_slider` so the three rows
+    // share one load/clamp/build/persist code path.
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row = build_persisted_ms_slider(
+        &group,
+        config,
+        &MsSliderSpec {
+            key: KEY_AUTO_BREAK_MIN_OPEN_MS,
+            title: "Auto Break: min open (ms)",
+            subtitle: "Transmissions shorter than this are discarded as noise spikes",
+            min: AUTO_BREAK_MIN_OPEN_MS_MIN,
+            max: AUTO_BREAK_MIN_OPEN_MS_MAX,
+            default: AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
+        },
+    );
+
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row = build_persisted_ms_slider(
+        &group,
+        config,
+        &MsSliderSpec {
+            key: KEY_AUTO_BREAK_TAIL_MS,
+            title: "Auto Break: tail (ms)",
+            subtitle: "Continue buffering audio this long after squelch closes",
+            min: AUTO_BREAK_TAIL_MS_MIN,
+            max: AUTO_BREAK_TAIL_MS_MAX,
+            default: AUTO_BREAK_TAIL_MS_DEFAULT,
+        },
+    );
+
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row = build_persisted_ms_slider(
+        &group,
+        config,
+        &MsSliderSpec {
+            key: KEY_AUTO_BREAK_MIN_SEGMENT_MS,
+            title: "Auto Break: min segment (ms)",
+            subtitle: "Segments shorter than this are discarded instead of decoded",
+            min: AUTO_BREAK_MIN_SEGMENT_MS_MIN,
+            max: AUTO_BREAK_MIN_SEGMENT_MS_MAX,
+            default: AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+        },
+    );
 
     // --- Display mode selector (Sherpa only) ---
     //
@@ -388,19 +718,73 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
             .get(saved_model_idx as usize)
             .copied()
             .is_some_and(sdr_transcription::SherpaModel::supports_partials);
+        let initial_is_offline = !initial_supports_partials;
+        let initial_auto_break_active = auto_break_row.is_active();
+
         display_mode_row.set_visible(initial_supports_partials);
-        vad_threshold_row.set_visible(!initial_supports_partials);
+        // VAD slider visible only when offline model AND Auto Break is OFF.
+        // When Auto Break is ON, it replaces the VAD slider functionally so
+        // showing both would confuse the user about which one is driving
+        // segmentation.
+        vad_threshold_row.set_visible(initial_is_offline && !initial_auto_break_active);
+        // Auto Break toggle visible only when an offline model is selected.
+        // The additional NFM demod-mode gate is applied by window.rs's
+        // DemodModeChanged handler — at widget-build time we don't yet
+        // know the demod mode and assume NFM is the common case.
+        auto_break_row.set_visible(initial_is_offline);
+        // Auto Break timing sliders are the mirror of the VAD slider:
+        // visible when offline model AND Auto Break is ON. Together
+        // with `vad_threshold_row` they form a mutex visible triplet
+        // — exactly one of (VAD slider) or (Auto Break sliders) is
+        // shown at any time for an offline model.
+        let ab_sliders_visible = initial_is_offline && initial_auto_break_active;
+        auto_break_min_open_row.set_visible(ab_sliders_visible);
+        auto_break_tail_row.set_visible(ab_sliders_visible);
+        auto_break_min_segment_row.set_visible(ab_sliders_visible);
 
         let display_mode_row_for_visibility = display_mode_row.clone();
         let vad_threshold_row_for_visibility = vad_threshold_row.clone();
+        let auto_break_row_for_model_change = auto_break_row.clone();
+        let ab_min_open_for_model_change = auto_break_min_open_row.clone();
+        let ab_tail_for_model_change = auto_break_tail_row.clone();
+        let ab_min_segment_for_model_change = auto_break_min_segment_row.clone();
         model_row.connect_selected_notify(move |r| {
             let idx = r.selected() as usize;
             let supports_partials = sdr_transcription::SherpaModel::ALL
                 .get(idx)
                 .copied()
                 .is_some_and(sdr_transcription::SherpaModel::supports_partials);
+            let is_offline = !supports_partials;
+            let ab_active = auto_break_row_for_model_change.is_active();
+            let ab_sliders = is_offline && ab_active;
+
             display_mode_row_for_visibility.set_visible(supports_partials);
-            vad_threshold_row_for_visibility.set_visible(!supports_partials);
+            vad_threshold_row_for_visibility.set_visible(is_offline && !ab_active);
+            auto_break_row_for_model_change.set_visible(is_offline);
+            ab_min_open_for_model_change.set_visible(ab_sliders);
+            ab_tail_for_model_change.set_visible(ab_sliders);
+            ab_min_segment_for_model_change.set_visible(ab_sliders);
+        });
+
+        // Mutex: toggling Auto Break hides/shows the VAD threshold slider
+        // AND the Auto Break timing sliders. Only applies when Auto Break
+        // itself is currently visible (an offline model is selected). If
+        // the row is hidden (streaming Zipformer), the mutex doesn't
+        // apply because the VAD slider is already hidden by the
+        // offline-model check and the AB sliders follow.
+        let vad_threshold_row_for_mutex = vad_threshold_row.clone();
+        let auto_break_row_for_mutex = auto_break_row.clone();
+        let ab_min_open_for_mutex = auto_break_min_open_row.clone();
+        let ab_tail_for_mutex = auto_break_tail_row.clone();
+        let ab_min_segment_for_mutex = auto_break_min_segment_row.clone();
+        auto_break_row.connect_active_notify(move |r| {
+            if auto_break_row_for_mutex.is_visible() {
+                let ab_on = r.is_active();
+                vad_threshold_row_for_mutex.set_visible(!ab_on);
+                ab_min_open_for_mutex.set_visible(ab_on);
+                ab_tail_for_mutex.set_visible(ab_on);
+                ab_min_segment_for_mutex.set_visible(ab_on);
+            }
         });
     }
 
@@ -539,10 +923,19 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         #[cfg(feature = "whisper")]
         silence_row,
         noise_gate_row,
+        audio_enhancement_row,
         #[cfg(feature = "sherpa")]
         display_mode_row,
         #[cfg(feature = "sherpa")]
         vad_threshold_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_min_open_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_tail_row,
+        #[cfg(feature = "sherpa")]
+        auto_break_min_segment_row,
         #[cfg(feature = "sherpa")]
         live_line_label,
         status_label,

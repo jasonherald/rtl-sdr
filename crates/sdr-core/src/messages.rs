@@ -1,6 +1,7 @@
 //! Message types for communication between the DSP thread and the UI thread.
 
-use sdr_radio::DeemphasisMode;
+use sdr_dsp::voice_squelch::VoiceSquelchMode;
+use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
 use sdr_types::DemodMode;
 
 /// Messages sent from the DSP pipeline thread to the UI main loop.
@@ -30,6 +31,26 @@ pub enum DspToUi {
     IqRecordingStarted(std::path::PathBuf),
     /// IQ recording stopped.
     IqRecordingStopped,
+    /// Demodulator mode changed. Emitted when `UiToDsp::SetDemodMode`
+    /// actually changes the active demod mode (edge detection — not
+    /// emitted if the requested mode matches the current mode). The
+    /// transcript panel subscribes to this to stop any active
+    /// transcription session (band change = new session boundary) and
+    /// to re-run Auto Break row visibility rules.
+    DemodModeChanged(DemodMode),
+    /// CTCSS sustained-gate state changed. Emitted only on edges
+    /// (closed → open / open → closed), not per-window, so the UI
+    /// status indicator can subscribe without flooding the channel.
+    /// Always `false` when CTCSS is currently `Off`.
+    CtcssSustainedChanged(bool),
+    /// Voice-squelch gate state changed. Same edge-triggered
+    /// contract as `CtcssSustainedChanged`: only emitted on
+    /// closed→open / open→closed transitions. Always `true`
+    /// when voice squelch is `Off` (the gate is permanently
+    /// open in that mode, so the edge is just a one-shot at
+    /// mode-entry that the controller handles by resetting the
+    /// tracker).
+    VoiceSquelchOpenChanged(bool),
 }
 
 /// Available source types for IQ input.
@@ -102,6 +123,16 @@ pub enum UiToDsp {
     SetNotchEnabled(bool),
     /// Set the audio notch filter frequency in Hz.
     SetNotchFrequency(f32),
+    /// Set the CTCSS sub-audible tone squelch mode.
+    SetCtcssMode(CtcssMode),
+    /// Set the CTCSS detection threshold (normalized magnitude, `(0, 1]`).
+    SetCtcssThreshold(f32),
+    /// Set the voice-activity squelch mode (Off / Syllabic / Snr).
+    SetVoiceSquelchMode(VoiceSquelchMode),
+    /// Set the voice-squelch threshold for the currently active
+    /// mode. Unit depends on the mode: normalized envelope ratio
+    /// for Syllabic, dB for Snr. No-op when mode is Off.
+    SetVoiceSquelchThreshold(f32),
     /// Set the audio output device by `PipeWire` node name.
     SetAudioDevice(String),
     /// Switch the source type (stops current source if running).
@@ -125,7 +156,7 @@ pub enum UiToDsp {
     /// Stop IQ recording and finalize the WAV file.
     StopIqRecording,
     /// Start sending audio to the transcription engine.
-    EnableTranscription(std::sync::mpsc::SyncSender<Vec<f32>>),
+    EnableTranscription(std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>),
     /// Stop sending audio to the transcription engine.
     DisableTranscription,
 }
@@ -167,6 +198,28 @@ mod tests {
 
         let iq_stop = DspToUi::IqRecordingStopped;
         assert!(matches!(iq_stop, DspToUi::IqRecordingStopped));
+    }
+
+    #[test]
+    fn demod_mode_changed_message_constructs() {
+        let m = DspToUi::DemodModeChanged(DemodMode::Nfm);
+        assert!(matches!(m, DspToUi::DemodModeChanged(DemodMode::Nfm)));
+    }
+
+    #[test]
+    fn ctcss_sustained_changed_message_constructs() {
+        let open = DspToUi::CtcssSustainedChanged(true);
+        assert!(matches!(open, DspToUi::CtcssSustainedChanged(true)));
+        let closed = DspToUi::CtcssSustainedChanged(false);
+        assert!(matches!(closed, DspToUi::CtcssSustainedChanged(false)));
+    }
+
+    #[test]
+    fn voice_squelch_open_changed_message_constructs() {
+        let open = DspToUi::VoiceSquelchOpenChanged(true);
+        assert!(matches!(open, DspToUi::VoiceSquelchOpenChanged(true)));
+        let closed = DspToUi::VoiceSquelchOpenChanged(false);
+        assert!(matches!(closed, DspToUi::VoiceSquelchOpenChanged(false)));
     }
 
     #[test]
@@ -264,6 +317,45 @@ mod tests {
             matches!(notch_freq, UiToDsp::SetNotchFrequency(f) if (f - 60.0).abs() < f32::EPSILON)
         );
 
+        let ctcss_off = UiToDsp::SetCtcssMode(CtcssMode::Off);
+        assert!(matches!(ctcss_off, UiToDsp::SetCtcssMode(CtcssMode::Off)));
+
+        let ctcss_tone = UiToDsp::SetCtcssMode(CtcssMode::Tone(100.0));
+        assert!(matches!(
+            ctcss_tone,
+            UiToDsp::SetCtcssMode(CtcssMode::Tone(hz)) if (hz - 100.0).abs() < f32::EPSILON
+        ));
+
+        let ctcss_thresh = UiToDsp::SetCtcssThreshold(0.15);
+        assert!(
+            matches!(ctcss_thresh, UiToDsp::SetCtcssThreshold(t) if (t - 0.15).abs() < f32::EPSILON)
+        );
+
+        let vs_off = UiToDsp::SetVoiceSquelchMode(VoiceSquelchMode::Off);
+        assert!(matches!(
+            vs_off,
+            UiToDsp::SetVoiceSquelchMode(VoiceSquelchMode::Off)
+        ));
+
+        let vs_syl = UiToDsp::SetVoiceSquelchMode(VoiceSquelchMode::Syllabic { threshold: 0.15 });
+        assert!(matches!(
+            vs_syl,
+            UiToDsp::SetVoiceSquelchMode(VoiceSquelchMode::Syllabic { threshold })
+                if (threshold - 0.15).abs() < f32::EPSILON
+        ));
+
+        let vs_snr = UiToDsp::SetVoiceSquelchMode(VoiceSquelchMode::Snr { threshold_db: 6.0 });
+        assert!(matches!(
+            vs_snr,
+            UiToDsp::SetVoiceSquelchMode(VoiceSquelchMode::Snr { threshold_db })
+                if (threshold_db - 6.0).abs() < f32::EPSILON
+        ));
+
+        let vs_thresh = UiToDsp::SetVoiceSquelchThreshold(0.2);
+        assert!(
+            matches!(vs_thresh, UiToDsp::SetVoiceSquelchThreshold(t) if (t - 0.2).abs() < f32::EPSILON)
+        );
+
         let device = UiToDsp::SetAudioDevice("default".to_string());
         assert!(matches!(device, UiToDsp::SetAudioDevice(ref s) if s == "default"));
 
@@ -313,7 +405,7 @@ mod tests {
         let iq_stop = UiToDsp::StopIqRecording;
         assert!(matches!(iq_stop, UiToDsp::StopIqRecording));
 
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<sdr_transcription::TranscriptionInput>(1);
         let enable = UiToDsp::EnableTranscription(tx);
         assert!(matches!(enable, UiToDsp::EnableTranscription(_)));
 

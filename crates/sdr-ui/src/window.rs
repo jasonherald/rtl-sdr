@@ -135,7 +135,13 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     setup_app_actions(app, &window, config, &rr_button);
 
     // Wire transcript panel (separate from sidebar panels).
-    let transcription_engine = connect_transcript_panel(&transcript_panel, &state, config);
+    let transcription_engine = connect_transcript_panel(
+        &transcript_panel,
+        &state,
+        config,
+        &panels.radio.squelch_enabled_row,
+        &toast_overlay,
+    );
 
     // On window close, signal the worker to stop without blocking.
     window.connect_close_request(move |_| {
@@ -312,7 +318,18 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let gain_row_for_dsp = panels.source.gain_row.clone();
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
+    let radio_panel_for_dsp = panels.radio.clone();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row_for_dsp = transcript_panel.auto_break_min_open_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row_for_dsp = transcript_panel.auto_break_tail_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row_for_dsp = transcript_panel.auto_break_min_segment_row.clone();
+    #[cfg(feature = "sherpa")]
+    let model_row_for_dsp = transcript_panel.model_row.clone();
     let engine_for_dsp = Rc::clone(&engine);
     // We deliberately discard the SourceId returned by `timeout_add_local`:
     // the window-lifecycle gate at the top of the closure returns
@@ -354,7 +371,18 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &gain_row_for_dsp,
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
+                        &radio_panel_for_dsp,
                         &transcription_enable_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_min_open_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_tail_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_min_segment_row_for_dsp,
+                        #[cfg(feature = "sherpa")]
+                        &model_row_for_dsp,
                     );
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -371,7 +399,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 }
 
 /// Handle a single message from the DSP thread.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_dsp_message(
     msg: DspToUi,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
@@ -382,7 +410,13 @@ fn handle_dsp_message(
     gain_row: &adw::SpinRow,
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
+    radio_panel: &sidebar::radio_panel::RadioPanel,
     transcription_enable_row: &adw::SwitchRow,
+    #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
+    #[cfg(feature = "sherpa")] auto_break_min_open_row: &adw::SpinRow,
+    #[cfg(feature = "sherpa")] auto_break_tail_row: &adw::SpinRow,
+    #[cfg(feature = "sherpa")] auto_break_min_segment_row: &adw::SpinRow,
+    #[cfg(feature = "sherpa")] model_row: &adw::ComboRow,
 ) {
     match msg {
         DspToUi::FftData(_) => {
@@ -472,6 +506,62 @@ fn handle_dsp_message(
                 let toast = adw::Toast::new("IQ recording saved");
                 overlay.add_toast(toast);
             }
+        }
+        DspToUi::DemodModeChanged(new_mode) => {
+            tracing::info!(?new_mode, "demod mode changed");
+
+            // Re-run Auto Break row visibility rules with the new mode.
+            // The row is only visible when the current mode is NFM AND an
+            // offline sherpa model is selected. Task 13 installed the
+            // "offline model" check as a signal-chain reaction to model_row
+            // changes; this layer adds the NFM gate on top, fired by the
+            // demod-mode-change event.
+            #[cfg(feature = "sherpa")]
+            {
+                let is_nfm = new_mode == sdr_types::DemodMode::Nfm;
+                let model_idx = model_row.selected() as usize;
+                let selected_is_offline = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .is_some_and(|m| !m.supports_partials());
+                let toggle_visible = is_nfm && selected_is_offline;
+                auto_break_row.set_visible(toggle_visible);
+                // Timing sliders follow the toggle's visibility AND
+                // the "Auto Break is actually ON" mutex. If the toggle
+                // itself just got hidden (switched out of NFM), the
+                // sliders must hide too.
+                let sliders_visible = toggle_visible && auto_break_row.is_active();
+                auto_break_min_open_row.set_visible(sliders_visible);
+                auto_break_tail_row.set_visible(sliders_visible);
+                auto_break_min_segment_row.set_visible(sliders_visible);
+            }
+
+            // If a transcription session is currently active, stop it and
+            // surface a toast. The band has conceptually changed, so the
+            // session must restart from scratch — session config (model,
+            // VAD threshold, Auto Break toggle) is preserved; the user
+            // clicks Start to resume on the new band.
+            if transcription_enable_row.is_active() {
+                tracing::info!("stopping active transcription due to demod mode change");
+                // Toggling enable_row off triggers the existing stop path
+                // (connect_active_notify handler wired elsewhere in window.rs).
+                transcription_enable_row.set_active(false);
+
+                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                    let toast = adw::Toast::new(
+                        "Transcription stopped — demod mode changed. Press Start to resume.",
+                    );
+                    overlay.add_toast(toast);
+                }
+            }
+        }
+        DspToUi::CtcssSustainedChanged(sustained) => {
+            tracing::debug!(sustained, "CTCSS sustained-gate edge");
+            radio_panel.set_ctcss_sustained(sustained);
+        }
+        DspToUi::VoiceSquelchOpenChanged(open) => {
+            tracing::debug!(open, "voice squelch gate edge");
+            radio_panel.set_voice_squelch_open(open);
         }
     }
 }
@@ -923,6 +1013,7 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
 }
 
 /// Connect radio panel controls to DSP commands.
+#[allow(clippy::too_many_lines)]
 fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Bandwidth
     let state_bw = Rc::clone(state);
@@ -1017,6 +1108,85 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .connect_value_notify(move |row| {
             #[allow(clippy::cast_possible_truncation)]
             state_notch_freq.send_dsp(UiToDsp::SetNotchFrequency(row.value() as f32));
+        });
+
+    // CTCSS tone selector
+    let state_ctcss = Rc::clone(state);
+    let radio_for_ctcss = panels.radio.clone();
+    panels.radio.ctcss_row.connect_selected_notify(move |row| {
+        let mode = sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(row.selected());
+        state_ctcss.send_dsp(UiToDsp::SetCtcssMode(mode));
+        // Push the status row label immediately — the detector
+        // only emits `CtcssSustainedChanged` on actual gate
+        // edges, so without this the label would lag behind a
+        // mode change (stay on "Tone detected" after flipping to
+        // Off, or stay on "Off" after picking a tone until the
+        // first detector window confirms).
+        radio_for_ctcss.set_ctcss_sustained(false);
+    });
+
+    // CTCSS detection threshold
+    let state_ctcss_thresh = Rc::clone(state);
+    panels
+        .radio
+        .ctcss_threshold_row
+        .connect_value_notify(move |row| {
+            #[allow(clippy::cast_possible_truncation)]
+            state_ctcss_thresh.send_dsp(UiToDsp::SetCtcssThreshold(row.value() as f32));
+        });
+
+    // Voice squelch mode
+    //
+    // On mode change: tell the AF chain to rebuild its detector,
+    // reconfigure the threshold spin row (units + range + default
+    // value), and push the status row label to the appropriate
+    // "waiting" / "Off" text so it doesn't lag behind the first
+    // real detector edge.
+    //
+    // The initial startup layout is Off, so nothing else needs
+    // to fire — `apply_voice_squelch_mode_ui(Off)` is called
+    // here too to make the starting state consistent.
+    panels
+        .radio
+        .apply_voice_squelch_mode_ui(sdr_dsp::voice_squelch::VoiceSquelchMode::Off);
+    let state_vs_mode = Rc::clone(state);
+    let radio_for_vs = panels.radio.clone();
+    panels
+        .radio
+        .voice_squelch_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Use the DEFAULT threshold for the target mode, NOT
+            // the current spin-row value. The previous mode's
+            // threshold is in different units (normalized ratio
+            // for Syllabic, dB for Snr), so forwarding it to the
+            // new variant would land far outside the new
+            // detector's tuning range — e.g. Off → Snr seeding
+            // 0.15 dB, or Snr → Syllabic seeding 6.0 as a
+            // normalized ratio. Both fail the detector.
+            //
+            // `apply_voice_squelch_mode_ui` below reconfigures
+            // the spin row's adjustment range AND seeds its
+            // value from the mode's inline threshold, so the
+            // UI and DSP end up aligned on the same default
+            // value in the same units.
+            let threshold =
+                sidebar::radio_panel::RadioPanel::voice_squelch_default_threshold_for_index(idx);
+            let mode =
+                sidebar::radio_panel::RadioPanel::voice_squelch_mode_from_index(idx, threshold);
+            state_vs_mode.send_dsp(UiToDsp::SetVoiceSquelchMode(mode));
+            radio_for_vs.apply_voice_squelch_mode_ui(mode);
+            radio_for_vs.set_voice_squelch_open(false);
+        });
+
+    // Voice squelch threshold
+    let state_vs_thresh = Rc::clone(state);
+    panels
+        .radio
+        .voice_squelch_threshold_row
+        .connect_value_notify(move |row| {
+            #[allow(clippy::cast_possible_truncation)]
+            state_vs_thresh.send_dsp(UiToDsp::SetVoiceSquelchThreshold(row.value() as f32));
         });
 }
 
@@ -1180,6 +1350,10 @@ fn restore_bookmark_profile(
         state.send_dsp(UiToDsp::SetSquelchEnabled(sq_en));
         radio.squelch_enabled_row.set_active(sq_en);
     }
+    if let Some(auto_sq) = bookmark.auto_squelch_enabled {
+        state.send_dsp(UiToDsp::SetAutoSquelch(auto_sq));
+        radio.auto_squelch_row.set_active(auto_sq);
+    }
     if let Some(sq_lvl) = bookmark.squelch_level {
         state.send_dsp(UiToDsp::SetSquelch(sq_lvl));
         #[allow(clippy::cast_lossless)]
@@ -1228,6 +1402,44 @@ fn restore_bookmark_profile(
     }
     if let Some(hp) = bookmark.high_pass {
         state.send_dsp(UiToDsp::SetHighPass(hp));
+    }
+    // Restore CTCSS threshold BEFORE mode so the detector the
+    // mode setter builds picks up the saved value instead of
+    // defaulting. Mirrors the RadioModule::set_mode order.
+    if let Some(threshold) = bookmark.ctcss_threshold {
+        state.send_dsp(UiToDsp::SetCtcssThreshold(threshold));
+        #[allow(clippy::cast_lossless)]
+        radio.ctcss_threshold_row.set_value(threshold as f64);
+    }
+    if let Some(mode) = bookmark.ctcss_mode {
+        state.send_dsp(UiToDsp::SetCtcssMode(mode));
+        radio
+            .ctcss_row
+            .set_selected(sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(
+                mode,
+            ));
+    }
+    // Voice squelch mode — the enum carries its threshold
+    // inline, so a single field captures both. Dispatch to the
+    // DSP first, then update the UI combo + threshold row to
+    // reflect the restored state.
+    if let Some(mode) = bookmark.voice_squelch_mode {
+        state.send_dsp(UiToDsp::SetVoiceSquelchMode(mode));
+        let idx = sidebar::radio_panel::RadioPanel::voice_squelch_index_from_mode(mode);
+        radio.voice_squelch_row.set_selected(idx);
+        let threshold = sidebar::radio_panel::RadioPanel::voice_squelch_threshold_from_mode(mode);
+        #[allow(clippy::cast_lossless)]
+        radio
+            .voice_squelch_threshold_row
+            .set_value(threshold as f64);
+        // Push the threshold over the wire explicitly too —
+        // `SetVoiceSquelchMode` already carries it inline on an
+        // active variant, but sending the dedicated threshold
+        // message keeps the radio module's cached mode variant
+        // in sync in case a future refactor routes the two
+        // updates through different code paths.
+        state.send_dsp(UiToDsp::SetVoiceSquelchThreshold(threshold));
+        radio.apply_voice_squelch_mode_ui(mode);
     }
 }
 
@@ -1336,6 +1548,7 @@ fn connect_navigation_panel(
         #[allow(clippy::cast_possible_truncation)]
         let profile = sidebar::navigation_panel::TuningProfile {
             squelch_enabled: radio_bm.squelch_enabled_row.is_active(),
+            auto_squelch_enabled: radio_bm.auto_squelch_row.is_active(),
             squelch_level: radio_bm.squelch_level_row.value() as f32,
             gain: source_gain_bm.value(),
             agc: source_agc_bm.is_active(),
@@ -1346,6 +1559,16 @@ fn connect_navigation_panel(
             fm_if_nr: radio_bm.fm_if_nr_row.is_active(),
             wfm_stereo: radio_bm.stereo_row.is_active(),
             high_pass: None, // No UI widget yet — don't persist.
+            ctcss_mode: Some(sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
+                radio_bm.ctcss_row.selected(),
+            )),
+            ctcss_threshold: Some(radio_bm.ctcss_threshold_row.value() as f32),
+            voice_squelch_mode: Some(
+                sidebar::radio_panel::RadioPanel::voice_squelch_mode_from_index(
+                    radio_bm.voice_squelch_row.selected(),
+                    radio_bm.voice_squelch_threshold_row.value() as f32,
+                ),
+            ),
         };
         let bookmark =
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
@@ -1374,12 +1597,17 @@ fn connect_navigation_panel(
     let save_state = Rc::clone(state);
     let save_radio_bw = panels.radio.bandwidth_row.clone();
     let save_radio_sq_en = panels.radio.squelch_enabled_row.clone();
+    let save_radio_auto_sq = panels.radio.auto_squelch_row.clone();
     let save_radio_sq_lvl = panels.radio.squelch_level_row.clone();
     let save_radio_deemp = panels.radio.deemphasis_row.clone();
     let save_radio_nben = panels.radio.noise_blanker_row.clone();
     let save_radio_nben_lvl = panels.radio.nb_level_row.clone();
     let save_radio_nr = panels.radio.fm_if_nr_row.clone();
     let save_radio_stereo = panels.radio.stereo_row.clone();
+    let save_radio_ctcss = panels.radio.ctcss_row.clone();
+    let save_radio_ctcss_threshold = panels.radio.ctcss_threshold_row.clone();
+    let save_radio_voice_squelch = panels.radio.voice_squelch_row.clone();
+    let save_radio_voice_squelch_threshold = panels.radio.voice_squelch_threshold_row.clone();
     let save_source_gain = panels.source.gain_row.clone();
     let save_source_agc = panels.source.agc_row.clone();
     nav.connect_save(move || {
@@ -1394,6 +1622,7 @@ fn connect_navigation_panel(
         let bw = save_radio_bw.value();
         let profile = sidebar::navigation_panel::TuningProfile {
             squelch_enabled: save_radio_sq_en.is_active(),
+            auto_squelch_enabled: save_radio_auto_sq.is_active(),
             #[allow(clippy::cast_possible_truncation)]
             squelch_level: save_radio_sq_lvl.value() as f32,
             gain: save_source_gain.value(),
@@ -1406,6 +1635,19 @@ fn connect_navigation_panel(
             fm_if_nr: save_radio_nr.is_active(),
             wfm_stereo: save_radio_stereo.is_active(),
             high_pass: None,
+            ctcss_mode: Some(sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
+                save_radio_ctcss.selected(),
+            )),
+            #[allow(clippy::cast_possible_truncation)]
+            ctcss_threshold: Some(save_radio_ctcss_threshold.value() as f32),
+            voice_squelch_mode: Some({
+                #[allow(clippy::cast_possible_truncation)]
+                let t = save_radio_voice_squelch_threshold.value() as f32;
+                sidebar::radio_panel::RadioPanel::voice_squelch_mode_from_index(
+                    save_radio_voice_squelch.selected(),
+                    t,
+                )
+            }),
         };
         // Find and update the active bookmark in the list.
         let mut bms = save_bm_rc.borrow_mut();
@@ -1417,6 +1659,7 @@ fn connect_navigation_panel(
             bm.demod_mode = sidebar::navigation_panel::demod_mode_to_string(mode);
             bm.bandwidth = bw;
             bm.squelch_enabled = Some(profile.squelch_enabled);
+            bm.auto_squelch_enabled = Some(profile.auto_squelch_enabled);
             bm.squelch_level = Some(profile.squelch_level);
             bm.gain = Some(profile.gain);
             bm.agc = Some(profile.agc);
@@ -1427,6 +1670,9 @@ fn connect_navigation_panel(
             bm.fm_if_nr = Some(profile.fm_if_nr);
             bm.wfm_stereo = Some(profile.wfm_stereo);
             bm.high_pass = profile.high_pass;
+            bm.ctcss_mode = profile.ctcss_mode;
+            bm.ctcss_threshold = profile.ctcss_threshold;
+            bm.voice_squelch_mode = profile.voice_squelch_mode;
             // Keep ActiveBookmark in sync with the updated frequency.
             *save_active.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
                 name: active.name.clone(),
@@ -1497,12 +1743,18 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
 /// Tolerant of any individual weak ref failing to upgrade (window close
 /// race) — each row is checked independently so a partially-dropped UI
 /// still recovers what it can.
+#[allow(clippy::too_many_arguments)]
 fn unlock_transcription_session_rows(
     model_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "whisper")] silence_row: &glib::WeakRef<adw::SpinRow>,
     noise_gate_row: &glib::WeakRef<adw::SpinRow>,
+    audio_enhancement_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] auto_break_row: &glib::WeakRef<adw::SwitchRow>,
+    #[cfg(feature = "sherpa")] auto_break_min_open_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] auto_break_tail_row: &glib::WeakRef<adw::SpinRow>,
+    #[cfg(feature = "sherpa")] auto_break_min_segment_row: &glib::WeakRef<adw::SpinRow>,
 ) {
     if let Some(row) = model_row.upgrade() {
         row.set_sensitive(true);
@@ -1514,12 +1766,31 @@ fn unlock_transcription_session_rows(
     if let Some(row) = noise_gate_row.upgrade() {
         row.set_sensitive(true);
     }
+    if let Some(row) = audio_enhancement_row.upgrade() {
+        row.set_sensitive(true);
+    }
     #[cfg(feature = "sherpa")]
     if let Some(row) = display_mode_row.upgrade() {
         row.set_sensitive(true);
     }
     #[cfg(feature = "sherpa")]
     if let Some(row) = vad_threshold_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_min_open_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_tail_row.upgrade() {
+        row.set_sensitive(true);
+    }
+    #[cfg(feature = "sherpa")]
+    if let Some(row) = auto_break_min_segment_row.upgrade() {
         row.set_sensitive(true);
     }
 }
@@ -1534,6 +1805,9 @@ fn connect_transcript_panel(
     #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] config: &std::sync::Arc<
         sdr_config::ConfigManager,
     >,
+    #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))]
+    squelch_enabled_row: &adw::SwitchRow,
+    #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] toast_overlay: &adw::ToastOverlay,
 ) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
     use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
 
@@ -1549,6 +1823,7 @@ fn connect_transcript_panel(
     #[cfg(feature = "whisper")]
     let silence_row = transcript.silence_row.clone();
     let noise_gate_row = transcript.noise_gate_row.clone();
+    let audio_enhancement_row = transcript.audio_enhancement_row.clone();
     // Weak refs used by the async event-loop closure to drive the same
     // teardown the synchronous error path does (see below) when the
     // backend fires TranscriptionEvent::Error mid-session. Weak so the
@@ -1558,16 +1833,37 @@ fn connect_transcript_panel(
     #[cfg(feature = "whisper")]
     let silence_row_weak = silence_row.downgrade();
     let noise_gate_row_weak = noise_gate_row.downgrade();
+    let audio_enhancement_row_weak = audio_enhancement_row.downgrade();
     #[cfg(feature = "sherpa")]
     let display_mode_row = transcript.display_mode_row.clone();
     #[cfg(feature = "sherpa")]
     let vad_threshold_row = transcript.vad_threshold_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_row = transcript.auto_break_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row = transcript.auto_break_min_open_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row = transcript.auto_break_tail_row.clone();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row = transcript.auto_break_min_segment_row.clone();
+    #[cfg(feature = "sherpa")]
+    let squelch_enabled_row_for_session = squelch_enabled_row.clone();
+    #[cfg(feature = "sherpa")]
+    let toast_overlay_for_session = toast_overlay.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_label = transcript.live_line_label.clone();
     #[cfg(feature = "sherpa")]
     let display_mode_row_weak = display_mode_row.downgrade();
     #[cfg(feature = "sherpa")]
     let vad_threshold_row_weak = vad_threshold_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_row_weak = auto_break_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_open_row_weak = auto_break_min_open_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_tail_row_weak = auto_break_tail_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row_weak = auto_break_min_segment_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -1719,12 +2015,64 @@ fn connect_transcript_panel(
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
-            // Read selected model from dropdown.
+            // Read the selected model index once at the top of the
+            // session-start branch; the Auto Break eligibility check
+            // below needs it, and the BackendConfig construction
+            // below reuses it.
+            let model_idx = model_row.selected() as usize;
+
+            // Auto Break is eligible ONLY when all three conditions
+            // hold: (1) the toggle itself is on, (2) the current demod
+            // mode is NFM, and (3) the selected sherpa model is offline
+            // (Moonshine, Parakeet). The toggle is persisted, so
+            // without this computed gate it would still report "on"
+            // after a restart into WFM, or after the user switched to
+            // streaming Zipformer and the row went invisible — either
+            // of which would produce an unsupported session
+            // (streaming Zipformer rejects AutoBreak at session start;
+            // non-NFM modes never emit squelch edges so the state
+            // machine sits in Idle forever). Compute the effective
+            // value once here and use it for both the precondition
+            // check and the BackendConfig assignment.
+            #[cfg(feature = "sherpa")]
+            let auto_break_enabled = {
+                let selected_is_offline = sdr_transcription::SherpaModel::ALL
+                    .get(model_idx)
+                    .copied()
+                    .is_some_and(|m| !m.supports_partials());
+                auto_break_row.is_active()
+                    && state_clone.demod_mode.get() == sdr_types::DemodMode::Nfm
+                    && selected_is_offline
+            };
+
+            // Auto Break precondition: squelch must be enabled so the
+            // radio produces the open/close transitions the state
+            // machine needs for segmentation. Without squelch enabled,
+            // the session would sit in Idle indefinitely producing
+            // zero transcripts — silent failure mode. Block session
+            // start with an actionable toast.
+            #[cfg(feature = "sherpa")]
+            if auto_break_enabled && !squelch_enabled_row_for_session.is_active() {
+                let toast = adw::Toast::new(
+                    "Auto Break needs squelch enabled to detect transmission boundaries. \
+                     Enable squelch in the radio panel, or turn off Auto Break to use VAD.",
+                );
+                if let Some(overlay) = toast_overlay_for_session.upgrade() {
+                    overlay.add_toast(toast);
+                }
+                // Revert the enable toggle so the user can take action first.
+                // The OFF branch of the handler is a safe no-op on an
+                // inactive session (it just drops any backend channels).
+                row.set_active(false);
+                return;
+            }
+
             // Lock model and tuning controls while transcription is active.
             model_row.set_sensitive(false);
             #[cfg(feature = "whisper")]
             silence_row.set_sensitive(false);
             noise_gate_row.set_sensitive(false);
+            audio_enhancement_row.set_sensitive(false);
             // All settings lock during a session for mid-session fault
             // tolerance — walks back PR 4's earlier display_mode_row
             // exception. User stops, changes, starts.
@@ -1732,8 +2080,14 @@ fn connect_transcript_panel(
             display_mode_row.set_sensitive(false);
             #[cfg(feature = "sherpa")]
             vad_threshold_row.set_sensitive(false);
-
-            let model_idx = model_row.selected() as usize;
+            #[cfg(feature = "sherpa")]
+            auto_break_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            auto_break_min_open_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            auto_break_tail_row.set_sensitive(false);
+            #[cfg(feature = "sherpa")]
+            auto_break_min_segment_row.set_sensitive(false);
 
             // Read tuning slider values.
             #[cfg(feature = "whisper")]
@@ -1772,11 +2126,60 @@ fn connect_transcript_panel(
             #[cfg(feature = "whisper")]
             let vad_threshold: f32 = sdr_transcription::VAD_THRESHOLD_DEFAULT;
 
+            #[cfg(feature = "sherpa")]
+            let segmentation_mode = if auto_break_enabled {
+                sdr_transcription::SegmentationMode::AutoBreak
+            } else {
+                sdr_transcription::SegmentationMode::Vad
+            };
+            #[cfg(feature = "whisper")]
+            let segmentation_mode = sdr_transcription::SegmentationMode::Vad;
+
+            // Auto Break timing parameters read from the session sliders.
+            // Whisper builds hardcode the defaults (these fields are
+            // never consumed because Whisper uses a different backend).
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let auto_break_min_open_ms = auto_break_min_open_row.value() as u32;
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let auto_break_tail_ms = auto_break_tail_row.value() as u32;
+            #[cfg(feature = "sherpa")]
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let auto_break_min_segment_ms = auto_break_min_segment_row.value() as u32;
+            #[cfg(feature = "whisper")]
+            let auto_break_min_open_ms = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_DEFAULT;
+            #[cfg(feature = "whisper")]
+            let auto_break_tail_ms = sdr_transcription::AUTO_BREAK_TAIL_MS_DEFAULT;
+            #[cfg(feature = "whisper")]
+            let auto_break_min_segment_ms =
+                sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT;
+
+            // Audio enhancement mode from the transcript panel
+            // combo row. The row's persisted index is captured at
+            // session start (not subscribed to — matches the
+            // existing "lock during session" behavior for all
+            // transcription settings).
+            let audio_enhancement = match audio_enhancement_row.selected() {
+                sidebar::transcript_panel::AUDIO_ENHANCEMENT_BROADBAND_IDX => {
+                    sdr_transcription::denoise::AudioEnhancement::Broadband
+                }
+                sidebar::transcript_panel::AUDIO_ENHANCEMENT_OFF_IDX => {
+                    sdr_transcription::denoise::AudioEnhancement::Off
+                }
+                _ => sdr_transcription::denoise::AudioEnhancement::VoiceBand,
+            };
+
             let config = sdr_transcription::BackendConfig {
                 model,
                 silence_threshold,
                 noise_gate_ratio,
                 vad_threshold,
+                segmentation_mode,
+                auto_break_min_open_ms,
+                auto_break_tail_ms,
+                auto_break_min_segment_ms,
+                audio_enhancement,
             };
 
             // Scope the borrow so it's dropped before any potential re-entry
@@ -1804,10 +2207,20 @@ fn connect_transcript_panel(
                     #[cfg(feature = "whisper")]
                     let silence_row_weak = silence_row_weak.clone();
                     let noise_gate_row_weak = noise_gate_row_weak.clone();
+                    let audio_enhancement_row_weak = audio_enhancement_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let display_mode_row_weak = display_mode_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let vad_threshold_row_weak = vad_threshold_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_row_weak = auto_break_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_min_open_row_weak = auto_break_min_open_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_tail_row_weak = auto_break_tail_row_weak.clone();
+                    #[cfg(feature = "sherpa")]
+                    let auto_break_min_segment_row_weak =
+                        auto_break_min_segment_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let live_line_weak = live_line_weak.clone();
 
@@ -1925,10 +2338,19 @@ fn connect_transcript_panel(
                                             #[cfg(feature = "whisper")]
                                             &silence_row_weak,
                                             &noise_gate_row_weak,
+                                            &audio_enhancement_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &display_mode_row_weak,
                                             #[cfg(feature = "sherpa")]
                                             &vad_threshold_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_min_open_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_tail_row_weak,
+                                            #[cfg(feature = "sherpa")]
+                                            &auto_break_min_segment_row_weak,
                                         );
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
@@ -1992,10 +2414,19 @@ fn connect_transcript_panel(
                                         #[cfg(feature = "whisper")]
                                         &silence_row_weak,
                                         &noise_gate_row_weak,
+                                        &audio_enhancement_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &display_mode_row_weak,
                                         #[cfg(feature = "sherpa")]
                                         &vad_threshold_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_min_open_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_tail_row_weak,
+                                        #[cfg(feature = "sherpa")]
+                                        &auto_break_min_segment_row_weak,
                                     );
                                     if let Some(enable) = enable_row_weak.upgrade() {
                                         enable.set_active(false);
@@ -2023,10 +2454,19 @@ fn connect_transcript_panel(
                         #[cfg(feature = "whisper")]
                         &silence_row.downgrade(),
                         &noise_gate_row.downgrade(),
+                        &audio_enhancement_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &display_mode_row.downgrade(),
                         #[cfg(feature = "sherpa")]
                         &vad_threshold_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_min_open_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_tail_row.downgrade(),
+                        #[cfg(feature = "sherpa")]
+                        &auto_break_min_segment_row.downgrade(),
                     );
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
@@ -2045,10 +2485,19 @@ fn connect_transcript_panel(
                 #[cfg(feature = "whisper")]
                 &silence_row.downgrade(),
                 &noise_gate_row.downgrade(),
+                &audio_enhancement_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &display_mode_row.downgrade(),
                 #[cfg(feature = "sherpa")]
                 &vad_threshold_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_min_open_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_tail_row.downgrade(),
+                #[cfg(feature = "sherpa")]
+                &auto_break_min_segment_row.downgrade(),
             );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             engine_clone.borrow_mut().shutdown_nonblocking();

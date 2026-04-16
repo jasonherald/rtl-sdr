@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::backend::{
     BackendConfig, BackendError, BackendHandle, TranscriptionBackend, TranscriptionEvent,
+    TranscriptionInput,
 };
 
 /// Records what the engine did to a backend. Cloneable handle so tests
@@ -65,7 +66,7 @@ impl TranscriptionBackend for MockBackend {
     fn start(&mut self, _config: BackendConfig) -> Result<BackendHandle, BackendError> {
         self.state.start_count.fetch_add(1, Ordering::Relaxed);
 
-        let (audio_tx, _audio_rx) = mpsc::sync_channel(8);
+        let (audio_tx, _audio_rx) = mpsc::sync_channel::<TranscriptionInput>(8);
         let (event_tx, event_rx) = mpsc::channel();
 
         // Stash the event_tx so tests can push events through it.
@@ -86,7 +87,7 @@ impl TranscriptionBackend for MockBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::ModelChoice;
+    use crate::backend::{ModelChoice, SegmentationMode};
     #[cfg(feature = "whisper")]
     use crate::model::WhisperModel;
 
@@ -100,6 +101,11 @@ mod tests {
             silence_threshold: 0.007,
             noise_gate_ratio: 3.0,
             vad_threshold: crate::VAD_THRESHOLD_DEFAULT,
+            segmentation_mode: SegmentationMode::default(),
+            auto_break_min_open_ms: crate::AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
+            auto_break_tail_ms: crate::AUTO_BREAK_TAIL_MS_DEFAULT,
+            auto_break_min_segment_ms: crate::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+            audio_enhancement: crate::denoise::AudioEnhancement::default(),
         }
     }
 

@@ -50,3 +50,45 @@ jobs:
 
       - name: cargo-audit
         run: cargo audit
+
+  sherpa-check:
+    name: Sherpa backends check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+        with:
+          # Share cache between sherpa-cpu and sherpa-cuda runs, but keep
+          # it separate from the main `check` job's cache because the
+          # sherpa-onnx sys crate downloads a different prebuilt archive
+          # under each link mode.
+          key: sherpa-backends
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake \
+            libgtk-4-dev libadwaita-1-dev libusb-1.0-0-dev \
+            libpipewire-0.3-dev libclang-dev libdbus-1-dev
+
+      # `cargo check` does not invoke the linker, so the CUDA variant
+      # works on a runner without CUDA/cuDNN installed. The build.rs
+      # download of the 235 MB CUDA prebuilt archive still runs on the
+      # first cold cache and is the main cost of this job.
+
+      - name: cargo check (sherpa-cpu)
+        run: cargo check --workspace --locked --no-default-features --features sherpa-cpu
+
+      - name: cargo check (sherpa-cuda)
+        run: cargo check --workspace --locked --no-default-features --features sherpa-cuda
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      # The default `check` job runs deny under the whisper-cpu feature
+      # graph, which doesn't see the sherpa-onnx git source. Re-run deny
+      # here under the sherpa-cuda graph so the fork allowlist entry in
+      # deny.toml is actually exercised by CI.
+      - name: cargo-deny (sherpa-cuda graph)
+        run: cargo deny --no-default-features --features sherpa-cuda check sources

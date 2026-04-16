@@ -36,7 +36,7 @@ pub fn build_demod_selector() -> (gtk4::DropDown, Rc<Cell<DemodMode>>) {
     let dropdown = gtk4::DropDown::builder()
         .model(&model)
         .selected(DEFAULT_MODE_INDEX)
-        .tooltip_text("Demodulation mode")
+        .tooltip_text("Demodulation mode — changing modes stops active transcription")
         .build();
 
     let mode = Rc::new(Cell::new(DEMOD_MODES[DEFAULT_MODE_INDEX as usize]));

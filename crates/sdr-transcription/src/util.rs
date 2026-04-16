@@ -28,6 +28,7 @@ pub fn wall_clock_timestamp() -> String {
 
     // SAFETY: gettimeofday writes into the provided buffer and is thread-safe.
     // We pass null for the timezone (deprecated parameter).
+    // Tracking issue for this unsafe_code exception: #250
     #[allow(unsafe_code)]
     let epoch = unsafe {
         libc::gettimeofday(&raw mut tv, std::ptr::null_mut());
@@ -39,6 +40,7 @@ pub fn wall_clock_timestamp() -> String {
     // SAFETY: localtime_r is the reentrant (thread-safe) variant.
     // We provide a valid `time_t` and a valid output buffer.
     // Returns null on failure, in which case we fall back to UTC via gmtime_r.
+    // Tracking issue for this unsafe_code exception: #250
     #[allow(unsafe_code)]
     let tm = unsafe {
         let result = libc::localtime_r(&raw const epoch, tm.as_mut_ptr());

@@ -269,13 +269,44 @@ fn dispatch_one(msg: &DspToUi, callback_slot: &Mutex<Option<EventCallbackSlot>>)
         }
 
         // Variants not yet exposed at the FFI boundary. Silently
-        // dropped — v2 will grow the ABI to cover recording,
-        // transcription, etc.
+        // dropped in v1; a v2 ABI minor bump grows the surface to
+        // cover them as each feature lands in the macOS SwiftUI
+        // host.
+        //
+        // Specifically:
+        //   - `FftData` is intentionally never routed through the
+        //     event callback — FFT frames go through the dedicated
+        //     pull function (`sdr_core_pull_fft`) instead so the
+        //     render loop stays on the main thread.
+        //   - `AudioRecordingStarted/Stopped` + `IqRecordingStarted/
+        //     Stopped` light up when recording controls land in
+        //     the macOS UI (v2 backlog issues #238 / #239).
+        //   - `DemodModeChanged` is the transcription-session
+        //     boundary event. macOS transcription IS on the
+        //     roadmap — it's currently blocked on a Metal
+        //     inference backend for sherpa-onnx (parallel work,
+        //     planned `metal.rs` port). When that lands, this
+        //     variant becomes the session-reset trigger for the
+        //     SwiftUI transcript panel too, exactly like it does
+        //     for the GTK transcript panel today.
+        //   - `CtcssSustainedChanged` and `VoiceSquelchOpenChanged`
+        //     drive status indicators in the Linux UI. They'll
+        //     light up in the macOS UI whenever the CTCSS / voice-
+        //     squelch panels get ported (no specific backlog issue
+        //     yet — part of the full-parity backlog under #228).
+        //
+        // Adding any of these to the ABI is additive (new
+        // `SDR_EVT_*` discriminant + new payload struct or reuse
+        // of existing ones), so a future minor bump won't break
+        // older hosts that don't know about them.
         DspToUi::FftData(_)
         | DspToUi::AudioRecordingStarted(_)
         | DspToUi::AudioRecordingStopped
         | DspToUi::IqRecordingStarted(_)
-        | DspToUi::IqRecordingStopped => return,
+        | DspToUi::IqRecordingStopped
+        | DspToUi::DemodModeChanged(_)
+        | DspToUi::CtcssSustainedChanged(_)
+        | DspToUi::VoiceSquelchOpenChanged(_) => return,
     };
 
     // Fire the callback. Re-lock the slot here (the outer

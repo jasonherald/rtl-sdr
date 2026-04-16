@@ -9,7 +9,7 @@ use std::sync::mpsc;
 
 use sherpa_onnx::{OnlineRecognizer, OnlineRecognizerConfig, OnlineStream};
 
-use crate::backend::TranscriptionEvent;
+use crate::backend::{TranscriptionEvent, TranscriptionInput};
 use crate::sherpa_model::{self, ModelFilePaths, SherpaModel};
 use crate::{denoise, resampler};
 
@@ -75,7 +75,18 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         event_tx,
         noise_gate_ratio,
         vad_threshold: _,
+        segmentation_mode,
+        auto_break_thresholds: _,
+        audio_enhancement,
     } = params;
+
+    if segmentation_mode == crate::backend::SegmentationMode::AutoBreak {
+        let msg = "streaming Zipformer does not support Auto Break segmentation \
+                   — it has its own endpoint detection. Use SegmentationMode::Vad.";
+        tracing::error!(%msg);
+        let _ = event_tx.send(TranscriptionEvent::Error(msg.to_owned()));
+        return;
+    }
 
     let stream = recognizer.create_stream();
 
@@ -93,10 +104,14 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
             return;
         }
 
-        let interleaved = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
+        let input = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
             Ok(d) => d,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let interleaved = match input {
+            TranscriptionInput::Samples(s) => s,
+            TranscriptionInput::SquelchOpened | TranscriptionInput::SquelchClosed => continue,
         };
 
         mono_buf.clear();
@@ -107,14 +122,16 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
                 finalize_session(recognizer, &stream, &last_partial, &event_tx);
                 return;
             }
-            resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
+            if let TranscriptionInput::Samples(s) = extra {
+                resampler::downsample_stereo_to_mono_16k(&s, &mut mono_buf);
+            }
         }
 
         if mono_buf.is_empty() {
             continue;
         }
 
-        denoise::spectral_denoise(&mut mono_buf, noise_gate_ratio);
+        denoise::apply(&mut mono_buf, audio_enhancement, noise_gate_ratio);
 
         stream.accept_waveform(SHERPA_SAMPLE_RATE_HZ, &mono_buf);
 

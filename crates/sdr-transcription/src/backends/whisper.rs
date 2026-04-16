@@ -13,8 +13,10 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::backend::{
     BackendConfig, BackendError, BackendHandle, ModelChoice, TranscriptionBackend,
-    TranscriptionEvent,
+    TranscriptionEvent, TranscriptionInput,
 };
+use crate::backends::earshot_vad::EarshotVad;
+use crate::vad::VoiceActivityDetector;
 use crate::{denoise, model, resampler};
 
 /// Bounded channel capacity for audio buffers from DSP → backend.
@@ -76,12 +78,13 @@ impl TranscriptionBackend for WhisperBackend {
 
         self.cancel.store(false, Ordering::Relaxed);
 
-        let (audio_tx, audio_rx) = mpsc::sync_channel(AUDIO_CHANNEL_CAPACITY);
+        let (audio_tx, audio_rx) = mpsc::sync_channel::<TranscriptionInput>(AUDIO_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
 
         let cancel = Arc::clone(&self.cancel);
         let silence_threshold = config.silence_threshold;
         let noise_gate_ratio = config.noise_gate_ratio;
+        let audio_enhancement = config.audio_enhancement;
 
         let handle = std::thread::Builder::new()
             .name("whisper-worker".into())
@@ -93,6 +96,7 @@ impl TranscriptionBackend for WhisperBackend {
                     whisper_model,
                     silence_threshold,
                     noise_gate_ratio,
+                    audio_enhancement,
                 );
             })?;
 
@@ -128,13 +132,15 @@ impl TranscriptionBackend for WhisperBackend {
 /// * `model` — which Whisper model to load
 /// * `silence_threshold` — RMS below which a chunk is skipped
 /// * `noise_gate_ratio` — spectral gate multiplier over noise floor
+/// * `audio_enhancement` — which denoise strategy to apply per segment
 fn run_worker(
-    audio_rx: &mpsc::Receiver<Vec<f32>>,
+    audio_rx: &mpsc::Receiver<TranscriptionInput>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
 ) {
     if let Err(e) = run_worker_inner(
         audio_rx,
@@ -143,6 +149,7 @@ fn run_worker(
         model,
         silence_threshold,
         noise_gate_ratio,
+        audio_enhancement,
     ) {
         let _ = event_tx.send(TranscriptionEvent::Error(e));
     }
@@ -152,12 +159,13 @@ fn run_worker(
 /// can forward them as `TranscriptionEvent::Error`.
 #[allow(clippy::too_many_lines)]
 fn run_worker_inner(
-    audio_rx: &mpsc::Receiver<Vec<f32>>,
+    audio_rx: &mpsc::Receiver<TranscriptionInput>,
     event_tx: &mpsc::Sender<TranscriptionEvent>,
     cancel: &Arc<AtomicBool>,
     model: model::WhisperModel,
     silence_threshold: f32,
     noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
 ) -> Result<(), String> {
     // --- Model download / load ---
     let model_path = if model::model_exists(model) {
@@ -204,8 +212,26 @@ fn run_worker_inner(
         .send(TranscriptionEvent::Ready)
         .map_err(|_| "event channel closed before Ready".to_owned())?;
 
-    // --- Audio loop ---
-    let mut mono_buf: Vec<f32> = Vec::with_capacity(CHUNK_SAMPLES * 2);
+    // --- VAD + audio loop ---
+    //
+    // Pre-#259: fixed 5-second chunking + broadband RMS silence gate.
+    // The fixed chunking frequently cut utterances in half (typical NFM
+    // transmission is 1–4 s, so two back-to-back transmissions land in
+    // different chunks or a long one gets split), and the RMS gate
+    // false-triggered on squelch tails. Both showed up in committed
+    // text as noisy mid-word splits and transcripts of dead air.
+    //
+    // Post-#259: EarshotVad (pure-Rust VAD, no ONNX runtime) runs a
+    // 16-ms-frame state machine over the incoming audio. Each popped
+    // segment is a complete utterance bounded by silence, so Whisper
+    // only ever sees whole transmissions and never decodes dead air.
+    //
+    // `silence_threshold` is still accepted in BackendConfig so the
+    // UI slider doesn't break, but it's no longer read here — the VAD
+    // subsumes its purpose. A follow-up PR can retire the slider.
+    let _ = silence_threshold; // preserved for API compatibility
+    let mut scratch: Vec<f32> = Vec::with_capacity(CHUNK_SAMPLES * 2);
+    let mut vad = EarshotVad::new();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -213,13 +239,18 @@ fn run_worker_inner(
             return Ok(());
         }
 
-        let interleaved = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
+        let input = match audio_rx.recv_timeout(AUDIO_RECV_TIMEOUT) {
             Ok(data) => data,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let interleaved = match input {
+            TranscriptionInput::Samples(s) => s,
+            TranscriptionInput::SquelchOpened | TranscriptionInput::SquelchClosed => continue,
+        };
 
-        resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
+        scratch.clear();
+        resampler::downsample_stereo_to_mono_16k(&interleaved, &mut scratch);
 
         // Drain any additional queued buffers to minimize frame drops
         // during long inference passes. Check cancel between drains.
@@ -228,69 +259,114 @@ fn run_worker_inner(
                 tracing::info!("transcription cancelled, worker exiting");
                 return Ok(());
             }
-            resampler::downsample_stereo_to_mono_16k(&extra, &mut mono_buf);
+            if let TranscriptionInput::Samples(s) = extra {
+                resampler::downsample_stereo_to_mono_16k(&s, &mut scratch);
+            }
         }
 
-        while mono_buf.len() >= CHUNK_SAMPLES {
+        if scratch.is_empty() {
+            continue;
+        }
+
+        // Feed the accumulated samples through the VAD. EarshotVad
+        // handles partial-frame stitching internally so we can send
+        // any length.
+        vad.accept(&scratch);
+
+        // Decode every segment the VAD has completed since the last
+        // iteration. Each segment is a bounded utterance; Whisper no
+        // longer sees arbitrary 5-second chunks of mixed speech and
+        // silence.
+        while let Some(mut segment) = vad.pop_segment() {
             if cancel.load(Ordering::Relaxed) {
                 tracing::info!("transcription cancelled, worker exiting");
                 return Ok(());
             }
-
-            let mut chunk: Vec<f32> = mono_buf.drain(..CHUNK_SAMPLES).collect();
-
-            // Spectral noise gate — remove broadband static and hiss
-            // before Whisper sees the audio.
-            denoise::spectral_denoise(&mut chunk, noise_gate_ratio);
-
-            let rms = compute_rms(&chunk);
-            if rms < silence_threshold {
-                tracing::debug!(rms, "chunk below silence threshold, skipping");
-                continue;
-            }
-
-            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-            params.set_language(Some("en"));
-            params.set_print_progress(false);
-            params.set_print_realtime(false);
-            params.set_print_timestamps(false);
-            params.set_no_context(true);
-
-            if let Err(e) = state.full(params, &chunk) {
-                tracing::warn!("whisper inference failed: {e}");
-                continue;
-            }
-
-            let n_segments = state.full_n_segments();
-            let mut combined = String::new();
-
-            for i in 0..n_segments {
-                if let Some(segment) = state.get_segment(i)
-                    && let Ok(text) = segment.to_str()
-                {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        if !combined.is_empty() {
-                            combined.push(' ');
-                        }
-                        combined.push_str(trimmed);
-                    }
-                }
-            }
-
-            if !combined.is_empty() && !is_hallucination(&combined) {
-                let timestamp = crate::util::wall_clock_timestamp();
-                tracing::debug!(%timestamp, %combined, "transcribed chunk");
-                let _ = event_tx.send(TranscriptionEvent::Text {
-                    timestamp,
-                    text: combined,
-                });
-            }
+            decode_and_emit_segment(
+                &mut state,
+                &mut segment,
+                event_tx,
+                noise_gate_ratio,
+                audio_enhancement,
+            );
         }
+    }
+
+    // Channel disconnected — force any in-flight segment out of the
+    // VAD so the last utterance isn't silently dropped.
+    vad.flush();
+    while let Some(mut segment) = vad.pop_segment() {
+        decode_and_emit_segment(
+            &mut state,
+            &mut segment,
+            event_tx,
+            noise_gate_ratio,
+            audio_enhancement,
+        );
     }
 
     tracing::info!("audio channel closed, worker exiting");
     Ok(())
+}
+
+/// Denoise a VAD-completed speech segment, run Whisper inference,
+/// filter hallucinations, and emit the result on `event_tx` as a
+/// `TranscriptionEvent::Text`. Extracted so the main audio loop and
+/// the on-exit flush path share one implementation — they need
+/// identical behavior but differ in what they do on error (the main
+/// loop continues, the flush path returns either way).
+fn decode_and_emit_segment(
+    state: &mut whisper_rs::WhisperState,
+    segment: &mut [f32],
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+    noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
+) {
+    // Audio enhancement dispatcher (#281) — routes to
+    // `enhance_speech` (default voice-band), `spectral_denoise`
+    // (broadband), or no-op (Off) based on the user-selected
+    // mode threaded through from `BackendConfig`. Runs per
+    // segment rather than per chunk now that segmentation lives
+    // upstream.
+    denoise::apply(segment, audio_enhancement, noise_gate_ratio);
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("en"));
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_no_context(true);
+
+    if let Err(e) = state.full(params, segment) {
+        tracing::warn!("whisper inference failed: {e}");
+        return;
+    }
+
+    let n_segments = state.full_n_segments();
+    let mut combined = String::new();
+
+    for i in 0..n_segments {
+        if let Some(seg) = state.get_segment(i)
+            && let Ok(text) = seg.to_str()
+        {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                if !combined.is_empty() {
+                    combined.push(' ');
+                }
+                combined.push_str(trimmed);
+            }
+        }
+    }
+
+    if !combined.is_empty() && !is_hallucination(&combined) {
+        let timestamp = crate::util::wall_clock_timestamp();
+        tracing::debug!(%timestamp, %combined, "transcribed segment");
+        let _ = event_tx.send(TranscriptionEvent::Text {
+            timestamp,
+            text: combined,
+        });
+    }
 }
 
 /// Common hallucination phrases Whisper produces on silence/noise.
@@ -323,40 +399,9 @@ fn is_hallucination(text: &str) -> bool {
         .any(|h| lower.trim().eq_ignore_ascii_case(h))
 }
 
-/// Compute the root-mean-square of a sample buffer.
-pub(crate) fn compute_rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
-    #[allow(clippy::cast_precision_loss)]
-    let mean = sum_sq / samples.len() as f32;
-    mean.sqrt()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rms_of_silence_is_zero() {
-        let silence = vec![0.0_f32; 1024];
-        let rms = compute_rms(&silence);
-        assert!((rms - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn rms_of_ones_is_one() {
-        let ones = vec![1.0_f32; 1024];
-        let rms = compute_rms(&ones);
-        assert!((rms - 1.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn rms_of_empty_is_zero() {
-        let rms = compute_rms(&[]);
-        assert!((rms - 0.0).abs() < f32::EPSILON);
-    }
 
     #[test]
     fn whisper_backend_does_not_support_partials() {

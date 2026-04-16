@@ -9,7 +9,11 @@ repository.workspace = true
 [dependencies]
 sdr-types.workspace = true
 rustfft.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
