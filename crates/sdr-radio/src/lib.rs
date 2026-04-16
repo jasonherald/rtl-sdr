@@ -14,6 +14,7 @@ use sdr_types::{Complex, DemodMode, DspError, Stereo};
 
 use af_chain::{AfChain, CtcssMode};
 use demod::{DemodConfig, Demodulator, create_demodulator};
+use sdr_dsp::voice_squelch::VoiceSquelchMode;
 
 /// Tolerance for considering two sample rates equal (skip resampling).
 const RATE_TOLERANCE: f64 = 1.0;
@@ -79,6 +80,10 @@ pub struct RadioModule {
     /// Persisted CTCSS detection threshold, paired with
     /// `ctcss_mode`. Same reapply-on-rebuild pattern.
     ctcss_threshold: f32,
+    /// Persisted voice-activity squelch mode (Off / Syllabic /
+    /// Snr). Reapplied to the new AF chain on mode switch the
+    /// same way CTCSS is.
+    voice_squelch_mode: VoiceSquelchMode,
     audio_sample_rate: f64,
     /// Input sample rate from the IQ frontend (Hz).
     input_sample_rate: f64,
@@ -117,6 +122,7 @@ impl RadioModule {
             notch_frequency: sdr_dsp::filter::DEFAULT_NOTCH_FREQ_HZ,
             ctcss_mode: CtcssMode::Off,
             ctcss_threshold: sdr_dsp::tone_detect::CTCSS_DEFAULT_THRESHOLD,
+            voice_squelch_mode: VoiceSquelchMode::Off,
             audio_sample_rate,
             input_sample_rate: 0.0,
             input_resampler: None,
@@ -199,6 +205,42 @@ impl RadioModule {
         af_chain
             .set_ctcss_mode(self.ctcss_mode)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to set CTCSS mode: {e}")))?;
+        // Voice squelch: apply LIVE only when the new mode is
+        // NFM. Syllabic and Snr detectors are calibrated around
+        // human speech shape — on WFM broadcast audio they'd
+        // mangle music and non-speech content, on AM/SSB the
+        // signal characteristics are different, and on DSB/CW/
+        // RAW the concept doesn't apply at all. Rather than let
+        // a stale cached Syllabic or Snr mode silently gate the
+        // speaker on WFM, we force the live AF chain to Off for
+        // any non-NFM mode.
+        //
+        // **Important**: we do NOT clear `self.voice_squelch_mode`
+        // here — the cached setting is preserved across the
+        // mode switch. When the user returns to NFM later, the
+        // cached mode is reapplied live and their tuning
+        // survives. This is a cleaner model than the
+        // force-clear-on-leave pattern CTCSS uses: the user's
+        // voice squelch configuration is "armed" and will
+        // automatically re-engage on NFM without requiring
+        // manual reselection.
+        //
+        // The UI layer's `apply_demod_visibility` hides the
+        // voice squelch rows on non-NFM modes (same as CTCSS),
+        // so the user never sees controls for a feature that
+        // isn't currently live. Their cached selection is
+        // preserved in the combo row as well so the roundtrip
+        // is seamless.
+        let live_voice_squelch_mode = if mode == DemodMode::Nfm {
+            self.voice_squelch_mode
+        } else {
+            VoiceSquelchMode::Off
+        };
+        af_chain
+            .set_voice_squelch_mode(live_voice_squelch_mode)
+            .map_err(|e| {
+                RadioError::ModeSwitchFailed(format!("failed to set voice squelch mode: {e}"))
+            })?;
 
         // Update IF chain feature flags based on new mode capabilities
         if !fm_if_nr_allowed {
@@ -455,6 +497,67 @@ impl RadioModule {
         self.ctcss_threshold
     }
 
+    /// Set the voice-activity squelch mode. `Off` is the default
+    /// (audio passes through unchanged). `Syllabic(threshold)` runs
+    /// a ~4 Hz envelope-modulation detector for speech-cadence
+    /// detection. `Snr(threshold_db)` runs a voice-band vs out-of-
+    /// voice-band power ratio detector. Persists across mode
+    /// changes.
+    ///
+    /// See [`sdr_dsp::voice_squelch`] for the underlying DSP.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RadioError::Dsp`] if the mode carries a non-
+    /// finite or otherwise invalid threshold.
+    pub fn set_voice_squelch_mode(&mut self, mode: VoiceSquelchMode) -> Result<(), RadioError> {
+        self.af_chain.set_voice_squelch_mode(mode)?;
+        self.voice_squelch_mode = mode;
+        Ok(())
+    }
+
+    /// Returns the current voice-squelch mode.
+    pub fn voice_squelch_mode(&self) -> VoiceSquelchMode {
+        self.voice_squelch_mode
+    }
+
+    /// Returns the voice-squelch gate state: `true` when the
+    /// detector has opened (speech-like content present) or when
+    /// the mode is `Off` (gate permanently open). `false` when
+    /// an active detector has the gate closed.
+    pub fn voice_squelch_open(&self) -> bool {
+        self.af_chain.voice_squelch_open()
+    }
+
+    /// Update the voice-squelch threshold. The interpretation of
+    /// `threshold` depends on the currently active mode: for
+    /// `Syllabic` it's a normalized envelope-ratio value
+    /// (positive, unitless), for `Snr` it's dB. No-op when the
+    /// mode is `Off`.
+    ///
+    /// Updates the persisted mode's inline threshold so
+    /// subsequent mode reloads (e.g. on `set_mode`) carry the
+    /// tuned value forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RadioError::Dsp`] if the threshold is non-finite
+    /// or (for syllabic) non-positive.
+    pub fn set_voice_squelch_threshold(&mut self, threshold: f32) -> Result<(), RadioError> {
+        self.af_chain.set_voice_squelch_threshold(threshold)?;
+        // Mirror the update into the cached mode so set_mode's
+        // reapply picks up the tuned value. `Off` variant has no
+        // threshold to update — no-op, matching the AF chain.
+        self.voice_squelch_mode = match self.voice_squelch_mode {
+            VoiceSquelchMode::Off => VoiceSquelchMode::Off,
+            VoiceSquelchMode::Syllabic { .. } => VoiceSquelchMode::Syllabic { threshold },
+            VoiceSquelchMode::Snr { .. } => VoiceSquelchMode::Snr {
+                threshold_db: threshold,
+            },
+        };
+        Ok(())
+    }
+
     /// Enable or disable WFM stereo decode.
     ///
     /// Only has an effect when the current mode is WFM. For other modes this
@@ -531,6 +634,43 @@ mod tests {
     /// `test_radio_module_ctcss_threshold_rejects_invalid`.
     const INVALID_CTCSS_THRESHOLDS: [f32; 6] =
         [0.0, -0.1, 1.001, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+
+    // ─── Voice-squelch test fixtures ────────────────────────────
+    // Same "named constants with rationale" pattern as CTCSS.
+    // These feed `test_radio_module_voice_squelch_*`; a future
+    // DSP retune of the default thresholds or the accepted range
+    // should touch these in one place rather than hunting down
+    // bare literals scattered across the tests.
+
+    /// Non-default Syllabic threshold used by the persistence
+    /// test. Chosen inside the DSP-layer `(0, 1]` range and
+    /// clearly different from
+    /// `VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD` (0.15) so a
+    /// regression that silently reverts to the default fails
+    /// loudly. Also distinct from
+    /// `VS_SYLLABIC_TUNED_THRESHOLD` below so the two syllabic
+    /// tests can't contaminate each other through shared state.
+    const VS_SYLLABIC_PERSIST_THRESHOLD: f32 = 0.22;
+
+    /// Non-default Snr threshold (dB) used by the persistence
+    /// test's Snr gauntlet. Chosen inside the 0–20 dB UI range
+    /// and clearly above `VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB`
+    /// (6.0) so a regression that reverts to the default fails
+    /// loudly.
+    const VS_SNR_PERSIST_THRESHOLD_DB: f32 = 9.0;
+
+    /// Construction baseline for the threshold-updates-cached-mode
+    /// test. Equals `VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD`
+    /// — we start the test at the default so the `set_voice_squelch_mode`
+    /// call exercises the default-construction path.
+    const VS_SYLLABIC_BASELINE_THRESHOLD: f32 = 0.15;
+
+    /// Tuned Syllabic threshold for the threshold-updates-cached-
+    /// mode test. Distinct from BOTH
+    /// `VS_SYLLABIC_BASELINE_THRESHOLD` (so the update is
+    /// observable) AND `VS_SYLLABIC_PERSIST_THRESHOLD` (so the
+    /// two syllabic tests are independent).
+    const VS_SYLLABIC_TUNED_THRESHOLD: f32 = 0.30;
 
     #[test]
     fn test_radio_module_default_mode() {
@@ -794,5 +934,152 @@ mod tests {
                 "AF chain effective threshold drifted after rejected value {v}"
             );
         }
+    }
+
+    // ─── Voice squelch persistence regression tests ─────────
+    //
+    // Mirror the CTCSS dual-level assertion pattern: after each
+    // mode switch, assert both the RadioModule cache AND the
+    // live AfChain value so a broken reapply path (cache
+    // updated but af_chain not) can't hide behind the cached
+    // field alone. Tests three transitions (Off → Syllabic,
+    // Syllabic → Snr, mode switch) to cover the
+    // reconstruct-the-AF-chain-on-set_mode code path.
+
+    #[test]
+    fn test_radio_module_voice_squelch_persists_across_set_mode() {
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        // Baseline: default mode is Off at both levels. Radio
+        // starts in WFM mode (RadioModule default).
+        assert_eq!(radio.voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert_eq!(radio.current_mode(), DemodMode::Wfm);
+
+        // Set a non-default Syllabic mode via the direct setter.
+        // On the CURRENT (WFM) AF chain the direct setter applies
+        // unconditionally — the NFM-only gate lives only in the
+        // `set_mode` rebuild path, not in the direct setter. This
+        // is deliberate: the user's intent on the direct setter
+        // is "use this mode now if applicable," and if they're
+        // on WFM that's their own choice; the gate keeps stale
+        // cached state from re-arming on non-NFM modes across
+        // rebuilds, not from the user's explicit current action.
+        let syl = VoiceSquelchMode::Syllabic {
+            threshold: VS_SYLLABIC_PERSIST_THRESHOLD,
+        };
+        radio.set_voice_squelch_mode(syl).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), syl);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+
+        // Mode switch to NFM: the AF chain is rebuilt from
+        // scratch. The NFM gate passes, so the cached Syllabic
+        // mode applies live on the new chain.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), syl);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+
+        // Switch AWAY from NFM to AM. The cache must preserve
+        // the user's Syllabic setting, but the live AF chain
+        // must be forced to Off — voice squelch is calibrated
+        // for speech and doesn't apply to AM.
+        radio.set_mode(DemodMode::Am).unwrap();
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            syl,
+            "cache must preserve user's setting across non-NFM transitions"
+        );
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Off,
+            "live AF chain must NOT run voice squelch on AM"
+        );
+
+        // Back to NFM — the cached Syllabic must re-apply live
+        // without user intervention. This is the core reason
+        // we preserve the cache across non-NFM modes: the user
+        // doesn't have to re-pick voice squelch every time they
+        // visit a non-NFM band and come back.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), syl);
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            syl,
+            "cached setting must re-arm on NFM re-entry"
+        );
+
+        // Flip to Snr and run a NFM → WFM → NFM gauntlet.
+        let snr = VoiceSquelchMode::Snr {
+            threshold_db: VS_SNR_PERSIST_THRESHOLD_DB,
+        };
+        radio.set_voice_squelch_mode(snr).unwrap();
+        radio.set_mode(DemodMode::Wfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), snr);
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Off,
+            "WFM must not run voice squelch live"
+        );
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), snr);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), snr);
+
+        // Explicitly set Off — must stay Off through any mode.
+        radio.set_voice_squelch_mode(VoiceSquelchMode::Off).unwrap();
+        radio.set_mode(DemodMode::Wfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
+    }
+
+    #[test]
+    fn test_radio_module_voice_squelch_threshold_updates_cached_mode() {
+        // `set_voice_squelch_threshold` has to mirror the new
+        // value into the cached `voice_squelch_mode` variant
+        // so that `set_mode`'s replay carries the tuned value
+        // forward. Regression test: tune a threshold, switch
+        // modes, confirm the tuned value is what gets reapplied.
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio
+            .set_voice_squelch_mode(VoiceSquelchMode::Syllabic {
+                threshold: VS_SYLLABIC_BASELINE_THRESHOLD,
+            })
+            .unwrap();
+        radio
+            .set_voice_squelch_threshold(VS_SYLLABIC_TUNED_THRESHOLD)
+            .unwrap();
+
+        // Cached mode should now carry the tuned threshold, not
+        // the construction-time default.
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic {
+                threshold: VS_SYLLABIC_TUNED_THRESHOLD
+            }
+        );
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic {
+                threshold: VS_SYLLABIC_TUNED_THRESHOLD
+            }
+        );
+
+        // Mode switch rebuilds the AF chain; the tuned value
+        // must survive through the replay.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic {
+                threshold: VS_SYLLABIC_TUNED_THRESHOLD
+            }
+        );
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Syllabic {
+                threshold: VS_SYLLABIC_TUNED_THRESHOLD
+            }
+        );
     }
 }

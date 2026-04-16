@@ -212,6 +212,15 @@ struct DspState {
     /// flooded at detector-window rate. Initialized to `false` to
     /// match the detector's initial closed state.
     ctcss_was_sustained: bool,
+
+    /// Last observed voice-squelch open state. Mirrors the CTCSS
+    /// tracker pattern — we only emit edge events, and the UI
+    /// status indicator subscribes to those. The initial value
+    /// intentionally starts as `true` to match the `Off` default
+    /// (gate permanently open); the first real edge fires when
+    /// the user picks Syllabic or Snr and the fresh detector
+    /// reports closed.
+    voice_squelch_was_open: bool,
 }
 
 impl DspState {
@@ -264,6 +273,7 @@ impl DspState {
             transcription_tx: None,
             squelch_was_open: false,
             ctcss_was_sustained: false,
+            voice_squelch_was_open: true,
         })
     }
 }
@@ -390,9 +400,16 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.transcription_tx = None;
                     state.squelch_was_open = false;
                     // Mode switch rebuilds the AF chain + CTCSS
-                    // detector — edge tracker must match the new
-                    // closed state.
+                    // detector + voice squelch — edge trackers
+                    // must match the new closed state.
                     state.ctcss_was_sustained = false;
+                    // Voice squelch reset to closed in an active
+                    // mode; in Off mode it's still "open" so the
+                    // tracker should track whatever the AF chain
+                    // reports after the rebuild. Simpler to just
+                    // snapshot it here and let the next process
+                    // iteration emit an edge if anything changed.
+                    state.voice_squelch_was_open = state.radio.voice_squelch_open();
                     let _ = dsp_tx.send(DspToUi::DemodModeChanged(mode));
                 }
             }
@@ -674,6 +691,24 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if let Err(e) = state.radio.set_ctcss_threshold(threshold) {
                 tracing::warn!("CTCSS threshold set failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("CTCSS threshold failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetVoiceSquelchMode(mode) => {
+            tracing::debug!(?mode, "set voice squelch mode");
+            if let Err(e) = state.radio.set_voice_squelch_mode(mode) {
+                tracing::warn!("voice squelch mode set failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Voice squelch failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetVoiceSquelchThreshold(threshold) => {
+            tracing::debug!(threshold, "set voice squelch threshold");
+            if let Err(e) = state.radio.set_voice_squelch_threshold(threshold) {
+                tracing::warn!("voice squelch threshold set failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!(
+                    "Voice squelch threshold failed: {e}"
+                )));
             }
         }
 
@@ -1085,6 +1120,18 @@ fn process_iq_block(
                         if now_ctcss != state.ctcss_was_sustained {
                             let _ = dsp_tx.send(DspToUi::CtcssSustainedChanged(now_ctcss));
                             state.ctcss_was_sustained = now_ctcss;
+                        }
+
+                        // Voice squelch edges — same pattern, different
+                        // source. Gate state comes from the AF-chain
+                        // voice squelch which uses a rolling RMS
+                        // window, so edges happen on timescales of
+                        // ~100 ms (the RMS integration length) rather
+                        // than CTCSS's 400 ms windows.
+                        let now_voice = state.radio.voice_squelch_open();
+                        if now_voice != state.voice_squelch_was_open {
+                            let _ = dsp_tx.send(DspToUi::VoiceSquelchOpenChanged(now_voice));
+                            state.voice_squelch_was_open = now_voice;
                         }
 
                         // Send audio copy to transcription worker BEFORE volume

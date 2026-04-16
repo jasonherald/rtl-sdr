@@ -6,6 +6,7 @@
 use sdr_dsp::filter::{DeemphasisFilter, NotchFilter};
 use sdr_dsp::multirate::RationalResampler;
 use sdr_dsp::tone_detect::{CTCSS_DEFAULT_THRESHOLD, CtcssDetector, ctcss_tone_index};
+use sdr_dsp::voice_squelch::{VoiceSquelch, VoiceSquelchMode};
 use sdr_types::{Complex, DspError, Stereo};
 
 /// Default audio output sample rate (Hz).
@@ -131,6 +132,15 @@ pub struct AfChain {
     /// Mono downmix scratch buffer fed to the detector. Reused
     /// across calls to avoid per-block allocation on the hot path.
     ctcss_mono_buf: Vec<f32>,
+    /// Voice-activity squelch (syllabic or SNR). Runs on the
+    /// same post-deemph mono downmix as the CTCSS detector and
+    /// contributes a second AF-level gate. Unlike CTCSS the
+    /// `VoiceSquelch` always exists — `Off` mode is represented
+    /// inside the type and returns `is_open() == true`
+    /// unconditionally, so the hot path never branches on
+    /// `Option::is_some`. See `sdr_dsp::voice_squelch` for the
+    /// detector algorithms.
+    voice_squelch: VoiceSquelch,
     /// Scratch buffer for deemphasis L input channel.
     deemp_buf_l: Vec<f32>,
     /// Scratch buffer for deemphasis R input channel.
@@ -170,6 +180,14 @@ impl AfChain {
         #[allow(clippy::cast_possible_truncation)]
         let audio_rate_f32 = audio_sample_rate as f32;
 
+        // Voice squelch defaults to Off (permanently open), which
+        // matches the pre-PR behavior — existing users see no
+        // audio change until they explicitly pick Syllabic or
+        // Snr from the UI. Constructor error propagates (can
+        // only happen on a non-canonical sample rate, matching
+        // the CTCSS detector's validation contract).
+        let voice_squelch = VoiceSquelch::new(VoiceSquelchMode::Off, audio_rate_f32)?;
+
         Ok(Self {
             deemp_l: None,
             deemp_r: None,
@@ -186,6 +204,7 @@ impl AfChain {
             ctcss_threshold: CTCSS_DEFAULT_THRESHOLD,
             ctcss_detector: None,
             ctcss_mono_buf: Vec::new(),
+            voice_squelch,
             deemp_buf_l: Vec::new(),
             deemp_out_l: Vec::new(),
             deemp_out_r: Vec::new(),
@@ -391,6 +410,45 @@ impl AfChain {
         self.ctcss_threshold
     }
 
+    /// Set the voice-activity squelch mode. `Off` passes audio
+    /// through unchanged (the detector is permanently open).
+    /// `Syllabic(threshold)` runs a 4 Hz envelope-modulation
+    /// detector for speech-cadence detection. `Snr(threshold_db)`
+    /// runs an in-voice-band vs out-of-voice-band power-ratio
+    /// detector. Mode change resets the gate to closed — the
+    /// new detector has to warm up before the gate opens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DspError::InvalidParameter`] if the mode carries
+    /// a non-finite or out-of-range threshold (see
+    /// [`VoiceSquelch::new`] for the full contract).
+    pub fn set_voice_squelch_mode(&mut self, mode: VoiceSquelchMode) -> Result<(), DspError> {
+        self.voice_squelch.set_mode(mode)
+    }
+
+    /// Returns the current voice-squelch mode.
+    pub fn voice_squelch_mode(&self) -> VoiceSquelchMode {
+        self.voice_squelch.mode()
+    }
+
+    /// Returns the voice squelch's current gate state.
+    /// Always `true` in Off mode (gate is permanently open).
+    pub fn voice_squelch_open(&self) -> bool {
+        self.voice_squelch.is_open()
+    }
+
+    /// Update the voice-squelch threshold for the currently
+    /// active mode. No-op when the mode is Off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DspError::InvalidParameter`] if the threshold
+    /// is non-finite, or (for syllabic mode) non-positive.
+    pub fn set_voice_squelch_threshold(&mut self, threshold: f32) -> Result<(), DspError> {
+        self.voice_squelch.set_threshold(threshold)
+    }
+
     /// Enable or disable the notch filter.
     pub fn set_notch_enabled(&mut self, enabled: bool) {
         self.notch_l.set_enabled(enabled);
@@ -519,24 +577,35 @@ impl AfChain {
             }
         }
 
-        // Stage 3a: CTCSS detector tap.
-        // Runs BEFORE the high-pass filter so the detector sees
-        // the full-bandwidth AF including the sub-audible tone
-        // (67–254 Hz). Feeds a mono downmix of the post-deemph
-        // signal; the detector buffers internally and only returns
-        // a decision once it has a full 400 ms / 19200-sample
-        // window. Sustained state is sticky across calls.
-        if let Some(detector) = self.ctcss_detector.as_mut() {
+        // Stage 3a: mono downmix tap for CTCSS and voice squelch.
+        // Both detectors consume the same post-deemph mono signal
+        // so we build the downmix once and feed both. Reuses a
+        // single scratch buffer (`ctcss_mono_buf`) to avoid per-
+        // block allocation on the hot path — the original name
+        // is kept for minimal churn, even though it now backs
+        // both detectors.
+        //
+        // Runs BEFORE the high-pass filter so CTCSS sees the
+        // full-bandwidth AF including the sub-audible tone
+        // (67–254 Hz); the voice squelch also gets the wideband
+        // signal, which is fine because its BPFs are narrow.
+        let needs_mono_tap = self.ctcss_detector.is_some() || self.voice_squelch.mode().is_active();
+        if needs_mono_tap {
             self.ctcss_mono_buf.clear();
             self.ctcss_mono_buf.reserve(resamp_count);
             for s in &output[..resamp_count] {
-                // (L + R) / 2 downmix — for NFM (the only mode
-                // that uses CTCSS in practice) L and R are
+                // (L + R) / 2 downmix — for NFM (the dominant
+                // CTCSS / voice-squelch use case) L and R are
                 // identical, but averaging is cheap and safe for
                 // any stereo content.
                 self.ctcss_mono_buf.push(0.5 * (s.l + s.r));
             }
-            let _ = detector.accept_samples(&self.ctcss_mono_buf);
+            if let Some(detector) = self.ctcss_detector.as_mut() {
+                let _ = detector.accept_samples(&self.ctcss_mono_buf);
+            }
+            if self.voice_squelch.mode().is_active() {
+                self.voice_squelch.accept_samples(&self.ctcss_mono_buf);
+            }
         }
 
         // Stage 3b: High-pass filter at audio output rate.
@@ -580,27 +649,37 @@ impl AfChain {
             }
         }
 
-        // Stage 5: CTCSS squelch gate.
-        // Zeroes the entire block when the detector's sustained
-        // gate is closed. This runs LAST so the preceding filters
-        // (HPF/notch) still update their state on the real signal
-        // — keeping the gate close doesn't desync the filters, so
-        // the first block after the gate reopens doesn't have a
+        // Stage 5: AF-level squelch gates (CTCSS + voice squelch).
+        //
+        // Zeroes the entire block when EITHER CTCSS (if in Tone
+        // mode and the sustained gate is closed) OR voice squelch
+        // (if in an active mode and the detector reports closed)
+        // rejects this block. The two gates AND together: both
+        // must be "open" for audio to flow. This matches real
+        // scanners where you might combine a CTCSS tone check
+        // with a voice-activity detector to reject dispatchers
+        // keying up without voice.
+        //
+        // This runs LAST so the preceding filters (HPF/notch)
+        // still update their state on the real signal — keeping
+        // the gate closed doesn't desync the filters, so the
+        // first block after the gate reopens doesn't have a
         // transient from state that lagged behind the signal.
         //
-        // Note the asymmetry: the detector in Stage 3a is fed the
-        // pre-HPF signal (it needs to see the sub-audible tone to
-        // detect it), while the output we zero here is the post-
-        // HPF signal (the user would otherwise hear the tone as a
-        // low buzz). Zeroing post-HPF is cheaper than zeroing pre-
-        // HPF anyway — a fresh zero passed through an active IIR
-        // is not quite zero, so zeroing last skips that subtlety.
-        if matches!(self.ctcss_mode, CtcssMode::Tone(_))
+        // Note the asymmetry: the detectors in Stage 3a are fed
+        // the pre-HPF signal (CTCSS needs to see the sub-audible
+        // tone, and feeding voice squelch from the same tap
+        // avoids a second downmix pass), while the output we zero
+        // here is the post-HPF signal. Zeroing post-HPF skips
+        // the subtlety of "a fresh zero passed through an active
+        // IIR is not quite zero."
+        let ctcss_closed = matches!(self.ctcss_mode, CtcssMode::Tone(_))
             && self
                 .ctcss_detector
                 .as_ref()
-                .is_some_and(|d| !d.is_sustained())
-        {
+                .is_some_and(|d| !d.is_sustained());
+        let voice_closed = self.voice_squelch.mode().is_active() && !self.voice_squelch.is_open();
+        if ctcss_closed || voice_closed {
             for s in &mut output[..resamp_count] {
                 *s = Stereo::new(0.0, 0.0);
             }
@@ -947,5 +1026,230 @@ mod tests {
         // Switch to 131.8 Hz. Sustained state must reset.
         chain.set_ctcss_mode(CtcssMode::Tone(131.8)).unwrap();
         assert!(!chain.ctcss_sustained());
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Voice squelch tests
+    //
+    // The exhaustive algorithmic tests live in
+    // `sdr_dsp::voice_squelch`. These are integration tests that
+    // prove the AF chain wires the voice squelch correctly:
+    //
+    // - Off mode leaves audio unchanged
+    // - Active modes actually gate the stereo output
+    // - Mode change resets state
+    // - Threshold update propagates
+    // - Voice squelch ANDs with CTCSS (both must be open)
+    // ─────────────────────────────────────────────────────────
+
+    use sdr_dsp::voice_squelch::{
+        VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB, VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+        VoiceSquelchMode,
+    };
+
+    // Test-only fixture constants. Per CLAUDE.md's "named
+    // constants for all magic numbers" rule, even test values
+    // with load-bearing intent get names + rationale so a
+    // future detector retune can find them in one place.
+
+    /// Sample rate for all voice-squelch AF-chain tests. Matches
+    /// the canonical 48 kHz the DSP layer is calibrated against
+    /// (see `VOICE_SQUELCH_SAMPLE_RATE_HZ`). Passed to
+    /// `AfChain::new` for both `af_sample_rate` and
+    /// `audio_sample_rate` so the tests don't exercise the
+    /// resampler — voice-squelch behavior is the focus.
+    const VS_TEST_SAMPLE_RATE: f64 = 48_000.0;
+
+    /// Length in samples of a 100 ms short-window test block.
+    /// Matches `VOICE_SQUELCH_RMS_WINDOW_MS` so silence-rejection
+    /// tests feed exactly one RMS integration window.
+    const VS_SHORT_BLOCK_SAMPLES: usize = 4_800;
+
+    /// Length in samples of a 2-second long block used by the
+    /// detector-opens tests. Hang time is 500 ms and the RMS
+    /// window is 100 ms, so 2 seconds is comfortably long enough
+    /// for the detector to ring up, the gate to open, and the
+    /// post-warmup tail to have audible signal.
+    const VS_LONG_BLOCK_SAMPLES: usize = 96_000;
+
+    /// Offset into `VS_LONG_BLOCK_SAMPLES` where we check the
+    /// output for post-warmup audible signal. 1 second in — past
+    /// both the HPF warmup transient and the detector ring-up,
+    /// but still inside the long block.
+    const VS_LONG_BLOCK_TAIL_OFFSET: usize = 48_000;
+
+    /// In-voice-band carrier frequency (Hz) used by all the
+    /// "strong tone opens the gate" tests. Chosen to land inside
+    /// both the SNR detector's in-band BPF passband (centered
+    /// at 1 kHz) and the voice-band weight region used by
+    /// `enhance_speech` elsewhere.
+    const VS_TEST_CARRIER_HZ: f32 = 1_000.0;
+
+    /// "Strong signal" amplitude — well above the detector's
+    /// noise floor. 0.8 peak leaves headroom under f32 [-1, 1]
+    /// so a single-channel stereo dupe doesn't clip.
+    const VS_STRONG_AMPLITUDE: f32 = 0.8;
+
+    /// "Normal signal" amplitude used by the Off-mode passthrough
+    /// test where we just need to verify audio reaches the
+    /// output, not open a gate.
+    const VS_NORMAL_AMPLITUDE: f32 = 0.5;
+
+    /// Build a stereo buffer of the given length filled with a
+    /// pure sine tone at `VS_TEST_CARRIER_HZ` and the given
+    /// amplitude, duplicated across both channels. Shared by
+    /// all three "strong tone" tests to avoid the same
+    /// generator being copy-pasted three times.
+    fn stereo_tone(n: usize, amplitude: f32) -> Vec<Stereo> {
+        #[allow(clippy::cast_possible_truncation)]
+        let sample_rate = VS_TEST_SAMPLE_RATE as f32;
+        (0..n)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 / sample_rate;
+                let v = amplitude * (core::f32::consts::TAU * VS_TEST_CARRIER_HZ * t).sin();
+                Stereo::new(v, v)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_voice_squelch_defaults_to_off_and_passes_through() {
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        assert_eq!(chain.voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert!(chain.voice_squelch_open(), "Off mode gate must start open");
+
+        // Feed a pure in-band tone — should pass through unchanged
+        // because the gate is permanently open in Off mode.
+        let input = stereo_tone(VS_SHORT_BLOCK_SAMPLES, VS_NORMAL_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_SHORT_BLOCK_SAMPLES];
+        chain.process(&input, &mut output).unwrap();
+        // Sample 100 should survive untouched (HPF is off by
+        // default and any warmup is well before this point).
+        assert!(output[100].l.abs() > 0.01);
+    }
+
+    #[test]
+    fn test_voice_squelch_snr_rejects_silence() {
+        // SNR mode with default threshold fed one 100 ms window
+        // of silence: gate must stay closed and the output must
+        // be zeroed.
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        chain
+            .set_voice_squelch_mode(VoiceSquelchMode::Snr {
+                threshold_db: VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
+            })
+            .unwrap();
+
+        let input = vec![Stereo::new(0.0, 0.0); VS_SHORT_BLOCK_SAMPLES];
+        let mut output = vec![Stereo::default(); VS_SHORT_BLOCK_SAMPLES];
+        chain.process(&input, &mut output).unwrap();
+
+        assert!(!chain.voice_squelch_open());
+        assert!(
+            output.iter().all(|s| s.l == 0.0 && s.r == 0.0),
+            "silence in → zero out regardless"
+        );
+    }
+
+    #[test]
+    fn test_voice_squelch_snr_opens_on_strong_tone() {
+        // Strong in-voice-band tone — the SNR detector should
+        // open the gate after ingesting the 2 s block, and the
+        // post-warmup output must contain audible signal.
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        chain
+            .set_voice_squelch_mode(VoiceSquelchMode::Snr {
+                threshold_db: VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
+            })
+            .unwrap();
+
+        let input = stereo_tone(VS_LONG_BLOCK_SAMPLES, VS_STRONG_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
+        chain.process(&input, &mut output).unwrap();
+
+        assert!(
+            chain.voice_squelch_open(),
+            "SNR gate must open on strong in-band tone"
+        );
+        let late_window = &output[VS_LONG_BLOCK_TAIL_OFFSET..];
+        assert!(late_window.iter().any(|s| s.l.abs() > 0.01));
+    }
+
+    #[test]
+    fn test_voice_squelch_mode_change_resets_gate() {
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        chain
+            .set_voice_squelch_mode(VoiceSquelchMode::Snr {
+                threshold_db: VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
+            })
+            .unwrap();
+
+        // Open on a strong tone.
+        let input = stereo_tone(VS_LONG_BLOCK_SAMPLES, VS_STRONG_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
+        chain.process(&input, &mut output).unwrap();
+        assert!(chain.voice_squelch_open());
+
+        // Switch to a different mode — gate must reset.
+        chain
+            .set_voice_squelch_mode(VoiceSquelchMode::Syllabic {
+                threshold: VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            })
+            .unwrap();
+        assert!(
+            !chain.voice_squelch_open(),
+            "mode change must reset gate to closed"
+        );
+    }
+
+    #[test]
+    fn test_voice_squelch_and_gates_with_ctcss() {
+        // When BOTH voice squelch and CTCSS are active, audio
+        // should only pass if both gates agree. Here CTCSS is on
+        // a tone that isn't present → CTCSS closed → output
+        // muted regardless of voice squelch state.
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        chain.set_ctcss_mode(CtcssMode::Tone(100.0)).unwrap();
+        chain
+            .set_voice_squelch_mode(VoiceSquelchMode::Snr {
+                threshold_db: VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB,
+            })
+            .unwrap();
+
+        // Strong in-band tone — voice squelch should open (high
+        // in-band energy) but CTCSS should NOT open (no 100 Hz
+        // sub-audible tone present), so CTCSS wins the AND and
+        // the output must be zeroed.
+        let input = stereo_tone(VS_LONG_BLOCK_SAMPLES, VS_STRONG_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
+        chain.process(&input, &mut output).unwrap();
+
+        assert!(
+            !chain.ctcss_sustained(),
+            "CTCSS should stay closed without a 100 Hz sub-audible tone"
+        );
+        let tail = &output[VS_LONG_BLOCK_TAIL_OFFSET..];
+        assert!(
+            tail.iter().all(|s| s.l == 0.0 && s.r == 0.0),
+            "CTCSS closed must mute output regardless of voice squelch state"
+        );
+    }
+
+    #[test]
+    fn test_voice_squelch_threshold_update_validates() {
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        chain
+            .set_voice_squelch_mode(VoiceSquelchMode::Syllabic { threshold: 0.15 })
+            .unwrap();
+
+        // Valid update.
+        assert!(chain.set_voice_squelch_threshold(0.2).is_ok());
+        // Non-finite rejected.
+        assert!(chain.set_voice_squelch_threshold(f32::NAN).is_err());
+        assert!(chain.set_voice_squelch_threshold(f32::INFINITY).is_err());
+        // Non-positive rejected (syllabic mode only).
+        assert!(chain.set_voice_squelch_threshold(0.0).is_err());
+        assert!(chain.set_voice_squelch_threshold(-0.1).is_err());
     }
 }

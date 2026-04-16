@@ -14,7 +14,9 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 - WAV file IQ playback with looping
 - Audio notch filter (biquad IIR, 20-20,000 Hz)
 - Auto-squelch with noise floor tracking
-- Bookmark tuning profiles with full state capture/restore
+- CTCSS tone squelch — 51 standard sub-audible tones (67.0–254.1 Hz), Goertzel-filter detection with neighbor-dominance gating and sustained-hit debouncing; per-bookmark tone selection and threshold tuning
+- Voice-activity squelch — syllabic envelope detector (2–10 Hz speech cadence) and SNR-ratio detector (voice-band vs out-of-band power), gates the speaker path alongside CTCSS and power squelch
+- Bookmark tuning profiles with full state capture/restore (including CTCSS + voice squelch per-channel)
 
 ### Display
 
