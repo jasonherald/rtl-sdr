@@ -41,17 +41,32 @@ apps/macos/
 From the repo root:
 
 ```bash
-# Build Rust static lib + Swift app + wrap into .app
+# Build release Rust + Swift + wrap into .app (default, use this
+# for anything that touches live RTL-SDR audio — release is the
+# only mode that keeps up with 2 MSps streaming on macOS).
 make mac-app
 
 # Launch the app
 open apps/macos/build/SDRMac.app
 ```
 
-`make mac-app` runs `cargo build --workspace` (workspace scope so
-the transcription backend feature unifies), then `swift build`
-inside `apps/macos/`, then calls `scripts/bundle-mac-app.sh` to
-ad-hoc sign and wrap the binary into a minimal `.app`.
+`make mac-app` runs `cargo build --workspace --release`
+(workspace scope so the transcription backend feature unifies),
+then `swift build -c release` inside `apps/macos/`, then calls
+`scripts/bundle-mac-app.sh release` to ad-hoc sign and wrap the
+binary into a minimal `.app`.
+
+### Debug build
+
+```bash
+make mac-app-debug
+```
+
+Builds cargo + swift in debug mode. **This will NOT keep up with
+live RTL-SDR streaming** — debug builds of the DSP chain drop
+USB throughput to ~45% of configured source rate, which
+produces garbled audio. Debug is only useful for non-streaming
+iteration (UI layout, event wiring, config, lifecycle paths).
 
 ## Testing
 

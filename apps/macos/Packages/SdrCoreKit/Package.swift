@@ -93,12 +93,28 @@ let package = Package(
             name: "SdrCoreKit",
             dependencies: ["sdr_core_c"],
             linkerSettings: [
-                // Debug build search path. `cargo build -p sdr-ffi`
-                // writes libsdr_ffi.a here.
-                .unsafeFlags([
-                    "-L", "\(workspaceTarget)/debug",
-                    "-L", "\(workspaceTarget)/release",
-                ]),
+                // Link the Rust static archive from the cargo
+                // target dir that matches the SwiftPM build
+                // configuration:
+                //   - `swift build`          → cargo debug
+                //   - `swift build -c release` → cargo release
+                //
+                // Without these `.when(configuration:)` gates,
+                // both search paths would be active regardless of
+                // build mode and the linker would pick whichever
+                // lib it saw first — a release Swift build could
+                // silently link an unoptimised Rust lib (the
+                // bug that surfaced as ~45% RTL-SDR throughput
+                // during M5 sub-PR 2 testing on macOS; it was a
+                // debug-build CPU cost masquerading as USB slowness).
+                .unsafeFlags(
+                    ["-L", "\(workspaceTarget)/debug"],
+                    .when(configuration: .debug)
+                ),
+                .unsafeFlags(
+                    ["-L", "\(workspaceTarget)/release"],
+                    .when(configuration: .release)
+                ),
                 // Link the static archive.
                 .linkedLibrary("sdr_ffi"),
                 // libc++ — whisper.cpp (pulled in transitively via

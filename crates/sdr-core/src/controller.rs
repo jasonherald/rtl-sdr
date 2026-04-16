@@ -213,6 +213,20 @@ struct DspState {
     /// match the detector's initial closed state.
     ctcss_was_sustained: bool,
 
+    /// Diagnostic: total stereo frames handed to the audio sink
+    /// since the last `Start`. Paired with `diag_log_at` to emit
+    /// a periodic `info` log so we can confirm the pipeline is
+    /// actually producing audio without flooding the log every
+    /// DSP block.
+    audio_frames_written: u64,
+    /// Diagnostic: total IQ samples read from the source since
+    /// the last `Start`. Logged alongside `audio_frames_written`
+    /// so the ratio (expected: `source_sample_rate /
+    /// audio_sample_rate`) makes USB-vs-DSP bottlenecks visible.
+    iq_samples_read: u64,
+    /// Next wall-clock deadline for the periodic diagnostic log.
+    diag_log_at: std::time::Instant,
+
     /// Last observed voice-squelch open state. Mirrors the CTCSS
     /// tracker pattern — we only emit edge events, and the UI
     /// status indicator subscribes to those. The initial value
@@ -274,6 +288,9 @@ impl DspState {
             squelch_was_open: false,
             ctcss_was_sustained: false,
             voice_squelch_was_open: true,
+            audio_frames_written: 0,
+            iq_samples_read: 0,
+            diag_log_at: std::time::Instant::now(),
         })
     }
 }
@@ -288,6 +305,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 return;
             }
             tracing::info!("starting DSP pipeline");
+            state.audio_frames_written = 0;
+            state.iq_samples_read = 0;
+            state.diag_log_at = std::time::Instant::now();
             match open_source(state) {
                 Ok(()) => {
                     // Start the audio sink -- if it fails, log but continue
@@ -305,8 +325,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         state.frontend.effective_sample_rate(),
                     ));
 
-                    // Send the source's supported gain values to the UI.
+                    // Send the source's display name + supported gain
+                    // values to the UI.
                     if let Some(source) = &state.source {
+                        let _ = dsp_tx.send(DspToUi::DeviceInfo(source.name().to_string()));
                         let gains: Vec<f64> = source
                             .gains()
                             .iter()
@@ -1025,7 +1047,42 @@ fn process_iq_block(
             std::thread::yield_now();
             return;
         }
-        Ok(n) => n,
+        Ok(n) => {
+            state.iq_samples_read = state.iq_samples_read.saturating_add(n as u64);
+            // Periodic rate diagnostic. Logs IQ read rate + audio
+            // output rate side-by-side so USB-vs-DSP bottlenecks
+            // are immediately visible: expected ratio is roughly
+            // `source_sample_rate / audio_sample_rate`. If IQ
+            // drops below the configured source rate, USB is
+            // starved; if audio drops below IQ/ratio, the DSP
+            // chain is behind.
+            if state.diag_log_at.elapsed() >= std::time::Duration::from_secs(2) {
+                let elapsed = state.diag_log_at.elapsed().as_secs_f64().max(f64::EPSILON);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let iq_rate_sps = (state.iq_samples_read as f64 / elapsed).round() as u64;
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let audio_rate_fps = (state.audio_frames_written as f64 / elapsed).round() as u64;
+                tracing::info!(
+                    iq_samples = state.iq_samples_read,
+                    iq_rate_sps,
+                    audio_frames = state.audio_frames_written,
+                    audio_rate_fps,
+                    "pipeline rates"
+                );
+                state.iq_samples_read = 0;
+                state.audio_frames_written = 0;
+                state.diag_log_at = std::time::Instant::now();
+            }
+            n
+        }
         Err(e) => {
             // Fatal errors (USB reader death, device lost) — stop the pipeline
             if matches!(
@@ -1226,7 +1283,13 @@ fn process_iq_block(
                             let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
                         }
 
-                        // Send to PipeWire for playback.
+                        // Send to the audio sink (PipeWire on Linux,
+                        // CoreAudio on macOS).
+                        if audio_count > 0 {
+                            state.audio_frames_written = state
+                                .audio_frames_written
+                                .saturating_add(audio_count as u64);
+                        }
                         if let Err(e) = state
                             .audio_sink
                             .write_samples(&state.audio_buf[..audio_count])

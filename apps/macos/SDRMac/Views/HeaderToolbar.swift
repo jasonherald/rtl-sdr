@@ -32,17 +32,22 @@ struct HeaderToolbar: ToolbarContent {
         }
 
         ToolbarItem(placement: .primaryAction) {
-            @Bindable var m = model
-            Picker("Mode", selection: $m.demodMode) {
+            // Route through the model setter (not `$m.demodMode`
+            // directly) so the binding's set path fires
+            // `setDemodMode` exactly once — the straightforward
+            // two-way binding would write the property first, then
+            // the onChange handler would write it again via the
+            // setter, which both worked and smelled.
+            Picker("Mode", selection: Binding(
+                get: { model.demodMode },
+                set: { model.setDemodMode($0) }
+            )) {
                 ForEach(DemodMode.allCases, id: \.self) {
                     Text($0.label).tag($0)
                 }
             }
             .pickerStyle(.menu)
             .frame(width: 110)
-            .onChange(of: model.demodMode) { _, new in
-                model.setDemodMode(new)
-            }
         }
     }
 }

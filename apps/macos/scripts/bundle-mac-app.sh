@@ -13,16 +13,22 @@
 # Usage:
 #   ./apps/macos/scripts/bundle-mac-app.sh [debug|release]
 #
+# Default is `release` — debug builds of the Rust DSP chain are
+# too slow for live RTL-SDR streaming (tested: ~45% throughput vs
+# release on macOS) so the dev loop should almost always use
+# release. Only reach for the `debug` variant when iterating on
+# non-streaming paths (UI, event wiring, config parsing).
+#
 # Produces:
 #   apps/macos/build/SDRMac.app
 #
-# Assumes `cargo build --workspace` and `swift build` (from
-# apps/macos/) have already run — the script just copies the
-# binary and plist into the bundle layout.
+# Assumes `cargo build --workspace [--release]` and `swift build
+# [-c release]` (from apps/macos/) have already run — the script
+# just copies the binary and plist into the bundle layout.
 
 set -euo pipefail
 
-CONFIG="${1:-debug}"
+CONFIG="${1:-release}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$APP_DIR/../.." && pwd)"

@@ -13,10 +13,21 @@ struct StatusBar: View {
             Label(formatRate(model.effectiveSampleRateHz), systemImage: "metronome")
             Spacer()
             if let err = model.lastError {
-                Label(err, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.red)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    Label(err, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .help(err)
+                    Button {
+                        model.clearError()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.red.opacity(0.7))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss error")
+                }
             }
         }
         .font(.caption)

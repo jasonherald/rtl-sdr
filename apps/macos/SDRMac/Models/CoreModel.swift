@@ -50,10 +50,24 @@ final class CoreModel {
 
     var centerFrequencyHz: Double = 100_700_000
     var vfoOffsetHz: Double = 0
-    /// Raw source rate (display bandwidth). Updated from
-    /// `DisplayBandwidth` events.
-    var sampleRateHz: Double = 2_000_000
-    /// Post-decimation. Updated from `SampleRateChanged` events.
+    /// User-selected source sample rate — what the tuner is
+    /// configured at (e.g., 2.048 MHz, 2.4 MHz). Bound to the
+    /// Source sidebar's sample-rate picker. Pushed to the engine
+    /// via `setSampleRate` on user edit. The engine does not
+    /// currently echo back source-rate confirmation events, so
+    /// this field is optimistic — it reflects the user's
+    /// request, not a post-apply readback.
+    ///
+    /// Default `2_048_000` must match an entry in the picker's
+    /// rate list (see `SourceSection.rtlSdrSampleRates`).
+    /// Otherwise the Picker would render with no visible
+    /// selection on first launch.
+    var sourceSampleRateHz: Double = 2_048_000
+    /// Engine-reported post-decimation / post-resample rate.
+    /// Updated from `SampleRateChanged` and `DisplayBandwidth`
+    /// events (both carry the same effective rate in v1). Used
+    /// by the status bar and, in M4, by the spectrum renderer
+    /// as its display span.
     var effectiveSampleRateHz: Double = 250_000
     var ppmCorrection: Int = 0
 
@@ -108,6 +122,13 @@ final class CoreModel {
     /// if the engine is already up.
     func bootstrap(configPath: URL) async {
         guard core == nil else { return }
+        // Install the Rust tracing subscriber once at process
+        // start so engine errors and info logs land on stderr
+        // (captured by Console.app / the xcrun log stream).
+        // `initLogging` is idempotent via a OnceLock on the Rust
+        // side — safe to call more than once, subsequent calls
+        // are no-ops.
+        SdrCore.initLogging(minLevel: .info)
         do {
             let c = try SdrCore(configPath: configPath)
             self.core = c
@@ -146,7 +167,12 @@ final class CoreModel {
             case .gainList(let gains):
                 availableGains = gains
             case .displayBandwidth(let hz):
-                sampleRateHz = hz
+                // Engine-reported spectrum-display bandwidth.
+                // Same value as `sampleRateChanged` in v1 (both
+                // are effective_sample_rate on the Rust side);
+                // we land them on the same UI field rather than
+                // maintain two copies.
+                effectiveSampleRateHz = hz
             case .error(let msg):
                 lastError = msg
             }
@@ -159,6 +185,16 @@ final class CoreModel {
 
     func start() {
         guard let core else { lastError = "engine not initialized"; return }
+        // Push the UI's current configuration to the engine
+        // BEFORE asking it to start. UI defaults and engine
+        // defaults don't agree out of the box (engine has its
+        // own Rust-side defaults — see `DEFAULT_CENTER_FREQ`
+        // etc. in `crates/sdr-core/src/controller.rs`), and
+        // optimistic setters only fire when the user touches a
+        // control. Syncing on Start guarantees "what you see is
+        // what the engine runs with" without waiting for the
+        // user to tap every knob.
+        syncToEngine()
         do {
             try core.start()
             isRunning = true
@@ -166,6 +202,31 @@ final class CoreModel {
         } catch {
             lastError = "start failed: \(error)"
         }
+    }
+
+    /// Push every optimistic-setter UI field to the engine.
+    /// Called from `start()` so the engine comes up in the same
+    /// state the UI is displaying. Safe to call anytime; each
+    /// command is a no-op if the value already matches. Errors
+    /// land in `lastError` via the individual setters' `capture`
+    /// helper.
+    func syncToEngine() {
+        guard core != nil else { return }
+        setCenter(centerFrequencyHz)
+        setVfoOffset(vfoOffsetHz)
+        setSampleRate(sourceSampleRateHz)
+        setPpm(ppmCorrection)
+        setGain(gainDb)
+        setAgc(agcEnabled)
+        setDemodMode(demodMode)
+        setBandwidth(bandwidthHz)
+        setSquelchEnabled(squelchEnabled)
+        setSquelchDb(squelchDb)
+        setDeemphasis(deemphasis)
+        setVolume(volume)
+        setFftSize(fftSize)
+        setFftWindow(fftWindow)
+        setFftRate(fftRateFps)
     }
 
     func stop() {
@@ -185,6 +246,11 @@ final class CoreModel {
     func setCenter(_ hz: Double) {
         centerFrequencyHz = hz
         capture { try core?.tune(hz) }
+    }
+
+    func setSampleRate(_ hz: Double) {
+        sourceSampleRateHz = hz
+        capture { try core?.setSampleRate(hz) }
     }
 
     func setVfoOffset(_ hz: Double) {
@@ -256,6 +322,12 @@ final class CoreModel {
     /// affect local rendering contrast.
     func setMinDb(_ db: Float) { minDb = db }
     func setMaxDb(_ db: Float) { maxDb = db }
+
+    /// Dismiss the current error banner. Called from the status
+    /// bar's "X" button and reset on the next successful start.
+    func clearError() {
+        lastError = nil
+    }
 
     // ==========================================================
     //  Internal helpers

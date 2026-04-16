@@ -26,8 +26,10 @@ struct SourceSection: View {
             }
 
             LabeledContent("Sample rate") {
-                @Bindable var m = model
-                Picker("", selection: $m.sampleRateHz) {
+                Picker("", selection: Binding(
+                    get: { model.sourceSampleRateHz },
+                    set: { model.setSampleRate($0) }
+                )) {
                     ForEach(rtlSdrSampleRates, id: \.self) {
                         Text(formatRate($0)).tag($0)
                     }
