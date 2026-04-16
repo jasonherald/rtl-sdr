@@ -11,7 +11,7 @@ distribution.
 
 ## Layout
 
-```
+```text
 apps/macos/Packages/SdrCoreKit/
 ├── Package.swift
 ├── README.md                       (you are here)

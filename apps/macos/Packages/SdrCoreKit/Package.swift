@@ -83,6 +83,24 @@ let package = Package(
                 ]),
                 // Link the static archive.
                 .linkedLibrary("sdr_ffi"),
+                // libc++ — whisper.cpp (pulled in transitively via
+                // sdr-transcription's whisper-cpu default backend)
+                // is C++, and ggml / whisper.cpp use a handful of
+                // libc++ symbols that don't come for free from a
+                // pure-Rust static lib. whisper-rs-sys's build.rs
+                // emits `cargo:rustc-link-lib=dylib=c++` which flows
+                // into libsdr_ffi.a's link metadata, but Swift
+                // doesn't see that — we re-state it here so the
+                // final binary links against /usr/lib/libc++.dylib.
+                .linkedLibrary("c++"),
+                // Accelerate — whisper.cpp's ggml uses vDSP and
+                // cblas routines from the Accelerate framework for
+                // vector math on macOS. Same situation as libc++:
+                // whisper-rs-sys emits a framework link directive
+                // which is honored in a Rust binary link but not
+                // propagated through to a Swift consumer of our
+                // static archive.
+                .linkedFramework("Accelerate"),
                 // macOS system frameworks that libsdr_ffi pulls in
                 // transitively via sdr-sink-audio (CoreAudio on
                 // this target). Declaring them explicitly here

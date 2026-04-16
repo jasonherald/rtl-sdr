@@ -395,7 +395,24 @@ pub unsafe extern "C" fn sdr_core_set_iq_correction(handle: *mut SdrCore, enable
 //  Spectrum display
 // ============================================================
 
-/// Set the FFT size. Must be a nonzero power of two.
+/// Maximum accepted FFT size. Matches the GTK display panel's
+/// upper bound (`FFT_SIZES` in `sdr-ui::sidebar::display_panel`,
+/// which tops out at 65536). Without an upper bound, a host that
+/// passes `usize::MAX` — or, on Swift, the interpretation of a
+/// signed `Int.max` through the unsigned `usize` parameter —
+/// would trigger an unbounded allocation attempt in rustfft
+/// and OOM the process before the engine can refuse it. The
+/// controller doesn't impose its own upper bound at the moment,
+/// so the FFI is the place to clamp.
+///
+/// 65536 bins at float32 = 256 KB per FFT buffer, well under
+/// any reasonable budget. Hosts that need more can raise this
+/// in a future ABI minor bump alongside whatever upstream work
+/// makes the engine comfortable with it.
+const MAX_FFT_SIZE: usize = 65536;
+
+/// Set the FFT size. Must be a nonzero power of two and
+/// `<= MAX_FFT_SIZE`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_set_fft_size(handle: *mut SdrCore, n: usize) -> i32 {
     unsafe {
@@ -403,6 +420,12 @@ pub unsafe extern "C" fn sdr_core_set_fft_size(handle: *mut SdrCore, n: usize) -
             if n == 0 || !n.is_power_of_two() {
                 set_last_error(format!(
                     "sdr_core_set_fft_size: size must be a nonzero power of two, got {n}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            }
+            if n > MAX_FFT_SIZE {
+                set_last_error(format!(
+                    "sdr_core_set_fft_size: size {n} exceeds maximum {MAX_FFT_SIZE}"
                 ));
                 return Err(SdrCoreError::InvalidArg);
             }
@@ -676,6 +699,40 @@ mod tests {
             unsafe { sdr_core_set_fft_size(h, 2048) },
             SdrCoreError::Ok.as_int()
         );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_fft_size_rejects_values_above_max() {
+        // Guards against a host passing usize::MAX (or, on
+        // Swift, a sign-cast of a negative Int) and tripping
+        // an unbounded allocation in rustfft. The boundary is
+        // a power of two so the "not a power of two" check
+        // wouldn't catch it.
+        let h = make_handle();
+
+        // MAX_FFT_SIZE itself must be accepted.
+        assert_eq!(
+            unsafe { sdr_core_set_fft_size(h, super::MAX_FFT_SIZE) },
+            SdrCoreError::Ok.as_int()
+        );
+
+        // 2 * MAX_FFT_SIZE is a power of two but over the cap.
+        assert_eq!(
+            unsafe { sdr_core_set_fft_size(h, super::MAX_FFT_SIZE * 2) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+
+        // usize::MAX isn't a power of two, so it already gets
+        // caught by the earlier check — but the upper-bound
+        // check is defense in depth. Pick a large power of two
+        // that's over the cap to exercise the new arm.
+        let large_power_of_two: usize = 1 << 30; // 1 GiB worth of bins
+        assert_eq!(
+            unsafe { sdr_core_set_fft_size(h, large_power_of_two) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+
         destroy(h);
     }
 }

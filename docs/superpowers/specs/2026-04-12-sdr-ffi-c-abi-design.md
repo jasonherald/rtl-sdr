@@ -71,9 +71,17 @@ version = "0.1.0"
 edition.workspace = true
 
 [lib]
-name = "sdr_core"
-crate-type = ["staticlib"]   # v1: link statically into .app to dodge @rpath
-                              # v2 may add cdylib for hot-reload during dev
+# No explicit `name` — defaults to the snake_case crate name
+# (`sdr_ffi`), producing `libsdr_ffi.a`. The naming reason is
+# documented in the implementation spec deviation note: the
+# workspace already has a `sdr-core` Rust crate, and two rlibs
+# with the same name in `target/deps/` break rustdoc. The
+# exported C symbols still all start with `sdr_core_*` —
+# that's the ABI prefix and is independent of the library
+# file name.
+crate-type = ["staticlib", "rlib"]   # v1: staticlib links into .app,
+                                      # rlib lets in-tree integration tests
+                                      # reference the FFI symbols directly
 
 [dependencies]
 sdr-core = { path = "../sdr-core" }

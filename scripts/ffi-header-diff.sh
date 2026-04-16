@@ -100,12 +100,28 @@ normalize() {
             print line
         }
     ' "$file" \
-    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
-    | tr -s '[:space:]' ' ' \
+    | sed -E -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' -e 's/[[:space:]]+/ /g' \
     | grep -vE '^$' \
     | grep -vE '^#' \
     | sort
 }
+# The sed pipeline above does three things:
+#   1. Strip leading whitespace per line.
+#   2. Strip trailing whitespace per line.
+#   3. Collapse runs of *internal* spaces/tabs to a single space,
+#      WITHOUT collapsing newlines.
+# Earlier drafts used `tr -s '[:space:]' ' '` for step 3, which
+# treats \n as whitespace and merges every line into one giant
+# single-line blob. After that merge, the `grep -vE '^#'` filter
+# would see the whole file as starting with `/*` (if the file
+# opens with a comment) or the first line's content, and in either
+# case the header guard's `#ifndef` / `#define` lines at the top
+# were being dropped by the very line filter that's supposed to
+# strip them — except applied across a merged blob, it ate
+# unrelated content too. Preserving line boundaries in the sed
+# form means header guards are dropped correctly and everything
+# else stays on its own line for the sort/diff. CodeRabbit caught
+# this on PR #256 round 1.
 
 HAND_NORM=$(mktemp -t sdr_ffi_hand.XXXXXX)
 GEN_NORM=$(mktemp -t sdr_ffi_gen.XXXXXX)

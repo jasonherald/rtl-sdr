@@ -84,11 +84,30 @@ public final class SdrCore: @unchecked Sendable {
         }
         self.handle = h
 
-        // Set up the event AsyncStream. The continuation is
-        // captured by the C trampoline via the retained
-        // `CallbackBox`.
+        // Set up the event AsyncStream.
+        //
+        // **Bounded buffering**: we use `.bufferingNewest(1)`
+        // instead of the default unbounded policy. The engine
+        // can emit SignalLevel updates at ~50 Hz, plus any
+        // SourceStopped / SampleRateChanged / DeviceInfo /
+        // GainList / DisplayBandwidth / Error events the DSP
+        // controller produces. If a host consumer stops
+        // `for await`-iterating (e.g., a SwiftUI view is
+        // backgrounded), an unbounded AsyncStream would
+        // accumulate every event forever and eventually blow
+        // up memory. Keeping the newest event is the right
+        // behavior for our use case — the UI only cares about
+        // the latest state for each category of event, and a
+        // stale SignalLevel that the consumer never actually
+        // rendered is exactly what we want to drop. CodeRabbit
+        // caught the unbounded form on PR #256 round 1.
+        //
+        // The continuation is captured by the C trampoline via
+        // the retained `CallbackBox`.
         var continuation: AsyncStream<SdrCoreEvent>.Continuation! = nil
-        self.events = AsyncStream { continuation = $0 }
+        self.events = AsyncStream<SdrCoreEvent>(
+            bufferingPolicy: .bufferingNewest(1)
+        ) { continuation = $0 }
         self.eventContinuation = continuation
 
         // Retain the box so the C side can safely dereference
@@ -101,13 +120,32 @@ public final class SdrCore: @unchecked Sendable {
         // `Unmanaged.fromOpaque(...).takeUnretainedValue()`
         // (not `takeRetainedValue` — we don't want the
         // callback to decrement the retain count).
+        //
+        // **Cleanup on failure**: if `sdr_core_set_event_callback`
+        // fails (or if checkRc throws on its return code), the
+        // initializer exits without running `deinit`, which
+        // would leak the native handle created above. We
+        // explicitly destroy the handle on the error path
+        // before rethrowing so the FFI-side resources are
+        // reclaimed. CodeRabbit caught this on PR #256 round 1.
         let boxPtr = Unmanaged.passUnretained(box).toOpaque()
         let registerRc = sdr_core_set_event_callback(
             handle,
             SdrCore.eventTrampoline,
             boxPtr
         )
-        try checkRc(registerRc)
+        if registerRc != 0 {
+            // Drain and finish the continuation so anything
+            // listening gets a clean end signal. Finishing
+            // first, destroying second — the C handle is still
+            // valid when we call `sdr_core_destroy`; if we
+            // tore it down first the continuation's `finish()`
+            // would be a no-op (no harm, just unnecessary
+            // cleanup ordering noise).
+            continuation.finish()
+            sdr_core_destroy(handle)
+            throw SdrCoreError.fromCurrentError(rawCode: registerRc)
+        }
     }
 
     deinit {

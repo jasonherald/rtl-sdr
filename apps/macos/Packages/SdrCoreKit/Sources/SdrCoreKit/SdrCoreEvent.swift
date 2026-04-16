@@ -23,15 +23,20 @@ import sdr_core_c
 //
 // These `Int32` mirrors of the kind discriminants let the switch
 // below match the `kind` field without per-case `Int32(...)`
-// conversions at every arm. Values must stay in lockstep with
-// `SdrEventKind` in `include/sdr_core.h`.
-private let kSourceStopped: Int32    = 1
-private let kSampleRateChanged: Int32 = 2
-private let kSignalLevel: Int32      = 3
-private let kDeviceInfo: Int32       = 4
-private let kGainList: Int32         = 5
-private let kDisplayBandwidth: Int32 = 6
-private let kError: Int32            = 7
+// conversions at every arm.
+//
+// **The values are derived from the Clang-imported `SdrEventKind`
+// enum rather than hard-coded literals** so any future renumber
+// in `include/sdr_core.h` flows through automatically — the Swift
+// side can't drift from the C header silently. CodeRabbit caught
+// the hard-coded form on PR #256 round 1.
+private let kSourceStopped    = Int32(SDR_EVT_SOURCE_STOPPED.rawValue)
+private let kSampleRateChanged = Int32(SDR_EVT_SAMPLE_RATE_CHANGED.rawValue)
+private let kSignalLevel      = Int32(SDR_EVT_SIGNAL_LEVEL.rawValue)
+private let kDeviceInfo       = Int32(SDR_EVT_DEVICE_INFO.rawValue)
+private let kGainList         = Int32(SDR_EVT_GAIN_LIST.rawValue)
+private let kDisplayBandwidth = Int32(SDR_EVT_DISPLAY_BANDWIDTH.rawValue)
+private let kError            = Int32(SDR_EVT_ERROR.rawValue)
 
 /// High-level event from the engine.
 ///
