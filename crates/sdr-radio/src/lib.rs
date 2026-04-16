@@ -205,12 +205,39 @@ impl RadioModule {
         af_chain
             .set_ctcss_mode(self.ctcss_mode)
             .map_err(|e| RadioError::ModeSwitchFailed(format!("failed to set CTCSS mode: {e}")))?;
-        // Restore voice squelch mode. Like CTCSS, the gate state
-        // intentionally resets to closed on mode switch — the new
-        // AF chain is a fresh detector and has to warm up before
-        // opening.
+        // Voice squelch: apply LIVE only when the new mode is
+        // NFM. Syllabic and Snr detectors are calibrated around
+        // human speech shape — on WFM broadcast audio they'd
+        // mangle music and non-speech content, on AM/SSB the
+        // signal characteristics are different, and on DSB/CW/
+        // RAW the concept doesn't apply at all. Rather than let
+        // a stale cached Syllabic or Snr mode silently gate the
+        // speaker on WFM, we force the live AF chain to Off for
+        // any non-NFM mode.
+        //
+        // **Important**: we do NOT clear `self.voice_squelch_mode`
+        // here — the cached setting is preserved across the
+        // mode switch. When the user returns to NFM later, the
+        // cached mode is reapplied live and their tuning
+        // survives. This is a cleaner model than the
+        // force-clear-on-leave pattern CTCSS uses: the user's
+        // voice squelch configuration is "armed" and will
+        // automatically re-engage on NFM without requiring
+        // manual reselection.
+        //
+        // The UI layer's `apply_demod_visibility` hides the
+        // voice squelch rows on non-NFM modes (same as CTCSS),
+        // so the user never sees controls for a feature that
+        // isn't currently live. Their cached selection is
+        // preserved in the combo row as well so the roundtrip
+        // is seamless.
+        let live_voice_squelch_mode = if mode == DemodMode::Nfm {
+            self.voice_squelch_mode
+        } else {
+            VoiceSquelchMode::Off
+        };
         af_chain
-            .set_voice_squelch_mode(self.voice_squelch_mode)
+            .set_voice_squelch_mode(live_voice_squelch_mode)
             .map_err(|e| {
                 RadioError::ModeSwitchFailed(format!("failed to set voice squelch mode: {e}"))
             })?;
@@ -887,39 +914,77 @@ mod tests {
         use sdr_dsp::voice_squelch::VoiceSquelchMode;
 
         let mut radio = RadioModule::with_default_rate().unwrap();
-        // Baseline: default mode is Off at both levels.
+        // Baseline: default mode is Off at both levels. Radio
+        // starts in WFM mode (RadioModule default).
         assert_eq!(radio.voice_squelch_mode(), VoiceSquelchMode::Off);
         assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert_eq!(radio.current_mode(), DemodMode::Wfm);
 
-        // Set a non-default Syllabic mode and verify both
-        // layers report it.
+        // Set a non-default Syllabic mode via the direct setter.
+        // On the CURRENT (WFM) AF chain the direct setter applies
+        // unconditionally — the NFM-only gate lives only in the
+        // `set_mode` rebuild path, not in the direct setter. This
+        // is deliberate: the user's intent on the direct setter
+        // is "use this mode now if applicable," and if they're
+        // on WFM that's their own choice; the gate keeps stale
+        // cached state from re-arming on non-NFM modes across
+        // rebuilds, not from the user's explicit current action.
         let syl = VoiceSquelchMode::Syllabic { threshold: 0.22 };
         radio.set_voice_squelch_mode(syl).unwrap();
         assert_eq!(radio.voice_squelch_mode(), syl);
         assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
 
-        // Mode switch: the AF chain is rebuilt from scratch.
-        // The cached voice-squelch mode must be reapplied by
-        // set_mode's replay block, so both the RadioModule
-        // cache AND the new AF chain instance must still
-        // report Syllabic at the same threshold.
+        // Mode switch to NFM: the AF chain is rebuilt from
+        // scratch. The NFM gate passes, so the cached Syllabic
+        // mode applies live on the new chain.
         radio.set_mode(DemodMode::Nfm).unwrap();
         assert_eq!(radio.voice_squelch_mode(), syl);
         assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
 
-        // Another mode switch — same invariant must hold.
+        // Switch AWAY from NFM to AM. The cache must preserve
+        // the user's Syllabic setting, but the live AF chain
+        // must be forced to Off — voice squelch is calibrated
+        // for speech and doesn't apply to AM.
         radio.set_mode(DemodMode::Am).unwrap();
-        assert_eq!(radio.voice_squelch_mode(), syl);
-        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            syl,
+            "cache must preserve user's setting across non-NFM transitions"
+        );
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Off,
+            "live AF chain must NOT run voice squelch on AM"
+        );
 
-        // Flip to Snr and run the same gauntlet.
+        // Back to NFM — the cached Syllabic must re-apply live
+        // without user intervention. This is the core reason
+        // we preserve the cache across non-NFM modes: the user
+        // doesn't have to re-pick voice squelch every time they
+        // visit a non-NFM band and come back.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), syl);
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            syl,
+            "cached setting must re-arm on NFM re-entry"
+        );
+
+        // Flip to Snr and run a NFM → WFM → NFM gauntlet.
         let snr = VoiceSquelchMode::Snr { threshold_db: 9.0 };
         radio.set_voice_squelch_mode(snr).unwrap();
+        radio.set_mode(DemodMode::Wfm).unwrap();
+        assert_eq!(radio.voice_squelch_mode(), snr);
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Off,
+            "WFM must not run voice squelch live"
+        );
         radio.set_mode(DemodMode::Nfm).unwrap();
         assert_eq!(radio.voice_squelch_mode(), snr);
         assert_eq!(radio.af_chain().voice_squelch_mode(), snr);
 
-        // Back to Off — must also round-trip through set_mode.
+        // Explicitly set Off — must stay Off through any mode.
         radio.set_voice_squelch_mode(VoiceSquelchMode::Off).unwrap();
         radio.set_mode(DemodMode::Wfm).unwrap();
         assert_eq!(radio.voice_squelch_mode(), VoiceSquelchMode::Off);

@@ -198,9 +198,23 @@ impl RadioPanel {
         // designed around human speech cadence and Snr keys on
         // a voice-band-centered BPF — neither makes sense on
         // WFM broadcast or SSB where the audio content is
-        // structurally different. Same "force to Off on leave"
-        // pattern as CTCSS to avoid a hidden-but-active state
-        // leak.
+        // structurally different.
+        //
+        // Unlike CTCSS (which force-clears the combo on leave-
+        // NFM), voice squelch PRESERVES the user's selection
+        // across non-NFM transitions. The DSP layer has a
+        // matching gate in `RadioModule::set_mode` that forces
+        // the live AF chain to `Off` for non-NFM modes while
+        // keeping the cached mode intact. So on WFM the combo
+        // still shows "Syllabic" (or whatever the user picked)
+        // but the detector isn't actually running — and on NFM
+        // re-entry everything re-arms automatically without the
+        // user having to reselect the mode.
+        //
+        // The rows just hide/show based on demod mode. The
+        // combo selection is left alone — the user's
+        // configuration survives round-trips through non-NFM
+        // bands.
         let voice_squelch_allowed = mode == sdr_types::DemodMode::Nfm;
         self.voice_squelch_row.set_visible(voice_squelch_allowed);
         self.voice_squelch_status_row
@@ -212,8 +226,16 @@ impl RadioPanel {
         let voice_squelch_active = self.voice_squelch_row.selected() != VOICE_SQUELCH_OFF_IDX;
         self.voice_squelch_threshold_row
             .set_visible(voice_squelch_allowed && voice_squelch_active);
-        if !voice_squelch_allowed {
-            self.voice_squelch_row.set_selected(VOICE_SQUELCH_OFF_IDX);
+        // On re-entry to NFM with a cached active voice-squelch
+        // mode, the status row subtitle might still say
+        // "Signal present — gate open" from the last session if
+        // the DSP detector happened to be open when the user
+        // last left NFM. The fresh AF chain starts closed, so
+        // reset the label to the mode-appropriate "waiting"
+        // text. The first real DSP edge after re-entry will
+        // override this if the detector actually opens.
+        if voice_squelch_allowed && voice_squelch_active {
+            self.set_voice_squelch_open(false);
         }
     }
 
@@ -602,6 +624,11 @@ pub fn build_radio_panel() -> RadioPanel {
         .title("Voice squelch")
         .subtitle("Speech / signal detector, gates alongside CTCSS")
         .model(&voice_squelch_model)
+        // Start hidden — `apply_demod_visibility` reveals it on
+        // NFM. Without this the row would flash briefly on the
+        // default non-NFM startup path before the visibility
+        // handler kicks in, mirroring the CTCSS pattern.
+        .visible(false)
         .build();
 
     // Threshold spin row — starts in syllabic-default range but
