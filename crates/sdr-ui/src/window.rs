@@ -62,16 +62,37 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // the Engine) is dropped, the command channel disconnects, and the
     // detached DSP thread exits naturally.
     //
-    // We `expect` on `Engine::new` because the only failure mode is the
-    // OS rejecting `std::thread::Builder::spawn`, which previously caused
-    // the process to exit anyway via `std::process::exit(1)` inside the
-    // old `spawn_dsp_thread`. Keeping the same panic-on-spawn-failure
-    // semantics for now; the FFI side will surface this as an error code.
-    let engine = Rc::new(Engine::new().expect("DSP engine should spawn"));
+    // `Engine::new` can fail if the OS rejects `std::thread::Builder::spawn`
+    // (rare, but possible under resource pressure). Earlier drafts of this
+    // function used `.expect()` and panicked, which CodeRabbit correctly
+    // flagged — panicking from inside a GTK activation handler produces
+    // an unclean shutdown and no user-visible error. We now log the error
+    // and call `app.quit()` so the process shuts down cleanly; subsequent
+    // activations can retry. The window is never presented in this
+    // failure path, so the user sees the app briefly register on the
+    // taskbar and then exit — not ideal UX, but the root cause is a
+    // host-OS resource issue the user will see in the tracing logs.
+    let engine = match Engine::new(config.path().to_path_buf()) {
+        Ok(e) => Rc::new(e),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to spawn DSP engine — aborting window build");
+            app.quit();
+            return;
+        }
+    };
     let ui_tx = engine.command_sender();
-    let dsp_rx = engine
-        .subscribe()
-        .expect("Engine::subscribe must return Some on its first call");
+    let Some(dsp_rx) = engine.subscribe() else {
+        // `Engine::subscribe` is a one-shot; a second caller would
+        // get `None`. We're the first (and only) subscriber, so this
+        // arm only fires if someone threads the engine through a
+        // pre-subscribe hook in the future. Log, quit, return.
+        tracing::error!(
+            "Engine::subscribe returned None — another subscriber \
+             already took the event receiver"
+        );
+        app.quit();
+        return;
+    };
     let fft_shared = engine.fft_buffer();
 
     // Shared application state with DSP sender.

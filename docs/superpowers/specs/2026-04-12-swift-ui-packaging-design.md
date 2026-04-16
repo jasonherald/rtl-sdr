@@ -49,7 +49,7 @@ SDRMac.app/
 │       └── CodeResources
 ```
 
-The `SDRMac` binary statically links `libsdr_core.a`, so there's no `Frameworks/libsdr_core.dylib` to deal with — one binary, one signature, one notarization submission. This is the entire reason the FFI spec picked `staticlib` for v1.
+The `SDRMac` binary statically links `libsdr_ffi.a`, so there's no `Frameworks/libsdr_core.dylib` to deal with — one binary, one signature, one notarization submission. This is the entire reason the FFI spec picked `staticlib` for v1.
 
 ## Repository Layout
 
@@ -120,7 +120,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_DIR="${REPO}/target"
-LIPO_LIB="${TARGET_DIR}/universal/release/libsdr_core.a"
+LIPO_LIB="${TARGET_DIR}/universal/release/libsdr_ffi.a"
 
 CONFIG="${1:-Debug}"        # Debug | Release
 
@@ -134,8 +134,8 @@ done
 # 2. lipo into a universal static lib that Xcode can link.
 mkdir -p "$(dirname "${LIPO_LIB}")"
 lipo -create \
-    "${TARGET_DIR}/aarch64-apple-darwin/release/libsdr_core.a" \
-    "${TARGET_DIR}/x86_64-apple-darwin/release/libsdr_core.a" \
+    "${TARGET_DIR}/aarch64-apple-darwin/release/libsdr_ffi.a" \
+    "${TARGET_DIR}/x86_64-apple-darwin/release/libsdr_ffi.a" \
     -output "${LIPO_LIB}"
 
 # 3. Build the Xcode project. The project's "Library Search Paths" build setting
@@ -162,15 +162,15 @@ In `SDRMac.xcodeproj`, the `SDRMac` target's Build Settings include:
 
 ```text
 LIBRARY_SEARCH_PATHS = $(SDR_CORE_LIB_PATH:dir)
-OTHER_LDFLAGS        = -lsdr_core -lc++ -framework AudioUnit -framework CoreAudio -framework AudioToolbox -framework Metal -framework MetalKit
+OTHER_LDFLAGS        = -lsdr_ffi -lc++ -framework AudioUnit -framework CoreAudio -framework AudioToolbox -framework Metal -framework MetalKit
 HEADER_SEARCH_PATHS  = $(SRCROOT)/../../include
 ARCHS                = arm64 x86_64
 ONLY_ACTIVE_ARCH     = NO     (for Release; YES for Debug to keep dev iteration fast)
 ```
 
-`SDR_CORE_LIB_PATH` is injected by `build-mac.sh`. When developers open Xcode directly without running the script first, Xcode falls back to a sensible default (`$(SRCROOT)/../../target/universal/release/libsdr_core.a`) and produces a clear "library not found" error if the script hasn't been run yet, with a hint pointing at the script.
+`SDR_CORE_LIB_PATH` is injected by `build-mac.sh`. When developers open Xcode directly without running the script first, Xcode falls back to a sensible default (`$(SRCROOT)/../../target/universal/release/libsdr_ffi.a`) and produces a clear "library not found" error if the script hasn't been run yet, with a hint pointing at the script.
 
-The `-lc++` is required because some `coreaudio-rs` symbols pull in C++ runtime bits (small, unavoidable). `-framework Metal -framework MetalKit` is needed for the renderer. `AudioUnit` / `CoreAudio` / `AudioToolbox` are needed by `libsdr_core.a` (CoreAudio sink).
+The `-lc++` is required because some `coreaudio-rs` symbols pull in C++ runtime bits (small, unavoidable). `-framework Metal -framework MetalKit` is needed for the renderer. `AudioUnit` / `CoreAudio` / `AudioToolbox` are needed by `libsdr_ffi.a` (CoreAudio sink).
 
 ## Info.plist & Entitlements
 
@@ -216,7 +216,7 @@ If a future feature actually needs an entitlement (e.g., the v2 Mac App Store pa
 
 **Why hardened runtime is on:** notarization requires it. The signing flag (`--options runtime`) enables it; the entitlements file does not need any keys to support a non-sandboxed, non-JIT app under the hardened runtime — that's the default secure configuration.
 
-**USB validation spike (must run before M5 starts):** confirm that an unsandboxed, hardened-runtime, codesigned, notarized "hello world" app statically linked against `libsdr_core.a` (which embeds `rusb`/libusb via the static lib) can enumerate USB devices and open an RTL-SDR. Done as a 1-day spike on a real macOS box. The expected outcome is "yes, with no entitlements" — many open-source SDR apps on macOS have proven this works. If the spike fails, we revisit (likely candidate: `com.apple.security.cs.disable-library-validation` if the linking pulls in a runtime dylib we didn't expect, or `IOUSBHost` if we have to leave libusb behind entirely). The risk is real but bounded.
+**USB validation spike (must run before M5 starts):** confirm that an unsandboxed, hardened-runtime, codesigned, notarized "hello world" app statically linked against `libsdr_ffi.a` (which embeds `rusb`/libusb via the static lib) can enumerate USB devices and open an RTL-SDR. Done as a 1-day spike on a real macOS box. The expected outcome is "yes, with no entitlements" — many open-source SDR apps on macOS have proven this works. If the spike fails, we revisit (likely candidate: `com.apple.security.cs.disable-library-validation` if the linking pulls in a runtime dylib we didn't expect, or `IOUSBHost` if we have to leave libusb behind entirely). The risk is real but bounded.
 
 ## Code Signing
 
@@ -481,7 +481,7 @@ Smaller binary, faster code, no debug bloat in the shipped `.a`.
 This is M6, the final milestone. Sub-PRs:
 
 1. **`apps/macos/` skeleton** — empty Xcode project, `Package.swift`, `build-mac.sh`. Builds an empty SwiftUI window.
-2. **Wire `libsdr_core.a` linkage** — Xcode build settings, OTHER_LDFLAGS, header search paths. Verifies the FFI is callable from Swift end-to-end via a smoke test that calls `sdr_core_abi_version()` and prints it.
+2. **Wire `libsdr_ffi.a` linkage** — Xcode build settings, OTHER_LDFLAGS, header search paths. Verifies the FFI is callable from Swift end-to-end via a smoke test that calls `sdr_core_abi_version()` and prints it.
 3. **Code-signing scripts + entitlements file** — `sign-mac.sh`, ad-hoc signing works, `codesign --verify` clean.
 4. **Notarization script + GitHub workflow** — `release-mac.sh` succeeds locally, then the workflow runs on tag.
 5. **dmg packaging** — `release-mac.sh` produces the dmg, workflow uploads to release.
@@ -494,4 +494,4 @@ This is M6, the final milestone. Sub-PRs:
 - [Apple — `notarytool`](https://developer.apple.com/documentation/security/customizing_the_notarization_workflow)
 - [`coreaudio-rs`](https://github.com/RustAudio/coreaudio-rs) — informs framework link list
 - `2026-04-12-sdr-ffi-c-abi-design.md` — explains why staticlib was chosen and what gets linked
-- `2026-04-12-coreaudio-sink-design.md` — what `libsdr_core.a` needs from CoreAudio at link time
+- `2026-04-12-coreaudio-sink-design.md` — what `libsdr_ffi.a` needs from CoreAudio at link time

@@ -1,0 +1,39 @@
+[package]
+name = "sdr-ffi"
+version = "0.1.0"
+description = "Hand-rolled C ABI exposing the sdr-core SDR engine to Swift / C / other native consumers. Source of truth for the contract is `include/sdr_core.h` (hand-written, not generated)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The library is published as both a `staticlib` (the v1 default — Apple
+# `.app` bundles statically link `libsdr_ffi.a` so there's one binary to
+# sign and no `@rpath` plumbing) and an `rlib` so the in-tree integration
+# tests can link against it directly. The C-side artifact is named
+# `libsdr_ffi.a` (from the default `[lib].name = "sdr_ffi"`) rather than
+# `libsdr_core.a` because the workspace already has a `sdr-core` Rust
+# crate, and two rlibs with the same name in the workspace deps directory
+# break rustdoc and any consumer that links against both. The exported
+# C symbols still all start with `sdr_core_*` (that's the public ABI
+# prefix and is independent of the library file name). Spec deviation
+# from `docs/superpowers/specs/2026-04-12-sdr-ffi-c-abi-design.md` —
+# the spec referenced `libsdr_core.a` and is updated in the same PR.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+sdr-core.workspace = true
+sdr-types.workspace = true
+# sdr-pipeline and sdr-radio are needed for the enum types the
+# command module translates at the FFI boundary (FftWindow,
+# DeemphasisMode). Both are pulled in transitively via sdr-core
+# anyway, but declaring them explicitly means we don't get burned
+# by a future sdr-core refactor that drops the transitive edge.
+sdr-pipeline.workspace = true
+sdr-radio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+libc.workspace = true
+
+[lints]
+workspace = true

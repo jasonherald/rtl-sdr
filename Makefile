@@ -20,7 +20,8 @@ CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v1
 .PHONY: all build install install-bin install-sherpa-runtime-libs \
         install-cuda-redist-libs install-icon install-desktop uninstall \
         fetch-cuda-redist test clippy fmt fmt-check \
-        lint deny audit scan clean help
+        lint deny audit scan clean help \
+        ffi-header-check ffi-header-regen swift-test
 
 # Runtime library copy targets are conditionally chained into `install`
 # only when the user asked for a sherpa-cuda build. This is important
@@ -223,7 +224,113 @@ deny:
 audit:
 	$(CARGO) audit
 
-lint: fmt-check clippy test deny audit
+lint: fmt-check clippy test deny audit ffi-header-check
+
+# ─────────────────────────────────────────────────────────────────────
+# sdr-ffi header drift check
+# ─────────────────────────────────────────────────────────────────────
+#
+# `include/sdr_core.h` is the **hand-written** source of truth for the
+# C ABI. `cbindgen` is NOT used to generate it — the hand-written file
+# can carry explanatory comments, section dividers, and
+# human-friendly ordering that a generator would flatten.
+#
+# However, we still want a machine-checked safety net against drift
+# between the Rust source (`crates/sdr-ffi/src/`) and the header.
+# `make ffi-header-check` runs cbindgen in check mode against the
+# Rust sources and diffs the generated signatures against the
+# hand-written header. The check is signature-only — it ignores
+# comments and formatting, so the human-friendly structure of the
+# hand-written header doesn't break the lint.
+#
+# cbindgen is an optional developer tool, installed via:
+#   cargo install cbindgen
+#
+# If cbindgen is not available, the target prints a skip warning
+# and exits 0. CI installs cbindgen explicitly so the check is
+# meaningful there.
+
+CBINDGEN ?= cbindgen
+FFI_HEADER := include/sdr_core.h
+FFI_GENERATED := target/sdr_core.h.generated
+
+ffi-header-check:
+	@if ! command -v $(CBINDGEN) >/dev/null 2>&1; then \
+		echo "cbindgen not installed — skipping ffi-header-check"; \
+		echo "(install with 'cargo install cbindgen' to enable)"; \
+	else \
+		echo "==> cbindgen sdr-ffi → $(FFI_GENERATED)"; \
+		mkdir -p $(dir $(FFI_GENERATED)); \
+		cbindgen_log=$$(mktemp); \
+		if ! $(CBINDGEN) --config crates/sdr-ffi/cbindgen.toml \
+			--crate sdr-ffi \
+			--output $(FFI_GENERATED) >"$$cbindgen_log" 2>&1; then \
+			cat "$$cbindgen_log"; \
+			rm -f "$$cbindgen_log"; \
+			echo "cbindgen failed — aborting ffi-header-check"; \
+			exit 1; \
+		fi; \
+		grep -v '^WARN:' "$$cbindgen_log" || true; \
+		rm -f "$$cbindgen_log"; \
+		echo "==> diff $(FFI_HEADER) vs $(FFI_GENERATED) (signature-only)"; \
+		./scripts/ffi-header-diff.sh $(FFI_HEADER) $(FFI_GENERATED); \
+	fi
+
+# Regenerate the hand-written header from cbindgen output. This is a
+# **manual** starting point for writing a new hand-written header,
+# not a build step — you'd run this once when adding a new batch of
+# FFI functions, then hand-edit the output into the real header.
+ffi-header-regen:
+	@if ! command -v $(CBINDGEN) >/dev/null 2>&1; then \
+		echo "cbindgen not installed — install with 'cargo install cbindgen'"; \
+		exit 1; \
+	fi
+	@mkdir -p $(dir $(FFI_GENERATED))
+	@$(CBINDGEN) --config crates/sdr-ffi/cbindgen.toml \
+		--crate sdr-ffi \
+		--output $(FFI_GENERATED)
+	@echo "Regenerated → $(FFI_GENERATED)"
+	@echo "(Copy signatures by hand into $(FFI_HEADER); do not commit $(FFI_GENERATED).)"
+
+# ─────────────────────────────────────────────────────────────────────
+# SwiftPM (SdrCoreKit) tests
+# ─────────────────────────────────────────────────────────────────────
+#
+# `swift test` in `apps/macos/Packages/SdrCoreKit` needs
+# `target/debug/libsdr_ffi.a` to exist before it can link. `make
+# swift-test` does both in the right order: build the Rust static
+# lib first, then invoke `swift test` with cwd set to the
+# SdrCoreKit package directory.
+#
+# Only meaningful on macOS — Linux users don't have the
+# Xcode/SwiftPM toolchain and the target would skip with a
+# friendly message there.
+
+SWIFT ?= swift
+SDR_CORE_KIT := apps/macos/Packages/SdrCoreKit
+
+swift-test:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "swift-test: skipping (not macOS)"; \
+		exit 0; \
+	fi
+	@if ! command -v $(SWIFT) >/dev/null 2>&1; then \
+		echo "swift-test: $(SWIFT) not found — install Xcode or Swift toolchain"; \
+		exit 1; \
+	fi
+	@echo "==> cargo build --workspace (debug)"
+	@# Build the whole workspace rather than `-p sdr-ffi` so feature
+	@# unification picks up the transcription backend (`whisper-cpu`
+	@# default) from the `sdr` binary. Building `-p sdr-ffi` in
+	@# isolation would not forward any backend feature through
+	@# sdr-core → sdr-transcription and trip the compile_error guard
+	@# in sdr-transcription/src/lib.rs. The artifact we care about
+	@# (`target/debug/libsdr_ffi.a`) is produced either way — the
+	@# workspace build just happens to also compile the GTK UI,
+	@# which we don't need but which is cheap once cached.
+	@$(CARGO) build --workspace
+	@echo "==> cd $(SDR_CORE_KIT) && swift test"
+	@cd $(SDR_CORE_KIT) && $(SWIFT) test
 
 # ─────────────────────────────────────────────────────────────────────
 # SonarQube

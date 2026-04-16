@@ -77,12 +77,28 @@ pub struct Engine {
     /// Wrapped in `Mutex<Option<_>>` because `mpsc::Receiver` is `!Sync`.
     evt_rx: Mutex<Option<mpsc::Receiver<DspToUi>>>,
     fft: Arc<SharedFftBuffer>,
+    /// Config file the engine was told about on construction. Stored
+    /// for future config-persistence wiring; v1 engines don't read
+    /// or write through this path, but accepting it at construction
+    /// time means adding persistence later won't change the public
+    /// API. See [`Engine::config_path`] for the accessor.
+    config_path: std::path::PathBuf,
 }
 
 impl Engine {
     /// Build the engine: create channels, allocate the shared FFT buffer,
     /// and spawn the DSP controller thread. Returns an error if the OS
     /// rejects the thread spawn (rare but possible under resource pressure).
+    ///
+    /// `config_path` is the on-disk location where engine settings
+    /// should eventually be loaded from and persisted to. v1 engines
+    /// accept the path and store it for future use but do not yet
+    /// read or write it — the DSP controller comes up with hardcoded
+    /// defaults (see `crates/sdr-core/src/controller.rs`). Threading
+    /// this argument through now means the FFI surface can take a
+    /// path from the host (`sdr_core_create(config_path_utf8, ...)`)
+    /// without a future ABI change. An empty `PathBuf` is accepted
+    /// and treated as "in-memory / no persistence".
     ///
     /// The DSP thread is **not yet running the source**: send
     /// [`UiToDsp::Start`] via [`Engine::send_command`] to begin sample flow.
@@ -93,7 +109,7 @@ impl Engine {
     ///
     /// Returns [`EngineError::SpawnFailed`] if `std::thread::Builder::spawn`
     /// returns an error.
-    pub fn new() -> Result<Self, EngineError> {
+    pub fn new(config_path: std::path::PathBuf) -> Result<Self, EngineError> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<UiToDsp>();
         let (evt_tx, evt_rx) = mpsc::channel::<DspToUi>();
         let fft = Arc::new(SharedFftBuffer::new(DEFAULT_FFT_BUFFER_SIZE));
@@ -110,7 +126,16 @@ impl Engine {
             cmd_tx,
             evt_rx: Mutex::new(Some(evt_rx)),
             fft,
+            config_path,
         })
+    }
+
+    /// Return the config file path the engine was told about at
+    /// construction. See [`Engine::new`] for the semantics of this
+    /// value in v1 (accepted but unused).
+    #[must_use]
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
     }
 
     /// Send a command to the DSP thread. Non-blocking; safe from any
@@ -207,7 +232,7 @@ mod tests {
 
     #[test]
     fn engine_new_spawns_thread_and_subscribe_returns_once() {
-        let engine = Engine::new().expect("engine should spawn");
+        let engine = Engine::new(std::path::PathBuf::new()).expect("engine should spawn");
 
         // First subscribe returns the receiver.
         let rx = engine.subscribe();
@@ -223,7 +248,7 @@ mod tests {
 
     #[test]
     fn pull_fft_returns_false_with_no_frame() {
-        let engine = Engine::new().expect("engine should spawn");
+        let engine = Engine::new(std::path::PathBuf::new()).expect("engine should spawn");
 
         let mut called = false;
         let got = engine.pull_fft(|_| called = true);
@@ -234,7 +259,7 @@ mod tests {
 
     #[test]
     fn command_sender_clone_is_independent() {
-        let engine = Engine::new().expect("engine should spawn");
+        let engine = Engine::new(std::path::PathBuf::new()).expect("engine should spawn");
         let sender = engine.command_sender();
         // Sending should not error on a freshly spawned engine.
         sender
@@ -244,10 +269,26 @@ mod tests {
 
     #[test]
     fn fft_buffer_arc_shares_state_with_engine() {
-        let engine = Engine::new().expect("engine should spawn");
+        let engine = Engine::new(std::path::PathBuf::new()).expect("engine should spawn");
         let buf = engine.fft_buffer();
         // Arc count: engine + clone we just took = 2.
         // (DSP thread also holds one, so >= 3.)
         assert!(Arc::strong_count(&buf) >= 2);
+    }
+
+    #[test]
+    fn config_path_round_trips() {
+        let path = std::path::PathBuf::from("/tmp/test-sdr-config.json");
+        let engine =
+            Engine::new(path.clone()).expect("engine should spawn with arbitrary config path");
+        assert_eq!(engine.config_path(), path.as_path());
+    }
+
+    #[test]
+    fn empty_config_path_is_accepted() {
+        // Empty PathBuf is the "in-memory / no persistence" signal;
+        // the engine should accept it without complaint.
+        let engine = Engine::new(std::path::PathBuf::new()).expect("engine should spawn");
+        assert!(engine.config_path().as_os_str().is_empty());
     }
 }

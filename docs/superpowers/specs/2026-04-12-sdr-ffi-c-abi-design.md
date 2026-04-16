@@ -71,9 +71,17 @@ version = "0.1.0"
 edition.workspace = true
 
 [lib]
-name = "sdr_core"
-crate-type = ["staticlib"]   # v1: link statically into .app to dodge @rpath
-                              # v2 may add cdylib for hot-reload during dev
+# No explicit `name` — defaults to the snake_case crate name
+# (`sdr_ffi`), producing `libsdr_ffi.a`. The naming reason is
+# documented in the implementation spec deviation note: the
+# workspace already has a `sdr-core` Rust crate, and two rlibs
+# with the same name in `target/deps/` break rustdoc. The
+# exported C symbols still all start with `sdr_core_*` —
+# that's the ABI prefix and is independent of the library
+# file name.
+crate-type = ["staticlib", "rlib"]   # v1: staticlib links into .app,
+                                      # rlib lets in-tree integration tests
+                                      # reference the FFI symbols directly
 
 [dependencies]
 sdr-core = { path = "../sdr-core" }
@@ -452,7 +460,7 @@ For v1 we are at `0.1`. We bump to `0.2` when we add transcription events, netwo
 
 ## Build Integration
 
-The Rust side produces `libsdr_core.a` (staticlib). Xcode is told about it via a SwiftPM `binaryTarget` *or* a build phase that runs `cargo build --release -p sdr-ffi --target <triple>` for both `aarch64-apple-darwin` and `x86_64-apple-darwin`, then `lipo`s them into a universal `libsdr_core.a`. Details in `2026-04-12-swift-ui-packaging-design.md`.
+The Rust side produces `libsdr_ffi.a` (staticlib). Xcode is told about it via a SwiftPM `binaryTarget` *or* a build phase that runs `cargo build --release -p sdr-ffi --target <triple>` for both `aarch64-apple-darwin` and `x86_64-apple-darwin`, then `lipo`s them into a universal `libsdr_ffi.a`. Details in `2026-04-12-swift-ui-packaging-design.md`.
 
 The header `include/sdr_core.h` is exposed as a SwiftPM systemModule:
 

@@ -111,6 +111,7 @@ members = [
     "crates/sdr-radioreference",
     "crates/sdr-transcription",
     "crates/sdr-core",
+    "crates/sdr-ffi",
     "crates/sdr-splash",
     "crates/sdr-splash-gtk",
     "crates/sdr-ui",
@@ -137,6 +138,7 @@ sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
+sdr-ffi = { path = "crates/sdr-ffi" }
 sdr-splash = { path = "crates/sdr-splash" }
 sdr-splash-gtk = { path = "crates/sdr-splash-gtk" }
 sdr-ui = { path = "crates/sdr-ui" }
