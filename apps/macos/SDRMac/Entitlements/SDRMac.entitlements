@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      USB device access for RTL-SDR hardware. Required so the
+      hardened runtime doesn't block libusb-rs / rusb from opening
+      /dev/usb* devices.
+    -->
+    <key>com.apple.security.device.usb</key>
+    <true/>
+
+    <!--
+      Audio input is not used; audio output is the default sink
+      and doesn't require a specific entitlement under the
+      hardened runtime. We declare `device.audio-output` anyway
+      for future Bluetooth output use cases.
+    -->
+    <key>com.apple.security.device.audio-output</key>
+    <true/>
+
+    <!--
+      Network access for future v2 network-IQ source and
+      RadioReference integration. Not strictly needed for MVP
+      but declared so v2 doesn't trigger a codesign-policy rewrite.
+    -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!--
+      Read/write to `~/Library/Application Support/SDRMac/`
+      via user-selected path. We don't need the wider
+      `app-sandbox` key because we're shipping developer-ID
+      (non-sandbox) in v1 per the packaging spec.
+    -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>

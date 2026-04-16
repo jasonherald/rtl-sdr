@@ -21,7 +21,7 @@ CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v1
         install-cuda-redist-libs install-icon install-desktop uninstall \
         fetch-cuda-redist test clippy fmt fmt-check \
         lint deny audit scan clean help \
-        ffi-header-check ffi-header-regen swift-test
+        ffi-header-check ffi-header-regen swift-test mac-app
 
 # Runtime library copy targets are conditionally chained into `install`
 # only when the user asked for a sherpa-cuda build. This is important
@@ -308,6 +308,34 @@ ffi-header-regen:
 
 SWIFT ?= swift
 SDR_CORE_KIT := apps/macos/Packages/SdrCoreKit
+SDR_MAC_APP  := apps/macos
+
+# Build the SwiftUI macOS app as a dev `.app` bundle:
+#   1. cargo build --workspace (produces libsdr_ffi.a with feature
+#      unification — see swift-test comment for why --workspace)
+#   2. swift build from apps/macos/ (the SDRMac executable target)
+#   3. wrap the Mach-O binary into a minimal .app bundle with
+#      Info.plist + entitlements + ad-hoc codesign
+#
+# NOT the production shipping flow — that's M6 (Xcode project +
+# Developer-ID signing + notarization). This target is purely for
+# developer iteration so `open apps/macos/build/SDRMac.app` shows
+# the actual UI.
+mac-app:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "mac-app: skipping (not macOS)"; \
+		exit 0; \
+	fi
+	@if ! command -v $(SWIFT) >/dev/null 2>&1; then \
+		echo "mac-app: $(SWIFT) not found — install Xcode or Swift toolchain"; \
+		exit 1; \
+	fi
+	@echo "==> cargo build --workspace (debug)"
+	@$(CARGO) build --workspace
+	@echo "==> swift build (SDRMac)"
+	@cd $(SDR_MAC_APP) && $(SWIFT) build
+	@echo "==> bundle SDRMac.app"
+	@./$(SDR_MAC_APP)/scripts/bundle-mac-app.sh debug
 
 swift-test:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
