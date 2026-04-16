@@ -17,12 +17,21 @@
 import PackageDescription
 
 let package = Package(
+    // Filesystem / Swift-module name stays `SDRMac` to avoid
+    // churn across test imports and SwiftPM plumbing. The
+    // user-facing executable and bundle name below are
+    // `sdr-rs`, matching the Linux binary and `com.sdr.rs.*`
+    // desktop/bundle identifiers.
     name: "SDRMac",
     platforms: [
         .macOS(.v14),
     ],
     products: [
-        .executable(name: "SDRMac", targets: ["SDRMac"]),
+        // The product name becomes the Mach-O binary filename
+        // inside the .app bundle. `sdr-rs` (with hyphen) is
+        // valid for product names even though Swift target
+        // names can't have hyphens.
+        .executable(name: "sdr-rs", targets: ["SDRMac"]),
     ],
     dependencies: [
         .package(path: "Packages/SdrCoreKit"),

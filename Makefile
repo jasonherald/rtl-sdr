@@ -313,13 +313,14 @@ SDR_MAC_APP  := apps/macos
 # Build the SwiftUI macOS app as a dev `.app` bundle:
 #   1. cargo build --workspace (produces libsdr_ffi.a with feature
 #      unification — see swift-test comment for why --workspace)
-#   2. swift build from apps/macos/ (the SDRMac executable target)
+#   2. swift build from apps/macos/ (the `sdr-rs` executable
+#      product built from the SDRMac Swift target/module)
 #   3. wrap the Mach-O binary into a minimal .app bundle with
-#      Info.plist + entitlements + ad-hoc codesign
+#      Info.plist + entitlements + rasterized icon + ad-hoc codesign
 #
 # NOT the production shipping flow — that's M6 (Xcode project +
 # Developer-ID signing + notarization). This target is purely for
-# developer iteration so `open apps/macos/build/SDRMac.app` shows
+# developer iteration so `open apps/macos/build/sdr-rs.app` shows
 # the actual UI.
 mac-app:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
@@ -342,10 +343,10 @@ mac-app:
 	@# SwiftPM's incremental builder caches the linked binary based
 	@# on Swift source change detection and doesn't notice when the
 	@# Rust static archive it links against has been rebuilt.
-	@rm -f $(SDR_MAC_APP)/.build/release/SDRMac
-	@echo "==> swift build -c release (SDRMac)"
+	@rm -f $(SDR_MAC_APP)/.build/release/sdr-rs
+	@echo "==> swift build -c release (sdr-rs)"
 	@cd $(SDR_MAC_APP) && $(SWIFT) build -c release
-	@echo "==> bundle SDRMac.app"
+	@echo "==> bundle sdr-rs.app"
 	@./$(SDR_MAC_APP)/scripts/bundle-mac-app.sh release
 
 # Debug variant for iterating on non-streaming code paths. Will
@@ -362,10 +363,10 @@ mac-app-debug:
 	fi
 	@echo "==> cargo build --workspace (debug)"
 	@$(CARGO) build --workspace
-	@rm -f $(SDR_MAC_APP)/.build/debug/SDRMac
-	@echo "==> swift build (SDRMac, debug)"
+	@rm -f $(SDR_MAC_APP)/.build/debug/sdr-rs
+	@echo "==> swift build (sdr-rs, debug)"
 	@cd $(SDR_MAC_APP) && $(SWIFT) build
-	@echo "==> bundle SDRMac.app"
+	@echo "==> bundle sdr-rs.app"
 	@./$(SDR_MAC_APP)/scripts/bundle-mac-app.sh debug
 
 swift-test:

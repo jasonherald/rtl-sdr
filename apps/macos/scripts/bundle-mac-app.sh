@@ -34,11 +34,17 @@ APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$APP_DIR/../.." && pwd)"
 
 SWIFT_BUILD_DIR="$APP_DIR/.build/$CONFIG"
-BUNDLE_DIR="$APP_DIR/build/SDRMac.app"
+# Mach-O executable name comes from the SwiftPM product name in
+# `Package.swift`. We ship the app as `sdr-rs` to match the Linux
+# binary name and the shared `com.sdr.rs.*` desktop / bundle
+# identifiers.
+EXE_NAME="sdr-rs"
+BUNDLE_DIR="$APP_DIR/build/sdr-rs.app"
 
-if [ ! -f "$SWIFT_BUILD_DIR/SDRMac" ]; then
-    echo "error: $SWIFT_BUILD_DIR/SDRMac not found" >&2
-    echo "       run 'cargo build --workspace' and 'swift build' first" >&2
+if [ ! -f "$SWIFT_BUILD_DIR/$EXE_NAME" ]; then
+    echo "error: $SWIFT_BUILD_DIR/$EXE_NAME not found" >&2
+    echo "       run 'cargo build --workspace [--release]' and \
+'swift build [-c release]' first" >&2
     exit 1
 fi
 
@@ -47,8 +53,13 @@ rm -rf "$BUNDLE_DIR"
 mkdir -p "$BUNDLE_DIR/Contents/MacOS"
 mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
-cp "$SWIFT_BUILD_DIR/SDRMac" "$BUNDLE_DIR/Contents/MacOS/SDRMac"
+cp "$SWIFT_BUILD_DIR/$EXE_NAME" "$BUNDLE_DIR/Contents/MacOS/$EXE_NAME"
 cp "$APP_DIR/SDRMac/Resources/Info.plist" "$BUNDLE_DIR/Contents/Info.plist"
+
+# Rasterize the shared project SVG to AppIcon.icns next to the
+# binary. The Info.plist declares `CFBundleIconFile = AppIcon`
+# which tells Finder / LaunchServices to pick up this file.
+"$SCRIPT_DIR/make-app-icon.sh" "$BUNDLE_DIR/Contents/Resources" >/dev/null
 
 # Ad-hoc sign so the binary can load on recent macOS — unsigned
 # .app bundles get blocked by the hardened-runtime defaults.
@@ -56,7 +67,7 @@ cp "$APP_DIR/SDRMac/Resources/Info.plist" "$BUNDLE_DIR/Contents/Info.plist"
 echo "==> ad-hoc signing (dev only)"
 codesign --force --sign - \
     --entitlements "$APP_DIR/SDRMac/Entitlements/SDRMac.entitlements" \
-    "$BUNDLE_DIR/Contents/MacOS/SDRMac"
+    "$BUNDLE_DIR/Contents/MacOS/$EXE_NAME"
 
 echo "==> bundle ready: $BUNDLE_DIR"
 echo "    open with:  open '$BUNDLE_DIR'"

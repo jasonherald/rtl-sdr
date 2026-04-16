@@ -1,19 +1,25 @@
-# SDRMac — SwiftUI macOS frontend
+# SDR-RS — SwiftUI macOS frontend
 
 Native macOS app that drives the headless `sdr-core` engine via
-the `sdr-ffi` C ABI. This is the eventual consumer of the
-SwiftUI/Metal epic described in
+the `sdr-ffi` C ABI. Ships as `sdr-rs.app` to match the Linux
+binary name and the shared `com.sdr.rs.*` bundle / desktop IDs.
+
+This is the eventual consumer of the SwiftUI/Metal epic in
 `docs/superpowers/specs/2026-04-12-swift-ui-macos-epic-design.md`.
 
 ## Layout
 
 ```text
 apps/macos/
-├── Package.swift                 — SwiftPM root for the SDRMac app
+├── Package.swift                 — SwiftPM root. Product name
+│                                   `sdr-rs`; module name
+│                                   `SDRMac` (Swift identifier
+│                                   rules — hyphens not allowed
+│                                   in target names).
 ├── README.md                     — (you are here)
 ├── Packages/
 │   └── SdrCoreKit/               — typed Swift wrapper around sdr-ffi
-├── SDRMac/                       — app source
+├── SDRMac/                       — app source (module name)
 │   ├── SDRMacApp.swift           — @main App struct, Window/Settings scenes
 │   ├── ContentView.swift         — top-level NavigationSplitView
 │   ├── Models/
@@ -28,12 +34,14 @@ apps/macos/
 │   │   ├── SettingsView.swift    — Cmd-, settings scene
 │   │   └── SDRCommands.swift     — menu-bar commands
 │   ├── Resources/
-│   │   └── Info.plist            — bundle metadata
+│   │   └── Info.plist            — bundle metadata (CFBundle* names
+│   │                               here are user-facing `sdr-rs`)
 │   └── Entitlements/
 │       └── SDRMac.entitlements   — USB + audio output
 ├── SDRMacTests/                  — XCTest suite
 └── scripts/
-    └── bundle-mac-app.sh         — dev-only .app wrapper
+    ├── bundle-mac-app.sh         — dev-only .app wrapper
+    └── make-app-icon.sh          — rasterize data/com.sdr.rs.svg → .icns
 ```
 
 ## Dev loop
@@ -47,7 +55,7 @@ From the repo root:
 make mac-app
 
 # Launch the app
-open apps/macos/build/SDRMac.app
+open apps/macos/build/sdr-rs.app
 ```
 
 `make mac-app` runs `cargo build --workspace --release`

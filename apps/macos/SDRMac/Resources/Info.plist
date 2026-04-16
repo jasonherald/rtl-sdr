@@ -5,15 +5,17 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>SDR</string>
+    <string>SDR-RS</string>
     <key>CFBundleExecutable</key>
-    <string>SDRMac</string>
+    <string>sdr-rs</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.sdr.rs.mac</string>
+    <string>com.sdr.rs</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>SDRMac</string>
+    <string>sdr-rs</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
