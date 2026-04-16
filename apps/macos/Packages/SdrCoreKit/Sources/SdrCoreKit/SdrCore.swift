@@ -55,12 +55,12 @@ public final class SdrCore: @unchecked Sendable {
     /// Build and start a new engine.
     ///
     /// `configPath` is the on-disk config file the engine should
-    /// eventually load from and persist to. Pass an empty URL
-    /// (`URL(fileURLWithPath: "")`) or a nil-equivalent to run
-    /// with in-memory defaults — v1 engines do not yet read or
-    /// write through this path, but passing a valid path now
-    /// means persistence can land in a follow-up without an
-    /// API change.
+    /// eventually load from and persist to. Pass `nil` to run
+    /// with in-memory defaults and no persistence. Must be a
+    /// file URL if non-nil. v1 engines accept the path and
+    /// store it but do not yet read or write through it —
+    /// passing a valid path now means persistence can land in
+    /// a follow-up without an API change.
     ///
     /// - Throws: `SdrCoreError` with a non-zero code if the
     ///   underlying FFI fails (spawn failure, invalid path,
@@ -179,6 +179,7 @@ public final class SdrCore: @unchecked Sendable {
         init(continuation: AsyncStream<SdrCoreEvent>.Continuation) {
             self.continuation = continuation
         }
+        deinit {}
     }
 
     /// C callback trampoline. Fires from the FFI dispatcher
@@ -370,6 +371,7 @@ public final class SdrCore: @unchecked Sendable {
         ) {
             self.body = body
         }
+        deinit {}
     }
 
     /// C callback trampoline for the FFT pull path.
