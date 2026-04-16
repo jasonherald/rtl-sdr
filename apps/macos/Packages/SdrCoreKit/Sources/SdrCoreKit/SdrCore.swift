@@ -141,16 +141,12 @@ public final class SdrCore: @unchecked Sendable {
             boxPtr
         )
         if registerRc != 0 {
-            // Drain and finish the continuation so anything
-            // listening gets a clean end signal. Finishing
-            // first, destroying second — the C handle is still
-            // valid when we call `sdr_core_destroy`; if we
-            // tore it down first the continuation's `finish()`
-            // would be a no-op (no harm, just unnecessary
-            // cleanup ordering noise).
+            // Capture the error BEFORE destroy — sdr_core_destroy
+            // can overwrite the thread-local last-error message.
+            let error = SdrCoreError.fromCurrentError(rawCode: registerRc)
             continuation.finish()
             sdr_core_destroy(handle)
-            throw SdrCoreError.fromCurrentError(rawCode: registerRc)
+            throw error
         }
     }
 
