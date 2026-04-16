@@ -35,12 +35,12 @@
 
 use std::ffi::{CString, c_char, c_void};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use sdr_core::DspToUi;
 
-use crate::handle::EventCallbackSlot;
+use crate::handle::{EventCallbackGuard, EventCallbackSlot};
 
 // ============================================================
 //  Event kind discriminants — must match `SdrEventKind` in
@@ -149,56 +149,49 @@ pub type SdrEventCallback =
 /// Called from `sdr_core_create` immediately after `Engine::new`.
 pub(crate) fn spawn_dispatcher(
     rx: mpsc::Receiver<DspToUi>,
-    callback_slot: Arc<Mutex<Option<EventCallbackSlot>>>,
+    callback_guard: Arc<EventCallbackGuard>,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("sdr-ffi-event-dispatcher".into())
         .spawn(move || {
-            dispatcher_loop(&rx, &callback_slot);
+            dispatcher_loop(&rx, &callback_guard);
         })
 }
 
 /// Dispatcher thread main loop. Exits when the receiver
 /// disconnects (engine dropped).
-fn dispatcher_loop(rx: &mpsc::Receiver<DspToUi>, callback_slot: &Mutex<Option<EventCallbackSlot>>) {
+fn dispatcher_loop(rx: &mpsc::Receiver<DspToUi>, callback_guard: &EventCallbackGuard) {
     while let Ok(msg) = rx.recv() {
-        // Skip the work entirely if no callback is registered.
-        // This is the "events before registration" case — they
-        // land on the floor rather than being queued.
-        let has_callback = callback_slot
+        let has_callback = callback_guard
+            .state
             .lock()
-            .map(|guard| guard.is_some())
+            .map(|guard| guard.slot.is_some())
             .unwrap_or(false);
         if !has_callback {
             continue;
         }
 
-        dispatch_one(&msg, callback_slot);
+        dispatch_one(&msg, callback_guard);
     }
     tracing::debug!("sdr-ffi event dispatcher exiting (channel disconnected)");
 }
 
-/// Translate one `DspToUi` into an `SdrEvent` and fire the
-/// registered callback. No-op if the callback slot became `None`
-/// between the check in `dispatcher_loop` and the time we
-/// reacquired the lock here (the host can clear the callback at
-/// any time from another thread).
-fn dispatch_one(msg: &DspToUi, callback_slot: &Mutex<Option<EventCallbackSlot>>) {
-    // Stack-local owned storage for borrowed payloads. Kept alive
-    // for the duration of the callback call — the raw pointers
-    // in `SdrEvent` reference these locals.
-    //
-    // Yes, some of these are allocated-then-dropped per event.
-    // The v1 event rate is dominated by SignalLevel updates which
-    // don't allocate at all, so the per-event allocation cost
-    // only matters for the rare DeviceInfo / GainList / Error
-    // paths. If profiling ever shows contention here, we can
-    // reuse per-dispatcher scratch buffers like the CoreAudio
-    // render callback does.
+/// Translate one `DspToUi` into a C-layout `SdrEvent` plus the
+/// owned storage that must outlive the callback (the raw pointers
+/// inside the event reference these locals). Returns `None` for
+/// variants not yet exposed at the FFI boundary.
+///
+/// Allocation cost: the v1 event rate is dominated by SignalLevel
+/// updates which don't allocate at all. The per-event allocation
+/// cost only matters for the rare DeviceInfo / GainList / Error
+/// paths. If profiling ever shows contention here, we can reuse
+/// per-dispatcher scratch buffers like the CoreAudio render
+/// callback does.
+fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<Vec<f64>>)> {
     let mut owned_cstring: Option<CString> = None;
     let mut owned_vec: Option<Vec<f64>> = None;
 
-    let event: SdrEvent = match msg {
+    let event = match msg {
         DspToUi::SourceStopped => SdrEvent {
             kind: SDR_EVT_SOURCE_STOPPED,
             payload: SdrEventPayload { _placeholder: 0 },
@@ -229,8 +222,10 @@ fn dispatch_one(msg: &DspToUi, callback_slot: &Mutex<Option<EventCallbackSlot>>)
             // Replace interior NULs defensively rather than drop
             // the event on an unusual device name.
             let sanitized = name.replace('\0', "?");
-            let cstr = CString::new(sanitized)
-                .unwrap_or_else(|_| CString::new("(unrepresentable device info)").expect("static"));
+            let Ok(cstr) = CString::new(sanitized) else {
+                // Unreachable: replace('\0', "?") removed all interior NULs.
+                return None;
+            };
             let ptr = cstr.as_ptr();
             owned_cstring = Some(cstr);
             SdrEvent {
@@ -256,8 +251,10 @@ fn dispatch_one(msg: &DspToUi, callback_slot: &Mutex<Option<EventCallbackSlot>>)
 
         DspToUi::Error(msg) => {
             let sanitized = msg.replace('\0', "?");
-            let cstr = CString::new(sanitized)
-                .unwrap_or_else(|_| CString::new("(unrepresentable error)").expect("static"));
+            let Ok(cstr) = CString::new(sanitized) else {
+                // Unreachable: replace('\0', "?") removed all interior NULs.
+                return None;
+            };
             let ptr = cstr.as_ptr();
             owned_cstring = Some(cstr);
             SdrEvent {
@@ -306,32 +303,48 @@ fn dispatch_one(msg: &DspToUi, callback_slot: &Mutex<Option<EventCallbackSlot>>)
         | DspToUi::IqRecordingStopped
         | DspToUi::DemodModeChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
-        | DspToUi::VoiceSquelchOpenChanged(_) => return,
+        | DspToUi::VoiceSquelchOpenChanged(_) => return None,
     };
 
-    // Fire the callback. Re-lock the slot here (the outer
-    // `has_callback` check in the loop was just a fast path).
-    //
-    // We wrap the call itself in catch_unwind: if the host's
-    // callback panics (unlikely from Swift / C, but possible from
-    // a host written in another language bound to this ABI), we
-    // don't want the panic to propagate up through our dispatcher
-    // and tear down the thread.
-    let slot_guard = match callback_slot.lock() {
+    Some((event, owned_cstring, owned_vec))
+}
+
+/// Fire the registered callback for one translated `SdrEvent`.
+///
+/// No-op if the callback slot became `None` between the check in
+/// `dispatcher_loop` and the time we reacquired the lock here (the
+/// host can clear the callback at any time from another thread).
+///
+/// Quiescence protocol: we increment `in_flight` before dropping
+/// the lock and decrement after the callback returns. This lets
+/// `sdr_core_set_event_callback` wait for in-flight dispatches to
+/// drain before returning — preventing use-after-free of the old
+/// `user_data` when the host clears or replaces the callback.
+///
+/// The callback itself is wrapped in `catch_unwind`: if the host's
+/// callback panics (unlikely from Swift / C, but possible from a
+/// host written in another language bound to this ABI), we don't
+/// want the panic to propagate up through our dispatcher and tear
+/// down the thread.
+fn dispatch_one(msg: &DspToUi, callback_guard: &EventCallbackGuard) {
+    let Some((event, owned_cstring, owned_vec)) = translate_event(msg) else {
+        return;
+    };
+
+    let mut guard = match callback_guard.state.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(slot) = slot_guard.as_ref()
+    if let Some(slot) = guard.slot.as_ref()
         && let Some(cb) = slot.callback
     {
         let user_data = slot.user_data;
+        guard.in_flight += 1;
         // Release the lock before calling the host to avoid
         // deadlock if the callback re-enters the FFI (e.g.,
         // calls a command that eventually needs this lock).
-        // The borrow of `event` happens via `&raw const` to
-        // match clippy's borrow-as-raw-ptr lint.
         let event_ptr: *const SdrEvent = &raw const event;
-        drop(slot_guard);
+        drop(guard);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: cb is a C callback; user_data ownership
@@ -344,6 +357,15 @@ fn dispatch_one(msg: &DspToUi, callback_slot: &Mutex<Option<EventCallbackSlot>>)
         }));
         if result.is_err() {
             tracing::warn!("sdr-ffi event callback panicked (payload swallowed)");
+        }
+
+        let mut guard = match callback_guard.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.in_flight -= 1;
+        if guard.in_flight == 0 {
+            callback_guard.quiesced.notify_all();
         }
     }
 
@@ -385,15 +407,23 @@ pub unsafe extern "C" fn sdr_core_set_event_callback(
             return SdrCoreError::InvalidHandle.as_int();
         };
 
-        let mut guard = match core.event_callback.lock() {
+        let mut guard = match core.event_callback.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        // Store `Some(slot)` when the host registered a callback,
-        // `None` when they cleared it. `Option::map` lets us do
-        // this without a match arm just for the Some/None dispatch.
-        *guard = callback.map(|cb| EventCallbackSlot {
+        // Wait for any in-flight dispatch of the old callback to
+        // finish before replacing the slot. This guarantees the
+        // host can safely free old user_data after this call returns.
+        while guard.in_flight > 0 {
+            guard = core
+                .event_callback
+                .quiesced
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+
+        guard.slot = callback.map(|cb| EventCallbackSlot {
             callback: Some(cb),
             user_data,
         });

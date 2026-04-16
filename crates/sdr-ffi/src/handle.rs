@@ -10,7 +10,7 @@
 //! on `sdr_core_destroy`. Between those two calls the host owns the
 //! pointer (in the C sense — the Rust `Box` is leaked into raw form).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use sdr_core::Engine;
 
@@ -24,14 +24,10 @@ pub struct SdrCore {
     /// The headless engine. Consumed by `Engine::shutdown` on destroy.
     pub(crate) engine: Engine,
 
-    /// Registered event callback + user_data, set by
-    /// `sdr_core_set_event_callback`. Wrapped in `Arc<Mutex<_>>`
-    /// so the dispatcher thread can hold a clone of the Arc and
-    /// read the slot under the mutex without having to go through
-    /// the `SdrCore` handle (which we never give the dispatcher a
-    /// borrow of — the dispatcher lives independently).
-    /// `None` until the host registers a callback.
-    pub(crate) event_callback: Arc<Mutex<Option<EventCallbackSlot>>>,
+    /// Registered event callback + user_data + quiescence protocol.
+    /// Wrapped in `Arc` so the dispatcher thread can hold a clone
+    /// without borrowing the `SdrCore` handle directly.
+    pub(crate) event_callback: Arc<EventCallbackGuard>,
 
     /// Path the host provided to `sdr_core_create`. Stored for future
     /// config-persistence wiring (the v1 engine doesn't load it yet —
@@ -76,6 +72,25 @@ pub(crate) struct EventCallbackSlot {
 // closures to be Send-friendly).
 unsafe impl Send for EventCallbackSlot {}
 
+/// Mutex-protected callback slot + in-flight counter for quiescence.
+///
+/// When the dispatcher thread invokes the host callback, it increments
+/// `in_flight` (under the mutex) before dropping the lock and calling
+/// the host, then decrements it afterwards. When the host clears or
+/// replaces the callback via `sdr_core_set_event_callback`, the setter
+/// waits on the `quiesced` condvar until `in_flight` reaches zero
+/// before returning — guaranteeing the old callback (and its
+/// `user_data`) is no longer in use when the setter returns.
+pub(crate) struct EventCallbackGuard {
+    pub(crate) state: Mutex<EventCallbackState>,
+    pub(crate) quiesced: Condvar,
+}
+
+pub(crate) struct EventCallbackState {
+    pub slot: Option<EventCallbackSlot>,
+    pub in_flight: usize,
+}
+
 impl SdrCore {
     /// Construct from a successfully-built [`Engine`], the
     /// host-provided config path, and the spawned dispatcher
@@ -83,7 +98,7 @@ impl SdrCore {
     pub(crate) fn new(
         engine: Engine,
         config_path: std::path::PathBuf,
-        event_callback: Arc<Mutex<Option<EventCallbackSlot>>>,
+        event_callback: Arc<EventCallbackGuard>,
         dispatcher_handle: std::thread::JoinHandle<()>,
     ) -> Self {
         Self {

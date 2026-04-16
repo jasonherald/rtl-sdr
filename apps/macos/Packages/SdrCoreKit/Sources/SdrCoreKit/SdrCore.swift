@@ -87,20 +87,19 @@ public final class SdrCore: @unchecked Sendable {
         // Set up the event AsyncStream.
         //
         // **Bounded buffering**: we use `.bufferingNewest(1)`
-        // instead of the default unbounded policy. The engine
-        // can emit SignalLevel updates at ~50 Hz, plus any
-        // SourceStopped / SampleRateChanged / DeviceInfo /
-        // GainList / DisplayBandwidth / Error events the DSP
-        // controller produces. If a host consumer stops
-        // `for await`-iterating (e.g., a SwiftUI view is
-        // backgrounded), an unbounded AsyncStream would
-        // accumulate every event forever and eventually blow
-        // up memory. Keeping the newest event is the right
-        // behavior for our use case — the UI only cares about
-        // the latest state for each category of event, and a
-        // stale SignalLevel that the consumer never actually
-        // rendered is exactly what we want to drop. CodeRabbit
-        // caught the unbounded form on PR #256 round 1.
+        // instead of the default unbounded policy. Without a
+        // bound, a stalled consumer would accumulate events
+        // forever (SignalLevel alone runs at ~50 Hz).
+        //
+        // Trade-off: the 1-slot buffer can drop rare one-shot
+        // events (DeviceInfo, GainList, Error) when a burst of
+        // SignalLevel updates fills the slot between consumer
+        // reads. For v1 this is acceptable — the consumer is
+        // expected to iterate promptly. A v2 improvement is to
+        // split into a high-frequency telemetry stream
+        // (SignalLevel, bufferingNewest(1)) and a separate
+        // control stream (everything else, larger bounded
+        // buffer) so one-shot events are never starved.
         //
         // The continuation is captured by the C trampoline via
         // the retained `CallbackBox`.

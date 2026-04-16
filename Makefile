@@ -261,10 +261,12 @@ ffi-header-check:
 	else \
 		echo "==> cbindgen sdr-ffi → $(FFI_GENERATED)"; \
 		mkdir -p $(dir $(FFI_GENERATED)); \
-		$(CBINDGEN) --config crates/sdr-ffi/cbindgen.toml \
+		if ! $(CBINDGEN) --config crates/sdr-ffi/cbindgen.toml \
 			--crate sdr-ffi \
-			--output $(FFI_GENERATED) 2>&1 | \
-			grep -v '^WARN:' || true; \
+			--output $(FFI_GENERATED) 2>&1 | grep -v '^WARN:'; then \
+			echo "cbindgen failed — aborting ffi-header-check"; \
+			exit 1; \
+		fi; \
 		echo "==> diff $(FFI_HEADER) vs $(FFI_GENERATED) (signature-only)"; \
 		./scripts/ffi-header-diff.sh $(FFI_HEADER) $(FFI_GENERATED); \
 	fi

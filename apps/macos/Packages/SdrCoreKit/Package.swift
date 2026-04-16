@@ -46,8 +46,8 @@ let workspaceTarget = "../../../../target"
 let package = Package(
     name: "SdrCoreKit",
     platforms: [
-        // macOS 26 floor per the epic spec. Locks in the
-        // minimum OS for modern SwiftUI / @Observable /
+        // macOS 14 (Sonoma) floor per the epic spec. Locks in
+        // the minimum OS for modern SwiftUI / @Observable /
         // latest AsyncStream semantics.
         .macOS(.v14),
     ],

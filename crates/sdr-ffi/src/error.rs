@@ -79,9 +79,11 @@ pub fn set_last_error(msg: impl Into<String>) {
     // a static message just in case so we never panic on the error
     // path (which would be ironic).
     let sanitized = owned.replace('\0', "?");
-    let cstring = CString::new(sanitized).unwrap_or_else(|_| {
-        CString::new("(unrepresentable error)").expect("static ASCII has no interior NUL")
-    });
+    let Ok(cstring) = CString::new(sanitized) else {
+        // Unreachable: replace('\0', "?") above removed all interior
+        // NULs. Return without setting the error rather than panic.
+        return;
+    };
     LAST_ERROR.with(|cell| {
         *cell.borrow_mut() = Some(cstring);
     });

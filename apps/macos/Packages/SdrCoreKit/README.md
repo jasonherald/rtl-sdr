@@ -50,14 +50,15 @@ The one-command sequence from the repo root:
 make swift-test
 ```
 
-That target runs `cargo build -p sdr-ffi` and then
+That target runs `cargo build --workspace` (for feature
+unification with the transcription backend) and then
 `swift test` in this directory. Use it instead of calling
 `swift test` directly.
 
 Manual equivalent:
 
 ```bash
-cargo build -p sdr-ffi
+cargo build --workspace
 cd apps/macos/Packages/SdrCoreKit
 swift build        # compile only
 swift test         # compile + run the XCTest suite

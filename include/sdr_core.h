@@ -145,12 +145,12 @@ void sdr_core_init_logging(int32_t min_level);
  * Create a new engine instance.
  *
  * `config_path_utf8` is the on-disk config file the engine should
- * eventually load from and persist to. Must be a NUL-terminated
- * UTF-8 string. Pass an empty string ("") to run with in-memory
- * defaults and no persistence. v1 engines accept the path and
- * store it for future use but do not yet read or write through it
- * — passing a valid path now means persistence can land in a
- * follow-up without an ABI change.
+ * eventually load from and persist to. Must be either NULL or a
+ * NUL-terminated UTF-8 string. NULL and empty string ("") are
+ * equivalent: both run with in-memory defaults and no persistence.
+ * v1 engines accept the path and store it for future use but do
+ * not yet read or write through it — passing a valid path now
+ * means persistence can land in a follow-up without an ABI change.
  *
  * On success: writes the opaque handle to `*out_handle` and
  * returns `SDR_CORE_OK`. The handle must eventually be released
@@ -162,9 +162,9 @@ void sdr_core_init_logging(int32_t min_level);
  * `sdr_core_last_error_message`.
  *
  * Possible errors:
- *   SDR_CORE_ERR_INVALID_ARG     — null pointer arguments, or
- *                                 `config_path_utf8` is not valid
- *                                 UTF-8.
+ *   SDR_CORE_ERR_INVALID_ARG     — `out_handle` is NULL, or
+ *                                 `config_path_utf8` is non-NULL
+ *                                 but not valid UTF-8.
  *   SDR_CORE_ERR_INTERNAL        — DSP thread spawn failed, or a
  *                                 Rust panic crossed the boundary.
  */
@@ -490,9 +490,9 @@ typedef void (*SdrFftCallback)(const SdrFftFrame* frame, void* user_data);
  * ready — hosts render the previous frame again (or skip
  * rendering) in that case.
  *
- * Lock-free fast path when no new frame is available; acquires
- * the shared FFT buffer's mutex only for the short `memcpy`
- * window when a frame is being handed to the host.
+ * Fast path when no new frame is available. Acquires the shared
+ * FFT buffer's mutex briefly when a frame is being handed to the
+ * host.
  *
  * Safe from any thread, but in practice hosts call this from
  * their render loop (which is on the main / display-linked

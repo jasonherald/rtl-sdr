@@ -84,9 +84,9 @@ pub type SdrFftCallback =
 /// `callback` when no new frame has arrived since the previous
 /// pull.
 ///
-/// Lock-free fast path when no new frame is available; acquires
-/// the shared FFT buffer's mutex only for the short `memcpy`
-/// window when a frame is being handed to the callback.
+/// Fast path when no new frame is available. Acquires the shared
+/// FFT buffer's mutex briefly when a frame is being handed to
+/// the callback.
 ///
 /// # Safety
 ///

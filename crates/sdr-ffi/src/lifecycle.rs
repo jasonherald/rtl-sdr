@@ -6,7 +6,7 @@
 
 use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use sdr_core::Engine;
 
@@ -149,7 +149,13 @@ pub unsafe extern "C" fn sdr_core_create(
         // both hand back to the same Mutex<Option<_>>, so
         // `sdr_core_set_event_callback` and the dispatcher see
         // the same registration.
-        let event_callback = Arc::new(Mutex::new(None));
+        let event_callback = Arc::new(crate::handle::EventCallbackGuard {
+            state: Mutex::new(crate::handle::EventCallbackState {
+                slot: None,
+                in_flight: 0,
+            }),
+            quiesced: Condvar::new(),
+        });
         let dispatcher_handle = match spawn_dispatcher(evt_rx, Arc::clone(&event_callback)) {
             Ok(h) => h,
             Err(err) => {
@@ -242,10 +248,14 @@ pub unsafe extern "C" fn sdr_core_destroy(handle: *mut SdrCore) {
         // Now join the dispatcher. With the Engine dropped, the
         // event channel is closed and the dispatcher's recv
         // loop should exit immediately.
-        if let Some(handle) = dispatcher_handle
-            && handle.join().is_err()
-        {
-            eprintln!("sdr_core_destroy: dispatcher thread panicked during teardown");
+        if let Some(handle) = dispatcher_handle {
+            if handle.thread().id() == std::thread::current().id() {
+                tracing::error!(
+                    "sdr_core_destroy called from dispatcher thread — skipping join to avoid deadlock"
+                );
+            } else if handle.join().is_err() {
+                eprintln!("sdr_core_destroy: dispatcher thread panicked during teardown");
+            }
         }
     }));
 
