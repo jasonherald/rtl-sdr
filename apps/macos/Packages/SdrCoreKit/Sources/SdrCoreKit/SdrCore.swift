@@ -20,8 +20,9 @@
 //      actor.
 //   4. FFT frames flow via `withLatestFftFrame { ... }` from
 //      the render tick.
-//   5. `shutdown()` is called on `deinit`, but hosts that want
-//      deterministic teardown can call it explicitly.
+//   5. Teardown happens in `deinit`, which unregisters the
+//      callback, finishes the event stream, and calls
+//      `sdr_core_destroy`.
 //
 // The class is `@unchecked Sendable`: the underlying C handle is
 // a `Send + Sync` Rust type (via the FFI contract) and we don't

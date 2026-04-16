@@ -331,10 +331,13 @@ int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
  *     the data must copy it out before returning.
  *
  *   - The callback is safe to be reentrant with other
- *     `sdr_core_*` calls except for `sdr_core_destroy` — calling
- *     destroy from inside the callback is unsupported (the
- *     implementation detects the self-join and skips it, but
- *     teardown is incomplete).
+ *     `sdr_core_*` calls except for `sdr_core_destroy` and
+ *     `sdr_core_set_event_callback`. Destroy from inside the
+ *     callback is unsupported (self-join detected and skipped,
+ *     teardown incomplete). Set-event-callback from inside the
+ *     callback is rejected with `SDR_CORE_ERR_INVALID_ARG`
+ *     (the quiescence wait would deadlock against the in-flight
+ *     dispatch).
  */
 
 typedef enum SdrEventKind {
@@ -396,8 +399,8 @@ typedef union SdrEventPayload {
     SdrEventDeviceInfo device_info;
     SdrEventGainList   gain_list;
     SdrEventError      error;
-    /* Placeholder so kinds with no payload (SOURCE_STOPPED) have
-     * a well-defined zero-byte default. */
+    /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
+     * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;
 } SdrEventPayload;
 

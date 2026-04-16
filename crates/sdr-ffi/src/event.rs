@@ -406,6 +406,27 @@ pub unsafe extern "C" fn sdr_core_set_event_callback(
             return SdrCoreError::InvalidHandle.as_int();
         };
 
+        // Reject re-entry from the dispatcher thread. If the host
+        // calls this from inside the event callback, the quiescence
+        // wait below would deadlock (in_flight is non-zero because
+        // WE are the in-flight dispatch).
+        let is_dispatcher = core
+            .dispatcher_handle
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .map(|h| h.thread().id() == std::thread::current().id())
+            })
+            .unwrap_or(false);
+        if is_dispatcher {
+            set_last_error(
+                "sdr_core_set_event_callback: called from inside the event callback \
+                 (re-entry not supported)",
+            );
+            return SdrCoreError::InvalidArg.as_int();
+        }
+
         let mut guard = match core.event_callback.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
