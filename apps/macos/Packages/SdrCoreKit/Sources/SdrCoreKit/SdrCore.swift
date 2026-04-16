@@ -68,6 +68,12 @@ public final class SdrCore: @unchecked Sendable {
         // Resolve the path to a C string. An empty/nil URL
         // maps to an empty C string, which the FFI treats as
         // "no persistence".
+        if let url = configPath, !url.isFileURL {
+            throw SdrCoreError(
+                code: .invalidArg,
+                message: "configPath must be a file URL, got \(url.scheme ?? "unknown") scheme"
+            )
+        }
         let pathString: String = configPath?.path ?? ""
 
         // Create the handle.

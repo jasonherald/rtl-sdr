@@ -34,8 +34,7 @@
 //! events fired during source open will be missed.
 
 use std::ffi::{CString, c_char, c_void};
-use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use sdr_core::DspToUi;

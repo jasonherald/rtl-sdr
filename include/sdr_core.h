@@ -14,8 +14,10 @@
  *   - The event callback fires on the FFI dispatcher thread, NOT
  *     the host's main thread. The host is responsible for marshaling
  *     to its UI thread.
- *   - `sdr_core_destroy` must NOT be called from inside the event
- *     callback — it joins the dispatcher thread and would deadlock.
+ *   - `sdr_core_destroy` should NOT be called from inside the event
+ *     callback. The implementation detects self-join and skips the
+ *     dispatcher join, but teardown is incomplete in that case —
+ *     always destroy from outside the callback.
  *   - Errors go through a thread-local last-error message; call
  *     `sdr_core_last_error_message()` from the same thread that
  *     observed the error code.
@@ -183,8 +185,10 @@ int32_t sdr_core_create(const char* config_path_utf8, SdrCore** out_handle);
  * sense that passing null is OK; passing the same non-null handle
  * twice is use-after-free and will probably crash.
  *
- * Must NOT be called from inside the event callback — joining the
- * dispatcher thread from its own thread would deadlock.
+ * Should NOT be called from inside the event callback. The
+ * implementation detects a self-join and skips the dispatcher
+ * thread join to avoid deadlock, but teardown is incomplete in
+ * that case. Always destroy from outside the callback.
  */
 void sdr_core_destroy(SdrCore* handle);
 
@@ -293,7 +297,7 @@ typedef enum SdrFftWindow {
     SDR_FFT_WIN_NUTTALL  = 2,
 } SdrFftWindow;
 
-/* `n` must be a nonzero power of two. */
+/* `n` must be a nonzero power of two, at most 65536. */
 int32_t sdr_core_set_fft_size(SdrCore* handle, size_t n);
 int32_t sdr_core_set_fft_window(SdrCore* handle, int32_t window);
 int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
@@ -328,8 +332,9 @@ int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
  *
  *   - The callback is safe to be reentrant with other
  *     `sdr_core_*` calls except for `sdr_core_destroy` — calling
- *     destroy from inside the callback would deadlock against the
- *     dispatcher join.
+ *     destroy from inside the callback is unsupported (the
+ *     implementation detects the self-join and skips it, but
+ *     teardown is incomplete).
  */
 
 typedef enum SdrEventKind {
