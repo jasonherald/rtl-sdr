@@ -34,16 +34,16 @@ final class CoreModel {
     /// successfully. All setters guard on this being non-nil.
     private(set) var core: SdrCore?
 
-    /// Event-consuming task. Cancelled on shutdown.
-    /// `nonisolated(unsafe)` so the `deinit` (which is
-    /// nonisolated by default on a `@MainActor` class) can
-    /// cancel it without hopping back to the main actor. The
-    /// `Task<Void, Never>` handle is itself `Sendable` and
-    /// `cancel()` is thread-safe; the `unsafe` label
-    /// acknowledges that we've opted out of the actor's
-    /// compile-time serialization for this one field, which is
-    /// fine because all other accesses (bootstrap assignment,
-    /// shutdown cancel) happen on the main actor.
+    /// Event-consuming task. Created in `bootstrap`, cancelled
+    /// by `shutdown`. Also self-ends naturally when the
+    /// underlying `SdrCore` handle is released — see the
+    /// "No explicit deinit" comment below and issue #293 for
+    /// the teardown story. This property stays @MainActor-
+    /// isolated like the rest of the model; we experimented
+    /// with making it `nonisolated` to allow deinit access
+    /// and backed off (the `@ObservationTracked` macro that
+    /// backs `@Observable` forbids `nonisolated` on its
+    /// generated storage).
     private var eventTask: Task<Void, Never>?
 
     // ==========================================================
@@ -168,9 +168,17 @@ final class CoreModel {
     func shutdown() {
         eventTask?.cancel()
         eventTask = nil
-        if isRunning, let core {
+        if let core {
+            // Best-effort stop — a thrown error shouldn't leave
+            // the model claiming `isRunning == true` alongside a
+            // nil `core`, which the start() idempotency guard
+            // would then misread as "already running" and
+            // refuse to recover from. Clear `isRunning`
+            // unconditionally below so the next bootstrap+start
+            // cycle starts from a clean slate.
             try? core.stop()
         }
+        isRunning = false
         core = nil
     }
 
@@ -198,6 +206,15 @@ final class CoreModel {
             effectiveSampleRateHz = hz
         case .error(let msg):
             lastError = msg
+        @unknown default:
+            // Surface new engine event variants during
+            // development. SdrCoreEvent is a non-frozen enum
+            // from SdrCoreKit — a future `SDR_EVT_*`
+            // discriminant can be added via a minor ABI bump
+            // without breaking older hosts, and this arm keeps
+            // those extra events visible in the log instead
+            // of silently dropped.
+            print("[CoreModel] unhandled SdrCoreEvent: \(event)")
         }
     }
 
@@ -212,6 +229,10 @@ final class CoreModel {
         // already running", but cheaper to short-circuit here.
         if isRunning { return }
         guard let core else { lastError = "engine not initialized"; return }
+        // Clear any stale error BEFORE syncing so a setter
+        // failure inside syncToEngine() lands on a clean slate
+        // and is detectable below.
+        lastError = nil
         // Push the UI's current configuration to the engine
         // BEFORE asking it to start. UI defaults and engine
         // defaults don't agree out of the box (engine has its
@@ -222,10 +243,18 @@ final class CoreModel {
         // what the engine runs with" without waiting for the
         // user to tap every knob.
         syncToEngine()
+        // Fail fast if the sync produced a setter error — don't
+        // then flip `isRunning` true while the engine is
+        // partially configured. `capture` in each setter records
+        // the error in `lastError`; if that's non-nil after
+        // sync, the engine state doesn't match what the UI
+        // displays and starting anyway would produce confusing
+        // mismatched behaviour (e.g., tuning landed but demod
+        // mode didn't).
+        if lastError != nil { return }
         do {
             try core.start()
             isRunning = true
-            lastError = nil
         } catch {
             lastError = "start failed: \(error)"
         }

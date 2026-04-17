@@ -108,5 +108,11 @@ for entry in "${SIZES[@]}"; do
     fi
 done
 
-iconutil --convert icns "$ICONSET" --output "$OUT_DIR/AppIcon.icns"
+if ! iconutil --convert icns "$ICONSET" --output "$OUT_DIR/AppIcon.icns"; then
+    # Normalize any iconutil failure to exit 1 (matching the
+    # documented contract in the header) rather than letting
+    # the tool's raw exit code leak through `set -e`. iconutil
+    # prints its own stderr — we don't need to re-echo here.
+    exit 1
+fi
 echo "==> wrote $OUT_DIR/AppIcon.icns"
