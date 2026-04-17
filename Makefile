@@ -21,7 +21,7 @@ CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v1
         install-cuda-redist-libs install-icon install-desktop uninstall \
         fetch-cuda-redist test clippy fmt fmt-check \
         lint deny audit scan clean help \
-        ffi-header-check ffi-header-regen swift-test
+        ffi-header-check ffi-header-regen swift-test mac-app mac-app-debug
 
 # Runtime library copy targets are conditionally chained into `install`
 # only when the user asked for a sherpa-cuda build. This is important
@@ -308,6 +308,66 @@ ffi-header-regen:
 
 SWIFT ?= swift
 SDR_CORE_KIT := apps/macos/Packages/SdrCoreKit
+SDR_MAC_APP  := apps/macos
+
+# Build the SwiftUI macOS app as a dev `.app` bundle:
+#   1. cargo build --workspace (produces libsdr_ffi.a with feature
+#      unification — see swift-test comment for why --workspace)
+#   2. swift build from apps/macos/ (the `sdr-rs` executable
+#      product built from the SDRMac Swift target/module)
+#   3. wrap the Mach-O binary into a minimal .app bundle with
+#      Info.plist + entitlements + rasterized icon + ad-hoc codesign
+#
+# NOT the production shipping flow — that's M6 (Xcode project +
+# Developer-ID signing + notarization). This target is purely for
+# developer iteration so `open apps/macos/build/sdr-rs.app` shows
+# the actual UI.
+mac-app:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "mac-app: skipping (not macOS)"; \
+		exit 0; \
+	fi
+	@if ! command -v $(SWIFT) >/dev/null 2>&1; then \
+		echo "mac-app: $(SWIFT) not found — install Xcode or Swift toolchain"; \
+		exit 1; \
+	fi
+	@# Release is the default: debug builds of the Rust DSP chain
+	@# can't keep up with 2 MSps on macOS (seen during M5 sub-PR 2
+	@# testing — debug CPU overhead dropped USB throughput to ~45%
+	@# and produced garbled audio). For live RTL-SDR work you
+	@# always want release. Use `make mac-app-debug` only for
+	@# non-streaming UI / lifecycle iteration.
+	@echo "==> cargo build --workspace --release"
+	@$(CARGO) build --workspace --release
+	@# Delete the stale Mach-O so SwiftPM is forced to relink.
+	@# SwiftPM's incremental builder caches the linked binary based
+	@# on Swift source change detection and doesn't notice when the
+	@# Rust static archive it links against has been rebuilt.
+	@rm -f $(SDR_MAC_APP)/.build/release/sdr-rs
+	@echo "==> swift build -c release (sdr-rs)"
+	@cd $(SDR_MAC_APP) && $(SWIFT) build -c release
+	@echo "==> bundle sdr-rs.app"
+	@./$(SDR_MAC_APP)/scripts/bundle-mac-app.sh release
+
+# Debug variant for iterating on non-streaming code paths. Will
+# NOT keep up with live RTL-SDR streaming — don't use this for
+# audio testing. See `mac-app` comment for why.
+mac-app-debug:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "mac-app-debug: skipping (not macOS)"; \
+		exit 0; \
+	fi
+	@if ! command -v $(SWIFT) >/dev/null 2>&1; then \
+		echo "mac-app-debug: $(SWIFT) not found — install Xcode or Swift toolchain"; \
+		exit 1; \
+	fi
+	@echo "==> cargo build --workspace (debug)"
+	@$(CARGO) build --workspace
+	@rm -f $(SDR_MAC_APP)/.build/debug/sdr-rs
+	@echo "==> swift build (sdr-rs, debug)"
+	@cd $(SDR_MAC_APP) && $(SWIFT) build
+	@echo "==> bundle sdr-rs.app"
+	@./$(SDR_MAC_APP)/scripts/bundle-mac-app.sh debug
 
 swift-test:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \

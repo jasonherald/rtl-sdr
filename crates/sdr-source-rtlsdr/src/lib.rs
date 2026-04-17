@@ -30,12 +30,25 @@ use std::time::Duration;
 const IQ_OFFSET: f32 = 127.4;
 const IQ_SCALE: f32 = 128.0;
 
-/// Raw USB buffer size in bytes (16K IQ pairs x 2 bytes each).
-const RAW_BUF_SIZE: usize = 16_384 * 2;
+/// Raw USB buffer size in bytes — matches the original librtlsdr
+/// async-transfer buffer size. Larger buffers mean fewer bulk
+/// transfers per second and less per-transfer overhead. This
+/// matters a lot on macOS where IOKit's USB layer has measurably
+/// higher per-transfer latency than Linux kernel USB — at the
+/// original 32 KB per transfer we were seeing only ~45% of the
+/// configured source rate (900 kSps instead of 2 MSps) before the
+/// device-side FIFO would drop samples. At 256 KB per transfer the
+/// overhead drops enough to sustain the full configured rate.
+///
+/// Each USB transfer delivers `RAW_BUF_SIZE / 2` IQ pairs (1 byte
+/// I + 1 byte Q per pair). The DSP thread consumes them in smaller
+/// chunks via `read_samples` — see `RingSlot::consumed`.
+const RAW_BUF_SIZE: usize = 262_144;
 
 /// Number of slots in the USB ring buffer.
-/// At 2 Msps, each slot is 16384 samples = ~8.2 ms. 32 slots = ~260 ms buffer.
-const RING_SLOTS: usize = 32;
+/// At 2 Msps, each slot is 131072 IQ pairs = ~65 ms. 16 slots =
+/// ~1.0 s buffer, plenty of headroom for DSP bursts.
+const RING_SLOTS: usize = 16;
 
 /// RTL-SDR USB sample rates (Hz).
 pub const SAMPLE_RATES: &[f64] = &[
@@ -63,6 +76,12 @@ pub const SAMPLE_RATES: &[f64] = &[
 struct RingSlot {
     data: Mutex<Vec<u8>>,
     len: AtomicUsize,
+    /// Bytes consumed by the reader so far within the current fill.
+    /// Touched only by the reader thread (single-consumer) — the
+    /// atomic is for memory-visibility / `Sync` rather than for
+    /// cross-thread coordination. Reset to 0 when the reader
+    /// releases the slot (state → 0).
+    consumed: AtomicUsize,
     /// 0 = empty (writer can fill), 1 = full (reader can consume).
     state: AtomicU8,
 }
@@ -87,6 +106,7 @@ impl UsbRingBuffer {
             .map(|_| RingSlot {
                 data: Mutex::new(vec![0u8; slot_size]),
                 len: AtomicUsize::new(0),
+                consumed: AtomicUsize::new(0),
                 state: AtomicU8::new(0),
             })
             .collect();
@@ -284,17 +304,34 @@ impl Source for RtlSdrSource {
         }
 
         let len = slot.len.load(Ordering::Relaxed);
+        let consumed = slot.consumed.load(Ordering::Relaxed);
+
+        // Convert the next chunk of the slot, up to `output.len()`
+        // IQ pairs. A slot holds up to `RAW_BUF_SIZE / 2` = 131072
+        // IQ pairs but the DSP typically asks for 16384 at a time,
+        // so one USB bulk transfer will typically be drained over
+        // several `read_samples` calls.
         let count = {
             let data = slot
                 .data
                 .lock()
                 .map_err(|e| SourceError::ReadFailed(e.to_string()))?;
-            Self::convert_samples(&data[..len], output)
+            Self::convert_samples(&data[consumed..len], output)
         };
 
-        // Release the slot back to the writer.
-        slot.state.store(0, Ordering::Release);
-        ring.read_idx.fetch_add(1, Ordering::Relaxed);
+        // Each IQ pair = 2 raw bytes. Advance the consumed offset.
+        let new_consumed = consumed + count * 2;
+        if new_consumed >= len {
+            // Slot fully drained — release back to the writer.
+            slot.consumed.store(0, Ordering::Relaxed);
+            slot.state.store(0, Ordering::Release);
+            ring.read_idx.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // Partial consumption — leave the slot owned by the
+            // reader. The writer's `state != 0` check in the ring
+            // loop will skip it until we release.
+            slot.consumed.store(new_consumed, Ordering::Relaxed);
+        }
 
         Ok(count)
     }

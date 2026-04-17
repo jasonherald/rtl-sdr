@@ -33,15 +33,33 @@
 // the link step with a "library not found for -lsdr_ffi" error.
 
 import PackageDescription
+import Foundation
 
-// Relative path from this Package.swift (which lives at
-// `apps/macos/Packages/SdrCoreKit/`) back to the workspace
-// `target/` directory. Count up seven levels: Package.swift →
-// SdrCoreKit → Packages → macos → apps → repo-root → target.
-// Wait — SdrCoreKit IS the directory containing Package.swift,
-// so we count from there up. Six levels up from
-// Packages/SdrCoreKit/ gets us to repo-root, then `target`.
-let workspaceTarget = "../../../../target"
+// Absolute path to the workspace `target/` directory.
+//
+// SwiftPM's `-L` linker search paths are resolved relative to the
+// *build root* (the package being built), NOT to this Package.swift.
+// That means a hardcoded relative like `../../../../target` only
+// works when this package is the root (e.g. `swift test` run from
+// `apps/macos/Packages/SdrCoreKit/`). Consumers at
+// `apps/macos/Package.swift` would resolve it against apps/macos/,
+// which is wrong.
+//
+// Compute it from `#filePath` instead — that's this Package.swift's
+// on-disk location — so the `-L` paths stay correct no matter
+// which package is the build root.
+let workspaceTarget: String = {
+    let me = URL(fileURLWithPath: #filePath)
+    // #filePath → .../apps/macos/Packages/SdrCoreKit/Package.swift
+    // Go up 4 levels to repo root, then into `target/`.
+    let repoRoot = me
+        .deletingLastPathComponent()  // SdrCoreKit
+        .deletingLastPathComponent()  // Packages
+        .deletingLastPathComponent()  // macos
+        .deletingLastPathComponent()  // apps
+        .deletingLastPathComponent()  // repo root
+    return repoRoot.appendingPathComponent("target").path
+}()
 
 let package = Package(
     name: "SdrCoreKit",
@@ -75,12 +93,28 @@ let package = Package(
             name: "SdrCoreKit",
             dependencies: ["sdr_core_c"],
             linkerSettings: [
-                // Debug build search path. `cargo build -p sdr-ffi`
-                // writes libsdr_ffi.a here.
-                .unsafeFlags([
-                    "-L", "\(workspaceTarget)/debug",
-                    "-L", "\(workspaceTarget)/release",
-                ]),
+                // Link the Rust static archive from the cargo
+                // target dir that matches the SwiftPM build
+                // configuration:
+                //   - `swift build`          → cargo debug
+                //   - `swift build -c release` → cargo release
+                //
+                // Without these `.when(configuration:)` gates,
+                // both search paths would be active regardless of
+                // build mode and the linker would pick whichever
+                // lib it saw first — a release Swift build could
+                // silently link an unoptimised Rust lib (the
+                // bug that surfaced as ~45% RTL-SDR throughput
+                // during M5 sub-PR 2 testing on macOS; it was a
+                // debug-build CPU cost masquerading as USB slowness).
+                .unsafeFlags(
+                    ["-L", "\(workspaceTarget)/debug"],
+                    .when(configuration: .debug)
+                ),
+                .unsafeFlags(
+                    ["-L", "\(workspaceTarget)/release"],
+                    .when(configuration: .release)
+                ),
                 // Link the static archive.
                 .linkedLibrary("sdr_ffi"),
                 // libc++ — whisper.cpp (pulled in transitively via

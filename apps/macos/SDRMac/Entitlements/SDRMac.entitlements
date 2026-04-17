@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      USB device access for RTL-SDR hardware. Required so the
+      hardened runtime doesn't block libusb-rs / rusb from opening
+      /dev/usb* devices.
+    -->
+    <key>com.apple.security.device.usb</key>
+    <true/>
+
+    <!--
+      Future entitlements (network client for Network-IQ source
+      + RadioReference, user-selected file read/write for IQ /
+      audio recording and file-source playback) will be added
+      here when their corresponding features actually ship.
+      Declaring them pre-emptively broadens the app's capability
+      surface without benefit — we add them alongside the code
+      that needs them, not ahead of time.
+    -->
+</dict>
+</plist>
