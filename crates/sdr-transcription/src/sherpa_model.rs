@@ -209,6 +209,27 @@ const SILERO_VAD_DIR_NAME: &str = "silero-vad";
 const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
+/// Total-request timeout for the Silero VAD download. The
+/// file is ~2 MB but the releases CDN is occasionally slow on
+/// cold cache or from specific regions — 5 minutes gives
+/// rural broadband / hotel `WiFi` a reasonable envelope without
+/// letting a genuinely broken connection hang forever. The
+/// separate `connect_timeout(30s)` catches the "can't reach
+/// github at all" case fast.
+const SILERO_VAD_REQUEST_TIMEOUT_MINS: u64 = 5;
+
+/// Total-request timeout for the sherpa-onnx ASR bundle
+/// downloads. These are tarballs in the 250 MB – 1.2 GB range
+/// depending on the model (Parakeet is the largest), and
+/// unlike the VAD file they can legitimately take a long time
+/// over rural broadband. 1 hour is our "give up" threshold —
+/// generous enough that a user on a 5 Mbps connection can
+/// still download the largest bundle (Parakeet ≈ 30 min at
+/// that speed), tight enough that a dead connection eventually
+/// surfaces as an error instead of a permanent "Downloading…"
+/// spinner.
+const SHERPA_ARCHIVE_REQUEST_TIMEOUT_HOURS: u64 = 1;
+
 /// Full path to the Silero VAD ONNX file on disk.
 pub fn silero_vad_path() -> PathBuf {
     sherpa_models_dir()
@@ -263,7 +284,7 @@ pub fn download_silero_vad(
 
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_mins(SILERO_VAD_REQUEST_TIMEOUT_MINS))
         .build()?;
 
     let response = client.get(SILERO_VAD_URL).send()?.error_for_status()?;
@@ -467,7 +488,7 @@ pub fn download_sherpa_archive(
     // legitimate for users on rural broadband or hotel WiFi).
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_mins(60))
+        .timeout(Duration::from_hours(SHERPA_ARCHIVE_REQUEST_TIMEOUT_HOURS))
         .build()?;
 
     let response = client.get(&archive_url).send()?.error_for_status()?;
