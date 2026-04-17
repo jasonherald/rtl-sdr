@@ -26,11 +26,16 @@ private struct GeneralPane: View {
     var body: some View {
         Form {
             LabeledContent("Config file") {
-                Text("~/Library/Application Support/SDRMac/config.json")
+                // Render the live path via the same helper
+                // SDRMacApp uses at bootstrap time, so a bundle-id
+                // rename or FileManager layout change keeps the
+                // settings pane in sync automatically.
+                Text(verbatim: SDRMacApp.defaultConfigPath().path)
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .textSelection(.enabled)
             }
         }
     }

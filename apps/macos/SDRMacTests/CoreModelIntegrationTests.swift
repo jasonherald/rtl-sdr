@@ -15,6 +15,12 @@ import SdrCoreKit
 
 @MainActor
 final class CoreModelIntegrationTests: XCTestCase {
+    // Empty deinit satisfies SwiftLint's `required_deinit` rule
+    // — same reasoning as the SdrCoreKit helper classes (see
+    // `SdrCore.CallbackBox.deinit`). XCTestCase manages its own
+    // lifecycle; we don't need teardown logic here.
+    deinit {}
+
     private func inMemoryConfigPath() -> URL {
         // Empty path → SdrCore.init passes an empty C string
         // which the FFI treats as "no persistence". Nothing
@@ -90,18 +96,18 @@ final class CoreModelIntegrationTests: XCTestCase {
         m.start()
 
         // Give the event consumer up to 1 s to surface any async
-        // error, using an NSPredicate-based XCTestExpectation
-        // rather than a manual poll. XCTWaiter returns when the
-        // predicate matches (or the timeout fires) — both
-        // outcomes are acceptable here since whether an error
-        // actually appears depends on hardware presence.
-        let errorAppeared = XCTNSPredicateExpectation(
-            predicate: NSPredicate { _, _ in
-                MainActor.assumeIsolated { m.lastError != nil }
-            },
-            object: nil
-        )
-        _ = await XCTWaiter.fulfillment(of: [errorAppeared], timeout: 1.0)
+        // error. We do the polling ourselves on the MainActor
+        // rather than using NSPredicate because the predicate
+        // closure runs on XCTest's internal thread —
+        // `MainActor.assumeIsolated` would crash at runtime
+        // there, and `MainActor.run` is async (not usable from
+        // a sync NSPredicate closure). Short sync sleeps inside
+        // an async loop are cheap and safe.
+        let deadline = Date().addingTimeInterval(1.0)
+        while Date() < deadline {
+            if m.lastError != nil { break }
+            try? await Task.sleep(nanoseconds: 20_000_000) // 20 ms
+        }
 
         // Consistency: if an error was reported, we should NOT
         // claim to be running. If no error, we can be either

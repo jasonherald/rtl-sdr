@@ -11,15 +11,6 @@
     <true/>
 
     <!--
-      Audio input is not used; audio output is the default sink
-      and doesn't require a specific entitlement under the
-      hardened runtime. We declare `device.audio-output` anyway
-      for future Bluetooth output use cases.
-    -->
-    <key>com.apple.security.device.audio-output</key>
-    <true/>
-
-    <!--
       Future entitlements (network client for Network-IQ source
       + RadioReference, user-selected file read/write for IQ /
       audio recording and file-source playback) will be added

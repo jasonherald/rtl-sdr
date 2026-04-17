@@ -10,12 +10,18 @@
 # fallback), then pack with `iconutil`.
 #
 # Usage:
-#   apps/macos/scripts/make-app-icon.sh <out-path>
+#   apps/macos/scripts/make-app-icon.sh <out-dir>
 #
-# Exits 0 on success, 1 on failure. Writes:
-#   <out-path>/AppIcon.icns
+# Writes `<out-dir>/AppIcon.icns` (overwriting any existing file
+# at that path).
 #
-# Idempotent: overwrites existing output.
+# Exit codes:
+#   0 — success, icon written
+#   1 — rasterization or iconutil step failed
+#   2 — wrong argument count
+#
+# Idempotent: running twice with the same <out-dir> leaves
+# AppIcon.icns in a consistent state.
 
 set -euo pipefail
 

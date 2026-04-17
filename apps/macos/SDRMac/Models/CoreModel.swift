@@ -35,6 +35,15 @@ final class CoreModel {
     private(set) var core: SdrCore?
 
     /// Event-consuming task. Cancelled on shutdown.
+    /// `nonisolated(unsafe)` so the `deinit` (which is
+    /// nonisolated by default on a `@MainActor` class) can
+    /// cancel it without hopping back to the main actor. The
+    /// `Task<Void, Never>` handle is itself `Sendable` and
+    /// `cancel()` is thread-safe; the `unsafe` label
+    /// acknowledges that we've opted out of the actor's
+    /// compile-time serialization for this one field, which is
+    /// fine because all other accesses (bootstrap assignment,
+    /// shutdown cancel) happen on the main actor.
     private var eventTask: Task<Void, Never>?
 
     // ==========================================================
@@ -144,7 +153,7 @@ final class CoreModel {
             self.eventTask = Task { [weak self, events = c.events] in
                 for await event in events {
                     guard let self else { return }
-                    await self.handleEvent(event)
+                    self.handleEvent(event)
                 }
             }
         } catch {
@@ -197,6 +206,11 @@ final class CoreModel {
     // ==========================================================
 
     func start() {
+        // Idempotency guard — repeated Play clicks / Cmd-R
+        // presses don't re-sync state or re-enter the engine's
+        // start path. The engine warns on "start requested but
+        // already running", but cheaper to short-circuit here.
+        if isRunning { return }
         guard let core else { lastError = "engine not initialized"; return }
         // Push the UI's current configuration to the engine
         // BEFORE asking it to start. UI defaults and engine
@@ -243,6 +257,8 @@ final class CoreModel {
     }
 
     func stop() {
+        // Mirror of `start`'s idempotency guard.
+        if !isRunning { return }
         guard let core else { return }
         do {
             try core.stop()
@@ -341,6 +357,26 @@ final class CoreModel {
     func clearError() {
         lastError = nil
     }
+
+    // No explicit `deinit` on CoreModel. The `@MainActor
+    // @Observable` class gets @ObservationTracked-macro-generated
+    // storage for every `var`, and Swift's current rules don't
+    // let macro-generated mutable stored properties be
+    // `nonisolated`, which would be required for a `deinit` on a
+    // MainActor class to access them. Cleanup relies on:
+    //   1. The event-consumer Task's `[weak self]` capture,
+    //      which makes `self?.handleEvent` a no-op after the
+    //      model is dropped.
+    //   2. `SdrCore.deinit` firing when `self.core` is released,
+    //      which calls `sdr_core_destroy` → closes the engine's
+    //      event channel → the AsyncStream completes → the Task
+    //      exits its `for await` loop cleanly.
+    //
+    // In practice, app shutdown goes through
+    // `AppDelegate.applicationWillTerminate → shutdown()` which
+    // cancels the task explicitly, so the fallback path only
+    // runs in tests that let the model dealloc without calling
+    // shutdown.
 
     // ==========================================================
     //  Internal helpers

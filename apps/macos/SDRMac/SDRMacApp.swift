@@ -41,7 +41,11 @@ struct SDRMacApp: App {
 
     /// `~/Library/Application Support/SDRMac/config.json`. Created
     /// on first launch so the engine can persist through it.
-    private static func defaultConfigPath() -> URL {
+    /// Exposed as `internal` (not `private`) so `SettingsView`
+    /// can render the live path instead of a hardcoded string —
+    /// a bundle-id or layout change would otherwise make the
+    /// displayed path drift from the real one.
+    static func defaultConfigPath() -> URL {
         let fm = FileManager.default
         let dir = (try? fm.url(
             for: .applicationSupportDirectory,
