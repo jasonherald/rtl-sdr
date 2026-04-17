@@ -4,6 +4,7 @@
 
 import XCTest
 @testable import SDRMac
+import SdrCoreKit  // DemodMode/Deemphasis/FftWindow referenced below
 
 @MainActor
 final class CoreModelTests: XCTestCase {

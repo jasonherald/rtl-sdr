@@ -11,15 +11,16 @@ This is the eventual consumer of the SwiftUI/Metal epic in
 
 ```text
 apps/macos/
-├── Package.swift                 — SwiftPM root. Product name
-│                                   `sdr-rs`; module name
-│                                   `SDRMac` (Swift identifier
-│                                   rules — hyphens not allowed
-│                                   in target names).
 ├── README.md                     — (you are here)
+├── SDRMac.xcodeproj/             — Xcode project (shared pbxproj
+│                                   under git; per-user
+│                                   xcuserdata is .gitignored)
 ├── Packages/
-│   └── SdrCoreKit/               — typed Swift wrapper around sdr-ffi
-├── SDRMac/                       — app source (module name)
+│   └── SdrCoreKit/               — SwiftPM package: typed Swift
+│                                   wrapper around sdr-ffi, used
+│                                   by the Xcode project as a
+│                                   local package dependency
+├── SDRMac/                       — app source (Xcode module)
 │   ├── SDRMacApp.swift           — @main App struct, Window/Settings scenes
 │   ├── ContentView.swift         — top-level NavigationSplitView
 │   ├── Models/
@@ -32,37 +33,47 @@ apps/macos/
 │   │   ├── CenterView.swift      — spectrum+waterfall placeholder (M4)
 │   │   ├── StatusBar.swift       — bottom status strip
 │   │   ├── SettingsView.swift    — Cmd-, settings scene
-│   │   └── SDRCommands.swift     — menu-bar commands
+│   │   ├── SDRCommands.swift     — menu-bar commands
+│   │   └── Formatters.swift      — shared display helpers (formatRate, …)
 │   ├── Resources/
-│   │   └── Info.plist            — bundle metadata (CFBundle* names
-│   │                               here are user-facing `sdr-rs`)
+│   │   ├── Info.plist            — bundle metadata (CFBundle* names
+│   │   │                           here are user-facing `sdr-rs`)
+│   │   └── AppIcon.icns          — rasterized from data/com.sdr.rs.svg
 │   └── Entitlements/
-│       └── SDRMac.entitlements   — USB + audio output
+│       └── SDRMac.entitlements   — USB entitlement (non-sandbox)
 ├── SDRMacTests/                  — XCTest suite
 └── scripts/
-    ├── bundle-mac-app.sh         — dev-only .app wrapper
     └── make-app-icon.sh          — rasterize data/com.sdr.rs.svg → .icns
 ```
+
+The `SDRMac` target builds the `sdr-rs.app` bundle — the target
+name is `SDRMac` (matches the Swift module name; Swift forbids
+hyphens in module identifiers), but `PRODUCT_NAME = sdr-rs` in
+the build settings so the output Mach-O and `.app` wrapper are
+named `sdr-rs` to match the Linux binary and
+`com.sdr.rs.*` bundle / desktop IDs.
 
 ## Dev loop
 
 From the repo root:
 
 ```bash
-# Build release Rust + Swift + wrap into .app (default, use this
-# for anything that touches live RTL-SDR audio — release is the
-# only mode that keeps up with 2 MSps streaming on macOS).
+# Build release Rust + Xcode app
 make mac-app
 
-# Launch the app
+# Launch the app (use `open`, not the binary directly — a
+# proper .app bundle needs LaunchServices to bootstrap the
+# SwiftUI window-server connection)
 open apps/macos/build/sdr-rs.app
 ```
 
 `make mac-app` runs `cargo build --workspace --release`
-(workspace scope so the transcription backend feature unifies),
-then `swift build -c release` inside `apps/macos/`, then calls
-`scripts/bundle-mac-app.sh release` to ad-hoc sign and wrap the
-binary into a minimal `.app`.
+(workspace scope so the transcription backend feature unifies
+— see the `swift-test` Makefile target for the rationale), then
+`xcodebuild -configuration Release` to produce a real `.app`
+bundle with automatic asset compilation, `.metal →
+default.metallib`, and ad-hoc codesign. The finished bundle is
+copied to `apps/macos/build/sdr-rs.app` for easy launching.
 
 ### Debug build
 
@@ -70,33 +81,44 @@ binary into a minimal `.app`.
 make mac-app-debug
 ```
 
-Builds cargo + swift in debug mode. **This will NOT keep up with
-live RTL-SDR streaming** — debug builds of the DSP chain drop
-USB throughput to ~45% of configured source rate, which
-produces garbled audio. Debug is only useful for non-streaming
-iteration (UI layout, event wiring, config, lifecycle paths).
+Runs the same pipeline with `cargo build` (debug) +
+`xcodebuild -configuration Debug`. **Not useful for live
+RTL-SDR streaming** — debug builds of the DSP chain drop USB
+throughput to ~45% of configured source rate, producing
+garbled audio. Only useful for non-streaming iteration (UI
+layout, event wiring, config, lifecycle paths).
+
+### Working inside Xcode directly
+
+Open `apps/macos/SDRMac.xcodeproj` in Xcode. Before running,
+either run `cargo build --workspace --release` (for release)
+or `cargo build --workspace` (for debug) once to produce
+`target/{debug,release}/libsdr_ffi.a`. The Xcode build then
+links against whichever matches the scheme configuration.
+
+SwiftUI previews work as long as `libsdr_ffi.a` exists — the
+SdrCoreKit package's `linkerSettings` derive the path from
+`#filePath` at manifest-execution time.
 
 ## Testing
 
 ```bash
-# Run app-level unit tests (CoreModel)
-cd apps/macos && swift test
+# App-level unit tests via xcodebuild test
+make mac-test
 
-# Run SdrCoreKit FFI integration tests
+# SdrCoreKit FFI integration tests (standalone SwiftPM)
 make swift-test
 ```
 
 ## Notes
 
 - **The `.app` this produces is NOT shippable.** Ad-hoc signed,
-  no Developer ID, no notarization. That's M6 via the production
-  `scripts/build-mac.sh` pipeline and an Xcode project. This flow
-  is purely for developer iteration on the SwiftUI code.
+  no Developer ID, no notarization. That's M6 (production
+  signing + notarization + stapling + GitHub Actions).
 - **macOS deployment target is 14 (Sonoma)** per the epic spec —
   `@Observable`, `NavigationSplitView`, modern AsyncStream
   semantics all need 14+.
-- **The linker search path in `SdrCoreKit/Package.swift`** computes
-  an absolute path from `#filePath` at manifest-execution time.
-  This lets the package be used both as a standalone (`swift test`
-  in `Packages/SdrCoreKit/`) and as a local dep from
-  `apps/macos/Package.swift`. See the Package.swift comments.
+- **Mach-O deployment-target pin** lives in `.cargo/config.toml`
+  (`MACOSX_DEPLOYMENT_TARGET = "14.0"`), matching the Xcode
+  project's setting so the Rust static archive's object files
+  and the Swift-linked host agree on the min-OS stamp.
