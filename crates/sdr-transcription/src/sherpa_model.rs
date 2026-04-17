@@ -263,7 +263,7 @@ pub fn download_silero_vad(
 
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300))
+        .timeout(Duration::from_mins(5))
         .build()?;
 
     let response = client.get(SILERO_VAD_URL).send()?.error_for_status()?;
@@ -467,7 +467,7 @@ pub fn download_sherpa_archive(
     // legitimate for users on rural broadband or hotel WiFi).
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_mins(60))
+        .timeout(Duration::from_hours(1))
         .build()?;
 
     let response = client.get(&archive_url).send()?.error_for_status()?;

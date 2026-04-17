@@ -164,8 +164,7 @@ fn dispatcher_loop(rx: &mpsc::Receiver<DspToUi>, callback_guard: &EventCallbackG
         let has_callback = callback_guard
             .state
             .lock()
-            .map(|guard| guard.slot.is_some())
-            .unwrap_or(false);
+            .is_ok_and(|guard| guard.slot.is_some());
         if !has_callback {
             continue;
         }

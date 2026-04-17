@@ -234,8 +234,8 @@ pub unsafe extern "C" fn sdr_core_destroy(handle: *mut SdrCore) {
         let dispatcher_handle = core
             .dispatcher_handle
             .lock()
-            .map(|mut guard| guard.take())
-            .unwrap_or(None);
+            .ok()
+            .and_then(|mut guard| guard.take());
 
         // Drop the Engine explicitly before the join so the
         // event channel closes and the dispatcher's `recv()`
