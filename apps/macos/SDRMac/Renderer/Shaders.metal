@@ -82,3 +82,83 @@ fragment float4 spectrum_frag(
     float3 rgb    = mix(base, accent, in.intensity * 0.3);
     return float4(rgb, 1.0);
 }
+
+// --------------------------------------------------------------
+//  Waterfall
+//
+//  History is an r32Float texture of size (fftBins × historyRows).
+//  One row per FFT frame, in dB. Writing advances `write_row` and
+//  wraps at `history_rows`, so the texture itself never moves in
+//  memory — the wrap happens in the sampling math below.
+//
+//  Convention: uv.y = 0 at the TOP of the viewport (newest
+//  row, just under the spectrum line) → uv.y = 1 at the
+//  BOTTOM (oldest row, scrolling out). Matches SDR++ / GTK
+//  UI.
+// --------------------------------------------------------------
+
+struct WaterfallVertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+/// Full-screen quad vertex shader. `vertex_id` 0..3 produces
+/// a triangle strip covering the full clip-space. The Swift
+/// side restricts the viewport to the waterfall region so the
+/// "full-screen" quad actually fills only the bottom portion
+/// of the MTKView's drawable.
+vertex WaterfallVertexOut waterfall_vert(
+    uint vid [[vertex_id]]
+) {
+    // Triangle strip: BL, BR, TL, TR.
+    float2 pos[4] = {
+        float2(-1.0, -1.0),
+        float2( 1.0, -1.0),
+        float2(-1.0,  1.0),
+        float2( 1.0,  1.0),
+    };
+    // UVs arranged so uv.y=0 is at the TOP of the viewport
+    // (matches the "newest at top" convention).
+    float2 uvs[4] = {
+        float2(0.0, 1.0),  // BL: bottom-left → oldest on the left
+        float2(1.0, 1.0),  // BR: bottom-right → oldest on the right
+        float2(0.0, 0.0),  // TL: top-left → newest on the left
+        float2(1.0, 0.0),  // TR: top-right → newest on the right
+    };
+
+    WaterfallVertexOut out;
+    out.position = float4(pos[vid], 0.0, 1.0);
+    out.uv = uvs[vid];
+    return out;
+}
+
+/// Waterfall fragment shader. Samples the history ring, maps
+/// dB to a palette entry via the turbo LUT.
+///
+/// UV-wrap math explanation: `write_row` is the index of the
+/// row we JUST wrote this frame, i.e. the NEWEST row. (The
+/// Swift side sets `uniforms.writeRow` before incrementing
+/// the cursor — see `draw()` in `SpectrumMTKView.swift`.)
+/// As `uv.y` grows from 0 (top) to 1 (bottom), we walk
+/// backwards through the ring. `fract` wraps the resulting
+/// normalized row into [0, 1); the `+ history_rows` bias
+/// keeps the argument positive even when `write_row` is
+/// small and `age_rows` is large.
+fragment float4 waterfall_frag(
+    WaterfallVertexOut       in      [[stage_in]],
+    texture2d<float>         history [[texture(0)]],
+    texture2d<float>         palette [[texture(1)]],
+    constant Uniforms&       u       [[buffer(0)]]
+) {
+    constexpr sampler hist_s(filter::linear, address::clamp_to_edge);
+    constexpr sampler pal_s (filter::linear, address::clamp_to_edge);
+
+    float hist_rows_f = float(u.history_rows);
+    float age_rows    = in.uv.y * (hist_rows_f - 1.0);
+    float newest_row  = float(u.write_row);
+    float sample_y    = fract((newest_row + hist_rows_f - age_rows) / hist_rows_f);
+
+    float db  = history.sample(hist_s, float2(in.uv.x, sample_y)).r;
+    float t   = saturate((db - u.min_db) / max(0.001, u.max_db - u.min_db));
+    return palette.sample(pal_s, float2(t, 0.5));
+}

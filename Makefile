@@ -382,8 +382,16 @@ mac-app-debug:
 		echo "mac-app-debug: $(XCODEBUILD) not found — install Xcode"; \
 		exit 1; \
 	fi
-	@echo "==> cargo build --workspace (debug)"
-	@$(CARGO) build --workspace
+	@# Rust side always builds release even for Xcode-debug
+	@# builds. Xcode (tested on 26.4) emits both `-L debug` and
+	@# `-L release` to the linker regardless of the active
+	@# config, and SdrCoreKit's Package.swift lists release
+	@# first so both Xcode configs pick `target/release/
+	@# libsdr_ffi.a`. If we built debug Rust here, target/
+	@# release would be stale/missing and the link would
+	@# either use a stale archive or fail.
+	@echo "==> cargo build --workspace --release (Rust always release for Xcode builds)"
+	@$(CARGO) build --workspace --release
 	@echo "==> xcodebuild -configuration Debug"
 	@# Same xcodebuild exit-status handling as `mac-app`. See
 	@# comment there.
