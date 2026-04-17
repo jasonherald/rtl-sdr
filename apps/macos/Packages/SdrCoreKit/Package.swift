@@ -39,15 +39,17 @@ import Foundation
 //
 // SwiftPM's `-L` linker search paths are resolved relative to the
 // *build root* (the package being built), NOT to this Package.swift.
-// That means a hardcoded relative like `../../../../target` only
-// works when this package is the root (e.g. `swift test` run from
-// `apps/macos/Packages/SdrCoreKit/`). Consumers at
-// `apps/macos/Package.swift` would resolve it against apps/macos/,
-// which is wrong.
+// A hardcoded relative like `../../../../target` only works when
+// this package is the root (`swift test` run from
+// `apps/macos/Packages/SdrCoreKit/`). Consumers — notably the
+// `apps/macos/SDRMac.xcodeproj` project that references this
+// package via `XCLocalSwiftPackageReference` — would resolve
+// the same relative path against their own build root, which
+// is wrong.
 //
 // Compute it from `#filePath` instead — that's this Package.swift's
 // on-disk location — so the `-L` paths stay correct no matter
-// which package is the build root.
+// which build host is consuming the package.
 let workspaceTarget: String = {
     let me = URL(fileURLWithPath: #filePath)
     // #filePath → .../apps/macos/Packages/SdrCoreKit/Package.swift

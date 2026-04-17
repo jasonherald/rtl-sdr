@@ -21,7 +21,8 @@ CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v1
         install-cuda-redist-libs install-icon install-desktop uninstall \
         fetch-cuda-redist test clippy fmt fmt-check \
         lint deny audit scan clean help \
-        ffi-header-check ffi-header-regen swift-test mac-app mac-app-debug
+        ffi-header-check ffi-header-regen swift-test \
+        mac-app mac-app-debug mac-test
 
 # Runtime library copy targets are conditionally chained into `install`
 # only when the user asked for a sherpa-cuda build. This is important
@@ -306,48 +307,68 @@ ffi-header-regen:
 # Xcode/SwiftPM toolchain and the target would skip with a
 # friendly message there.
 
-SWIFT ?= swift
-SDR_CORE_KIT := apps/macos/Packages/SdrCoreKit
-SDR_MAC_APP  := apps/macos
+SWIFT         ?= swift
+XCODEBUILD    ?= xcodebuild
+SDR_CORE_KIT  := apps/macos/Packages/SdrCoreKit
+SDR_MAC_APP   := apps/macos
+SDR_MAC_PROJ  := $(SDR_MAC_APP)/SDRMac.xcodeproj
+SDR_MAC_DD    := $(SDR_MAC_APP)/build/DerivedData
 
-# Build the SwiftUI macOS app as a dev `.app` bundle:
-#   1. cargo build --workspace (produces libsdr_ffi.a with feature
-#      unification — see swift-test comment for why --workspace)
-#   2. swift build from apps/macos/ (the `sdr-rs` executable
-#      product built from the SDRMac Swift target/module)
-#   3. wrap the Mach-O binary into a minimal .app bundle with
-#      Info.plist + entitlements + rasterized icon + ad-hoc codesign
+# Build the SwiftUI macOS app as a real `.app` bundle via Xcode:
+#   1. cargo build --workspace --release (produces libsdr_ffi.a
+#      with feature unification — see swift-test comment for why
+#      --workspace)
+#   2. xcodebuild builds SDRMac.xcodeproj for the SDRMac scheme.
+#      Xcode's build pipeline handles SwiftUI compile,
+#      .metal → default.metallib, Info.plist embed, entitlements,
+#      asset processing, and ad-hoc codesign. Output is a
+#      proper .app bundle under DerivedData.
+#   3. Copy / symlink the finished .app into build/ so
+#      `open apps/macos/build/sdr-rs.app` works without digging
+#      through DerivedData.
 #
-# NOT the production shipping flow — that's M6 (Xcode project +
-# Developer-ID signing + notarization). This target is purely for
-# developer iteration so `open apps/macos/build/sdr-rs.app` shows
-# the actual UI.
+# Release is the default: debug builds of the Rust DSP chain
+# can't keep up with 2 MSps on macOS (debug CPU overhead drops
+# USB throughput to ~45% → garbled audio). Use
+# `make mac-app-debug` only for non-streaming UI iteration.
+#
+# NOT the production shipping flow — that's M6 (Developer-ID
+# signing + notarization + stapling). This target ad-hoc signs
+# only.
 mac-app:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 		echo "mac-app: skipping (not macOS)"; \
 		exit 0; \
 	fi
-	@if ! command -v $(SWIFT) >/dev/null 2>&1; then \
-		echo "mac-app: $(SWIFT) not found — install Xcode or Swift toolchain"; \
+	@if ! command -v $(XCODEBUILD) >/dev/null 2>&1; then \
+		echo "mac-app: $(XCODEBUILD) not found — install Xcode"; \
 		exit 1; \
 	fi
-	@# Release is the default: debug builds of the Rust DSP chain
-	@# can't keep up with 2 MSps on macOS (seen during M5 sub-PR 2
-	@# testing — debug CPU overhead dropped USB throughput to ~45%
-	@# and produced garbled audio). For live RTL-SDR work you
-	@# always want release. Use `make mac-app-debug` only for
-	@# non-streaming UI / lifecycle iteration.
 	@echo "==> cargo build --workspace --release"
 	@$(CARGO) build --workspace --release
-	@# Delete the stale Mach-O so SwiftPM is forced to relink.
-	@# SwiftPM's incremental builder caches the linked binary based
-	@# on Swift source change detection and doesn't notice when the
-	@# Rust static archive it links against has been rebuilt.
-	@rm -f $(SDR_MAC_APP)/.build/release/sdr-rs
-	@echo "==> swift build -c release (sdr-rs)"
-	@cd $(SDR_MAC_APP) && $(SWIFT) build -c release
-	@echo "==> bundle sdr-rs.app"
-	@./$(SDR_MAC_APP)/scripts/bundle-mac-app.sh release
+	@echo "==> xcodebuild -configuration Release"
+	@# Capture xcodebuild stdout+stderr to a temp file, check its
+	@# real exit status, then filter for display. Piping directly
+	@# into `grep ... || true` only surfaces grep's exit code —
+	@# a silent xcodebuild failure would let the `cp` below copy
+	@# a stale .app from a previous successful build.
+	@xcb_log=$$(mktemp); \
+	if ! $(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
+		-configuration Release \
+		-derivedDataPath $(SDR_MAC_DD) \
+		build >"$$xcb_log" 2>&1; then \
+		echo "xcodebuild failed:"; \
+		cat "$$xcb_log"; \
+		rm -f "$$xcb_log"; \
+		exit 1; \
+	fi; \
+	grep -E '^(.+error:|.+warning:|\*\* [A-Z]+)' "$$xcb_log" || true; \
+	rm -f "$$xcb_log"
+	@mkdir -p $(SDR_MAC_APP)/build
+	@rm -rf $(SDR_MAC_APP)/build/sdr-rs.app
+	@cp -R $(SDR_MAC_DD)/Build/Products/Release/sdr-rs.app \
+		$(SDR_MAC_APP)/build/sdr-rs.app
+	@echo "==> bundle ready: $(SDR_MAC_APP)/build/sdr-rs.app"
 
 # Debug variant for iterating on non-streaming code paths. Will
 # NOT keep up with live RTL-SDR streaming — don't use this for
@@ -357,17 +378,50 @@ mac-app-debug:
 		echo "mac-app-debug: skipping (not macOS)"; \
 		exit 0; \
 	fi
-	@if ! command -v $(SWIFT) >/dev/null 2>&1; then \
-		echo "mac-app-debug: $(SWIFT) not found — install Xcode or Swift toolchain"; \
+	@if ! command -v $(XCODEBUILD) >/dev/null 2>&1; then \
+		echo "mac-app-debug: $(XCODEBUILD) not found — install Xcode"; \
 		exit 1; \
 	fi
 	@echo "==> cargo build --workspace (debug)"
 	@$(CARGO) build --workspace
-	@rm -f $(SDR_MAC_APP)/.build/debug/sdr-rs
-	@echo "==> swift build (sdr-rs, debug)"
-	@cd $(SDR_MAC_APP) && $(SWIFT) build
-	@echo "==> bundle sdr-rs.app"
-	@./$(SDR_MAC_APP)/scripts/bundle-mac-app.sh debug
+	@echo "==> xcodebuild -configuration Debug"
+	@# Same xcodebuild exit-status handling as `mac-app`. See
+	@# comment there.
+	@xcb_log=$$(mktemp); \
+	if ! $(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
+		-configuration Debug \
+		-derivedDataPath $(SDR_MAC_DD) \
+		build >"$$xcb_log" 2>&1; then \
+		echo "xcodebuild failed:"; \
+		cat "$$xcb_log"; \
+		rm -f "$$xcb_log"; \
+		exit 1; \
+	fi; \
+	grep -E '^(.+error:|.+warning:|\*\* [A-Z]+)' "$$xcb_log" || true; \
+	rm -f "$$xcb_log"
+	@mkdir -p $(SDR_MAC_APP)/build
+	@rm -rf $(SDR_MAC_APP)/build/sdr-rs.app
+	@cp -R $(SDR_MAC_DD)/Build/Products/Debug/sdr-rs.app \
+		$(SDR_MAC_APP)/build/sdr-rs.app
+	@echo "==> bundle ready: $(SDR_MAC_APP)/build/sdr-rs.app"
+
+# Run the SDRMacTests XCTest target via xcodebuild.
+mac-test:
+	@if [ "$$(uname -s)" != "Darwin" ]; then \
+		echo "mac-test: skipping (not macOS)"; \
+		exit 0; \
+	fi
+	@if ! command -v $(XCODEBUILD) >/dev/null 2>&1; then \
+		echo "mac-test: $(XCODEBUILD) not found — install Xcode"; \
+		exit 1; \
+	fi
+	@echo "==> cargo build --workspace"
+	@$(CARGO) build --workspace
+	@echo "==> xcodebuild test"
+	@$(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
+		-destination 'platform=macOS' \
+		-derivedDataPath $(SDR_MAC_DD) \
+		test
 
 swift-test:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
