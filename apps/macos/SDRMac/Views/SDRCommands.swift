@@ -26,9 +26,14 @@ struct SDRCommands: Commands {
             }
             .keyboardShortcut(.upArrow, modifiers: .command)
             Button("Tune Down 100 kHz") {
-                core.setCenter(core.centerFrequencyHz - 100_000)
+                // Clamp to 0 so repeated taps don't drive the
+                // center frequency negative (the engine would
+                // reject it but the UI would still show a
+                // negative value in the toolbar).
+                core.setCenter(max(core.centerFrequencyHz - 100_000, 0))
             }
             .keyboardShortcut(.downArrow, modifiers: .command)
+            .disabled(core.centerFrequencyHz < 100_000)
         }
 
         CommandGroup(after: .toolbar) {

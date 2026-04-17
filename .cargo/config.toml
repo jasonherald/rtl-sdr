@@ -1,0 +1,29 @@
+# Cargo workspace-level config.
+#
+# Scope: anything Cargo runs in this tree picks this up — no
+# opt-in required — so keep entries cross-platform safe and
+# universally desirable.
+
+[env]
+# Pin the Mach-O deployment target for macOS builds to match the
+# SwiftPM / Xcode deployment target declared in
+# `apps/macos/Packages/SdrCoreKit/Package.swift` (`.macOS(.v14)`).
+#
+# Without this, Cargo's C/C++ deps (whisper.cpp, libusb, etc.)
+# compile with macOS 14+'s *current* SDK default deployment
+# target (e.g., 26.x on a machine running macOS 26), which
+# produces Mach-O objects stamped with a higher min-os version
+# than the Swift side. Swift's ld then emits a warning per
+# object file:
+#
+#     ld: warning: object file (libsdr_ffi.a[...]) was built
+#         for newer 'macOS' version (26.4) than being linked (14.0)
+#
+# The warnings are cosmetic (the final binary still works on
+# macOS 14) but noisy enough to drown out real link errors.
+# Pinning the env var to the Swift floor silences them.
+#
+# Only meaningful on macOS — ignored on Linux / Windows cargo
+# invocations because MACOSX_DEPLOYMENT_TARGET has no effect
+# off-platform.
+MACOSX_DEPLOYMENT_TARGET = "14.0"

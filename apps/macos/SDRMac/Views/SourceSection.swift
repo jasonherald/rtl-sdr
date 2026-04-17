@@ -83,7 +83,8 @@ private struct GainSlider: View {
                 value: $index,
                 in: 0...Double(max(steps.count - 1, 0)),
                 step: 1,
-                onEditingChanged: { _ in
+                onEditingChanged: { editing in
+                    guard !editing else { return }
                     let i = Int(index.rounded())
                     if steps.indices.contains(i) { commit(steps[i]) }
                 }
@@ -115,12 +116,6 @@ private struct GainSlider: View {
     }
 }
 
-func formatRate(_ hz: Double) -> String {
-    if hz >= 1_000_000 {
-        return String(format: "%.3f MHz", hz / 1_000_000)
-    } else if hz >= 1_000 {
-        return String(format: "%.1f kHz", hz / 1_000)
-    } else {
-        return String(format: "%.0f Hz", hz)
-    }
-}
+// `formatRate` moved to `Formatters.swift` so StatusBar and any
+// future view can share the same rendering without a dangling
+// forward reference between sibling files.

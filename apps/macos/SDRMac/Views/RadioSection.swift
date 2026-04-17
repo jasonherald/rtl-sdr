@@ -32,8 +32,18 @@ struct RadioSection: View {
                         Slider(
                             value: $m.squelchDb,
                             in: -120...0,
-                            onEditingChanged: { _ in
-                                model.setSquelchDb(model.squelchDb)
+                            // `onEditingChanged` fires on BOTH drag
+                            // start (editing=true) and drag end
+                            // (editing=false). Commit only on drag
+                            // end, otherwise we'd fire an engine
+                            // command at the instant the user
+                            // touches the slider — with the old
+                            // value, before their drag has moved
+                            // it — then a second one on release.
+                            onEditingChanged: { editing in
+                                if !editing {
+                                    model.setSquelchDb(model.squelchDb)
+                                }
                             }
                         )
                         Text("\(Int(model.squelchDb)) dB")
@@ -60,8 +70,10 @@ struct RadioSection: View {
                 Slider(
                     value: $m.volume,
                     in: 0...1,
-                    onEditingChanged: { _ in
-                        model.setVolume(model.volume)
+                    onEditingChanged: { editing in
+                        if !editing {
+                            model.setVolume(model.volume)
+                        }
                     }
                 )
             }

@@ -49,7 +49,11 @@ private struct AudioPane: View {
                 Slider(
                     value: $m.volume,
                     in: 0...1,
-                    onEditingChanged: { _ in model.setVolume(model.volume) }
+                    onEditingChanged: { editing in
+                        if !editing {
+                            model.setVolume(model.volume)
+                        }
+                    }
                 )
             }
         }

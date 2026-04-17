@@ -89,11 +89,19 @@ final class CoreModelIntegrationTests: XCTestCase {
 
         m.start()
 
-        // Let any async error propagate through the event stream.
-        for _ in 0..<50 {
-            if m.lastError != nil { break }
-            try? await Task.sleep(nanoseconds: 20_000_000) // 20 ms
-        }
+        // Give the event consumer up to 1 s to surface any async
+        // error, using an NSPredicate-based XCTestExpectation
+        // rather than a manual poll. XCTWaiter returns when the
+        // predicate matches (or the timeout fires) — both
+        // outcomes are acceptable here since whether an error
+        // actually appears depends on hardware presence.
+        let errorAppeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                MainActor.assumeIsolated { m.lastError != nil }
+            },
+            object: nil
+        )
+        _ = await XCTWaiter.fulfillment(of: [errorAppeared], timeout: 1.0)
 
         // Consistency: if an error was reported, we should NOT
         // claim to be running. If no error, we can be either

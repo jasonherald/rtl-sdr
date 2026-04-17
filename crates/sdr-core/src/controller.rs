@@ -37,6 +37,14 @@ const IQ_PAIRS_PER_READ: usize = 16_384;
 /// Default FFT size for spectrum display.
 const DEFAULT_FFT_SIZE: usize = 2048;
 
+/// How often to emit the diagnostic `pipeline rates` log line.
+/// Short enough that a regression shows up within a few seconds
+/// of starting playback, long enough that the log doesn't flood
+/// on busy UIs. Controller-local constant so both the reset
+/// (on `Start`) and the emission site agree without a magic
+/// number in either place.
+const DIAG_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Default FFT display rate in FPS (matches SDR++ default of 20).
 /// Lower rate reduces Mesa GL driver memory pressure from per-frame
 /// buffer uploads.
@@ -1056,7 +1064,7 @@ fn process_iq_block(
             // drops below the configured source rate, USB is
             // starved; if audio drops below IQ/ratio, the DSP
             // chain is behind.
-            if state.diag_log_at.elapsed() >= std::time::Duration::from_secs(2) {
+            if state.diag_log_at.elapsed() >= DIAG_LOG_INTERVAL {
                 let elapsed = state.diag_log_at.elapsed().as_secs_f64().max(f64::EPSILON);
                 #[allow(
                     clippy::cast_precision_loss,

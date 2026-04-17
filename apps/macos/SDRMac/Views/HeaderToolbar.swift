@@ -94,7 +94,15 @@ private func formatHz(_ hz: Double) -> String {
 }
 
 private func parseHz(_ s: String) -> Double? {
-    let trimmed = s.trimmingCharacters(in: .whitespaces).lowercased()
+    var trimmed = s.trimmingCharacters(in: .whitespaces).lowercased()
+    // Reject negative frequencies up front — the engine would
+    // reject them too, but we can give faster feedback here
+    // (FrequencyEntry's onSubmit reverts to the last good value
+    // on nil) rather than letting a doomed tune command flow all
+    // the way to the DSP thread. Accept a leading `+` as a
+    // no-op so "+100M" isn't surprising.
+    if trimmed.hasPrefix("-") { return nil }
+    if trimmed.hasPrefix("+") { trimmed = String(trimmed.dropFirst()) }
     let multipliers: [(String, Double)] = [
         ("ghz", 1_000_000_000), ("g", 1_000_000_000),
         ("mhz", 1_000_000),     ("m", 1_000_000),
@@ -103,7 +111,8 @@ private func parseHz(_ s: String) -> Double? {
     ]
     for (suffix, mult) in multipliers where trimmed.hasSuffix(suffix) {
         let body = trimmed.dropLast(suffix.count).trimmingCharacters(in: .whitespaces)
-        if let v = Double(body) { return v * mult }
+        if let v = Double(body), v >= 0 { return v * mult }
     }
-    return Double(trimmed)
+    guard let v = Double(trimmed), v >= 0 else { return nil }
+    return v
 }

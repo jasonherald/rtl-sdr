@@ -62,9 +62,16 @@ SIZES=(
 if command -v rsvg-convert >/dev/null 2>&1; then
     RENDER="rsvg"
 elif command -v sips >/dev/null 2>&1; then
+    # `sips` ships with macOS and handles SVG via Image I/O on
+    # macOS 12+. Tested: valid 128×128 RGBA PNG output from the
+    # project SVG. Slightly softer antialiasing than librsvg but
+    # fine for the app icon at the sizes we render.
     RENDER="sips"
 else
-    echo "error: need rsvg-convert or sips to rasterize SVG" >&2
+    echo "error: neither rsvg-convert nor sips available" >&2
+    echo "       install rsvg-convert with: brew install librsvg" >&2
+    echo "       (sips is built into macOS, so this branch should" >&2
+    echo "        only trigger on a dev machine with PATH stripped)" >&2
     exit 1
 fi
 
@@ -74,12 +81,24 @@ for entry in "${SIZES[@]}"; do
     name="${entry##* }"
     out="$ICONSET/$name"
     if [ "$RENDER" = "rsvg" ]; then
-        rsvg-convert -w "$size" -h "$size" "$SVG" -o "$out"
+        if ! rsvg-convert -w "$size" -h "$size" "$SVG" -o "$out"; then
+            echo "error: rsvg-convert failed rendering $name (${size}x${size})" >&2
+            exit 1
+        fi
     else
-        # sips accepts SVG input on modern macOS. Render to a
-        # size-specific PNG without touching the source.
-        # The --out path controls the output filename.
-        sips -s format png -z "$size" "$size" "$SVG" --out "$out" >/dev/null 2>&1
+        # Let sips' own stderr flow through on failure rather
+        # than swallowing it — previous versions of this script
+        # piped sips to /dev/null, which turned a silent failure
+        # into an empty .icns. Noise on success is acceptable;
+        # sips is conservative about warnings.
+        if ! sips -s format png -z "$size" "$size" "$SVG" --out "$out" >/dev/null; then
+            echo "error: sips failed rendering $name (${size}x${size})" >&2
+            exit 1
+        fi
+        if [ ! -s "$out" ]; then
+            echo "error: sips produced an empty file for $name" >&2
+            exit 1
+        fi
     fi
 done
 

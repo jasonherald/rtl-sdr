@@ -132,8 +132,20 @@ final class CoreModel {
         do {
             let c = try SdrCore(configPath: configPath)
             self.core = c
-            self.eventTask = Task { [events = c.events] in
-                await self.consumeEvents(from: events)
+            // `[weak self]` breaks the retain cycle that would
+            // otherwise form: CoreModel → eventTask → closure →
+            // self. If the model is dropped (e.g., from a future
+            // test that bootstraps + releases in a tight scope),
+            // the task ends cleanly on the next iteration instead
+            // of pinning the model alive. We keep a strong ref to
+            // the stream itself via the `events` capture so the
+            // for-await doesn't get cancelled by the weak self
+            // going nil mid-event.
+            self.eventTask = Task { [weak self, events = c.events] in
+                for await event in events {
+                    guard let self else { return }
+                    await self.handleEvent(event)
+                }
             }
         } catch {
             self.lastError = "Failed to start engine: \(error)"
@@ -153,29 +165,30 @@ final class CoreModel {
         core = nil
     }
 
-    private func consumeEvents(from stream: AsyncStream<SdrCoreEvent>) async {
-        for await event in stream {
-            switch event {
-            case .sourceStopped:
-                isRunning = false
-            case .sampleRateChanged(let hz):
-                effectiveSampleRateHz = hz
-            case .signalLevel(let db):
-                signalLevelDb = db
-            case .deviceInfo(let s):
-                deviceInfo = s
-            case .gainList(let gains):
-                availableGains = gains
-            case .displayBandwidth(let hz):
-                // Engine-reported spectrum-display bandwidth.
-                // Same value as `sampleRateChanged` in v1 (both
-                // are effective_sample_rate on the Rust side);
-                // we land them on the same UI field rather than
-                // maintain two copies.
-                effectiveSampleRateHz = hz
-            case .error(let msg):
-                lastError = msg
-            }
+    /// Apply one event to the model. Split out from the `for
+    /// await` loop so the task can iterate the stream against a
+    /// weak self without duplicating the switch.
+    private func handleEvent(_ event: SdrCoreEvent) {
+        switch event {
+        case .sourceStopped:
+            isRunning = false
+        case .sampleRateChanged(let hz):
+            effectiveSampleRateHz = hz
+        case .signalLevel(let db):
+            signalLevelDb = db
+        case .deviceInfo(let s):
+            deviceInfo = s
+        case .gainList(let gains):
+            availableGains = gains
+        case .displayBandwidth(let hz):
+            // Engine-reported spectrum-display bandwidth.
+            // Same value as `sampleRateChanged` in v1 (both
+            // are effective_sample_rate on the Rust side);
+            // we land them on the same UI field rather than
+            // maintain two copies.
+            effectiveSampleRateHz = hz
+        case .error(let msg):
+            lastError = msg
         }
     }
 
@@ -334,7 +347,17 @@ final class CoreModel {
     // ==========================================================
 
     private func capture(_ work: () throws -> Void) {
-        do { try work() }
-        catch { lastError = "\(error)" }
+        do {
+            try work()
+        } catch {
+            // Preserve both the concrete error type and its
+            // localized description so diagnostics aren't
+            // reduced to a bare `Optional(...)` or a raw
+            // `Debug`-style string. `type(of:)` captures the
+            // Swift type (e.g., `SdrCoreError`) and lets the
+            // user / status bar distinguish between command
+            // rejections, FFI panics, etc.
+            lastError = "\(type(of: error)) — \(error.localizedDescription)"
+        }
     }
 }

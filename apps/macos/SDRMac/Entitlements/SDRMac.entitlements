@@ -20,20 +20,13 @@
     <true/>
 
     <!--
-      Network access for future v2 network-IQ source and
-      RadioReference integration. Not strictly needed for MVP
-      but declared so v2 doesn't trigger a codesign-policy rewrite.
+      Future entitlements (network client for Network-IQ source
+      + RadioReference, user-selected file read/write for IQ /
+      audio recording and file-source playback) will be added
+      here when their corresponding features actually ship.
+      Declaring them pre-emptively broadens the app's capability
+      surface without benefit — we add them alongside the code
+      that needs them, not ahead of time.
     -->
-    <key>com.apple.security.network.client</key>
-    <true/>
-
-    <!--
-      Read/write to `~/Library/Application Support/SDRMac/`
-      via user-selected path. We don't need the wider
-      `app-sandbox` key because we're shipping developer-ID
-      (non-sandbox) in v1 per the packaging spec.
-    -->
-    <key>com.apple.security.files.user-selected.read-write</key>
-    <true/>
 </dict>
 </plist>
