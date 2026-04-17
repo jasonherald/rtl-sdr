@@ -358,7 +358,8 @@ final class CoreModel {
         lastError = nil
     }
 
-    // No explicit `deinit` on CoreModel. The `@MainActor
+    // No explicit `deinit` on CoreModel — tracked by issue #293.
+    // The `@MainActor
     // @Observable` class gets @ObservationTracked-macro-generated
     // storage for every `var`, and Swift's current rules don't
     // let macro-generated mutable stored properties be
