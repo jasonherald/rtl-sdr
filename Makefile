@@ -347,11 +347,23 @@ mac-app:
 	@echo "==> cargo build --workspace --release"
 	@$(CARGO) build --workspace --release
 	@echo "==> xcodebuild -configuration Release"
-	@$(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
+	@# Capture xcodebuild stdout+stderr to a temp file, check its
+	@# real exit status, then filter for display. Piping directly
+	@# into `grep ... || true` only surfaces grep's exit code —
+	@# a silent xcodebuild failure would let the `cp` below copy
+	@# a stale .app from a previous successful build.
+	@xcb_log=$$(mktemp); \
+	if ! $(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
 		-configuration Release \
 		-derivedDataPath $(SDR_MAC_DD) \
-		build | \
-		grep -E '^(.+error:|.+warning:|\*\* [A-Z]+)' || true
+		build >"$$xcb_log" 2>&1; then \
+		echo "xcodebuild failed:"; \
+		cat "$$xcb_log"; \
+		rm -f "$$xcb_log"; \
+		exit 1; \
+	fi; \
+	grep -E '^(.+error:|.+warning:|\*\* [A-Z]+)' "$$xcb_log" || true; \
+	rm -f "$$xcb_log"
 	@mkdir -p $(SDR_MAC_APP)/build
 	@rm -rf $(SDR_MAC_APP)/build/sdr-rs.app
 	@cp -R $(SDR_MAC_DD)/Build/Products/Release/sdr-rs.app \
@@ -373,11 +385,20 @@ mac-app-debug:
 	@echo "==> cargo build --workspace (debug)"
 	@$(CARGO) build --workspace
 	@echo "==> xcodebuild -configuration Debug"
-	@$(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
+	@# Same xcodebuild exit-status handling as `mac-app`. See
+	@# comment there.
+	@xcb_log=$$(mktemp); \
+	if ! $(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
 		-configuration Debug \
 		-derivedDataPath $(SDR_MAC_DD) \
-		build | \
-		grep -E '^(.+error:|.+warning:|\*\* [A-Z]+)' || true
+		build >"$$xcb_log" 2>&1; then \
+		echo "xcodebuild failed:"; \
+		cat "$$xcb_log"; \
+		rm -f "$$xcb_log"; \
+		exit 1; \
+	fi; \
+	grep -E '^(.+error:|.+warning:|\*\* [A-Z]+)' "$$xcb_log" || true; \
+	rm -f "$$xcb_log"
 	@mkdir -p $(SDR_MAC_APP)/build
 	@rm -rf $(SDR_MAC_APP)/build/sdr-rs.app
 	@cp -R $(SDR_MAC_DD)/Build/Products/Debug/sdr-rs.app \
@@ -389,6 +410,10 @@ mac-test:
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 		echo "mac-test: skipping (not macOS)"; \
 		exit 0; \
+	fi
+	@if ! command -v $(XCODEBUILD) >/dev/null 2>&1; then \
+		echo "mac-test: $(XCODEBUILD) not found — install Xcode"; \
+		exit 1; \
 	fi
 	@echo "==> cargo build --workspace"
 	@$(CARGO) build --workspace

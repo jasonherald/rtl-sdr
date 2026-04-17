@@ -118,6 +118,15 @@ make swift-test
 - **macOS deployment target is 14 (Sonoma)** per the epic spec —
   `@Observable`, `NavigationSplitView`, modern AsyncStream
   semantics all need 14+.
+- **Xcode 16 or newer is required to open the project.** The
+  `.xcodeproj` uses `objectVersion = 77` and the
+  `PBXFileSystemSynchronizedRootGroup` ISA added in Xcode 16 so
+  source files auto-sync from the filesystem without per-file
+  UUID churn in the pbxproj. Xcode 15 and earlier cannot parse
+  the file. If you need to support older Xcodes, we'd revert
+  to `objectVersion = 63` and maintain explicit `PBXGroup`
+  members — not a regression worth taking on unless someone
+  actually hits it.
 - **Mach-O deployment-target pin** lives in `.cargo/config.toml`
   (`MACOSX_DEPLOYMENT_TARGET = "14.0"`), matching the Xcode
   project's setting so the Rust static archive's object files
