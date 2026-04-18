@@ -1952,6 +1952,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-server-rtltcp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rusb",
+ "sdr-rtlsdr",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sdr-sink-audio"
 version = "0.1.0"
 dependencies = [
