@@ -15,6 +15,18 @@
 //!
 //! Ports SDR++ `NetworkSourceModule`. Receives IQ samples over
 //! TCP (client) or UDP connections with configurable sample format.
+//!
+//! Also hosts an `rtl_tcp`-protocol client (see [`rtl_tcp`]) that
+//! connects to any `rtl_tcp`-compatible server (GQRX, SDR++,
+//! [`sdr-server-rtltcp`]) and streams 8-bit I/Q with tuning command
+//! support.
+
+pub mod rtl_tcp;
+
+pub use rtl_tcp::{
+    ConnectionState, DEFAULT_CONNECT_TIMEOUT, DEFAULT_DATA_READ_TIMEOUT,
+    DEFAULT_MAX_CONSECUTIVE_TIMEOUTS, RtlTcpConfig, RtlTcpSource, TunerInfo,
+};
 
 use sdr_pipeline::source_manager::Source;
 use sdr_types::{Complex, Protocol, SampleFormat, SourceError};

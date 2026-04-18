@@ -39,6 +39,12 @@ pub enum SourceError {
     ReadFailed(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Wire-protocol-level failure from a network source — e.g. a stream
+    /// that was supposed to speak `rtl_tcp` but didn't return the expected
+    /// 12-byte `RTL0` header. Distinct from `Io` so UI can surface
+    /// "not an `rtl_tcp` server" rather than a generic socket error.
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
 
 /// Errors from sink modules.
