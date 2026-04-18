@@ -109,7 +109,7 @@ impl Browser {
                     }
                 }
             })
-            .map_err(DiscoveryError::Hostname)?;
+            .map_err(DiscoveryError::Io)?;
 
         Ok(Self {
             daemon,

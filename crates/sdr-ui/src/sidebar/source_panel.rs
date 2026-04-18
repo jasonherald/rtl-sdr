@@ -83,9 +83,6 @@ pub struct SourcePanel {
     /// Discovered `rtl_tcp` servers (live from mDNS). Collapsed by
     /// default; expands when servers are seen.
     pub rtl_tcp_discovered_row: adw::ExpanderRow,
-    /// Connection-state label for `rtl_tcp` (Connecting / Connected /
-    /// Retrying / Failed / Disconnected).
-    pub rtl_tcp_status_row: adw::ActionRow,
 }
 
 /// Default sample rate selector index (2.4 MHz = index 7).
@@ -294,14 +291,16 @@ pub fn build_source_panel() -> SourcePanel {
     // RTL-TCP-specific rows. Built always, shown only when the RTL-TCP
     // source type is selected (see connect_device_visibility + the
     // initial-visibility block below).
+    //
+    // Connection-state display (Connecting / Connected / Retrying /
+    // Failed) is intentionally deferred to #323 — wiring it requires
+    // a new DspToUi event from the controller that polls
+    // RtlTcpSource::connection_state(), which is outside this PR's
+    // scope. Shipping the row without that plumbing would leave it
+    // stuck on "Disconnected" misleadingly.
     let rtl_tcp_discovered_row = adw::ExpanderRow::builder()
         .title("Discovered rtl_tcp servers")
         .subtitle("No servers discovered on the local network yet.")
-        .visible(false)
-        .build();
-    let rtl_tcp_status_row = adw::ActionRow::builder()
-        .title("Connection")
-        .subtitle("Disconnected")
         .visible(false)
         .build();
 
@@ -321,7 +320,6 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&decimation_row);
     group.add(&record_iq_row);
     group.add(&rtl_tcp_discovered_row);
-    group.add(&rtl_tcp_status_row);
 
     // Derive initial visibility from the selected device.
     let selected = device_row.selected();
@@ -339,7 +337,6 @@ pub fn build_source_panel() -> SourcePanel {
     protocol_row.set_visible(is_network);
     file_path_row.set_visible(is_file);
     rtl_tcp_discovered_row.set_visible(is_rtltcp);
-    rtl_tcp_status_row.set_visible(is_rtltcp);
 
     connect_device_visibility(
         &device_row,
@@ -352,7 +349,7 @@ pub fn build_source_panel() -> SourcePanel {
         &protocol_row,
         &file_path_row,
     );
-    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row, &rtl_tcp_status_row);
+    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row);
 
     // Controls connected to DSP pipeline via window.rs
 
@@ -373,7 +370,6 @@ pub fn build_source_panel() -> SourcePanel {
         decimation_row,
         record_iq_row,
         rtl_tcp_discovered_row,
-        rtl_tcp_status_row,
     }
 }
 
@@ -383,17 +379,13 @@ pub fn build_source_panel() -> SourcePanel {
 fn connect_rtl_tcp_visibility(
     device_row: &adw::ComboRow,
     rtl_tcp_discovered_row: &adw::ExpanderRow,
-    rtl_tcp_status_row: &adw::ActionRow,
 ) {
     device_row.connect_selected_notify(glib::clone!(
         #[weak]
         rtl_tcp_discovered_row,
-        #[weak]
-        rtl_tcp_status_row,
         move |row| {
             let is_rtltcp = row.selected() == DEVICE_RTLTCP;
             rtl_tcp_discovered_row.set_visible(is_rtltcp);
-            rtl_tcp_status_row.set_visible(is_rtltcp);
         }
     ));
 }

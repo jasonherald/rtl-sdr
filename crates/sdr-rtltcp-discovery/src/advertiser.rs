@@ -124,7 +124,16 @@ fn local_hostname() -> Result<String, DiscoveryError> {
             .or_else(|_| std::fs::read_to_string("/etc/hostname"))
         {
             Ok(s) => {
-                let trimmed = s.trim();
+                // Defensive: strip any trailing `.local` / `.local.`
+                // before re-appending, so an `/etc/hostname` that
+                // already contains the suffix doesn't produce
+                // `foo.local..local.`. mDNS daemons typically
+                // normalize this but costing a single `trim_end_matches`
+                // pair per registration is cheap insurance.
+                let trimmed = s
+                    .trim()
+                    .trim_end_matches(".local.")
+                    .trim_end_matches(".local");
                 if trimmed.is_empty() {
                     Ok("localhost.local.".to_string())
                 } else {

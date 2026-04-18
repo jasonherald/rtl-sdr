@@ -875,6 +875,13 @@ fn connect_sidebar_panels(
 fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     use std::collections::HashMap;
 
+    // Shared cell that lets the Connect closure read the current
+    // (host, port) for a given row. Re-announces update the cell
+    // in-place without rebuilding the button closure, so a server
+    // that comes back on a new address doesn't leave the UI dialing
+    // the stale endpoint.
+    type EndpointCell = Rc<RefCell<(String, u16)>>;
+
     let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
     let browser = match Browser::start(move |event| {
         // Ignore send errors — means the UI thread dropped the rx,
@@ -888,10 +895,12 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
         }
     };
 
-    // Tracks the AdwActionRow per-server so we can remove it on
+    // Tracks the `AdwActionRow` per-server so we can remove it on
     // `ServerWithdrawn`. Keyed by full DNS-SD instance name (stable
-    // across nickname changes).
-    let displayed_rows: Rc<RefCell<HashMap<String, adw::ActionRow>>> =
+    // across nickname changes). The per-row value bundles the row
+    // widget with its `EndpointCell` — see the type-alias docstring
+    // for why that separation matters.
+    let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, EndpointCell)>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
     let expander = panels.source.rtl_tcp_discovered_row.clone();
@@ -925,11 +934,15 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                         host, server.port, server.txt.tuner, server.txt.gains
                     );
 
-                    if let Some(existing) = rows.get(&server.instance_name) {
+                    if let Some((existing_row, endpoint)) = rows.get(&server.instance_name) {
                         // Resolve fired again (TTL refresh) — update
-                        // subtitle in case nickname / tuner changed.
-                        existing.set_title(&title);
-                        existing.set_subtitle(&subtitle);
+                        // labels AND the shared endpoint cell so the
+                        // existing Connect button dials the current
+                        // (possibly moved) server, not the stale one
+                        // captured at first-announce time.
+                        existing_row.set_title(&title);
+                        existing_row.set_subtitle(&subtitle);
+                        *endpoint.borrow_mut() = (host.clone(), server.port);
                         continue;
                     }
 
@@ -941,35 +954,36 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     connect_btn.add_css_class("suggested-action");
                     connect_btn.set_valign(gtk4::Align::Center);
 
-                    // Capture by clone into the click handler. Each
-                    // discovered server spawns its own independent
-                    // closure — no cross-row coupling.
-                    let host_clone = host.clone();
-                    let port = server.port;
+                    // Shared endpoint cell — the Connect closure reads
+                    // the latest (host, port) at click time, not the
+                    // values captured when the row was first built.
+                    let endpoint: EndpointCell = Rc::new(RefCell::new((host.clone(), server.port)));
+                    let endpoint_for_click = Rc::clone(&endpoint);
                     let hr = hostname_row.clone();
                     let pr = port_row.clone();
                     let dr = device_row.clone();
                     let st = Rc::clone(&state);
                     connect_btn.connect_clicked(move |_| {
-                        hr.set_text(&host_clone);
-                        pr.set_value(f64::from(port));
+                        let (current_host, current_port) = endpoint_for_click.borrow().clone();
+                        hr.set_text(&current_host);
+                        pr.set_value(f64::from(current_port));
                         dr.set_selected(crate::sidebar::source_panel::DEVICE_RTLTCP);
                         st.send_dsp(UiToDsp::SetNetworkConfig {
-                            hostname: host_clone.clone(),
-                            port,
+                            hostname: current_host,
+                            port: current_port,
                             protocol: sdr_types::Protocol::TcpClient,
                         });
                         st.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
                     });
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
-                    rows.insert(server.instance_name.clone(), row);
+                    rows.insert(server.instance_name.clone(), (row, endpoint));
 
                     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
                 }
                 DiscoveryEvent::ServerWithdrawn { instance_name } => {
                     let mut rows = displayed_rows.borrow_mut();
-                    if let Some(row) = rows.remove(&instance_name) {
+                    if let Some((row, _endpoint)) = rows.remove(&instance_name) {
                         expander.remove(&row);
                     }
                     if rows.is_empty() {

@@ -6,6 +6,18 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Default includes `mdns-advertise` so the CLI binary and sdr-rs'
+# bundled build keep their announce-by-default UX. Library consumers
+# who only want the Server API can build with
+# `default-features = false` and skip the mdns-sd dep tree entirely.
+default = ["mdns-advertise"]
+# Pulls in `sdr-rtltcp-discovery` so the bin target can advertise via
+# mDNS. The library itself never references this dep; gating it here
+# enforces the stated design intent ("lib stays free of this dep")
+# at the manifest level rather than relying on source-level hygiene.
+mdns-advertise = ["dep:sdr-rtltcp-discovery"]
+
 [dependencies]
 sdr-rtlsdr.workspace = true
 thiserror.workspace = true
@@ -19,10 +31,9 @@ rusb.workspace = true
 # Binary only — enables `-s info` style env-filter logging for the CLI.
 # Kept in regular deps (not dev-deps) because the `[[bin]]` target needs it.
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-# mDNS advertise for the `sdr-rtl-tcp` bin. The lib crate stays free of
-# this dep; only the binary composes it (so a downstream consumer that
-# just wants the Server API doesn't pull in mdns-sd).
-sdr-rtltcp-discovery.workspace = true
+# Optional — only pulled in when `mdns-advertise` is enabled. The bin
+# target requires this feature (see `required-features` below).
+sdr-rtltcp-discovery = { workspace = true, optional = true }
 
 [lints]
 workspace = true
@@ -30,4 +41,9 @@ workspace = true
 [[bin]]
 name = "sdr-rtl-tcp"
 path = "src/bin/sdr-rtl-tcp.rs"
+# The bin invokes `sdr_rtltcp_discovery::{Advertiser, ...}` directly,
+# so its build MUST enable `mdns-advertise`. This ties the feature to
+# the binary target specifically without forcing library consumers to
+# opt out.
+required-features = ["mdns-advertise"]
 
