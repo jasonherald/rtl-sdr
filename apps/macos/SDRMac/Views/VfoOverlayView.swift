@@ -74,6 +74,15 @@ struct VfoOverlayView: View {
             let leftPx = centerPx - bwPixels / 2
 
             ZStack(alignment: .topLeading) {
+                // Clear backdrop forces the ZStack to fill the
+                // full geo size. Without this, the ZStack sizes
+                // to its largest child (the band), and
+                // `.contentShape` only covers that strip — which
+                // is why click-to-tune outside the band didn't
+                // work.
+                Color.clear
+                    .frame(width: width, height: height)
+
                 // Passband fill — wide enough to cover the
                 // demodulator's accepted bandwidth. Alpha kept
                 // low so waterfall detail underneath stays
@@ -120,18 +129,33 @@ struct VfoOverlayView: View {
         }
     }
 
-    /// Convert the drag's x-pixel to an offset-from-tuner-center
-    /// frequency and push it to the engine via CoreModel.
-    /// Clamped to the visible span so we don't produce huge
-    /// offsets that would be outside anything meaningful. For
-    /// now, dragging past the edge just parks the VFO at the
-    /// edge; a future pass can add tuner re-centering.
+    /// Convert the drag's x-pixel to an absolute frequency and
+    /// RETUNE the hardware tuner to center on it, parking the
+    /// VFO offset at 0.
+    ///
+    /// This matches the GTK UI's click-to-tune behaviour (see
+    /// `crates/sdr-ui/src/window.rs:270` — the VFO offset change
+    /// callback pulls `center + offset` and calls `Tune(...)`).
+    /// Setting `vfoOffset` directly doesn't work for clicks
+    /// outside ±effective_sample_rate/2 because the demod only
+    /// processes the post-decimation passband; retuning the
+    /// tuner to the clicked frequency puts the signal back at
+    /// DC where the demod can lock onto it.
     private func applyDrag(at x: CGFloat, width: CGFloat, span: Double) {
         guard width > 0, span > 0 else { return }
         let frac = max(0, min(1, x / width))
-        let rawOffset = (Double(frac) - 0.5) * span
-        let halfSpan = span / 2
-        let clamped = max(-halfSpan, min(halfSpan, rawOffset))
-        model.setVfoOffset(clamped)
+        // Absolute Hz = tuner center + (offset from center on the
+        // visible axis). `span` is `displayBandwidthHz`, the full
+        // FFT span.
+        let absoluteHz = model.centerFrequencyHz + (Double(frac) - 0.5) * span
+        // Reject obviously-bad clicks (e.g. if centerFrequencyHz
+        // is uninitialised). Negative Hz never makes sense.
+        guard absoluteHz > 0 else { return }
+        model.setCenter(absoluteHz)
+        // Park the VFO at the new center; the demod now sees
+        // the desired signal at DC.
+        if model.vfoOffsetHz != 0 {
+            model.setVfoOffset(0)
+        }
     }
 }
