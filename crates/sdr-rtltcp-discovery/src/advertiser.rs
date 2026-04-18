@@ -36,8 +36,14 @@ pub struct AdvertiseOptions {
 /// The underlying `ServiceDaemon` is kept alive inside `Advertiser` so
 /// the registration stays valid. Dropping the `Advertiser` both
 /// unregisters the service AND shuts the daemon down.
+///
+/// `daemon` is wrapped in `Option` so [`Advertiser::stop`] can take it
+/// out explicitly, leaving `Drop::drop` as a no-op for already-stopped
+/// instances — otherwise callers who `stop()` would pay for two rounds
+/// of unregister + shutdown against the same (potentially already
+/// dead) daemon.
 pub struct Advertiser {
-    daemon: ServiceDaemon,
+    daemon: Option<ServiceDaemon>,
     /// Full service name as registered, e.g.
     /// `jason-desk rtl-sdr._rtl_tcp._tcp.local.`. Needed by
     /// `ServiceDaemon::unregister` when we drop.
@@ -52,7 +58,10 @@ impl Advertiser {
         let props = opts.txt.to_properties()?;
 
         let host = if opts.hostname.is_empty() {
-            local_hostname()?
+            // Auto-derive the mDNS hostname from the OS hostname.
+            // `local_hostname()` returns the bare name (no suffix);
+            // mDNS wants fully-qualified, so we append `.local.` here.
+            format!("{}.local.", local_hostname())
         } else {
             opts.hostname.clone()
         };
@@ -78,73 +87,107 @@ impl Advertiser {
             port = opts.port,
             "rtl_tcp mDNS advertisement registered"
         );
-        Ok(Self { daemon, full_name })
+        Ok(Self {
+            daemon: Some(daemon),
+            full_name,
+        })
     }
 
     /// Stop advertising and shut the daemon down. Equivalent to
     /// dropping the `Advertiser`, but lets the caller propagate errors.
-    pub fn stop(self) -> Result<(), DiscoveryError> {
-        let rx = self.daemon.unregister(&self.full_name)?;
+    /// Taking the daemon out of `Option` here means the subsequent
+    /// `Drop` call is a no-op for an already-stopped advertiser.
+    pub fn stop(mut self) -> Result<(), DiscoveryError> {
+        let Some(daemon) = self.daemon.take() else {
+            return Ok(());
+        };
+        let rx = daemon.unregister(&self.full_name)?;
         // `unregister` returns a Receiver for the completion status so
         // the caller can wait for unregistration to finish. Short
         // timeout is fine; if mDNS is wedged we still want to exit.
         let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
         // Shutdown follows the same pattern.
-        let _ = self.daemon.shutdown();
+        let _ = daemon.shutdown();
         Ok(())
     }
 }
 
 impl Drop for Advertiser {
     fn drop(&mut self) {
+        // No-op if `stop()` already consumed the daemon — the Option
+        // lets us distinguish "still owned, need teardown" from
+        // "already torn down by an explicit stop()."
+        let Some(daemon) = self.daemon.take() else {
+            return;
+        };
         // Best-effort teardown — we don't want Drop to panic even if
         // the mDNS daemon has already shut down or a mutex is poisoned.
-        if let Ok(rx) = self.daemon.unregister(&self.full_name) {
+        if let Ok(rx) = daemon.unregister(&self.full_name) {
             let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
         }
-        let _ = self.daemon.shutdown();
+        let _ = daemon.shutdown();
     }
 }
 
-/// Best-effort local hostname lookup. Uses `gethostname` via the
-/// `hostname::get` crate? — we avoid a new dependency by reading
-/// `/etc/hostname` on Unix and falling back to `localhost` otherwise.
+/// Best-effort local hostname lookup, returning the **bare** hostname
+/// without any `.local.` suffix. Useful as a default nickname for
+/// advertisement (callers who want the full mDNS form can append
+/// `.local.` themselves).
 ///
-/// The returned string is passed to mDNS as the A/AAAA host; mDNS
-/// will normalize / append `.local.` if needed.
-fn local_hostname() -> Result<String, DiscoveryError> {
-    // std's hostname accessor is nightly-only, so we roll our own for
-    // Unix. The `"localhost"` fallback keeps the advertisement alive on
-    // an unusual system rather than erroring out.
-    #[cfg(unix)]
-    {
-        // Read /proc/sys/kernel/hostname on Linux, /etc/hostname
-        // elsewhere. Both are plain text, one line.
-        match std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-        {
-            Ok(s) => {
-                // Defensive: strip any trailing `.local` / `.local.`
-                // before re-appending, so an `/etc/hostname` that
-                // already contains the suffix doesn't produce
-                // `foo.local..local.`. mDNS daemons typically
-                // normalize this but costing a single `trim_end_matches`
-                // pair per registration is cheap insurance.
-                let trimmed = s
-                    .trim()
-                    .trim_end_matches(".local.")
-                    .trim_end_matches(".local");
-                if trimmed.is_empty() {
-                    Ok("localhost.local.".to_string())
-                } else {
-                    Ok(format!("{trimmed}.local."))
-                }
-            }
-            Err(e) => Err(DiscoveryError::Hostname(e)),
-        }
+/// Uses `libc::gethostname(3)` on Unix — portable across Linux, macOS,
+/// and the BSDs, unlike the `/proc/sys/kernel/hostname` + `/etc/hostname`
+/// reads we had before (Linux-only). On the exceedingly rare failure
+/// path — `gethostname()` cannot actually fail on a modern OS except
+/// for `EFAULT` against a buffer we control — we log and return
+/// `"localhost"` so a degraded system still gets an advertisement
+/// rather than a cryptic mDNS registration error.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn local_hostname() -> String {
+    // POSIX caps HOST_NAME_MAX at 255; 256 includes the NUL and
+    // leaves room for any OS that returns a non-NUL-terminated
+    // buffer at full capacity.
+    const BUFFER_LEN: usize = 256;
+    let mut buf = [0u8; BUFFER_LEN];
+    // SAFETY: `buf` is a fixed-size stack array whose lifetime
+    // outlives the syscall. We pass its length via `size_of_val`, so
+    // `gethostname()` cannot write past the end. The result is read
+    // only after we confirm success.
+    let rc = unsafe {
+        libc::gethostname(
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            std::mem::size_of_val(&buf),
+        )
+    };
+    if rc != 0 {
+        tracing::warn!("gethostname() failed, using 'localhost' as nickname default");
+        return String::from("localhost");
     }
-    #[cfg(not(unix))]
-    {
-        Ok("localhost.local.".to_string())
+    // gethostname does NOT guarantee NUL-termination when the name
+    // fills the buffer, but POSIX HOST_NAME_MAX is well under 256, so
+    // in practice every returned hostname is NUL-terminated and the
+    // NUL scan is safe. Still, defensively cap the length.
+    let name_len = buf.iter().position(|&b| b == 0).unwrap_or(BUFFER_LEN);
+    let Ok(name) = std::str::from_utf8(&buf[..name_len]) else {
+        tracing::warn!("gethostname() returned non-UTF-8 bytes, using 'localhost'");
+        return String::from("localhost");
+    };
+    let trimmed = name
+        .trim()
+        .trim_end_matches(".local.")
+        .trim_end_matches(".local");
+    if trimmed.is_empty() {
+        String::from("localhost")
+    } else {
+        trimmed.to_string()
     }
+}
+
+/// Non-Unix stub. `sdr-rtl-tcp` bin is `compile_error!`-gated to Unix
+/// already, so this path is only reachable from library consumers on
+/// exotic platforms. Returns `"localhost"` so they still get a valid
+/// (if boring) default nickname.
+#[cfg(not(unix))]
+pub fn local_hostname() -> String {
+    String::from("localhost")
 }

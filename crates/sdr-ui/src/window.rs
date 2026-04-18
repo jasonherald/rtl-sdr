@@ -906,6 +906,7 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     let expander = panels.source.rtl_tcp_discovered_row.clone();
     let hostname_row = panels.source.hostname_row.clone();
     let port_row = panels.source.port_row.clone();
+    let protocol_row = panels.source.protocol_row.clone();
     let device_row = panels.source.device_row.clone();
     let state = Rc::clone(state);
 
@@ -961,12 +962,22 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     let endpoint_for_click = Rc::clone(&endpoint);
                     let hr = hostname_row.clone();
                     let pr = port_row.clone();
+                    let protor = protocol_row.clone();
                     let dr = device_row.clone();
                     let st = Rc::clone(&state);
                     connect_btn.connect_clicked(move |_| {
                         let (current_host, current_port) = endpoint_for_click.borrow().clone();
                         hr.set_text(&current_host);
                         pr.set_value(f64::from(current_port));
+                        // Force the shared protocol row to TCP. rtl_tcp
+                        // is always TCP, and the hostname_row /
+                        // port_row edit handlers re-read this widget
+                        // when dispatching SetNetworkConfig — leaving
+                        // it on UDP (the previous Network-source
+                        // selection) would silently overwrite our
+                        // protocol on the next hostname edit. Index 0
+                        // = TcpClient; see protocol_row builder.
+                        protor.set_selected(0);
                         dr.set_selected(crate::sidebar::source_panel::DEVICE_RTLTCP);
                         st.send_dsp(UiToDsp::SetNetworkConfig {
                             hostname: current_host,

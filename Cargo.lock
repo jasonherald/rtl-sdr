@@ -2013,6 +2013,7 @@ dependencies = [
 name = "sdr-rtltcp-discovery"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mdns-sd",
  "thiserror 2.0.18",
  "tracing",

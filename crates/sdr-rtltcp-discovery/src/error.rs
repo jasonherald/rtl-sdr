@@ -17,16 +17,11 @@ pub enum DiscoveryError {
     #[error("invalid TXT record field: {0}")]
     InvalidTxt(String),
 
-    /// Local hostname lookup failed. We need it to build the mDNS
-    /// registration's default instance name; callers can pass an
-    /// explicit nickname to bypass.
-    #[error("failed to determine local hostname: {0}")]
-    Hostname(std::io::Error),
-
     /// Generic IO error — thread spawn failures, socket operations
-    /// that surface an unrelated error, etc. Distinct from `Hostname`
-    /// so a downstream error-matcher doesn't conflate "hostname
-    /// lookup failed" with "couldn't spawn a worker thread."
+    /// that surface an unrelated error, etc. Hostname lookup no
+    /// longer errors (it uses `libc::gethostname` + a
+    /// `"localhost"` fallback), but kept broad so future discovery
+    /// paths can reuse.
     #[error("IO error: {0}")]
     Io(std::io::Error),
 }

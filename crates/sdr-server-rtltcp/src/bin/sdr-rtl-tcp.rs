@@ -40,7 +40,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sdr_rtltcp_discovery::{AdvertiseOptions, Advertiser, TxtRecord};
+use sdr_rtltcp_discovery::{AdvertiseOptions, Advertiser, TxtRecord, local_hostname};
 use sdr_server_rtltcp::server::{DEFAULT_SAMPLE_RATE_HZ, Server, ServerConfig};
 use sdr_server_rtltcp::{DEFAULT_BUFFER_CAPACITY, DEFAULT_PORT};
 
@@ -370,10 +370,13 @@ fn announce_over_mdns(
     discovery: &DiscoveryOptions,
 ) -> Result<Advertiser, sdr_rtltcp_discovery::DiscoveryError> {
     let tuner = server.tuner_info();
-    let nickname = discovery
-        .nickname
-        .clone()
-        .unwrap_or_else(|| "sdr-rtl-tcp".to_string());
+    // Fallback nickname: system hostname via libc::gethostname.
+    // Previously this was hardcoded to "sdr-rtl-tcp" — which meant
+    // two stock servers on the same LAN would show up as the same
+    // label in the discovery list (and could collide on the DNS-SD
+    // instance name). Matches the help text's "defaults to hostname"
+    // promise.
+    let nickname = discovery.nickname.clone().unwrap_or_else(local_hostname);
     let txt = TxtRecord {
         tuner: tuner.name.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -384,7 +387,7 @@ fn announce_over_mdns(
     Advertiser::announce(AdvertiseOptions {
         port: server.bind_address().port(),
         instance_name: format!("{nickname} rtl-sdr"),
-        hostname: String::new(), // auto-derive from /etc/hostname
+        hostname: String::new(), // auto-derive in the advertiser
         txt,
     })
 }

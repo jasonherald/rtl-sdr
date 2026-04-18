@@ -44,7 +44,7 @@ mod browser;
 mod error;
 mod txt;
 
-pub use advertiser::{AdvertiseOptions, Advertiser};
+pub use advertiser::{AdvertiseOptions, Advertiser, local_hostname};
 pub use browser::{Browser, DiscoveredServer, DiscoveryEvent};
 pub use error::DiscoveryError;
 pub use txt::TxtRecord;
@@ -59,6 +59,32 @@ pub const SERVICE_TYPE: &str = "_rtl_tcp._tcp.local.";
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_hostname_returns_bare_non_empty_name_without_local_suffix() {
+        // Contract: non-empty, no trailing `.local.` / `.local`.
+        // `libc::gethostname` on CI runners and dev machines returns a
+        // real name; if the syscall ever failed it'd fall back to
+        // "localhost" which still satisfies the contract.
+        let host = local_hostname();
+        assert!(!host.is_empty(), "local_hostname() returned empty string");
+        // clippy::case_sensitive_file_extension_comparisons wants
+        // `.rsplit('.').next()` — but this is a hostname-suffix check
+        // that is genuinely case-sensitive per DNS labels (though
+        // mDNS normalizes case in practice, our local_hostname()
+        // contract is byte-exact). Allow the lint locally.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        let ends_bad = host.ends_with(".local.") || host.ends_with(".local");
+        assert!(
+            !ends_bad,
+            "local_hostname() must return bare name, not mDNS-qualified: {host:?}"
+        );
+        // mDNS DNS-SD instance-name components aren't allowed to
+        // contain NUL bytes. gethostname should never produce one, but
+        // our UTF-8 trim path should have stripped any interior NUL
+        // regardless.
+        assert!(!host.contains('\0'));
+    }
 
     #[test]
     fn service_type_matches_dns_sd_shape() {

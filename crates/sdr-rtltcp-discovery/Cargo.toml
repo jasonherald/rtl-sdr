@@ -13,6 +13,11 @@ tracing.workspace = true
 # Version kept in sync with the workspace so future crates can share
 # the same dependency if they need discovery.
 mdns-sd = { workspace = true }
+# libc::gethostname for portable hostname lookup across Unix flavors
+# (Linux, macOS, BSD). The `/proc/sys/kernel/hostname` + `/etc/hostname`
+# path we used before is Linux-only; `gethostname(3)` works on every
+# Unix. See the `unix`-gated block in advertiser::local_hostname.
+libc.workspace = true
 
 [lints]
 workspace = true

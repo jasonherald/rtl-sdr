@@ -417,6 +417,15 @@ mod tests {
 
     #[test]
     fn device_indices_are_distinct() {
+        // Full pairwise distinctness — adding a 5th source type
+        // without updating this test would let a collision slip
+        // through. The device_row -> SourceType match in window.rs
+        // depends on these being unique integer indices.
         assert_ne!(DEVICE_RTLSDR, DEVICE_NETWORK);
+        assert_ne!(DEVICE_RTLSDR, DEVICE_FILE);
+        assert_ne!(DEVICE_RTLSDR, DEVICE_RTLTCP);
+        assert_ne!(DEVICE_NETWORK, DEVICE_FILE);
+        assert_ne!(DEVICE_NETWORK, DEVICE_RTLTCP);
+        assert_ne!(DEVICE_FILE, DEVICE_RTLTCP);
     }
 }
