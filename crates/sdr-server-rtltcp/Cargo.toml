@@ -1,0 +1,29 @@
+[package]
+name = "sdr-server-rtltcp"
+version = "0.1.0"
+description = "rtl_tcp-compatible server — streams local RTL-SDR I/Q over TCP with tuning command channel. Port of original/librtlsdr/src/rtl_tcp.c."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-rtlsdr.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Needed for `SO_KEEPALIVE` via setsockopt — std::net::TcpStream exposes
+# `set_nodelay` and friends but not keepalive. Rather than pull in socket2
+# just for one call, we use the same libc/allow(unsafe_code) pattern used
+# elsewhere in the workspace (e.g. crates/sdr-transcription/src/util.rs).
+libc.workspace = true
+rusb.workspace = true
+# Binary only — enables `-s info` style env-filter logging for the CLI.
+# Kept in regular deps (not dev-deps) because the `[[bin]]` target needs it.
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sdr-rtl-tcp"
+path = "src/bin/sdr-rtl-tcp.rs"
+

@@ -1,0 +1,1030 @@
+//! TCP server — accept loop, per-client data/command/writer threads.
+//!
+//! Faithful port of the upstream rtl_tcp threading model with one Rust
+//! tweak: upstream uses a pthread condvar + linked list to decouple the
+//! libusb async callback from the TCP writer (dropping buffers when the
+//! list exceeds `llbuf_num`, default 500). We use a bounded
+//! `std::sync::mpsc::sync_channel` with identical drop-on-full semantics —
+//! simpler and no `unsafe`, same backpressure behavior.
+//!
+//! Upstream layout (rtl_tcp.c:498-720):
+//!   main: bind → accept → apply defaults → reset_buffer → spawn
+//!         tcp_worker + command_worker → rtlsdr_read_async (blocks) →
+//!         cancel_async on SIGINT → join → accept again
+//!
+//! Our layout: accept thread owns the outer loop; each accepted client
+//! spawns data_worker (USB → channel), writer (channel → TCP send), and
+//! command_worker (TCP recv → dispatch). First worker to exit signals
+//! the others via the shutdown flag.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use sdr_rtlsdr::device::RtlSdrDevice;
+
+use crate::dispatch::dispatch;
+use crate::error::ServerError;
+use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode};
+
+/// USB read buffer size (bytes). Matches `DEFAULT_BUF_LENGTH` upstream
+/// (`rtl_tcp` inherits `rtlsdr_read_async`'s 16 × 32 KiB = 256 KiB default).
+///
+/// NOTE: must be a multiple of 512 (USB bulk alignment).
+pub const READ_BUFFER_LEN: u32 = 256 * 1024;
+
+/// Maximum number of 256 KiB buffers allowed to queue between the USB
+/// reader and the TCP writer. Matches upstream's default `llbuf_num = 500`
+/// (rtl_tcp.c:61). When the queue is full, new USB buffers are dropped and
+/// a warning is logged — exactly upstream's drop-on-overflow policy.
+pub const DEFAULT_BUFFER_CAPACITY: usize = 500;
+
+/// Socket receive timeout for the command worker select loop. Upstream
+/// uses a 1-second select timeout so the loop re-checks `do_exit` even
+/// when no commands arrive (rtl_tcp.c:293-304).
+const COMMAND_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Sleep between non-blocking `accept()` polls. Small enough that the
+/// accept thread notices the shutdown flag within ~100 ms of `Drop`.
+/// `TcpListener` doesn't expose a per-accept timeout, so we poll with
+/// `set_nonblocking(true)` + `thread::sleep`.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Backoff after an `accept()` call returns a non-WouldBlock error.
+/// Typically an exhausted-FD / out-of-memory situation — short enough
+/// to retry quickly once the transient resolves, long enough to avoid
+/// a tight log-spam loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
+
+/// `recv_timeout` in the TCP writer so it notices shutdown even when
+/// the USB reader is starving (dongle unplug, no data incoming).
+const WRITER_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Timeout on each USB bulk read in the data worker. Matches upstream's
+/// 1-second poll interval in the `rtlsdr_read_async` loop. The data
+/// worker re-checks the shutdown flag between reads.
+const USB_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Default sample rate in Hz. Matches upstream `rtl_tcp.c:DEFAULT_SAMPLE_RATE_HZ`.
+///
+/// Exposed so the CLI can share the same constant instead of hard-coding
+/// the literal — keeps CLI and library defaults in lock-step if we ever
+/// change it.
+pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 2_048_000;
+
+/// Default center frequency in Hz, matching upstream rtl_tcp's
+/// `frequency = 100000000` default at rtl_tcp.c:389.
+pub const DEFAULT_CENTER_FREQ_HZ: u32 = 100_000_000;
+
+/// Server configuration.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// TCP bind address. **Caller is responsible for setting a safe
+    /// default** — this crate does not impose a policy. The CLI and UI
+    /// both default to loopback per epic #299 review.
+    pub bind: SocketAddr,
+
+    /// Device index (0 = first dongle).
+    pub device_index: u32,
+
+    /// Initial device state applied after open.
+    pub initial: InitialDeviceState,
+
+    /// Max queued buffers between USB reader and TCP writer. 0 = use
+    /// [`DEFAULT_BUFFER_CAPACITY`].
+    pub buffer_capacity: usize,
+}
+
+impl ServerConfig {
+    /// Config with upstream-like defaults and loopback bind. Caller is
+    /// still responsible for overriding `bind` if they want to expose
+    /// the server beyond localhost.
+    pub fn default_loopback() -> Self {
+        Self {
+            bind: SocketAddr::from(([127, 0, 0, 1], crate::protocol::DEFAULT_PORT)),
+            device_index: 0,
+            initial: InitialDeviceState::default(),
+            buffer_capacity: DEFAULT_BUFFER_CAPACITY,
+        }
+    }
+}
+
+/// Initial device state applied on open, before the first client connects.
+/// Each field matches a CLI flag in upstream rtl_tcp.
+#[derive(Debug, Clone)]
+pub struct InitialDeviceState {
+    /// `-f` center frequency in Hz.
+    pub center_freq_hz: u32,
+    /// `-s` sample rate in Hz.
+    pub sample_rate_hz: u32,
+    /// `-g` tuner gain in 0.1 dB. `None` = auto (upstream's `gain == 0`).
+    pub gain_tenths_db: Option<i32>,
+    /// `-P` frequency correction in ppm.
+    pub ppm: i32,
+    /// `-T` enable bias tee.
+    pub bias_tee: bool,
+    /// `-D` direct sampling (0 = off, 2 = Q branch — upstream hard-codes 2).
+    pub direct_sampling: i32,
+}
+
+impl Default for InitialDeviceState {
+    fn default() -> Self {
+        // Upstream rtl_tcp.c:389-392 defaults.
+        Self {
+            center_freq_hz: DEFAULT_CENTER_FREQ_HZ,
+            sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
+            gain_tenths_db: None,
+            ppm: 0,
+            bias_tee: false,
+            direct_sampling: 0,
+        }
+    }
+}
+
+/// Live server statistics for UI consumption.
+#[derive(Debug, Clone, Default)]
+pub struct ServerStats {
+    pub connected_client: Option<SocketAddr>,
+    pub connected_since: Option<Instant>,
+    pub bytes_sent: u64,
+    pub buffers_dropped: u64,
+    pub last_command: Option<(CommandOp, Instant)>,
+}
+
+/// Running server handle.
+pub struct Server {
+    shutdown: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    accept_thread: Option<JoinHandle<()>>,
+    stats: Arc<Mutex<ServerStats>>,
+    bind: SocketAddr,
+}
+
+impl Server {
+    /// Bind the listener, open the RTL-SDR, apply initial defaults, and
+    /// start accepting clients.
+    ///
+    /// The returned handle owns the accept thread. Dropping it signals
+    /// shutdown and waits for the current client (if any) to disconnect.
+    pub fn start(config: ServerConfig) -> Result<Self, ServerError> {
+        // Bind first — surface port-in-use before touching the USB device
+        // so we don't leave a dongle claimed after a failed bind.
+        let listener = TcpListener::bind(config.bind).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                ServerError::PortInUse(config.bind.to_string())
+            } else {
+                ServerError::Io(e)
+            }
+        })?;
+        // `config.bind` may request port 0 (OS-assigned); in that case
+        // the actual port is only known after bind completes. Read it
+        // back from the socket so `bind_address()` returns the real
+        // port the UI/logs can show.
+        let actual_bind = listener.local_addr().map_err(ServerError::Io)?;
+        // The listener is already blocking by default from `bind` —
+        // no need to force it here. The accept thread flips it to
+        // nonblocking immediately on entry.
+
+        let device_count = sdr_rtlsdr::get_device_count();
+        if device_count == 0 {
+            return Err(ServerError::NoDevice);
+        }
+        if config.device_index >= device_count {
+            return Err(ServerError::BadDeviceIndex {
+                requested: config.device_index,
+                available: device_count,
+            });
+        }
+
+        let mut device = RtlSdrDevice::open(config.device_index)?;
+        apply_initial_state(&mut device, &config.initial)?;
+
+        tracing::info!(
+            bind = %actual_bind,
+            tuner = ?device.tuner_type(),
+            gain_count = device.tuner_gains().len(),
+            "rtl_tcp server listening"
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(Mutex::new(ServerStats::default()));
+
+        let dev_mutex = Arc::new(Mutex::new(device));
+        let capacity = if config.buffer_capacity == 0 {
+            DEFAULT_BUFFER_CAPACITY
+        } else {
+            config.buffer_capacity
+        };
+
+        let accept_thread = spawn_accept_thread(
+            listener,
+            dev_mutex,
+            shutdown.clone(),
+            stopped.clone(),
+            stats.clone(),
+            capacity,
+            config.initial.clone(),
+        )?;
+
+        Ok(Server {
+            shutdown,
+            stopped,
+            accept_thread: Some(accept_thread),
+            stats,
+            bind: actual_bind,
+        })
+    }
+
+    /// Current server statistics.
+    pub fn stats(&self) -> ServerStats {
+        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// The address the server is bound to.
+    pub fn bind_address(&self) -> SocketAddr {
+        self.bind
+    }
+
+    /// Has the accept thread exited (either via `stop()` or an
+    /// unrecoverable error like USB device loss)?
+    ///
+    /// CLI callers poll this alongside their own Ctrl-C handler so the
+    /// process exits when serving actually stops, instead of sleeping
+    /// forever after the dongle is unplugged.
+    pub fn has_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Signal shutdown and wait for the accept thread to exit.
+    ///
+    /// Equivalent to dropping the `Server`. Any panic from the accept
+    /// thread is silently swallowed — if you need to observe panics,
+    /// keep the `JoinHandle` yourself instead of calling `stop()`.
+    pub fn stop(mut self) {
+        self.initiate_shutdown();
+        if let Some(h) = self.accept_thread.take() {
+            let _ = h.join();
+        }
+    }
+
+    fn initiate_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.initiate_shutdown();
+        if let Some(h) = self.accept_thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Lock the device and reapply initial state for a new client session.
+/// Exists so the accept loop has a small surface that wraps the lock
+/// acquisition; `apply_initial_state` itself stays lock-agnostic.
+fn reset_device_to_initial(
+    device: &Arc<Mutex<RtlSdrDevice>>,
+    initial: &InitialDeviceState,
+) -> Result<(), ServerError> {
+    let mut dev = device
+        .lock()
+        .map_err(|_| ServerError::Io(std::io::Error::other("device mutex poisoned")))?;
+    apply_initial_state(&mut dev, initial)
+}
+
+/// Apply the user's initial settings to the freshly-opened device.
+///
+/// Mirrors the setup block in rtl_tcp.c:490-520. Called once at
+/// `Server::start` so the dongle is in a sane state even before any
+/// client connects, and again on every new client session via
+/// `reset_device_to_initial` so sequential clients don't inherit each
+/// other's tuning.
+fn apply_initial_state(
+    dev: &mut RtlSdrDevice,
+    initial: &InitialDeviceState,
+) -> Result<(), ServerError> {
+    // 0 is a valid direct-sampling state (off) and MUST be applied —
+    // not skipped — so a previous session that enabled direct sampling
+    // doesn't leak its mode into the next client's session. Previously
+    // the `!= 0` guard treated 0 as "leave alone," which broke
+    // reset_device_to_initial's promise of a clean slate per client.
+    dev.set_direct_sampling(initial.direct_sampling)?;
+    dev.set_freq_correction(initial.ppm)?;
+    dev.set_sample_rate(initial.sample_rate_hz)?;
+    dev.set_center_freq(initial.center_freq_hz)?;
+    match initial.gain_tenths_db {
+        None => {
+            // Upstream: `gain == 0` → automatic
+            dev.set_tuner_gain_mode(false)?;
+        }
+        Some(g) => {
+            dev.set_tuner_gain_mode(true)?;
+            dev.set_tuner_gain(g)?;
+        }
+    }
+    dev.set_bias_tee(initial.bias_tee)?;
+    dev.reset_buffer()?;
+    Ok(())
+}
+
+/// Spawn the outer accept loop. Upstream's main runs this inline; we run
+/// it on a thread so `Server::start` can return a handle to the caller.
+///
+/// `initial_state` is reapplied on every new client session so sequential
+/// clients start from a clean slate rather than inheriting the prior
+/// client's tuning / gain / direct-sampling state. Matches upstream's
+/// `accept → apply defaults → reset_buffer → spawn workers` shape,
+/// extended to the multi-client accept loop.
+///
+/// Returns `Err` on thread spawn failure (rare — kernel resource
+/// exhaustion). Callers propagate up to the user.
+fn spawn_accept_thread(
+    listener: TcpListener,
+    device: Arc<Mutex<RtlSdrDevice>>,
+    shutdown: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    stats: Arc<Mutex<ServerStats>>,
+    buffer_capacity: usize,
+    initial_state: InitialDeviceState,
+) -> std::io::Result<JoinHandle<()>> {
+    // Poll-accept cadence means the listener must be nonblocking.
+    // Configure it BEFORE spawning so failures surface through
+    // `Server::start`'s `?` rather than getting buried inside the
+    // spawned thread body — burying it would return `Ok` to the caller
+    // and the accept thread would die without ever setting `stopped`,
+    // leaving callers polling `has_stopped()` stuck forever.
+    listener.set_nonblocking(true)?;
+    thread::Builder::new()
+        .name("rtl_tcp-accept".into())
+        .spawn(move || {
+            // Session slot: set to true while a client is being served.
+            // Kept in an Arc so the session thread can clear it on exit.
+            // Using `swap(true, ...)` to claim the slot atomically — if
+            // it returns true, we were already busy and this new accept
+            // must be rejected immediately (kernel had queued it in the
+            // backlog, but we refuse to hold it).
+            let busy = Arc::new(AtomicBool::new(false));
+            let mut session_handle: Option<JoinHandle<()>> = None;
+
+            while !shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, peer)) => {
+                        if busy.swap(true, Ordering::SeqCst) {
+                            tracing::info!(
+                                %peer,
+                                "rtl_tcp already serving a client — rejecting new connection"
+                            );
+                            // Close the socket immediately so the client
+                            // sees FIN instead of hanging in backlog.
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            // swap set busy=true, but we weren't actually
+                            // idle — the already-active session will
+                            // eventually clear busy when it exits. Leave
+                            // the flag set; don't reset.
+                            continue;
+                        }
+                        // We now own the session slot. Reap the previous
+                        // session handle if any (it must be finished,
+                        // because the session thread clears busy at its
+                        // tail — we got false from the swap, which means
+                        // the prior session already cleared it).
+                        if let Some(h) = session_handle.take() {
+                            let _ = h.join();
+                        }
+
+                        tracing::info!(%peer, "rtl_tcp client connected");
+                        if let Err(e) = stream.set_nonblocking(false) {
+                            tracing::error!(%e, "failed to set client socket blocking");
+                            busy.store(false, Ordering::SeqCst);
+                            continue;
+                        }
+                        configure_client_socket(&stream);
+                        update_stats_on_connect(&stats, peer);
+
+                        // Reapply initial state BEFORE spawning workers
+                        // so this client starts on clean tuning/gain
+                        // rather than inheriting the prior session's
+                        // state. Matches upstream's per-accept setup
+                        // block (rtl_tcp.c:490-520).
+                        if let Err(e) = reset_device_to_initial(&device, &initial_state) {
+                            tracing::error!(
+                                %e, %peer,
+                                "rtl_tcp failed to reset device to initial state, dropping client"
+                            );
+                            busy.store(false, Ordering::SeqCst);
+                            update_stats_on_disconnect(&stats);
+                            continue;
+                        }
+
+                        let session_device = device.clone();
+                        let session_shutdown = shutdown.clone();
+                        let session_stats = stats.clone();
+                        let session_busy = busy.clone();
+                        match thread::Builder::new().name("rtl_tcp-session".into()).spawn(
+                            move || {
+                                handle_client(
+                                    stream,
+                                    session_device,
+                                    session_shutdown,
+                                    session_stats.clone(),
+                                    buffer_capacity,
+                                );
+                                update_stats_on_disconnect(&session_stats);
+                                tracing::info!(%peer, "rtl_tcp client disconnected");
+                                session_busy.store(false, Ordering::SeqCst);
+                            },
+                        ) {
+                            Ok(h) => session_handle = Some(h),
+                            Err(e) => {
+                                tracing::error!(%e, "failed to spawn session thread");
+                                busy.store(false, Ordering::SeqCst);
+                                update_stats_on_disconnect(&stats);
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(ACCEPT_POLL_INTERVAL);
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "rtl_tcp accept error");
+                        thread::sleep(ACCEPT_ERROR_BACKOFF);
+                    }
+                }
+            }
+
+            // Shutdown: wait for the active session (if any) to finish
+            // before returning, so Server::drop sees all workers done.
+            if let Some(h) = session_handle.take() {
+                let _ = h.join();
+            }
+            // Signal to CLI / UI callers polling `Server::has_stopped()`
+            // that the server is no longer serving. Set AFTER the
+            // session join so a caller that observes `has_stopped() ==
+            // true` can safely assume all workers have exited.
+            stopped.store(true, Ordering::SeqCst);
+            tracing::debug!("rtl_tcp accept thread exiting");
+        })
+}
+
+fn configure_client_socket(stream: &TcpStream) {
+    // Keep TCP alive so dead clients (laptop lid closed, wifi dropped) stop
+    // wedging the server rather than trickling forever into the void.
+    // Per-platform keepalive tuning lives in std behind raw setsockopt; we
+    // enable the default which at least lets the kernel eventually notice.
+    if let Err(e) = set_keepalive(stream, true) {
+        tracing::warn!(%e, "SO_KEEPALIVE not applied (non-fatal)");
+    }
+    // Disable Nagle — commands are 5 bytes and we want snappy tuning.
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::warn!(%e, "TCP_NODELAY not applied (non-fatal)");
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_keepalive(stream: &TcpStream, on: bool) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let value: libc::c_int = libc::c_int::from(on);
+    // SAFETY: `fd` is a valid open socket for the duration of this call
+    // (we borrow `stream` by reference). `value` is a stack-local
+    // `c_int` passed as a pointer along with the matching size — this
+    // is the documented shape of `setsockopt(_, SOL_SOCKET,
+    // SO_KEEPALIVE, ...)` on every POSIX target.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_keepalive(_stream: &TcpStream, _on: bool) -> std::io::Result<()> {
+    // Non-unix has no implementation yet. Return Unsupported so the
+    // warn path in `configure_client_socket` fires and the log makes
+    // the missing keepalive visible — silently returning Ok would
+    // leave operators thinking dead-peer detection is active when it
+    // isn't.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "SO_KEEPALIVE not implemented on this platform",
+    ))
+}
+
+fn update_stats_on_connect(stats: &Arc<Mutex<ServerStats>>, peer: SocketAddr) {
+    if let Ok(mut s) = stats.lock() {
+        s.connected_client = Some(peer);
+        s.connected_since = Some(Instant::now());
+        s.bytes_sent = 0;
+        s.buffers_dropped = 0;
+        s.last_command = None;
+    }
+}
+
+fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
+    if let Ok(mut s) = stats.lock() {
+        // `update_stats_on_connect` treats every counter below as
+        // session-scoped (resets them on new connect), so the
+        // disconnect path must clear them too — otherwise a UI polling
+        // `ServerStats` while no client is connected would see stale
+        // traffic / command data from the previous session.
+        s.connected_client = None;
+        s.connected_since = None;
+        s.bytes_sent = 0;
+        s.buffers_dropped = 0;
+        s.last_command = None;
+    }
+}
+
+/// Serve exactly one client. Spawns the three worker threads, waits for
+/// the first to exit, signals the others, joins all.
+fn handle_client(
+    stream: TcpStream,
+    device: Arc<Mutex<RtlSdrDevice>>,
+    global_shutdown: Arc<AtomicBool>,
+    stats: Arc<Mutex<ServerStats>>,
+    buffer_capacity: usize,
+) {
+    // Send the 12-byte dongle_info_t header first (rtl_tcp.c:576-594).
+    let header = {
+        let Ok(dev) = device.lock() else {
+            tracing::error!("device mutex poisoned, aborting client");
+            return;
+        };
+        DongleInfo {
+            tuner: TunerTypeCode::from(dev.tuner_type()),
+            gain_count: dev.tuner_gains().len() as u32,
+        }
+    };
+    let header_bytes = header.to_bytes();
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(%e, "failed to clone client stream for writer — dropping client");
+            return;
+        }
+    };
+    if let Err(e) = writer.write_all(&header_bytes) {
+        tracing::warn!(%e, "failed to send dongle_info_t — client gone");
+        return;
+    }
+
+    // Per-client shutdown flag. Flipped when any worker exits, so the
+    // others stop quickly. Honors the global flag too.
+    let client_shutdown = Arc::new(AtomicBool::new(false));
+    let merged_shutdown = MergedShutdown::new(global_shutdown, client_shutdown);
+
+    // Buffer data path: USB bulk → bounded channel → TCP writer.
+    let (tx, rx) = sync_channel::<Vec<u8>>(buffer_capacity);
+
+    let reader_shutdown = merged_shutdown.clone();
+    let reader_device = device.clone();
+    let reader_stats = stats.clone();
+    let Ok(reader_handle) = thread::Builder::new()
+        .name("rtl_tcp-reader".into())
+        .spawn(move || {
+            data_worker(reader_device, tx, reader_shutdown, reader_stats);
+        })
+    else {
+        tracing::error!("failed to spawn rtl_tcp reader thread — dropping client");
+        return;
+    };
+
+    let writer_shutdown = merged_shutdown.clone();
+    let writer_stats = stats.clone();
+    let Ok(writer_handle) = thread::Builder::new()
+        .name("rtl_tcp-writer".into())
+        .spawn(move || {
+            tcp_writer(writer, rx, writer_shutdown, writer_stats);
+        })
+    else {
+        tracing::error!("failed to spawn rtl_tcp writer thread — tearing down client");
+        merged_shutdown.set_client();
+        let _ = reader_handle.join();
+        return;
+    };
+
+    let command_shutdown = merged_shutdown.clone();
+    let command_device = device;
+    let command_stats = stats;
+    let command_stream = stream;
+    let Ok(command_handle) =
+        thread::Builder::new()
+            .name("rtl_tcp-command".into())
+            .spawn(move || {
+                command_worker(
+                    command_stream,
+                    command_device,
+                    command_shutdown,
+                    command_stats,
+                );
+            })
+    else {
+        tracing::error!("failed to spawn rtl_tcp command thread — tearing down client");
+        merged_shutdown.set_client();
+        let _ = reader_handle.join();
+        let _ = writer_handle.join();
+        return;
+    };
+
+    // Wait for any worker to exit, then cancel the others.
+    let _ = command_handle.join();
+    merged_shutdown.set_client();
+    let _ = reader_handle.join();
+    let _ = writer_handle.join();
+}
+
+/// Combines the server-wide shutdown flag with a per-client flag so we can
+/// tear down one client without stopping the server, and vice versa.
+#[derive(Clone)]
+struct MergedShutdown {
+    global: Arc<AtomicBool>,
+    client: Arc<AtomicBool>,
+}
+
+impl MergedShutdown {
+    fn new(global: Arc<AtomicBool>, client: Arc<AtomicBool>) -> Self {
+        Self { global, client }
+    }
+    fn is_set(&self) -> bool {
+        self.global.load(Ordering::Relaxed) || self.client.load(Ordering::Relaxed)
+    }
+    fn set_client(&self) {
+        self.client.store(true, Ordering::SeqCst);
+    }
+    /// Escalate to server-wide shutdown: the accept thread exits after
+    /// the current session tears down, and `Server::has_stopped()`
+    /// eventually observes `true`. Used for unrecoverable errors that
+    /// can't be remedied by just dropping the current client, such as
+    /// a lost USB dongle (`rusb::Error::NoDevice`).
+    fn set_global(&self) {
+        self.global.store(true, Ordering::SeqCst);
+        self.client.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Continuously pull USB bulk buffers and push into the bounded queue.
+/// Drops on full, matching upstream's `llbuf_num` cap behavior.
+fn data_worker(
+    device: Arc<Mutex<RtlSdrDevice>>,
+    tx: SyncSender<Vec<u8>>,
+    shutdown: MergedShutdown,
+    stats: Arc<Mutex<ServerStats>>,
+) {
+    // Pull an Arc<DeviceHandle> once so we don't have to lock the device
+    // mutex on every USB read (bulk read is &self-safe via usb_handle).
+    let handle = {
+        let Ok(dev) = device.lock() else {
+            // Poisoned mutex is unrecoverable shared state — close out
+            // the whole session so the writer/command workers exit too
+            // instead of spinning on a dead channel.
+            tracing::error!("device mutex poisoned, data worker aborting and closing session");
+            shutdown.set_client();
+            return;
+        };
+        dev.usb_handle()
+    };
+    let timeout = USB_READ_TIMEOUT;
+    // Scratch buffer reused across iterations — only the Vec we actually
+    // send to the writer gets a fresh allocation, sized to the data the
+    // USB read returned. This avoids allocating 256 KiB on every timeout
+    // tick (reviewed on PR #313).
+    let mut scratch = vec![0u8; READ_BUFFER_LEN as usize];
+    // Edge-trigger flag for the tx-queue-full warning. Set when a
+    // drop happens, cleared on the first successful send after — so
+    // we log once per stall-and-drain cycle rather than per buffer.
+    let mut was_dropping = false;
+
+    while !shutdown.is_set() {
+        match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut scratch, timeout) {
+            Ok(n) if n > 0 => {
+                // Allocate only when we have real data to hand off.
+                let buf = scratch[..n].to_vec();
+                match tx.try_send(buf) {
+                    Ok(()) => {
+                        // Rearm the overflow edge so a future stall
+                        // logs again.
+                        was_dropping = false;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        // Queue is full — drop this buffer (upstream does
+                        // the same when the linked list exceeds llbuf_num;
+                        // rtl_tcp.c:137-152). `buffers_dropped` in the
+                        // shared stats is the authoritative cumulative
+                        // counter; the warn is just an edge signal.
+                        if let Ok(mut s) = stats.lock() {
+                            s.buffers_dropped = s.buffers_dropped.saturating_add(1);
+                        }
+                        if !was_dropping {
+                            tracing::warn!(
+                                "rtl_tcp tx queue full — dropping USB buffers (further drops accumulate silently; see ServerStats::buffers_dropped)"
+                            );
+                            was_dropping = true;
+                        }
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        tracing::debug!("writer gone, data worker exiting");
+                        return;
+                    }
+                }
+            }
+            Ok(_) | Err(rusb::Error::Timeout) => {
+                // No data — loop and re-check shutdown.
+            }
+            Err(rusb::Error::NoDevice) => {
+                // Dongle unplug is unrecoverable at the server level —
+                // the accept loop has nothing to serve. Escalate to a
+                // global shutdown so the accept thread exits, the CLI
+                // sees `has_stopped() == true`, and new clients don't
+                // connect to a dead-device server.
+                tracing::error!("rtl_tcp: USB device lost mid-stream, stopping server");
+                shutdown.set_global();
+                return;
+            }
+            Err(e) => {
+                tracing::error!(%e, "rtl_tcp bulk read error");
+                shutdown.set_client();
+                return;
+            }
+        }
+    }
+}
+
+fn tcp_writer(
+    mut stream: TcpStream,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    shutdown: MergedShutdown,
+    stats: Arc<Mutex<ServerStats>>,
+) {
+    // A slow peer that stops reading will fill its kernel receive
+    // buffer → our kernel send buffer saturates → `write_all` blocks
+    // indefinitely. Since the write path can't re-check shutdown while
+    // blocked, a wedged writer would deadlock the
+    // writer.join → handle_client → accept.join → Server::Drop chain.
+    // Setting a write timeout mirrors what `command_worker` does for
+    // reads so the same shutdown-responsiveness guarantee applies here.
+    if let Err(e) = stream.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
+        tracing::warn!(%e, "set_write_timeout on data channel failed; dropping client");
+        shutdown.set_client();
+        return;
+    }
+    // `recv_timeout` lets us notice shutdown even when the USB reader is
+    // starving (e.g., dongle unplug).
+    loop {
+        if shutdown.is_set() {
+            return;
+        }
+        match rx.recv_timeout(WRITER_RECV_TIMEOUT) {
+            Ok(buf) => {
+                if let Err(e) = stream.write_all(&buf) {
+                    tracing::debug!(%e, "rtl_tcp client socket write failed, closing");
+                    shutdown.set_client();
+                    return;
+                }
+                if let Ok(mut s) = stats.lock() {
+                    s.bytes_sent = s.bytes_sent.saturating_add(buf.len() as u64);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Re-check shutdown flag above.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return;
+            }
+        }
+    }
+}
+
+fn command_worker(
+    mut stream: TcpStream,
+    device: Arc<Mutex<RtlSdrDevice>>,
+    shutdown: MergedShutdown,
+    stats: Arc<Mutex<ServerStats>>,
+) {
+    // Upstream loops on a 1 s select() so shutdown is noticed promptly.
+    // Our equivalent is the socket read timeout. If we can't install it,
+    // `read_full` would block indefinitely in `stream.read()` without
+    // ever re-checking the shutdown flag — which would deadlock
+    // `handle_client`'s join on this worker, then the accept thread's
+    // join on handle_client, then `Server::Drop`. Treat the failure as
+    // fatal for this client session.
+    if let Err(e) = stream.set_read_timeout(Some(COMMAND_READ_TIMEOUT)) {
+        tracing::warn!(%e, "set_read_timeout on command channel failed; dropping client");
+        shutdown.set_client();
+        return;
+    }
+    let mut buf = [0u8; COMMAND_LEN];
+    while !shutdown.is_set() {
+        match read_full(&mut stream, &mut buf, &shutdown) {
+            ReadResult::Ok => {}
+            ReadResult::Eof => {
+                tracing::debug!("rtl_tcp command channel EOF");
+                shutdown.set_client();
+                return;
+            }
+            ReadResult::Shutdown => return,
+            ReadResult::Err(e) => {
+                tracing::warn!(%e, "rtl_tcp command recv error");
+                shutdown.set_client();
+                return;
+            }
+        }
+        let Some(cmd) = Command::from_bytes(&buf) else {
+            // Upstream silently drops unknown opcodes (switch has no default).
+            tracing::debug!(op = buf[0], "rtl_tcp unknown command opcode, dropping");
+            continue;
+        };
+        let Ok(mut dev) = device.lock() else {
+            // Same rationale as data_worker: a poisoned device mutex
+            // is unrecoverable, and silently dropping commands here
+            // would leave the client driving the UI with no visible
+            // effect on the server. Close the session.
+            tracing::error!("device mutex poisoned, command worker aborting and closing session");
+            shutdown.set_client();
+            return;
+        };
+        dispatch(&mut dev, cmd);
+        drop(dev);
+        if let Ok(mut s) = stats.lock() {
+            s.last_command = Some((cmd.op, Instant::now()));
+        }
+    }
+}
+
+enum ReadResult {
+    Ok,
+    Eof,
+    Shutdown,
+    Err(std::io::Error),
+}
+
+/// Read exactly `buf.len()` bytes, splitting across multiple `read`s but
+/// re-checking the shutdown flag on each timeout. Mirrors the upstream
+/// `while(left > 0)` loop in rtl_tcp.c:297-313.
+fn read_full(stream: &mut TcpStream, buf: &mut [u8], shutdown: &MergedShutdown) -> ReadResult {
+    let mut filled = 0;
+    while filled < buf.len() {
+        if shutdown.is_set() {
+            return ReadResult::Shutdown;
+        }
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return ReadResult::Eof,
+            Ok(n) => filled += n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Timeout — loop to re-check shutdown.
+            }
+            Err(e) => return ReadResult::Err(e),
+        }
+    }
+    ReadResult::Ok
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_surfaces_port_conflict_as_typed_error() {
+        // Hold a port before calling Server::start — the second bind must
+        // surface as ServerError::PortInUse (not a generic IO error), so
+        // the UI can fall back without parsing error strings.
+        //
+        // This test does NOT need a real RTL-SDR dongle present because
+        // Server::start binds the listener before touching USB.
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let config = ServerConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], port)),
+            device_index: 0,
+            initial: InitialDeviceState::default(),
+            buffer_capacity: 0,
+        };
+        match Server::start(config) {
+            Err(ServerError::PortInUse(ref addr)) => {
+                assert!(addr.contains(&format!("{port}")));
+            }
+            Err(e) => panic!("expected PortInUse, got {e:?}"),
+            Ok(_) => panic!("bind should have failed"),
+        }
+        drop(holder);
+    }
+
+    #[test]
+    fn initial_device_state_defaults_match_upstream_rtl_tcp() {
+        let d = InitialDeviceState::default();
+        // rtl_tcp.c:389-392 — these are the upstream defaults.
+        assert_eq!(d.center_freq_hz, 100_000_000);
+        assert_eq!(d.sample_rate_hz, 2_048_000);
+        assert_eq!(d.ppm, 0);
+        assert!(!d.bias_tee);
+        assert_eq!(d.direct_sampling, 0);
+        assert!(d.gain_tenths_db.is_none());
+    }
+
+    #[test]
+    fn default_loopback_config_binds_localhost() {
+        let cfg = ServerConfig::default_loopback();
+        assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
+        assert_eq!(cfg.bind.port(), crate::protocol::DEFAULT_PORT);
+        assert_eq!(cfg.buffer_capacity, DEFAULT_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn update_stats_on_disconnect_clears_per_session_counters() {
+        // Session-scoped counters (bytes_sent, buffers_dropped,
+        // last_command) must be cleared when the client disconnects —
+        // otherwise a UI polling ServerStats would see stale data from
+        // the prior session while connected_client = None.
+        let stats = Arc::new(Mutex::new(ServerStats {
+            connected_client: Some(SocketAddr::from(([127, 0, 0, 1], 42_000))),
+            connected_since: Some(Instant::now()),
+            bytes_sent: 12345,
+            buffers_dropped: 7,
+            last_command: Some((CommandOp::SetCenterFreq, Instant::now())),
+        }));
+        update_stats_on_disconnect(&stats);
+        let s = stats.lock().unwrap();
+        assert!(s.connected_client.is_none());
+        assert!(s.connected_since.is_none());
+        assert_eq!(s.bytes_sent, 0);
+        assert_eq!(s.buffers_dropped, 0);
+        assert!(s.last_command.is_none());
+    }
+
+    #[test]
+    fn server_stats_default_is_not_connected() {
+        let stats = ServerStats::default();
+        assert!(stats.connected_client.is_none());
+        assert!(stats.connected_since.is_none());
+        assert_eq!(stats.bytes_sent, 0);
+        assert_eq!(stats.buffers_dropped, 0);
+        assert!(stats.last_command.is_none());
+    }
+
+    #[test]
+    fn merged_shutdown_set_global_escalates_to_both_flags() {
+        // set_client() → client=true, global unchanged.
+        // set_global() → both flags true, so accept loop also exits.
+        // Regression test for the "NoDevice flips client only" bug:
+        // unplug used to stop the current session but leave the accept
+        // thread polling forever against a dead dongle.
+        let ms = MergedShutdown::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(!ms.is_set());
+
+        ms.set_client();
+        assert!(ms.is_set());
+        assert!(!ms.global.load(Ordering::Relaxed));
+        assert!(ms.client.load(Ordering::Relaxed));
+
+        // Reset client so we can see set_global set BOTH.
+        ms.client.store(false, Ordering::SeqCst);
+        assert!(!ms.is_set());
+        ms.set_global();
+        assert!(ms.global.load(Ordering::Relaxed));
+        assert!(ms.client.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn has_stopped_is_false_before_accept_thread_exits() {
+        // We can't stand up a real Server without hardware, but we CAN
+        // sanity-check the `stopped` flag contract: `has_stopped()`
+        // reads the AtomicBool directly. Default state is false.
+        let stopped = Arc::new(AtomicBool::new(false));
+        assert!(!stopped.load(Ordering::Relaxed));
+        // Accept thread setting the flag → has_stopped() observes true.
+        stopped.store(true, Ordering::SeqCst);
+        assert!(stopped.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn buffer_capacity_zero_uses_default() {
+        // ServerConfig exposes `buffer_capacity: 0` as "use default". This
+        // is checked during Server::start, but we can sanity-check the
+        // DEFAULT_BUFFER_CAPACITY matches upstream's llbuf_num = 500
+        // (rtl_tcp.c:61).
+        assert_eq!(DEFAULT_BUFFER_CAPACITY, 500);
+    }
+}

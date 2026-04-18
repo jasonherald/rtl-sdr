@@ -103,6 +103,7 @@ members = [
     "crates/sdr-rtlsdr",
     "crates/sdr-source-rtlsdr",
     "crates/sdr-source-network",
+    "crates/sdr-server-rtltcp",
     "crates/sdr-source-file",
     "crates/sdr-sink-audio",
     "crates/sdr-sink-network",
@@ -130,6 +131,7 @@ sdr-pipeline = { path = "crates/sdr-pipeline" }
 sdr-rtlsdr = { path = "crates/sdr-rtlsdr" }
 sdr-source-rtlsdr = { path = "crates/sdr-source-rtlsdr" }
 sdr-source-network = { path = "crates/sdr-source-network" }
+sdr-server-rtltcp = { path = "crates/sdr-server-rtltcp" }
 sdr-source-file = { path = "crates/sdr-source-file" }
 sdr-sink-audio = { path = "crates/sdr-sink-audio" }
 sdr-sink-network = { path = "crates/sdr-sink-network" }

@@ -10,8 +10,16 @@ repository.workspace = true
 sdr-types.workspace = true
 sdr-pipeline.workspace = true
 sdr-config.workspace = true
+# rtl_tcp client shares wire protocol types (DongleInfo, Command, CommandOp)
+# with the server implementation. Avoiding a separate `-protocol` crate for
+# a few hundred lines of code; naming is awkward ("server" crate re-used
+# for client protocol) but the dep graph stays clean.
+sdr-server-rtltcp.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# SO_KEEPALIVE via setsockopt (see rtl_tcp.rs). Matches the pattern used
+# in sdr-server-rtltcp and sdr-transcription.
+libc.workspace = true
 
 [lints]
 workspace = true
