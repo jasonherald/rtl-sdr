@@ -324,20 +324,20 @@ impl RtlTcpSource {
         })
     }
 
-    fn start_manager(&mut self) {
+    fn start_manager(&mut self) -> Result<(), SourceError> {
         let host = self.host.clone();
         let port = self.port;
         let shared = self.shared.clone();
 
         self.shared.shutdown.store(false, Ordering::SeqCst);
-        self.manager = Some(
-            thread::Builder::new()
-                .name("rtl_tcp-client".into())
-                .spawn(move || {
-                    connection_manager(host, port, shared);
-                })
-                .expect("spawn rtl_tcp client manager"),
-        );
+        let handle = thread::Builder::new()
+            .name("rtl_tcp-client".into())
+            .spawn(move || {
+                connection_manager(host, port, shared);
+            })
+            .map_err(SourceError::Io)?;
+        self.manager = Some(handle);
+        Ok(())
     }
 
     fn stop_manager(&mut self) {
@@ -591,8 +591,7 @@ impl Source for RtlTcpSource {
     }
 
     fn start(&mut self) -> Result<(), SourceError> {
-        self.start_manager();
-        Ok(())
+        self.start_manager()
     }
 
     fn stop(&mut self) -> Result<(), SourceError> {
@@ -677,6 +676,17 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    /// Placeholder host/port for tests that never actually connect —
+    /// just exercise builder state or buffer logic. The string "127.0.0.1"
+    /// is fine as-is, but the port number is named for intent.
+    const UNUSED_TEST_PORT: u16 = 1234;
+
+    /// A port we expect connect() to fail with ECONNREFUSED on localhost
+    /// so the shutdown-during-retry test doesn't hang waiting for a SYN
+    /// timeout. Port 1 is a well-known unused privileged port and on
+    /// Linux loopback refuses instantly.
+    const REFUSED_TEST_PORT: u16 = 1;
+
     #[test]
     fn backoff_schedule_caps_at_30s() {
         assert_eq!(backoff_delay(0), Duration::from_secs(1));
@@ -687,7 +697,7 @@ mod tests {
 
     #[test]
     fn new_source_starts_disconnected() {
-        let source = RtlTcpSource::new("127.0.0.1", 1234);
+        let source = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         match source.connection_state() {
             ConnectionState::Disconnected => {}
             other => unreachable!("expected Disconnected, got {other:?}"),
@@ -709,7 +719,7 @@ mod tests {
         });
 
         let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
-        src.start_manager();
+        src.start_manager().unwrap();
 
         // Wait up to 2s for the manager to transition to Failed.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -759,7 +769,7 @@ mod tests {
         });
 
         let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
-        src.start_manager();
+        src.start_manager().unwrap();
 
         // Wait for Connected state.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -788,7 +798,7 @@ mod tests {
 
     #[test]
     fn record_command_sets_replay_bit() {
-        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         let cmd = Command {
             op: CommandOp::SetCenterFreq,
             param: 99_500_000,
@@ -805,7 +815,7 @@ mod tests {
 
     #[test]
     fn read_samples_with_empty_output_returns_zero() {
-        let mut src = RtlTcpSource::new("127.0.0.1", 1234);
+        let mut src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         let mut output: [Complex; 0] = [];
         let n = src.read_samples(&mut output).unwrap();
         assert_eq!(n, 0);
@@ -813,7 +823,7 @@ mod tests {
 
     #[test]
     fn read_samples_with_no_data_returns_zero() {
-        let mut src = RtlTcpSource::new("127.0.0.1", 1234);
+        let mut src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         // Source was never started, no bytes buffered.
         let mut output = [Complex::default(); 4];
         let n = src.read_samples(&mut output).unwrap();
@@ -822,7 +832,7 @@ mod tests {
 
     #[test]
     fn read_samples_converts_8bit_offset_iq() {
-        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         // 128 is midscale zero, 255 is +1 - small epsilon, 0 is -1.
         if let Ok(mut rx) = src.shared.rx_buf.lock() {
             rx.extend_from_slice(&[128, 128, 255, 0, 0, 255]);
@@ -847,7 +857,7 @@ mod tests {
     fn read_samples_handles_partial_pair_at_end() {
         // Odd byte count — the trailing lone byte must stay queued
         // rather than produce half a sample.
-        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         if let Ok(mut rx) = src.shared.rx_buf.lock() {
             rx.extend_from_slice(&[128, 128, 200]); // 1.5 pairs
         }
@@ -881,7 +891,7 @@ mod tests {
         });
 
         let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
-        src.start_manager();
+        src.start_manager().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut got = None;
         while Instant::now() < deadline {
@@ -924,7 +934,7 @@ mod tests {
         });
 
         let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
-        src.start_manager();
+        src.start_manager().unwrap();
         let deadline = Instant::now() + Duration::from_millis(1500);
         let mut saw_retrying = false;
         while Instant::now() < deadline {
@@ -981,7 +991,7 @@ mod tests {
         src.set_center_freq_hz(433_000_000).unwrap();
         src.set_tuner_gain_tenths_db(197).unwrap();
 
-        src.start_manager();
+        src.start_manager().unwrap();
         // Collect the replayed commands.
         let mut received = Vec::new();
         while let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(1500)) {
@@ -1009,8 +1019,8 @@ mod tests {
         // Point client at a port nothing's listening on; start_manager
         // enters the retry loop. stop_manager should return within ~1 s,
         // well below the exponential-backoff window.
-        let mut src = RtlTcpSource::new("127.0.0.1", 1); // port 1 likely refused
-        src.start_manager();
+        let mut src = RtlTcpSource::new("127.0.0.1", REFUSED_TEST_PORT); // port 1 likely refused
+        src.start_manager().unwrap();
         let t0 = Instant::now();
         src.stop_manager();
         let elapsed = t0.elapsed();
@@ -1022,7 +1032,7 @@ mod tests {
 
     #[test]
     fn replay_bits_set_independently_per_op() {
-        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         src.record_command(Command {
             op: CommandOp::SetBiasTee,
             param: 1,

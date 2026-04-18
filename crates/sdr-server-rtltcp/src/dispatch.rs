@@ -9,6 +9,13 @@ use sdr_rtlsdr::device::RtlSdrDevice;
 
 use crate::protocol::{Command, CommandOp};
 
+/// Upper-16-bit field of a `SetIfGain` (0x06) param is the IF stage
+/// number; lower 16 bits is a signed gain value in tenths of dB.
+/// Wire layout matches upstream rtl_tcp.c:337-339.
+const IF_GAIN_STAGE_SHIFT_BITS: u32 = 16;
+/// Mask for the lower-16-bit signed gain field of `SetIfGain`.
+const IF_GAIN_VALUE_MASK: u32 = 0xffff;
+
 /// Execute a single command against the device.
 ///
 /// Mirrors `rtl_tcp.c:315-372`. Upstream prints each command; we use
@@ -59,9 +66,9 @@ pub fn dispatch(dev: &mut RtlSdrDevice, cmd: Command) {
         // tuner that actually programs IF gain stages. Log and drop until
         // #308 lands.
         CommandOp::SetIfGain => {
-            let stage = (param >> 16) as i16;
+            let stage = (param >> IF_GAIN_STAGE_SHIFT_BITS) as i16;
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let gain = (param & 0xffff) as i16;
+            let gain = (param & IF_GAIN_VALUE_MASK) as i16;
             tracing::debug!(
                 stage,
                 gain_tenths_db = gain,

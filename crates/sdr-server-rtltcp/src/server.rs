@@ -48,6 +48,17 @@ pub const DEFAULT_BUFFER_CAPACITY: usize = 500;
 /// when no commands arrive (rtl_tcp.c:293-304).
 const COMMAND_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Default sample rate in Hz. Matches upstream `rtl_tcp.c:DEFAULT_SAMPLE_RATE_HZ`.
+///
+/// Exposed so the CLI can share the same constant instead of hard-coding
+/// the literal — keeps CLI and library defaults in lock-step if we ever
+/// change it.
+pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 2_048_000;
+
+/// Default center frequency in Hz, matching upstream rtl_tcp's
+/// `frequency = 100000000` default at rtl_tcp.c:389.
+pub const DEFAULT_CENTER_FREQ_HZ: u32 = 100_000_000;
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -101,10 +112,10 @@ pub struct InitialDeviceState {
 
 impl Default for InitialDeviceState {
     fn default() -> Self {
-        // Upstream rtl_tcp.c:390 defaults.
+        // Upstream rtl_tcp.c:389-392 defaults.
         Self {
-            center_freq_hz: 100_000_000,
-            sample_rate_hz: 2_048_000,
+            center_freq_hz: DEFAULT_CENTER_FREQ_HZ,
+            sample_rate_hz: DEFAULT_SAMPLE_RATE_HZ,
             gain_tenths_db: None,
             ppm: 0,
             bias_tee: false,
@@ -188,7 +199,7 @@ impl Server {
             shutdown.clone(),
             stats.clone(),
             capacity,
-        );
+        )?;
 
         Ok(Server {
             shutdown,
@@ -263,22 +274,29 @@ fn apply_initial_state(
 
 /// Spawn the outer accept loop. Upstream's main runs this inline; we run
 /// it on a thread so `Server::start` can return a handle to the caller.
+///
+/// Returns `Err` on thread spawn failure (rare — kernel resource
+/// exhaustion). Callers propagate up to the user.
 fn spawn_accept_thread(
     listener: TcpListener,
     device: Arc<Mutex<RtlSdrDevice>>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
     buffer_capacity: usize,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("rtl_tcp-accept".into())
         .spawn(move || {
             // Poll-accept with a short timeout so we notice shutdown within
             // a second. std's TcpListener doesn't have set_read_timeout for
             // the listen fd itself, so we use set_nonblocking + sleep.
-            listener
-                .set_nonblocking(true)
-                .expect("set listener nonblocking");
+            if let Err(e) = listener.set_nonblocking(true) {
+                tracing::error!(
+                    %e,
+                    "failed to set accept listener nonblocking, accept thread exiting"
+                );
+                return;
+            }
 
             while !shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -313,7 +331,6 @@ fn spawn_accept_thread(
             }
             tracing::debug!("rtl_tcp accept thread exiting");
         })
-        .expect("spawn accept thread")
 }
 
 fn configure_client_socket(stream: &TcpStream) {
@@ -401,7 +418,13 @@ fn handle_client(
         }
     };
     let header_bytes = header.to_bytes();
-    let mut writer = stream.try_clone().expect("clone stream for writer");
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(%e, "failed to clone client stream for writer — dropping client");
+            return;
+        }
+    };
     if let Err(e) = writer.write_all(&header_bytes) {
         tracing::warn!(%e, "failed to send dongle_info_t — client gone");
         return;
@@ -418,37 +441,52 @@ fn handle_client(
     let reader_shutdown = merged_shutdown.clone();
     let reader_device = device.clone();
     let reader_stats = stats.clone();
-    let reader_handle = thread::Builder::new()
+    let Ok(reader_handle) = thread::Builder::new()
         .name("rtl_tcp-reader".into())
         .spawn(move || {
             data_worker(reader_device, tx, reader_shutdown, reader_stats);
         })
-        .expect("spawn data worker");
+    else {
+        tracing::error!("failed to spawn rtl_tcp reader thread — dropping client");
+        return;
+    };
 
     let writer_shutdown = merged_shutdown.clone();
     let writer_stats = stats.clone();
-    let writer_handle = thread::Builder::new()
+    let Ok(writer_handle) = thread::Builder::new()
         .name("rtl_tcp-writer".into())
         .spawn(move || {
             tcp_writer(writer, rx, writer_shutdown, writer_stats);
         })
-        .expect("spawn writer");
+    else {
+        tracing::error!("failed to spawn rtl_tcp writer thread — tearing down client");
+        merged_shutdown.set_client();
+        let _ = reader_handle.join();
+        return;
+    };
 
     let command_shutdown = merged_shutdown.clone();
     let command_device = device;
     let command_stats = stats;
     let command_stream = stream;
-    let command_handle = thread::Builder::new()
-        .name("rtl_tcp-command".into())
-        .spawn(move || {
-            command_worker(
-                command_stream,
-                command_device,
-                command_shutdown,
-                command_stats,
-            );
-        })
-        .expect("spawn command worker");
+    let Ok(command_handle) =
+        thread::Builder::new()
+            .name("rtl_tcp-command".into())
+            .spawn(move || {
+                command_worker(
+                    command_stream,
+                    command_device,
+                    command_shutdown,
+                    command_stats,
+                );
+            })
+    else {
+        tracing::error!("failed to spawn rtl_tcp command thread — tearing down client");
+        merged_shutdown.set_client();
+        let _ = reader_handle.join();
+        let _ = writer_handle.join();
+        return;
+    };
 
     // Wait for any worker to exit, then cancel the others.
     let _ = command_handle.join();
@@ -495,12 +533,17 @@ fn data_worker(
         dev.usb_handle()
     };
     let timeout = Duration::from_secs(1);
+    // Scratch buffer reused across iterations — only the Vec we actually
+    // send to the writer gets a fresh allocation, sized to the data the
+    // USB read returned. This avoids allocating 256 KiB on every timeout
+    // tick (reviewed on PR #313).
+    let mut scratch = vec![0u8; READ_BUFFER_LEN as usize];
 
     while !shutdown.is_set() {
-        let mut buf = vec![0u8; READ_BUFFER_LEN as usize];
-        match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut buf, timeout) {
+        match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut scratch, timeout) {
             Ok(n) if n > 0 => {
-                buf.truncate(n);
+                // Allocate only when we have real data to hand off.
+                let buf = scratch[..n].to_vec();
                 match tx.try_send(buf) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {

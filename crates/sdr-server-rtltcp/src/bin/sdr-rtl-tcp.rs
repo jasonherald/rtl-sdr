@@ -23,8 +23,10 @@
 use std::net::IpAddr;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use sdr_server_rtltcp::server::{Server, ServerConfig};
+use sdr_server_rtltcp::server::{DEFAULT_SAMPLE_RATE_HZ, Server, ServerConfig};
 use sdr_server_rtltcp::{DEFAULT_BUFFER_CAPACITY, DEFAULT_PORT};
 
 fn usage() -> ! {
@@ -64,13 +66,16 @@ fn main() -> ExitCode {
     match Server::start(config) {
         Ok(server) => {
             tracing::info!(bind = %server.bind_address(), "rtl_tcp server running");
-            // Sit in the foreground until Ctrl-C. On SIGINT, dropping the
-            // Server handle drives shutdown.
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            if let Err(e) = ctrlc_handler(tx) {
+            if let Err(e) = ctrlc_handler() {
                 tracing::warn!(%e, "ctrl-c handler setup failed — kill the process manually");
             }
-            let _ = rx.recv();
+            // Poll the shutdown flag instead of using an mpsc channel,
+            // because the signal handler can only safely touch an atomic.
+            // 100 ms poll is well below any user-perceptible shutdown lag
+            // and costs nothing while idle.
+            while !CTRL_C_RECEIVED.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
             tracing::info!("shutting down");
             drop(server);
             ExitCode::SUCCESS
@@ -82,30 +87,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// Install a minimal SIGINT/SIGTERM handler that signals the main thread
-/// to stop. Uses the same pattern as `rtl_tcp.c:477-488`.
+/// Shared flag that the SIGINT/SIGTERM handler sets, which `main` polls.
+///
+/// Using an `AtomicBool` rather than an mpsc channel because `Mutex::lock`
+/// and `mpsc::Sender::send` are NOT async-signal-safe per POSIX — locking
+/// from inside a signal handler can deadlock or corrupt the mutex state
+/// if the signal fires while the main thread holds the lock.
+/// `AtomicBool::store` IS async-signal-safe (single atomic hardware op,
+/// no allocation, no locks).
+static CTRL_C_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+/// Install a minimal SIGINT/SIGTERM handler. Matches the upstream pattern
+/// at `rtl_tcp.c:477-488`, but without the non-async-signal-safe locking.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn ctrlc_handler(tx: std::sync::mpsc::Sender<()>) -> std::io::Result<()> {
-    use std::sync::Mutex;
-    static SENDER: Mutex<Option<std::sync::mpsc::Sender<()>>> = Mutex::new(None);
-    if let Ok(mut slot) = SENDER.lock() {
-        *slot = Some(tx);
-    }
+fn ctrlc_handler() -> std::io::Result<()> {
     extern "C" fn handler(_: libc::c_int) {
-        if let Ok(slot) = SENDER.lock() {
-            if let Some(tx) = slot.as_ref() {
-                let _ = tx.send(());
-            }
-        }
+        // Async-signal-safe: atomic store, no allocation, no locks.
+        CTRL_C_RECEIVED.store(true, Ordering::SeqCst);
     }
-    // SAFETY: `handler` is `extern "C"` with the correct signature for a
-    // POSIX signal handler. We install it for SIGINT / SIGTERM only; the
-    // handler body uses a Mutex + mpsc Sender, both of which are safe to
-    // call from a signal context for this workload (mpsc send is
-    // non-allocating when the receiver is alive; we don't care if a
-    // pathological double-ctrl-c hits the locked path because the handler
-    // just returns without sending).
+    // SAFETY: `handler` has the correct `extern "C" fn(c_int)` signature
+    // for a POSIX signal handler and touches only an AtomicBool, which
+    // is on the POSIX async-signal-safe list.
     unsafe {
         libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
@@ -114,7 +117,7 @@ fn ctrlc_handler(tx: std::sync::mpsc::Sender<()>) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ctrlc_handler(_tx: std::sync::mpsc::Sender<()>) -> std::io::Result<()> {
+fn ctrlc_handler() -> std::io::Result<()> {
     Ok(())
 }
 
@@ -123,7 +126,7 @@ struct ParseError;
 
 fn parse_args(args: &[String]) -> Result<ServerConfig, ParseError> {
     let mut config = ServerConfig::default_loopback();
-    config.initial.sample_rate_hz = 2_048_000;
+    config.initial.sample_rate_hz = DEFAULT_SAMPLE_RATE_HZ;
 
     let mut i = 0;
     while i < args.len() {
