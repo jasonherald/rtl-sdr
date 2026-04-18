@@ -435,7 +435,7 @@ final class SpectrumRenderer {
         passDesc.colorAttachments[0].texture = drawable.texture
         passDesc.colorAttachments[0].loadAction = .clear
         passDesc.colorAttachments[0].storeAction = .store
-        passDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0.09, green: 0.09, blue: 0.11, alpha: 1.0)
+        passDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0.08, green: 0.08, blue: 0.10, alpha: 1.0)
 
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: passDesc) else {
             // Semaphore will be released by the completion

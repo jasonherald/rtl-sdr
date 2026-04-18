@@ -57,7 +57,11 @@ final class CoreModel {
     //  Tuning
     // ==========================================================
 
-    var centerFrequencyHz: Double = 100_700_000
+    // Match the engine-side default center frequency
+    // (`crates/sdr-core/src/controller.rs::DEFAULT_CENTER_FREQ`,
+    // 100.000 MHz) so a side-by-side Linux/Mac launch paints
+    // the same tuner state before any user action.
+    var centerFrequencyHz: Double = 100_000_000
     var vfoOffsetHz: Double = 0
     /// User-selected source sample rate — what the tuner is
     /// configured at (e.g., 2.048 MHz, 2.4 MHz). Bound to the
