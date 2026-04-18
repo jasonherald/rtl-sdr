@@ -269,6 +269,87 @@ mod tests {
     }
 
     #[test]
+    fn parse_hz_rejects_garbage() {
+        assert!(parse_hz("not-a-number").is_err());
+        assert!(parse_hz("").is_err());
+        assert!(parse_hz("5MHz").is_err()); // trailing "Hz" not valid suffix
+        assert!(parse_hz("-100").is_err()); // negative Hz not representable as u32
+    }
+
+    #[test]
+    fn parse_hz_accepts_fractional_suffix_values() {
+        assert_eq!(parse_hz("1.5k").unwrap(), 1_500);
+        assert_eq!(parse_hz("0.1M").unwrap(), 100_000);
+    }
+
+    #[test]
+    fn parse_hz_overflows_u32_rejected() {
+        // 5 GHz > u32::MAX (~4.29 GHz)
+        assert!(parse_hz("5G").is_err());
+    }
+
+    #[test]
+    fn parse_args_missing_value_rejected() {
+        // -a requires an argument
+        let args = vec!["-a".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_unknown_flag_rejected() {
+        let args = vec!["-X".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_invalid_port_rejected() {
+        let args = vec!["-p".to_string(), "not-a-port".to_string()];
+        assert!(parse_args(&args).is_err());
+
+        // Port > u16::MAX is rejected by the u16 parser.
+        let args = vec!["-p".to_string(), "99999".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_help_flag_exits() {
+        // `-h` and `--help` both return Err so `main` calls `usage()`
+        // which exits — don't call `main` in a test, just verify.
+        assert!(parse_args(&["-h".to_string()]).is_err());
+        assert!(parse_args(&["--help".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_malformed_ip_rejected() {
+        let args = vec!["-a".to_string(), "not.an.ip".to_string()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_all_flags_together() {
+        // Exercise the full parse path with every option set, so future
+        // refactors of the match keep the option ordering flexibility.
+        let args: Vec<String> = [
+            "-a", "10.0.0.5", "-p", "12345", "-f", "433.92M", "-g", "19.7", "-s", "1800k", "-d",
+            "1", "-P", "-5", "-n", "250", "-T", "-D",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let cfg = parse_args(&args).unwrap();
+        assert_eq!(cfg.bind.ip().to_string(), "10.0.0.5");
+        assert_eq!(cfg.bind.port(), 12_345);
+        assert_eq!(cfg.initial.center_freq_hz, 433_920_000);
+        assert_eq!(cfg.initial.gain_tenths_db, Some(197));
+        assert_eq!(cfg.initial.sample_rate_hz, 1_800_000);
+        assert_eq!(cfg.device_index, 1);
+        assert_eq!(cfg.initial.ppm, -5);
+        assert_eq!(cfg.buffer_capacity, 250);
+        assert!(cfg.initial.bias_tee);
+        assert_eq!(cfg.initial.direct_sampling, 2);
+    }
+
+    #[test]
     fn parse_bind_override() {
         let args = vec!["-a".to_string(), "0.0.0.0".to_string()];
         let cfg = parse_args(&args).unwrap();

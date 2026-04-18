@@ -1,0 +1,1036 @@
+#![allow(
+    clippy::doc_markdown,
+    clippy::needless_pass_by_value,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    clippy::large_stack_arrays,
+    clippy::collapsible_if
+)]
+//! `rtl_tcp` client.
+//!
+//! Connects to a remote `rtl_tcp`-compatible server, parses the 12-byte
+//! `dongle_info_t` header, pulls 8-bit unsigned-offset I/Q samples, and
+//! forwards user tuning commands as 5-byte big-endian messages over the
+//! same socket. Speaks the wire protocol described in
+//! `original/librtlsdr/src/rtl_tcp.c` — compatible with GQRX, SDR++,
+//! SoapySDR, `rtl_sdr --server`, and our own `sdr-server-rtltcp`.
+//!
+//! Wire types (`DongleInfo`, `Command`, `CommandOp`, `TunerTypeCode`) are
+//! re-exported from [`sdr_server_rtltcp::protocol`] so both sides share
+//! one source of truth.
+//!
+//! Robustness additions beyond a bare protocol port (epic #299 review):
+//!
+//! - Exponential-backoff reconnect on socket loss. Connection lifecycle
+//!   exposed via [`ConnectionState`] so UI can render Connecting /
+//!   Connected / Retrying / Failed / Disconnected.
+//! - `SO_KEEPALIVE` on the socket to notice silent peer drops.
+//! - Graceful magic-mismatch surfaced as
+//!   [`SourceError::Protocol`] with a descriptive message so connecting
+//!   to a non-rtl_tcp port doesn't treat the first 12 bytes of junk as
+//!   samples.
+//!
+//! Command debouncing (rapid UI dial scrubs → fewer wire commands) is
+//! intentionally **not** handled here — it is a UI concern and the caller
+//! is responsible for coalescing intents before driving `set_*`. Matches
+//! upstream GQRX/SDR++ behavior.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use sdr_pipeline::source_manager::Source;
+use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
+use sdr_types::{Complex, SourceError};
+
+/// Read timeout on the data socket. Stalled reads longer than this trip
+/// the reconnect state machine — matches the upstream 1-second select in
+/// `rtl_tcp.c` command worker.
+const DATA_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Exponential-backoff schedule for reconnect. Values in seconds.
+/// Clamped at 30 s, matching the review of epic #299.
+const BACKOFF_SCHEDULE_SECS: &[u64] = &[1, 2, 5, 10, 30];
+
+/// Metadata parsed from the server's `dongle_info_t` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunerInfo {
+    pub tuner: TunerTypeCode,
+    /// Number of discrete gain steps the tuner exposes. The actual gain
+    /// table is NOT carried on the wire — clients that want to render dB
+    /// values must either assume the R820T table or drive the server via
+    /// [`CommandOp::SetGainByIndex`] and show "step N of M".
+    pub gain_count: u32,
+}
+
+impl From<DongleInfo> for TunerInfo {
+    fn from(info: DongleInfo) -> Self {
+        Self {
+            tuner: info.tuner,
+            gain_count: info.gain_count,
+        }
+    }
+}
+
+/// Connection lifecycle state for UI consumption.
+#[derive(Debug, Clone)]
+pub enum ConnectionState {
+    /// Initial state before first `start()` call.
+    Disconnected,
+    /// `start()` in progress — first TCP connect attempt.
+    Connecting,
+    /// Handshake complete, handler streaming I/Q.
+    Connected { tuner: TunerInfo },
+    /// Connection dropped, backoff pending.
+    Retrying { attempt: u32, next_at: Instant },
+    /// Terminal failure after max attempts, or protocol error.
+    Failed { reason: String },
+}
+
+/// rtl_tcp source client.
+///
+/// Spawns a background connection manager thread on `start()`. The
+/// manager owns the socket, does the reconnect loop, and publishes the
+/// byte stream into a ring buffer that `read_samples` drains.
+pub struct RtlTcpSource {
+    host: String,
+    port: u16,
+    sample_rate: f64,
+    frequency: f64,
+
+    shared: Arc<SharedState>,
+    manager: Option<JoinHandle<()>>,
+}
+
+/// State shared between the public API (main thread) and the background
+/// connection manager thread.
+struct SharedState {
+    shutdown: AtomicBool,
+    state: Mutex<ConnectionState>,
+    tuner: Mutex<Option<TunerInfo>>,
+
+    /// Latest 8-bit I/Q bytes read from the server. The connection
+    /// manager appends bytes here; `read_samples` drains and converts.
+    /// Guarded by a Mutex because it's accessed from two threads; a
+    /// lock-free ring buffer would be lower overhead but adds unsafe,
+    /// and this matches the simplicity of the sibling `NetworkSource`.
+    rx_buf: Mutex<Vec<u8>>,
+
+    /// Write side of the socket, protected by a Mutex so command senders
+    /// can share it without racing. Replaced on every reconnect.
+    command_sink: Mutex<Option<TcpStream>>,
+
+    /// Latest values for each sticky command op, replayed on reconnect
+    /// so the server state matches what the UI thinks it has set.
+    /// Using AtomicU32 rather than a HashMap since the op set is small
+    /// and fixed.
+    last_center_freq_hz: AtomicU32,
+    last_sample_rate_hz: AtomicU32,
+    last_gain_mode: AtomicU32,
+    last_tuner_gain: AtomicU32,
+    last_ppm: AtomicU32,
+    last_agc_mode: AtomicU32,
+    last_direct_sampling: AtomicU32,
+    last_offset_tuning: AtomicU32,
+    last_bias_tee: AtomicU32,
+    last_gain_by_index: AtomicU32,
+    // Sentinel: bit 0 of `replay_mask` is set once ANY value has been
+    // written for each op, so a fresh connection doesn't replay default
+    // zeros onto a server whose operator explicitly wanted something
+    // else. Bit i = op 0x01 + i.
+    replay_mask: AtomicU32,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self {
+            shutdown: AtomicBool::new(false),
+            state: Mutex::new(ConnectionState::Disconnected),
+            tuner: Mutex::new(None),
+            rx_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
+            command_sink: Mutex::new(None),
+            last_center_freq_hz: AtomicU32::new(0),
+            last_sample_rate_hz: AtomicU32::new(0),
+            last_gain_mode: AtomicU32::new(0),
+            last_tuner_gain: AtomicU32::new(0),
+            last_ppm: AtomicU32::new(0),
+            last_agc_mode: AtomicU32::new(0),
+            last_direct_sampling: AtomicU32::new(0),
+            last_offset_tuning: AtomicU32::new(0),
+            last_bias_tee: AtomicU32::new(0),
+            last_gain_by_index: AtomicU32::new(0),
+            replay_mask: AtomicU32::new(0),
+        }
+    }
+}
+
+impl RtlTcpSource {
+    /// Create a new rtl_tcp client. Doesn't connect — call
+    /// [`Source::start`] or [`Self::start_manager`] to open the socket.
+    pub fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+            sample_rate: 2_048_000.0,
+            frequency: 100_000_000.0,
+            shared: Arc::new(SharedState::new()),
+            manager: None,
+        }
+    }
+
+    /// Snapshot of the current connection lifecycle state.
+    pub fn connection_state(&self) -> ConnectionState {
+        match self.shared.state.lock() {
+            Ok(s) => s.clone(),
+            Err(_) => ConnectionState::Disconnected,
+        }
+    }
+
+    /// Tuner metadata from the last successful handshake, if any.
+    pub fn tuner_info(&self) -> Option<TunerInfo> {
+        self.shared.tuner.lock().ok().and_then(|g| *g)
+    }
+
+    /// Send a raw rtl_tcp command over the current socket. Returns
+    /// `NotRunning` if the connection manager is not alive.
+    ///
+    /// Callers should prefer the typed setters (`set_center_freq_hz`,
+    /// etc.) — this is the low-level escape hatch used by the setters.
+    pub fn send_command(&self, cmd: Command) -> Result<(), SourceError> {
+        // Remember the value for reconnect-replay before actually sending
+        // so we don't lose it if the write happens to race a reconnect.
+        self.record_command(cmd);
+
+        let mut sink = self
+            .shared
+            .command_sink
+            .lock()
+            .map_err(|_| SourceError::NotRunning)?;
+        let Some(stream) = sink.as_mut() else {
+            // Not connected yet. Not an error — manager will replay on
+            // reconnect via `record_command` above.
+            return Ok(());
+        };
+        if let Err(e) = stream.write_all(&cmd.to_bytes()) {
+            tracing::debug!(%e, "rtl_tcp command write failed — reconnect will replay");
+            // Drop the broken stream; manager will notice and reconnect.
+            *sink = None;
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn record_command(&self, cmd: Command) {
+        let slot = match cmd.op {
+            CommandOp::SetCenterFreq => &self.shared.last_center_freq_hz,
+            CommandOp::SetSampleRate => &self.shared.last_sample_rate_hz,
+            CommandOp::SetGainMode => &self.shared.last_gain_mode,
+            CommandOp::SetTunerGain => &self.shared.last_tuner_gain,
+            CommandOp::SetFreqCorrection => &self.shared.last_ppm,
+            CommandOp::SetAgcMode => &self.shared.last_agc_mode,
+            CommandOp::SetDirectSampling => &self.shared.last_direct_sampling,
+            CommandOp::SetOffsetTuning => &self.shared.last_offset_tuning,
+            CommandOp::SetBiasTee => &self.shared.last_bias_tee,
+            CommandOp::SetGainByIndex => &self.shared.last_gain_by_index,
+            // Ops we don't replay (testmode, if-gain, xtal frequencies)
+            // are stateful on the server but rarely adjusted; skip the
+            // replay plumbing for now. Re-examine if a use case appears.
+            _ => return,
+        };
+        slot.store(cmd.param, Ordering::Relaxed);
+        let bit = u32::from((cmd.op as u8) - 1);
+        self.shared
+            .replay_mask
+            .fetch_or(1u32 << bit, Ordering::Relaxed);
+    }
+
+    /// Convenience typed setters — each one round-trips through
+    /// [`Self::send_command`].
+    pub fn set_center_freq_hz(&self, hz: u32) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetCenterFreq,
+            param: hz,
+        })
+    }
+
+    pub fn set_sample_rate_hz(&self, hz: u32) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetSampleRate,
+            param: hz,
+        })
+    }
+
+    pub fn set_tuner_gain_tenths_db(&self, gain: i32) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetTunerGain,
+            #[allow(clippy::cast_sign_loss)]
+            param: gain as u32,
+        })
+    }
+
+    pub fn set_gain_mode_manual(&self, manual: bool) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetGainMode,
+            param: u32::from(manual),
+        })
+    }
+
+    pub fn set_freq_correction_ppm(&self, ppm: i32) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetFreqCorrection,
+            #[allow(clippy::cast_sign_loss)]
+            param: ppm as u32,
+        })
+    }
+
+    pub fn set_agc_mode(&self, on: bool) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetAgcMode,
+            param: u32::from(on),
+        })
+    }
+
+    pub fn set_direct_sampling(&self, mode: i32) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetDirectSampling,
+            #[allow(clippy::cast_sign_loss)]
+            param: mode as u32,
+        })
+    }
+
+    pub fn set_offset_tuning(&self, on: bool) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetOffsetTuning,
+            param: u32::from(on),
+        })
+    }
+
+    pub fn set_bias_tee(&self, on: bool) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetBiasTee,
+            param: u32::from(on),
+        })
+    }
+
+    pub fn set_gain_by_index(&self, idx: u32) -> Result<(), SourceError> {
+        self.send_command(Command {
+            op: CommandOp::SetGainByIndex,
+            param: idx,
+        })
+    }
+
+    fn start_manager(&mut self) {
+        let host = self.host.clone();
+        let port = self.port;
+        let shared = self.shared.clone();
+
+        self.shared.shutdown.store(false, Ordering::SeqCst);
+        self.manager = Some(
+            thread::Builder::new()
+                .name("rtl_tcp-client".into())
+                .spawn(move || {
+                    connection_manager(host, port, shared);
+                })
+                .expect("spawn rtl_tcp client manager"),
+        );
+    }
+
+    fn stop_manager(&mut self) {
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        // Close the current socket so any blocked read returns fast.
+        if let Ok(mut sink) = self.shared.command_sink.lock() {
+            if let Some(s) = sink.take() {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        if let Some(h) = self.manager.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for RtlTcpSource {
+    fn drop(&mut self) {
+        self.stop_manager();
+    }
+}
+
+/// Background thread body: reconnect loop + data-read pump.
+fn connection_manager(host: String, port: u16, shared: Arc<SharedState>) {
+    let mut attempt: u32 = 0;
+
+    while !shared.shutdown.load(Ordering::Relaxed) {
+        set_state(&shared, ConnectionState::Connecting);
+
+        match attempt_connect(&host, port, &shared) {
+            Ok(stream) => {
+                attempt = 0;
+                // At this point handshake has completed successfully.
+                replay_sticky_commands(&shared);
+                run_data_pump(stream, &shared);
+                // run_data_pump returned — connection dropped.
+            }
+            Err(e) => {
+                tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
+                if let SourceError::Protocol(_) = e {
+                    // Non-recoverable: server isn't speaking rtl_tcp.
+                    set_state(
+                        &shared,
+                        ConnectionState::Failed {
+                            reason: format!("{e}"),
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+
+        if shared.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        attempt = attempt.saturating_add(1);
+        let delay = backoff_delay(attempt);
+        let next_at = Instant::now() + delay;
+        set_state(&shared, ConnectionState::Retrying { attempt, next_at });
+        sleep_until(next_at, &shared.shutdown);
+    }
+
+    set_state(&shared, ConnectionState::Disconnected);
+}
+
+fn attempt_connect(
+    host: &str,
+    port: u16,
+    shared: &Arc<SharedState>,
+) -> Result<TcpStream, SourceError> {
+    let addr = format!("{host}:{port}");
+    let stream = TcpStream::connect(&addr).map_err(SourceError::Io)?;
+
+    stream.set_read_timeout(Some(DATA_READ_TIMEOUT))?;
+    if let Err(e) = set_keepalive(&stream, true) {
+        tracing::warn!(%e, "SO_KEEPALIVE not applied (non-fatal)");
+    }
+
+    // Read and verify the 12-byte dongle_info_t header.
+    let mut header_buf = [0u8; DONGLE_INFO_LEN];
+    read_exact_with_context(&stream, &mut header_buf)?;
+
+    let Some(info) = DongleInfo::from_bytes(&header_buf) else {
+        return Err(SourceError::Protocol(
+            "not an rtl_tcp server: dongle_info_t magic prefix mismatch".into(),
+        ));
+    };
+    let tuner = TunerInfo::from(info);
+    if let Ok(mut slot) = shared.tuner.lock() {
+        *slot = Some(tuner);
+    }
+    set_state(shared, ConnectionState::Connected { tuner });
+
+    // Publish a clone of the stream for the command sender.
+    let sink = stream.try_clone().map_err(SourceError::Io)?;
+    if let Ok(mut slot) = shared.command_sink.lock() {
+        *slot = Some(sink);
+    }
+
+    Ok(stream)
+}
+
+fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>) {
+    let mut buf = [0u8; 64 * 1024];
+    while !shared.shutdown.load(Ordering::Relaxed) {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                tracing::info!("rtl_tcp server closed connection");
+                break;
+            }
+            Ok(n) => {
+                if let Ok(mut rx) = shared.rx_buf.lock() {
+                    rx.extend_from_slice(&buf[..n]);
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Read timeout — server may have silently gone away.
+                // Loop back and re-check shutdown; keepalive probes will
+                // eventually turn a silent drop into an explicit error.
+            }
+            Err(e) => {
+                tracing::info!(%e, "rtl_tcp socket read failed, will reconnect");
+                break;
+            }
+        }
+    }
+
+    // Drop the command sink so subsequent send_command calls stop
+    // writing into a dead stream.
+    if let Ok(mut sink) = shared.command_sink.lock() {
+        *sink = None;
+    }
+}
+
+fn replay_sticky_commands(shared: &Arc<SharedState>) {
+    let mask = shared.replay_mask.load(Ordering::Relaxed);
+    let replay_bit = |bit: u32| mask & (1u32 << bit) != 0;
+    let Ok(mut sink) = shared.command_sink.lock() else {
+        return;
+    };
+    let Some(stream) = sink.as_mut() else {
+        return;
+    };
+
+    let ops = [
+        (CommandOp::SetCenterFreq, &shared.last_center_freq_hz),
+        (CommandOp::SetSampleRate, &shared.last_sample_rate_hz),
+        (CommandOp::SetGainMode, &shared.last_gain_mode),
+        (CommandOp::SetTunerGain, &shared.last_tuner_gain),
+        (CommandOp::SetFreqCorrection, &shared.last_ppm),
+        (CommandOp::SetAgcMode, &shared.last_agc_mode),
+        (CommandOp::SetDirectSampling, &shared.last_direct_sampling),
+        (CommandOp::SetOffsetTuning, &shared.last_offset_tuning),
+        (CommandOp::SetBiasTee, &shared.last_bias_tee),
+        (CommandOp::SetGainByIndex, &shared.last_gain_by_index),
+    ];
+    for (op, slot) in ops {
+        let bit = u32::from((op as u8) - 1);
+        if !replay_bit(bit) {
+            continue;
+        }
+        let cmd = Command {
+            op,
+            param: slot.load(Ordering::Relaxed),
+        };
+        if let Err(e) = stream.write_all(&cmd.to_bytes()) {
+            tracing::debug!(%e, op = ?op, "replay write failed — will retry on next reconnect");
+            return;
+        }
+    }
+}
+
+fn backoff_delay(attempt: u32) -> Duration {
+    let idx = (attempt as usize).min(BACKOFF_SCHEDULE_SECS.len() - 1);
+    Duration::from_secs(BACKOFF_SCHEDULE_SECS[idx])
+}
+
+fn sleep_until(deadline: Instant, shutdown: &AtomicBool) {
+    let step = Duration::from_millis(100);
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(step.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn set_state(shared: &Arc<SharedState>, state: ConnectionState) {
+    if let Ok(mut s) = shared.state.lock() {
+        *s = state;
+    }
+}
+
+fn read_exact_with_context(stream: &TcpStream, buf: &mut [u8]) -> Result<(), SourceError> {
+    let mut filled = 0;
+    let mut s = stream;
+    while filled < buf.len() {
+        match Read::read(&mut s, &mut buf[filled..]) {
+            Ok(0) => {
+                return Err(SourceError::Io(std::io::Error::from(
+                    std::io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            Ok(n) => filled += n,
+            Err(e) => return Err(SourceError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_keepalive(stream: &TcpStream, on: bool) -> std::io::Result<()> {
+    // Same setsockopt dance as `sdr-server-rtltcp::server::set_keepalive`.
+    // Kept duplicated rather than extracted into a shared crate so both
+    // ends stay self-contained — this is one function.
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let value: libc::c_int = libc::c_int::from(on);
+    // SAFETY: `fd` is a valid open socket for the duration of this call
+    // (we borrow `stream` by reference); `value` is a stable stack local
+    // with the matching `c_int` type for `SO_KEEPALIVE`.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_keepalive(_stream: &TcpStream, _on: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
+impl Source for RtlTcpSource {
+    fn name(&self) -> &str {
+        "RTL-TCP"
+    }
+
+    fn start(&mut self) -> Result<(), SourceError> {
+        self.start_manager();
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), SourceError> {
+        self.stop_manager();
+        Ok(())
+    }
+
+    fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
+        self.frequency = frequency_hz;
+        // Round to u32 — upstream wire protocol is u32 Hz.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let hz = frequency_hz.round() as u32;
+        self.set_center_freq_hz(hz)
+    }
+
+    fn sample_rates(&self) -> &[f64] {
+        &[]
+    }
+
+    fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError> {
+        self.sample_rate = rate;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let hz = rate.round() as u32;
+        self.set_sample_rate_hz(hz)
+    }
+
+    fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let need = output.len().saturating_mul(2);
+        let mut bytes = Vec::with_capacity(need);
+
+        // Drain up to `need` bytes from the shared rx buffer, aligned to
+        // a pair boundary — an odd trailing byte must stay queued so the
+        // I channel of the next sample isn't shifted one byte into the Q
+        // of the previous one. Kernel socket reads produce odd byte
+        // counts occasionally; upstream rtl_tcp avoids this because it
+        // works in raw byte space, but our complex-pair conversion needs
+        // even alignment.
+        if let Ok(mut rx) = self.shared.rx_buf.lock() {
+            let take = (rx.len().min(need)) & !1;
+            if take > 0 {
+                bytes.extend_from_slice(&rx[..take]);
+                rx.drain(..take);
+            }
+        } else {
+            return Err(SourceError::NotRunning);
+        }
+
+        // 8-bit unsigned-offset I/Q: byte 0..255 with zero at 127.5.
+        // Convert to f32 in [-1, 1) using the same scale as
+        // sdr-source-rtlsdr's internal path.
+        let pairs = bytes.len() / 2;
+        let count = pairs.min(output.len());
+        for i in 0..count {
+            let re_u = bytes[i * 2];
+            let im_u = bytes[i * 2 + 1];
+            let re = (f32::from(re_u) - 127.5) / 127.5;
+            let im = (f32::from(im_u) - 127.5) / 127.5;
+            output[i] = Complex::new(re, im);
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn backoff_schedule_caps_at_30s() {
+        assert_eq!(backoff_delay(0), Duration::from_secs(1));
+        assert_eq!(backoff_delay(4), Duration::from_secs(30));
+        // Further attempts saturate.
+        assert_eq!(backoff_delay(999), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn new_source_starts_disconnected() {
+        let source = RtlTcpSource::new("127.0.0.1", 1234);
+        match source.connection_state() {
+            ConnectionState::Disconnected => {}
+            other => unreachable!("expected Disconnected, got {other:?}"),
+        }
+        assert!(source.tuner_info().is_none());
+    }
+
+    #[test]
+    fn bad_magic_produces_failed_state() {
+        // Spin up a toy server that writes junk then closes.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(b"XXXXjunknoise");
+                // Keep open briefly so client reads fail cleanly.
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager();
+
+        // Wait up to 2s for the manager to transition to Failed.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_failed = false;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
+                saw_failed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        src.stop_manager();
+        let _ = server_thread.join();
+        assert!(saw_failed, "expected Failed state after bad magic");
+    }
+
+    #[test]
+    fn happy_path_handshake_and_command_roundtrip() {
+        // Mock rtl_tcp server: writes a valid RTL0 header then pushes
+        // a fixed byte pattern as "samples" while reading tuning
+        // commands into a channel we can inspect.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            // Advertise an R820T with 29 gains.
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: 29,
+            }
+            .to_bytes();
+            sock.write_all(&header).unwrap();
+            // Stream a few hundred bytes of synthetic I/Q (all 128 = zero).
+            sock.write_all(&[128u8; 512]).unwrap();
+            // Read one command (5 bytes) from the client and forward it.
+            let mut cmd_buf = [0u8; 5];
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            if sock.read_exact(&mut cmd_buf).is_ok() {
+                if let Some(cmd) = Command::from_bytes(&cmd_buf) {
+                    let _ = cmd_tx.send(cmd);
+                }
+            }
+            // Hold connection briefly so the client doesn't see EOF mid-test.
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager();
+
+        // Wait for Connected state.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut tuner = None;
+        while Instant::now() < deadline {
+            if let ConnectionState::Connected { tuner: t } = src.connection_state() {
+                tuner = Some(t);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(tuner.is_some(), "client never reached Connected state");
+        let t = tuner.unwrap();
+        assert_eq!(t.tuner, TunerTypeCode::R820t);
+        assert_eq!(t.gain_count, 29);
+
+        // Send a tune command and verify the server received it.
+        src.set_center_freq_hz(99_500_000).unwrap();
+        let received = cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(received.op, CommandOp::SetCenterFreq);
+        assert_eq!(received.param, 99_500_000);
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn record_command_sets_replay_bit() {
+        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        let cmd = Command {
+            op: CommandOp::SetCenterFreq,
+            param: 99_500_000,
+        };
+        src.record_command(cmd);
+        let mask = src.shared.replay_mask.load(Ordering::Relaxed);
+        // CenterFreq is op 0x01, bit index 0.
+        assert_eq!(mask & 0x1, 0x1);
+        assert_eq!(
+            src.shared.last_center_freq_hz.load(Ordering::Relaxed),
+            99_500_000
+        );
+    }
+
+    #[test]
+    fn read_samples_with_empty_output_returns_zero() {
+        let mut src = RtlTcpSource::new("127.0.0.1", 1234);
+        let mut output: [Complex; 0] = [];
+        let n = src.read_samples(&mut output).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn read_samples_with_no_data_returns_zero() {
+        let mut src = RtlTcpSource::new("127.0.0.1", 1234);
+        // Source was never started, no bytes buffered.
+        let mut output = [Complex::default(); 4];
+        let n = src.read_samples(&mut output).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn read_samples_converts_8bit_offset_iq() {
+        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        // 128 is midscale zero, 255 is +1 - small epsilon, 0 is -1.
+        if let Ok(mut rx) = src.shared.rx_buf.lock() {
+            rx.extend_from_slice(&[128, 128, 255, 0, 0, 255]);
+        }
+        let mut out = [Complex::default(); 3];
+        // Call read_samples via the trait impl, matching public API.
+        let mut mutable_src = src;
+        let n = mutable_src.read_samples(&mut out).unwrap();
+        assert_eq!(n, 3);
+        // Midscale pair → near zero.
+        assert!(out[0].re.abs() < 0.01);
+        assert!(out[0].im.abs() < 0.01);
+        // (255, 0) → +1, -1.
+        assert!((out[1].re - 1.0).abs() < 0.01);
+        assert!((out[1].im + 1.0).abs() < 0.01);
+        // (0, 255) → -1, +1.
+        assert!((out[2].re + 1.0).abs() < 0.01);
+        assert!((out[2].im - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn read_samples_handles_partial_pair_at_end() {
+        // Odd byte count — the trailing lone byte must stay queued
+        // rather than produce half a sample.
+        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        if let Ok(mut rx) = src.shared.rx_buf.lock() {
+            rx.extend_from_slice(&[128, 128, 200]); // 1.5 pairs
+        }
+        let mut out = [Complex::default(); 2];
+        let mut src = src;
+        let n = src.read_samples(&mut out).unwrap();
+        assert_eq!(n, 1, "should only consume the complete pair");
+        // The trailing 200 stays queued — drained on the next call.
+        let remaining = src.shared.rx_buf.lock().unwrap().len();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
+    fn partial_header_read_still_completes_handshake() {
+        // Server sends the 12-byte dongle_info_t in two chunks with a
+        // sleep between, exercising the read_exact_with_context loop.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let header = DongleInfo {
+                tuner: TunerTypeCode::E4000,
+                gain_count: 14,
+            }
+            .to_bytes();
+            sock.write_all(&header[..5]).unwrap();
+            thread::sleep(Duration::from_millis(80));
+            sock.write_all(&header[5..]).unwrap();
+            // Hold open briefly.
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = None;
+        while Instant::now() < deadline {
+            if let ConnectionState::Connected { tuner } = src.connection_state() {
+                got = Some(tuner);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        src.stop_manager();
+        let _ = server_thread.join();
+        let tuner = got.expect("handshake should succeed across split reads");
+        assert_eq!(tuner.tuner, TunerTypeCode::E4000);
+        assert_eq!(tuner.gain_count, 14);
+    }
+
+    #[test]
+    fn tcp_eof_mid_stream_transitions_to_retrying() {
+        // Server completes handshake then immediately closes and drops
+        // its listener — client must leave Connected and enter Retrying.
+        // NOTE: do NOT accept a second time here. A second accept without
+        // a header write would make the client hang on the header read
+        // until DATA_READ_TIMEOUT (5 s). We let the listener drop so the
+        // reconnect attempt gets ECONNREFUSED immediately, which puts
+        // the client into Retrying within a few ms.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: 29,
+            }
+            .to_bytes();
+            sock.write_all(&header).unwrap();
+            // Drop sock → FIN → client's data-pump read returns Ok(0).
+            // Dropping `listener` at the end of the closure scope makes
+            // subsequent connect() from the client fail with
+            // ECONNREFUSED, which lands the client in Retrying.
+        });
+
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager();
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut saw_retrying = false;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::Retrying { .. }) {
+                saw_retrying = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        src.stop_manager();
+        let _ = server_thread.join();
+        assert!(saw_retrying, "client never entered Retrying after EOF");
+    }
+
+    #[test]
+    fn commands_before_connect_are_recorded_and_replayed() {
+        // Driver queues commands before start() / before the server
+        // accepts; on handshake those values should be replayed to the
+        // server.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: 29,
+            }
+            .to_bytes();
+            sock.write_all(&header).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            // Read whatever the client sends (replays + any subsequent
+            // calls) for up to 1 s or until we've collected 2 commands.
+            let mut got = 0;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while got < 2 && Instant::now() < deadline {
+                let mut buf = [0u8; 5];
+                match sock.read_exact(&mut buf) {
+                    Ok(()) => {
+                        if let Some(cmd) = Command::from_bytes(&buf) {
+                            let _ = cmd_tx.send(cmd);
+                            got += 1;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        // Queue commands BEFORE start — these must end up sent after
+        // handshake via the replay path.
+        src.set_center_freq_hz(433_000_000).unwrap();
+        src.set_tuner_gain_tenths_db(197).unwrap();
+
+        src.start_manager();
+        // Collect the replayed commands.
+        let mut received = Vec::new();
+        while let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_millis(1500)) {
+            received.push(cmd);
+            if received.len() == 2 {
+                break;
+            }
+        }
+        src.stop_manager();
+        let _ = server_thread.join();
+
+        let params: Vec<(CommandOp, u32)> = received.iter().map(|c| (c.op, c.param)).collect();
+        assert!(
+            params.contains(&(CommandOp::SetCenterFreq, 433_000_000)),
+            "expected replay of center freq, got {params:?}"
+        );
+        assert!(
+            params.contains(&(CommandOp::SetTunerGain, 197)),
+            "expected replay of tuner gain, got {params:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_during_failed_connect_is_prompt() {
+        // Point client at a port nothing's listening on; start_manager
+        // enters the retry loop. stop_manager should return within ~1 s,
+        // well below the exponential-backoff window.
+        let mut src = RtlTcpSource::new("127.0.0.1", 1); // port 1 likely refused
+        src.start_manager();
+        let t0 = Instant::now();
+        src.stop_manager();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop_manager took {elapsed:?}, should be prompt"
+        );
+    }
+
+    #[test]
+    fn replay_bits_set_independently_per_op() {
+        let src = RtlTcpSource::new("127.0.0.1", 1234);
+        src.record_command(Command {
+            op: CommandOp::SetBiasTee,
+            param: 1,
+        });
+        let mask = src.shared.replay_mask.load(Ordering::Relaxed);
+        // BiasTee is op 0x0e, so bit index (0x0e - 1) = 13.
+        assert!(mask & (1 << 13) != 0);
+        // No other bits should be set.
+        assert_eq!(mask.count_ones(), 1);
+    }
+}

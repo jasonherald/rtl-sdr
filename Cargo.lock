@@ -2003,8 +2003,10 @@ dependencies = [
 name = "sdr-source-network"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sdr-config",
  "sdr-pipeline",
+ "sdr-server-rtltcp",
  "sdr-types",
  "thiserror 2.0.18",
  "tracing",

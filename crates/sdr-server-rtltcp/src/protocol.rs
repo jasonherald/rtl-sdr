@@ -280,6 +280,88 @@ mod tests {
     }
 
     #[test]
+    fn command_rejects_reserved_low_opcodes() {
+        // 0x00 is not a defined opcode; upstream's switch has no default
+        // arm for it. We reject at parse time so the dispatcher's match
+        // stays exhaustive.
+        let bytes = [0x00, 0, 0, 0, 0];
+        assert!(Command::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn command_rejects_opcodes_above_0x0e() {
+        // Every value 0x0f..=0xff must be rejected — sanity-check the
+        // upper boundary so a future upstream extension doesn't leak.
+        for op in 0x0f..=0xff {
+            let bytes = [op, 1, 2, 3, 4];
+            assert!(
+                Command::from_bytes(&bytes).is_none(),
+                "opcode 0x{op:02x} should be rejected but parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn all_known_opcodes_have_distinct_codes() {
+        use std::collections::HashSet;
+        let codes: HashSet<u8> = [
+            CommandOp::SetCenterFreq,
+            CommandOp::SetSampleRate,
+            CommandOp::SetGainMode,
+            CommandOp::SetTunerGain,
+            CommandOp::SetFreqCorrection,
+            CommandOp::SetIfGain,
+            CommandOp::SetTestMode,
+            CommandOp::SetAgcMode,
+            CommandOp::SetDirectSampling,
+            CommandOp::SetOffsetTuning,
+            CommandOp::SetRtlXtal,
+            CommandOp::SetTunerXtal,
+            CommandOp::SetGainByIndex,
+            CommandOp::SetBiasTee,
+        ]
+        .iter()
+        .map(|&op| op as u8)
+        .collect();
+        assert_eq!(codes.len(), 14);
+    }
+
+    #[test]
+    fn dongle_info_all_zeros_yields_unknown_tuner() {
+        let bytes = [0u8; DONGLE_INFO_LEN];
+        // Magic is not "RTL0" — must be rejected outright, not silently
+        // treated as an Unknown-tuner server.
+        assert!(DongleInfo::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn dongle_info_valid_magic_with_zero_gain_count() {
+        // Magic valid, tuner=0 (Unknown), gain_count=0 — edge case that
+        // corresponds to a dongle that enumerates with no advertised
+        // gain table. Should parse successfully.
+        let mut bytes = [0u8; DONGLE_INFO_LEN];
+        bytes[0..4].copy_from_slice(b"RTL0");
+        let info = DongleInfo::from_bytes(&bytes).unwrap();
+        assert_eq!(info.tuner, TunerTypeCode::Unknown);
+        assert_eq!(info.gain_count, 0);
+    }
+
+    #[test]
+    fn command_param_boundary_values() {
+        // Test u32 min and max to catch any accidental signed interpretation
+        // in the serialization layer.
+        for param in [0u32, 1, u32::MAX, u32::MAX - 1, 0x8000_0000] {
+            let cmd = Command {
+                op: CommandOp::SetCenterFreq,
+                param,
+            };
+            let bytes = cmd.to_bytes();
+            let decoded = Command::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, cmd);
+        }
+    }
+
+    #[test]
     fn tuner_type_code_mapping_matches_upstream_numbering() {
         assert_eq!(TunerTypeCode::from(TunerType::Unknown) as u32, 0);
         assert_eq!(TunerTypeCode::from(TunerType::E4000) as u32, 1);

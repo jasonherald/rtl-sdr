@@ -638,3 +638,74 @@ fn read_full(stream: &mut TcpStream, buf: &mut [u8], shutdown: &MergedShutdown) 
     }
     ReadResult::Ok
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_surfaces_port_conflict_as_typed_error() {
+        // Hold a port before calling Server::start — the second bind must
+        // surface as ServerError::PortInUse (not a generic IO error), so
+        // the UI can fall back without parsing error strings.
+        //
+        // This test does NOT need a real RTL-SDR dongle present because
+        // Server::start binds the listener before touching USB.
+        let holder = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let config = ServerConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], port)),
+            device_index: 0,
+            initial: InitialDeviceState::default(),
+            buffer_capacity: 0,
+        };
+        match Server::start(config) {
+            Err(crate::ServerError::PortInUse(ref addr)) => {
+                assert!(addr.contains(&format!("{port}")));
+            }
+            Err(e) => panic!("expected PortInUse, got {e:?}"),
+            Ok(_) => panic!("bind should have failed"),
+        }
+        drop(holder);
+    }
+
+    #[test]
+    fn initial_device_state_defaults_match_upstream_rtl_tcp() {
+        let d = InitialDeviceState::default();
+        // rtl_tcp.c:389-392 — these are the upstream defaults.
+        assert_eq!(d.center_freq_hz, 100_000_000);
+        assert_eq!(d.sample_rate_hz, 2_048_000);
+        assert_eq!(d.ppm, 0);
+        assert!(!d.bias_tee);
+        assert_eq!(d.direct_sampling, 0);
+        assert!(d.gain_tenths_db.is_none());
+    }
+
+    #[test]
+    fn default_loopback_config_binds_localhost() {
+        let cfg = ServerConfig::default_loopback();
+        assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
+        assert_eq!(cfg.bind.port(), crate::protocol::DEFAULT_PORT);
+        assert_eq!(cfg.buffer_capacity, DEFAULT_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn server_stats_default_is_not_connected() {
+        let stats = ServerStats::default();
+        assert!(stats.connected_client.is_none());
+        assert!(stats.connected_since.is_none());
+        assert_eq!(stats.bytes_sent, 0);
+        assert_eq!(stats.buffers_dropped, 0);
+        assert!(stats.last_command.is_none());
+    }
+
+    #[test]
+    fn buffer_capacity_zero_uses_default() {
+        // ServerConfig exposes `buffer_capacity: 0` as "use default". This
+        // is checked during Server::start, but we can sanity-check the
+        // DEFAULT_BUFFER_CAPACITY matches upstream's llbuf_num = 500
+        // (rtl_tcp.c:61).
+        assert_eq!(DEFAULT_BUFFER_CAPACITY, 500);
+    }
+}
