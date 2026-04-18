@@ -906,7 +906,7 @@ mod tests {
             buffer_capacity: 0,
         };
         match Server::start(config) {
-            Err(crate::ServerError::PortInUse(ref addr)) => {
+            Err(ServerError::PortInUse(ref addr)) => {
                 assert!(addr.contains(&format!("{port}")));
             }
             Err(e) => panic!("expected PortInUse, got {e:?}"),

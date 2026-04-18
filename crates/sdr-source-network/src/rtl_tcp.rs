@@ -464,6 +464,16 @@ impl RtlTcpSource {
     }
 
     pub fn set_sample_rate_hz(&self, hz: u32) -> Result<(), SourceError> {
+        // Mirror the `Source::set_sample_rate` guard: a zero sample rate
+        // wedges the RTL-SDR USB controller, so reject at the typed
+        // setter too. Otherwise a caller using the public helper could
+        // bypass the trait-level validation, cache 0 in
+        // `cached_sample_rate_bits`, and send it on the wire.
+        if hz == 0 {
+            return Err(SourceError::InvalidParameter(
+                "sample rate out of range: 0".into(),
+            ));
+        }
         self.shared
             .cached_sample_rate_bits
             .store(f64::from(hz).to_bits(), Ordering::Relaxed);
@@ -1254,6 +1264,21 @@ mod tests {
             left_connected,
             "client still Connected after timeout threshold — reconnect didn't fire"
         );
+    }
+
+    #[test]
+    fn set_sample_rate_hz_rejects_zero() {
+        // Matches `Source::set_sample_rate`'s `<= 0` guard. Bypassing
+        // via the typed helper would cache 0 and wedge the remote USB
+        // controller.
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        let err = src.set_sample_rate_hz(0);
+        assert!(
+            matches!(err, Err(SourceError::InvalidParameter(_))),
+            "expected InvalidParameter for 0 Hz sample rate, got {err:?}"
+        );
+        // Valid rates still succeed.
+        assert!(src.set_sample_rate_hz(2_048_000).is_ok());
     }
 
     #[test]

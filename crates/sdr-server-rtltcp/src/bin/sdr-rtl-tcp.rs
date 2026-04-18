@@ -141,7 +141,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("sdr-rtl-tcp: {e}");
+            // Route through the configured tracing subscriber so this
+            // startup failure gets structured fields + the same output
+            // sink as the rest of the crate (per-workspace rule: no
+            // `println!` / `eprintln!` in crates).
+            tracing::error!(%e, "sdr-rtl-tcp: server startup failed");
             ExitCode::FAILURE
         }
     }
@@ -201,8 +205,9 @@ fn ctrlc_handler() -> std::io::Result<()> {
 struct ParseError;
 
 fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<ServerConfig, ParseError> {
+    // `default_loopback()` seeds `initial` via `InitialDeviceState::default()`,
+    // which already uses `DEFAULT_SAMPLE_RATE_HZ`. No need to re-assign here.
     let mut config = ServerConfig::default_loopback();
-    config.initial.sample_rate_hz = DEFAULT_SAMPLE_RATE_HZ;
 
     let mut i = 0;
     while i < args.len() {
