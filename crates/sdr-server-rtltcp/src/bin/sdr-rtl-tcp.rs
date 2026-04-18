@@ -70,7 +70,7 @@ fn usage(exit_code: i32) -> ! {
     );
     let _ = writeln!(
         out,
-        "    -n <N>       Max queued USB buffers (default: {DEFAULT_BUFFER_CAPACITY})"
+        "    -n <N>       Max queued USB buffers, ~256 KiB each (default: {DEFAULT_BUFFER_CAPACITY})"
     );
     let _ = writeln!(out, "    -T           Enable bias tee");
     let _ = writeln!(
@@ -235,7 +235,15 @@ fn parse_args(args: &[String]) -> Result<ServerConfig, ParseError> {
             }
             "-s" => {
                 let v = args.get(i + 1).ok_or(ParseError)?;
-                config.initial.sample_rate_hz = parse_hz(v)?;
+                let sample_rate_hz = parse_hz(v)?;
+                // Reject 0 up front: `parse_hz` accepts it as a valid
+                // non-negative u32, but a zero sample rate wedges the
+                // RTL-SDR USB controller. Same rule that `Source::
+                // set_sample_rate` in the client uses.
+                if sample_rate_hz == 0 {
+                    return Err(ParseError);
+                }
+                config.initial.sample_rate_hz = sample_rate_hz;
                 i += 2;
             }
             "-d" => {
@@ -438,6 +446,20 @@ mod tests {
     fn parse_args_unknown_flag_rejected() {
         let args = vec!["-X".to_string()];
         assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_rejects_zero_sample_rate() {
+        // `parse_hz` accepts "0" as a valid non-negative u32, but a
+        // zero sample rate wedges the RTL-SDR USB controller. Reject
+        // up-front.
+        for v in ["0", "0k", "0.0", "0M"] {
+            let args = vec!["-s".to_string(), v.to_string()];
+            assert!(
+                parse_args(&args).is_err(),
+                "parse_args should reject -s {v}"
+            );
+        }
     }
 
     #[test]

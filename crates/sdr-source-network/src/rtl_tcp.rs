@@ -183,6 +183,11 @@ struct SharedState {
     /// for observability / UI "consumer too slow" indicators.
     rx_dropped_bytes: AtomicU64,
 
+    /// Edge-trigger flag for the overflow warn log. Set when we drop
+    /// bytes; cleared when the buffer drains to below half-cap. Ensures
+    /// we log once per stall-and-drain cycle instead of per-chunk.
+    rx_in_overflow: AtomicBool,
+
     /// Write side of the socket, protected by a Mutex so command senders
     /// can share it without racing. Replaced on every reconnect.
     command_sink: Mutex<Option<TcpStream>>,
@@ -201,6 +206,15 @@ struct SharedState {
     last_offset_tuning: AtomicU32,
     last_bias_tee: AtomicU32,
     last_gain_by_index: AtomicU32,
+    // Rarely-adjusted but still stateful ops. Tracked + replayed so a
+    // pre-connect set_testmode (etc.) isn't silently lost and so the
+    // server state matches the UI view across reconnects, same as the
+    // common setters. Addresses CodeRabbit round 5 concern that these
+    // previously returned Ok without persisting.
+    last_testmode: AtomicU32,
+    last_if_gain: AtomicU32,
+    last_rtl_xtal: AtomicU32,
+    last_tuner_xtal: AtomicU32,
     // Sentinel: bit 0 of `replay_mask` is set once ANY value has been
     // written for each op, so a fresh connection doesn't replay default
     // zeros onto a server whose operator explicitly wanted something
@@ -228,6 +242,11 @@ impl SharedState {
             last_gain_by_index: AtomicU32::new(0),
             replay_mask: AtomicU32::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
+            rx_in_overflow: AtomicBool::new(false),
+            last_testmode: AtomicU32::new(0),
+            last_if_gain: AtomicU32::new(0),
+            last_rtl_xtal: AtomicU32::new(0),
+            last_tuner_xtal: AtomicU32::new(0),
         }
     }
 }
@@ -256,13 +275,33 @@ fn append_with_cap_inner(rx: &mut Vec<u8>, chunk: &[u8]) -> usize {
 }
 
 /// Wrapper that does the drop-bookkeeping on the shared counter.
+///
+/// Logs only on the *transition* into the overflow state — once the
+/// buffer is over cap we can log dozens of times per second on a hot
+/// path, which adds CPU and log pressure while the consumer is already
+/// behind. The `rx_dropped_bytes` counter is the authoritative source
+/// of truth for "how much has been lost"; the warn is just an edge
+/// signal so operators notice each stall start.
+///
+/// When the buffer drains to below half-cap the flag rearms, so a
+/// subsequent stall will log again.
 fn append_with_cap_to_shared(shared: &SharedState, rx: &mut Vec<u8>, chunk: &[u8]) {
     let dropped = append_with_cap_inner(rx, chunk);
     if dropped > 0 {
         shared
             .rx_dropped_bytes
             .fetch_add(dropped as u64, Ordering::Relaxed);
-        tracing::warn!(dropped, "rtl_tcp rx_buf full, dropped oldest bytes");
+        let was_in_overflow = shared.rx_in_overflow.swap(true, Ordering::Relaxed);
+        if !was_in_overflow {
+            tracing::warn!(
+                dropped,
+                "rtl_tcp rx_buf full, dropping oldest bytes (see rx_dropped_bytes counter for cumulative loss)"
+            );
+        }
+    } else if rx.len() < RX_BUFFER_SOFT_CAP_BYTES / 2 {
+        // Consumer is keeping up well enough that we're back below
+        // half-cap — rearm the edge so a future stall logs again.
+        shared.rx_in_overflow.store(false, Ordering::Relaxed);
     }
 }
 
@@ -331,21 +370,26 @@ impl RtlTcpSource {
     }
 
     fn record_command(&self, cmd: Command) {
+        // ALL 14 stateful ops are recorded for reconnect replay. A
+        // pre-connect `set_testmode(true)` (etc.) would previously
+        // return `Ok(())` without actually being sent, because the
+        // command sink wasn't up yet — silent loss. Now every op
+        // survives the connect / reconnect cycle.
         let slot = match cmd.op {
             CommandOp::SetCenterFreq => &self.shared.last_center_freq_hz,
             CommandOp::SetSampleRate => &self.shared.last_sample_rate_hz,
             CommandOp::SetGainMode => &self.shared.last_gain_mode,
             CommandOp::SetTunerGain => &self.shared.last_tuner_gain,
             CommandOp::SetFreqCorrection => &self.shared.last_ppm,
+            CommandOp::SetIfGain => &self.shared.last_if_gain,
+            CommandOp::SetTestMode => &self.shared.last_testmode,
             CommandOp::SetAgcMode => &self.shared.last_agc_mode,
             CommandOp::SetDirectSampling => &self.shared.last_direct_sampling,
             CommandOp::SetOffsetTuning => &self.shared.last_offset_tuning,
-            CommandOp::SetBiasTee => &self.shared.last_bias_tee,
+            CommandOp::SetRtlXtal => &self.shared.last_rtl_xtal,
+            CommandOp::SetTunerXtal => &self.shared.last_tuner_xtal,
             CommandOp::SetGainByIndex => &self.shared.last_gain_by_index,
-            // Ops we don't replay (testmode, if-gain, xtal frequencies)
-            // are stateful on the server but rarely adjusted; skip the
-            // replay plumbing for now. Re-examine if a use case appears.
-            _ => return,
+            CommandOp::SetBiasTee => &self.shared.last_bias_tee,
         };
         slot.store(cmd.param, Ordering::Relaxed);
         let bit = u32::from((cmd.op as u8) - 1);
@@ -673,11 +717,15 @@ fn replay_sticky_commands(shared: &Arc<SharedState>) {
         (CommandOp::SetGainMode, &shared.last_gain_mode),
         (CommandOp::SetTunerGain, &shared.last_tuner_gain),
         (CommandOp::SetFreqCorrection, &shared.last_ppm),
+        (CommandOp::SetIfGain, &shared.last_if_gain),
+        (CommandOp::SetTestMode, &shared.last_testmode),
         (CommandOp::SetAgcMode, &shared.last_agc_mode),
         (CommandOp::SetDirectSampling, &shared.last_direct_sampling),
         (CommandOp::SetOffsetTuning, &shared.last_offset_tuning),
-        (CommandOp::SetBiasTee, &shared.last_bias_tee),
+        (CommandOp::SetRtlXtal, &shared.last_rtl_xtal),
+        (CommandOp::SetTunerXtal, &shared.last_tuner_xtal),
         (CommandOp::SetGainByIndex, &shared.last_gain_by_index),
+        (CommandOp::SetBiasTee, &shared.last_bias_tee),
     ];
     for (op, slot) in ops {
         let bit = u32::from((op as u8) - 1);
@@ -1461,6 +1509,74 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "stop_manager took {elapsed:?}, should be prompt"
+        );
+    }
+
+    #[test]
+    fn record_command_covers_all_14_wire_ops() {
+        // Every upstream command is recorded for reconnect-replay so a
+        // pre-connect call (e.g. set_testmode before start()) isn't
+        // silently lost. Walk all 14 opcodes and confirm each lands in
+        // the replay_mask.
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        let all_ops = [
+            CommandOp::SetCenterFreq,
+            CommandOp::SetSampleRate,
+            CommandOp::SetGainMode,
+            CommandOp::SetTunerGain,
+            CommandOp::SetFreqCorrection,
+            CommandOp::SetIfGain,
+            CommandOp::SetTestMode,
+            CommandOp::SetAgcMode,
+            CommandOp::SetDirectSampling,
+            CommandOp::SetOffsetTuning,
+            CommandOp::SetRtlXtal,
+            CommandOp::SetTunerXtal,
+            CommandOp::SetGainByIndex,
+            CommandOp::SetBiasTee,
+        ];
+        for op in all_ops {
+            src.record_command(Command { op, param: 42 });
+        }
+        let mask = src.shared.replay_mask.load(Ordering::Relaxed);
+        // Every op from 0x01..=0x0e should have its bit set (bit index
+        // = opcode - 1), so the low 14 bits should all be 1.
+        assert_eq!(mask & 0x3fff, 0x3fff, "mask={mask:#x}");
+    }
+
+    #[test]
+    fn rx_overflow_warning_is_edge_triggered() {
+        // Fill rx past cap → first overflow flips the flag. Subsequent
+        // overflows without a drain in between should leave the flag
+        // set (log suppressed). A drain below half-cap rearms the flag.
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        assert!(!src.shared.rx_in_overflow.load(Ordering::Relaxed));
+
+        // Simulate first overflow.
+        {
+            let mut rx = src.shared.rx_buf.lock().unwrap();
+            *rx = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES];
+            append_with_cap_to_shared(&src.shared, &mut rx, &[0xFFu8; 100]);
+        }
+        assert!(src.shared.rx_in_overflow.load(Ordering::Relaxed));
+
+        // Second overflow — flag already set, no transition.
+        {
+            let mut rx = src.shared.rx_buf.lock().unwrap();
+            append_with_cap_to_shared(&src.shared, &mut rx, &[0xFFu8; 100]);
+        }
+        assert!(src.shared.rx_in_overflow.load(Ordering::Relaxed));
+
+        // Drain well below half-cap and then append a non-overflowing
+        // chunk — flag should rearm.
+        {
+            let mut rx = src.shared.rx_buf.lock().unwrap();
+            rx.clear();
+            append_with_cap_to_shared(&src.shared, &mut rx, &[0u8; 100]);
+        }
+        assert!(
+            !src.shared.rx_in_overflow.load(Ordering::Relaxed),
+            "flag should rearm once buffer drains below half-cap"
         );
     }
 

@@ -226,8 +226,9 @@ impl Server {
 
     /// Signal shutdown and wait for the accept thread to exit.
     ///
-    /// Equivalent to dropping the `Server`, but lets the caller propagate
-    /// join panics if desired.
+    /// Equivalent to dropping the `Server`. Any panic from the accept
+    /// thread is silently swallowed — if you need to observe panics,
+    /// keep the `JoinHandle` yourself instead of calling `stop()`.
     pub fn stop(mut self) {
         self.initiate_shutdown();
         if let Some(h) = self.accept_thread.take() {
@@ -435,8 +436,15 @@ fn set_keepalive(stream: &TcpStream, on: bool) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_keepalive(_stream: &TcpStream, _on: bool) -> std::io::Result<()> {
-    // Non-unix targets: caller swallows the warning.
-    Ok(())
+    // Non-unix has no implementation yet. Return Unsupported so the
+    // warn path in `configure_client_socket` fires and the log makes
+    // the missing keepalive visible — silently returning Ok would
+    // leave operators thinking dead-peer detection is active when it
+    // isn't.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "SO_KEEPALIVE not implemented on this platform",
+    ))
 }
 
 fn update_stats_on_connect(stats: &Arc<Mutex<ServerStats>>, peer: SocketAddr) {
