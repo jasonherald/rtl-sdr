@@ -327,10 +327,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.running = true;
                     tracing::info!("DSP pipeline started");
 
-                    // Send display bandwidth (raw rate) so the spectrum display
-                    // shows the full tuner bandwidth.
+                    // Send display bandwidth (raw sample rate) so
+                    // the spectrum display shows the full tuner
+                    // bandwidth. The FFT is computed on the pre-
+                    // decimation stream (see
+                    // `crates/sdr-pipeline/src/iq_frontend.rs:156`),
+                    // so bins span `sample_rate()`, not
+                    // `effective_sample_rate()`.
                     let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                        state.frontend.effective_sample_rate(),
+                        state.frontend.sample_rate(),
                     ));
 
                     // Send the source's display name + supported gain
@@ -408,7 +413,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.frontend.effective_sample_rate(),
                 ));
                 let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                    state.frontend.effective_sample_rate(),
+                    state.frontend.sample_rate(),
                 ));
 
                 // Notify the UI of the mode transition (edge detection — only
@@ -533,7 +538,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         state.frontend.effective_sample_rate(),
                     ));
                     let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                        state.frontend.effective_sample_rate(),
+                        state.frontend.sample_rate(),
                     ));
                 }
                 Err(e) => {
@@ -558,7 +563,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.frontend.effective_sample_rate(),
                 ));
                 let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                    state.frontend.effective_sample_rate(),
+                    state.frontend.sample_rate(),
                 ));
             }
         }
@@ -783,7 +788,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                             state.frontend.effective_sample_rate(),
                         ));
                         let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                            state.frontend.effective_sample_rate(),
+                            state.frontend.sample_rate(),
                         ));
                     }
                     Err(e) => {

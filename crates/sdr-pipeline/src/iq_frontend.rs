@@ -415,10 +415,21 @@ impl IqFrontend {
             self.window_coherent_gain,
         )?;
 
-        // No fftshift — testing if signal centers without it.
-        // DC is at bin 0 (left edge). VFO display range is set to
-        // [0, effective_rate] to match.
-        fft_out[..self.fft_size].copy_from_slice(&self.fft_output);
+        // Apply fftshift so consumers see the natural ordering:
+        // [ -Nyquist ... DC ... +Nyquist-1bin ]
+        //
+        // Without this, the raw rustfft output has DC at bin 0,
+        // positive frequencies in [1..N/2], and negative (aliased)
+        // frequencies in [N/2..N-1]. Both UI consumers
+        // (`crates/sdr-ui/src/spectrum/fft_plot.rs:317-320` for
+        // GTK, the Swift Metal renderer for macOS) map bin index
+        // linearly to frequency assuming shifted ordering — so
+        // without the shift, strong signals around DC appear at
+        // both edges of the display with a dead zone in the
+        // middle. Classic symptom, hence the shift.
+        let half = self.fft_size / 2;
+        fft_out[..half].copy_from_slice(&self.fft_output[half..self.fft_size]);
+        fft_out[half..self.fft_size].copy_from_slice(&self.fft_output[..half]);
 
         Ok(())
     }
@@ -521,7 +532,11 @@ mod tests {
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map_or(0, |(i, _)| i);
-        assert_eq!(peak_bin, 0, "DC signal should peak at bin 0");
+        assert_eq!(
+            peak_bin,
+            TEST_FFT_SIZE / 2,
+            "DC signal should peak at the center bin after fftshift"
+        );
     }
 
     #[test]
@@ -556,9 +571,13 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map_or(0, |(i, _)| i);
 
+        // After fftshift, positive frequencies in [1..N/2] are
+        // moved to [N/2+1..N-1]. A tone generated at bin
+        // `tone_bin` (positive) now peaks at `tone_bin + N/2`.
+        let expected = tone_bin + TEST_FFT_SIZE / 2;
         assert!(
-            peak_bin.abs_diff(tone_bin) <= 2,
-            "expected peak near bin {tone_bin}, got {peak_bin}"
+            peak_bin.abs_diff(expected) <= 2,
+            "expected peak near bin {expected} (tone_bin + N/2 after shift), got {peak_bin}"
         );
     }
 
