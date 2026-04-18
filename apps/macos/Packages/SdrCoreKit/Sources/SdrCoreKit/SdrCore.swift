@@ -417,4 +417,37 @@ public final class SdrCore: @unchecked Sendable {
         case debug = 3
         case trace = 4
     }
+
+    // ==========================================================
+    //  Device enumeration (static, no handle required)
+    // ==========================================================
+
+    /// Number of RTL-SDR devices currently attached to the USB
+    /// bus. Safe to call before `SdrCore` is created — hosts
+    /// typically call this at app launch to surface whether a
+    /// dongle is plugged in, independent of the engine lifecycle.
+    ///
+    /// Returns 0 when no devices are present (or enumeration
+    /// failed; check `SdrCore.lastErrorMessage()` in that case).
+    public static var deviceCount: UInt32 {
+        sdr_core_device_count()
+    }
+
+    /// Human-readable name for the RTL-SDR device at `index`.
+    /// Returns `nil` if `index` is out of range or the name
+    /// couldn't be probed. Safe to call at any time — no handle
+    /// required.
+    public static func deviceName(at index: UInt32) -> String? {
+        // 128 bytes is comfortably more than any RTL-SDR name
+        // ever printed. Fixed buffer on the stack is cheap and
+        // avoids a heap alloc for what's typically a one-shot
+        // probe at startup.
+        var buf = [CChar](repeating: 0, count: 128)
+        let rc = buf.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            guard let base = ptr.baseAddress else { return -1 }
+            return sdr_core_device_name(index, base, ptr.count)
+        }
+        guard rc >= 0 else { return nil }
+        return String(cString: buf)
+    }
 }

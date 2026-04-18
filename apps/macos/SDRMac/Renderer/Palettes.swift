@@ -56,15 +56,16 @@ struct ColorPalette {
 
 // MARK: - Turbo
 
-/// Google's Turbo colormap. Perceptually uniform, high dynamic
-/// range. Reference:
-/// https://ai.googleblog.com/2019/08/turbo-improved-rainbow-colormap-for.html
+/// Turbo colormap — porting the GTK UI's 8-stop piecewise-linear
+/// implementation (`crates/sdr-ui/src/spectrum/colormap.rs:43`)
+/// verbatim so the Linux and macOS waterfalls read identically.
 ///
-/// The numeric values below are the standard published Turbo
-/// coefficients, sampled at 256 points. Generating them at
-/// compile time would require a polynomial evaluation in Swift
-/// that's slower than just embedding the LUT. The byte array is
-/// 1 KB — well within the "fine to commit" size bar.
+/// The original implementation here used the Google Research
+/// reference polynomial, which produces a perceptually similar
+/// curve but not pixel-identical colors — the noise floor on
+/// Linux came out slightly darker and the peaks slightly cooler.
+/// Matching the Linux stops is the simplest way to make side-
+/// by-side screenshots look like the same product.
 enum Palettes {
     static let turbo = ColorPalette(
         name: "Turbo",
@@ -72,39 +73,40 @@ enum Palettes {
     )
 }
 
-/// 256×RGBA turbo LUT generated from the reference polynomial:
-///
-///     R = 34.61 + t*(1172.33 - t*(10793.56 - t*(33300.12 - t*(38394.49 - t*14825.05))))
-///     G = 23.31 + t*(557.33 + t*(1225.33 - t*(3574.96 - t*(1073.77 + t*707.56))))
-///     B = 27.2 + t*(3211.1 - t*(15327.97 - t*(27814 - t*(22569.18 - t*6838.66))))
-///
-/// Values precomputed and clamped to [0, 255]. Alpha is always 255.
+/// 8-stop piecewise-linear turbo. Exact copy of `TURBO_STOPS` in
+/// `crates/sdr-ui/src/spectrum/colormap.rs:43-52`.
+private let turboStops: [(t: Double, r: UInt8, g: UInt8, b: UInt8)] = [
+    (0.00,   0,   0,   0),
+    (0.10,  10,  10,  80),
+    (0.25,  20,  40, 200),
+    (0.40,   0, 180, 220),
+    (0.55,  20, 200,  40),
+    (0.70, 240, 220,  10),
+    (0.85, 240,  40,  10),
+    (1.00, 255, 255, 255),
+]
+
 private let turboBytes: [UInt8] = {
     var out = [UInt8](repeating: 0, count: 256 * 4)
     for i in 0..<256 {
         let t = Double(i) / 255.0
-        // Turbo polynomial (Google Research reference)
-        let r = 34.61
-            + t * (1172.33
-                - t * (10793.56
-                    - t * (33300.12
-                        - t * (38394.49 - t * 14825.05))))
-        let g = 23.31
-            + t * (557.33
-                + t * (1225.33
-                    - t * (3574.96
-                        - t * (1073.77 + t * 707.56))))
-        let b = 27.2
-            + t * (3211.1
-                - t * (15327.97
-                    - t * (27814.0
-                        - t * (22569.18 - t * 6838.66))))
-        let rc = max(0.0, min(255.0, r.rounded()))
-        let gc = max(0.0, min(255.0, g.rounded()))
-        let bc = max(0.0, min(255.0, b.rounded()))
-        out[i * 4 + 0] = UInt8(rc)
-        out[i * 4 + 1] = UInt8(gc)
-        out[i * 4 + 2] = UInt8(bc)
+        // Find the pair of stops `t` falls between. Linear
+        // scan is fine — 8 stops, happens 256 times at init.
+        var lo = turboStops[0]
+        var hi = turboStops[turboStops.count - 1]
+        for j in 0..<(turboStops.count - 1) where t >= turboStops[j].t && t <= turboStops[j + 1].t {
+            lo = turboStops[j]
+            hi = turboStops[j + 1]
+            break
+        }
+        let span = hi.t - lo.t
+        let frac = span > 0 ? (t - lo.t) / span : 0
+        let r = Double(lo.r) + frac * (Double(hi.r) - Double(lo.r))
+        let g = Double(lo.g) + frac * (Double(hi.g) - Double(lo.g))
+        let b = Double(lo.b) + frac * (Double(hi.b) - Double(lo.b))
+        out[i * 4 + 0] = UInt8(max(0.0, min(255.0, r.rounded())))
+        out[i * 4 + 1] = UInt8(max(0.0, min(255.0, g.rounded())))
+        out[i * 4 + 2] = UInt8(max(0.0, min(255.0, b.rounded())))
         out[i * 4 + 3] = 255
     }
     return out

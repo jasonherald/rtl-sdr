@@ -66,21 +66,57 @@ vertex SpectrumVertexOut spectrum_vert(
     return out;
 }
 
-/// Spectrum fragment shader. Solid spectrum color, modulated
-/// slightly by intensity so peaks pop visually. Keeping this
-/// as a flat color rather than sampling the palette — the
-/// palette is the waterfall's domain; the line is its own
-/// high-contrast accent against whatever waterfall is underneath.
+/// Spectrum fragment shader. Solid accent-blue trace, matching
+/// the GTK UI's TRACE_COLOR
+/// (`crates/sdr-ui/src/spectrum/fft_plot.rs:33`): (0.3, 0.7, 1.0).
+/// Intensity modulation brightens peaks slightly so they pop
+/// against the turbo waterfall underneath without drifting from
+/// the Linux-side look.
 fragment float4 spectrum_frag(
     SpectrumVertexOut in [[stage_in]]
 ) {
-    // Base: an SDR green-on-dark aesthetic that reads well on
-    // both light and dark system appearance, with just enough
-    // saturation to pop against the turbo waterfall.
-    float3 base   = float3(0.55, 0.95, 0.65);
+    float3 base   = float3(0.30, 0.70, 1.00);
     float3 accent = float3(1.00, 1.00, 1.00);
     float3 rgb    = mix(base, accent, in.intensity * 0.3);
     return float4(rgb, 1.0);
+}
+
+// --------------------------------------------------------------
+//  Spectrum fill — semi-transparent envelope under the trace
+//
+//  Invoked with 2N vertices for N bins, rendered as a triangle
+//  strip. Even vertex_id = top (at signal dB); odd = bottom (at
+//  clip-space Y = -1). Pairs form quads that tile across the
+//  spectrum, giving a filled envelope. Matches the GTK UI's
+//  FILL_COLOR (`fft_plot.rs:35`).
+// --------------------------------------------------------------
+
+vertex SpectrumVertexOut spectrum_fill_vert(
+    uint                     vid      [[vertex_id]],
+    constant float          *mags_db  [[buffer(0)]],
+    constant Uniforms&       u        [[buffer(1)]]
+) {
+    uint  bin    = vid / 2;
+    bool  is_top = (vid & 1u) == 0u;
+
+    float denom = max(1.0, float(u.bin_count - 1));
+    float x = 2.0 * (float(bin) / denom) - 1.0;
+
+    float db = mags_db[bin];
+    float t  = saturate((db - u.min_db) / max(0.001, u.max_db - u.min_db));
+    float y  = is_top ? (2.0 * t - 1.0) : -1.0;
+
+    SpectrumVertexOut out;
+    out.position  = float4(x, y, 0.0, 1.0);
+    out.intensity = t;
+    return out;
+}
+
+fragment float4 spectrum_fill_frag(
+    SpectrumVertexOut in [[stage_in]]
+) {
+    // GTK UI FILL_COLOR (`fft_plot.rs:35`): (0.2, 0.4, 0.8, 0.35).
+    return float4(0.20, 0.40, 0.80, 0.35);
 }
 
 // --------------------------------------------------------------

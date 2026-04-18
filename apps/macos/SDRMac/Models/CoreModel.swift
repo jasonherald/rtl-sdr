@@ -72,12 +72,28 @@ final class CoreModel {
     /// Otherwise the Picker would render with no visible
     /// selection on first launch.
     var sourceSampleRateHz: Double = 2_048_000
-    /// Engine-reported post-decimation / post-resample rate.
-    /// Updated from `SampleRateChanged` and `DisplayBandwidth`
-    /// events (both carry the same effective rate in v1). Used
-    /// by the status bar and, in M4, by the spectrum renderer
-    /// as its display span.
+    /// Engine-reported post-decimation / post-resample rate —
+    /// the width of the demodulator's accepted passband, in Hz.
+    /// Updated from `SampleRateChanged` events. Used by the
+    /// status bar display of "effective rate". NOT the spectrum
+    /// display span — that's `displayBandwidthHz` below.
     var effectiveSampleRateHz: Double = 250_000
+
+    /// Engine-reported raw (pre-decimation) sample rate —
+    /// the full width of the FFT the engine publishes, which
+    /// is also the full width of the Metal spectrum view. The
+    /// VFO overlay uses this as its coordinate span.
+    ///
+    /// Updated from `DisplayBandwidth` events. Defaults to
+    /// 2.048 MHz (the typical RTL-SDR source rate) so the VFO
+    /// overlay has a sane span before the first engine event
+    /// arrives.
+    ///
+    /// Matches the GTK UI's `set_display_bandwidth()` + stored
+    /// `full_bandwidth` (see
+    /// `crates/sdr-ui/src/spectrum/mod.rs:244`): two rates,
+    /// distinct semantics.
+    var displayBandwidthHz: Double = 2_048_000
     var ppmCorrection: Int = 0
 
     // ==========================================================
@@ -112,7 +128,12 @@ final class CoreModel {
     var fftSize: Int = 2048
     var fftWindow: FftWindow = .blackman
     var fftRateFps: Double = 20
-    var minDb: Float = -100
+    // Default dB range matches the GTK UI (see
+    // `crates/sdr-ui/src/spectrum/mod.rs:58`). -70 dB floor
+    // hides the ADC noise floor so the waterfall background is
+    // black / cold without the user having to adjust sliders on
+    // first launch.
+    var minDb: Float = -70
     var maxDb: Float = 0
 
     // ==========================================================
@@ -138,6 +159,14 @@ final class CoreModel {
         // side — safe to call more than once, subsequent calls
         // are no-ops.
         SdrCore.initLogging(minLevel: .info)
+
+        // Probe for RTL-SDR hardware BEFORE creating the engine
+        // so the UI can show device presence (or absence) from
+        // the first frame, not only after the user hits Play.
+        // This is a handle-free libusb device-list query; no USB
+        // control transfers, no hardware open.
+        refreshDeviceInfo()
+
         do {
             let c = try SdrCore(configPath: configPath)
             self.core = c
@@ -182,6 +211,27 @@ final class CoreModel {
         core = nil
     }
 
+    /// Probe the USB bus for RTL-SDR hardware and populate
+    /// `deviceInfo` with the detected device name (or a clear
+    /// "not found" string). Handle-free — calls straight into
+    /// `sdr-rtlsdr` via the C ABI; no engine instance needed.
+    ///
+    /// Called once from `bootstrap()` so the device state shows
+    /// up on first paint rather than only after Play. Safe to
+    /// call again later (hotplug detection is a future add).
+    func refreshDeviceInfo() {
+        let count = SdrCore.deviceCount
+        if count == 0 {
+            deviceInfo = "No RTL-SDR device found"
+            return
+        }
+        // Only one device is wired through the pipeline today
+        // (`RtlSdrSource::new(0)`); when we add a source picker
+        // we can list `(0..<count)` and let the user choose.
+        // For now, show device 0's name.
+        deviceInfo = SdrCore.deviceName(at: 0) ?? "RTL-SDR"
+    }
+
     /// Apply one event to the model. Split out from the `for
     /// await` loop so the task can iterate the stream against a
     /// weak self without duplicating the switch.
@@ -194,16 +244,29 @@ final class CoreModel {
         case .signalLevel(let db):
             signalLevelDb = db
         case .deviceInfo(let s):
+            // The engine publishes `DeviceInfo` when a source
+            // opens (see `crates/sdr-core/src/controller.rs`).
+            // This is the post-Play confirmation path — for
+            // the pre-Play "what's plugged in?" display, see
+            // `refreshDeviceInfo()` called from `bootstrap()`.
+            // The engine string takes precedence when it arrives
+            // because it reflects the device that actually
+            // opened (may differ from index 0 if source picker
+            // lands in a future version).
             deviceInfo = s
         case .gainList(let gains):
             availableGains = gains
         case .displayBandwidth(let hz):
-            // Engine-reported spectrum-display bandwidth.
-            // Same value as `sampleRateChanged` in v1 (both
-            // are effective_sample_rate on the Rust side);
-            // we land them on the same UI field rather than
-            // maintain two copies.
-            effectiveSampleRateHz = hz
+            // Engine-reported raw (pre-decimation) sample rate
+            // — the full FFT span, distinct from the post-
+            // decimation `effectiveSampleRateHz` published by
+            // `SampleRateChanged`. The GTK UI makes the same
+            // split; see `crates/sdr-ui/src/window.rs:474` where
+            // `DisplayBandwidth(raw_rate)` is routed to
+            // `spectrum_handle.set_display_bandwidth(raw_rate)`
+            // while `SampleRateChanged` only updates the status
+            // bar.
+            displayBandwidthHz = hz
         case .error(let msg):
             lastError = msg
         @unknown default:

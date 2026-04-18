@@ -79,6 +79,7 @@ final class SpectrumRenderer {
 
     private let commandQueue: MTLCommandQueue
     private let spectrumPipeline: MTLRenderPipelineState
+    private let spectrumFillPipeline: MTLRenderPipelineState
     private let waterfallPipeline: MTLRenderPipelineState
 
     /// 256×1 rgba8Unorm colormap LUT sampled by the waterfall
@@ -184,6 +185,8 @@ final class SpectrumRenderer {
               let library = device.makeDefaultLibrary(),
               let specVert = library.makeFunction(name: "spectrum_vert"),
               let specFrag = library.makeFunction(name: "spectrum_frag"),
+              let fillVert = library.makeFunction(name: "spectrum_fill_vert"),
+              let fillFrag = library.makeFunction(name: "spectrum_fill_frag"),
               let wfVert = library.makeFunction(name: "waterfall_vert"),
               let wfFrag = library.makeFunction(name: "waterfall_frag")
         else {
@@ -196,6 +199,26 @@ final class SpectrumRenderer {
         specDesc.fragmentFunction = specFrag
         specDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
         guard let specPipeline = try? device.makeRenderPipelineState(descriptor: specDesc) else {
+            return nil
+        }
+
+        // Fill pipeline shares the vertex buffer with the line
+        // but emits 2 vertices per bin (top + baseline). Alpha
+        // blending ON so the envelope is translucent — matches
+        // the GTK UI's FILL_COLOR alpha of 0.35.
+        let fillDesc = MTLRenderPipelineDescriptor()
+        fillDesc.label = "spectrum_fill"
+        fillDesc.vertexFunction = fillVert
+        fillDesc.fragmentFunction = fillFrag
+        fillDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        fillDesc.colorAttachments[0].isBlendingEnabled = true
+        fillDesc.colorAttachments[0].rgbBlendOperation = .add
+        fillDesc.colorAttachments[0].alphaBlendOperation = .add
+        fillDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        fillDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+        fillDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        fillDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        guard let fillPipeline = try? device.makeRenderPipelineState(descriptor: fillDesc) else {
             return nil
         }
 
@@ -228,6 +251,7 @@ final class SpectrumRenderer {
             device: device,
             queue: queue,
             spectrumPipeline: specPipeline,
+            spectrumFillPipeline: fillPipeline,
             waterfallPipeline: wfPipeline,
             vertexBuffer: buf,
             stagingBuffer: staging,
@@ -239,6 +263,7 @@ final class SpectrumRenderer {
         device: MTLDevice,
         queue: MTLCommandQueue,
         spectrumPipeline: MTLRenderPipelineState,
+        spectrumFillPipeline: MTLRenderPipelineState,
         waterfallPipeline: MTLRenderPipelineState,
         vertexBuffer: MTLBuffer,
         stagingBuffer: MTLBuffer,
@@ -247,6 +272,7 @@ final class SpectrumRenderer {
         self.device = device
         self.commandQueue = queue
         self.spectrumPipeline = spectrumPipeline
+        self.spectrumFillPipeline = spectrumFillPipeline
         self.waterfallPipeline = waterfallPipeline
         self.spectrumVertexBuffer = vertexBuffer
         self.historyStagingBuffer = stagingBuffer
@@ -455,12 +481,24 @@ final class SpectrumRenderer {
             znear: 0,
             zfar: 1
         ))
-        enc.setRenderPipelineState(spectrumPipeline)
+        let binCount = Int(uniforms.binCount)
         enc.setVertexBuffer(spectrumVertexBuffer, offset: 0, index: 0)
         withUnsafePointer(to: &uniforms) { ptr in
             enc.setVertexBytes(ptr, length: MemoryLayout<RendererUniforms>.stride, index: 1)
         }
-        enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: Int(uniforms.binCount))
+        // Fill first (envelope under the trace), then stroke the
+        // line on top — same layering as the GTK UI's
+        // `fft_plot.rs` Cairo draw order.
+        if binCount >= 2 {
+            enc.setRenderPipelineState(spectrumFillPipeline)
+            enc.drawPrimitives(
+                type: .triangleStrip,
+                vertexStart: 0,
+                vertexCount: binCount * 2
+            )
+        }
+        enc.setRenderPipelineState(spectrumPipeline)
+        enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: binCount)
         enc.popDebugGroup()
 
         enc.endEncoding()

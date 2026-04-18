@@ -16,11 +16,18 @@ struct CenterView: View {
 
     var body: some View {
         @Bindable var m = model
-        SpectrumWaterfallView(
-            model: model,
-            minDb: $m.minDb,
-            maxDb: $m.maxDb
-        )
+        ZStack {
+            SpectrumWaterfallView(
+                model: model,
+                minDb: $m.minDb,
+                maxDb: $m.maxDb
+            )
+            // VFO band + center tick + click-to-tune. Drawn in
+            // SwiftUI rather than Metal so it picks up native
+            // colors / accessibility features without a second
+            // render pipeline.
+            VfoOverlayView(model: model)
+        }
         .frame(minHeight: 300)
     }
 }
