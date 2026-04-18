@@ -38,7 +38,7 @@
 //! upstream GQRX/SDR++ behavior.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,6 +60,16 @@ pub const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 2;
 /// [`RtlTcpConfig::connect_timeout`].
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default sample rate the client reports to pipeline callers before
+/// the first `set_sample_rate` arrives. Matches upstream rtl_tcp's
+/// 2.048 Msps default.
+const DEFAULT_CLIENT_SAMPLE_RATE_HZ: f64 = 2_048_000.0;
+
+/// Default center frequency the client reports to pipeline callers
+/// before the first `tune` arrives. Matches upstream rtl_tcp's
+/// 100 MHz default.
+const DEFAULT_CLIENT_CENTER_FREQ_HZ: f64 = 100_000_000.0;
+
 /// Exponential-backoff schedule for reconnect. Values in seconds.
 /// Clamped at 30 s, matching the review of epic #299.
 const BACKOFF_SCHEDULE_SECS: &[u64] = &[1, 2, 5, 10, 30];
@@ -71,6 +81,14 @@ const BACKOFF_SCHEDULE_SECS: &[u64] = &[1, 2, 5, 10, 30];
 /// which is plenty of slack for a momentarily slow consumer without
 /// letting a wedged consumer OOM the process.
 const RX_BUFFER_SOFT_CAP_BYTES: usize = 4 * 1024 * 1024;
+
+/// How often the manager thread checks the shutdown flag while waiting
+/// on an outstanding blocking connect. `TcpStream::connect_timeout`
+/// can't be cancelled from another thread, so we run it on a helper
+/// and poll a channel at this cadence instead — stop_manager's
+/// observable shutdown lag is bounded by this value, not by the full
+/// `connect_timeout` window.
+const CONNECT_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
 /// Metadata parsed from the server's `dongle_info_t` header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,8 +337,8 @@ impl RtlTcpSource {
         Self {
             host: host.to_string(),
             port,
-            sample_rate: 2_048_000.0,
-            frequency: 100_000_000.0,
+            sample_rate: DEFAULT_CLIENT_SAMPLE_RATE_HZ,
+            frequency: DEFAULT_CLIENT_CENTER_FREQ_HZ,
             config,
             shared: Arc::new(SharedState::new()),
             manager: None,
@@ -340,8 +358,14 @@ impl RtlTcpSource {
         self.shared.tuner.lock().ok().and_then(|g| *g)
     }
 
-    /// Send a raw rtl_tcp command over the current socket. Returns
-    /// `NotRunning` if the connection manager is not alive.
+    /// Send a raw rtl_tcp command over the current socket.
+    ///
+    /// If no live socket is available (pre-connect, mid-reconnect, or
+    /// after a write failure), the command is recorded via
+    /// `record_command` and replayed on the next successful handshake
+    /// — the caller does NOT get `NotRunning` for the offline case.
+    /// `SourceError::NotRunning` is returned only when local
+    /// synchronization fails (poisoned `command_sink` mutex).
     ///
     /// Callers should prefer the typed setters (`set_center_freq_hz`,
     /// etc.) — this is the low-level escape hatch used by the setters.
@@ -597,32 +621,21 @@ fn attempt_connect(
     // `format!("{host}:{port}")` that we had before would build
     // `::1:1234` for IPv6, which SocketAddr::from_str then rejects.
     //
-    // `connect_timeout` is per-resolved-address rather than
-    // whole-call, so when a hostname resolves to multiple A/AAAA
-    // records we effectively iterate. Without any timeout, a
-    // blackholed destination wedges the manager thread for 60+ s
-    // waiting on TCP SYN retransmits.
+    // Resolution itself is ~instant on localhost; the slow path is the
+    // actual `connect_timeout` call, which is offloaded below.
     use std::net::ToSocketAddrs;
-    let resolved = (host, port).to_socket_addrs().map_err(SourceError::Io)?;
-    let mut last_err: Option<std::io::Error> = None;
-    let mut stream: Option<TcpStream> = None;
-    for addr in resolved {
-        match TcpStream::connect_timeout(&addr, config.connect_timeout) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(e) => last_err = Some(e),
-        }
-    }
-    let stream = stream.ok_or_else(|| {
-        SourceError::Io(last_err.unwrap_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                "no socket addresses resolved",
-            )
-        }))
-    })?;
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(SourceError::Io)?
+        .collect();
+
+    // Run the blocking connect on a helper thread so the manager can
+    // respond to `shutdown` within `CONNECT_SHUTDOWN_POLL` instead of
+    // being wedged for the full `config.connect_timeout` window when a
+    // destination is blackholed. `TcpStream::connect_timeout` has no
+    // cancellation hook, so we let the helper finish naturally after
+    // shutdown and just ignore its result.
+    let stream = connect_cancellable(addrs, config.connect_timeout, &shared.shutdown)?;
 
     stream.set_read_timeout(Some(config.data_read_timeout))?;
     if let Err(e) = set_keepalive(&stream, true) {
@@ -651,6 +664,75 @@ fn attempt_connect(
     }
 
     Ok(stream)
+}
+
+/// Run `TcpStream::connect_timeout` on a helper thread, polling a
+/// channel from the manager thread so shutdown is noticed promptly.
+///
+/// Iterates `addrs` in order (covers hostnames that resolve to multiple
+/// A/AAAA records), first successful connect wins. On shutdown the
+/// helper is abandoned — its `tx.send` becomes a no-op when `rx` drops
+/// at return, and the helper thread dies naturally once its `connect`
+/// call returns or times out.
+fn connect_cancellable(
+    addrs: Vec<SocketAddr>,
+    timeout: Duration,
+    shutdown: &AtomicBool,
+) -> Result<TcpStream, SourceError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<TcpStream, std::io::Error>>();
+    thread::Builder::new()
+        .name("rtl_tcp-connect".into())
+        .spawn(move || {
+            let mut last_err: Option<std::io::Error> = None;
+            let mut stream: Option<TcpStream> = None;
+            for addr in addrs {
+                match TcpStream::connect_timeout(&addr, timeout) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            let result = match stream {
+                Some(s) => Ok(s),
+                None => Err(last_err.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "no socket addresses resolved",
+                    )
+                })),
+            };
+            // `rx` may already have dropped if the manager shut down
+            // during our blocking connect — that's fine, the helper
+            // just exits with its result thrown away.
+            let _ = tx.send(result);
+        })
+        .map_err(SourceError::Io)?;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            // Abandon the helper. On return `rx` drops, the helper's
+            // next `tx.send` becomes a no-op, and the helper thread
+            // exits on its own once the current connect completes.
+            return Err(SourceError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "manager shutdown during connect",
+            )));
+        }
+        match rx.recv_timeout(CONNECT_SHUTDOWN_POLL) {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => return Err(SourceError::Io(e)),
+            // Timeout: loop back and re-check shutdown. (Empty arm —
+            // fall through to the next iteration.)
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(SourceError::Io(std::io::Error::other(
+                    "connect helper thread disconnected unexpectedly",
+                )));
+            }
+        }
+    }
 }
 
 fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlTcpConfig) {
@@ -1494,6 +1576,34 @@ mod tests {
         }
         // Sanity: 2.048 Msps passes.
         assert!(<RtlTcpSource as Source>::set_sample_rate(&mut src, 2_048_000.0).is_ok());
+    }
+
+    #[test]
+    fn connect_cancellable_aborts_promptly_on_shutdown() {
+        // `TcpStream::connect_timeout` itself has no cancellation hook,
+        // but our cancellable wrapper polls the shutdown flag at
+        // `CONNECT_SHUTDOWN_POLL` cadence. When the flag is pre-set,
+        // the caller returns before the helper thread finishes — this
+        // exercise that path without needing a blackholed IP in CI.
+        let shutdown = AtomicBool::new(true);
+        // Any address — doesn't matter, shutdown is already set so the
+        // poll loop returns on the first iteration before the helper's
+        // `connect_timeout` ever completes.
+        let addrs = vec![SocketAddr::from(([127, 0, 0, 1], REFUSED_TEST_PORT))];
+        let t0 = Instant::now();
+        let result = connect_cancellable(addrs, Duration::from_secs(30), &shutdown);
+        let elapsed = t0.elapsed();
+        assert!(
+            matches!(
+                result,
+                Err(SourceError::Io(ref e)) if e.kind() == std::io::ErrorKind::Interrupted
+            ),
+            "expected Interrupted on shutdown, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "connect_cancellable returned in {elapsed:?}, should be ≤ CONNECT_SHUTDOWN_POLL"
+        );
     }
 
     #[test]

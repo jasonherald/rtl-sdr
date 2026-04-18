@@ -296,9 +296,12 @@ fn apply_initial_state(
     dev: &mut RtlSdrDevice,
     initial: &InitialDeviceState,
 ) -> Result<(), ServerError> {
-    if initial.direct_sampling != 0 {
-        dev.set_direct_sampling(initial.direct_sampling)?;
-    }
+    // 0 is a valid direct-sampling state (off) and MUST be applied —
+    // not skipped — so a previous session that enabled direct sampling
+    // doesn't leak its mode into the next client's session. Previously
+    // the `!= 0` guard treated 0 as "leave alone," which broke
+    // reset_device_to_initial's promise of a clean slate per client.
+    dev.set_direct_sampling(initial.direct_sampling)?;
     dev.set_freq_correction(initial.ppm)?;
     dev.set_sample_rate(initial.sample_rate_hz)?;
     dev.set_center_freq(initial.center_freq_hz)?;
@@ -720,6 +723,18 @@ fn tcp_writer(
     shutdown: MergedShutdown,
     stats: Arc<Mutex<ServerStats>>,
 ) {
+    // A slow peer that stops reading will fill its kernel receive
+    // buffer → our kernel send buffer saturates → `write_all` blocks
+    // indefinitely. Since the write path can't re-check shutdown while
+    // blocked, a wedged writer would deadlock the
+    // writer.join → handle_client → accept.join → Server::Drop chain.
+    // Setting a write timeout mirrors what `command_worker` does for
+    // reads so the same shutdown-responsiveness guarantee applies here.
+    if let Err(e) = stream.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
+        tracing::warn!(%e, "set_write_timeout on data channel failed; dropping client");
+        shutdown.set_client();
+        return;
+    }
     // `recv_timeout` lets us notice shutdown even when the USB reader is
     // starving (e.g., dongle unplug).
     loop {

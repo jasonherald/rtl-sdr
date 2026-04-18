@@ -17,8 +17,9 @@
 //! in the review of epic #299:
 //!
 //! - Upstream defaults to `-a 127.0.0.1` (loopback). We keep that.
-//! - Upstream rejects `-g 0` (auto-gain) and requires an explicit value.
-//!   We follow upstream: `gain == 0` means automatic.
+//! - Upstream and we both treat `-g 0` as "automatic gain mode" (no
+//!   manual gain set); see `parse_auto_gain_is_none` test for the
+//!   exact behavior.
 
 use std::net::IpAddr;
 use std::process::ExitCode;
@@ -291,15 +292,17 @@ fn parse_hz(s: &str) -> Result<u32, ParseError> {
             (s, 1u64)
         };
     let n: f64 = number.parse().map_err(|_| ParseError)?;
-    // Reject NaN / ±Inf outright. Without this check `f64 as i64`
-    // silently converts NaN → 0 and ±Inf → saturating i64 bounds, both
-    // of which would then pass or miss the range guard in ways that
-    // produce a plausible-looking frequency from garbage input.
-    if !n.is_finite() {
+    // Reject NaN / ±Inf AND any negative input outright. Without the
+    // negative-guard, `parse_hz("-0.4")` would round-to-zero and pass
+    // the u32 range check as a valid 0 Hz frequency; without the
+    // is_finite guard, `f64 as i64` silently converts NaN → 0 and ±Inf
+    // → saturating i64 bounds. Both paths could turn garbage input
+    // into plausible-looking output.
+    if !n.is_finite() || n < 0.0 {
         return Err(ParseError);
     }
-    let hz = (n * multiplier as f64).round() as i64;
-    if hz < 0 || hz > u32::MAX as i64 {
+    let hz = (n * multiplier as f64).round();
+    if hz > f64::from(u32::MAX) {
         return Err(ParseError);
     }
     Ok(hz as u32)
@@ -427,6 +430,18 @@ mod tests {
     fn parse_hz_accepts_fractional_suffix_values() {
         assert_eq!(parse_hz("1.5k").unwrap(), 1_500);
         assert_eq!(parse_hz("0.1M").unwrap(), 100_000);
+    }
+
+    #[test]
+    fn parse_hz_rejects_negative_fractional_before_rounding() {
+        // `parse_hz("-0.4")` would previously round to 0, pass the
+        // u32 range check, and be accepted as a plausible 0 Hz
+        // frequency. The pre-cast `n < 0.0` guard catches it as a
+        // parse error instead.
+        assert!(parse_hz("-0.4").is_err());
+        assert!(parse_hz("-0.5").is_err());
+        assert!(parse_hz("-0.4k").is_err());
+        assert!(parse_hz("-1e-10").is_err());
     }
 
     #[test]
