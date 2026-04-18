@@ -29,25 +29,56 @@ use std::time::Duration;
 use sdr_server_rtltcp::server::{DEFAULT_SAMPLE_RATE_HZ, Server, ServerConfig};
 use sdr_server_rtltcp::{DEFAULT_BUFFER_CAPACITY, DEFAULT_PORT};
 
-fn usage() -> ! {
-    eprintln!("sdr-rtl-tcp — I/Q spectrum server for RTL-SDR dongles");
-    eprintln!();
-    eprintln!("USAGE:");
-    eprintln!("    sdr-rtl-tcp [OPTIONS]");
-    eprintln!();
-    eprintln!("OPTIONS:");
-    eprintln!("    -a <addr>    Listen address (default: 127.0.0.1)");
-    eprintln!("    -p <port>    Listen port (default: {DEFAULT_PORT})");
-    eprintln!("    -f <hz>      Initial center frequency (accepts k/M/G suffix)");
-    eprintln!("    -g <gain>    Tuner gain in dB (default: 0 = automatic)");
-    eprintln!("    -s <rate>    Sample rate in Hz (default: 2048000)");
-    eprintln!("    -d <idx>     Device index (default: 0)");
-    eprintln!("    -P <ppm>     Frequency correction in ppm (default: 0)");
-    eprintln!("    -n <N>       Max queued USB buffers (default: {DEFAULT_BUFFER_CAPACITY})");
-    eprintln!("    -T           Enable bias tee");
-    eprintln!("    -D           Enable direct sampling (mode 2, Q branch)");
-    eprintln!("    -h, --help   Show this help");
-    std::process::exit(1);
+/// Print the `--help` / `-h` message and exit with the given status code.
+///
+/// Exit 0 when invoked via `-h`/`--help` (successful help request), exit 1
+/// for unknown / malformed arguments. Shells and packaging checks treat a
+/// non-zero exit from `--help` as a failure, so those paths must diverge.
+fn usage(exit_code: i32) -> ! {
+    let out: &mut dyn std::io::Write = if exit_code == 0 {
+        &mut std::io::stdout()
+    } else {
+        &mut std::io::stderr()
+    };
+    let _ = writeln!(out, "sdr-rtl-tcp — I/Q spectrum server for RTL-SDR dongles");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "USAGE:");
+    let _ = writeln!(out, "    sdr-rtl-tcp [OPTIONS]");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "OPTIONS:");
+    let _ = writeln!(out, "    -a <addr>    Listen address (default: 127.0.0.1)");
+    let _ = writeln!(
+        out,
+        "    -p <port>    Listen port (default: {DEFAULT_PORT})"
+    );
+    let _ = writeln!(
+        out,
+        "    -f <hz>      Initial center frequency (accepts k/M/G suffix)"
+    );
+    let _ = writeln!(
+        out,
+        "    -g <gain>    Tuner gain in dB (default: 0 = automatic)"
+    );
+    let _ = writeln!(
+        out,
+        "    -s <rate>    Sample rate in Hz (default: {DEFAULT_SAMPLE_RATE_HZ})"
+    );
+    let _ = writeln!(out, "    -d <idx>     Device index (default: 0)");
+    let _ = writeln!(
+        out,
+        "    -P <ppm>     Frequency correction in ppm (default: 0)"
+    );
+    let _ = writeln!(
+        out,
+        "    -n <N>       Max queued USB buffers (default: {DEFAULT_BUFFER_CAPACITY})"
+    );
+    let _ = writeln!(out, "    -T           Enable bias tee");
+    let _ = writeln!(
+        out,
+        "    -D           Enable direct sampling (mode 2, Q branch)"
+    );
+    let _ = writeln!(out, "    -h, --help   Show this help");
+    std::process::exit(exit_code);
 }
 
 fn main() -> ExitCode {
@@ -59,8 +90,13 @@ fn main() -> ExitCode {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // -h / --help asked for help explicitly — exit 0. Anything else that
+    // fails to parse is a user error — exit 1.
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        usage(0);
+    }
     let Ok(config) = parse_args(&args) else {
-        usage();
+        usage(1);
     };
 
     match Server::start(config) {
@@ -155,15 +191,23 @@ fn parse_args(args: &[String]) -> Result<ServerConfig, ParseError> {
                 // Upstream: `gain = (int)(atof(optarg) * 10)`. Value 0
                 // means automatic gain mode; anything else is tenths-of-dB.
                 //
-                // Explicitly reject NaN and ±Inf: Rust's `f64 as i32`
-                // silently converts NaN → 0 (which would switch to auto
-                // gain) and ±Inf → saturating i32 bounds. We want a
-                // parse error rather than a plausible-looking value.
+                // Explicitly reject NaN / ±Inf and oversized finite values:
+                //   - NaN / ±Inf: `f64 as i32` silently converts NaN → 0
+                //     (which would switch to auto gain) and ±Inf → saturating
+                //     i32 bounds.
+                //   - Oversized finite (e.g., 1e100): also saturates silently
+                //     to i32::MAX, producing an absurd gain setting from what
+                //     parsed as a valid float. Range-check before the cast so
+                //     garbage input surfaces as a parse error instead.
                 let db: f64 = v.parse().map_err(|_| ParseError)?;
                 if !db.is_finite() {
                     return Err(ParseError);
                 }
-                let tenths = (db * 10.0).round() as i32;
+                let tenths_f = (db * 10.0).round();
+                if tenths_f < i32::MIN as f64 || tenths_f > i32::MAX as f64 {
+                    return Err(ParseError);
+                }
+                let tenths = tenths_f as i32;
                 config.initial.gain_tenths_db = if tenths == 0 { None } else { Some(tenths) };
                 i += 2;
             }
@@ -316,6 +360,36 @@ mod tests {
                 parse_args(&args).is_err(),
                 "parse_args should reject -g {v}"
             );
+        }
+    }
+
+    #[test]
+    fn parse_gain_rejects_oversized_finite_values() {
+        // Finite f64s large enough that (db * 10.0) overflows i32 must
+        // be rejected rather than saturating silently to i32::MAX.
+        // Covers the gap that `is_finite()` alone doesn't catch.
+        for v in ["1e100", "1e20", "-1e100", "1e10"] {
+            let args = vec!["-g".to_string(), v.to_string()];
+            assert!(
+                parse_args(&args).is_err(),
+                "parse_args should reject oversized -g {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_gain_accepts_realistic_range() {
+        // Sanity check the valid gain range isn't accidentally rejected.
+        // RTL-SDR tuner gain table goes ~0..49.6 dB; pick a few plausible values.
+        for (v, want) in [
+            ("0", None),
+            ("14.4", Some(144)),
+            ("49.6", Some(496)),
+            ("-5", Some(-50)),
+        ] {
+            let args = vec!["-g".to_string(), v.to_string()];
+            let cfg = parse_args(&args).unwrap();
+            assert_eq!(cfg.initial.gain_tenths_db, want, "gain {v}");
         }
     }
 

@@ -420,6 +420,25 @@ impl RtlTcpSource {
     }
 
     fn start_manager(&mut self) -> Result<(), SourceError> {
+        // Guard against a second `start()` call: if there's already a
+        // manager thread, refuse to spawn a second one. Previously this
+        // overwrote `self.manager` unconditionally, which leaked the
+        // prior JoinHandle and could leave two connection_manager
+        // threads racing on the same SharedState. `stop_manager` /
+        // `Drop` would then only wait for the newest one.
+        //
+        // Reap a finished handle (manager exited naturally after a
+        // transport error) so a fresh start can proceed.
+        if let Some(handle) = self.manager.as_ref() {
+            if handle.is_finished() {
+                if let Some(h) = self.manager.take() {
+                    let _ = h.join();
+                }
+            } else {
+                return Err(SourceError::AlreadyRunning);
+            }
+        }
+
         let host = self.host.clone();
         let port = self.port;
         let shared = self.shared.clone();
@@ -723,6 +742,15 @@ impl Source for RtlTcpSource {
     }
 
     fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
+        // Guard the f64 → u32 cast: NaN and ±Inf silently coerce to 0
+        // or saturating u32 bounds, both invalid RF parameters. Out-of-
+        // range finite values saturate too. Mirror the CLI parser's
+        // is_finite + range-check pattern.
+        if !frequency_hz.is_finite() || frequency_hz < 0.0 || frequency_hz > f64::from(u32::MAX) {
+            return Err(SourceError::InvalidParameter(format!(
+                "center frequency out of range: {frequency_hz}"
+            )));
+        }
         self.frequency = frequency_hz;
         // Round to u32 — upstream wire protocol is u32 Hz.
         #[allow(
@@ -743,6 +771,15 @@ impl Source for RtlTcpSource {
     }
 
     fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError> {
+        // Same guard as `tune`: NaN, ±Inf, ≤ 0, and out-of-u32 all get
+        // rejected up-front. A zero sample rate in particular would
+        // wedge the USB controller — better to error loudly than send
+        // it over the wire.
+        if !rate.is_finite() || rate <= 0.0 || rate > f64::from(u32::MAX) {
+            return Err(SourceError::InvalidParameter(format!(
+                "sample rate out of range: {rate}"
+            )));
+        }
         self.sample_rate = rate;
         #[allow(
             clippy::cast_possible_truncation,
@@ -1295,6 +1332,66 @@ mod tests {
             params.contains(&(CommandOp::SetTunerGain, 197)),
             "expected replay of tuner gain, got {params:?}"
         );
+    }
+
+    #[test]
+    fn second_start_call_is_rejected_not_leaked() {
+        // Two back-to-back `start_manager` calls must not leak the
+        // first manager thread. Previously the second call silently
+        // overwrote `self.manager`, leaving two connection_manager
+        // threads racing on the same SharedState and
+        // `stop_manager`/`Drop` only waiting for the newest one.
+        let mut src = RtlTcpSource::new("127.0.0.1", REFUSED_TEST_PORT);
+        src.start_manager().unwrap();
+        // The first manager is alive (sitting in the reconnect loop
+        // because port 1 refuses). Second call must Err.
+        let second = src.start_manager();
+        assert!(matches!(second, Err(SourceError::AlreadyRunning)));
+        src.stop_manager();
+
+        // After shutdown the prior handle is joined; a fresh start is
+        // allowed again. Hit the "finished handle gets reaped" path.
+        src.start_manager().unwrap();
+        src.stop_manager();
+    }
+
+    #[test]
+    fn tune_rejects_non_finite_and_out_of_range() {
+        let mut src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        // Never started, so no IO will actually happen — the tune call
+        // goes through the trait impl's validation guard and either
+        // returns Err or short-circuits at the command channel (which
+        // is None).
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 1e12] {
+            let err = <RtlTcpSource as Source>::tune(&mut src, bad);
+            assert!(
+                matches!(err, Err(SourceError::InvalidParameter(_))),
+                "tune({bad}) should reject with InvalidParameter"
+            );
+        }
+        // Sanity: a valid finite in-range frequency does NOT trip the guard.
+        assert!(<RtlTcpSource as Source>::tune(&mut src, 100_000_000.0).is_ok());
+    }
+
+    #[test]
+    fn set_sample_rate_rejects_non_finite_zero_negative_and_oversized() {
+        let mut src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,  // zero rate would wedge USB
+            -1.0, // negative rate
+            1e12, // > u32::MAX
+        ] {
+            let err = <RtlTcpSource as Source>::set_sample_rate(&mut src, bad);
+            assert!(
+                matches!(err, Err(SourceError::InvalidParameter(_))),
+                "set_sample_rate({bad}) should reject with InvalidParameter"
+            );
+        }
+        // Sanity: 2.048 Msps passes.
+        assert!(<RtlTcpSource as Source>::set_sample_rate(&mut src, 2_048_000.0).is_ok());
     }
 
     #[test]

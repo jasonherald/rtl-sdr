@@ -446,8 +446,16 @@ fn update_stats_on_connect(stats: &Arc<Mutex<ServerStats>>, peer: SocketAddr) {
 
 fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
     if let Ok(mut s) = stats.lock() {
+        // `update_stats_on_connect` treats every counter below as
+        // session-scoped (resets them on new connect), so the
+        // disconnect path must clear them too — otherwise a UI polling
+        // `ServerStats` while no client is connected would see stale
+        // traffic / command data from the previous session.
         s.connected_client = None;
         s.connected_since = None;
+        s.bytes_sent = 0;
+        s.buffers_dropped = 0;
+        s.last_command = None;
     }
 }
 
@@ -785,6 +793,28 @@ mod tests {
         assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
         assert_eq!(cfg.bind.port(), crate::protocol::DEFAULT_PORT);
         assert_eq!(cfg.buffer_capacity, DEFAULT_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn update_stats_on_disconnect_clears_per_session_counters() {
+        // Session-scoped counters (bytes_sent, buffers_dropped,
+        // last_command) must be cleared when the client disconnects —
+        // otherwise a UI polling ServerStats would see stale data from
+        // the prior session while connected_client = None.
+        let stats = Arc::new(Mutex::new(ServerStats {
+            connected_client: Some(SocketAddr::from(([127, 0, 0, 1], 42_000))),
+            connected_since: Some(Instant::now()),
+            bytes_sent: 12345,
+            buffers_dropped: 7,
+            last_command: Some((CommandOp::SetCenterFreq, Instant::now())),
+        }));
+        update_stats_on_disconnect(&stats);
+        let s = stats.lock().unwrap();
+        assert!(s.connected_client.is_none());
+        assert!(s.connected_since.is_none());
+        assert_eq!(s.bytes_sent, 0);
+        assert_eq!(s.buffers_dropped, 0);
+        assert!(s.last_command.is_none());
     }
 
     #[test]
