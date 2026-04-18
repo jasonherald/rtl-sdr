@@ -874,6 +874,20 @@ fn connect_sidebar_panels(
 /// UX immediate instead of "wait 5 s for the first advertisement."
 fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     use std::collections::HashMap;
+    use std::time::Instant;
+
+    /// Grace window after which a server that has stopped
+    /// re-announcing gets pruned from the UI list. A healthy mDNS
+    /// responder re-announces well before its TTL (default 120 s on
+    /// most daemons) expires; 3 minutes without a refresh means the
+    /// responder is either dead or network-partitioned.
+    ///
+    /// Defense-in-depth: mdns-sd's daemon SHOULD fire
+    /// `ServiceRemoved` on TTL expiry, but a crashed server that
+    /// vanishes without a goodbye may leave the cache entry around
+    /// longer than the client wants. Expiring client-side keeps the
+    /// Connect button from offering a dead endpoint.
+    const STALE_ROW_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
 
     let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
     let browser = match Browser::start(move |event| {
@@ -889,16 +903,11 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     };
 
     // Tracks the `AdwActionRow` per-server so we can remove it on
-    // `ServerWithdrawn`. Keyed by full DNS-SD instance name (stable
-    // across nickname changes).
-    //
-    // No interior-mutability cell on the endpoint: on re-announce we
-    // remove-and-rebuild the row so the Connect closure always captures
-    // the current (host, port). Simpler than a shared cell, at the
-    // cost of a brief row flicker during the rare re-resolve — which
-    // typically only fires on a server's address change, not every
-    // TTL refresh.
-    let displayed_rows: Rc<RefCell<HashMap<String, adw::ActionRow>>> =
+    // `ServerWithdrawn` OR when the row goes stale past
+    // `STALE_ROW_GRACE`. Keyed by full DNS-SD instance name (stable
+    // across nickname changes). Value carries the row widget + a
+    // `last_seen` Instant updated on every `ServerAnnounced`.
+    let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, Instant)>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
     // Weak ref on the expander so the timeout closure doesn't keep
@@ -925,6 +934,33 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
         let Some(expander) = expander_weak.upgrade() else {
             return glib::ControlFlow::Break;
         };
+        // Prune stale rows before processing incoming events. A
+        // responder that crashed or network-partitioned won't send
+        // ServerWithdrawn, so without this pass the Connect button
+        // for a dead server keeps showing until mDNS cache TTL fires
+        // (if it fires at all). 3-minute grace is long enough that
+        // a healthy responder's re-announce keeps its row alive.
+        {
+            let mut rows = displayed_rows.borrow_mut();
+            let now = Instant::now();
+            let stale_names: Vec<String> = rows
+                .iter()
+                .filter(|(_, (_, seen))| now.duration_since(*seen) > STALE_ROW_GRACE)
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in stale_names {
+                if let Some((row, _)) = rows.remove(&name) {
+                    tracing::debug!(instance = %name, "pruning stale rtl_tcp discovery row");
+                    expander.remove(&row);
+                }
+            }
+            if rows.is_empty() {
+                expander.set_subtitle("No servers discovered on the local network yet.");
+            } else {
+                expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+            }
+        }
+
         while let Ok(event) = disc_rx.try_recv() {
             match event {
                 DiscoveryEvent::ServerAnnounced(server) => {
@@ -949,7 +985,7 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     // the new Connect closure; otherwise the stale
                     // values from first-announce would stick. See the
                     // displayed_rows docstring above.
-                    if let Some(existing_row) = rows.remove(&server.instance_name) {
+                    if let Some((existing_row, _)) = rows.remove(&server.instance_name) {
                         expander.remove(&existing_row);
                     }
 
@@ -969,6 +1005,17 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     let dr = device_row.clone();
                     let st = Rc::clone(&state);
                     connect_btn.connect_clicked(move |_| {
+                        // Remember whether the device row was already
+                        // on RTL-TCP. If it WAS, `set_selected` below
+                        // is a no-op and the `device_row` notify
+                        // handler doesn't fire, so we need to send
+                        // SetSourceType ourselves to force the
+                        // controller to reopen the source against the
+                        // new endpoint. If it WASN'T, the notify
+                        // handler will dispatch SetSourceType for us
+                        // and an explicit send would double-open.
+                        let already_rtl_tcp =
+                            dr.selected() == crate::sidebar::source_panel::DEVICE_RTLTCP;
                         hr.set_text(&click_host);
                         pr.set_value(f64::from(click_port));
                         // Force the shared protocol row to TCP. rtl_tcp
@@ -986,17 +1033,22 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                             port: click_port,
                             protocol: sdr_types::Protocol::TcpClient,
                         });
-                        st.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
+                        if already_rtl_tcp {
+                            // device_row notify handler did NOT fire
+                            // (we were already on RTL-TCP); force the
+                            // source reopen so the new endpoint takes.
+                            st.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
+                        }
                     });
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
-                    rows.insert(server.instance_name.clone(), row);
+                    rows.insert(server.instance_name.clone(), (row, Instant::now()));
 
                     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
                 }
                 DiscoveryEvent::ServerWithdrawn { instance_name } => {
                     let mut rows = displayed_rows.borrow_mut();
-                    if let Some(row) = rows.remove(&instance_name) {
+                    if let Some((row, _seen)) = rows.remove(&instance_name) {
                         expander.remove(&row);
                     }
                     if rows.is_empty() {

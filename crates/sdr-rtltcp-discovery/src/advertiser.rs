@@ -1,10 +1,19 @@
 //! Advertiser: publish a single `_rtl_tcp._tcp.local.` registration.
 
+use std::time::Duration;
+
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 
 use crate::SERVICE_TYPE;
 use crate::error::DiscoveryError;
 use crate::txt::TxtRecord;
+
+/// How long we wait for mDNS unregister / shutdown completion before
+/// proceeding. Short timeout is intentional — if the daemon is wedged
+/// we prefer to exit promptly; the registration will time out on the
+/// LAN side via its normal TTL regardless of whether our explicit
+/// unregister succeeded.
+const UNREGISTER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Options for [`Advertiser::announce`]. All values except `port` have
 /// reasonable defaults derivable from the local environment, but the
@@ -120,7 +129,7 @@ impl Advertiser {
         // `unregister` returns a Receiver for the completion status so
         // the caller can wait for unregistration to finish. Short
         // timeout is fine; if mDNS is wedged we still want to exit.
-        let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+        let _ = rx.recv_timeout(UNREGISTER_TIMEOUT);
         // Shutdown follows the same pattern.
         let _ = daemon.shutdown();
         Ok(())
@@ -138,7 +147,7 @@ impl Drop for Advertiser {
         // Best-effort teardown — we don't want Drop to panic even if
         // the mDNS daemon has already shut down or a mutex is poisoned.
         if let Ok(rx) = daemon.unregister(&self.full_name) {
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+            let _ = rx.recv_timeout(UNREGISTER_TIMEOUT);
         }
         let _ = daemon.shutdown();
     }
