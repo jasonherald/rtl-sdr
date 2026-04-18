@@ -549,7 +549,12 @@ final class SpectrumRenderer {
             mipmapped: false
         )
         desc.storageMode = .private
-        desc.usage = [.shaderRead]
+        // `.renderTarget` in addition to `.shaderRead` so we can
+        // one-shot clear the texture to the floor value via a
+        // render-pass `loadAction = .clear`. The render path
+        // writes every texel in a single encoder — no per-row
+        // blit loop, no staging buffer. See `fillHistoryToFloor`.
+        desc.usage = [.shaderRead, .renderTarget]
         guard let tex = device.makeTexture(descriptor: desc) else {
             return nil
         }
@@ -569,43 +574,34 @@ final class SpectrumRenderer {
         return tex
     }
 
-    /// One-shot blit-fill of the whole history texture to the
-    /// floor dB value. Called at texture creation; not part of
-    /// the per-frame hot path.
+    /// One-shot clear of the whole history texture to the floor
+    /// dB value. Issues a single render pass with `loadAction =
+    /// .clear` — Metal writes every texel via the GPU's fast
+    /// clear hardware path, no extra encoder / staging buffer /
+    /// blit-loop required. Called at texture creation; not part
+    /// of the per-frame hot path.
+    ///
+    /// Uses `MTLClearColor.red` as the r32Float write value —
+    /// for a single-channel r32Float target, only `.red` is
+    /// consumed. The other components are ignored by the
+    /// hardware but must be present in the struct.
     private func fillHistoryToFloor(_ texture: MTLTexture) {
-        let width = texture.width
-        let rowFloats = width
-        let rowBytes = rowFloats * MemoryLayout<Float>.stride
-        guard let clearBuf = device.makeBuffer(
-            length: rowBytes,
-            options: .storageModeShared
-        ) else {
-            return
-        }
-        let ptr = clearBuf.contents().bindMemory(to: Float.self, capacity: rowFloats)
-        for i in 0..<rowFloats {
-            ptr[i] = Self.floorDb
-        }
+        let passDesc = MTLRenderPassDescriptor()
+        passDesc.colorAttachments[0].texture = texture
+        passDesc.colorAttachments[0].loadAction = .clear
+        passDesc.colorAttachments[0].storeAction = .store
+        passDesc.colorAttachments[0].clearColor = MTLClearColor(
+            red: Double(Self.floorDb),
+            green: 0, blue: 0, alpha: 0
+        )
 
         guard let cmd = commandQueue.makeCommandBuffer(),
-              let blit = cmd.makeBlitCommandEncoder() else {
+              let enc = cmd.makeRenderCommandEncoder(descriptor: passDesc) else {
             return
         }
-        blit.label = "history_floor_init"
-        for row in 0..<texture.height {
-            blit.copy(
-                from: clearBuf,
-                sourceOffset: 0,
-                sourceBytesPerRow: rowBytes,
-                sourceBytesPerImage: rowBytes,
-                sourceSize: MTLSizeMake(width, 1, 1),
-                to: texture,
-                destinationSlice: 0,
-                destinationLevel: 0,
-                destinationOrigin: MTLOriginMake(0, row, 0)
-            )
-        }
-        blit.endEncoding()
+        enc.label = "history_floor_init"
+        // Zero draw calls — the clear happens at loadAction time.
+        enc.endEncoding()
         cmd.commit()
         // Don't wait — the next render-pass command buffer will
         // naturally order after this via Metal's scheduling
