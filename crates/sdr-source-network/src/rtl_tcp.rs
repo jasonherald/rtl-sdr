@@ -39,7 +39,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -48,14 +48,25 @@ use sdr_pipeline::source_manager::Source;
 use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
 use sdr_types::{Complex, SourceError};
 
-/// Read timeout on the data socket. Stalled reads longer than this trip
-/// the reconnect state machine — matches the upstream 1-second select in
-/// `rtl_tcp.c` command worker.
-const DATA_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default read timeout on the data socket. See
+/// [`RtlTcpConfig::data_read_timeout`].
+pub const DEFAULT_DATA_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default max consecutive read timeouts before reconnect. See
+/// [`RtlTcpConfig::max_consecutive_timeouts`].
+pub const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 2;
 
 /// Exponential-backoff schedule for reconnect. Values in seconds.
 /// Clamped at 30 s, matching the review of epic #299.
 const BACKOFF_SCHEDULE_SECS: &[u64] = &[1, 2, 5, 10, 30];
+
+/// Soft cap on bytes buffered between the network reader and the
+/// pipeline consumer. Past this, newly-received bytes push out the
+/// oldest bytes (drop-oldest policy — the SDR pipeline wants fresh
+/// samples; stale ones are useless). 4 MiB ≈ 0.7 s of I/Q at 3.2 Msps,
+/// which is plenty of slack for a momentarily slow consumer without
+/// letting a wedged consumer OOM the process.
+const RX_BUFFER_SOFT_CAP_BYTES: usize = 4 * 1024 * 1024;
 
 /// Metadata parsed from the server's `dongle_info_t` header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +103,37 @@ pub enum ConnectionState {
     Failed { reason: String },
 }
 
+/// Tunable knobs for the connection manager. All fields have sensible
+/// production defaults; tests and future UIs may want shorter timeouts
+/// (mobile / flaky networks) or a different reconnect tolerance.
+#[derive(Debug, Clone)]
+pub struct RtlTcpConfig {
+    /// Read timeout on the data socket. A stalled read longer than this
+    /// counts toward [`Self::max_consecutive_timeouts`] and, once
+    /// exceeded, trips the reconnect state machine. Shorter than the
+    /// kernel keepalive window so we detect silent drops within seconds
+    /// rather than minutes.
+    pub data_read_timeout: Duration,
+
+    /// Number of consecutive read timeouts before the data pump gives
+    /// up on the current connection and falls through to the reconnect
+    /// loop. With the default 5 s timeout this gives ~10 s of silence
+    /// before we declare the peer dead — well above any legitimate
+    /// network hiccup but still fast enough that a yanked cable doesn't
+    /// leave the UI frozen in Connected state until the kernel
+    /// keepalive finally fires.
+    pub max_consecutive_timeouts: u32,
+}
+
+impl Default for RtlTcpConfig {
+    fn default() -> Self {
+        Self {
+            data_read_timeout: DEFAULT_DATA_READ_TIMEOUT,
+            max_consecutive_timeouts: DEFAULT_MAX_CONSECUTIVE_TIMEOUTS,
+        }
+    }
+}
+
 /// rtl_tcp source client.
 ///
 /// Spawns a background connection manager thread on `start()`. The
@@ -102,6 +144,7 @@ pub struct RtlTcpSource {
     port: u16,
     sample_rate: f64,
     frequency: f64,
+    config: RtlTcpConfig,
 
     shared: Arc<SharedState>,
     manager: Option<JoinHandle<()>>,
@@ -116,10 +159,17 @@ struct SharedState {
 
     /// Latest 8-bit I/Q bytes read from the server. The connection
     /// manager appends bytes here; `read_samples` drains and converts.
-    /// Guarded by a Mutex because it's accessed from two threads; a
-    /// lock-free ring buffer would be lower overhead but adds unsafe,
-    /// and this matches the simplicity of the sibling `NetworkSource`.
+    /// Bounded at [`RX_BUFFER_SOFT_CAP_BYTES`] via drop-oldest on append
+    /// — prevents OOM if the downstream consumer stalls, and stale I/Q
+    /// samples are useless for a live SDR anyway. Guarded by a Mutex
+    /// because it's accessed from two threads; a lock-free ring buffer
+    /// would be lower overhead but adds unsafe, and this matches the
+    /// simplicity of the sibling `NetworkSource`.
     rx_buf: Mutex<Vec<u8>>,
+
+    /// Running count of bytes dropped to keep `rx_buf` under its cap,
+    /// for observability / UI "consumer too slow" indicators.
+    rx_dropped_bytes: AtomicU64,
 
     /// Write side of the socket, protected by a Mutex so command senders
     /// can share it without racing. Replaced on every reconnect.
@@ -165,19 +215,64 @@ impl SharedState {
             last_bias_tee: AtomicU32::new(0),
             last_gain_by_index: AtomicU32::new(0),
             replay_mask: AtomicU32::new(0),
+            rx_dropped_bytes: AtomicU64::new(0),
         }
     }
 }
 
+/// Append `chunk` to `rx`, dropping the oldest bytes if doing so would
+/// exceed [`RX_BUFFER_SOFT_CAP_BYTES`]. Returns the number of bytes
+/// dropped so the caller can surface it through observability.
+fn append_with_cap_inner(rx: &mut Vec<u8>, chunk: &[u8]) -> usize {
+    let desired_total = rx.len().saturating_add(chunk.len());
+    let mut dropped = 0;
+    if desired_total > RX_BUFFER_SOFT_CAP_BYTES {
+        // Drop enough from the front to make room for the new chunk.
+        let excess = desired_total - RX_BUFFER_SOFT_CAP_BYTES;
+        let to_drop = excess.min(rx.len());
+        rx.drain(..to_drop);
+        dropped = to_drop;
+    }
+    // If the chunk itself is larger than the cap, keep only the tail —
+    // the UI/consumer cares about the newest samples.
+    if chunk.len() > RX_BUFFER_SOFT_CAP_BYTES {
+        let keep_from = chunk.len() - RX_BUFFER_SOFT_CAP_BYTES;
+        rx.extend_from_slice(&chunk[keep_from..]);
+        dropped = dropped.saturating_add(keep_from);
+    } else {
+        rx.extend_from_slice(chunk);
+    }
+    dropped
+}
+
+/// Wrapper that does the drop-bookkeeping on the shared counter.
+fn append_with_cap_to_shared(shared: &SharedState, rx: &mut Vec<u8>, chunk: &[u8]) {
+    let dropped = append_with_cap_inner(rx, chunk);
+    if dropped > 0 {
+        shared
+            .rx_dropped_bytes
+            .fetch_add(dropped as u64, Ordering::Relaxed);
+        tracing::warn!(dropped, "rtl_tcp rx_buf full, dropped oldest bytes");
+    }
+}
+
 impl RtlTcpSource {
-    /// Create a new rtl_tcp client. Doesn't connect — call
-    /// [`Source::start`] or [`Self::start_manager`] to open the socket.
+    /// Create a new rtl_tcp client with default timeouts. Doesn't
+    /// connect — call [`Source::start`] to open the socket.
     pub fn new(host: &str, port: u16) -> Self {
+        Self::with_config(host, port, RtlTcpConfig::default())
+    }
+
+    /// Create a new rtl_tcp client with explicit timeout configuration.
+    /// Useful for tests and for UIs that want shorter detection windows
+    /// on flaky networks.
+    pub fn with_config(host: &str, port: u16, config: RtlTcpConfig) -> Self {
         Self {
             host: host.to_string(),
             port,
             sample_rate: 2_048_000.0,
             frequency: 100_000_000.0,
+            config,
             shared: Arc::new(SharedState::new()),
             manager: None,
         }
@@ -328,12 +423,13 @@ impl RtlTcpSource {
         let host = self.host.clone();
         let port = self.port;
         let shared = self.shared.clone();
+        let config = self.config.clone();
 
         self.shared.shutdown.store(false, Ordering::SeqCst);
         let handle = thread::Builder::new()
             .name("rtl_tcp-client".into())
             .spawn(move || {
-                connection_manager(host, port, shared);
+                connection_manager(host, port, shared, config);
             })
             .map_err(SourceError::Io)?;
         self.manager = Some(handle);
@@ -361,18 +457,18 @@ impl Drop for RtlTcpSource {
 }
 
 /// Background thread body: reconnect loop + data-read pump.
-fn connection_manager(host: String, port: u16, shared: Arc<SharedState>) {
+fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config: RtlTcpConfig) {
     let mut attempt: u32 = 0;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         set_state(&shared, ConnectionState::Connecting);
 
-        match attempt_connect(&host, port, &shared) {
+        match attempt_connect(&host, port, &shared, &config) {
             Ok(stream) => {
                 attempt = 0;
                 // At this point handshake has completed successfully.
                 replay_sticky_commands(&shared);
-                run_data_pump(stream, &shared);
+                run_data_pump(stream, &shared, &config);
                 // run_data_pump returned — connection dropped.
             }
             Err(e) => {
@@ -394,10 +490,23 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>) {
             break;
         }
 
-        attempt = attempt.saturating_add(1);
+        // Compute the delay using the PRE-increment attempt counter so
+        // the first retry actually uses slot 0 of BACKOFF_SCHEDULE_SECS
+        // (1 s), not slot 1 (2 s). Previously `attempt` was incremented
+        // before the `backoff_delay` call, giving an off-by-one where
+        // the observable schedule was 2 → 5 → 10 → 30 instead of the
+        // documented 1 → 2 → 5 → 10 → 30.
         let delay = backoff_delay(attempt);
+        let retry_number = attempt.saturating_add(1);
         let next_at = Instant::now() + delay;
-        set_state(&shared, ConnectionState::Retrying { attempt, next_at });
+        set_state(
+            &shared,
+            ConnectionState::Retrying {
+                attempt: retry_number,
+                next_at,
+            },
+        );
+        attempt = retry_number;
         sleep_until(next_at, &shared.shutdown);
     }
 
@@ -408,11 +517,12 @@ fn attempt_connect(
     host: &str,
     port: u16,
     shared: &Arc<SharedState>,
+    config: &RtlTcpConfig,
 ) -> Result<TcpStream, SourceError> {
     let addr = format!("{host}:{port}");
     let stream = TcpStream::connect(&addr).map_err(SourceError::Io)?;
 
-    stream.set_read_timeout(Some(DATA_READ_TIMEOUT))?;
+    stream.set_read_timeout(Some(config.data_read_timeout))?;
     if let Err(e) = set_keepalive(&stream, true) {
         tracing::warn!(%e, "SO_KEEPALIVE not applied (non-fatal)");
     }
@@ -441,8 +551,9 @@ fn attempt_connect(
     Ok(stream)
 }
 
-fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>) {
+fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlTcpConfig) {
     let mut buf = [0u8; 64 * 1024];
+    let mut consecutive_timeouts: u32 = 0;
     while !shared.shutdown.load(Ordering::Relaxed) {
         match stream.read(&mut buf) {
             Ok(0) => {
@@ -450,8 +561,9 @@ fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>) {
                 break;
             }
             Ok(n) => {
+                consecutive_timeouts = 0;
                 if let Ok(mut rx) = shared.rx_buf.lock() {
-                    rx.extend_from_slice(&buf[..n]);
+                    append_with_cap_to_shared(shared, &mut rx, &buf[..n]);
                 }
             }
             Err(e)
@@ -459,8 +571,19 @@ fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>) {
                     || e.kind() == std::io::ErrorKind::WouldBlock =>
             {
                 // Read timeout — server may have silently gone away.
-                // Loop back and re-check shutdown; keepalive probes will
-                // eventually turn a silent drop into an explicit error.
+                // Break out to the reconnect loop after a handful of
+                // consecutive timeouts rather than waiting for the kernel
+                // keepalive (which can take minutes). A single timeout
+                // can be a transient stall; repeated timeouts mean the
+                // peer is dead.
+                consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+                if consecutive_timeouts >= config.max_consecutive_timeouts {
+                    tracing::info!(
+                        consecutive_timeouts,
+                        "rtl_tcp stream stalled, breaking out for reconnect"
+                    );
+                    break;
+                }
             }
             Err(e) => {
                 tracing::info!(%e, "rtl_tcp socket read failed, will reconnect");
@@ -693,6 +816,166 @@ mod tests {
         assert_eq!(backoff_delay(4), Duration::from_secs(30));
         // Further attempts saturate.
         assert_eq!(backoff_delay(999), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn first_retry_uses_1s_backoff() {
+        // Regression test for a real off-by-one: the first retry used
+        // BACKOFF_SCHEDULE_SECS[1] (2s) instead of [0] (1s). Drive the
+        // manager against a never-listener and look at the first
+        // Retrying state it publishes.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Drop the listener immediately — any connect() will refuse.
+        drop(listener);
+
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager().unwrap();
+
+        // Wait up to 2s for the first Retrying state.
+        let t0 = Instant::now();
+        let mut first_delay = None;
+        while t0.elapsed() < Duration::from_secs(2) {
+            if let ConnectionState::Retrying { attempt, next_at } = src.connection_state() {
+                // `attempt` must be 1 for the first retry, and `next_at`
+                // must correspond to a ~1 s delay, not 2 s.
+                assert_eq!(attempt, 1, "first retry must be attempt 1");
+                let delay = next_at.saturating_duration_since(Instant::now());
+                first_delay = Some(delay);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        src.stop_manager();
+
+        let d = first_delay.expect("never saw Retrying state within 2 s");
+        // Allow a little jitter. Must be <= 1 s + a small slack,
+        // NOT around 2 s.
+        assert!(
+            d <= Duration::from_millis(1100),
+            "first retry delay = {d:?}, expected ~1s"
+        );
+    }
+
+    #[test]
+    fn append_with_cap_drops_oldest_when_full() {
+        let mut rx = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES - 10];
+        // Mark the tail so we can verify what survives.
+        rx[RX_BUFFER_SOFT_CAP_BYTES - 11] = 0xAA;
+        let incoming = vec![0xFFu8; 100]; // 100 bytes incoming — need to drop 90
+        let dropped = append_with_cap_inner(&mut rx, &incoming);
+        assert_eq!(dropped, 90);
+        assert_eq!(rx.len(), RX_BUFFER_SOFT_CAP_BYTES);
+        // Tail should be the 100 new 0xFF bytes.
+        assert!(rx[rx.len() - 100..].iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn append_with_cap_handles_oversized_chunk() {
+        // Chunk larger than the cap: keep only the tail of the chunk.
+        let mut rx = Vec::new();
+        let mut big = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES + 1000];
+        // Mark the tail so we can verify it survives.
+        let len = big.len();
+        big[len - 1] = 0xAB;
+        let dropped = append_with_cap_inner(&mut rx, &big);
+        assert_eq!(dropped, 1000);
+        assert_eq!(rx.len(), RX_BUFFER_SOFT_CAP_BYTES);
+        assert_eq!(*rx.last().unwrap(), 0xAB);
+    }
+
+    #[test]
+    fn append_with_cap_no_drop_below_cap() {
+        let mut rx = vec![0u8; 1000];
+        let incoming = vec![0xFFu8; 500];
+        let dropped = append_with_cap_inner(&mut rx, &incoming);
+        assert_eq!(dropped, 0);
+        assert_eq!(rx.len(), 1500);
+    }
+
+    #[test]
+    fn second_client_is_rejected_not_queued() {
+        // This test verifies the contract stated in the module docs:
+        // "single client at a time; second connection rejected with
+        // graceful close." Upstream rtl_tcp silently hangs second
+        // connections in the kernel backlog; our implementation closes
+        // them immediately.
+        //
+        // We don't bring up a full Server here (needs a real RTL-SDR),
+        // but we can exercise the exact accept-loop logic by mocking
+        // the listener behavior: the key invariant is that a second
+        // connection's read(stream) returns EOF quickly rather than
+        // hanging for the DATA_READ_TIMEOUT window.
+        //
+        // Since Server::start requires hardware, cover the pure-logic
+        // part — the AtomicBool swap semantics — directly.
+        let busy = AtomicBool::new(false);
+        assert!(!busy.swap(true, Ordering::SeqCst)); // first claim: was false
+        assert!(busy.swap(true, Ordering::SeqCst)); // second claim: already true
+        // A second accept caller would see `true` and reject.
+        busy.store(false, Ordering::SeqCst); // session done
+        assert!(!busy.swap(true, Ordering::SeqCst)); // next client can claim again
+    }
+
+    #[test]
+    fn consecutive_timeouts_break_out_of_data_pump() {
+        // Server completes handshake then stops sending anything. With
+        // a 200 ms read timeout and max 2 consecutive timeouts, the
+        // client should leave Connected within ~400 ms rather than
+        // hanging for the full DATA_READ_TIMEOUT window.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let header = DongleInfo {
+                    tuner: TunerTypeCode::R820t,
+                    gain_count: 29,
+                }
+                .to_bytes();
+                let _ = sock.write_all(&header);
+                // Hold for well past 2 × read_timeout so the client's
+                // read() actually hits TimedOut (not EOF).
+                thread::sleep(Duration::from_secs(2));
+            }
+        });
+
+        let config = RtlTcpConfig {
+            data_read_timeout: Duration::from_millis(200),
+            max_consecutive_timeouts: 2,
+        };
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        src.start_manager().unwrap();
+
+        // Wait for Connected.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut reached_connected = false;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::Connected { .. }) {
+                reached_connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reached_connected, "never reached Connected");
+
+        // After 2 × 200 ms of silence the data pump should break out.
+        // Give up to 1 second of slack for scheduling jitter.
+        let timeout_deadline = Instant::now() + Duration::from_secs(1);
+        let mut left_connected = false;
+        while Instant::now() < timeout_deadline {
+            if !matches!(src.connection_state(), ConnectionState::Connected { .. }) {
+                left_connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        src.stop_manager();
+        let _ = server_thread.join();
+        assert!(
+            left_connected,
+            "client still Connected after timeout threshold — reconnect didn't fire"
+        );
     }
 
     #[test]

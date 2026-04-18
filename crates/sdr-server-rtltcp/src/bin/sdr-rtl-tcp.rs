@@ -154,7 +154,15 @@ fn parse_args(args: &[String]) -> Result<ServerConfig, ParseError> {
                 let v = args.get(i + 1).ok_or(ParseError)?;
                 // Upstream: `gain = (int)(atof(optarg) * 10)`. Value 0
                 // means automatic gain mode; anything else is tenths-of-dB.
+                //
+                // Explicitly reject NaN and ±Inf: Rust's `f64 as i32`
+                // silently converts NaN → 0 (which would switch to auto
+                // gain) and ±Inf → saturating i32 bounds. We want a
+                // parse error rather than a plausible-looking value.
                 let db: f64 = v.parse().map_err(|_| ParseError)?;
+                if !db.is_finite() {
+                    return Err(ParseError);
+                }
                 let tenths = (db * 10.0).round() as i32;
                 config.initial.gain_tenths_db = if tenths == 0 { None } else { Some(tenths) };
                 i += 2;
@@ -209,6 +217,13 @@ fn parse_hz(s: &str) -> Result<u32, ParseError> {
             (s, 1u64)
         };
     let n: f64 = number.parse().map_err(|_| ParseError)?;
+    // Reject NaN / ±Inf outright. Without this check `f64 as i64`
+    // silently converts NaN → 0 and ±Inf → saturating i64 bounds, both
+    // of which would then pass or miss the range guard in ways that
+    // produce a plausible-looking frequency from garbage input.
+    if !n.is_finite() {
+        return Err(ParseError);
+    }
     let hz = (n * multiplier as f64).round() as i64;
     if hz < 0 || hz > u32::MAX as i64 {
         return Err(ParseError);
@@ -277,6 +292,31 @@ mod tests {
         assert!(parse_hz("").is_err());
         assert!(parse_hz("5MHz").is_err()); // trailing "Hz" not valid suffix
         assert!(parse_hz("-100").is_err()); // negative Hz not representable as u32
+    }
+
+    #[test]
+    fn parse_hz_rejects_nan_and_infinity() {
+        // `f64::parse` accepts these; without the `is_finite` guard the
+        // subsequent `as i64` cast silently converts NaN → 0 and ±Inf to
+        // saturating bounds — producing plausible-looking output from
+        // garbage. Verify both paths reject.
+        assert!(parse_hz("NaN").is_err());
+        assert!(parse_hz("nan").is_err());
+        assert!(parse_hz("inf").is_err());
+        assert!(parse_hz("Infinity").is_err());
+        assert!(parse_hz("-inf").is_err());
+        assert!(parse_hz("NaNk").is_err()); // with suffix too
+    }
+
+    #[test]
+    fn parse_gain_rejects_nan_and_infinity() {
+        for v in ["NaN", "inf", "-inf", "Infinity"] {
+            let args = vec!["-g".to_string(), v.to_string()];
+            assert!(
+                parse_args(&args).is_err(),
+                "parse_args should reject -g {v}"
+            );
+        }
     }
 
     #[test]

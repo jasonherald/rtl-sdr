@@ -298,27 +298,75 @@ fn spawn_accept_thread(
                 return;
             }
 
+            // Session slot: set to true while a client is being served.
+            // Kept in an Arc so the session thread can clear it on exit.
+            // Using `swap(true, ...)` to claim the slot atomically — if
+            // it returns true, we were already busy and this new accept
+            // must be rejected immediately (kernel had queued it in the
+            // backlog, but we refuse to hold it).
+            let busy = Arc::new(AtomicBool::new(false));
+            let mut session_handle: Option<JoinHandle<()>> = None;
+
             while !shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
+                        if busy.swap(true, Ordering::SeqCst) {
+                            tracing::info!(
+                                %peer,
+                                "rtl_tcp already serving a client — rejecting new connection"
+                            );
+                            // Close the socket immediately so the client
+                            // sees FIN instead of hanging in backlog.
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            // swap set busy=true, but we weren't actually
+                            // idle — the already-active session will
+                            // eventually clear busy when it exits. Leave
+                            // the flag set; don't reset.
+                            continue;
+                        }
+                        // We now own the session slot. Reap the previous
+                        // session handle if any (it must be finished,
+                        // because the session thread clears busy at its
+                        // tail — we got false from the swap, which means
+                        // the prior session already cleared it).
+                        if let Some(h) = session_handle.take() {
+                            let _ = h.join();
+                        }
+
                         tracing::info!(%peer, "rtl_tcp client connected");
-                        // Switch stream back to blocking for the per-client
-                        // workers; only the accept fd is nonblocking.
                         if let Err(e) = stream.set_nonblocking(false) {
                             tracing::error!(%e, "failed to set client socket blocking");
+                            busy.store(false, Ordering::SeqCst);
                             continue;
                         }
                         configure_client_socket(&stream);
                         update_stats_on_connect(&stats, peer);
-                        handle_client(
-                            stream,
-                            device.clone(),
-                            shutdown.clone(),
-                            stats.clone(),
-                            buffer_capacity,
-                        );
-                        update_stats_on_disconnect(&stats);
-                        tracing::info!(%peer, "rtl_tcp client disconnected");
+
+                        let session_device = device.clone();
+                        let session_shutdown = shutdown.clone();
+                        let session_stats = stats.clone();
+                        let session_busy = busy.clone();
+                        match thread::Builder::new().name("rtl_tcp-session".into()).spawn(
+                            move || {
+                                handle_client(
+                                    stream,
+                                    session_device,
+                                    session_shutdown,
+                                    session_stats.clone(),
+                                    buffer_capacity,
+                                );
+                                update_stats_on_disconnect(&session_stats);
+                                tracing::info!(%peer, "rtl_tcp client disconnected");
+                                session_busy.store(false, Ordering::SeqCst);
+                            },
+                        ) {
+                            Ok(h) => session_handle = Some(h),
+                            Err(e) => {
+                                tracing::error!(%e, "failed to spawn session thread");
+                                busy.store(false, Ordering::SeqCst);
+                                update_stats_on_disconnect(&stats);
+                            }
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(100));
@@ -328,6 +376,12 @@ fn spawn_accept_thread(
                         thread::sleep(Duration::from_millis(200));
                     }
                 }
+            }
+
+            // Shutdown: wait for the active session (if any) to finish
+            // before returning, so Server::drop sees all workers done.
+            if let Some(h) = session_handle.take() {
+                let _ = h.join();
             }
             tracing::debug!("rtl_tcp accept thread exiting");
         })

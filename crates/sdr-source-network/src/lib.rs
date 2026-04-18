@@ -23,7 +23,10 @@
 
 pub mod rtl_tcp;
 
-pub use rtl_tcp::{ConnectionState, RtlTcpSource, TunerInfo};
+pub use rtl_tcp::{
+    ConnectionState, DEFAULT_DATA_READ_TIMEOUT, DEFAULT_MAX_CONSECUTIVE_TIMEOUTS, RtlTcpConfig,
+    RtlTcpSource, TunerInfo,
+};
 
 use sdr_pipeline::source_manager::Source;
 use sdr_types::{Complex, Protocol, SampleFormat, SourceError};
