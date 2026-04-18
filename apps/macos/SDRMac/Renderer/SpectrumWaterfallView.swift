@@ -10,11 +10,15 @@
 // Metal resources.
 
 import SwiftUI
-// SdrCoreKit is not imported yet — sub-PR 3 wires the real
-// engine. Keeping the import out for now means a cleaner review
-// of what's actually used.
+import SdrCoreKit
 
 struct SpectrumWaterfallView: NSViewRepresentable {
+    /// Source of truth for the engine handle. The renderer pulls
+    /// FFT frames via a closure that reads `model.core` each
+    /// draw tick. Passed by unowned reference — `CoreModel` is a
+    /// reference type and its lifetime is tied to the app root,
+    /// so we won't outlive it.
+    let model: CoreModel
     @Binding var minDb: Float
     @Binding var maxDb: Float
 
@@ -27,7 +31,15 @@ struct SpectrumWaterfallView: NSViewRepresentable {
         guard let renderer = SpectrumRenderer.make() else {
             return makeFallbackView()
         }
-        let view = MetalSpectrumNSView(renderer: renderer)
+        // Capture the model weakly in the provider closure so a
+        // stray retain through the renderer can't outlive
+        // CoreModel. CoreModel is @MainActor; the renderer polls
+        // the closure on the main runloop (where the display
+        // link is scheduled), so the actor-isolated read is
+        // safe without an explicit hop.
+        let view = MetalSpectrumNSView(renderer: renderer) { [weak model] in
+            model?.core
+        }
         view.applyBindings(minDb: minDb, maxDb: maxDb)
         return view
     }

@@ -41,6 +41,7 @@
 import AppKit
 import Metal
 import QuartzCore
+import SdrCoreKit
 
 final class MetalSpectrumNSView: NSView, CAMetalDisplayLinkDelegate {
     // ----------------------------------------------------------
@@ -61,9 +62,17 @@ final class MetalSpectrumNSView: NSView, CAMetalDisplayLinkDelegate {
     //  Init
     // ----------------------------------------------------------
 
-    init(renderer: SpectrumRenderer) {
+    init(renderer: SpectrumRenderer, coreProvider: @escaping () -> SdrCore?) {
         self.renderer = renderer
         super.init(frame: .zero)
+
+        // Wire the renderer to poll the engine handle each
+        // frame. The closure is invoked on the display-link
+        // thread (which we've attached to the main runloop, so
+        // it's the main thread in practice) — safe to read
+        // `CoreModel.core` from there given CoreModel is
+        // @MainActor.
+        renderer.coreProvider = coreProvider
 
         // Tell AppKit we're layer-backed and that we want to
         // supply our own layer (a CAMetalLayer) rather than

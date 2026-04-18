@@ -2,16 +2,12 @@
 // CenterView.swift — main spectrum + waterfall area.
 //
 // Hosts the Metal-backed renderer via `SpectrumWaterfallView`
-// (NSViewRepresentable + MTKView). The renderer consumes
+// (NSViewRepresentable + CAMetalLayer). The renderer consumes
 // min/max dB bindings from `CoreModel` — the user adjusts these
 // via the Display sidebar section, and the shader saturate()
-// maps the dB range to the visible vertical axis.
-//
-// In this sub-PR (M4/1) the renderer is fed by a synthetic
-// FFT source, so you'll see three moving peaks on a noise floor
-// regardless of whether Play is active. Sub-PR 3 swaps the
-// source for the real `SdrCore.withLatestFftFrame` and
-// invalidates on each FFT tick.
+// maps the dB range to the visible vertical axis. The renderer
+// also pulls FFT frames directly from `model.core` on each
+// display-link tick.
 
 import SwiftUI
 
@@ -21,6 +17,7 @@ struct CenterView: View {
     var body: some View {
         @Bindable var m = model
         SpectrumWaterfallView(
+            model: model,
             minDb: $m.minDb,
             maxDb: $m.maxDb
         )

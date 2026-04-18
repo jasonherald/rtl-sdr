@@ -42,9 +42,7 @@
 import Metal
 import OSLog
 import QuartzCore
-// SdrCoreKit is not imported here yet — sub-PR 1 uses a
-// synthetic FFT source. Sub-PR 3 adds the import + swaps
-// `SyntheticFftSource` for `SdrCore.withLatestFftFrame`.
+import SdrCoreKit
 
 /// Renderer-scoped logger. Visible via
 /// `log stream --predicate 'subsystem == "com.sdr.rs" AND category == "renderer"'`.
@@ -139,10 +137,25 @@ final class SpectrumRenderer {
     private let inflightSemaphore = DispatchSemaphore(value: 3)
 
     // ----------------------------------------------------------
-    //  Data source (synthetic for sub-PR 1/2; real in 3)
+    //  Data source
     // ----------------------------------------------------------
 
-    private let syntheticSource: SyntheticFftSource
+    /// Late-bound provider for the engine handle. The view sets
+    /// this when it's constructed (or whenever `CoreModel.core`
+    /// changes) so the renderer can pull FFT frames without
+    /// taking a strong reference to `CoreModel`.
+    ///
+    /// Read on the display-link thread; written on the main
+    /// thread. The display link is on the main runloop, so
+    /// reads/writes don't interleave across threads here.
+    var coreProvider: (() -> SdrCore?)?
+
+    /// Floor value the spectrum line and waterfall history are
+    /// initialised to before any real frame arrives. Picked well
+    /// below typical `min_db` UI settings (-100 is the default)
+    /// so an empty renderer maps through the palette to the
+    /// coldest color, not the hottest.
+    private static let floorDb: Float = -120
 
     /// Uniform block. Mutated each frame before encoding.
     private var uniforms = RendererUniforms()
@@ -238,7 +251,16 @@ final class SpectrumRenderer {
         self.spectrumVertexBuffer = vertexBuffer
         self.historyStagingBuffer = stagingBuffer
         self.paletteTexture = paletteTexture
-        self.syntheticSource = SyntheticFftSource(binCount: 2048)
+
+        // Initialise the spectrum vertex buffer to the floor
+        // value so a view with no FFT data yet renders a flat
+        // line at the bottom of the plot rather than showing
+        // whatever garbage Metal handed us.
+        let floorPtr = spectrumVertexBuffer.contents().bindMemory(
+            to: Float.self, capacity: Self.maxFftBins)
+        for i in 0..<Self.maxFftBins {
+            floorPtr[i] = Self.floorDb
+        }
     }
 
     // ----------------------------------------------------------
@@ -289,33 +311,58 @@ final class SpectrumRenderer {
 
         logFrameRateIfNeeded()
 
-        // Advance the synthetic source. Sub-PR 3 swaps this for
-        // `SdrCore.withLatestFftFrame` which returns a bool
-        // indicating whether a new frame arrived; on `false`
-        // we'll still re-present but skip the memcpy + blit.
-        syntheticSource.next()
+        // Pull the latest FFT frame from the engine. Returns
+        // false on any of: no engine yet, engine idle, no new
+        // frame since last pull. On false we DON'T update the
+        // history ring — the display link is fixed-cadence but
+        // FFT data is engine-cadence, so when a new render
+        // tick arrives without new data, we just re-present
+        // the existing texture state.
+        var newFrameBinCount: Int = 0
+        let hasNewFrame = coreProvider?()?.withLatestFftFrame {
+            [self] buf, _, _ in
+            let count = min(buf.count, Self.maxFftBins)
+            newFrameBinCount = count
+            let rowBytes = count * MemoryLayout<Float>.stride
+            guard let src = buf.baseAddress else { return }
+            memcpy(spectrumVertexBuffer.contents(), src, rowBytes)
+            memcpy(historyStagingBuffer.contents(), src, rowBytes)
+        } ?? false
 
-        // 1. Copy current bins into the spectrum vertex buffer
-        //    AND the history-row staging buffer.
-        let bins = syntheticSource.magnitudes
-        let count = min(bins.count, Self.maxFftBins)
-        let rowBytes = count * MemoryLayout<Float>.stride
-        bins.withUnsafeBufferPointer { src in
-            memcpy(spectrumVertexBuffer.contents(), src.baseAddress!, rowBytes)
-            memcpy(historyStagingBuffer.contents(), src.baseAddress!, rowBytes)
+        // Ensure the history ring exists. Its width tracks the
+        // FFT bin count — needs recreation on size change. Use
+        // the new frame's count when available, else keep the
+        // current size (or skip if we've never seen a frame).
+        let historyWidth: Int
+        if hasNewFrame {
+            historyWidth = newFrameBinCount
+        } else if historyBinCount > 0 {
+            historyWidth = historyBinCount
+        } else {
+            // No frame ever, no texture yet — nothing to render
+            // but the clear color. Still need to present so the
+            // display link doesn't back up.
+            renderClearFrame(into: drawable)
+            return
         }
-        uniforms.binCount = UInt32(count)
-        uniforms.historyRows = Self.historyRows
 
-        // 2. Ensure the history ring exists with the right width.
-        guard let history = ensureHistoryTexture(binCount: count) else {
+        guard let history = ensureHistoryTexture(binCount: historyWidth) else {
             inflightSemaphore.signal()
             return
         }
 
-        uniforms.writeRow = writeRow
+        uniforms.historyRows = Self.historyRows
+
+        // Advance the ring cursor ONLY when we actually wrote a
+        // new row. Otherwise the waterfall would scroll through
+        // garbage/stale rows at display-link cadence even with
+        // no new data.
         let thisWriteRow = writeRow
-        writeRow = (writeRow + 1) % Self.historyRows
+        if hasNewFrame {
+            uniforms.binCount = UInt32(newFrameBinCount)
+            uniforms.writeRow = writeRow
+            writeRow = (writeRow + 1) % Self.historyRows
+        }
 
         // 3. One command buffer, two encoders.
         guard let cmd = commandQueue.makeCommandBuffer() else {
@@ -334,14 +381,21 @@ final class SpectrumRenderer {
         }
 
         // --- Blit: staging buffer → history[writeRow]
-        if let blit = cmd.makeBlitCommandEncoder() {
+        //
+        // Only write a new row when we actually have new FFT
+        // data this tick. Re-blitting stale data at display-link
+        // cadence would still be correct (same bits going to the
+        // same row), but there's no need — we already skipped
+        // advancing `writeRow` above.
+        if hasNewFrame, let blit = cmd.makeBlitCommandEncoder() {
+            let rowBytes = newFrameBinCount * MemoryLayout<Float>.stride
             blit.label = "history_row_blit"
             blit.copy(
                 from: historyStagingBuffer,
                 sourceOffset: 0,
                 sourceBytesPerRow: rowBytes,
                 sourceBytesPerImage: rowBytes,
-                sourceSize: MTLSizeMake(count, 1, 1),
+                sourceSize: MTLSizeMake(newFrameBinCount, 1, 1),
                 to: history,
                 destinationSlice: 0,
                 destinationLevel: 0,
@@ -406,7 +460,7 @@ final class SpectrumRenderer {
         withUnsafePointer(to: &uniforms) { ptr in
             enc.setVertexBytes(ptr, length: MemoryLayout<RendererUniforms>.stride, index: 1)
         }
-        enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: count)
+        enc.drawPrimitives(type: .lineStrip, vertexStart: 0, vertexCount: Int(uniforms.binCount))
         enc.popDebugGroup()
 
         enc.endEncoding()
@@ -463,9 +517,88 @@ final class SpectrumRenderer {
         }
         tex.label = "waterfall_history_ring"
 
+        // New `.private` textures contain undefined content.
+        // Sampling garbage floats through the palette gives
+        // arbitrary colors (sometimes mostly-hot, which looks
+        // alarming). Fill the whole ring with the floor value
+        // so a pre-data view renders as the coldest palette
+        // entry throughout.
+        fillHistoryToFloor(tex)
+
         historyTexture = tex
         historyBinCount = binCount
         writeRow = 0
         return tex
+    }
+
+    /// One-shot blit-fill of the whole history texture to the
+    /// floor dB value. Called at texture creation; not part of
+    /// the per-frame hot path.
+    private func fillHistoryToFloor(_ texture: MTLTexture) {
+        let width = texture.width
+        let rowFloats = width
+        let rowBytes = rowFloats * MemoryLayout<Float>.stride
+        guard let clearBuf = device.makeBuffer(
+            length: rowBytes,
+            options: .storageModeShared
+        ) else {
+            return
+        }
+        let ptr = clearBuf.contents().bindMemory(to: Float.self, capacity: rowFloats)
+        for i in 0..<rowFloats {
+            ptr[i] = Self.floorDb
+        }
+
+        guard let cmd = commandQueue.makeCommandBuffer(),
+              let blit = cmd.makeBlitCommandEncoder() else {
+            return
+        }
+        blit.label = "history_floor_init"
+        for row in 0..<texture.height {
+            blit.copy(
+                from: clearBuf,
+                sourceOffset: 0,
+                sourceBytesPerRow: rowBytes,
+                sourceBytesPerImage: rowBytes,
+                sourceSize: MTLSizeMake(width, 1, 1),
+                to: texture,
+                destinationSlice: 0,
+                destinationLevel: 0,
+                destinationOrigin: MTLOriginMake(0, row, 0)
+            )
+        }
+        blit.endEncoding()
+        cmd.commit()
+        // Don't wait — the next render-pass command buffer will
+        // naturally order after this via Metal's scheduling
+        // guarantees on the same queue.
+    }
+
+    /// Render a blank clear-color frame. Used before the first
+    /// FFT frame arrives so the display link has something to
+    /// present and doesn't queue a backlog waiting for data.
+    private func renderClearFrame(into drawable: CAMetalDrawable) {
+        let passDesc = MTLRenderPassDescriptor()
+        passDesc.colorAttachments[0].texture = drawable.texture
+        passDesc.colorAttachments[0].loadAction = .clear
+        passDesc.colorAttachments[0].storeAction = .store
+        passDesc.colorAttachments[0].clearColor = MTLClearColor(
+            red: 0.09, green: 0.09, blue: 0.11, alpha: 1.0)
+
+        guard let cmd = commandQueue.makeCommandBuffer() else {
+            inflightSemaphore.signal()
+            return
+        }
+        cmd.label = "sdr_frame_clear"
+        cmd.addCompletedHandler { [weak self] _ in
+            self?.inflightSemaphore.signal()
+        }
+
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: passDesc) {
+            enc.label = "clear_only"
+            enc.endEncoding()
+        }
+        cmd.present(drawable)
+        cmd.commit()
     }
 }
