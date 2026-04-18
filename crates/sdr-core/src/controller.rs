@@ -334,9 +334,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     // `crates/sdr-pipeline/src/iq_frontend.rs:156`),
                     // so bins span `sample_rate()`, not
                     // `effective_sample_rate()`.
-                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                        state.frontend.sample_rate(),
-                    ));
+                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
 
                     // Send the source's display name + supported gain
                     // values to the UI.
@@ -412,9 +410,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::SampleRateChanged(
                     state.frontend.effective_sample_rate(),
                 ));
-                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                    state.frontend.sample_rate(),
-                ));
+                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
 
                 // Notify the UI of the mode transition (edge detection — only
                 // when the mode actually changed so idempotent refreshes do not
@@ -537,9 +533,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     let _ = dsp_tx.send(DspToUi::SampleRateChanged(
                         state.frontend.effective_sample_rate(),
                     ));
-                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                        state.frontend.sample_rate(),
-                    ));
+                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
                 }
                 Err(e) => {
                     tracing::warn!("frontend rebuild failed: {e}");
@@ -562,9 +556,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::SampleRateChanged(
                     state.frontend.effective_sample_rate(),
                 ));
-                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                    state.frontend.sample_rate(),
-                ));
+                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
             }
         }
 
@@ -787,9 +779,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         let _ = dsp_tx.send(DspToUi::SampleRateChanged(
                             state.frontend.effective_sample_rate(),
                         ));
-                        let _ = dsp_tx.send(DspToUi::DisplayBandwidth(
-                            state.frontend.sample_rate(),
-                        ));
+                        let _ =
+                            dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
                     }
                     Err(e) => {
                         tracing::warn!("source switch failed: {e}");

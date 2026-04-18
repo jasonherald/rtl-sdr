@@ -15,7 +15,7 @@
 //! the memory, we fill it. This is the same contract as POSIX
 //! `strerror_r` / `snprintf`.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::c_char;
 
 use crate::error::{SdrCoreError, clear_last_error, set_last_error};
 
@@ -109,22 +109,13 @@ pub unsafe extern "C" fn sdr_core_device_name(
         }
     });
 
-    match result {
-        Ok(rc) => rc,
-        Err(_) => {
-            set_last_error("sdr_core_device_name: panic during name probe");
-            SdrCoreError::Internal.as_int()
-        }
+    if let Ok(rc) = result {
+        rc
+    } else {
+        set_last_error("sdr_core_device_name: panic during name probe");
+        SdrCoreError::Internal.as_int()
     }
 }
-
-// Tiny shim to silence the clippy::needless_doctest_main path —
-// `c_void` is imported to be available if we later add a probe-
-// with-context function, but isn't used by the two functions
-// above. Keeping the import in an `#[allow(unused)]` block means
-// subsequent additions don't need to re-add it.
-#[allow(dead_code)]
-const _: *mut c_void = std::ptr::null_mut();
 
 #[cfg(test)]
 mod tests {
@@ -157,9 +148,8 @@ mod tests {
     fn name_with_out_of_range_index_returns_device_error() {
         let mut buf = [0_u8; 64];
         // Choose an index way past any real device count.
-        let rc = unsafe {
-            sdr_core_device_name(u32::MAX, buf.as_mut_ptr().cast::<c_char>(), buf.len())
-        };
+        let rc =
+            unsafe { sdr_core_device_name(u32::MAX, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         assert_eq!(rc, SdrCoreError::Device.as_int());
     }
 
@@ -173,9 +163,9 @@ mod tests {
         let mut buf = [0_u8; 128];
         let rc = unsafe { sdr_core_device_name(0, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         assert!(rc >= 0, "expected success, got {rc}");
-        let written = rc as usize;
+        let written = usize::try_from(rc).expect("rc is non-negative after the assert above");
         let got = CStr::from_bytes_with_nul(&buf[..=written])
-            .unwrap()
+            .expect("FFI writes a NUL at `written` per contract")
             .to_string_lossy();
         assert!(!got.is_empty(), "device name should not be empty");
     }
