@@ -1,4 +1,5 @@
-//! Source device configuration panel — device selector, RTL-SDR / Network controls.
+//! Source device configuration panel — device selector, RTL-SDR /
+//! Network / File / RTL-TCP controls.
 
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -11,6 +12,8 @@ const DEVICE_RTLSDR: u32 = 0;
 const DEVICE_NETWORK: u32 = 1;
 /// Device selector index for File.
 const DEVICE_FILE: u32 = 2;
+/// Device selector index for RTL-TCP (rtl_tcp-protocol network client).
+pub const DEVICE_RTLTCP: u32 = 3;
 
 /// Default gain in dB.
 const DEFAULT_GAIN_DB: f64 = 0.0;
@@ -77,6 +80,12 @@ pub struct SourcePanel {
     pub decimation_row: adw::ComboRow,
     /// Toggle to start/stop IQ recording.
     pub record_iq_row: adw::SwitchRow,
+    /// Discovered `rtl_tcp` servers (live from mDNS). Collapsed by
+    /// default; expands when servers are seen.
+    pub rtl_tcp_discovered_row: adw::ExpanderRow,
+    /// Connection-state label for `rtl_tcp` (Connecting / Connected /
+    /// Retrying / Failed / Disconnected).
+    pub rtl_tcp_status_row: adw::ActionRow,
 }
 
 /// Default sample rate selector index (2.4 MHz = index 7).
@@ -223,14 +232,25 @@ fn connect_device_visibility(
             let is_rtlsdr = selected == DEVICE_RTLSDR;
             let is_network = selected == DEVICE_NETWORK;
             let is_file = selected == DEVICE_FILE;
+            let is_rtltcp = selected == DEVICE_RTLTCP;
 
-            sample_rate_row.set_visible(is_rtlsdr);
-            gain_row.set_visible(is_rtlsdr);
-            agc_row.set_visible(is_rtlsdr);
-            ppm_row.set_visible(is_rtlsdr);
+            // Tuning controls are meaningful for both the local dongle
+            // AND a remote rtl_tcp server (they route through the
+            // Source trait's set_gain / set_gain_mode / set_ppm_correction
+            // hooks, which RtlTcpSource implements by forwarding wire
+            // commands). Sample-rate row too — UiToDsp::SetSampleRate
+            // goes through Source::set_sample_rate either way.
+            let tune_controls_visible = is_rtlsdr || is_rtltcp;
+            sample_rate_row.set_visible(tune_controls_visible);
+            gain_row.set_visible(tune_controls_visible);
+            agc_row.set_visible(tune_controls_visible);
+            ppm_row.set_visible(tune_controls_visible);
 
-            hostname_row.set_visible(is_network);
-            port_row.set_visible(is_network);
+            // Hostname / port entry is shared between raw-IQ Network
+            // and RTL-TCP modes. Protocol (TCP/UDP) only applies to
+            // raw Network — RTL-TCP always rides on TCP.
+            hostname_row.set_visible(is_network || is_rtltcp);
+            port_row.set_visible(is_network || is_rtltcp);
             protocol_row.set_visible(is_network);
 
             file_path_row.set_visible(is_file);
@@ -247,7 +267,10 @@ pub fn build_source_panel() -> SourcePanel {
         .description("Device and input configuration")
         .build();
 
-    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network", "File"]);
+    // Order is load-bearing — matches `DEVICE_RTLSDR / NETWORK / FILE /
+    // RTLTCP` index constants. If you change the order here, update the
+    // constants AND the `SourceType` match in window.rs at the same time.
+    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network", "File", "RTL-TCP (network)"]);
     let device_row = adw::ComboRow::builder()
         .title("Device")
         .model(&device_model)
@@ -268,6 +291,20 @@ pub fn build_source_panel() -> SourcePanel {
         .subtitle("Raw IQ samples to WAV")
         .build();
 
+    // RTL-TCP-specific rows. Built always, shown only when the RTL-TCP
+    // source type is selected (see connect_device_visibility + the
+    // initial-visibility block below).
+    let rtl_tcp_discovered_row = adw::ExpanderRow::builder()
+        .title("Discovered rtl_tcp servers")
+        .subtitle("No servers discovered on the local network yet.")
+        .visible(false)
+        .build();
+    let rtl_tcp_status_row = adw::ActionRow::builder()
+        .title("Connection")
+        .subtitle("Disconnected")
+        .visible(false)
+        .build();
+
     // Add all rows to the group.
     group.add(&device_row);
     group.add(&sample_rate_row);
@@ -283,20 +320,26 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&iq_inversion_row);
     group.add(&decimation_row);
     group.add(&record_iq_row);
+    group.add(&rtl_tcp_discovered_row);
+    group.add(&rtl_tcp_status_row);
 
     // Derive initial visibility from the selected device.
     let selected = device_row.selected();
     let is_rtlsdr = selected == DEVICE_RTLSDR;
     let is_network = selected == DEVICE_NETWORK;
     let is_file = selected == DEVICE_FILE;
-    sample_rate_row.set_visible(is_rtlsdr);
-    gain_row.set_visible(is_rtlsdr);
-    agc_row.set_visible(is_rtlsdr);
-    ppm_row.set_visible(is_rtlsdr);
-    hostname_row.set_visible(is_network);
-    port_row.set_visible(is_network);
+    let is_rtltcp = selected == DEVICE_RTLTCP;
+    let tune_controls_visible = is_rtlsdr || is_rtltcp;
+    sample_rate_row.set_visible(tune_controls_visible);
+    gain_row.set_visible(tune_controls_visible);
+    agc_row.set_visible(tune_controls_visible);
+    ppm_row.set_visible(tune_controls_visible);
+    hostname_row.set_visible(is_network || is_rtltcp);
+    port_row.set_visible(is_network || is_rtltcp);
     protocol_row.set_visible(is_network);
     file_path_row.set_visible(is_file);
+    rtl_tcp_discovered_row.set_visible(is_rtltcp);
+    rtl_tcp_status_row.set_visible(is_rtltcp);
 
     connect_device_visibility(
         &device_row,
@@ -309,6 +352,7 @@ pub fn build_source_panel() -> SourcePanel {
         &protocol_row,
         &file_path_row,
     );
+    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row, &rtl_tcp_status_row);
 
     // Controls connected to DSP pipeline via window.rs
 
@@ -328,7 +372,30 @@ pub fn build_source_panel() -> SourcePanel {
         iq_inversion_row,
         decimation_row,
         record_iq_row,
+        rtl_tcp_discovered_row,
+        rtl_tcp_status_row,
     }
+}
+
+/// Toggle visibility of the RTL-TCP-specific rows based on the device
+/// selector. Kept separate from `connect_device_visibility` so the
+/// existing function's argument list doesn't grow further.
+fn connect_rtl_tcp_visibility(
+    device_row: &adw::ComboRow,
+    rtl_tcp_discovered_row: &adw::ExpanderRow,
+    rtl_tcp_status_row: &adw::ActionRow,
+) {
+    device_row.connect_selected_notify(glib::clone!(
+        #[weak]
+        rtl_tcp_discovered_row,
+        #[weak]
+        rtl_tcp_status_row,
+        move |row| {
+            let is_rtltcp = row.selected() == DEVICE_RTLTCP;
+            rtl_tcp_discovered_row.set_visible(is_rtltcp);
+            rtl_tcp_status_row.set_visible(is_rtltcp);
+        }
+    ));
 }
 
 #[cfg(test)]

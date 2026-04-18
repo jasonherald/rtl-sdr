@@ -13,6 +13,7 @@ use libadwaita::prelude::*;
 use sdr_core::Engine;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
+use sdr_rtltcp_discovery::{Browser, DiscoveryEvent};
 use sdr_source_rtlsdr::SAMPLE_RATES;
 
 use crate::header;
@@ -843,6 +844,7 @@ fn connect_sidebar_panels(
     status_bar: &Rc<StatusBar>,
 ) {
     connect_source_panel(panels, state);
+    connect_rtl_tcp_discovery(panels, state);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
@@ -859,6 +861,133 @@ fn connect_sidebar_panels(
 
 /// Connect source panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
+/// Spawn an mDNS browser for `_rtl_tcp._tcp.local.` services and wire
+/// its events into the `rtl_tcp_discovered_row` expander. Each
+/// discovered server gets an `AdwActionRow` with a Connect button that
+/// populates hostname/port and switches the source type.
+///
+/// The `Browser` handle is moved into the `timeout_add_local` closure
+/// so it lives for the lifetime of the main context (= the app), and
+/// mDNS discovery runs continuously whether or not the RTL-TCP source
+/// is currently selected. That's fine — discovery is cheap and having
+/// the list pre-populated when the user switches to RTL-TCP makes the
+/// UX immediate instead of "wait 5 s for the first advertisement."
+fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
+    use std::collections::HashMap;
+
+    let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
+    let browser = match Browser::start(move |event| {
+        // Ignore send errors — means the UI thread dropped the rx,
+        // which only happens on shutdown.
+        let _ = disc_tx.send(event);
+    }) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(%e, "mDNS browser failed to start — discovery disabled");
+            None
+        }
+    };
+
+    // Tracks the AdwActionRow per-server so we can remove it on
+    // `ServerWithdrawn`. Keyed by full DNS-SD instance name (stable
+    // across nickname changes).
+    let displayed_rows: Rc<RefCell<HashMap<String, adw::ActionRow>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
+    let expander = panels.source.rtl_tcp_discovered_row.clone();
+    let hostname_row = panels.source.hostname_row.clone();
+    let port_row = panels.source.port_row.clone();
+    let device_row = panels.source.device_row.clone();
+    let state = Rc::clone(state);
+
+    // Poll the discovery channel from the main thread every 200 ms.
+    // Cheap enough to be always-on; discovery events are bursty at
+    // start and then idle.
+    let _ = glib::timeout_add_local(Duration::from_millis(200), move || {
+        // Keep the Browser alive as long as the timeout closure is
+        // attached (i.e., for the app's lifetime).
+        let _keep_browser = &browser;
+        while let Ok(event) = disc_rx.try_recv() {
+            match event {
+                DiscoveryEvent::ServerAnnounced(server) => {
+                    let mut rows = displayed_rows.borrow_mut();
+                    let title = if server.txt.nickname.is_empty() {
+                        server.instance_name.clone()
+                    } else {
+                        server.txt.nickname.clone()
+                    };
+                    let host = server
+                        .addresses
+                        .first()
+                        .map_or_else(|| server.hostname.clone(), ToString::to_string);
+                    let subtitle = format!(
+                        "{}:{} — {} ({} gain steps)",
+                        host, server.port, server.txt.tuner, server.txt.gains
+                    );
+
+                    if let Some(existing) = rows.get(&server.instance_name) {
+                        // Resolve fired again (TTL refresh) — update
+                        // subtitle in case nickname / tuner changed.
+                        existing.set_title(&title);
+                        existing.set_subtitle(&subtitle);
+                        continue;
+                    }
+
+                    let row = adw::ActionRow::builder()
+                        .title(&title)
+                        .subtitle(&subtitle)
+                        .build();
+                    let connect_btn = gtk4::Button::with_label("Connect");
+                    connect_btn.add_css_class("suggested-action");
+                    connect_btn.set_valign(gtk4::Align::Center);
+
+                    // Capture by clone into the click handler. Each
+                    // discovered server spawns its own independent
+                    // closure — no cross-row coupling.
+                    let host_clone = host.clone();
+                    let port = server.port;
+                    let hr = hostname_row.clone();
+                    let pr = port_row.clone();
+                    let dr = device_row.clone();
+                    let st = Rc::clone(&state);
+                    connect_btn.connect_clicked(move |_| {
+                        hr.set_text(&host_clone);
+                        pr.set_value(f64::from(port));
+                        dr.set_selected(crate::sidebar::source_panel::DEVICE_RTLTCP);
+                        st.send_dsp(UiToDsp::SetNetworkConfig {
+                            hostname: host_clone.clone(),
+                            port,
+                            protocol: sdr_types::Protocol::TcpClient,
+                        });
+                        st.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
+                    });
+                    row.add_suffix(&connect_btn);
+                    expander.add_row(&row);
+                    rows.insert(server.instance_name.clone(), row);
+
+                    expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+                }
+                DiscoveryEvent::ServerWithdrawn { instance_name } => {
+                    let mut rows = displayed_rows.borrow_mut();
+                    if let Some(row) = rows.remove(&instance_name) {
+                        expander.remove(&row);
+                    }
+                    if rows.is_empty() {
+                        expander.set_subtitle("No servers discovered on the local network yet.");
+                    } else {
+                        expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+                    }
+                }
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "GTK signal-wiring panel; splitting would fragment the control mapping"
+)]
 fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Sample rate selector
     let state_sr = Rc::clone(state);
@@ -940,6 +1069,7 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
                 0 => SourceType::RtlSdr,
                 1 => SourceType::Network,
                 2 => SourceType::File,
+                3 => SourceType::RtlTcp,
                 _ => return, // ignore transient indices
             };
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));

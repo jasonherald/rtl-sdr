@@ -58,10 +58,15 @@ pub enum DspToUi {
 pub enum SourceType {
     /// RTL-SDR USB dongle.
     RtlSdr,
-    /// TCP/UDP network IQ stream.
+    /// Raw TCP/UDP network IQ stream (generic, fixed-format).
     Network,
     /// WAV file playback.
     File,
+    /// rtl_tcp-protocol network source — speaks the RTL0 handshake,
+    /// supports discovery via mDNS, and tunes the remote dongle via
+    /// the 5-byte command channel. Distinct from `Network` because
+    /// the wire protocol and feature set diverge.
+    RtlTcp,
 }
 
 /// Messages sent from the UI thread to the DSP pipeline thread.
