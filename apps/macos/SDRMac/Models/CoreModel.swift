@@ -98,6 +98,41 @@ final class CoreModel {
     /// `crates/sdr-ui/src/spectrum/mod.rs:244`): two rates,
     /// distinct semantics.
     var displayBandwidthHz: Double = 2_048_000
+
+    /// Scroll / pinch zoom state. When `displayedSpanHz == 0` OR
+    /// `>= displayBandwidthHz`, the viewport shows the full FFT
+    /// span (no zoom). A smaller value zooms in: only bins whose
+    /// frequency falls in
+    /// `[displayedCenterOffsetHz - displayedSpanHz/2,
+    ///   displayedCenterOffsetHz + displayedSpanHz/2]`
+    /// are shown, stretched across the view.
+    ///
+    /// `displayedCenterOffsetHz` is the center of the viewport,
+    /// measured as offset from the tuner center (same frame as
+    /// `vfoOffsetHz`). 0 = the tuner-center is the viewport
+    /// center; positive = viewport is shifted right.
+    ///
+    /// Matches the GTK `VfoState::display_start_hz` /
+    /// `display_end_hz` concept (see
+    /// `crates/sdr-ui/src/spectrum/vfo_overlay.rs::zoom`), but
+    /// stored as (center, span) which is friendlier for
+    /// cursor-centered zoom math.
+    var displayedSpanHz: Double = 0
+    var displayedCenterOffsetHz: Double = 0
+
+    /// Minimum displayed span in Hz. Matches GTK's
+    /// `MIN_DISPLAY_SPAN_HZ = 1000`.
+    static let minDisplayedSpanHz: Double = 1_000
+
+    /// Effective viewport span — resolves the "0 means full" rule
+    /// once, everywhere else reads this instead of
+    /// `displayedSpanHz` directly.
+    var effectiveDisplayedSpanHz: Double {
+        displayedSpanHz > 0 && displayedSpanHz < displayBandwidthHz
+            ? displayedSpanHz
+            : displayBandwidthHz
+    }
+
     var ppmCorrection: Int = 0
 
     // ==========================================================
@@ -381,6 +416,50 @@ final class CoreModel {
     func setVfoOffset(_ hz: Double) {
         vfoOffsetHz = hz
         capture { try core?.setVfoOffset(hz) }
+    }
+
+    /// Apply a cursor-centered zoom to the display viewport.
+    /// `factor > 1` zooms IN (narrower visible span); `factor < 1`
+    /// zooms OUT. `focalOffsetHz` is the frequency under the
+    /// cursor (or pinch centroid), measured as an offset from
+    /// the tuner center — it stays at the same relative viewport
+    /// position through the zoom so the thing you're looking at
+    /// doesn't drift out of view.
+    ///
+    /// Display-only state — does not send anything to the engine.
+    /// Matches the GTK behaviour in
+    /// `crates/sdr-ui/src/spectrum/vfo_overlay.rs::zoom`.
+    func zoomView(by factor: Double, around focalOffsetHz: Double) {
+        guard displayBandwidthHz > 0, factor > 0, factor.isFinite else { return }
+        let oldSpan = effectiveDisplayedSpanHz
+        let rawSpan = oldSpan / factor
+        let newSpan = max(Self.minDisplayedSpanHz, min(displayBandwidthHz, rawSpan))
+
+        // Cursor-centered rescale: keep focalOffsetHz at the
+        // same relative fraction of the viewport before and
+        // after.
+        let oldLeft = displayedCenterOffsetHz - oldSpan / 2
+        let frac = oldSpan > 0 ? (focalOffsetHz - oldLeft) / oldSpan : 0.5
+        var newCenter = focalOffsetHz - (frac - 0.5) * newSpan
+
+        // Keep viewport inside the full FFT range.
+        let halfBw = displayBandwidthHz / 2
+        let minCenter = -halfBw + newSpan / 2
+        let maxCenter = halfBw - newSpan / 2
+        if minCenter <= maxCenter {
+            newCenter = max(minCenter, min(maxCenter, newCenter))
+        } else {
+            newCenter = 0
+        }
+
+        displayedSpanHz = newSpan
+        displayedCenterOffsetHz = newCenter
+    }
+
+    /// Reset the viewport to show the full FFT span.
+    func resetZoom() {
+        displayedSpanHz = 0
+        displayedCenterOffsetHz = 0
     }
 
     func setDemodMode(_ m: DemodMode) {

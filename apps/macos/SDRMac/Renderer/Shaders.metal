@@ -18,12 +18,21 @@ using namespace metal;
 // descending so Swift's default struct alignment matches MSL's
 // — no explicit `alignas` needed on either side for this size.
 struct Uniforms {
-    float min_db;         // bottom of visible dB range
-    float max_db;         // top of visible dB range
-    uint  bin_count;      // current FFT bin count
-    uint  history_rows;   // waterfall texture height (sub-PR 2)
-    uint  write_row;      // waterfall ring cursor (sub-PR 2)
-    uint  _pad0;          // keep 8-byte multiple for Swift interop
+    float min_db;             // bottom of visible dB range
+    float max_db;             // top of visible dB range
+    uint  bin_count;          // current FFT bin count
+    uint  history_rows;       // waterfall texture height
+    uint  write_row;          // waterfall ring cursor
+    // Zoom window expressed as fractions of the full FFT span.
+    // 0.0 = left edge of FFT, 1.0 = right edge. With no zoom
+    // these are (0, 1); zooming in shifts them inward. Spectrum
+    // bins whose fraction falls outside [left, right] map to
+    // clip-space x outside [-1, 1] and get clipped. Waterfall
+    // uv.x is remapped from viewport space to bin-index space
+    // via the same pair.
+    float display_left_frac;
+    float display_right_frac;
+    uint  _pad0;              // keep 8-byte multiple for Swift interop
 };
 
 // --------------------------------------------------------------
@@ -54,7 +63,15 @@ vertex SpectrumVertexOut spectrum_vert(
     // practice, but returning off-screen is safer than dividing
     // by zero.
     float denom = max(1.0, float(u.bin_count - 1));
-    float x = 2.0 * (float(vid) / denom) - 1.0;
+    float bin_frac = float(vid) / denom;
+
+    // Zoom: remap bin_frac [0,1] (full FFT) to viewport-x [-1,1]
+    // using the display window [left, right]. Without zoom the
+    // window is (0, 1) and this collapses to the old
+    // `2 * bin_frac - 1`. Bins outside the window get x outside
+    // [-1, 1] and are clipped by the viewport.
+    float span = max(0.0001, u.display_right_frac - u.display_left_frac);
+    float x = 2.0 * (bin_frac - u.display_left_frac) / span - 1.0;
 
     float db = mags_db[vid];
     float t  = saturate((db - u.min_db) / max(0.001, u.max_db - u.min_db));
@@ -100,7 +117,11 @@ vertex SpectrumVertexOut spectrum_fill_vert(
     bool  is_top = (vid & 1u) == 0u;
 
     float denom = max(1.0, float(u.bin_count - 1));
-    float x = 2.0 * (float(bin) / denom) - 1.0;
+    float bin_frac = float(bin) / denom;
+
+    // Same zoom-window remapping as `spectrum_vert`.
+    float span = max(0.0001, u.display_right_frac - u.display_left_frac);
+    float x = 2.0 * (bin_frac - u.display_left_frac) / span - 1.0;
 
     float db = mags_db[bin];
     float t  = saturate((db - u.min_db) / max(0.001, u.max_db - u.min_db));
@@ -194,7 +215,16 @@ fragment float4 waterfall_frag(
     float newest_row  = float(u.write_row);
     float sample_y    = fract((newest_row + hist_rows_f - age_rows) / hist_rows_f);
 
-    float db  = history.sample(hist_s, float2(in.uv.x, sample_y)).r;
+    // Zoom: uv.x is viewport space (0..1 across the visible
+    // portion of the spectrum). Remap into bin-index space
+    // (0..1 across the full FFT) before sampling the history
+    // texture, so a zoomed view stretches the appropriate bin
+    // range across the waterfall viewport. No zoom → this is an
+    // identity remap.
+    float span = max(0.0001, u.display_right_frac - u.display_left_frac);
+    float hist_uv_x = u.display_left_frac + in.uv.x * span;
+
+    float db  = history.sample(hist_s, float2(hist_uv_x, sample_y)).r;
     float t   = saturate((db - u.min_db) / max(0.001, u.max_db - u.min_db));
     return palette.sample(pal_s, float2(t, 0.5));
 }

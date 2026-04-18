@@ -57,6 +57,13 @@ struct RendererUniforms {
     var binCount: UInt32 = 2048
     var historyRows: UInt32 = 1024
     var writeRow: UInt32 = 0
+    // Display zoom window as fractions of the full FFT span.
+    // `(0, 1)` = no zoom; narrower pair = zoomed in. The shader
+    // uses these to remap bin-index → clip-space (spectrum) and
+    // viewport-uv → texture-uv (waterfall). Drives #306's
+    // scroll / pinch zoom.
+    var displayLeftFrac: Float = 0
+    var displayRightFrac: Float = 1
     var _pad0: UInt32 = 0
 }
 
@@ -296,6 +303,33 @@ final class SpectrumRenderer {
     func applyBindings(minDb: Float, maxDb: Float) {
         if minDb.isFinite { uniforms.minDb = minDb }
         if maxDb.isFinite { uniforms.maxDb = max(minDb + 1.0, maxDb) }
+    }
+
+    /// Update the zoom window. `displayedCenterOffsetHz` is the
+    /// viewport center in offset-from-tuner Hz; `displayedSpanHz`
+    /// is the visible span; `displayBandwidthHz` is the full FFT
+    /// span. Converts to the `(left_frac, right_frac)` pair the
+    /// shader consumes.
+    func applyZoomWindow(
+        displayedCenterOffsetHz: Double,
+        displayedSpanHz: Double,
+        displayBandwidthHz: Double
+    ) {
+        guard displayBandwidthHz > 0 else {
+            uniforms.displayLeftFrac = 0
+            uniforms.displayRightFrac = 1
+            return
+        }
+        // FFT range is centered at 0 offset, spans ±bw/2.
+        let halfBw = displayBandwidthHz / 2
+        let halfSpan = displayedSpanHz / 2
+        let leftHz = displayedCenterOffsetHz - halfSpan
+        let rightHz = displayedCenterOffsetHz + halfSpan
+        // Convert to fraction of full FFT range.
+        let leftFrac = (leftHz + halfBw) / displayBandwidthHz
+        let rightFrac = (rightHz + halfBw) / displayBandwidthHz
+        uniforms.displayLeftFrac = Float(max(0, min(1, leftFrac)))
+        uniforms.displayRightFrac = Float(max(0, min(1, rightFrac)))
     }
 
     // ----------------------------------------------------------

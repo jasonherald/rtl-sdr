@@ -45,7 +45,19 @@ struct SpectrumWaterfallView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: NSView, context: Context) {
-        (view as? MetalSpectrumNSView)?.applyBindings(minDb: minDb, maxDb: maxDb)
+        guard let mtk = view as? MetalSpectrumNSView else { return }
+        mtk.applyBindings(minDb: minDb, maxDb: maxDb)
+        // Push the zoom window every update. Reads of
+        // `@Observable` CoreModel properties during
+        // `updateNSView` re-trigger this method when they
+        // change, so a scroll/pinch → `model.zoomView(...)` →
+        // model property change → updateNSView → renderer sees
+        // the new window next frame.
+        mtk.applyZoom(
+            displayedCenterOffsetHz: model.displayedCenterOffsetHz,
+            displayedSpanHz: model.effectiveDisplayedSpanHz,
+            displayBandwidthHz: model.displayBandwidthHz
+        )
     }
 
     private func makeFallbackView() -> NSView {

@@ -81,23 +81,22 @@ struct VfoOverlayView: View {
         GeometryReader { geo in
             let width = geo.size.width
             let height = geo.size.height
-            // Full frequency span painted by the Metal renderer.
-            // The FFT is computed on the RAW (pre-decimation)
-            // IQ stream so the spectrum shows the full tuner
-            // bandwidth — same convention as the GTK UI (see
-            // `crates/sdr-ui/src/spectrum/mod.rs:244` and
-            // `crates/sdr-pipeline/src/iq_frontend.rs:156`).
-            // Updated from `DisplayBandwidth` events, not
-            // `SampleRateChanged` (which carries the post-
-            // decimation passband).
-            let span = model.displayBandwidthHz
+            // Use the displayed-viewport span (not the full FFT
+            // span) — so the overlay zooms with the waterfall.
+            // When there's no zoom this equals
+            // `displayBandwidthHz` and the math collapses to the
+            // unzoomed case.
+            let span = model.effectiveDisplayedSpanHz
+            // Viewport center in offset-from-tuner-center Hz. 0
+            // when unzoomed.
+            let viewCenter = model.displayedCenterOffsetHz
 
             // Pixel positions derived from current state. We
             // fall through to zero-width when span is 0 so the
             // overlay degrades to invisible rather than dividing
             // by zero.
             let centerPx = span > 0
-                ? (model.vfoOffsetHz / span + 0.5) * width
+                ? ((model.vfoOffsetHz - viewCenter) / span + 0.5) * width
                 : width / 2
             let bwPixels = span > 0
                 ? model.bandwidthHz / span * width
@@ -238,10 +237,15 @@ struct VfoOverlayView: View {
     /// DC where the demod can lock onto it.
     private func retuneAt(x: CGFloat, width: CGFloat, span: Double) {
         let frac = max(0, min(1, x / width))
-        // Absolute Hz = tuner center + (offset from center on the
-        // visible axis). `span` is `displayBandwidthHz`, the full
-        // FFT span.
-        let absoluteHz = model.centerFrequencyHz + (Double(frac) - 0.5) * span
+        // Absolute Hz = tuner center + viewport-center offset +
+        // position-within-viewport. `span` is the DISPLAYED
+        // span (may be narrower than the full FFT when zoomed);
+        // `viewCenter` is the zoom viewport's center offset (0
+        // when unzoomed). Unzoomed, this collapses to the old
+        // `center + (frac - 0.5) * fullSpan` formula.
+        let viewCenter = model.displayedCenterOffsetHz
+        let absoluteHz =
+            model.centerFrequencyHz + viewCenter + (Double(frac) - 0.5) * span
         guard absoluteHz > 0 else { return }
         model.setCenter(absoluteHz)
         if model.vfoOffsetHz != 0 {
@@ -259,9 +263,12 @@ struct VfoOverlayView: View {
     /// so the user can't produce negative / nonsensical sizes.
     private func resize(edge: ResizeEdge, currentX: CGFloat, width: CGFloat, span: Double) {
         // Drag position in offset-from-tuner-center Hz (same
-        // frame as `vfoOffsetHz` / `bandwidthHz`).
+        // frame as `vfoOffsetHz` / `bandwidthHz`). `span` is the
+        // displayed-viewport span; the viewport may be offset
+        // from tuner center when zoomed, so add that in.
         let frac = max(0, min(1, currentX / width))
-        let dragOffsetHz = (Double(frac) - 0.5) * span
+        let viewCenter = model.displayedCenterOffsetHz
+        let dragOffsetHz = viewCenter + (Double(frac) - 0.5) * span
 
         // Pinned opposite edge in offset-Hz.
         let leftAtStart = dragStartVfoOffsetHz - dragStartBandwidthHz / 2
