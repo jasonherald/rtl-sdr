@@ -411,8 +411,14 @@ impl RtlTcpSource {
             return Ok(());
         };
         if let Err(e) = stream.write_all(&cmd.to_bytes()) {
-            tracing::debug!(%e, "rtl_tcp command write failed — reconnect will replay");
-            // Drop the broken stream; manager will notice and reconnect.
+            tracing::debug!(%e, "rtl_tcp command write failed — tearing down session to force reconnect");
+            // Full socket shutdown so `run_data_pump` on the sibling
+            // read-half breaks out of its blocking read IMMEDIATELY
+            // instead of continuing to pump bytes off a half-dead
+            // connection. Without the explicit shutdown, the read path
+            // keeps going and subsequent commands queue in the replay
+            // cache without ever actually going out.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             *sink = None;
             return Ok(());
         }
@@ -883,7 +889,14 @@ fn replay_sticky_commands(shared: &Arc<SharedState>) {
             param: slot.load(Ordering::Relaxed),
         };
         if let Err(e) = stream.write_all(&cmd.to_bytes()) {
-            tracing::debug!(%e, op = ?op, "replay write failed — will retry on next reconnect");
+            tracing::debug!(%e, op = ?op, "replay write failed — tearing down session to force reconnect");
+            // Same pattern as `send_command`: full shutdown so
+            // `run_data_pump` breaks out immediately instead of
+            // continuing to pump on a half-dead socket. Otherwise the
+            // replay would partially land on the wire, leaving server
+            // state desynced from the client's view of it.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            *sink = None;
             return;
         }
     }

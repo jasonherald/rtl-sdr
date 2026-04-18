@@ -668,6 +668,15 @@ impl MergedShutdown {
     fn set_client(&self) {
         self.client.store(true, Ordering::SeqCst);
     }
+    /// Escalate to server-wide shutdown: the accept thread exits after
+    /// the current session tears down, and `Server::has_stopped()`
+    /// eventually observes `true`. Used for unrecoverable errors that
+    /// can't be remedied by just dropping the current client, such as
+    /// a lost USB dongle (`rusb::Error::NoDevice`).
+    fn set_global(&self) {
+        self.global.store(true, Ordering::SeqCst);
+        self.client.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Continuously pull USB bulk buffers and push into the bounded queue.
@@ -739,8 +748,13 @@ fn data_worker(
                 // No data — loop and re-check shutdown.
             }
             Err(rusb::Error::NoDevice) => {
-                tracing::error!("rtl_tcp: USB device lost mid-stream");
-                shutdown.set_client();
+                // Dongle unplug is unrecoverable at the server level —
+                // the accept loop has nothing to serve. Escalate to a
+                // global shutdown so the accept thread exits, the CLI
+                // sees `has_stopped() == true`, and new clients don't
+                // connect to a dead-device server.
+                tracing::error!("rtl_tcp: USB device lost mid-stream, stopping server");
+                shutdown.set_global();
                 return;
             }
             Err(e) => {
@@ -965,6 +979,32 @@ mod tests {
         assert_eq!(stats.bytes_sent, 0);
         assert_eq!(stats.buffers_dropped, 0);
         assert!(stats.last_command.is_none());
+    }
+
+    #[test]
+    fn merged_shutdown_set_global_escalates_to_both_flags() {
+        // set_client() → client=true, global unchanged.
+        // set_global() → both flags true, so accept loop also exits.
+        // Regression test for the "NoDevice flips client only" bug:
+        // unplug used to stop the current session but leave the accept
+        // thread polling forever against a dead dongle.
+        let ms = MergedShutdown::new(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(!ms.is_set());
+
+        ms.set_client();
+        assert!(ms.is_set());
+        assert!(!ms.global.load(Ordering::Relaxed));
+        assert!(ms.client.load(Ordering::Relaxed));
+
+        // Reset client so we can see set_global set BOTH.
+        ms.client.store(false, Ordering::SeqCst);
+        assert!(!ms.is_set());
+        ms.set_global();
+        assert!(ms.global.load(Ordering::Relaxed));
+        assert!(ms.client.load(Ordering::Relaxed));
     }
 
     #[test]

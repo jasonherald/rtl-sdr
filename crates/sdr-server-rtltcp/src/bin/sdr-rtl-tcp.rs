@@ -20,6 +20,19 @@
 //! - Upstream and we both treat `-g 0` as "automatic gain mode" (no
 //!   manual gain set); see `parse_auto_gain_is_none` test for the
 //!   exact behavior.
+//!
+//! **Unix-only binary.** The server library (`sdr-server-rtltcp` lib)
+//! builds on any platform, but the CLI uses POSIX `libc::signal` for
+//! Ctrl-C / graceful shutdown and has no equivalent path elsewhere.
+//! Non-Unix targets trip the `compile_error!` below — Windows support
+//! would need a `SetConsoleCtrlHandler`-based handler.
+
+#[cfg(not(unix))]
+compile_error!(
+    "sdr-rtl-tcp requires a Unix target (uses POSIX signals for graceful shutdown). \
+     Windows support would need a SetConsoleCtrlHandler-based path; \
+     file an issue if that's needed."
+);
 
 use std::net::IpAddr;
 use std::process::ExitCode;
@@ -167,7 +180,9 @@ static CTRL_C_RECEIVED: AtomicBool = AtomicBool::new(false);
 /// Returns `Err` if either `signal()` call fails — the caller MUST treat
 /// this as fatal, because the sleep loop in `main` has no alternate
 /// shutdown path and would leave the process unresponsive to Ctrl-C.
-#[cfg(unix)]
+///
+/// Only defined on Unix — non-Unix targets trip the `compile_error!`
+/// at the top of this file.
 #[allow(unsafe_code)]
 fn ctrlc_handler() -> std::io::Result<()> {
     extern "C" fn handler(_: libc::c_int) {
@@ -187,18 +202,6 @@ fn ctrlc_handler() -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Non-unix targets have no signal handling plumbing yet. Return an
-/// explicit Unsupported error rather than `Ok(())`, because an `Ok`
-/// result would let `main` enter its sleep loop without a shutdown
-/// path.
-#[cfg(not(unix))]
-fn ctrlc_handler() -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "signal handling not implemented on this platform",
-    ))
 }
 
 #[derive(Debug)]
