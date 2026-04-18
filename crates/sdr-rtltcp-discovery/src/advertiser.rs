@@ -57,13 +57,28 @@ impl Advertiser {
         let daemon = ServiceDaemon::new()?;
         let props = opts.txt.to_properties()?;
 
-        let host = if opts.hostname.is_empty() {
-            // Auto-derive the mDNS hostname from the OS hostname.
-            // `local_hostname()` returns the bare name (no suffix);
-            // mDNS wants fully-qualified, so we append `.local.` here.
-            format!("{}.local.", local_hostname())
+        // Normalize the mDNS hostname identically for both the
+        // auto-derived and caller-provided paths. Previously only the
+        // empty-string branch appended `.local.`; a caller that
+        // passed this crate's own `local_hostname()` output (which
+        // returns the bare name by contract) would have registered
+        // under a non-qualified hostname while the auto-derive path
+        // registered under `.local.`. Trimming defensively on both
+        // paths also lets a caller pass `"foo.local."` without
+        // producing `foo.local..local.`.
+        let raw_host = if opts.hostname.is_empty() {
+            local_hostname()
         } else {
             opts.hostname.clone()
+        };
+        let trimmed = raw_host
+            .trim()
+            .trim_end_matches(".local.")
+            .trim_end_matches(".local");
+        let host = if trimmed.is_empty() {
+            String::from("localhost.local.")
+        } else {
+            format!("{trimmed}.local.")
         };
 
         // Empty-string host IPs + `enable_addr_auto()` tells mdns-sd to

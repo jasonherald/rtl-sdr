@@ -112,6 +112,21 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::{Duration, Instant};
 
+        /// Arbitrary high port for the fake advertisement — outside
+        /// the upstream rtl_tcp default (1234) so a stray real server
+        /// doesn't alias this test.
+        const MDNS_ROUNDTRIP_PORT: u16 = 31_234;
+        /// How long to wait for mDNS propagation across the loopback
+        /// multicast path. Typical resolution is 1-2 s; 5 s is slack
+        /// for slower loopbacks / loaded machines.
+        const MDNS_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(5);
+        /// Poll cadence while waiting. Short enough that the test
+        /// doesn't sleep meaningfully past the actual resolution.
+        const MDNS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+        /// Expected gain count in the TXT payload — R820T standard
+        /// step count.
+        const R820T_GAIN_COUNT: u32 = 29;
+
         let observed: Arc<Mutex<Vec<DiscoveredServer>>> = Arc::new(Mutex::new(Vec::new()));
         let obs_clone = observed.clone();
         let browser = Browser::start(move |event| {
@@ -125,27 +140,25 @@ mod tests {
 
         // Advertise a fake server.
         let _advertiser = Advertiser::announce(AdvertiseOptions {
-            port: 31234,
+            port: MDNS_ROUNDTRIP_PORT,
             instance_name: "sdr-rtltcp-integration-test".into(),
             hostname: String::new(),
             txt: TxtRecord {
                 tuner: "R820T".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
-                gains: 29,
+                gains: R820T_GAIN_COUNT,
                 nickname: "integration-test-nick".into(),
                 txbuf: None,
             },
         })
         .expect("announce");
 
-        // Give mDNS ~5 s to propagate. Typical resolution is 1-2 s on
-        // loopback.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + MDNS_PROPAGATION_TIMEOUT;
         while Instant::now() < deadline {
             if !observed.lock().unwrap().is_empty() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(MDNS_POLL_INTERVAL);
         }
 
         browser.stop();
@@ -156,9 +169,9 @@ mod tests {
             "browser never observed the advertised service"
         );
         let server = &seen[0];
-        assert_eq!(server.port, 31234);
+        assert_eq!(server.port, MDNS_ROUNDTRIP_PORT);
         assert_eq!(server.txt.tuner, "R820T");
         assert_eq!(server.txt.nickname, "integration-test-nick");
-        assert_eq!(server.txt.gains, 29);
+        assert_eq!(server.txt.gains, R820T_GAIN_COUNT);
     }
 }
