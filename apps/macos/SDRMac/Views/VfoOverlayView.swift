@@ -46,6 +46,37 @@ struct VfoOverlayView: View {
     private static let bandColor = Color(red: 0.2, green: 0.6, blue: 1.0)
     private static let centerColor = Color(red: 0.3, green: 0.7, blue: 1.0)
 
+    /// Pixel radius for "grabbing" a bandwidth edge. Matches the
+    /// GTK `BW_HANDLE_THRESHOLD_PX = 8.0` in `vfo_overlay.rs`.
+    /// Within this distance of a passband edge, a drag resizes
+    /// the bandwidth instead of retuning the tuner.
+    private static let edgeThresholdPx: CGFloat = 8
+
+    /// Bandwidth clamp — matches GTK's MIN_BANDWIDTH_HZ (500) /
+    /// MAX_BANDWIDTH_HZ (250 kHz) in `vfo_overlay.rs`. Prevents
+    /// the user from dragging an edge past the VFO center
+    /// (negative bandwidth) or past the visible span.
+    private static let minBandwidthHz: Double = 500
+    private static let maxBandwidthHz: Double = 250_000
+
+    /// Classification of the active drag gesture. Captured on
+    /// the first `.onChanged` event of each drag and honored for
+    /// the rest so a drag that *starts* near an edge keeps
+    /// resizing even when the mouse wanders toward the center.
+    private enum DragKind {
+        case idle
+        case retune
+        case resizeLeft
+        case resizeRight
+    }
+    @State private var dragKind: DragKind = .idle
+
+    /// Snapshot of the VFO state at drag start, so edge-resize
+    /// math can pin the opposite edge in Hz space regardless of
+    /// how far the drag moves.
+    @State private var dragStartVfoOffsetHz: Double = 0
+    @State private var dragStartBandwidthHz: Double = 0
+
     var body: some View {
         GeometryReader { geo in
             let width = geo.size.width
@@ -123,39 +154,141 @@ struct VfoOverlayView: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
-                        applyDrag(at: value.location.x, width: width, span: span)
+                        handleDrag(
+                            currentX: value.location.x,
+                            startX: value.startLocation.x,
+                            width: width,
+                            span: span,
+                            centerPx: centerPx,
+                            bwPixels: bwPixels
+                        )
+                    }
+                    .onEnded { _ in
+                        dragKind = .idle
                     }
             )
         }
+    }
+
+    /// Top-level drag handler. Classifies the drag on its first
+    /// frame (retune vs edge-resize) and dispatches to the
+    /// appropriate helper. The classification sticks for the
+    /// duration of the drag so the gesture doesn't flip modes
+    /// when the mouse crosses another edge mid-drag.
+    private func handleDrag(
+        currentX: CGFloat,
+        startX: CGFloat,
+        width: CGFloat,
+        span: Double,
+        centerPx: CGFloat,
+        bwPixels: CGFloat
+    ) {
+        guard width > 0, span > 0 else { return }
+
+        if dragKind == .idle {
+            dragKind = classify(
+                startX: startX,
+                centerPx: centerPx,
+                bwPixels: bwPixels
+            )
+            dragStartVfoOffsetHz = model.vfoOffsetHz
+            dragStartBandwidthHz = model.bandwidthHz
+        }
+
+        switch dragKind {
+        case .idle, .retune:
+            retuneAt(x: currentX, width: width, span: span)
+        case .resizeLeft:
+            resize(edge: .left, currentX: currentX, width: width, span: span)
+        case .resizeRight:
+            resize(edge: .right, currentX: currentX, width: width, span: span)
+        }
+    }
+
+    /// Hit-test the drag's starting x against the passband edges.
+    /// Within `edgeThresholdPx` of either edge = resize; anywhere
+    /// else = retune.
+    private func classify(
+        startX: CGFloat,
+        centerPx: CGFloat,
+        bwPixels: CGFloat
+    ) -> DragKind {
+        let leftPx = centerPx - bwPixels / 2
+        let rightPx = centerPx + bwPixels / 2
+        if abs(startX - leftPx) <= Self.edgeThresholdPx {
+            return .resizeLeft
+        }
+        if abs(startX - rightPx) <= Self.edgeThresholdPx {
+            return .resizeRight
+        }
+        return .retune
     }
 
     /// Convert the drag's x-pixel to an absolute frequency and
     /// RETUNE the hardware tuner to center on it, parking the
     /// VFO offset at 0.
     ///
-    /// This matches the GTK UI's click-to-tune behaviour (see
-    /// `crates/sdr-ui/src/window.rs:270` — the VFO offset change
+    /// Matches the GTK UI's click-to-tune behaviour
+    /// (`crates/sdr-ui/src/window.rs:270` — the VFO-offset-change
     /// callback pulls `center + offset` and calls `Tune(...)`).
     /// Setting `vfoOffset` directly doesn't work for clicks
     /// outside ±effective_sample_rate/2 because the demod only
     /// processes the post-decimation passband; retuning the
     /// tuner to the clicked frequency puts the signal back at
     /// DC where the demod can lock onto it.
-    private func applyDrag(at x: CGFloat, width: CGFloat, span: Double) {
-        guard width > 0, span > 0 else { return }
+    private func retuneAt(x: CGFloat, width: CGFloat, span: Double) {
         let frac = max(0, min(1, x / width))
         // Absolute Hz = tuner center + (offset from center on the
         // visible axis). `span` is `displayBandwidthHz`, the full
         // FFT span.
         let absoluteHz = model.centerFrequencyHz + (Double(frac) - 0.5) * span
-        // Reject obviously-bad clicks (e.g. if centerFrequencyHz
-        // is uninitialised). Negative Hz never makes sense.
         guard absoluteHz > 0 else { return }
         model.setCenter(absoluteHz)
-        // Park the VFO at the new center; the demod now sees
-        // the desired signal at DC.
         if model.vfoOffsetHz != 0 {
             model.setVfoOffset(0)
+        }
+    }
+
+    private enum ResizeEdge { case left, right }
+
+    /// Resize the passband by dragging one edge. The OPPOSITE
+    /// edge stays pinned in Hz space (snapshot at drag start),
+    /// so the visual mental model — "I'm dragging THIS edge" —
+    /// holds regardless of how far the drag goes. New
+    /// bandwidth is clamped to [minBandwidthHz, maxBandwidthHz]
+    /// so the user can't produce negative / nonsensical sizes.
+    private func resize(edge: ResizeEdge, currentX: CGFloat, width: CGFloat, span: Double) {
+        // Drag position in offset-from-tuner-center Hz (same
+        // frame as `vfoOffsetHz` / `bandwidthHz`).
+        let frac = max(0, min(1, currentX / width))
+        let dragOffsetHz = (Double(frac) - 0.5) * span
+
+        // Pinned opposite edge in offset-Hz.
+        let leftAtStart = dragStartVfoOffsetHz - dragStartBandwidthHz / 2
+        let rightAtStart = dragStartVfoOffsetHz + dragStartBandwidthHz / 2
+
+        let newLeft: Double
+        let newRight: Double
+        switch edge {
+        case .left:
+            newLeft = min(dragOffsetHz, rightAtStart - Self.minBandwidthHz)
+            newRight = rightAtStart
+        case .right:
+            newRight = max(dragOffsetHz, leftAtStart + Self.minBandwidthHz)
+            newLeft = leftAtStart
+        }
+
+        let newBandwidth = max(Self.minBandwidthHz, min(Self.maxBandwidthHz, newRight - newLeft))
+        let newCenter = (newLeft + newRight) / 2
+
+        // Only push to the engine when the values actually
+        // changed — avoids a flood of identical commands on
+        // tiny pixel movements.
+        if abs(newBandwidth - model.bandwidthHz) > 0.5 {
+            model.setBandwidth(newBandwidth)
+        }
+        if abs(newCenter - model.vfoOffsetHz) > 0.5 {
+            model.setVfoOffset(newCenter)
         }
     }
 }
