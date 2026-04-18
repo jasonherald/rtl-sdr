@@ -102,8 +102,14 @@ fn main() -> ExitCode {
     match Server::start(config) {
         Ok(server) => {
             tracing::info!(bind = %server.bind_address(), "rtl_tcp server running");
+            // Install the signal handler BEFORE entering the sleep loop.
+            // The loop has no alternate shutdown path, so a failed install
+            // leaves the process unkillable without SIGKILL — fatal, not
+            // a warning.
             if let Err(e) = ctrlc_handler() {
-                tracing::warn!(%e, "ctrl-c handler setup failed — kill the process manually");
+                tracing::error!(%e, "ctrl-c handler setup failed — aborting");
+                drop(server);
+                return ExitCode::FAILURE;
             }
             // Poll the shutdown flag instead of using an mpsc channel,
             // because the signal handler can only safely touch an atomic.
@@ -135,6 +141,10 @@ static CTRL_C_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 /// Install a minimal SIGINT/SIGTERM handler. Matches the upstream pattern
 /// at `rtl_tcp.c:477-488`, but without the non-async-signal-safe locking.
+///
+/// Returns `Err` if either `signal()` call fails — the caller MUST treat
+/// this as fatal, because the sleep loop in `main` has no alternate
+/// shutdown path and would leave the process unresponsive to Ctrl-C.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn ctrlc_handler() -> std::io::Result<()> {
@@ -145,16 +155,28 @@ fn ctrlc_handler() -> std::io::Result<()> {
     // SAFETY: `handler` has the correct `extern "C" fn(c_int)` signature
     // for a POSIX signal handler and touches only an AtomicBool, which
     // is on the POSIX async-signal-safe list.
+    let handler_ptr = handler as *const () as libc::sighandler_t;
     unsafe {
-        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        if libc::signal(libc::SIGINT, handler_ptr) == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::signal(libc::SIGTERM, handler_ptr) == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     Ok(())
 }
 
+/// Non-unix targets have no signal handling plumbing yet. Return an
+/// explicit Unsupported error rather than `Ok(())`, because an `Ok`
+/// result would let `main` enter its sleep loop without a shutdown
+/// path.
 #[cfg(not(unix))]
 fn ctrlc_handler() -> std::io::Result<()> {
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "signal handling not implemented on this platform",
+    ))
 }
 
 #[derive(Debug)]

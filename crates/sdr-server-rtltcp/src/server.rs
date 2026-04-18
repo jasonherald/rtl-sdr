@@ -158,6 +158,11 @@ impl Server {
                 ServerError::Io(e)
             }
         })?;
+        // `config.bind` may request port 0 (OS-assigned); in that case
+        // the actual port is only known after bind completes. Read it
+        // back from the socket so `bind_address()` returns the real
+        // port the UI/logs can show.
+        let actual_bind = listener.local_addr().map_err(ServerError::Io)?;
         // Set a short accept timeout so the accept loop can notice the
         // shutdown flag promptly on Server::drop.
         listener.set_nonblocking(false)?;
@@ -177,7 +182,7 @@ impl Server {
         apply_initial_state(&mut device, &config.initial)?;
 
         tracing::info!(
-            bind = %config.bind,
+            bind = %actual_bind,
             tuner = ?device.tuner_type(),
             gain_count = device.tuner_gains().len(),
             "rtl_tcp server listening"
@@ -205,7 +210,7 @@ impl Server {
             shutdown,
             accept_thread: Some(accept_thread),
             stats,
-            bind: config.bind,
+            bind: actual_bind,
         })
     }
 
@@ -680,8 +685,16 @@ fn command_worker(
     stats: Arc<Mutex<ServerStats>>,
 ) {
     // Upstream loops on a 1 s select() so shutdown is noticed promptly.
+    // Our equivalent is the socket read timeout. If we can't install it,
+    // `read_full` would block indefinitely in `stream.read()` without
+    // ever re-checking the shutdown flag — which would deadlock
+    // `handle_client`'s join on this worker, then the accept thread's
+    // join on handle_client, then `Server::Drop`. Treat the failure as
+    // fatal for this client session.
     if let Err(e) = stream.set_read_timeout(Some(COMMAND_READ_TIMEOUT)) {
-        tracing::warn!(%e, "set_read_timeout on command channel failed");
+        tracing::warn!(%e, "set_read_timeout on command channel failed; dropping client");
+        shutdown.set_client();
+        return;
     }
     let mut buf = [0u8; COMMAND_LEN];
     while !shutdown.is_set() {

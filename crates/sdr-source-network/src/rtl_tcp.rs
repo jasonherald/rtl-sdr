@@ -56,6 +56,10 @@ pub const DEFAULT_DATA_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`RtlTcpConfig::max_consecutive_timeouts`].
 pub const DEFAULT_MAX_CONSECUTIVE_TIMEOUTS: u32 = 2;
 
+/// Default timeout for the initial TCP connect. See
+/// [`RtlTcpConfig::connect_timeout`].
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Exponential-backoff schedule for reconnect. Values in seconds.
 /// Clamped at 30 s, matching the review of epic #299.
 const BACKOFF_SCHEDULE_SECS: &[u64] = &[1, 2, 5, 10, 30];
@@ -123,6 +127,13 @@ pub struct RtlTcpConfig {
     /// leave the UI frozen in Connected state until the kernel
     /// keepalive finally fires.
     pub max_consecutive_timeouts: u32,
+
+    /// Timeout for each TCP `connect()` attempt. Default 10 s. Without
+    /// this the call can sit in the kernel for 60+ seconds waiting on
+    /// TCP SYN retransmits when the destination is a blackhole (IP
+    /// drops packets rather than replying RST), leaving the manager
+    /// thread stuck.
+    pub connect_timeout: Duration,
 }
 
 impl Default for RtlTcpConfig {
@@ -130,6 +141,7 @@ impl Default for RtlTcpConfig {
         Self {
             data_read_timeout: DEFAULT_DATA_READ_TIMEOUT,
             max_consecutive_timeouts: DEFAULT_MAX_CONSECUTIVE_TIMEOUTS,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -223,26 +235,24 @@ impl SharedState {
 /// Append `chunk` to `rx`, dropping the oldest bytes if doing so would
 /// exceed [`RX_BUFFER_SOFT_CAP_BYTES`]. Returns the number of bytes
 /// dropped so the caller can surface it through observability.
+///
+/// Drop count is rounded up to an even number so the buffer always
+/// stays aligned on I/Q pair boundaries. Dropping an odd number of
+/// bytes would leave `rx` starting mid-pair — subsequent `read_samples`
+/// calls would then pair `Q[n]` with `I[n+1]`, phase-shifting the
+/// stream until another odd drop happened to realign it.
 fn append_with_cap_inner(rx: &mut Vec<u8>, chunk: &[u8]) -> usize {
     let desired_total = rx.len().saturating_add(chunk.len());
-    let mut dropped = 0;
-    if desired_total > RX_BUFFER_SOFT_CAP_BYTES {
-        // Drop enough from the front to make room for the new chunk.
-        let excess = desired_total - RX_BUFFER_SOFT_CAP_BYTES;
-        let to_drop = excess.min(rx.len());
-        rx.drain(..to_drop);
-        dropped = to_drop;
-    }
-    // If the chunk itself is larger than the cap, keep only the tail —
-    // the UI/consumer cares about the newest samples.
-    if chunk.len() > RX_BUFFER_SOFT_CAP_BYTES {
-        let keep_from = chunk.len() - RX_BUFFER_SOFT_CAP_BYTES;
-        rx.extend_from_slice(&chunk[keep_from..]);
-        dropped = dropped.saturating_add(keep_from);
-    } else {
-        rx.extend_from_slice(chunk);
-    }
-    dropped
+    let raw_excess = desired_total.saturating_sub(RX_BUFFER_SOFT_CAP_BYTES);
+    // Round up to even so we never split an I/Q pair.
+    let total_drop = raw_excess.saturating_add(raw_excess & 1);
+
+    let drop_from_rx = total_drop.min(rx.len());
+    rx.drain(..drop_from_rx);
+
+    let drop_from_chunk = total_drop.saturating_sub(drop_from_rx).min(chunk.len());
+    rx.extend_from_slice(&chunk[drop_from_chunk..]);
+    total_drop
 }
 
 /// Wrapper that does the drop-bookkeeping on the shared counter.
@@ -538,8 +548,37 @@ fn attempt_connect(
     shared: &Arc<SharedState>,
     config: &RtlTcpConfig,
 ) -> Result<TcpStream, SourceError> {
-    let addr = format!("{host}:{port}");
-    let stream = TcpStream::connect(&addr).map_err(SourceError::Io)?;
+    // `(host, port).to_socket_addrs()` handles both IPv4 dotted
+    // quads AND IPv6 literals like `::1` correctly — the naïve
+    // `format!("{host}:{port}")` that we had before would build
+    // `::1:1234` for IPv6, which SocketAddr::from_str then rejects.
+    //
+    // `connect_timeout` is per-resolved-address rather than
+    // whole-call, so when a hostname resolves to multiple A/AAAA
+    // records we effectively iterate. Without any timeout, a
+    // blackholed destination wedges the manager thread for 60+ s
+    // waiting on TCP SYN retransmits.
+    use std::net::ToSocketAddrs;
+    let resolved = (host, port).to_socket_addrs().map_err(SourceError::Io)?;
+    let mut last_err: Option<std::io::Error> = None;
+    let mut stream: Option<TcpStream> = None;
+    for addr in resolved {
+        match TcpStream::connect_timeout(&addr, config.connect_timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let stream = stream.ok_or_else(|| {
+        SourceError::Io(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no socket addresses resolved",
+            )
+        }))
+    })?;
 
     stream.set_read_timeout(Some(config.data_read_timeout))?;
     if let Err(e) = set_keepalive(&stream, true) {
@@ -794,39 +833,27 @@ impl Source for RtlTcpSource {
         if output.is_empty() {
             return Ok(0);
         }
-        let need = output.len().saturating_mul(2);
-        let mut bytes = Vec::with_capacity(need);
-
-        // Drain up to `need` bytes from the shared rx buffer, aligned to
-        // a pair boundary — an odd trailing byte must stay queued so the
-        // I channel of the next sample isn't shifted one byte into the Q
-        // of the previous one. Kernel socket reads produce odd byte
-        // counts occasionally; upstream rtl_tcp avoids this because it
-        // works in raw byte space, but our complex-pair conversion needs
-        // even alignment.
-        if let Ok(mut rx) = self.shared.rx_buf.lock() {
-            let take = (rx.len().min(need)) & !1;
-            if take > 0 {
-                bytes.extend_from_slice(&rx[..take]);
-                rx.drain(..take);
-            }
-        } else {
-            return Err(SourceError::NotRunning);
+        // Convert I/Q bytes to Complex samples directly under the lock,
+        // no intermediate `Vec` copy. Hot path — avoids one allocation
+        // + one memcpy per pull. 8-bit unsigned-offset I/Q: byte 0..=255
+        // with zero at 127.5, scaled to f32 in [-1, 1).
+        let mut rx = self
+            .shared
+            .rx_buf
+            .lock()
+            .map_err(|_| SourceError::NotRunning)?;
+        let take_pairs = (rx.len() / 2).min(output.len());
+        let take_bytes = take_pairs * 2;
+        for i in 0..take_pairs {
+            let re_u = rx[i * 2];
+            let im_u = rx[i * 2 + 1];
+            output[i] = Complex::new(
+                (f32::from(re_u) - 127.5) / 127.5,
+                (f32::from(im_u) - 127.5) / 127.5,
+            );
         }
-
-        // 8-bit unsigned-offset I/Q: byte 0..255 with zero at 127.5.
-        // Convert to f32 in [-1, 1) using the same scale as
-        // sdr-source-rtlsdr's internal path.
-        let pairs = bytes.len() / 2;
-        let count = pairs.min(output.len());
-        for i in 0..count {
-            let re_u = bytes[i * 2];
-            let im_u = bytes[i * 2 + 1];
-            let re = (f32::from(re_u) - 127.5) / 127.5;
-            let im = (f32::from(im_u) - 127.5) / 127.5;
-            output[i] = Complex::new(re, im);
-        }
-        Ok(count)
+        rx.drain(..take_bytes);
+        Ok(take_pairs)
     }
 }
 
@@ -922,6 +949,32 @@ mod tests {
     }
 
     #[test]
+    fn append_with_cap_rounds_drop_up_to_even() {
+        // Construct an overflow by exactly 1 byte. The drop count MUST
+        // round up to 2 so we don't split an I/Q pair — Q would get
+        // misaligned with the next I, phase-shifting the output stream
+        // until another odd-drop event happened to realign it.
+        //
+        // Mark the I byte of the pair that should survive after drop so
+        // we can verify it ends up at rx[0] (still an I position, not
+        // shifted into a Q slot).
+        let mut rx = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES];
+        rx[0] = 0x11; // I of dropped pair 0
+        rx[1] = 0x12; // Q of dropped pair 0
+        rx[2] = 0xAA; // I of surviving pair 1 — must land at rx[0] post-drop
+        rx[3] = 0xBB; // Q of surviving pair 1
+        let incoming = [0xFFu8; 1];
+        let dropped = append_with_cap_inner(&mut rx, &incoming);
+        assert_eq!(dropped, 2, "drop count must be even, got {dropped}");
+        // Pair 1's I landed at position 0 — alignment preserved.
+        assert_eq!(rx[0], 0xAA, "I byte of surviving pair must be at rx[0]");
+        assert_eq!(rx[1], 0xBB, "Q byte of surviving pair must be at rx[1]");
+        // rx can legitimately end on an odd length (the trailing byte is
+        // half of a pair waiting for its mate on the next read) — what
+        // matters is that the DROP was pair-aligned, not the final length.
+    }
+
+    #[test]
     fn append_with_cap_no_drop_below_cap() {
         let mut rx = vec![0u8; 1000];
         let incoming = vec![0xFFu8; 500];
@@ -980,6 +1033,7 @@ mod tests {
         let config = RtlTcpConfig {
             data_read_timeout: Duration::from_millis(200),
             max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
