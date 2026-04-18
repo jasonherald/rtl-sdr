@@ -71,14 +71,21 @@ extract_names() {
     # future `sdr_core_v2_foo`). No case-insensitivity needed —
     # the project's convention is snake_case.
     #
-    # The `|| true` around `grep` matters: under `set -o pipefail`
-    # at the top of the script, a grep that matches zero lines
-    # exits 1 and aborts the whole pipeline before `sort` can
-    # emit an empty set. Empty-file handling ("no FFI functions
-    # declared") should be a clean no-match, not a hard error.
-    { grep -oE 'sdr_core_[a-z0-9_]+\(' "$file" || true; } \
-        | sed 's/(//' \
-        | sort -u
+    # grep exit codes to distinguish:
+    #   0 → matches found, proceed.
+    #   1 → no matches — legitimate for a header with zero FFI
+    #       functions. Proceed with empty output.
+    #   ≥2 → real failure (file unreadable, binary file, regex
+    #       error). Must abort, otherwise a permission-denied
+    #       read on both headers falsely passes the check (both
+    #       extract to empty, diff says "match").
+    local names rc=0
+    names="$(grep -oE 'sdr_core_[a-z0-9_]+\(' "$file")" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        echo "error: grep failed (rc=$rc) extracting FFI symbols from $file" >&2
+        return "$rc"
+    fi
+    printf '%s\n' "$names" | sed 's/(//' | sort -u
 }
 
 HAND_NAMES=$(mktemp -t sdr_ffi_hand.XXXXXX)
