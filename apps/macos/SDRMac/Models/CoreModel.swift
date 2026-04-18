@@ -53,6 +53,15 @@ final class CoreModel {
     var isRunning: Bool = false
     var lastError: String? = nil
 
+    /// True when the Swift side's compiled-against ABI major
+    /// version differs from the runtime library's. Set by
+    /// `bootstrap(configPath:)` before any engine work. The UI
+    /// presents a fatal modal and skips `SdrCore` creation — the
+    /// app can't do anything useful against a mismatched ABI, so
+    /// the only option is Quit.
+    var abiMismatch: (compiled: (major: UInt16, minor: UInt16),
+                      runtime: (major: UInt16, minor: UInt16))?
+
     // ==========================================================
     //  Tuning
     // ==========================================================
@@ -191,6 +200,25 @@ final class CoreModel {
     /// if the engine is already up.
     func bootstrap(configPath: URL) async {
         guard core == nil else { return }
+
+        // ABI guard. Runs BEFORE any engine work so a mismatched
+        // lib can't silently misbehave — a major-version drift
+        // between the compiled Swift wrapper and the statically-
+        // linked `libsdr_ffi.a` means struct layouts / enum
+        // discriminants likely differ and the engine would crash
+        // or misinterpret commands. Catch it at the front door.
+        let compiled = SdrCore.compiledAbiVersion
+        let runtime = SdrCore.abiVersion
+        if compiled.major != runtime.major {
+            abiMismatch = (compiled: compiled, runtime: runtime)
+            lastError = """
+                SDR engine ABI major mismatch: compiled against \
+                \(compiled.major).\(compiled.minor), runtime reports \
+                \(runtime.major).\(runtime.minor). The app can't start.
+                """
+            return
+        }
+
         // Install the Rust tracing subscriber once at process
         // start so engine errors and info logs land on stderr
         // (captured by Console.app / the xcrun log stream).

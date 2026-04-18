@@ -402,6 +402,20 @@ public final class SdrCore: @unchecked Sendable {
         )
     }
 
+    /// ABI version the Swift wrapper was COMPILED against, pulled
+    /// from the C header's `SDR_CORE_ABI_VERSION_*` `#define`s at
+    /// build time via Clang's macro import. Compare with
+    /// `abiVersion` (runtime) at launch to catch a catastrophic
+    /// packaging bug where the Swift side and the statically-
+    /// linked `libsdr_ffi.a` drifted apart — a mismatched major
+    /// means struct layouts / enum discriminants likely differ
+    /// and the engine will misbehave unpredictably. Fail fast
+    /// instead.
+    public static let compiledAbiVersion: (major: UInt16, minor: UInt16) = (
+        UInt16(SDR_CORE_ABI_VERSION_MAJOR),
+        UInt16(SDR_CORE_ABI_VERSION_MINOR)
+    )
+
     /// Initialize `tracing` log routing to stderr. Optional —
     /// call once before creating any `SdrCore` instance if you
     /// want Rust-side log output visible.
