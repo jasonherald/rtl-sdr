@@ -48,6 +48,27 @@ pub const DEFAULT_BUFFER_CAPACITY: usize = 500;
 /// when no commands arrive (rtl_tcp.c:293-304).
 const COMMAND_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Sleep between non-blocking `accept()` polls. Small enough that the
+/// accept thread notices the shutdown flag within ~100 ms of `Drop`.
+/// `TcpListener` doesn't expose a per-accept timeout, so we poll with
+/// `set_nonblocking(true)` + `thread::sleep`.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Backoff after an `accept()` call returns a non-WouldBlock error.
+/// Typically an exhausted-FD / out-of-memory situation — short enough
+/// to retry quickly once the transient resolves, long enough to avoid
+/// a tight log-spam loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
+
+/// `recv_timeout` in the TCP writer so it notices shutdown even when
+/// the USB reader is starving (dongle unplug, no data incoming).
+const WRITER_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Timeout on each USB bulk read in the data worker. Matches upstream's
+/// 1-second poll interval in the `rtlsdr_read_async` loop. The data
+/// worker re-checks the shutdown flag between reads.
+const USB_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Default sample rate in Hz. Matches upstream `rtl_tcp.c:DEFAULT_SAMPLE_RATE_HZ`.
 ///
 /// Exposed so the CLI can share the same constant instead of hard-coding
@@ -204,6 +225,7 @@ impl Server {
             shutdown.clone(),
             stats.clone(),
             capacity,
+            config.initial.clone(),
         )?;
 
         Ok(Server {
@@ -250,9 +272,26 @@ impl Drop for Server {
     }
 }
 
+/// Lock the device and reapply initial state for a new client session.
+/// Exists so the accept loop has a small surface that wraps the lock
+/// acquisition; `apply_initial_state` itself stays lock-agnostic.
+fn reset_device_to_initial(
+    device: &Arc<Mutex<RtlSdrDevice>>,
+    initial: &InitialDeviceState,
+) -> Result<(), ServerError> {
+    let mut dev = device
+        .lock()
+        .map_err(|_| ServerError::Io(std::io::Error::other("device mutex poisoned")))?;
+    apply_initial_state(&mut dev, initial)
+}
+
 /// Apply the user's initial settings to the freshly-opened device.
 ///
-/// Mirrors the setup block in rtl_tcp.c:490-520.
+/// Mirrors the setup block in rtl_tcp.c:490-520. Called once at
+/// `Server::start` so the dongle is in a sane state even before any
+/// client connects, and again on every new client session via
+/// `reset_device_to_initial` so sequential clients don't inherit each
+/// other's tuning.
 fn apply_initial_state(
     dev: &mut RtlSdrDevice,
     initial: &InitialDeviceState,
@@ -281,6 +320,12 @@ fn apply_initial_state(
 /// Spawn the outer accept loop. Upstream's main runs this inline; we run
 /// it on a thread so `Server::start` can return a handle to the caller.
 ///
+/// `initial_state` is reapplied on every new client session so sequential
+/// clients start from a clean slate rather than inheriting the prior
+/// client's tuning / gain / direct-sampling state. Matches upstream's
+/// `accept → apply defaults → reset_buffer → spawn workers` shape,
+/// extended to the multi-client accept loop.
+///
 /// Returns `Err` on thread spawn failure (rare — kernel resource
 /// exhaustion). Callers propagate up to the user.
 fn spawn_accept_thread(
@@ -289,6 +334,7 @@ fn spawn_accept_thread(
     shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
     buffer_capacity: usize,
+    initial_state: InitialDeviceState,
 ) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("rtl_tcp-accept".into())
@@ -348,6 +394,21 @@ fn spawn_accept_thread(
                         configure_client_socket(&stream);
                         update_stats_on_connect(&stats, peer);
 
+                        // Reapply initial state BEFORE spawning workers
+                        // so this client starts on clean tuning/gain
+                        // rather than inheriting the prior session's
+                        // state. Matches upstream's per-accept setup
+                        // block (rtl_tcp.c:490-520).
+                        if let Err(e) = reset_device_to_initial(&device, &initial_state) {
+                            tracing::error!(
+                                %e, %peer,
+                                "rtl_tcp failed to reset device to initial state, dropping client"
+                            );
+                            busy.store(false, Ordering::SeqCst);
+                            update_stats_on_disconnect(&stats);
+                            continue;
+                        }
+
                         let session_device = device.clone();
                         let session_shutdown = shutdown.clone();
                         let session_stats = stats.clone();
@@ -375,11 +436,11 @@ fn spawn_accept_thread(
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(100));
+                        thread::sleep(ACCEPT_POLL_INTERVAL);
                     }
                     Err(e) => {
                         tracing::error!(%e, "rtl_tcp accept error");
-                        thread::sleep(Duration::from_millis(200));
+                        thread::sleep(ACCEPT_ERROR_BACKOFF);
                     }
                 }
             }
@@ -607,7 +668,7 @@ fn data_worker(
         };
         dev.usb_handle()
     };
-    let timeout = Duration::from_secs(1);
+    let timeout = USB_READ_TIMEOUT;
     // Scratch buffer reused across iterations — only the Vec we actually
     // send to the writer gets a fresh allocation, sized to the data the
     // USB read returned. This avoids allocating 256 KiB on every timeout
@@ -665,7 +726,7 @@ fn tcp_writer(
         if shutdown.is_set() {
             return;
         }
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        match rx.recv_timeout(WRITER_RECV_TIMEOUT) {
             Ok(buf) => {
                 if let Err(e) = stream.write_all(&buf) {
                     tracing::debug!(%e, "rtl_tcp client socket write failed, closing");
