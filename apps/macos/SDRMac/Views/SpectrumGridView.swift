@@ -134,7 +134,6 @@ struct SpectrumGridView: View {
             // doesn't clip the line itself. Matches the Cairo
             // reference: `move_to(2.0, y - 2.0)`.
             context.draw(text, at: CGPoint(x: 2, y: y - 2), anchor: .bottomLeading)
-            _ = h  // silence unused-warning in case layout changes
         }
     }
 
