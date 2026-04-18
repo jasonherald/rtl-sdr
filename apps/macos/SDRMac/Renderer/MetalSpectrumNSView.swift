@@ -50,6 +50,7 @@ final class MetalSpectrumNSView: NSView, CAMetalDisplayLinkDelegate {
 
     private let renderer: SpectrumRenderer
     private var displayLink: CAMetalDisplayLink?
+    private let powerObserver = PowerModeObserver()
 
     /// Typed accessor for the backing layer. `makeBackingLayer()`
     /// returns a `CAMetalLayer`, so the force-cast is safe.
@@ -73,6 +74,13 @@ final class MetalSpectrumNSView: NSView, CAMetalDisplayLinkDelegate {
         // `CoreModel.core` from there given CoreModel is
         // @MainActor.
         renderer.coreProvider = coreProvider
+
+        // Re-apply the display link's rate range on any AC /
+        // battery / Low Power Mode transition. `powerObserver`
+        // owns the wiring; we just react to the published mode.
+        powerObserver.onChange = { [weak self] mode in
+            self?.applyPowerMode(mode)
+        }
 
         // Tell AppKit we're layer-backed and that we want to
         // supply our own layer (a CAMetalLayer) rather than
@@ -189,19 +197,39 @@ final class MetalSpectrumNSView: NSView, CAMetalDisplayLinkDelegate {
         guard displayLink == nil else { return }
         let link = CAMetalDisplayLink(metalLayer: metalLayer)
         link.delegate = self
-        // ProMotion on M-series hits 120 Hz when we ask for it,
-        // but "up to 120" with a preferred minimum lets the
-        // system throttle to match content cadence (e.g. when
-        // the tab is occluded). The renderer's synthetic source
-        // advances per-frame so higher is fine; when we swap in
-        // real SdrCore in sub-PR 3 we'll re-tune this.
-        link.preferredFrameRateRange = CAFrameRateRange(
-            minimum: 30,
-            maximum: 120,
-            preferred: 60
-        )
+        link.preferredFrameRateRange = Self.rateRange(for: powerObserver.mode)
         link.add(to: .main, forMode: .common)
         displayLink = link
+    }
+
+    /// Recompute and push the preferred frame rate range to the
+    /// display link when power posture changes. `link` may be
+    /// nil if the view is offscreen (window == nil); in that
+    /// case we noop — `startDisplayLink` will re-read the mode
+    /// next time the view attaches.
+    private func applyPowerMode(_ mode: PowerMode) {
+        displayLink?.preferredFrameRateRange = Self.rateRange(for: mode)
+    }
+
+    /// Display-link rate range per power mode.
+    ///
+    /// - `.acFull`: ProMotion-friendly — let the display link
+    ///   match display-native refresh (120 Hz on M-series
+    ///   laptops). `preferred: 60` is a hint that balances
+    ///   visual smoothness against unnecessary GPU work; the
+    ///   system picks an actual rate in the window.
+    /// - `.conserve`: clamped to 10–30 fps with a 20 fps
+    ///   preferred rate. That roughly matches typical FFT engine
+    ///   cadence, so the waterfall still moves at its natural
+    ///   pace without the render loop burning extra cycles on
+    ///   no-new-data ticks.
+    private static func rateRange(for mode: PowerMode) -> CAFrameRateRange {
+        switch mode {
+        case .acFull:
+            return CAFrameRateRange(minimum: 30, maximum: 120, preferred: 60)
+        case .conserve:
+            return CAFrameRateRange(minimum: 10, maximum: 30, preferred: 20)
+        }
     }
 
     private func stopDisplayLink() {
