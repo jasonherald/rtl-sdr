@@ -19,6 +19,10 @@ rusb.workspace = true
 # Binary only — enables `-s info` style env-filter logging for the CLI.
 # Kept in regular deps (not dev-deps) because the `[[bin]]` target needs it.
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# mDNS advertise for the `sdr-rtl-tcp` bin. The lib crate stays free of
+# this dep; only the binary composes it (so a downstream consumer that
+# just wants the Server API doesn't pull in mdns-sd).
+sdr-rtltcp-discovery.workspace = true
 
 [lints]
 workspace = true

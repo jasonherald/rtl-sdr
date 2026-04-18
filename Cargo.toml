@@ -104,6 +104,7 @@ members = [
     "crates/sdr-source-rtlsdr",
     "crates/sdr-source-network",
     "crates/sdr-server-rtltcp",
+    "crates/sdr-rtltcp-discovery",
     "crates/sdr-source-file",
     "crates/sdr-sink-audio",
     "crates/sdr-sink-network",
@@ -132,6 +133,7 @@ sdr-rtlsdr = { path = "crates/sdr-rtlsdr" }
 sdr-source-rtlsdr = { path = "crates/sdr-source-rtlsdr" }
 sdr-source-network = { path = "crates/sdr-source-network" }
 sdr-server-rtltcp = { path = "crates/sdr-server-rtltcp" }
+sdr-rtltcp-discovery = { path = "crates/sdr-rtltcp-discovery" }
 sdr-source-file = { path = "crates/sdr-source-file" }
 sdr-sink-audio = { path = "crates/sdr-sink-audio" }
 sdr-sink-network = { path = "crates/sdr-sink-network" }
@@ -200,6 +202,10 @@ coreaudio-rs = "0.14"
 
 # WAV files
 hound = "3"
+
+# mDNS-SD service discovery (_rtl_tcp._tcp.local) — pure Rust, no
+# Avahi/Bonjour system dependency, no async runtime required.
+mdns-sd = "0.19"
 
 # Zero-copy type casting
 bytemuck = { version = "1", features = ["derive"] }

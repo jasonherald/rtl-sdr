@@ -1,0 +1,18 @@
+[package]
+name = "sdr-rtltcp-discovery"
+version = "0.1.0"
+description = "mDNS/DNS-SD discovery for rtl_tcp servers — announce from sdr-server-rtltcp, browse from sdr-source-network clients. Service type _rtl_tcp._tcp.local."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+# Pure-Rust mDNS-SD — no Avahi/Bonjour system dep, no async runtime.
+# Version kept in sync with the workspace so future crates can share
+# the same dependency if they need discovery.
+mdns-sd = { workspace = true }
+
+[lints]
+workspace = true
