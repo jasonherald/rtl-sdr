@@ -30,6 +30,16 @@ use std::time::Duration;
 use sdr_server_rtltcp::server::{DEFAULT_SAMPLE_RATE_HZ, Server, ServerConfig};
 use sdr_server_rtltcp::{DEFAULT_BUFFER_CAPACITY, DEFAULT_PORT};
 
+/// How often `main` polls the shutdown / server-stopped flags. Below
+/// any user-perceptible latency; costs a few syscalls per second while
+/// the server is idle.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Direct-sampling mode the upstream `-D` flag activates.
+/// Upstream rtl_tcp.c hard-codes `2` (Q branch); we match that
+/// exactly.
+const DIRECT_SAMPLING_Q_BRANCH: i32 = 2;
+
 /// Print the `--help` / `-h` message and exit with the given status code.
 ///
 /// Exit 0 when invoked via `-h`/`--help` (successful help request), exit 1
@@ -120,7 +130,7 @@ fn main() -> ExitCode {
             // stopped. 100 ms poll is well below any user-perceptible
             // shutdown lag and costs nothing while idle.
             while !CTRL_C_RECEIVED.load(Ordering::SeqCst) && !server.has_stopped() {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
             }
             if server.has_stopped() {
                 tracing::info!("rtl_tcp server stopped serving — exiting");
@@ -275,7 +285,7 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<ServerConfig, ParseError> {
             }
             "-D" => {
                 // Upstream hardcodes direct-sampling mode 2 (Q branch).
-                config.initial.direct_sampling = 2;
+                config.initial.direct_sampling = DIRECT_SAMPLING_Q_BRANCH;
                 i += 1;
             }
             _ => return Err(ParseError),
@@ -299,11 +309,11 @@ fn parse_hz(s: &str) -> Result<u32, ParseError> {
             (s, 1u64)
         };
     let n: f64 = number.parse().map_err(|_| ParseError)?;
-    // Reject NaN / ±Inf AND any negative input outright. Without the
-    // negative-guard, `parse_hz("-0.4")` would round-to-zero and pass
-    // the u32 range check as a valid 0 Hz frequency; without the
-    // is_finite guard, `f64 as i64` silently converts NaN → 0 and ±Inf
-    // → saturating i64 bounds. Both paths could turn garbage input
+    // Reject NaN / ±Inf AND any negative input outright before rounding.
+    // Without the negative-guard, `parse_hz("-0.4")` would round-to-zero
+    // and pass the u32 range check as a valid 0 Hz frequency. Without
+    // the is_finite guard, `f64 as u32` silently converts NaN → 0 and
+    // ±Inf → saturating u32 bounds — either could turn garbage input
     // into plausible-looking output.
     if !n.is_finite() || n < 0.0 {
         return Err(ParseError);
@@ -375,7 +385,7 @@ mod tests {
         assert!(parse_hz("not-a-number").is_err());
         assert!(parse_hz("").is_err());
         assert!(parse_hz("5MHz").is_err()); // trailing "Hz" not valid suffix
-        assert!(parse_hz("-100").is_err()); // negative Hz not representable as u32
+        assert!(parse_hz("-100").is_err()); // caught by the `n < 0.0` guard before rounding
     }
 
     #[test]

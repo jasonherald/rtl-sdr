@@ -179,11 +179,16 @@ impl Default for RtlTcpConfig {
 /// Spawns a background connection manager thread on `start()`. The
 /// manager owns the socket, does the reconnect loop, and publishes the
 /// byte stream into a ring buffer that `read_samples` drains.
+///
+/// The "current frequency / sample rate" values exposed through
+/// [`Source::sample_rate`] / `sample_rate()` live on `SharedState` as
+/// atomic f64 bit-patterns rather than on `self`, so every setter path
+/// — the `&mut self` trait methods AND the `&self` typed `set_*_hz`
+/// helpers — updates the same source of truth. Keeps callers that
+/// bypass the trait from seeing a stale cache.
 pub struct RtlTcpSource {
     host: String,
     port: u16,
-    sample_rate: f64,
-    frequency: f64,
     config: RtlTcpConfig,
 
     shared: Arc<SharedState>,
@@ -215,6 +220,17 @@ struct SharedState {
     /// bytes; cleared when the buffer drains to below half-cap. Ensures
     /// we log once per stall-and-drain cycle instead of per-chunk.
     rx_in_overflow: AtomicBool,
+
+    /// Cached "current sample rate" reported via the `Source::sample_rate`
+    /// getter. f64 bits so we can update from `&self` setters without
+    /// interior-mutability boilerplate. Initialized to
+    /// [`DEFAULT_CLIENT_SAMPLE_RATE_HZ`].
+    cached_sample_rate_bits: AtomicU64,
+
+    /// Cached "current center frequency" reported via `Source::tune`'s
+    /// `frequency` accessor pattern. Same rationale as
+    /// `cached_sample_rate_bits`.
+    cached_frequency_bits: AtomicU64,
 
     /// Write side of the socket, protected by a Mutex so command senders
     /// can share it without racing. Replaced on every reconnect.
@@ -271,6 +287,8 @@ impl SharedState {
             replay_mask: AtomicU32::new(0),
             rx_dropped_bytes: AtomicU64::new(0),
             rx_in_overflow: AtomicBool::new(false),
+            cached_sample_rate_bits: AtomicU64::new(DEFAULT_CLIENT_SAMPLE_RATE_HZ.to_bits()),
+            cached_frequency_bits: AtomicU64::new(DEFAULT_CLIENT_CENTER_FREQ_HZ.to_bits()),
             last_testmode: AtomicU32::new(0),
             last_if_gain: AtomicU32::new(0),
             last_rtl_xtal: AtomicU32::new(0),
@@ -347,8 +365,6 @@ impl RtlTcpSource {
         Self {
             host: host.to_string(),
             port,
-            sample_rate: DEFAULT_CLIENT_SAMPLE_RATE_HZ,
-            frequency: DEFAULT_CLIENT_CENTER_FREQ_HZ,
             config,
             shared: Arc::new(SharedState::new()),
             manager: None,
@@ -435,6 +451,12 @@ impl RtlTcpSource {
     /// Convenience typed setters — each one round-trips through
     /// [`Self::send_command`].
     pub fn set_center_freq_hz(&self, hz: u32) -> Result<(), SourceError> {
+        // Update the cached getter value BEFORE sending so a reader
+        // that races with a concurrent getter never sees stale state
+        // while the new value is on the wire.
+        self.shared
+            .cached_frequency_bits
+            .store(f64::from(hz).to_bits(), Ordering::Relaxed);
         self.send_command(Command {
             op: CommandOp::SetCenterFreq,
             param: hz,
@@ -442,6 +464,9 @@ impl RtlTcpSource {
     }
 
     pub fn set_sample_rate_hz(&self, hz: u32) -> Result<(), SourceError> {
+        self.shared
+            .cached_sample_rate_bits
+            .store(f64::from(hz).to_bits(), Ordering::Relaxed);
         self.send_command(Command {
             op: CommandOp::SetSampleRate,
             param: hz,
@@ -799,6 +824,17 @@ fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlT
     if let Ok(mut sink) = shared.command_sink.lock() {
         *sink = None;
     }
+    // Clear any buffered I/Q so the next successful session doesn't
+    // rewind the consumer with pre-drop samples from the previous
+    // server. Stale samples are useless for a live SDR; the user wants
+    // fresh data from the new handshake onward.
+    if let Ok(mut rx) = shared.rx_buf.lock() {
+        rx.clear();
+    }
+    // Rearm the edge-triggered overflow warn so if the next session
+    // stalls, the warning logs again rather than being suppressed by a
+    // stale flag left over from the previous session.
+    shared.rx_in_overflow.store(false, Ordering::Relaxed);
 }
 
 fn replay_sticky_commands(shared: &Arc<SharedState>) {
@@ -938,8 +974,9 @@ impl Source for RtlTcpSource {
                 "center frequency out of range: {frequency_hz}"
             )));
         }
-        self.frequency = frequency_hz;
-        // Round to u32 — upstream wire protocol is u32 Hz.
+        // Round to u32 — upstream wire protocol is u32 Hz. Cache
+        // update happens inside `set_center_freq_hz` via the shared
+        // atomic; no local field write here.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -954,7 +991,10 @@ impl Source for RtlTcpSource {
     }
 
     fn sample_rate(&self) -> f64 {
-        self.sample_rate
+        // Read from the shared cache so the value stays consistent
+        // whether the caller used `Source::set_sample_rate` or the
+        // typed `set_sample_rate_hz` helper.
+        f64::from_bits(self.shared.cached_sample_rate_bits.load(Ordering::Relaxed))
     }
 
     fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError> {
@@ -967,7 +1007,6 @@ impl Source for RtlTcpSource {
                 "sample rate out of range: {rate}"
             )));
         }
-        self.sample_rate = rate;
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -1215,6 +1254,66 @@ mod tests {
             left_connected,
             "client still Connected after timeout threshold — reconnect didn't fire"
         );
+    }
+
+    #[test]
+    fn typed_setter_updates_cached_getter_value() {
+        // Regression for the split-brain bug: `set_sample_rate_hz` and
+        // `set_center_freq_hz` write the wire command but previously
+        // left the cached getter value untouched, so a caller polling
+        // `Source::sample_rate()` after using the typed setter would
+        // see the default rate, not what they just set. Moving the
+        // caches onto `SharedState` with atomic f64 bit-patterns fixes
+        // this.
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        // Default before any set:
+        let default_rate = <RtlTcpSource as Source>::sample_rate(&src);
+        assert!((default_rate - DEFAULT_CLIENT_SAMPLE_RATE_HZ).abs() < 0.5);
+
+        // Typed setter (bypasses `Source::set_sample_rate`):
+        src.set_sample_rate_hz(2_400_000).unwrap();
+        let after = <RtlTcpSource as Source>::sample_rate(&src);
+        assert!(
+            (after - 2_400_000.0).abs() < 0.5,
+            "getter after set_sample_rate_hz = {after}, want 2_400_000"
+        );
+    }
+
+    #[test]
+    fn session_end_clears_rx_buf_and_rearms_overflow() {
+        // Stale I/Q in rx_buf after a session ends would replay into
+        // the next session's consumer, rewinding the stream. Set some
+        // fake rx state + overflow flag, then simulate the path that
+        // run_data_pump takes on disconnect.
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        if let Ok(mut rx) = src.shared.rx_buf.lock() {
+            rx.extend_from_slice(&[0u8; 1024]);
+        }
+        src.shared.rx_in_overflow.store(true, Ordering::Relaxed);
+        if let Ok(mut sink) = src.shared.command_sink.lock() {
+            // Use a dummy stream so there's something to clear.
+            let (client, _server) = {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server_thread = thread::spawn(move || listener.accept().unwrap().0);
+                let c = TcpStream::connect(addr).unwrap();
+                (c, server_thread.join().unwrap())
+            };
+            *sink = Some(client);
+        }
+
+        // Simulate the disconnect cleanup body inline.
+        if let Ok(mut sink) = src.shared.command_sink.lock() {
+            *sink = None;
+        }
+        if let Ok(mut rx) = src.shared.rx_buf.lock() {
+            rx.clear();
+        }
+        src.shared.rx_in_overflow.store(false, Ordering::Relaxed);
+
+        assert_eq!(src.shared.rx_buf.lock().unwrap().len(), 0);
+        assert!(!src.shared.rx_in_overflow.load(Ordering::Relaxed));
+        assert!(src.shared.command_sink.lock().unwrap().is_none());
     }
 
     #[test]

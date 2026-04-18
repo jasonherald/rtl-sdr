@@ -354,20 +354,16 @@ fn spawn_accept_thread(
     buffer_capacity: usize,
     initial_state: InitialDeviceState,
 ) -> std::io::Result<JoinHandle<()>> {
+    // Poll-accept cadence means the listener must be nonblocking.
+    // Configure it BEFORE spawning so failures surface through
+    // `Server::start`'s `?` rather than getting buried inside the
+    // spawned thread body — burying it would return `Ok` to the caller
+    // and the accept thread would die without ever setting `stopped`,
+    // leaving callers polling `has_stopped()` stuck forever.
+    listener.set_nonblocking(true)?;
     thread::Builder::new()
         .name("rtl_tcp-accept".into())
         .spawn(move || {
-            // Poll-accept with a short timeout so we notice shutdown within
-            // a second. std's TcpListener doesn't have set_read_timeout for
-            // the listen fd itself, so we use set_nonblocking + sleep.
-            if let Err(e) = listener.set_nonblocking(true) {
-                tracing::error!(
-                    %e,
-                    "failed to set accept listener nonblocking, accept thread exiting"
-                );
-                return;
-            }
-
             // Session slot: set to true while a client is being served.
             // Kept in an Arc so the session thread can clear it on exit.
             // Using `swap(true, ...)` to claim the slot atomically — if
