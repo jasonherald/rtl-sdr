@@ -195,7 +195,13 @@ struct VfoOverlayView: View {
         }
 
         switch dragKind {
-        case .idle, .retune:
+        case .idle:
+            // Unreachable in practice — `classify(...)` above
+            // never returns `.idle`. Explicit no-op here so a
+            // future classifier change defaults to "do nothing"
+            // rather than silently retuning on an unknown drag.
+            return
+        case .retune:
             retuneAt(x: currentX, width: width, span: span)
         case .resizeLeft:
             resize(edge: .left, currentX: currentX, width: width, span: span)
@@ -286,7 +292,21 @@ struct VfoOverlayView: View {
         }
 
         let newBandwidth = max(Self.minBandwidthHz, min(Self.maxBandwidthHz, newRight - newLeft))
-        let newCenter = (newLeft + newRight) / 2
+        // Derive center from the PINNED edge + the clamped
+        // bandwidth. Using `(newLeft + newRight) / 2` directly
+        // would let the center drift past the pinned edge when
+        // the user drags into the min/max-bandwidth clamp — the
+        // VFO would slide sideways even though the visible
+        // bandwidth stopped changing. Per #320 review.
+        let newCenter: Double
+        switch edge {
+        case .left:
+            // Right edge pinned; derive center from it.
+            newCenter = rightAtStart - newBandwidth / 2
+        case .right:
+            // Left edge pinned; derive center from it.
+            newCenter = leftAtStart + newBandwidth / 2
+        }
 
         // Only push to the engine when the values actually
         // changed — avoids a flood of identical commands on

@@ -179,6 +179,16 @@ private struct ScrollWheelZoomCatcher: NSViewRepresentable {
                 let locInView = self.convert(event.locationInWindow, from: nil)
                 guard self.bounds.contains(locInView) else { return event }
 
+                // Skip trackpad momentum tails. A flick-scroll
+                // delivers dozens of momentum events after the
+                // fingers leave the pad; zooming on each one
+                // rockets past the user's intent. Keep only
+                // discrete wheel clicks and active-touch scrolls
+                // — `.momentumPhase == []` covers both.
+                if !event.momentumPhase.isEmpty {
+                    return event
+                }
+
                 let fracX = self.bounds.width > 0
                     ? locInView.x / self.bounds.width
                     : 0.5

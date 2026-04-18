@@ -296,6 +296,7 @@ final class CoreModel {
         case .gainList(let gains):
             availableGains = gains
         case .displayBandwidth(let hz):
+            let oldBandwidth = displayBandwidthHz
             // Engine-reported raw (pre-decimation) sample rate
             // — the full FFT span, distinct from the post-
             // decimation `effectiveSampleRateHz` published by
@@ -306,6 +307,17 @@ final class CoreModel {
             // while `SampleRateChanged` only updates the status
             // bar.
             displayBandwidthHz = hz
+            // Keep zoom state consistent with the new full-span
+            // value. Without this, a tuner/source switch that
+            // shrinks the reported bandwidth leaves
+            // `displayedCenterOffsetHz` pointing outside the new
+            // range; `SpectrumRenderer.applyZoomWindow` then
+            // clamps both fractions to the same edge, collapsing
+            // the view to a sliver until the user manually
+            // resets zoom. Per #320 review.
+            if oldBandwidth != hz {
+                normalizeZoomState()
+            }
         case .error(let msg):
             lastError = msg
         @unknown default:
@@ -430,7 +442,12 @@ final class CoreModel {
     /// Matches the GTK behaviour in
     /// `crates/sdr-ui/src/spectrum/vfo_overlay.rs::zoom`.
     func zoomView(by factor: Double, around focalOffsetHz: Double) {
-        guard displayBandwidthHz > 0, factor > 0, factor.isFinite else { return }
+        // Reject non-finite inputs before they propagate into
+        // `displayedCenterOffsetHz` and later into grid math /
+        // renderer uniforms. Per #320 review.
+        guard displayBandwidthHz > 0,
+              factor > 0, factor.isFinite,
+              focalOffsetHz.isFinite else { return }
         let oldSpan = effectiveDisplayedSpanHz
         let rawSpan = oldSpan / factor
         let newSpan = max(Self.minDisplayedSpanHz, min(displayBandwidthHz, rawSpan))
@@ -460,6 +477,40 @@ final class CoreModel {
     func resetZoom() {
         displayedSpanHz = 0
         displayedCenterOffsetHz = 0
+    }
+
+    /// Clamp the stored zoom state into the current
+    /// `displayBandwidthHz` range. Called when the engine
+    /// reports a new full-span value so a shrinking bandwidth
+    /// doesn't leave the viewport pointing outside anything.
+    ///
+    /// Safe to call at any time — a no-op when span / center
+    /// are already inside bounds.
+    private func normalizeZoomState() {
+        guard displayBandwidthHz > 0 else {
+            // Can't normalize against a bogus bandwidth — punt
+            // until a sane value arrives.
+            return
+        }
+        // Span: 0 means "full span", no clamp needed.
+        // Anything >= displayBandwidthHz collapses back to full.
+        if displayedSpanHz > displayBandwidthHz {
+            displayedSpanHz = 0
+        }
+        // Center: keep the viewport inside the FFT range. Use
+        // the resolved effective span for the bounds so a
+        // fully-zoomed-out viewport (span == 0) collapses to
+        // center == 0 cleanly.
+        let effSpan = effectiveDisplayedSpanHz
+        let halfBw = displayBandwidthHz / 2
+        let halfSpan = effSpan / 2
+        let minCenter = -halfBw + halfSpan
+        let maxCenter = halfBw - halfSpan
+        if minCenter <= maxCenter {
+            displayedCenterOffsetHz = max(minCenter, min(maxCenter, displayedCenterOffsetHz))
+        } else {
+            displayedCenterOffsetHz = 0
+        }
     }
 
     func setDemodMode(_ m: DemodMode) {

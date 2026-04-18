@@ -68,14 +68,34 @@ enum FrequencyAxis {
         // Find smallest step that yields strictly fewer than
         // `maxLines` entries. Strict `<` matches Linux; the line
         // count is `floor(span/step) + 1` worst-case.
+        //
+        // Fallback `span * 2`: if no candidate fits (very
+        // narrow span with high `maxLines`, or `maxLines == 1`),
+        // the step exceeds the span so `first` lands past
+        // `endHz` and the loop emits zero lines. That's
+        // deliberate — better to show no grid than a crowded
+        // one on pathological inputs.
         let step = stepCandidates.first(where: { (span / $0) < Double(maxLines) })
             ?? span * 2
         let first = (startHz / step).rounded(.up) * step
+
+        // Index-based iteration avoids floating-point drift
+        // accumulating across many `freq += step` additions.
+        // Matters at high line counts + sub-Hz precision; for
+        // the ≤20 lines we typically ask for it's overkill but
+        // the same cost. Per #320 review.
+        let remaining = endHz - first
+        guard remaining >= 0, step > 0 else { return [] }
+        let count = Int(floor(remaining / step)) + 1
         var lines: [(Double, String)] = []
-        var freq = first
-        while freq <= endHz {
+        lines.reserveCapacity(count)
+        for i in 0..<count {
+            let freq = first + Double(i) * step
+            // Defensive `<= endHz` guard — floor + step math is
+            // exact for power-of-ten steps but protect against
+            // any weird edge case.
+            if freq > endHz { break }
             lines.append((freq, formatFrequency(freq)))
-            freq += step
         }
         return lines
     }
