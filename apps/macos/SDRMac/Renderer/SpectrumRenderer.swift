@@ -57,6 +57,13 @@ struct RendererUniforms {
     var binCount: UInt32 = 2048
     var historyRows: UInt32 = 1024
     var writeRow: UInt32 = 0
+    // Display zoom window as fractions of the full FFT span.
+    // `(0, 1)` = no zoom; narrower pair = zoomed in. The shader
+    // uses these to remap bin-index → clip-space (spectrum) and
+    // viewport-uv → texture-uv (waterfall). Drives #306's
+    // scroll / pinch zoom.
+    var displayLeftFrac: Float = 0
+    var displayRightFrac: Float = 1
     var _pad0: UInt32 = 0
 }
 
@@ -296,6 +303,33 @@ final class SpectrumRenderer {
     func applyBindings(minDb: Float, maxDb: Float) {
         if minDb.isFinite { uniforms.minDb = minDb }
         if maxDb.isFinite { uniforms.maxDb = max(minDb + 1.0, maxDb) }
+    }
+
+    /// Update the zoom window. `displayedCenterOffsetHz` is the
+    /// viewport center in offset-from-tuner Hz; `displayedSpanHz`
+    /// is the visible span; `displayBandwidthHz` is the full FFT
+    /// span. Converts to the `(left_frac, right_frac)` pair the
+    /// shader consumes.
+    func applyZoomWindow(
+        displayedCenterOffsetHz: Double,
+        displayedSpanHz: Double,
+        displayBandwidthHz: Double
+    ) {
+        guard displayBandwidthHz > 0 else {
+            uniforms.displayLeftFrac = 0
+            uniforms.displayRightFrac = 1
+            return
+        }
+        // FFT range is centered at 0 offset, spans ±bw/2.
+        let halfBw = displayBandwidthHz / 2
+        let halfSpan = displayedSpanHz / 2
+        let leftHz = displayedCenterOffsetHz - halfSpan
+        let rightHz = displayedCenterOffsetHz + halfSpan
+        // Convert to fraction of full FFT range.
+        let leftFrac = (leftHz + halfBw) / displayBandwidthHz
+        let rightFrac = (rightHz + halfBw) / displayBandwidthHz
+        uniforms.displayLeftFrac = Float(max(0, min(1, leftFrac)))
+        uniforms.displayRightFrac = Float(max(0, min(1, rightFrac)))
     }
 
     // ----------------------------------------------------------
@@ -549,7 +583,12 @@ final class SpectrumRenderer {
             mipmapped: false
         )
         desc.storageMode = .private
-        desc.usage = [.shaderRead]
+        // `.renderTarget` in addition to `.shaderRead` so we can
+        // one-shot clear the texture to the floor value via a
+        // render-pass `loadAction = .clear`. The render path
+        // writes every texel in a single encoder — no per-row
+        // blit loop, no staging buffer. See `fillHistoryToFloor`.
+        desc.usage = [.shaderRead, .renderTarget]
         guard let tex = device.makeTexture(descriptor: desc) else {
             return nil
         }
@@ -569,43 +608,34 @@ final class SpectrumRenderer {
         return tex
     }
 
-    /// One-shot blit-fill of the whole history texture to the
-    /// floor dB value. Called at texture creation; not part of
-    /// the per-frame hot path.
+    /// One-shot clear of the whole history texture to the floor
+    /// dB value. Issues a single render pass with `loadAction =
+    /// .clear` — Metal writes every texel via the GPU's fast
+    /// clear hardware path, no extra encoder / staging buffer /
+    /// blit-loop required. Called at texture creation; not part
+    /// of the per-frame hot path.
+    ///
+    /// Uses `MTLClearColor.red` as the r32Float write value —
+    /// for a single-channel r32Float target, only `.red` is
+    /// consumed. The other components are ignored by the
+    /// hardware but must be present in the struct.
     private func fillHistoryToFloor(_ texture: MTLTexture) {
-        let width = texture.width
-        let rowFloats = width
-        let rowBytes = rowFloats * MemoryLayout<Float>.stride
-        guard let clearBuf = device.makeBuffer(
-            length: rowBytes,
-            options: .storageModeShared
-        ) else {
-            return
-        }
-        let ptr = clearBuf.contents().bindMemory(to: Float.self, capacity: rowFloats)
-        for i in 0..<rowFloats {
-            ptr[i] = Self.floorDb
-        }
+        let passDesc = MTLRenderPassDescriptor()
+        passDesc.colorAttachments[0].texture = texture
+        passDesc.colorAttachments[0].loadAction = .clear
+        passDesc.colorAttachments[0].storeAction = .store
+        passDesc.colorAttachments[0].clearColor = MTLClearColor(
+            red: Double(Self.floorDb),
+            green: 0, blue: 0, alpha: 0
+        )
 
         guard let cmd = commandQueue.makeCommandBuffer(),
-              let blit = cmd.makeBlitCommandEncoder() else {
+              let enc = cmd.makeRenderCommandEncoder(descriptor: passDesc) else {
             return
         }
-        blit.label = "history_floor_init"
-        for row in 0..<texture.height {
-            blit.copy(
-                from: clearBuf,
-                sourceOffset: 0,
-                sourceBytesPerRow: rowBytes,
-                sourceBytesPerImage: rowBytes,
-                sourceSize: MTLSizeMake(width, 1, 1),
-                to: texture,
-                destinationSlice: 0,
-                destinationLevel: 0,
-                destinationOrigin: MTLOriginMake(0, row, 0)
-            )
-        }
-        blit.endEncoding()
+        enc.label = "history_floor_init"
+        // Zero draw calls — the clear happens at loadAction time.
+        enc.endEncoding()
         cmd.commit()
         // Don't wait — the next render-pass command buffer will
         // naturally order after this via Metal's scheduling

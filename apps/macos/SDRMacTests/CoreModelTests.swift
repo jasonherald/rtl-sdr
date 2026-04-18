@@ -12,7 +12,11 @@ final class CoreModelTests: XCTestCase {
         let m = CoreModel()
         XCTAssertFalse(m.isRunning)
         XCTAssertNil(m.lastError)
-        XCTAssertEqual(m.centerFrequencyHz, 100_700_000)
+        // Default center freq aligns with the Rust engine's
+        // `DEFAULT_CENTER_FREQ` (100.000 MHz) so Linux / Mac
+        // both paint the same tuner state at first launch —
+        // see commit 31e7f7f.
+        XCTAssertEqual(m.centerFrequencyHz, 100_000_000)
         XCTAssertEqual(m.demodMode, .wfm)
         XCTAssertEqual(m.fftSize, 2048)
     }

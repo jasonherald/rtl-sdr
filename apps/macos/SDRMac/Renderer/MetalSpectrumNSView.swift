@@ -266,4 +266,20 @@ final class MetalSpectrumNSView: NSView, CAMetalDisplayLinkDelegate {
     func applyBindings(minDb: Float, maxDb: Float) {
         renderer.applyBindings(minDb: minDb, maxDb: maxDb)
     }
+
+    /// Forward the current zoom window to the renderer so the
+    /// Metal shader remaps bin-index / viewport-uv accordingly.
+    /// Called from `updateNSView` whenever CoreModel's zoom
+    /// state changes.
+    func applyZoom(
+        displayedCenterOffsetHz: Double,
+        displayedSpanHz: Double,
+        displayBandwidthHz: Double
+    ) {
+        renderer.applyZoomWindow(
+            displayedCenterOffsetHz: displayedCenterOffsetHz,
+            displayedSpanHz: displayedSpanHz,
+            displayBandwidthHz: displayBandwidthHz
+        )
+    }
 }
