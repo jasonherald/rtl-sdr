@@ -15,12 +15,14 @@ final class SdrCoreTests: XCTestCase {
     //  ABI version / logging / static helpers
     // ==========================================================
 
-    func testAbiVersionMatchesV1() {
+    func testAbiVersionMatchesCurrent() {
         // Lock in that the Swift wrapper parses the packed
-        // version from the C side consistently. v1 is 0.1.
+        // version from the C side consistently. Current: 0.2
+        // (0.2 added device enumeration: sdr_core_device_count +
+        // sdr_core_device_name).
         let v = SdrCore.abiVersion
         XCTAssertEqual(v.major, 0)
-        XCTAssertEqual(v.minor, 1)
+        XCTAssertEqual(v.minor, 2)
     }
 
     func testInitLoggingIsIdempotent() {

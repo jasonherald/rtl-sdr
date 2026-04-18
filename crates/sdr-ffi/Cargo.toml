@@ -31,6 +31,11 @@ sdr-types.workspace = true
 # by a future sdr-core refactor that drops the transitive edge.
 sdr-pipeline.workspace = true
 sdr-radio.workspace = true
+# Direct dep on sdr-rtlsdr for the device-enumeration functions
+# (`sdr_core_device_count` / `sdr_core_device_name` in the C ABI).
+# These are static (no handle required), so they don't fit the
+# engine-dispatch path; they go through `sdr-rtlsdr` directly.
+sdr-rtlsdr.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 libc.workspace = true

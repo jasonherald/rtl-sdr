@@ -28,13 +28,28 @@ header = """
  * means someone edited one without editing the other.
  */
 """
-style = "tag"
+# `style = "both"` emits both the tag and typedef for each
+# struct/enum, matching the hand-written header's idiom:
+#   `typedef struct Foo { ... } Foo;`
+# cbindgen's default `"tag"` emitted `struct Foo*` everywhere and
+# `"type"` emits anonymous `typedef struct {...} Foo;` — neither
+# matches the hand-written style.
+style = "both"
 cpp_compat = true
 sys_includes = ["stdbool.h", "stddef.h", "stdint.h"]
 no_includes = true
-
-[export]
-prefix = "Sdr"
+# Don't wrap function signatures across multiple lines — the
+# hand-written header keeps each prototype on one line, and the
+# drift check diffs line-by-line.
+line_length = 200
+# Map Rust `usize` / `isize` to C `size_t` / `ptrdiff_t` instead of
+# cbindgen's defaults (`uintptr_t` / `intptr_t`). The hand-written
+# header uses `size_t` in public API like `sdr_core_device_name`'s
+# `buf_len`, and `size_t` is the conventional choice for buffer
+# lengths in C APIs. `uintptr_t` and `size_t` happen to be the same
+# type on every platform we target, but spelling them consistently
+# keeps the drift check meaningful.
+usize_is_size_t = true
 
 [parse]
 parse_deps = false

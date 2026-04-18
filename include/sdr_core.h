@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 1
+#define SDR_CORE_ABI_VERSION_MINOR 2
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -99,6 +99,54 @@ typedef enum SdrCoreError {
  * the event callback. Does not produce its own errors.
  */
 const char* sdr_core_last_error_message(void);
+
+/* ================================================================ */
+/*  Device enumeration                                              */
+/* ================================================================ */
+
+/*
+ * Count RTL-SDR devices currently attached to the host's USB bus.
+ *
+ * Does NOT open any device, does NOT require an `SdrCore` handle,
+ * and does NOT issue USB control transfers — under the hood this
+ * enumerates libusb's device list and matches by VID/PID.
+ *
+ * Safe to call at any time, on any thread, as often as the host
+ * wants. A host that surfaces device presence in its UI should
+ * call this at launch and again on USB hotplug events (on macOS,
+ * hotplug comes via `NSWorkspace` / IOKit notifications; this API
+ * does not push — it's query-on-demand).
+ *
+ * Returns the number of devices found (0 if none).
+ */
+uint32_t sdr_core_device_count(void);
+
+/*
+ * Fill `out_buf` with the human-readable name of the RTL-SDR
+ * device at `index` (UTF-8, NUL-terminated). `buf_len` is the
+ * total capacity of `out_buf` in bytes, INCLUDING the NUL.
+ *
+ * Returns the number of bytes written (not counting the NUL) on
+ * success, or one of:
+ *   - `SDR_CORE_ERR_INVALID_ARG`  if `out_buf` is NULL or
+ *                                 `buf_len` is 0.
+ *   - `SDR_CORE_ERR_DEVICE`       if `index` is out of range or
+ *                                 the device name couldn't be
+ *                                 probed.
+ *
+ * A 128-byte buffer is comfortably enough for every RTL-SDR
+ * device name known (typically ~30 chars). If `buf_len` is too
+ * small the written string is truncated and NUL-terminated at
+ * `buf_len - 1`; no error is returned for truncation.
+ *
+ * Safe to call at any time, on any thread. Does NOT require an
+ * `SdrCore` handle.
+ */
+int32_t sdr_core_device_name(
+    uint32_t index,
+    char*    out_buf,
+    size_t   buf_len
+);
 
 /* ================================================================ */
 /*  Lifecycle                                                       */

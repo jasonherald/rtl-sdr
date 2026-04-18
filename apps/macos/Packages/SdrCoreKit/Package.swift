@@ -101,21 +101,31 @@ let package = Package(
                 //   - `swift build`          → cargo debug
                 //   - `swift build -c release` → cargo release
                 //
-                // Without these `.when(configuration:)` gates,
-                // both search paths would be active regardless of
-                // build mode and the linker would pick whichever
-                // lib it saw first — a release Swift build could
-                // silently link an unoptimised Rust lib (the
-                // bug that surfaced as ~45% RTL-SDR throughput
-                // during M5 sub-PR 2 testing on macOS; it was a
-                // debug-build CPU cost masquerading as USB slowness).
-                .unsafeFlags(
-                    ["-L", "\(workspaceTarget)/debug"],
-                    .when(configuration: .debug)
-                ),
+                // **Order matters** when the build host is Xcode
+                // — Xcode's SwiftPM integration emits BOTH
+                // `.when(configuration:)` branches to the linker
+                // regardless of the active config (tested on
+                // Xcode 26.4). The linker picks the first match,
+                // so we list release FIRST. That way an Xcode
+                // release build always picks up
+                // `target/release/libsdr_ffi.a` (what we want for
+                // live RTL-SDR streaming — debug Rust can't keep
+                // up on any build host), and an Xcode debug build
+                // also picks release Rust (fine — Rust debug
+                // info isn't what anyone debugs here; debug
+                // Swift host is what matters for UI iteration).
+                //
+                // Standalone `swift test` run from inside
+                // `Packages/SdrCoreKit/` still honours `.when`
+                // correctly — only the appropriate path is
+                // emitted for that config.
                 .unsafeFlags(
                     ["-L", "\(workspaceTarget)/release"],
                     .when(configuration: .release)
+                ),
+                .unsafeFlags(
+                    ["-L", "\(workspaceTarget)/debug"],
+                    .when(configuration: .debug)
                 ),
                 // Link the static archive.
                 .linkedLibrary("sdr_ffi"),

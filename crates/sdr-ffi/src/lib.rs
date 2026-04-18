@@ -42,6 +42,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod command;
+pub mod enumerate;
 pub mod error;
 pub mod event;
 pub mod fft;
@@ -59,6 +60,7 @@ pub use command::{
     sdr_core_set_squelch_db, sdr_core_set_squelch_enabled, sdr_core_set_vfo_offset,
     sdr_core_set_volume, sdr_core_start, sdr_core_stop, sdr_core_tune,
 };
+pub use enumerate::{sdr_core_device_count, sdr_core_device_name};
 pub use error::sdr_core_last_error_message;
 pub use event::{
     SdrEvent, SdrEventCallback, SdrEventDeviceInfo, SdrEventError, SdrEventGainList,

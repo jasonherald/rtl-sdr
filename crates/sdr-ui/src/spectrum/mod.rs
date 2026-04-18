@@ -13,21 +13,6 @@ pub mod waterfall;
 
 use std::cell::{Cell, RefCell};
 
-/// In-place FFT shift: swap the first and second halves of a buffer
-/// so that DC (bin 0) moves to the center position. Used on the display
-/// side rather than the DSP pipeline to correctly handle the R820T
-/// tuner's hardware spectrum inversion.
-fn fftshift_in_place(buf: &mut [f32]) {
-    let n = buf.len();
-    if n < 2 {
-        return;
-    }
-    let mid = n / 2;
-    // Swap first half with second half in-place.
-    for i in 0..mid {
-        buf.swap(i, i + mid);
-    }
-}
 use std::rc::Rc;
 
 use gtk4::glib;
@@ -111,8 +96,6 @@ pub struct SpectrumHandle {
     fill_enabled: Rc<Cell<bool>>,
     averaging_mode: Rc<Cell<AveragingMode>>,
     avg_buffer: Rc<RefCell<Vec<f32>>>,
-    /// Pre-allocated buffer for fftshift of waterfall data (avoids per-frame alloc).
-    shift_buffer: Rc<RefCell<Vec<f32>>>,
     cursor_callback: CursorCallback,
     /// Callback invoked when the VFO offset changes from user interaction
     /// (click-to-tune or drag). Used by `window.rs` to update the frequency
@@ -172,28 +155,28 @@ impl SpectrumHandle {
                 }
             }
 
-            // Display-side fftshift: rotate bins so DC (bin 0) moves to center.
-            // Done here rather than in the DSP pipeline because the R820T's
-            // spectrum inversion makes pipeline-side fftshift show the signal
-            // on the wrong side. Rotating the display data is equivalent.
-            fftshift_in_place(&mut s.current_data);
+            // NOTE: no display-side fftshift here. The DSP pipeline
+            // (`crates/sdr-pipeline/src/iq_frontend.rs::compute_fft`)
+            // now shifts the FFT output before publishing so both
+            // GTK and the macOS Metal renderer see the natural
+            // ordering [-Nyquist … DC … +Nyquist]. A display-side
+            // shift on top of that double-shifts the buffer and
+            // splits signals to both edges.
         }
         self.fft_area.queue_draw();
 
-        // Push a new line to the waterfall (also needs fftshift).
-        // Auto-resize the waterfall when the FFT size changes —
-        // driven by the first matching-size frame rather than synchronously
-        // from the UI, avoiding races with queued old-size frames.
+        // Push a new line to the waterfall. Auto-resize the
+        // waterfall when the FFT size changes — driven by the
+        // first matching-size frame rather than synchronously from
+        // the UI, avoiding races with queued old-size frames. No
+        // display-side fftshift (see note above on the FFT plot
+        // branch).
         if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
             let target_width = waterfall::supported_texture_width_for(data.len());
             if target_width != s.renderer.texture_width() {
                 s.renderer.resize(data.len());
             }
-            let mut shifted = self.shift_buffer.borrow_mut();
-            shifted.resize(data.len(), 0.0);
-            shifted.copy_from_slice(data);
-            fftshift_in_place(&mut shifted);
-            s.renderer.push_line(&shifted);
+            s.renderer.push_line(data);
         }
         self.waterfall_area.queue_draw();
     }
@@ -419,7 +402,6 @@ pub fn build_spectrum_view(
         fill_enabled,
         averaging_mode: Rc::new(Cell::new(AveragingMode::default())),
         avg_buffer: Rc::new(RefCell::new(Vec::new())),
-        shift_buffer: Rc::new(RefCell::new(Vec::new())),
         cursor_callback,
         vfo_offset_callback,
         full_bandwidth,
