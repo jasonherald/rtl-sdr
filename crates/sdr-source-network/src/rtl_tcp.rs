@@ -90,6 +90,11 @@ const RX_BUFFER_SOFT_CAP_BYTES: usize = 4 * 1024 * 1024;
 /// `connect_timeout` window.
 const CONNECT_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
+/// Chunk size for both the warm-capacity hint on `rx_buf` and the
+/// stack buffer the data pump reads into. Keeps the read-chunk and
+/// initial-allocation policy in one place so they can't drift.
+const RECV_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Metadata parsed from the server's `dongle_info_t` header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunerInfo {
@@ -119,9 +124,14 @@ pub enum ConnectionState {
     Connecting,
     /// Handshake complete, handler streaming I/Q.
     Connected { tuner: TunerInfo },
-    /// Connection dropped, backoff pending.
+    /// Connection dropped, backoff pending. Transport-level errors
+    /// (TCP connect refused, EOF, stall) stay in this state — the
+    /// manager retries forever with exponential backoff up to the
+    /// 30 s cap.
     Retrying { attempt: u32, next_at: Instant },
-    /// Terminal failure after max attempts, or protocol error.
+    /// Terminal failure — only entered for a protocol-level error
+    /// (e.g., server sent a non-RTL0 header). Transport failures
+    /// never reach this state; they remain in `Retrying`.
     Failed { reason: String },
 }
 
@@ -246,7 +256,7 @@ impl SharedState {
             shutdown: AtomicBool::new(false),
             state: Mutex::new(ConnectionState::Disconnected),
             tuner: Mutex::new(None),
-            rx_buf: Mutex::new(Vec::with_capacity(64 * 1024)),
+            rx_buf: Mutex::new(Vec::with_capacity(RECV_CHUNK_BYTES)),
             command_sink: Mutex::new(None),
             last_center_freq_hz: AtomicU32::new(0),
             last_sample_rate_hz: AtomicU32::new(0),
@@ -657,8 +667,16 @@ fn attempt_connect(
     }
     set_state(shared, ConnectionState::Connected { tuner });
 
-    // Publish a clone of the stream for the command sender.
+    // Publish a clone of the stream for the command sender. Install a
+    // write timeout on the clone so `send_command`'s blocking
+    // `write_all` can't hang indefinitely if a zero-window peer
+    // saturates our kernel send buffer — tune/gain changes must stay
+    // responsive. Socket options propagate across `try_clone` on the
+    // same underlying fd, so this applies to every subsequent write.
     let sink = stream.try_clone().map_err(SourceError::Io)?;
+    if let Err(e) = sink.set_write_timeout(Some(config.data_read_timeout)) {
+        tracing::warn!(%e, "set_write_timeout on command sink failed — command sends may block");
+    }
     if let Ok(mut slot) = shared.command_sink.lock() {
         *slot = Some(sink);
     }
@@ -736,7 +754,7 @@ fn connect_cancellable(
 }
 
 fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlTcpConfig) {
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; RECV_CHUNK_BYTES];
     let mut consecutive_timeouts: u32 = 0;
     while !shared.shutdown.load(Ordering::Relaxed) {
         match stream.read(&mut buf) {

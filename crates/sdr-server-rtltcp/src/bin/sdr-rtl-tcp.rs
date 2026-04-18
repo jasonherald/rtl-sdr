@@ -114,12 +114,19 @@ fn main() -> ExitCode {
             }
             // Poll the shutdown flag instead of using an mpsc channel,
             // because the signal handler can only safely touch an atomic.
-            // 100 ms poll is well below any user-perceptible shutdown lag
-            // and costs nothing while idle.
-            while !CTRL_C_RECEIVED.load(Ordering::SeqCst) {
+            // Also poll `server.has_stopped()` so the CLI exits when the
+            // accept thread exits on its own (e.g., dongle unplug);
+            // otherwise the process would sleep forever after serving
+            // stopped. 100 ms poll is well below any user-perceptible
+            // shutdown lag and costs nothing while idle.
+            while !CTRL_C_RECEIVED.load(Ordering::SeqCst) && !server.has_stopped() {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            tracing::info!("shutting down");
+            if server.has_stopped() {
+                tracing::info!("rtl_tcp server stopped serving — exiting");
+            } else {
+                tracing::info!("shutting down");
+            }
             drop(server);
             ExitCode::SUCCESS
         }
@@ -183,34 +190,34 @@ fn ctrlc_handler() -> std::io::Result<()> {
 #[derive(Debug)]
 struct ParseError;
 
-fn parse_args(args: &[String]) -> Result<ServerConfig, ParseError> {
+fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<ServerConfig, ParseError> {
     let mut config = ServerConfig::default_loopback();
     config.initial.sample_rate_hz = DEFAULT_SAMPLE_RATE_HZ;
 
     let mut i = 0;
     while i < args.len() {
-        let arg = args[i].as_str();
+        let arg = args[i].as_ref();
         match arg {
             "-h" | "--help" => return Err(ParseError),
             "-a" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 let ip = IpAddr::from_str(v).map_err(|_| ParseError)?;
                 config.bind.set_ip(ip);
                 i += 2;
             }
             "-p" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 let port: u16 = v.parse().map_err(|_| ParseError)?;
                 config.bind.set_port(port);
                 i += 2;
             }
             "-f" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 config.initial.center_freq_hz = parse_hz(v)?;
                 i += 2;
             }
             "-g" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 // Upstream: `gain = (int)(atof(optarg) * 10)`. Value 0
                 // means automatic gain mode; anything else is tenths-of-dB.
                 //
@@ -235,7 +242,7 @@ fn parse_args(args: &[String]) -> Result<ServerConfig, ParseError> {
                 i += 2;
             }
             "-s" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 let sample_rate_hz = parse_hz(v)?;
                 // Reject 0 up front: `parse_hz` accepts it as a valid
                 // non-negative u32, but a zero sample rate wedges the
@@ -248,17 +255,17 @@ fn parse_args(args: &[String]) -> Result<ServerConfig, ParseError> {
                 i += 2;
             }
             "-d" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 config.device_index = v.parse().map_err(|_| ParseError)?;
                 i += 2;
             }
             "-P" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 config.initial.ppm = v.parse().map_err(|_| ParseError)?;
                 i += 2;
             }
             "-n" => {
-                let v = args.get(i + 1).ok_or(ParseError)?;
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
                 config.buffer_capacity = v.parse().map_err(|_| ParseError)?;
                 i += 2;
             }
@@ -337,7 +344,7 @@ mod tests {
 
     #[test]
     fn parse_defaults_are_loopback_and_upstream_port() {
-        let cfg = parse_args(&[]).unwrap();
+        let cfg = parse_args::<&str>(&[]).unwrap();
         assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
         assert_eq!(cfg.bind.port(), DEFAULT_PORT);
     }

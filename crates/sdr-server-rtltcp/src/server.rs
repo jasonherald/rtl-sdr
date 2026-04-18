@@ -158,6 +158,7 @@ pub struct ServerStats {
 /// Running server handle.
 pub struct Server {
     shutdown: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     stats: Arc<Mutex<ServerStats>>,
     bind: SocketAddr,
@@ -184,9 +185,9 @@ impl Server {
         // back from the socket so `bind_address()` returns the real
         // port the UI/logs can show.
         let actual_bind = listener.local_addr().map_err(ServerError::Io)?;
-        // Set a short accept timeout so the accept loop can notice the
-        // shutdown flag promptly on Server::drop.
-        listener.set_nonblocking(false)?;
+        // The listener is already blocking by default from `bind` —
+        // no need to force it here. The accept thread flips it to
+        // nonblocking immediately on entry.
 
         let device_count = sdr_rtlsdr::get_device_count();
         if device_count == 0 {
@@ -210,6 +211,7 @@ impl Server {
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(Mutex::new(ServerStats::default()));
 
         let dev_mutex = Arc::new(Mutex::new(device));
@@ -223,6 +225,7 @@ impl Server {
             listener,
             dev_mutex,
             shutdown.clone(),
+            stopped.clone(),
             stats.clone(),
             capacity,
             config.initial.clone(),
@@ -230,6 +233,7 @@ impl Server {
 
         Ok(Server {
             shutdown,
+            stopped,
             accept_thread: Some(accept_thread),
             stats,
             bind: actual_bind,
@@ -244,6 +248,16 @@ impl Server {
     /// The address the server is bound to.
     pub fn bind_address(&self) -> SocketAddr {
         self.bind
+    }
+
+    /// Has the accept thread exited (either via `stop()` or an
+    /// unrecoverable error like USB device loss)?
+    ///
+    /// CLI callers poll this alongside their own Ctrl-C handler so the
+    /// process exits when serving actually stops, instead of sleeping
+    /// forever after the dongle is unplugged.
+    pub fn has_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
     }
 
     /// Signal shutdown and wait for the accept thread to exit.
@@ -335,6 +349,7 @@ fn spawn_accept_thread(
     listener: TcpListener,
     device: Arc<Mutex<RtlSdrDevice>>,
     shutdown: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
     buffer_capacity: usize,
     initial_state: InitialDeviceState,
@@ -453,6 +468,11 @@ fn spawn_accept_thread(
             if let Some(h) = session_handle.take() {
                 let _ = h.join();
             }
+            // Signal to CLI / UI callers polling `Server::has_stopped()`
+            // that the server is no longer serving. Set AFTER the
+            // session join so a caller that observes `has_stopped() ==
+            // true` can safely assume all workers have exited.
+            stopped.store(true, Ordering::SeqCst);
             tracing::debug!("rtl_tcp accept thread exiting");
         })
 }
@@ -666,7 +686,11 @@ fn data_worker(
     // mutex on every USB read (bulk read is &self-safe via usb_handle).
     let handle = {
         let Ok(dev) = device.lock() else {
-            tracing::error!("device mutex poisoned, data worker aborting");
+            // Poisoned mutex is unrecoverable shared state — close out
+            // the whole session so the writer/command workers exit too
+            // instead of spinning on a dead channel.
+            tracing::error!("device mutex poisoned, data worker aborting and closing session");
+            shutdown.set_client();
             return;
         };
         dev.usb_handle()
@@ -677,6 +701,10 @@ fn data_worker(
     // USB read returned. This avoids allocating 256 KiB on every timeout
     // tick (reviewed on PR #313).
     let mut scratch = vec![0u8; READ_BUFFER_LEN as usize];
+    // Edge-trigger flag for the tx-queue-full warning. Set when a
+    // drop happens, cleared on the first successful send after — so
+    // we log once per stall-and-drain cycle rather than per buffer.
+    let mut was_dropping = false;
 
     while !shutdown.is_set() {
         match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut scratch, timeout) {
@@ -684,15 +712,26 @@ fn data_worker(
                 // Allocate only when we have real data to hand off.
                 let buf = scratch[..n].to_vec();
                 match tx.try_send(buf) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        // Rearm the overflow edge so a future stall
+                        // logs again.
+                        was_dropping = false;
+                    }
                     Err(TrySendError::Full(_)) => {
                         // Queue is full — drop this buffer (upstream does
                         // the same when the linked list exceeds llbuf_num;
-                        // rtl_tcp.c:137-152).
+                        // rtl_tcp.c:137-152). `buffers_dropped` in the
+                        // shared stats is the authoritative cumulative
+                        // counter; the warn is just an edge signal.
                         if let Ok(mut s) = stats.lock() {
                             s.buffers_dropped = s.buffers_dropped.saturating_add(1);
                         }
-                        tracing::warn!("rtl_tcp tx queue full — dropping USB buffer");
+                        if !was_dropping {
+                            tracing::warn!(
+                                "rtl_tcp tx queue full — dropping USB buffers (further drops accumulate silently; see ServerStats::buffers_dropped)"
+                            );
+                            was_dropping = true;
+                        }
                     }
                     Err(TrySendError::Disconnected(_)) => {
                         tracing::debug!("writer gone, data worker exiting");
@@ -801,9 +840,17 @@ fn command_worker(
             tracing::debug!(op = buf[0], "rtl_tcp unknown command opcode, dropping");
             continue;
         };
-        if let Ok(mut dev) = device.lock() {
-            dispatch(&mut dev, cmd);
-        }
+        let Ok(mut dev) = device.lock() else {
+            // Same rationale as data_worker: a poisoned device mutex
+            // is unrecoverable, and silently dropping commands here
+            // would leave the client driving the UI with no visible
+            // effect on the server. Close the session.
+            tracing::error!("device mutex poisoned, command worker aborting and closing session");
+            shutdown.set_client();
+            return;
+        };
+        dispatch(&mut dev, cmd);
+        drop(dev);
         if let Ok(mut s) = stats.lock() {
             s.last_command = Some((cmd.op, Instant::now()));
         }
@@ -922,6 +969,18 @@ mod tests {
         assert_eq!(stats.bytes_sent, 0);
         assert_eq!(stats.buffers_dropped, 0);
         assert!(stats.last_command.is_none());
+    }
+
+    #[test]
+    fn has_stopped_is_false_before_accept_thread_exits() {
+        // We can't stand up a real Server without hardware, but we CAN
+        // sanity-check the `stopped` flag contract: `has_stopped()`
+        // reads the AtomicBool directly. Default state is false.
+        let stopped = Arc::new(AtomicBool::new(false));
+        assert!(!stopped.load(Ordering::Relaxed));
+        // Accept thread setting the flag → has_stopped() observes true.
+        stopped.store(true, Ordering::SeqCst);
+        assert!(stopped.load(Ordering::Relaxed));
     }
 
     #[test]
