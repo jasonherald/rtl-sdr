@@ -423,8 +423,13 @@ mac-test:
 		echo "mac-test: $(XCODEBUILD) not found — install Xcode"; \
 		exit 1; \
 	fi
-	@echo "==> cargo build --workspace"
-	@$(CARGO) build --workspace
+	@# Build release so the Rust artifact at target/release/libsdr_ffi.a
+	@# exists before xcodebuild links. SdrCoreKit's Package.swift lists
+	@# the release path first (see its linkerSettings comment); without
+	@# --release here, xcodebuild test fails with a missing-file link
+	@# error on a clean checkout.
+	@echo "==> cargo build --workspace --release"
+	@$(CARGO) build --workspace --release
 	@echo "==> xcodebuild test"
 	@$(XCODEBUILD) -project $(SDR_MAC_PROJ) -scheme SDRMac \
 		-destination 'platform=macOS' \

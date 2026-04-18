@@ -67,7 +67,10 @@ extract_names() {
     # Match lines like "returntype sdr_core_foo(", extracting
     # "sdr_core_foo". grep -o prints only the matched text per
     # occurrence, one per line.
-    grep -oE 'sdr_core_[a-z_]+\(' "$file" \
+    # `[a-z0-9_]+` matches digit-containing names too (e.g. a
+    # future `sdr_core_v2_foo`). No case-insensitivity needed —
+    # the project's convention is snake_case.
+    grep -oE 'sdr_core_[a-z0-9_]+\(' "$file" \
         | sed 's/(//' \
         | sort -u
 }

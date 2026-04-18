@@ -427,9 +427,17 @@ impl IqFrontend {
         // without the shift, strong signals around DC appear at
         // both edges of the display with a dead zone in the
         // middle. Classic symptom, hence the shift.
-        let half = self.fft_size / 2;
-        fft_out[..half].copy_from_slice(&self.fft_output[half..self.fft_size]);
-        fft_out[half..self.fft_size].copy_from_slice(&self.fft_output[..half]);
+        // Careful with odd sizes: `half = n / 2` rounds down, so
+        // the upper half has `n - half` elements (one more than
+        // `half` when n is odd). `RustFftEngine::new` doesn't
+        // enforce power-of-2 / even sizes, so defend here rather
+        // than relying on upstream validation. `copy_from_slice`
+        // panics on length mismatch, not a silent mis-shift.
+        let n = self.fft_size;
+        let half = n / 2;
+        let upper_len = n - half;
+        fft_out[..upper_len].copy_from_slice(&self.fft_output[half..n]);
+        fft_out[upper_len..n].copy_from_slice(&self.fft_output[..half]);
 
         Ok(())
     }

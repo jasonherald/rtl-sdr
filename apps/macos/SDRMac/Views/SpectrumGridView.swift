@@ -43,8 +43,15 @@ struct SpectrumGridView: View {
 
     var body: some View {
         Canvas { context, size in
-            drawGrid(context: context, size: size)
-            drawLabels(context: context, size: size)
+            // Compute frequency grid lines once per draw and share
+            // them between the grid-line and label passes — the
+            // positions are identical and the step-size lookup
+            // isn't free. Canvas redraws are cheap, but there's no
+            // reason to do the same work twice.
+            let freqLines = frequencyGridLines(span: model.displayBandwidthHz,
+                                               center: model.centerFrequencyHz)
+            drawGrid(context: context, size: size, freqLines: freqLines)
+            drawLabels(context: context, size: size, freqLines: freqLines)
         }
         .allowsHitTesting(false)
     }
@@ -53,7 +60,7 @@ struct SpectrumGridView: View {
     //  Grid lines (drawn under labels)
     // ----------------------------------------------------------
 
-    private func drawGrid(context: GraphicsContext, size: CGSize) {
+    private func drawGrid(context: GraphicsContext, size: CGSize, freqLines: [(Double, String)]) {
         let w = size.width
         let h = size.height
         let spectrumH = (h * Self.spectrumFraction).rounded()
@@ -70,8 +77,6 @@ struct SpectrumGridView: View {
         context.stroke(dbPath, with: .color(Self.gridColor), lineWidth: 1)
 
         // --- Vertical frequency grid (spans full height)
-        let freqLines = frequencyGridLines(span: model.displayBandwidthHz,
-                                           center: model.centerFrequencyHz)
         guard !freqLines.isEmpty, model.displayBandwidthHz > 0 else { return }
         var freqPath = Path()
         let halfSpan = model.displayBandwidthHz / 2
@@ -89,14 +94,12 @@ struct SpectrumGridView: View {
     //  Labels (drawn on top of grid)
     // ----------------------------------------------------------
 
-    private func drawLabels(context: GraphicsContext, size: CGSize) {
+    private func drawLabels(context: GraphicsContext, size: CGSize, freqLines: [(Double, String)]) {
         let w = size.width
         let h = size.height
         let spectrumH = (h * Self.spectrumFraction).rounded()
 
         // --- Frequency labels at top of spectrum
-        let freqLines = frequencyGridLines(span: model.displayBandwidthHz,
-                                           center: model.centerFrequencyHz)
         if model.displayBandwidthHz > 0 {
             let halfSpan = model.displayBandwidthHz / 2
             let leftHz = model.centerFrequencyHz - halfSpan
