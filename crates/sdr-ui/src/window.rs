@@ -1197,12 +1197,17 @@ fn connect_rtl_tcp_discovery(
                         .css_classes(["flat"])
                         .tooltip_text("Pin as favorite")
                         .build();
-                    let starred_initially = favorites.borrow().contains(&server.instance_name);
+                    // Use the stable hostname+port key, not
+                    // `instance_name`. `instance_name` comes from
+                    // the server's TXT nickname, which the operator
+                    // can edit — keying favorites off it would
+                    // silently drop the star on any rename.
+                    let star_key = favorite_key(&server);
+                    let starred_initially = favorites.borrow().contains(&star_key);
                     star_btn.set_active(starred_initially);
                     if starred_initially {
                         star_btn.set_icon_name(FAVORITE_ICON_FILLED);
                     }
-                    let star_instance = server.instance_name.clone();
                     let star_favorites = Rc::clone(&favorites);
                     let star_config = std::sync::Arc::clone(&config_for_discovery);
                     let star_rows = Rc::clone(&displayed_rows);
@@ -1217,9 +1222,9 @@ fn connect_rtl_tcp_discovery(
                         {
                             let mut favs = star_favorites.borrow_mut();
                             if active {
-                                favs.insert(star_instance.clone());
+                                favs.insert(star_key.clone());
                             } else {
-                                favs.remove(&star_instance);
+                                favs.remove(&star_key);
                             }
                             // Persist immediately. Order within
                             // the persisted list is unspecified —
@@ -1276,16 +1281,23 @@ fn connect_rtl_tcp_discovery(
                         // handler will dispatch SetSourceType for us
                         // and an explicit send would double-open.
                         let already_rtl_tcp = dr.selected() == DEVICE_RTLTCP;
+                        // Force the shared protocol row to TCP
+                        // BEFORE the hostname/port writes below.
+                        // `hr.set_text` and `pr.set_value` fire the
+                        // `connect_changed` / `connect_value_notify`
+                        // handlers on the shared network rows, which
+                        // re-read `protocol_row.selected()` to build
+                        // their `SetNetworkConfig`. If the shared
+                        // protocol row is still on UDP from a prior
+                        // raw-Network session, those handlers would
+                        // dispatch a stale-UDP `SetNetworkConfig`
+                        // for our clicked endpoint before the
+                        // RTL-TCP switch lands — a transient
+                        // retarget of any live raw-Network source.
+                        // rtl_tcp is always TCP.
+                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
                         hr.set_text(&click_host);
                         pr.set_value(f64::from(click_port));
-                        // Force the shared protocol row to TCP. rtl_tcp
-                        // is always TCP, and the hostname_row /
-                        // port_row edit handlers re-read this widget
-                        // when dispatching SetNetworkConfig — leaving
-                        // it on UDP (the previous Network-source
-                        // selection) would silently overwrite our
-                        // protocol on the next hostname edit.
-                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
                         dr.set_selected(DEVICE_RTLTCP);
                         st.send_dsp(UiToDsp::SetNetworkConfig {
                             hostname: click_host.clone(),
@@ -1356,6 +1368,21 @@ const FAVORITE_ICON_OUTLINE: &str = "non-starred-symbolic";
 /// the button chrome.
 const FAVORITE_ICON_FILLED: &str = "starred-symbolic";
 
+/// Stable persistence key for a discovered server's favorite
+/// state. We key by **advertised hostname + port**, not by the
+/// DNS-SD `instance_name`, because `instance_name` is derived
+/// from the user-editable TXT nickname — renaming the server
+/// would silently drop the saved favorite on the next announce.
+/// Hostname is the machine's mDNS identity (e.g. `shack-pi.local.`)
+/// which stays put across nickname changes; paired with port it's
+/// unique enough that two servers on the same host (different
+/// ports) remain distinct favorites. A full machine rename breaks
+/// the favorite — acceptable, since a rename semantically IS a
+/// different host.
+fn favorite_key(server: &DiscoveredServer) -> String {
+    format!("{}:{}", server.hostname, server.port)
+}
+
 /// Re-add rows to an `AdwExpanderRow` in a deterministic order:
 /// favorites (alphabetical by instance name) first, then
 /// non-favorites (same alpha order). Called after any mutation
@@ -1374,12 +1401,19 @@ fn reorder_discovered_rows(
     for (row, _) in rows.values() {
         expander.remove(row);
     }
-    // Sort keys: favorites first, then alpha. Stable across calls
-    // so the user doesn't see rows jitter on every re-announce.
+    // Sort keys: favorites first, then alpha. Favorite check goes
+    // through `favorite_key(server)` (hostname+port) so it matches
+    // what the star-toggle persists. Alpha tiebreak uses the
+    // `instance_name` (HashMap key) so rendering order stays
+    // predictable across re-announces.
     let mut keys: Vec<&String> = rows.keys().collect();
     keys.sort_by(|a, b| {
-        let a_fav = favorites.contains(a.as_str());
-        let b_fav = favorites.contains(b.as_str());
+        let a_fav = rows
+            .get(a.as_str())
+            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
+        let b_fav = rows
+            .get(b.as_str())
+            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
         match (a_fav, b_fav) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
