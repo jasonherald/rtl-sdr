@@ -1227,7 +1227,9 @@ fn connect_rtl_tcp_discovery(
         protocol_row: protocol_row.downgrade(),
         device_row: device_row.downgrade(),
         expander_weak: expander_weak.clone(),
-        displayed_rows: Rc::clone(&displayed_rows),
+        // Weak ref — see `FavoriteRowContext.displayed_rows`
+        // docstring for the retain-cycle reasoning.
+        displayed_rows: Rc::downgrade(&displayed_rows),
     });
     // Seed the popover's content from the restored favorites so
     // the list is ready when the user first clicks the header
@@ -1419,8 +1421,13 @@ fn connect_rtl_tcp_discovery(
                     let star_gain_count = Some(server.txt.gains);
                     let star_favorites = Rc::clone(&favorites);
                     let star_config = std::sync::Arc::clone(&config_for_discovery);
-                    let star_rows = Rc::clone(&displayed_rows);
                     let star_expander_weak = expander_weak.clone();
+                    // Closure captures `star_row_ctx` only — reaches
+                    // `displayed_rows` via its `Weak` field inside.
+                    // A separate `Rc::clone(&displayed_rows)` capture
+                    // here would reintroduce the retain cycle the
+                    // `FavoriteRowContext.displayed_rows` docstring
+                    // describes (map → row → signal → ctx → map).
                     let star_row_ctx = Rc::clone(&favorite_row_ctx);
                     star_btn.connect_toggled(move |btn| {
                         let active = btn.is_active();
@@ -1463,11 +1470,18 @@ fn connect_rtl_tcp_discovery(
                         // state. Reuses the `displayed_rows` map
                         // (strong refs on the AdwActionRow
                         // widgets) — ordering is the only thing
-                        // that changes.
-                        if let Some(expander) = star_expander_weak.upgrade() {
+                        // that changes. The map is held Weak via
+                        // `FavoriteRowContext`; upgrade fails
+                        // silently if the discovery timer has
+                        // already torn down, which means there's
+                        // nothing to reorder anyway.
+                        if let (Some(expander), Some(rows)) = (
+                            star_expander_weak.upgrade(),
+                            star_row_ctx.displayed_rows.upgrade(),
+                        ) {
                             reorder_discovered_rows(
                                 &expander,
-                                &star_rows.borrow(),
+                                &rows.borrow(),
                                 &star_favorites.borrow(),
                             );
                         }
@@ -1731,6 +1745,17 @@ impl FavoritesPopoverWeak {
 /// re-capturing nine individual weak refs. All widget handles are
 /// `glib::WeakRef` to keep the closures leak-free per the
 /// `ServerStatusWidgetsWeak` pattern on #329.
+///
+/// `displayed_rows` is stored as `std::rc::Weak` specifically to
+/// break a retain cycle: the `AdwActionRow` values inside the map
+/// own their `connect_toggled` / `connect_clicked` closures, and
+/// those closures capture this `FavoriteRowContext`. A strong
+/// `Rc<RefCell<HashMap<...>>>` here would close the loop (map →
+/// row → signal closure → context → map) and keep the widgets
+/// alive past window close. The primary owner of the map — the
+/// discovery-polling `glib::timeout_add_local` timer — retains
+/// the strong `Rc`, so the upgrade at use-time is reliable while
+/// the timer is running and correctly fails when it isn't.
 struct FavoriteRowContext {
     popover: FavoritesPopoverWeak,
     favorites: Rc<RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>>,
@@ -1741,8 +1766,9 @@ struct FavoriteRowContext {
     protocol_row: glib::WeakRef<adw::ComboRow>,
     device_row: glib::WeakRef<adw::ComboRow>,
     expander_weak: glib::WeakRef<adw::ExpanderRow>,
-    displayed_rows:
-        Rc<RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>>,
+    displayed_rows: std::rc::Weak<
+        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
+    >,
 }
 
 /// Clear the `ListBox` and rebuild one row per `FavoriteEntry`,
@@ -1923,12 +1949,15 @@ fn attach_favorite_row_actions(
         // `set_active(is_favorite)`). Acceptable transient
         // inconsistency; a simultaneously-visible popover-unstar
         // plus discovery-list view is an edge case.
-        if let Some(expander) = unstar_ctx.expander_weak.upgrade() {
-            reorder_discovered_rows(
-                &expander,
-                &unstar_ctx.displayed_rows.borrow(),
-                &unstar_ctx.favorites.borrow(),
-            );
+        //
+        // `displayed_rows` is Weak on the context — upgrade fails
+        // if the discovery timer has been torn down, which also
+        // means there's nothing left to reorder.
+        if let (Some(expander), Some(rows)) = (
+            unstar_ctx.expander_weak.upgrade(),
+            unstar_ctx.displayed_rows.upgrade(),
+        ) {
+            reorder_discovered_rows(&expander, &rows.borrow(), &unstar_ctx.favorites.borrow());
         }
         // Rebuild the popover so the unstarred row disappears.
         // GTK signal-lifetime guarantees we can `ListBox::remove`

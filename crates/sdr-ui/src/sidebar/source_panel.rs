@@ -630,7 +630,8 @@ pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<FavoriteEntry> {
             return Vec::new();
         };
         arr.iter()
-            .filter_map(|entry| {
+            .enumerate()
+            .filter_map(|(idx, entry)| {
                 if let Some(s) = entry.as_str() {
                     // Legacy bare-string entry. Build a stub
                     // FavoriteEntry so the slide-out still has
@@ -644,7 +645,22 @@ pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<FavoriteEntry> {
                         last_seen_unix: None,
                     })
                 } else {
-                    serde_json::from_value::<FavoriteEntry>(entry.clone()).ok()
+                    // Corrupt object entry — hand-edited JSON or a
+                    // shape we don't recognize. Skip the entry so
+                    // the rest of the list still loads, but log so
+                    // a "my favorite disappeared" bug report
+                    // surfaces the parse failure.
+                    match serde_json::from_value::<FavoriteEntry>(entry.clone()) {
+                        Ok(fav) => Some(fav),
+                        Err(err) => {
+                            tracing::warn!(
+                                entry_index = idx,
+                                error = %err,
+                                "skipping corrupt rtl_tcp favorite entry",
+                            );
+                            None
+                        }
+                    }
                 }
             })
             .collect()
