@@ -17,6 +17,7 @@ import SwiftUI
 @main
 struct SDRMacApp: App {
     @State private var core = CoreModel()
+    @State private var bookmarks = BookmarksStore(storagePath: SDRMacApp.defaultBookmarksPath())
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
@@ -24,6 +25,7 @@ struct SDRMacApp: App {
         WindowGroup("SDR") {
             ContentView()
                 .environment(core)
+                .environment(bookmarks)
                 .frame(minWidth: 900, minHeight: 600)
                 .task {
                     await core.bootstrap(configPath: Self.defaultConfigPath())
@@ -46,6 +48,19 @@ struct SDRMacApp: App {
     /// a bundle-id or layout change would otherwise make the
     /// displayed path drift from the real one.
     static func defaultConfigPath() -> URL {
+        appSupportDirectory().appendingPathComponent("config.json")
+    }
+
+    /// `~/Library/Application Support/SDRMac/bookmarks.json`.
+    /// Separate file from the engine's `config.json` so bookmark
+    /// mutations don't round-trip through the engine and so
+    /// bookmarks can survive a config schema change. Matches the
+    /// GTK side's file split.
+    static func defaultBookmarksPath() -> URL {
+        appSupportDirectory().appendingPathComponent("bookmarks.json")
+    }
+
+    private static func appSupportDirectory() -> URL {
         let fm = FileManager.default
         let dir = (try? fm.url(
             for: .applicationSupportDirectory,
@@ -55,7 +70,7 @@ struct SDRMacApp: App {
         )) ?? fm.homeDirectoryForCurrentUser
         let appDir = dir.appendingPathComponent("SDRMac")
         try? fm.createDirectory(at: appDir, withIntermediateDirectories: true)
-        return appDir.appendingPathComponent("config.json")
+        return appDir
     }
 }
 

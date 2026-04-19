@@ -270,6 +270,14 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(sdr_core_set_squelch_enabled(handle, enabled))
     }
 
+    /// Enable or disable auto-squelch (engine-side noise-floor
+    /// tracking). While on, the engine adjusts the squelch
+    /// threshold continuously; manual `setSquelchDb` writes are
+    /// accepted but will be overwritten on the next tracker cycle.
+    public func setAutoSquelch(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_auto_squelch(handle, enabled))
+    }
+
     /// Set the squelch threshold in dB.
     public func setSquelchDb(_ db: Float) throws {
         try checkRc(sdr_core_set_squelch_db(handle, db))

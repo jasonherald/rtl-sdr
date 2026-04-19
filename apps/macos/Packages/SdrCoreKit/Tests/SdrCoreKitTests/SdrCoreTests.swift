@@ -17,12 +17,13 @@ final class SdrCoreTests: XCTestCase {
 
     func testAbiVersionMatchesCurrent() {
         // Lock in that the Swift wrapper parses the packed
-        // version from the C side consistently. Current: 0.2
-        // (0.2 added device enumeration: sdr_core_device_count +
-        // sdr_core_device_name).
+        // version from the C side consistently. Current: 0.3
+        // (0.2 added device enumeration: sdr_core_device_count
+        // + sdr_core_device_name. 0.3 added
+        // sdr_core_set_auto_squelch.)
         let v = SdrCore.abiVersion
         XCTAssertEqual(v.major, 0)
-        XCTAssertEqual(v.minor, 2)
+        XCTAssertEqual(v.minor, 3)
     }
 
     func testInitLoggingIsIdempotent() {
