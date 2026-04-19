@@ -206,6 +206,13 @@ pub enum UiToDsp {
 mod tests {
     use super::*;
 
+    /// Fixed bandwidth used by the message-variant round-trip
+    /// tests. 12.5 kHz is NFM's default and the value the VFO-drag
+    /// feedback loop most commonly emits in practice — hoisting it
+    /// to a const both removes the magic-number duplication in the
+    /// construct + match and documents the choice of value.
+    const TEST_BANDWIDTH_HZ: f64 = 12_500.0;
+
     #[test]
     fn test_dsp_to_ui_variants() {
         let fft = DspToUi::FftData(vec![1.0, 2.0, 3.0]);
@@ -252,11 +259,11 @@ mod tests {
         // Pins the variant shape + payload round-trip so future
         // refactors that accidentally change the f64 carrier
         // (e.g. to `u32` Hz or a `Bandwidth` newtype) trip this
-        // test. Value is NFM's default bandwidth, matching what
-        // the VFO-drag feedback loop most commonly emits in
-        // practice.
-        let bw = DspToUi::BandwidthChanged(12_500.0);
-        assert!(matches!(bw, DspToUi::BandwidthChanged(v) if (v - 12_500.0).abs() < f64::EPSILON));
+        // test.
+        let bw = DspToUi::BandwidthChanged(TEST_BANDWIDTH_HZ);
+        assert!(
+            matches!(bw, DspToUi::BandwidthChanged(v) if (v - TEST_BANDWIDTH_HZ).abs() < f64::EPSILON)
+        );
     }
 
     #[test]

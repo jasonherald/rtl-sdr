@@ -3301,12 +3301,25 @@ fn connect_source_rtlsdr_probe(panels: &SidebarPanels) {
     let widget_weak = panels.source.widget.downgrade();
     let model_weak = panels.source.device_model.downgrade();
     // Cached label from the last tick so we only rewrite on a
-    // real edge. Seeded to match the initial label set in
-    // `build_source_panel` so the first tick doesn't flip the
-    // slot back to itself.
-    let last_label: Rc<RefCell<String>> = Rc::new(RefCell::new(
-        sidebar::source_panel::probe_rtlsdr_device_label(),
-    ));
+    // real edge. Seed from the model's current `DEVICE_RTLSDR`
+    // entry — NOT from a fresh probe — so we're comparing
+    // subsequent probes against what the UI is actually showing.
+    //
+    // A second probe here would race the USB state: if the user
+    // unplugs their dongle between `build_source_panel` (which
+    // ran the initial probe + seed) and this wiring point, a
+    // second probe would read the new bus state, cache it as
+    // `last_label`, and then every subsequent tick's probe would
+    // match the cache — the combo would stay on the stale plugged-
+    // in name forever (or until the NEXT plug / unplug edge
+    // briefly desynced them again). Reading the model directly
+    // guarantees first-tick reconciliation.
+    let seed_label = panels
+        .source
+        .device_model
+        .string(DEVICE_RTLSDR)
+        .map_or_else(String::new, |s| s.to_string());
+    let last_label: Rc<RefCell<String>> = Rc::new(RefCell::new(seed_label));
     let _ = glib::timeout_add_local(SOURCE_RTLSDR_PROBE_INTERVAL, move || {
         if widget_weak.upgrade().is_none() {
             return glib::ControlFlow::Break;
