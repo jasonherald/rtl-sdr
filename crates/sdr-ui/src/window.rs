@@ -1190,10 +1190,28 @@ fn connect_rtl_tcp_discovery(
     // taught us to avoid — per-callback atomic upgrade + drop
     // keeps the popover widgets releasable on window close.
     let favorites_popover_weak = FavoritesPopoverWeak::from_header(favorites_header);
+    // Bundle of per-row action dependencies. Built once, cloned
+    // into the three rebuild call sites (startup seed, star
+    // toggle, re-announce refresh). `rebuild_favorites_popover`
+    // hands a clone to each row's Connect / Copy / Unstar
+    // closure, so each button ends up with a single `Rc` clone
+    // instead of nine weak-ref captures.
+    let favorite_row_ctx: Rc<FavoriteRowContext> = Rc::new(FavoriteRowContext {
+        popover: favorites_popover_weak.clone(),
+        favorites: Rc::clone(&favorites),
+        config: std::sync::Arc::clone(&config_for_discovery),
+        state: Rc::clone(&state),
+        hostname_row: hostname_row.downgrade(),
+        port_row: port_row.downgrade(),
+        protocol_row: protocol_row.downgrade(),
+        device_row: device_row.downgrade(),
+        expander_weak: expander_weak.clone(),
+        displayed_rows: Rc::clone(&displayed_rows),
+    });
     // Seed the popover's content from the restored favorites so
     // the list is ready when the user first clicks the header
     // star, without waiting for a mutation to trigger a rebuild.
-    favorites_popover_weak.rebuild(&favorites.borrow());
+    rebuild_favorites_popover(&favorite_row_ctx, &favorites.borrow());
 
     // Populate the hostname / port fields on startup from the last
     // connected server, if any. Runs once before the poller starts
@@ -1382,7 +1400,7 @@ fn connect_rtl_tcp_discovery(
                     let star_config = std::sync::Arc::clone(&config_for_discovery);
                     let star_rows = Rc::clone(&displayed_rows);
                     let star_expander_weak = expander_weak.clone();
-                    let star_favorites_popover = favorites_popover_weak.clone();
+                    let star_row_ctx = Rc::clone(&favorite_row_ctx);
                     star_btn.connect_toggled(move |btn| {
                         let active = btn.is_active();
                         btn.set_icon_name(if active {
@@ -1434,10 +1452,10 @@ fn connect_rtl_tcp_discovery(
                         }
                         // Refresh the header-bar favorites popover
                         // so the star-toggle reflects there too.
-                        // Upgrade-and-drop inside `rebuild` keeps
+                        // Upgrade-and-drop inside the rebuild keeps
                         // the closure leak-free per the #329
                         // weak-ref pattern.
-                        star_favorites_popover.rebuild(&star_favorites.borrow());
+                        rebuild_favorites_popover(&star_row_ctx, &star_favorites.borrow());
                     });
                     row.add_prefix(&star_btn);
 
@@ -1553,7 +1571,7 @@ fn connect_rtl_tcp_discovery(
                             // metadata). Cheap — it rebuilds the
                             // whole list but at favorites scale
                             // that's trivial.
-                            favorites_popover_weak.rebuild(&favs);
+                            rebuild_favorites_popover(&favorite_row_ctx, &favs);
                         }
                     }
                     rows.insert(server.instance_name.clone(), (row, server));
@@ -1666,13 +1684,13 @@ fn reorder_discovered_rows(
 /// cleanup. Same per-tick-upgrade pattern established in
 /// `ServerStatusWidgetsWeak` on #329.
 ///
-/// `Clone` so we can hand a copy to each per-row star-toggle
-/// closure; `glib::WeakRef` is Rc-like internally, so cloning is
-/// cheap.
+/// `Clone` so we can hand a copy to each per-row action closure;
+/// `glib::WeakRef` is Rc-like internally, so cloning is cheap.
 #[derive(Clone)]
 struct FavoritesPopoverWeak {
     list: glib::WeakRef<gtk4::ListBox>,
     empty_label: glib::WeakRef<gtk4::Label>,
+    popover: glib::WeakRef<gtk4::Popover>,
 }
 
 impl FavoritesPopoverWeak {
@@ -1680,50 +1698,242 @@ impl FavoritesPopoverWeak {
         Self {
             list: handle.list.downgrade(),
             empty_label: handle.empty_label.downgrade(),
+            popover: handle.popover.downgrade(),
         }
     }
+}
 
-    /// Clear the `ListBox` and rebuild one row per `FavoriteEntry`,
-    /// sorted alphabetically by nickname. Toggles the empty-state
-    /// label visibility so the popover reads cleanly in both the
-    /// no-favorites and has-favorites states.
-    ///
-    /// Silent no-op when either widget is gone (window torn down).
-    /// Rows are content-only in commit 3 — Connect / Copy / Unstar
-    /// buttons land in the next commit on this branch.
-    fn rebuild(
-        &self,
-        favorites: &std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>,
-    ) {
-        let (Some(list), Some(empty)) = (self.list.upgrade(), self.empty_label.upgrade()) else {
+/// Bundle of dependencies that per-row action closures (Connect /
+/// Copy / Unstar) need to capture. Passed by `Rc<FavoriteRowContext>`
+/// through `rebuild_favorites_popover` and `attach_favorite_row_actions`
+/// so each row-button closure only clones the `Rc` instead of
+/// re-capturing nine individual weak refs. All widget handles are
+/// `glib::WeakRef` to keep the closures leak-free per the
+/// `ServerStatusWidgetsWeak` pattern on #329.
+struct FavoriteRowContext {
+    popover: FavoritesPopoverWeak,
+    favorites: Rc<RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>>,
+    config: std::sync::Arc<sdr_config::ConfigManager>,
+    state: Rc<AppState>,
+    hostname_row: glib::WeakRef<adw::EntryRow>,
+    port_row: glib::WeakRef<adw::SpinRow>,
+    protocol_row: glib::WeakRef<adw::ComboRow>,
+    device_row: glib::WeakRef<adw::ComboRow>,
+    expander_weak: glib::WeakRef<adw::ExpanderRow>,
+    displayed_rows:
+        Rc<RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>>,
+}
+
+/// Clear the `ListBox` and rebuild one row per `FavoriteEntry`,
+/// sorted alphabetically by nickname. Toggles the empty-state
+/// label visibility so the popover reads cleanly in both the
+/// no-favorites and has-favorites states.
+///
+/// Silent no-op when either popover widget is gone (window torn
+/// down). Each row gets Connect / Copy / Unstar suffix buttons via
+/// `attach_favorite_row_actions`.
+fn rebuild_favorites_popover(
+    ctx: &Rc<FavoriteRowContext>,
+    favorites: &std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>,
+) {
+    let (Some(list), Some(empty)) = (
+        ctx.popover.list.upgrade(),
+        ctx.popover.empty_label.upgrade(),
+    ) else {
+        return;
+    };
+    // Clear existing rows. `ListBox::remove` detaches without
+    // dropping the widgets past us — the HashMap has already
+    // gone through its mutation above this call.
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let has_any = !favorites.is_empty();
+    empty.set_visible(!has_any);
+    list.set_visible(has_any);
+    if !has_any {
+        return;
+    }
+    let now = sidebar::source_panel::now_unix_seconds();
+    let mut entries: Vec<&sidebar::source_panel::FavoriteEntry> = favorites.values().collect();
+    // Alpha by nickname so adding / removing doesn't reorder
+    // the rest of the list.
+    entries.sort_by_key(|e| e.nickname.to_lowercase());
+    for entry in entries {
+        let row = adw::ActionRow::builder()
+            .title(&entry.nickname)
+            .subtitle(format_favorite_subtitle(entry, now))
+            .activatable(false)
+            .build();
+        attach_favorite_row_actions(&row, entry, ctx);
+        list.append(&row);
+    }
+}
+
+/// Build the three suffix buttons on a favorites-popover row:
+/// Connect (suggested-action, pins TCP + dispatches to DSP), Copy
+/// (writes `host:port` to the clipboard), and Unstar (removes from
+/// favorites, persists, reorders discovery, rebuilds the popover).
+///
+/// Dependencies flow through `FavoriteRowContext` so each closure
+/// only clones the `Rc` — not nine individual weak refs. The
+/// Connect-button ordering (`protocol_row.set_selected(TCP)`
+/// BEFORE `hostname_row.set_text` / `port_row.set_value`) mirrors
+/// the discovery-row Connect handler established in PR #335: the
+/// hostname / port writes fire change handlers that read the
+/// protocol row, so the row must already be on TCP or those
+/// handlers will dispatch a stale-UDP `SetNetworkConfig`.
+fn attach_favorite_row_actions(
+    row: &adw::ActionRow,
+    entry: &sidebar::source_panel::FavoriteEntry,
+    ctx: &Rc<FavoriteRowContext>,
+) {
+    // Connect button — pins TCP, loads host/port, switches to RTL-TCP.
+    let connect_btn = gtk4::Button::with_label("Connect");
+    connect_btn.add_css_class("suggested-action");
+    connect_btn.set_valign(gtk4::Align::Center);
+    let connect_ctx = Rc::clone(ctx);
+    let connect_key = entry.key.clone();
+    let connect_nickname = entry.nickname.clone();
+    connect_btn.connect_clicked(move |_| {
+        let Some((host, port)) = parse_host_port(&connect_key) else {
+            // Corrupt key shouldn't happen in practice —
+            // `favorite_key(server)` always produces
+            // `hostname:port`. Log rather than silently dropping
+            // the click, so a future schema drift is discoverable.
+            tracing::warn!(
+                key = %connect_key,
+                "favorites popover: Connect clicked on un-parseable key, ignoring",
+            );
             return;
         };
-        // Clear existing rows. `ListBox::remove` detaches without
-        // dropping the widgets past us — the HashMap has already
-        // gone through its mutation above this call.
-        while let Some(child) = list.first_child() {
-            list.remove(&child);
-        }
-        let has_any = !favorites.is_empty();
-        empty.set_visible(!has_any);
-        list.set_visible(has_any);
-        if !has_any {
+        let (Some(hostname_row), Some(port_row), Some(protocol_row), Some(device_row)) = (
+            connect_ctx.hostname_row.upgrade(),
+            connect_ctx.port_row.upgrade(),
+            connect_ctx.protocol_row.upgrade(),
+            connect_ctx.device_row.upgrade(),
+        ) else {
             return;
+        };
+        // See discovery-row Connect handler (and #335 protocol-
+        // ordering lesson): pin TCP before writing host/port
+        // so the change handlers on those rows don't dispatch
+        // a stale-UDP `SetNetworkConfig` against the endpoint.
+        let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
+        protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
+        hostname_row.set_text(&host);
+        port_row.set_value(f64::from(port));
+        device_row.set_selected(DEVICE_RTLTCP);
+        connect_ctx.state.send_dsp(UiToDsp::SetNetworkConfig {
+            hostname: host.clone(),
+            port,
+            protocol: sdr_types::Protocol::TcpClient,
+        });
+        crate::sidebar::source_panel::save_last_connected(
+            &connect_ctx.config,
+            &crate::sidebar::source_panel::LastConnectedServer {
+                host: host.clone(),
+                port,
+                nickname: connect_nickname.clone(),
+            },
+        );
+        if already_rtl_tcp {
+            // device_row notify handler did NOT fire (we were
+            // already on RTL-TCP); force the source reopen so
+            // the new endpoint takes. Mirrors the discovery-row
+            // Connect path.
+            connect_ctx
+                .state
+                .send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
         }
-        let now = sidebar::source_panel::now_unix_seconds();
-        let mut entries: Vec<&sidebar::source_panel::FavoriteEntry> = favorites.values().collect();
-        // Alpha by nickname so adding / removing doesn't reorder
-        // the rest of the list.
-        entries.sort_by_key(|e| e.nickname.to_lowercase());
-        for entry in entries {
-            let row = adw::ActionRow::builder()
-                .title(&entry.nickname)
-                .subtitle(format_favorite_subtitle(entry, now))
-                .activatable(false)
-                .build();
-            list.append(&row);
+        // Dismiss the popover once the connection is dispatched
+        // so the user sees the source row update underneath.
+        if let Some(popover) = connect_ctx.popover.popover.upgrade() {
+            popover.popdown();
         }
+    });
+    row.add_suffix(&connect_btn);
+
+    // Copy button — writes `host:port` to the clipboard. Lets
+    // the user grab the endpoint for pasting into another tool
+    // without having to hand-transcribe the subtitle.
+    let copy_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
+    copy_btn.set_tooltip_text(Some("Copy host:port"));
+    copy_btn.add_css_class("flat");
+    copy_btn.set_valign(gtk4::Align::Center);
+    let copy_key = entry.key.clone();
+    copy_btn.connect_clicked(move |btn| {
+        // `WidgetExt::clipboard` reaches the display clipboard
+        // via the button's realized display. If the popover has
+        // been torn down the button isn't reachable anyway, so
+        // we just use the button itself as the anchor widget.
+        btn.clipboard().set_text(&copy_key);
+    });
+    row.add_suffix(&copy_btn);
+
+    // Unstar button — removes from the favorites map, persists,
+    // and rebuilds both the discovery expander (so the row moves
+    // out of the pinned section) and the popover list (so the
+    // row disappears from here).
+    let unstar_btn = gtk4::Button::from_icon_name("starred-symbolic");
+    unstar_btn.set_tooltip_text(Some("Remove from favorites"));
+    unstar_btn.add_css_class("flat");
+    unstar_btn.set_valign(gtk4::Align::Center);
+    let unstar_key = entry.key.clone();
+    let unstar_ctx = Rc::clone(ctx);
+    unstar_btn.connect_clicked(move |_| {
+        {
+            let mut favs = unstar_ctx.favorites.borrow_mut();
+            if favs.remove(&unstar_key).is_none() {
+                // Already gone (e.g., double-click race). Nothing
+                // to persist and nothing to rebuild.
+                return;
+            }
+            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                favs.values().cloned().collect();
+            crate::sidebar::source_panel::save_favorites(&unstar_ctx.config, &snapshot);
+        }
+        // Reorder the discovery expander so this server drops
+        // out of the pinned section. The star-button ICON on
+        // any currently-displayed discovery row for this key is
+        // NOT refreshed here — it self-heals on the next mDNS
+        // re-announce (see `ServerAnnounced` branch above, which
+        // removes the old row and builds a fresh one with
+        // `set_active(is_favorite)`). Acceptable transient
+        // inconsistency; a simultaneously-visible popover-unstar
+        // plus discovery-list view is an edge case.
+        if let Some(expander) = unstar_ctx.expander_weak.upgrade() {
+            reorder_discovered_rows(
+                &expander,
+                &unstar_ctx.displayed_rows.borrow(),
+                &unstar_ctx.favorites.borrow(),
+            );
+        }
+        // Rebuild the popover so the unstarred row disappears.
+        // GTK signal-lifetime guarantees we can `ListBox::remove`
+        // our own row from inside this button-clicked handler:
+        // GTK retains the signal's source widget for the
+        // callback's duration, so the button won't drop under us.
+        rebuild_favorites_popover(&unstar_ctx, &unstar_ctx.favorites.borrow());
+    });
+    row.add_suffix(&unstar_btn);
+}
+
+/// Parse a `hostname:port` favorite key back into its two fields.
+/// Uses `rsplit_once(':')` so IPv6 literals with multiple colons
+/// round-trip if we ever start producing them (today's
+/// `favorite_key` only emits the DNS hostname, but the parser
+/// should be the conservative half of that contract).
+///
+/// Returns `None` when the key lacks a colon or the port field
+/// doesn't parse as `u16` — callers log and swallow.
+fn parse_host_port(key: &str) -> Option<(String, u16)> {
+    let (host, port_str) = key.rsplit_once(':')?;
+    let port: u16 = port_str.parse().ok()?;
+    if host.is_empty() {
+        return None;
     }
+    Some((host.to_string(), port))
 }
 
 /// Render a `FavoriteEntry` into the one-line subtitle shown on
@@ -4711,6 +4921,60 @@ fn recording_path(prefix: &str) -> std::path::PathBuf {
         .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
         .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
     base.join(format!("{prefix}-{timestamp}.wav"))
+}
+
+#[cfg(test)]
+mod parse_host_port_tests {
+    use super::parse_host_port;
+
+    #[test]
+    fn round_trips_a_simple_hostname_port_pair() {
+        // The mainline case — `favorite_key(server)` today
+        // produces exactly this shape, so Connect-from-popover
+        // depends on this round-trip working.
+        assert_eq!(
+            parse_host_port("shack-pi:1234"),
+            Some(("shack-pi".to_string(), 1234))
+        );
+    }
+
+    #[test]
+    fn ipv6_literal_with_embedded_colons_splits_on_last_colon() {
+        // We don't emit bracketed IPv6 in `favorite_key` today,
+        // but the parser should be the conservative half of the
+        // contract: `rsplit_once(':')` keeps everything up to the
+        // last colon as the host so an IPv6 literal round-trips
+        // if we ever start persisting one.
+        assert_eq!(
+            parse_host_port("fe80::1:8080"),
+            Some(("fe80::1".to_string(), 8080))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_colon() {
+        assert_eq!(parse_host_port("shack-pi"), None);
+    }
+
+    #[test]
+    fn rejects_non_numeric_port() {
+        assert_eq!(parse_host_port("shack-pi:abc"), None);
+    }
+
+    #[test]
+    fn rejects_out_of_range_port() {
+        // 65536 overflows u16; parse must fail rather than
+        // silently truncating.
+        assert_eq!(parse_host_port("shack-pi:65536"), None);
+    }
+
+    #[test]
+    fn rejects_empty_host() {
+        // ":1234" shouldn't round-trip as a valid endpoint —
+        // callers would dispatch `SetNetworkConfig { hostname:
+        // "" }` which is garbage.
+        assert_eq!(parse_host_port(":1234"), None);
+    }
 }
 
 #[cfg(test)]
