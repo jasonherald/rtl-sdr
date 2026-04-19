@@ -118,8 +118,15 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     ) = build_split_view(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
-    let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
-        build_header_bar(&sidebar_toggle, &state);
+    let (
+        header,
+        play_button,
+        demod_dropdown,
+        freq_selector,
+        screenshot_button,
+        rr_button,
+        favorites_handle,
+    ) = build_header_bar(&sidebar_toggle, &state);
 
     // Transcript toggle button in header bar.
     let transcript_button = gtk4::ToggleButton::builder()
@@ -204,6 +211,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &status_bar_demod,
         &toast_overlay,
         config,
+        &favorites_handle,
     );
 
     // Wire waterfall screenshot button.
@@ -762,11 +770,29 @@ fn build_sidebar_toggle(split_view: &adw::OverlaySplitView) -> gtk4::ToggleButto
     toggle
 }
 
+/// Handles handed back from `build_header_bar` for the `rtl_tcp`
+/// favorites slide-out. The `button` is packed into the header bar
+/// and drops its popover on click; the `list` is the scrollable
+/// `ListBox` inside that popover — `connect_rtl_tcp_discovery`
+/// clears + re-populates it when the favorites map changes. The
+/// `empty_label` is shown when the list is empty so the user sees
+/// "No pinned servers yet" instead of a blank popover.
+pub struct FavoritesHeaderHandle {
+    pub button: gtk4::MenuButton,
+    pub popover: gtk4::Popover,
+    pub list: gtk4::ListBox,
+    pub empty_label: gtk4::Label,
+}
+
 /// Build the `AdwHeaderBar` with play/stop, frequency selector, demod selector,
 /// and volume control.
 ///
 /// Returns the header bar, play button, demod dropdown, and frequency selector
 /// (for shortcuts, status bar wiring, and frequency change callbacks).
+#[allow(
+    clippy::too_many_lines,
+    reason = "widget-assembly — splitting scatters one-time wire-up across helpers without readability win"
+)]
 fn build_header_bar(
     sidebar_toggle: &gtk4::ToggleButton,
     state: &Rc<AppState>,
@@ -777,6 +803,7 @@ fn build_header_bar(
     header::frequency_selector::FrequencySelector,
     gtk4::Button,
     gtk4::Button,
+    FavoritesHeaderHandle,
 ) {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()
@@ -858,10 +885,17 @@ fn build_header_bar(
         .visible(crate::preferences::accounts_page::has_rr_credentials())
         .build();
 
+    // Favorites slide-out button — opens a popover listing the
+    // user's pinned `rtl_tcp` servers. Entries populated
+    // dynamically by `connect_rtl_tcp_discovery`. MenuButton
+    // auto-toggles and handles click-outside dismissal.
+    let favorites_handle = build_favorites_header();
+
     header.pack_end(&menu_button);
     header.pack_end(&volume_button);
     header.pack_end(&rr_button);
     header.pack_end(&screenshot_button);
+    header.pack_end(&favorites_handle.button);
 
     (
         header,
@@ -870,7 +904,89 @@ fn build_header_bar(
         freq_selector,
         screenshot_button,
         rr_button,
+        favorites_handle,
     )
+}
+
+/// Width of the favorites popover's scrollable list. Wide enough
+/// for a `rtl_tcp://hostname.local.:12345 — R820T (29 gains)`
+/// subtitle without wrapping.
+const FAVORITES_POPOVER_WIDTH_PX: i32 = 420;
+/// Max height of the favorites popover's scrollable list. Caps the
+/// popover so a large favorites set doesn't paint past the bottom
+/// of the window; the internal `ScrolledWindow` handles overflow.
+const FAVORITES_POPOVER_HEIGHT_PX: i32 = 360;
+
+/// Build the header-bar favorites button + its popover contents.
+/// The popover hosts a `ListBox` (populated by
+/// `connect_rtl_tcp_discovery` whenever the favorites map mutates)
+/// wrapped in a capped `ScrolledWindow`. The empty-state label is
+/// shown when the list is empty and hidden when it's populated —
+/// callers are responsible for that toggle alongside row rebuilds.
+fn build_favorites_header() -> FavoritesHeaderHandle {
+    let popover = gtk4::Popover::builder()
+        .autohide(true)
+        .has_arrow(true)
+        .width_request(FAVORITES_POPOVER_WIDTH_PX)
+        .build();
+    popover.add_css_class("menu");
+
+    let title = gtk4::Label::builder()
+        .label("Pinned servers")
+        .halign(gtk4::Align::Start)
+        .margin_start(12)
+        .margin_top(12)
+        .margin_bottom(6)
+        .css_classes(["heading"])
+        .build();
+
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .margin_start(6)
+        .margin_end(6)
+        .margin_bottom(6)
+        .build();
+
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .max_content_height(FAVORITES_POPOVER_HEIGHT_PX)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build();
+
+    let empty_label = gtk4::Label::builder()
+        .label("No pinned servers yet.\n\nStar a discovered server to pin it here.")
+        .justify(gtk4::Justification::Center)
+        .wrap(true)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .css_classes(["dim-label"])
+        .build();
+
+    let content = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(0)
+        .build();
+    content.append(&title);
+    content.append(&empty_label);
+    content.append(&scroll);
+    popover.set_child(Some(&content));
+
+    let button = gtk4::MenuButton::builder()
+        .icon_name("starred-symbolic")
+        .tooltip_text("Pinned rtl_tcp servers")
+        .popover(&popover)
+        .build();
+
+    FavoritesHeaderHandle {
+        button,
+        popover,
+        list,
+        empty_label,
+    }
 }
 
 /// Build the app menu button with Preferences / Keyboard Shortcuts / About / Quit actions.
@@ -924,6 +1040,7 @@ fn connect_sidebar_panels(
     status_bar: &Rc<StatusBar>,
     toast_overlay: &adw::ToastOverlay,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    favorites_header: &FavoritesHeaderHandle,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -936,7 +1053,7 @@ fn connect_sidebar_panels(
     let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
     connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
-    connect_rtl_tcp_discovery(panels, state, config);
+    connect_rtl_tcp_discovery(panels, state, config, favorites_header);
     connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
@@ -969,6 +1086,11 @@ fn connect_rtl_tcp_discovery(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    // Unused in commit 2 — scaffolding only. Subsequent commits
+    // on this branch (#315) populate the popover's list from the
+    // favorites map. Threaded through now so the wire-up lives in
+    // exactly one signature and we don't churn callers again.
+    _favorites_header: &FavoritesHeaderHandle,
 ) {
     use std::collections::HashMap;
     use std::time::Instant;
