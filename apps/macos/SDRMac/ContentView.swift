@@ -7,6 +7,7 @@
 // spectrum/waterfall + status bar, with the header toolbar
 // attached via `.toolbar`.
 
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
@@ -23,6 +24,34 @@ struct ContentView: View {
             }
         }
         .toolbar { HeaderToolbar() }
+        // Fatal ABI-mismatch modal. The binding's setter is a
+        // no-op so dismissing the alert is impossible — the
+        // only action is Quit. Matches the spec ("fail launch
+        // with a dialog, since nothing else will work") in
+        // `2026-04-12-swift-ui-surface-design.md`.
+        .alert(
+            "SDR engine version mismatch",
+            isPresented: Binding(
+                get: { model.abiMismatch != nil },
+                set: { _ in }
+            ),
+            presenting: model.abiMismatch
+        ) { _ in
+            Button("Quit", role: .destructive) {
+                NSApplication.shared.terminate(nil)
+            }
+        } message: { mismatch in
+            Text("""
+                This build of SDR was compiled against engine \
+                ABI \(mismatch.compiled.major).\(mismatch.compiled.minor), \
+                but the linked library reports \
+                \(mismatch.runtime.major).\(mismatch.runtime.minor). \
+                A major-version difference means the Swift side \
+                and the Rust engine disagree on fundamental data \
+                layouts; running anyway would crash or produce \
+                bad output. Reinstall a matching build.
+                """)
+        }
     }
 }
 

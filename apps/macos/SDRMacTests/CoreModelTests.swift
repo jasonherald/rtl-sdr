@@ -36,4 +36,39 @@ final class CoreModelTests: XCTestCase {
         XCTAssertEqual(m.minDb, -90)
         XCTAssertEqual(m.maxDb, -10)
     }
+
+    // ==========================================================
+    //  setCenter clamping (guards all tune paths uniformly)
+    // ==========================================================
+
+    func testSetCenterClampsBelowZero() {
+        let m = CoreModel()
+        m.setCenter(-1_000_000)
+        XCTAssertEqual(m.centerFrequencyHz, 0)
+    }
+
+    func testSetCenterClampsAboveMax() {
+        let m = CoreModel()
+        m.setCenter(10_000_000_000_000)  // 10 THz — over the cap
+        XCTAssertEqual(m.centerFrequencyHz, CoreModel.maxCenterFrequencyHz)
+    }
+
+    func testSetCenterIgnoresNonFinite() {
+        let m = CoreModel()
+        m.setCenter(1_000_000)
+        m.setCenter(.infinity)
+        // Should leave the previous valid value in place rather
+        // than write Inf / NaN.
+        XCTAssertEqual(m.centerFrequencyHz, 1_000_000)
+        m.setCenter(.nan)
+        XCTAssertEqual(m.centerFrequencyHz, 1_000_000)
+    }
+
+    func testSetCenterKeepsInRangeValues() {
+        let m = CoreModel()
+        m.setCenter(88_500_000)
+        XCTAssertEqual(m.centerFrequencyHz, 88_500_000)
+        m.setCenter(1_700_000_000)  // 1.7 GHz — real RTL-SDR top end
+        XCTAssertEqual(m.centerFrequencyHz, 1_700_000_000)
+    }
 }
