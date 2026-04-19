@@ -1055,7 +1055,18 @@ fn connect_rtl_tcp_discovery(
     // so the user sees "the server they were last on" immediately
     // instead of having to wait for a fresh mDNS beacon. No-op on
     // first launch / after a config reset.
+    //
+    // Protocol row is forced to TCP *before* the hostname / port
+    // writes. Those writes fire `connect_changed` / `connect_value_
+    // notify` handlers that re-read `protocol_row.selected()` and
+    // dispatch `SetNetworkConfig { protocol: ... }`. If the shared
+    // protocol row was restored to UDP from a prior raw-Network
+    // session, the restore path would otherwise push a UDP
+    // `SetNetworkConfig` against the RTL-TCP endpoint on the very
+    // first tick. Pinning TCP first keeps the restore both silent
+    // to the user and correct end-to-end.
     if let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery) {
+        protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
         hostname_row.set_text(&last.host);
         port_row.set_value(f64::from(last.port));
     }
@@ -1326,18 +1337,14 @@ fn connect_rtl_tcp_discovery(
 const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Icon name for the un-filled ("not pinned") star on discovery
-/// rows. GNOME Symbolic icon set — present on every GTK4 install.
-const FAVORITE_ICON_OUTLINE: &str = "starred-symbolic";
-/// Icon name for the filled ("pinned") star. Uses the same icon
-/// as the outline so the toggle state reads as "emphasis" rather
-/// than two-icon-switcharoo; UI consumers distinguish the two via
-/// the `ToggleButton::is_active` styling.
-///
-/// **Note:** GNOME's `starred-symbolic` is filled and
-/// `non-starred-symbolic` is outlined — we use both for a clearer
-/// visual toggle. Kept as named consts so future icon swaps
-/// (e.g. to a separate checkmark-based treatment) happen in one
-/// place.
+/// rows. GNOME Symbolic icon set — `non-starred-symbolic` renders
+/// the outline glyph, which is visually distinct from the filled
+/// pinned state so the affordance reads clearly without relying
+/// on the `ToggleButton::is_active` styling alone.
+const FAVORITE_ICON_OUTLINE: &str = "non-starred-symbolic";
+/// Icon name for the filled ("pinned") star. Paired with
+/// `FAVORITE_ICON_OUTLINE` so toggling swaps the glyph, not just
+/// the button chrome.
 const FAVORITE_ICON_FILLED: &str = "starred-symbolic";
 
 /// Re-add rows to an `AdwExpanderRow` in a deterministic order:

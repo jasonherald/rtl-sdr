@@ -250,6 +250,53 @@ mod tests {
     }
 
     #[test]
+    fn rtl_tcp_connection_state_message_constructs() {
+        // Constructing each variant through the DspToUi wrapper
+        // exercises the `#[derive(Debug)]` + message plumbing end
+        // to end. Catches the class of bugs where a future refactor
+        // changes the `RtlTcpConnectionState` shape without updating
+        // the message-side re-export — the build would still pass
+        // but the variant wouldn't wrap.
+        let disc = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Disconnected);
+        assert!(matches!(
+            disc,
+            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Disconnected)
+        ));
+
+        let connecting = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connecting);
+        assert!(matches!(
+            connecting,
+            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connecting)
+        ));
+
+        let connected = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connected {
+            tuner_name: "R820T".into(),
+            gain_count: 29,
+        });
+        assert!(matches!(
+            connected,
+            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connected { gain_count: 29, .. })
+        ));
+
+        let retrying = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Retrying {
+            attempt: 3,
+            retry_in: std::time::Duration::from_secs(5),
+        });
+        assert!(matches!(
+            retrying,
+            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Retrying { attempt: 3, .. })
+        ));
+
+        let failed = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Failed {
+            reason: "bad handshake".into(),
+        });
+        assert!(matches!(
+            failed,
+            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Failed { .. })
+        ));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn test_ui_to_dsp_variants() {
         let start = UiToDsp::Start;
@@ -438,6 +485,15 @@ mod tests {
 
         let disable = UiToDsp::DisableTranscription;
         assert!(matches!(disable, UiToDsp::DisableTranscription));
+
+        // RTL-TCP connection controls (commit 3 of PR #335) —
+        // constructed directly so a future signature change (e.g.
+        // adding an instance-selector param) fails this test
+        // rather than silently going quiet at the UI-handler site.
+        let disc = UiToDsp::DisconnectRtlTcp;
+        assert!(matches!(disc, UiToDsp::DisconnectRtlTcp));
+        let retry = UiToDsp::RetryRtlTcpNow;
+        assert!(matches!(retry, UiToDsp::RetryRtlTcpNow));
     }
 
     #[test]

@@ -89,6 +89,12 @@ const CENTER_FREQ_PAGE_HZ: f64 = 1_000_000.0;
 /// Same ordering as `source_panel::build_rtlsdr_rows` so keyboard
 /// muscle memory matches.
 const DEFAULT_SERVER_SAMPLE_RATE_INDEX: u32 = 7;
+/// Number of entries in the sample-rate `StringList`. Load-bearing
+/// for the persistence validator: any index `>=` this count is
+/// treated as a corrupt / transient GTK value and dropped on both
+/// restore and persist. Must match the list literal in
+/// `build_device_defaults_rows`.
+const SAMPLE_RATE_COUNT: u32 = 11;
 
 /// Server device-defaults: gain default (dB). 0.0 dB matches
 /// upstream's "auto" gain interpretation when the CLI passes `-g 0`.
@@ -639,7 +645,13 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             .get(KEY_SERVER_DEFAULT_SR_IDX)
             .and_then(serde_json::Value::as_u64)
             && let Ok(idx_u32) = u32::try_from(idx)
+            && idx_u32 < SAMPLE_RATE_COUNT
         {
+            // Strict bounds check on the stored index: anything
+            // past the StringList's last entry is discarded (not
+            // silently clamped) so a corrupt config leaves the
+            // widget on its build-time default instead of flipping
+            // to an arbitrary rate. Same policy as `bind_row`.
             panel.sample_rate_row.set_selected(idx_u32);
         }
         if let Some(gain) = v
@@ -692,12 +704,21 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             v[KEY_SERVER_PORT] = serde_json::json!(port);
         });
     });
-    // Bind-address combo.
+    // Bind-address combo. Only persist legal indices — GTK's
+    // ComboRow can emit transient out-of-range values during
+    // widget-model churn (e.g. a repopulation mid-drag). Writing
+    // those verbatim would corrupt the next startup's restore,
+    // which would then silently fall back to loopback and hide
+    // the drift. Strict gate here + on the restore side keeps
+    // the persisted state well-formed.
     let cfg_bind = Arc::clone(config);
     panel.bind_row.connect_selected_notify(move |row| {
-        cfg_bind.write(|v| {
-            v[KEY_SERVER_BIND_IDX] = serde_json::json!(row.selected());
-        });
+        let selected = row.selected();
+        if selected == BIND_LOOPBACK_IDX || selected == BIND_ALL_INTERFACES_IDX {
+            cfg_bind.write(|v| {
+                v[KEY_SERVER_BIND_IDX] = serde_json::json!(selected);
+            });
+        }
     });
     // Advertise switch.
     let cfg_adv = Arc::clone(config);
@@ -719,12 +740,17 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             v[KEY_SERVER_DEFAULT_FREQ_HZ] = serde_json::json!(hz);
         });
     });
-    // Sample-rate combo (device default).
+    // Sample-rate combo (device default). Same strict-gate policy
+    // as `bind_row` — don't persist transient out-of-range values
+    // from GTK widget-model churn.
     let cfg_sr = Arc::clone(config);
     panel.sample_rate_row.connect_selected_notify(move |row| {
-        cfg_sr.write(|v| {
-            v[KEY_SERVER_DEFAULT_SR_IDX] = serde_json::json!(row.selected());
-        });
+        let selected = row.selected();
+        if selected < SAMPLE_RATE_COUNT {
+            cfg_sr.write(|v| {
+                v[KEY_SERVER_DEFAULT_SR_IDX] = serde_json::json!(selected);
+            });
+        }
     });
     // Gain spin row (device default).
     let cfg_gain = Arc::clone(config);

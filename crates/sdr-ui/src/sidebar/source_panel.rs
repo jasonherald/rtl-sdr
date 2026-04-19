@@ -166,9 +166,15 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
             gain_count,
         } => format!("Connected — {tuner_name} ({gain_count} gains)"),
         RtlTcpConnectionState::Retrying { attempt, retry_in } => {
-            // Round up so "<1 s" still shows something rather than
-            // "0 s" (which would read like the retry already fired).
-            let secs = retry_in.as_secs().max(1);
+            // Ceil, not floor — `as_secs` truncates fractional
+            // seconds, so `1.9 s` would read as "1 s" and the row
+            // would understate the remaining delay. Bump by one
+            // whenever there are any subsec nanos, then clamp to
+            // at least 1 so sub-1 s retries still show something
+            // rather than "0 s" (which reads like the retry
+            // already fired).
+            let secs_ceil = retry_in.as_secs() + u64::from(retry_in.subsec_nanos() > 0);
+            let secs = secs_ceil.max(1);
             format!("Retrying in {secs} s (attempt {attempt})")
         }
         RtlTcpConnectionState::Failed { reason } => format!("Failed — {reason}"),
@@ -583,9 +589,9 @@ mod tests {
             }),
             "Connected — R820T (29 gains)"
         );
-        // Retrying rounds a sub-1-second retry_in up to "1 s" so the
-        // row never displays "Retrying in 0 s" (which would read as
-        // "the retry just fired").
+        // Retrying ceils fractional seconds so the row never
+        // understates the delay: 250 ms remaining → "1 s", not
+        // "0 s" (which would read as "the retry just fired").
         assert_eq!(
             format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
                 attempt: 3,
@@ -593,6 +599,18 @@ mod tests {
             }),
             "Retrying in 1 s (attempt 3)"
         );
+        // Key regression guard for the ceil semantics — 1.9 s must
+        // read as "2 s", never "1 s". Flooring on `as_secs` would
+        // silently understate the countdown here.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
+                attempt: 4,
+                retry_in: Duration::from_millis(1_900),
+            }),
+            "Retrying in 2 s (attempt 4)"
+        );
+        // Exact integer seconds must NOT get bumped by the ceil —
+        // 12 s stays at "12 s", not "13 s".
         assert_eq!(
             format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
                 attempt: 5,
