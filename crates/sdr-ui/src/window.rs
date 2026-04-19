@@ -608,6 +608,23 @@ fn handle_dsp_message(
                 }
             }
         }
+        DspToUi::BandwidthChanged(bw) => {
+            // DSP-originated bandwidth change (typically a VFO drag
+            // on the spectrum). Reflect it in the Radio panel's
+            // spin row so the numeric readout stays in lockstep
+            // with the active filter width.
+            //
+            // Set the suppress flag around the `set_value` call so
+            // the spin's `connect_value_notify` handler knows this
+            // update is DSP-originated and doesn't dispatch a
+            // redundant `UiToDsp::SetBandwidth` back to the
+            // controller. Restored after the set_value returns so
+            // user-originated edits from the next event loop tick
+            // are dispatched normally.
+            state.suppress_bandwidth_notify.set(true);
+            radio_panel.bandwidth_row.set_value(bw);
+            state.suppress_bandwidth_notify.set(false);
+        }
         DspToUi::CtcssSustainedChanged(sustained) => {
             tracing::debug!(sustained, "CTCSS sustained-gate edge");
             radio_panel.set_ctcss_sustained(sustained);
@@ -3545,9 +3562,19 @@ fn connect_source_panel(
 /// Connect radio panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
 fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
-    // Bandwidth
+    // Bandwidth. The DSP can originate a change too (VFO drag on
+    // the spectrum dispatches `UiToDsp::SetBandwidth` directly,
+    // and the controller echoes `DspToUi::BandwidthChanged` so the
+    // spin row reflects the drag). The echo path updates this row
+    // via `set_value` which re-fires `connect_value_notify` —
+    // `suppress_bandwidth_notify` breaks the cycle by telling this
+    // handler to skip the DSP dispatch when the change originated
+    // on the DSP side.
     let state_bw = Rc::clone(state);
     panels.radio.bandwidth_row.connect_value_notify(move |row| {
+        if state_bw.suppress_bandwidth_notify.get() {
+            return;
+        }
         state_bw.send_dsp(UiToDsp::SetBandwidth(row.value()));
     });
 

@@ -38,6 +38,20 @@ pub enum DspToUi {
     /// transcription session (band change = new session boundary) and
     /// to re-run Auto Break row visibility rules.
     DemodModeChanged(DemodMode),
+    /// Channel bandwidth changed. Emitted from the controller's
+    /// `SetBandwidth` handler after the new value has been applied
+    /// to `state.vfo`, `state.radio`, and `state.bandwidth`. Lets
+    /// the Radio sidebar panel's bandwidth spin row reflect drags
+    /// initiated from the spectrum VFO handles — without this, the
+    /// spin row would go stale relative to the DSP and confuse the
+    /// user about the active filter width.
+    ///
+    /// Emitted on every successful `SetBandwidth` application, not
+    /// edge-filtered — the spin row's `set_value` is idempotent
+    /// when called with its current value, so the cost is
+    /// negligible and emitting unconditionally keeps the controller
+    /// free of per-field before/after comparisons.
+    BandwidthChanged(f64),
     /// CTCSS sustained-gate state changed. Emitted only on edges
     /// (closed → open / open → closed), not per-window, so the UI
     /// status indicator can subscribe without flooding the channel.

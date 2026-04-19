@@ -300,6 +300,7 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::IqRecordingStarted(_)
         | DspToUi::IqRecordingStopped
         | DspToUi::DemodModeChanged(_)
+        | DspToUi::BandwidthChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
         | DspToUi::RtlTcpConnectionState(_) => return None,
