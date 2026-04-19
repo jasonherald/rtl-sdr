@@ -7,13 +7,21 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 /// Device selector index for RTL-SDR.
-const DEVICE_RTLSDR: u32 = 0;
+pub const DEVICE_RTLSDR: u32 = 0;
 /// Device selector index for Network.
-const DEVICE_NETWORK: u32 = 1;
+pub const DEVICE_NETWORK: u32 = 1;
 /// Device selector index for File.
-const DEVICE_FILE: u32 = 2;
+pub const DEVICE_FILE: u32 = 2;
 /// Device selector index for RTL-TCP (rtl_tcp-protocol network client).
 pub const DEVICE_RTLTCP: u32 = 3;
+
+/// Network protocol selector index for TCP (client). Load-bearing:
+/// both `build_network_rows()` (protocol `StringList`) and callers in
+/// `window.rs` that set or read this row rely on this exact mapping.
+/// Reorder the `StringList` and these constants must move in lockstep.
+pub const NETWORK_PROTOCOL_TCPCLIENT_IDX: u32 = 0;
+/// Network protocol selector index for UDP.
+pub const NETWORK_PROTOCOL_UDP_IDX: u32 = 1;
 
 /// Default gain in dB.
 const DEFAULT_GAIN_DB: f64 = 0.0;
@@ -155,6 +163,8 @@ fn build_network_rows() -> (adw::EntryRow, adw::SpinRow, adw::ComboRow) {
         .digits(0)
         .build();
 
+    // Order is load-bearing — must match
+    // `NETWORK_PROTOCOL_TCPCLIENT_IDX` / `NETWORK_PROTOCOL_UDP_IDX`.
     let protocol_model = gtk4::StringList::new(&["TCP", "UDP"]);
     let protocol_row = adw::ComboRow::builder()
         .title("Protocol")

@@ -125,13 +125,22 @@ impl Advertiser {
         let Some(daemon) = self.daemon.take() else {
             return Ok(());
         };
-        let rx = daemon.unregister(&self.full_name)?;
-        // `unregister` returns a Receiver for the completion status so
-        // the caller can wait for unregistration to finish. Short
-        // timeout is fine; if mDNS is wedged we still want to exit.
-        let _ = rx.recv_timeout(UNREGISTER_TIMEOUT);
-        // Shutdown follows the same pattern.
+        // Run shutdown unconditionally. The Option::take above has
+        // already disarmed Drop, so if we bailed here via `?` on an
+        // unregister error the daemon thread and its mDNS sockets
+        // would leak for the rest of the process lifetime.
+        // `unregister` returns a Receiver for the completion status;
+        // short timeout is fine because if mDNS is wedged we still
+        // want to exit.
+        let unregister_result = daemon.unregister(&self.full_name);
+        if let Ok(rx) = &unregister_result {
+            let _ = rx.recv_timeout(UNREGISTER_TIMEOUT);
+        }
         let _ = daemon.shutdown();
+        // Surface the unregister error (if any) to the caller after
+        // the daemon is fully torn down. Discard the Receiver on the
+        // Ok path — we already awaited it above.
+        unregister_result?;
         Ok(())
     }
 }

@@ -22,6 +22,10 @@ use crate::messages::{DspToUi, SourceType, UiToDsp};
 use crate::shortcuts;
 use crate::sidebar;
 use crate::sidebar::SidebarPanels;
+use crate::sidebar::source_panel::{
+    DEVICE_FILE, DEVICE_NETWORK, DEVICE_RTLSDR, DEVICE_RTLTCP, NETWORK_PROTOCOL_TCPCLIENT_IDX,
+    NETWORK_PROTOCOL_UDP_IDX,
+};
 use crate::spectrum;
 use crate::state::AppState;
 use crate::status_bar::{self, StatusBar};
@@ -1014,8 +1018,7 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                         // new endpoint. If it WASN'T, the notify
                         // handler will dispatch SetSourceType for us
                         // and an explicit send would double-open.
-                        let already_rtl_tcp =
-                            dr.selected() == crate::sidebar::source_panel::DEVICE_RTLTCP;
+                        let already_rtl_tcp = dr.selected() == DEVICE_RTLTCP;
                         hr.set_text(&click_host);
                         pr.set_value(f64::from(click_port));
                         // Force the shared protocol row to TCP. rtl_tcp
@@ -1024,10 +1027,9 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                         // when dispatching SetNetworkConfig — leaving
                         // it on UDP (the previous Network-source
                         // selection) would silently overwrite our
-                        // protocol on the next hostname edit. Index 0
-                        // = TcpClient; see protocol_row builder.
-                        protor.set_selected(0);
-                        dr.set_selected(crate::sidebar::source_panel::DEVICE_RTLTCP);
+                        // protocol on the next hostname edit.
+                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
+                        dr.set_selected(DEVICE_RTLTCP);
                         st.send_dsp(UiToDsp::SetNetworkConfig {
                             hostname: click_host.clone(),
                             port: click_port,
@@ -1145,10 +1147,10 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .device_row
         .connect_selected_notify(move |row| {
             let source_type = match row.selected() {
-                0 => SourceType::RtlSdr,
-                1 => SourceType::Network,
-                2 => SourceType::File,
-                3 => SourceType::RtlTcp,
+                DEVICE_RTLSDR => SourceType::RtlSdr,
+                DEVICE_NETWORK => SourceType::Network,
+                DEVICE_FILE => SourceType::File,
+                DEVICE_RTLTCP => SourceType::RtlTcp,
                 _ => return, // ignore transient indices
             };
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));
@@ -1162,7 +1164,7 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         let hostname = row.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = port_for_host.value() as u16;
-        let protocol = if proto_for_host.selected() == 1 {
+        let protocol = if proto_for_host.selected() == NETWORK_PROTOCOL_UDP_IDX {
             sdr_types::Protocol::Udp
         } else {
             sdr_types::Protocol::TcpClient
@@ -1182,7 +1184,7 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         let hostname = host_for_port.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = row.value() as u16;
-        let protocol = if proto_for_port.selected() == 1 {
+        let protocol = if proto_for_port.selected() == NETWORK_PROTOCOL_UDP_IDX {
             sdr_types::Protocol::Udp
         } else {
             sdr_types::Protocol::TcpClient
@@ -1206,8 +1208,8 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let port = port_for_proto.value() as u16;
             let protocol = match row.selected() {
-                0 => sdr_types::Protocol::TcpClient,
-                1 => sdr_types::Protocol::Udp,
+                NETWORK_PROTOCOL_TCPCLIENT_IDX => sdr_types::Protocol::TcpClient,
+                NETWORK_PROTOCOL_UDP_IDX => sdr_types::Protocol::Udp,
                 _ => return, // ignore transient indices
             };
             state_proto.send_dsp(UiToDsp::SetNetworkConfig {
