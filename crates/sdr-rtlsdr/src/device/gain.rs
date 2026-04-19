@@ -44,6 +44,31 @@ impl RtlSdrDevice {
         }
     }
 
+    /// Set the gain of one of the tuner's IF stages, in tenths of
+    /// dB.
+    ///
+    /// Ports `rtlsdr_set_tuner_if_gain`. Upstream dispatches to the
+    /// active tuner's `set_if_gain` callback; all tuners other than
+    /// the E4000 implement that as a no-op. Our `Tuner` trait has a
+    /// matching no-op default, so this method forwards unconditionally
+    /// and the non-E4000 modules silently return Ok. Returns Ok with
+    /// no side effects when no tuner is attached (mirrors the
+    /// `set_tuner_gain` / `set_tuner_gain_mode` convention above).
+    ///
+    /// `stage` is 1-based (1 through 6 on the E4000). `gain` is
+    /// signed tenths of dB — the same unit the rtl_tcp wire
+    /// protocol uses for command `0x06`.
+    pub fn set_tuner_if_gain(&mut self, stage: i32, gain: i32) -> Result<(), RtlSdrError> {
+        if let Some(tuner) = &mut self.tuner {
+            usb::set_i2c_repeater(&self.handle, true)?;
+            let result = tuner.set_if_gain(&self.handle, stage, gain);
+            usb::set_i2c_repeater(&self.handle, false)?;
+            result
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set RTL2832 AGC mode.
     ///
     /// Ports `rtlsdr_set_agc_mode`.

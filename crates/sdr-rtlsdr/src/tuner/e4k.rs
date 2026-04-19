@@ -24,6 +24,13 @@ pub const CHECK_ADDR: u8 = 0x02;
 /// Expected chip ID value read from `CHECK_ADDR`.
 pub const CHECK_VAL: u8 = 0x40;
 
+/// Divisor for converting tenths-of-dB wire values into integer
+/// dB values the E4K IF-stage gain LUT is indexed by. Matches
+/// upstream `e4000_set_if_gain` in `tuner_e4000.c`, which does
+/// `(int8_t)(gain / 10)` to collapse the rtl_tcp wire unit onto
+/// the driver's internal unit.
+const TENTHS_DB_PER_DB: i32 = 10;
+
 // ---------------------------------------------------------------------------
 // Register addresses
 // ---------------------------------------------------------------------------
@@ -1261,6 +1268,40 @@ impl Tuner for E4kTuner {
         manual: bool,
     ) -> Result<(), RtlSdrError> {
         self.enable_manual_gain(handle, manual)
+    }
+
+    fn set_if_gain(
+        &mut self,
+        handle: &rusb::DeviceHandle<rusb::GlobalContext>,
+        stage: i32,
+        gain: i32,
+    ) -> Result<(), RtlSdrError> {
+        // Upstream `e4000_set_if_gain` in `tuner_e4000.c`:
+        //
+        //     return e4k_if_gain_set(&devt->e4k_s,
+        //                            (uint8_t)stage,
+        //                            (int8_t)(gain / 10));
+        //
+        // Two-value cast — bare C-style truncation — is the
+        // upstream contract. Stages outside 1..=6 fall through to
+        // `find_stage_gain` which emits a typed `RtlSdrError`;
+        // matches upstream where the out-of-range path bubbles up
+        // as a nonzero return. Integer division on the tenths
+        // floors toward zero, consistent with the C cast (exact
+        // match for non-negative values; negatives round
+        // identically in both languages once the cast truncates).
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "faithful port of upstream's C-style u8/i8 casts — callers that pass out-of-range stages get a typed error from find_stage_gain"
+        )]
+        let stage_u8 = stage as u8;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "upstream truncates gain/10 to i8 via bare cast; RtlTcp 0x06 command wire gain is tenths-of-dB, E4K internal LUT is integer dB"
+        )]
+        let gain_i8 = (gain / TENTHS_DB_PER_DB) as i8;
+        self.if_gain_set(handle, stage_u8, gain_i8)
     }
 }
 
