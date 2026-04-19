@@ -51,6 +51,12 @@ sdr-transcription.workspace = true
 # Discovery for the rtl_tcp client picker — Browser events feed the
 # AdwExpanderRow under the source panel.
 sdr-rtltcp-discovery.workspace = true
+# Server for the share-over-network panel. `default-features = false`
+# because we already depend on `sdr-rtltcp-discovery` directly — no
+# need for the server crate to pull in its own (feature-gated) copy.
+# Using the path form (not `workspace = true`) because current cargo
+# rejects child-side `default-features = false` when inheriting.
+sdr-server-rtltcp = { path = "../sdr-server-rtltcp", default-features = false }
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

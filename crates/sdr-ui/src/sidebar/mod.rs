@@ -8,6 +8,7 @@ pub mod audio_panel;
 pub mod display_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
+pub mod server_panel;
 pub mod source_panel;
 pub mod transcript_panel;
 
@@ -15,6 +16,7 @@ pub use audio_panel::{AudioPanel, build_audio_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
+pub use server_panel::{ServerPanel, build_server_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
 pub use transcript_panel::{TranscriptPanel, build_transcript_panel};
 
@@ -35,6 +37,10 @@ pub struct SidebarPanels {
     pub display: DisplayPanel,
     /// Navigation — band presets and bookmarks.
     pub navigation: NavigationPanel,
+    /// Share-over-network (`rtl_tcp` server) controls. Hidden by
+    /// default; `window.rs` reveals it when a local RTL-SDR dongle
+    /// is plugged in and not currently the active source.
+    pub server: ServerPanel,
 }
 
 /// Build the complete sidebar `ScrolledWindow` containing all configuration panels.
@@ -43,6 +49,7 @@ pub struct SidebarPanels {
 /// `SidebarPanels` struct (for DSP bridge signal wiring — see issue #92).
 pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let source = build_source_panel();
+    let server = build_server_panel();
     let audio = build_audio_panel();
     let radio = build_radio_panel();
     let display = build_display_panel();
@@ -59,6 +66,10 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     sidebar_box.append(&navigation.presets_widget);
     sidebar_box.append(&navigation.bookmarks_widget);
     sidebar_box.append(&source.widget);
+    // Server panel sits directly under Source so the "consume local
+    // dongle" vs "share local dongle" decision is one visual group.
+    // Hidden by default; revealed dynamically by the wiring layer.
+    sidebar_box.append(&server.widget);
     sidebar_box.append(&audio.widget);
     sidebar_box.append(&radio.widget);
     sidebar_box.append(&display.widget);
@@ -74,6 +85,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         radio,
         display,
         navigation,
+        server,
     };
 
     (scroll, panels)
