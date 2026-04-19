@@ -1623,6 +1623,120 @@ fn connect_server_panel(
 /// `Server::start`, optionally attach an `Advertiser`, lock or
 /// unlock the panel controls, reapply visibility, and surface any
 /// error via a toast while flipping the switch back to off).
+/// Weak refs to every widget the share-switch handler reads or
+/// mutates. Mirrors the `ServerStatusWidgetsWeak` pattern: the
+/// closure attached to `share_row.connect_active_notify` would
+/// otherwise create a self-cycle (`share_row` → closure →
+/// `server_panel.share_row` → …) via the previous
+/// `clone_server_panel` capture. With this struct we capture weak
+/// refs only; strong refs live for the duration of one callback
+/// via `upgrade()` and drop at function return, so the widgets can
+/// be released on window close.
+///
+/// `source_device_row` is a sidebar neighbour (not in `ServerPanel`)
+/// and comes along for the exclusivity guard read.
+struct ServerSwitchWidgetsWeak {
+    nickname_row: glib::WeakRef<adw::EntryRow>,
+    port_row: glib::WeakRef<adw::SpinRow>,
+    bind_row: glib::WeakRef<adw::ComboRow>,
+    advertise_row: glib::WeakRef<adw::SwitchRow>,
+    device_defaults_row: glib::WeakRef<adw::ExpanderRow>,
+    center_freq_row: glib::WeakRef<adw::SpinRow>,
+    sample_rate_row: glib::WeakRef<adw::ComboRow>,
+    gain_row: glib::WeakRef<adw::SpinRow>,
+    ppm_row: glib::WeakRef<adw::SpinRow>,
+    bias_tee_row: glib::WeakRef<adw::SwitchRow>,
+    direct_sampling_row: glib::WeakRef<adw::SwitchRow>,
+    status_row: glib::WeakRef<adw::ExpanderRow>,
+    status_client_row: glib::WeakRef<adw::ActionRow>,
+    status_uptime_row: glib::WeakRef<adw::ActionRow>,
+    status_data_rate_row: glib::WeakRef<adw::ActionRow>,
+    status_commanded_row: glib::WeakRef<adw::ActionRow>,
+    activity_log_row: glib::WeakRef<adw::ExpanderRow>,
+    activity_log_list: glib::WeakRef<gtk4::ListBox>,
+    source_device_row: glib::WeakRef<adw::ComboRow>,
+}
+
+/// Upgraded strong refs held for the duration of a single handler
+/// invocation. Field names match `ServerPanel` so the existing
+/// helpers (`build_server_config_from_panel`, `set_controls_locked`,
+/// etc.) keep working after a simple type rename on their `panel`
+/// parameter.
+struct ServerSwitchWidgets {
+    nickname_row: adw::EntryRow,
+    port_row: adw::SpinRow,
+    bind_row: adw::ComboRow,
+    advertise_row: adw::SwitchRow,
+    device_defaults_row: adw::ExpanderRow,
+    center_freq_row: adw::SpinRow,
+    sample_rate_row: adw::ComboRow,
+    gain_row: adw::SpinRow,
+    ppm_row: adw::SpinRow,
+    bias_tee_row: adw::SwitchRow,
+    direct_sampling_row: adw::SwitchRow,
+    status_row: adw::ExpanderRow,
+    status_client_row: adw::ActionRow,
+    status_uptime_row: adw::ActionRow,
+    status_data_rate_row: adw::ActionRow,
+    status_commanded_row: adw::ActionRow,
+    activity_log_row: adw::ExpanderRow,
+    activity_log_list: gtk4::ListBox,
+    source_device_row: adw::ComboRow,
+}
+
+impl ServerSwitchWidgetsWeak {
+    fn from_panels(panels: &SidebarPanels) -> Self {
+        let s = &panels.server;
+        Self {
+            nickname_row: s.nickname_row.downgrade(),
+            port_row: s.port_row.downgrade(),
+            bind_row: s.bind_row.downgrade(),
+            advertise_row: s.advertise_row.downgrade(),
+            device_defaults_row: s.device_defaults_row.downgrade(),
+            center_freq_row: s.center_freq_row.downgrade(),
+            sample_rate_row: s.sample_rate_row.downgrade(),
+            gain_row: s.gain_row.downgrade(),
+            ppm_row: s.ppm_row.downgrade(),
+            bias_tee_row: s.bias_tee_row.downgrade(),
+            direct_sampling_row: s.direct_sampling_row.downgrade(),
+            status_row: s.status_row.downgrade(),
+            status_client_row: s.status_client_row.downgrade(),
+            status_uptime_row: s.status_uptime_row.downgrade(),
+            status_data_rate_row: s.status_data_rate_row.downgrade(),
+            status_commanded_row: s.status_commanded_row.downgrade(),
+            activity_log_row: s.activity_log_row.downgrade(),
+            activity_log_list: s.activity_log_list.downgrade(),
+            source_device_row: panels.source.device_row.downgrade(),
+        }
+    }
+
+    /// Lift every weak ref atomically — any missing widget means
+    /// the window's torn down and we skip the callback entirely.
+    fn upgrade(&self) -> Option<ServerSwitchWidgets> {
+        Some(ServerSwitchWidgets {
+            nickname_row: self.nickname_row.upgrade()?,
+            port_row: self.port_row.upgrade()?,
+            bind_row: self.bind_row.upgrade()?,
+            advertise_row: self.advertise_row.upgrade()?,
+            device_defaults_row: self.device_defaults_row.upgrade()?,
+            center_freq_row: self.center_freq_row.upgrade()?,
+            sample_rate_row: self.sample_rate_row.upgrade()?,
+            gain_row: self.gain_row.upgrade()?,
+            ppm_row: self.ppm_row.upgrade()?,
+            bias_tee_row: self.bias_tee_row.upgrade()?,
+            direct_sampling_row: self.direct_sampling_row.upgrade()?,
+            status_row: self.status_row.upgrade()?,
+            status_client_row: self.status_client_row.upgrade()?,
+            status_uptime_row: self.status_uptime_row.upgrade()?,
+            status_data_rate_row: self.status_data_rate_row.upgrade()?,
+            status_commanded_row: self.status_commanded_row.upgrade()?,
+            activity_log_row: self.activity_log_row.upgrade()?,
+            activity_log_list: self.activity_log_list.upgrade()?,
+            source_device_row: self.source_device_row.upgrade()?,
+        })
+    }
+}
+
 fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
@@ -1640,29 +1754,29 @@ fn connect_share_switch(
     let toast_overlay_weak = toast_overlay.downgrade();
 
     let share_row_weak = panels.server.share_row.downgrade();
-    // Clone the whole ServerPanel Rc-backed widget handles into the
-    // closure. adw/gtk widgets are GObject refs; cloning increments
-    // a refcount, not the data.
-    let server_panel = clone_server_panel(&panels.server);
-    // Reverse-direction exclusivity guard: we need to read the
-    // source-panel's device_row selection inside this closure to
-    // decline server start when the user still has RTL-SDR picked
-    // as their local source. Cloned (GObject refcount bump) rather
-    // than downgraded because the device_row's lifetime is bound to
-    // the sidebar which outlives the server panel's signal handler.
-    let source_device_row = panels.source.device_row.clone();
+    // Weak refs to every row/widget the handler reads or mutates.
+    // Replaces the previous `clone_server_panel` strong capture,
+    // which bumped share_row's GObject refcount and created a
+    // self-cycle with the `connect_active_notify` subscription.
+    // Upgraded per-callback so strong refs live for one tick only.
+    let widgets_weak = ServerSwitchWidgetsWeak::from_panels(panels);
 
     panels.server.share_row.connect_active_notify(move |row| {
         if reentry_guard.get() {
             return;
         }
+        let Some(widgets) = widgets_weak.upgrade() else {
+            // Window is gone — the signal should stop firing soon.
+            // Belt-and-suspenders early return.
+            return;
+        };
         let active = row.is_active();
         if active {
             // Exclusivity guard: can't claim the dongle for the
             // server while the UI still has RTL-SDR picked as the
             // local source type. Toast + revert the switch without
             // touching `running` or widget lock state.
-            if source_device_row.selected() == DEVICE_RTLSDR {
+            if widgets.source_device_row.selected() == DEVICE_RTLSDR {
                 if let Some(overlay) = toast_overlay_weak.upgrade() {
                     overlay.add_toast(adw::Toast::new(
                         "Switch the source away from local RTL-SDR before sharing over network.",
@@ -1676,7 +1790,7 @@ fn connect_share_switch(
             // Build a ServerConfig from current panel state. Widget
             // readers run on the main thread — safe to block-read
             // the rows synchronously.
-            let config = build_server_config_from_panel(&server_panel);
+            let config = build_server_config_from_panel(&widgets);
             match Server::start(config) {
                 Ok(server) => {
                     // If advertising is on, build the TXT record
@@ -1689,8 +1803,8 @@ fn connect_share_switch(
                     // `advertiser = None` so the stop path doesn't
                     // try to unregister something that never
                     // registered.
-                    let advertiser = if server_panel.advertise_row.is_active() {
-                        match build_advertiser(&server, &server_panel.nickname_row.text()) {
+                    let advertiser = if widgets.advertise_row.is_active() {
+                        match build_advertiser(&server, &widgets.nickname_row.text()) {
                             Ok(adv) => Some(adv),
                             Err(e) => {
                                 tracing::warn!(error = %e, "mDNS advertiser failed; server running without LAN advertisement");
@@ -1705,9 +1819,9 @@ fn connect_share_switch(
                     } else {
                         None
                     };
-                    set_controls_locked(&server_panel, true);
-                    server_panel.status_row.set_visible(true);
-                    server_panel.activity_log_row.set_visible(true);
+                    set_controls_locked(&widgets, true);
+                    widgets.status_row.set_visible(true);
+                    widgets.activity_log_row.set_visible(true);
                     *running.borrow_mut() = Some(RunningServer { server, advertiser });
                     // Flip the shared "server is live" flag AFTER
                     // the handle is stored so the source-panel
@@ -1749,45 +1863,14 @@ fn connect_share_switch(
             // re-selection triggered by the user's next action sees
             // the coherent post-stop state.
             server_running.set(false);
-            set_controls_locked(&server_panel, false);
-            server_panel.status_row.set_visible(false);
-            server_panel.activity_log_row.set_visible(false);
-            reset_status_rows(&server_panel);
-            reset_activity_log(&server_panel);
+            set_controls_locked(&widgets, false);
+            widgets.status_row.set_visible(false);
+            widgets.activity_log_row.set_visible(false);
+            reset_status_rows(&widgets);
+            reset_activity_log(&widgets);
         }
         apply_visibility();
     });
-}
-
-/// Deep-clone a `ServerPanel` (via `GObject` refcounts — all fields
-/// are adw/gtk widget handles, not data owners). Used to move a full
-/// panel reference into a long-lived closure without borrowing from
-/// the original `SidebarPanels`.
-fn clone_server_panel(panel: &sidebar::ServerPanel) -> sidebar::ServerPanel {
-    sidebar::ServerPanel {
-        widget: panel.widget.clone(),
-        share_row: panel.share_row.clone(),
-        nickname_row: panel.nickname_row.clone(),
-        port_row: panel.port_row.clone(),
-        bind_row: panel.bind_row.clone(),
-        advertise_row: panel.advertise_row.clone(),
-        device_defaults_row: panel.device_defaults_row.clone(),
-        center_freq_row: panel.center_freq_row.clone(),
-        sample_rate_row: panel.sample_rate_row.clone(),
-        gain_row: panel.gain_row.clone(),
-        ppm_row: panel.ppm_row.clone(),
-        bias_tee_row: panel.bias_tee_row.clone(),
-        direct_sampling_row: panel.direct_sampling_row.clone(),
-        status_row: panel.status_row.clone(),
-        status_client_row: panel.status_client_row.clone(),
-        status_uptime_row: panel.status_uptime_row.clone(),
-        status_data_rate_row: panel.status_data_rate_row.clone(),
-        status_commanded_row: panel.status_commanded_row.clone(),
-        status_stop_button: panel.status_stop_button.clone(),
-        activity_log_row: panel.activity_log_row.clone(),
-        activity_log_list: panel.activity_log_list.clone(),
-        bandwidth_advisory_row: panel.bandwidth_advisory_row.clone(),
-    }
 }
 
 /// Cadence for the server-stats poll that renders the "Server
@@ -2144,7 +2227,7 @@ fn render_activity_log(
 /// Reset activity-log list + subtitle on stop. Without this the
 /// list would persist after the server stopped — misleading users
 /// into thinking the log reflects a currently-running session.
-fn reset_activity_log(panel: &sidebar::ServerPanel) {
+fn reset_activity_log(panel: &ServerSwitchWidgets) {
     use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
     while let Some(child) = panel.activity_log_list.first_child() {
         panel.activity_log_list.remove(&child);
@@ -2176,7 +2259,7 @@ fn format_log_age(elapsed: Duration) -> String {
 /// Reset status rows to their idle-no-client state. Called when the
 /// server stops so the user doesn't see stale "connected at 127.0.0.1"
 /// / "uptime 5m" data after they flipped the share switch off.
-fn reset_status_rows(panel: &sidebar::ServerPanel) {
+fn reset_status_rows(panel: &ServerSwitchWidgets) {
     use crate::sidebar::server_panel::{
         STATUS_IDLE_VALUE_SUBTITLE, STATUS_WAITING_FOR_CLIENT_SUBTITLE,
     };
@@ -2219,7 +2302,7 @@ const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
     clippy::cast_sign_loss,
     reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
 )]
-fn build_server_config_from_panel(panel: &sidebar::ServerPanel) -> ServerConfig {
+fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
     use std::net::SocketAddr;
 
     use crate::sidebar::server_panel::{BIND_ALL_INTERFACES_IDX, BIND_LOOPBACK_IDX};
@@ -2330,7 +2413,7 @@ fn build_advertiser(
 /// start (so the user can't mutate config out from under a live
 /// session) and `false` on stop. `share_row` itself stays sensitive
 /// — that's how the user turns things off.
-fn set_controls_locked(panel: &sidebar::ServerPanel, locked: bool) {
+fn set_controls_locked(panel: &ServerSwitchWidgets, locked: bool) {
     let sensitive = !locked;
     panel.nickname_row.set_sensitive(sensitive);
     panel.port_row.set_sensitive(sensitive);
@@ -2430,19 +2513,34 @@ fn connect_source_panel(
     // selection AND the device-type selection (only network paths
     // care about wire bandwidth). We clone the helper closure into
     // both notify handlers so either trigger re-evaluates.
+    // All three widgets the advisory closure touches are weak-
+    // ref'd. The closure is attached to both `sample_rate_row` and
+    // `device_row`'s `connect_selected_notify` — strong captures
+    // here would create the same self-cycle pattern flagged in
+    // `connect_share_switch` / `connect_server_status_polling`:
+    // `row → closure → row.clone()` keeps the widget alive forever.
     let advisory_row_weak = panels.source.bandwidth_advisory_row.downgrade();
-    let device_row_for_advisory = panels.source.device_row.clone();
-    let sample_rate_row_for_advisory = panels.source.sample_rate_row.clone();
+    let device_row_weak = panels.source.device_row.downgrade();
+    let sample_rate_row_weak = panels.source.sample_rate_row.downgrade();
     let apply_source_bandwidth_advisory = {
         let advisory_row_weak = advisory_row_weak.clone();
+        let device_row_weak = device_row_weak.clone();
+        let sample_rate_row_weak = sample_rate_row_weak.clone();
         move || {
-            let Some(row) = advisory_row_weak.upgrade() else {
+            // Any missing widget means the window has been torn
+            // down; skip the render — subsequent notify events
+            // won't fire against dead widgets.
+            let (Some(advisory), Some(device_row), Some(sample_rate_row)) = (
+                advisory_row_weak.upgrade(),
+                device_row_weak.upgrade(),
+                sample_rate_row_weak.upgrade(),
+            ) else {
                 return;
             };
-            let is_network_path = device_row_for_advisory.selected() == DEVICE_RTLTCP;
-            let is_high_rate = sample_rate_row_for_advisory.selected()
+            let is_network_path = device_row.selected() == DEVICE_RTLTCP;
+            let is_high_rate = sample_rate_row.selected()
                 >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX;
-            row.set_visible(is_network_path && is_high_rate);
+            advisory.set_visible(is_network_path && is_high_rate);
         }
     };
     // Seed the advisory visibility once at wire-up. Without this,
