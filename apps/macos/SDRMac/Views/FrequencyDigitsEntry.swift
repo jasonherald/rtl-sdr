@@ -147,13 +147,33 @@ struct FrequencyDigitsEntry: View {
     private func digitLabel(at i: Int) -> some View {
         let firstNonzero = digits.firstIndex(where: { $0 != 0 }) ?? Self.numDigits
         let isLeading = i < firstNonzero && i != Self.numDigits - 1
-        let isSelected = focused && i == selectedIndex
+        // Selection is independent of keyboard focus — the user
+        // who clicks a digit and then moves the mouse still has
+        // a meaningful "this is the target digit" expectation.
+        // Paint the selected digit in the system accent color
+        // (bold weight too) so it reads at a glance without any
+        // background chrome. Dim when the control doesn't have
+        // keyboard focus, brighten when focused, so "typing lands
+        // here" vs "click first" is still distinguishable.
+        // Closes #328.
+        let isSelected = i == selectedIndex
+
+        let digitColor: Color
+        if isSelected {
+            digitColor = focused
+                ? .accentColor
+                : .accentColor.opacity(0.65)
+        } else if isLeading {
+            digitColor = .secondary.opacity(0.6)
+        } else {
+            digitColor = .primary
+        }
 
         return Text("\(digits[i])")
             .font(Self.digitFont)
-            .foregroundStyle(isLeading ? .tertiary : .primary)
+            .fontWeight(isSelected ? .bold : .regular)
+            .foregroundStyle(digitColor)
             .frame(minWidth: 12)
-            .underline(isSelected, color: .accentColor)
             .contentShape(Rectangle())
             .onTapGesture {
                 selectedIndex = i
