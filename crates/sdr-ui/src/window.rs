@@ -1535,57 +1535,22 @@ fn connect_rtl_tcp_discovery(
                         server.txt.nickname.clone()
                     };
                     connect_btn.connect_clicked(move |_| {
-                        // Remember whether the device row was already
-                        // on RTL-TCP. If it WAS, `set_selected` below
-                        // is a no-op and the `device_row` notify
-                        // handler doesn't fire, so we need to send
-                        // SetSourceType ourselves to force the
-                        // controller to reopen the source against the
-                        // new endpoint. If it WASN'T, the notify
-                        // handler will dispatch SetSourceType for us
-                        // and an explicit send would double-open.
-                        let already_rtl_tcp = dr.selected() == DEVICE_RTLTCP;
-                        // Force the shared protocol row to TCP
-                        // BEFORE the hostname/port writes below.
-                        // `hr.set_text` and `pr.set_value` fire the
-                        // `connect_changed` / `connect_value_notify`
-                        // handlers on the shared network rows, which
-                        // re-read `protocol_row.selected()` to build
-                        // their `SetNetworkConfig`. If the shared
-                        // protocol row is still on UDP from a prior
-                        // raw-Network session, those handlers would
-                        // dispatch a stale-UDP `SetNetworkConfig`
-                        // for our clicked endpoint before the
-                        // RTL-TCP switch lands — a transient
-                        // retarget of any live raw-Network source.
-                        // rtl_tcp is always TCP.
-                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
-                        hr.set_text(&click_host);
-                        pr.set_value(f64::from(click_port));
-                        dr.set_selected(DEVICE_RTLTCP);
-                        st.send_dsp(UiToDsp::SetNetworkConfig {
-                            hostname: click_host.clone(),
-                            port: click_port,
-                            protocol: sdr_types::Protocol::TcpClient,
-                        });
-                        // Persist the choice so next app launch
-                        // pre-populates the hostname / port fields
-                        // with the same server without needing
-                        // another mDNS round-trip.
-                        crate::sidebar::source_panel::save_last_connected(
+                        // Shared ordering-sensitive flow lives in
+                        // `apply_rtl_tcp_connect` — see its doc for
+                        // why `protocol_row` gets set to TCP before
+                        // the host/port writes and why
+                        // `SetSourceType` only fires conditionally.
+                        apply_rtl_tcp_connect(
+                            &click_host,
+                            click_port,
+                            &click_nickname,
+                            &hr,
+                            &pr,
+                            &protor,
+                            &dr,
+                            &st,
                             &cfg,
-                            &crate::sidebar::source_panel::LastConnectedServer {
-                                host: click_host.clone(),
-                                port: click_port,
-                                nickname: click_nickname.clone(),
-                            },
                         );
-                        if already_rtl_tcp {
-                            // device_row notify handler did NOT fire
-                            // (we were already on RTL-TCP); force the
-                            // source reopen so the new endpoint takes.
-                            st.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
-                        }
                     });
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
@@ -1685,6 +1650,78 @@ const FAVORITE_ICON_FILLED: &str = "starred-symbolic";
 /// different host.
 fn favorite_key(server: &DiscoveredServer) -> String {
     format!("{}:{}", server.hostname, server.port)
+}
+
+/// Execute the shared RTL-TCP connect sequence — used by both the
+/// discovery-row Connect button and the favorites-popover Connect
+/// button. Centralizes the ordering-sensitive steps so a future
+/// fix can't land on one caller and miss the other:
+///
+/// 1. **Snapshot** `already_rtl_tcp` before touching `device_row`.
+///    If the selector was ALREADY on RTL-TCP, `set_selected` is a
+///    no-op and the device-row notify handler won't fire — we
+///    need to dispatch `SetSourceType` ourselves to force the
+///    controller to reopen the source against the new endpoint.
+///    If it was on a different source type, the notify handler
+///    fires and dispatches `SetSourceType` for us; an explicit
+///    send here would double-open.
+///
+/// 2. **Pin TCP** on `protocol_row` BEFORE writing host / port.
+///    `hostname_row.set_text` and `port_row.set_value` fire
+///    change handlers that re-read `protocol_row.selected()` to
+///    build their `SetNetworkConfig`. If the shared protocol row
+///    is still on UDP from a prior raw-Network session, those
+///    handlers would dispatch a stale-UDP config against the
+///    clicked endpoint before the RTL-TCP switch lands — a
+///    transient retarget of any live raw-Network source. `rtl_tcp`
+///    is always TCP, so we force TCP unconditionally.
+///
+/// 3. **Write host / port**, flip `device_row` to RTL-TCP, dispatch
+///    the fresh `SetNetworkConfig`, persist a `LastConnectedServer`
+///    snapshot so next launch pre-populates the fields without
+///    waiting for mDNS.
+///
+/// 4. **Conditionally** dispatch `SetSourceType(RtlTcp)` — only when
+///    `already_rtl_tcp` was true (step 1's rationale).
+///
+/// Caller-owned follow-ups (popover `popdown`, etc.) happen after
+/// this helper returns.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each arg is a distinct widget / state handle the caller owns in its own shape (strong Rc clone vs weak-upgraded strong). Bundling into a struct would duplicate FavoriteRowContext for the favorites caller and invent a mirror struct for the discovery caller, trading argument count for two near-identical shim types."
+)]
+fn apply_rtl_tcp_connect(
+    host: &str,
+    port: u16,
+    nickname: &str,
+    hostname_row: &adw::EntryRow,
+    port_row: &adw::SpinRow,
+    protocol_row: &adw::ComboRow,
+    device_row: &adw::ComboRow,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
+    protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
+    hostname_row.set_text(host);
+    port_row.set_value(f64::from(port));
+    device_row.set_selected(DEVICE_RTLTCP);
+    state.send_dsp(UiToDsp::SetNetworkConfig {
+        hostname: host.to_string(),
+        port,
+        protocol: sdr_types::Protocol::TcpClient,
+    });
+    crate::sidebar::source_panel::save_last_connected(
+        config,
+        &crate::sidebar::source_panel::LastConnectedServer {
+            host: host.to_string(),
+            port,
+            nickname: nickname.to_string(),
+        },
+    );
+    if already_rtl_tcp {
+        state.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
+    }
 }
 
 /// Re-add rows to an `AdwExpanderRow` in a deterministic order:
@@ -1882,37 +1919,20 @@ fn attach_favorite_row_actions(
         ) else {
             return;
         };
-        // See discovery-row Connect handler (and #335 protocol-
-        // ordering lesson): pin TCP before writing host/port
-        // so the change handlers on those rows don't dispatch
-        // a stale-UDP `SetNetworkConfig` against the endpoint.
-        let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
-        protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
-        hostname_row.set_text(&host);
-        port_row.set_value(f64::from(port));
-        device_row.set_selected(DEVICE_RTLTCP);
-        connect_ctx.state.send_dsp(UiToDsp::SetNetworkConfig {
-            hostname: host.clone(),
+        // Shared ordering-sensitive flow lives in
+        // `apply_rtl_tcp_connect`. The popover-specific follow-up
+        // (popdown) happens after this returns.
+        apply_rtl_tcp_connect(
+            &host,
             port,
-            protocol: sdr_types::Protocol::TcpClient,
-        });
-        crate::sidebar::source_panel::save_last_connected(
+            &connect_nickname,
+            &hostname_row,
+            &port_row,
+            &protocol_row,
+            &device_row,
+            &connect_ctx.state,
             &connect_ctx.config,
-            &crate::sidebar::source_panel::LastConnectedServer {
-                host: host.clone(),
-                port,
-                nickname: connect_nickname.clone(),
-            },
         );
-        if already_rtl_tcp {
-            // device_row notify handler did NOT fire (we were
-            // already on RTL-TCP); force the source reopen so
-            // the new endpoint takes. Mirrors the discovery-row
-            // Connect path.
-            connect_ctx
-                .state
-                .send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
-        }
         // Dismiss the popover once the connection is dispatched
         // so the user sees the source row update underneath.
         if let Some(popover) = connect_ctx.popover.popover.upgrade() {
@@ -5052,6 +5072,127 @@ mod parse_host_port_tests {
         // callers would dispatch `SetNetworkConfig { hostname:
         // "" }` which is garbage.
         assert_eq!(parse_host_port(":1234"), None);
+    }
+}
+
+#[cfg(test)]
+mod favorite_subtitle_format_tests {
+    use super::{format_favorite_subtitle, format_seen_age};
+    use crate::sidebar::source_panel::FavoriteEntry;
+
+    /// Fixed "wall-clock now" for the subtitle + age tests. Pinning
+    /// this keeps the expected output deterministic; the actual
+    /// seconds value is arbitrary (2023-11-14T22:13:20Z) — what
+    /// matters is that all test inputs derive their `last_seen`
+    /// offsets from here.
+    const NOW_UNIX: u64 = 1_700_000_000;
+
+    fn sample_entry(
+        tuner: Option<&str>,
+        gains: Option<u32>,
+        last_seen: Option<u64>,
+    ) -> FavoriteEntry {
+        FavoriteEntry {
+            key: "shack-pi.local.:1234".into(),
+            nickname: "Shack Pi".into(),
+            tuner_name: tuner.map(str::to_string),
+            gain_count: gains,
+            last_seen_unix: last_seen,
+        }
+    }
+
+    #[test]
+    fn seen_age_just_now_under_60_seconds() {
+        // Sub-minute gap renders as "just now" — avoids "0m ago"
+        // churn on freshly-stamped entries.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 30), "just now");
+    }
+
+    #[test]
+    fn seen_age_minute_bucket() {
+        // Integer division, not rounding: 179s → 2m (not 3m).
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 179), "2m ago");
+    }
+
+    #[test]
+    fn seen_age_hour_bucket() {
+        // 3599s → 59m (last second of minute bucket), 3600s → 1h.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 3_600), "1h ago");
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 3_599), "59m ago");
+    }
+
+    #[test]
+    fn seen_age_day_bucket() {
+        // 86_399s → 23h, 86_400s → 1d.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 86_400), "1d ago");
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 86_399), "23h ago");
+    }
+
+    #[test]
+    fn seen_age_clock_skew_renders_just_now() {
+        // `last_seen > now` means the entry was stamped against a
+        // clock that was ahead of ours — shouldn't underflow into
+        // a garbage value.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX + 60), "just now");
+        // Equal case.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX), "just now");
+    }
+
+    #[test]
+    fn subtitle_includes_all_three_parts_when_metadata_present() {
+        // Canonical "rich" entry: key + tuner·gains + seen age,
+        // joined by middle-dot separators.
+        let entry = sample_entry(Some("R820T"), Some(29), Some(NOW_UNIX - 7_200));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • R820T · 29 gains • seen 2h ago",
+        );
+    }
+
+    #[test]
+    fn subtitle_drops_tuner_segment_when_tuner_missing() {
+        // Legacy-upgraded entry with no tuner metadata — the
+        // "tuner · gains" middle segment is omitted entirely
+        // rather than rendering empty "— · 0 gains" placeholder.
+        let entry = sample_entry(None, None, Some(NOW_UNIX - 300));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • seen 5m ago",
+        );
+    }
+
+    #[test]
+    fn subtitle_drops_tuner_segment_when_only_gains_missing() {
+        // Partial metadata is still incomplete — `if let (Some,
+        // Some)` means both must be present or neither renders.
+        let entry = sample_entry(Some("R820T"), None, Some(NOW_UNIX - 300));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • seen 5m ago",
+        );
+    }
+
+    #[test]
+    fn subtitle_shows_offline_when_last_seen_is_none() {
+        // Never seen this session → "offline" in the seen slot.
+        let entry = sample_entry(Some("R820T"), Some(29), None);
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • R820T · 29 gains • offline",
+        );
+    }
+
+    #[test]
+    fn subtitle_shows_offline_when_last_seen_is_zero() {
+        // Zero is treated as "no real stamp" — `format_favorite_
+        // subtitle` explicitly gates on `ts > 0` so a corrupt /
+        // default-valued timestamp doesn't render as "seen 55y
+        // ago" (the 1970 epoch).
+        let entry = sample_entry(Some("R820T"), Some(29), Some(0));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • R820T · 29 gains • offline",
+        );
     }
 }
 
