@@ -1604,8 +1604,18 @@ fn connect_server_panel(
         let Some(advisory) = advisory_row_weak.upgrade() else {
             return;
         };
+        // Bounds-check the selected index before threshold compare.
+        // `ComboRow::selected()` can emit transient out-of-range
+        // values during widget-model churn (GTK model repopulate,
+        // drag-mid-scroll, etc.) — a bare `>=` would treat those
+        // as high-bandwidth and flash the advisory visible against
+        // no legal selection. Mirrors the `SAMPLE_RATES.get()`
+        // safety pattern used elsewhere in this file.
+        let selected = row.selected();
+        let is_legal = (selected as usize) < SAMPLE_RATES.len();
         advisory.set_visible(
-            row.selected() >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX,
+            is_legal
+                && selected >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX,
         );
     };
     // Seed initial visibility + subscribe for future changes.
@@ -2538,8 +2548,15 @@ fn connect_source_panel(
                 return;
             };
             let is_network_path = device_row.selected() == DEVICE_RTLTCP;
-            let is_high_rate = sample_rate_row.selected()
-                >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX;
+            // Bounds-check the sample-rate index: transient
+            // out-of-range values from widget-model churn would
+            // otherwise satisfy the `>= threshold` compare and
+            // flash the advisory visible with no legal selection.
+            // Same safety pattern as the server-panel advisory
+            // above.
+            let selected = sample_rate_row.selected();
+            let is_high_rate = (selected as usize) < SAMPLE_RATES.len()
+                && selected >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX;
             advisory.set_visible(is_network_path && is_high_rate);
         }
     };
