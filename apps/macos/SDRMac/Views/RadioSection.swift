@@ -29,6 +29,15 @@ struct RadioSection: View {
             ))
 
             if model.squelchEnabled {
+                // Auto-squelch tracks the noise floor and writes
+                // the threshold. Only visible alongside the main
+                // squelch toggle — the feature has no meaning
+                // when squelch itself is off.
+                Toggle("Auto", isOn: Binding(
+                    get: { model.autoSquelchEnabled },
+                    set: { model.setAutoSquelch($0) }
+                ))
+
                 LabeledContent("Threshold") {
                     VStack(spacing: 2) {
                         @Bindable var m = model
@@ -49,9 +58,19 @@ struct RadioSection: View {
                                 }
                             }
                         )
-                        Text("\(Int(model.squelchDb)) dB")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        // Slider is disabled while auto-squelch
+                        // owns the threshold — letting the user
+                        // drag against a value that re-sets at
+                        // ~50 Hz is confusing UX. The label still
+                        // shows the live auto-picked value.
+                        .disabled(model.autoSquelchEnabled)
+                        Text(
+                            model.autoSquelchEnabled
+                                ? "Auto: \(Int(model.squelchDb)) dB"
+                                : "\(Int(model.squelchDb)) dB"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
             }

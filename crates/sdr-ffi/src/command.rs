@@ -326,6 +326,15 @@ pub unsafe extern "C" fn sdr_core_set_squelch_enabled(handle: *mut SdrCore, enab
     }
 }
 
+/// Enable or disable auto-squelch (noise-floor tracking).
+/// The engine self-adjusts the squelch threshold while this is
+/// on; manual `sdr_core_set_squelch_db` calls are still accepted
+/// but will be overwritten by the tracker on the next update.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_auto_squelch(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetAutoSquelch(enabled))) }
+}
+
 /// Set the squelch threshold in dB. Value must be finite.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_set_squelch_db(handle: *mut SdrCore, db: f32) -> i32 {

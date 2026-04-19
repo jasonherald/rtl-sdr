@@ -193,6 +193,13 @@ final class CoreModel {
 
     var signalLevelDb: Float = -120
 
+    /// Auto-squelch tracks the noise floor in the DSP and
+    /// self-adjusts the threshold. This is an engine-side
+    /// feature (`sdr-radio::IfChain::set_auto_squelch_enabled`);
+    /// the UI just toggles it. Only meaningful when
+    /// `squelchEnabled` is also on.
+    var autoSquelchEnabled: Bool = false
+
     // ==========================================================
     //  Bootstrap / shutdown
     // ==========================================================
@@ -423,6 +430,7 @@ final class CoreModel {
         setBandwidth(bandwidthHz)
         setSquelchEnabled(squelchEnabled)
         setSquelchDb(squelchDb)
+        setAutoSquelch(autoSquelchEnabled)
         setDeemphasis(deemphasis)
         setVolume(volume)
         setFftSize(fftSize)
@@ -590,6 +598,11 @@ final class CoreModel {
     func setSquelchEnabled(_ on: Bool) {
         squelchEnabled = on
         capture { try core?.setSquelchEnabled(on) }
+    }
+
+    func setAutoSquelch(_ on: Bool) {
+        autoSquelchEnabled = on
+        capture { try core?.setAutoSquelch(on) }
     }
 
     func setDeemphasis(_ m: Deemphasis) {

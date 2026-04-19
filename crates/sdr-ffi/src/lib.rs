@@ -53,12 +53,12 @@ pub mod lifecycle;
 // the rlib (in-tree integration tests) can reference them via
 // `sdr_ffi::sdr_core_*`.
 pub use command::{
-    sdr_core_set_agc, sdr_core_set_bandwidth, sdr_core_set_dc_blocking, sdr_core_set_decimation,
-    sdr_core_set_deemphasis, sdr_core_set_demod_mode, sdr_core_set_fft_rate, sdr_core_set_fft_size,
-    sdr_core_set_fft_window, sdr_core_set_gain, sdr_core_set_iq_correction,
-    sdr_core_set_iq_inversion, sdr_core_set_ppm_correction, sdr_core_set_sample_rate,
-    sdr_core_set_squelch_db, sdr_core_set_squelch_enabled, sdr_core_set_vfo_offset,
-    sdr_core_set_volume, sdr_core_start, sdr_core_stop, sdr_core_tune,
+    sdr_core_set_agc, sdr_core_set_auto_squelch, sdr_core_set_bandwidth, sdr_core_set_dc_blocking,
+    sdr_core_set_decimation, sdr_core_set_deemphasis, sdr_core_set_demod_mode,
+    sdr_core_set_fft_rate, sdr_core_set_fft_size, sdr_core_set_fft_window, sdr_core_set_gain,
+    sdr_core_set_iq_correction, sdr_core_set_iq_inversion, sdr_core_set_ppm_correction,
+    sdr_core_set_sample_rate, sdr_core_set_squelch_db, sdr_core_set_squelch_enabled,
+    sdr_core_set_vfo_offset, sdr_core_set_volume, sdr_core_start, sdr_core_stop, sdr_core_tune,
 };
 pub use enumerate::{sdr_core_device_count, sdr_core_device_name};
 pub use error::sdr_core_last_error_message;

@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 2
+#define SDR_CORE_ABI_VERSION_MINOR 3
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -307,6 +307,16 @@ int32_t sdr_core_set_demod_mode(SdrCore* handle, int32_t mode);
 int32_t sdr_core_set_bandwidth(SdrCore* handle, double bw_hz);
 int32_t sdr_core_set_squelch_enabled(SdrCore* handle, bool enabled);
 int32_t sdr_core_set_squelch_db(SdrCore* handle, float db);
+
+/*
+ * Enable or disable auto-squelch (engine-side noise-floor
+ * tracking). Complements `sdr_core_set_squelch_enabled` — while
+ * auto-squelch is on, the engine continuously adjusts the
+ * squelch threshold to sit above the measured noise floor.
+ * Manual `sdr_core_set_squelch_db` writes are accepted but the
+ * tracker will overwrite them on its next cycle.
+ */
+int32_t sdr_core_set_auto_squelch(SdrCore* handle, bool enabled);
 
 typedef enum SdrDeemphasis {
     SDR_DEEMPH_NONE = 0,
