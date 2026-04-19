@@ -853,9 +853,19 @@ fn connect_sidebar_panels(
     status_bar: &Rc<StatusBar>,
     toast_overlay: &adw::ToastOverlay,
 ) {
-    connect_source_panel(panels, state);
+    // Shared "is the rtl_tcp server currently live?" flag. Written by
+    // the server panel's start/stop handler, read by the source
+    // panel's device-type guard so the two panels can enforce the
+    // "local RTL-SDR source and server-sharing-the-dongle are
+    // mutually exclusive" rule without either side owning state the
+    // other has to synthesize. `Rc<Cell<bool>>` is ideal: GTK single-
+    // threaded, no interior locking needed, cheap to clone into
+    // closures.
+    let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+    connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
     connect_rtl_tcp_discovery(panels, state);
-    connect_server_panel(panels, toast_overlay);
+    connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
@@ -1175,7 +1185,11 @@ struct RunningServer {
     clippy::too_many_lines,
     reason = "GTK signal-wiring: visibility + start-stop + control-locking all share state via nested closures — splitting scatters the captures"
 )]
-fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverlay) {
+fn connect_server_panel(
+    panels: &SidebarPanels,
+    toast_overlay: &adw::ToastOverlay,
+    server_running: Rc<std::cell::Cell<bool>>,
+) {
     use std::cell::Cell;
 
     let server_widget_weak = panels.server.widget.downgrade();
@@ -1272,6 +1286,7 @@ fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverla
         toast_overlay,
         Rc::clone(&running),
         apply_visibility.clone(),
+        server_running,
     );
 
     // Poll `Server::stats()` on a timer, render the status rows,
@@ -1292,6 +1307,7 @@ fn connect_share_switch(
     toast_overlay: &adw::ToastOverlay,
     running: Rc<RefCell<Option<RunningServer>>>,
     apply_visibility: impl Fn() + Clone + 'static,
+    server_running: Rc<std::cell::Cell<bool>>,
 ) {
     use std::cell::Cell;
 
@@ -1307,6 +1323,13 @@ fn connect_share_switch(
     // closure. adw/gtk widgets are GObject refs; cloning increments
     // a refcount, not the data.
     let server_panel = clone_server_panel(&panels.server);
+    // Reverse-direction exclusivity guard: we need to read the
+    // source-panel's device_row selection inside this closure to
+    // decline server start when the user still has RTL-SDR picked
+    // as their local source. Cloned (GObject refcount bump) rather
+    // than downgraded because the device_row's lifetime is bound to
+    // the sidebar which outlives the server panel's signal handler.
+    let source_device_row = panels.source.device_row.clone();
 
     panels.server.share_row.connect_active_notify(move |row| {
         if reentry_guard.get() {
@@ -1314,6 +1337,21 @@ fn connect_share_switch(
         }
         let active = row.is_active();
         if active {
+            // Exclusivity guard: can't claim the dongle for the
+            // server while the UI still has RTL-SDR picked as the
+            // local source type. Toast + revert the switch without
+            // touching `running` or widget lock state.
+            if source_device_row.selected() == DEVICE_RTLSDR {
+                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                    overlay.add_toast(adw::Toast::new(
+                        "Switch the source away from local RTL-SDR before sharing over network.",
+                    ));
+                }
+                reentry_guard.set(true);
+                row.set_active(false);
+                reentry_guard.set(false);
+                return;
+            }
             // Build a ServerConfig from current panel state. Widget
             // readers run on the main thread — safe to block-read
             // the rows synchronously.
@@ -1350,6 +1388,11 @@ fn connect_share_switch(
                     server_panel.status_row.set_visible(true);
                     server_panel.activity_log_row.set_visible(true);
                     *running.borrow_mut() = Some(RunningServer { server, advertiser });
+                    // Flip the shared "server is live" flag AFTER
+                    // the handle is stored so the source-panel
+                    // guard can't race against a mid-construction
+                    // state.
+                    server_running.set(true);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to start rtl_tcp server");
@@ -1380,6 +1423,11 @@ fn connect_share_switch(
                 drop(handle.advertiser.take());
                 drop(handle.server);
             }
+            // Clear the shared "server is live" flag ahead of the
+            // widget-visibility changes so an immediate source-type
+            // re-selection triggered by the user's next action sees
+            // the coherent post-stop state.
+            server_running.set(false);
             set_controls_locked(&server_panel, false);
             server_panel.status_row.set_visible(false);
             server_panel.activity_log_row.set_visible(false);
@@ -2049,7 +2097,12 @@ fn format_age(elapsed: Duration) -> String {
     clippy::too_many_lines,
     reason = "GTK signal-wiring panel; splitting would fragment the control mapping"
 )]
-fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
+fn connect_source_panel(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    toast_overlay: &adw::ToastOverlay,
+    server_running: Rc<std::cell::Cell<bool>>,
+) {
     // Sample rate selector
     let state_sr = Rc::clone(state);
     panels
@@ -2120,19 +2173,53 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         state_ppm.send_dsp(UiToDsp::SetPpmCorrection(row.value() as i32));
     });
 
-    // Source type selector — guard against transient out-of-range indices
+    // Source type selector — guard against transient out-of-range
+    // indices AND enforce mutual exclusivity with the rtl_tcp server
+    // (the dongle can only serve one master; re-selecting RTL-SDR
+    // while the server's accept thread has the USB device would
+    // trigger a double-open at the next Play).
     let state_source = Rc::clone(state);
+    let toast_overlay_weak = toast_overlay.downgrade();
+    // Last-known legal selection. Seeded from the current row state
+    // so the revert path on first illegal transition lands on the
+    // value the UI already shows. Updated every time the guard
+    // accepts a new selection.
+    let last_legal_selection: Rc<std::cell::Cell<u32>> =
+        Rc::new(std::cell::Cell::new(panels.source.device_row.selected()));
+    // Re-entry guard against our own `set_selected` (the revert).
+    // Without it the revert would re-enter this handler, see the
+    // previous illegal value as "new", and endlessly toggle.
+    let reverting: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
     panels
         .source
         .device_row
         .connect_selected_notify(move |row| {
-            let source_type = match row.selected() {
+            if reverting.get() {
+                // Our own revert fired this notify — drop it.
+                return;
+            }
+            let selected = row.selected();
+            // Exclusivity guard: can't re-enter the local-source
+            // world while the rtl_tcp server has the dongle claimed.
+            if selected == DEVICE_RTLSDR && server_running.get() {
+                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                    overlay.add_toast(adw::Toast::new(
+                        "Stop the network server first before switching to local RTL-SDR.",
+                    ));
+                }
+                reverting.set(true);
+                row.set_selected(last_legal_selection.get());
+                reverting.set(false);
+                return;
+            }
+            let source_type = match selected {
                 DEVICE_RTLSDR => SourceType::RtlSdr,
                 DEVICE_NETWORK => SourceType::Network,
                 DEVICE_FILE => SourceType::File,
                 DEVICE_RTLTCP => SourceType::RtlTcp,
                 _ => return, // ignore transient indices
             };
+            last_legal_selection.set(selected);
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));
         });
 
