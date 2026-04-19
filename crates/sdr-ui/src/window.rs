@@ -1155,6 +1155,19 @@ fn connect_rtl_tcp_discovery(
                     tracing::warn!(
                         "mDNS discovery channel disconnected — stopping discovery poller"
                     );
+                    // Drain any previously announced rows before we
+                    // break out. Without this, they'd linger in the
+                    // expander indefinitely — no more
+                    // `ServerWithdrawn` events will arrive, and the
+                    // stale-age pruner at the top of the tick is
+                    // also about to stop firing. Users would see
+                    // rows that look Connect-able for endpoints
+                    // the UI has already declared unavailable.
+                    let mut rows = displayed_rows.borrow_mut();
+                    for (_, (row, _)) in rows.drain() {
+                        expander.remove(&row);
+                    }
+                    drop(rows);
                     expander.set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
                     return glib::ControlFlow::Break;
                 }
