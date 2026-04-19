@@ -937,17 +937,48 @@ mod tests {
     }
 
     /// `set_sample_rate` applies the same validation as `new`.
-    /// On rejection, the envelope's coefficients and gain state
+    /// On rejection, the envelope's coefficients AND gain state
     /// must be left untouched so a bad rate update doesn't
-    /// corrupt a working envelope.
+    /// corrupt a working envelope. Warm up the gain to a non-
+    /// trivial value before the rejection calls so the gain-
+    /// preservation assertion actually exercises the contract
+    /// (a fresh envelope's gain is 0.0, which would trivially
+    /// equal itself after any no-op).
     #[test]
     fn squelch_audio_envelope_set_sample_rate_rejects_invalid_and_preserves_state() {
+        use sdr_types::Stereo;
         let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ).unwrap();
+        // Open the gate and run one block so envelope_gain lands
+        // somewhere nontrivially > 0.0 but < 1.0 — this is the
+        // mid-transition state where a state-clobbering bug in
+        // set_sample_rate would be most visible.
+        env.set_gate_open(true);
+        let mut warmup = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP,
+            };
+            ENV_SHORT_BLOCK_SAMPLES
+        ];
+        env.process_stereo(&mut warmup);
+        let gain_before = env.envelope_gain;
         let attack_before = env.attack_coeff;
         let release_before = env.release_coeff;
 
+        // All five invalid cases must produce `InvalidParameter`.
+        // ±Inf isn't trivially rejected by the `<= 0.0` clause
+        // alone — it's only caught by the `is_finite` guard, so
+        // including both directions pins the guard explicitly.
         assert!(matches!(
             env.set_sample_rate(f32::NAN),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            env.set_sample_rate(f32::INFINITY),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            env.set_sample_rate(f32::NEG_INFINITY),
             Err(DspError::InvalidParameter(_))
         ));
         assert!(matches!(
@@ -959,10 +990,12 @@ mod tests {
             Err(DspError::InvalidParameter(_))
         ));
 
-        // Coefficients must still match the original rate — the
-        // rejected calls should have left them alone.
+        // Coefficients AND gain must all still match the pre-
+        // rejection snapshot — any of these drifting would mean
+        // a rejected call silently mutated state.
         assert_eq!(env.attack_coeff, attack_before);
         assert_eq!(env.release_coeff, release_before);
+        assert_eq!(env.envelope_gain, gain_before);
 
         // Valid update applies cleanly.
         assert!(env.set_sample_rate(2.0 * ENV_TEST_SAMPLE_RATE_HZ).is_ok());
