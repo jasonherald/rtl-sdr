@@ -352,16 +352,20 @@ mod tests {
         }
 
         // Post-AGC peak ratio should be bounded. Without AGC the
-        // ratio would be ~2.5× (matching the deviation ratio);
-        // with AGC a 3× ceiling leaves margin for the envelope
-        // follower's settling time at the 2000-sample mark.
+        // no-AGC baseline matches the deviation ratio exactly —
+        // 5000/2000 = 2.5× — so the assertion bound must sit
+        // BELOW 2.5 for the test to actually catch an AGC bypass.
+        // A ratio of 2.0 leaves ~20% margin for the envelope
+        // follower's finite settling time at the 2000-sample
+        // mark while still failing decisively if the AGC stage
+        // is removed or short-circuited.
         let ratio = if peaks[0] > peaks[1] {
             peaks[0] / peaks[1].max(1e-10)
         } else {
             peaks[1] / peaks[0].max(1e-10)
         };
         assert!(
-            ratio < 3.0,
+            ratio < 2.0,
             "audio AGC should normalize across FM deviations, peaks = {peaks:?}, ratio = {ratio}"
         );
     }

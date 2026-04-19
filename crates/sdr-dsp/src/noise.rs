@@ -64,11 +64,17 @@ const SQUELCH_RELEASE_SECONDS: f32 = 0.005;
 /// Compute the one-pole IIR coefficient that reaches ~63% of the gap
 /// toward the target in `tau_seconds` at `sample_rate_hz`. Standard
 /// exponential-decay form: `α = 1 - exp(-Δt / τ)` where `Δt = 1 /
-/// sample_rate_hz`. Returns `1.0` (instant transition) on zero or
-/// negative inputs so a misconfigured caller degrades to the pre-
-/// envelope hard-gate behavior rather than panicking on divide-by-zero.
+/// sample_rate_hz`. Returns `1.0` (instant transition) on non-finite,
+/// zero, or negative inputs so a misconfigured caller degrades to
+/// the pre-envelope hard-gate behavior rather than panicking on
+/// divide-by-zero OR poisoning the envelope with NaN / Inf that
+/// would propagate into every subsequent `envelope_gain` update.
 fn envelope_coefficient(tau_seconds: f32, sample_rate_hz: f32) -> f32 {
-    if sample_rate_hz <= 0.0 || tau_seconds <= 0.0 {
+    if !sample_rate_hz.is_finite()
+        || !tau_seconds.is_finite()
+        || sample_rate_hz <= 0.0
+        || tau_seconds <= 0.0
+    {
         return 1.0;
     }
     (-1.0 / (tau_seconds * sample_rate_hz))
@@ -85,7 +91,7 @@ fn envelope_coefficient(tau_seconds: f32, sample_rate_hz: f32) -> f32 {
 ///
 /// The owning module (`RadioModule` today) drives `target` via
 /// [`set_gate_open`] on every process call using the IF-level
-/// `PowerSquelch`'s `is_open()` state; this struct's [`process`]
+/// `PowerSquelch`'s `is_open()` state; this struct's [`process_stereo`]
 /// ramps the per-sample gain toward the target and applies it
 /// uniformly to both stereo channels so imaging is preserved.
 ///
@@ -612,6 +618,37 @@ mod tests {
     const SQUELCH_REG_CLOSE_DB: f32 = -15.0;
     const SQUELCH_REG_OPEN_DB: f32 = -25.0;
 
+    // --- Envelope test constants ---
+    //
+    // Canonical AF rate for envelope timing assertions. All block-
+    // size and convergence-sample constants below are derived from
+    // this rate paired with `SQUELCH_ATTACK_SECONDS` /
+    // `SQUELCH_RELEASE_SECONDS` — keeping them centralized makes it
+    // obvious which value to update if the time constants change.
+    const ENV_TEST_SAMPLE_RATE_HZ: f32 = 48_000.0;
+    /// Short block length used for "fresh envelope stays muted" and
+    /// "tail preserved across close" assertions — ~2 ms at 48 kHz.
+    const ENV_SHORT_BLOCK_SAMPLES: usize = 100;
+    /// Long block length used to let the attack envelope converge
+    /// fully before the convergence-sample assertion — 20 ms at
+    /// 48 kHz covers ~10 attack time constants.
+    const ENV_LONG_BLOCK_SAMPLES: usize = 1_000;
+    /// Index at which the attack envelope is expected to have
+    /// converged to within ~1% of the target. 500 samples at
+    /// 48 kHz = 10 ms, which is 5 attack time constants
+    /// (`SQUELCH_ATTACK_SECONDS = 0.002 s`) → `exp(-5) ≈ 0.0067`
+    /// residual, well under the 0.99 gain assertion.
+    const ENV_CONVERGENCE_SAMPLE_IDX: usize = 500;
+    /// Numerical tolerance for "silenced" assertions. Envelope
+    /// gain starts at literal 0.0 so output is exactly 0.0 by
+    /// construction; the epsilon is pro-forma against future
+    /// float-math drift.
+    const ENV_SILENCE_EPSILON: f32 = 1e-6;
+    /// Stereo sample amplitude used in envelope tests — arbitrary
+    /// unit value so gain multiplication reads directly as the
+    /// envelope state.
+    const ENV_STEREO_SAMPLE_AMP: f32 = 1.0;
+
     // --- Power Squelch tests ---
 
     #[test]
@@ -677,12 +714,23 @@ mod tests {
     #[test]
     fn squelch_audio_envelope_starts_muted() {
         use sdr_types::Stereo;
-        let mut env = SquelchAudioEnvelope::new(48_000.0);
-        let mut buf = vec![Stereo { l: 0.5, r: 0.5 }; 100];
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ);
+        // Use a non-zero input so the "output is 0" assertion is
+        // actually exercising the envelope (an all-zero input
+        // would pass even if the envelope were broken).
+        let mut buf = vec![Stereo { l: 0.5, r: 0.5 }; ENV_SHORT_BLOCK_SAMPLES];
         env.process_stereo(&mut buf);
         for (i, s) in buf.iter().enumerate() {
-            assert!(s.l.abs() < 1e-6, "sample {i} L not silenced: {}", s.l);
-            assert!(s.r.abs() < 1e-6, "sample {i} R not silenced: {}", s.r);
+            assert!(
+                s.l.abs() < ENV_SILENCE_EPSILON,
+                "sample {i} L not silenced: {}",
+                s.l
+            );
+            assert!(
+                s.r.abs() < ENV_SILENCE_EPSILON,
+                "sample {i} R not silenced: {}",
+                s.r
+            );
         }
     }
 
@@ -692,20 +740,26 @@ mod tests {
     #[test]
     fn squelch_audio_envelope_ramps_up_on_gate_open() {
         use sdr_types::Stereo;
-        let mut env = SquelchAudioEnvelope::new(48_000.0);
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ);
         env.set_gate_open(true);
-        let mut buf = vec![Stereo { l: 1.0, r: 1.0 }; 1000];
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_LONG_BLOCK_SAMPLES
+        ];
         env.process_stereo(&mut buf);
         // First sample: partially ramped up. Not the full input
         // (that would be a hard gate), not zero (that would be
         // stuck muted).
         assert!(buf[0].l > 0.0 && buf[0].l < 0.5);
-        // By sample 500 (10 ms at 48 kHz = 5 attack time
-        // constants) the envelope has converged.
+        // By `ENV_CONVERGENCE_SAMPLE_IDX` (5 attack time constants
+        // at 48 kHz) the envelope is within ~1% of the target.
         assert!(
-            buf[500].l > 0.99,
-            "envelope should converge by sample 500, got {}",
-            buf[500].l
+            buf[ENV_CONVERGENCE_SAMPLE_IDX].l > 0.99,
+            "envelope should converge by sample {ENV_CONVERGENCE_SAMPLE_IDX}, got {}",
+            buf[ENV_CONVERGENCE_SAMPLE_IDX].l
         );
     }
 
@@ -715,16 +769,28 @@ mod tests {
     #[test]
     fn squelch_audio_envelope_preserves_tail_on_close() {
         use sdr_types::Stereo;
-        let mut env = SquelchAudioEnvelope::new(48_000.0);
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ);
         // Open and converge.
         env.set_gate_open(true);
-        let mut ramp = vec![Stereo { l: 1.0, r: 1.0 }; 1000];
+        let mut ramp = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_LONG_BLOCK_SAMPLES
+        ];
         env.process_stereo(&mut ramp);
 
         // Close and feed another block — first sample should
         // be close to full amplitude (tail preserved), not 0.
         env.set_gate_open(false);
-        let mut buf = vec![Stereo { l: 1.0, r: 1.0 }; 100];
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_SHORT_BLOCK_SAMPLES
+        ];
         env.process_stereo(&mut buf);
         assert!(
             buf[0].l > 0.9,
@@ -739,33 +805,65 @@ mod tests {
     #[test]
     fn squelch_audio_envelope_reset_clears_gain() {
         use sdr_types::Stereo;
-        let mut env = SquelchAudioEnvelope::new(48_000.0);
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ);
         env.set_gate_open(true);
-        let mut buf = vec![Stereo { l: 1.0, r: 1.0 }; 1000];
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_LONG_BLOCK_SAMPLES
+        ];
         env.process_stereo(&mut buf);
 
         env.reset();
         // First post-reset block should be silent (gain back to
         // 0, target back to 0).
-        let mut buf = vec![Stereo { l: 1.0, r: 1.0 }; 100];
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_SHORT_BLOCK_SAMPLES
+        ];
         env.process_stereo(&mut buf);
         for s in &buf {
-            assert!(s.l.abs() < 1e-6);
+            assert!(s.l.abs() < ENV_SILENCE_EPSILON);
         }
     }
 
-    /// `envelope_coefficient` pathological-input guards — zero
-    /// or negative rate / tau fall back to instant-transition
-    /// `1.0` so misconfiguration degrades to the hard-gate
-    /// behavior rather than panicking on divide-by-zero.
+    /// `envelope_coefficient` pathological-input guards —
+    /// non-finite, zero, or negative rate / tau fall back to
+    /// instant-transition `1.0` so misconfiguration degrades to
+    /// the hard-gate behavior rather than panicking on divide-
+    /// by-zero OR poisoning the envelope with NaN / Inf.
     #[test]
     fn envelope_coefficient_handles_pathological_inputs() {
-        let coeff = envelope_coefficient(0.002, 48_000.0);
+        let coeff = envelope_coefficient(SQUELCH_ATTACK_SECONDS, ENV_TEST_SAMPLE_RATE_HZ);
         assert!(coeff > 0.0 && coeff < 1.0);
-        assert_eq!(envelope_coefficient(0.002, 0.0), 1.0);
-        assert_eq!(envelope_coefficient(0.002, -48_000.0), 1.0);
-        assert_eq!(envelope_coefficient(0.0, 48_000.0), 1.0);
-        assert_eq!(envelope_coefficient(-0.002, 48_000.0), 1.0);
+        assert_eq!(envelope_coefficient(SQUELCH_ATTACK_SECONDS, 0.0), 1.0);
+        assert_eq!(
+            envelope_coefficient(SQUELCH_ATTACK_SECONDS, -ENV_TEST_SAMPLE_RATE_HZ),
+            1.0
+        );
+        assert_eq!(envelope_coefficient(0.0, ENV_TEST_SAMPLE_RATE_HZ), 1.0);
+        assert_eq!(
+            envelope_coefficient(-SQUELCH_ATTACK_SECONDS, ENV_TEST_SAMPLE_RATE_HZ),
+            1.0
+        );
+        // Non-finite guards: NaN and ±Inf on either input must
+        // fall back to 1.0, not propagate into downstream
+        // `envelope_gain` math where they'd poison every block.
+        assert_eq!(envelope_coefficient(f32::NAN, ENV_TEST_SAMPLE_RATE_HZ), 1.0);
+        assert_eq!(envelope_coefficient(SQUELCH_ATTACK_SECONDS, f32::NAN), 1.0);
+        assert_eq!(
+            envelope_coefficient(f32::INFINITY, ENV_TEST_SAMPLE_RATE_HZ),
+            1.0
+        );
+        assert_eq!(
+            envelope_coefficient(SQUELCH_ATTACK_SECONDS, f32::INFINITY),
+            1.0
+        );
     }
 
     // --- Noise Blanker tests ---

@@ -198,23 +198,29 @@ impl Demodulator for WfmDemodulator {
                 .process(&self.mono_buf[..count], &mut output[..count])?;
 
             // Apply audio AGC with shared L/R gain so stereo
-            // imaging is preserved. Envelope is driven by the
-            // L+R mono sum; the resulting gain is applied
-            // uniformly to both channels. An independent AGC per
-            // channel would let L and R drift relative to each
-            // other on asymmetric content.
+            // imaging is preserved. Drive the envelope from a
+            // non-cancelling RMS energy estimate —
+            // `sqrt((L² + R²) / 2)` — instead of the `(L+R)/2`
+            // mono sum: the sum cancels to zero on anti-phase
+            // material (L and R equal and opposite) and drops
+            // 3 dB on left- or right-only content, both of which
+            // would steer the AGC wrong even though the user is
+            // hearing real energy. Energy estimate is always
+            // non-negative and matches what the channels
+            // actually put through the speakers.
             self.agc_mono_buf.resize(count, 0.0);
             for (i, s) in output[..count].iter().enumerate() {
-                self.agc_mono_buf[i] = 0.5 * (s.l + s.r);
+                self.agc_mono_buf[i] = (0.5 * (s.l * s.l + s.r * s.r)).sqrt();
             }
             self.agc_buf.resize(count, 0.0);
             self.audio_agc
                 .process_f32(&self.agc_mono_buf[..count], &mut self.agc_buf[..count])?;
             for (i, s) in output[..count].iter_mut().enumerate() {
-                // `gain = agc_output / mono_input`. Guard the
-                // zero-input case so silent samples don't
-                // produce NaN via 0/0.
-                let gain = if self.agc_mono_buf[i].abs() > f32::MIN_POSITIVE {
+                // `gain = agc_output / rms_energy`. The energy
+                // estimate is non-negative by construction, so a
+                // single positive-magnitude guard covers the
+                // silent-input case without needing `.abs()`.
+                let gain = if self.agc_mono_buf[i] > f32::MIN_POSITIVE {
                     self.agc_buf[i] / self.agc_mono_buf[i]
                 } else {
                     1.0
