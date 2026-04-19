@@ -176,6 +176,9 @@ final class CoreModel {
     var fftSize: Int = 2048
     var fftWindow: FftWindow = .blackman
     var fftRateFps: Double = 20
+    /// Spectrum averaging mode. Display-only — applied in the
+    /// Swift renderer before blit; the engine is unaware.
+    var averagingMode: AveragingMode = .none
     // Default dB range matches the GTK UI (see
     // `crates/sdr-ui/src/spectrum/mod.rs:58`). -70 dB floor
     // hides the ADC noise floor so the waterfall background is

@@ -29,6 +29,37 @@ struct DisplaySection: View {
                 }
             }
 
+            // Display-side averaging — pure Swift renderer work,
+            // no engine round-trip. Switching modes reseeds the
+            // averaging buffer so there's no one-frame artifact.
+            Picker("Averaging", selection: Binding(
+                get: { model.averagingMode },
+                set: { model.averagingMode = $0 }
+            )) {
+                ForEach(AveragingMode.allCases, id: \.self) {
+                    Text($0.label).tag($0)
+                }
+            }
+
+            LabeledContent("FFT Rate") {
+                VStack(spacing: 2) {
+                    @Bindable var m = model
+                    Slider(
+                        value: $m.fftRateFps,
+                        in: 5...60,
+                        step: 1,
+                        onEditingChanged: { editing in
+                            if !editing {
+                                model.setFftRate(model.fftRateFps)
+                            }
+                        }
+                    )
+                    Text("\(Int(model.fftRateFps)) fps")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             LabeledContent("Min dB") {
                 VStack(spacing: 2) {
                     @Bindable var m = model

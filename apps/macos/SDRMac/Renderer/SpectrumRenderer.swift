@@ -305,6 +305,23 @@ final class SpectrumRenderer {
         if maxDb.isFinite { uniforms.maxDb = max(minDb + 1.0, maxDb) }
     }
 
+    /// Display-side spectrum averaging. None = raw pass-through
+    /// (default). PeakHold / MinHold / RunningAvg accumulate
+    /// across frames in `averagingBuffer`. Mode changes reseed
+    /// the buffer from the next frame to avoid one-frame
+    /// artifacts (e.g. leftover max values polluting a new
+    /// `.runningAvg` run). Matches GTK averaging semantics in
+    /// `crates/sdr-ui/src/spectrum/mod.rs`.
+    func applyAveraging(mode: AveragingMode) {
+        if averagingMode != mode {
+            averagingMode = mode
+            averagingBuffer.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private var averagingMode: AveragingMode = .none
+    private var averagingBuffer: [Float] = []
+
     /// Update the zoom window. `displayedCenterOffsetHz` is the
     /// viewport center in offset-from-tuner Hz; `displayedSpanHz`
     /// is the visible span; `displayBandwidthHz` is the full FFT
@@ -385,8 +402,44 @@ final class SpectrumRenderer {
             newFrameBinCount = count
             let rowBytes = count * MemoryLayout<Float>.stride
             guard let src = buf.baseAddress else { return }
-            memcpy(spectrumVertexBuffer.contents(), src, rowBytes)
-            memcpy(historyStagingBuffer.contents(), src, rowBytes)
+
+            // Apply display-side averaging. Re-seed the buffer
+            // when its size doesn't match the current frame
+            // (size change OR first frame after mode switch, via
+            // `applyAveraging`). After seeding, fold each bin
+            // through the active mode. `.none` skips the
+            // accumulator entirely for minimum overhead.
+            if averagingMode != .none {
+                if averagingBuffer.count != count {
+                    averagingBuffer = Array(UnsafeBufferPointer(start: src, count: count))
+                } else {
+                    averagingBuffer.withUnsafeMutableBufferPointer { acc in
+                        guard let accPtr = acc.baseAddress else { return }
+                        switch averagingMode {
+                        case .peakHold:
+                            for i in 0..<count { accPtr[i] = max(accPtr[i], src[i]) }
+                        case .minHold:
+                            for i in 0..<count { accPtr[i] = min(accPtr[i], src[i]) }
+                        case .runningAvg:
+                            let a = averagingAlpha
+                            for i in 0..<count {
+                                accPtr[i] = a * src[i] + (1 - a) * accPtr[i]
+                            }
+                        case .none:
+                            break  // unreachable — guarded above
+                        }
+                    }
+                }
+                // Write the averaged values into both buffers.
+                averagingBuffer.withUnsafeBufferPointer { buf in
+                    guard let p = buf.baseAddress else { return }
+                    memcpy(spectrumVertexBuffer.contents(), p, rowBytes)
+                    memcpy(historyStagingBuffer.contents(), p, rowBytes)
+                }
+            } else {
+                memcpy(spectrumVertexBuffer.contents(), src, rowBytes)
+                memcpy(historyStagingBuffer.contents(), src, rowBytes)
+            }
         } ?? false
 
         // Ensure the history ring exists. Its width tracks the
