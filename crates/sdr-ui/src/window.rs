@@ -13,7 +13,11 @@ use libadwaita::prelude::*;
 use sdr_core::Engine;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
-use sdr_rtltcp_discovery::{Browser, DiscoveredServer, DiscoveryEvent};
+use sdr_rtltcp_discovery::{
+    AdvertiseOptions, Advertiser, Browser, DiscoveredServer, DiscoveryEvent, TxtRecord,
+    local_hostname,
+};
+use sdr_server_rtltcp::{InitialDeviceState, Server, ServerConfig};
 use sdr_source_rtlsdr::SAMPLE_RATES;
 
 use crate::header;
@@ -198,6 +202,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &freq_selector,
         &demod_dropdown,
         &status_bar_demod,
+        &toast_overlay,
     );
 
     // Wire waterfall screenshot button.
@@ -846,10 +851,11 @@ fn connect_sidebar_panels(
     freq_selector: &header::frequency_selector::FrequencySelector,
     demod_dropdown: &gtk4::DropDown,
     status_bar: &Rc<StatusBar>,
+    toast_overlay: &adw::ToastOverlay,
 ) {
     connect_source_panel(panels, state);
     connect_rtl_tcp_discovery(panels, state);
-    connect_server_panel_visibility(panels);
+    connect_server_panel(panels, toast_overlay);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
@@ -1131,42 +1137,67 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
 /// profile traces.
 const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Wire the server panel's visibility to USB hotplug state and the
-/// currently-selected source type. The panel appears only when both
-/// hold:
+/// Owned handle for a running `rtl_tcp` server + optional mDNS
+/// advertisement. Drops in reverse order: advertiser first (so
+/// peers see the goodbye packet before the server stops), then the
+/// server itself (which consumes its accept thread + USB device).
 ///
+/// `Advertiser` is an `Option` because the user can run the server
+/// without LAN advertising via the "Announce via mDNS" switch.
+struct RunningServer {
+    server: Server,
+    advertiser: Option<Advertiser>,
+}
+
+/// Wire the server panel end-to-end: visibility gating, the master
+/// share-over-network switch, and its downstream start/stop effects.
+/// Errors surface via the `toast_overlay`, and the switch auto-
+/// reverts to its off state so the UI never lies about whether a
+/// server is actually running.
+///
+/// Visibility rule:
 /// 1. at least one RTL-SDR dongle is visible on the local USB bus
 ///    (`sdr_rtlsdr::get_device_count() > 0`), and
 /// 2. the active source type is **not** RTL-SDR — re-exposing the
 ///    same dongle over `rtl_tcp` while a local `RtlSdrSource` is
-///    holding it would cause a USB-device double-open.
+///    holding it would cause a USB-device double-open, and
+/// 3. OR the server is already running (keep the panel visible so
+///    the user can reach the Stop switch no matter what).
 ///
-/// Visibility is recomputed on two triggers so the panel feels
+/// Visibility is recomputed on three triggers so the panel feels
 /// responsive without polling the world: a low-frequency timer that
 /// handles the USB side (hotplug has no GTK signal we can subscribe
-/// to) and a `device_row.connect_selected_notify` handler that fires
-/// on every source-type change. A `Cell<u32>` tracks the last-seen
-/// device count so we only pay the widget-state-update cost on an
-/// actual edge.
-fn connect_server_panel_visibility(panels: &SidebarPanels) {
+/// to), a `device_row.connect_selected_notify` handler that fires
+/// on every source-type change, and the share-row start/stop path
+/// itself. A `Cell<u32>` tracks the last-seen device count so we
+/// only pay the widget-state-update cost on an actual edge.
+#[allow(
+    clippy::too_many_lines,
+    reason = "GTK signal-wiring: visibility + start-stop + control-locking all share state via nested closures — splitting scatters the captures"
+)]
+fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverlay) {
     use std::cell::Cell;
 
     let server_widget_weak = panels.server.widget.downgrade();
     let device_row = panels.source.device_row.clone();
     let last_seen_count = Rc::new(Cell::new(u32::MAX));
+    let running: Rc<RefCell<Option<RunningServer>>> = Rc::new(RefCell::new(None));
 
-    // Pure function: does the combined rule say "show"?
-    let should_be_visible = |dongle_count: u32, selected: u32| -> bool {
-        dongle_count > 0 && selected != DEVICE_RTLSDR
+    // Pure function: does the combined rule say "show"? A running
+    // server always wins — the user must be able to reach the Stop
+    // switch regardless of hotplug / source-type state.
+    let should_be_visible = |dongle_count: u32, selected: u32, is_running: bool| -> bool {
+        is_running || (dongle_count > 0 && selected != DEVICE_RTLSDR)
     };
 
     // Apply visibility, using the cached dongle count. Shared
-    // between the poll tick and the device-row notify handler so
-    // the two callers stay in lockstep.
+    // between the poll tick, the device-row notify handler, and the
+    // start/stop path so all three callers stay in lockstep.
     let apply_visibility = {
         let server_widget_weak = server_widget_weak.clone();
         let device_row = device_row.clone();
         let last_seen_count = Rc::clone(&last_seen_count);
+        let running = Rc::clone(&running);
         move || {
             let Some(widget) = server_widget_weak.upgrade() else {
                 return;
@@ -1178,7 +1209,12 @@ fn connect_server_panel_visibility(panels: &SidebarPanels) {
             // stays hidden until we actually know — prevents a
             // flash-of-unwanted-panel during startup.
             let effective_count = if count == u32::MAX { 0 } else { count };
-            widget.set_visible(should_be_visible(effective_count, device_row.selected()));
+            let is_running = running.borrow().is_some();
+            widget.set_visible(should_be_visible(
+                effective_count,
+                device_row.selected(),
+                is_running,
+            ));
         }
     };
 
@@ -1195,12 +1231,14 @@ fn connect_server_panel_visibility(panels: &SidebarPanels) {
     // (rather than running the USB probe synchronously during
     // wiring) keeps the window-build path fast and avoids a libusb
     // session init on a thread that may not have one ready.
-    let apply_on_tick = apply_visibility;
+    let apply_on_tick = apply_visibility.clone();
+    let poll_widget_weak = server_widget_weak.clone();
+    let poll_last_seen_count = Rc::clone(&last_seen_count);
     let _ = glib::timeout_add_local(SERVER_PANEL_HOTPLUG_POLL_INTERVAL, move || {
         // If the widget is gone, tear the poller down — nothing to
         // show, and we don't want to leak `rusb::devices()` calls
         // past window close.
-        if server_widget_weak.upgrade().is_none() {
+        if poll_widget_weak.upgrade().is_none() {
             return glib::ControlFlow::Break;
         }
         // `sdr_rtlsdr::get_device_count()` is a libusb enumerate
@@ -1213,17 +1251,263 @@ fn connect_server_panel_visibility(panels: &SidebarPanels) {
         // that's the "resolve the panel out of its pre-first-tick
         // hidden state" moment. Subsequent ticks only apply on a
         // real edge so we don't churn widget state every 3 s.
-        if count != last_seen_count.get() {
+        if count != poll_last_seen_count.get() {
             tracing::debug!(
-                previous = last_seen_count.get(),
+                previous = poll_last_seen_count.get(),
                 current = count,
                 "rtl_tcp server panel: local dongle count changed"
             );
-            last_seen_count.set(count);
+            poll_last_seen_count.set(count);
             apply_on_tick();
         }
         glib::ControlFlow::Continue
     });
+
+    // Wire the master share-over-network switch. The handler is the
+    // authority on server lifecycle — on toggle we either start a
+    // new `Server` (+ optional `Advertiser`) and store the handle,
+    // or drop the handle so the accept thread tears down.
+    connect_share_switch(panels, toast_overlay, Rc::clone(&running), apply_visibility);
+}
+
+/// Extracted out of `connect_server_panel` so the parent function
+/// stays under clippy's `too_many_lines` limit. Handles exactly one
+/// thing: the `share_row.connect_active_notify` wiring, with its
+/// downstream start/stop effects (build `ServerConfig`, call
+/// `Server::start`, optionally attach an `Advertiser`, lock or
+/// unlock the panel controls, reapply visibility, and surface any
+/// error via a toast while flipping the switch back to off).
+fn connect_share_switch(
+    panels: &SidebarPanels,
+    toast_overlay: &adw::ToastOverlay,
+    running: Rc<RefCell<Option<RunningServer>>>,
+    apply_visibility: impl Fn() + Clone + 'static,
+) {
+    use std::cell::Cell;
+
+    // Guards against our own `set_active(false)` (called when the
+    // user-initiated start path errors out) re-entering the handler
+    // and triggering a spurious stop dispatch on a server that
+    // never started.
+    let reentry_guard = Rc::new(Cell::new(false));
+    let toast_overlay_weak = toast_overlay.downgrade();
+
+    let share_row_weak = panels.server.share_row.downgrade();
+    // Clone the whole ServerPanel Rc-backed widget handles into the
+    // closure. adw/gtk widgets are GObject refs; cloning increments
+    // a refcount, not the data.
+    let server_panel = clone_server_panel(&panels.server);
+
+    panels.server.share_row.connect_active_notify(move |row| {
+        if reentry_guard.get() {
+            return;
+        }
+        let active = row.is_active();
+        if active {
+            // Build a ServerConfig from current panel state. Widget
+            // readers run on the main thread — safe to block-read
+            // the rows synchronously.
+            let config = build_server_config_from_panel(&server_panel);
+            match Server::start(config) {
+                Ok(server) => {
+                    // If advertising is on, build the TXT record
+                    // from the tuner metadata the Server exposes.
+                    // An Advertiser failure is non-fatal — the
+                    // server keeps running without mDNS.
+                    let advertiser = if server_panel.advertise_row.is_active() {
+                        build_advertiser(&server, &server_panel.nickname_row.text())
+                    } else {
+                        None
+                    };
+                    set_controls_locked(&server_panel, true);
+                    *running.borrow_mut() = Some(RunningServer { server, advertiser });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start rtl_tcp server");
+                    if let Some(overlay) = toast_overlay_weak.upgrade() {
+                        overlay.add_toast(adw::Toast::new(&format!(
+                            "Couldn't share over network: {e}"
+                        )));
+                    }
+                    // Revert the switch without re-entering this
+                    // same handler — the reentry_guard covers the
+                    // set_active call below.
+                    reentry_guard.set(true);
+                    if let Some(share) = share_row_weak.upgrade() {
+                        share.set_active(false);
+                    }
+                    reentry_guard.set(false);
+                }
+            }
+        } else {
+            // Drop the handle → Server::drop signals shutdown and
+            // joins the accept thread; Advertiser::drop unregisters
+            // the mDNS record. Sequence matters (advertiser first
+            // so peers see the goodbye packet before the server
+            // stops) — field declaration order in `RunningServer`
+            // would drop `server` first, so take the advertiser
+            // explicitly first to reverse.
+            if let Some(mut handle) = running.borrow_mut().take() {
+                drop(handle.advertiser.take());
+                drop(handle.server);
+            }
+            set_controls_locked(&server_panel, false);
+        }
+        apply_visibility();
+    });
+}
+
+/// Deep-clone a `ServerPanel` (via `GObject` refcounts — all fields
+/// are adw/gtk widget handles, not data owners). Used to move a full
+/// panel reference into a long-lived closure without borrowing from
+/// the original `SidebarPanels`.
+fn clone_server_panel(panel: &sidebar::ServerPanel) -> sidebar::ServerPanel {
+    sidebar::ServerPanel {
+        widget: panel.widget.clone(),
+        share_row: panel.share_row.clone(),
+        nickname_row: panel.nickname_row.clone(),
+        port_row: panel.port_row.clone(),
+        bind_row: panel.bind_row.clone(),
+        advertise_row: panel.advertise_row.clone(),
+        device_defaults_row: panel.device_defaults_row.clone(),
+        center_freq_row: panel.center_freq_row.clone(),
+        sample_rate_row: panel.sample_rate_row.clone(),
+        gain_row: panel.gain_row.clone(),
+        ppm_row: panel.ppm_row.clone(),
+        bias_tee_row: panel.bias_tee_row.clone(),
+        direct_sampling_row: panel.direct_sampling_row.clone(),
+    }
+}
+
+/// Read the server panel widget values and build a `ServerConfig`
+/// off them. Takes the full `ServerPanel` by reference so the arg
+/// list stays short and the fn signature documents the "this reads
+/// EVERY relevant row" contract clearly.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
+)]
+fn build_server_config_from_panel(panel: &sidebar::ServerPanel) -> ServerConfig {
+    use std::net::SocketAddr;
+
+    use crate::sidebar::server_panel::{BIND_ALL_INTERFACES_IDX, BIND_LOOPBACK_IDX};
+
+    let port = panel.port_row.value() as u16;
+    // Match arm bodies duplicate between `BIND_LOOPBACK_IDX` and the
+    // wildcard intentionally: the explicit arm documents the
+    // expected value at a glance, and the wildcard catches transient
+    // out-of-range indices GTK can emit during widget churn. Folding
+    // them loses the at-a-glance enumeration of legal indices next
+    // to the feature-flag constants.
+    #[allow(
+        clippy::match_same_arms,
+        reason = "explicit legal-index arms document the rule"
+    )]
+    let bind = match panel.bind_row.selected() {
+        BIND_LOOPBACK_IDX => SocketAddr::from(([127, 0, 0, 1], port)),
+        BIND_ALL_INTERFACES_IDX => SocketAddr::from(([0, 0, 0, 0], port)),
+        _ => SocketAddr::from(([127, 0, 0, 1], port)),
+    };
+
+    let center_freq_hz = panel.center_freq_row.value() as u32;
+    // Sample-rate rows share the SAMPLE_RATES table via
+    // `source_panel::build_rtlsdr_rows` ordering. `SAMPLE_RATES`
+    // holds f64 values; the server API wants u32 Hz, so round on
+    // the way across. Out-of-range selectors fall back on the
+    // upstream rtl_tcp.c default.
+    let sample_rate_hz = SAMPLE_RATES
+        .get(panel.sample_rate_row.selected() as usize)
+        .copied()
+        .map_or(sdr_server_rtltcp::DEFAULT_SAMPLE_RATE_HZ, |rate| {
+            rate.round() as u32
+        });
+
+    // UI treats gain = 0.0 as auto (None), matching upstream's
+    // `-g 0` semantics. Any positive value becomes tenths-of-dB.
+    let gain_db = panel.gain_row.value();
+    let gain_tenths_db = if gain_db > 0.0 {
+        Some((gain_db * 10.0).round() as i32)
+    } else {
+        None
+    };
+
+    let ppm = panel.ppm_row.value() as i32;
+    let bias_tee = panel.bias_tee_row.is_active();
+    let direct_sampling = if panel.direct_sampling_row.is_active() {
+        2 // Q branch — upstream rtl_tcp hardcodes 2 for -D.
+    } else {
+        0
+    };
+
+    ServerConfig {
+        bind,
+        device_index: 0,
+        initial: InitialDeviceState {
+            center_freq_hz,
+            sample_rate_hz,
+            gain_tenths_db,
+            ppm,
+            bias_tee,
+            direct_sampling,
+        },
+        buffer_capacity: 0, // 0 = crate default
+    }
+}
+
+/// Start an mDNS advertiser for the running `Server` using the
+/// user's chosen nickname (falling back to `local_hostname()` if the
+/// entry is empty or whitespace). Returns `None` on failure — the
+/// server itself keeps running, just without LAN advertising.
+fn build_advertiser(server: &Server, nickname_raw: &str) -> Option<Advertiser> {
+    let nickname = nickname_raw.trim();
+    let nickname = if nickname.is_empty() {
+        local_hostname()
+    } else {
+        nickname.to_string()
+    };
+    let host = local_hostname();
+    // DNS-SD instance names must be unique on the LAN. Combine host
+    // + nickname the same way the CLI does in
+    // `sdr-server-rtltcp/src/bin/sdr-rtl-tcp.rs::announce_over_mdns`.
+    let instance_name = if nickname == host {
+        nickname.clone()
+    } else {
+        format!("{host} {nickname}")
+    };
+    let tuner_info = server.tuner_info();
+    let opts = AdvertiseOptions {
+        port: server.bind_address().port(),
+        instance_name,
+        hostname: host.clone(),
+        txt: TxtRecord {
+            tuner: tuner_info.name.clone(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            gains: tuner_info.gain_count,
+            nickname,
+            txbuf: None,
+        },
+    };
+    match Advertiser::announce(opts) {
+        Ok(adv) => Some(adv),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to start mDNS advertiser; server running without LAN advertisement");
+            None
+        }
+    }
+}
+
+/// Lock or unlock the server-config rows. Called with `true` on
+/// start (so the user can't mutate config out from under a live
+/// session) and `false` on stop. `share_row` itself stays sensitive
+/// — that's how the user turns things off.
+fn set_controls_locked(panel: &sidebar::ServerPanel, locked: bool) {
+    let sensitive = !locked;
+    panel.nickname_row.set_sensitive(sensitive);
+    panel.port_row.set_sensitive(sensitive);
+    panel.bind_row.set_sensitive(sensitive);
+    panel.advertise_row.set_sensitive(sensitive);
+    panel.device_defaults_row.set_sensitive(sensitive);
 }
 
 /// Format the subtitle string for a discovered `rtl_tcp` server row.
