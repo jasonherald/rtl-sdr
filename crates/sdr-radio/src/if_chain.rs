@@ -107,6 +107,18 @@ impl IfChain {
         !active || self.squelch.is_open()
     }
 
+    /// Returns whether the squelch is actively gating — i.e.,
+    /// manual squelch is enabled OR auto-squelch is enabled.
+    /// Downstream consumers (the AF-level squelch envelope in
+    /// `RadioModule::process`) skip their per-sample attenuation
+    /// when this is `false` because the gate would never close
+    /// anyway; running the envelope would mute the initial
+    /// audio samples while the envelope ramps up from 0 for no
+    /// reason.
+    pub fn squelch_active(&self) -> bool {
+        self.squelch_enabled || self.squelch.auto_squelch_enabled()
+    }
+
     /// Enable or disable FM IF noise reduction.
     pub fn set_fm_if_nr_enabled(&mut self, enabled: bool) {
         self.fm_if_nr_enabled = enabled;

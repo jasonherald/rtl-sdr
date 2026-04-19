@@ -42,6 +42,178 @@ const AUTO_SQUELCH_OPEN_MARGIN_DB: f32 = 10.0;
 /// it stays open until it drops closer to the noise floor.
 const AUTO_SQUELCH_CLOSE_MARGIN_DB: f32 = 6.0;
 
+/// Attack time constant for the squelch gain envelope, in seconds.
+///
+/// 2 ms is short enough that a keying-up transmission's leading edge
+/// isn't audibly ramped (the user doesn't perceive the fade-in), but
+/// long enough that the step discontinuity is smoothed past any
+/// downstream audio-sink resampler's ringing (see issue #331: macOS
+/// AUHAL's internal 48 kHz → 44.1 kHz SRC rings hard on sub-ms steps
+/// and produces the loud pop users reported).
+const SQUELCH_ATTACK_SECONDS: f32 = 0.002;
+
+/// Release time constant for the squelch gain envelope, in seconds.
+///
+/// 5 ms is deliberately longer than the attack so we don't clip the
+/// tail of a word when the squelch closes mid-utterance. The attack-
+/// release asymmetry is a deliberate ergonomic choice: bright on, soft
+/// off — mirrors the SDR++ `PowerSquelch` envelope pattern referenced
+/// in issue #331.
+const SQUELCH_RELEASE_SECONDS: f32 = 0.005;
+
+/// Compute the one-pole IIR coefficient that reaches ~63% of the gap
+/// toward the target in `tau_seconds` at `sample_rate_hz`. Standard
+/// exponential-decay form: `α = 1 - exp(-Δt / τ)` where `Δt = 1 /
+/// sample_rate_hz`. Returns `1.0` (instant transition) on non-finite,
+/// zero, or negative inputs so a misconfigured caller degrades to
+/// the pre-envelope hard-gate behavior rather than panicking on
+/// divide-by-zero OR poisoning the envelope with NaN / Inf that
+/// would propagate into every subsequent `envelope_gain` update.
+fn envelope_coefficient(tau_seconds: f32, sample_rate_hz: f32) -> f32 {
+    if !sample_rate_hz.is_finite()
+        || !tau_seconds.is_finite()
+        || sample_rate_hz <= 0.0
+        || tau_seconds <= 0.0
+    {
+        return 1.0;
+    }
+    (-1.0 / (tau_seconds * sample_rate_hz))
+        .exp()
+        .mul_add(-1.0, 1.0)
+}
+
+/// Per-sample attack/release envelope applied to the **audio
+/// output** after FM/AM demodulation to smooth squelch gate
+/// transitions. Lives in the AF path (not the IF path) because
+/// FM discriminators are amplitude-invariant — scaling the IQ
+/// input has zero effect on FM audio output, so the gate-
+/// transition pop has to be attenuated post-demod.
+///
+/// The owning module (`RadioModule` today) drives `target` via
+/// [`set_gate_open`] on every process call using the IF-level
+/// `PowerSquelch`'s `is_open()` state; this struct's [`process_stereo`]
+/// ramps the per-sample gain toward the target and applies it
+/// uniformly to both stereo channels so imaging is preserved.
+///
+/// Attack/release asymmetry is deliberate: fast open (~2 ms) so
+/// keying-up leading edges aren't audibly faded, slow close
+/// (~5 ms) so tails of dropped words aren't clipped.
+pub struct SquelchAudioEnvelope {
+    envelope_gain: f32,
+    target: f32,
+    attack_coeff: f32,
+    release_coeff: f32,
+}
+
+impl SquelchAudioEnvelope {
+    /// Validate that `sample_rate_hz` is usable for envelope
+    /// coefficient math: finite (not NaN / ±Inf) and strictly
+    /// positive. The inner `envelope_coefficient` helper already
+    /// degrades gracefully to 1.0 on bad inputs, but that
+    /// silently reinstates the exact hard-gate behavior this
+    /// type was introduced to avoid — surfacing the error at
+    /// the public API boundary means upstream misconfiguration
+    /// fails loudly instead of appearing as a stale "pop"
+    /// regression.
+    fn validate_sample_rate(sample_rate_hz: f32) -> Result<(), DspError> {
+        if !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate_hz must be finite and > 0, got {sample_rate_hz}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Construct an envelope for audio running at
+    /// `sample_rate_hz`. Coefficients are seeded from the
+    /// `SQUELCH_ATTACK_SECONDS` / `SQUELCH_RELEASE_SECONDS` time
+    /// constants; call [`set_sample_rate`] if the audio rate
+    /// changes at runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` when `sample_rate_hz`
+    /// is non-finite or non-positive.
+    pub fn new(sample_rate_hz: f32) -> Result<Self, DspError> {
+        Self::validate_sample_rate(sample_rate_hz)?;
+        Ok(Self {
+            envelope_gain: 0.0,
+            target: 0.0,
+            attack_coeff: envelope_coefficient(SQUELCH_ATTACK_SECONDS, sample_rate_hz),
+            release_coeff: envelope_coefficient(SQUELCH_RELEASE_SECONDS, sample_rate_hz),
+        })
+    }
+
+    /// Update the target gain: `true` (gate open) ramps to 1.0,
+    /// `false` (gate closed) ramps to 0.0. No-op if the target
+    /// matches the current setting so repeated calls from a
+    /// block-level caller are cheap.
+    pub fn set_gate_open(&mut self, open: bool) {
+        self.target = if open { 1.0 } else { 0.0 };
+    }
+
+    /// Recompute the attack / release coefficients for a new
+    /// audio sample rate. Preserves `envelope_gain` so the
+    /// recomputation doesn't snap mid-utterance.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` when `sample_rate_hz`
+    /// is non-finite or non-positive. The existing `envelope_gain`
+    /// and coefficients are left untouched on error so a bad
+    /// rate update can't corrupt the envelope.
+    pub fn set_sample_rate(&mut self, sample_rate_hz: f32) -> Result<(), DspError> {
+        Self::validate_sample_rate(sample_rate_hz)?;
+        self.attack_coeff = envelope_coefficient(SQUELCH_ATTACK_SECONDS, sample_rate_hz);
+        self.release_coeff = envelope_coefficient(SQUELCH_RELEASE_SECONDS, sample_rate_hz);
+        Ok(())
+    }
+
+    /// Reset the envelope to the closed-gate state. Use when
+    /// swapping the upstream demod (mode change) so stale gain
+    /// state from the previous mode doesn't bleed through the
+    /// first block of the new one.
+    pub fn reset(&mut self) {
+        self.envelope_gain = 0.0;
+        self.target = 0.0;
+    }
+
+    /// Force the envelope to the fully-open state (gain = 1.0,
+    /// target = 1.0). Used by `RadioModule::process` when the
+    /// user has squelch disabled so the envelope doesn't need
+    /// to ramp up from 0 on every block. Keeps state coherent
+    /// for when the user re-enables squelch: first post-enable
+    /// block starts at full passthrough and the normal open /
+    /// close ramping takes over from there.
+    pub fn reset_to_open(&mut self) {
+        self.envelope_gain = 1.0;
+        self.target = 1.0;
+    }
+
+    /// Apply the envelope to a stereo audio buffer in place.
+    /// Both L and R receive the same per-sample gain so stereo
+    /// imaging is preserved across the transition.
+    pub fn process_stereo(&mut self, buf: &mut [sdr_types::Stereo]) {
+        // `target` is stable for the call, and the rising /
+        // falling direction depends on `target > envelope_gain`.
+        // Within one call `envelope_gain` only crosses the target
+        // asymptotically (IIR, never overshoots by construction)
+        // so the direction — and therefore the coefficient — is
+        // constant for the whole buffer. Hoisting the branch out
+        // of the hot loop removes a per-sample compare.
+        let coeff = if self.target > self.envelope_gain {
+            self.attack_coeff
+        } else {
+            self.release_coeff
+        };
+        for s in buf.iter_mut() {
+            self.envelope_gain += (self.target - self.envelope_gain) * coeff;
+            s.l *= self.envelope_gain;
+            s.r *= self.envelope_gain;
+        }
+    }
+}
+
 /// Power squelch — gates signal based on average power level.
 ///
 /// Ports SDR++ `dsp::noise_reduction::PowerSquelch`. Computes the mean
@@ -188,6 +360,17 @@ impl PowerSquelch {
             output[..input.len()].copy_from_slice(input);
             self.open = true;
         } else {
+            // Hard-zero the IQ on closed state — FM discriminators
+            // are amplitude-invariant (they read atan2 of the phase
+            // delta between consecutive samples, which ignores a
+            // common scaling), so a "smooth" amplitude envelope on
+            // IQ would have zero effect on FM audio output. The
+            // exact zero here gives `atan2(0, 0) = 0`, producing
+            // genuinely silent FM demod output. The transition-
+            // pop smoothing lives in the AF path
+            // (`SquelchAudioEnvelope` in `sdr-radio::lib::RadioModule`)
+            // where it can act on post-demod audio regardless of
+            // modulation type.
             output[..input.len()].fill(Complex::default());
             self.open = false;
         }
@@ -474,6 +657,37 @@ mod tests {
     const SQUELCH_REG_CLOSE_DB: f32 = -15.0;
     const SQUELCH_REG_OPEN_DB: f32 = -25.0;
 
+    // --- Envelope test constants ---
+    //
+    // Canonical AF rate for envelope timing assertions. All block-
+    // size and convergence-sample constants below are derived from
+    // this rate paired with `SQUELCH_ATTACK_SECONDS` /
+    // `SQUELCH_RELEASE_SECONDS` — keeping them centralized makes it
+    // obvious which value to update if the time constants change.
+    const ENV_TEST_SAMPLE_RATE_HZ: f32 = 48_000.0;
+    /// Short block length used for "fresh envelope stays muted" and
+    /// "tail preserved across close" assertions — ~2 ms at 48 kHz.
+    const ENV_SHORT_BLOCK_SAMPLES: usize = 100;
+    /// Long block length used to let the attack envelope converge
+    /// fully before the convergence-sample assertion — 20 ms at
+    /// 48 kHz covers ~10 attack time constants.
+    const ENV_LONG_BLOCK_SAMPLES: usize = 1_000;
+    /// Index at which the attack envelope is expected to have
+    /// converged to within ~1% of the target. 500 samples at
+    /// 48 kHz = 10 ms, which is 5 attack time constants
+    /// (`SQUELCH_ATTACK_SECONDS = 0.002 s`) → `exp(-5) ≈ 0.0067`
+    /// residual, well under the 0.99 gain assertion.
+    const ENV_CONVERGENCE_SAMPLE_IDX: usize = 500;
+    /// Numerical tolerance for "silenced" assertions. Envelope
+    /// gain starts at literal 0.0 so output is exactly 0.0 by
+    /// construction; the epsilon is pro-forma against future
+    /// float-math drift.
+    const ENV_SILENCE_EPSILON: f32 = 1e-6;
+    /// Stereo sample amplitude used in envelope tests — arbitrary
+    /// unit value so gain multiplication reads directly as the
+    /// envelope state.
+    const ENV_STEREO_SAMPLE_AMP: f32 = 1.0;
+
     // --- Power Squelch tests ---
 
     #[test]
@@ -529,6 +743,262 @@ mod tests {
             squelch_open.is_open(),
             "amplitude 0.1 (-20 dB) should be above -25 dB threshold"
         );
+    }
+
+    // --- Squelch audio envelope tests (#331) ---
+
+    /// Fresh envelope starts muted: gate target 0.0, gain 0.0.
+    /// A stereo buffer processed without any `set_gate_open` call
+    /// should stay silent.
+    #[test]
+    fn squelch_audio_envelope_starts_muted() {
+        use sdr_types::Stereo;
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ).unwrap();
+        // Use a non-zero input so the "output is 0" assertion is
+        // actually exercising the envelope (an all-zero input
+        // would pass even if the envelope were broken).
+        let mut buf = vec![Stereo { l: 0.5, r: 0.5 }; ENV_SHORT_BLOCK_SAMPLES];
+        env.process_stereo(&mut buf);
+        for (i, s) in buf.iter().enumerate() {
+            assert!(
+                s.l.abs() < ENV_SILENCE_EPSILON,
+                "sample {i} L not silenced: {}",
+                s.l
+            );
+            assert!(
+                s.r.abs() < ENV_SILENCE_EPSILON,
+                "sample {i} R not silenced: {}",
+                s.r
+            );
+        }
+    }
+
+    /// Attack ramp: on gate open, the per-sample gain rises
+    /// smoothly toward 1.0. After several ms the envelope has
+    /// converged and the output matches the input.
+    #[test]
+    fn squelch_audio_envelope_ramps_up_on_gate_open() {
+        use sdr_types::Stereo;
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ).unwrap();
+        env.set_gate_open(true);
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_LONG_BLOCK_SAMPLES
+        ];
+        env.process_stereo(&mut buf);
+        // First sample: partially ramped up. Not the full input
+        // (that would be a hard gate), not zero (that would be
+        // stuck muted).
+        assert!(buf[0].l > 0.0 && buf[0].l < 0.5);
+        // By `ENV_CONVERGENCE_SAMPLE_IDX` (5 attack time constants
+        // at 48 kHz) the envelope is within ~1% of the target.
+        assert!(
+            buf[ENV_CONVERGENCE_SAMPLE_IDX].l > 0.99,
+            "envelope should converge by sample {ENV_CONVERGENCE_SAMPLE_IDX}, got {}",
+            buf[ENV_CONVERGENCE_SAMPLE_IDX].l
+        );
+    }
+
+    /// Release ramp on gate close: envelope decays smoothly
+    /// toward 0 across ~5 ms. Tail of the previous block's audio
+    /// is NOT clipped on the first sample after close.
+    #[test]
+    fn squelch_audio_envelope_preserves_tail_on_close() {
+        use sdr_types::Stereo;
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ).unwrap();
+        // Open and converge.
+        env.set_gate_open(true);
+        let mut ramp = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_LONG_BLOCK_SAMPLES
+        ];
+        env.process_stereo(&mut ramp);
+
+        // Close and feed another block — first sample should
+        // be close to full amplitude (tail preserved), not 0.
+        env.set_gate_open(false);
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_SHORT_BLOCK_SAMPLES
+        ];
+        env.process_stereo(&mut buf);
+        assert!(
+            buf[0].l > 0.9,
+            "first post-close sample should preserve the tail, got {}",
+            buf[0].l
+        );
+    }
+
+    /// Reset snaps back to the closed-gate state — used by
+    /// `RadioModule` on demod-mode change to prevent cross-
+    /// pipeline gain bleed.
+    #[test]
+    fn squelch_audio_envelope_reset_clears_gain() {
+        use sdr_types::Stereo;
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ).unwrap();
+        env.set_gate_open(true);
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_LONG_BLOCK_SAMPLES
+        ];
+        env.process_stereo(&mut buf);
+
+        env.reset();
+        // First post-reset block should be silent (gain back to
+        // 0, target back to 0).
+        let mut buf = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP
+            };
+            ENV_SHORT_BLOCK_SAMPLES
+        ];
+        env.process_stereo(&mut buf);
+        for s in &buf {
+            assert!(s.l.abs() < ENV_SILENCE_EPSILON);
+        }
+    }
+
+    /// `envelope_coefficient` pathological-input guards —
+    /// non-finite, zero, or negative rate / tau fall back to
+    /// instant-transition `1.0` so misconfiguration degrades to
+    /// the hard-gate behavior rather than panicking on divide-
+    /// by-zero OR poisoning the envelope with NaN / Inf.
+    #[test]
+    fn envelope_coefficient_handles_pathological_inputs() {
+        let coeff = envelope_coefficient(SQUELCH_ATTACK_SECONDS, ENV_TEST_SAMPLE_RATE_HZ);
+        assert!(coeff > 0.0 && coeff < 1.0);
+        assert_eq!(envelope_coefficient(SQUELCH_ATTACK_SECONDS, 0.0), 1.0);
+        assert_eq!(
+            envelope_coefficient(SQUELCH_ATTACK_SECONDS, -ENV_TEST_SAMPLE_RATE_HZ),
+            1.0
+        );
+        assert_eq!(envelope_coefficient(0.0, ENV_TEST_SAMPLE_RATE_HZ), 1.0);
+        assert_eq!(
+            envelope_coefficient(-SQUELCH_ATTACK_SECONDS, ENV_TEST_SAMPLE_RATE_HZ),
+            1.0
+        );
+        // Non-finite guards: NaN and ±Inf on either input must
+        // fall back to 1.0, not propagate into downstream
+        // `envelope_gain` math where they'd poison every block.
+        assert_eq!(envelope_coefficient(f32::NAN, ENV_TEST_SAMPLE_RATE_HZ), 1.0);
+        assert_eq!(envelope_coefficient(SQUELCH_ATTACK_SECONDS, f32::NAN), 1.0);
+        assert_eq!(
+            envelope_coefficient(f32::INFINITY, ENV_TEST_SAMPLE_RATE_HZ),
+            1.0
+        );
+        assert_eq!(
+            envelope_coefficient(SQUELCH_ATTACK_SECONDS, f32::INFINITY),
+            1.0
+        );
+    }
+
+    /// `SquelchAudioEnvelope::new` must reject non-finite / non-
+    /// positive sample rates instead of silently degrading to a
+    /// hard gate — that's the exact pop behavior the type was
+    /// added to eliminate, so a misconfigured caller should get
+    /// a loud error rather than a silent regression.
+    #[test]
+    fn squelch_audio_envelope_new_rejects_invalid_sample_rates() {
+        assert!(matches!(
+            SquelchAudioEnvelope::new(0.0),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            SquelchAudioEnvelope::new(-ENV_TEST_SAMPLE_RATE_HZ),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            SquelchAudioEnvelope::new(f32::NAN),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            SquelchAudioEnvelope::new(f32::INFINITY),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            SquelchAudioEnvelope::new(f32::NEG_INFINITY),
+            Err(DspError::InvalidParameter(_))
+        ));
+        // Positive rate accepted.
+        assert!(SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ).is_ok());
+    }
+
+    /// `set_sample_rate` applies the same validation as `new`.
+    /// On rejection, the envelope's coefficients AND gain state
+    /// must be left untouched so a bad rate update doesn't
+    /// corrupt a working envelope. Warm up the gain to a non-
+    /// trivial value before the rejection calls so the gain-
+    /// preservation assertion actually exercises the contract
+    /// (a fresh envelope's gain is 0.0, which would trivially
+    /// equal itself after any no-op).
+    #[test]
+    fn squelch_audio_envelope_set_sample_rate_rejects_invalid_and_preserves_state() {
+        use sdr_types::Stereo;
+        let mut env = SquelchAudioEnvelope::new(ENV_TEST_SAMPLE_RATE_HZ).unwrap();
+        // Open the gate and run one block so envelope_gain lands
+        // somewhere nontrivially > 0.0 but < 1.0 — this is the
+        // mid-transition state where a state-clobbering bug in
+        // set_sample_rate would be most visible.
+        env.set_gate_open(true);
+        let mut warmup = vec![
+            Stereo {
+                l: ENV_STEREO_SAMPLE_AMP,
+                r: ENV_STEREO_SAMPLE_AMP,
+            };
+            ENV_SHORT_BLOCK_SAMPLES
+        ];
+        env.process_stereo(&mut warmup);
+        let gain_before = env.envelope_gain;
+        let attack_before = env.attack_coeff;
+        let release_before = env.release_coeff;
+
+        // All five invalid cases must produce `InvalidParameter`.
+        // ±Inf isn't trivially rejected by the `<= 0.0` clause
+        // alone — it's only caught by the `is_finite` guard, so
+        // including both directions pins the guard explicitly.
+        assert!(matches!(
+            env.set_sample_rate(f32::NAN),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            env.set_sample_rate(f32::INFINITY),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            env.set_sample_rate(f32::NEG_INFINITY),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            env.set_sample_rate(0.0),
+            Err(DspError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            env.set_sample_rate(-ENV_TEST_SAMPLE_RATE_HZ),
+            Err(DspError::InvalidParameter(_))
+        ));
+
+        // Coefficients AND gain must all still match the pre-
+        // rejection snapshot — any of these drifting would mean
+        // a rejected call silently mutated state.
+        assert_eq!(env.attack_coeff, attack_before);
+        assert_eq!(env.release_coeff, release_before);
+        assert_eq!(env.envelope_gain, gain_before);
+
+        // Valid update applies cleanly.
+        assert!(env.set_sample_rate(2.0 * ENV_TEST_SAMPLE_RATE_HZ).is_ok());
     }
 
     // --- Noise Blanker tests ---
