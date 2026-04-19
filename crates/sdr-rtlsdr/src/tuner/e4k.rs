@@ -24,6 +24,13 @@ pub const CHECK_ADDR: u8 = 0x02;
 /// Expected chip ID value read from `CHECK_ADDR`.
 pub const CHECK_VAL: u8 = 0x40;
 
+/// Divisor for converting tenths-of-dB wire values into integer
+/// dB values the E4K IF-stage gain LUT is indexed by. Matches
+/// upstream `e4000_set_if_gain` in `tuner_e4000.c`, which does
+/// `(int8_t)(gain / 10)` to collapse the rtl_tcp wire unit onto
+/// the driver's internal unit.
+const TENTHS_DB_PER_DB: i32 = 10;
+
 // ---------------------------------------------------------------------------
 // Register addresses
 // ---------------------------------------------------------------------------
@@ -1293,7 +1300,7 @@ impl Tuner for E4kTuner {
             clippy::cast_possible_truncation,
             reason = "upstream truncates gain/10 to i8 via bare cast; RtlTcp 0x06 command wire gain is tenths-of-dB, E4K internal LUT is integer dB"
         )]
-        let gain_i8 = (gain / 10) as i8;
+        let gain_i8 = (gain / TENTHS_DB_PER_DB) as i8;
         self.if_gain_set(handle, stage_u8, gain_i8)
     }
 }
