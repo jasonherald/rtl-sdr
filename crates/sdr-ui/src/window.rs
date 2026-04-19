@@ -608,6 +608,23 @@ fn handle_dsp_message(
                 }
             }
         }
+        DspToUi::BandwidthChanged(bw) => {
+            // DSP-originated bandwidth change (typically a VFO drag
+            // on the spectrum). Reflect it in the Radio panel's
+            // spin row so the numeric readout stays in lockstep
+            // with the active filter width.
+            //
+            // Set the suppress flag around the `set_value` call so
+            // the spin's `connect_value_notify` handler knows this
+            // update is DSP-originated and doesn't dispatch a
+            // redundant `UiToDsp::SetBandwidth` back to the
+            // controller. Restored after the set_value returns so
+            // user-originated edits from the next event loop tick
+            // are dispatched normally.
+            state.suppress_bandwidth_notify.set(true);
+            radio_panel.bandwidth_row.set_value(bw);
+            state.suppress_bandwidth_notify.set(false);
+        }
         DspToUi::CtcssSustainedChanged(sustained) => {
             tracing::debug!(sustained, "CTCSS sustained-gate edge");
             radio_panel.set_ctcss_sustained(sustained);
@@ -1057,6 +1074,7 @@ fn connect_sidebar_panels(
     let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
     connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
+    connect_source_rtlsdr_probe(panels);
     connect_rtl_tcp_discovery(panels, state, config, favorites_header);
     connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state);
@@ -3250,6 +3268,90 @@ fn format_age(elapsed: Duration) -> String {
     }
 }
 
+/// Interval for refreshing the source combo's RTL-SDR slot label
+/// against the live USB bus. Low-frequency enough to be
+/// negligible CPU-wise; fast enough that a user plugging in their
+/// dongle after app launch sees the slot update to the real
+/// device name within a few seconds without having to restart.
+///
+/// Shares cadence with `SERVER_PANEL_HOTPLUG_POLL_INTERVAL` as a
+/// deliberate choice — both pollers watch the same libusb bus for
+/// the same vendor/product-filtered device set, so users see
+/// both the source combo and the server panel update on the same
+/// tick. Kept as a separate constant so each poller's sizing can
+/// evolve independently.
+const SOURCE_RTLSDR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Install a hotplug poller on the source panel that keeps the
+/// RTL-SDR slot label (`device_row` entry 0) in sync with the
+/// live USB bus. Seeded once at build-time (inside
+/// `build_source_panel`); this helper adds the ongoing refresh.
+///
+/// Compared against a cached last-seen label so the `splice` fires
+/// only on real edges — plugging in, unplugging, or USB string
+/// changing. Without the edge gate we'd churn the combo's model
+/// every 3 s and risk transient selection flicker (though GTK's
+/// `ComboRow` is robust to same-value splices, the no-op is
+/// cheaper to skip than to perform).
+///
+/// Weak ref on the source panel's `widget` so the poller tears
+/// down cleanly on window close — upgrade returns `None` and the
+/// `ControlFlow::Break` arm fires.
+fn connect_source_rtlsdr_probe(panels: &SidebarPanels) {
+    let widget_weak = panels.source.widget.downgrade();
+    let model_weak = panels.source.device_model.downgrade();
+    // Cached label from the last tick so we only rewrite on a
+    // real edge. Seed from the model's current `DEVICE_RTLSDR`
+    // entry — NOT from a fresh probe — so we're comparing
+    // subsequent probes against what the UI is actually showing.
+    //
+    // A second probe here would race the USB state: if the user
+    // unplugs their dongle between `build_source_panel` (which
+    // ran the initial probe + seed) and this wiring point, a
+    // second probe would read the new bus state, cache it as
+    // `last_label`, and then every subsequent tick's probe would
+    // match the cache — the combo would stay on the stale plugged-
+    // in name forever (or until the NEXT plug / unplug edge
+    // briefly desynced them again). Reading the model directly
+    // guarantees first-tick reconciliation.
+    let seed_label = panels
+        .source
+        .device_model
+        .string(DEVICE_RTLSDR)
+        .map_or_else(String::new, |s| s.to_string());
+    let last_label: Rc<RefCell<String>> = Rc::new(RefCell::new(seed_label));
+    let _ = glib::timeout_add_local(SOURCE_RTLSDR_PROBE_INTERVAL, move || {
+        if widget_weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let Some(model) = model_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let current = sidebar::source_panel::probe_rtlsdr_device_label();
+        let mut last = last_label.borrow_mut();
+        if *last != current {
+            tracing::debug!(
+                previous = %*last,
+                current = %current,
+                "source panel: RTL-SDR slot label updated",
+            );
+            // Replace the RTL-SDR slot in the StringList.
+            // `splice(pos, n, additions)` removes `n` items at
+            // `pos` and inserts `additions` — so `(DEVICE_RTLSDR,
+            // 1, &[&current])` is a single-entry in-place swap.
+            // Using the shared `DEVICE_RTLSDR` constant instead
+            // of a literal `0` keeps the probe aligned with the
+            // rest of the source-row selection logic; all four
+            // `DEVICE_*` indices are the one source of truth for
+            // slot positions. Leaves Network / File / RTL-TCP
+            // entries untouched.
+            model.splice(DEVICE_RTLSDR, 1, &[&current]);
+            *last = current;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "GTK signal-wiring panel; splitting would fragment the control mapping"
@@ -3545,9 +3647,19 @@ fn connect_source_panel(
 /// Connect radio panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
 fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
-    // Bandwidth
+    // Bandwidth. The DSP can originate a change too (VFO drag on
+    // the spectrum dispatches `UiToDsp::SetBandwidth` directly,
+    // and the controller echoes `DspToUi::BandwidthChanged` so the
+    // spin row reflects the drag). The echo path updates this row
+    // via `set_value` which re-fires `connect_value_notify` —
+    // `suppress_bandwidth_notify` breaks the cycle by telling this
+    // handler to skip the DSP dispatch when the change originated
+    // on the DSP side.
     let state_bw = Rc::clone(state);
     panels.radio.bandwidth_row.connect_value_notify(move |row| {
+        if state_bw.suppress_bandwidth_notify.get() {
+            return;
+        }
         state_bw.send_dsp(UiToDsp::SetBandwidth(row.value()));
     });
 

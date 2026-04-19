@@ -36,6 +36,39 @@ pub const DEVICE_FILE: u32 = 2;
 /// Device selector index for RTL-TCP (rtl_tcp-protocol network client).
 pub const DEVICE_RTLTCP: u32 = 3;
 
+/// Label shown in the source combo's RTL-SDR slot when no dongle
+/// is detected on the USB bus. Kept as a pub const so the hotplug
+/// poller and the probe helper render identical text.
+pub const RTLSDR_ABSENT_LABEL: &str = "No RTL-SDR device found";
+
+/// Probe the USB bus for an RTL-SDR dongle and return the label
+/// to show in the source combo's RTL-SDR slot (index 0).
+///
+/// Returns the librtlsdr device name of the first matching device
+/// when present (e.g. `"Generic RTL2832U OEM"`), or
+/// [`RTLSDR_ABSENT_LABEL`] when the bus has no dongle. Cheap
+/// enough to call from a 3 s hotplug poller on the GTK main
+/// thread — `sdr_rtlsdr::get_device_count` is a libusb enumerate
+/// filtered by vendor/product ID, and `get_device_name` re-runs
+/// the same enumerate to reach the Nth match.
+///
+/// When `get_device_count` reports > 0 but `get_device_name`
+/// returns an empty string (shouldn't happen outside of a race
+/// where the device was unplugged between the two enumerate
+/// calls), we fall back to the generic "RTL-SDR" label so the
+/// UI stays usable rather than rendering an empty combo entry.
+pub fn probe_rtlsdr_device_label() -> String {
+    if sdr_rtlsdr::get_device_count() == 0 {
+        return RTLSDR_ABSENT_LABEL.to_string();
+    }
+    let name = sdr_rtlsdr::get_device_name(0);
+    if name.is_empty() {
+        "RTL-SDR".to_string()
+    } else {
+        name
+    }
+}
+
 /// Default subtitle for the RTL-TCP status row before any
 /// `DspToUi::RtlTcpConnectionState` event has arrived (or after a
 /// Disconnect). Kept as a const so the empty-at-startup and
@@ -107,6 +140,12 @@ pub struct SourcePanel {
     pub widget: adw::PreferencesGroup,
     /// Device type selector (RTL-SDR, Network).
     pub device_row: adw::ComboRow,
+    /// Backing `StringList` for `device_row`. Exposed so a
+    /// hotplug poller can update the RTL-SDR slot's label (entry
+    /// index 0) via `splice` when the probed device name or
+    /// presence changes, without replacing the whole model (which
+    /// would reset the selection).
+    pub device_model: gtk4::StringList,
     /// RTL-SDR sample rate selector.
     pub sample_rate_row: adw::ComboRow,
     /// RTL-SDR gain control.
@@ -384,7 +423,17 @@ pub fn build_source_panel() -> SourcePanel {
     // Order is load-bearing — matches `DEVICE_RTLSDR / NETWORK / FILE /
     // RTLTCP` index constants. If you change the order here, update the
     // constants AND the `SourceType` match in window.rs at the same time.
-    let device_model = gtk4::StringList::new(&["RTL-SDR", "Network", "File", "RTL-TCP (network)"]);
+    // Initial label for the RTL-SDR slot — probed against the USB
+    // bus so a first-launch user without a dongle sees "No RTL-SDR
+    // device found" instead of the app lying that a dongle is
+    // present. Kept in sync with hotplug events by the probe
+    // poller wired in `connect_source_rtlsdr_probe` in window.rs.
+    let device_model = gtk4::StringList::new(&[
+        &probe_rtlsdr_device_label(),
+        "Network",
+        "File",
+        "RTL-TCP (network)",
+    ]);
     let device_row = adw::ComboRow::builder()
         .title("Device")
         .model(&device_model)
@@ -512,6 +561,7 @@ pub fn build_source_panel() -> SourcePanel {
     SourcePanel {
         widget: group,
         device_row,
+        device_model,
         sample_rate_row,
         gain_row,
         agc_row,

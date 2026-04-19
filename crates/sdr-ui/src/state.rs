@@ -23,6 +23,15 @@ pub struct AppState {
     pub demod_mode: Cell<DemodMode>,
     /// Sender for dispatching commands to the DSP thread.
     pub ui_tx: mpsc::Sender<UiToDsp>,
+    /// Re-entrancy guard for programmatic `bandwidth_row.set_value`
+    /// calls from the `DspToUi::BandwidthChanged` handler. Toggled
+    /// true before the `set_value`, cleared after, and checked in
+    /// the spin row's `connect_value_notify` handler — prevents a DSP-
+    /// originated bandwidth update (e.g. from a VFO drag) from
+    /// bouncing back as a redundant `UiToDsp::SetBandwidth` dispatch
+    /// which would in turn re-emit `BandwidthChanged` and waste a
+    /// round trip per UI reflection.
+    pub suppress_bandwidth_notify: Cell<bool>,
 }
 
 impl AppState {
@@ -35,6 +44,7 @@ impl AppState {
             center_frequency: Cell::new(DEFAULT_CENTER_FREQUENCY_HZ),
             demod_mode: Cell::new(DemodMode::Wfm),
             ui_tx,
+            suppress_bandwidth_notify: Cell::new(false),
         })
     }
 

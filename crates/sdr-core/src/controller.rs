@@ -524,6 +524,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             }
             // Also pass to the radio module (some demods use it internally).
             state.radio.set_bandwidth(bw);
+            // Notify UI so widgets that initiate bandwidth changes
+            // via a different path (VFO drag handles on the
+            // spectrum) can reflect the new value in the Radio
+            // panel's bandwidth spin row. The `bandwidth_row`'s
+            // own `set_value` path guards against feedback loops
+            // via a `suppress_notify` flag on the UI side.
+            let _ = dsp_tx.send(DspToUi::BandwidthChanged(state.bandwidth));
         }
 
         UiToDsp::SetSquelch(level) => {

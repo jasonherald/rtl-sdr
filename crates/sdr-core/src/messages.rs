@@ -38,6 +38,20 @@ pub enum DspToUi {
     /// transcription session (band change = new session boundary) and
     /// to re-run Auto Break row visibility rules.
     DemodModeChanged(DemodMode),
+    /// Channel bandwidth changed. Emitted from the controller's
+    /// `SetBandwidth` handler after the new value has been applied
+    /// to `state.vfo`, `state.radio`, and `state.bandwidth`. Lets
+    /// the Radio sidebar panel's bandwidth spin row reflect drags
+    /// initiated from the spectrum VFO handles — without this, the
+    /// spin row would go stale relative to the DSP and confuse the
+    /// user about the active filter width.
+    ///
+    /// Emitted on every successful `SetBandwidth` application, not
+    /// edge-filtered — the spin row's `set_value` is idempotent
+    /// when called with its current value, so the cost is
+    /// negligible and emitting unconditionally keeps the controller
+    /// free of per-field before/after comparisons.
+    BandwidthChanged(f64),
     /// CTCSS sustained-gate state changed. Emitted only on edges
     /// (closed → open / open → closed), not per-window, so the UI
     /// status indicator can subscribe without flooding the channel.
@@ -192,6 +206,13 @@ pub enum UiToDsp {
 mod tests {
     use super::*;
 
+    /// Fixed bandwidth used by the message-variant round-trip
+    /// tests. 12.5 kHz is NFM's default and the value the VFO-drag
+    /// feedback loop most commonly emits in practice — hoisting it
+    /// to a const both removes the magic-number duplication in the
+    /// construct + match and documents the choice of value.
+    const TEST_BANDWIDTH_HZ: f64 = 12_500.0;
+
     #[test]
     fn test_dsp_to_ui_variants() {
         let fft = DspToUi::FftData(vec![1.0, 2.0, 3.0]);
@@ -231,6 +252,18 @@ mod tests {
     fn demod_mode_changed_message_constructs() {
         let m = DspToUi::DemodModeChanged(DemodMode::Nfm);
         assert!(matches!(m, DspToUi::DemodModeChanged(DemodMode::Nfm)));
+    }
+
+    #[test]
+    fn bandwidth_changed_message_constructs() {
+        // Pins the variant shape + payload round-trip so future
+        // refactors that accidentally change the f64 carrier
+        // (e.g. to `u32` Hz or a `Bandwidth` newtype) trip this
+        // test.
+        let bw = DspToUi::BandwidthChanged(TEST_BANDWIDTH_HZ);
+        assert!(
+            matches!(bw, DspToUi::BandwidthChanged(v) if (v - TEST_BANDWIDTH_HZ).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
