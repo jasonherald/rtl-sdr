@@ -643,14 +643,22 @@ fn apply_rtl_tcp_connection_state(
             | RtlTcpConnectionState::Connected { .. }
             | RtlTcpConnectionState::Retrying { .. }
     );
-    let is_between_attempts = matches!(
+    // "Retry now" is only meaningful when there's an active source
+    // to short-circuit out of its backoff wait — Retrying (most
+    // common) or Failed (the terminal protocol-error path where the
+    // source is still registered but not advancing). After an
+    // explicit Disconnect the controller drops `state.source`, and
+    // `UiToDsp::RetryRtlTcpNow` is a no-op (it checks
+    // `state.source.as_mut()` → None → early return). Leaving the
+    // button visibly enabled in that state misleads the user into
+    // thinking they can reconnect in one click; the correct
+    // post-Disconnect path is to press Play.
+    let can_retry_now = matches!(
         state,
-        RtlTcpConnectionState::Disconnected
-            | RtlTcpConnectionState::Retrying { .. }
-            | RtlTcpConnectionState::Failed { .. }
+        RtlTcpConnectionState::Retrying { .. } | RtlTcpConnectionState::Failed { .. }
     );
     disconnect_button.set_sensitive(is_active);
-    retry_button.set_sensitive(is_between_attempts);
+    retry_button.set_sensitive(can_retry_now);
 }
 
 /// Build the `AdwOverlaySplitView` with sidebar configuration panels, content,
