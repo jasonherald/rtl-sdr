@@ -1047,14 +1047,20 @@ fn connect_rtl_tcp_discovery(
     // a `LastConnectedServer` snapshot on click.
     let config_for_discovery = std::sync::Arc::clone(config);
 
-    // Favorites set — instance names the user has starred. Loaded
-    // once on startup, mutated by star-toggle handlers, persisted
-    // after each change via `save_favorites`. `Rc<RefCell<HashSet>>`
-    // mirrors the `displayed_rows` pattern — single-threaded GTK
-    // main loop, no lock contention.
-    let favorites: Rc<RefCell<std::collections::HashSet<String>>> = Rc::new(RefCell::new(
+    // Favorites map — key (stable hostname:port) → rich
+    // `FavoriteEntry` record. Loaded once on startup, mutated by
+    // star-toggle handlers and re-announce metadata refresh,
+    // persisted after each change via `save_favorites`.
+    // `Rc<RefCell<HashMap>>` mirrors the `displayed_rows` pattern
+    // — single-threaded GTK main loop, no lock contention. Keyed
+    // by the same `favorite_key(server)` that the reorder / pin-
+    // to-top path uses so lookups stay consistent.
+    let favorites: Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    > = Rc::new(RefCell::new(
         crate::sidebar::source_panel::load_favorites(&config_for_discovery)
             .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
             .collect(),
     ));
 
@@ -1224,11 +1230,23 @@ fn connect_rtl_tcp_discovery(
                     // can edit — keying favorites off it would
                     // silently drop the star on any rename.
                     let star_key = favorite_key(&server);
-                    let starred_initially = favorites.borrow().contains(&star_key);
+                    let starred_initially = favorites.borrow().contains_key(&star_key);
                     star_btn.set_active(starred_initially);
                     if starred_initially {
                         star_btn.set_icon_name(FAVORITE_ICON_FILLED);
                     }
+                    // Capture the display metadata into move-able
+                    // values so the toggle closure can build a
+                    // `FavoriteEntry` without holding onto
+                    // `server` (which is consumed by the HashMap
+                    // insert further down).
+                    let star_nickname = if server.txt.nickname.is_empty() {
+                        server.instance_name.clone()
+                    } else {
+                        server.txt.nickname.clone()
+                    };
+                    let star_tuner_name = Some(server.txt.tuner.clone());
+                    let star_gain_count = Some(server.txt.gains);
                     let star_favorites = Rc::clone(&favorites);
                     let star_config = std::sync::Arc::clone(&config_for_discovery);
                     let star_rows = Rc::clone(&displayed_rows);
@@ -1243,16 +1261,30 @@ fn connect_rtl_tcp_discovery(
                         {
                             let mut favs = star_favorites.borrow_mut();
                             if active {
-                                favs.insert(star_key.clone());
+                                // Build a fresh entry with the
+                                // current metadata. Replaces any
+                                // older entry with the same key
+                                // (= metadata refresh on re-star).
+                                favs.insert(
+                                    star_key.clone(),
+                                    sidebar::source_panel::FavoriteEntry {
+                                        key: star_key.clone(),
+                                        nickname: star_nickname.clone(),
+                                        tuner_name: star_tuner_name.clone(),
+                                        gain_count: star_gain_count,
+                                        last_seen_unix: Some(
+                                            sidebar::source_panel::now_unix_seconds(),
+                                        ),
+                                    },
+                                );
                             } else {
                                 favs.remove(&star_key);
                             }
                             // Persist immediately. Order within
                             // the persisted list is unspecified —
-                            // sort on read if the UI ever needs a
-                            // stable presentation order for
-                            // favorites management.
-                            let snapshot: Vec<String> = favs.iter().cloned().collect();
+                            // the slide-out sorts on read.
+                            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                                favs.values().cloned().collect();
                             crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
                         }
                         // Rebuild the expander so the row moves
@@ -1346,6 +1378,40 @@ fn connect_rtl_tcp_discovery(
                     });
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
+                    // If this server is already favorited, refresh
+                    // the persisted metadata (tuner name, gain
+                    // count, nickname, last-seen) off the fresh
+                    // announce. Keeps the favorites slide-out's
+                    // display honest when the user revisits it
+                    // after the server has been renamed /
+                    // re-announced with updated TXT records.
+                    let fav_key = favorite_key(&server);
+                    {
+                        let mut favs = favorites.borrow_mut();
+                        if favs.contains_key(&fav_key) {
+                            let refreshed_nickname = if server.txt.nickname.is_empty() {
+                                server.instance_name.clone()
+                            } else {
+                                server.txt.nickname.clone()
+                            };
+                            favs.insert(
+                                fav_key.clone(),
+                                sidebar::source_panel::FavoriteEntry {
+                                    key: fav_key.clone(),
+                                    nickname: refreshed_nickname,
+                                    tuner_name: Some(server.txt.tuner.clone()),
+                                    gain_count: Some(server.txt.gains),
+                                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+                                },
+                            );
+                            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                                favs.values().cloned().collect();
+                            crate::sidebar::source_panel::save_favorites(
+                                &config_for_discovery,
+                                &snapshot,
+                            );
+                        }
+                    }
                     rows.insert(server.instance_name.clone(), (row, server));
                     // Reorder after insert so favorites float to
                     // the top of the new view.
@@ -1415,7 +1481,7 @@ fn favorite_key(server: &DiscoveredServer) -> String {
 fn reorder_discovered_rows(
     expander: &adw::ExpanderRow,
     rows: &std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>,
-    favorites: &std::collections::HashSet<String>,
+    favorites: &std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>,
 ) {
     // Remove every row from the expander — widgets live in the
     // HashMap, so no drop happens.
@@ -1431,10 +1497,10 @@ fn reorder_discovered_rows(
     keys.sort_by(|a, b| {
         let a_fav = rows
             .get(a.as_str())
-            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
+            .is_some_and(|(_, srv)| favorites.contains_key(&favorite_key(srv)));
         let b_fav = rows
             .get(b.as_str())
-            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
+            .is_some_and(|(_, srv)| favorites.contains_key(&favorite_key(srv)));
         match (a_fav, b_fav) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
