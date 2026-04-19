@@ -13,7 +13,7 @@ use libadwaita::prelude::*;
 use sdr_core::Engine;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
-use sdr_rtltcp_discovery::{Browser, DiscoveryEvent};
+use sdr_rtltcp_discovery::{Browser, DiscoveredServer, DiscoveryEvent};
 use sdr_source_rtlsdr::SAMPLE_RATES;
 
 use crate::header;
@@ -933,9 +933,11 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Tracks the `AdwActionRow` per-server so we can remove it on
     // `ServerWithdrawn` OR when the row goes stale past
     // `STALE_ROW_GRACE`. Keyed by full DNS-SD instance name (stable
-    // across nickname changes). Value carries the row widget + a
-    // `last_seen` Instant updated on every `ServerAnnounced`.
-    let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, Instant)>>> =
+    // across nickname changes). Value carries the row widget + the
+    // last `DiscoveredServer` payload seen for that instance —
+    // `server.last_seen` drives both staleness pruning and the
+    // per-tick freshness indicator rendered in the row subtitle.
+    let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, DiscoveredServer)>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
     // Weak ref on the expander so the timeout closure doesn't keep
@@ -973,7 +975,9 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
             let now = Instant::now();
             let stale_names: Vec<String> = rows
                 .iter()
-                .filter(|(_, (_, seen))| now.duration_since(*seen) > STALE_ROW_GRACE)
+                .filter(|(_, (_, server))| {
+                    now.saturating_duration_since(server.last_seen) > STALE_ROW_GRACE
+                })
                 .map(|(name, _)| name.clone())
                 .collect();
             for name in stale_names {
@@ -981,6 +985,17 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     tracing::debug!(instance = %name, "pruning stale rtl_tcp discovery row");
                     expander.remove(&row);
                 }
+            }
+            // Refresh each surviving row's subtitle with a fresh
+            // "seen N ago" stamp. Without this per-tick refresh the
+            // age text would freeze at whatever it said when the row
+            // was built (or last re-announced) and silently mislead
+            // the user about how recent a server is. GTK short-
+            // circuits the set_subtitle call when the string is
+            // unchanged, so this is nearly free on quiescent rows.
+            for (row, server) in rows.values() {
+                let elapsed = now.saturating_duration_since(server.last_seen);
+                row.set_subtitle(&format_discovery_subtitle(server, elapsed));
             }
             if rows.is_empty() {
                 expander.set_subtitle("No servers discovered on the local network yet.");
@@ -1018,10 +1033,12 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                         .addresses
                         .first()
                         .map_or_else(|| server.hostname.clone(), ToString::to_string);
-                    let subtitle = format!(
-                        "{}:{} — {} ({} gain steps)",
-                        host, server.port, server.txt.tuner, server.txt.gains
-                    );
+                    // Age is effectively 0 here — `server.last_seen` was
+                    // stamped by the browser thread a few ms ago —
+                    // `format_age` will render "just now". Subsequent
+                    // poll ticks refresh this with the actual age.
+                    let elapsed = Instant::now().saturating_duration_since(server.last_seen);
+                    let subtitle = format_discovery_subtitle(&server, elapsed);
 
                     // Re-announce for a known instance_name: remove the
                     // old row and fall through to build a fresh one.
@@ -1084,13 +1101,13 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     });
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
-                    rows.insert(server.instance_name.clone(), (row, Instant::now()));
+                    rows.insert(server.instance_name.clone(), (row, server));
 
                     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
                 }
                 DiscoveryEvent::ServerWithdrawn { instance_name } => {
                     let mut rows = displayed_rows.borrow_mut();
-                    if let Some((row, _seen)) = rows.remove(&instance_name) {
+                    if let Some((row, _)) = rows.remove(&instance_name) {
                         expander.remove(&row);
                     }
                     if rows.is_empty() {
@@ -1103,6 +1120,82 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Format the subtitle string for a discovered `rtl_tcp` server row.
+///
+/// Emits three pieces separated by ` • `:
+///
+/// 1. `{connect_target}:{port}` — the address the Connect button will
+///    dial (IPv4 address if we have one, otherwise the advertised
+///    hostname).
+/// 2. advertised mDNS hostname — only when it's non-empty AND
+///    genuinely different from the connect target (i.e., we have an
+///    IP and want to show the friendly name alongside it). The
+///    hostname is stripped of any trailing `.local.` so we show
+///    `shack-pi` instead of `shack-pi.local.`.
+/// 3. `{tuner} · {gains} gains · seen {age}` — hardware info plus
+///    the freshness indicator from `format_age`.
+///
+/// Kept as a free function (not a method on `DiscoveredServer`) so the
+/// age-stamp convention stays a UI concern and the discovery crate
+/// doesn't need to think about human-readable timestamps.
+fn format_discovery_subtitle(server: &DiscoveredServer, elapsed: Duration) -> String {
+    let connect_target = server
+        .addresses
+        .first()
+        .map_or_else(|| server.hostname.clone(), ToString::to_string);
+    let bare_hostname = bare_local_host(&server.hostname);
+    // Compare `bare_hostname` against a similarly-trimmed view of the
+    // connect target so the no-IP fallback (target = hostname) doesn't
+    // render "shack-pi.local.:1234 • shack-pi • …" — one name twice.
+    let bare_connect_target = bare_local_host(&connect_target);
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    parts.push(format!("{connect_target}:{}", server.port));
+    if !bare_hostname.is_empty() && bare_hostname != bare_connect_target {
+        parts.push(bare_hostname.to_string());
+    }
+    parts.push(format!(
+        "{} · {} gains · seen {}",
+        server.txt.tuner,
+        server.txt.gains,
+        format_age(elapsed)
+    ));
+    parts.join(" • ")
+}
+
+/// Strip a trailing `.local.` / `.local` / `.` suffix from an mDNS
+/// hostname so the user sees `shack-pi` instead of `shack-pi.local.`.
+/// Purely presentational — resolution still happens against the full
+/// name in the Connect button's dial path.
+fn bare_local_host(host: &str) -> &str {
+    host.trim_end_matches('.')
+        .trim_end_matches(".local")
+        .trim_end_matches('.')
+}
+
+/// Render an elapsed duration as a short human-readable age string.
+///
+/// Buckets:
+/// - under 5 s → `"just now"` (avoids flicker on the 200 ms poll tick)
+/// - 5 s – 60 s → `"Ns ago"`
+/// - 1 m – 60 m → `"Nm ago"`
+/// - 60 m and up → `"Nh ago"`
+///
+/// Coarse by design — the point is to tell "freshly re-announced" from
+/// "cached and possibly dead", not to replace an NTP timestamp.
+fn format_age(elapsed: Duration) -> String {
+    const FRESH_THRESHOLD: Duration = Duration::from_secs(5);
+    let secs = elapsed.as_secs();
+    if elapsed < FRESH_THRESHOLD {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
 }
 
 #[allow(
@@ -2878,4 +2971,117 @@ fn recording_path(prefix: &str) -> std::path::PathBuf {
         .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
         .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
     base.join(format!("{prefix}-{timestamp}.wav"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod rtl_tcp_discovery_format_tests {
+    use std::net::IpAddr;
+    use std::time::{Duration, Instant};
+
+    use sdr_rtltcp_discovery::{DiscoveredServer, TxtRecord};
+
+    use super::{format_age, format_discovery_subtitle};
+
+    fn sample_server(addresses: Vec<IpAddr>, hostname: &str) -> DiscoveredServer {
+        DiscoveredServer {
+            instance_name: "shack-pi weather._rtl_tcp._tcp.local.".into(),
+            hostname: hostname.into(),
+            port: 1234,
+            addresses,
+            txt: TxtRecord {
+                tuner: "R820T".into(),
+                version: "0.1.0".into(),
+                gains: 29,
+                nickname: "weather".into(),
+                txbuf: None,
+            },
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn format_age_buckets_seconds_minutes_hours() {
+        // < 5 s bucket → "just now" (debounces the 200 ms refresh
+        // from showing "0s ago / 1s ago" noise).
+        assert_eq!(format_age(Duration::from_millis(0)), "just now");
+        assert_eq!(format_age(Duration::from_secs(4)), "just now");
+        // 5 s – 59 s → "Ns ago"
+        assert_eq!(format_age(Duration::from_secs(5)), "5s ago");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s ago");
+        // 1 m – 59 m → "Nm ago"
+        assert_eq!(format_age(Duration::from_mins(1)), "1m ago");
+        assert_eq!(format_age(Duration::from_secs(125)), "2m ago");
+        assert_eq!(format_age(Duration::from_secs(3599)), "59m ago");
+        // 1 h+ → "Nh ago"
+        assert_eq!(format_age(Duration::from_hours(1)), "1h ago");
+        assert_eq!(format_age(Duration::from_hours(2)), "2h ago");
+    }
+
+    #[test]
+    fn subtitle_with_ip_shows_hostname_and_freshness() {
+        // When we have a resolved IP, the subtitle includes both the
+        // IP (the Connect button's target) AND the advertised
+        // hostname (the friendly name the user recognises).
+        let ip: IpAddr = "192.168.1.5".parse().unwrap();
+        let server = sample_server(vec![ip], "shack-pi.local.");
+        let subtitle = format_discovery_subtitle(&server, Duration::from_secs(12));
+        assert!(
+            subtitle.contains("192.168.1.5:1234"),
+            "subtitle missing connect target: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("shack-pi"),
+            "subtitle missing advertised hostname: {subtitle}"
+        );
+        assert!(
+            !subtitle.contains(".local"),
+            "subtitle should strip .local suffix: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("R820T"),
+            "subtitle missing tuner: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("29 gains"),
+            "subtitle missing gain count: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("seen 12s ago"),
+            "subtitle missing freshness: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn subtitle_without_ip_omits_duplicate_hostname_segment() {
+        // No resolved addresses: connect target falls back to the
+        // hostname itself. Showing it twice (once as target, once as
+        // hostname segment) would be noise, so the hostname segment
+        // is suppressed when it would duplicate the target.
+        let server = sample_server(vec![], "shack-pi.local.");
+        let subtitle = format_discovery_subtitle(&server, Duration::from_secs(1));
+        assert!(
+            subtitle.starts_with("shack-pi.local.:1234"),
+            "subtitle should use hostname as target: {subtitle}"
+        );
+        // Exactly two ` • ` separators: target + hardware/freshness.
+        assert_eq!(
+            subtitle.matches(" • ").count(),
+            1,
+            "expected one bullet separator when hostname segment is suppressed: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn subtitle_fresh_announce_reads_just_now() {
+        // On the initial announce, elapsed is effectively 0 — the
+        // subtitle should say "just now" rather than "0s ago".
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let server = sample_server(vec![ip], "radio.local.");
+        let subtitle = format_discovery_subtitle(&server, Duration::from_millis(50));
+        assert!(
+            subtitle.ends_with("seen just now"),
+            "subtitle should read 'seen just now' for sub-5s age: {subtitle}"
+        );
+    }
 }
