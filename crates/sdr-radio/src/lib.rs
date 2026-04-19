@@ -122,8 +122,12 @@ impl RadioModule {
         // because it's applied to the stereo output after AfChain's
         // resampler — see `process()` and #331's bug-fix notes for
         // why this has to live in the AF path and not at IF.
+        // `SquelchAudioEnvelope::new` rejects non-finite /
+        // non-positive rates; error propagates via `RadioError::Dsp`
+        // rather than silently collapsing to the pre-envelope hard
+        // gate it was meant to replace.
         #[allow(clippy::cast_possible_truncation)]
-        let squelch_envelope = sdr_dsp::noise::SquelchAudioEnvelope::new(audio_sample_rate as f32);
+        let squelch_envelope = sdr_dsp::noise::SquelchAudioEnvelope::new(audio_sample_rate as f32)?;
 
         Ok(Self {
             mode,

@@ -335,31 +335,76 @@ mod tests {
 
     #[test]
     fn test_wfm_stereo_audio_agc_preserves_imaging() {
-        // In stereo mode, shared-gain AGC applies the same gain
-        // to both channels (envelope driven by the per-sample
-        // RMS energy `sqrt((L² + R²) / 2)` so anti-phase and
-        // mono-in-one-channel content both drive the AGC
-        // correctly). If L is louder than R in the input, that
-        // relationship
-        // should survive AGC — not be flattened by independent
-        // per-channel normalization.
+        use core::f32::consts::PI;
+        // Synthesize an FM broadcast MPX signal carrying
+        // asymmetric stereo content — L four times louder than
+        // R — and confirm the relationship survives the shared-
+        // gain AGC. An accidental switch to independent L/R
+        // AGCs (each channel normalized to its own envelope)
+        // would flatten the L:R ratio toward 1.0 and fail this
+        // test, where the vacuous silence-only version it
+        // replaces would have passed regardless.
+        let sample_rate = WFM_IF_SAMPLE_RATE as f32;
+        let deviation_hz: f32 = 50_000.0;
+        let audio_freq_hz: f32 = 1_000.0;
+        let pilot_freq_hz: f32 = 19_000.0;
+        let subcarrier_freq_hz: f32 = 2.0 * pilot_freq_hz;
+        // L >> R on the same 1 kHz tone. Amplitudes chosen to
+        // keep the MPX peak under FM's ±75 kHz deviation headroom
+        // and produce a large, measurable L/R ratio after decode.
+        let left_amp: f32 = 0.4;
+        let right_amp: f32 = 0.1;
+
+        // Phase accumulation over 20_000 samples (80 ms at
+        // 250 kHz). Generous settling time for the stereo
+        // decoder's 19 kHz pilot PLL plus the audio AGC's
+        // ~300-sample attack.
+        let n = 20_000;
+        let mut phase: f32 = 0.0;
+        let phase_scale = 2.0 * PI * deviation_hz / sample_rate;
+        let input: Vec<Complex> = (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                let left = left_amp * (2.0 * PI * audio_freq_hz * t).sin();
+                let right = right_amp * (2.0 * PI * audio_freq_hz * t).sin();
+                // Broadcast MPX: mono sum + pilot + DSBSC(L-R).
+                let mono = left + right;
+                let diff = left - right;
+                let pilot = 0.1 * (2.0 * PI * pilot_freq_hz * t).cos();
+                let subcarrier = diff * (2.0 * PI * subcarrier_freq_hz * t).cos();
+                let mpx = mono + pilot + subcarrier;
+                phase += phase_scale * mpx;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+
         let mut demod = WfmDemodulator::new().unwrap();
         demod.set_stereo(true);
-        // Drive enough samples so the stereo decoder's PLL and
-        // the AGC envelope both settle before measurement.
-        let n = 5000;
-        let input = vec![Complex::new(1.0, 0.0); n];
         let mut output = vec![Stereo::default(); n];
         demod.process(&input, &mut output).unwrap();
-        // Constant-frequency input means silence after FM demod
-        // → output amplitude near zero. Exact L == R is expected
-        // (both channels share the zero envelope). This test just
-        // confirms the stereo path compiles, runs, and doesn't
-        // NaN out via 0/0 in the gain calculation.
-        for s in &output[2000..] {
-            assert!(s.l.is_finite(), "stereo AGC produced non-finite L sample");
-            assert!(s.r.is_finite(), "stereo AGC produced non-finite R sample");
-        }
+
+        // Skip PLL + AGC settling, then measure the L / R
+        // envelope-level ratio over the steady-state portion.
+        let settle = 10_000;
+        let mean_abs_l =
+            output[settle..].iter().map(|s| s.l.abs()).sum::<f32>() / (n - settle) as f32;
+        let mean_abs_r =
+            output[settle..].iter().map(|s| s.r.abs()).sum::<f32>() / (n - settle) as f32;
+
+        // Shared-gain AGC must preserve the input 4:1 imbalance
+        // roughly. Floor the ratio at 2.0× so an independent
+        // per-channel AGC (which would push this toward 1.0)
+        // fails decisively, and ceil it at 10× so a catastrophic
+        // bug amplifying one channel wildly also fails.
+        assert!(
+            mean_abs_r > 1e-5,
+            "stereo AGC produced a near-zero R channel: mean_abs_r = {mean_abs_r}"
+        );
+        let ratio = mean_abs_l / mean_abs_r;
+        assert!(
+            ratio > 2.0 && ratio < 10.0,
+            "stereo imaging not preserved: mean_abs_l = {mean_abs_l}, mean_abs_r = {mean_abs_r}, ratio = {ratio}"
+        );
     }
 
     #[test]
