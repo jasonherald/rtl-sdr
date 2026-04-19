@@ -1117,6 +1117,27 @@ fn connect_rtl_tcp_discovery(
     /// would lie by showing the idle "No servers discovered…" state.
     const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
 
+    // "Manage favorites…" button inside the discovered-servers
+    // expander — a second entry point into the same popover as
+    // the header-bar star button. Wired here because the
+    // `MenuButton` whose `popup()` we trigger lives in the
+    // header. Weak ref on the button keeps the closure drop-safe
+    // if the header is torn down before the source panel (though
+    // in practice the window owns both and they drop together).
+    let favorites_menu_weak = favorites_header.button.downgrade();
+    panels
+        .source
+        .manage_favorites_button
+        .connect_clicked(move |_| {
+            if let Some(btn) = favorites_menu_weak.upgrade() {
+                // `MenuButton::popup` activates the attached
+                // popover anchored to the menu button itself, so
+                // the slide-out appears from the header regardless
+                // of which entry point the user clicked.
+                btn.popup();
+            }
+        });
+
     let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
     // `Option<Browser>` — `None` on mDNS startup failure. We still
     // need the rest of this function to run so the *manually*-

@@ -129,6 +129,14 @@ pub struct SourcePanel {
     /// Discovered `rtl_tcp` servers (live from mDNS). Collapsed by
     /// default; expands when servers are seen.
     pub rtl_tcp_discovered_row: adw::ExpanderRow,
+    /// Second entry point into the header-bar favorites popover.
+    /// Packed as a suffix on `rtl_tcp_discovered_row` — visible
+    /// only when the RTL-TCP device is selected (same visibility
+    /// as its parent expander). Click handler in `window.rs` calls
+    /// the header-bar favorites `MenuButton::popup()` so the slide-
+    /// out appears anchored to the header regardless of which
+    /// button the user clicked.
+    pub manage_favorites_button: gtk4::Button,
 
     /// Connection status line shown only while the RTL-TCP source
     /// type is selected. Subtitle reflects the current
@@ -398,6 +406,19 @@ pub fn build_source_panel() -> SourcePanel {
         .subtitle("No servers discovered on the local network yet.")
         .visible(false)
         .build();
+    // Second entry point into the favorites slide-out. The header
+    // bar's star button is the always-visible path; this one lives
+    // inside the RTL-TCP section so users who are actively picking
+    // a server don't have to route up to the header. Click handler
+    // is wired in window.rs because the MenuButton whose `popup()`
+    // we call is owned by the header bar, not the source panel.
+    let manage_favorites_button = gtk4::Button::builder()
+        .label("Manage favorites…")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text("Open the favorites slide-out from the header bar")
+        .build();
+    rtl_tcp_discovered_row.add_suffix(&manage_favorites_button);
 
     // Connection-state status row — subtitle updated by the DSP
     // bridge via `DspToUi::RtlTcpConnectionState`. Suffix buttons
@@ -498,6 +519,7 @@ pub fn build_source_panel() -> SourcePanel {
         decimation_row,
         record_iq_row,
         rtl_tcp_discovered_row,
+        manage_favorites_button,
         rtl_tcp_status_row,
         rtl_tcp_disconnect_button,
         rtl_tcp_retry_button,
