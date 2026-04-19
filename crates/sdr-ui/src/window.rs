@@ -3268,6 +3268,34 @@ fn format_age(elapsed: Duration) -> String {
     }
 }
 
+/// Enforce the tuner AGC ↔ manual gain mutual exclusion on the UI
+/// side: when AGC is on, the gain spin row becomes insensitive
+/// (grayed out, non-interactive). When AGC is off, the row is
+/// fully editable.
+///
+/// The mutex exists because librtlsdr's `rtlsdr_set_tuner_gain`
+/// silently no-ops when AGC mode is active on most RTL variants,
+/// and on some oscillates between the manual target and the AGC
+/// target in a loop that produces audible artifacts. Preventing
+/// the user from editing the control while it would silently fail
+/// is the discoverable fix (see #332). Bookmarks restore the full
+/// tuning profile with AGC-first-then-gain ordering already, so
+/// the restore path still updates `gain_row.set_value` cleanly
+/// even when the row is insensitive — the value displays but the
+/// user can't edit it until AGC is turned off.
+///
+/// The subtitle flips too so the reason for the lock is on-screen.
+/// Without the subtitle, an insensitive row is easy to mistake for
+/// a bug rather than intentional behavior.
+fn apply_agc_gain_mutex(gain_row: &adw::SpinRow, agc_active: bool) {
+    gain_row.set_sensitive(!agc_active);
+    gain_row.set_subtitle(if agc_active {
+        "Disabled while AGC is on"
+    } else {
+        ""
+    });
+}
+
 /// Interval for refreshing the source combo's RTL-SDR slot label
 /// against the live USB bus. Low-frequency enough to be
 /// negligible CPU-wise; fast enough that a user plugging in their
@@ -3458,16 +3486,36 @@ fn connect_source_panel(
             }
         });
 
-    // Gain control
+    // Gain control. Sensitivity is gated by AGC — see the `AGC
+    // toggle` handler below and `apply_agc_gain_mutex` for the
+    // reasoning (librtlsdr silently ignores gain writes when
+    // tuner AGC is on; some variants also oscillate between
+    // manual and AGC targets on mixed writes). Updating
+    // `gain_row.set_value` from bookmark restore still works
+    // even when insensitive — the row just displays the value
+    // and stays locked against user edits.
     let state_gain = Rc::clone(state);
     panels.source.gain_row.connect_value_notify(move |row| {
         state_gain.send_dsp(UiToDsp::SetGain(row.value()));
     });
 
-    // AGC toggle
+    // AGC toggle. In addition to dispatching the DSP command,
+    // toggle the gain row's sensitivity so the user can't edit
+    // the gain while tuner AGC is on — matches the macOS app's
+    // behavior and prevents the silent-no-op / tuner-oscillation
+    // failure modes documented in #332.
+    //
+    // Initial state: `AdwSwitchRow` defaults to `active = false`,
+    // which means gain_row starts sensitive. Bookmark restore sets
+    // agc via `agc_row.set_active(agc)`, which fires this handler
+    // and reapplies the mutex — no separate seeding path needed.
+    apply_agc_gain_mutex(&panels.source.gain_row, panels.source.agc_row.is_active());
     let state_agc = Rc::clone(state);
+    let gain_row_for_agc = panels.source.gain_row.clone();
     panels.source.agc_row.connect_active_notify(move |row| {
-        state_agc.send_dsp(UiToDsp::SetAgc(row.is_active()));
+        let agc_active = row.is_active();
+        state_agc.send_dsp(UiToDsp::SetAgc(agc_active));
+        apply_agc_gain_mutex(&gain_row_for_agc, agc_active);
     });
 
     // IQ correction toggle
