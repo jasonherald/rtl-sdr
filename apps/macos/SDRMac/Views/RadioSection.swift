@@ -15,9 +15,12 @@ struct RadioSection: View {
         Section("Radio") {
             LabeledContent("Bandwidth") {
                 @Bindable var m = model
-                TextField("Hz", value: $m.bandwidthHz, format: .number)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.setBandwidth(model.bandwidthHz) }
+                BandwidthEntry(
+                    hz: $m.bandwidthHz,
+                    mode: model.demodMode
+                ) { hz in
+                    model.setBandwidth(hz)
+                }
             }
 
             Toggle("Squelch", isOn: Binding(
