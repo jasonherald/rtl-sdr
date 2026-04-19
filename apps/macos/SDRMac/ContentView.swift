@@ -64,6 +64,7 @@ struct SidebarView: View {
             SourceSection()
             RadioSection()
             DisplaySection()
+            BookmarksSection()
         }
         .formStyle(.grouped)
     }

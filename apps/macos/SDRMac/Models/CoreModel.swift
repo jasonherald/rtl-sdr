@@ -418,6 +418,48 @@ final class CoreModel {
     /// command is a no-op if the value already matches. Errors
     /// land in `lastError` via the individual setters' `capture`
     /// helper.
+    /// Snapshot the current tuning state as a Bookmark. The
+    /// user-visible name defaults to the current center
+    /// frequency; callers can override. Only the fields the user
+    /// would reasonably want to recall are captured; FFT / PPM /
+    /// volume are intentionally NOT part of a bookmark — those
+    /// feel more like environmental settings than per-station
+    /// preferences.
+    func snapshotBookmark(name: String? = nil) -> Bookmark {
+        Bookmark(
+            name: name ?? formatRate(centerFrequencyHz),
+            centerFrequencyHz: centerFrequencyHz,
+            demodMode: demodMode,
+            bandwidthHz: bandwidthHz,
+            squelchEnabled: squelchEnabled,
+            autoSquelchEnabled: autoSquelchEnabled,
+            squelchDb: squelchDb,
+            gainDb: gainDb,
+            agcEnabled: agcEnabled,
+            volume: nil,       // feels more like env setting than per-bookmark
+            deemphasis: deemphasis
+        )
+    }
+
+    /// Apply a saved Bookmark. Each field that's non-nil goes
+    /// through the matching setter (so the engine sees the same
+    /// command stream a user tapping the UI would send). Fields
+    /// left nil are untouched — e.g. a "600 MHz memory channel"
+    /// bookmark saved without a squelch setting won't unintentionally
+    /// flip the user's current squelch state.
+    func apply(_ bookmark: Bookmark) {
+        if let hz = bookmark.centerFrequencyHz { setCenter(hz) }
+        if let m = bookmark.demodMode          { setDemodMode(m) }
+        if let bw = bookmark.bandwidthHz       { setBandwidth(bw) }
+        if let on = bookmark.squelchEnabled    { setSquelchEnabled(on) }
+        if let db = bookmark.squelchDb         { setSquelchDb(db) }
+        if let auto = bookmark.autoSquelchEnabled { setAutoSquelch(auto) }
+        if let g = bookmark.gainDb             { setGain(g) }
+        if let agc = bookmark.agcEnabled       { setAgc(agc) }
+        if let v = bookmark.volume             { setVolume(v) }
+        if let d = bookmark.deemphasis         { setDeemphasis(d) }
+    }
+
     func syncToEngine() {
         guard core != nil else { return }
         setCenter(centerFrequencyHz)
