@@ -10,7 +10,7 @@
 import sdr_core_c
 
 /// Demodulation mode. Matches `SdrDemodMode` in the C header.
-public enum DemodMode: Int32, Sendable, CaseIterable {
+public enum DemodMode: Int32, Sendable, CaseIterable, Codable {
     case wfm  = 0
     case nfm  = 1
     case am   = 2
@@ -36,7 +36,7 @@ public enum DemodMode: Int32, Sendable, CaseIterable {
 }
 
 /// FM de-emphasis mode. Matches `SdrDeemphasis` in the C header.
-public enum Deemphasis: Int32, Sendable, CaseIterable {
+public enum Deemphasis: Int32, Sendable, CaseIterable, Codable {
     case none = 0
     case us75 = 1
     case eu50 = 2

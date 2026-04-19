@@ -83,7 +83,11 @@ final class BookmarksStore {
             // Persist failure — don't crash the app; log and
             // start empty. A future launch with a hand-fixed
             // file takes precedence.
-            bookmarksLog.error("Failed to load bookmarks: \(error.localizedDescription, privacy: .public)")
+            // `localizedDescription` can include the absolute file
+            // path (e.g. `/Users/<name>/Library/...`). Leave the
+            // default `.private` privacy so the path doesn't leak
+            // to unified logs.
+            bookmarksLog.error("Failed to load bookmarks: \(error.localizedDescription)")
         }
     }
 
@@ -102,7 +106,7 @@ final class BookmarksStore {
             )
             try data.write(to: storagePath, options: .atomic)
         } catch {
-            bookmarksLog.error("Failed to save bookmarks: \(error.localizedDescription, privacy: .public)")
+            bookmarksLog.error("Failed to save bookmarks: \(error.localizedDescription)")
         }
     }
 }

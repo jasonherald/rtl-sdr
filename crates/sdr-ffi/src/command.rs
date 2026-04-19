@@ -516,6 +516,28 @@ mod tests {
             unsafe { sdr_core_set_demod_mode(std::ptr::null_mut(), SDR_DEMOD_NFM) },
             SdrCoreError::InvalidHandle.as_int()
         );
+        assert_eq!(
+            unsafe { sdr_core_set_auto_squelch(std::ptr::null_mut(), true) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+    }
+
+    // ------------------------------------------------------
+    //  Squelch — auto-squelch toggle (ABI 0.3)
+    // ------------------------------------------------------
+
+    #[test]
+    fn set_auto_squelch_round_trip() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_auto_squelch(h, true) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_auto_squelch(h, false) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
     }
 
     // ------------------------------------------------------

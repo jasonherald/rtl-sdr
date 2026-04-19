@@ -32,18 +32,25 @@ struct BookmarksSection: View {
                     .font(.caption)
             } else {
                 ForEach(store.bookmarks) { bm in
-                    BookmarkRow(bookmark: bm)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            model.apply(bm)
+                    // Button (rather than `onTapGesture`) so
+                    // keyboard / VoiceOver / switch-control
+                    // activation works the same as a mouse
+                    // click. `.plain` keeps the row from picking
+                    // up button chrome.
+                    Button {
+                        model.apply(bm)
+                    } label: {
+                        BookmarkRow(bookmark: bm)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button(role: .destructive) {
+                            store.remove(id: bm.id)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
                         }
-                        .contextMenu {
-                            Button(role: .destructive) {
-                                store.remove(id: bm.id)
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                        }
+                    }
                 }
                 .onMove { source, destination in
                     store.move(fromOffsets: source, toOffset: destination)
@@ -134,7 +141,7 @@ private struct AddBookmarkSheet: View {
                     .keyboardShortcut(.cancelAction)
                 Button("Save", action: submit)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(20)
@@ -147,7 +154,7 @@ private struct AddBookmarkSheet: View {
     }
 
     private func submit() {
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         onSave(trimmed)
         dismiss()

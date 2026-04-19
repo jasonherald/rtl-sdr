@@ -15,15 +15,6 @@
 import Foundation
 import SdrCoreKit
 
-// `DemodMode` / `Deemphasis` are `Int32`-raw-value enums defined
-// in SdrCoreKit. Swift synthesizes `Codable` automatically for
-// `RawRepresentable` enums once conformance is declared — we
-// just need the retroactive conformance for Codable-nested
-// bookmark fields to work. Nothing stored in the JSON except
-// the raw integer.
-extension DemodMode: Codable {}
-extension Deemphasis: Codable {}
-
 struct Bookmark: Codable, Identifiable, Hashable {
     /// Stable identity for SwiftUI list diffing; randomly
     /// assigned at creation, persisted across runs.
