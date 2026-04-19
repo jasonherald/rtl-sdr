@@ -118,8 +118,15 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     ) = build_split_view(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
-    let (header, play_button, demod_dropdown, freq_selector, screenshot_button, rr_button) =
-        build_header_bar(&sidebar_toggle, &state);
+    let (
+        header,
+        play_button,
+        demod_dropdown,
+        freq_selector,
+        screenshot_button,
+        rr_button,
+        favorites_handle,
+    ) = build_header_bar(&sidebar_toggle, &state);
 
     // Transcript toggle button in header bar.
     let transcript_button = gtk4::ToggleButton::builder()
@@ -204,6 +211,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &status_bar_demod,
         &toast_overlay,
         config,
+        &favorites_handle,
     );
 
     // Wire waterfall screenshot button.
@@ -762,11 +770,29 @@ fn build_sidebar_toggle(split_view: &adw::OverlaySplitView) -> gtk4::ToggleButto
     toggle
 }
 
+/// Handles handed back from `build_header_bar` for the `rtl_tcp`
+/// favorites slide-out. The `button` is packed into the header bar
+/// and drops its popover on click; the `list` is the scrollable
+/// `ListBox` inside that popover — `connect_rtl_tcp_discovery`
+/// clears + re-populates it when the favorites map changes. The
+/// `empty_label` is shown when the list is empty so the user sees
+/// "No pinned servers yet" instead of a blank popover.
+struct FavoritesHeaderHandle {
+    button: gtk4::MenuButton,
+    popover: gtk4::Popover,
+    list: gtk4::ListBox,
+    empty_label: gtk4::Label,
+}
+
 /// Build the `AdwHeaderBar` with play/stop, frequency selector, demod selector,
 /// and volume control.
 ///
 /// Returns the header bar, play button, demod dropdown, and frequency selector
 /// (for shortcuts, status bar wiring, and frequency change callbacks).
+#[allow(
+    clippy::too_many_lines,
+    reason = "widget-assembly — splitting scatters one-time wire-up across helpers without readability win"
+)]
 fn build_header_bar(
     sidebar_toggle: &gtk4::ToggleButton,
     state: &Rc<AppState>,
@@ -777,6 +803,7 @@ fn build_header_bar(
     header::frequency_selector::FrequencySelector,
     gtk4::Button,
     gtk4::Button,
+    FavoritesHeaderHandle,
 ) {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()
@@ -858,10 +885,17 @@ fn build_header_bar(
         .visible(crate::preferences::accounts_page::has_rr_credentials())
         .build();
 
+    // Favorites slide-out button — opens a popover listing the
+    // user's pinned `rtl_tcp` servers. Entries populated
+    // dynamically by `connect_rtl_tcp_discovery`. MenuButton
+    // auto-toggles and handles click-outside dismissal.
+    let favorites_handle = build_favorites_header();
+
     header.pack_end(&menu_button);
     header.pack_end(&volume_button);
     header.pack_end(&rr_button);
     header.pack_end(&screenshot_button);
+    header.pack_end(&favorites_handle.button);
 
     (
         header,
@@ -870,7 +904,93 @@ fn build_header_bar(
         freq_selector,
         screenshot_button,
         rr_button,
+        favorites_handle,
     )
+}
+
+/// Width of the favorites popover's scrollable list. Wide enough
+/// for a `rtl_tcp://hostname.local.:12345 — R820T (29 gains)`
+/// subtitle without wrapping.
+const FAVORITES_POPOVER_WIDTH_PX: i32 = 420;
+/// Max height of the favorites popover's scrollable list. Caps the
+/// popover so a large favorites set doesn't paint past the bottom
+/// of the window; the internal `ScrolledWindow` handles overflow.
+const FAVORITES_POPOVER_HEIGHT_PX: i32 = 360;
+
+/// Build the header-bar favorites button + its popover contents.
+/// The popover hosts a `ListBox` (populated by
+/// `connect_rtl_tcp_discovery` whenever the favorites map mutates)
+/// wrapped in a capped `ScrolledWindow`. The empty-state label is
+/// shown when the list is empty and hidden when it's populated —
+/// callers are responsible for that toggle alongside row rebuilds.
+fn build_favorites_header() -> FavoritesHeaderHandle {
+    let popover = gtk4::Popover::builder()
+        .autohide(true)
+        .has_arrow(true)
+        .width_request(FAVORITES_POPOVER_WIDTH_PX)
+        .build();
+    popover.add_css_class("menu");
+
+    let title = gtk4::Label::builder()
+        .label("Pinned servers")
+        .halign(gtk4::Align::Start)
+        .margin_start(12)
+        .margin_top(12)
+        .margin_bottom(6)
+        .css_classes(["heading"])
+        .build();
+
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .margin_start(6)
+        .margin_end(6)
+        .margin_bottom(6)
+        .build();
+
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .max_content_height(FAVORITES_POPOVER_HEIGHT_PX)
+        .propagate_natural_height(true)
+        .child(&list)
+        .build();
+
+    let empty_label = gtk4::Label::builder()
+        .label("No pinned servers yet.\n\nStar a discovered server to pin it here.")
+        .justify(gtk4::Justification::Center)
+        .wrap(true)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .css_classes(["dim-label"])
+        .build();
+
+    let content = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(0)
+        .build();
+    content.append(&title);
+    content.append(&empty_label);
+    content.append(&scroll);
+    popover.set_child(Some(&content));
+
+    let button = gtk4::MenuButton::builder()
+        .icon_name("starred-symbolic")
+        .tooltip_text("Pinned rtl_tcp servers")
+        .popover(&popover)
+        .build();
+    // Screen-reader name. Tooltips aren't announced by most
+    // ATs — icon-only controls need an explicit accessible
+    // label via the GtkAccessible `Label` property.
+    button.update_property(&[gtk4::accessible::Property::Label("Pinned servers menu")]);
+
+    FavoritesHeaderHandle {
+        button,
+        popover,
+        list,
+        empty_label,
+    }
 }
 
 /// Build the app menu button with Preferences / Keyboard Shortcuts / About / Quit actions.
@@ -924,6 +1044,7 @@ fn connect_sidebar_panels(
     status_bar: &Rc<StatusBar>,
     toast_overlay: &adw::ToastOverlay,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    favorites_header: &FavoritesHeaderHandle,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -936,7 +1057,7 @@ fn connect_sidebar_panels(
     let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
     connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
-    connect_rtl_tcp_discovery(panels, state, config);
+    connect_rtl_tcp_discovery(panels, state, config, favorites_header);
     connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
@@ -969,6 +1090,7 @@ fn connect_rtl_tcp_discovery(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    favorites_header: &FavoritesHeaderHandle,
 ) {
     use std::collections::HashMap;
     use std::time::Instant;
@@ -998,6 +1120,27 @@ fn connect_rtl_tcp_discovery(
     /// to see yet" from "we gave up listening" — without this the UI
     /// would lie by showing the idle "No servers discovered…" state.
     const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
+
+    // "Manage favorites…" button inside the discovered-servers
+    // expander — a second entry point into the same popover as
+    // the header-bar star button. Wired here because the
+    // `MenuButton` whose `popup()` we trigger lives in the
+    // header. Weak ref on the button keeps the closure drop-safe
+    // if the header is torn down before the source panel (though
+    // in practice the window owns both and they drop together).
+    let favorites_menu_weak = favorites_header.button.downgrade();
+    panels
+        .source
+        .manage_favorites_button
+        .connect_clicked(move |_| {
+            if let Some(btn) = favorites_menu_weak.upgrade() {
+                // `MenuButton::popup` activates the attached
+                // popover anchored to the menu button itself, so
+                // the slide-out appears from the header regardless
+                // of which entry point the user clicked.
+                btn.popup();
+            }
+        });
 
     let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
     // `Option<Browser>` — `None` on mDNS startup failure. We still
@@ -1033,6 +1176,26 @@ fn connect_rtl_tcp_discovery(
     let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, DiscoveredServer)>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
+    // Auxiliary map: favorite_key (hostname:port) → weak ref on
+    // the currently-rendered discovery-row star `ToggleButton`.
+    // Let the favorites-popover Unstar handler find and flip the
+    // matching discovery toggle immediately rather than waiting
+    // for the next mDNS re-announce — without this, the filled
+    // star would stay rendered while the map says otherwise, and
+    // the first user click on the stale star would fire
+    // `toggled` with `active=false` (wasted click from the
+    // user's perspective: they wanted to re-pin).
+    //
+    // Weak refs only — the `ToggleButton`s are strongly owned by
+    // their parent `AdwActionRow`s (as prefix widgets) which are
+    // strongly owned by `displayed_rows`. Stale entries
+    // (rows that have since been removed from `displayed_rows`)
+    // fail to upgrade and self-clean at lookup time; no explicit
+    // prune necessary at the <50-server scale this map is sized
+    // for.
+    let discovered_star_buttons: Rc<RefCell<HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     // Weak ref on the expander so the timeout closure doesn't keep
     // the window alive after close — upgrade() returns None on a
     // destroyed widget and the poller breaks out.
@@ -1047,16 +1210,76 @@ fn connect_rtl_tcp_discovery(
     // a `LastConnectedServer` snapshot on click.
     let config_for_discovery = std::sync::Arc::clone(config);
 
-    // Favorites set — instance names the user has starred. Loaded
-    // once on startup, mutated by star-toggle handlers, persisted
-    // after each change via `save_favorites`. `Rc<RefCell<HashSet>>`
-    // mirrors the `displayed_rows` pattern — single-threaded GTK
-    // main loop, no lock contention.
-    let favorites: Rc<RefCell<std::collections::HashSet<String>>> = Rc::new(RefCell::new(
+    // Favorites map — key (stable hostname:port) → rich
+    // `FavoriteEntry` record. Loaded once on startup, mutated by
+    // star-toggle handlers and re-announce metadata refresh,
+    // persisted after each change via `save_favorites`.
+    // `Rc<RefCell<HashMap>>` mirrors the `displayed_rows` pattern
+    // — single-threaded GTK main loop, no lock contention. Keyed
+    // by the same `favorite_key(server)` that the reorder / pin-
+    // to-top path uses so lookups stay consistent.
+    let favorites: Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    > = Rc::new(RefCell::new(
         crate::sidebar::source_panel::load_favorites(&config_for_discovery)
             .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
             .collect(),
     ));
+
+    // Weak refs to the favorites popover's contents. The star-
+    // toggle closure (attached to each row's `ToggleButton`) and
+    // the discovery poll timer both need to refresh the popover
+    // when the favorites map mutates. Strong captures would create
+    // the same closure-cycle pattern the #329 / #335 lessons
+    // taught us to avoid — per-callback atomic upgrade + drop
+    // keeps the popover widgets releasable on window close.
+    let favorites_popover_weak = FavoritesPopoverWeak::from_header(favorites_header);
+    // Bundle of per-row action dependencies. Built once, cloned
+    // into the three rebuild call sites (startup seed, star
+    // toggle, re-announce refresh). `rebuild_favorites_popover`
+    // hands a clone to each row's Connect / Copy / Unstar
+    // closure, so each button ends up with a single `Rc` clone
+    // instead of nine weak-ref captures.
+    let favorite_row_ctx: Rc<FavoriteRowContext> = Rc::new(FavoriteRowContext {
+        popover: favorites_popover_weak.clone(),
+        favorites: Rc::clone(&favorites),
+        config: std::sync::Arc::clone(&config_for_discovery),
+        state: Rc::clone(&state),
+        hostname_row: hostname_row.downgrade(),
+        port_row: port_row.downgrade(),
+        protocol_row: protocol_row.downgrade(),
+        device_row: device_row.downgrade(),
+        expander_weak: expander_weak.clone(),
+        // Weak refs — see `FavoriteRowContext.displayed_rows`
+        // docstring for the retain-cycle reasoning.
+        displayed_rows: Rc::downgrade(&displayed_rows),
+        discovered_star_buttons: Rc::downgrade(&discovered_star_buttons),
+    });
+    // Seed the popover's content from the restored favorites so
+    // the list is ready when the user first clicks the header
+    // star, without waiting for a mutation to trigger a rebuild.
+    rebuild_favorites_popover(&favorite_row_ctx, &favorites.borrow());
+
+    // Rebuild on every popover show so the "seen Xm ago" subtitles
+    // reflect current wall-clock time. Without this, the ages
+    // captured by `format_favorite_subtitle` at startup / star
+    // toggle / re-announce freeze between popover openings — a
+    // user who closes the popover and reopens it 10 minutes later
+    // would still see "seen just now" for servers that actually
+    // went offline during that gap.
+    //
+    // `favorite_row_ctx.popover.popover` is the same weak ref the
+    // per-row Connect closure uses to dismiss the popover, so no
+    // new capture shape is introduced. The closure holds
+    // `Rc<FavoriteRowContext>`; no retain cycle because
+    // `FavoriteRowContext.popover` is weak.
+    {
+        let ctx_for_show = Rc::clone(&favorite_row_ctx);
+        favorites_header.popover.connect_show(move |_| {
+            rebuild_favorites_popover(&ctx_for_show, &ctx_for_show.favorites.borrow());
+        });
+    }
 
     // Populate the hostname / port fields on startup from the last
     // connected server, if any. Runs once before the poller starts
@@ -1224,15 +1447,51 @@ fn connect_rtl_tcp_discovery(
                     // can edit — keying favorites off it would
                     // silently drop the star on any rename.
                     let star_key = favorite_key(&server);
-                    let starred_initially = favorites.borrow().contains(&star_key);
+                    let starred_initially = favorites.borrow().contains_key(&star_key);
                     star_btn.set_active(starred_initially);
                     if starred_initially {
                         star_btn.set_icon_name(FAVORITE_ICON_FILLED);
                     }
+                    // Initial accessible name — state-dependent so
+                    // screen readers announce the action the click
+                    // will take, not the icon's current appearance.
+                    // Updated again inside the toggle closure when
+                    // the user flips the state.
+                    set_favorite_toggle_accessible_name(&star_btn, starred_initially);
+                    // Register the star_btn against its
+                    // favorite_key so the favorites-popover
+                    // Unstar handler can find and flip this
+                    // exact toggle when the user unstars from
+                    // the popover. `insert` overwrites any
+                    // prior (stale) weak ref under the same key
+                    // — e.g. from a re-announce rebuild of the
+                    // row, where the old button was dropped.
+                    let star_key_for_map = favorite_key(&server);
+                    discovered_star_buttons
+                        .borrow_mut()
+                        .insert(star_key_for_map, star_btn.downgrade());
+                    // Capture the display metadata into move-able
+                    // values so the toggle closure can build a
+                    // `FavoriteEntry` without holding onto
+                    // `server` (which is consumed by the HashMap
+                    // insert further down).
+                    let star_nickname = if server.txt.nickname.is_empty() {
+                        server.instance_name.clone()
+                    } else {
+                        server.txt.nickname.clone()
+                    };
+                    let star_tuner_name = Some(server.txt.tuner.clone());
+                    let star_gain_count = Some(server.txt.gains);
                     let star_favorites = Rc::clone(&favorites);
                     let star_config = std::sync::Arc::clone(&config_for_discovery);
-                    let star_rows = Rc::clone(&displayed_rows);
                     let star_expander_weak = expander_weak.clone();
+                    // Closure captures `star_row_ctx` only — reaches
+                    // `displayed_rows` via its `Weak` field inside.
+                    // A separate `Rc::clone(&displayed_rows)` capture
+                    // here would reintroduce the retain cycle the
+                    // `FavoriteRowContext.displayed_rows` docstring
+                    // describes (map → row → signal → ctx → map).
+                    let star_row_ctx = Rc::clone(&favorite_row_ctx);
                     star_btn.connect_toggled(move |btn| {
                         let active = btn.is_active();
                         btn.set_icon_name(if active {
@@ -1240,19 +1499,38 @@ fn connect_rtl_tcp_discovery(
                         } else {
                             FAVORITE_ICON_OUTLINE
                         });
+                        // Keep the accessible name in sync with
+                        // the new state so AT announces the next
+                        // action ("Unpin from favorites" after the
+                        // user just pinned it, and vice versa).
+                        set_favorite_toggle_accessible_name(btn, active);
                         {
                             let mut favs = star_favorites.borrow_mut();
                             if active {
-                                favs.insert(star_key.clone());
+                                // Build a fresh entry with the
+                                // current metadata. Replaces any
+                                // older entry with the same key
+                                // (= metadata refresh on re-star).
+                                favs.insert(
+                                    star_key.clone(),
+                                    sidebar::source_panel::FavoriteEntry {
+                                        key: star_key.clone(),
+                                        nickname: star_nickname.clone(),
+                                        tuner_name: star_tuner_name.clone(),
+                                        gain_count: star_gain_count,
+                                        last_seen_unix: Some(
+                                            sidebar::source_panel::now_unix_seconds(),
+                                        ),
+                                    },
+                                );
                             } else {
                                 favs.remove(&star_key);
                             }
                             // Persist immediately. Order within
                             // the persisted list is unspecified —
-                            // sort on read if the UI ever needs a
-                            // stable presentation order for
-                            // favorites management.
-                            let snapshot: Vec<String> = favs.iter().cloned().collect();
+                            // the slide-out sorts on read.
+                            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                                favs.values().cloned().collect();
                             crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
                         }
                         // Rebuild the expander so the row moves
@@ -1260,14 +1538,27 @@ fn connect_rtl_tcp_discovery(
                         // state. Reuses the `displayed_rows` map
                         // (strong refs on the AdwActionRow
                         // widgets) — ordering is the only thing
-                        // that changes.
-                        if let Some(expander) = star_expander_weak.upgrade() {
+                        // that changes. The map is held Weak via
+                        // `FavoriteRowContext`; upgrade fails
+                        // silently if the discovery timer has
+                        // already torn down, which means there's
+                        // nothing to reorder anyway.
+                        if let (Some(expander), Some(rows)) = (
+                            star_expander_weak.upgrade(),
+                            star_row_ctx.displayed_rows.upgrade(),
+                        ) {
                             reorder_discovered_rows(
                                 &expander,
-                                &star_rows.borrow(),
+                                &rows.borrow(),
                                 &star_favorites.borrow(),
                             );
                         }
+                        // Refresh the header-bar favorites popover
+                        // so the star-toggle reflects there too.
+                        // Upgrade-and-drop inside the rebuild keeps
+                        // the closure leak-free per the #329
+                        // weak-ref pattern.
+                        rebuild_favorites_popover(&star_row_ctx, &star_favorites.borrow());
                     });
                     row.add_prefix(&star_btn);
 
@@ -1292,60 +1583,65 @@ fn connect_rtl_tcp_discovery(
                         server.txt.nickname.clone()
                     };
                     connect_btn.connect_clicked(move |_| {
-                        // Remember whether the device row was already
-                        // on RTL-TCP. If it WAS, `set_selected` below
-                        // is a no-op and the `device_row` notify
-                        // handler doesn't fire, so we need to send
-                        // SetSourceType ourselves to force the
-                        // controller to reopen the source against the
-                        // new endpoint. If it WASN'T, the notify
-                        // handler will dispatch SetSourceType for us
-                        // and an explicit send would double-open.
-                        let already_rtl_tcp = dr.selected() == DEVICE_RTLTCP;
-                        // Force the shared protocol row to TCP
-                        // BEFORE the hostname/port writes below.
-                        // `hr.set_text` and `pr.set_value` fire the
-                        // `connect_changed` / `connect_value_notify`
-                        // handlers on the shared network rows, which
-                        // re-read `protocol_row.selected()` to build
-                        // their `SetNetworkConfig`. If the shared
-                        // protocol row is still on UDP from a prior
-                        // raw-Network session, those handlers would
-                        // dispatch a stale-UDP `SetNetworkConfig`
-                        // for our clicked endpoint before the
-                        // RTL-TCP switch lands — a transient
-                        // retarget of any live raw-Network source.
-                        // rtl_tcp is always TCP.
-                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
-                        hr.set_text(&click_host);
-                        pr.set_value(f64::from(click_port));
-                        dr.set_selected(DEVICE_RTLTCP);
-                        st.send_dsp(UiToDsp::SetNetworkConfig {
-                            hostname: click_host.clone(),
-                            port: click_port,
-                            protocol: sdr_types::Protocol::TcpClient,
-                        });
-                        // Persist the choice so next app launch
-                        // pre-populates the hostname / port fields
-                        // with the same server without needing
-                        // another mDNS round-trip.
-                        crate::sidebar::source_panel::save_last_connected(
+                        // Shared ordering-sensitive flow lives in
+                        // `apply_rtl_tcp_connect` — see its doc for
+                        // why `protocol_row` gets set to TCP before
+                        // the host/port writes and why
+                        // `SetSourceType` only fires conditionally.
+                        apply_rtl_tcp_connect(
+                            &click_host,
+                            click_port,
+                            &click_nickname,
+                            &hr,
+                            &pr,
+                            &protor,
+                            &dr,
+                            &st,
                             &cfg,
-                            &crate::sidebar::source_panel::LastConnectedServer {
-                                host: click_host.clone(),
-                                port: click_port,
-                                nickname: click_nickname.clone(),
-                            },
                         );
-                        if already_rtl_tcp {
-                            // device_row notify handler did NOT fire
-                            // (we were already on RTL-TCP); force the
-                            // source reopen so the new endpoint takes.
-                            st.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
-                        }
                     });
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
+                    // If this server is already favorited, refresh
+                    // the persisted metadata (tuner name, gain
+                    // count, nickname, last-seen) off the fresh
+                    // announce. Keeps the favorites slide-out's
+                    // display honest when the user revisits it
+                    // after the server has been renamed /
+                    // re-announced with updated TXT records.
+                    let fav_key = favorite_key(&server);
+                    {
+                        let mut favs = favorites.borrow_mut();
+                        if favs.contains_key(&fav_key) {
+                            let refreshed_nickname = if server.txt.nickname.is_empty() {
+                                server.instance_name.clone()
+                            } else {
+                                server.txt.nickname.clone()
+                            };
+                            favs.insert(
+                                fav_key.clone(),
+                                sidebar::source_panel::FavoriteEntry {
+                                    key: fav_key.clone(),
+                                    nickname: refreshed_nickname,
+                                    tuner_name: Some(server.txt.tuner.clone()),
+                                    gain_count: Some(server.txt.gains),
+                                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+                                },
+                            );
+                            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                                favs.values().cloned().collect();
+                            crate::sidebar::source_panel::save_favorites(
+                                &config_for_discovery,
+                                &snapshot,
+                            );
+                            // Refresh the header-bar popover's
+                            // rendering of this entry (age + tuner
+                            // metadata). Cheap — it rebuilds the
+                            // whole list but at favorites scale
+                            // that's trivial.
+                            rebuild_favorites_popover(&favorite_row_ctx, &favs);
+                        }
+                    }
                     rows.insert(server.instance_name.clone(), (row, server));
                     // Reorder after insert so favorites float to
                     // the top of the new view.
@@ -1404,6 +1700,113 @@ fn favorite_key(server: &DiscoveredServer) -> String {
     format!("{}:{}", server.hostname, server.port)
 }
 
+/// Order favorites for popover display: primary key lowercased
+/// nickname (alphabetical, case-insensitive), secondary key the
+/// stable `FavoriteEntry.key` (hostname:port).
+///
+/// The secondary key is load-bearing — `HashMap::values()`
+/// iteration order is non-deterministic, and two favorites with
+/// the same nickname would otherwise reshuffle across inserts /
+/// removals / app restarts (tie-broken by whatever the hash
+/// state happened to be that tick). Tying to `key` pins the
+/// order across all three.
+fn sort_favorites_for_display(entries: &mut [&sidebar::source_panel::FavoriteEntry]) {
+    entries.sort_by(|a, b| {
+        a.nickname
+            .to_lowercase()
+            .cmp(&b.nickname.to_lowercase())
+            .then_with(|| a.key.cmp(&b.key))
+    });
+}
+
+/// Update the `GtkAccessible` `Label` on the discovery-row star
+/// toggle. The label describes the action the next click will
+/// take (NOT the icon's current appearance), so a screen reader
+/// announces "Unpin from favorites" when the row is currently
+/// pinned and "Pin as favorite" when it isn't. Called once at
+/// row-build time and again inside the toggled closure so the
+/// name stays in sync with state.
+fn set_favorite_toggle_accessible_name(btn: &gtk4::ToggleButton, is_favorite: bool) {
+    let label = if is_favorite {
+        "Unpin from favorites"
+    } else {
+        "Pin as favorite"
+    };
+    btn.update_property(&[gtk4::accessible::Property::Label(label)]);
+}
+
+/// Execute the shared RTL-TCP connect sequence — used by both the
+/// discovery-row Connect button and the favorites-popover Connect
+/// button. Centralizes the ordering-sensitive steps so a future
+/// fix can't land on one caller and miss the other:
+///
+/// 1. **Snapshot** `already_rtl_tcp` before touching `device_row`.
+///    If the selector was ALREADY on RTL-TCP, `set_selected` is a
+///    no-op and the device-row notify handler won't fire — we
+///    need to dispatch `SetSourceType` ourselves to force the
+///    controller to reopen the source against the new endpoint.
+///    If it was on a different source type, the notify handler
+///    fires and dispatches `SetSourceType` for us; an explicit
+///    send here would double-open.
+///
+/// 2. **Pin TCP** on `protocol_row` BEFORE writing host / port.
+///    `hostname_row.set_text` and `port_row.set_value` fire
+///    change handlers that re-read `protocol_row.selected()` to
+///    build their `SetNetworkConfig`. If the shared protocol row
+///    is still on UDP from a prior raw-Network session, those
+///    handlers would dispatch a stale-UDP config against the
+///    clicked endpoint before the RTL-TCP switch lands — a
+///    transient retarget of any live raw-Network source. `rtl_tcp`
+///    is always TCP, so we force TCP unconditionally.
+///
+/// 3. **Write host / port**, flip `device_row` to RTL-TCP, dispatch
+///    the fresh `SetNetworkConfig`, persist a `LastConnectedServer`
+///    snapshot so next launch pre-populates the fields without
+///    waiting for mDNS.
+///
+/// 4. **Conditionally** dispatch `SetSourceType(RtlTcp)` — only when
+///    `already_rtl_tcp` was true (step 1's rationale).
+///
+/// Caller-owned follow-ups (popover `popdown`, etc.) happen after
+/// this helper returns.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each arg is a distinct widget / state handle the caller owns in its own shape (strong Rc clone vs weak-upgraded strong). Bundling into a struct would duplicate FavoriteRowContext for the favorites caller and invent a mirror struct for the discovery caller, trading argument count for two near-identical shim types."
+)]
+fn apply_rtl_tcp_connect(
+    host: &str,
+    port: u16,
+    nickname: &str,
+    hostname_row: &adw::EntryRow,
+    port_row: &adw::SpinRow,
+    protocol_row: &adw::ComboRow,
+    device_row: &adw::ComboRow,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
+    protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
+    hostname_row.set_text(host);
+    port_row.set_value(f64::from(port));
+    device_row.set_selected(DEVICE_RTLTCP);
+    state.send_dsp(UiToDsp::SetNetworkConfig {
+        hostname: host.to_string(),
+        port,
+        protocol: sdr_types::Protocol::TcpClient,
+    });
+    crate::sidebar::source_panel::save_last_connected(
+        config,
+        &crate::sidebar::source_panel::LastConnectedServer {
+            host: host.to_string(),
+            port,
+            nickname: nickname.to_string(),
+        },
+    );
+    if already_rtl_tcp {
+        state.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
+    }
+}
+
 /// Re-add rows to an `AdwExpanderRow` in a deterministic order:
 /// favorites (alphabetical by instance name) first, then
 /// non-favorites (same alpha order). Called after any mutation
@@ -1415,7 +1818,7 @@ fn favorite_key(server: &DiscoveredServer) -> String {
 fn reorder_discovered_rows(
     expander: &adw::ExpanderRow,
     rows: &std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>,
-    favorites: &std::collections::HashSet<String>,
+    favorites: &std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>,
 ) {
     // Remove every row from the expander — widgets live in the
     // HashMap, so no drop happens.
@@ -1431,10 +1834,10 @@ fn reorder_discovered_rows(
     keys.sort_by(|a, b| {
         let a_fav = rows
             .get(a.as_str())
-            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
+            .is_some_and(|(_, srv)| favorites.contains_key(&favorite_key(srv)));
         let b_fav = rows
             .get(b.as_str())
-            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
+            .is_some_and(|(_, srv)| favorites.contains_key(&favorite_key(srv)));
         match (a_fav, b_fav) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
@@ -1445,6 +1848,346 @@ fn reorder_discovered_rows(
         if let Some((row, _)) = rows.get(key) {
             expander.add_row(row);
         }
+    }
+}
+
+/// Weak references to the widgets inside the header-bar favorites
+/// popover. The discovery-flow closures (star toggles, re-announce
+/// refresh) refresh popover contents whenever the favorites map
+/// mutates; strong captures here would hold the list / label / popover
+/// alive for the closure's lifetime, defeating window-close
+/// cleanup. Same per-tick-upgrade pattern established in
+/// `ServerStatusWidgetsWeak` on #329.
+///
+/// `Clone` so we can hand a copy to each per-row action closure;
+/// `glib::WeakRef` is Rc-like internally, so cloning is cheap.
+#[derive(Clone)]
+struct FavoritesPopoverWeak {
+    list: glib::WeakRef<gtk4::ListBox>,
+    empty_label: glib::WeakRef<gtk4::Label>,
+    popover: glib::WeakRef<gtk4::Popover>,
+}
+
+impl FavoritesPopoverWeak {
+    fn from_header(handle: &FavoritesHeaderHandle) -> Self {
+        Self {
+            list: handle.list.downgrade(),
+            empty_label: handle.empty_label.downgrade(),
+            popover: handle.popover.downgrade(),
+        }
+    }
+}
+
+/// Bundle of dependencies that per-row action closures (Connect /
+/// Copy / Unstar) need to capture. Passed by `Rc<FavoriteRowContext>`
+/// through `rebuild_favorites_popover` and `attach_favorite_row_actions`
+/// so each row-button closure only clones the `Rc` instead of
+/// re-capturing nine individual weak refs. All widget handles are
+/// `glib::WeakRef` to keep the closures leak-free per the
+/// `ServerStatusWidgetsWeak` pattern on #329.
+///
+/// `displayed_rows` is stored as `std::rc::Weak` specifically to
+/// break a retain cycle: the `AdwActionRow` values inside the map
+/// own their `connect_toggled` / `connect_clicked` closures, and
+/// those closures capture this `FavoriteRowContext`. A strong
+/// `Rc<RefCell<HashMap<...>>>` here would close the loop (map →
+/// row → signal closure → context → map) and keep the widgets
+/// alive past window close. The primary owner of the map — the
+/// discovery-polling `glib::timeout_add_local` timer — retains
+/// the strong `Rc`, so the upgrade at use-time is reliable while
+/// the timer is running and correctly fails when it isn't.
+struct FavoriteRowContext {
+    popover: FavoritesPopoverWeak,
+    favorites: Rc<RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>>,
+    config: std::sync::Arc<sdr_config::ConfigManager>,
+    state: Rc<AppState>,
+    hostname_row: glib::WeakRef<adw::EntryRow>,
+    port_row: glib::WeakRef<adw::SpinRow>,
+    protocol_row: glib::WeakRef<adw::ComboRow>,
+    device_row: glib::WeakRef<adw::ComboRow>,
+    expander_weak: glib::WeakRef<adw::ExpanderRow>,
+    displayed_rows: std::rc::Weak<
+        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
+    >,
+    /// Keyed by `favorite_key(server)` (hostname:port), maps to
+    /// a weak ref on the star `ToggleButton` in the currently-
+    /// rendered discovery row for that server (if any). Weak
+    /// here for the same retain-cycle reason as `displayed_rows`:
+    /// the per-row Unstar closure captures this context, and a
+    /// strong `Rc` field would close the loop back through the
+    /// inner `WeakRef`s to the rows themselves.
+    discovered_star_buttons: std::rc::Weak<
+        RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>,
+    >,
+}
+
+/// Clear the `ListBox` and rebuild one row per `FavoriteEntry`,
+/// sorted alphabetically by nickname. Toggles the empty-state
+/// label visibility so the popover reads cleanly in both the
+/// no-favorites and has-favorites states.
+///
+/// Silent no-op when either popover widget is gone (window torn
+/// down). Each row gets Connect / Copy / Unstar suffix buttons via
+/// `attach_favorite_row_actions`.
+fn rebuild_favorites_popover(
+    ctx: &Rc<FavoriteRowContext>,
+    favorites: &std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>,
+) {
+    let (Some(list), Some(empty)) = (
+        ctx.popover.list.upgrade(),
+        ctx.popover.empty_label.upgrade(),
+    ) else {
+        return;
+    };
+    // Clear existing rows. `ListBox::remove` detaches without
+    // dropping the widgets past us — the HashMap has already
+    // gone through its mutation above this call.
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let has_any = !favorites.is_empty();
+    empty.set_visible(!has_any);
+    list.set_visible(has_any);
+    if !has_any {
+        return;
+    }
+    let now = sidebar::source_panel::now_unix_seconds();
+    let mut entries: Vec<&sidebar::source_panel::FavoriteEntry> = favorites.values().collect();
+    sort_favorites_for_display(&mut entries);
+    for entry in entries {
+        let row = adw::ActionRow::builder()
+            .title(&entry.nickname)
+            .subtitle(format_favorite_subtitle(entry, now))
+            .activatable(false)
+            .build();
+        attach_favorite_row_actions(&row, entry, ctx);
+        list.append(&row);
+    }
+}
+
+/// Build the three suffix buttons on a favorites-popover row:
+/// Connect (suggested-action, pins TCP + dispatches to DSP), Copy
+/// (writes `host:port` to the clipboard), and Unstar (removes from
+/// favorites, persists, reorders discovery, rebuilds the popover).
+///
+/// Dependencies flow through `FavoriteRowContext` so each closure
+/// only clones the `Rc` — not nine individual weak refs. The
+/// Connect-button ordering (`protocol_row.set_selected(TCP)`
+/// BEFORE `hostname_row.set_text` / `port_row.set_value`) mirrors
+/// the discovery-row Connect handler established in PR #335: the
+/// hostname / port writes fire change handlers that read the
+/// protocol row, so the row must already be on TCP or those
+/// handlers will dispatch a stale-UDP `SetNetworkConfig`.
+fn attach_favorite_row_actions(
+    row: &adw::ActionRow,
+    entry: &sidebar::source_panel::FavoriteEntry,
+    ctx: &Rc<FavoriteRowContext>,
+) {
+    // Connect button — pins TCP, loads host/port, switches to RTL-TCP.
+    let connect_btn = gtk4::Button::with_label("Connect");
+    connect_btn.add_css_class("suggested-action");
+    connect_btn.set_valign(gtk4::Align::Center);
+    let connect_ctx = Rc::clone(ctx);
+    let connect_key = entry.key.clone();
+    let connect_nickname = entry.nickname.clone();
+    connect_btn.connect_clicked(move |_| {
+        let Some((host, port)) = parse_host_port(&connect_key) else {
+            // Corrupt key shouldn't happen in practice —
+            // `favorite_key(server)` always produces
+            // `hostname:port`. Log rather than silently dropping
+            // the click, so a future schema drift is discoverable.
+            tracing::warn!(
+                key = %connect_key,
+                "favorites popover: Connect clicked on un-parseable key, ignoring",
+            );
+            return;
+        };
+        let (Some(hostname_row), Some(port_row), Some(protocol_row), Some(device_row)) = (
+            connect_ctx.hostname_row.upgrade(),
+            connect_ctx.port_row.upgrade(),
+            connect_ctx.protocol_row.upgrade(),
+            connect_ctx.device_row.upgrade(),
+        ) else {
+            return;
+        };
+        // Shared ordering-sensitive flow lives in
+        // `apply_rtl_tcp_connect`. The popover-specific follow-up
+        // (popdown) happens after this returns.
+        apply_rtl_tcp_connect(
+            &host,
+            port,
+            &connect_nickname,
+            &hostname_row,
+            &port_row,
+            &protocol_row,
+            &device_row,
+            &connect_ctx.state,
+            &connect_ctx.config,
+        );
+        // Dismiss the popover once the connection is dispatched
+        // so the user sees the source row update underneath.
+        if let Some(popover) = connect_ctx.popover.popover.upgrade() {
+            popover.popdown();
+        }
+    });
+    row.add_suffix(&connect_btn);
+
+    // Copy button — writes `host:port` to the clipboard. Lets
+    // the user grab the endpoint for pasting into another tool
+    // without having to hand-transcribe the subtitle.
+    let copy_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
+    copy_btn.set_tooltip_text(Some("Copy host:port"));
+    copy_btn.add_css_class("flat");
+    copy_btn.set_valign(gtk4::Align::Center);
+    // Icon-only button — give it an explicit accessible name so
+    // screen readers don't fall back to the icon filename.
+    copy_btn.update_property(&[gtk4::accessible::Property::Label("Copy server address")]);
+    let copy_key = entry.key.clone();
+    copy_btn.connect_clicked(move |btn| {
+        // `WidgetExt::clipboard` reaches the display clipboard
+        // via the button's realized display. If the popover has
+        // been torn down the button isn't reachable anyway, so
+        // we just use the button itself as the anchor widget.
+        btn.clipboard().set_text(&copy_key);
+    });
+    row.add_suffix(&copy_btn);
+
+    // Unstar button — removes from the favorites map, persists,
+    // and rebuilds both the discovery expander (so the row moves
+    // out of the pinned section) and the popover list (so the
+    // row disappears from here).
+    let unstar_btn = gtk4::Button::from_icon_name("starred-symbolic");
+    unstar_btn.set_tooltip_text(Some("Remove from favorites"));
+    unstar_btn.add_css_class("flat");
+    unstar_btn.set_valign(gtk4::Align::Center);
+    // Icon-only button — matches the tooltip here but stays as
+    // a distinct property so screen readers announce it even
+    // when tooltips are disabled / long-hover wouldn't fire.
+    unstar_btn.update_property(&[gtk4::accessible::Property::Label("Remove from favorites")]);
+    let unstar_key = entry.key.clone();
+    let unstar_ctx = Rc::clone(ctx);
+    unstar_btn.connect_clicked(move |_| {
+        {
+            let mut favs = unstar_ctx.favorites.borrow_mut();
+            if favs.remove(&unstar_key).is_none() {
+                // Already gone (e.g., double-click race). Nothing
+                // to persist and nothing to rebuild.
+                return;
+            }
+            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                favs.values().cloned().collect();
+            crate::sidebar::source_panel::save_favorites(&unstar_ctx.config, &snapshot);
+        }
+
+        // If the discovery row for this key is currently rendered,
+        // flip its star toggle to the unpinned state. The
+        // toggle's own `connect_toggled` handler then does the
+        // map cleanup (no-op — we already removed), the persist
+        // (redundant but idempotent), the discovery reorder, and
+        // the popover rebuild — so we early-return and skip OUR
+        // reorder / rebuild below.
+        //
+        // Without this, the filled star would keep rendering
+        // until the next mDNS beacon, which isn't just
+        // cosmetic: the first user click on the stale filled
+        // star fires `toggled` with `active=false` (the intent
+        // was "re-pin"), silently wasting a click.
+        if let Some(star_map) = unstar_ctx.discovered_star_buttons.upgrade() {
+            let maybe_btn = star_map
+                .borrow()
+                .get(&unstar_key)
+                .and_then(glib::WeakRef::upgrade);
+            if let Some(btn) = maybe_btn
+                && btn.is_active()
+            {
+                btn.set_active(false);
+                return;
+            }
+        }
+
+        // No discovery row visible for this key — do the reorder
+        // and popover rebuild ourselves.
+        //
+        // `displayed_rows` is Weak on the context — upgrade fails
+        // if the discovery timer has been torn down, which also
+        // means there's nothing left to reorder.
+        if let (Some(expander), Some(rows)) = (
+            unstar_ctx.expander_weak.upgrade(),
+            unstar_ctx.displayed_rows.upgrade(),
+        ) {
+            reorder_discovered_rows(&expander, &rows.borrow(), &unstar_ctx.favorites.borrow());
+        }
+        // Rebuild the popover so the unstarred row disappears.
+        // GTK signal-lifetime guarantees we can `ListBox::remove`
+        // our own row from inside this button-clicked handler:
+        // GTK retains the signal's source widget for the
+        // callback's duration, so the button won't drop under us.
+        rebuild_favorites_popover(&unstar_ctx, &unstar_ctx.favorites.borrow());
+    });
+    row.add_suffix(&unstar_btn);
+}
+
+/// Parse a `hostname:port` favorite key back into its two fields.
+/// Uses `rsplit_once(':')` so IPv6 literals with multiple colons
+/// round-trip if we ever start producing them (today's
+/// `favorite_key` only emits the DNS hostname, but the parser
+/// should be the conservative half of that contract).
+///
+/// Returns `None` when the key lacks a colon or the port field
+/// doesn't parse as `u16` — callers log and swallow.
+fn parse_host_port(key: &str) -> Option<(String, u16)> {
+    let (host, port_str) = key.rsplit_once(':')?;
+    let port: u16 = port_str.parse().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port))
+}
+
+/// Render a `FavoriteEntry` into the one-line subtitle shown on
+/// its row. Joined with ` • ` separators — matches the discovery-
+/// row subtitle format so the two lists read consistently.
+fn format_favorite_subtitle(entry: &sidebar::source_panel::FavoriteEntry, now_unix: u64) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    parts.push(entry.key.clone());
+    if let (Some(tuner), Some(gains)) = (entry.tuner_name.as_deref(), entry.gain_count) {
+        parts.push(format!("{tuner} · {gains} gains"));
+    }
+    let seen = match entry.last_seen_unix {
+        Some(ts) if ts > 0 => format!("seen {}", format_seen_age(now_unix, ts)),
+        _ => "offline".to_string(),
+    };
+    parts.push(seen);
+    parts.join(" • ")
+}
+
+/// Bucket boundaries for [`format_seen_age`]. Raw Unix-seconds
+/// arithmetic (not `std::time::Duration`) because `last_seen_unix`
+/// is stored as `u64` seconds in the favorites JSON and stays in
+/// that domain end-to-end.
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
+/// Bucket a `now - last_seen` difference into a short human
+/// string. Coarser buckets than the discovery-row's `format_age`
+/// because favorites ages are typically much larger (minutes to
+/// days) and the row subtitle has limited horizontal real estate.
+fn format_seen_age(now_unix: u64, last_seen_unix: u64) -> String {
+    if last_seen_unix >= now_unix {
+        // Clock skew or freshly-stamped — render as the latest
+        // bucket rather than a garbage negative value.
+        return "just now".to_string();
+    }
+    let secs = now_unix - last_seen_unix;
+    if secs < SECONDS_PER_MINUTE {
+        "just now".to_string()
+    } else if secs < SECONDS_PER_HOUR {
+        format!("{}m ago", secs / SECONDS_PER_MINUTE)
+    } else if secs < SECONDS_PER_DAY {
+        format!("{}h ago", secs / SECONDS_PER_HOUR)
+    } else {
+        format!("{}d ago", secs / SECONDS_PER_DAY)
     }
 }
 
@@ -4394,6 +5137,245 @@ fn recording_path(prefix: &str) -> std::path::PathBuf {
         .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
         .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
     base.join(format!("{prefix}-{timestamp}.wav"))
+}
+
+#[cfg(test)]
+mod parse_host_port_tests {
+    use super::parse_host_port;
+
+    #[test]
+    fn round_trips_a_simple_hostname_port_pair() {
+        // The mainline case — `favorite_key(server)` today
+        // produces exactly this shape, so Connect-from-popover
+        // depends on this round-trip working.
+        assert_eq!(
+            parse_host_port("shack-pi:1234"),
+            Some(("shack-pi".to_string(), 1234))
+        );
+    }
+
+    #[test]
+    fn ipv6_literal_with_embedded_colons_splits_on_last_colon() {
+        // We don't emit bracketed IPv6 in `favorite_key` today,
+        // but the parser should be the conservative half of the
+        // contract: `rsplit_once(':')` keeps everything up to the
+        // last colon as the host so an IPv6 literal round-trips
+        // if we ever start persisting one.
+        assert_eq!(
+            parse_host_port("fe80::1:8080"),
+            Some(("fe80::1".to_string(), 8080))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_colon() {
+        assert_eq!(parse_host_port("shack-pi"), None);
+    }
+
+    #[test]
+    fn rejects_non_numeric_port() {
+        assert_eq!(parse_host_port("shack-pi:abc"), None);
+    }
+
+    #[test]
+    fn rejects_out_of_range_port() {
+        // 65536 overflows u16; parse must fail rather than
+        // silently truncating.
+        assert_eq!(parse_host_port("shack-pi:65536"), None);
+    }
+
+    #[test]
+    fn rejects_empty_host() {
+        // ":1234" shouldn't round-trip as a valid endpoint —
+        // callers would dispatch `SetNetworkConfig { hostname:
+        // "" }` which is garbage.
+        assert_eq!(parse_host_port(":1234"), None);
+    }
+}
+
+#[cfg(test)]
+mod favorite_sort_tests {
+    use super::sort_favorites_for_display;
+    use crate::sidebar::source_panel::FavoriteEntry;
+
+    fn entry(key: &str, nickname: &str) -> FavoriteEntry {
+        FavoriteEntry {
+            key: key.into(),
+            nickname: nickname.into(),
+            tuner_name: None,
+            gain_count: None,
+            last_seen_unix: None,
+        }
+    }
+
+    #[test]
+    fn primary_order_is_lowercased_nickname() {
+        let a = entry("a.local.:1234", "Zeta");
+        let b = entry("b.local.:1234", "alpha");
+        let c = entry("c.local.:1234", "Beta");
+        let mut entries = vec![&a, &b, &c];
+        sort_favorites_for_display(&mut entries);
+        // Case-insensitive: "alpha" < "Beta" < "Zeta".
+        assert_eq!(
+            entries.iter().map(|e| &e.key[..]).collect::<Vec<_>>(),
+            ["b.local.:1234", "c.local.:1234", "a.local.:1234",]
+        );
+    }
+
+    #[test]
+    fn tie_breaks_on_key_when_nicknames_match() {
+        // Duplicate nickname across two servers — the secondary
+        // key must pin the order deterministically so two app
+        // launches (or two inserts against an unstable HashMap
+        // iteration order) render the popover the same way.
+        let a = entry("attic-pi.local.:1234", "Shack");
+        let b = entry("shack-pi.local.:1234", "Shack");
+        let c = entry("basement-pi.local.:1234", "Shack");
+        let mut entries = vec![&a, &b, &c];
+        sort_favorites_for_display(&mut entries);
+        // Alphabetical by `key` — attic < basement < shack.
+        assert_eq!(
+            entries.iter().map(|e| &e.key[..]).collect::<Vec<_>>(),
+            [
+                "attic-pi.local.:1234",
+                "basement-pi.local.:1234",
+                "shack-pi.local.:1234",
+            ]
+        );
+    }
+
+    #[test]
+    fn idempotent_when_already_sorted() {
+        let a = entry("a.local.:1234", "alpha");
+        let b = entry("b.local.:1234", "beta");
+        let mut entries = vec![&a, &b];
+        sort_favorites_for_display(&mut entries);
+        assert_eq!(
+            entries.iter().map(|e| &e.key[..]).collect::<Vec<_>>(),
+            ["a.local.:1234", "b.local.:1234",]
+        );
+    }
+}
+
+#[cfg(test)]
+mod favorite_subtitle_format_tests {
+    use super::{format_favorite_subtitle, format_seen_age};
+    use crate::sidebar::source_panel::FavoriteEntry;
+
+    /// Fixed "wall-clock now" for the subtitle + age tests. Pinning
+    /// this keeps the expected output deterministic; the actual
+    /// seconds value is arbitrary (2023-11-14T22:13:20Z) — what
+    /// matters is that all test inputs derive their `last_seen`
+    /// offsets from here.
+    const NOW_UNIX: u64 = 1_700_000_000;
+
+    fn sample_entry(
+        tuner: Option<&str>,
+        gains: Option<u32>,
+        last_seen: Option<u64>,
+    ) -> FavoriteEntry {
+        FavoriteEntry {
+            key: "shack-pi.local.:1234".into(),
+            nickname: "Shack Pi".into(),
+            tuner_name: tuner.map(str::to_string),
+            gain_count: gains,
+            last_seen_unix: last_seen,
+        }
+    }
+
+    #[test]
+    fn seen_age_just_now_under_60_seconds() {
+        // Sub-minute gap renders as "just now" — avoids "0m ago"
+        // churn on freshly-stamped entries.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 30), "just now");
+    }
+
+    #[test]
+    fn seen_age_minute_bucket() {
+        // Integer division, not rounding: 179s → 2m (not 3m).
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 179), "2m ago");
+    }
+
+    #[test]
+    fn seen_age_hour_bucket() {
+        // 3599s → 59m (last second of minute bucket), 3600s → 1h.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 3_600), "1h ago");
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 3_599), "59m ago");
+    }
+
+    #[test]
+    fn seen_age_day_bucket() {
+        // 86_399s → 23h, 86_400s → 1d.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 86_400), "1d ago");
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX - 86_399), "23h ago");
+    }
+
+    #[test]
+    fn seen_age_clock_skew_renders_just_now() {
+        // `last_seen > now` means the entry was stamped against a
+        // clock that was ahead of ours — shouldn't underflow into
+        // a garbage value.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX + 60), "just now");
+        // Equal case.
+        assert_eq!(format_seen_age(NOW_UNIX, NOW_UNIX), "just now");
+    }
+
+    #[test]
+    fn subtitle_includes_all_three_parts_when_metadata_present() {
+        // Canonical "rich" entry: key + tuner·gains + seen age,
+        // joined by middle-dot separators.
+        let entry = sample_entry(Some("R820T"), Some(29), Some(NOW_UNIX - 7_200));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • R820T · 29 gains • seen 2h ago",
+        );
+    }
+
+    #[test]
+    fn subtitle_drops_tuner_segment_when_tuner_missing() {
+        // Legacy-upgraded entry with no tuner metadata — the
+        // "tuner · gains" middle segment is omitted entirely
+        // rather than rendering empty "— · 0 gains" placeholder.
+        let entry = sample_entry(None, None, Some(NOW_UNIX - 300));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • seen 5m ago",
+        );
+    }
+
+    #[test]
+    fn subtitle_drops_tuner_segment_when_only_gains_missing() {
+        // Partial metadata is still incomplete — `if let (Some,
+        // Some)` means both must be present or neither renders.
+        let entry = sample_entry(Some("R820T"), None, Some(NOW_UNIX - 300));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • seen 5m ago",
+        );
+    }
+
+    #[test]
+    fn subtitle_shows_offline_when_last_seen_is_none() {
+        // Never seen this session → "offline" in the seen slot.
+        let entry = sample_entry(Some("R820T"), Some(29), None);
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • R820T · 29 gains • offline",
+        );
+    }
+
+    #[test]
+    fn subtitle_shows_offline_when_last_seen_is_zero() {
+        // Zero is treated as "no real stamp" — `format_favorite_
+        // subtitle` explicitly gates on `ts > 0` so a corrupt /
+        // default-valued timestamp doesn't render as "seen 55y
+        // ago" (the 1970 epoch).
+        let entry = sample_entry(Some("R820T"), Some(29), Some(0));
+        assert_eq!(
+            format_favorite_subtitle(&entry, NOW_UNIX),
+            "shack-pi.local.:1234 • R820T · 29 gains • offline",
+        );
+    }
 }
 
 #[cfg(test)]

@@ -10,9 +10,16 @@ use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
 use sdr_types::RtlTcpConnectionState;
 
-/// Config key for the persisted list of favorited `rtl_tcp` server
-/// instance names. Stored as a JSON array of strings; unknown /
-/// stale entries are tolerated by the read path.
+/// Config key for the persisted list of favorited `rtl_tcp`
+/// servers. Stored as a JSON array of [`FavoriteEntry`] objects,
+/// each keyed by the stable `hostname:port` identity produced by
+/// `window.rs::favorite_key` (NOT by DNS-SD `instance_name` —
+/// operators can rename the mDNS nickname, which would otherwise
+/// silently drop the star on any rename). The read path
+/// ([`load_favorites`]) also accepts legacy bare-string
+/// `hostname:port` entries from the PR #335 schema for backward
+/// compatibility; unknown / stale objects are skipped with a
+/// `tracing::warn!` so schema drift stays diagnosable.
 pub const KEY_RTL_TCP_CLIENT_FAVORITES: &str = "rtl_tcp_client_favorites";
 /// Config key for the persisted last-connected server. Stored as
 /// a JSON object `{ host, port, nickname }` so we can repopulate
@@ -129,6 +136,14 @@ pub struct SourcePanel {
     /// Discovered `rtl_tcp` servers (live from mDNS). Collapsed by
     /// default; expands when servers are seen.
     pub rtl_tcp_discovered_row: adw::ExpanderRow,
+    /// Second entry point into the header-bar favorites popover.
+    /// Packed as a suffix on `rtl_tcp_discovered_row` — visible
+    /// only when the RTL-TCP device is selected (same visibility
+    /// as its parent expander). Click handler in `window.rs` calls
+    /// the header-bar favorites `MenuButton::popup()` so the slide-
+    /// out appears anchored to the header regardless of which
+    /// button the user clicked.
+    pub manage_favorites_button: gtk4::Button,
 
     /// Connection status line shown only while the RTL-TCP source
     /// type is selected. Subtitle reflects the current
@@ -398,6 +413,19 @@ pub fn build_source_panel() -> SourcePanel {
         .subtitle("No servers discovered on the local network yet.")
         .visible(false)
         .build();
+    // Second entry point into the favorites slide-out. The header
+    // bar's star button is the always-visible path; this one lives
+    // inside the RTL-TCP section so users who are actively picking
+    // a server don't have to route up to the header. Click handler
+    // is wired in window.rs because the MenuButton whose `popup()`
+    // we call is owned by the header bar, not the source panel.
+    let manage_favorites_button = gtk4::Button::builder()
+        .label("Manage favorites…")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text("Open the favorites slide-out from the header bar")
+        .build();
+    rtl_tcp_discovered_row.add_suffix(&manage_favorites_button);
 
     // Connection-state status row — subtitle updated by the DSP
     // bridge via `DspToUi::RtlTcpConnectionState`. Suffix buttons
@@ -498,6 +526,7 @@ pub fn build_source_panel() -> SourcePanel {
         decimation_row,
         record_iq_row,
         rtl_tcp_discovered_row,
+        manage_favorites_button,
         rtl_tcp_status_row,
         rtl_tcp_disconnect_button,
         rtl_tcp_retry_button,
@@ -543,28 +572,129 @@ pub struct LastConnectedServer {
     pub nickname: String,
 }
 
-/// Load the list of favorited server instance names. Returns an
-/// empty Vec on first launch / absent / corrupt config. Safe to
-/// call unconditionally.
-pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<String> {
+/// Rich favorite-entry record. Persisted in the
+/// `rtl_tcp_client_favorites` config array as a JSON object per
+/// entry. Keeps the stable `key` (hostname:port — see
+/// `window.rs::favorite_key`) alongside display metadata the
+/// favorites slide-out shows even when the server is offline: the
+/// nickname the user last saw, the tuner type and gain-step count
+/// from the last mDNS announcement, and a "last seen" wall-clock
+/// stamp.
+///
+/// Optional fields default to `None` so a freshly-starred server
+/// with no cached metadata still round-trips correctly, and so
+/// legacy bare-string entries (PR #335 schema) can be read back
+/// without drift — see `load_favorites`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FavoriteEntry {
+    /// Stable identity: `format!("{}:{}", hostname, port)`. Same
+    /// value produced by `window.rs::favorite_key` on the live
+    /// `DiscoveredServer`. Load-bearing — two entries with the
+    /// same key refer to the same endpoint.
+    pub key: String,
+    /// User-facing label. Preferred source: the mDNS TXT
+    /// `nickname`. Fallback: the DNS-SD `instance_name`. For a
+    /// migrated legacy entry this is the same string as `key`
+    /// until the server re-announces and the user re-stars (or
+    /// next-session metadata refresh lands).
+    pub nickname: String,
+    /// Tuner model from the last-seen `DiscoveredServer` TXT
+    /// record, e.g. `"R820T"`. `None` for offline-only entries
+    /// we haven't seen since the schema upgrade.
+    pub tuner_name: Option<String>,
+    /// Gain-step count from the same TXT record. `None` same as
+    /// `tuner_name`.
+    pub gain_count: Option<u32>,
+    /// Unix timestamp (seconds) of the most recent
+    /// `ServerAnnounced` event for this `key`. `None` when we
+    /// haven't seen the server this session.
+    pub last_seen_unix: Option<u64>,
+}
+
+/// Load the persisted favorites list. Returns an empty `Vec` on
+/// first launch / absent / corrupt config — safe to call
+/// unconditionally.
+///
+/// **Backward compatibility:** accepts two on-disk shapes:
+///
+/// 1. **Current (PR #315):** `Vec<FavoriteEntry>` — array of JSON
+///    objects, each decoded via `serde_json::from_value`. Objects
+///    that fail to deserialize are skipped AND logged at
+///    `tracing::warn!` with the offending entry index and the
+///    serde error, so schema drift is diagnosable in bug reports
+///    instead of silently eating favorites.
+/// 2. **Legacy (PR #335):** `Vec<String>` — array of bare
+///    `hostname:port` keys. Upgraded in-place by constructing a
+///    `FavoriteEntry` with `nickname = key` and every optional
+///    metadata field set to `None`. Those blanks fill in on the
+///    next re-announce + re-star, so no user-visible data is lost
+///    — just a one-session degraded display until the server is
+///    seen again.
+pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<FavoriteEntry> {
     config.read(|v| {
-        v.get(KEY_RTL_TCP_CLIENT_FAVORITES)
+        let Some(arr) = v
+            .get(KEY_RTL_TCP_CLIENT_FAVORITES)
             .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|entry| entry.as_str().map(str::to_string))
-                    .collect()
+        else {
+            return Vec::new();
+        };
+        arr.iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                if let Some(s) = entry.as_str() {
+                    // Legacy bare-string entry. Build a stub
+                    // FavoriteEntry so the slide-out still has
+                    // something to render while the user waits
+                    // for the server to re-announce.
+                    Some(FavoriteEntry {
+                        key: s.to_string(),
+                        nickname: s.to_string(),
+                        tuner_name: None,
+                        gain_count: None,
+                        last_seen_unix: None,
+                    })
+                } else {
+                    // Corrupt object entry — hand-edited JSON or a
+                    // shape we don't recognize. Skip the entry so
+                    // the rest of the list still loads, but log so
+                    // a "my favorite disappeared" bug report
+                    // surfaces the parse failure.
+                    match serde_json::from_value::<FavoriteEntry>(entry.clone()) {
+                        Ok(fav) => Some(fav),
+                        Err(err) => {
+                            tracing::warn!(
+                                entry_index = idx,
+                                error = %err,
+                                "skipping corrupt rtl_tcp favorite entry",
+                            );
+                            None
+                        }
+                    }
+                }
             })
-            .unwrap_or_default()
+            .collect()
     })
 }
 
-/// Persist the full favorites list. Overwrites the config entry —
-/// callers pass the current UI state of pinned instance names.
-pub fn save_favorites(config: &Arc<ConfigManager>, favorites: &[String]) {
+/// Persist the full favorites list as a JSON array of
+/// `FavoriteEntry` objects. Overwrites the config entry — callers
+/// pass the current UI state of pinned entries.
+pub fn save_favorites(config: &Arc<ConfigManager>, favorites: &[FavoriteEntry]) {
     config.write(|v| {
-        v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!(favorites);
+        v[KEY_RTL_TCP_CLIENT_FAVORITES] =
+            serde_json::to_value(favorites).unwrap_or(serde_json::Value::Null);
     });
+}
+
+/// Current wall-clock time as Unix seconds. Helper for building
+/// `FavoriteEntry::last_seen_unix` on star-toggle / re-announce.
+/// Saturating-zero on clock skew (pre-epoch system time) so
+/// we never return a garbage very-large value from a
+/// `Duration::as_secs` on an error path.
+pub fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Load the last-connected server snapshot, if any was recorded.
@@ -593,6 +723,18 @@ pub fn save_last_connected(config: &Arc<ConfigManager>, server: &LastConnectedSe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixed Unix timestamp used in the favorites round-trip test
+    /// to pin the `last_seen_unix` field. Value is arbitrary (from
+    /// November 2023) but deliberately chosen to be well past any
+    /// clock-skew-fallback sentinel and well before `u32::MAX`
+    /// seconds so overflow edges aren't in play.
+    const TEST_LAST_SEEN_UNIX: u64 = 1_700_000_000;
+    /// Unix timestamp for 2020-01-01T00:00:00Z. Used by the
+    /// `now_unix_seconds` smoke test as a "modern wall-clock"
+    /// floor — anything past this is clearly real time and not a
+    /// clock-skew fallback returning 0.
+    const MODERN_UNIX_FLOOR: u64 = 1_577_836_800;
 
     /// Compile-time validation that gain constants are consistent.
     const _: () = {
@@ -697,29 +839,106 @@ mod tests {
     }
 
     #[test]
-    fn favorites_round_trip() {
+    fn favorites_round_trip_preserves_rich_metadata() {
         let config = make_config();
         // Fresh config → empty list.
         assert!(load_favorites(&config).is_empty());
         let favs = vec![
-            "shack-pi rtl-sdr._rtl_tcp._tcp.local.".to_string(),
-            "attic pi._rtl_tcp._tcp.local.".to_string(),
+            FavoriteEntry {
+                key: "shack-pi.local.:1234".into(),
+                nickname: "Shack Pi".into(),
+                tuner_name: Some("R820T".into()),
+                gain_count: Some(29),
+                last_seen_unix: Some(TEST_LAST_SEEN_UNIX),
+            },
+            FavoriteEntry {
+                key: "attic-pi.local.:1234".into(),
+                nickname: "Attic Pi".into(),
+                tuner_name: None,
+                gain_count: None,
+                last_seen_unix: None,
+            },
         ];
         save_favorites(&config, &favs);
         let loaded = load_favorites(&config);
-        assert_eq!(loaded, favs);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].key, "shack-pi.local.:1234");
+        assert_eq!(loaded[0].nickname, "Shack Pi");
+        assert_eq!(loaded[0].tuner_name.as_deref(), Some("R820T"));
+        assert_eq!(loaded[0].gain_count, Some(29));
+        assert_eq!(loaded[0].last_seen_unix, Some(TEST_LAST_SEEN_UNIX));
+        // Second entry has every optional field None → must
+        // round-trip as None, NOT as missing / default values.
+        assert!(loaded[1].tuner_name.is_none());
+        assert!(loaded[1].gain_count.is_none());
+        assert!(loaded[1].last_seen_unix.is_none());
+    }
+
+    #[test]
+    fn favorites_loader_upgrades_legacy_string_entries() {
+        // Regression guard for the PR #335 → #315 schema
+        // migration. Users who starred servers before #315 have
+        // `Vec<String>` persisted; the new loader must synthesize
+        // `FavoriteEntry` stubs so those favorites still appear
+        // in the slide-out (with degraded metadata until the
+        // server re-announces).
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_RTL_TCP_CLIENT_FAVORITES] =
+                serde_json::json!(["shack-pi.local.:1234", "attic-pi.local.:1235",]);
+        });
+        let loaded = load_favorites(&config);
+        assert_eq!(loaded.len(), 2);
+        // `nickname` falls back to the key so the slide-out has
+        // something printable.
+        assert_eq!(loaded[0].key, "shack-pi.local.:1234");
+        assert_eq!(loaded[0].nickname, "shack-pi.local.:1234");
+        // Metadata blanks — filled by next re-announce + re-star.
+        assert!(loaded[0].tuner_name.is_none());
+        assert!(loaded[0].gain_count.is_none());
+        assert!(loaded[0].last_seen_unix.is_none());
     }
 
     #[test]
     fn favorites_loader_tolerates_non_array_entry() {
         // If someone hand-edits the config file and makes the
-        // entry a string, we shouldn't panic or corrupt state —
-        // just return empty and let the user re-pin.
+        // entry a string (not an array), we shouldn't panic or
+        // corrupt state — just return empty and let the user
+        // re-pin.
         let config = make_config();
         config.write(|v| {
             v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!("not an array");
         });
         assert!(load_favorites(&config).is_empty());
+    }
+
+    #[test]
+    fn favorites_loader_skips_corrupt_object_entries() {
+        // Mixed-array case: a well-formed FavoriteEntry object
+        // alongside a JSON blob that doesn't match the schema
+        // (e.g. missing required fields). The bad entry is
+        // dropped; the good one survives — no "one bad apple
+        // spoils the list" failure mode.
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!([
+                { "key": "shack-pi.local.:1234", "nickname": "Shack Pi" },
+                { "this": "is not a FavoriteEntry" },
+            ]);
+        });
+        let loaded = load_favorites(&config);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key, "shack-pi.local.:1234");
+    }
+
+    #[test]
+    fn now_unix_seconds_is_monotonic_within_call() {
+        // Not a real monotonicity test — just a smoke-test that
+        // the helper returns a sensible modern value. Anything
+        // past `MODERN_UNIX_FLOOR` (2020-01-01T00:00:00Z) is
+        // clearly real wall-clock time and not a clock-skew
+        // fallback returning 0.
+        assert!(now_unix_seconds() > MODERN_UNIX_FLOOR);
     }
 
     #[test]
