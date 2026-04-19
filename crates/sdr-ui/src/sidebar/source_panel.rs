@@ -1,11 +1,24 @@
 //! Source device configuration panel — device selector, RTL-SDR /
 //! Network / File / RTL-TCP controls.
 
+use std::sync::Arc;
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_config::ConfigManager;
 use sdr_types::RtlTcpConnectionState;
+
+/// Config key for the persisted list of favorited `rtl_tcp` server
+/// instance names. Stored as a JSON array of strings; unknown /
+/// stale entries are tolerated by the read path.
+pub const KEY_RTL_TCP_CLIENT_FAVORITES: &str = "rtl_tcp_client_favorites";
+/// Config key for the persisted last-connected server. Stored as
+/// a JSON object `{ host, port, nickname }` so we can repopulate
+/// the hostname / port rows on app launch without waiting for
+/// mDNS to rediscover.
+pub const KEY_RTL_TCP_CLIENT_LAST_CONNECTED: &str = "rtl_tcp_client_last_connected";
 
 /// Device selector index for RTL-SDR.
 pub const DEVICE_RTLSDR: u32 = 0;
@@ -593,5 +606,131 @@ mod tests {
             }),
             "Failed — bad handshake"
         );
+    }
+}
+
+/// Snapshot of a previously-connected `rtl_tcp` server. Serialized
+/// into the `rtl_tcp_client_last_connected` config entry so the
+/// next app launch can repopulate the hostname / port / nickname
+/// fields without waiting for mDNS to rediscover.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LastConnectedServer {
+    /// Hostname or IP literal the Connect button dialed — either
+    /// a resolved address (`192.168.1.5`) or an mDNS hostname
+    /// (`shack-pi.local.`), whichever the discovery layer yielded.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+    /// User-facing nickname — normally the mDNS TXT nickname, or
+    /// the `instance_name` when no nickname was published.
+    pub nickname: String,
+}
+
+/// Load the list of favorited server instance names. Returns an
+/// empty Vec on first launch / absent / corrupt config. Safe to
+/// call unconditionally.
+pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<String> {
+    config.read(|v| {
+        v.get(KEY_RTL_TCP_CLIENT_FAVORITES)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Persist the full favorites list. Overwrites the config entry —
+/// callers pass the current UI state of pinned instance names.
+pub fn save_favorites(config: &Arc<ConfigManager>, favorites: &[String]) {
+    config.write(|v| {
+        v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!(favorites);
+    });
+}
+
+/// Load the last-connected server snapshot, if any was recorded.
+/// Returns `None` on first launch or when the stored blob fails
+/// to deserialize (schema drift, hand-edited config, etc.).
+pub fn load_last_connected(config: &Arc<ConfigManager>) -> Option<LastConnectedServer> {
+    config.read(|v| {
+        v.get(KEY_RTL_TCP_CLIENT_LAST_CONNECTED)
+            .and_then(|entry| serde_json::from_value(entry.clone()).ok())
+    })
+}
+
+/// Persist a `LastConnectedServer` snapshot. Called from the
+/// discovery-row Connect handler and from any manual-server
+/// connect path once that UI exists.
+pub fn save_last_connected(config: &Arc<ConfigManager>, server: &LastConnectedServer) {
+    config.write(|v| {
+        // Serialize via serde_json::to_value so we don't re-embed
+        // JSON-encoded text inside a JSON string (the common
+        // round-trip mistake here).
+        v[KEY_RTL_TCP_CLIENT_LAST_CONNECTED] =
+            serde_json::to_value(server).unwrap_or(serde_json::Value::Null);
+    });
+}
+
+#[cfg(test)]
+mod client_persistence_tests {
+    use super::*;
+
+    fn make_config() -> Arc<ConfigManager> {
+        Arc::new(ConfigManager::in_memory(&serde_json::json!({})))
+    }
+
+    #[test]
+    fn favorites_round_trip() {
+        let config = make_config();
+        // Fresh config → empty list.
+        assert!(load_favorites(&config).is_empty());
+        let favs = vec![
+            "shack-pi rtl-sdr._rtl_tcp._tcp.local.".to_string(),
+            "attic pi._rtl_tcp._tcp.local.".to_string(),
+        ];
+        save_favorites(&config, &favs);
+        let loaded = load_favorites(&config);
+        assert_eq!(loaded, favs);
+    }
+
+    #[test]
+    fn favorites_loader_tolerates_non_array_entry() {
+        // If someone hand-edits the config file and makes the
+        // entry a string, we shouldn't panic or corrupt state —
+        // just return empty and let the user re-pin.
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!("not an array");
+        });
+        assert!(load_favorites(&config).is_empty());
+    }
+
+    #[test]
+    fn last_connected_round_trip() {
+        let config = make_config();
+        assert!(load_last_connected(&config).is_none());
+        let server = LastConnectedServer {
+            host: "192.168.1.5".to_string(),
+            port: 1234,
+            nickname: "shack-pi".to_string(),
+        };
+        save_last_connected(&config, &server);
+        let loaded = load_last_connected(&config).expect("loaded");
+        assert_eq!(loaded.host, server.host);
+        assert_eq!(loaded.port, server.port);
+        assert_eq!(loaded.nickname, server.nickname);
+    }
+
+    #[test]
+    fn last_connected_loader_tolerates_malformed_entry() {
+        // Schema drift: an older version persisted a plain string.
+        // New loader should return None rather than panic.
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_RTL_TCP_CLIENT_LAST_CONNECTED] = serde_json::json!("shack-pi:1234");
+        });
+        assert!(load_last_connected(&config).is_none());
     }
 }

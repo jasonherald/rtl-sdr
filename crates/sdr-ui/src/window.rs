@@ -203,6 +203,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &demod_dropdown,
         &status_bar_demod,
         &toast_overlay,
+        config,
     );
 
     // Wire waterfall screenshot button.
@@ -905,6 +906,7 @@ fn build_breakpoint(split_view: &adw::OverlaySplitView) -> adw::Breakpoint {
 }
 
 /// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
+#[allow(clippy::too_many_arguments)]
 fn connect_sidebar_panels(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -913,6 +915,7 @@ fn connect_sidebar_panels(
     demod_dropdown: &gtk4::DropDown,
     status_bar: &Rc<StatusBar>,
     toast_overlay: &adw::ToastOverlay,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -925,7 +928,7 @@ fn connect_sidebar_panels(
     let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
     connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
-    connect_rtl_tcp_discovery(panels, state);
+    connect_rtl_tcp_discovery(panels, state, config);
     connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
@@ -954,7 +957,11 @@ fn connect_sidebar_panels(
 /// is currently selected. That's fine — discovery is cheap and having
 /// the list pre-populated when the user switches to RTL-TCP makes the
 /// UX immediate instead of "wait 5 s for the first advertisement."
-fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
+fn connect_rtl_tcp_discovery(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -1027,6 +1034,20 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     let protocol_row = panels.source.protocol_row.clone();
     let device_row = panels.source.device_row.clone();
     let state = Rc::clone(state);
+    // Shared config handle — the Connect button on each discovered
+    // row clones it once more inside the closure so it can persist
+    // a `LastConnectedServer` snapshot on click.
+    let config_for_discovery = std::sync::Arc::clone(config);
+
+    // Populate the hostname / port fields on startup from the last
+    // connected server, if any. Runs once before the poller starts
+    // so the user sees "the server they were last on" immediately
+    // instead of having to wait for a fresh mDNS beacon. No-op on
+    // first launch / after a config reset.
+    if let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery) {
+        hostname_row.set_text(&last.host);
+        port_row.set_value(f64::from(last.port));
+    }
 
     // Poll the discovery channel from the main thread. Cheap enough
     // to be always-on; discovery events are bursty at start and then
@@ -1143,6 +1164,15 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     let protor = protocol_row.clone();
                     let dr = device_row.clone();
                     let st = Rc::clone(&state);
+                    let cfg = std::sync::Arc::clone(&config_for_discovery);
+                    // Friendly nickname for the persisted snapshot.
+                    // Prefer the TXT nickname if the responder set
+                    // one, fall back to the DNS-SD instance name.
+                    let click_nickname = if server.txt.nickname.is_empty() {
+                        server.instance_name.clone()
+                    } else {
+                        server.txt.nickname.clone()
+                    };
                     connect_btn.connect_clicked(move |_| {
                         // Remember whether the device row was already
                         // on RTL-TCP. If it WAS, `set_selected` below
@@ -1170,6 +1200,18 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                             port: click_port,
                             protocol: sdr_types::Protocol::TcpClient,
                         });
+                        // Persist the choice so next app launch
+                        // pre-populates the hostname / port fields
+                        // with the same server without needing
+                        // another mDNS round-trip.
+                        crate::sidebar::source_panel::save_last_connected(
+                            &cfg,
+                            &crate::sidebar::source_panel::LastConnectedServer {
+                                host: click_host.clone(),
+                                port: click_port,
+                                nickname: click_nickname.clone(),
+                            },
+                        );
                         if already_rtl_tcp {
                             // device_row notify handler did NOT fire
                             // (we were already on RTL-TCP); force the
