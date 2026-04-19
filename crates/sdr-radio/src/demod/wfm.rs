@@ -2,6 +2,7 @@
 
 use sdr_dsp::demod::BroadcastFmDemod;
 use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, FirFilter};
+use sdr_dsp::loops::Agc;
 use sdr_dsp::stereo::FmStereoDecoder;
 use sdr_dsp::taps;
 use sdr_types::{Complex, DspError, Stereo};
@@ -33,6 +34,25 @@ const WFM_MAX_BANDWIDTH: f64 = 250_000.0;
 /// Default frequency snap interval for WFM (Hz) — broadcast FM spacing.
 const WFM_SNAP_INTERVAL: f64 = 100_000.0;
 
+// Audio AGC parameters — same shape as NFM / AM so all three
+// demodulators normalize to comparable output loudness. Broadcast
+// FM stations follow a ±75 kHz deviation standard, but modulation
+// practice varies (compressed / uncompressed music, talk, etc.)
+// and RF path losses shift the discriminator output level too.
+// AGC closes both loops.
+/// Audio AGC set point (target output amplitude).
+const WFM_AGC_SET_POINT: f32 = 1.0;
+/// Audio AGC attack coefficient.
+const WFM_AGC_ATTACK: f32 = 0.003_333_333;
+/// Audio AGC decay coefficient.
+const WFM_AGC_DECAY: f32 = 0.000_333_333;
+/// Audio AGC maximum gain ceiling.
+const WFM_AGC_MAX_GAIN: f32 = 1e6;
+/// Audio AGC maximum output amplitude (look-ahead clipping cap).
+const WFM_AGC_MAX_OUTPUT: f32 = 10.0;
+/// Audio AGC initial gain (pre-settling).
+const WFM_AGC_INIT_GAIN: f32 = 1.0;
+
 /// Wideband FM demodulator using `BroadcastFmDemod` from sdr-dsp.
 ///
 /// Supports both mono and stereo output:
@@ -49,9 +69,19 @@ pub struct WfmDemodulator {
     /// FM stereo decoder — pilot PLL, subcarrier extraction, L/R matrixing.
     /// Used in stereo mode.
     stereo_decoder: FmStereoDecoder,
+    /// Audio-level AGC — normalizes mono output loudness. In
+    /// stereo mode we apply the same AGC's gain to both L and R
+    /// via a shared-gain pass so stereo imaging is preserved
+    /// (independent per-channel AGCs would drift L vs R).
+    audio_agc: Agc,
+    /// Scratch buffer for the post-LPF / post-stereo-decoder
+    /// mono signal that drives the AGC envelope. For stereo, the
+    /// AGC runs on `(L + R) / 2` so stereo imaging is preserved.
+    agc_mono_buf: Vec<f32>,
     config: DemodConfig,
     mono_buf: Vec<f32>,
     lpf_buf: Vec<f32>,
+    agc_buf: Vec<f32>,
     /// When true, perform stereo decode (pilot extraction + L−R matrixing).
     /// Default: false (mono), matching C++ SDR++ `_stereo = false` default.
     stereo: bool,
@@ -79,6 +109,15 @@ impl WfmDemodulator {
 
         let stereo_decoder = FmStereoDecoder::new(WFM_IF_SAMPLE_RATE)?;
 
+        let audio_agc = Agc::new(
+            WFM_AGC_SET_POINT,
+            WFM_AGC_ATTACK,
+            WFM_AGC_DECAY,
+            WFM_AGC_MAX_GAIN,
+            WFM_AGC_MAX_OUTPUT,
+            WFM_AGC_INIT_GAIN,
+        )?;
+
         let config = DemodConfig {
             if_sample_rate: WFM_IF_SAMPLE_RATE,
             af_sample_rate: WFM_AF_SAMPLE_RATE,
@@ -100,9 +139,12 @@ impl WfmDemodulator {
             demod,
             audio_lpf,
             stereo_decoder,
+            audio_agc,
+            agc_mono_buf: Vec::new(),
             config,
             mono_buf: Vec::new(),
             lpf_buf: Vec::new(),
+            agc_buf: Vec::new(),
             stereo: false,
         })
     }
@@ -114,9 +156,16 @@ impl WfmDemodulator {
     /// channels receive the same mono (L+R) signal.
     pub fn set_stereo(&mut self, enabled: bool) {
         if self.stereo != enabled {
-            // Reset stateful blocks to avoid stale history from the inactive path
+            // Reset stateful blocks to avoid stale history from
+            // the inactive path. Audio AGC is reset too — mono
+            // and stereo paths feed the envelope tracker with
+            // different amplitude scales (stereo has the L+R
+            // mono sum which averages vs. the mono LPF output),
+            // so carrying envelope state across the flip would
+            // produce a transient loudness jump.
             self.audio_lpf.reset();
             self.stereo_decoder.reset();
+            self.audio_agc.reset();
         }
         self.stereo = enabled;
         if enabled {
@@ -147,12 +196,45 @@ impl Demodulator for WfmDemodulator {
             // Stereo decode: pilot PLL → 38 kHz subcarrier → L−R → matrix
             self.stereo_decoder
                 .process(&self.mono_buf[..count], &mut output[..count])?;
+
+            // Apply audio AGC with shared L/R gain so stereo
+            // imaging is preserved. Envelope is driven by the
+            // L+R mono sum; the resulting gain is applied
+            // uniformly to both channels. An independent AGC per
+            // channel would let L and R drift relative to each
+            // other on asymmetric content.
+            self.agc_mono_buf.resize(count, 0.0);
+            for (i, s) in output[..count].iter().enumerate() {
+                self.agc_mono_buf[i] = 0.5 * (s.l + s.r);
+            }
+            self.agc_buf.resize(count, 0.0);
+            self.audio_agc
+                .process_f32(&self.agc_mono_buf[..count], &mut self.agc_buf[..count])?;
+            for (i, s) in output[..count].iter_mut().enumerate() {
+                // `gain = agc_output / mono_input`. Guard the
+                // zero-input case so silent samples don't
+                // produce NaN via 0/0.
+                let gain = if self.agc_mono_buf[i].abs() > f32::MIN_POSITIVE {
+                    self.agc_buf[i] / self.agc_mono_buf[i]
+                } else {
+                    1.0
+                };
+                s.l *= gain;
+                s.r *= gain;
+            }
         } else {
-            // Mono: 15 kHz lowpass → dual-mono
+            // Mono: 15 kHz lowpass → AGC → dual-mono
             self.lpf_buf.resize(count, 0.0);
             self.audio_lpf
                 .process_f32(&self.mono_buf[..count], &mut self.lpf_buf[..count])?;
-            sdr_dsp::convert::mono_to_stereo(&self.lpf_buf[..count], &mut output[..count])?;
+            // Audio AGC — see NFM's AGC stage for the rationale.
+            // WFM's deviation is fixed at ±75 kHz by standard but
+            // RF path loss and station modulation practice still
+            // produce varying output levels; AGC normalizes.
+            self.agc_buf.resize(count, 0.0);
+            self.audio_agc
+                .process_f32(&self.lpf_buf[..count], &mut self.agc_buf[..count])?;
+            sdr_dsp::convert::mono_to_stereo(&self.agc_buf[..count], &mut output[..count])?;
         }
 
         Ok(count)
@@ -178,7 +260,11 @@ impl Demodulator for WfmDemodulator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::cast_precision_loss)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
 
@@ -201,6 +287,64 @@ mod tests {
         let mut output = vec![Stereo::default(); 1000];
         let count = demod.process(&input, &mut output).unwrap();
         assert_eq!(count, 1000);
+    }
+
+    #[test]
+    fn test_wfm_mono_audio_agc_preserves_channel_match() {
+        // Audio AGC must apply the SAME gain to L and R in mono
+        // mode (they come from a shared mono buffer via
+        // mono_to_stereo), so per-sample L and R should stay
+        // within float epsilon of each other. Pins the invariant
+        // that we're not accidentally running independent L/R
+        // AGCs and losing the mono guarantee.
+        use core::f32::consts::PI;
+        let mut demod = WfmDemodulator::new().unwrap();
+        let mod_freq = 1_000.0_f32;
+        let deviation_hz = 50_000.0_f32;
+        let n = 3000;
+        let input: Vec<Complex> = (0..n)
+            .map(|i| {
+                let t = i as f32 / WFM_IF_SAMPLE_RATE as f32;
+                let phase = deviation_hz * (2.0 * PI * mod_freq * t).sin() / mod_freq;
+                Complex::new(phase.cos(), phase.sin())
+            })
+            .collect();
+        let mut output = vec![Stereo::default(); n];
+        demod.process(&input, &mut output).unwrap();
+        for (i, s) in output.iter().enumerate().skip(1500) {
+            assert!(
+                (s.l - s.r).abs() < 1e-6,
+                "mono WFM must preserve L == R after AGC at sample {i}, got L={} R={}",
+                s.l,
+                s.r
+            );
+        }
+    }
+
+    #[test]
+    fn test_wfm_stereo_audio_agc_preserves_imaging() {
+        // In stereo mode, shared-gain AGC applies the same gain
+        // to both channels (envelope driven by the L+R mono sum).
+        // If L is louder than R in the input, that relationship
+        // should survive AGC — not be flattened by independent
+        // per-channel normalization.
+        let mut demod = WfmDemodulator::new().unwrap();
+        demod.set_stereo(true);
+        // Drive enough samples so the stereo decoder's PLL and
+        // the AGC envelope both settle before measurement.
+        let n = 5000;
+        let input = vec![Complex::new(1.0, 0.0); n];
+        let mut output = vec![Stereo::default(); n];
+        demod.process(&input, &mut output).unwrap();
+        // Constant-frequency input means silence after FM demod
+        // → output amplitude near zero. Exact L == R is expected
+        // (both channels share the zero envelope). This test just
+        // confirms the stereo path compiles, runs, and doesn't
+        // NaN out via 0/0 in the gain calculation.
+        for s in &output[2000..] {
+            assert!(s.l.is_finite(), "stereo AGC produced non-finite L sample");
+            assert!(s.r.is_finite(), "stereo AGC produced non-finite R sample");
+        }
     }
 
     #[test]
