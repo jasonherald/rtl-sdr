@@ -1614,8 +1614,7 @@ fn connect_server_panel(
         let selected = row.selected();
         let is_legal = (selected as usize) < SAMPLE_RATES.len();
         advisory.set_visible(
-            is_legal
-                && selected >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX,
+            is_legal && selected >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX,
         );
     };
     // Seed initial visibility + subscribe for future changes.
