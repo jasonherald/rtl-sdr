@@ -267,6 +267,13 @@ final class MetalSpectrumNSView: NSView, CAMetalDisplayLinkDelegate {
         renderer.applyBindings(minDb: minDb, maxDb: maxDb)
     }
 
+    /// Push the current display-side averaging mode down to the
+    /// renderer. Called from `updateNSView` when CoreModel's
+    /// `averagingMode` changes.
+    func applyAveraging(mode: AveragingMode) {
+        renderer.applyAveraging(mode: mode)
+    }
+
     /// Forward the current zoom window to the renderer so the
     /// Metal shader remaps bin-index / viewport-uv accordingly.
     /// Called from `updateNSView` whenever CoreModel's zoom

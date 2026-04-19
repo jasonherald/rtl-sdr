@@ -176,6 +176,9 @@ final class CoreModel {
     var fftSize: Int = 2048
     var fftWindow: FftWindow = .blackman
     var fftRateFps: Double = 20
+    /// Spectrum averaging mode. Display-only — applied in the
+    /// Swift renderer before blit; the engine is unaware.
+    var averagingMode: AveragingMode = .none
     // Default dB range matches the GTK UI (see
     // `crates/sdr-ui/src/spectrum/mod.rs:58`). -70 dB floor
     // hides the ADC noise floor so the waterfall background is
@@ -189,6 +192,13 @@ final class CoreModel {
     // ==========================================================
 
     var signalLevelDb: Float = -120
+
+    /// Auto-squelch tracks the noise floor in the DSP and
+    /// self-adjusts the threshold. This is an engine-side
+    /// feature (`sdr-radio::IfChain::set_auto_squelch_enabled`);
+    /// the UI just toggles it. Only meaningful when
+    /// `squelchEnabled` is also on.
+    var autoSquelchEnabled: Bool = false
 
     // ==========================================================
     //  Bootstrap / shutdown
@@ -408,6 +418,48 @@ final class CoreModel {
     /// command is a no-op if the value already matches. Errors
     /// land in `lastError` via the individual setters' `capture`
     /// helper.
+    /// Snapshot the current tuning state as a Bookmark. The
+    /// user-visible name defaults to the current center
+    /// frequency; callers can override. Only the fields the user
+    /// would reasonably want to recall are captured; FFT / PPM /
+    /// volume are intentionally NOT part of a bookmark — those
+    /// feel more like environmental settings than per-station
+    /// preferences.
+    func snapshotBookmark(name: String? = nil) -> Bookmark {
+        Bookmark(
+            name: name ?? formatRate(centerFrequencyHz),
+            centerFrequencyHz: centerFrequencyHz,
+            demodMode: demodMode,
+            bandwidthHz: bandwidthHz,
+            squelchEnabled: squelchEnabled,
+            autoSquelchEnabled: autoSquelchEnabled,
+            squelchDb: squelchDb,
+            gainDb: gainDb,
+            agcEnabled: agcEnabled,
+            volume: nil,       // feels more like env setting than per-bookmark
+            deemphasis: deemphasis
+        )
+    }
+
+    /// Apply a saved Bookmark. Each field that's non-nil goes
+    /// through the matching setter (so the engine sees the same
+    /// command stream a user tapping the UI would send). Fields
+    /// left nil are untouched — e.g. a "600 MHz memory channel"
+    /// bookmark saved without a squelch setting won't unintentionally
+    /// flip the user's current squelch state.
+    func apply(_ bookmark: Bookmark) {
+        if let hz = bookmark.centerFrequencyHz { setCenter(hz) }
+        if let m = bookmark.demodMode          { setDemodMode(m) }
+        if let bw = bookmark.bandwidthHz       { setBandwidth(bw) }
+        if let on = bookmark.squelchEnabled    { setSquelchEnabled(on) }
+        if let db = bookmark.squelchDb         { setSquelchDb(db) }
+        if let auto = bookmark.autoSquelchEnabled { setAutoSquelch(auto) }
+        if let g = bookmark.gainDb             { setGain(g) }
+        if let agc = bookmark.agcEnabled       { setAgc(agc) }
+        if let v = bookmark.volume             { setVolume(v) }
+        if let d = bookmark.deemphasis         { setDeemphasis(d) }
+    }
+
     func syncToEngine() {
         guard core != nil else { return }
         setCenter(centerFrequencyHz)
@@ -420,6 +472,7 @@ final class CoreModel {
         setBandwidth(bandwidthHz)
         setSquelchEnabled(squelchEnabled)
         setSquelchDb(squelchDb)
+        setAutoSquelch(autoSquelchEnabled)
         setDeemphasis(deemphasis)
         setVolume(volume)
         setFftSize(fftSize)
@@ -587,6 +640,11 @@ final class CoreModel {
     func setSquelchEnabled(_ on: Bool) {
         squelchEnabled = on
         capture { try core?.setSquelchEnabled(on) }
+    }
+
+    func setAutoSquelch(_ on: Bool) {
+        autoSquelchEnabled = on
+        capture { try core?.setAutoSquelch(on) }
     }
 
     func setDeemphasis(_ m: Deemphasis) {

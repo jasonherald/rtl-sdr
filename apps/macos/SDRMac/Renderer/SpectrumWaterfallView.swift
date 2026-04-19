@@ -58,6 +58,7 @@ struct SpectrumWaterfallView: NSViewRepresentable {
             displayedSpanHz: model.effectiveDisplayedSpanHz,
             displayBandwidthHz: model.displayBandwidthHz
         )
+        mtk.applyAveraging(mode: model.averagingMode)
     }
 
     private func makeFallbackView() -> NSView {
