@@ -1074,6 +1074,7 @@ fn connect_sidebar_panels(
     let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
     connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
+    connect_source_rtlsdr_probe(panels);
     connect_rtl_tcp_discovery(panels, state, config, favorites_header);
     connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state);
@@ -3265,6 +3266,73 @@ fn format_age(elapsed: Duration) -> String {
     } else {
         format!("{}h ago", secs / 3600)
     }
+}
+
+/// Interval for refreshing the source combo's RTL-SDR slot label
+/// against the live USB bus. Low-frequency enough to be
+/// negligible CPU-wise; fast enough that a user plugging in their
+/// dongle after app launch sees the slot update to the real
+/// device name within a few seconds without having to restart.
+///
+/// Shares cadence with `SERVER_PANEL_HOTPLUG_POLL_INTERVAL` as a
+/// deliberate choice — both pollers watch the same libusb bus for
+/// the same vendor/product-filtered device set, so users see
+/// both the source combo and the server panel update on the same
+/// tick. Kept as a separate constant so each poller's sizing can
+/// evolve independently.
+const SOURCE_RTLSDR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Install a hotplug poller on the source panel that keeps the
+/// RTL-SDR slot label (`device_row` entry 0) in sync with the
+/// live USB bus. Seeded once at build-time (inside
+/// `build_source_panel`); this helper adds the ongoing refresh.
+///
+/// Compared against a cached last-seen label so the `splice` fires
+/// only on real edges — plugging in, unplugging, or USB string
+/// changing. Without the edge gate we'd churn the combo's model
+/// every 3 s and risk transient selection flicker (though GTK's
+/// `ComboRow` is robust to same-value splices, the no-op is
+/// cheaper to skip than to perform).
+///
+/// Weak ref on the source panel's `widget` so the poller tears
+/// down cleanly on window close — upgrade returns `None` and the
+/// `ControlFlow::Break` arm fires.
+fn connect_source_rtlsdr_probe(panels: &SidebarPanels) {
+    let widget_weak = panels.source.widget.downgrade();
+    let model_weak = panels.source.device_model.downgrade();
+    // Cached label from the last tick so we only rewrite on a
+    // real edge. Seeded to match the initial label set in
+    // `build_source_panel` so the first tick doesn't flip the
+    // slot back to itself.
+    let last_label: Rc<RefCell<String>> = Rc::new(RefCell::new(
+        sidebar::source_panel::probe_rtlsdr_device_label(),
+    ));
+    let _ = glib::timeout_add_local(SOURCE_RTLSDR_PROBE_INTERVAL, move || {
+        if widget_weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let Some(model) = model_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let current = sidebar::source_panel::probe_rtlsdr_device_label();
+        let mut last = last_label.borrow_mut();
+        if *last != current {
+            tracing::debug!(
+                previous = %*last,
+                current = %current,
+                "source panel: RTL-SDR slot label updated",
+            );
+            // Replace entry 0 in the StringList. `splice(pos, n,
+            // additions)` removes `n` items at `pos` and inserts
+            // `additions` — so `(0, 1, &[&current])` is a
+            // single-entry in-place swap. Leaves Network / File /
+            // RTL-TCP entries untouched so their indices stay
+            // pinned to the `DEVICE_*` constants.
+            model.splice(0, 1, &[&current]);
+            *last = current;
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 #[allow(
