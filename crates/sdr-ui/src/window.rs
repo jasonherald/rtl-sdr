@@ -3268,6 +3268,12 @@ fn format_age(elapsed: Duration) -> String {
     }
 }
 
+/// Subtitle text shown on AGC-mutexed rows in the grayed-out
+/// state so the reason for the lock is inline — without it, an
+/// insensitive row is easy to mistake for a bug rather than
+/// intentional behavior.
+const AGC_MUTEX_SUBTITLE: &str = "Disabled while AGC is on";
+
 /// Enforce the tuner AGC ↔ manual gain mutual exclusion on the UI
 /// side: when AGC is on, the gain spin row becomes insensitive
 /// (grayed out, non-interactive). When AGC is off, the row is
@@ -3283,17 +3289,44 @@ fn format_age(elapsed: Duration) -> String {
 /// the restore path still updates `gain_row.set_value` cleanly
 /// even when the row is insensitive — the value displays but the
 /// user can't edit it until AGC is turned off.
-///
-/// The subtitle flips too so the reason for the lock is on-screen.
-/// Without the subtitle, an insensitive row is easy to mistake for
-/// a bug rather than intentional behavior.
 fn apply_agc_gain_mutex(gain_row: &adw::SpinRow, agc_active: bool) {
     gain_row.set_sensitive(!agc_active);
-    gain_row.set_subtitle(if agc_active {
-        "Disabled while AGC is on"
-    } else {
-        ""
-    });
+    gain_row.set_subtitle(if agc_active { AGC_MUTEX_SUBTITLE } else { "" });
+}
+
+/// Enforce the tuner AGC ↔ squelch mutual exclusion on the UI
+/// side: when AGC is on, the squelch controls (manual enable,
+/// manual level, auto-squelch enable) become insensitive.
+///
+/// The mutex exists because RTL-SDR's hardware tuner AGC auto-
+/// normalizes the IF signal amplitude — the tuner's internal
+/// VGA pushes toward a target level regardless of actual RF
+/// input. `PowerSquelch` reads mean IF amplitude and gates
+/// against a threshold, so with AGC on every signal (including
+/// noise on an empty channel) looks like "above threshold" and
+/// the gate stays open. Users see this as "all static all the
+/// time" the moment they enable AGC while squelch is on.
+///
+/// Same UX pattern as `apply_agc_gain_mutex`: gray the rows,
+/// set a subtitle on the first row explaining why, restore
+/// sensitivity when AGC turns off. Both mutexes share the
+/// `AGC_MUTEX_SUBTITLE` string so the explanation reads
+/// identically across the panel.
+fn apply_agc_squelch_mutex(
+    squelch_enabled_row: &adw::SwitchRow,
+    squelch_level_row: &adw::SpinRow,
+    auto_squelch_row: &adw::SwitchRow,
+    agc_active: bool,
+) {
+    squelch_enabled_row.set_sensitive(!agc_active);
+    squelch_level_row.set_sensitive(!agc_active);
+    auto_squelch_row.set_sensitive(!agc_active);
+    // Only one subtitle — the squelch-enabled row is the
+    // "header" of this group in the Radio panel, so that's
+    // where the explanation lands. The other two rows stay
+    // grayed without extra text to avoid repeating the
+    // message three times in a row.
+    squelch_enabled_row.set_subtitle(if agc_active { AGC_MUTEX_SUBTITLE } else { "" });
 }
 
 /// Interval for refreshing the source combo's RTL-SDR slot label
@@ -3500,22 +3533,44 @@ fn connect_source_panel(
     });
 
     // AGC toggle. In addition to dispatching the DSP command,
-    // toggle the gain row's sensitivity so the user can't edit
-    // the gain while tuner AGC is on — matches the macOS app's
-    // behavior and prevents the silent-no-op / tuner-oscillation
-    // failure modes documented in #332.
+    // toggle two mutexes so the UI doesn't lie about controls
+    // that tuner AGC actually disables:
+    //
+    // 1. Gain row — `rtlsdr_set_tuner_gain` silently no-ops on
+    //    most RTL variants when AGC is on.
+    // 2. Squelch rows — RTL-SDR's tuner AGC auto-normalizes IF
+    //    amplitude, so amplitude-based squelch can't distinguish
+    //    signal from noise and the gate just stays open. Without
+    //    this mutex users see "all static all the time" the
+    //    moment they enable AGC with squelch on.
     //
     // Initial state: `AdwSwitchRow` defaults to `active = false`,
-    // which means gain_row starts sensitive. Bookmark restore sets
-    // agc via `agc_row.set_active(agc)`, which fires this handler
-    // and reapplies the mutex — no separate seeding path needed.
+    // which means the gated rows start sensitive. Bookmark
+    // restore sets agc via `agc_row.set_active(agc)`, which
+    // fires this handler and reapplies the mutexes — no
+    // separate seeding path needed.
     apply_agc_gain_mutex(&panels.source.gain_row, panels.source.agc_row.is_active());
+    apply_agc_squelch_mutex(
+        &panels.radio.squelch_enabled_row,
+        &panels.radio.squelch_level_row,
+        &panels.radio.auto_squelch_row,
+        panels.source.agc_row.is_active(),
+    );
     let state_agc = Rc::clone(state);
     let gain_row_for_agc = panels.source.gain_row.clone();
+    let squelch_enabled_for_agc = panels.radio.squelch_enabled_row.clone();
+    let squelch_level_for_agc = panels.radio.squelch_level_row.clone();
+    let auto_squelch_for_agc = panels.radio.auto_squelch_row.clone();
     panels.source.agc_row.connect_active_notify(move |row| {
         let agc_active = row.is_active();
         state_agc.send_dsp(UiToDsp::SetAgc(agc_active));
         apply_agc_gain_mutex(&gain_row_for_agc, agc_active);
+        apply_agc_squelch_mutex(
+            &squelch_enabled_for_agc,
+            &squelch_level_for_agc,
+            &auto_squelch_for_agc,
+            agc_active,
+        );
     });
 
     // IQ correction toggle
