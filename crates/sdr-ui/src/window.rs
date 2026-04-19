@@ -849,6 +849,7 @@ fn connect_sidebar_panels(
 ) {
     connect_source_panel(panels, state);
     connect_rtl_tcp_discovery(panels, state);
+    connect_server_panel_visibility(panels);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
@@ -1117,6 +1118,109 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     }
                 }
             }
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Cadence for the USB hotplug poll that drives server-panel
+/// visibility. 3 s is the sweet spot: fast enough that a user
+/// plugging in a dongle sees the panel within the time it takes them
+/// to reach the sidebar with the mouse, slow enough that the
+/// per-tick `rusb::devices()` USB-bus enumerate is invisible in
+/// profile traces.
+const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Wire the server panel's visibility to USB hotplug state and the
+/// currently-selected source type. The panel appears only when both
+/// hold:
+///
+/// 1. at least one RTL-SDR dongle is visible on the local USB bus
+///    (`sdr_rtlsdr::get_device_count() > 0`), and
+/// 2. the active source type is **not** RTL-SDR — re-exposing the
+///    same dongle over `rtl_tcp` while a local `RtlSdrSource` is
+///    holding it would cause a USB-device double-open.
+///
+/// Visibility is recomputed on two triggers so the panel feels
+/// responsive without polling the world: a low-frequency timer that
+/// handles the USB side (hotplug has no GTK signal we can subscribe
+/// to) and a `device_row.connect_selected_notify` handler that fires
+/// on every source-type change. A `Cell<u32>` tracks the last-seen
+/// device count so we only pay the widget-state-update cost on an
+/// actual edge.
+fn connect_server_panel_visibility(panels: &SidebarPanels) {
+    use std::cell::Cell;
+
+    let server_widget_weak = panels.server.widget.downgrade();
+    let device_row = panels.source.device_row.clone();
+    let last_seen_count = Rc::new(Cell::new(u32::MAX));
+
+    // Pure function: does the combined rule say "show"?
+    let should_be_visible = |dongle_count: u32, selected: u32| -> bool {
+        dongle_count > 0 && selected != DEVICE_RTLSDR
+    };
+
+    // Apply visibility, using the cached dongle count. Shared
+    // between the poll tick and the device-row notify handler so
+    // the two callers stay in lockstep.
+    let apply_visibility = {
+        let server_widget_weak = server_widget_weak.clone();
+        let device_row = device_row.clone();
+        let last_seen_count = Rc::clone(&last_seen_count);
+        move || {
+            let Some(widget) = server_widget_weak.upgrade() else {
+                return;
+            };
+            let count = last_seen_count.get();
+            // First invocation before any poll: count is u32::MAX,
+            // which would evaluate true for `> 0`. Treat the
+            // pre-first-tick state as "no dongle yet" so the panel
+            // stays hidden until we actually know — prevents a
+            // flash-of-unwanted-panel during startup.
+            let effective_count = if count == u32::MAX { 0 } else { count };
+            widget.set_visible(should_be_visible(effective_count, device_row.selected()));
+        }
+    };
+
+    // Reapply on source-type change. Cloned because
+    // `connect_selected_notify` takes an `Fn(&ComboRow)` and we want
+    // the same logic as the poll tick.
+    let apply_on_device_change = apply_visibility.clone();
+    panels
+        .source
+        .device_row
+        .connect_selected_notify(move |_| apply_on_device_change());
+
+    // Seed `last_seen_count` on the first tick. Using a glib timer
+    // (rather than running the USB probe synchronously during
+    // wiring) keeps the window-build path fast and avoids a libusb
+    // session init on a thread that may not have one ready.
+    let apply_on_tick = apply_visibility;
+    let _ = glib::timeout_add_local(SERVER_PANEL_HOTPLUG_POLL_INTERVAL, move || {
+        // If the widget is gone, tear the poller down — nothing to
+        // show, and we don't want to leak `rusb::devices()` calls
+        // past window close.
+        if server_widget_weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        // `sdr_rtlsdr::get_device_count()` is a libusb enumerate
+        // (vendor/product-ID filter over `rusb::devices()`). Fast
+        // enough for the UI thread at a 3 s cadence; no syscall
+        // churn worth moving to a worker.
+        let count = sdr_rtlsdr::get_device_count();
+        // First tick ALWAYS flips the cache off `u32::MAX`, so this
+        // branch fires at least once even if the real count is 0 —
+        // that's the "resolve the panel out of its pre-first-tick
+        // hidden state" moment. Subsequent ticks only apply on a
+        // real edge so we don't churn widget state every 3 s.
+        if count != last_seen_count.get() {
+            tracing::debug!(
+                previous = last_seen_count.get(),
+                current = count,
+                "rtl_tcp server panel: local dongle count changed"
+            );
+            last_seen_count.set(count);
+            apply_on_tick();
         }
         glib::ControlFlow::Continue
     });
