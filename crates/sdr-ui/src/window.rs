@@ -669,6 +669,11 @@ fn build_split_view(
 ) {
     // Sidebar — configuration panels.
     let (sidebar_scroll, panels) = sidebar::build_sidebar();
+    // Restore saved server-panel settings + subscribe to persist
+    // future changes. Runs as soon as panels are built so the
+    // saved values are visible before any user interaction could
+    // otherwise overwrite them.
+    sidebar::server_panel::connect_server_panel_persistence(&panels.server, config);
 
     // Main content area — spectrum display (FFT plot + waterfall) + status bar.
     let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view(state.ui_tx.clone());
