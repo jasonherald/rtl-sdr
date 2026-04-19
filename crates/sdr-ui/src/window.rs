@@ -13,6 +13,7 @@ use libadwaita::prelude::*;
 use sdr_core::Engine;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
+use sdr_rtltcp_discovery::{Browser, DiscoveredServer, DiscoveryEvent};
 use sdr_source_rtlsdr::SAMPLE_RATES;
 
 use crate::header;
@@ -21,6 +22,10 @@ use crate::messages::{DspToUi, SourceType, UiToDsp};
 use crate::shortcuts;
 use crate::sidebar;
 use crate::sidebar::SidebarPanels;
+use crate::sidebar::source_panel::{
+    DEVICE_FILE, DEVICE_NETWORK, DEVICE_RTLSDR, DEVICE_RTLTCP, NETWORK_PROTOCOL_TCPCLIENT_IDX,
+    NETWORK_PROTOCOL_UDP_IDX,
+};
 use crate::spectrum;
 use crate::state::AppState;
 use crate::status_bar::{self, StatusBar};
@@ -843,6 +848,7 @@ fn connect_sidebar_panels(
     status_bar: &Rc<StatusBar>,
 ) {
     connect_source_panel(panels, state);
+    connect_rtl_tcp_discovery(panels, state);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
@@ -859,6 +865,343 @@ fn connect_sidebar_panels(
 
 /// Connect source panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
+/// Spawn an mDNS browser for `_rtl_tcp._tcp.local.` services and wire
+/// its events into the `rtl_tcp_discovered_row` expander. Each
+/// discovered server gets an `AdwActionRow` with a Connect button that
+/// populates hostname/port and switches the source type.
+///
+/// The `Browser` handle is moved into the `timeout_add_local` closure
+/// so it lives for the lifetime of the main context (= the app), and
+/// mDNS discovery runs continuously whether or not the RTL-TCP source
+/// is currently selected. That's fine — discovery is cheap and having
+/// the list pre-populated when the user switches to RTL-TCP makes the
+/// UX immediate instead of "wait 5 s for the first advertisement."
+fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    /// Grace window after which a server that has stopped
+    /// re-announcing gets pruned from the UI list. A healthy mDNS
+    /// responder re-announces well before its TTL (default 120 s on
+    /// most daemons) expires; 3 minutes without a refresh means the
+    /// responder is either dead or network-partitioned.
+    ///
+    /// Defense-in-depth: mdns-sd's daemon SHOULD fire
+    /// `ServiceRemoved` on TTL expiry, but a crashed server that
+    /// vanishes without a goodbye may leave the cache entry around
+    /// longer than the client wants. Expiring client-side keeps the
+    /// Connect button from offering a dead endpoint.
+    const STALE_ROW_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
+
+    /// Poll cadence for the mDNS discovery event channel. 200 ms is
+    /// fast enough that newly-announced servers appear "instantly" to
+    /// the user and cheap enough to be always-on even when RTL-TCP is
+    /// not the selected source type.
+    const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// Subtitle shown on the discovered-servers expander when mDNS
+    /// discovery is non-functional (either `Browser::start` failed or
+    /// the browser thread exited at runtime). Distinguishes "nothing
+    /// to see yet" from "we gave up listening" — without this the UI
+    /// would lie by showing the idle "No servers discovered…" state.
+    const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
+
+    let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
+    let browser = match Browser::start(move |event| {
+        // Ignore send errors — means the UI thread dropped the rx,
+        // which only happens on shutdown.
+        let _ = disc_tx.send(event);
+    }) {
+        Ok(b) => b,
+        Err(e) => {
+            // Surface the failure in the UI and return early. Without
+            // the early return the timeout below would still spawn,
+            // and because `disc_tx` was moved into the failed
+            // `Browser::start` call its drop has already disconnected
+            // `disc_rx` — the poller would spin forever returning
+            // `TryRecvError::Disconnected` while the UI kept showing
+            // the benign idle "No servers discovered…" subtitle.
+            tracing::warn!(%e, "mDNS browser failed to start — discovery disabled");
+            panels
+                .source
+                .rtl_tcp_discovered_row
+                .set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
+            return;
+        }
+    };
+
+    // Tracks the `AdwActionRow` per-server so we can remove it on
+    // `ServerWithdrawn` OR when the row goes stale past
+    // `STALE_ROW_GRACE`. Keyed by full DNS-SD instance name (stable
+    // across nickname changes). Value carries the row widget + the
+    // last `DiscoveredServer` payload seen for that instance —
+    // `server.last_seen` drives both staleness pruning and the
+    // per-tick freshness indicator rendered in the row subtitle.
+    let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, DiscoveredServer)>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
+    // Weak ref on the expander so the timeout closure doesn't keep
+    // the window alive after close — upgrade() returns None on a
+    // destroyed widget and the poller breaks out.
+    let expander_weak = panels.source.rtl_tcp_discovered_row.downgrade();
+    let hostname_row = panels.source.hostname_row.clone();
+    let port_row = panels.source.port_row.clone();
+    let protocol_row = panels.source.protocol_row.clone();
+    let device_row = panels.source.device_row.clone();
+    let state = Rc::clone(state);
+
+    // Poll the discovery channel from the main thread. Cheap enough
+    // to be always-on; discovery events are bursty at start and then
+    // idle.
+    let _ = glib::timeout_add_local(DISCOVERY_POLL_INTERVAL, move || {
+        // Keep the Browser alive as long as the timeout closure is
+        // attached.
+        let _keep_browser = &browser;
+        // If the window / expander has been destroyed, stop polling
+        // and let the browser + closure captures drop. Prevents leaked
+        // pollers after a hypothetical close-and-reopen of the main
+        // window.
+        let Some(expander) = expander_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        // Prune stale rows before processing incoming events. A
+        // responder that crashed or network-partitioned won't send
+        // ServerWithdrawn, so without this pass the Connect button
+        // for a dead server keeps showing until mDNS cache TTL fires
+        // (if it fires at all). 3-minute grace is long enough that
+        // a healthy responder's re-announce keeps its row alive.
+        {
+            let mut rows = displayed_rows.borrow_mut();
+            let now = Instant::now();
+            let stale_names: Vec<String> = rows
+                .iter()
+                .filter(|(_, (_, server))| {
+                    now.saturating_duration_since(server.last_seen) > STALE_ROW_GRACE
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in stale_names {
+                if let Some((row, _)) = rows.remove(&name) {
+                    tracing::debug!(instance = %name, "pruning stale rtl_tcp discovery row");
+                    expander.remove(&row);
+                }
+            }
+            // Refresh each surviving row's subtitle with a fresh
+            // "seen N ago" stamp. Without this per-tick refresh the
+            // age text would freeze at whatever it said when the row
+            // was built (or last re-announced) and silently mislead
+            // the user about how recent a server is. GTK short-
+            // circuits the set_subtitle call when the string is
+            // unchanged, so this is nearly free on quiescent rows.
+            for (row, server) in rows.values() {
+                let elapsed = now.saturating_duration_since(server.last_seen);
+                row.set_subtitle(&format_discovery_subtitle(server, elapsed));
+            }
+            if rows.is_empty() {
+                expander.set_subtitle("No servers discovered on the local network yet.");
+            } else {
+                expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+            }
+        }
+
+        loop {
+            let event = match disc_rx.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Browser thread exited — `disc_tx` dropped. Stop
+                    // polling and surface the degraded state; without
+                    // the Break this timeout would spin forever and
+                    // the UI would keep claiming "No servers
+                    // discovered yet" when we've in fact given up.
+                    tracing::warn!(
+                        "mDNS discovery channel disconnected — stopping discovery poller"
+                    );
+                    expander.set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
+                    return glib::ControlFlow::Break;
+                }
+            };
+            match event {
+                DiscoveryEvent::ServerAnnounced(server) => {
+                    let mut rows = displayed_rows.borrow_mut();
+                    let title = if server.txt.nickname.is_empty() {
+                        server.instance_name.clone()
+                    } else {
+                        server.txt.nickname.clone()
+                    };
+                    let host = server
+                        .addresses
+                        .first()
+                        .map_or_else(|| server.hostname.clone(), ToString::to_string);
+                    // Age is effectively 0 here — `server.last_seen` was
+                    // stamped by the browser thread a few ms ago —
+                    // `format_age` will render "just now". Subsequent
+                    // poll ticks refresh this with the actual age.
+                    let elapsed = Instant::now().saturating_duration_since(server.last_seen);
+                    let subtitle = format_discovery_subtitle(&server, elapsed);
+
+                    // Re-announce for a known instance_name: remove the
+                    // old row and fall through to build a fresh one.
+                    // Rebuilding captures the current (host, port) in
+                    // the new Connect closure; otherwise the stale
+                    // values from first-announce would stick. See the
+                    // displayed_rows docstring above.
+                    if let Some((existing_row, _)) = rows.remove(&server.instance_name) {
+                        expander.remove(&existing_row);
+                    }
+
+                    let row = adw::ActionRow::builder()
+                        .title(&title)
+                        .subtitle(&subtitle)
+                        .build();
+                    let connect_btn = gtk4::Button::with_label("Connect");
+                    connect_btn.add_css_class("suggested-action");
+                    connect_btn.set_valign(gtk4::Align::Center);
+
+                    let click_host = host.clone();
+                    let click_port = server.port;
+                    let hr = hostname_row.clone();
+                    let pr = port_row.clone();
+                    let protor = protocol_row.clone();
+                    let dr = device_row.clone();
+                    let st = Rc::clone(&state);
+                    connect_btn.connect_clicked(move |_| {
+                        // Remember whether the device row was already
+                        // on RTL-TCP. If it WAS, `set_selected` below
+                        // is a no-op and the `device_row` notify
+                        // handler doesn't fire, so we need to send
+                        // SetSourceType ourselves to force the
+                        // controller to reopen the source against the
+                        // new endpoint. If it WASN'T, the notify
+                        // handler will dispatch SetSourceType for us
+                        // and an explicit send would double-open.
+                        let already_rtl_tcp = dr.selected() == DEVICE_RTLTCP;
+                        hr.set_text(&click_host);
+                        pr.set_value(f64::from(click_port));
+                        // Force the shared protocol row to TCP. rtl_tcp
+                        // is always TCP, and the hostname_row /
+                        // port_row edit handlers re-read this widget
+                        // when dispatching SetNetworkConfig — leaving
+                        // it on UDP (the previous Network-source
+                        // selection) would silently overwrite our
+                        // protocol on the next hostname edit.
+                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
+                        dr.set_selected(DEVICE_RTLTCP);
+                        st.send_dsp(UiToDsp::SetNetworkConfig {
+                            hostname: click_host.clone(),
+                            port: click_port,
+                            protocol: sdr_types::Protocol::TcpClient,
+                        });
+                        if already_rtl_tcp {
+                            // device_row notify handler did NOT fire
+                            // (we were already on RTL-TCP); force the
+                            // source reopen so the new endpoint takes.
+                            st.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
+                        }
+                    });
+                    row.add_suffix(&connect_btn);
+                    expander.add_row(&row);
+                    rows.insert(server.instance_name.clone(), (row, server));
+
+                    expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+                }
+                DiscoveryEvent::ServerWithdrawn { instance_name } => {
+                    let mut rows = displayed_rows.borrow_mut();
+                    if let Some((row, _)) = rows.remove(&instance_name) {
+                        expander.remove(&row);
+                    }
+                    if rows.is_empty() {
+                        expander.set_subtitle("No servers discovered on the local network yet.");
+                    } else {
+                        expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+                    }
+                }
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Format the subtitle string for a discovered `rtl_tcp` server row.
+///
+/// Emits three pieces separated by ` • `:
+///
+/// 1. `{connect_target}:{port}` — the address the Connect button will
+///    dial (IPv4 address if we have one, otherwise the advertised
+///    hostname).
+/// 2. advertised mDNS hostname — only when it's non-empty AND
+///    genuinely different from the connect target (i.e., we have an
+///    IP and want to show the friendly name alongside it). The
+///    hostname is stripped of any trailing `.local.` so we show
+///    `shack-pi` instead of `shack-pi.local.`.
+/// 3. `{tuner} · {gains} gains · seen {age}` — hardware info plus
+///    the freshness indicator from `format_age`.
+///
+/// Kept as a free function (not a method on `DiscoveredServer`) so the
+/// age-stamp convention stays a UI concern and the discovery crate
+/// doesn't need to think about human-readable timestamps.
+fn format_discovery_subtitle(server: &DiscoveredServer, elapsed: Duration) -> String {
+    let connect_target = server
+        .addresses
+        .first()
+        .map_or_else(|| server.hostname.clone(), ToString::to_string);
+    let bare_hostname = bare_local_host(&server.hostname);
+    // Compare `bare_hostname` against a similarly-trimmed view of the
+    // connect target so the no-IP fallback (target = hostname) doesn't
+    // render "shack-pi.local.:1234 • shack-pi • …" — one name twice.
+    let bare_connect_target = bare_local_host(&connect_target);
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    parts.push(format!("{connect_target}:{}", server.port));
+    if !bare_hostname.is_empty() && bare_hostname != bare_connect_target {
+        parts.push(bare_hostname.to_string());
+    }
+    parts.push(format!(
+        "{} · {} gains · seen {}",
+        server.txt.tuner,
+        server.txt.gains,
+        format_age(elapsed)
+    ));
+    parts.join(" • ")
+}
+
+/// Strip a trailing `.local.` / `.local` / `.` suffix from an mDNS
+/// hostname so the user sees `shack-pi` instead of `shack-pi.local.`.
+/// Purely presentational — resolution still happens against the full
+/// name in the Connect button's dial path.
+fn bare_local_host(host: &str) -> &str {
+    host.trim_end_matches('.')
+        .trim_end_matches(".local")
+        .trim_end_matches('.')
+}
+
+/// Render an elapsed duration as a short human-readable age string.
+///
+/// Buckets:
+/// - under 5 s → `"just now"` (avoids flicker on the 200 ms poll tick)
+/// - 5 s – 60 s → `"Ns ago"`
+/// - 1 m – 60 m → `"Nm ago"`
+/// - 60 m and up → `"Nh ago"`
+///
+/// Coarse by design — the point is to tell "freshly re-announced" from
+/// "cached and possibly dead", not to replace an NTP timestamp.
+fn format_age(elapsed: Duration) -> String {
+    const FRESH_THRESHOLD: Duration = Duration::from_secs(5);
+    let secs = elapsed.as_secs();
+    if elapsed < FRESH_THRESHOLD {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "GTK signal-wiring panel; splitting would fragment the control mapping"
+)]
 fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Sample rate selector
     let state_sr = Rc::clone(state);
@@ -937,9 +1280,10 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .device_row
         .connect_selected_notify(move |row| {
             let source_type = match row.selected() {
-                0 => SourceType::RtlSdr,
-                1 => SourceType::Network,
-                2 => SourceType::File,
+                DEVICE_RTLSDR => SourceType::RtlSdr,
+                DEVICE_NETWORK => SourceType::Network,
+                DEVICE_FILE => SourceType::File,
+                DEVICE_RTLTCP => SourceType::RtlTcp,
                 _ => return, // ignore transient indices
             };
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));
@@ -953,7 +1297,7 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         let hostname = row.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = port_for_host.value() as u16;
-        let protocol = if proto_for_host.selected() == 1 {
+        let protocol = if proto_for_host.selected() == NETWORK_PROTOCOL_UDP_IDX {
             sdr_types::Protocol::Udp
         } else {
             sdr_types::Protocol::TcpClient
@@ -973,7 +1317,7 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         let hostname = host_for_port.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = row.value() as u16;
-        let protocol = if proto_for_port.selected() == 1 {
+        let protocol = if proto_for_port.selected() == NETWORK_PROTOCOL_UDP_IDX {
             sdr_types::Protocol::Udp
         } else {
             sdr_types::Protocol::TcpClient
@@ -997,8 +1341,8 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let port = port_for_proto.value() as u16;
             let protocol = match row.selected() {
-                0 => sdr_types::Protocol::TcpClient,
-                1 => sdr_types::Protocol::Udp,
+                NETWORK_PROTOCOL_TCPCLIENT_IDX => sdr_types::Protocol::TcpClient,
+                NETWORK_PROTOCOL_UDP_IDX => sdr_types::Protocol::Udp,
                 _ => return, // ignore transient indices
             };
             state_proto.send_dsp(UiToDsp::SetNetworkConfig {
@@ -2627,4 +2971,117 @@ fn recording_path(prefix: &str) -> std::path::PathBuf {
         .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
         .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
     base.join(format!("{prefix}-{timestamp}.wav"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod rtl_tcp_discovery_format_tests {
+    use std::net::IpAddr;
+    use std::time::{Duration, Instant};
+
+    use sdr_rtltcp_discovery::{DiscoveredServer, TxtRecord};
+
+    use super::{format_age, format_discovery_subtitle};
+
+    fn sample_server(addresses: Vec<IpAddr>, hostname: &str) -> DiscoveredServer {
+        DiscoveredServer {
+            instance_name: "shack-pi weather._rtl_tcp._tcp.local.".into(),
+            hostname: hostname.into(),
+            port: 1234,
+            addresses,
+            txt: TxtRecord {
+                tuner: "R820T".into(),
+                version: "0.1.0".into(),
+                gains: 29,
+                nickname: "weather".into(),
+                txbuf: None,
+            },
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn format_age_buckets_seconds_minutes_hours() {
+        // < 5 s bucket → "just now" (debounces the 200 ms refresh
+        // from showing "0s ago / 1s ago" noise).
+        assert_eq!(format_age(Duration::from_millis(0)), "just now");
+        assert_eq!(format_age(Duration::from_secs(4)), "just now");
+        // 5 s – 59 s → "Ns ago"
+        assert_eq!(format_age(Duration::from_secs(5)), "5s ago");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s ago");
+        // 1 m – 59 m → "Nm ago"
+        assert_eq!(format_age(Duration::from_mins(1)), "1m ago");
+        assert_eq!(format_age(Duration::from_secs(125)), "2m ago");
+        assert_eq!(format_age(Duration::from_secs(3599)), "59m ago");
+        // 1 h+ → "Nh ago"
+        assert_eq!(format_age(Duration::from_hours(1)), "1h ago");
+        assert_eq!(format_age(Duration::from_hours(2)), "2h ago");
+    }
+
+    #[test]
+    fn subtitle_with_ip_shows_hostname_and_freshness() {
+        // When we have a resolved IP, the subtitle includes both the
+        // IP (the Connect button's target) AND the advertised
+        // hostname (the friendly name the user recognises).
+        let ip: IpAddr = "192.168.1.5".parse().unwrap();
+        let server = sample_server(vec![ip], "shack-pi.local.");
+        let subtitle = format_discovery_subtitle(&server, Duration::from_secs(12));
+        assert!(
+            subtitle.contains("192.168.1.5:1234"),
+            "subtitle missing connect target: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("shack-pi"),
+            "subtitle missing advertised hostname: {subtitle}"
+        );
+        assert!(
+            !subtitle.contains(".local"),
+            "subtitle should strip .local suffix: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("R820T"),
+            "subtitle missing tuner: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("29 gains"),
+            "subtitle missing gain count: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("seen 12s ago"),
+            "subtitle missing freshness: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn subtitle_without_ip_omits_duplicate_hostname_segment() {
+        // No resolved addresses: connect target falls back to the
+        // hostname itself. Showing it twice (once as target, once as
+        // hostname segment) would be noise, so the hostname segment
+        // is suppressed when it would duplicate the target.
+        let server = sample_server(vec![], "shack-pi.local.");
+        let subtitle = format_discovery_subtitle(&server, Duration::from_secs(1));
+        assert!(
+            subtitle.starts_with("shack-pi.local.:1234"),
+            "subtitle should use hostname as target: {subtitle}"
+        );
+        // Exactly two ` • ` separators: target + hardware/freshness.
+        assert_eq!(
+            subtitle.matches(" • ").count(),
+            1,
+            "expected one bullet separator when hostname segment is suppressed: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn subtitle_fresh_announce_reads_just_now() {
+        // On the initial announce, elapsed is effectively 0 — the
+        // subtitle should say "just now" rather than "0s ago".
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let server = sample_server(vec![ip], "radio.local.");
+        let subtitle = format_discovery_subtitle(&server, Duration::from_millis(50));
+        assert!(
+            subtitle.ends_with("seen just now"),
+            "subtitle should read 'seen just now' for sub-5s age: {subtitle}"
+        );
+    }
 }

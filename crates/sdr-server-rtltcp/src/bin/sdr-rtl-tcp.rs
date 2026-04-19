@@ -40,6 +40,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use sdr_rtltcp_discovery::{AdvertiseOptions, Advertiser, TxtRecord, local_hostname};
 use sdr_server_rtltcp::server::{DEFAULT_SAMPLE_RATE_HZ, Server, ServerConfig};
 use sdr_server_rtltcp::{DEFAULT_BUFFER_CAPACITY, DEFAULT_PORT};
 
@@ -101,6 +102,14 @@ fn usage(exit_code: i32) -> ! {
         out,
         "    -D           Enable direct sampling (mode 2, Q branch)"
     );
+    let _ = writeln!(
+        out,
+        "    -N <name>    mDNS nickname for this server (defaults to hostname)"
+    );
+    let _ = writeln!(
+        out,
+        "    --no-announce  Skip mDNS advertisement (default: advertise)"
+    );
     let _ = writeln!(out, "    -h, --help   Show this help");
     std::process::exit(exit_code);
 }
@@ -119,13 +128,31 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         usage(0);
     }
-    let Ok(config) = parse_args(&args) else {
+    let Ok(parsed) = parse_args(&args) else {
         usage(1);
     };
+    let (config, discovery) = parsed;
 
     match Server::start(config) {
         Ok(server) => {
             tracing::info!(bind = %server.bind_address(), "rtl_tcp server running");
+
+            // Advertise via mDNS if the user didn't opt out. Keep the
+            // Advertiser alive for the rest of main's scope so its
+            // Drop-based unregister fires on normal shutdown.
+            let _advertiser = if discovery.announce {
+                match announce_over_mdns(&server, &discovery) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        tracing::warn!(%e, "mDNS advertise failed — server is running but won't be auto-discovered");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("mDNS advertise disabled (--no-announce)");
+                None
+            };
+
             // Install the signal handler BEFORE entering the sleep loop.
             // The loop has no alternate shutdown path, so a failed install
             // leaves the process unkillable without SIGKILL — fatal, not
@@ -207,10 +234,32 @@ fn ctrlc_handler() -> std::io::Result<()> {
 #[derive(Debug)]
 struct ParseError;
 
-fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<ServerConfig, ParseError> {
+/// CLI-only mDNS settings. Lives alongside `ServerConfig` in the parsed
+/// result because the server crate deliberately doesn't know about
+/// discovery (different dep tree).
+#[derive(Debug, Clone)]
+struct DiscoveryOptions {
+    /// `--no-announce` flips this off. Default: advertise.
+    announce: bool,
+    /// `-N <name>` override. None → derive from system hostname at
+    /// advertise time.
+    nickname: Option<String>,
+}
+
+impl Default for DiscoveryOptions {
+    fn default() -> Self {
+        Self {
+            announce: true,
+            nickname: None,
+        }
+    }
+}
+
+fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<(ServerConfig, DiscoveryOptions), ParseError> {
     // `default_loopback()` seeds `initial` via `InitialDeviceState::default()`,
     // which already uses `DEFAULT_SAMPLE_RATE_HZ`. No need to re-assign here.
     let mut config = ServerConfig::default_loopback();
+    let mut discovery = DiscoveryOptions::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -296,11 +345,51 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<ServerConfig, ParseError> {
                 config.initial.direct_sampling = DIRECT_SAMPLING_Q_BRANCH;
                 i += 1;
             }
+            "-N" => {
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
+                discovery.nickname = Some(v.to_string());
+                i += 2;
+            }
+            "--no-announce" => {
+                discovery.announce = false;
+                i += 1;
+            }
             _ => return Err(ParseError),
         }
     }
 
-    Ok(config)
+    Ok((config, discovery))
+}
+
+/// Register the running server in mDNS so clients can discover it
+/// without manual host:port entry. Builds the instance name from the
+/// user-provided nickname (falling back to "sdr-rtl-tcp") and pulls
+/// tuner metadata from `Server::tuner_info()`.
+fn announce_over_mdns(
+    server: &Server,
+    discovery: &DiscoveryOptions,
+) -> Result<Advertiser, sdr_rtltcp_discovery::DiscoveryError> {
+    let tuner = server.tuner_info();
+    // Fallback nickname: system hostname via libc::gethostname.
+    // Previously this was hardcoded to "sdr-rtl-tcp" — which meant
+    // two stock servers on the same LAN would show up as the same
+    // label in the discovery list (and could collide on the DNS-SD
+    // instance name). Matches the help text's "defaults to hostname"
+    // promise.
+    let nickname = discovery.nickname.clone().unwrap_or_else(local_hostname);
+    let txt = TxtRecord {
+        tuner: tuner.name.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        gains: tuner.gain_count,
+        nickname: nickname.clone(),
+        txbuf: None,
+    };
+    Advertiser::announce(AdvertiseOptions {
+        port: server.bind_address().port(),
+        instance_name: format!("{nickname} rtl-sdr"),
+        hostname: String::new(), // auto-derive in the advertiser
+        txt,
+    })
 }
 
 /// Port of upstream `atofs()` — accepts `k` / `M` / `G` suffix multipliers.
@@ -362,7 +451,7 @@ mod tests {
 
     #[test]
     fn parse_defaults_are_loopback_and_upstream_port() {
-        let cfg = parse_args::<&str>(&[]).unwrap();
+        let (cfg, _disc) = parse_args::<&str>(&[]).unwrap();
         assert_eq!(cfg.bind.ip().to_string(), "127.0.0.1");
         assert_eq!(cfg.bind.port(), DEFAULT_PORT);
     }
@@ -370,21 +459,21 @@ mod tests {
     #[test]
     fn parse_auto_gain_is_none() {
         let args = vec!["-g".to_string(), "0".to_string()];
-        let cfg = parse_args(&args).unwrap();
+        let (cfg, _disc) = parse_args(&args).unwrap();
         assert!(cfg.initial.gain_tenths_db.is_none());
     }
 
     #[test]
     fn parse_manual_gain_rounds_to_tenths() {
         let args = vec!["-g".to_string(), "28.2".to_string()];
-        let cfg = parse_args(&args).unwrap();
+        let (cfg, _disc) = parse_args(&args).unwrap();
         assert_eq!(cfg.initial.gain_tenths_db, Some(282));
     }
 
     #[test]
     fn parse_direct_sampling_hardcodes_mode_2() {
         let args = vec!["-D".to_string()];
-        let cfg = parse_args(&args).unwrap();
+        let (cfg, _disc) = parse_args(&args).unwrap();
         assert_eq!(cfg.initial.direct_sampling, 2);
     }
 
@@ -446,7 +535,7 @@ mod tests {
             ("-5", Some(-50)),
         ] {
             let args = vec!["-g".to_string(), v.to_string()];
-            let cfg = parse_args(&args).unwrap();
+            let (cfg, _disc) = parse_args(&args).unwrap();
             assert_eq!(cfg.initial.gain_tenths_db, want, "gain {v}");
         }
     }
@@ -537,7 +626,7 @@ mod tests {
         .iter()
         .map(ToString::to_string)
         .collect();
-        let cfg = parse_args(&args).unwrap();
+        let (cfg, _disc) = parse_args(&args).unwrap();
         assert_eq!(cfg.bind.ip().to_string(), "10.0.0.5");
         assert_eq!(cfg.bind.port(), 12_345);
         assert_eq!(cfg.initial.center_freq_hz, 433_920_000);
@@ -551,9 +640,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_discovery_defaults_on() {
+        let (_cfg, disc) = parse_args::<&str>(&[]).unwrap();
+        assert!(disc.announce, "mDNS advertise should default to on");
+        assert!(disc.nickname.is_none());
+    }
+
+    #[test]
+    fn parse_no_announce_flag_disables_mdns() {
+        let args = vec!["--no-announce".to_string()];
+        let (_cfg, disc) = parse_args(&args).unwrap();
+        assert!(!disc.announce);
+    }
+
+    #[test]
+    fn parse_nickname_flag_captures_name() {
+        let args = vec!["-N".to_string(), "attic-pi".to_string()];
+        let (_cfg, disc) = parse_args(&args).unwrap();
+        assert_eq!(disc.nickname.as_deref(), Some("attic-pi"));
+    }
+
+    #[test]
     fn parse_bind_override() {
         let args = vec!["-a".to_string(), "0.0.0.0".to_string()];
-        let cfg = parse_args(&args).unwrap();
+        let (cfg, _disc) = parse_args(&args).unwrap();
         assert_eq!(cfg.bind.ip().to_string(), "0.0.0.0");
     }
 }

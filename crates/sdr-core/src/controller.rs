@@ -892,6 +892,16 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
             state.network_protocol,
         )),
         SourceType::File => Box::new(sdr_source_file::FileSource::new(&state.file_path)),
+        // rtl_tcp client: connects to a remote `rtl_tcp`-compatible
+        // server, handshakes the 12-byte RTL0 header, and routes
+        // future tune / gain / PPM messages through the 5-byte
+        // command channel. Reuses the `network_host` + `network_port`
+        // config fields since the connection shape is the same (no
+        // separate RtlTcpConfig state field needed).
+        SourceType::RtlTcp => Box::new(sdr_source_network::RtlTcpSource::new(
+            &state.network_host,
+            state.network_port,
+        )),
     };
 
     if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {
@@ -902,7 +912,10 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
         }
     }
 
-    if state.source_type == SourceType::RtlSdr {
+    // Tune is a meaningful operation for both the local RTL-SDR and
+    // any remote (RtlTcp) — both need the initial center frequency.
+    // Network raw-IQ and File sources ignore it.
+    if matches!(state.source_type, SourceType::RtlSdr | SourceType::RtlTcp) {
         source.tune(state.center_freq).map_err(|e| e.to_string())?;
     }
 

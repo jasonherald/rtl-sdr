@@ -1065,6 +1065,24 @@ impl Source for RtlTcpSource {
         rx.drain(..take_bytes);
         Ok(take_pairs)
     }
+
+    /// Route the workspace-wide "set gain" message to the remote dongle
+    /// via the typed setter. Implementing these Source-trait hooks
+    /// means the existing UI controls (which dispatch
+    /// `UiToDsp::SetGain` / `SetAgc` / `SetPpmCorrection` to the
+    /// active `Source`) "just work" when the active source is an
+    /// rtl_tcp client — no source-type branching in the controller.
+    fn set_gain(&mut self, gain_tenths: i32) -> Result<(), SourceError> {
+        self.set_tuner_gain_tenths_db(gain_tenths)
+    }
+
+    fn set_gain_mode(&mut self, manual: bool) -> Result<(), SourceError> {
+        self.set_gain_mode_manual(manual)
+    }
+
+    fn set_ppm_correction(&mut self, ppm: i32) -> Result<(), SourceError> {
+        self.set_freq_correction_ppm(ppm)
+    }
 }
 
 #[cfg(test)]
