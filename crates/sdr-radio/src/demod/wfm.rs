@@ -74,9 +74,15 @@ pub struct WfmDemodulator {
     /// via a shared-gain pass so stereo imaging is preserved
     /// (independent per-channel AGCs would drift L vs R).
     audio_agc: Agc,
-    /// Scratch buffer for the post-LPF / post-stereo-decoder
-    /// mono signal that drives the AGC envelope. For stereo, the
-    /// AGC runs on `(L + R) / 2` so stereo imaging is preserved.
+    /// Scratch buffer for the mono signal that drives the AGC
+    /// envelope. For the mono path this is the post-LPF output;
+    /// for the stereo path it's the per-sample RMS energy
+    /// estimate `sqrt((L² + R²) / 2)` computed from the stereo-
+    /// decoder output. The RMS form (vs. the naive `(L + R) / 2`)
+    /// avoids anti-phase cancellation and the 3 dB under-count on
+    /// mono-in-one-channel content — see the stereo branch in
+    /// `process` and the `SquelchAudioEnvelope` / #332 notes for
+    /// the full reasoning.
     agc_mono_buf: Vec<f32>,
     config: DemodConfig,
     mono_buf: Vec<f32>,
@@ -330,8 +336,11 @@ mod tests {
     #[test]
     fn test_wfm_stereo_audio_agc_preserves_imaging() {
         // In stereo mode, shared-gain AGC applies the same gain
-        // to both channels (envelope driven by the L+R mono sum).
-        // If L is louder than R in the input, that relationship
+        // to both channels (envelope driven by the per-sample
+        // RMS energy `sqrt((L² + R²) / 2)` so anti-phase and
+        // mono-in-one-channel content both drive the AGC
+        // correctly). If L is louder than R in the input, that
+        // relationship
         // should survive AGC — not be flattened by independent
         // per-channel normalization.
         let mut demod = WfmDemodulator::new().unwrap();

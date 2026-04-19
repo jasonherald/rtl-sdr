@@ -162,12 +162,19 @@ impl SquelchAudioEnvelope {
     /// Both L and R receive the same per-sample gain so stereo
     /// imaging is preserved across the transition.
     pub fn process_stereo(&mut self, buf: &mut [sdr_types::Stereo]) {
+        // `target` is stable for the call, and the rising /
+        // falling direction depends on `target > envelope_gain`.
+        // Within one call `envelope_gain` only crosses the target
+        // asymptotically (IIR, never overshoots by construction)
+        // so the direction — and therefore the coefficient — is
+        // constant for the whole buffer. Hoisting the branch out
+        // of the hot loop removes a per-sample compare.
+        let coeff = if self.target > self.envelope_gain {
+            self.attack_coeff
+        } else {
+            self.release_coeff
+        };
         for s in buf.iter_mut() {
-            let coeff = if self.target > self.envelope_gain {
-                self.attack_coeff
-            } else {
-                self.release_coeff
-            };
             self.envelope_gain += (self.target - self.envelope_gain) * coeff;
             s.l *= self.envelope_gain;
             s.r *= self.envelope_gain;
