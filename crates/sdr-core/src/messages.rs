@@ -2,7 +2,7 @@
 
 use sdr_dsp::voice_squelch::VoiceSquelchMode;
 use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
-use sdr_types::DemodMode;
+use sdr_types::{DemodMode, RtlTcpConnectionState};
 
 /// Messages sent from the DSP pipeline thread to the UI main loop.
 #[derive(Debug)]
@@ -51,6 +51,16 @@ pub enum DspToUi {
     /// mode-entry that the controller handles by resetting the
     /// tracker).
     VoiceSquelchOpenChanged(bool),
+    /// Connection-lifecycle state for the currently active
+    /// `rtl_tcp` client source. Emitted only on **edge** — when
+    /// the projected `RtlTcpConnectionState` differs from the
+    /// previous snapshot — so the UI can subscribe without
+    /// flooding the channel at the poll cadence. Controller also
+    /// emits `Disconnected` when the active source type is not
+    /// `RtlTcp`, so the UI status row can rely on receiving that
+    /// value to reset on source-type changes without needing a
+    /// separate "hide the row" signal.
+    RtlTcpConnectionState(RtlTcpConnectionState),
 }
 
 /// Available source types for IQ input.
@@ -164,6 +174,18 @@ pub enum UiToDsp {
     EnableTranscription(std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>),
     /// Stop sending audio to the transcription engine.
     DisableTranscription,
+    /// Stop the `rtl_tcp` client connection without changing the
+    /// selected source type. Sends `source.stop()` so the manager
+    /// thread tears down and the connection state transitions to
+    /// `Disconnected`. User can reconnect via the Play button or
+    /// `RetryRtlTcpNow`.
+    DisconnectRtlTcp,
+    /// Force an immediate reconnect of the active `rtl_tcp` client
+    /// by stopping and restarting the source. Useful when the
+    /// server just came back online and the user doesn't want to
+    /// wait for the current exponential-backoff delay to expire.
+    /// No-op when the active source is not `RtlTcp`.
+    RetryRtlTcpNow,
 }
 
 #[cfg(test)]

@@ -349,6 +349,14 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let radio_panel_for_dsp = panels.radio.clone();
+    // Just the three widgets the rtl_tcp status renderer touches —
+    // cloning the whole SourcePanel would be a lot of refcount
+    // traffic for one signal handler. Weak refs, upgraded per
+    // message, keep the closure from keeping widgets alive past
+    // window close (same pattern as `ServerStatusWidgetsWeak`).
+    let rtl_tcp_status_row_weak = panels.source.rtl_tcp_status_row.downgrade();
+    let rtl_tcp_disconnect_button_weak = panels.source.rtl_tcp_disconnect_button.downgrade();
+    let rtl_tcp_retry_button_weak = panels.source.rtl_tcp_retry_button.downgrade();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
     #[cfg(feature = "sherpa")]
     let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
@@ -402,6 +410,9 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
                         &radio_panel_for_dsp,
+                        &rtl_tcp_status_row_weak,
+                        &rtl_tcp_disconnect_button_weak,
+                        &rtl_tcp_retry_button_weak,
                         &transcription_enable_for_dsp,
                         #[cfg(feature = "sherpa")]
                         &auto_break_row_for_dsp,
@@ -441,6 +452,9 @@ fn handle_dsp_message(
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
     radio_panel: &sidebar::radio_panel::RadioPanel,
+    rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
+    rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
+    rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
     transcription_enable_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_min_open_row: &adw::SpinRow,
@@ -593,7 +607,49 @@ fn handle_dsp_message(
             tracing::debug!(open, "voice squelch gate edge");
             radio_panel.set_voice_squelch_open(open);
         }
+        DspToUi::RtlTcpConnectionState(conn_state) => {
+            tracing::debug!(?conn_state, "rtl_tcp connection state");
+            // Upgrade all three weak refs atomically; any missing
+            // widget means the window's gone, so we drop the event
+            // rather than render a ghost status row.
+            if let (Some(status_row), Some(disconnect), Some(retry)) = (
+                rtl_tcp_status_row_weak.upgrade(),
+                rtl_tcp_disconnect_button_weak.upgrade(),
+                rtl_tcp_retry_button_weak.upgrade(),
+            ) {
+                apply_rtl_tcp_connection_state(&status_row, &disconnect, &retry, &conn_state);
+            }
+        }
     }
+}
+
+/// Render a `RtlTcpConnectionState` into the status row + button
+/// sensitivities. Pulled out of the renderer so the message
+/// handler can call it with individual weak-upgraded widgets
+/// instead of holding a whole `SourcePanel` clone across the
+/// signal-handler boundary.
+fn apply_rtl_tcp_connection_state(
+    status_row: &adw::ActionRow,
+    disconnect_button: &gtk4::Button,
+    retry_button: &gtk4::Button,
+    state: &sdr_types::RtlTcpConnectionState,
+) {
+    use sdr_types::RtlTcpConnectionState;
+    status_row.set_subtitle(&sidebar::source_panel::format_rtl_tcp_state(state));
+    let is_active = matches!(
+        state,
+        RtlTcpConnectionState::Connecting
+            | RtlTcpConnectionState::Connected { .. }
+            | RtlTcpConnectionState::Retrying { .. }
+    );
+    let is_between_attempts = matches!(
+        state,
+        RtlTcpConnectionState::Disconnected
+            | RtlTcpConnectionState::Retrying { .. }
+            | RtlTcpConnectionState::Failed { .. }
+    );
+    disconnect_button.set_sensitive(is_active);
+    retry_button.set_sensitive(is_between_attempts);
 }
 
 /// Build the `AdwOverlaySplitView` with sidebar configuration panels, content,
@@ -2172,6 +2228,27 @@ fn connect_source_panel(
         #[allow(clippy::cast_possible_truncation)]
         state_ppm.send_dsp(UiToDsp::SetPpmCorrection(row.value() as i32));
     });
+
+    // rtl_tcp connection controls — Disconnect + Retry now.
+    // Both route to the DSP controller which owns the active
+    // Source and performs the stop/start teardown. Buttons are
+    // sensitive-gated by the state-change handler in
+    // `handle_dsp_message`, so clicks should only ever reach here
+    // on legal transitions.
+    let state_disconnect = Rc::clone(state);
+    panels
+        .source
+        .rtl_tcp_disconnect_button
+        .connect_clicked(move |_| {
+            state_disconnect.send_dsp(UiToDsp::DisconnectRtlTcp);
+        });
+    let state_retry = Rc::clone(state);
+    panels
+        .source
+        .rtl_tcp_retry_button
+        .connect_clicked(move |_| {
+            state_retry.send_dsp(UiToDsp::RetryRtlTcpNow);
+        });
 
     // Source type selector — guard against transient out-of-range
     // indices AND enforce mutual exclusivity with the rtl_tcp server

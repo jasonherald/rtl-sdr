@@ -5,6 +5,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_types::RtlTcpConnectionState;
 
 /// Device selector index for RTL-SDR.
 pub const DEVICE_RTLSDR: u32 = 0;
@@ -14,6 +15,12 @@ pub const DEVICE_NETWORK: u32 = 1;
 pub const DEVICE_FILE: u32 = 2;
 /// Device selector index for RTL-TCP (rtl_tcp-protocol network client).
 pub const DEVICE_RTLTCP: u32 = 3;
+
+/// Default subtitle for the RTL-TCP status row before any
+/// `DspToUi::RtlTcpConnectionState` event has arrived (or after a
+/// Disconnect). Kept as a const so the empty-at-startup and
+/// empty-after-disconnect paths render identical text.
+pub const RTL_TCP_STATUS_DISCONNECTED_SUBTITLE: &str = "Disconnected";
 
 /// Network protocol selector index for TCP (client). Load-bearing:
 /// both `build_network_rows()` (protocol `StringList`) and callers in
@@ -91,6 +98,43 @@ pub struct SourcePanel {
     /// Discovered `rtl_tcp` servers (live from mDNS). Collapsed by
     /// default; expands when servers are seen.
     pub rtl_tcp_discovered_row: adw::ExpanderRow,
+
+    /// Connection status line shown only while the RTL-TCP source
+    /// type is selected. Subtitle reflects the current
+    /// `RtlTcpConnectionState` — "Connected to R820T (29 gains)",
+    /// "Retrying in 5 s (attempt 3)", "Failed: bad handshake", etc.
+    pub rtl_tcp_status_row: adw::ActionRow,
+    /// Stops the current `rtl_tcp` connection without changing
+    /// source type. Packed as a suffix on `rtl_tcp_status_row`,
+    /// sensitive only when there's something to disconnect from.
+    pub rtl_tcp_disconnect_button: gtk4::Button,
+    /// Forces a reconnect attempt immediately, skipping the
+    /// exponential-backoff sleep. Packed as a suffix on
+    /// `rtl_tcp_status_row`, sensitive only when the state
+    /// indicates we're between attempts (Retrying / Failed /
+    /// Disconnected).
+    pub rtl_tcp_retry_button: gtk4::Button,
+}
+
+/// Render a connection state into a one-line human-readable form
+/// for the status row subtitle. Free function + pure formatter so
+/// it's unit-testable without instantiating GTK widgets.
+pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
+    match state {
+        RtlTcpConnectionState::Disconnected => RTL_TCP_STATUS_DISCONNECTED_SUBTITLE.to_string(),
+        RtlTcpConnectionState::Connecting => "Connecting…".to_string(),
+        RtlTcpConnectionState::Connected {
+            tuner_name,
+            gain_count,
+        } => format!("Connected — {tuner_name} ({gain_count} gains)"),
+        RtlTcpConnectionState::Retrying { attempt, retry_in } => {
+            // Round up so "<1 s" still shows something rather than
+            // "0 s" (which would read like the retry already fired).
+            let secs = retry_in.as_secs().max(1);
+            format!("Retrying in {secs} s (attempt {attempt})")
+        }
+        RtlTcpConnectionState::Failed { reason } => format!("Failed — {reason}"),
+    }
 }
 
 /// Default sample rate selector index (2.4 MHz = index 7).
@@ -268,6 +312,10 @@ fn connect_device_visibility(
 }
 
 /// Build the source device configuration panel.
+#[allow(
+    clippy::too_many_lines,
+    reason = "widget-assembly function — splitting would scatter one-time wire-up across many helpers with no readability win"
+)]
 pub fn build_source_panel() -> SourcePanel {
     let group = adw::PreferencesGroup::builder()
         .title("Source")
@@ -301,18 +349,30 @@ pub fn build_source_panel() -> SourcePanel {
     // RTL-TCP-specific rows. Built always, shown only when the RTL-TCP
     // source type is selected (see connect_device_visibility + the
     // initial-visibility block below).
-    //
-    // Connection-state display (Connecting / Connected / Retrying /
-    // Failed) is intentionally deferred to #323 — wiring it requires
-    // a new DspToUi event from the controller that polls
-    // RtlTcpSource::connection_state(), which is outside this PR's
-    // scope. Shipping the row without that plumbing would leave it
-    // stuck on "Disconnected" misleadingly.
     let rtl_tcp_discovered_row = adw::ExpanderRow::builder()
         .title("Discovered rtl_tcp servers")
         .subtitle("No servers discovered on the local network yet.")
         .visible(false)
         .build();
+
+    // Connection-state status row — subtitle updated by the DSP
+    // bridge via `DspToUi::RtlTcpConnectionState`. Suffix buttons
+    // let the user tear down or force-retry the connection without
+    // leaving the RTL-TCP source type.
+    let rtl_tcp_status_row = adw::ActionRow::builder()
+        .title("Connection")
+        .subtitle(RTL_TCP_STATUS_DISCONNECTED_SUBTITLE)
+        .visible(false)
+        .build();
+    let rtl_tcp_disconnect_button = gtk4::Button::with_label("Disconnect");
+    rtl_tcp_disconnect_button.set_valign(gtk4::Align::Center);
+    rtl_tcp_disconnect_button.set_sensitive(false);
+    let rtl_tcp_retry_button = gtk4::Button::with_label("Retry now");
+    rtl_tcp_retry_button.set_valign(gtk4::Align::Center);
+    rtl_tcp_retry_button.add_css_class("suggested-action");
+    rtl_tcp_retry_button.set_sensitive(false);
+    rtl_tcp_status_row.add_suffix(&rtl_tcp_disconnect_button);
+    rtl_tcp_status_row.add_suffix(&rtl_tcp_retry_button);
 
     // Add all rows to the group.
     group.add(&device_row);
@@ -330,6 +390,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&decimation_row);
     group.add(&record_iq_row);
     group.add(&rtl_tcp_discovered_row);
+    group.add(&rtl_tcp_status_row);
 
     // Derive initial visibility from the selected device.
     let selected = device_row.selected();
@@ -347,6 +408,7 @@ pub fn build_source_panel() -> SourcePanel {
     protocol_row.set_visible(is_network);
     file_path_row.set_visible(is_file);
     rtl_tcp_discovered_row.set_visible(is_rtltcp);
+    rtl_tcp_status_row.set_visible(is_rtltcp);
 
     connect_device_visibility(
         &device_row,
@@ -359,7 +421,7 @@ pub fn build_source_panel() -> SourcePanel {
         &protocol_row,
         &file_path_row,
     );
-    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row);
+    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row, &rtl_tcp_status_row);
 
     // Controls connected to DSP pipeline via window.rs
 
@@ -380,6 +442,9 @@ pub fn build_source_panel() -> SourcePanel {
         decimation_row,
         record_iq_row,
         rtl_tcp_discovered_row,
+        rtl_tcp_status_row,
+        rtl_tcp_disconnect_button,
+        rtl_tcp_retry_button,
     }
 }
 
@@ -389,13 +454,17 @@ pub fn build_source_panel() -> SourcePanel {
 fn connect_rtl_tcp_visibility(
     device_row: &adw::ComboRow,
     rtl_tcp_discovered_row: &adw::ExpanderRow,
+    rtl_tcp_status_row: &adw::ActionRow,
 ) {
     device_row.connect_selected_notify(glib::clone!(
         #[weak]
         rtl_tcp_discovered_row,
+        #[weak]
+        rtl_tcp_status_row,
         move |row| {
             let is_rtltcp = row.selected() == DEVICE_RTLTCP;
             rtl_tcp_discovered_row.set_visible(is_rtltcp);
+            rtl_tcp_status_row.set_visible(is_rtltcp);
         }
     ));
 }
@@ -437,5 +506,54 @@ mod tests {
         assert_ne!(DEVICE_NETWORK, DEVICE_FILE);
         assert_ne!(DEVICE_NETWORK, DEVICE_RTLTCP);
         assert_ne!(DEVICE_FILE, DEVICE_RTLTCP);
+    }
+
+    #[test]
+    fn format_rtl_tcp_state_covers_every_variant() {
+        use std::time::Duration;
+
+        // Disconnected → empty-looking but consistent with the const.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Disconnected),
+            RTL_TCP_STATUS_DISCONNECTED_SUBTITLE
+        );
+        // Connecting → ellipsis marker (avoids the reader confusing
+        // "Connecting" with "Connected" on a cursory glance).
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Connecting),
+            "Connecting…"
+        );
+        // Connected carries tuner metadata both the user and the
+        // debugging eye can parse.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Connected {
+                tuner_name: "R820T".into(),
+                gain_count: 29,
+            }),
+            "Connected — R820T (29 gains)"
+        );
+        // Retrying rounds a sub-1-second retry_in up to "1 s" so the
+        // row never displays "Retrying in 0 s" (which would read as
+        // "the retry just fired").
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
+                attempt: 3,
+                retry_in: Duration::from_millis(250),
+            }),
+            "Retrying in 1 s (attempt 3)"
+        );
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
+                attempt: 5,
+                retry_in: Duration::from_secs(12),
+            }),
+            "Retrying in 12 s (attempt 5)"
+        );
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Failed {
+                reason: "bad handshake".into(),
+            }),
+            "Failed — bad handshake"
+        );
     }
 }
