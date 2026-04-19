@@ -893,16 +893,40 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     /// Connect button from offering a dead endpoint.
     const STALE_ROW_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
 
+    /// Poll cadence for the mDNS discovery event channel. 200 ms is
+    /// fast enough that newly-announced servers appear "instantly" to
+    /// the user and cheap enough to be always-on even when RTL-TCP is
+    /// not the selected source type.
+    const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// Subtitle shown on the discovered-servers expander when mDNS
+    /// discovery is non-functional (either `Browser::start` failed or
+    /// the browser thread exited at runtime). Distinguishes "nothing
+    /// to see yet" from "we gave up listening" — without this the UI
+    /// would lie by showing the idle "No servers discovered…" state.
+    const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
+
     let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
     let browser = match Browser::start(move |event| {
         // Ignore send errors — means the UI thread dropped the rx,
         // which only happens on shutdown.
         let _ = disc_tx.send(event);
     }) {
-        Ok(b) => Some(b),
+        Ok(b) => b,
         Err(e) => {
+            // Surface the failure in the UI and return early. Without
+            // the early return the timeout below would still spawn,
+            // and because `disc_tx` was moved into the failed
+            // `Browser::start` call its drop has already disconnected
+            // `disc_rx` — the poller would spin forever returning
+            // `TryRecvError::Disconnected` while the UI kept showing
+            // the benign idle "No servers discovered…" subtitle.
             tracing::warn!(%e, "mDNS browser failed to start — discovery disabled");
-            None
+            panels
+                .source
+                .rtl_tcp_discovered_row
+                .set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
+            return;
         }
     };
 
@@ -924,10 +948,10 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     let device_row = panels.source.device_row.clone();
     let state = Rc::clone(state);
 
-    // Poll the discovery channel from the main thread every 200 ms.
-    // Cheap enough to be always-on; discovery events are bursty at
-    // start and then idle.
-    let _ = glib::timeout_add_local(Duration::from_millis(200), move || {
+    // Poll the discovery channel from the main thread. Cheap enough
+    // to be always-on; discovery events are bursty at start and then
+    // idle.
+    let _ = glib::timeout_add_local(DISCOVERY_POLL_INTERVAL, move || {
         // Keep the Browser alive as long as the timeout closure is
         // attached.
         let _keep_browser = &browser;
@@ -965,7 +989,23 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
             }
         }
 
-        while let Ok(event) = disc_rx.try_recv() {
+        loop {
+            let event = match disc_rx.try_recv() {
+                Ok(event) => event,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Browser thread exited — `disc_tx` dropped. Stop
+                    // polling and surface the degraded state; without
+                    // the Break this timeout would spin forever and
+                    // the UI would keep claiming "No servers
+                    // discovered yet" when we've in fact given up.
+                    tracing::warn!(
+                        "mDNS discovery channel disconnected — stopping discovery poller"
+                    );
+                    expander.set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
+                    return glib::ControlFlow::Break;
+                }
+            };
             match event {
                 DiscoveryEvent::ServerAnnounced(server) => {
                     let mut rows = displayed_rows.borrow_mut();
