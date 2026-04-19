@@ -992,26 +992,26 @@ fn connect_rtl_tcp_discovery(
     const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
 
     let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
+    // `Option<Browser>` — `None` on mDNS startup failure. We still
+    // need the rest of this function to run so the *manually*-
+    // persisted `last_connected` / favorites restore can repopulate
+    // the client UI. Only the discovery poller is skipped in the
+    // `None` branch (there'd be nothing to poll, and `disc_tx` is
+    // already dropped so `disc_rx` would immediately return
+    // `TryRecvError::Disconnected` and spin forever).
     let browser = match Browser::start(move |event| {
         // Ignore send errors — means the UI thread dropped the rx,
         // which only happens on shutdown.
         let _ = disc_tx.send(event);
     }) {
-        Ok(b) => b,
+        Ok(b) => Some(b),
         Err(e) => {
-            // Surface the failure in the UI and return early. Without
-            // the early return the timeout below would still spawn,
-            // and because `disc_tx` was moved into the failed
-            // `Browser::start` call its drop has already disconnected
-            // `disc_rx` — the poller would spin forever returning
-            // `TryRecvError::Disconnected` while the UI kept showing
-            // the benign idle "No servers discovered…" subtitle.
             tracing::warn!(%e, "mDNS browser failed to start — discovery disabled");
             panels
                 .source
                 .rtl_tcp_discovered_row
                 .set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
-            return;
+            None
         }
     };
 
@@ -1074,6 +1074,15 @@ fn connect_rtl_tcp_discovery(
     // Poll the discovery channel from the main thread. Cheap enough
     // to be always-on; discovery events are bursty at start and then
     // idle.
+    //
+    // Gated on `Some(browser)` so we don't spawn a poller against a
+    // dead `disc_rx` when mDNS startup failed. The
+    // `DISCOVERY_UNAVAILABLE_SUBTITLE` set in the `Err` branch
+    // stays on the expander as the long-term idle state; the
+    // restore / favorites paths above already ran unconditionally.
+    let Some(browser) = browser else {
+        return;
+    };
     let _ = glib::timeout_add_local(DISCOVERY_POLL_INTERVAL, move || {
         // Keep the Browser alive as long as the timeout closure is
         // attached.
@@ -2381,6 +2390,12 @@ fn connect_source_panel(
             row.set_visible(is_network_path && is_high_rate);
         }
     };
+    // Seed the advisory visibility once at wire-up. Without this,
+    // the caption stays hidden until the user nudges one of the
+    // two rows — which hides it even when the restored config
+    // already has RTL-TCP + a high sample rate selected.
+    apply_source_bandwidth_advisory();
+
     let state_sr = Rc::clone(state);
     let apply_on_sr = apply_source_bandwidth_advisory.clone();
     panels

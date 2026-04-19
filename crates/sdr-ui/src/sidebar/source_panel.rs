@@ -526,6 +526,70 @@ fn connect_rtl_tcp_visibility(
     ));
 }
 
+/// Snapshot of a previously-connected `rtl_tcp` server. Serialized
+/// into the `rtl_tcp_client_last_connected` config entry so the
+/// next app launch can repopulate the hostname / port / nickname
+/// fields without waiting for mDNS to rediscover.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LastConnectedServer {
+    /// Hostname or IP literal the Connect button dialed — either
+    /// a resolved address (`192.168.1.5`) or an mDNS hostname
+    /// (`shack-pi.local.`), whichever the discovery layer yielded.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+    /// User-facing nickname — normally the mDNS TXT nickname, or
+    /// the `instance_name` when no nickname was published.
+    pub nickname: String,
+}
+
+/// Load the list of favorited server instance names. Returns an
+/// empty Vec on first launch / absent / corrupt config. Safe to
+/// call unconditionally.
+pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<String> {
+    config.read(|v| {
+        v.get(KEY_RTL_TCP_CLIENT_FAVORITES)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Persist the full favorites list. Overwrites the config entry —
+/// callers pass the current UI state of pinned instance names.
+pub fn save_favorites(config: &Arc<ConfigManager>, favorites: &[String]) {
+    config.write(|v| {
+        v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!(favorites);
+    });
+}
+
+/// Load the last-connected server snapshot, if any was recorded.
+/// Returns `None` on first launch or when the stored blob fails
+/// to deserialize (schema drift, hand-edited config, etc.).
+pub fn load_last_connected(config: &Arc<ConfigManager>) -> Option<LastConnectedServer> {
+    config.read(|v| {
+        v.get(KEY_RTL_TCP_CLIENT_LAST_CONNECTED)
+            .and_then(|entry| serde_json::from_value(entry.clone()).ok())
+    })
+}
+
+/// Persist a `LastConnectedServer` snapshot. Called from the
+/// discovery-row Connect handler and from any manual-server
+/// connect path once that UI exists.
+pub fn save_last_connected(config: &Arc<ConfigManager>, server: &LastConnectedServer) {
+    config.write(|v| {
+        // Serialize via serde_json::to_value so we don't re-embed
+        // JSON-encoded text inside a JSON string (the common
+        // round-trip mistake here).
+        v[KEY_RTL_TCP_CLIENT_LAST_CONNECTED] =
+            serde_json::to_value(server).unwrap_or(serde_json::Value::Null);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,75 +689,8 @@ mod tests {
             "Failed — bad handshake"
         );
     }
-}
 
-/// Snapshot of a previously-connected `rtl_tcp` server. Serialized
-/// into the `rtl_tcp_client_last_connected` config entry so the
-/// next app launch can repopulate the hostname / port / nickname
-/// fields without waiting for mDNS to rediscover.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct LastConnectedServer {
-    /// Hostname or IP literal the Connect button dialed — either
-    /// a resolved address (`192.168.1.5`) or an mDNS hostname
-    /// (`shack-pi.local.`), whichever the discovery layer yielded.
-    pub host: String,
-    /// TCP port.
-    pub port: u16,
-    /// User-facing nickname — normally the mDNS TXT nickname, or
-    /// the `instance_name` when no nickname was published.
-    pub nickname: String,
-}
-
-/// Load the list of favorited server instance names. Returns an
-/// empty Vec on first launch / absent / corrupt config. Safe to
-/// call unconditionally.
-pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<String> {
-    config.read(|v| {
-        v.get(KEY_RTL_TCP_CLIENT_FAVORITES)
-            .and_then(serde_json::Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|entry| entry.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    })
-}
-
-/// Persist the full favorites list. Overwrites the config entry —
-/// callers pass the current UI state of pinned instance names.
-pub fn save_favorites(config: &Arc<ConfigManager>, favorites: &[String]) {
-    config.write(|v| {
-        v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!(favorites);
-    });
-}
-
-/// Load the last-connected server snapshot, if any was recorded.
-/// Returns `None` on first launch or when the stored blob fails
-/// to deserialize (schema drift, hand-edited config, etc.).
-pub fn load_last_connected(config: &Arc<ConfigManager>) -> Option<LastConnectedServer> {
-    config.read(|v| {
-        v.get(KEY_RTL_TCP_CLIENT_LAST_CONNECTED)
-            .and_then(|entry| serde_json::from_value(entry.clone()).ok())
-    })
-}
-
-/// Persist a `LastConnectedServer` snapshot. Called from the
-/// discovery-row Connect handler and from any manual-server
-/// connect path once that UI exists.
-pub fn save_last_connected(config: &Arc<ConfigManager>, server: &LastConnectedServer) {
-    config.write(|v| {
-        // Serialize via serde_json::to_value so we don't re-embed
-        // JSON-encoded text inside a JSON string (the common
-        // round-trip mistake here).
-        v[KEY_RTL_TCP_CLIENT_LAST_CONNECTED] =
-            serde_json::to_value(server).unwrap_or(serde_json::Value::Null);
-    });
-}
-
-#[cfg(test)]
-mod client_persistence_tests {
-    use super::*;
+    // ---- Client-persistence helpers (favorites + last-connected) ----
 
     fn make_config() -> Arc<ConfigManager> {
         Arc::new(ConfigManager::in_memory(&serde_json::json!({})))

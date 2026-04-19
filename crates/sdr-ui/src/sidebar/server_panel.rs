@@ -580,8 +580,11 @@ pub fn build_server_panel() -> ServerPanel {
 ///
 /// 1. **Restore** — read each key, fall back to the widget's
 ///    existing default if the key is absent or of the wrong type.
-///    Unknown / corrupt types don't panic; they produce a log at
-///    `warn!` and the widget keeps its default.
+///    Unknown / corrupt types are silently dropped (the restore
+///    path is fire-and-forget — `serde_json`'s `as_*` helpers
+///    return `None` on a type mismatch, the `if let Some` guard
+///    skips the apply, and the widget keeps its build-time
+///    default). No panic path.
 /// 2. **Subscribe** — install a notify handler on each editable
 ///    widget that writes its current value back to `config`. The
 ///    config manager's auto-save thread picks up the change on
