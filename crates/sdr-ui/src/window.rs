@@ -3322,13 +3322,17 @@ fn connect_source_rtlsdr_probe(panels: &SidebarPanels) {
                 current = %current,
                 "source panel: RTL-SDR slot label updated",
             );
-            // Replace entry 0 in the StringList. `splice(pos, n,
-            // additions)` removes `n` items at `pos` and inserts
-            // `additions` — so `(0, 1, &[&current])` is a
-            // single-entry in-place swap. Leaves Network / File /
-            // RTL-TCP entries untouched so their indices stay
-            // pinned to the `DEVICE_*` constants.
-            model.splice(0, 1, &[&current]);
+            // Replace the RTL-SDR slot in the StringList.
+            // `splice(pos, n, additions)` removes `n` items at
+            // `pos` and inserts `additions` — so `(DEVICE_RTLSDR,
+            // 1, &[&current])` is a single-entry in-place swap.
+            // Using the shared `DEVICE_RTLSDR` constant instead
+            // of a literal `0` keeps the probe aligned with the
+            // rest of the source-row selection logic; all four
+            // `DEVICE_*` indices are the one source of truth for
+            // slot positions. Leaves Network / File / RTL-TCP
+            // entries untouched.
+            model.splice(DEVICE_RTLSDR, 1, &[&current]);
             *last = current;
         }
         glib::ControlFlow::Continue

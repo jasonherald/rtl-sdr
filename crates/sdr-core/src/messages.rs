@@ -248,6 +248,18 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_changed_message_constructs() {
+        // Pins the variant shape + payload round-trip so future
+        // refactors that accidentally change the f64 carrier
+        // (e.g. to `u32` Hz or a `Bandwidth` newtype) trip this
+        // test. Value is NFM's default bandwidth, matching what
+        // the VFO-drag feedback loop most commonly emits in
+        // practice.
+        let bw = DspToUi::BandwidthChanged(12_500.0);
+        assert!(matches!(bw, DspToUi::BandwidthChanged(v) if (v - 12_500.0).abs() < f64::EPSILON));
+    }
+
+    #[test]
     fn ctcss_sustained_changed_message_constructs() {
         let open = DspToUi::CtcssSustainedChanged(true);
         assert!(matches!(open, DspToUi::CtcssSustainedChanged(true)));
