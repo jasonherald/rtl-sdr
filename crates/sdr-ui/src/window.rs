@@ -777,11 +777,11 @@ fn build_sidebar_toggle(split_view: &adw::OverlaySplitView) -> gtk4::ToggleButto
 /// clears + re-populates it when the favorites map changes. The
 /// `empty_label` is shown when the list is empty so the user sees
 /// "No pinned servers yet" instead of a blank popover.
-pub struct FavoritesHeaderHandle {
-    pub button: gtk4::MenuButton,
-    pub popover: gtk4::Popover,
-    pub list: gtk4::ListBox,
-    pub empty_label: gtk4::Label,
+struct FavoritesHeaderHandle {
+    button: gtk4::MenuButton,
+    popover: gtk4::Popover,
+    list: gtk4::ListBox,
+    empty_label: gtk4::Label,
 }
 
 /// Build the `AdwHeaderBar` with play/stop, frequency selector, demod selector,
@@ -1176,6 +1176,26 @@ fn connect_rtl_tcp_discovery(
     let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, DiscoveredServer)>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
+    // Auxiliary map: favorite_key (hostname:port) → weak ref on
+    // the currently-rendered discovery-row star `ToggleButton`.
+    // Let the favorites-popover Unstar handler find and flip the
+    // matching discovery toggle immediately rather than waiting
+    // for the next mDNS re-announce — without this, the filled
+    // star would stay rendered while the map says otherwise, and
+    // the first user click on the stale star would fire
+    // `toggled` with `active=false` (wasted click from the
+    // user's perspective: they wanted to re-pin).
+    //
+    // Weak refs only — the `ToggleButton`s are strongly owned by
+    // their parent `AdwActionRow`s (as prefix widgets) which are
+    // strongly owned by `displayed_rows`. Stale entries
+    // (rows that have since been removed from `displayed_rows`)
+    // fail to upgrade and self-clean at lookup time; no explicit
+    // prune necessary at the <50-server scale this map is sized
+    // for.
+    let discovered_star_buttons: Rc<RefCell<HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     // Weak ref on the expander so the timeout closure doesn't keep
     // the window alive after close — upgrade() returns None on a
     // destroyed widget and the poller breaks out.
@@ -1231,9 +1251,10 @@ fn connect_rtl_tcp_discovery(
         protocol_row: protocol_row.downgrade(),
         device_row: device_row.downgrade(),
         expander_weak: expander_weak.clone(),
-        // Weak ref — see `FavoriteRowContext.displayed_rows`
+        // Weak refs — see `FavoriteRowContext.displayed_rows`
         // docstring for the retain-cycle reasoning.
         displayed_rows: Rc::downgrade(&displayed_rows),
+        discovered_star_buttons: Rc::downgrade(&discovered_star_buttons),
     });
     // Seed the popover's content from the restored favorites so
     // the list is ready when the user first clicks the header
@@ -1437,6 +1458,18 @@ fn connect_rtl_tcp_discovery(
                     // Updated again inside the toggle closure when
                     // the user flips the state.
                     set_favorite_toggle_accessible_name(&star_btn, starred_initially);
+                    // Register the star_btn against its
+                    // favorite_key so the favorites-popover
+                    // Unstar handler can find and flip this
+                    // exact toggle when the user unstars from
+                    // the popover. `insert` overwrites any
+                    // prior (stale) weak ref under the same key
+                    // — e.g. from a re-announce rebuild of the
+                    // row, where the old button was dropped.
+                    let star_key_for_map = favorite_key(&server);
+                    discovered_star_buttons
+                        .borrow_mut()
+                        .insert(star_key_for_map, star_btn.downgrade());
                     // Capture the display metadata into move-able
                     // values so the toggle closure can build a
                     // `FavoriteEntry` without holding onto
@@ -1876,6 +1909,16 @@ struct FavoriteRowContext {
     displayed_rows: std::rc::Weak<
         RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
     >,
+    /// Keyed by `favorite_key(server)` (hostname:port), maps to
+    /// a weak ref on the star `ToggleButton` in the currently-
+    /// rendered discovery row for that server (if any). Weak
+    /// here for the same retain-cycle reason as `displayed_rows`:
+    /// the per-row Unstar closure captures this context, and a
+    /// strong `Rc` field would close the loop back through the
+    /// inner `WeakRef`s to the rows themselves.
+    discovered_star_buttons: std::rc::Weak<
+        RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>,
+    >,
 }
 
 /// Clear the `ListBox` and rebuild one row per `FavoriteEntry`,
@@ -2035,15 +2078,35 @@ fn attach_favorite_row_actions(
                 favs.values().cloned().collect();
             crate::sidebar::source_panel::save_favorites(&unstar_ctx.config, &snapshot);
         }
-        // Reorder the discovery expander so this server drops
-        // out of the pinned section. The star-button ICON on
-        // any currently-displayed discovery row for this key is
-        // NOT refreshed here — it self-heals on the next mDNS
-        // re-announce (see `ServerAnnounced` branch above, which
-        // removes the old row and builds a fresh one with
-        // `set_active(is_favorite)`). Acceptable transient
-        // inconsistency; a simultaneously-visible popover-unstar
-        // plus discovery-list view is an edge case.
+
+        // If the discovery row for this key is currently rendered,
+        // flip its star toggle to the unpinned state. The
+        // toggle's own `connect_toggled` handler then does the
+        // map cleanup (no-op — we already removed), the persist
+        // (redundant but idempotent), the discovery reorder, and
+        // the popover rebuild — so we early-return and skip OUR
+        // reorder / rebuild below.
+        //
+        // Without this, the filled star would keep rendering
+        // until the next mDNS beacon, which isn't just
+        // cosmetic: the first user click on the stale filled
+        // star fires `toggled` with `active=false` (the intent
+        // was "re-pin"), silently wasting a click.
+        if let Some(star_map) = unstar_ctx.discovered_star_buttons.upgrade() {
+            let maybe_btn = star_map
+                .borrow()
+                .get(&unstar_key)
+                .and_then(glib::WeakRef::upgrade);
+            if let Some(btn) = maybe_btn
+                && btn.is_active()
+            {
+                btn.set_active(false);
+                return;
+            }
+        }
+
+        // No discovery row visible for this key — do the reorder
+        // and popover rebuild ourselves.
         //
         // `displayed_rows` is Weak on the context — upgrade fails
         // if the discovery timer has been torn down, which also
