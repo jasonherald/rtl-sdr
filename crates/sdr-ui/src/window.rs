@@ -1349,6 +1349,26 @@ fn connect_server_panel(
     // and auto-stop the server if `has_stopped()` becomes true
     // (e.g. USB unplug or accept-thread failure).
     connect_server_status_polling(panels, Rc::clone(&running), apply_visibility);
+
+    // Bandwidth advisory — toggled on the device-default sample
+    // rate. Unlike the source panel's advisory (which also gates
+    // on source type), the server is inherently a network path so
+    // only the rate matters.
+    let advisory_row_weak = panels.server.bandwidth_advisory_row.downgrade();
+    let apply_server_bandwidth_advisory = move |row: &adw::ComboRow| {
+        let Some(advisory) = advisory_row_weak.upgrade() else {
+            return;
+        };
+        advisory.set_visible(
+            row.selected() >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX,
+        );
+    };
+    // Seed initial visibility + subscribe for future changes.
+    apply_server_bandwidth_advisory(&panels.server.sample_rate_row);
+    panels
+        .server
+        .sample_rate_row
+        .connect_selected_notify(apply_server_bandwidth_advisory);
 }
 
 /// Extracted out of `connect_server_panel` so the parent function
@@ -1521,6 +1541,7 @@ fn clone_server_panel(panel: &sidebar::ServerPanel) -> sidebar::ServerPanel {
         status_stop_button: panel.status_stop_button.clone(),
         activity_log_row: panel.activity_log_row.clone(),
         activity_log_list: panel.activity_log_list.clone(),
+        bandwidth_advisory_row: panel.bandwidth_advisory_row.clone(),
     }
 }
 
@@ -2159,8 +2180,28 @@ fn connect_source_panel(
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
-    // Sample rate selector
+    // Sample rate selector + bandwidth advisory re-render.
+    // The advisory visibility depends on BOTH the sample-rate
+    // selection AND the device-type selection (only network paths
+    // care about wire bandwidth). We clone the helper closure into
+    // both notify handlers so either trigger re-evaluates.
+    let advisory_row_weak = panels.source.bandwidth_advisory_row.downgrade();
+    let device_row_for_advisory = panels.source.device_row.clone();
+    let sample_rate_row_for_advisory = panels.source.sample_rate_row.clone();
+    let apply_source_bandwidth_advisory = {
+        let advisory_row_weak = advisory_row_weak.clone();
+        move || {
+            let Some(row) = advisory_row_weak.upgrade() else {
+                return;
+            };
+            let is_network_path = device_row_for_advisory.selected() == DEVICE_RTLTCP;
+            let is_high_rate = sample_rate_row_for_advisory.selected()
+                >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX;
+            row.set_visible(is_network_path && is_high_rate);
+        }
+    };
     let state_sr = Rc::clone(state);
+    let apply_on_sr = apply_source_bandwidth_advisory.clone();
     panels
         .source
         .sample_rate_row
@@ -2169,7 +2210,13 @@ fn connect_source_panel(
             if let Some(&rate) = SAMPLE_RATES.get(idx) {
                 state_sr.send_dsp(UiToDsp::SetSampleRate(rate));
             }
+            apply_on_sr();
         });
+    let apply_on_device = apply_source_bandwidth_advisory;
+    panels
+        .source
+        .device_row
+        .connect_selected_notify(move |_| apply_on_device());
 
     // DC blocking toggle
     let state_dc_block = Rc::clone(state);

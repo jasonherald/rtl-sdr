@@ -22,6 +22,24 @@ pub const DEVICE_RTLTCP: u32 = 3;
 /// empty-after-disconnect paths render identical text.
 pub const RTL_TCP_STATUS_DISCONNECTED_SUBTITLE: &str = "Disconnected";
 
+/// Sample-rate selector index at which we start showing the
+/// "high bandwidth" advisory caption. Index 7 = 2.4 MHz, which
+/// at 8-bit I/Q pairs wire-format works out to ~38 Mbps — over
+/// a typical home Wi-Fi link (11/24/54 Mbps practical throughput
+/// for older hardware) this produces silent drops. Anything at
+/// or above this index triggers the caption so the user gets a
+/// heads-up before commanding the remote server.
+pub const HIGH_BANDWIDTH_SAMPLE_RATE_IDX: u32 = 7;
+
+/// Title shown on the advisory row when a network-heavy sample
+/// rate is selected. Kept as a const so source + server panels
+/// render identical copy.
+pub const HIGH_BANDWIDTH_ADVISORY_TITLE: &str = "High sample rate";
+/// Subtitle for the advisory row — the supporting detail under
+/// the title.
+pub const HIGH_BANDWIDTH_ADVISORY_SUBTITLE: &str =
+    "Your network may not keep up (≈38 Mbps at 2.4 Msps with 8-bit I/Q).";
+
 /// Network protocol selector index for TCP (client). Load-bearing:
 /// both `build_network_rows()` (protocol `StringList`) and callers in
 /// `window.rs` that set or read this row rely on this exact mapping.
@@ -114,6 +132,13 @@ pub struct SourcePanel {
     /// indicates we're between attempts (Retrying / Failed /
     /// Disconnected).
     pub rtl_tcp_retry_button: gtk4::Button,
+
+    /// Advisory caption shown when the selected sample rate is at
+    /// or above `HIGH_BANDWIDTH_SAMPLE_RATE_IDX` AND the source
+    /// type routes over the network (RTL-TCP). Silent for local
+    /// RTL-SDR and File sources — the wire-bandwidth concern only
+    /// applies to network paths.
+    pub bandwidth_advisory_row: adw::ActionRow,
 }
 
 /// Render a connection state into a one-line human-readable form
@@ -374,6 +399,17 @@ pub fn build_source_panel() -> SourcePanel {
     rtl_tcp_status_row.add_suffix(&rtl_tcp_disconnect_button);
     rtl_tcp_status_row.add_suffix(&rtl_tcp_retry_button);
 
+    // Bandwidth advisory row — hidden by default. Visibility is
+    // toggled by the sample-rate and device-type notify handlers
+    // in window.rs. Title + subtitle copy come from shared consts
+    // so the source and server panels render identical text.
+    let bandwidth_advisory_row = adw::ActionRow::builder()
+        .title(HIGH_BANDWIDTH_ADVISORY_TITLE)
+        .subtitle(HIGH_BANDWIDTH_ADVISORY_SUBTITLE)
+        .visible(false)
+        .build();
+    bandwidth_advisory_row.add_prefix(&gtk4::Image::from_icon_name("dialog-information-symbolic"));
+
     // Add all rows to the group.
     group.add(&device_row);
     group.add(&sample_rate_row);
@@ -391,6 +427,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&record_iq_row);
     group.add(&rtl_tcp_discovered_row);
     group.add(&rtl_tcp_status_row);
+    group.add(&bandwidth_advisory_row);
 
     // Derive initial visibility from the selected device.
     let selected = device_row.selected();
@@ -445,6 +482,7 @@ pub fn build_source_panel() -> SourcePanel {
         rtl_tcp_status_row,
         rtl_tcp_disconnect_button,
         rtl_tcp_retry_button,
+        bandwidth_advisory_row,
     }
 }
 

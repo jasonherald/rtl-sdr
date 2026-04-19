@@ -187,6 +187,12 @@ pub struct ServerPanel {
     /// expander so the stats poller can rebuild it on updates
     /// without walking the expander's `AdwActionRow` children.
     pub activity_log_list: gtk4::ListBox,
+    /// Advisory caption shown when the device-default sample rate
+    /// is at or above the "high bandwidth" threshold. Shared copy
+    /// with the source panel's same-named row so the user sees a
+    /// consistent warning whether they're commanding a high rate
+    /// via the server or the client side.
+    pub bandwidth_advisory_row: adw::ActionRow,
 }
 
 /// Subtitle shown on `status_client_row` when the accept loop is
@@ -402,6 +408,10 @@ fn build_device_defaults_rows() -> DeviceDefaultsRows {
 /// Build the server-panel widgets. The panel is hidden by default;
 /// `window.rs` toggles `widget.set_visible(true)` once a local dongle
 /// is detected and the active source is not RTL-SDR.
+#[allow(
+    clippy::too_many_lines,
+    reason = "widget-assembly function — splitting scatters one-time wire-up across many helpers with no readability win"
+)]
 pub fn build_server_panel() -> ServerPanel {
     let widget = adw::PreferencesGroup::builder()
         .title("Share over network")
@@ -482,6 +492,18 @@ pub fn build_server_panel() -> ServerPanel {
 
     let (activity_log_row, activity_log_list) = build_activity_log_row();
 
+    // Bandwidth advisory — hidden initially. Visibility is toggled
+    // on sample-rate changes via the wiring in window.rs, mirroring
+    // the source-panel path. Copy is intentionally identical to the
+    // source-panel version (shared consts) so users see the same
+    // warning wording no matter which side they're configuring.
+    let bandwidth_advisory_row = adw::ActionRow::builder()
+        .title(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_TITLE)
+        .subtitle(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_SUBTITLE)
+        .visible(false)
+        .build();
+    bandwidth_advisory_row.add_prefix(&gtk4::Image::from_icon_name("dialog-information-symbolic"));
+
     widget.add(&share_row);
     widget.add(&nickname_row);
     widget.add(&port_row);
@@ -490,6 +512,7 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&device_defaults_row);
     widget.add(&status_row);
     widget.add(&activity_log_row);
+    widget.add(&bandwidth_advisory_row);
 
     ServerPanel {
         widget,
@@ -513,5 +536,6 @@ pub fn build_server_panel() -> ServerPanel {
         status_stop_button,
         activity_log_row,
         activity_log_list,
+        bandwidth_advisory_row,
     }
 }
