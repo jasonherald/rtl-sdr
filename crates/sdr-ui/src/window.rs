@@ -980,6 +980,10 @@ fn build_favorites_header() -> FavoritesHeaderHandle {
         .tooltip_text("Pinned rtl_tcp servers")
         .popover(&popover)
         .build();
+    // Screen-reader name. Tooltips aren't announced by most
+    // ATs — icon-only controls need an explicit accessible
+    // label via the GtkAccessible `Label` property.
+    button.update_property(&[gtk4::accessible::Property::Label("Pinned servers menu")]);
 
     FavoritesHeaderHandle {
         button,
@@ -1427,6 +1431,12 @@ fn connect_rtl_tcp_discovery(
                     if starred_initially {
                         star_btn.set_icon_name(FAVORITE_ICON_FILLED);
                     }
+                    // Initial accessible name — state-dependent so
+                    // screen readers announce the action the click
+                    // will take, not the icon's current appearance.
+                    // Updated again inside the toggle closure when
+                    // the user flips the state.
+                    set_favorite_toggle_accessible_name(&star_btn, starred_initially);
                     // Capture the display metadata into move-able
                     // values so the toggle closure can build a
                     // `FavoriteEntry` without holding onto
@@ -1456,6 +1466,11 @@ fn connect_rtl_tcp_discovery(
                         } else {
                             FAVORITE_ICON_OUTLINE
                         });
+                        // Keep the accessible name in sync with
+                        // the new state so AT announces the next
+                        // action ("Unpin from favorites" after the
+                        // user just pinned it, and vice versa).
+                        set_favorite_toggle_accessible_name(btn, active);
                         {
                             let mut favs = star_favorites.borrow_mut();
                             if active {
@@ -1650,6 +1665,41 @@ const FAVORITE_ICON_FILLED: &str = "starred-symbolic";
 /// different host.
 fn favorite_key(server: &DiscoveredServer) -> String {
     format!("{}:{}", server.hostname, server.port)
+}
+
+/// Order favorites for popover display: primary key lowercased
+/// nickname (alphabetical, case-insensitive), secondary key the
+/// stable `FavoriteEntry.key` (hostname:port).
+///
+/// The secondary key is load-bearing — `HashMap::values()`
+/// iteration order is non-deterministic, and two favorites with
+/// the same nickname would otherwise reshuffle across inserts /
+/// removals / app restarts (tie-broken by whatever the hash
+/// state happened to be that tick). Tying to `key` pins the
+/// order across all three.
+fn sort_favorites_for_display(entries: &mut [&sidebar::source_panel::FavoriteEntry]) {
+    entries.sort_by(|a, b| {
+        a.nickname
+            .to_lowercase()
+            .cmp(&b.nickname.to_lowercase())
+            .then_with(|| a.key.cmp(&b.key))
+    });
+}
+
+/// Update the `GtkAccessible` `Label` on the discovery-row star
+/// toggle. The label describes the action the next click will
+/// take (NOT the icon's current appearance), so a screen reader
+/// announces "Unpin from favorites" when the row is currently
+/// pinned and "Pin as favorite" when it isn't. Called once at
+/// row-build time and again inside the toggled closure so the
+/// name stays in sync with state.
+fn set_favorite_toggle_accessible_name(btn: &gtk4::ToggleButton, is_favorite: bool) {
+    let label = if is_favorite {
+        "Unpin from favorites"
+    } else {
+        "Pin as favorite"
+    };
+    btn.update_property(&[gtk4::accessible::Property::Label(label)]);
 }
 
 /// Execute the shared RTL-TCP connect sequence — used by both the
@@ -1860,9 +1910,7 @@ fn rebuild_favorites_popover(
     }
     let now = sidebar::source_panel::now_unix_seconds();
     let mut entries: Vec<&sidebar::source_panel::FavoriteEntry> = favorites.values().collect();
-    // Alpha by nickname so adding / removing doesn't reorder
-    // the rest of the list.
-    entries.sort_by_key(|e| e.nickname.to_lowercase());
+    sort_favorites_for_display(&mut entries);
     for entry in entries {
         let row = adw::ActionRow::builder()
             .title(&entry.nickname)
@@ -1948,6 +1996,9 @@ fn attach_favorite_row_actions(
     copy_btn.set_tooltip_text(Some("Copy host:port"));
     copy_btn.add_css_class("flat");
     copy_btn.set_valign(gtk4::Align::Center);
+    // Icon-only button — give it an explicit accessible name so
+    // screen readers don't fall back to the icon filename.
+    copy_btn.update_property(&[gtk4::accessible::Property::Label("Copy server address")]);
     let copy_key = entry.key.clone();
     copy_btn.connect_clicked(move |btn| {
         // `WidgetExt::clipboard` reaches the display clipboard
@@ -1966,6 +2017,10 @@ fn attach_favorite_row_actions(
     unstar_btn.set_tooltip_text(Some("Remove from favorites"));
     unstar_btn.add_css_class("flat");
     unstar_btn.set_valign(gtk4::Align::Center);
+    // Icon-only button — matches the tooltip here but stays as
+    // a distinct property so screen readers announce it even
+    // when tooltips are disabled / long-hover wouldn't fire.
+    unstar_btn.update_property(&[gtk4::accessible::Property::Label("Remove from favorites")]);
     let unstar_key = entry.key.clone();
     let unstar_ctx = Rc::clone(ctx);
     unstar_btn.connect_clicked(move |_| {
@@ -5072,6 +5127,70 @@ mod parse_host_port_tests {
         // callers would dispatch `SetNetworkConfig { hostname:
         // "" }` which is garbage.
         assert_eq!(parse_host_port(":1234"), None);
+    }
+}
+
+#[cfg(test)]
+mod favorite_sort_tests {
+    use super::sort_favorites_for_display;
+    use crate::sidebar::source_panel::FavoriteEntry;
+
+    fn entry(key: &str, nickname: &str) -> FavoriteEntry {
+        FavoriteEntry {
+            key: key.into(),
+            nickname: nickname.into(),
+            tuner_name: None,
+            gain_count: None,
+            last_seen_unix: None,
+        }
+    }
+
+    #[test]
+    fn primary_order_is_lowercased_nickname() {
+        let a = entry("a.local.:1234", "Zeta");
+        let b = entry("b.local.:1234", "alpha");
+        let c = entry("c.local.:1234", "Beta");
+        let mut entries = vec![&a, &b, &c];
+        sort_favorites_for_display(&mut entries);
+        // Case-insensitive: "alpha" < "Beta" < "Zeta".
+        assert_eq!(
+            entries.iter().map(|e| &e.key[..]).collect::<Vec<_>>(),
+            ["b.local.:1234", "c.local.:1234", "a.local.:1234",]
+        );
+    }
+
+    #[test]
+    fn tie_breaks_on_key_when_nicknames_match() {
+        // Duplicate nickname across two servers — the secondary
+        // key must pin the order deterministically so two app
+        // launches (or two inserts against an unstable HashMap
+        // iteration order) render the popover the same way.
+        let a = entry("attic-pi.local.:1234", "Shack");
+        let b = entry("shack-pi.local.:1234", "Shack");
+        let c = entry("basement-pi.local.:1234", "Shack");
+        let mut entries = vec![&a, &b, &c];
+        sort_favorites_for_display(&mut entries);
+        // Alphabetical by `key` — attic < basement < shack.
+        assert_eq!(
+            entries.iter().map(|e| &e.key[..]).collect::<Vec<_>>(),
+            [
+                "attic-pi.local.:1234",
+                "basement-pi.local.:1234",
+                "shack-pi.local.:1234",
+            ]
+        );
+    }
+
+    #[test]
+    fn idempotent_when_already_sorted() {
+        let a = entry("a.local.:1234", "alpha");
+        let b = entry("b.local.:1234", "beta");
+        let mut entries = vec![&a, &b];
+        sort_favorites_for_display(&mut entries);
+        assert_eq!(
+            entries.iter().map(|e| &e.key[..]).collect::<Vec<_>>(),
+            ["a.local.:1234", "b.local.:1234",]
+        );
     }
 }
 
