@@ -177,6 +177,16 @@ pub struct ServerPanel {
     /// the master `share_row` switch off, which is the same control
     /// path the user would hit to stop manually.
     pub status_stop_button: gtk4::Button,
+    /// Collapsible "Activity log" expander, listing the last
+    /// `sdr_server_rtltcp::RECENT_COMMANDS_CAPACITY` commands the
+    /// server has received with timestamps. Hidden while the
+    /// server isn't running.
+    pub activity_log_row: adw::ExpanderRow,
+    /// `ListBox` child of `activity_log_row` where individual
+    /// activity entries are appended. Held separately from the
+    /// expander so the stats poller can rebuild it on updates
+    /// without walking the expander's `AdwActionRow` children.
+    pub activity_log_list: gtk4::ListBox,
 }
 
 /// Subtitle shown on `status_client_row` when the accept loop is
@@ -187,6 +197,18 @@ pub const STATUS_WAITING_FOR_CLIENT_SUBTITLE: &str = "Waiting for client";
 /// Subtitle shown on data-rate / uptime / commanded rows when the
 /// accept loop is idle — same no-client state, different row.
 pub const STATUS_IDLE_VALUE_SUBTITLE: &str = "—";
+
+/// Subtitle shown on the activity-log expander when no commands
+/// have been received yet. Empty-state text that distinguishes
+/// "nothing to show" from "the ring buffer cleared after disconnect"
+/// (which also renders as empty but is a different journey).
+pub const ACTIVITY_LOG_EMPTY_SUBTITLE: &str = "No commands received yet";
+
+/// Max height the activity-log `ScrolledWindow` grows before
+/// scrolling kicks in. Small enough to fit inside the sidebar
+/// without dominating it; the expander is collapsed by default so
+/// users opt in to seeing the log at all.
+const ACTIVITY_LOG_MAX_HEIGHT_PX: i32 = 240;
 
 /// Aggregated status rows rendered under the "Server status"
 /// expander. Grouped so the builder stays readable and the
@@ -203,6 +225,35 @@ struct StatusRows {
     data_rate_row: adw::ActionRow,
     commanded_row: adw::ActionRow,
     stop_button: gtk4::Button,
+}
+
+/// Build the "Activity log" expander plus its scrollable child
+/// `ListBox`. The `ListBox` is wrapped in a `ScrolledWindow` with
+/// an `ACTIVITY_LOG_MAX_HEIGHT_PX` cap so the expander doesn't grow
+/// the sidebar taller than the viewport when the ring fills up.
+fn build_activity_log_row() -> (adw::ExpanderRow, gtk4::ListBox) {
+    let row = adw::ExpanderRow::builder()
+        .title("Activity log")
+        .subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE)
+        .visible(false)
+        .build();
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(ACTIVITY_LOG_MAX_HEIGHT_PX)
+        .child(&list)
+        .build();
+    // Wrap the scroll in an ActionRow so the expander's layout
+    // machinery (which expects rows) renders it correctly. Empty
+    // title/subtitle pushes the scroll widget into the row body.
+    let wrapper = adw::ActionRow::builder().activatable(false).build();
+    wrapper.add_prefix(&scroll);
+    row.add_row(&wrapper);
+    (row, list)
 }
 
 fn build_status_rows() -> StatusRows {
@@ -429,6 +480,8 @@ pub fn build_server_panel() -> ServerPanel {
         stop_button: status_stop_button,
     } = build_status_rows();
 
+    let (activity_log_row, activity_log_list) = build_activity_log_row();
+
     widget.add(&share_row);
     widget.add(&nickname_row);
     widget.add(&port_row);
@@ -436,6 +489,7 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&advertise_row);
     widget.add(&device_defaults_row);
     widget.add(&status_row);
+    widget.add(&activity_log_row);
 
     ServerPanel {
         widget,
@@ -457,5 +511,7 @@ pub fn build_server_panel() -> ServerPanel {
         status_data_rate_row,
         status_commanded_row,
         status_stop_button,
+        activity_log_row,
+        activity_log_list,
     }
 }

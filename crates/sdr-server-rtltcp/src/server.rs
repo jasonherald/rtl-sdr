@@ -17,6 +17,7 @@
 //! command_worker (TCP recv → dispatch). First worker to exit signals
 //! the others via the shutdown flag.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +80,14 @@ pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 2_048_000;
 /// Default center frequency in Hz, matching upstream rtl_tcp's
 /// `frequency = 100000000` default at rtl_tcp.c:389.
 pub const DEFAULT_CENTER_FREQ_HZ: u32 = 100_000_000;
+
+/// Maximum number of recent `(CommandOp, Instant)` entries retained
+/// in `ServerStats::recent_commands`. 50 covers a typical rtl_tcp
+/// session's worth of tuning / gain / mode changes — enough to
+/// debug "why didn't my tune command land?" scenarios without
+/// unbounded memory growth on long-running servers. Oldest entries
+/// are popped when the ring fills.
+pub const RECENT_COMMANDS_CAPACITY: usize = 50;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -190,6 +199,13 @@ pub struct ServerStats {
     /// `None` when it hasn't sent one this session. UI renders
     /// "auto" vs "manual" accordingly.
     pub current_gain_auto: Option<bool>,
+    /// Ring buffer of recent commands received this session, bounded
+    /// at `RECENT_COMMANDS_CAPACITY` entries. Newest-first ordering
+    /// is the UI's responsibility; this preserves insertion order
+    /// (oldest at front, newest at back) so the producer stays cheap
+    /// (`push_back` + `pop_front` at cap). Reset on connect /
+    /// disconnect along with the other per-session counters.
+    pub recent_commands: VecDeque<(CommandOp, Instant)>,
 }
 
 /// Tuner metadata captured at open time, exposed for callers that
@@ -601,6 +617,7 @@ fn update_stats_on_connect(stats: &Arc<Mutex<ServerStats>>, peer: SocketAddr) {
         s.current_sample_rate_hz = None;
         s.current_gain_tenths_db = None;
         s.current_gain_auto = None;
+        s.recent_commands.clear();
     }
 }
 
@@ -620,6 +637,7 @@ fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
         s.current_sample_rate_hz = None;
         s.current_gain_tenths_db = None;
         s.current_gain_auto = None;
+        s.recent_commands.clear();
     }
 }
 
@@ -933,7 +951,16 @@ fn command_worker(
         dispatch(&mut dev, cmd);
         drop(dev);
         if let Ok(mut s) = stats.lock() {
-            s.last_command = Some((cmd.op, Instant::now()));
+            let now = Instant::now();
+            s.last_command = Some((cmd.op, now));
+            // Push onto the bounded ring. Pop the oldest entry when
+            // we'd otherwise exceed the cap — keeps memory bounded
+            // on long-running sessions without a dedicated ring-
+            // buffer crate.
+            if s.recent_commands.len() >= RECENT_COMMANDS_CAPACITY {
+                s.recent_commands.pop_front();
+            }
+            s.recent_commands.push_back((cmd.op, now));
             // Capture the commanded state alongside the
             // last-command stamp. We record what the CLIENT
             // requested (not what the device ultimately applied)
@@ -1054,6 +1081,9 @@ mod tests {
         // ServerStats would see stale data from the prior session
         // while connected_client = None, e.g. the status row would
         // still show "100.3 MHz @ 2.4 MHz" for a dead session.
+        let mut recent = VecDeque::new();
+        recent.push_back((CommandOp::SetCenterFreq, Instant::now()));
+        recent.push_back((CommandOp::SetTunerGain, Instant::now()));
         let stats = Arc::new(Mutex::new(ServerStats {
             connected_client: Some(SocketAddr::from(([127, 0, 0, 1], 42_000))),
             connected_since: Some(Instant::now()),
@@ -1064,6 +1094,7 @@ mod tests {
             current_sample_rate_hz: Some(2_400_000),
             current_gain_tenths_db: Some(200),
             current_gain_auto: Some(false),
+            recent_commands: recent,
         }));
         update_stats_on_disconnect(&stats);
         let s = stats.lock().unwrap();
@@ -1076,6 +1107,10 @@ mod tests {
         assert!(s.current_sample_rate_hz.is_none());
         assert!(s.current_gain_tenths_db.is_none());
         assert!(s.current_gain_auto.is_none());
+        assert!(
+            s.recent_commands.is_empty(),
+            "activity log ring must clear on disconnect to avoid stale entries in the next session"
+        );
     }
 
     #[test]
@@ -1090,6 +1125,15 @@ mod tests {
         assert!(stats.current_sample_rate_hz.is_none());
         assert!(stats.current_gain_tenths_db.is_none());
         assert!(stats.current_gain_auto.is_none());
+        assert!(stats.recent_commands.is_empty());
+    }
+
+    #[test]
+    fn recent_commands_capacity_matches_documented_bound() {
+        // Sanity check on the published const. If the UI side starts
+        // depending on a specific size for pagination, changing the
+        // constant becomes a contract break this test catches.
+        assert_eq!(RECENT_COMMANDS_CAPACITY, 50);
     }
 
     #[test]

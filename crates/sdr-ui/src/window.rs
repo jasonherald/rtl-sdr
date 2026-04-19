@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::gio;
 use gtk4::glib;
@@ -1331,6 +1331,7 @@ fn connect_share_switch(
                     };
                     set_controls_locked(&server_panel, true);
                     server_panel.status_row.set_visible(true);
+                    server_panel.activity_log_row.set_visible(true);
                     *running.borrow_mut() = Some(RunningServer { server, advertiser });
                 }
                 Err(e) => {
@@ -1364,7 +1365,9 @@ fn connect_share_switch(
             }
             set_controls_locked(&server_panel, false);
             server_panel.status_row.set_visible(false);
+            server_panel.activity_log_row.set_visible(false);
             reset_status_rows(&server_panel);
+            reset_activity_log(&server_panel);
         }
         apply_visibility();
     });
@@ -1395,6 +1398,8 @@ fn clone_server_panel(panel: &sidebar::ServerPanel) -> sidebar::ServerPanel {
         status_data_rate_row: panel.status_data_rate_row.clone(),
         status_commanded_row: panel.status_commanded_row.clone(),
         status_stop_button: panel.status_stop_button.clone(),
+        activity_log_row: panel.activity_log_row.clone(),
+        activity_log_list: panel.activity_log_list.clone(),
     }
 }
 
@@ -1439,6 +1444,10 @@ fn connect_server_status_polling(
     let share_row_weak = panels.server.share_row.downgrade();
     let widget_weak = panels.server.widget.downgrade();
     let last_bytes_sent = Rc::new(Cell::new(0u64));
+    // Activity-log diff key: (ring_len, newest_instant). Rendering
+    // is cheap but clearing the ListBox resets any user scroll
+    // position, so we short-circuit on unchanged ticks.
+    let last_activity_key: Rc<Cell<(usize, Option<Instant>)>> = Rc::new(Cell::new((0, None)));
 
     // Separate subscription on the Stop button. Flipping the switch
     // off is the single canonical stop path — pointing the button
@@ -1483,6 +1492,7 @@ fn connect_server_status_polling(
         }
 
         render_status_rows(&server_panel, &stats, &last_bytes_sent);
+        render_activity_log(&server_panel, &stats, &last_activity_key);
         glib::ControlFlow::Continue
     });
 }
@@ -1624,6 +1634,86 @@ fn format_hz(hz: u32) -> String {
         format!("{:.3} kHz", hz_f / 1_000.0)
     } else {
         format!("{hz} Hz")
+    }
+}
+
+/// Rebuild the activity-log list from the `ServerStats` ring if
+/// it has actually changed since the last render. The "changed?"
+/// check uses the ring length + the timestamp of the newest entry
+/// so we skip the clear-and-rebuild on idle ticks — preserves any
+/// scroll position the user has in the `ListBox`.
+fn render_activity_log(
+    panel: &sidebar::ServerPanel,
+    stats: &sdr_server_rtltcp::ServerStats,
+    last_rendered: &Rc<std::cell::Cell<(usize, Option<Instant>)>>,
+) {
+    use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
+
+    let newest = stats.recent_commands.back().map(|(_, t)| *t);
+    let current_key = (stats.recent_commands.len(), newest);
+    if current_key == last_rendered.get() {
+        return;
+    }
+    last_rendered.set(current_key);
+
+    // Clear the ListBox children. GTK4 ListBox has no mass-remove,
+    // so walk the child list.
+    while let Some(child) = panel.activity_log_list.first_child() {
+        panel.activity_log_list.remove(&child);
+    }
+
+    if stats.recent_commands.is_empty() {
+        panel
+            .activity_log_row
+            .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
+        return;
+    }
+
+    panel
+        .activity_log_row
+        .set_subtitle(&format!("{} commands", stats.recent_commands.len()));
+    // Newest first so the user doesn't have to scroll to see the
+    // most recent activity.
+    let now = Instant::now();
+    for (op, at) in stats.recent_commands.iter().rev() {
+        let row = adw::ActionRow::builder()
+            .title(format!("{op:?}"))
+            .subtitle(format_log_age(now.saturating_duration_since(*at)))
+            .activatable(false)
+            .build();
+        panel.activity_log_list.append(&row);
+    }
+}
+
+/// Reset activity-log list + subtitle on stop. Without this the
+/// list would persist after the server stopped — misleading users
+/// into thinking the log reflects a currently-running session.
+fn reset_activity_log(panel: &sidebar::ServerPanel) {
+    use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
+    while let Some(child) = panel.activity_log_list.first_child() {
+        panel.activity_log_list.remove(&child);
+    }
+    panel
+        .activity_log_row
+        .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
+}
+
+/// Render an elapsed duration as a compact "age" string for the
+/// activity-log rows. Narrower set of buckets than the discovery
+/// formatter — commands arrive in bursts during a session, so the
+/// "just now" / seconds-ago distinction matters but hours isn't
+/// common in a single session.
+fn format_log_age(elapsed: Duration) -> String {
+    const JUST_NOW_THRESHOLD: Duration = Duration::from_secs(2);
+    let secs = elapsed.as_secs();
+    if elapsed < JUST_NOW_THRESHOLD {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
     }
 }
 
@@ -3863,5 +3953,24 @@ mod server_panel_format_tests {
             subtitle.contains("gain 49.6 dB"),
             "49.6 dB should render from 496 tenths: {subtitle}"
         );
+    }
+
+    #[test]
+    fn format_log_age_buckets() {
+        use super::format_log_age;
+        // < 2 s → "just now" debounces the 500 ms poll from showing
+        // "0s ago" / "1s ago" noise on the most-recent entry.
+        assert_eq!(format_log_age(Duration::from_millis(0)), "just now");
+        assert_eq!(format_log_age(Duration::from_millis(1999)), "just now");
+        // 2 s – 59 s → "Ns ago"
+        assert_eq!(format_log_age(Duration::from_secs(2)), "2s ago");
+        assert_eq!(format_log_age(Duration::from_secs(59)), "59s ago");
+        // 1 m – 59 m → "Nm ago"
+        assert_eq!(format_log_age(Duration::from_mins(1)), "1m ago");
+        assert_eq!(format_log_age(Duration::from_secs(3599)), "59m ago");
+        // 1 h+ → "Nh ago" (rare — single-session command histories
+        // almost never live long enough, but the bucket keeps the
+        // formatter total).
+        assert_eq!(format_log_age(Duration::from_hours(1)), "1h ago");
     }
 }
