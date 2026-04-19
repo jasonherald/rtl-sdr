@@ -443,9 +443,27 @@ final class CoreModel {
     //  Commands — optimistic setters
     // ==========================================================
 
+    /// Upper bound for center frequency in Hz. Matches the
+    /// 12-digit display range in `FrequencyDigitsEntry`
+    /// (999.999.999.999 Hz — well above any known SDR tuner).
+    /// The clamp in `setCenter` is the canonical validation
+    /// point for every tune path — digit entry, VFO click-to-
+    /// tune retune, menu shortcuts, engine-event syncs —
+    /// instead of each caller reinventing the check.
+    static let maxCenterFrequencyHz: Double = 999_999_999_999
+
     func setCenter(_ hz: Double) {
-        centerFrequencyHz = hz
-        capture { try core?.tune(hz) }
+        // Clamp non-finite and out-of-range values before both
+        // the UI write and the engine call. Prevents NaN / Inf /
+        // negative tune commands from any caller (per #327 review).
+        let clamped: Double
+        if !hz.isFinite {
+            clamped = centerFrequencyHz
+        } else {
+            clamped = max(0, min(Self.maxCenterFrequencyHz, hz))
+        }
+        centerFrequencyHz = clamped
+        capture { try core?.tune(clamped) }
     }
 
     func setSampleRate(_ hz: Double) {
