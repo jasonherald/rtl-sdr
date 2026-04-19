@@ -51,18 +51,21 @@ struct FrequencyDigitsEntry: View {
                 }
             }
         }
-        .padding(.horizontal, 4)
+        // Horizontal padding sizes the native toolbar pill — the
+        // pill hugs the content, so a bit of breathing room
+        // inside the HStack translates to a wider, less-cramped
+        // pill.
+        .padding(.horizontal, 12)
         .padding(.vertical, 2)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .stroke(.separator, lineWidth: 1)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                )
-        )
         .focusable()
         .focused($focused)
+        // Suppress SwiftUI's default focus ring (the blue
+        // rectangle that wraps the whole digit row when the
+        // control gains keyboard focus). The selected-digit
+        // underline is our intentional selection indicator —
+        // the focus ring is redundant + clashes with the
+        // toolbar pill behind it.
+        .focusEffectDisabled()
         // Per-digit scroll wheel step. Consumes scrollWheel only
         // when the cursor is over the frequency control so
         // scrolls elsewhere (spectrum, sidebar) still work.
@@ -99,11 +102,7 @@ struct FrequencyDigitsEntry: View {
             .font(Self.digitFont)
             .foregroundStyle(isLeading ? .tertiary : .primary)
             .frame(minWidth: 12)
-            .background(
-                isSelected
-                    ? Color.accentColor.opacity(0.35)
-                    : Color.clear
-            )
+            .underline(isSelected, color: .accentColor)
             .contentShape(Rectangle())
             .onTapGesture {
                 selectedIndex = i
@@ -195,6 +194,12 @@ struct FrequencyDigitsEntry: View {
     private func commitFrequency(_ newFreq: UInt64) {
         let f = Double(newFreq)
         digits = Self.freqToDigits(newFreq)
+        // Skip the engine round-trip when the frequency is
+        // unchanged. Hitting the clamp floor / ceiling or
+        // re-entering a digit with the same value would
+        // otherwise spam duplicate `setCenter(...)` calls onto
+        // the DSP command channel. Per #327 review.
+        guard hz != f else { return }
         hz = f
         commit(f)
     }
@@ -343,10 +348,17 @@ private struct DigitScrollCatcher: NSViewRepresentable {
                     ? locInView.x / self.bounds.width
                     : 0.5
                 let idx = self.digitAtFraction(fracX)
+                // Horizontal-only trackpad gestures still
+                // deliver scrollWheel events with dy == 0.
+                // Treating 0 as "negative" would decrement the
+                // digit on every stray horizontal swipe; skip
+                // those cleanly. Per #327 review.
+                let dy = event.scrollingDeltaY
+                guard dy != 0 else { return event }
                 // dy > 0 on trackpad = natural scroll up, i.e.
                 // content moves up, meaning the user wants to
                 // see larger numbers. Step +1.
-                let direction = event.scrollingDeltaY > 0 ? 1 : -1
+                let direction = dy > 0 ? 1 : -1
                 self.onStep(idx, direction)
                 return nil
             }

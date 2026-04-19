@@ -31,6 +31,14 @@ func formatRate(_ hz: Double) -> String {
 /// digit grid and parses nothing). These inputs want the same
 /// permissive parse rules.
 func parseHzFrequency(_ s: String) -> Double? {
+    // Sanity cap — 1 THz is well above any known SDR tunable
+    // range, so anything larger is almost certainly a typo
+    // (trailing digit, missing decimal, etc.). Letting
+    // `Double("1e309")` through returns `.infinity`, which then
+    // crashes any downstream `UInt64(hz)` / `Int64(hz)` cast.
+    // Reject non-finite and out-of-range up front.
+    let maxHz: Double = 1e12
+
     var trimmed = s.trimmingCharacters(in: .whitespaces).lowercased()
     if trimmed.hasPrefix("-") { return nil }
     if trimmed.hasPrefix("+") { trimmed = String(trimmed.dropFirst()) }
@@ -42,8 +50,12 @@ func parseHzFrequency(_ s: String) -> Double? {
     ]
     for (suffix, mult) in multipliers where trimmed.hasSuffix(suffix) {
         let body = trimmed.dropLast(suffix.count).trimmingCharacters(in: .whitespaces)
-        if let v = Double(body), v >= 0 { return v * mult }
+        guard let v = Double(body), v.isFinite, v >= 0 else { return nil }
+        let hz = v * mult
+        guard hz.isFinite, hz <= maxHz else { return nil }
+        return hz
     }
-    guard let v = Double(trimmed), v >= 0 else { return nil }
+    guard let v = Double(trimmed),
+          v.isFinite, v >= 0, v <= maxHz else { return nil }
     return v
 }
