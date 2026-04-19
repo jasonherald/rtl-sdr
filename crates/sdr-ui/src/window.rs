@@ -1086,11 +1086,7 @@ fn connect_rtl_tcp_discovery(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    // Unused in commit 2 — scaffolding only. Subsequent commits
-    // on this branch (#315) populate the popover's list from the
-    // favorites map. Threaded through now so the wire-up lives in
-    // exactly one signature and we don't churn callers again.
-    _favorites_header: &FavoritesHeaderHandle,
+    favorites_header: &FavoritesHeaderHandle,
 ) {
     use std::collections::HashMap;
     use std::time::Instant;
@@ -1185,6 +1181,19 @@ fn connect_rtl_tcp_discovery(
             .map(|entry| (entry.key.clone(), entry))
             .collect(),
     ));
+
+    // Weak refs to the favorites popover's contents. The star-
+    // toggle closure (attached to each row's `ToggleButton`) and
+    // the discovery poll timer both need to refresh the popover
+    // when the favorites map mutates. Strong captures would create
+    // the same closure-cycle pattern the #329 / #335 lessons
+    // taught us to avoid — per-callback atomic upgrade + drop
+    // keeps the popover widgets releasable on window close.
+    let favorites_popover_weak = FavoritesPopoverWeak::from_header(favorites_header);
+    // Seed the popover's content from the restored favorites so
+    // the list is ready when the user first clicks the header
+    // star, without waiting for a mutation to trigger a rebuild.
+    favorites_popover_weak.rebuild(&favorites.borrow());
 
     // Populate the hostname / port fields on startup from the last
     // connected server, if any. Runs once before the poller starts
@@ -1373,6 +1382,7 @@ fn connect_rtl_tcp_discovery(
                     let star_config = std::sync::Arc::clone(&config_for_discovery);
                     let star_rows = Rc::clone(&displayed_rows);
                     let star_expander_weak = expander_weak.clone();
+                    let star_favorites_popover = favorites_popover_weak.clone();
                     star_btn.connect_toggled(move |btn| {
                         let active = btn.is_active();
                         btn.set_icon_name(if active {
@@ -1422,6 +1432,12 @@ fn connect_rtl_tcp_discovery(
                                 &star_favorites.borrow(),
                             );
                         }
+                        // Refresh the header-bar favorites popover
+                        // so the star-toggle reflects there too.
+                        // Upgrade-and-drop inside `rebuild` keeps
+                        // the closure leak-free per the #329
+                        // weak-ref pattern.
+                        star_favorites_popover.rebuild(&star_favorites.borrow());
                     });
                     row.add_prefix(&star_btn);
 
@@ -1532,6 +1548,12 @@ fn connect_rtl_tcp_discovery(
                                 &config_for_discovery,
                                 &snapshot,
                             );
+                            // Refresh the header-bar popover's
+                            // rendering of this entry (age + tuner
+                            // metadata). Cheap — it rebuilds the
+                            // whole list but at favorites scale
+                            // that's trivial.
+                            favorites_popover_weak.rebuild(&favs);
                         }
                     }
                     rows.insert(server.instance_name.clone(), (row, server));
@@ -1633,6 +1655,113 @@ fn reorder_discovered_rows(
         if let Some((row, _)) = rows.get(key) {
             expander.add_row(row);
         }
+    }
+}
+
+/// Weak references to the widgets inside the header-bar favorites
+/// popover. The discovery-flow closures (star toggles, re-announce
+/// refresh) refresh popover contents whenever the favorites map
+/// mutates; strong captures here would hold the list / label / popover
+/// alive for the closure's lifetime, defeating window-close
+/// cleanup. Same per-tick-upgrade pattern established in
+/// `ServerStatusWidgetsWeak` on #329.
+///
+/// `Clone` so we can hand a copy to each per-row star-toggle
+/// closure; `glib::WeakRef` is Rc-like internally, so cloning is
+/// cheap.
+#[derive(Clone)]
+struct FavoritesPopoverWeak {
+    list: glib::WeakRef<gtk4::ListBox>,
+    empty_label: glib::WeakRef<gtk4::Label>,
+}
+
+impl FavoritesPopoverWeak {
+    fn from_header(handle: &FavoritesHeaderHandle) -> Self {
+        Self {
+            list: handle.list.downgrade(),
+            empty_label: handle.empty_label.downgrade(),
+        }
+    }
+
+    /// Clear the `ListBox` and rebuild one row per `FavoriteEntry`,
+    /// sorted alphabetically by nickname. Toggles the empty-state
+    /// label visibility so the popover reads cleanly in both the
+    /// no-favorites and has-favorites states.
+    ///
+    /// Silent no-op when either widget is gone (window torn down).
+    /// Rows are content-only in commit 3 — Connect / Copy / Unstar
+    /// buttons land in the next commit on this branch.
+    fn rebuild(
+        &self,
+        favorites: &std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>,
+    ) {
+        let (Some(list), Some(empty)) = (self.list.upgrade(), self.empty_label.upgrade()) else {
+            return;
+        };
+        // Clear existing rows. `ListBox::remove` detaches without
+        // dropping the widgets past us — the HashMap has already
+        // gone through its mutation above this call.
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+        let has_any = !favorites.is_empty();
+        empty.set_visible(!has_any);
+        list.set_visible(has_any);
+        if !has_any {
+            return;
+        }
+        let now = sidebar::source_panel::now_unix_seconds();
+        let mut entries: Vec<&sidebar::source_panel::FavoriteEntry> = favorites.values().collect();
+        // Alpha by nickname so adding / removing doesn't reorder
+        // the rest of the list.
+        entries.sort_by_key(|e| e.nickname.to_lowercase());
+        for entry in entries {
+            let row = adw::ActionRow::builder()
+                .title(&entry.nickname)
+                .subtitle(format_favorite_subtitle(entry, now))
+                .activatable(false)
+                .build();
+            list.append(&row);
+        }
+    }
+}
+
+/// Render a `FavoriteEntry` into the one-line subtitle shown on
+/// its row. Joined with ` • ` separators — matches the discovery-
+/// row subtitle format so the two lists read consistently.
+fn format_favorite_subtitle(entry: &sidebar::source_panel::FavoriteEntry, now_unix: u64) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    parts.push(entry.key.clone());
+    if let (Some(tuner), Some(gains)) = (entry.tuner_name.as_deref(), entry.gain_count) {
+        parts.push(format!("{tuner} · {gains} gains"));
+    }
+    let seen = match entry.last_seen_unix {
+        Some(ts) if ts > 0 => format!("seen {}", format_seen_age(now_unix, ts)),
+        _ => "offline".to_string(),
+    };
+    parts.push(seen);
+    parts.join(" • ")
+}
+
+/// Bucket a `now - last_seen` difference into a short human
+/// string. Coarser buckets than the discovery-row's `format_age`
+/// because favorites ages are typically much larger (minutes to
+/// days) and the row subtitle has limited horizontal real estate.
+fn format_seen_age(now_unix: u64, last_seen_unix: u64) -> String {
+    if last_seen_unix >= now_unix {
+        // Clock skew or freshly-stamped — render as the latest
+        // bucket rather than a garbage negative value.
+        return "just now".to_string();
+    }
+    let secs = now_unix - last_seen_unix;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
     }
 }
 
