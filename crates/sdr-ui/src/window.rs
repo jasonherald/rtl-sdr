@@ -1039,6 +1039,17 @@ fn connect_rtl_tcp_discovery(
     // a `LastConnectedServer` snapshot on click.
     let config_for_discovery = std::sync::Arc::clone(config);
 
+    // Favorites set — instance names the user has starred. Loaded
+    // once on startup, mutated by star-toggle handlers, persisted
+    // after each change via `save_favorites`. `Rc<RefCell<HashSet>>`
+    // mirrors the `displayed_rows` pattern — single-threaded GTK
+    // main loop, no lock contention.
+    let favorites: Rc<RefCell<std::collections::HashSet<String>>> = Rc::new(RefCell::new(
+        crate::sidebar::source_panel::load_favorites(&config_for_discovery)
+            .into_iter()
+            .collect(),
+    ));
+
     // Populate the hostname / port fields on startup from the last
     // connected server, if any. Runs once before the poller starts
     // so the user sees "the server they were last on" immediately
@@ -1153,6 +1164,67 @@ fn connect_rtl_tcp_discovery(
                         .title(&title)
                         .subtitle(&subtitle)
                         .build();
+
+                    // Star toggle — prefix icon, pinning this
+                    // server to the top of the discovered list and
+                    // persisting the choice across app launches.
+                    // Using the outlined / filled star icon pair
+                    // so the toggle state reads clearly without
+                    // extra CSS.
+                    let star_btn = gtk4::ToggleButton::builder()
+                        .icon_name(FAVORITE_ICON_OUTLINE)
+                        .valign(gtk4::Align::Center)
+                        .css_classes(["flat"])
+                        .tooltip_text("Pin as favorite")
+                        .build();
+                    let starred_initially = favorites.borrow().contains(&server.instance_name);
+                    star_btn.set_active(starred_initially);
+                    if starred_initially {
+                        star_btn.set_icon_name(FAVORITE_ICON_FILLED);
+                    }
+                    let star_instance = server.instance_name.clone();
+                    let star_favorites = Rc::clone(&favorites);
+                    let star_config = std::sync::Arc::clone(&config_for_discovery);
+                    let star_rows = Rc::clone(&displayed_rows);
+                    let star_expander_weak = expander_weak.clone();
+                    star_btn.connect_toggled(move |btn| {
+                        let active = btn.is_active();
+                        btn.set_icon_name(if active {
+                            FAVORITE_ICON_FILLED
+                        } else {
+                            FAVORITE_ICON_OUTLINE
+                        });
+                        {
+                            let mut favs = star_favorites.borrow_mut();
+                            if active {
+                                favs.insert(star_instance.clone());
+                            } else {
+                                favs.remove(&star_instance);
+                            }
+                            // Persist immediately. Order within
+                            // the persisted list is unspecified —
+                            // sort on read if the UI ever needs a
+                            // stable presentation order for
+                            // favorites management.
+                            let snapshot: Vec<String> = favs.iter().cloned().collect();
+                            crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
+                        }
+                        // Rebuild the expander so the row moves
+                        // to/from the top per the new favorite
+                        // state. Reuses the `displayed_rows` map
+                        // (strong refs on the AdwActionRow
+                        // widgets) — ordering is the only thing
+                        // that changes.
+                        if let Some(expander) = star_expander_weak.upgrade() {
+                            reorder_discovered_rows(
+                                &expander,
+                                &star_rows.borrow(),
+                                &star_favorites.borrow(),
+                            );
+                        }
+                    });
+                    row.add_prefix(&star_btn);
+
                     let connect_btn = gtk4::Button::with_label("Connect");
                     connect_btn.add_css_class("suggested-action");
                     connect_btn.set_valign(gtk4::Align::Center);
@@ -1222,6 +1294,9 @@ fn connect_rtl_tcp_discovery(
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
                     rows.insert(server.instance_name.clone(), (row, server));
+                    // Reorder after insert so favorites float to
+                    // the top of the new view.
+                    reorder_discovered_rows(&expander, &rows, &favorites.borrow());
 
                     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
                 }
@@ -1249,6 +1324,58 @@ fn connect_rtl_tcp_discovery(
 /// per-tick `rusb::devices()` USB-bus enumerate is invisible in
 /// profile traces.
 const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Icon name for the un-filled ("not pinned") star on discovery
+/// rows. GNOME Symbolic icon set — present on every GTK4 install.
+const FAVORITE_ICON_OUTLINE: &str = "starred-symbolic";
+/// Icon name for the filled ("pinned") star. Uses the same icon
+/// as the outline so the toggle state reads as "emphasis" rather
+/// than two-icon-switcharoo; UI consumers distinguish the two via
+/// the `ToggleButton::is_active` styling.
+///
+/// **Note:** GNOME's `starred-symbolic` is filled and
+/// `non-starred-symbolic` is outlined — we use both for a clearer
+/// visual toggle. Kept as named consts so future icon swaps
+/// (e.g. to a separate checkmark-based treatment) happen in one
+/// place.
+const FAVORITE_ICON_FILLED: &str = "starred-symbolic";
+
+/// Re-add rows to an `AdwExpanderRow` in a deterministic order:
+/// favorites (alphabetical by instance name) first, then
+/// non-favorites (same alpha order). Called after any mutation
+/// that could change the sort — new announce, favorite toggle —
+/// so the user's pinned entries stay glued to the top. GTK4 gives
+/// us no in-place reorder API for expander children, so we
+/// remove-and-re-add. At the expected scale (<50 servers on any
+/// realistic LAN) the reparenting is invisible.
+fn reorder_discovered_rows(
+    expander: &adw::ExpanderRow,
+    rows: &std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>,
+    favorites: &std::collections::HashSet<String>,
+) {
+    // Remove every row from the expander — widgets live in the
+    // HashMap, so no drop happens.
+    for (row, _) in rows.values() {
+        expander.remove(row);
+    }
+    // Sort keys: favorites first, then alpha. Stable across calls
+    // so the user doesn't see rows jitter on every re-announce.
+    let mut keys: Vec<&String> = rows.keys().collect();
+    keys.sort_by(|a, b| {
+        let a_fav = favorites.contains(a.as_str());
+        let b_fav = favorites.contains(b.as_str());
+        match (a_fav, b_fav) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        }
+    });
+    for key in keys {
+        if let Some((row, _)) = rows.get(key) {
+            expander.add_row(row);
+        }
+    }
+}
 
 /// Owned handle for a running `rtl_tcp` server + optional mDNS
 /// advertisement. Drops in reverse order: advertiser first (so
