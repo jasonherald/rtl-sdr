@@ -87,6 +87,57 @@ struct FrequencyDigitsEntry: View {
             selected digit, ←/→ move selection, 0–9 set the \
             digit. Scroll wheel also works over any digit.
             """)
+        // Accessibility: expose the row as a single adjustable
+        // element. VoiceOver reads the current frequency + the
+        // selected digit, and increment/decrement drive
+        // `step(digit:by:)` on the selected digit. Per-digit
+        // access is still available to sighted users via click /
+        // arrow keys, but a single-element adjustable is what
+        // screen readers expect for a numeric spinner.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Frequency")
+        .accessibilityValue(accessibilityValue)
+        .accessibilityHint("Adjustable. Increment or decrement the selected digit.")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment:
+                step(digit: selectedIndex, by: +1)
+            case .decrement:
+                step(digit: selectedIndex, by: -1)
+            @unknown default:
+                break
+            }
+        }
+        .accessibilityAction(named: "Select next digit") {
+            if selectedIndex < Self.numDigits - 1 {
+                selectedIndex += 1
+            }
+        }
+        .accessibilityAction(named: "Select previous digit") {
+            if selectedIndex > 0 {
+                selectedIndex -= 1
+            }
+        }
+    }
+
+    /// VoiceOver-friendly rendering of the current state. Reads
+    /// like "100.700 megahertz, selecting 10 kilohertz digit"
+    /// so the user knows both the value and what the next
+    /// increment/decrement will affect.
+    private var accessibilityValue: String {
+        let freq = formatRate(hz)
+            .replacingOccurrences(of: "MHz", with: "megahertz")
+            .replacingOccurrences(of: "kHz", with: "kilohertz")
+            .replacingOccurrences(of: "Hz", with: "hertz")
+        let stepSize = Self.digitStep(selectedIndex)
+        let stepLabel: String
+        switch stepSize {
+        case 1_000_000_000...: stepLabel = "\(stepSize / 1_000_000_000) gigahertz"
+        case 1_000_000...:     stepLabel = "\(stepSize / 1_000_000) megahertz"
+        case 1_000...:         stepLabel = "\(stepSize / 1_000) kilohertz"
+        default:               stepLabel = "\(stepSize) hertz"
+        }
+        return "\(freq), selecting \(stepLabel) digit"
     }
 
     // ----------------------------------------------------------
@@ -247,28 +298,31 @@ struct FrequencyDigitsEntry: View {
         return freq
     }
 
+    /// Step size (Hz) for each digit position. Module-private
+    /// static so key-repeat / scroll events don't re-allocate a
+    /// 12-entry array on every invocation.
+    /// Position 0 = 100 GHz (10^11); position 11 = 1 Hz (10^0).
+    private static let digitStepTable: [UInt64] = [
+        100_000_000_000,  // 100 GHz
+        10_000_000_000,   // 10 GHz
+        1_000_000_000,    // 1 GHz
+        100_000_000,      // 100 MHz
+        10_000_000,       // 10 MHz
+        1_000_000,        // 1 MHz
+        100_000,          // 100 kHz
+        10_000,           // 10 kHz
+        1_000,             // 1 kHz
+        100,              // 100 Hz
+        10,               // 10 Hz
+        1,                // 1 Hz
+    ]
+
     /// Step size (Hz) for a digit position.
     /// Position 0 = 100 GHz (10^11); position 11 = 1 Hz (10^0).
     static func digitStep(_ position: Int) -> UInt64 {
         precondition(position >= 0 && position < numDigits,
                      "digit position out of range")
-        // Precomputed; `pow(10, ...)` on UInt64 isn't free at
-        // runtime and this is hot during arrow-key repeat.
-        let steps: [UInt64] = [
-            100_000_000_000,  // 100 GHz
-            10_000_000_000,   // 10 GHz
-            1_000_000_000,    // 1 GHz
-            100_000_000,      // 100 MHz
-            10_000_000,       // 10 MHz
-            1_000_000,        // 1 MHz
-            100_000,          // 100 kHz
-            10_000,           // 10 kHz
-            1_000,            // 1 kHz
-            100,              // 100 Hz
-            10,               // 10 Hz
-            1,                // 1 Hz
-        ]
-        return steps[position]
+        return digitStepTable[position]
     }
 }
 
