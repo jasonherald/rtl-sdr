@@ -55,4 +55,27 @@ pub trait Tuner: Send {
         handle: &rusb::DeviceHandle<rusb::GlobalContext>,
         manual: bool,
     ) -> Result<(), RtlSdrError>;
+
+    /// Set the gain of an IF stage, in tenths of dB.
+    ///
+    /// Ports `rtlsdr_set_tuner_if_gain`. Only the E4000 programs IF
+    /// stages meaningfully — R820T / R828D / FC0012 / FC0013 /
+    /// FC2580 have no IF-stage controls and silently no-op (matches
+    /// upstream librtlsdr's per-tuner `set_if_gain` dispatch where
+    /// those tuners return 0 without side effects). The default
+    /// trait impl captures that no-op behavior so tuner modules
+    /// only override when they actually do something.
+    ///
+    /// `stage` is 1-based (stage 1 through 6 on the E4000).
+    /// `gain` is signed tenths of dB on the wire; E4000 converts
+    /// to integer dB internally because its stage-gain LUTs are
+    /// integer-valued.
+    fn set_if_gain(
+        &mut self,
+        _handle: &rusb::DeviceHandle<rusb::GlobalContext>,
+        _stage: i32,
+        _gain: i32,
+    ) -> Result<(), RtlSdrError> {
+        Ok(())
+    }
 }

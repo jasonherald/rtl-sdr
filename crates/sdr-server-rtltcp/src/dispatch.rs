@@ -61,20 +61,16 @@ pub fn dispatch(dev: &mut RtlSdrDevice, cmd: Command) {
         // 0x06: tmp = ntohl(cmd.param);
         //       rtlsdr_set_tuner_if_gain(dev, tmp >> 16, (short)(tmp & 0xffff));
         //
-        // Not yet available in our sdr-rtlsdr driver (see #308). Upstream
-        // behavior for R820T/R828D/FC* is also a no-op — E4000 is the only
-        // tuner that actually programs IF gain stages. Log and drop until
-        // #308 lands.
+        // Upstream dispatches to the active tuner's `set_if_gain`.
+        // Only the E4000 programs IF stages meaningfully — every
+        // other supported tuner is a no-op there (matched by our
+        // `Tuner::set_if_gain` default). Sign-extending via `i16`
+        // replicates the short cast upstream applies to the wire
+        // gain so negative tenths-of-dB values survive unchanged.
         CommandOp::SetIfGain => {
-            let stage = (param >> IF_GAIN_STAGE_SHIFT_BITS) as i16;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let gain = (param & IF_GAIN_VALUE_MASK) as i16;
-            tracing::debug!(
-                stage,
-                gain_tenths_db = gain,
-                "rtl_tcp set_tuner_if_gain: not implemented (see #308), dropping"
-            );
-            Ok(())
+            let (stage, gain) = unpack_if_gain_param(param);
+            tracing::debug!(stage, gain_tenths_db = gain, "rtl_tcp set tuner if gain");
+            dev.set_tuner_if_gain(i32::from(stage), i32::from(gain))
         }
         // 0x07: rtlsdr_set_testmode(dev, ntohl(cmd.param));
         //       C takes int, non-zero = on.
@@ -156,4 +152,67 @@ fn set_gain_by_index(dev: &mut RtlSdrDevice, index: u32) -> Result<(), sdr_rtlsd
     }
     let gain = gains[idx];
     dev.set_tuner_gain(gain)
+}
+
+/// Unpack the `SetIfGain` (0x06) wire param into its two fields.
+///
+/// Upper 16 bits = IF stage index (unsigned, but `i16` preserves
+/// the upstream C prototype `int stage`). Lower 16 bits = signed
+/// gain in tenths of dB — upstream casts to `short`, and we do the
+/// same via `as i16` so negative values sign-extend correctly when
+/// widened back to `i32` for the `set_tuner_if_gain` call.
+///
+/// Pure function for unit-testability; the handler just calls it
+/// and forwards.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "wire format: rtl_tcp.c:337-339 packs stage in the high 16 bits and signed gain in the low 16 bits of the 32-bit param"
+)]
+fn unpack_if_gain_param(param: u32) -> (i16, i16) {
+    let stage = (param >> IF_GAIN_STAGE_SHIFT_BITS) as i16;
+    let gain = (param & IF_GAIN_VALUE_MASK) as i16;
+    (stage, gain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpack_if_gain_param_positive_values() {
+        // stage=3, gain=+50 tenths (= +5 dB). Both values sit in
+        // their respective 16-bit fields.
+        let param = (0x0003_u32 << 16) | 0x0032_u32;
+        assert_eq!(unpack_if_gain_param(param), (3, 50));
+    }
+
+    #[test]
+    fn unpack_if_gain_param_negative_gain_sign_extends() {
+        // stage=2, gain=-50 tenths. Wire stores -50 as a 16-bit
+        // two's-complement value (0xFFCE) in the lower half. The
+        // `as i16` cast must read it back as -50, NOT 0xFFCE
+        // (= 65486) — that's the sign-extension regression this
+        // test pins. Mirrors upstream rtl_tcp.c's `(short)` cast.
+        let gain_wire = u32::from((-50i16) as u16);
+        let param = (0x0002_u32 << 16) | gain_wire;
+        assert_eq!(unpack_if_gain_param(param), (2, -50));
+    }
+
+    #[test]
+    fn unpack_if_gain_param_boundary_values() {
+        // i16::MAX stage + i16::MIN gain — exercises both extremes
+        // of the signed 16-bit interpretation.
+        let stage_wire = u32::from(i16::MAX as u16) << 16;
+        let gain_wire = u32::from(i16::MIN as u16);
+        assert_eq!(
+            unpack_if_gain_param(stage_wire | gain_wire),
+            (i16::MAX, i16::MIN)
+        );
+    }
+
+    #[test]
+    fn unpack_if_gain_param_zero_returns_zero() {
+        assert_eq!(unpack_if_gain_param(0), (0, 0));
+    }
 }
