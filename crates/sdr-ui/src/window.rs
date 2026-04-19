@@ -1322,10 +1322,27 @@ fn connect_share_switch(
                 Ok(server) => {
                     // If advertising is on, build the TXT record
                     // from the tuner metadata the Server exposes.
-                    // An Advertiser failure is non-fatal — the
-                    // server keeps running without mDNS.
+                    // An Advertiser failure is non-fatal for the
+                    // server itself (the accept loop keeps running
+                    // without mDNS), but the user explicitly asked
+                    // for LAN announcement so they need to KNOW the
+                    // intent failed — surface a toast and leave
+                    // `advertiser = None` so the stop path doesn't
+                    // try to unregister something that never
+                    // registered.
                     let advertiser = if server_panel.advertise_row.is_active() {
-                        build_advertiser(&server, &server_panel.nickname_row.text())
+                        match build_advertiser(&server, &server_panel.nickname_row.text()) {
+                            Ok(adv) => Some(adv),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "mDNS advertiser failed; server running without LAN advertisement");
+                                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                                    overlay.add_toast(adw::Toast::new(&format!(
+                                        "Server running, but mDNS advertising failed: {e}"
+                                    )));
+                                }
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
@@ -1418,6 +1435,71 @@ const BITS_PER_BYTE: u64 = 8;
 /// telecom/carrier conventions for transport rates.
 const BITS_PER_MEGABIT: f64 = 1_000_000.0;
 
+/// Weak references to every widget the server-status poll tick
+/// touches. Held by the poll closure INSTEAD of a strong
+/// `ServerPanel` clone so the closure doesn't bump the widgets'
+/// `GObject` refcounts past window lifetime.
+///
+/// The original design cloned the whole `ServerPanel` into the
+/// closure and relied on a single `widget_weak.upgrade().is_none()`
+/// break gate — but the clone held strong refs to every widget,
+/// including the group itself, so the weak check could never fire
+/// and the 500 ms timer leaked past window close. Every
+/// panel-touching closure in this file now uses weak refs for the
+/// same reason (see `connect_rtl_tcp_discovery`'s pattern).
+struct ServerStatusWidgetsWeak {
+    status_row: glib::WeakRef<adw::ExpanderRow>,
+    status_client_row: glib::WeakRef<adw::ActionRow>,
+    status_uptime_row: glib::WeakRef<adw::ActionRow>,
+    status_data_rate_row: glib::WeakRef<adw::ActionRow>,
+    status_commanded_row: glib::WeakRef<adw::ActionRow>,
+    activity_log_row: glib::WeakRef<adw::ExpanderRow>,
+    activity_log_list: glib::WeakRef<gtk4::ListBox>,
+}
+
+/// Snapshot of upgraded strong references held for the duration of
+/// a single poll tick. All seven widgets upgrade together or we
+/// `Break` the timer — render functions then read these fields
+/// directly without needing their own weak-ref fallbacks.
+struct ServerStatusWidgets {
+    status_row: adw::ExpanderRow,
+    status_client_row: adw::ActionRow,
+    status_uptime_row: adw::ActionRow,
+    status_data_rate_row: adw::ActionRow,
+    status_commanded_row: adw::ActionRow,
+    activity_log_row: adw::ExpanderRow,
+    activity_log_list: gtk4::ListBox,
+}
+
+impl ServerStatusWidgetsWeak {
+    fn from_panel(panel: &sidebar::ServerPanel) -> Self {
+        Self {
+            status_row: panel.status_row.downgrade(),
+            status_client_row: panel.status_client_row.downgrade(),
+            status_uptime_row: panel.status_uptime_row.downgrade(),
+            status_data_rate_row: panel.status_data_rate_row.downgrade(),
+            status_commanded_row: panel.status_commanded_row.downgrade(),
+            activity_log_row: panel.activity_log_row.downgrade(),
+            activity_log_list: panel.activity_log_list.downgrade(),
+        }
+    }
+
+    /// Upgrade all seven weak refs atomically. Returns `None` if
+    /// any one widget has been destroyed — the caller breaks its
+    /// timer instead of rendering against a partially-dead panel.
+    fn upgrade(&self) -> Option<ServerStatusWidgets> {
+        Some(ServerStatusWidgets {
+            status_row: self.status_row.upgrade()?,
+            status_client_row: self.status_client_row.upgrade()?,
+            status_uptime_row: self.status_uptime_row.upgrade()?,
+            status_data_rate_row: self.status_data_rate_row.upgrade()?,
+            status_commanded_row: self.status_commanded_row.upgrade()?,
+            activity_log_row: self.activity_log_row.upgrade()?,
+            activity_log_list: self.activity_log_list.upgrade()?,
+        })
+    }
+}
+
 /// Poll `Server::stats()` on a fixed cadence, render the four
 /// status rows from the snapshot, and auto-stop the server if
 /// `has_stopped()` becomes true (e.g. USB dongle unplugged or
@@ -1440,9 +1522,8 @@ fn connect_server_status_polling(
 ) {
     use std::cell::Cell;
 
-    let server_panel = clone_server_panel(&panels.server);
+    let widgets_weak = ServerStatusWidgetsWeak::from_panel(&panels.server);
     let share_row_weak = panels.server.share_row.downgrade();
-    let widget_weak = panels.server.widget.downgrade();
     let last_bytes_sent = Rc::new(Cell::new(0u64));
     // Activity-log diff key: (ring_len, newest_instant). Rendering
     // is cheap but clearing the ListBox resets any user scroll
@@ -1460,12 +1541,14 @@ fn connect_server_status_polling(
     });
 
     let _ = glib::timeout_add_local(SERVER_STATUS_POLL_INTERVAL, move || {
-        // Tear the poller down if the panel widget is gone (window
-        // closed). Prevents leaking `server.stats()` locks past
-        // window lifetime.
-        if widget_weak.upgrade().is_none() {
+        // Upgrade all the status widgets in one shot. If any is gone
+        // (window closed → sidebar dropped → widgets orphaned), tear
+        // the timer down. Strong refs live only for the duration of
+        // this tick — dropped at function return — so they never
+        // contribute to the long-running GObject refcount.
+        let Some(widgets) = widgets_weak.upgrade() else {
             return glib::ControlFlow::Break;
-        }
+        };
         // Snapshot `Server::stats()` under the borrow. `stats()`
         // internally locks a Mutex — the return is a Clone, so the
         // borrow scope is tight.
@@ -1491,17 +1574,20 @@ fn connect_server_status_polling(
             return glib::ControlFlow::Continue;
         }
 
-        render_status_rows(&server_panel, &stats, &last_bytes_sent);
-        render_activity_log(&server_panel, &stats, &last_activity_key);
+        render_status_rows(&widgets, &stats, &last_bytes_sent);
+        render_activity_log(&widgets, &stats, &last_activity_key);
         glib::ControlFlow::Continue
     });
 }
 
 /// Write the current `ServerStats` snapshot into the four status
 /// rows. Uses `last_bytes_sent` to compute a rolling data-rate from
-/// delta-over-poll-interval.
+/// delta-over-poll-interval. Takes upgraded `ServerStatusWidgets`
+/// — strong refs held only for this call's duration — so the poll
+/// closure itself doesn't contribute to the long-running `GObject`
+/// refcount.
 fn render_status_rows(
-    panel: &sidebar::ServerPanel,
+    widgets: &ServerStatusWidgets,
     stats: &sdr_server_rtltcp::ServerStats,
     last_bytes_sent: &Rc<std::cell::Cell<u64>>,
 ) {
@@ -1512,21 +1598,21 @@ fn render_status_rows(
     // Client row + expander subtitle.
     if let Some(peer) = stats.connected_client {
         let peer_str = peer.to_string();
-        panel.status_client_row.set_subtitle(&peer_str);
-        panel
+        widgets.status_client_row.set_subtitle(&peer_str);
+        widgets
             .status_row
             .set_subtitle(&format!("Connected: {peer_str}"));
     } else {
-        panel
+        widgets
             .status_client_row
             .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
-        panel
+        widgets
             .status_row
             .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
     }
 
     // Uptime row.
-    panel
+    widgets
         .status_uptime_row
         .set_subtitle(&stats.connected_since.map_or_else(
             || STATUS_IDLE_VALUE_SUBTITLE.to_string(),
@@ -1539,7 +1625,7 @@ fn render_status_rows(
     let current_bytes = stats.bytes_sent;
     let delta = current_bytes.saturating_sub(last_bytes_sent.get());
     last_bytes_sent.set(current_bytes);
-    panel
+    widgets
         .status_data_rate_row
         .set_subtitle(&format_data_rate(delta, SERVER_STATUS_POLL_INTERVAL));
 
@@ -1547,7 +1633,7 @@ fn render_status_rows(
     // most recently requested." Assembled one piece at a time; an
     // unset field shows its upstream default stamp from
     // `InitialDeviceState::default()` rather than blanking out.
-    panel
+    widgets
         .status_commanded_row
         .set_subtitle(&format_commanded_state(stats));
 }
@@ -1643,7 +1729,7 @@ fn format_hz(hz: u32) -> String {
 /// so we skip the clear-and-rebuild on idle ticks — preserves any
 /// scroll position the user has in the `ListBox`.
 fn render_activity_log(
-    panel: &sidebar::ServerPanel,
+    widgets: &ServerStatusWidgets,
     stats: &sdr_server_rtltcp::ServerStats,
     last_rendered: &Rc<std::cell::Cell<(usize, Option<Instant>)>>,
 ) {
@@ -1658,18 +1744,18 @@ fn render_activity_log(
 
     // Clear the ListBox children. GTK4 ListBox has no mass-remove,
     // so walk the child list.
-    while let Some(child) = panel.activity_log_list.first_child() {
-        panel.activity_log_list.remove(&child);
+    while let Some(child) = widgets.activity_log_list.first_child() {
+        widgets.activity_log_list.remove(&child);
     }
 
     if stats.recent_commands.is_empty() {
-        panel
+        widgets
             .activity_log_row
             .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
         return;
     }
 
-    panel
+    widgets
         .activity_log_row
         .set_subtitle(&format!("{} commands", stats.recent_commands.len()));
     // Newest first so the user doesn't have to scroll to see the
@@ -1681,7 +1767,7 @@ fn render_activity_log(
             .subtitle(format_log_age(now.saturating_duration_since(*at)))
             .activatable(false)
             .build();
-        panel.activity_log_list.append(&row);
+        widgets.activity_log_list.append(&row);
     }
 }
 
@@ -1741,6 +1827,19 @@ fn reset_status_rows(panel: &sidebar::ServerPanel) {
         .set_subtitle(STATUS_IDLE_VALUE_SUBTITLE);
 }
 
+/// Upstream `rtl_tcp`'s `-D` flag accepts 0 = off, 2 = Q-branch
+/// direct sampling. Only those two values are meaningful for the
+/// UI switch; I-branch (1) is deliberately not exposed because
+/// upstream's CLI also hardcodes 2 for `-D`.
+const DIRECT_SAMPLING_OFF: i32 = 0;
+/// See [`DIRECT_SAMPLING_OFF`]. 2 selects the Q branch.
+const DIRECT_SAMPLING_Q_BRANCH: i32 = 2;
+/// Buffer-capacity sentinel passed to `ServerConfig`. `0` tells
+/// the server crate to use its internal `DEFAULT_BUFFER_CAPACITY`,
+/// keeping the UI honest about "we're not overriding this" rather
+/// than pinning a value the server may later tune.
+const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
+
 /// Read the server panel widget values and build a `ServerConfig`
 /// off them. Takes the full `ServerPanel` by reference so the arg
 /// list stays short and the fn signature documents the "this reads
@@ -1797,9 +1896,9 @@ fn build_server_config_from_panel(panel: &sidebar::ServerPanel) -> ServerConfig 
     let ppm = panel.ppm_row.value() as i32;
     let bias_tee = panel.bias_tee_row.is_active();
     let direct_sampling = if panel.direct_sampling_row.is_active() {
-        2 // Q branch — upstream rtl_tcp hardcodes 2 for -D.
+        DIRECT_SAMPLING_Q_BRANCH
     } else {
-        0
+        DIRECT_SAMPLING_OFF
     };
 
     ServerConfig {
@@ -1813,15 +1912,19 @@ fn build_server_config_from_panel(panel: &sidebar::ServerPanel) -> ServerConfig 
             bias_tee,
             direct_sampling,
         },
-        buffer_capacity: 0, // 0 = crate default
+        buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
     }
 }
 
 /// Start an mDNS advertiser for the running `Server` using the
-/// user's chosen nickname (falling back to `local_hostname()` if the
-/// entry is empty or whitespace). Returns `None` on failure — the
-/// server itself keeps running, just without LAN advertising.
-fn build_advertiser(server: &Server, nickname_raw: &str) -> Option<Advertiser> {
+/// user's chosen nickname (falling back to `local_hostname()` if
+/// the entry is empty or whitespace). Errors propagate to the
+/// caller so the UI can toast them — the server itself keeps
+/// running regardless, just without LAN advertising.
+fn build_advertiser(
+    server: &Server,
+    nickname_raw: &str,
+) -> Result<Advertiser, sdr_rtltcp_discovery::DiscoveryError> {
     let nickname = nickname_raw.trim();
     let nickname = if nickname.is_empty() {
         local_hostname()
@@ -1850,13 +1953,7 @@ fn build_advertiser(server: &Server, nickname_raw: &str) -> Option<Advertiser> {
             txbuf: None,
         },
     };
-    match Advertiser::announce(opts) {
-        Ok(adv) => Some(adv),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to start mDNS advertiser; server running without LAN advertisement");
-            None
-        }
-    }
+    Advertiser::announce(opts)
 }
 
 /// Lock or unlock the server-config rows. Called with `true` on
