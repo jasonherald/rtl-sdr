@@ -58,10 +58,15 @@ pub enum DspToUi {
 pub enum SourceType {
     /// RTL-SDR USB dongle.
     RtlSdr,
-    /// TCP/UDP network IQ stream.
+    /// Raw TCP/UDP network IQ stream (generic, fixed-format).
     Network,
     /// WAV file playback.
     File,
+    /// rtl_tcp-protocol network source — speaks the RTL0 handshake,
+    /// supports discovery via mDNS, and tunes the remote dongle via
+    /// the 5-byte command channel. Distinct from `Network` because
+    /// the wire protocol and feature set diverge.
+    RtlTcp,
 }
 
 /// Messages sent from the UI thread to the DSP pipeline thread.
@@ -415,11 +420,32 @@ mod tests {
 
     #[test]
     fn test_source_type_variants() {
+        // Equality + discrimination across all four variants. RtlTcp
+        // is the rtl_tcp-protocol network client added alongside the
+        // existing raw Network variant; keep them distinct at the
+        // type level.
         assert_eq!(SourceType::RtlSdr, SourceType::RtlSdr);
         assert_ne!(SourceType::RtlSdr, SourceType::Network);
         assert_ne!(SourceType::Network, SourceType::File);
+        assert_ne!(SourceType::Network, SourceType::RtlTcp);
+        assert_ne!(SourceType::RtlTcp, SourceType::RtlSdr);
 
-        let types = [SourceType::RtlSdr, SourceType::Network, SourceType::File];
-        assert_eq!(types.len(), 3);
+        let types = [
+            SourceType::RtlSdr,
+            SourceType::Network,
+            SourceType::File,
+            SourceType::RtlTcp,
+        ];
+        assert_eq!(types.len(), 4);
+    }
+
+    #[test]
+    fn test_set_source_type_rtl_tcp_message() {
+        // Regression coverage for the new variant — make sure the
+        // message wraps it and pattern-matches cleanly, same shape as
+        // the existing RtlSdr / Network / File branches elsewhere in
+        // this test suite.
+        let msg = UiToDsp::SetSourceType(SourceType::RtlTcp);
+        assert!(matches!(msg, UiToDsp::SetSourceType(SourceType::RtlTcp)));
     }
 }

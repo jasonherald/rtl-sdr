@@ -155,6 +155,18 @@ pub struct ServerStats {
     pub last_command: Option<(CommandOp, Instant)>,
 }
 
+/// Tuner metadata captured at open time, exposed for callers that
+/// need to advertise it (e.g. the `sdr-rtltcp-discovery` advertiser
+/// populating mDNS TXT fields).
+#[derive(Debug, Clone)]
+pub struct TunerAdvertiseInfo {
+    /// Human-readable tuner name, e.g. `"R820T"`. Rendered from the
+    /// driver's `TunerType` enum via `Debug`.
+    pub name: String,
+    /// Number of discrete gain steps the tuner exposes.
+    pub gain_count: u32,
+}
+
 /// Running server handle.
 pub struct Server {
     shutdown: Arc<AtomicBool>,
@@ -162,6 +174,7 @@ pub struct Server {
     accept_thread: Option<JoinHandle<()>>,
     stats: Arc<Mutex<ServerStats>>,
     bind: SocketAddr,
+    tuner: TunerAdvertiseInfo,
 }
 
 impl Server {
@@ -203,10 +216,14 @@ impl Server {
         let mut device = RtlSdrDevice::open(config.device_index)?;
         apply_initial_state(&mut device, &config.initial)?;
 
+        let tuner = TunerAdvertiseInfo {
+            name: format!("{:?}", device.tuner_type()),
+            gain_count: device.tuner_gains().len() as u32,
+        };
         tracing::info!(
             bind = %actual_bind,
-            tuner = ?device.tuner_type(),
-            gain_count = device.tuner_gains().len(),
+            tuner = %tuner.name,
+            gain_count = tuner.gain_count,
             "rtl_tcp server listening"
         );
 
@@ -237,6 +254,7 @@ impl Server {
             accept_thread: Some(accept_thread),
             stats,
             bind: actual_bind,
+            tuner,
         })
     }
 
@@ -248,6 +266,14 @@ impl Server {
     /// The address the server is bound to.
     pub fn bind_address(&self) -> SocketAddr {
         self.bind
+    }
+
+    /// Tuner metadata captured at `start()` time. Callers that want to
+    /// advertise the server (e.g. via mDNS) read this for the tuner
+    /// name + gain-count fields; we don't pull in a discovery dep here
+    /// to keep the server crate free of mDNS deps.
+    pub fn tuner_info(&self) -> &TunerAdvertiseInfo {
+        &self.tuner
     }
 
     /// Has the accept thread exited (either via `stop()` or an

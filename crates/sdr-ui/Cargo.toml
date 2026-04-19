@@ -48,6 +48,9 @@ sdr-source-rtlsdr.workspace = true
 sdr-sink-audio.workspace = true
 sdr-radioreference.workspace = true
 sdr-transcription.workspace = true
+# Discovery for the rtl_tcp client picker — Browser events feed the
+# AdwExpanderRow under the source panel.
+sdr-rtltcp-discovery.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
