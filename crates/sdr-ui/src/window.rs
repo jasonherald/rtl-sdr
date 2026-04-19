@@ -2023,6 +2023,14 @@ fn format_favorite_subtitle(entry: &sidebar::source_panel::FavoriteEntry, now_un
     parts.join(" • ")
 }
 
+/// Bucket boundaries for [`format_seen_age`]. Raw Unix-seconds
+/// arithmetic (not `std::time::Duration`) because `last_seen_unix`
+/// is stored as `u64` seconds in the favorites JSON and stays in
+/// that domain end-to-end.
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+
 /// Bucket a `now - last_seen` difference into a short human
 /// string. Coarser buckets than the discovery-row's `format_age`
 /// because favorites ages are typically much larger (minutes to
@@ -2034,14 +2042,14 @@ fn format_seen_age(now_unix: u64, last_seen_unix: u64) -> String {
         return "just now".to_string();
     }
     let secs = now_unix - last_seen_unix;
-    if secs < 60 {
+    if secs < SECONDS_PER_MINUTE {
         "just now".to_string()
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
+    } else if secs < SECONDS_PER_HOUR {
+        format!("{}m ago", secs / SECONDS_PER_MINUTE)
+    } else if secs < SECONDS_PER_DAY {
+        format!("{}h ago", secs / SECONDS_PER_HOUR)
     } else {
-        format!("{}d ago", secs / 86_400)
+        format!("{}d ago", secs / SECONDS_PER_DAY)
     }
 }
 

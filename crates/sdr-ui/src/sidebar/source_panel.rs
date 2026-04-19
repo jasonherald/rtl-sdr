@@ -10,9 +10,16 @@ use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
 use sdr_types::RtlTcpConnectionState;
 
-/// Config key for the persisted list of favorited `rtl_tcp` server
-/// instance names. Stored as a JSON array of strings; unknown /
-/// stale entries are tolerated by the read path.
+/// Config key for the persisted list of favorited `rtl_tcp`
+/// servers. Stored as a JSON array of [`FavoriteEntry`] objects,
+/// each keyed by the stable `hostname:port` identity produced by
+/// `window.rs::favorite_key` (NOT by DNS-SD `instance_name` —
+/// operators can rename the mDNS nickname, which would otherwise
+/// silently drop the star on any rename). The read path
+/// ([`load_favorites`]) also accepts legacy bare-string
+/// `hostname:port` entries from the PR #335 schema for backward
+/// compatibility; unknown / stale objects are skipped with a
+/// `tracing::warn!` so schema drift stays diagnosable.
 pub const KEY_RTL_TCP_CLIENT_FAVORITES: &str = "rtl_tcp_client_favorites";
 /// Config key for the persisted last-connected server. Stored as
 /// a JSON object `{ host, port, nickname }` so we can repopulate
