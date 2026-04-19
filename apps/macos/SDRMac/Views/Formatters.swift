@@ -26,8 +26,9 @@ func formatRate(_ hz: Double) -> String {
 /// interior whitespace, accepts a leading `+`. Rejects negative
 /// inputs — callers treat `nil` as "revert to last value".
 ///
-/// Shared by `FrequencyEntry` (big tuner display) and
-/// `BandwidthEntry` (Radio sidebar). Both want the same
+/// Shared by the bandwidth / frequency text-entry surfaces
+/// (currently `BandwidthEntry`; the big tuner now uses a
+/// digit grid and parses nothing). These inputs want the same
 /// permissive parse rules.
 func parseHzFrequency(_ s: String) -> Double? {
     var trimmed = s.trimmingCharacters(in: .whitespaces).lowercased()

@@ -155,12 +155,26 @@ struct FrequencyDigitsEntry: View {
 
     /// Step the frequency by ±(10^position). Positive delta =
     /// increase, negative = decrease. Clamped to the valid range.
+    ///
+    /// Clamp `hz` into range BEFORE converting, not just after.
+    /// If a caller set an out-of-range value externally (e.g. a
+    /// tune command that the engine clamps silently), the base
+    /// we step from must be the clamped value, not the stale
+    /// binding — otherwise `+1` on an already-too-big number
+    /// produces garbage. Per #327 review.
     private func step(digit position: Int, by delta: Int) {
         let stepHz = Self.digitStep(position)
-        let current = UInt64(max(0, hz))
+        let current = UInt64(
+            max(0, min(Double(Self.maxFrequencyHz), hz))
+        )
         let new: UInt64
         if delta > 0 {
-            new = min(Self.maxFrequencyHz, current &+ stepHz)
+            // Plain `+` (not `&+`) so an unforeseen overflow
+            // traps loudly instead of wrapping silently. The
+            // `min` above guarantees we can't actually overflow
+            // a UInt64 here — maxFrequencyHz + 100_000_000_000
+            // is nowhere near UInt64.max.
+            new = min(Self.maxFrequencyHz, current + stepHz)
         } else {
             new = current >= stepHz ? current - stepHz : 0
         }
@@ -194,9 +208,15 @@ struct FrequencyDigitsEntry: View {
     /// and ignores separator dots. Close enough for scroll
     /// intent; click-to-select uses `.onTapGesture` on the
     /// digit views directly so it's pixel-accurate.
+    ///
+    /// Multiply by `numDigits` (not `numDigits - 1`) so each
+    /// digit owns an equal 1/12 slice of the width. Using
+    /// `numDigits - 1` made the rightmost slice reachable only
+    /// at exactly frac == 1.0, which effectively hid the 1 Hz
+    /// digit from the scroll path. Per #327 review.
     private func digitIndex(atFraction frac: CGFloat) -> Int {
         let f = max(0, min(1, frac))
-        let idx = Int(f * CGFloat(Self.numDigits - 1))
+        let idx = Int(f * CGFloat(Self.numDigits))
         return max(0, min(Self.numDigits - 1, idx))
     }
 
