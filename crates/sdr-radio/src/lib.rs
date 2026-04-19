@@ -95,6 +95,13 @@ pub struct RadioModule {
     resamp_buf: Vec<Complex>,
     /// Scratch buffer for demod output (stereo, at AF sample rate).
     demod_buf: Vec<Stereo>,
+    /// Per-sample attack / release envelope on the post-demod
+    /// stereo output, driven by the IF-chain squelch's gate
+    /// state. Lives in the AF path because FM discriminators are
+    /// amplitude-invariant — an IQ-side envelope has zero effect
+    /// on FM audio output. See #331 and the
+    /// `SquelchAudioEnvelope` docstring for the full reasoning.
+    squelch_envelope: sdr_dsp::noise::SquelchAudioEnvelope,
 }
 
 impl RadioModule {
@@ -110,6 +117,13 @@ impl RadioModule {
         let demod = create_demodulator(mode)?;
         let if_chain = IfChain::new()?;
         let af_chain = AfChain::new(demod.config().af_sample_rate, audio_sample_rate)?;
+        // Audio-path envelope for smoothing squelch open / close
+        // transitions. Runs at the final `audio_sample_rate`
+        // because it's applied to the stereo output after AfChain's
+        // resampler — see `process()` and #331's bug-fix notes for
+        // why this has to live in the AF path and not at IF.
+        #[allow(clippy::cast_possible_truncation)]
+        let squelch_envelope = sdr_dsp::noise::SquelchAudioEnvelope::new(audio_sample_rate as f32);
 
         Ok(Self {
             mode,
@@ -129,6 +143,7 @@ impl RadioModule {
             if_buf: Vec::new(),
             resamp_buf: Vec::new(),
             demod_buf: Vec::new(),
+            squelch_envelope,
         })
     }
 
@@ -252,6 +267,12 @@ impl RadioModule {
         if !squelch_allowed {
             self.if_chain.set_squelch_enabled(false);
         }
+        // Reset the AF squelch envelope so stale gain state from
+        // the previous mode's audio pipeline doesn't bleed into
+        // the first block on the new mode. Envelope coefficients
+        // stay valid — audio output rate is fixed at construction
+        // and the AfChain resampler normalizes all modes to it.
+        self.squelch_envelope.reset();
 
         self.mode = mode;
         self.demod = new_demod;
@@ -351,6 +372,39 @@ impl RadioModule {
         let af_count = self
             .af_chain
             .process(&self.demod_buf[..demod_count], output)?;
+
+        // Stage 4: Audio squelch envelope — only when the user
+        // has actually enabled squelch (manual or auto). Running
+        // the envelope unconditionally would mute the first
+        // ~2 ms of every block while the envelope ramps up from
+        // 0, even when there's no gate to open in the first
+        // place — a regression on modes like Raw that disable
+        // squelch entirely.
+        //
+        // When active: drives target gain from the IF-chain's
+        // block-level gate state and ramps the stereo output
+        // per-sample toward that target, smoothing the step
+        // discontinuity that otherwise produces loud gate-
+        // transition pops (particularly on macOS CoreAudio's
+        // internal resampler — see #331).
+        //
+        // Why here and not at IF: FM discriminators compute
+        // `atan2(phase delta)` which is amplitude-invariant, so
+        // scaling IQ magnitude has zero effect on FM audio.
+        // Applying the envelope to post-demod audio works for
+        // all modulation types uniformly.
+        if self.if_chain.squelch_active() {
+            self.squelch_envelope
+                .set_gate_open(self.if_chain.squelch_open());
+            self.squelch_envelope
+                .process_stereo(&mut output[..af_count]);
+        } else {
+            // Keep the envelope state coherent for when the user
+            // re-enables squelch mid-session — force it to fully-
+            // open so the first block post-enable doesn't fade in
+            // from silence.
+            self.squelch_envelope.reset_to_open();
+        }
 
         Ok(af_count)
     }
