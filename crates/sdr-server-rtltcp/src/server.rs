@@ -17,6 +17,7 @@
 //! command_worker (TCP recv → dispatch). First worker to exit signals
 //! the others via the shutdown flag.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +80,14 @@ pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 2_048_000;
 /// Default center frequency in Hz, matching upstream rtl_tcp's
 /// `frequency = 100000000` default at rtl_tcp.c:389.
 pub const DEFAULT_CENTER_FREQ_HZ: u32 = 100_000_000;
+
+/// Maximum number of recent `(CommandOp, Instant)` entries retained
+/// in `ServerStats::recent_commands`. 50 covers a typical rtl_tcp
+/// session's worth of tuning / gain / mode changes — enough to
+/// debug "why didn't my tune command land?" scenarios without
+/// unbounded memory growth on long-running servers. Oldest entries
+/// are popped when the ring fills.
+pub const RECENT_COMMANDS_CAPACITY: usize = 50;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -146,13 +155,57 @@ impl Default for InitialDeviceState {
 }
 
 /// Live server statistics for UI consumption.
+///
+/// Each field is either a session-scoped counter (reset when the
+/// current client disconnects — `bytes_sent`, `buffers_dropped`,
+/// `last_command`, and the `current_*` commanded fields) or a
+/// session-identity hint (`connected_client`, `connected_since`).
+/// UI callers snapshot the struct via `Server::stats()` on a timer
+/// and compute deltas (e.g. data-rate) across consecutive snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct ServerStats {
+    /// Socket address of the currently-connected client. `None`
+    /// means the accept loop is waiting.
     pub connected_client: Option<SocketAddr>,
+    /// Wall-clock moment the current session began. Paired with
+    /// `connected_client`: both are `Some` or both are `None`.
     pub connected_since: Option<Instant>,
+    /// Bytes written to the client socket across the current
+    /// session. Reset to 0 on connect / disconnect.
     pub bytes_sent: u64,
+    /// Buffer-drop count: how many times the USB→TCP queue was
+    /// full when a new IQ block arrived, forcing us to discard.
+    /// Reset to 0 on connect / disconnect.
     pub buffers_dropped: u64,
+    /// Most recent command received from the client, with the
+    /// moment it was dispatched. UI renders this as the "activity
+    /// log" preview. Reset to `None` on disconnect.
     pub last_command: Option<(CommandOp, Instant)>,
+    /// Most recent `SetCenterFreq` value requested by the client,
+    /// in Hz. Populated from the wire param so it reflects what
+    /// the client asked for even if the device layer rejected it;
+    /// UI treats this as "the client thinks we're tuned here."
+    /// Reset on disconnect.
+    pub current_freq_hz: Option<u32>,
+    /// Most recent `SetSampleRate` request, in Hz. Same "client's
+    /// view" semantics as `current_freq_hz`.
+    pub current_sample_rate_hz: Option<u32>,
+    /// Most recent `SetTunerGain` request, in tenths of dB
+    /// (negative is legal per upstream). `None` means the client
+    /// hasn't requested a manual gain since connecting.
+    pub current_gain_tenths_db: Option<i32>,
+    /// `true` when the client most recently sent
+    /// `SetGainMode(auto)`, `false` on `SetGainMode(manual)`,
+    /// `None` when it hasn't sent one this session. UI renders
+    /// "auto" vs "manual" accordingly.
+    pub current_gain_auto: Option<bool>,
+    /// Ring buffer of recent commands received this session, bounded
+    /// at `RECENT_COMMANDS_CAPACITY` entries. Newest-first ordering
+    /// is the UI's responsibility; this preserves insertion order
+    /// (oldest at front, newest at back) so the producer stays cheap
+    /// (`push_back` + `pop_front` at cap). Reset on connect /
+    /// disconnect along with the other per-session counters.
+    pub recent_commands: VecDeque<(CommandOp, Instant)>,
 }
 
 /// Tuner metadata captured at open time, exposed for callers that
@@ -560,6 +613,11 @@ fn update_stats_on_connect(stats: &Arc<Mutex<ServerStats>>, peer: SocketAddr) {
         s.bytes_sent = 0;
         s.buffers_dropped = 0;
         s.last_command = None;
+        s.current_freq_hz = None;
+        s.current_sample_rate_hz = None;
+        s.current_gain_tenths_db = None;
+        s.current_gain_auto = None;
+        s.recent_commands.clear();
     }
 }
 
@@ -575,6 +633,11 @@ fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
         s.bytes_sent = 0;
         s.buffers_dropped = 0;
         s.last_command = None;
+        s.current_freq_hz = None;
+        s.current_sample_rate_hz = None;
+        s.current_gain_tenths_db = None;
+        s.current_gain_auto = None;
+        s.recent_commands.clear();
     }
 }
 
@@ -888,7 +951,42 @@ fn command_worker(
         dispatch(&mut dev, cmd);
         drop(dev);
         if let Ok(mut s) = stats.lock() {
-            s.last_command = Some((cmd.op, Instant::now()));
+            let now = Instant::now();
+            s.last_command = Some((cmd.op, now));
+            // Push onto the bounded ring. Pop the oldest entry when
+            // we'd otherwise exceed the cap — keeps memory bounded
+            // on long-running sessions without a dedicated ring-
+            // buffer crate.
+            if s.recent_commands.len() >= RECENT_COMMANDS_CAPACITY {
+                s.recent_commands.pop_front();
+            }
+            s.recent_commands.push_back((cmd.op, now));
+            // Capture the commanded state alongside the
+            // last-command stamp. We record what the CLIENT
+            // requested (not what the device ultimately applied)
+            // because: (a) the dispatch layer already logs device
+            // failures at warn!, (b) if a SetCenterFreq request is
+            // rejected by the device, the client will re-request,
+            // and (c) showing the client's view helps debug
+            // client-side bugs ("why is GQRX stuck on 145 MHz?").
+            match cmd.op {
+                CommandOp::SetCenterFreq => s.current_freq_hz = Some(cmd.param),
+                CommandOp::SetSampleRate => s.current_sample_rate_hz = Some(cmd.param),
+                CommandOp::SetTunerGain => {
+                    #[allow(
+                        clippy::cast_possible_wrap,
+                        reason = "gain param is signed tenths-of-dB on the wire, u32 is a raw-bits transport"
+                    )]
+                    let gain = cmd.param as i32;
+                    s.current_gain_tenths_db = Some(gain);
+                }
+                CommandOp::SetGainMode => {
+                    // Upstream: 0 = auto, nonzero = manual. Store
+                    // the auto bool for the UI status-row renderer.
+                    s.current_gain_auto = Some(cmd.param == 0);
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -978,15 +1076,25 @@ mod tests {
     #[test]
     fn update_stats_on_disconnect_clears_per_session_counters() {
         // Session-scoped counters (bytes_sent, buffers_dropped,
-        // last_command) must be cleared when the client disconnects —
-        // otherwise a UI polling ServerStats would see stale data from
-        // the prior session while connected_client = None.
+        // last_command, current_* commanded fields) must be cleared
+        // when the client disconnects — otherwise a UI polling
+        // ServerStats would see stale data from the prior session
+        // while connected_client = None, e.g. the status row would
+        // still show "100.3 MHz @ 2.4 MHz" for a dead session.
+        let mut recent = VecDeque::new();
+        recent.push_back((CommandOp::SetCenterFreq, Instant::now()));
+        recent.push_back((CommandOp::SetTunerGain, Instant::now()));
         let stats = Arc::new(Mutex::new(ServerStats {
             connected_client: Some(SocketAddr::from(([127, 0, 0, 1], 42_000))),
             connected_since: Some(Instant::now()),
             bytes_sent: 12345,
             buffers_dropped: 7,
             last_command: Some((CommandOp::SetCenterFreq, Instant::now())),
+            current_freq_hz: Some(100_300_000),
+            current_sample_rate_hz: Some(2_400_000),
+            current_gain_tenths_db: Some(200),
+            current_gain_auto: Some(false),
+            recent_commands: recent,
         }));
         update_stats_on_disconnect(&stats);
         let s = stats.lock().unwrap();
@@ -995,6 +1103,14 @@ mod tests {
         assert_eq!(s.bytes_sent, 0);
         assert_eq!(s.buffers_dropped, 0);
         assert!(s.last_command.is_none());
+        assert!(s.current_freq_hz.is_none());
+        assert!(s.current_sample_rate_hz.is_none());
+        assert!(s.current_gain_tenths_db.is_none());
+        assert!(s.current_gain_auto.is_none());
+        assert!(
+            s.recent_commands.is_empty(),
+            "activity log ring must clear on disconnect to avoid stale entries in the next session"
+        );
     }
 
     #[test]
@@ -1005,6 +1121,19 @@ mod tests {
         assert_eq!(stats.bytes_sent, 0);
         assert_eq!(stats.buffers_dropped, 0);
         assert!(stats.last_command.is_none());
+        assert!(stats.current_freq_hz.is_none());
+        assert!(stats.current_sample_rate_hz.is_none());
+        assert!(stats.current_gain_tenths_db.is_none());
+        assert!(stats.current_gain_auto.is_none());
+        assert!(stats.recent_commands.is_empty());
+    }
+
+    #[test]
+    fn recent_commands_capacity_matches_documented_bound() {
+        // Sanity check on the published const. If the UI side starts
+        // depending on a specific size for pagination, changing the
+        // constant becomes a contract break this test catches.
+        assert_eq!(RECENT_COMMANDS_CAPACITY, 50);
     }
 
     #[test]

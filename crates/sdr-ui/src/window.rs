@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk4::gio;
 use gtk4::glib;
@@ -13,7 +13,11 @@ use libadwaita::prelude::*;
 use sdr_core::Engine;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
-use sdr_rtltcp_discovery::{Browser, DiscoveredServer, DiscoveryEvent};
+use sdr_rtltcp_discovery::{
+    AdvertiseOptions, Advertiser, Browser, DiscoveredServer, DiscoveryEvent, TxtRecord,
+    local_hostname,
+};
+use sdr_server_rtltcp::{InitialDeviceState, Server, ServerConfig};
 use sdr_source_rtlsdr::SAMPLE_RATES;
 
 use crate::header;
@@ -198,6 +202,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &freq_selector,
         &demod_dropdown,
         &status_bar_demod,
+        &toast_overlay,
     );
 
     // Wire waterfall screenshot button.
@@ -846,9 +851,11 @@ fn connect_sidebar_panels(
     freq_selector: &header::frequency_selector::FrequencySelector,
     demod_dropdown: &gtk4::DropDown,
     status_bar: &Rc<StatusBar>,
+    toast_overlay: &adw::ToastOverlay,
 ) {
     connect_source_panel(panels, state);
     connect_rtl_tcp_discovery(panels, state);
+    connect_server_panel(panels, toast_overlay);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
@@ -1120,6 +1127,846 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Cadence for the USB hotplug poll that drives server-panel
+/// visibility. 3 s is the sweet spot: fast enough that a user
+/// plugging in a dongle sees the panel within the time it takes them
+/// to reach the sidebar with the mouse, slow enough that the
+/// per-tick `rusb::devices()` USB-bus enumerate is invisible in
+/// profile traces.
+const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Owned handle for a running `rtl_tcp` server + optional mDNS
+/// advertisement. Drops in reverse order: advertiser first (so
+/// peers see the goodbye packet before the server stops), then the
+/// server itself (which consumes its accept thread + USB device).
+///
+/// `Advertiser` is an `Option` because the user can run the server
+/// without LAN advertising via the "Announce via mDNS" switch.
+struct RunningServer {
+    server: Server,
+    advertiser: Option<Advertiser>,
+}
+
+/// Wire the server panel end-to-end: visibility gating, the master
+/// share-over-network switch, and its downstream start/stop effects.
+/// Errors surface via the `toast_overlay`, and the switch auto-
+/// reverts to its off state so the UI never lies about whether a
+/// server is actually running.
+///
+/// Visibility rule:
+/// 1. at least one RTL-SDR dongle is visible on the local USB bus
+///    (`sdr_rtlsdr::get_device_count() > 0`), and
+/// 2. the active source type is **not** RTL-SDR — re-exposing the
+///    same dongle over `rtl_tcp` while a local `RtlSdrSource` is
+///    holding it would cause a USB-device double-open, and
+/// 3. OR the server is already running (keep the panel visible so
+///    the user can reach the Stop switch no matter what).
+///
+/// Visibility is recomputed on three triggers so the panel feels
+/// responsive without polling the world: a low-frequency timer that
+/// handles the USB side (hotplug has no GTK signal we can subscribe
+/// to), a `device_row.connect_selected_notify` handler that fires
+/// on every source-type change, and the share-row start/stop path
+/// itself. A `Cell<u32>` tracks the last-seen device count so we
+/// only pay the widget-state-update cost on an actual edge.
+#[allow(
+    clippy::too_many_lines,
+    reason = "GTK signal-wiring: visibility + start-stop + control-locking all share state via nested closures — splitting scatters the captures"
+)]
+fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverlay) {
+    use std::cell::Cell;
+
+    let server_widget_weak = panels.server.widget.downgrade();
+    let device_row = panels.source.device_row.clone();
+    let last_seen_count = Rc::new(Cell::new(u32::MAX));
+    let running: Rc<RefCell<Option<RunningServer>>> = Rc::new(RefCell::new(None));
+
+    // Pure function: does the combined rule say "show"? A running
+    // server always wins — the user must be able to reach the Stop
+    // switch regardless of hotplug / source-type state.
+    let should_be_visible = |dongle_count: u32, selected: u32, is_running: bool| -> bool {
+        is_running || (dongle_count > 0 && selected != DEVICE_RTLSDR)
+    };
+
+    // Apply visibility, using the cached dongle count. Shared
+    // between the poll tick, the device-row notify handler, and the
+    // start/stop path so all three callers stay in lockstep.
+    let apply_visibility = {
+        let server_widget_weak = server_widget_weak.clone();
+        let device_row = device_row.clone();
+        let last_seen_count = Rc::clone(&last_seen_count);
+        let running = Rc::clone(&running);
+        move || {
+            let Some(widget) = server_widget_weak.upgrade() else {
+                return;
+            };
+            let count = last_seen_count.get();
+            // First invocation before any poll: count is u32::MAX,
+            // which would evaluate true for `> 0`. Treat the
+            // pre-first-tick state as "no dongle yet" so the panel
+            // stays hidden until we actually know — prevents a
+            // flash-of-unwanted-panel during startup.
+            let effective_count = if count == u32::MAX { 0 } else { count };
+            let is_running = running.borrow().is_some();
+            widget.set_visible(should_be_visible(
+                effective_count,
+                device_row.selected(),
+                is_running,
+            ));
+        }
+    };
+
+    // Reapply on source-type change. Cloned because
+    // `connect_selected_notify` takes an `Fn(&ComboRow)` and we want
+    // the same logic as the poll tick.
+    let apply_on_device_change = apply_visibility.clone();
+    panels
+        .source
+        .device_row
+        .connect_selected_notify(move |_| apply_on_device_change());
+
+    // Seed `last_seen_count` on the first tick. Using a glib timer
+    // (rather than running the USB probe synchronously during
+    // wiring) keeps the window-build path fast and avoids a libusb
+    // session init on a thread that may not have one ready.
+    let apply_on_tick = apply_visibility.clone();
+    let poll_widget_weak = server_widget_weak.clone();
+    let poll_last_seen_count = Rc::clone(&last_seen_count);
+    let _ = glib::timeout_add_local(SERVER_PANEL_HOTPLUG_POLL_INTERVAL, move || {
+        // If the widget is gone, tear the poller down — nothing to
+        // show, and we don't want to leak `rusb::devices()` calls
+        // past window close.
+        if poll_widget_weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        // `sdr_rtlsdr::get_device_count()` is a libusb enumerate
+        // (vendor/product-ID filter over `rusb::devices()`). Fast
+        // enough for the UI thread at a 3 s cadence; no syscall
+        // churn worth moving to a worker.
+        let count = sdr_rtlsdr::get_device_count();
+        // First tick ALWAYS flips the cache off `u32::MAX`, so this
+        // branch fires at least once even if the real count is 0 —
+        // that's the "resolve the panel out of its pre-first-tick
+        // hidden state" moment. Subsequent ticks only apply on a
+        // real edge so we don't churn widget state every 3 s.
+        if count != poll_last_seen_count.get() {
+            tracing::debug!(
+                previous = poll_last_seen_count.get(),
+                current = count,
+                "rtl_tcp server panel: local dongle count changed"
+            );
+            poll_last_seen_count.set(count);
+            apply_on_tick();
+        }
+        glib::ControlFlow::Continue
+    });
+
+    // Wire the master share-over-network switch. The handler is the
+    // authority on server lifecycle — on toggle we either start a
+    // new `Server` (+ optional `Advertiser`) and store the handle,
+    // or drop the handle so the accept thread tears down.
+    connect_share_switch(
+        panels,
+        toast_overlay,
+        Rc::clone(&running),
+        apply_visibility.clone(),
+    );
+
+    // Poll `Server::stats()` on a timer, render the status rows,
+    // and auto-stop the server if `has_stopped()` becomes true
+    // (e.g. USB unplug or accept-thread failure).
+    connect_server_status_polling(panels, Rc::clone(&running), apply_visibility);
+}
+
+/// Extracted out of `connect_server_panel` so the parent function
+/// stays under clippy's `too_many_lines` limit. Handles exactly one
+/// thing: the `share_row.connect_active_notify` wiring, with its
+/// downstream start/stop effects (build `ServerConfig`, call
+/// `Server::start`, optionally attach an `Advertiser`, lock or
+/// unlock the panel controls, reapply visibility, and surface any
+/// error via a toast while flipping the switch back to off).
+fn connect_share_switch(
+    panels: &SidebarPanels,
+    toast_overlay: &adw::ToastOverlay,
+    running: Rc<RefCell<Option<RunningServer>>>,
+    apply_visibility: impl Fn() + Clone + 'static,
+) {
+    use std::cell::Cell;
+
+    // Guards against our own `set_active(false)` (called when the
+    // user-initiated start path errors out) re-entering the handler
+    // and triggering a spurious stop dispatch on a server that
+    // never started.
+    let reentry_guard = Rc::new(Cell::new(false));
+    let toast_overlay_weak = toast_overlay.downgrade();
+
+    let share_row_weak = panels.server.share_row.downgrade();
+    // Clone the whole ServerPanel Rc-backed widget handles into the
+    // closure. adw/gtk widgets are GObject refs; cloning increments
+    // a refcount, not the data.
+    let server_panel = clone_server_panel(&panels.server);
+
+    panels.server.share_row.connect_active_notify(move |row| {
+        if reentry_guard.get() {
+            return;
+        }
+        let active = row.is_active();
+        if active {
+            // Build a ServerConfig from current panel state. Widget
+            // readers run on the main thread — safe to block-read
+            // the rows synchronously.
+            let config = build_server_config_from_panel(&server_panel);
+            match Server::start(config) {
+                Ok(server) => {
+                    // If advertising is on, build the TXT record
+                    // from the tuner metadata the Server exposes.
+                    // An Advertiser failure is non-fatal for the
+                    // server itself (the accept loop keeps running
+                    // without mDNS), but the user explicitly asked
+                    // for LAN announcement so they need to KNOW the
+                    // intent failed — surface a toast and leave
+                    // `advertiser = None` so the stop path doesn't
+                    // try to unregister something that never
+                    // registered.
+                    let advertiser = if server_panel.advertise_row.is_active() {
+                        match build_advertiser(&server, &server_panel.nickname_row.text()) {
+                            Ok(adv) => Some(adv),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "mDNS advertiser failed; server running without LAN advertisement");
+                                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                                    overlay.add_toast(adw::Toast::new(&format!(
+                                        "Server running, but mDNS advertising failed: {e}"
+                                    )));
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    set_controls_locked(&server_panel, true);
+                    server_panel.status_row.set_visible(true);
+                    server_panel.activity_log_row.set_visible(true);
+                    *running.borrow_mut() = Some(RunningServer { server, advertiser });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start rtl_tcp server");
+                    if let Some(overlay) = toast_overlay_weak.upgrade() {
+                        overlay.add_toast(adw::Toast::new(&format!(
+                            "Couldn't share over network: {e}"
+                        )));
+                    }
+                    // Revert the switch without re-entering this
+                    // same handler — the reentry_guard covers the
+                    // set_active call below.
+                    reentry_guard.set(true);
+                    if let Some(share) = share_row_weak.upgrade() {
+                        share.set_active(false);
+                    }
+                    reentry_guard.set(false);
+                }
+            }
+        } else {
+            // Drop the handle → Server::drop signals shutdown and
+            // joins the accept thread; Advertiser::drop unregisters
+            // the mDNS record. Sequence matters (advertiser first
+            // so peers see the goodbye packet before the server
+            // stops) — field declaration order in `RunningServer`
+            // would drop `server` first, so take the advertiser
+            // explicitly first to reverse.
+            if let Some(mut handle) = running.borrow_mut().take() {
+                drop(handle.advertiser.take());
+                drop(handle.server);
+            }
+            set_controls_locked(&server_panel, false);
+            server_panel.status_row.set_visible(false);
+            server_panel.activity_log_row.set_visible(false);
+            reset_status_rows(&server_panel);
+            reset_activity_log(&server_panel);
+        }
+        apply_visibility();
+    });
+}
+
+/// Deep-clone a `ServerPanel` (via `GObject` refcounts — all fields
+/// are adw/gtk widget handles, not data owners). Used to move a full
+/// panel reference into a long-lived closure without borrowing from
+/// the original `SidebarPanels`.
+fn clone_server_panel(panel: &sidebar::ServerPanel) -> sidebar::ServerPanel {
+    sidebar::ServerPanel {
+        widget: panel.widget.clone(),
+        share_row: panel.share_row.clone(),
+        nickname_row: panel.nickname_row.clone(),
+        port_row: panel.port_row.clone(),
+        bind_row: panel.bind_row.clone(),
+        advertise_row: panel.advertise_row.clone(),
+        device_defaults_row: panel.device_defaults_row.clone(),
+        center_freq_row: panel.center_freq_row.clone(),
+        sample_rate_row: panel.sample_rate_row.clone(),
+        gain_row: panel.gain_row.clone(),
+        ppm_row: panel.ppm_row.clone(),
+        bias_tee_row: panel.bias_tee_row.clone(),
+        direct_sampling_row: panel.direct_sampling_row.clone(),
+        status_row: panel.status_row.clone(),
+        status_client_row: panel.status_client_row.clone(),
+        status_uptime_row: panel.status_uptime_row.clone(),
+        status_data_rate_row: panel.status_data_rate_row.clone(),
+        status_commanded_row: panel.status_commanded_row.clone(),
+        status_stop_button: panel.status_stop_button.clone(),
+        activity_log_row: panel.activity_log_row.clone(),
+        activity_log_list: panel.activity_log_list.clone(),
+    }
+}
+
+/// Cadence for the server-stats poll that renders the "Server
+/// status" rows. 500 ms is fast enough that "connected / waiting"
+/// transitions feel instant while keeping the `ServerStats` clone +
+/// row-subtitle churn off the critical path.
+const SERVER_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Bits-per-byte conversion used in the Mbps formatter. Kept behind
+/// a named constant so the arithmetic at the call site reads as
+/// unit math ("bytes * `BITS_PER_BYTE` / duration / MEGA") instead
+/// of opaque `8`s and `1_000_000`s.
+const BITS_PER_BYTE: u64 = 8;
+/// Megabits divisor for rendering Mbps. `1_000_000` matches
+/// telecom/carrier conventions for transport rates.
+const BITS_PER_MEGABIT: f64 = 1_000_000.0;
+
+/// Weak references to every widget the server-status poll tick
+/// touches. Held by the poll closure INSTEAD of a strong
+/// `ServerPanel` clone so the closure doesn't bump the widgets'
+/// `GObject` refcounts past window lifetime.
+///
+/// The original design cloned the whole `ServerPanel` into the
+/// closure and relied on a single `widget_weak.upgrade().is_none()`
+/// break gate — but the clone held strong refs to every widget,
+/// including the group itself, so the weak check could never fire
+/// and the 500 ms timer leaked past window close. Every
+/// panel-touching closure in this file now uses weak refs for the
+/// same reason (see `connect_rtl_tcp_discovery`'s pattern).
+struct ServerStatusWidgetsWeak {
+    status_row: glib::WeakRef<adw::ExpanderRow>,
+    status_client_row: glib::WeakRef<adw::ActionRow>,
+    status_uptime_row: glib::WeakRef<adw::ActionRow>,
+    status_data_rate_row: glib::WeakRef<adw::ActionRow>,
+    status_commanded_row: glib::WeakRef<adw::ActionRow>,
+    activity_log_row: glib::WeakRef<adw::ExpanderRow>,
+    activity_log_list: glib::WeakRef<gtk4::ListBox>,
+}
+
+/// Snapshot of upgraded strong references held for the duration of
+/// a single poll tick. All seven widgets upgrade together or we
+/// `Break` the timer — render functions then read these fields
+/// directly without needing their own weak-ref fallbacks.
+struct ServerStatusWidgets {
+    status_row: adw::ExpanderRow,
+    status_client_row: adw::ActionRow,
+    status_uptime_row: adw::ActionRow,
+    status_data_rate_row: adw::ActionRow,
+    status_commanded_row: adw::ActionRow,
+    activity_log_row: adw::ExpanderRow,
+    activity_log_list: gtk4::ListBox,
+}
+
+impl ServerStatusWidgetsWeak {
+    fn from_panel(panel: &sidebar::ServerPanel) -> Self {
+        Self {
+            status_row: panel.status_row.downgrade(),
+            status_client_row: panel.status_client_row.downgrade(),
+            status_uptime_row: panel.status_uptime_row.downgrade(),
+            status_data_rate_row: panel.status_data_rate_row.downgrade(),
+            status_commanded_row: panel.status_commanded_row.downgrade(),
+            activity_log_row: panel.activity_log_row.downgrade(),
+            activity_log_list: panel.activity_log_list.downgrade(),
+        }
+    }
+
+    /// Upgrade all seven weak refs atomically. Returns `None` if
+    /// any one widget has been destroyed — the caller breaks its
+    /// timer instead of rendering against a partially-dead panel.
+    fn upgrade(&self) -> Option<ServerStatusWidgets> {
+        Some(ServerStatusWidgets {
+            status_row: self.status_row.upgrade()?,
+            status_client_row: self.status_client_row.upgrade()?,
+            status_uptime_row: self.status_uptime_row.upgrade()?,
+            status_data_rate_row: self.status_data_rate_row.upgrade()?,
+            status_commanded_row: self.status_commanded_row.upgrade()?,
+            activity_log_row: self.activity_log_row.upgrade()?,
+            activity_log_list: self.activity_log_list.upgrade()?,
+        })
+    }
+}
+
+/// Poll `Server::stats()` on a fixed cadence, render the four
+/// status rows from the snapshot, and auto-stop the server if
+/// `has_stopped()` becomes true (e.g. USB dongle unplugged or
+/// accept-thread error).
+///
+/// Auto-stop flips the `share_row` back off, which re-enters the
+/// switch's `connect_active_notify` handler — that branch drops the
+/// `RunningServer` handle and releases the dongle for subsequent
+/// reopens. Without this the UI would lie about the server's
+/// running state indefinitely.
+///
+/// Data-rate is computed from the delta in `bytes_sent` between
+/// consecutive poll ticks. Counter resets (on disconnect) produce
+/// negative deltas which we clamp to zero so the row reads "0 bps"
+/// instead of a bogus megabit-scale number during the transient.
+fn connect_server_status_polling(
+    panels: &SidebarPanels,
+    running: Rc<RefCell<Option<RunningServer>>>,
+    apply_visibility: impl Fn() + 'static,
+) {
+    use std::cell::Cell;
+
+    let widgets_weak = ServerStatusWidgetsWeak::from_panel(&panels.server);
+    let share_row_weak = panels.server.share_row.downgrade();
+    let last_bytes_sent = Rc::new(Cell::new(0u64));
+    // Activity-log diff key: (ring_len, newest_instant). Rendering
+    // is cheap but clearing the ListBox resets any user scroll
+    // position, so we short-circuit on unchanged ticks.
+    let last_activity_key: Rc<Cell<(usize, Option<Instant>)>> = Rc::new(Cell::new((0, None)));
+
+    // Separate subscription on the Stop button. Flipping the switch
+    // off is the single canonical stop path — pointing the button
+    // there avoids a second teardown codepath that could drift.
+    let stop_share_row_weak = share_row_weak.clone();
+    panels.server.status_stop_button.connect_clicked(move |_| {
+        if let Some(share) = stop_share_row_weak.upgrade() {
+            share.set_active(false);
+        }
+    });
+
+    let _ = glib::timeout_add_local(SERVER_STATUS_POLL_INTERVAL, move || {
+        // Upgrade all the status widgets in one shot. If any is gone
+        // (window closed → sidebar dropped → widgets orphaned), tear
+        // the timer down. Strong refs live only for the duration of
+        // this tick — dropped at function return — so they never
+        // contribute to the long-running GObject refcount.
+        let Some(widgets) = widgets_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        // Snapshot `Server::stats()` under the borrow. `stats()`
+        // internally locks a Mutex — the return is a Clone, so the
+        // borrow scope is tight.
+        let snapshot = running
+            .borrow()
+            .as_ref()
+            .map(|h| (h.server.stats(), h.server.has_stopped()));
+        let Some((stats, stopped)) = snapshot else {
+            // No server running — nothing to render, keep ticking
+            // (the share switch handler will spin us up again).
+            return glib::ControlFlow::Continue;
+        };
+
+        // If the accept thread exited on its own (USB unplug,
+        // fatal error), auto-flip the share switch off. Re-enters
+        // the switch handler, which drops the server handle.
+        if stopped {
+            tracing::warn!("rtl_tcp server stopped on its own — flipping share switch off");
+            if let Some(share) = share_row_weak.upgrade() {
+                share.set_active(false);
+            }
+            apply_visibility();
+            return glib::ControlFlow::Continue;
+        }
+
+        render_status_rows(&widgets, &stats, &last_bytes_sent);
+        render_activity_log(&widgets, &stats, &last_activity_key);
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Write the current `ServerStats` snapshot into the four status
+/// rows. Uses `last_bytes_sent` to compute a rolling data-rate from
+/// delta-over-poll-interval. Takes upgraded `ServerStatusWidgets`
+/// — strong refs held only for this call's duration — so the poll
+/// closure itself doesn't contribute to the long-running `GObject`
+/// refcount.
+fn render_status_rows(
+    widgets: &ServerStatusWidgets,
+    stats: &sdr_server_rtltcp::ServerStats,
+    last_bytes_sent: &Rc<std::cell::Cell<u64>>,
+) {
+    use crate::sidebar::server_panel::{
+        STATUS_IDLE_VALUE_SUBTITLE, STATUS_WAITING_FOR_CLIENT_SUBTITLE,
+    };
+
+    // Client row + expander subtitle.
+    if let Some(peer) = stats.connected_client {
+        let peer_str = peer.to_string();
+        widgets.status_client_row.set_subtitle(&peer_str);
+        widgets
+            .status_row
+            .set_subtitle(&format!("Connected: {peer_str}"));
+    } else {
+        widgets
+            .status_client_row
+            .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+        widgets
+            .status_row
+            .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+    }
+
+    // Uptime row.
+    widgets
+        .status_uptime_row
+        .set_subtitle(&stats.connected_since.map_or_else(
+            || STATUS_IDLE_VALUE_SUBTITLE.to_string(),
+            |since| format_uptime(since.elapsed()),
+        ));
+
+    // Data-rate row. Counter reset on disconnect produces a
+    // negative delta in the u64 arithmetic; clamp to 0 so the row
+    // doesn't read a bogus Mbps number on the transient.
+    let current_bytes = stats.bytes_sent;
+    let delta = current_bytes.saturating_sub(last_bytes_sent.get());
+    last_bytes_sent.set(current_bytes);
+    widgets
+        .status_data_rate_row
+        .set_subtitle(&format_data_rate(delta, SERVER_STATUS_POLL_INTERVAL));
+
+    // Commanded-state row. "Tuned to" means "what the client has
+    // most recently requested." Assembled one piece at a time; an
+    // unset field shows its upstream default stamp from
+    // `InitialDeviceState::default()` rather than blanking out.
+    widgets
+        .status_commanded_row
+        .set_subtitle(&format_commanded_state(stats));
+}
+
+/// Render a `Duration` as `Nh Nm Ns` / `Nm Ns` / `Ns` depending on
+/// magnitude. Keeps the row readable at a glance without fighting a
+/// full clock component.
+fn format_uptime(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Render bytes/interval as a human-readable data rate. Picks the
+/// right unit automatically: kbps when we're below 1 Mbps (quiet
+/// clients), Mbps otherwise. `rtl_tcp` IQ streams at 2.4 MS/s × 2
+/// bytes per sample = ~4.8 Mbps, so the Mbps case dominates in
+/// practice.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "intermediate f64 conversion for rate math; Mbps precision is cosmetic"
+)]
+fn format_data_rate(bytes: u64, interval: Duration) -> String {
+    let secs = interval.as_secs_f64();
+    if secs <= 0.0 {
+        return "—".to_string();
+    }
+    let bits_per_sec = (bytes as f64 * BITS_PER_BYTE as f64) / secs;
+    if bits_per_sec < BITS_PER_MEGABIT {
+        format!("{:.1} kbps", bits_per_sec / 1_000.0)
+    } else {
+        format!("{:.2} Mbps", bits_per_sec / BITS_PER_MEGABIT)
+    }
+}
+
+/// Render the "Tuned to" row subtitle. Combines frequency, sample
+/// rate and gain into one line. Unset fields show their upstream
+/// default stamp from `InitialDeviceState::default()` — which is
+/// what the server applied on open — rather than blanking out, so
+/// the row never looks broken during the pre-first-command window.
+fn format_commanded_state(stats: &sdr_server_rtltcp::ServerStats) -> String {
+    let freq_hz = stats
+        .current_freq_hz
+        .unwrap_or(sdr_server_rtltcp::DEFAULT_CENTER_FREQ_HZ);
+    let sample_rate_hz = stats
+        .current_sample_rate_hz
+        .unwrap_or(sdr_server_rtltcp::DEFAULT_SAMPLE_RATE_HZ);
+    let gain_text = match (stats.current_gain_auto, stats.current_gain_tenths_db) {
+        (Some(true), _) => "auto".to_string(),
+        (_, Some(gain_tenths)) => {
+            #[allow(clippy::cast_precision_loss, reason = "gain tenths-of-dB, cosmetic")]
+            let db = f64::from(gain_tenths) / 10.0;
+            format!("{db:.1} dB")
+        }
+        _ => "initial".to_string(),
+    };
+    format!(
+        "{} @ {} • gain {}",
+        format_hz(freq_hz),
+        format_hz(sample_rate_hz),
+        gain_text
+    )
+}
+
+/// Short Hz formatter — kHz / MHz / GHz depending on magnitude.
+/// Kept local to this module because the status row's formatting
+/// needs differ from the header-bar frequency selector (which has
+/// its own 12-digit grid display).
+fn format_hz(hz: u32) -> String {
+    let hz_f = f64::from(hz);
+    if hz >= 1_000_000_000 {
+        format!("{:.3} GHz", hz_f / 1_000_000_000.0)
+    } else if hz >= 1_000_000 {
+        format!("{:.3} MHz", hz_f / 1_000_000.0)
+    } else if hz >= 1_000 {
+        format!("{:.3} kHz", hz_f / 1_000.0)
+    } else {
+        format!("{hz} Hz")
+    }
+}
+
+/// Rebuild the activity-log list from the `ServerStats` ring if
+/// it has actually changed since the last render. The "changed?"
+/// check uses the ring length + the timestamp of the newest entry
+/// so we skip the clear-and-rebuild on idle ticks — preserves any
+/// scroll position the user has in the `ListBox`.
+fn render_activity_log(
+    widgets: &ServerStatusWidgets,
+    stats: &sdr_server_rtltcp::ServerStats,
+    last_rendered: &Rc<std::cell::Cell<(usize, Option<Instant>)>>,
+) {
+    use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
+
+    let newest = stats.recent_commands.back().map(|(_, t)| *t);
+    let current_key = (stats.recent_commands.len(), newest);
+    if current_key == last_rendered.get() {
+        return;
+    }
+    last_rendered.set(current_key);
+
+    // Clear the ListBox children. GTK4 ListBox has no mass-remove,
+    // so walk the child list.
+    while let Some(child) = widgets.activity_log_list.first_child() {
+        widgets.activity_log_list.remove(&child);
+    }
+
+    if stats.recent_commands.is_empty() {
+        widgets
+            .activity_log_row
+            .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
+        return;
+    }
+
+    widgets
+        .activity_log_row
+        .set_subtitle(&format!("{} commands", stats.recent_commands.len()));
+    // Newest first so the user doesn't have to scroll to see the
+    // most recent activity.
+    let now = Instant::now();
+    for (op, at) in stats.recent_commands.iter().rev() {
+        let row = adw::ActionRow::builder()
+            .title(format!("{op:?}"))
+            .subtitle(format_log_age(now.saturating_duration_since(*at)))
+            .activatable(false)
+            .build();
+        widgets.activity_log_list.append(&row);
+    }
+}
+
+/// Reset activity-log list + subtitle on stop. Without this the
+/// list would persist after the server stopped — misleading users
+/// into thinking the log reflects a currently-running session.
+fn reset_activity_log(panel: &sidebar::ServerPanel) {
+    use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
+    while let Some(child) = panel.activity_log_list.first_child() {
+        panel.activity_log_list.remove(&child);
+    }
+    panel
+        .activity_log_row
+        .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
+}
+
+/// Render an elapsed duration as a compact "age" string for the
+/// activity-log rows. Narrower set of buckets than the discovery
+/// formatter — commands arrive in bursts during a session, so the
+/// "just now" / seconds-ago distinction matters but hours isn't
+/// common in a single session.
+fn format_log_age(elapsed: Duration) -> String {
+    const JUST_NOW_THRESHOLD: Duration = Duration::from_secs(2);
+    let secs = elapsed.as_secs();
+    if elapsed < JUST_NOW_THRESHOLD {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+/// Reset status rows to their idle-no-client state. Called when the
+/// server stops so the user doesn't see stale "connected at 127.0.0.1"
+/// / "uptime 5m" data after they flipped the share switch off.
+fn reset_status_rows(panel: &sidebar::ServerPanel) {
+    use crate::sidebar::server_panel::{
+        STATUS_IDLE_VALUE_SUBTITLE, STATUS_WAITING_FOR_CLIENT_SUBTITLE,
+    };
+    panel
+        .status_row
+        .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+    panel
+        .status_client_row
+        .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+    panel
+        .status_uptime_row
+        .set_subtitle(STATUS_IDLE_VALUE_SUBTITLE);
+    panel
+        .status_data_rate_row
+        .set_subtitle(STATUS_IDLE_VALUE_SUBTITLE);
+    panel
+        .status_commanded_row
+        .set_subtitle(STATUS_IDLE_VALUE_SUBTITLE);
+}
+
+/// Upstream `rtl_tcp`'s `-D` flag accepts 0 = off, 2 = Q-branch
+/// direct sampling. Only those two values are meaningful for the
+/// UI switch; I-branch (1) is deliberately not exposed because
+/// upstream's CLI also hardcodes 2 for `-D`.
+const DIRECT_SAMPLING_OFF: i32 = 0;
+/// See [`DIRECT_SAMPLING_OFF`]. 2 selects the Q branch.
+const DIRECT_SAMPLING_Q_BRANCH: i32 = 2;
+/// Buffer-capacity sentinel passed to `ServerConfig`. `0` tells
+/// the server crate to use its internal `DEFAULT_BUFFER_CAPACITY`,
+/// keeping the UI honest about "we're not overriding this" rather
+/// than pinning a value the server may later tune.
+const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
+
+/// Read the server panel widget values and build a `ServerConfig`
+/// off them. Takes the full `ServerPanel` by reference so the arg
+/// list stays short and the fn signature documents the "this reads
+/// EVERY relevant row" contract clearly.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
+)]
+fn build_server_config_from_panel(panel: &sidebar::ServerPanel) -> ServerConfig {
+    use std::net::SocketAddr;
+
+    use crate::sidebar::server_panel::{BIND_ALL_INTERFACES_IDX, BIND_LOOPBACK_IDX};
+
+    let port = panel.port_row.value() as u16;
+    // Match arm bodies duplicate between `BIND_LOOPBACK_IDX` and the
+    // wildcard intentionally: the explicit arm documents the
+    // expected value at a glance, and the wildcard catches transient
+    // out-of-range indices GTK can emit during widget churn. Folding
+    // them loses the at-a-glance enumeration of legal indices next
+    // to the feature-flag constants.
+    #[allow(
+        clippy::match_same_arms,
+        reason = "explicit legal-index arms document the rule"
+    )]
+    let bind = match panel.bind_row.selected() {
+        BIND_LOOPBACK_IDX => SocketAddr::from(([127, 0, 0, 1], port)),
+        BIND_ALL_INTERFACES_IDX => SocketAddr::from(([0, 0, 0, 0], port)),
+        _ => SocketAddr::from(([127, 0, 0, 1], port)),
+    };
+
+    let center_freq_hz = panel.center_freq_row.value() as u32;
+    // Sample-rate rows share the SAMPLE_RATES table via
+    // `source_panel::build_rtlsdr_rows` ordering. `SAMPLE_RATES`
+    // holds f64 values; the server API wants u32 Hz, so round on
+    // the way across. Out-of-range selectors fall back on the
+    // upstream rtl_tcp.c default.
+    let sample_rate_hz = SAMPLE_RATES
+        .get(panel.sample_rate_row.selected() as usize)
+        .copied()
+        .map_or(sdr_server_rtltcp::DEFAULT_SAMPLE_RATE_HZ, |rate| {
+            rate.round() as u32
+        });
+
+    // UI treats gain = 0.0 as auto (None), matching upstream's
+    // `-g 0` semantics. Any positive value becomes tenths-of-dB.
+    let gain_db = panel.gain_row.value();
+    let gain_tenths_db = if gain_db > 0.0 {
+        Some((gain_db * 10.0).round() as i32)
+    } else {
+        None
+    };
+
+    let ppm = panel.ppm_row.value() as i32;
+    let bias_tee = panel.bias_tee_row.is_active();
+    let direct_sampling = if panel.direct_sampling_row.is_active() {
+        DIRECT_SAMPLING_Q_BRANCH
+    } else {
+        DIRECT_SAMPLING_OFF
+    };
+
+    ServerConfig {
+        bind,
+        device_index: 0,
+        initial: InitialDeviceState {
+            center_freq_hz,
+            sample_rate_hz,
+            gain_tenths_db,
+            ppm,
+            bias_tee,
+            direct_sampling,
+        },
+        buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
+    }
+}
+
+/// Start an mDNS advertiser for the running `Server` using the
+/// user's chosen nickname (falling back to `local_hostname()` if
+/// the entry is empty or whitespace). Errors propagate to the
+/// caller so the UI can toast them — the server itself keeps
+/// running regardless, just without LAN advertising.
+fn build_advertiser(
+    server: &Server,
+    nickname_raw: &str,
+) -> Result<Advertiser, sdr_rtltcp_discovery::DiscoveryError> {
+    let nickname = nickname_raw.trim();
+    let nickname = if nickname.is_empty() {
+        local_hostname()
+    } else {
+        nickname.to_string()
+    };
+    let host = local_hostname();
+    // DNS-SD instance names must be unique on the LAN. Combine host
+    // + nickname the same way the CLI does in
+    // `sdr-server-rtltcp/src/bin/sdr-rtl-tcp.rs::announce_over_mdns`.
+    let instance_name = if nickname == host {
+        nickname.clone()
+    } else {
+        format!("{host} {nickname}")
+    };
+    let tuner_info = server.tuner_info();
+    let opts = AdvertiseOptions {
+        port: server.bind_address().port(),
+        instance_name,
+        hostname: host.clone(),
+        txt: TxtRecord {
+            tuner: tuner_info.name.clone(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            gains: tuner_info.gain_count,
+            nickname,
+            txbuf: None,
+        },
+    };
+    Advertiser::announce(opts)
+}
+
+/// Lock or unlock the server-config rows. Called with `true` on
+/// start (so the user can't mutate config out from under a live
+/// session) and `false` on stop. `share_row` itself stays sensitive
+/// — that's how the user turns things off.
+fn set_controls_locked(panel: &sidebar::ServerPanel, locked: bool) {
+    let sensitive = !locked;
+    panel.nickname_row.set_sensitive(sensitive);
+    panel.port_row.set_sensitive(sensitive);
+    panel.bind_row.set_sensitive(sensitive);
+    panel.advertise_row.set_sensitive(sensitive);
+    panel.device_defaults_row.set_sensitive(sensitive);
 }
 
 /// Format the subtitle string for a discovered `rtl_tcp` server row.
@@ -3083,5 +3930,144 @@ mod rtl_tcp_discovery_format_tests {
             subtitle.ends_with("seen just now"),
             "subtitle should read 'seen just now' for sub-5s age: {subtitle}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod server_panel_format_tests {
+    use std::time::Duration;
+
+    use sdr_server_rtltcp::ServerStats;
+
+    use super::{
+        SERVER_STATUS_POLL_INTERVAL, format_commanded_state, format_data_rate, format_hz,
+        format_uptime,
+    };
+
+    #[test]
+    fn format_uptime_uses_compact_unit_picker() {
+        // Sub-minute: just seconds.
+        assert_eq!(format_uptime(Duration::from_secs(5)), "5s");
+        // Sub-hour: minutes + seconds, no hours prefix.
+        assert_eq!(format_uptime(Duration::from_secs(61)), "1m 1s");
+        assert_eq!(format_uptime(Duration::from_secs(3599)), "59m 59s");
+        // Hour+: full triple.
+        assert_eq!(format_uptime(Duration::from_secs(3661)), "1h 1m 1s");
+        assert_eq!(format_uptime(Duration::from_secs(7322)), "2h 2m 2s");
+    }
+
+    #[test]
+    fn format_data_rate_picks_kbps_below_mbps_boundary() {
+        // 0.5 Mbps worth of bytes over the 500 ms interval → 0.5 Mbps
+        // → still kbps under the 1 Mbps switchover. (1 Mbps =
+        // 125_000 bytes/s, so 500 ms of 0.5 Mbps is 31_250 bytes.)
+        assert_eq!(
+            format_data_rate(31_250, SERVER_STATUS_POLL_INTERVAL),
+            "500.0 kbps"
+        );
+        // ~4.8 Mbps (the rtl_tcp canonical rate) over 500 ms.
+        // 4.8 Mbps * 0.5 s = 2.4 Mbit = 300_000 bytes.
+        assert_eq!(
+            format_data_rate(300_000, SERVER_STATUS_POLL_INTERVAL),
+            "4.80 Mbps"
+        );
+        // Zero bytes → "0.0 kbps" not a panic.
+        assert_eq!(format_data_rate(0, SERVER_STATUS_POLL_INTERVAL), "0.0 kbps");
+    }
+
+    #[test]
+    fn format_data_rate_handles_zero_interval() {
+        // A degenerate 0-second interval would divide by zero; fn
+        // must return a safe sentinel so the row renders instead of
+        // crashing.
+        assert_eq!(format_data_rate(100, Duration::ZERO), "—");
+    }
+
+    #[test]
+    fn format_hz_picks_unit_by_magnitude() {
+        assert_eq!(format_hz(500), "500 Hz");
+        assert_eq!(format_hz(1_500), "1.500 kHz");
+        assert_eq!(format_hz(100_300_000), "100.300 MHz");
+        assert_eq!(format_hz(1_500_000_000), "1.500 GHz");
+    }
+
+    #[test]
+    fn format_commanded_state_uses_upstream_defaults_when_client_silent() {
+        // A brand-new session that hasn't sent any commands should
+        // still render a sensible line — we show the upstream
+        // rtl_tcp.c defaults (100 MHz @ 2.048 MHz, gain "initial")
+        // rather than blanking the row.
+        let stats = ServerStats::default();
+        let subtitle = format_commanded_state(&stats);
+        assert!(
+            subtitle.contains("100.000 MHz"),
+            "default freq should show: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("2.048 MHz"),
+            "default sample rate should show: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("gain initial"),
+            "default gain hint should show: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn format_commanded_state_renders_client_auto_gain_preference() {
+        // When the client has sent SetGainMode(auto), "auto" wins
+        // regardless of any previous manual gain value.
+        let stats = ServerStats {
+            current_freq_hz: Some(145_500_000),
+            current_sample_rate_hz: Some(2_400_000),
+            current_gain_tenths_db: Some(200),
+            current_gain_auto: Some(true),
+            ..ServerStats::default()
+        };
+        let subtitle = format_commanded_state(&stats);
+        assert!(subtitle.contains("145.500 MHz"));
+        assert!(subtitle.contains("2.400 MHz"));
+        assert!(
+            subtitle.contains("gain auto"),
+            "auto should override manual gain value: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn format_commanded_state_renders_manual_gain_in_db() {
+        // SetTunerGain records tenths-of-dB; the render converts to
+        // full dB with one decimal.
+        let stats = ServerStats {
+            current_freq_hz: Some(100_000_000),
+            current_sample_rate_hz: Some(2_400_000),
+            current_gain_tenths_db: Some(496),
+            current_gain_auto: Some(false),
+            ..ServerStats::default()
+        };
+        let subtitle = format_commanded_state(&stats);
+        assert!(
+            subtitle.contains("gain 49.6 dB"),
+            "49.6 dB should render from 496 tenths: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn format_log_age_buckets() {
+        use super::format_log_age;
+        // < 2 s → "just now" debounces the 500 ms poll from showing
+        // "0s ago" / "1s ago" noise on the most-recent entry.
+        assert_eq!(format_log_age(Duration::from_millis(0)), "just now");
+        assert_eq!(format_log_age(Duration::from_millis(1999)), "just now");
+        // 2 s – 59 s → "Ns ago"
+        assert_eq!(format_log_age(Duration::from_secs(2)), "2s ago");
+        assert_eq!(format_log_age(Duration::from_secs(59)), "59s ago");
+        // 1 m – 59 m → "Nm ago"
+        assert_eq!(format_log_age(Duration::from_mins(1)), "1m ago");
+        assert_eq!(format_log_age(Duration::from_secs(3599)), "59m ago");
+        // 1 h+ → "Nh ago" (rare — single-session command histories
+        // almost never live long enough, but the bucket keeps the
+        // formatter total).
+        assert_eq!(format_log_age(Duration::from_hours(1)), "1h ago");
     }
 }
