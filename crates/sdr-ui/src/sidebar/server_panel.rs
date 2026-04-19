@@ -12,8 +12,36 @@
 //! rest of the DSP/UI bridge. Keeping this file widget-only mirrors
 //! the pattern in `source_panel.rs` / `audio_panel.rs` / etc.
 
+use std::sync::Arc;
+
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_config::ConfigManager;
+
+/// Config key for the persisted server nickname (mDNS TXT field).
+const KEY_SERVER_NICKNAME: &str = "rtl_tcp_server_nickname";
+/// Config key for the persisted TCP bind port.
+const KEY_SERVER_PORT: &str = "rtl_tcp_server_port";
+/// Config key for the persisted bind-address selector index
+/// (`BIND_LOOPBACK_IDX` / `BIND_ALL_INTERFACES_IDX`).
+const KEY_SERVER_BIND_IDX: &str = "rtl_tcp_server_bind_idx";
+/// Config key for the persisted "Announce via mDNS" switch state.
+const KEY_SERVER_ADVERTISE: &str = "rtl_tcp_server_advertise";
+/// Config key for the persisted default center frequency (Hz).
+const KEY_SERVER_DEFAULT_FREQ_HZ: &str = "rtl_tcp_server_default_freq_hz";
+/// Config key for the persisted default sample-rate selector
+/// index (0..=10 in the 11-entry list). Stored as an index rather
+/// than a Hz value so a future rate-table edit doesn't break
+/// existing configs.
+const KEY_SERVER_DEFAULT_SR_IDX: &str = "rtl_tcp_server_default_sample_rate_idx";
+/// Config key for the persisted default tuner gain (dB).
+const KEY_SERVER_DEFAULT_GAIN_DB: &str = "rtl_tcp_server_default_gain_db";
+/// Config key for the persisted default PPM correction.
+const KEY_SERVER_DEFAULT_PPM: &str = "rtl_tcp_server_default_ppm";
+/// Config key for the persisted default bias-tee toggle.
+const KEY_SERVER_DEFAULT_BIAS_TEE: &str = "rtl_tcp_server_default_bias_tee";
+/// Config key for the persisted default direct-sampling toggle.
+const KEY_SERVER_DEFAULT_DIRECT_SAMPLING: &str = "rtl_tcp_server_default_direct_sampling";
 
 /// Default TCP port for `rtl_tcp`. Matches upstream `rtl_tcp.c` and
 /// every ecosystem client's default. Changing it means users have to
@@ -61,6 +89,12 @@ const CENTER_FREQ_PAGE_HZ: f64 = 1_000_000.0;
 /// Same ordering as `source_panel::build_rtlsdr_rows` so keyboard
 /// muscle memory matches.
 const DEFAULT_SERVER_SAMPLE_RATE_INDEX: u32 = 7;
+/// Number of entries in the sample-rate `StringList`. Load-bearing
+/// for the persistence validator: any index `>=` this count is
+/// treated as a corrupt / transient GTK value and dropped on both
+/// restore and persist. Must match the list literal in
+/// `build_device_defaults_rows`.
+const SAMPLE_RATE_COUNT: u32 = 11;
 
 /// Server device-defaults: gain default (dB). 0.0 dB matches
 /// upstream's "auto" gain interpretation when the CLI passes `-g 0`.
@@ -187,6 +221,12 @@ pub struct ServerPanel {
     /// expander so the stats poller can rebuild it on updates
     /// without walking the expander's `AdwActionRow` children.
     pub activity_log_list: gtk4::ListBox,
+    /// Advisory caption shown when the device-default sample rate
+    /// is at or above the "high bandwidth" threshold. Shared copy
+    /// with the source panel's same-named row so the user sees a
+    /// consistent warning whether they're commanding a high rate
+    /// via the server or the client side.
+    pub bandwidth_advisory_row: adw::ActionRow,
 }
 
 /// Subtitle shown on `status_client_row` when the accept loop is
@@ -402,6 +442,10 @@ fn build_device_defaults_rows() -> DeviceDefaultsRows {
 /// Build the server-panel widgets. The panel is hidden by default;
 /// `window.rs` toggles `widget.set_visible(true)` once a local dongle
 /// is detected and the active source is not RTL-SDR.
+#[allow(
+    clippy::too_many_lines,
+    reason = "widget-assembly function — splitting scatters one-time wire-up across many helpers with no readability win"
+)]
 pub fn build_server_panel() -> ServerPanel {
     let widget = adw::PreferencesGroup::builder()
         .title("Share over network")
@@ -482,6 +526,18 @@ pub fn build_server_panel() -> ServerPanel {
 
     let (activity_log_row, activity_log_list) = build_activity_log_row();
 
+    // Bandwidth advisory — hidden initially. Visibility is toggled
+    // on sample-rate changes via the wiring in window.rs, mirroring
+    // the source-panel path. Copy is intentionally identical to the
+    // source-panel version (shared consts) so users see the same
+    // warning wording no matter which side they're configuring.
+    let bandwidth_advisory_row = adw::ActionRow::builder()
+        .title(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_TITLE)
+        .subtitle(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_SUBTITLE)
+        .visible(false)
+        .build();
+    bandwidth_advisory_row.add_prefix(&gtk4::Image::from_icon_name("dialog-information-symbolic"));
+
     widget.add(&share_row);
     widget.add(&nickname_row);
     widget.add(&port_row);
@@ -490,6 +546,7 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&device_defaults_row);
     widget.add(&status_row);
     widget.add(&activity_log_row);
+    widget.add(&bandwidth_advisory_row);
 
     ServerPanel {
         widget,
@@ -513,5 +570,222 @@ pub fn build_server_panel() -> ServerPanel {
         status_stop_button,
         activity_log_row,
         activity_log_list,
+        bandwidth_advisory_row,
     }
+}
+
+/// Load saved server-panel values from `config` and wire every
+/// editable row to re-persist on change. Called from `window.rs`
+/// after the panel is built. Two-phase:
+///
+/// 1. **Restore** — read each key, fall back to the widget's
+///    existing default if the key is absent or of the wrong type.
+///    Unknown / corrupt types are silently dropped (the restore
+///    path is fire-and-forget — `serde_json`'s `as_*` helpers
+///    return `None` on a type mismatch, the `if let Some` guard
+///    skips the apply, and the widget keeps its build-time
+///    default). No panic path.
+/// 2. **Subscribe** — install a notify handler on each editable
+///    widget that writes its current value back to `config`. The
+///    config manager's auto-save thread picks up the change on
+///    its ~1 s tick.
+///
+/// `GObject` weak refs on the capture side would over-complicate
+/// this signal-handler block; `clone()` is fine here because the
+/// panel's widgets are all held strongly by the sidebar (= window)
+/// lifetime anyway, and the notify handlers only fire on user
+/// action — no leak risk from a long-running timer.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of 10 persistence bindings — splitting would just fragment a straightforward contract"
+)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "persisted numeric fields (port / freq Hz / ppm) fit well below f64's 52-bit mantissa; the spin rows clamp to u16/u32 ranges at the widget level"
+)]
+pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<ConfigManager>) {
+    // ---- Phase 1: restore ----
+    config.read(|v| {
+        if let Some(nickname) = v
+            .get(KEY_SERVER_NICKNAME)
+            .and_then(serde_json::Value::as_str)
+        {
+            panel.nickname_row.set_text(nickname);
+        }
+        if let Some(port) = v.get(KEY_SERVER_PORT).and_then(serde_json::Value::as_u64) {
+            let clamped = (port as f64).clamp(MIN_SERVER_PORT, MAX_SERVER_PORT);
+            panel.port_row.set_value(clamped);
+        }
+        if let Some(bind_idx) = v
+            .get(KEY_SERVER_BIND_IDX)
+            .and_then(serde_json::Value::as_u64)
+        {
+            // Accept only the legal indices; anything else falls
+            // back to loopback (safest default — never silently
+            // widens exposure).
+            let idx = u32::try_from(bind_idx).unwrap_or(BIND_LOOPBACK_IDX);
+            let legal = if idx == BIND_ALL_INTERFACES_IDX {
+                BIND_ALL_INTERFACES_IDX
+            } else {
+                BIND_LOOPBACK_IDX
+            };
+            panel.bind_row.set_selected(legal);
+        }
+        if let Some(advertise) = v
+            .get(KEY_SERVER_ADVERTISE)
+            .and_then(serde_json::Value::as_bool)
+        {
+            panel.advertise_row.set_active(advertise);
+        }
+        if let Some(freq) = v
+            .get(KEY_SERVER_DEFAULT_FREQ_HZ)
+            .and_then(serde_json::Value::as_u64)
+        {
+            let clamped = (freq as f64).clamp(MIN_CENTER_FREQ_HZ, MAX_CENTER_FREQ_HZ);
+            panel.center_freq_row.set_value(clamped);
+        }
+        if let Some(idx) = v
+            .get(KEY_SERVER_DEFAULT_SR_IDX)
+            .and_then(serde_json::Value::as_u64)
+            && let Ok(idx_u32) = u32::try_from(idx)
+            && idx_u32 < SAMPLE_RATE_COUNT
+        {
+            // Strict bounds check on the stored index: anything
+            // past the StringList's last entry is discarded (not
+            // silently clamped) so a corrupt config leaves the
+            // widget on its build-time default instead of flipping
+            // to an arbitrary rate. Same policy as `bind_row`.
+            panel.sample_rate_row.set_selected(idx_u32);
+        }
+        if let Some(gain) = v
+            .get(KEY_SERVER_DEFAULT_GAIN_DB)
+            .and_then(serde_json::Value::as_f64)
+        {
+            let clamped = gain.clamp(MIN_SERVER_GAIN_DB, MAX_SERVER_GAIN_DB);
+            panel.gain_row.set_value(clamped);
+        }
+        if let Some(ppm) = v
+            .get(KEY_SERVER_DEFAULT_PPM)
+            .and_then(serde_json::Value::as_i64)
+        {
+            let clamped = (ppm as f64).clamp(MIN_SERVER_PPM, MAX_SERVER_PPM);
+            panel.ppm_row.set_value(clamped);
+        }
+        if let Some(bias_tee) = v
+            .get(KEY_SERVER_DEFAULT_BIAS_TEE)
+            .and_then(serde_json::Value::as_bool)
+        {
+            panel.bias_tee_row.set_active(bias_tee);
+        }
+        if let Some(ds) = v
+            .get(KEY_SERVER_DEFAULT_DIRECT_SAMPLING)
+            .and_then(serde_json::Value::as_bool)
+        {
+            panel.direct_sampling_row.set_active(ds);
+        }
+    });
+
+    // ---- Phase 2: subscribe ----
+    // Nickname: AdwEntryRow fires `connect_changed` on every edit.
+    let cfg_nick = Arc::clone(config);
+    panel.nickname_row.connect_changed(move |row| {
+        let text = row.text();
+        cfg_nick.write(|v| {
+            v[KEY_SERVER_NICKNAME] = serde_json::json!(text.as_str());
+        });
+    });
+    // Port spin row.
+    let cfg_port = Arc::clone(config);
+    panel.port_row.connect_value_notify(move |row| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "spin row bounded to 1024..=65535 at the widget level"
+        )]
+        let port = row.value() as u64;
+        cfg_port.write(|v| {
+            v[KEY_SERVER_PORT] = serde_json::json!(port);
+        });
+    });
+    // Bind-address combo. Only persist legal indices — GTK's
+    // ComboRow can emit transient out-of-range values during
+    // widget-model churn (e.g. a repopulation mid-drag). Writing
+    // those verbatim would corrupt the next startup's restore,
+    // which would then silently fall back to loopback and hide
+    // the drift. Strict gate here + on the restore side keeps
+    // the persisted state well-formed.
+    let cfg_bind = Arc::clone(config);
+    panel.bind_row.connect_selected_notify(move |row| {
+        let selected = row.selected();
+        if selected == BIND_LOOPBACK_IDX || selected == BIND_ALL_INTERFACES_IDX {
+            cfg_bind.write(|v| {
+                v[KEY_SERVER_BIND_IDX] = serde_json::json!(selected);
+            });
+        }
+    });
+    // Advertise switch.
+    let cfg_adv = Arc::clone(config);
+    panel.advertise_row.connect_active_notify(move |row| {
+        cfg_adv.write(|v| {
+            v[KEY_SERVER_ADVERTISE] = serde_json::json!(row.is_active());
+        });
+    });
+    // Center frequency spin row (device default).
+    let cfg_freq = Arc::clone(config);
+    panel.center_freq_row.connect_value_notify(move |row| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "spin row bounded to u32-valid Hz range at the widget level"
+        )]
+        let hz = row.value() as u64;
+        cfg_freq.write(|v| {
+            v[KEY_SERVER_DEFAULT_FREQ_HZ] = serde_json::json!(hz);
+        });
+    });
+    // Sample-rate combo (device default). Same strict-gate policy
+    // as `bind_row` — don't persist transient out-of-range values
+    // from GTK widget-model churn.
+    let cfg_sr = Arc::clone(config);
+    panel.sample_rate_row.connect_selected_notify(move |row| {
+        let selected = row.selected();
+        if selected < SAMPLE_RATE_COUNT {
+            cfg_sr.write(|v| {
+                v[KEY_SERVER_DEFAULT_SR_IDX] = serde_json::json!(selected);
+            });
+        }
+    });
+    // Gain spin row (device default).
+    let cfg_gain = Arc::clone(config);
+    panel.gain_row.connect_value_notify(move |row| {
+        cfg_gain.write(|v| {
+            v[KEY_SERVER_DEFAULT_GAIN_DB] = serde_json::json!(row.value());
+        });
+    });
+    // PPM spin row (device default).
+    let cfg_ppm = Arc::clone(config);
+    panel.ppm_row.connect_value_notify(move |row| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "spin row bounded to ±200 at the widget level"
+        )]
+        let ppm = row.value() as i64;
+        cfg_ppm.write(|v| {
+            v[KEY_SERVER_DEFAULT_PPM] = serde_json::json!(ppm);
+        });
+    });
+    // Bias-tee switch.
+    let cfg_bt = Arc::clone(config);
+    panel.bias_tee_row.connect_active_notify(move |row| {
+        cfg_bt.write(|v| {
+            v[KEY_SERVER_DEFAULT_BIAS_TEE] = serde_json::json!(row.is_active());
+        });
+    });
+    // Direct-sampling switch.
+    let cfg_ds = Arc::clone(config);
+    panel.direct_sampling_row.connect_active_notify(move |row| {
+        cfg_ds.write(|v| {
+            v[KEY_SERVER_DEFAULT_DIRECT_SAMPLING] = serde_json::json!(row.is_active());
+        });
+    });
 }

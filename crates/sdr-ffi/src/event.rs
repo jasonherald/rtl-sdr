@@ -301,7 +301,8 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::IqRecordingStopped
         | DspToUi::DemodModeChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
-        | DspToUi::VoiceSquelchOpenChanged(_) => return None,
+        | DspToUi::VoiceSquelchOpenChanged(_)
+        | DspToUi::RtlTcpConnectionState(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

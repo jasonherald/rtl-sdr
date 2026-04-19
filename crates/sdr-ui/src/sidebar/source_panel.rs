@@ -1,10 +1,24 @@
 //! Source device configuration panel — device selector, RTL-SDR /
 //! Network / File / RTL-TCP controls.
 
+use std::sync::Arc;
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_config::ConfigManager;
+use sdr_types::RtlTcpConnectionState;
+
+/// Config key for the persisted list of favorited `rtl_tcp` server
+/// instance names. Stored as a JSON array of strings; unknown /
+/// stale entries are tolerated by the read path.
+pub const KEY_RTL_TCP_CLIENT_FAVORITES: &str = "rtl_tcp_client_favorites";
+/// Config key for the persisted last-connected server. Stored as
+/// a JSON object `{ host, port, nickname }` so we can repopulate
+/// the hostname / port rows on app launch without waiting for
+/// mDNS to rediscover.
+pub const KEY_RTL_TCP_CLIENT_LAST_CONNECTED: &str = "rtl_tcp_client_last_connected";
 
 /// Device selector index for RTL-SDR.
 pub const DEVICE_RTLSDR: u32 = 0;
@@ -14,6 +28,30 @@ pub const DEVICE_NETWORK: u32 = 1;
 pub const DEVICE_FILE: u32 = 2;
 /// Device selector index for RTL-TCP (rtl_tcp-protocol network client).
 pub const DEVICE_RTLTCP: u32 = 3;
+
+/// Default subtitle for the RTL-TCP status row before any
+/// `DspToUi::RtlTcpConnectionState` event has arrived (or after a
+/// Disconnect). Kept as a const so the empty-at-startup and
+/// empty-after-disconnect paths render identical text.
+pub const RTL_TCP_STATUS_DISCONNECTED_SUBTITLE: &str = "Disconnected";
+
+/// Sample-rate selector index at which we start showing the
+/// "high bandwidth" advisory caption. Index 7 = 2.4 MHz, which
+/// at 8-bit I/Q pairs wire-format works out to ~38 Mbps — over
+/// a typical home Wi-Fi link (11/24/54 Mbps practical throughput
+/// for older hardware) this produces silent drops. Anything at
+/// or above this index triggers the caption so the user gets a
+/// heads-up before commanding the remote server.
+pub const HIGH_BANDWIDTH_SAMPLE_RATE_IDX: u32 = 7;
+
+/// Title shown on the advisory row when a network-heavy sample
+/// rate is selected. Kept as a const so source + server panels
+/// render identical copy.
+pub const HIGH_BANDWIDTH_ADVISORY_TITLE: &str = "High sample rate";
+/// Subtitle for the advisory row — the supporting detail under
+/// the title.
+pub const HIGH_BANDWIDTH_ADVISORY_SUBTITLE: &str =
+    "Your network may not keep up (≈38 Mbps at 2.4 Msps with 8-bit I/Q).";
 
 /// Network protocol selector index for TCP (client). Load-bearing:
 /// both `build_network_rows()` (protocol `StringList`) and callers in
@@ -91,6 +129,56 @@ pub struct SourcePanel {
     /// Discovered `rtl_tcp` servers (live from mDNS). Collapsed by
     /// default; expands when servers are seen.
     pub rtl_tcp_discovered_row: adw::ExpanderRow,
+
+    /// Connection status line shown only while the RTL-TCP source
+    /// type is selected. Subtitle reflects the current
+    /// `RtlTcpConnectionState` — "Connected to R820T (29 gains)",
+    /// "Retrying in 5 s (attempt 3)", "Failed: bad handshake", etc.
+    pub rtl_tcp_status_row: adw::ActionRow,
+    /// Stops the current `rtl_tcp` connection without changing
+    /// source type. Packed as a suffix on `rtl_tcp_status_row`,
+    /// sensitive only when there's something to disconnect from.
+    pub rtl_tcp_disconnect_button: gtk4::Button,
+    /// Forces a reconnect attempt immediately, skipping the
+    /// exponential-backoff sleep. Packed as a suffix on
+    /// `rtl_tcp_status_row`, sensitive only when the state
+    /// indicates we're between attempts (Retrying / Failed /
+    /// Disconnected).
+    pub rtl_tcp_retry_button: gtk4::Button,
+
+    /// Advisory caption shown when the selected sample rate is at
+    /// or above `HIGH_BANDWIDTH_SAMPLE_RATE_IDX` AND the source
+    /// type routes over the network (RTL-TCP). Silent for local
+    /// RTL-SDR and File sources — the wire-bandwidth concern only
+    /// applies to network paths.
+    pub bandwidth_advisory_row: adw::ActionRow,
+}
+
+/// Render a connection state into a one-line human-readable form
+/// for the status row subtitle. Free function + pure formatter so
+/// it's unit-testable without instantiating GTK widgets.
+pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
+    match state {
+        RtlTcpConnectionState::Disconnected => RTL_TCP_STATUS_DISCONNECTED_SUBTITLE.to_string(),
+        RtlTcpConnectionState::Connecting => "Connecting…".to_string(),
+        RtlTcpConnectionState::Connected {
+            tuner_name,
+            gain_count,
+        } => format!("Connected — {tuner_name} ({gain_count} gains)"),
+        RtlTcpConnectionState::Retrying { attempt, retry_in } => {
+            // Ceil, not floor — `as_secs` truncates fractional
+            // seconds, so `1.9 s` would read as "1 s" and the row
+            // would understate the remaining delay. Bump by one
+            // whenever there are any subsec nanos, then clamp to
+            // at least 1 so sub-1 s retries still show something
+            // rather than "0 s" (which reads like the retry
+            // already fired).
+            let secs_ceil = retry_in.as_secs() + u64::from(retry_in.subsec_nanos() > 0);
+            let secs = secs_ceil.max(1);
+            format!("Retrying in {secs} s (attempt {attempt})")
+        }
+        RtlTcpConnectionState::Failed { reason } => format!("Failed — {reason}"),
+    }
 }
 
 /// Default sample rate selector index (2.4 MHz = index 7).
@@ -268,6 +356,10 @@ fn connect_device_visibility(
 }
 
 /// Build the source device configuration panel.
+#[allow(
+    clippy::too_many_lines,
+    reason = "widget-assembly function — splitting would scatter one-time wire-up across many helpers with no readability win"
+)]
 pub fn build_source_panel() -> SourcePanel {
     let group = adw::PreferencesGroup::builder()
         .title("Source")
@@ -301,18 +393,41 @@ pub fn build_source_panel() -> SourcePanel {
     // RTL-TCP-specific rows. Built always, shown only when the RTL-TCP
     // source type is selected (see connect_device_visibility + the
     // initial-visibility block below).
-    //
-    // Connection-state display (Connecting / Connected / Retrying /
-    // Failed) is intentionally deferred to #323 — wiring it requires
-    // a new DspToUi event from the controller that polls
-    // RtlTcpSource::connection_state(), which is outside this PR's
-    // scope. Shipping the row without that plumbing would leave it
-    // stuck on "Disconnected" misleadingly.
     let rtl_tcp_discovered_row = adw::ExpanderRow::builder()
         .title("Discovered rtl_tcp servers")
         .subtitle("No servers discovered on the local network yet.")
         .visible(false)
         .build();
+
+    // Connection-state status row — subtitle updated by the DSP
+    // bridge via `DspToUi::RtlTcpConnectionState`. Suffix buttons
+    // let the user tear down or force-retry the connection without
+    // leaving the RTL-TCP source type.
+    let rtl_tcp_status_row = adw::ActionRow::builder()
+        .title("Connection")
+        .subtitle(RTL_TCP_STATUS_DISCONNECTED_SUBTITLE)
+        .visible(false)
+        .build();
+    let rtl_tcp_disconnect_button = gtk4::Button::with_label("Disconnect");
+    rtl_tcp_disconnect_button.set_valign(gtk4::Align::Center);
+    rtl_tcp_disconnect_button.set_sensitive(false);
+    let rtl_tcp_retry_button = gtk4::Button::with_label("Retry now");
+    rtl_tcp_retry_button.set_valign(gtk4::Align::Center);
+    rtl_tcp_retry_button.add_css_class("suggested-action");
+    rtl_tcp_retry_button.set_sensitive(false);
+    rtl_tcp_status_row.add_suffix(&rtl_tcp_disconnect_button);
+    rtl_tcp_status_row.add_suffix(&rtl_tcp_retry_button);
+
+    // Bandwidth advisory row — hidden by default. Visibility is
+    // toggled by the sample-rate and device-type notify handlers
+    // in window.rs. Title + subtitle copy come from shared consts
+    // so the source and server panels render identical text.
+    let bandwidth_advisory_row = adw::ActionRow::builder()
+        .title(HIGH_BANDWIDTH_ADVISORY_TITLE)
+        .subtitle(HIGH_BANDWIDTH_ADVISORY_SUBTITLE)
+        .visible(false)
+        .build();
+    bandwidth_advisory_row.add_prefix(&gtk4::Image::from_icon_name("dialog-information-symbolic"));
 
     // Add all rows to the group.
     group.add(&device_row);
@@ -330,6 +445,8 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&decimation_row);
     group.add(&record_iq_row);
     group.add(&rtl_tcp_discovered_row);
+    group.add(&rtl_tcp_status_row);
+    group.add(&bandwidth_advisory_row);
 
     // Derive initial visibility from the selected device.
     let selected = device_row.selected();
@@ -347,6 +464,7 @@ pub fn build_source_panel() -> SourcePanel {
     protocol_row.set_visible(is_network);
     file_path_row.set_visible(is_file);
     rtl_tcp_discovered_row.set_visible(is_rtltcp);
+    rtl_tcp_status_row.set_visible(is_rtltcp);
 
     connect_device_visibility(
         &device_row,
@@ -359,7 +477,7 @@ pub fn build_source_panel() -> SourcePanel {
         &protocol_row,
         &file_path_row,
     );
-    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row);
+    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row, &rtl_tcp_status_row);
 
     // Controls connected to DSP pipeline via window.rs
 
@@ -380,6 +498,10 @@ pub fn build_source_panel() -> SourcePanel {
         decimation_row,
         record_iq_row,
         rtl_tcp_discovered_row,
+        rtl_tcp_status_row,
+        rtl_tcp_disconnect_button,
+        rtl_tcp_retry_button,
+        bandwidth_advisory_row,
     }
 }
 
@@ -389,15 +511,83 @@ pub fn build_source_panel() -> SourcePanel {
 fn connect_rtl_tcp_visibility(
     device_row: &adw::ComboRow,
     rtl_tcp_discovered_row: &adw::ExpanderRow,
+    rtl_tcp_status_row: &adw::ActionRow,
 ) {
     device_row.connect_selected_notify(glib::clone!(
         #[weak]
         rtl_tcp_discovered_row,
+        #[weak]
+        rtl_tcp_status_row,
         move |row| {
             let is_rtltcp = row.selected() == DEVICE_RTLTCP;
             rtl_tcp_discovered_row.set_visible(is_rtltcp);
+            rtl_tcp_status_row.set_visible(is_rtltcp);
         }
     ));
+}
+
+/// Snapshot of a previously-connected `rtl_tcp` server. Serialized
+/// into the `rtl_tcp_client_last_connected` config entry so the
+/// next app launch can repopulate the hostname / port / nickname
+/// fields without waiting for mDNS to rediscover.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LastConnectedServer {
+    /// Hostname or IP literal the Connect button dialed — either
+    /// a resolved address (`192.168.1.5`) or an mDNS hostname
+    /// (`shack-pi.local.`), whichever the discovery layer yielded.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+    /// User-facing nickname — normally the mDNS TXT nickname, or
+    /// the `instance_name` when no nickname was published.
+    pub nickname: String,
+}
+
+/// Load the list of favorited server instance names. Returns an
+/// empty Vec on first launch / absent / corrupt config. Safe to
+/// call unconditionally.
+pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<String> {
+    config.read(|v| {
+        v.get(KEY_RTL_TCP_CLIENT_FAVORITES)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|entry| entry.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Persist the full favorites list. Overwrites the config entry —
+/// callers pass the current UI state of pinned instance names.
+pub fn save_favorites(config: &Arc<ConfigManager>, favorites: &[String]) {
+    config.write(|v| {
+        v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!(favorites);
+    });
+}
+
+/// Load the last-connected server snapshot, if any was recorded.
+/// Returns `None` on first launch or when the stored blob fails
+/// to deserialize (schema drift, hand-edited config, etc.).
+pub fn load_last_connected(config: &Arc<ConfigManager>) -> Option<LastConnectedServer> {
+    config.read(|v| {
+        v.get(KEY_RTL_TCP_CLIENT_LAST_CONNECTED)
+            .and_then(|entry| serde_json::from_value(entry.clone()).ok())
+    })
+}
+
+/// Persist a `LastConnectedServer` snapshot. Called from the
+/// discovery-row Connect handler and from any manual-server
+/// connect path once that UI exists.
+pub fn save_last_connected(config: &Arc<ConfigManager>, server: &LastConnectedServer) {
+    config.write(|v| {
+        // Serialize via serde_json::to_value so we don't re-embed
+        // JSON-encoded text inside a JSON string (the common
+        // round-trip mistake here).
+        v[KEY_RTL_TCP_CLIENT_LAST_CONNECTED] =
+            serde_json::to_value(server).unwrap_or(serde_json::Value::Null);
+    });
 }
 
 #[cfg(test)]
@@ -437,5 +627,125 @@ mod tests {
         assert_ne!(DEVICE_NETWORK, DEVICE_FILE);
         assert_ne!(DEVICE_NETWORK, DEVICE_RTLTCP);
         assert_ne!(DEVICE_FILE, DEVICE_RTLTCP);
+    }
+
+    #[test]
+    fn format_rtl_tcp_state_covers_every_variant() {
+        use std::time::Duration;
+
+        // Disconnected → empty-looking but consistent with the const.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Disconnected),
+            RTL_TCP_STATUS_DISCONNECTED_SUBTITLE
+        );
+        // Connecting → ellipsis marker (avoids the reader confusing
+        // "Connecting" with "Connected" on a cursory glance).
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Connecting),
+            "Connecting…"
+        );
+        // Connected carries tuner metadata both the user and the
+        // debugging eye can parse.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Connected {
+                tuner_name: "R820T".into(),
+                gain_count: 29,
+            }),
+            "Connected — R820T (29 gains)"
+        );
+        // Retrying ceils fractional seconds so the row never
+        // understates the delay: 250 ms remaining → "1 s", not
+        // "0 s" (which would read as "the retry just fired").
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
+                attempt: 3,
+                retry_in: Duration::from_millis(250),
+            }),
+            "Retrying in 1 s (attempt 3)"
+        );
+        // Key regression guard for the ceil semantics — 1.9 s must
+        // read as "2 s", never "1 s". Flooring on `as_secs` would
+        // silently understate the countdown here.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
+                attempt: 4,
+                retry_in: Duration::from_millis(1_900),
+            }),
+            "Retrying in 2 s (attempt 4)"
+        );
+        // Exact integer seconds must NOT get bumped by the ceil —
+        // 12 s stays at "12 s", not "13 s".
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
+                attempt: 5,
+                retry_in: Duration::from_secs(12),
+            }),
+            "Retrying in 12 s (attempt 5)"
+        );
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Failed {
+                reason: "bad handshake".into(),
+            }),
+            "Failed — bad handshake"
+        );
+    }
+
+    // ---- Client-persistence helpers (favorites + last-connected) ----
+
+    fn make_config() -> Arc<ConfigManager> {
+        Arc::new(ConfigManager::in_memory(&serde_json::json!({})))
+    }
+
+    #[test]
+    fn favorites_round_trip() {
+        let config = make_config();
+        // Fresh config → empty list.
+        assert!(load_favorites(&config).is_empty());
+        let favs = vec![
+            "shack-pi rtl-sdr._rtl_tcp._tcp.local.".to_string(),
+            "attic pi._rtl_tcp._tcp.local.".to_string(),
+        ];
+        save_favorites(&config, &favs);
+        let loaded = load_favorites(&config);
+        assert_eq!(loaded, favs);
+    }
+
+    #[test]
+    fn favorites_loader_tolerates_non_array_entry() {
+        // If someone hand-edits the config file and makes the
+        // entry a string, we shouldn't panic or corrupt state —
+        // just return empty and let the user re-pin.
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_RTL_TCP_CLIENT_FAVORITES] = serde_json::json!("not an array");
+        });
+        assert!(load_favorites(&config).is_empty());
+    }
+
+    #[test]
+    fn last_connected_round_trip() {
+        let config = make_config();
+        assert!(load_last_connected(&config).is_none());
+        let server = LastConnectedServer {
+            host: "192.168.1.5".to_string(),
+            port: 1234,
+            nickname: "shack-pi".to_string(),
+        };
+        save_last_connected(&config, &server);
+        let loaded = load_last_connected(&config).expect("loaded");
+        assert_eq!(loaded.host, server.host);
+        assert_eq!(loaded.port, server.port);
+        assert_eq!(loaded.nickname, server.nickname);
+    }
+
+    #[test]
+    fn last_connected_loader_tolerates_malformed_entry() {
+        // Schema drift: an older version persisted a plain string.
+        // New loader should return None rather than panic.
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_RTL_TCP_CLIENT_LAST_CONNECTED] = serde_json::json!("shack-pi:1234");
+        });
+        assert!(load_last_connected(&config).is_none());
     }
 }

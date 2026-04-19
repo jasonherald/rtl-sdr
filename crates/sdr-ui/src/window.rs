@@ -203,6 +203,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &demod_dropdown,
         &status_bar_demod,
         &toast_overlay,
+        config,
     );
 
     // Wire waterfall screenshot button.
@@ -349,6 +350,14 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let radio_panel_for_dsp = panels.radio.clone();
+    // Just the three widgets the rtl_tcp status renderer touches —
+    // cloning the whole SourcePanel would be a lot of refcount
+    // traffic for one signal handler. Weak refs, upgraded per
+    // message, keep the closure from keeping widgets alive past
+    // window close (same pattern as `ServerStatusWidgetsWeak`).
+    let rtl_tcp_status_row_weak = panels.source.rtl_tcp_status_row.downgrade();
+    let rtl_tcp_disconnect_button_weak = panels.source.rtl_tcp_disconnect_button.downgrade();
+    let rtl_tcp_retry_button_weak = panels.source.rtl_tcp_retry_button.downgrade();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
     #[cfg(feature = "sherpa")]
     let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
@@ -402,6 +411,9 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
                         &radio_panel_for_dsp,
+                        &rtl_tcp_status_row_weak,
+                        &rtl_tcp_disconnect_button_weak,
+                        &rtl_tcp_retry_button_weak,
                         &transcription_enable_for_dsp,
                         #[cfg(feature = "sherpa")]
                         &auto_break_row_for_dsp,
@@ -441,6 +453,9 @@ fn handle_dsp_message(
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
     radio_panel: &sidebar::radio_panel::RadioPanel,
+    rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
+    rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
+    rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
     transcription_enable_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_min_open_row: &adw::SpinRow,
@@ -593,7 +608,57 @@ fn handle_dsp_message(
             tracing::debug!(open, "voice squelch gate edge");
             radio_panel.set_voice_squelch_open(open);
         }
+        DspToUi::RtlTcpConnectionState(conn_state) => {
+            tracing::debug!(?conn_state, "rtl_tcp connection state");
+            // Upgrade all three weak refs atomically; any missing
+            // widget means the window's gone, so we drop the event
+            // rather than render a ghost status row.
+            if let (Some(status_row), Some(disconnect), Some(retry)) = (
+                rtl_tcp_status_row_weak.upgrade(),
+                rtl_tcp_disconnect_button_weak.upgrade(),
+                rtl_tcp_retry_button_weak.upgrade(),
+            ) {
+                apply_rtl_tcp_connection_state(&status_row, &disconnect, &retry, &conn_state);
+            }
+        }
     }
+}
+
+/// Render a `RtlTcpConnectionState` into the status row + button
+/// sensitivities. Pulled out of the renderer so the message
+/// handler can call it with individual weak-upgraded widgets
+/// instead of holding a whole `SourcePanel` clone across the
+/// signal-handler boundary.
+fn apply_rtl_tcp_connection_state(
+    status_row: &adw::ActionRow,
+    disconnect_button: &gtk4::Button,
+    retry_button: &gtk4::Button,
+    state: &sdr_types::RtlTcpConnectionState,
+) {
+    use sdr_types::RtlTcpConnectionState;
+    status_row.set_subtitle(&sidebar::source_panel::format_rtl_tcp_state(state));
+    let is_active = matches!(
+        state,
+        RtlTcpConnectionState::Connecting
+            | RtlTcpConnectionState::Connected { .. }
+            | RtlTcpConnectionState::Retrying { .. }
+    );
+    // "Retry now" is only meaningful when there's an active source
+    // to short-circuit out of its backoff wait — Retrying (most
+    // common) or Failed (the terminal protocol-error path where the
+    // source is still registered but not advancing). After an
+    // explicit Disconnect the controller drops `state.source`, and
+    // `UiToDsp::RetryRtlTcpNow` is a no-op (it checks
+    // `state.source.as_mut()` → None → early return). Leaving the
+    // button visibly enabled in that state misleads the user into
+    // thinking they can reconnect in one click; the correct
+    // post-Disconnect path is to press Play.
+    let can_retry_now = matches!(
+        state,
+        RtlTcpConnectionState::Retrying { .. } | RtlTcpConnectionState::Failed { .. }
+    );
+    disconnect_button.set_sensitive(is_active);
+    retry_button.set_sensitive(can_retry_now);
 }
 
 /// Build the `AdwOverlaySplitView` with sidebar configuration panels, content,
@@ -613,6 +678,11 @@ fn build_split_view(
 ) {
     // Sidebar — configuration panels.
     let (sidebar_scroll, panels) = sidebar::build_sidebar();
+    // Restore saved server-panel settings + subscribe to persist
+    // future changes. Runs as soon as panels are built so the
+    // saved values are visible before any user interaction could
+    // otherwise overwrite them.
+    sidebar::server_panel::connect_server_panel_persistence(&panels.server, config);
 
     // Main content area — spectrum display (FFT plot + waterfall) + status bar.
     let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view(state.ui_tx.clone());
@@ -844,6 +914,7 @@ fn build_breakpoint(split_view: &adw::OverlaySplitView) -> adw::Breakpoint {
 }
 
 /// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
+#[allow(clippy::too_many_arguments)]
 fn connect_sidebar_panels(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -852,10 +923,21 @@ fn connect_sidebar_panels(
     demod_dropdown: &gtk4::DropDown,
     status_bar: &Rc<StatusBar>,
     toast_overlay: &adw::ToastOverlay,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
-    connect_source_panel(panels, state);
-    connect_rtl_tcp_discovery(panels, state);
-    connect_server_panel(panels, toast_overlay);
+    // Shared "is the rtl_tcp server currently live?" flag. Written by
+    // the server panel's start/stop handler, read by the source
+    // panel's device-type guard so the two panels can enforce the
+    // "local RTL-SDR source and server-sharing-the-dongle are
+    // mutually exclusive" rule without either side owning state the
+    // other has to synthesize. `Rc<Cell<bool>>` is ideal: GTK single-
+    // threaded, no interior locking needed, cheap to clone into
+    // closures.
+    let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+    connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
+    connect_rtl_tcp_discovery(panels, state, config);
+    connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
@@ -883,7 +965,11 @@ fn connect_sidebar_panels(
 /// is currently selected. That's fine — discovery is cheap and having
 /// the list pre-populated when the user switches to RTL-TCP makes the
 /// UX immediate instead of "wait 5 s for the first advertisement."
-fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
+fn connect_rtl_tcp_discovery(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -914,26 +1000,26 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
 
     let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
+    // `Option<Browser>` — `None` on mDNS startup failure. We still
+    // need the rest of this function to run so the *manually*-
+    // persisted `last_connected` / favorites restore can repopulate
+    // the client UI. Only the discovery poller is skipped in the
+    // `None` branch (there'd be nothing to poll, and `disc_tx` is
+    // already dropped so `disc_rx` would immediately return
+    // `TryRecvError::Disconnected` and spin forever).
     let browser = match Browser::start(move |event| {
         // Ignore send errors — means the UI thread dropped the rx,
         // which only happens on shutdown.
         let _ = disc_tx.send(event);
     }) {
-        Ok(b) => b,
+        Ok(b) => Some(b),
         Err(e) => {
-            // Surface the failure in the UI and return early. Without
-            // the early return the timeout below would still spawn,
-            // and because `disc_tx` was moved into the failed
-            // `Browser::start` call its drop has already disconnected
-            // `disc_rx` — the poller would spin forever returning
-            // `TryRecvError::Disconnected` while the UI kept showing
-            // the benign idle "No servers discovered…" subtitle.
             tracing::warn!(%e, "mDNS browser failed to start — discovery disabled");
             panels
                 .source
                 .rtl_tcp_discovered_row
                 .set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
-            return;
+            None
         }
     };
 
@@ -956,10 +1042,55 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
     let protocol_row = panels.source.protocol_row.clone();
     let device_row = panels.source.device_row.clone();
     let state = Rc::clone(state);
+    // Shared config handle — the Connect button on each discovered
+    // row clones it once more inside the closure so it can persist
+    // a `LastConnectedServer` snapshot on click.
+    let config_for_discovery = std::sync::Arc::clone(config);
+
+    // Favorites set — instance names the user has starred. Loaded
+    // once on startup, mutated by star-toggle handlers, persisted
+    // after each change via `save_favorites`. `Rc<RefCell<HashSet>>`
+    // mirrors the `displayed_rows` pattern — single-threaded GTK
+    // main loop, no lock contention.
+    let favorites: Rc<RefCell<std::collections::HashSet<String>>> = Rc::new(RefCell::new(
+        crate::sidebar::source_panel::load_favorites(&config_for_discovery)
+            .into_iter()
+            .collect(),
+    ));
+
+    // Populate the hostname / port fields on startup from the last
+    // connected server, if any. Runs once before the poller starts
+    // so the user sees "the server they were last on" immediately
+    // instead of having to wait for a fresh mDNS beacon. No-op on
+    // first launch / after a config reset.
+    //
+    // Protocol row is forced to TCP *before* the hostname / port
+    // writes. Those writes fire `connect_changed` / `connect_value_
+    // notify` handlers that re-read `protocol_row.selected()` and
+    // dispatch `SetNetworkConfig { protocol: ... }`. If the shared
+    // protocol row was restored to UDP from a prior raw-Network
+    // session, the restore path would otherwise push a UDP
+    // `SetNetworkConfig` against the RTL-TCP endpoint on the very
+    // first tick. Pinning TCP first keeps the restore both silent
+    // to the user and correct end-to-end.
+    if let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery) {
+        protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
+        hostname_row.set_text(&last.host);
+        port_row.set_value(f64::from(last.port));
+    }
 
     // Poll the discovery channel from the main thread. Cheap enough
     // to be always-on; discovery events are bursty at start and then
     // idle.
+    //
+    // Gated on `Some(browser)` so we don't spawn a poller against a
+    // dead `disc_rx` when mDNS startup failed. The
+    // `DISCOVERY_UNAVAILABLE_SUBTITLE` set in the `Err` branch
+    // stays on the expander as the long-term idle state; the
+    // restore / favorites paths above already ran unconditionally.
+    let Some(browser) = browser else {
+        return;
+    };
     let _ = glib::timeout_add_local(DISCOVERY_POLL_INTERVAL, move || {
         // Keep the Browser alive as long as the timeout closure is
         // attached.
@@ -1024,6 +1155,19 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     tracing::warn!(
                         "mDNS discovery channel disconnected — stopping discovery poller"
                     );
+                    // Drain any previously announced rows before we
+                    // break out. Without this, they'd linger in the
+                    // expander indefinitely — no more
+                    // `ServerWithdrawn` events will arrive, and the
+                    // stale-age pruner at the top of the tick is
+                    // also about to stop firing. Users would see
+                    // rows that look Connect-able for endpoints
+                    // the UI has already declared unavailable.
+                    let mut rows = displayed_rows.borrow_mut();
+                    for (_, (row, _)) in rows.drain() {
+                        expander.remove(&row);
+                    }
+                    drop(rows);
                     expander.set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
                     return glib::ControlFlow::Break;
                 }
@@ -1061,6 +1205,72 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                         .title(&title)
                         .subtitle(&subtitle)
                         .build();
+
+                    // Star toggle — prefix icon, pinning this
+                    // server to the top of the discovered list and
+                    // persisting the choice across app launches.
+                    // Using the outlined / filled star icon pair
+                    // so the toggle state reads clearly without
+                    // extra CSS.
+                    let star_btn = gtk4::ToggleButton::builder()
+                        .icon_name(FAVORITE_ICON_OUTLINE)
+                        .valign(gtk4::Align::Center)
+                        .css_classes(["flat"])
+                        .tooltip_text("Pin as favorite")
+                        .build();
+                    // Use the stable hostname+port key, not
+                    // `instance_name`. `instance_name` comes from
+                    // the server's TXT nickname, which the operator
+                    // can edit — keying favorites off it would
+                    // silently drop the star on any rename.
+                    let star_key = favorite_key(&server);
+                    let starred_initially = favorites.borrow().contains(&star_key);
+                    star_btn.set_active(starred_initially);
+                    if starred_initially {
+                        star_btn.set_icon_name(FAVORITE_ICON_FILLED);
+                    }
+                    let star_favorites = Rc::clone(&favorites);
+                    let star_config = std::sync::Arc::clone(&config_for_discovery);
+                    let star_rows = Rc::clone(&displayed_rows);
+                    let star_expander_weak = expander_weak.clone();
+                    star_btn.connect_toggled(move |btn| {
+                        let active = btn.is_active();
+                        btn.set_icon_name(if active {
+                            FAVORITE_ICON_FILLED
+                        } else {
+                            FAVORITE_ICON_OUTLINE
+                        });
+                        {
+                            let mut favs = star_favorites.borrow_mut();
+                            if active {
+                                favs.insert(star_key.clone());
+                            } else {
+                                favs.remove(&star_key);
+                            }
+                            // Persist immediately. Order within
+                            // the persisted list is unspecified —
+                            // sort on read if the UI ever needs a
+                            // stable presentation order for
+                            // favorites management.
+                            let snapshot: Vec<String> = favs.iter().cloned().collect();
+                            crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
+                        }
+                        // Rebuild the expander so the row moves
+                        // to/from the top per the new favorite
+                        // state. Reuses the `displayed_rows` map
+                        // (strong refs on the AdwActionRow
+                        // widgets) — ordering is the only thing
+                        // that changes.
+                        if let Some(expander) = star_expander_weak.upgrade() {
+                            reorder_discovered_rows(
+                                &expander,
+                                &star_rows.borrow(),
+                                &star_favorites.borrow(),
+                            );
+                        }
+                    });
+                    row.add_prefix(&star_btn);
+
                     let connect_btn = gtk4::Button::with_label("Connect");
                     connect_btn.add_css_class("suggested-action");
                     connect_btn.set_valign(gtk4::Align::Center);
@@ -1072,6 +1282,15 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     let protor = protocol_row.clone();
                     let dr = device_row.clone();
                     let st = Rc::clone(&state);
+                    let cfg = std::sync::Arc::clone(&config_for_discovery);
+                    // Friendly nickname for the persisted snapshot.
+                    // Prefer the TXT nickname if the responder set
+                    // one, fall back to the DNS-SD instance name.
+                    let click_nickname = if server.txt.nickname.is_empty() {
+                        server.instance_name.clone()
+                    } else {
+                        server.txt.nickname.clone()
+                    };
                     connect_btn.connect_clicked(move |_| {
                         // Remember whether the device row was already
                         // on RTL-TCP. If it WAS, `set_selected` below
@@ -1083,22 +1302,41 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                         // handler will dispatch SetSourceType for us
                         // and an explicit send would double-open.
                         let already_rtl_tcp = dr.selected() == DEVICE_RTLTCP;
+                        // Force the shared protocol row to TCP
+                        // BEFORE the hostname/port writes below.
+                        // `hr.set_text` and `pr.set_value` fire the
+                        // `connect_changed` / `connect_value_notify`
+                        // handlers on the shared network rows, which
+                        // re-read `protocol_row.selected()` to build
+                        // their `SetNetworkConfig`. If the shared
+                        // protocol row is still on UDP from a prior
+                        // raw-Network session, those handlers would
+                        // dispatch a stale-UDP `SetNetworkConfig`
+                        // for our clicked endpoint before the
+                        // RTL-TCP switch lands — a transient
+                        // retarget of any live raw-Network source.
+                        // rtl_tcp is always TCP.
+                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
                         hr.set_text(&click_host);
                         pr.set_value(f64::from(click_port));
-                        // Force the shared protocol row to TCP. rtl_tcp
-                        // is always TCP, and the hostname_row /
-                        // port_row edit handlers re-read this widget
-                        // when dispatching SetNetworkConfig — leaving
-                        // it on UDP (the previous Network-source
-                        // selection) would silently overwrite our
-                        // protocol on the next hostname edit.
-                        protor.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
                         dr.set_selected(DEVICE_RTLTCP);
                         st.send_dsp(UiToDsp::SetNetworkConfig {
                             hostname: click_host.clone(),
                             port: click_port,
                             protocol: sdr_types::Protocol::TcpClient,
                         });
+                        // Persist the choice so next app launch
+                        // pre-populates the hostname / port fields
+                        // with the same server without needing
+                        // another mDNS round-trip.
+                        crate::sidebar::source_panel::save_last_connected(
+                            &cfg,
+                            &crate::sidebar::source_panel::LastConnectedServer {
+                                host: click_host.clone(),
+                                port: click_port,
+                                nickname: click_nickname.clone(),
+                            },
+                        );
                         if already_rtl_tcp {
                             // device_row notify handler did NOT fire
                             // (we were already on RTL-TCP); force the
@@ -1109,6 +1347,9 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
                     row.add_suffix(&connect_btn);
                     expander.add_row(&row);
                     rows.insert(server.instance_name.clone(), (row, server));
+                    // Reorder after insert so favorites float to
+                    // the top of the new view.
+                    reorder_discovered_rows(&expander, &rows, &favorites.borrow());
 
                     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
                 }
@@ -1136,6 +1377,76 @@ fn connect_rtl_tcp_discovery(panels: &SidebarPanels, state: &Rc<AppState>) {
 /// per-tick `rusb::devices()` USB-bus enumerate is invisible in
 /// profile traces.
 const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Icon name for the un-filled ("not pinned") star on discovery
+/// rows. GNOME Symbolic icon set — `non-starred-symbolic` renders
+/// the outline glyph, which is visually distinct from the filled
+/// pinned state so the affordance reads clearly without relying
+/// on the `ToggleButton::is_active` styling alone.
+const FAVORITE_ICON_OUTLINE: &str = "non-starred-symbolic";
+/// Icon name for the filled ("pinned") star. Paired with
+/// `FAVORITE_ICON_OUTLINE` so toggling swaps the glyph, not just
+/// the button chrome.
+const FAVORITE_ICON_FILLED: &str = "starred-symbolic";
+
+/// Stable persistence key for a discovered server's favorite
+/// state. We key by **advertised hostname + port**, not by the
+/// DNS-SD `instance_name`, because `instance_name` is derived
+/// from the user-editable TXT nickname — renaming the server
+/// would silently drop the saved favorite on the next announce.
+/// Hostname is the machine's mDNS identity (e.g. `shack-pi.local.`)
+/// which stays put across nickname changes; paired with port it's
+/// unique enough that two servers on the same host (different
+/// ports) remain distinct favorites. A full machine rename breaks
+/// the favorite — acceptable, since a rename semantically IS a
+/// different host.
+fn favorite_key(server: &DiscoveredServer) -> String {
+    format!("{}:{}", server.hostname, server.port)
+}
+
+/// Re-add rows to an `AdwExpanderRow` in a deterministic order:
+/// favorites (alphabetical by instance name) first, then
+/// non-favorites (same alpha order). Called after any mutation
+/// that could change the sort — new announce, favorite toggle —
+/// so the user's pinned entries stay glued to the top. GTK4 gives
+/// us no in-place reorder API for expander children, so we
+/// remove-and-re-add. At the expected scale (<50 servers on any
+/// realistic LAN) the reparenting is invisible.
+fn reorder_discovered_rows(
+    expander: &adw::ExpanderRow,
+    rows: &std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>,
+    favorites: &std::collections::HashSet<String>,
+) {
+    // Remove every row from the expander — widgets live in the
+    // HashMap, so no drop happens.
+    for (row, _) in rows.values() {
+        expander.remove(row);
+    }
+    // Sort keys: favorites first, then alpha. Favorite check goes
+    // through `favorite_key(server)` (hostname+port) so it matches
+    // what the star-toggle persists. Alpha tiebreak uses the
+    // `instance_name` (HashMap key) so rendering order stays
+    // predictable across re-announces.
+    let mut keys: Vec<&String> = rows.keys().collect();
+    keys.sort_by(|a, b| {
+        let a_fav = rows
+            .get(a.as_str())
+            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
+        let b_fav = rows
+            .get(b.as_str())
+            .is_some_and(|(_, srv)| favorites.contains(&favorite_key(srv)));
+        match (a_fav, b_fav) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.cmp(b),
+        }
+    });
+    for key in keys {
+        if let Some((row, _)) = rows.get(key) {
+            expander.add_row(row);
+        }
+    }
+}
 
 /// Owned handle for a running `rtl_tcp` server + optional mDNS
 /// advertisement. Drops in reverse order: advertiser first (so
@@ -1175,7 +1486,11 @@ struct RunningServer {
     clippy::too_many_lines,
     reason = "GTK signal-wiring: visibility + start-stop + control-locking all share state via nested closures — splitting scatters the captures"
 )]
-fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverlay) {
+fn connect_server_panel(
+    panels: &SidebarPanels,
+    toast_overlay: &adw::ToastOverlay,
+    server_running: Rc<std::cell::Cell<bool>>,
+) {
     use std::cell::Cell;
 
     let server_widget_weak = panels.server.widget.downgrade();
@@ -1272,12 +1587,42 @@ fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverla
         toast_overlay,
         Rc::clone(&running),
         apply_visibility.clone(),
+        server_running,
     );
 
     // Poll `Server::stats()` on a timer, render the status rows,
     // and auto-stop the server if `has_stopped()` becomes true
     // (e.g. USB unplug or accept-thread failure).
     connect_server_status_polling(panels, Rc::clone(&running), apply_visibility);
+
+    // Bandwidth advisory — toggled on the device-default sample
+    // rate. Unlike the source panel's advisory (which also gates
+    // on source type), the server is inherently a network path so
+    // only the rate matters.
+    let advisory_row_weak = panels.server.bandwidth_advisory_row.downgrade();
+    let apply_server_bandwidth_advisory = move |row: &adw::ComboRow| {
+        let Some(advisory) = advisory_row_weak.upgrade() else {
+            return;
+        };
+        // Bounds-check the selected index before threshold compare.
+        // `ComboRow::selected()` can emit transient out-of-range
+        // values during widget-model churn (GTK model repopulate,
+        // drag-mid-scroll, etc.) — a bare `>=` would treat those
+        // as high-bandwidth and flash the advisory visible against
+        // no legal selection. Mirrors the `SAMPLE_RATES.get()`
+        // safety pattern used elsewhere in this file.
+        let selected = row.selected();
+        let is_legal = (selected as usize) < SAMPLE_RATES.len();
+        advisory.set_visible(
+            is_legal && selected >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX,
+        );
+    };
+    // Seed initial visibility + subscribe for future changes.
+    apply_server_bandwidth_advisory(&panels.server.sample_rate_row);
+    panels
+        .server
+        .sample_rate_row
+        .connect_selected_notify(apply_server_bandwidth_advisory);
 }
 
 /// Extracted out of `connect_server_panel` so the parent function
@@ -1287,11 +1632,126 @@ fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverla
 /// `Server::start`, optionally attach an `Advertiser`, lock or
 /// unlock the panel controls, reapply visibility, and surface any
 /// error via a toast while flipping the switch back to off).
+/// Weak refs to every widget the share-switch handler reads or
+/// mutates. Mirrors the `ServerStatusWidgetsWeak` pattern: the
+/// closure attached to `share_row.connect_active_notify` would
+/// otherwise create a self-cycle (`share_row` → closure →
+/// `server_panel.share_row` → …) via the previous
+/// `clone_server_panel` capture. With this struct we capture weak
+/// refs only; strong refs live for the duration of one callback
+/// via `upgrade()` and drop at function return, so the widgets can
+/// be released on window close.
+///
+/// `source_device_row` is a sidebar neighbour (not in `ServerPanel`)
+/// and comes along for the exclusivity guard read.
+struct ServerSwitchWidgetsWeak {
+    nickname_row: glib::WeakRef<adw::EntryRow>,
+    port_row: glib::WeakRef<adw::SpinRow>,
+    bind_row: glib::WeakRef<adw::ComboRow>,
+    advertise_row: glib::WeakRef<adw::SwitchRow>,
+    device_defaults_row: glib::WeakRef<adw::ExpanderRow>,
+    center_freq_row: glib::WeakRef<adw::SpinRow>,
+    sample_rate_row: glib::WeakRef<adw::ComboRow>,
+    gain_row: glib::WeakRef<adw::SpinRow>,
+    ppm_row: glib::WeakRef<adw::SpinRow>,
+    bias_tee_row: glib::WeakRef<adw::SwitchRow>,
+    direct_sampling_row: glib::WeakRef<adw::SwitchRow>,
+    status_row: glib::WeakRef<adw::ExpanderRow>,
+    status_client_row: glib::WeakRef<adw::ActionRow>,
+    status_uptime_row: glib::WeakRef<adw::ActionRow>,
+    status_data_rate_row: glib::WeakRef<adw::ActionRow>,
+    status_commanded_row: glib::WeakRef<adw::ActionRow>,
+    activity_log_row: glib::WeakRef<adw::ExpanderRow>,
+    activity_log_list: glib::WeakRef<gtk4::ListBox>,
+    source_device_row: glib::WeakRef<adw::ComboRow>,
+}
+
+/// Upgraded strong refs held for the duration of a single handler
+/// invocation. Field names match `ServerPanel` so the existing
+/// helpers (`build_server_config_from_panel`, `set_controls_locked`,
+/// etc.) keep working after a simple type rename on their `panel`
+/// parameter.
+struct ServerSwitchWidgets {
+    nickname_row: adw::EntryRow,
+    port_row: adw::SpinRow,
+    bind_row: adw::ComboRow,
+    advertise_row: adw::SwitchRow,
+    device_defaults_row: adw::ExpanderRow,
+    center_freq_row: adw::SpinRow,
+    sample_rate_row: adw::ComboRow,
+    gain_row: adw::SpinRow,
+    ppm_row: adw::SpinRow,
+    bias_tee_row: adw::SwitchRow,
+    direct_sampling_row: adw::SwitchRow,
+    status_row: adw::ExpanderRow,
+    status_client_row: adw::ActionRow,
+    status_uptime_row: adw::ActionRow,
+    status_data_rate_row: adw::ActionRow,
+    status_commanded_row: adw::ActionRow,
+    activity_log_row: adw::ExpanderRow,
+    activity_log_list: gtk4::ListBox,
+    source_device_row: adw::ComboRow,
+}
+
+impl ServerSwitchWidgetsWeak {
+    fn from_panels(panels: &SidebarPanels) -> Self {
+        let s = &panels.server;
+        Self {
+            nickname_row: s.nickname_row.downgrade(),
+            port_row: s.port_row.downgrade(),
+            bind_row: s.bind_row.downgrade(),
+            advertise_row: s.advertise_row.downgrade(),
+            device_defaults_row: s.device_defaults_row.downgrade(),
+            center_freq_row: s.center_freq_row.downgrade(),
+            sample_rate_row: s.sample_rate_row.downgrade(),
+            gain_row: s.gain_row.downgrade(),
+            ppm_row: s.ppm_row.downgrade(),
+            bias_tee_row: s.bias_tee_row.downgrade(),
+            direct_sampling_row: s.direct_sampling_row.downgrade(),
+            status_row: s.status_row.downgrade(),
+            status_client_row: s.status_client_row.downgrade(),
+            status_uptime_row: s.status_uptime_row.downgrade(),
+            status_data_rate_row: s.status_data_rate_row.downgrade(),
+            status_commanded_row: s.status_commanded_row.downgrade(),
+            activity_log_row: s.activity_log_row.downgrade(),
+            activity_log_list: s.activity_log_list.downgrade(),
+            source_device_row: panels.source.device_row.downgrade(),
+        }
+    }
+
+    /// Lift every weak ref atomically — any missing widget means
+    /// the window's torn down and we skip the callback entirely.
+    fn upgrade(&self) -> Option<ServerSwitchWidgets> {
+        Some(ServerSwitchWidgets {
+            nickname_row: self.nickname_row.upgrade()?,
+            port_row: self.port_row.upgrade()?,
+            bind_row: self.bind_row.upgrade()?,
+            advertise_row: self.advertise_row.upgrade()?,
+            device_defaults_row: self.device_defaults_row.upgrade()?,
+            center_freq_row: self.center_freq_row.upgrade()?,
+            sample_rate_row: self.sample_rate_row.upgrade()?,
+            gain_row: self.gain_row.upgrade()?,
+            ppm_row: self.ppm_row.upgrade()?,
+            bias_tee_row: self.bias_tee_row.upgrade()?,
+            direct_sampling_row: self.direct_sampling_row.upgrade()?,
+            status_row: self.status_row.upgrade()?,
+            status_client_row: self.status_client_row.upgrade()?,
+            status_uptime_row: self.status_uptime_row.upgrade()?,
+            status_data_rate_row: self.status_data_rate_row.upgrade()?,
+            status_commanded_row: self.status_commanded_row.upgrade()?,
+            activity_log_row: self.activity_log_row.upgrade()?,
+            activity_log_list: self.activity_log_list.upgrade()?,
+            source_device_row: self.source_device_row.upgrade()?,
+        })
+    }
+}
+
 fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
     running: Rc<RefCell<Option<RunningServer>>>,
     apply_visibility: impl Fn() + Clone + 'static,
+    server_running: Rc<std::cell::Cell<bool>>,
 ) {
     use std::cell::Cell;
 
@@ -1303,21 +1763,43 @@ fn connect_share_switch(
     let toast_overlay_weak = toast_overlay.downgrade();
 
     let share_row_weak = panels.server.share_row.downgrade();
-    // Clone the whole ServerPanel Rc-backed widget handles into the
-    // closure. adw/gtk widgets are GObject refs; cloning increments
-    // a refcount, not the data.
-    let server_panel = clone_server_panel(&panels.server);
+    // Weak refs to every row/widget the handler reads or mutates.
+    // Replaces the previous `clone_server_panel` strong capture,
+    // which bumped share_row's GObject refcount and created a
+    // self-cycle with the `connect_active_notify` subscription.
+    // Upgraded per-callback so strong refs live for one tick only.
+    let widgets_weak = ServerSwitchWidgetsWeak::from_panels(panels);
 
     panels.server.share_row.connect_active_notify(move |row| {
         if reentry_guard.get() {
             return;
         }
+        let Some(widgets) = widgets_weak.upgrade() else {
+            // Window is gone — the signal should stop firing soon.
+            // Belt-and-suspenders early return.
+            return;
+        };
         let active = row.is_active();
         if active {
+            // Exclusivity guard: can't claim the dongle for the
+            // server while the UI still has RTL-SDR picked as the
+            // local source type. Toast + revert the switch without
+            // touching `running` or widget lock state.
+            if widgets.source_device_row.selected() == DEVICE_RTLSDR {
+                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                    overlay.add_toast(adw::Toast::new(
+                        "Switch the source away from local RTL-SDR before sharing over network.",
+                    ));
+                }
+                reentry_guard.set(true);
+                row.set_active(false);
+                reentry_guard.set(false);
+                return;
+            }
             // Build a ServerConfig from current panel state. Widget
             // readers run on the main thread — safe to block-read
             // the rows synchronously.
-            let config = build_server_config_from_panel(&server_panel);
+            let config = build_server_config_from_panel(&widgets);
             match Server::start(config) {
                 Ok(server) => {
                     // If advertising is on, build the TXT record
@@ -1330,8 +1812,8 @@ fn connect_share_switch(
                     // `advertiser = None` so the stop path doesn't
                     // try to unregister something that never
                     // registered.
-                    let advertiser = if server_panel.advertise_row.is_active() {
-                        match build_advertiser(&server, &server_panel.nickname_row.text()) {
+                    let advertiser = if widgets.advertise_row.is_active() {
+                        match build_advertiser(&server, &widgets.nickname_row.text()) {
                             Ok(adv) => Some(adv),
                             Err(e) => {
                                 tracing::warn!(error = %e, "mDNS advertiser failed; server running without LAN advertisement");
@@ -1346,10 +1828,15 @@ fn connect_share_switch(
                     } else {
                         None
                     };
-                    set_controls_locked(&server_panel, true);
-                    server_panel.status_row.set_visible(true);
-                    server_panel.activity_log_row.set_visible(true);
+                    set_controls_locked(&widgets, true);
+                    widgets.status_row.set_visible(true);
+                    widgets.activity_log_row.set_visible(true);
                     *running.borrow_mut() = Some(RunningServer { server, advertiser });
+                    // Flip the shared "server is live" flag AFTER
+                    // the handle is stored so the source-panel
+                    // guard can't race against a mid-construction
+                    // state.
+                    server_running.set(true);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to start rtl_tcp server");
@@ -1380,44 +1867,19 @@ fn connect_share_switch(
                 drop(handle.advertiser.take());
                 drop(handle.server);
             }
-            set_controls_locked(&server_panel, false);
-            server_panel.status_row.set_visible(false);
-            server_panel.activity_log_row.set_visible(false);
-            reset_status_rows(&server_panel);
-            reset_activity_log(&server_panel);
+            // Clear the shared "server is live" flag ahead of the
+            // widget-visibility changes so an immediate source-type
+            // re-selection triggered by the user's next action sees
+            // the coherent post-stop state.
+            server_running.set(false);
+            set_controls_locked(&widgets, false);
+            widgets.status_row.set_visible(false);
+            widgets.activity_log_row.set_visible(false);
+            reset_status_rows(&widgets);
+            reset_activity_log(&widgets);
         }
         apply_visibility();
     });
-}
-
-/// Deep-clone a `ServerPanel` (via `GObject` refcounts — all fields
-/// are adw/gtk widget handles, not data owners). Used to move a full
-/// panel reference into a long-lived closure without borrowing from
-/// the original `SidebarPanels`.
-fn clone_server_panel(panel: &sidebar::ServerPanel) -> sidebar::ServerPanel {
-    sidebar::ServerPanel {
-        widget: panel.widget.clone(),
-        share_row: panel.share_row.clone(),
-        nickname_row: panel.nickname_row.clone(),
-        port_row: panel.port_row.clone(),
-        bind_row: panel.bind_row.clone(),
-        advertise_row: panel.advertise_row.clone(),
-        device_defaults_row: panel.device_defaults_row.clone(),
-        center_freq_row: panel.center_freq_row.clone(),
-        sample_rate_row: panel.sample_rate_row.clone(),
-        gain_row: panel.gain_row.clone(),
-        ppm_row: panel.ppm_row.clone(),
-        bias_tee_row: panel.bias_tee_row.clone(),
-        direct_sampling_row: panel.direct_sampling_row.clone(),
-        status_row: panel.status_row.clone(),
-        status_client_row: panel.status_client_row.clone(),
-        status_uptime_row: panel.status_uptime_row.clone(),
-        status_data_rate_row: panel.status_data_rate_row.clone(),
-        status_commanded_row: panel.status_commanded_row.clone(),
-        status_stop_button: panel.status_stop_button.clone(),
-        activity_log_row: panel.activity_log_row.clone(),
-        activity_log_list: panel.activity_log_list.clone(),
-    }
 }
 
 /// Cadence for the server-stats poll that renders the "Server
@@ -1774,7 +2236,7 @@ fn render_activity_log(
 /// Reset activity-log list + subtitle on stop. Without this the
 /// list would persist after the server stopped — misleading users
 /// into thinking the log reflects a currently-running session.
-fn reset_activity_log(panel: &sidebar::ServerPanel) {
+fn reset_activity_log(panel: &ServerSwitchWidgets) {
     use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
     while let Some(child) = panel.activity_log_list.first_child() {
         panel.activity_log_list.remove(&child);
@@ -1806,7 +2268,7 @@ fn format_log_age(elapsed: Duration) -> String {
 /// Reset status rows to their idle-no-client state. Called when the
 /// server stops so the user doesn't see stale "connected at 127.0.0.1"
 /// / "uptime 5m" data after they flipped the share switch off.
-fn reset_status_rows(panel: &sidebar::ServerPanel) {
+fn reset_status_rows(panel: &ServerSwitchWidgets) {
     use crate::sidebar::server_panel::{
         STATUS_IDLE_VALUE_SUBTITLE, STATUS_WAITING_FOR_CLIENT_SUBTITLE,
     };
@@ -1849,7 +2311,7 @@ const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
     clippy::cast_sign_loss,
     reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
 )]
-fn build_server_config_from_panel(panel: &sidebar::ServerPanel) -> ServerConfig {
+fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
     use std::net::SocketAddr;
 
     use crate::sidebar::server_panel::{BIND_ALL_INTERFACES_IDX, BIND_LOOPBACK_IDX};
@@ -1960,7 +2422,7 @@ fn build_advertiser(
 /// start (so the user can't mutate config out from under a live
 /// session) and `false` on stop. `share_row` itself stays sensitive
 /// — that's how the user turns things off.
-fn set_controls_locked(panel: &sidebar::ServerPanel, locked: bool) {
+fn set_controls_locked(panel: &ServerSwitchWidgets, locked: bool) {
     let sensitive = !locked;
     panel.nickname_row.set_sensitive(sensitive);
     panel.port_row.set_sensitive(sensitive);
@@ -2049,9 +2511,62 @@ fn format_age(elapsed: Duration) -> String {
     clippy::too_many_lines,
     reason = "GTK signal-wiring panel; splitting would fragment the control mapping"
 )]
-fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
-    // Sample rate selector
+fn connect_source_panel(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    toast_overlay: &adw::ToastOverlay,
+    server_running: Rc<std::cell::Cell<bool>>,
+) {
+    // Sample rate selector + bandwidth advisory re-render.
+    // The advisory visibility depends on BOTH the sample-rate
+    // selection AND the device-type selection (only network paths
+    // care about wire bandwidth). We clone the helper closure into
+    // both notify handlers so either trigger re-evaluates.
+    // All three widgets the advisory closure touches are weak-
+    // ref'd. The closure is attached to both `sample_rate_row` and
+    // `device_row`'s `connect_selected_notify` — strong captures
+    // here would create the same self-cycle pattern flagged in
+    // `connect_share_switch` / `connect_server_status_polling`:
+    // `row → closure → row.clone()` keeps the widget alive forever.
+    let advisory_row_weak = panels.source.bandwidth_advisory_row.downgrade();
+    let device_row_weak = panels.source.device_row.downgrade();
+    let sample_rate_row_weak = panels.source.sample_rate_row.downgrade();
+    let apply_source_bandwidth_advisory = {
+        let advisory_row_weak = advisory_row_weak.clone();
+        let device_row_weak = device_row_weak.clone();
+        let sample_rate_row_weak = sample_rate_row_weak.clone();
+        move || {
+            // Any missing widget means the window has been torn
+            // down; skip the render — subsequent notify events
+            // won't fire against dead widgets.
+            let (Some(advisory), Some(device_row), Some(sample_rate_row)) = (
+                advisory_row_weak.upgrade(),
+                device_row_weak.upgrade(),
+                sample_rate_row_weak.upgrade(),
+            ) else {
+                return;
+            };
+            let is_network_path = device_row.selected() == DEVICE_RTLTCP;
+            // Bounds-check the sample-rate index: transient
+            // out-of-range values from widget-model churn would
+            // otherwise satisfy the `>= threshold` compare and
+            // flash the advisory visible with no legal selection.
+            // Same safety pattern as the server-panel advisory
+            // above.
+            let selected = sample_rate_row.selected();
+            let is_high_rate = (selected as usize) < SAMPLE_RATES.len()
+                && selected >= crate::sidebar::source_panel::HIGH_BANDWIDTH_SAMPLE_RATE_IDX;
+            advisory.set_visible(is_network_path && is_high_rate);
+        }
+    };
+    // Seed the advisory visibility once at wire-up. Without this,
+    // the caption stays hidden until the user nudges one of the
+    // two rows — which hides it even when the restored config
+    // already has RTL-TCP + a high sample rate selected.
+    apply_source_bandwidth_advisory();
+
     let state_sr = Rc::clone(state);
+    let apply_on_sr = apply_source_bandwidth_advisory.clone();
     panels
         .source
         .sample_rate_row
@@ -2060,7 +2575,13 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             if let Some(&rate) = SAMPLE_RATES.get(idx) {
                 state_sr.send_dsp(UiToDsp::SetSampleRate(rate));
             }
+            apply_on_sr();
         });
+    let apply_on_device = apply_source_bandwidth_advisory;
+    panels
+        .source
+        .device_row
+        .connect_selected_notify(move |_| apply_on_device());
 
     // DC blocking toggle
     let state_dc_block = Rc::clone(state);
@@ -2120,19 +2641,74 @@ fn connect_source_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         state_ppm.send_dsp(UiToDsp::SetPpmCorrection(row.value() as i32));
     });
 
-    // Source type selector — guard against transient out-of-range indices
+    // rtl_tcp connection controls — Disconnect + Retry now.
+    // Both route to the DSP controller which owns the active
+    // Source and performs the stop/start teardown. Buttons are
+    // sensitive-gated by the state-change handler in
+    // `handle_dsp_message`, so clicks should only ever reach here
+    // on legal transitions.
+    let state_disconnect = Rc::clone(state);
+    panels
+        .source
+        .rtl_tcp_disconnect_button
+        .connect_clicked(move |_| {
+            state_disconnect.send_dsp(UiToDsp::DisconnectRtlTcp);
+        });
+    let state_retry = Rc::clone(state);
+    panels
+        .source
+        .rtl_tcp_retry_button
+        .connect_clicked(move |_| {
+            state_retry.send_dsp(UiToDsp::RetryRtlTcpNow);
+        });
+
+    // Source type selector — guard against transient out-of-range
+    // indices AND enforce mutual exclusivity with the rtl_tcp server
+    // (the dongle can only serve one master; re-selecting RTL-SDR
+    // while the server's accept thread has the USB device would
+    // trigger a double-open at the next Play).
     let state_source = Rc::clone(state);
+    let toast_overlay_weak = toast_overlay.downgrade();
+    // Last-known legal selection. Seeded from the current row state
+    // so the revert path on first illegal transition lands on the
+    // value the UI already shows. Updated every time the guard
+    // accepts a new selection.
+    let last_legal_selection: Rc<std::cell::Cell<u32>> =
+        Rc::new(std::cell::Cell::new(panels.source.device_row.selected()));
+    // Re-entry guard against our own `set_selected` (the revert).
+    // Without it the revert would re-enter this handler, see the
+    // previous illegal value as "new", and endlessly toggle.
+    let reverting: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
     panels
         .source
         .device_row
         .connect_selected_notify(move |row| {
-            let source_type = match row.selected() {
+            if reverting.get() {
+                // Our own revert fired this notify — drop it.
+                return;
+            }
+            let selected = row.selected();
+            // Exclusivity guard: can't re-enter the local-source
+            // world while the rtl_tcp server has the dongle claimed.
+            if selected == DEVICE_RTLSDR && server_running.get() {
+                if let Some(overlay) = toast_overlay_weak.upgrade() {
+                    overlay.add_toast(adw::Toast::new(
+                        "Stop the network server first before switching to local RTL-SDR.",
+                    ));
+                }
+                reverting.set(true);
+                row.set_selected(last_legal_selection.get());
+                reverting.set(false);
+                return;
+            }
+            let source_type = match selected {
                 DEVICE_RTLSDR => SourceType::RtlSdr,
                 DEVICE_NETWORK => SourceType::Network,
                 DEVICE_FILE => SourceType::File,
                 DEVICE_RTLTCP => SourceType::RtlTcp,
                 _ => return, // ignore transient indices
             };
+            last_legal_selection.set(selected);
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));
         });
 

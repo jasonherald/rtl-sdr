@@ -25,7 +25,7 @@ use sdr_pipeline::source_manager::Source;
 use sdr_radio::RadioModule;
 use sdr_sink_audio::AudioSink;
 use sdr_source_rtlsdr::RtlSdrSource;
-use sdr_types::{Complex, SinkError, Stereo};
+use sdr_types::{Complex, RtlTcpConnectionState, SinkError, Stereo};
 
 use crate::fft_buffer::SharedFftBuffer;
 use crate::messages::{DspToUi, SourceType, UiToDsp};
@@ -140,6 +140,11 @@ fn dsp_thread_main(
 
             // Read and process one IQ block.
             process_iq_block(&mut state, &dsp_tx, &fft_shared);
+            // Edge-emit rtl_tcp connection-state changes. Poll is
+            // time-throttled inside the helper so at ~106 Hz block
+            // cadence we only hit the source's state mutex twice a
+            // second.
+            poll_rtl_tcp_connection_state(&mut state, &dsp_tx);
         } else {
             // Pipeline stopped — block with timeout to avoid busy-waiting.
             match ui_rx.recv_timeout(Duration::from_millis(RECV_TIMEOUT_MS)) {
@@ -151,6 +156,45 @@ fn dsp_thread_main(
                 }
             }
         }
+    }
+}
+
+/// Poll cadence for the `rtl_tcp` connection-state check. 500 ms
+/// matches the UI-side stats poll on the server panel and is fast
+/// enough that "Connecting → Connected" transitions feel
+/// instantaneous while keeping the per-tick state-mutex lock off
+/// the IQ-block hot path.
+const RTL_TCP_STATE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Poll the active source's projected `rtl_tcp_connection_state()`
+/// and emit `DspToUi::RtlTcpConnectionState` on edge (state changed
+/// since last emit). Throttled via `state.rtl_tcp_poll_at`.
+///
+/// Non-`RtlTcp` sources return `None` from the trait method — we
+/// map that to `Disconnected` so the UI can track the absence
+/// uniformly (source-type change → status row collapses without a
+/// separate teardown signal).
+fn poll_rtl_tcp_connection_state(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+    let now = std::time::Instant::now();
+    if now < state.rtl_tcp_poll_at {
+        return;
+    }
+    state.rtl_tcp_poll_at = now + RTL_TCP_STATE_POLL_INTERVAL;
+
+    let current = state
+        .source
+        .as_ref()
+        .and_then(|s| s.rtl_tcp_connection_state())
+        .unwrap_or(RtlTcpConnectionState::Disconnected);
+
+    // `RtlTcpConnectionState` derives PartialEq; Retrying variants
+    // with a different `retry_in` compare unequal, so the poll
+    // emits twice a second during the backoff wait. That's what we
+    // want — the UI renders a live countdown without the status
+    // text going stale between attempt-counter bumps.
+    if state.last_rtl_tcp_state != current {
+        state.last_rtl_tcp_state = current.clone();
+        let _ = dsp_tx.send(DspToUi::RtlTcpConnectionState(current));
     }
 }
 
@@ -243,6 +287,22 @@ struct DspState {
     /// the user picks Syllabic or Snr and the fresh detector
     /// reports closed.
     voice_squelch_was_open: bool,
+
+    /// Last emitted `rtl_tcp` connection state. Edge-filters the
+    /// `DspToUi::RtlTcpConnectionState` emissions so we don't
+    /// flood the channel at poll cadence when the state is static
+    /// (Connected for a long session, Retrying between attempts,
+    /// etc.). Initialized to `Disconnected` — matches the initial
+    /// UI render and the state of a freshly-constructed
+    /// `RtlTcpSource` before its first `start()`.
+    last_rtl_tcp_state: RtlTcpConnectionState,
+    /// Next wall-clock deadline for polling the active source's
+    /// connection state. We poll at ~2 Hz (500 ms) rather than on
+    /// every IQ block because the underlying state is a
+    /// `Mutex<ConnectionState>` lock — cheap but not free, and the
+    /// UI cadence doesn't need sub-second resolution to render the
+    /// "Connecting… / Connected / Retrying in N s" text.
+    rtl_tcp_poll_at: std::time::Instant,
 }
 
 impl DspState {
@@ -299,6 +359,8 @@ impl DspState {
             audio_frames_written: 0,
             iq_samples_read: 0,
             diag_log_at: std::time::Instant::now(),
+            last_rtl_tcp_state: RtlTcpConnectionState::Disconnected,
+            rtl_tcp_poll_at: std::time::Instant::now(),
         })
     }
 }
@@ -755,6 +817,23 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 state.running = false;
             }
             state.source_type = source_type;
+            // Force the rtl_tcp status row to reset when switching
+            // away from RTL-TCP. Without this, a user mid-session
+            // who switches to a different source would see the
+            // stale "Connected — R820T" text linger until the next
+            // poll tick (which won't fire if running=false). Only
+            // emits on an actual edge.
+            if source_type != SourceType::RtlTcp
+                && !matches!(
+                    state.last_rtl_tcp_state,
+                    RtlTcpConnectionState::Disconnected
+                )
+            {
+                state.last_rtl_tcp_state = RtlTcpConnectionState::Disconnected;
+                let _ = dsp_tx.send(DspToUi::RtlTcpConnectionState(
+                    RtlTcpConnectionState::Disconnected,
+                ));
+            }
             // Restart with the new source type if was playing
             if was_running {
                 match open_source(state) {
@@ -878,6 +957,52 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // always starts from a known state.
             state.squelch_was_open = false;
             tracing::info!("transcription audio tap disabled");
+        }
+        UiToDsp::DisconnectRtlTcp => {
+            // Only meaningful while `RtlTcp` is the active source
+            // type. For any other source we log-and-drop so
+            // misrouted commands from buggy UI paths don't panic.
+            if state.source_type != SourceType::RtlTcp {
+                tracing::debug!(
+                    active = ?state.source_type,
+                    "DisconnectRtlTcp ignored — active source is not RtlTcp"
+                );
+                return;
+            }
+            if let Some(source) = state.source.as_mut()
+                && let Err(e) = source.stop()
+            {
+                tracing::warn!(error = %e, "rtl_tcp source stop failed");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Disconnect failed: {e}")));
+            }
+            // Drop the source outright so `rtl_tcp_connection_state`
+            // returns `None` (→ Disconnected) on the next poll,
+            // cascading into a UI row that reflects reality.
+            state.source = None;
+            state.running = false;
+            let _ = dsp_tx.send(DspToUi::SourceStopped);
+        }
+        UiToDsp::RetryRtlTcpNow => {
+            // Same source-type gate as Disconnect. "Retry now"
+            // implements as stop+start so the current backoff
+            // sleep is short-circuited; the existing start_manager
+            // path tears up a fresh connection from Connecting.
+            if state.source_type != SourceType::RtlTcp {
+                tracing::debug!(
+                    active = ?state.source_type,
+                    "RetryRtlTcpNow ignored — active source is not RtlTcp"
+                );
+                return;
+            }
+            if let Some(source) = state.source.as_mut() {
+                if let Err(e) = source.stop() {
+                    tracing::warn!(error = %e, "rtl_tcp stop before retry failed");
+                }
+                if let Err(e) = source.start() {
+                    tracing::warn!(error = %e, "rtl_tcp restart failed");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Retry failed: {e}")));
+                }
+            }
         }
     }
 }

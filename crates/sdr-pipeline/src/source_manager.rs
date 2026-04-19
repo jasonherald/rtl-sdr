@@ -53,6 +53,18 @@ pub trait Source: Send {
     fn set_ppm_correction(&mut self, _ppm: i32) -> Result<(), SourceError> {
         Ok(())
     }
+
+    /// UI-facing connection state for `rtl_tcp` clients. Only the
+    /// network `RtlTcpSource` implements this meaningfully — every
+    /// other source returns `None`. Lets the UI poll the active
+    /// source without downcasting to the concrete type.
+    ///
+    /// Returns a projected form (`Instant`-free) so the type can
+    /// live in `sdr-types` without pulling in scheduling primitives
+    /// that don't cross crate boundaries cleanly.
+    fn rtl_tcp_connection_state(&self) -> Option<sdr_types::RtlTcpConnectionState> {
+        None
+    }
 }
 
 /// Manages available IQ sources and the active source lifecycle.
