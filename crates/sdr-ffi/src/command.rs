@@ -24,6 +24,9 @@
 //! the other (and the `make ffi-header-check` drift linter in a
 //! later checkpoint catches any divergence).
 
+use std::ffi::{CStr, c_char};
+use std::path::PathBuf;
+
 use sdr_core::UiToDsp;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
@@ -378,6 +381,86 @@ pub unsafe extern "C" fn sdr_core_set_volume(handle: *mut SdrCore, volume_0_1: f
     }
 }
 
+/// Shared helper for commands that take a NUL-terminated UTF-8
+/// path / identifier string. Returns an owned `String` on success
+/// or an `InvalidArg` after setting the last-error.
+///
+/// # Safety
+///
+/// `ptr` must be either null or a pointer to a NUL-terminated UTF-8
+/// C string.
+unsafe fn cstr_to_string(fn_name: &str, ptr: *const c_char) -> Result<String, SdrCoreError> {
+    if ptr.is_null() {
+        set_last_error(format!("{fn_name}: string pointer is null"));
+        return Err(SdrCoreError::InvalidArg);
+    }
+    // SAFETY: caller contract.
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    if let Ok(s) = cstr.to_str() {
+        Ok(s.to_string())
+    } else {
+        set_last_error(format!("{fn_name}: string is not valid UTF-8"));
+        Err(SdrCoreError::InvalidArg)
+    }
+}
+
+/// Select the audio output device by caller-opaque UID. Empty
+/// string routes to the system default output. The UID is the
+/// value previously obtained from `sdr_core_audio_device_uid`.
+///
+/// # Safety
+///
+/// `uid_utf8` must be a NUL-terminated UTF-8 C string (or empty).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_audio_device(
+    handle: *mut SdrCore,
+    uid_utf8: *const c_char,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let uid = cstr_to_string("sdr_core_set_audio_device", uid_utf8)?;
+            send(core, UiToDsp::SetAudioDevice(uid))
+        })
+    }
+}
+
+/// Start writing the demodulated audio stream to a 16-bit PCM WAV
+/// file at `path_utf8`. If recording was already active the engine
+/// logs a warning and overwrites — callers should stop first.
+///
+/// The engine confirms start via `SDR_EVT_AUDIO_RECORDING_STARTED`
+/// or emits `SDR_EVT_ERROR` on failure (open error, disk full, etc.).
+///
+/// # Safety
+///
+/// `path_utf8` must be a NUL-terminated UTF-8 C string naming a
+/// writable filesystem path (the engine creates the file). Does
+/// not accept null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_start_audio_recording(
+    handle: *mut SdrCore,
+    path_utf8: *const c_char,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let path = cstr_to_string("sdr_core_start_audio_recording", path_utf8)?;
+            if path.is_empty() {
+                set_last_error("sdr_core_start_audio_recording: path is empty");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::StartAudioRecording(PathBuf::from(path)))
+        })
+    }
+}
+
+/// Stop audio recording. The engine finalizes the WAV header on
+/// writer drop and confirms via `SDR_EVT_AUDIO_RECORDING_STOPPED`.
+/// Safe to call when no recording is active (no-op + stop event).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_stop_audio_recording(handle: *mut SdrCore) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::StopAudioRecording)) }
+}
+
 // ============================================================
 //  IQ frontend
 // ============================================================
@@ -520,6 +603,89 @@ mod tests {
             unsafe { sdr_core_set_auto_squelch(std::ptr::null_mut(), true) },
             SdrCoreError::InvalidHandle.as_int()
         );
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_set_audio_device(std::ptr::null_mut(), empty.as_ptr()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+        assert_eq!(
+            unsafe {
+                sdr_core_start_audio_recording(std::ptr::null_mut(), empty.as_ptr())
+            },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_stop_audio_recording(std::ptr::null_mut()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+    }
+
+    // ------------------------------------------------------
+    //  Audio routing + recording (ABI 0.4)
+    // ------------------------------------------------------
+
+    #[test]
+    fn set_audio_device_accepts_empty_string_for_default() {
+        let h = make_handle();
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_set_audio_device(h, empty.as_ptr()) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_audio_device_rejects_null_string() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_audio_device(h, std::ptr::null()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn start_audio_recording_rejects_null_or_empty_path() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_start_audio_recording(h, std::ptr::null()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_start_audio_recording(h, empty.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn audio_recording_start_stop_round_trip() {
+        // Write to a temp file path so the controller's WavWriter
+        // has somewhere it can open. We don't inspect the output —
+        // just exercise the command plumbing.
+        let h = make_handle();
+        let tmp = std::env::temp_dir().join(format!(
+            "sdr-ffi-test-{}.wav",
+            std::process::id()
+        ));
+        let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            unsafe { sdr_core_start_audio_recording(h, path.as_ptr()) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_stop_audio_recording(h) },
+            SdrCoreError::Ok.as_int()
+        );
+        // Give the controller a moment to process + drop the writer,
+        // then clean up. If the file wasn't created (e.g., the DSP
+        // thread hadn't processed the command yet) remove_file errs;
+        // that's fine — test doesn't depend on it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = std::fs::remove_file(&tmp);
+        destroy(h);
     }
 
     // ------------------------------------------------------

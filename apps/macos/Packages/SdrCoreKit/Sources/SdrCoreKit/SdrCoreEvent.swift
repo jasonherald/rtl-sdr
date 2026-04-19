@@ -30,13 +30,15 @@ import sdr_core_c
 // in `include/sdr_core.h` flows through automatically — the Swift
 // side can't drift from the C header silently. CodeRabbit caught
 // the hard-coded form on PR #256 round 1.
-private let kSourceStopped    = Int32(SDR_EVT_SOURCE_STOPPED.rawValue)
-private let kSampleRateChanged = Int32(SDR_EVT_SAMPLE_RATE_CHANGED.rawValue)
-private let kSignalLevel      = Int32(SDR_EVT_SIGNAL_LEVEL.rawValue)
-private let kDeviceInfo       = Int32(SDR_EVT_DEVICE_INFO.rawValue)
-private let kGainList         = Int32(SDR_EVT_GAIN_LIST.rawValue)
-private let kDisplayBandwidth = Int32(SDR_EVT_DISPLAY_BANDWIDTH.rawValue)
-private let kError            = Int32(SDR_EVT_ERROR.rawValue)
+private let kSourceStopped         = Int32(SDR_EVT_SOURCE_STOPPED.rawValue)
+private let kSampleRateChanged     = Int32(SDR_EVT_SAMPLE_RATE_CHANGED.rawValue)
+private let kSignalLevel           = Int32(SDR_EVT_SIGNAL_LEVEL.rawValue)
+private let kDeviceInfo            = Int32(SDR_EVT_DEVICE_INFO.rawValue)
+private let kGainList              = Int32(SDR_EVT_GAIN_LIST.rawValue)
+private let kDisplayBandwidth      = Int32(SDR_EVT_DISPLAY_BANDWIDTH.rawValue)
+private let kError                 = Int32(SDR_EVT_ERROR.rawValue)
+private let kAudioRecordingStarted = Int32(SDR_EVT_AUDIO_RECORDING_STARTED.rawValue)
+private let kAudioRecordingStopped = Int32(SDR_EVT_AUDIO_RECORDING_STOPPED.rawValue)
 
 /// High-level event from the engine.
 ///
@@ -71,6 +73,15 @@ public enum SdrCoreEvent: Sendable, Equatable {
 
     /// A non-fatal error occurred in the pipeline.
     case error(String)
+
+    /// Audio recording to WAV has started. The associated path is
+    /// the file the engine opened for writing.
+    case audioRecordingStarted(path: String)
+
+    /// Audio recording to WAV has stopped. Also fires on engine
+    /// shutdown while a recording is active, so hosts can clear
+    /// their "recording" UI without tracking teardown separately.
+    case audioRecordingStopped
 
     /// Translate a C `SdrEvent` into a Swift value.
     ///
@@ -115,6 +126,14 @@ public enum SdrCoreEvent: Sendable, Equatable {
             let cstr = payload.error.utf8
             guard let cstr else { return .error("") }
             return .error(String(cString: cstr))
+
+        case kAudioRecordingStarted:
+            let cstr = payload.audio_recording.path_utf8
+            guard let cstr else { return .audioRecordingStarted(path: "") }
+            return .audioRecordingStarted(path: String(cString: cstr))
+
+        case kAudioRecordingStopped:
+            return .audioRecordingStopped
 
         default:
             // Unknown kind — a future FFI may add variants we

@@ -60,6 +60,26 @@ struct SDRMacApp: App {
         appSupportDirectory().appendingPathComponent("bookmarks.json")
     }
 
+    /// Directory the app writes WAV recordings to, per #239:
+    /// `~/Documents/SDRMac/Audio/`. Created lazily on first
+    /// recording start so a user who never hits Record doesn't
+    /// wind up with a stray empty folder.
+    ///
+    /// Returned as a URL, not just a path, so SwiftUI callers can
+    /// `showInFinder` the destination directly.
+    static func audioRecordingsDirectory() -> URL {
+        let fm = FileManager.default
+        let docs = (try? fm.url(
+            for: .documentDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )) ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Documents")
+        let dir = docs.appendingPathComponent("SDRMac/Audio")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
     private static func appSupportDirectory() -> URL {
         let fm = FileManager.default
         let dir = (try? fm.url(
