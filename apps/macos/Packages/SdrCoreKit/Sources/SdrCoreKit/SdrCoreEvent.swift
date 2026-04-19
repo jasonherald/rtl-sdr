@@ -128,8 +128,15 @@ public enum SdrCoreEvent: Sendable, Equatable {
             return .error(String(cString: cstr))
 
         case kAudioRecordingStarted:
-            let cstr = payload.audio_recording.path_utf8
-            guard let cstr else { return .audioRecordingStarted(path: "") }
+            // Drop the event on a null path pointer rather than
+            // emit `.audioRecordingStarted(path: "")` — an empty
+            // path would flip CoreModel's `audioRecordingPath`
+            // into a bogus non-nil "recording" state with no file
+            // the UI can meaningfully display or reveal. The
+            // subsequent `.audioRecordingStopped` will still
+            // clear state correctly. Per CodeRabbit round 1 on
+            // PR #344.
+            guard let cstr = payload.audio_recording.path_utf8 else { return nil }
             return .audioRecordingStarted(path: String(cString: cstr))
 
         case kAudioRecordingStopped:

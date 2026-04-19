@@ -66,15 +66,25 @@ struct RecordingSection: View {
     }
 
     /// Build a full destination path for a new recording. The
-    /// filename pattern is `sdr-audio-YYYYMMDD-HHMMSS.wav` —
-    /// sortable, human-readable, and unique enough that back-to-
-    /// back recordings don't collide.
+    /// filename pattern is `sdr-audio-YYYYMMDD-HHMMSS-SSS.wav` —
+    /// sortable, human-readable, and millisecond-precise so
+    /// rapid stop/start cycles (button spam, scripted automation)
+    /// produce distinct filenames. On the off chance that two
+    /// timestamps still collide — or the user explicitly asked
+    /// for a name that exists from a previous session — an
+    /// integer suffix is appended until an unused name is found.
     static func generateRecordingPath() -> String {
         let dir = SDRMacApp.audioRecordingsDirectory()
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
         let stamp = formatter.string(from: Date())
-        return dir.appendingPathComponent("sdr-audio-\(stamp).wav").path
+        var candidate = dir.appendingPathComponent("sdr-audio-\(stamp).wav")
+        var suffix = 1
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = dir.appendingPathComponent("sdr-audio-\(stamp)-\(suffix).wav")
+            suffix += 1
+        }
+        return candidate.path
     }
 }

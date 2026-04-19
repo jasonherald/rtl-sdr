@@ -609,9 +609,7 @@ mod tests {
             SdrCoreError::InvalidHandle.as_int()
         );
         assert_eq!(
-            unsafe {
-                sdr_core_start_audio_recording(std::ptr::null_mut(), empty.as_ptr())
-            },
+            unsafe { sdr_core_start_audio_recording(std::ptr::null_mut(), empty.as_ptr()) },
             SdrCoreError::InvalidHandle.as_int()
         );
         assert_eq!(
@@ -666,10 +664,7 @@ mod tests {
         // has somewhere it can open. We don't inspect the output —
         // just exercise the command plumbing.
         let h = make_handle();
-        let tmp = std::env::temp_dir().join(format!(
-            "sdr-ffi-test-{}.wav",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("sdr-ffi-test-{}.wav", std::process::id()));
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
         assert_eq!(
             unsafe { sdr_core_start_audio_recording(h, path.as_ptr()) },

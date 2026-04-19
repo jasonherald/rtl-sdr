@@ -58,9 +58,8 @@ pub use command::{
     sdr_core_set_demod_mode, sdr_core_set_fft_rate, sdr_core_set_fft_size, sdr_core_set_fft_window,
     sdr_core_set_gain, sdr_core_set_iq_correction, sdr_core_set_iq_inversion,
     sdr_core_set_ppm_correction, sdr_core_set_sample_rate, sdr_core_set_squelch_db,
-    sdr_core_set_squelch_enabled, sdr_core_set_vfo_offset, sdr_core_set_volume,
-    sdr_core_start, sdr_core_start_audio_recording, sdr_core_stop, sdr_core_stop_audio_recording,
-    sdr_core_tune,
+    sdr_core_set_squelch_enabled, sdr_core_set_vfo_offset, sdr_core_set_volume, sdr_core_start,
+    sdr_core_start_audio_recording, sdr_core_stop, sdr_core_stop_audio_recording, sdr_core_tune,
 };
 pub use enumerate::{
     sdr_core_audio_device_count, sdr_core_audio_device_name, sdr_core_audio_device_uid,

@@ -158,12 +158,26 @@ int32_t sdr_core_device_name(
  * the host surface them in a Settings picker. They are handle-free
  * and can be called before `sdr_core_create`.
  *
- * Each call to `sdr_core_audio_device_count` / `_name` / `_uid`
- * independently re-runs the backend query, so in the rare case
- * where a device hot-plugs mid-enumeration, the host may see an
- * inconsistent index mapping. In practice hosts call these once
- * per Settings panel open; a v3 ABI bump adds a hot-plug listener
- * that pushes a dedicated event instead of requiring polling.
+ * Atomicity (thread-local snapshot):
+ *   - `sdr_core_audio_device_count` runs the backend query and
+ *     stores the result in a per-thread snapshot.
+ *   - `sdr_core_audio_device_name` and `_uid` read from that
+ *     snapshot, so for a given thread, `_name(i)` and `_uid(i)`
+ *     always refer to the same device entry — even if a device
+ *     hot-plugs between the two calls. Callers get coherent
+ *     name/UID pairs for every index returned by `_count`.
+ *   - Calling `_name(i)` / `_uid(i)` without a prior `_count` on
+ *     this thread triggers a lazy refresh. That path doesn't
+ *     benefit from cross-index consistency (each call refreshes
+ *     if the snapshot was empty), but single-device pickers
+ *     still work.
+ *   - Each new `_count` call discards the previous snapshot and
+ *     takes a fresh one, so the pattern "call count, iterate
+ *     indices, call count again" gives the host two independent
+ *     views and lets it detect hot-plug by comparing sizes.
+ *
+ * A v3 hot-plug listener (pushed as a dedicated event variant)
+ * is on the roadmap for continuous device-presence tracking.
  *
  * `_name` returns the human-readable label (e.g. "MacBook Pro
  * Speakers"). `_uid` returns the caller-opaque identifier that

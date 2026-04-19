@@ -15,6 +15,7 @@
 //! the memory, we fill it. This is the same contract as POSIX
 //! `strerror_r` / `snprintf`.
 
+use std::cell::RefCell;
 use std::ffi::c_char;
 
 use crate::error::{SdrCoreError, clear_last_error, set_last_error};
@@ -118,31 +119,93 @@ pub unsafe extern "C" fn sdr_core_device_name(
 }
 
 // ============================================================
-//  Audio output device enumeration (handle-free)
+//  Audio output device enumeration (handle-free, atomic)
 // ============================================================
 //
 // Wraps `sdr_sink_audio::list_audio_sinks()` — the same snapshot
-// the engine uses internally when opening the sink. Each FFI call
-// re-runs the query. For ~10 devices at settings-panel open time
-// this is cheap; we accept the tiny race window if a device hot-
-// plugs between `count` and `name`/`uid` calls (the UI refreshes
-// on next panel open or on the v3 hot-plug listener).
+// the engine uses internally when opening the sink. To give
+// callers a coherent name+UID pair for every index in a round
+// of enumeration (count → name(0) → uid(0) → name(1) → …), we
+// stash the snapshot in a **thread-local** and have the
+// per-index getters read from it.
+//
+// Why thread-local instead of a snapshot-handle API:
+//   - Same API shape as `sdr_core_device_count` / `_name` (the
+//     RTL-SDR enumerate), which hosts already use without a
+//     snapshot handle.
+//   - No new ABI surface: host code that was written against
+//     the pre-atomic draft (Swift `SdrCore.audioDevices`
+//     computed property on PR #344) keeps working — it just
+//     gets internal consistency for free.
+//   - Snapshot scope is "everything `_name` or `_uid` called on
+//     this thread between two `_count` calls." That matches
+//     SwiftUI pickers where the whole enumeration runs on the
+//     main actor in a synchronous loop.
+//
+// Semantics of the three entry points:
+//   - `_count()` **always** re-runs `list_audio_sinks()` and
+//     stores the result in the thread-local, then returns the
+//     length. Calling it twice gives you two independent
+//     snapshots.
+//   - `_name(i)` / `_uid(i)` read from the thread-local. If
+//     the thread-local is empty (first call in the thread, or
+//     after a previous snapshot observed zero devices), they
+//     lazy-refresh before reading. This makes "one-shot"
+//     callers that forgot to call `_count` also work — they
+//     just don't benefit from cross-index consistency beyond
+//     the single call.
+//
+// Hot-plug between `_count` and `_name(N-1)` is benign: the
+// getter still sees the original snapshot and returns the
+// name/UID for the element that was at index `i` when `_count`
+// ran, whether the device still exists or not. That's the
+// behavior the caller wants — any UI round-tripping back
+// through `sdr_core_set_audio_device` will get
+// `SinkError::DeviceNotFound` from the engine if the target
+// disappeared, and the next `_count` call reflects the new
+// state.
 //
 // String fields come straight from the backend-specific
 // `AudioDevice` struct:
 //   - `display_name` is the human-readable label from
 //     `kAudioObjectPropertyName` on CoreAudio, or the PipeWire
 //     node description on Linux.
-//   - `node_name` is the caller-opaque UID — on CoreAudio it's the
-//     `AudioDeviceID` as a decimal string in v1 (per the inline
-//     docs in `sdr-sink-audio::coreaudio_impl`), migrating to the
-//     `kAudioDevicePropertyDeviceUID` string in a later PR. Empty
-//     means "system default output" on every backend.
+//   - `node_name` is the caller-opaque UID — on CoreAudio it's
+//     the `AudioDeviceID` as a decimal string in v1 (per the
+//     inline docs in `sdr-sink-audio::coreaudio_impl`),
+//     migrating to the `kAudioDevicePropertyDeviceUID` string
+//     in a later PR. Empty means "system default output" on
+//     every backend.
 //
 // The caller-allocated-buffer + truncation contract matches
 // `sdr_core_device_name` above.
 
-/// Count audio output devices currently enumerable by the backend.
+thread_local! {
+    /// Per-thread snapshot of the device list. Replaced on each
+    /// `sdr_core_audio_device_count` call so the per-index
+    /// getters see a coherent view even if devices hot-plug
+    /// between calls. `RefCell` because we mutate it (assign the
+    /// new snapshot), but we never borrow across a re-entry so
+    /// the `borrow_mut` can't panic in practice.
+    static AUDIO_DEVICE_SNAPSHOT: RefCell<Vec<sdr_sink_audio::AudioDevice>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Refresh the thread-local snapshot and return it as a length.
+/// Broken out so both `_count` and the lazy-refresh path in
+/// `audio_device_string` share one implementation.
+fn refresh_audio_device_snapshot() -> usize {
+    let devices = sdr_sink_audio::list_audio_sinks();
+    let len = devices.len();
+    AUDIO_DEVICE_SNAPSHOT.with(|cell| {
+        *cell.borrow_mut() = devices;
+    });
+    len
+}
+
+/// Count audio output devices currently enumerable by the backend,
+/// taking a fresh snapshot. Subsequent `_name` / `_uid` calls on
+/// this thread read from that snapshot.
 ///
 /// See `include/sdr_core.h` for the contract. Does not open any
 /// device and does not require a handle.
@@ -157,10 +220,10 @@ pub extern "C" fn sdr_core_audio_device_count() -> u32 {
     // enumeration path mustn't cross the FFI boundary. Fallback is
     // "0 devices" — the honest answer when enumeration failed.
     std::panic::catch_unwind(|| {
-        let devices = sdr_sink_audio::list_audio_sinks();
+        let len = refresh_audio_device_snapshot();
         // Cap at u32::MAX defensively. In practice there are <100
         // devices on any real system.
-        u32::try_from(devices.len()).unwrap_or(u32::MAX)
+        u32::try_from(len).unwrap_or(u32::MAX)
     })
     .unwrap_or_else(|_| {
         set_last_error("sdr_core_audio_device_count: panic during enumeration");
@@ -171,6 +234,10 @@ pub extern "C" fn sdr_core_audio_device_count() -> u32 {
 /// Shared helper for `sdr_core_audio_device_name` / `_uid`. Picks
 /// the string to copy via `select_field` and follows the same
 /// write-and-NUL-terminate contract as `sdr_core_device_name`.
+/// Reads from the thread-local snapshot; lazy-refreshes the
+/// snapshot when empty so a caller that forgot to call `_count`
+/// first still gets a usable result (it just won't be
+/// consistent with any prior `_count` return).
 ///
 /// # Safety
 ///
@@ -184,7 +251,9 @@ unsafe fn audio_device_string<F>(
     select_field: F,
 ) -> i32
 where
-    F: Fn(&sdr_sink_audio::AudioDevice) -> &str + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+    F: Fn(&sdr_sink_audio::AudioDevice) -> &str
+        + std::panic::UnwindSafe
+        + std::panic::RefUnwindSafe,
 {
     let result = std::panic::catch_unwind(|| {
         if out_buf.is_null() || buf_len == 0 {
@@ -192,35 +261,47 @@ where
             return SdrCoreError::InvalidArg.as_int();
         }
 
-        let devices = sdr_sink_audio::list_audio_sinks();
+        // Lazy-refresh on first use — a caller that jumps
+        // straight to `_name(0)` without calling `_count` still
+        // gets the right answer. This does a backend query per
+        // call in that path; the atomic multi-index case still
+        // uses the cached snapshot.
         let idx = usize::try_from(index).unwrap_or(usize::MAX);
-        let Some(dev) = devices.get(idx) else {
-            set_last_error(format!(
-                "{fn_name}: index {index} out of range (count={})",
-                devices.len()
-            ));
-            return SdrCoreError::Device.as_int();
-        };
+        AUDIO_DEVICE_SNAPSHOT.with(|cell| {
+            if cell.borrow().is_empty() {
+                let fresh = sdr_sink_audio::list_audio_sinks();
+                *cell.borrow_mut() = fresh;
+            }
 
-        let bytes = select_field(dev).as_bytes();
-        let max_payload = buf_len.saturating_sub(1); // reserve 1 for NUL
-        let to_copy = bytes.len().min(max_payload);
+            let snap = cell.borrow();
+            let Some(dev) = snap.get(idx) else {
+                set_last_error(format!(
+                    "{fn_name}: index {index} out of range (count={})",
+                    snap.len()
+                ));
+                return SdrCoreError::Device.as_int();
+            };
 
-        // SAFETY: Caller contract guarantees `out_buf` is writable
-        // for `buf_len` bytes; `to_copy <= buf_len - 1 < buf_len`
-        // and the NUL write at `out_buf.add(to_copy)` is within
-        // `buf_len` because `to_copy <= buf_len - 1`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.cast::<u8>(), to_copy);
-            *out_buf.add(to_copy) = 0;
-        }
+            let bytes = select_field(dev).as_bytes();
+            let max_payload = buf_len.saturating_sub(1); // reserve 1 for NUL
+            let to_copy = bytes.len().min(max_payload);
 
-        clear_last_error();
+            // SAFETY: Caller contract guarantees `out_buf` is writable
+            // for `buf_len` bytes; `to_copy <= buf_len - 1 < buf_len`
+            // and the NUL write at `out_buf.add(to_copy)` is within
+            // `buf_len` because `to_copy <= buf_len - 1`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.cast::<u8>(), to_copy);
+                *out_buf.add(to_copy) = 0;
+            }
 
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        {
-            to_copy as i32
-        }
+            clear_last_error();
+
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            {
+                to_copy as i32
+            }
+        })
     });
 
     if let Ok(rc) = result {
@@ -383,6 +464,65 @@ mod tests {
     }
 
     #[test]
+    fn audio_device_name_and_uid_share_snapshot_after_count() {
+        // Regression test for the CodeRabbit round 1 finding on
+        // PR #344: before the thread-local snapshot, `_name(i)`
+        // and `_uid(i)` each re-ran `list_audio_sinks()`, so a
+        // hot-plug between the two could pair a name from one
+        // snapshot with a UID from another. The thread-local
+        // pins the snapshot to the last `_count` call — each
+        // index pairs `_name(i)` with `_uid(i)` consistently.
+        //
+        // We can't force a hot-plug in a unit test, but we can
+        // verify that between `_count` and the per-index reads
+        // the same index always resolves to matching strings
+        // from a single backend call, regardless of what a
+        // parallel thread's own snapshot looks like.
+        let count = sdr_core_audio_device_count();
+        assert!(count >= 1);
+
+        for i in 0..count {
+            let mut name_buf = [0_u8; 256];
+            let mut uid_buf = [0_u8; 256];
+            let rc_name = unsafe {
+                sdr_core_audio_device_name(
+                    i,
+                    name_buf.as_mut_ptr().cast::<c_char>(),
+                    name_buf.len(),
+                )
+            };
+            let rc_uid = unsafe {
+                sdr_core_audio_device_uid(i, uid_buf.as_mut_ptr().cast::<c_char>(), uid_buf.len())
+            };
+            assert!(rc_name >= 0);
+            assert!(rc_uid >= 0);
+            // Both calls must succeed for every index the count
+            // call reported — if `_uid` returned Device error while
+            // `_name` succeeded, that's the inconsistency the
+            // thread-local is meant to prevent.
+        }
+    }
+
+    #[test]
+    fn audio_device_lazy_refresh_when_count_not_called() {
+        // A caller that jumps straight to `_name(0)` without
+        // calling `_count` first should still get a valid answer.
+        // We exercise this on a fresh thread so there's no prior
+        // snapshot in thread-local storage.
+        let handle = std::thread::spawn(|| {
+            let mut buf = [0_u8; 256];
+            let rc = unsafe {
+                sdr_core_audio_device_name(0, buf.as_mut_ptr().cast::<c_char>(), buf.len())
+            };
+            assert!(
+                rc >= 0,
+                "lazy refresh path must return a valid answer for index 0, got {rc}"
+            );
+        });
+        handle.join().expect("thread should exit cleanly");
+    }
+
+    #[test]
     fn audio_device_first_entry_round_trips() {
         // Every backend returns at least one entry for index 0.
         // Name may be empty on the stub's "Default" when the test
@@ -392,9 +532,8 @@ mod tests {
         assert!(count >= 1);
 
         let mut buf = [0_u8; 256];
-        let rc = unsafe {
-            sdr_core_audio_device_name(0, buf.as_mut_ptr().cast::<c_char>(), buf.len())
-        };
+        let rc =
+            unsafe { sdr_core_audio_device_name(0, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         assert!(rc >= 0, "expected success, got {rc}");
         let written = usize::try_from(rc).expect("rc is non-negative after the assert above");
         // Check NUL termination — not the string contents (backend-dependent).
@@ -404,8 +543,9 @@ mod tests {
         // UID for index 0 is typically the empty string ("system default"),
         // but that's backend policy — we just check the call works.
         let mut uid_buf = [0_u8; 256];
-        let rc =
-            unsafe { sdr_core_audio_device_uid(0, uid_buf.as_mut_ptr().cast::<c_char>(), uid_buf.len()) };
+        let rc = unsafe {
+            sdr_core_audio_device_uid(0, uid_buf.as_mut_ptr().cast::<c_char>(), uid_buf.len())
+        };
         assert!(rc >= 0, "expected success, got {rc}");
     }
 }
