@@ -612,8 +612,10 @@ pub struct FavoriteEntry {
 ///
 /// 1. **Current (PR #315):** `Vec<FavoriteEntry>` — array of JSON
 ///    objects, each decoded via `serde_json::from_value`. Objects
-///    that fail to deserialize are silently skipped (same
-///    schema-drift tolerance as `load_last_connected`).
+///    that fail to deserialize are skipped AND logged at
+///    `tracing::warn!` with the offending entry index and the
+///    serde error, so schema drift is diagnosable in bug reports
+///    instead of silently eating favorites.
 /// 2. **Legacy (PR #335):** `Vec<String>` — array of bare
 ///    `hostname:port` keys. Upgraded in-place by constructing a
 ///    `FavoriteEntry` with `nickname = key` and every optional
@@ -714,6 +716,18 @@ pub fn save_last_connected(config: &Arc<ConfigManager>, server: &LastConnectedSe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixed Unix timestamp used in the favorites round-trip test
+    /// to pin the `last_seen_unix` field. Value is arbitrary (from
+    /// November 2023) but deliberately chosen to be well past any
+    /// clock-skew-fallback sentinel and well before `u32::MAX`
+    /// seconds so overflow edges aren't in play.
+    const TEST_LAST_SEEN_UNIX: u64 = 1_700_000_000;
+    /// Unix timestamp for 2020-01-01T00:00:00Z. Used by the
+    /// `now_unix_seconds` smoke test as a "modern wall-clock"
+    /// floor — anything past this is clearly real time and not a
+    /// clock-skew fallback returning 0.
+    const MODERN_UNIX_FLOOR: u64 = 1_577_836_800;
 
     /// Compile-time validation that gain constants are consistent.
     const _: () = {
@@ -828,7 +842,7 @@ mod tests {
                 nickname: "Shack Pi".into(),
                 tuner_name: Some("R820T".into()),
                 gain_count: Some(29),
-                last_seen_unix: Some(1_700_000_000),
+                last_seen_unix: Some(TEST_LAST_SEEN_UNIX),
             },
             FavoriteEntry {
                 key: "attic-pi.local.:1234".into(),
@@ -845,7 +859,7 @@ mod tests {
         assert_eq!(loaded[0].nickname, "Shack Pi");
         assert_eq!(loaded[0].tuner_name.as_deref(), Some("R820T"));
         assert_eq!(loaded[0].gain_count, Some(29));
-        assert_eq!(loaded[0].last_seen_unix, Some(1_700_000_000));
+        assert_eq!(loaded[0].last_seen_unix, Some(TEST_LAST_SEEN_UNIX));
         // Second entry has every optional field None → must
         // round-trip as None, NOT as missing / default values.
         assert!(loaded[1].tuner_name.is_none());
@@ -914,9 +928,10 @@ mod tests {
     fn now_unix_seconds_is_monotonic_within_call() {
         // Not a real monotonicity test — just a smoke-test that
         // the helper returns a sensible modern value. Anything
-        // past 2020-01-01 (Unix 1_577_836_800) is clearly real
-        // wall-clock time and not a clock-skew fallback.
-        assert!(now_unix_seconds() > 1_577_836_800);
+        // past `MODERN_UNIX_FLOOR` (2020-01-01T00:00:00Z) is
+        // clearly real wall-clock time and not a clock-skew
+        // fallback returning 0.
+        assert!(now_unix_seconds() > MODERN_UNIX_FLOOR);
     }
 
     #[test]

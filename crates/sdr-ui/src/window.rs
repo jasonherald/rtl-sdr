@@ -1236,6 +1236,26 @@ fn connect_rtl_tcp_discovery(
     // star, without waiting for a mutation to trigger a rebuild.
     rebuild_favorites_popover(&favorite_row_ctx, &favorites.borrow());
 
+    // Rebuild on every popover show so the "seen Xm ago" subtitles
+    // reflect current wall-clock time. Without this, the ages
+    // captured by `format_favorite_subtitle` at startup / star
+    // toggle / re-announce freeze between popover openings — a
+    // user who closes the popover and reopens it 10 minutes later
+    // would still see "seen just now" for servers that actually
+    // went offline during that gap.
+    //
+    // `favorite_row_ctx.popover.popover` is the same weak ref the
+    // per-row Connect closure uses to dismiss the popover, so no
+    // new capture shape is introduced. The closure holds
+    // `Rc<FavoriteRowContext>`; no retain cycle because
+    // `FavoriteRowContext.popover` is weak.
+    {
+        let ctx_for_show = Rc::clone(&favorite_row_ctx);
+        favorites_header.popover.connect_show(move |_| {
+            rebuild_favorites_popover(&ctx_for_show, &ctx_for_show.favorites.borrow());
+        });
+    }
+
     // Populate the hostname / port fields on startup from the last
     // connected server, if any. Runs once before the poller starts
     // so the user sees "the server they were last on" immediately
