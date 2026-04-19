@@ -1267,7 +1267,17 @@ fn connect_server_panel(panels: &SidebarPanels, toast_overlay: &adw::ToastOverla
     // authority on server lifecycle — on toggle we either start a
     // new `Server` (+ optional `Advertiser`) and store the handle,
     // or drop the handle so the accept thread tears down.
-    connect_share_switch(panels, toast_overlay, Rc::clone(&running), apply_visibility);
+    connect_share_switch(
+        panels,
+        toast_overlay,
+        Rc::clone(&running),
+        apply_visibility.clone(),
+    );
+
+    // Poll `Server::stats()` on a timer, render the status rows,
+    // and auto-stop the server if `has_stopped()` becomes true
+    // (e.g. USB unplug or accept-thread failure).
+    connect_server_status_polling(panels, Rc::clone(&running), apply_visibility);
 }
 
 /// Extracted out of `connect_server_panel` so the parent function
@@ -1320,6 +1330,7 @@ fn connect_share_switch(
                         None
                     };
                     set_controls_locked(&server_panel, true);
+                    server_panel.status_row.set_visible(true);
                     *running.borrow_mut() = Some(RunningServer { server, advertiser });
                 }
                 Err(e) => {
@@ -1352,6 +1363,8 @@ fn connect_share_switch(
                 drop(handle.server);
             }
             set_controls_locked(&server_panel, false);
+            server_panel.status_row.set_visible(false);
+            reset_status_rows(&server_panel);
         }
         apply_visibility();
     });
@@ -1376,7 +1389,266 @@ fn clone_server_panel(panel: &sidebar::ServerPanel) -> sidebar::ServerPanel {
         ppm_row: panel.ppm_row.clone(),
         bias_tee_row: panel.bias_tee_row.clone(),
         direct_sampling_row: panel.direct_sampling_row.clone(),
+        status_row: panel.status_row.clone(),
+        status_client_row: panel.status_client_row.clone(),
+        status_uptime_row: panel.status_uptime_row.clone(),
+        status_data_rate_row: panel.status_data_rate_row.clone(),
+        status_commanded_row: panel.status_commanded_row.clone(),
+        status_stop_button: panel.status_stop_button.clone(),
     }
+}
+
+/// Cadence for the server-stats poll that renders the "Server
+/// status" rows. 500 ms is fast enough that "connected / waiting"
+/// transitions feel instant while keeping the `ServerStats` clone +
+/// row-subtitle churn off the critical path.
+const SERVER_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Bits-per-byte conversion used in the Mbps formatter. Kept behind
+/// a named constant so the arithmetic at the call site reads as
+/// unit math ("bytes * `BITS_PER_BYTE` / duration / MEGA") instead
+/// of opaque `8`s and `1_000_000`s.
+const BITS_PER_BYTE: u64 = 8;
+/// Megabits divisor for rendering Mbps. `1_000_000` matches
+/// telecom/carrier conventions for transport rates.
+const BITS_PER_MEGABIT: f64 = 1_000_000.0;
+
+/// Poll `Server::stats()` on a fixed cadence, render the four
+/// status rows from the snapshot, and auto-stop the server if
+/// `has_stopped()` becomes true (e.g. USB dongle unplugged or
+/// accept-thread error).
+///
+/// Auto-stop flips the `share_row` back off, which re-enters the
+/// switch's `connect_active_notify` handler — that branch drops the
+/// `RunningServer` handle and releases the dongle for subsequent
+/// reopens. Without this the UI would lie about the server's
+/// running state indefinitely.
+///
+/// Data-rate is computed from the delta in `bytes_sent` between
+/// consecutive poll ticks. Counter resets (on disconnect) produce
+/// negative deltas which we clamp to zero so the row reads "0 bps"
+/// instead of a bogus megabit-scale number during the transient.
+fn connect_server_status_polling(
+    panels: &SidebarPanels,
+    running: Rc<RefCell<Option<RunningServer>>>,
+    apply_visibility: impl Fn() + 'static,
+) {
+    use std::cell::Cell;
+
+    let server_panel = clone_server_panel(&panels.server);
+    let share_row_weak = panels.server.share_row.downgrade();
+    let widget_weak = panels.server.widget.downgrade();
+    let last_bytes_sent = Rc::new(Cell::new(0u64));
+
+    // Separate subscription on the Stop button. Flipping the switch
+    // off is the single canonical stop path — pointing the button
+    // there avoids a second teardown codepath that could drift.
+    let stop_share_row_weak = share_row_weak.clone();
+    panels.server.status_stop_button.connect_clicked(move |_| {
+        if let Some(share) = stop_share_row_weak.upgrade() {
+            share.set_active(false);
+        }
+    });
+
+    let _ = glib::timeout_add_local(SERVER_STATUS_POLL_INTERVAL, move || {
+        // Tear the poller down if the panel widget is gone (window
+        // closed). Prevents leaking `server.stats()` locks past
+        // window lifetime.
+        if widget_weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        // Snapshot `Server::stats()` under the borrow. `stats()`
+        // internally locks a Mutex — the return is a Clone, so the
+        // borrow scope is tight.
+        let snapshot = running
+            .borrow()
+            .as_ref()
+            .map(|h| (h.server.stats(), h.server.has_stopped()));
+        let Some((stats, stopped)) = snapshot else {
+            // No server running — nothing to render, keep ticking
+            // (the share switch handler will spin us up again).
+            return glib::ControlFlow::Continue;
+        };
+
+        // If the accept thread exited on its own (USB unplug,
+        // fatal error), auto-flip the share switch off. Re-enters
+        // the switch handler, which drops the server handle.
+        if stopped {
+            tracing::warn!("rtl_tcp server stopped on its own — flipping share switch off");
+            if let Some(share) = share_row_weak.upgrade() {
+                share.set_active(false);
+            }
+            apply_visibility();
+            return glib::ControlFlow::Continue;
+        }
+
+        render_status_rows(&server_panel, &stats, &last_bytes_sent);
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Write the current `ServerStats` snapshot into the four status
+/// rows. Uses `last_bytes_sent` to compute a rolling data-rate from
+/// delta-over-poll-interval.
+fn render_status_rows(
+    panel: &sidebar::ServerPanel,
+    stats: &sdr_server_rtltcp::ServerStats,
+    last_bytes_sent: &Rc<std::cell::Cell<u64>>,
+) {
+    use crate::sidebar::server_panel::{
+        STATUS_IDLE_VALUE_SUBTITLE, STATUS_WAITING_FOR_CLIENT_SUBTITLE,
+    };
+
+    // Client row + expander subtitle.
+    if let Some(peer) = stats.connected_client {
+        let peer_str = peer.to_string();
+        panel.status_client_row.set_subtitle(&peer_str);
+        panel
+            .status_row
+            .set_subtitle(&format!("Connected: {peer_str}"));
+    } else {
+        panel
+            .status_client_row
+            .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+        panel
+            .status_row
+            .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+    }
+
+    // Uptime row.
+    panel
+        .status_uptime_row
+        .set_subtitle(&stats.connected_since.map_or_else(
+            || STATUS_IDLE_VALUE_SUBTITLE.to_string(),
+            |since| format_uptime(since.elapsed()),
+        ));
+
+    // Data-rate row. Counter reset on disconnect produces a
+    // negative delta in the u64 arithmetic; clamp to 0 so the row
+    // doesn't read a bogus Mbps number on the transient.
+    let current_bytes = stats.bytes_sent;
+    let delta = current_bytes.saturating_sub(last_bytes_sent.get());
+    last_bytes_sent.set(current_bytes);
+    panel
+        .status_data_rate_row
+        .set_subtitle(&format_data_rate(delta, SERVER_STATUS_POLL_INTERVAL));
+
+    // Commanded-state row. "Tuned to" means "what the client has
+    // most recently requested." Assembled one piece at a time; an
+    // unset field shows its upstream default stamp from
+    // `InitialDeviceState::default()` rather than blanking out.
+    panel
+        .status_commanded_row
+        .set_subtitle(&format_commanded_state(stats));
+}
+
+/// Render a `Duration` as `Nh Nm Ns` / `Nm Ns` / `Ns` depending on
+/// magnitude. Keeps the row readable at a glance without fighting a
+/// full clock component.
+fn format_uptime(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Render bytes/interval as a human-readable data rate. Picks the
+/// right unit automatically: kbps when we're below 1 Mbps (quiet
+/// clients), Mbps otherwise. `rtl_tcp` IQ streams at 2.4 MS/s × 2
+/// bytes per sample = ~4.8 Mbps, so the Mbps case dominates in
+/// practice.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "intermediate f64 conversion for rate math; Mbps precision is cosmetic"
+)]
+fn format_data_rate(bytes: u64, interval: Duration) -> String {
+    let secs = interval.as_secs_f64();
+    if secs <= 0.0 {
+        return "—".to_string();
+    }
+    let bits_per_sec = (bytes as f64 * BITS_PER_BYTE as f64) / secs;
+    if bits_per_sec < BITS_PER_MEGABIT {
+        format!("{:.1} kbps", bits_per_sec / 1_000.0)
+    } else {
+        format!("{:.2} Mbps", bits_per_sec / BITS_PER_MEGABIT)
+    }
+}
+
+/// Render the "Tuned to" row subtitle. Combines frequency, sample
+/// rate and gain into one line. Unset fields show their upstream
+/// default stamp from `InitialDeviceState::default()` — which is
+/// what the server applied on open — rather than blanking out, so
+/// the row never looks broken during the pre-first-command window.
+fn format_commanded_state(stats: &sdr_server_rtltcp::ServerStats) -> String {
+    let freq_hz = stats
+        .current_freq_hz
+        .unwrap_or(sdr_server_rtltcp::DEFAULT_CENTER_FREQ_HZ);
+    let sample_rate_hz = stats
+        .current_sample_rate_hz
+        .unwrap_or(sdr_server_rtltcp::DEFAULT_SAMPLE_RATE_HZ);
+    let gain_text = match (stats.current_gain_auto, stats.current_gain_tenths_db) {
+        (Some(true), _) => "auto".to_string(),
+        (_, Some(gain_tenths)) => {
+            #[allow(clippy::cast_precision_loss, reason = "gain tenths-of-dB, cosmetic")]
+            let db = f64::from(gain_tenths) / 10.0;
+            format!("{db:.1} dB")
+        }
+        _ => "initial".to_string(),
+    };
+    format!(
+        "{} @ {} • gain {}",
+        format_hz(freq_hz),
+        format_hz(sample_rate_hz),
+        gain_text
+    )
+}
+
+/// Short Hz formatter — kHz / MHz / GHz depending on magnitude.
+/// Kept local to this module because the status row's formatting
+/// needs differ from the header-bar frequency selector (which has
+/// its own 12-digit grid display).
+fn format_hz(hz: u32) -> String {
+    let hz_f = f64::from(hz);
+    if hz >= 1_000_000_000 {
+        format!("{:.3} GHz", hz_f / 1_000_000_000.0)
+    } else if hz >= 1_000_000 {
+        format!("{:.3} MHz", hz_f / 1_000_000.0)
+    } else if hz >= 1_000 {
+        format!("{:.3} kHz", hz_f / 1_000.0)
+    } else {
+        format!("{hz} Hz")
+    }
+}
+
+/// Reset status rows to their idle-no-client state. Called when the
+/// server stops so the user doesn't see stale "connected at 127.0.0.1"
+/// / "uptime 5m" data after they flipped the share switch off.
+fn reset_status_rows(panel: &sidebar::ServerPanel) {
+    use crate::sidebar::server_panel::{
+        STATUS_IDLE_VALUE_SUBTITLE, STATUS_WAITING_FOR_CLIENT_SUBTITLE,
+    };
+    panel
+        .status_row
+        .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+    panel
+        .status_client_row
+        .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
+    panel
+        .status_uptime_row
+        .set_subtitle(STATUS_IDLE_VALUE_SUBTITLE);
+    panel
+        .status_data_rate_row
+        .set_subtitle(STATUS_IDLE_VALUE_SUBTITLE);
+    panel
+        .status_commanded_row
+        .set_subtitle(STATUS_IDLE_VALUE_SUBTITLE);
 }
 
 /// Read the server panel widget values and build a `ServerConfig`
@@ -3470,6 +3742,126 @@ mod rtl_tcp_discovery_format_tests {
         assert!(
             subtitle.ends_with("seen just now"),
             "subtitle should read 'seen just now' for sub-5s age: {subtitle}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod server_panel_format_tests {
+    use std::time::Duration;
+
+    use sdr_server_rtltcp::ServerStats;
+
+    use super::{
+        SERVER_STATUS_POLL_INTERVAL, format_commanded_state, format_data_rate, format_hz,
+        format_uptime,
+    };
+
+    #[test]
+    fn format_uptime_uses_compact_unit_picker() {
+        // Sub-minute: just seconds.
+        assert_eq!(format_uptime(Duration::from_secs(5)), "5s");
+        // Sub-hour: minutes + seconds, no hours prefix.
+        assert_eq!(format_uptime(Duration::from_secs(61)), "1m 1s");
+        assert_eq!(format_uptime(Duration::from_secs(3599)), "59m 59s");
+        // Hour+: full triple.
+        assert_eq!(format_uptime(Duration::from_secs(3661)), "1h 1m 1s");
+        assert_eq!(format_uptime(Duration::from_secs(7322)), "2h 2m 2s");
+    }
+
+    #[test]
+    fn format_data_rate_picks_kbps_below_mbps_boundary() {
+        // 0.5 Mbps worth of bytes over the 500 ms interval → 0.5 Mbps
+        // → still kbps under the 1 Mbps switchover. (1 Mbps =
+        // 125_000 bytes/s, so 500 ms of 0.5 Mbps is 31_250 bytes.)
+        assert_eq!(
+            format_data_rate(31_250, SERVER_STATUS_POLL_INTERVAL),
+            "500.0 kbps"
+        );
+        // ~4.8 Mbps (the rtl_tcp canonical rate) over 500 ms.
+        // 4.8 Mbps * 0.5 s = 2.4 Mbit = 300_000 bytes.
+        assert_eq!(
+            format_data_rate(300_000, SERVER_STATUS_POLL_INTERVAL),
+            "4.80 Mbps"
+        );
+        // Zero bytes → "0.0 kbps" not a panic.
+        assert_eq!(format_data_rate(0, SERVER_STATUS_POLL_INTERVAL), "0.0 kbps");
+    }
+
+    #[test]
+    fn format_data_rate_handles_zero_interval() {
+        // A degenerate 0-second interval would divide by zero; fn
+        // must return a safe sentinel so the row renders instead of
+        // crashing.
+        assert_eq!(format_data_rate(100, Duration::ZERO), "—");
+    }
+
+    #[test]
+    fn format_hz_picks_unit_by_magnitude() {
+        assert_eq!(format_hz(500), "500 Hz");
+        assert_eq!(format_hz(1_500), "1.500 kHz");
+        assert_eq!(format_hz(100_300_000), "100.300 MHz");
+        assert_eq!(format_hz(1_500_000_000), "1.500 GHz");
+    }
+
+    #[test]
+    fn format_commanded_state_uses_upstream_defaults_when_client_silent() {
+        // A brand-new session that hasn't sent any commands should
+        // still render a sensible line — we show the upstream
+        // rtl_tcp.c defaults (100 MHz @ 2.048 MHz, gain "initial")
+        // rather than blanking the row.
+        let stats = ServerStats::default();
+        let subtitle = format_commanded_state(&stats);
+        assert!(
+            subtitle.contains("100.000 MHz"),
+            "default freq should show: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("2.048 MHz"),
+            "default sample rate should show: {subtitle}"
+        );
+        assert!(
+            subtitle.contains("gain initial"),
+            "default gain hint should show: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn format_commanded_state_renders_client_auto_gain_preference() {
+        // When the client has sent SetGainMode(auto), "auto" wins
+        // regardless of any previous manual gain value.
+        let stats = ServerStats {
+            current_freq_hz: Some(145_500_000),
+            current_sample_rate_hz: Some(2_400_000),
+            current_gain_tenths_db: Some(200),
+            current_gain_auto: Some(true),
+            ..ServerStats::default()
+        };
+        let subtitle = format_commanded_state(&stats);
+        assert!(subtitle.contains("145.500 MHz"));
+        assert!(subtitle.contains("2.400 MHz"));
+        assert!(
+            subtitle.contains("gain auto"),
+            "auto should override manual gain value: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn format_commanded_state_renders_manual_gain_in_db() {
+        // SetTunerGain records tenths-of-dB; the render converts to
+        // full dB with one decimal.
+        let stats = ServerStats {
+            current_freq_hz: Some(100_000_000),
+            current_sample_rate_hz: Some(2_400_000),
+            current_gain_tenths_db: Some(496),
+            current_gain_auto: Some(false),
+            ..ServerStats::default()
+        };
+        let subtitle = format_commanded_state(&stats);
+        assert!(
+            subtitle.contains("gain 49.6 dB"),
+            "49.6 dB should render from 496 tenths: {subtitle}"
         );
     }
 }

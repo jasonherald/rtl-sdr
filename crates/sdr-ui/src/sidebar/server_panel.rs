@@ -156,6 +156,94 @@ pub struct ServerPanel {
     /// Direct-sampling toggle (Q-branch) applied on server open.
     /// Only useful for HF experimentation; off for normal use.
     pub direct_sampling_row: adw::SwitchRow,
+    /// Collapsible "Server status" expander shown only while the
+    /// server is running. Children below render the live state
+    /// pulled from `ServerStats` every
+    /// `STATUS_POLL_INTERVAL`.
+    pub status_row: adw::ExpanderRow,
+    /// "Client: …" — connected peer socket address or "Waiting for
+    /// client" when the accept loop is idle.
+    pub status_client_row: adw::ActionRow,
+    /// "Uptime: …" — wall-clock time since the current client
+    /// connected. Hidden when no client.
+    pub status_uptime_row: adw::ActionRow,
+    /// "Data rate: …" — rolling Mbps computed from `bytes_sent`
+    /// deltas between status polls.
+    pub status_data_rate_row: adw::ActionRow,
+    /// "Tuned to: …" — reflects the client's most recent
+    /// `SetCenterFreq` / `SetSampleRate` / `SetTunerGain` commands.
+    pub status_commanded_row: adw::ActionRow,
+    /// Stop button packed as a suffix on the expander row. Flips
+    /// the master `share_row` switch off, which is the same control
+    /// path the user would hit to stop manually.
+    pub status_stop_button: gtk4::Button,
+}
+
+/// Subtitle shown on `status_client_row` when the accept loop is
+/// idle. Kept as a const so future i18n can swap every occurrence
+/// at once and the "no client yet" vs "some degraded state" render
+/// can't drift.
+pub const STATUS_WAITING_FOR_CLIENT_SUBTITLE: &str = "Waiting for client";
+/// Subtitle shown on data-rate / uptime / commanded rows when the
+/// accept loop is idle — same no-client state, different row.
+pub const STATUS_IDLE_VALUE_SUBTITLE: &str = "—";
+
+/// Aggregated status rows rendered under the "Server status"
+/// expander. Grouped so the builder stays readable and the
+/// top-level `build_server_panel` stays inside clippy's
+/// `too_many_lines` limit.
+#[allow(
+    clippy::struct_field_names,
+    reason = "all fields are GTK *Row widgets — shared suffix reads clearly at the call sites"
+)]
+struct StatusRows {
+    expander: adw::ExpanderRow,
+    client_row: adw::ActionRow,
+    uptime_row: adw::ActionRow,
+    data_rate_row: adw::ActionRow,
+    commanded_row: adw::ActionRow,
+    stop_button: gtk4::Button,
+}
+
+fn build_status_rows() -> StatusRows {
+    let expander = adw::ExpanderRow::builder()
+        .title("Server status")
+        .subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE)
+        .expanded(true)
+        .visible(false)
+        .build();
+    let client_row = adw::ActionRow::builder()
+        .title("Client")
+        .subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE)
+        .build();
+    let uptime_row = adw::ActionRow::builder()
+        .title("Uptime")
+        .subtitle(STATUS_IDLE_VALUE_SUBTITLE)
+        .build();
+    let data_rate_row = adw::ActionRow::builder()
+        .title("Data rate")
+        .subtitle(STATUS_IDLE_VALUE_SUBTITLE)
+        .build();
+    let commanded_row = adw::ActionRow::builder()
+        .title("Tuned to")
+        .subtitle(STATUS_IDLE_VALUE_SUBTITLE)
+        .build();
+    let stop_button = gtk4::Button::with_label("Stop");
+    stop_button.add_css_class("destructive-action");
+    stop_button.set_valign(gtk4::Align::Center);
+    expander.add_suffix(&stop_button);
+    expander.add_row(&client_row);
+    expander.add_row(&uptime_row);
+    expander.add_row(&data_rate_row);
+    expander.add_row(&commanded_row);
+    StatusRows {
+        expander,
+        client_row,
+        uptime_row,
+        data_rate_row,
+        commanded_row,
+        stop_button,
+    }
 }
 
 /// Rows applied-on-start that live inside the "Device defaults"
@@ -332,12 +420,22 @@ pub fn build_server_panel() -> ServerPanel {
     device_defaults_row.add_row(&bias_tee_row);
     device_defaults_row.add_row(&direct_sampling_row);
 
+    let StatusRows {
+        expander: status_row,
+        client_row: status_client_row,
+        uptime_row: status_uptime_row,
+        data_rate_row: status_data_rate_row,
+        commanded_row: status_commanded_row,
+        stop_button: status_stop_button,
+    } = build_status_rows();
+
     widget.add(&share_row);
     widget.add(&nickname_row);
     widget.add(&port_row);
     widget.add(&bind_row);
     widget.add(&advertise_row);
     widget.add(&device_defaults_row);
+    widget.add(&status_row);
 
     ServerPanel {
         widget,
@@ -353,5 +451,11 @@ pub fn build_server_panel() -> ServerPanel {
         ppm_row,
         bias_tee_row,
         direct_sampling_row,
+        status_row,
+        status_client_row,
+        status_uptime_row,
+        status_data_rate_row,
+        status_commanded_row,
+        status_stop_button,
     }
 }
