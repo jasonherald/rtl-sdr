@@ -115,7 +115,13 @@ impl From<DongleInfo> for TunerInfo {
     }
 }
 
-/// Connection lifecycle state for UI consumption.
+/// Connection lifecycle state — internal representation with an
+/// `Instant`-based retry deadline suited to the scheduling loop.
+///
+/// UI consumers receive a projected form without `Instant`s (which
+/// don't cross crate boundaries cleanly) via `connection_state()`
+/// — see the `From<&ConnectionState> for sdr_types::RtlTcpConnectionState`
+/// impl below.
 #[derive(Debug, Clone)]
 pub enum ConnectionState {
     /// Initial state before first `start()` call.
@@ -133,6 +139,35 @@ pub enum ConnectionState {
     /// (e.g., server sent a non-RTL0 header). Transport failures
     /// never reach this state; they remain in `Retrying`.
     Failed { reason: String },
+}
+
+impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
+    fn from(value: &ConnectionState) -> Self {
+        match value {
+            ConnectionState::Disconnected => Self::Disconnected,
+            ConnectionState::Connecting => Self::Connecting,
+            ConnectionState::Connected { tuner } => Self::Connected {
+                // `TunerTypeCode`'s `Debug` renders the upstream
+                // tuner name ("R820T", "E4000", etc.) directly —
+                // what the UI wants for the status row subtitle.
+                tuner_name: format!("{:?}", tuner.tuner),
+                gain_count: tuner.gain_count,
+            },
+            ConnectionState::Retrying { attempt, next_at } => Self::Retrying {
+                attempt: *attempt,
+                // Saturating: if the scheduling thread has drifted
+                // past the deadline (which just means the next
+                // attempt is imminent), we render "0 s" rather
+                // than underflow.
+                retry_in: next_at
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::ZERO),
+            },
+            ConnectionState::Failed { reason } => Self::Failed {
+                reason: reason.clone(),
+            },
+        }
+    }
 }
 
 /// Tunable knobs for the connection manager. All fields have sensible
@@ -1082,6 +1117,17 @@ impl Source for RtlTcpSource {
 
     fn set_ppm_correction(&mut self, ppm: i32) -> Result<(), SourceError> {
         self.set_freq_correction_ppm(ppm)
+    }
+
+    fn rtl_tcp_connection_state(&self) -> Option<sdr_types::RtlTcpConnectionState> {
+        // Project the internal `ConnectionState` (which carries an
+        // `Instant` for retry scheduling) into the UI-facing form
+        // with a `Duration` "time until next attempt". `From<&...>`
+        // handles the projection in one place.
+        match self.shared.state.lock() {
+            Ok(s) => Some(sdr_types::RtlTcpConnectionState::from(&*s)),
+            Err(_) => Some(sdr_types::RtlTcpConnectionState::Disconnected),
+        }
     }
 }
 
