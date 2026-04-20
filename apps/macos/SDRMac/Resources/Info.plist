@@ -23,12 +23,14 @@
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
+    <string>26.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 SDR-RS contributors.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>SDR-RS uses on-device speech recognition to transcribe demodulated radio audio in the Transcription panel. Audio never leaves your Mac — the Speech framework runs entirely on the Neural Engine.</string>
 </dict>
 </plist>
