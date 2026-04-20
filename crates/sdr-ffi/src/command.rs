@@ -424,6 +424,32 @@ pub unsafe extern "C" fn sdr_core_set_audio_device(
     }
 }
 
+/// Shared helper for the two `start_*_recording` commands. Validates
+/// `path_utf8` (non-null, UTF-8, non-empty) and dispatches the
+/// appropriate `UiToDsp` variant via `build_cmd`. Keeps the path
+/// validation in one place so a future rule (e.g., rejecting
+/// directory paths, normalizing trailing whitespace) lands in
+/// both start paths at once.
+///
+/// # Safety
+///
+/// `path_utf8` must be a NUL-terminated UTF-8 C string or null
+/// (null returns `SDR_CORE_ERR_INVALID_ARG`). `core` must be a
+/// valid engine reference.
+unsafe fn start_recording_with_path(
+    core: &SdrCore,
+    fn_name: &str,
+    path_utf8: *const c_char,
+    build_cmd: impl FnOnce(PathBuf) -> UiToDsp,
+) -> Result<(), SdrCoreError> {
+    let path = unsafe { cstr_to_string(fn_name, path_utf8) }?;
+    if path.is_empty() {
+        set_last_error(format!("{fn_name}: path is empty"));
+        return Err(SdrCoreError::InvalidArg);
+    }
+    send(core, build_cmd(PathBuf::from(path)))
+}
+
 /// Start writing the demodulated audio stream to a 16-bit PCM WAV
 /// file at `path_utf8`. If recording was already active the engine
 /// logs a warning and overwrites — callers should stop first.
@@ -443,12 +469,12 @@ pub unsafe extern "C" fn sdr_core_start_audio_recording(
 ) -> i32 {
     unsafe {
         with_core(handle, |core| {
-            let path = cstr_to_string("sdr_core_start_audio_recording", path_utf8)?;
-            if path.is_empty() {
-                set_last_error("sdr_core_start_audio_recording: path is empty");
-                return Err(SdrCoreError::InvalidArg);
-            }
-            send(core, UiToDsp::StartAudioRecording(PathBuf::from(path)))
+            start_recording_with_path(
+                core,
+                "sdr_core_start_audio_recording",
+                path_utf8,
+                UiToDsp::StartAudioRecording,
+            )
         })
     }
 }
@@ -482,12 +508,12 @@ pub unsafe extern "C" fn sdr_core_start_iq_recording(
 ) -> i32 {
     unsafe {
         with_core(handle, |core| {
-            let path = cstr_to_string("sdr_core_start_iq_recording", path_utf8)?;
-            if path.is_empty() {
-                set_last_error("sdr_core_start_iq_recording: path is empty");
-                return Err(SdrCoreError::InvalidArg);
-            }
-            send(core, UiToDsp::StartIqRecording(PathBuf::from(path)))
+            start_recording_with_path(
+                core,
+                "sdr_core_start_iq_recording",
+                path_utf8,
+                UiToDsp::StartIqRecording,
+            )
         })
     }
 }
