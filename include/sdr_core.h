@@ -496,8 +496,12 @@ int32_t sdr_core_radioreference_save_credentials(
  *     (service unavailable, platform error, …). Distinct from
  *     the empty-output "not stored" case so a broken backend
  *     doesn't masquerade as "no credentials."
- *   - `SDR_CORE_ERR_INVALID_ARG` → null buffers or zero-length
- *     buffers.
+ *   - `SDR_CORE_ERR_INVALID_ARG` → null buffers, or either
+ *     `_buf_len` < 2. A 1-byte buffer can only hold the NUL,
+ *     which would collide with the "empty ⇒ not stored"
+ *     sentinel — callers must pass at least two bytes so a
+ *     single-character credential can still be distinguished
+ *     from "nothing stored."
  */
 int32_t sdr_core_radioreference_load_credentials(
     char*  out_user,

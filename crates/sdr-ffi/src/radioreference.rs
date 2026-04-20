@@ -343,8 +343,12 @@ pub unsafe extern "C" fn sdr_core_radioreference_save_credentials(
 /// # Safety
 ///
 /// Both output buffers must point to at least their respective
-/// `_buf_len` writable bytes and `_buf_len` must be ≥ 1 (room for
-/// the NUL).
+/// `_buf_len` writable bytes and each `_buf_len` must be ≥ 2
+/// (one byte of payload + the NUL terminator). A 1-byte buffer
+/// can only hold the NUL, which would collide with the
+/// "empty ⇒ not stored" sentinel — a caller asking for exactly
+/// one byte would get `OK` with an empty buffer whether or not
+/// credentials were stored. Per CodeRabbit round 11 on PR #346.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_radioreference_load_credentials(
     out_user: *mut c_char,
@@ -353,8 +357,11 @@ pub unsafe extern "C" fn sdr_core_radioreference_load_credentials(
     pass_buf_len: usize,
 ) -> i32 {
     let result = std::panic::catch_unwind(|| {
-        if out_user.is_null() || out_pass.is_null() || user_buf_len == 0 || pass_buf_len == 0 {
-            set_last_error("sdr_core_radioreference_load_credentials: null buffer or zero length");
+        // `< 2` — a 1-byte buffer can only fit the NUL, which
+        // would silently alias stored credentials to the
+        // "not stored" sentinel. See the `# Safety` docs above.
+        if out_user.is_null() || out_pass.is_null() || user_buf_len < 2 || pass_buf_len < 2 {
+            set_last_error("sdr_core_radioreference_load_credentials: null buffer or buf_len < 2");
             return SdrCoreError::InvalidArg.as_int();
         }
 
@@ -892,7 +899,10 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_null_or_zero_length_buffers() {
+    fn load_rejects_null_or_short_buffers() {
+        // Per CodeRabbit round 11: load requires buf_len >= 2
+        // so a 1-byte buffer can't silently alias stored creds
+        // to the "not stored" sentinel (only the NUL fits).
         let mut u = [0_u8; CREDENTIAL_BUF_LEN];
         let mut p = [0_u8; CREDENTIAL_BUF_LEN];
         assert_eq!(
@@ -906,17 +916,32 @@ mod tests {
             },
             SdrCoreError::InvalidArg.as_int()
         );
-        assert_eq!(
-            unsafe {
-                sdr_core_radioreference_load_credentials(
-                    u.as_mut_ptr().cast::<c_char>(),
-                    0,
-                    p.as_mut_ptr().cast::<c_char>(),
-                    CREDENTIAL_BUF_LEN,
-                )
-            },
-            SdrCoreError::InvalidArg.as_int()
-        );
+        for bad_len in [0_usize, 1] {
+            assert_eq!(
+                unsafe {
+                    sdr_core_radioreference_load_credentials(
+                        u.as_mut_ptr().cast::<c_char>(),
+                        bad_len,
+                        p.as_mut_ptr().cast::<c_char>(),
+                        CREDENTIAL_BUF_LEN,
+                    )
+                },
+                SdrCoreError::InvalidArg.as_int(),
+                "user buf_len={bad_len} must be rejected"
+            );
+            assert_eq!(
+                unsafe {
+                    sdr_core_radioreference_load_credentials(
+                        u.as_mut_ptr().cast::<c_char>(),
+                        CREDENTIAL_BUF_LEN,
+                        p.as_mut_ptr().cast::<c_char>(),
+                        bad_len,
+                    )
+                },
+                SdrCoreError::InvalidArg.as_int(),
+                "pass buf_len={bad_len} must be rejected"
+            );
+        }
     }
 
     /// Pin the "not stored" sentinel contract: after delete,
