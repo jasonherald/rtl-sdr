@@ -59,19 +59,18 @@ const KEY_RR_PASSWORD: &str = "radioreference-password";
 /// SOAP fault.
 const RR_ZIP_LEN: usize = 5;
 
-/// Upper bound on usernames / passwords we'll round-trip through
-/// the save/load pair. This is the buffer size `load_credentials`
-/// uses on the Swift side, so any stored value that exceeds it
-/// would silently truncate on read — producing a different
-/// credential than the one saved, which then mysteriously fails
-/// auth.
+/// Size of the caller-allocated load buffer on the Swift side.
+/// `write_cstr_to_buf` reserves one byte for the NUL terminator,
+/// so the maximum UTF-8 payload that will round-trip intact is
+/// `MAX_CREDENTIAL_FIELD_LEN - 1` (511 bytes). `save_credentials`
+/// enforces a strict `len < MAX_CREDENTIAL_FIELD_LEN` guard (via
+/// `validate_rr_credentials`) so an exact-buffer-sized value
+/// can't sneak in and later reload truncated. Per CodeRabbit
+/// rounds 6 + 10 on PR #346.
 ///
-/// Enforced on the SAVE side: `save_credentials` rejects inputs
-/// whose UTF-8 byte length exceeds this cap with `InvalidArg`.
-/// RadioReference has no documented limit but 512 bytes each is
+/// RadioReference has no documented limit; 511 bytes each is
 /// comfortably more than any human typed, and matches the
-/// SwiftUI wrapper's fixed buffer. Per CodeRabbit round 6 on
-/// PR #346.
+/// SwiftUI wrapper's fixed buffer minus the NUL.
 const MAX_CREDENTIAL_FIELD_LEN: usize = 512;
 
 // ============================================================
@@ -155,9 +154,15 @@ fn validate_rr_credentials(fn_name: &str, user: &str, pass: &str) -> Result<(), 
         set_last_error(format!("{fn_name}: empty user or password"));
         return Err(SdrCoreError::InvalidArg);
     }
-    if user.len() > MAX_CREDENTIAL_FIELD_LEN || pass.len() > MAX_CREDENTIAL_FIELD_LEN {
+    // Strict `>=` — the load buffer reserves one byte for the
+    // NUL terminator, so the largest payload that round-trips
+    // intact is `MAX_CREDENTIAL_FIELD_LEN - 1`. A value exactly
+    // equal to the buffer size would truncate silently on
+    // reload. Per CodeRabbit round 10 on PR #346.
+    if user.len() >= MAX_CREDENTIAL_FIELD_LEN || pass.len() >= MAX_CREDENTIAL_FIELD_LEN {
         set_last_error(format!(
-            "{fn_name}: user or password exceeds {MAX_CREDENTIAL_FIELD_LEN}-byte cap"
+            "{fn_name}: user or password must fit in {} UTF-8 bytes plus NUL",
+            MAX_CREDENTIAL_FIELD_LEN - 1
         ));
         return Err(SdrCoreError::InvalidArg);
     }
@@ -379,13 +384,29 @@ pub unsafe extern "C" fn sdr_core_radioreference_load_credentials(
             }
         };
 
+        // Partial-keyring guard: the sentinel contract says
+        // "either buffer empty ⇒ nothing stored." If we copy an
+        // orphaned username through while the password is empty
+        // (or vice versa), a caller that only inspects one
+        // buffer before checking the other would see a "live"
+        // value even though the ABI is signaling "not stored."
+        // Collapse both sides to empty on any partial state so
+        // the sentinel is self-consistent no matter which buffer
+        // the caller reads first. Per CodeRabbit round 10 on PR
+        // #346.
+        let (user_bytes, pass_bytes) = if user_opt.is_empty() || pass_opt.is_empty() {
+            (&b""[..], &b""[..])
+        } else {
+            (user_opt.as_bytes(), pass_opt.as_bytes())
+        };
+
         // SAFETY: null + zero-length checked above; buffers are
-        // writable per the caller contract. Empty `user_opt` /
-        // `pass_opt` produce a single NUL byte in each output
+        // writable per the caller contract. Empty `user_bytes` /
+        // `pass_bytes` produce a single NUL byte in each output
         // buffer — the "no credentials stored" sentinel.
         unsafe {
-            write_cstr_to_buf(user_opt.as_bytes(), out_user, user_buf_len);
-            write_cstr_to_buf(pass_opt.as_bytes(), out_pass, pass_buf_len);
+            write_cstr_to_buf(user_bytes, out_user, user_buf_len);
+            write_cstr_to_buf(pass_bytes, out_pass, pass_buf_len);
         }
         clear_last_error();
         SdrCoreError::Ok.as_int()
@@ -819,18 +840,30 @@ mod tests {
 
     #[test]
     fn save_rejects_oversize_fields() {
-        // save_credentials must refuse values longer than
-        // MAX_CREDENTIAL_FIELD_LEN so they don't silently
-        // truncate on the next load. Regression for
-        // CodeRabbit round 6 on PR #346.
+        // save_credentials must refuse values whose UTF-8 length
+        // is >= MAX_CREDENTIAL_FIELD_LEN — the load buffer
+        // reserves one byte for the NUL, so a value exactly
+        // MAX_CREDENTIAL_FIELD_LEN bytes would truncate silently
+        // on the next load. Regression for CodeRabbit rounds
+        // 6 + 10 on PR #346. The exact-size case guards the
+        // off-by-one explicitly.
         let real = CString::new("jason").unwrap();
         let long = CString::new("x".repeat(MAX_CREDENTIAL_FIELD_LEN + 1)).unwrap();
+        let at_cap = CString::new("x".repeat(MAX_CREDENTIAL_FIELD_LEN)).unwrap();
         assert_eq!(
             unsafe { sdr_core_radioreference_save_credentials(long.as_ptr(), real.as_ptr()) },
             SdrCoreError::InvalidArg.as_int()
         );
         assert_eq!(
             unsafe { sdr_core_radioreference_save_credentials(real.as_ptr(), long.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_radioreference_save_credentials(at_cap.as_ptr(), real.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_radioreference_save_credentials(real.as_ptr(), at_cap.as_ptr()) },
             SdrCoreError::InvalidArg.as_int()
         );
     }
