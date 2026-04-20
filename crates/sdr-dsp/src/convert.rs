@@ -134,6 +134,47 @@ pub fn complex_to_stereo(input: &[Complex], output: &mut [Stereo]) -> Result<usi
     Ok(input.len())
 }
 
+/// 48 kHz → 16 kHz mono f32 downsampler for stereo input.
+///
+/// Input is the engine's post-demod stereo buffer (48 kHz). Output
+/// is mono at 16 kHz — the sample rate speech recognizers (macOS
+/// `SpeechAnalyzer`, whisper, sherpa-onnx) consume natively.
+/// Decimation factor is exactly 3:1 (48000 / 16000); every third
+/// stereo sample is averaged to mono and kept.
+///
+/// Number of output samples: `input.len().div_ceil(3)`. Callers
+/// should size `output` with that expression (the returned count
+/// is the exact number of samples written).
+///
+/// This is a naive keep-every-third-sample decimator — no
+/// anti-alias filter — because the engine's audio path has already
+/// produced a band-limited voice-rate signal by the time audio
+/// reaches this stage. Good enough for speech recognition; NOT
+/// suitable as a generic rate converter for arbitrary audio.
+///
+/// # Errors
+///
+/// Returns `DspError::BufferTooSmall` if `output` has fewer than
+/// `ceil(input.len() / 3)` elements.
+pub fn stereo_48k_to_mono_16k(input: &[Stereo], output: &mut [f32]) -> Result<usize, DspError> {
+    let needed = input.len().div_ceil(3);
+    if output.len() < needed {
+        return Err(DspError::BufferTooSmall {
+            need: needed,
+            got: output.len(),
+        });
+    }
+    let mut out_idx = 0;
+    let mut in_idx = 0;
+    while in_idx < input.len() {
+        let s = input[in_idx];
+        output[out_idx] = f32::midpoint(s.l, s.r);
+        out_idx += 1;
+        in_idx += 3;
+    }
+    Ok(out_idx)
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp, clippy::unwrap_used)]
 mod tests {
@@ -217,6 +258,70 @@ mod tests {
         assert_eq!(output[0].r, 2.0);
         assert_eq!(output[1].l, 3.0);
         assert_eq!(output[1].r, 4.0);
+    }
+
+    #[test]
+    fn test_stereo_48k_to_mono_16k_empty() {
+        let mut output = [0.0_f32; 0];
+        let count = stereo_48k_to_mono_16k(&[], &mut output).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_stereo_48k_to_mono_16k_single_sample() {
+        // One stereo sample → one mono output at 16k.
+        let input = [Stereo::new(0.6, 0.4)];
+        let mut output = [0.0_f32; 1];
+        let count = stereo_48k_to_mono_16k(&input, &mut output).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(output[0], 0.5);
+    }
+
+    #[test]
+    fn test_stereo_48k_to_mono_16k_three_to_one() {
+        // Three 48k samples → one kept (index 0), two skipped.
+        let input = [
+            Stereo::new(0.2, 0.8), // kept → midpoint 0.5
+            Stereo::new(0.0, 0.0),
+            Stereo::new(0.0, 0.0),
+        ];
+        let mut output = [0.0_f32; 1];
+        let count = stereo_48k_to_mono_16k(&input, &mut output).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(output[0], 0.5);
+    }
+
+    #[test]
+    fn test_stereo_48k_to_mono_16k_six_to_two() {
+        // Six 48k samples → indices 0 and 3 kept.
+        let input = [
+            Stereo::new(0.2, 0.4),
+            Stereo::new(0.0, 0.0),
+            Stereo::new(0.0, 0.0),
+            Stereo::new(0.6, 0.8),
+            Stereo::new(0.0, 0.0),
+            Stereo::new(0.0, 0.0),
+        ];
+        let mut output = [0.0_f32; 2];
+        let count = stereo_48k_to_mono_16k(&input, &mut output).unwrap();
+        assert_eq!(count, 2);
+        // f32 midpoint — use epsilon tolerance since (0.2+0.4)/2
+        // and (0.6+0.8)/2 don't round-trip exactly through
+        // binary32.
+        assert!((output[0] - 0.3).abs() < f32::EPSILON);
+        assert!((output[1] - 0.7).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_stereo_48k_to_mono_16k_buffer_too_small() {
+        // 3 samples → ceil(3/3) = 1 output; buffer of 0 must fail.
+        let input = [Stereo::default(); 3];
+        let mut output = [0.0_f32; 0];
+        let err = stereo_48k_to_mono_16k(&input, &mut output).unwrap_err();
+        assert!(
+            matches!(err, DspError::BufferTooSmall { need: 1, got: 0 }),
+            "expected BufferTooSmall {{ need: 1, got: 0 }}, got {err:?}"
+        );
     }
 
     #[test]

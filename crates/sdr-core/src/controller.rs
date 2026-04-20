@@ -252,6 +252,14 @@ struct DspState {
     /// Transcription audio tap — when Some, audio is copied to this channel.
     transcription_tx: Option<std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>>,
 
+    /// Generic audio tap — when Some, post-demod audio is downsampled
+    /// to 16 kHz mono f32 and dropped into this channel. Distinct
+    /// from `transcription_tx` so FFI consumers (e.g. the macOS
+    /// `SpeechAnalyzer` driver for issue #314) can receive
+    /// recognizer-ready samples without the sdr-transcription
+    /// dependency cross-compiling into the FFI surface.
+    audio_tap_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+
     /// Last known squelch gate state, used to detect open/close edge
     /// transitions so we only emit one `SquelchOpened` / `SquelchClosed`
     /// event per transition instead of one per audio chunk. Initialized
@@ -353,6 +361,7 @@ impl DspState {
             audio_writer: None,
             iq_writer: None,
             transcription_tx: None,
+            audio_tap_tx: None,
             squelch_was_open: false,
             ctcss_was_sustained: false,
             voice_squelch_was_open: true,
@@ -428,6 +437,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::info!("stopping DSP pipeline");
             // Disconnect transcription tap so the worker stops receiving audio.
             state.transcription_tx = None;
+            // Same treatment for the generic audio tap — the DSP pipeline
+            // is tearing down and any registered FFI consumer is about to
+            // see a `Disconnected` on their next pull regardless.
+            state.audio_tap_tx = None;
             cleanup(state);
             state.running = false;
             let _ = dsp_tx.send(DspToUi::SourceStopped);
@@ -965,6 +978,21 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.squelch_was_open = false;
             tracing::info!("transcription audio tap disabled");
         }
+
+        UiToDsp::EnableAudioTap(tx) => {
+            // Generic audio tap — post-demod, pre-volume, resampled to
+            // 16 kHz mono and dropped into `tx`. Distinct from the
+            // transcription tap above so FFI consumers (e.g. macOS
+            // `SpeechAnalyzer` for issue #314) receive recognizer-ready
+            // samples without pulling the sdr-transcription dep across
+            // the FFI.
+            state.audio_tap_tx = Some(tx);
+            tracing::info!("audio tap enabled");
+        }
+        UiToDsp::DisableAudioTap => {
+            state.audio_tap_tx = None;
+            tracing::info!("audio tap disabled");
+        }
         UiToDsp::DisconnectRtlTcp => {
             // Only meaningful while `RtlTcp` is the active source
             // type. For any other source we log-and-drop so
@@ -1410,6 +1438,54 @@ fn process_iq_block(
                                 tracing::info!(
                                     "transcription receiver disconnected, disabling tap"
                                 );
+                            }
+                        }
+
+                        // Generic audio tap: downsample to 16 kHz mono
+                        // and try_send. Pre-volume (like the transcription
+                        // tap) so the consumer's recognizer sees the raw
+                        // demod output regardless of how the user has
+                        // set the volume slider. `try_send` with
+                        // `TrySendError::Full` → drop the chunk rather
+                        // than block — the DSP thread MUST NOT stall on
+                        // a slow consumer. `SpeechAnalyzer` can tolerate
+                        // occasional frame drops; audio underruns are
+                        // much worse.
+                        if let Some(ref tx) = state.audio_tap_tx {
+                            let mono_len = state.audio_buf[..audio_count].len().div_ceil(3);
+                            let mut mono = vec![0.0_f32; mono_len];
+                            match sdr_dsp::convert::stereo_48k_to_mono_16k(
+                                &state.audio_buf[..audio_count],
+                                &mut mono,
+                            ) {
+                                Ok(n) => {
+                                    mono.truncate(n);
+                                    match tx.try_send(mono) {
+                                        Ok(()) => {}
+                                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                            // Consumer is lagging; drop
+                                            // this chunk and carry on.
+                                            tracing::debug!(
+                                                "audio tap channel full; dropping chunk"
+                                            );
+                                        }
+                                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                            state.audio_tap_tx = None;
+                                            tracing::info!(
+                                                "audio tap receiver disconnected, disabling"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Sizing bug — the buffer is sized by
+                                    // the same `div_ceil(3)` as the
+                                    // resampler's own calculation, so
+                                    // this arm should be unreachable.
+                                    // Log once and disable the tap.
+                                    state.audio_tap_tx = None;
+                                    tracing::error!(?e, "audio tap resampler failed");
+                                }
                             }
                         }
 
