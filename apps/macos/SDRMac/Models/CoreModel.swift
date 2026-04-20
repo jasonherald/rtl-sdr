@@ -145,6 +145,23 @@ final class CoreModel {
     var ppmCorrection: Int = 0
 
     // ==========================================================
+    //  Source (advanced) — #246
+    // ==========================================================
+    //
+    //  Defaults match the engine-side defaults in
+    //  `crates/sdr-core/src/controller.rs` so a fresh launch of
+    //  the Mac app and the GTK app both present the same source
+    //  configuration.
+
+    var dcBlockingEnabled: Bool = false
+    var iqInversionEnabled: Bool = false
+    var iqCorrectionEnabled: Bool = false
+
+    /// Power-of-two decimation ratio (1 = none). 8 matches the
+    /// engine default (`sdr_pipeline::iq_frontend::DEFAULT_DECIM`).
+    var decimationFactor: UInt32 = 8
+
+    // ==========================================================
     //  Tuner
     // ==========================================================
 
@@ -162,6 +179,42 @@ final class CoreModel {
     var squelchEnabled: Bool = false
     var squelchDb: Float = -60
     var deemphasis: Deemphasis = .us75
+
+    // ==========================================================
+    //  Demod (advanced) — #245
+    // ==========================================================
+    //
+    //  Mode-gating rules for the Radio panel:
+    //    - FM IF NR: WFM / NFM only
+    //    - WFM stereo: WFM only
+    //    - Noise blanker + notch: universal
+    //
+    //  Defaults mirror the engine-side defaults so a toggle from
+    //  off → on → off exactly reproduces the engine's own
+    //  initial state.
+
+    /// Noise blanker enable (IF stage). Off by default.
+    var noiseBlankerEnabled: Bool = false
+
+    /// Noise-blanker threshold multiplier. Engine clamps to
+    /// `>= 1.0`; we pick 2.0 as a sensible mid-range starting
+    /// point that matches the GTK slider's initial value.
+    var noiseBlankerLevel: Float = 2.0
+
+    /// FM IF noise reduction. Off by default; meaningful only
+    /// when the active demod is an FM mode (WFM or NFM).
+    var fmIfNrEnabled: Bool = false
+
+    /// WFM stereo decode. Off by default; only honored when
+    /// the active demod is WFM.
+    var wfmStereoEnabled: Bool = false
+
+    /// Audio-stage notch filter. Off by default.
+    var notchEnabled: Bool = false
+
+    /// Notch center frequency in Hz. 1 kHz is the common
+    /// starting point (also what the GTK UI defaults to).
+    var notchFrequencyHz: Float = 1_000
 
     // ==========================================================
     //  Audio
@@ -534,6 +587,14 @@ final class CoreModel {
         setCenter(centerFrequencyHz)
         setVfoOffset(vfoOffsetHz)
         setSampleRate(sourceSampleRateHz)
+        // Source (advanced) — #246. Replayed alongside the
+        // basic source fields so a reconnect doesn't leave the
+        // engine at its defaults while the UI shows the user's
+        // last-picked advanced settings.
+        setDecimation(decimationFactor)
+        setDcBlocking(dcBlockingEnabled)
+        setIqInversion(iqInversionEnabled)
+        setIqCorrection(iqCorrectionEnabled)
         setPpm(ppmCorrection)
         setGain(gainDb)
         setAgc(agcEnabled)
@@ -543,6 +604,15 @@ final class CoreModel {
         setSquelchDb(squelchDb)
         setAutoSquelch(autoSquelchEnabled)
         setDeemphasis(deemphasis)
+        // Demod (advanced) — #245. See above comment; replay
+        // keeps startup/reconnect in sync with the UI's
+        // optimistic state.
+        setNoiseBlankerEnabled(noiseBlankerEnabled)
+        setNoiseBlankerLevel(noiseBlankerLevel)
+        setFmIfNrEnabled(fmIfNrEnabled)
+        setWfmStereo(wfmStereoEnabled)
+        setNotchEnabled(notchEnabled)
+        setNotchFrequencyHz(notchFrequencyHz)
         setVolume(volume)
         // Route to the user's last-picked output device. The
         // engine default is "" (system default) so a fresh install
@@ -723,6 +793,93 @@ final class CoreModel {
     func setDeemphasis(_ m: Deemphasis) {
         deemphasis = m
         capture { try core?.setDeemphasis(m) }
+    }
+
+    // ----------------------------------------------------------
+    //  Demod (advanced) — #245
+    // ----------------------------------------------------------
+
+    func setNoiseBlankerEnabled(_ on: Bool) {
+        noiseBlankerEnabled = on
+        capture { try core?.setNoiseBlankerEnabled(on) }
+    }
+
+    func setNoiseBlankerLevel(_ level: Float) {
+        // Guard BEFORE the optimistic write so a programmatic
+        // caller passing NaN / Inf / < 1.0 (the UI slider itself
+        // is bounded at 1.0...10.0, but any Swift call path can
+        // reach this setter) doesn't leave the UI showing a
+        // value the engine rejected. Keeps the ABI-level
+        // constraint from NB_LEVEL_MIN in sync on both sides.
+        // Per CodeRabbit round 2 on PR #347.
+        guard level.isFinite, level >= 1.0 else {
+            lastError = "invalid noise blanker level: \(level)"
+            return
+        }
+        noiseBlankerLevel = level
+        capture { try core?.setNoiseBlankerLevel(level) }
+    }
+
+    func setFmIfNrEnabled(_ on: Bool) {
+        fmIfNrEnabled = on
+        capture { try core?.setFmIfNrEnabled(on) }
+    }
+
+    func setWfmStereo(_ on: Bool) {
+        wfmStereoEnabled = on
+        capture { try core?.setWfmStereo(on) }
+    }
+
+    func setNotchEnabled(_ on: Bool) {
+        notchEnabled = on
+        capture { try core?.setNotchEnabled(on) }
+    }
+
+    func setNotchFrequencyHz(_ hz: Float) {
+        // Matches the FFI's `freq_hz > 0` contract — reject
+        // invalid input up front so UI state can't diverge from
+        // engine state when a caller bypasses the slider bounds.
+        guard hz.isFinite, hz > 0 else {
+            lastError = "invalid notch frequency: \(hz)"
+            return
+        }
+        notchFrequencyHz = hz
+        capture { try core?.setNotchFrequencyHz(hz) }
+    }
+
+    // ----------------------------------------------------------
+    //  Source (advanced) — #246
+    // ----------------------------------------------------------
+
+    func setDcBlocking(_ on: Bool) {
+        dcBlockingEnabled = on
+        capture { try core?.setDcBlocking(on) }
+    }
+
+    func setIqInversion(_ on: Bool) {
+        iqInversionEnabled = on
+        capture { try core?.setIqInversion(on) }
+    }
+
+    func setIqCorrection(_ on: Bool) {
+        iqCorrectionEnabled = on
+        capture { try core?.setIqCorrection(on) }
+    }
+
+    func setDecimation(_ factor: UInt32) {
+        // Engine's `SetDecimation` handler requires a nonzero
+        // power of two. `nonzeroBitCount == 1` is equivalent to
+        // "exactly one bit set," which captures both conditions
+        // in one expression. The UI picker only emits values
+        // from {1, 2, 4, 8, 16}, but a programmatic caller
+        // could pass anything — reject-with-lastError keeps the
+        // UI honest.
+        guard factor.nonzeroBitCount == 1 else {
+            lastError = "invalid decimation factor: \(factor)"
+            return
+        }
+        decimationFactor = factor
+        capture { try core?.setDecimation(factor) }
     }
 
     func setVolume(_ v: Float) {

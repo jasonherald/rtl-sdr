@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 6
+#define SDR_CORE_ABI_VERSION_MINOR 7
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -383,6 +383,44 @@ typedef enum SdrDeemphasis {
 } SdrDeemphasis;
 
 int32_t sdr_core_set_deemphasis(SdrCore* handle, int32_t mode);
+
+/* --- Advanced demod ---------------------------------------------- */
+/*
+ * Route straight to the matching `UiToDsp` messages. Mode-gating
+ * is a host-side concern — e.g. WFM stereo is only meaningful
+ * when the active demod is WFM, but the engine still accepts
+ * the setter in any mode and no-ops outside of WFM. Host UIs
+ * typically hide the controls outside their relevant modes to
+ * avoid pointless toggles. Added in ABI minor 0.7 (issue #245).
+ */
+
+/* Enable or disable the noise blanker. */
+int32_t sdr_core_set_nb_enabled(SdrCore* handle, bool enabled);
+
+/*
+ * Noise-blanker threshold multiplier. Must be finite and
+ * `>= 1.0` — values below 1 would clip every sample. Higher
+ * values loosen the threshold.
+ */
+int32_t sdr_core_set_nb_level(SdrCore* handle, float level);
+
+/* Enable or disable FM IF noise reduction (WFM / NFM only). */
+int32_t sdr_core_set_fm_if_nr_enabled(SdrCore* handle, bool enabled);
+
+/* Enable or disable WFM stereo decode (WFM only). */
+int32_t sdr_core_set_wfm_stereo(SdrCore* handle, bool enabled);
+
+/* Enable or disable the audio-stage notch filter. */
+int32_t sdr_core_set_notch_enabled(SdrCore* handle, bool enabled);
+
+/*
+ * Audio notch center frequency, in Hz. Must be finite and
+ * strictly positive. The engine clamps to the audio Nyquist
+ * internally; values above Nyquist are not a hard FFI error
+ * because the clamp point depends on the active audio sample
+ * rate.
+ */
+int32_t sdr_core_set_notch_frequency(SdrCore* handle, float freq_hz);
 
 /* --- Audio -------------------------------------------------------- */
 

@@ -288,6 +288,44 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(sdr_core_set_deemphasis(handle, mode.rawValue))
     }
 
+    // ==========================================================
+    //  Advanced demod — #245. Each wraps a one-line FFI call to
+    //  a matching `UiToDsp::Set*` variant. Mode gating (WFM
+    //  stereo only meaningful in WFM, etc.) is left to the host
+    //  UI — the engine no-ops a toggle that doesn't apply to
+    //  the current demod.
+    // ==========================================================
+
+    /// Enable or disable the noise blanker.
+    public func setNoiseBlankerEnabled(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_nb_enabled(handle, enabled))
+    }
+
+    /// Set the noise-blanker threshold multiplier (>= 1.0).
+    public func setNoiseBlankerLevel(_ level: Float) throws {
+        try checkRc(sdr_core_set_nb_level(handle, level))
+    }
+
+    /// Enable or disable FM IF noise reduction (WFM / NFM only).
+    public func setFmIfNrEnabled(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_fm_if_nr_enabled(handle, enabled))
+    }
+
+    /// Enable or disable WFM stereo decode.
+    public func setWfmStereo(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_wfm_stereo(handle, enabled))
+    }
+
+    /// Enable or disable the audio-stage notch filter.
+    public func setNotchEnabled(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_notch_enabled(handle, enabled))
+    }
+
+    /// Set the audio notch frequency in Hz (> 0).
+    public func setNotchFrequencyHz(_ hz: Float) throws {
+        try checkRc(sdr_core_set_notch_frequency(handle, hz))
+    }
+
     /// Set the audio output volume (clamped internally to `[0, 1]`).
     public func setVolume(_ volume: Float) throws {
         try checkRc(sdr_core_set_volume(handle, volume))

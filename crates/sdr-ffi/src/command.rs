@@ -365,6 +365,108 @@ pub unsafe extern "C" fn sdr_core_set_deemphasis(handle: *mut SdrCore, mode: i32
 }
 
 // ============================================================
+//  Advanced demod — #245 exposure
+// ============================================================
+//
+//  These route straight to the existing `UiToDsp` messages the
+//  GTK UI already drives. Mode-gating (e.g. WFM stereo only
+//  meaningful in WFM) lives on the host side — the engine
+//  accepts the setter in any mode but ignores it when the
+//  active demod doesn't care, which matches the GTK UI's
+//  pattern of still letting the user set the toggle ahead of a
+//  mode switch. Per ABI minor bump 0.7 on PR #347.
+
+/// Minimum accepted value for `sdr_core_set_nb_level`. Values
+/// below 1.0 would have the blanker clip every sample (the
+/// engine treats the level as a multiplier over the running
+/// amplitude), producing silent audio instead of a usable
+/// output. Kept as an exclusive-minimum constant so the check
+/// in the setter and the boundary tests can't drift apart. Per
+/// CodeRabbit round 1 on PR #347.
+const NB_LEVEL_MIN: f32 = 1.0;
+
+/// Exclusive lower bound for `sdr_core_set_notch_frequency`.
+/// The notch filter coefficients are undefined at 0 Hz (and
+/// negative frequencies have no physical meaning here), so the
+/// setter rejects `freq_hz <= 0.0`. Per CodeRabbit round 1 on
+/// PR #347.
+const NOTCH_FREQUENCY_MIN_HZ_EXCLUSIVE: f32 = 0.0;
+
+/// Enable or disable the noise blanker.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_nb_enabled(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetNbEnabled(enabled))) }
+}
+
+/// Set the noise-blanker threshold multiplier. Must be finite
+/// and `>= 1.0` (the engine treats the level as a multiplier
+/// over the running sample amplitude; `< 1.0` would clip every
+/// sample). Values exceeding 1.0 loosen the blanking threshold.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_nb_level(handle: *mut SdrCore, level: f32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            require_finite("sdr_core_set_nb_level", f64::from(level))?;
+            if level < NB_LEVEL_MIN {
+                set_last_error(format!(
+                    "sdr_core_set_nb_level: level must be >= {NB_LEVEL_MIN}, got {level}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::SetNbLevel(level))
+        })
+    }
+}
+
+/// Enable or disable FM IF noise reduction. No-op when the
+/// active demod is not an FM mode; host UIs typically hide the
+/// toggle outside WFM / NFM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_fm_if_nr_enabled(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            send(core, UiToDsp::SetFmIfNrEnabled(enabled))
+        })
+    }
+}
+
+/// Enable or disable WFM stereo decode. Only meaningful in WFM
+/// mode; the engine ignores the setting in other modes but the
+/// host UI should also gate visibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_wfm_stereo(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetWfmStereo(enabled))) }
+}
+
+/// Enable or disable the audio-stage notch filter.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_notch_enabled(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetNotchEnabled(enabled))) }
+}
+
+/// Set the audio-stage notch filter frequency in Hz. Must be
+/// finite and `> 0`. The engine clamps to the audio-rate
+/// Nyquist internally; passing a value above Nyquist is not an
+/// error here because the clamp is sample-rate dependent and
+/// the FFI has no stable reference to that without querying
+/// the engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_notch_frequency(handle: *mut SdrCore, freq_hz: f32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            require_finite("sdr_core_set_notch_frequency", f64::from(freq_hz))?;
+            if freq_hz <= NOTCH_FREQUENCY_MIN_HZ_EXCLUSIVE {
+                set_last_error(format!(
+                    "sdr_core_set_notch_frequency: frequency must be > {NOTCH_FREQUENCY_MIN_HZ_EXCLUSIVE} Hz, got {freq_hz}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::SetNotchFrequency(freq_hz))
+        })
+    }
+}
+
+// ============================================================
 //  Audio
 // ============================================================
 
@@ -1078,6 +1180,111 @@ mod tests {
             SdrCoreError::InvalidArg.as_int()
         );
 
+        destroy(h);
+    }
+
+    // ------------------------------------------------------
+    //  Advanced demod (ABI 0.7) — regression tests for the
+    //  argument contracts established by the `NB_LEVEL_MIN`
+    //  and `NOTCH_FREQUENCY_MIN_HZ_EXCLUSIVE` constants. Per
+    //  CodeRabbit round 1 on PR #347.
+    // ------------------------------------------------------
+
+    #[test]
+    fn set_nb_level_accepts_at_minimum_and_rejects_below() {
+        let h = make_handle();
+        // Exactly at the minimum must be accepted — the engine
+        // treats `1.0` as "no clipping margin," which is the
+        // lower edge of the usable range.
+        assert_eq!(
+            unsafe { sdr_core_set_nb_level(h, NB_LEVEL_MIN) },
+            SdrCoreError::Ok.as_int()
+        );
+        // Any value below minimum must be rejected.
+        assert_eq!(
+            unsafe { sdr_core_set_nb_level(h, NB_LEVEL_MIN - 0.0001) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_nb_level(h, 0.0) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_nb_level(h, -1.0) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_nb_level_rejects_nan_and_infinity() {
+        let h = make_handle();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                unsafe { sdr_core_set_nb_level(h, bad) },
+                SdrCoreError::InvalidArg.as_int(),
+                "nb_level must reject {bad}"
+            );
+        }
+        destroy(h);
+    }
+
+    #[test]
+    fn set_notch_frequency_accepts_positive_rejects_nonpositive() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_notch_frequency(h, 1_000.0) },
+            SdrCoreError::Ok.as_int()
+        );
+        // Exactly at the exclusive lower bound must be rejected.
+        assert_eq!(
+            unsafe { sdr_core_set_notch_frequency(h, NOTCH_FREQUENCY_MIN_HZ_EXCLUSIVE) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_notch_frequency(h, -50.0) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_notch_frequency_rejects_nan_and_infinity() {
+        let h = make_handle();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                unsafe { sdr_core_set_notch_frequency(h, bad) },
+                SdrCoreError::InvalidArg.as_int(),
+                "notch_frequency must reject {bad}"
+            );
+        }
+        destroy(h);
+    }
+
+    #[test]
+    fn advanced_demod_bool_setters_accept_both_polarities() {
+        // The four bool-typed advanced setters have no validation
+        // beyond handle + panic catch — this just pins that they
+        // don't silently regress to rejecting a valid input.
+        let h = make_handle();
+        for &on in &[true, false] {
+            assert_eq!(
+                unsafe { sdr_core_set_nb_enabled(h, on) },
+                SdrCoreError::Ok.as_int()
+            );
+            assert_eq!(
+                unsafe { sdr_core_set_fm_if_nr_enabled(h, on) },
+                SdrCoreError::Ok.as_int()
+            );
+            assert_eq!(
+                unsafe { sdr_core_set_wfm_stereo(h, on) },
+                SdrCoreError::Ok.as_int()
+            );
+            assert_eq!(
+                unsafe { sdr_core_set_notch_enabled(h, on) },
+                SdrCoreError::Ok.as_int()
+            );
+        }
         destroy(h);
     }
 }
