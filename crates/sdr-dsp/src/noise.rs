@@ -324,6 +324,11 @@ impl PowerSquelch {
         }
         if input.is_empty() {
             self.open = false;
+            // Reset the diagnostic field so an empty-input
+            // call that closes the gate doesn't surface the
+            // previous block's power in downstream logs. Per
+            // CodeRabbit round 1 on PR #350.
+            self.last_measured_db = f32::NEG_INFINITY;
             return Ok(0);
         }
 
@@ -788,6 +793,48 @@ mod tests {
         );
     }
 
+    /// Block size used by the #348 regression test. Arbitrary
+    /// small value — any power of two ≥ 16 produces the same
+    /// qualitative behavior; 128 is close to typical live DSP
+    /// audio block sizes.
+    const STUCK_RECOVERY_BLOCK_LEN: usize = 128;
+
+    /// Number of post-settle blocks to drive through a
+    /// persistent strong carrier to exercise the slow-creep
+    /// recovery path. Sized so the EMA climbs measurably
+    /// (~35 dB at `NOISE_FLOOR_STUCK_RECOVERY_ALPHA = 0.002`)
+    /// while keeping the test fast.
+    const STUCK_RECOVERY_BLOCKS: usize = 500;
+
+    /// Minimum noise-floor climb (dB) that the post-settle
+    /// creep path must produce over `STUCK_RECOVERY_BLOCKS` of
+    /// persistent signal. Picked as a conservative floor under
+    /// the empirical ≈ 35 dB climb so minor tuning of the
+    /// recovery alpha doesn't rewrite the test.
+    const STUCK_RECOVERY_MIN_CLIMB_DB: f32 = 10.0;
+
+    /// Signal amplitude used as the "persistent carrier" in the
+    /// stuck-open scenario. 0.1 → -20 dB, comfortably above any
+    /// reasonable noise floor.
+    const STUCK_RECOVERY_CARRIER_AMPLITUDE: f32 = 0.1;
+
+    /// Signal amplitude used as "silence" in the recovery-then-
+    /// close assertion. Well below the floor after recovery so
+    /// the EMA clearly drops and the gate closes.
+    const STUCK_RECOVERY_SILENCE_AMPLITUDE: f32 = 0.000_01;
+
+    /// Number of silence blocks to drive after the creep window
+    /// to verify the gate closes. Order-of-magnitude matches
+    /// `NOISE_FLOOR_SETTLE_BLOCKS` so we're not timing-sensitive.
+    const STUCK_RECOVERY_SILENCE_BLOCKS: usize = 50;
+
+    /// Manual squelch threshold the stuck-recovery test uses
+    /// when constructing `PowerSquelch::new`. The test switches
+    /// to auto-squelch immediately so the manual value is
+    /// irrelevant to the behavior under test — kept as a
+    /// constant to avoid a bare `-60.0` in the body.
+    const STUCK_RECOVERY_IDLE_LEVEL_DB: f32 = -60.0;
+
     #[test]
     fn test_auto_squelch_recovers_from_overshoot_settle() {
         // Regression for issue #348.
@@ -811,15 +858,15 @@ mod tests {
         // recovery path is active — and that after enough time
         // it's climbed far enough that a subsequent drop below
         // the original floor closes the gate.
-        let mut squelch = PowerSquelch::new(-60.0);
+        let mut squelch = PowerSquelch::new(STUCK_RECOVERY_IDLE_LEVEL_DB);
         squelch.set_auto_squelch(true);
 
-        // Strong signal (amplitude 0.1 → -20 dB).
-        let strong = vec![Complex::new(0.1, 0.0); 128];
-        let mut out = vec![Complex::default(); 128];
+        let strong =
+            vec![Complex::new(STUCK_RECOVERY_CARRIER_AMPLITUDE, 0.0); STUCK_RECOVERY_BLOCK_LEN];
+        let mut out = vec![Complex::default(); STUCK_RECOVERY_BLOCK_LEN];
 
-        // Drive 50 settle blocks; capture the post-settle floor.
-        for _ in 0..50 {
+        // Drive the settle window; capture the post-settle floor.
+        for _ in 0..NOISE_FLOOR_SETTLE_BLOCKS {
             squelch.process(&strong, &mut out).unwrap();
         }
         let floor_after_settle = squelch.noise_floor_db();
@@ -828,38 +875,31 @@ mod tests {
             "strong signal must open the gate during / after settle"
         );
 
-        // Now 500 post-settle blocks of the same strong signal.
-        // With the stuck-recovery fix the slow-creep alpha
-        // pulls the floor upward toward the signal level;
-        // without it the floor stays frozen at the settle value
-        // forever.
-        for _ in 0..500 {
+        // Now STUCK_RECOVERY_BLOCKS of the same strong signal.
+        // With the fix the slow-creep alpha pulls the floor
+        // upward toward the signal level; without it the floor
+        // stays frozen at the settle value forever.
+        for _ in 0..STUCK_RECOVERY_BLOCKS {
             squelch.process(&strong, &mut out).unwrap();
         }
         let floor_after_creep = squelch.noise_floor_db();
 
-        // The exact delta depends on the settle overshoot and
-        // the recovery alpha; empirically ~35 dB of climb at
-        // alpha=0.002 over 500 blocks starting from the typical
-        // post-settle floor. Assert a conservative "it moved
-        // meaningfully" threshold (≥ 10 dB upward) rather than
-        // pinning the specific value, so minor tuning of the
-        // alpha doesn't force a test rewrite.
         let climb_db = floor_after_creep - floor_after_settle;
         assert!(
-            climb_db > 10.0,
+            climb_db > STUCK_RECOVERY_MIN_CLIMB_DB,
             "stuck-recovery must pull noise_floor up under persistent signal; \
              observed climb of only {climb_db:.2} dB \
              ({floor_after_settle:.2} dB → {floor_after_creep:.2} dB) (#348)"
         );
 
-        // Now drop the signal well below the new floor. With
-        // the fix the gate closes promptly because the floor
-        // has already climbed (so the close-margin gate of the
-        // EMA update fires + fast track-down), returning the
-        // squelch to its normal closed-on-silence behavior.
-        let silence = vec![Complex::new(0.000_01, 0.0); 128];
-        for _ in 0..50 {
+        // Drop the signal well below the new floor. With the
+        // fix the gate closes promptly because the floor has
+        // already climbed (so the close-margin gate of the EMA
+        // update fires + fast track-down), returning the squelch
+        // to its normal closed-on-silence behavior.
+        let silence =
+            vec![Complex::new(STUCK_RECOVERY_SILENCE_AMPLITUDE, 0.0); STUCK_RECOVERY_BLOCK_LEN];
+        for _ in 0..STUCK_RECOVERY_SILENCE_BLOCKS {
             squelch.process(&silence, &mut out).unwrap();
         }
         assert!(
