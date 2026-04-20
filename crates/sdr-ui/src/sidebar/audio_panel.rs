@@ -17,10 +17,15 @@ pub const SINK_TYPE_NETWORK_IDX: u32 = 1;
 pub const NETWORK_SINK_PROTOCOL_TCP_IDX: u32 = 0;
 pub const NETWORK_SINK_PROTOCOL_UDP_IDX: u32 = 1;
 
-/// Default endpoint values. Matches the IQ source-network
-/// defaults so a new install lands on familiar settings.
-pub const NETWORK_SINK_DEFAULT_HOST: &str = "localhost";
-pub const NETWORK_SINK_DEFAULT_PORT: u16 = 1234;
+// Defaults are owned by `sdr_core::sink_slot` so the engine
+// initializer and the panel always agree. Re-exported here as
+// pub use rather than redefined to keep the audit trail clear
+// — both crates point at the same byte. Per CodeRabbit round 1
+// on PR #351.
+pub use sdr_core::{
+    DEFAULT_NETWORK_SINK_HOST as NETWORK_SINK_DEFAULT_HOST,
+    DEFAULT_NETWORK_SINK_PORT as NETWORK_SINK_DEFAULT_PORT,
+};
 
 /// Map a combo index to a `Protocol`. Returns `Protocol::TcpClient`
 /// (TCP server mode — see `sdr_sink_network` docs) for the TCP

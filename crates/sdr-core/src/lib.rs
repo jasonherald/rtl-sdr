@@ -45,5 +45,8 @@ pub mod wav_writer;
 pub use engine::{Engine, EngineError};
 pub use fft_buffer::SharedFftBuffer;
 pub use messages::{DspToUi, SourceType, UiToDsp};
-pub use sink_slot::{AudioSinkSlot, AudioSinkType, NetworkSinkStatus};
+pub use sink_slot::{
+    AudioSinkSlot, AudioSinkType, DEFAULT_NETWORK_SINK_HOST, DEFAULT_NETWORK_SINK_PORT,
+    DEFAULT_NETWORK_SINK_PROTOCOL, NetworkSinkStatus,
+};
 pub use wav_writer::WavWriter;

@@ -28,6 +28,22 @@ use sdr_sink_audio::AudioSink;
 use sdr_sink_network::NetworkSink;
 use sdr_types::{Protocol, SinkError, Stereo};
 
+/// Default network audio sink hostname. Single source of truth
+/// shared by the engine controller (initial `DspState` value)
+/// and any UI panel that wants to seed an entry-row default.
+/// Per `CodeRabbit` round 1 on PR #351.
+pub const DEFAULT_NETWORK_SINK_HOST: &str = "localhost";
+
+/// Default network audio sink port. Mirrors the IQ
+/// source-network port default (1234) so users see consistent
+/// numbers across the panels.
+pub const DEFAULT_NETWORK_SINK_PORT: u16 = 1234;
+
+/// Default network audio sink protocol. TCP server (matching
+/// SDR++'s `TcpClient` naming convention — the device acts as
+/// the TCP server, accepting client connections).
+pub const DEFAULT_NETWORK_SINK_PROTOCOL: Protocol = Protocol::TcpClient;
+
 /// User-facing audio sink type. Mirrored on the UI side as a
 /// two-option picker (local audio device vs network stream).
 /// Stored on `DspState` so a sink restart (e.g. mode change,

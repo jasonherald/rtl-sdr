@@ -666,6 +666,7 @@ fn handle_dsp_message(
 ///   - `Active` → "Streaming to host:port (TCP/UDP)"
 ///   - `Inactive` → "Inactive" (e.g. just switched back to local)
 ///   - `Error { message }` → "Error: <message>"
+///
 /// Per issue #247.
 fn apply_network_sink_status(row: &adw::ActionRow, status: &sdr_core::NetworkSinkStatus) {
     use sdr_core::NetworkSinkStatus;
@@ -4525,9 +4526,23 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         let proto_row = panels.audio.network_protocol_row.clone();
         move || {
             let hostname = host_row.text().to_string();
-            // SpinRow's value clamps to its adjustment range
-            // (1..=65535) so the cast is in-range.
-            let port = port_row.value().round() as u16;
+            // SpinRow's adjustment is bounded (1..=65535), and
+            // we explicitly clamp again here as belt-and-
+            // suspenders against any future code path that
+            // hands us a different adjustment. After the clamp
+            // the value is finite and in [0, 65535] so the
+            // narrowing cast is exact — the clippy lints below
+            // are safe to silence with that justification.
+            let port_clamped = port_row
+                .value()
+                .round()
+                .clamp(f64::from(u16::MIN), f64::from(u16::MAX));
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to [0, u16::MAX] above"
+            )]
+            let port = port_clamped as u16;
             let protocol = sidebar::audio_panel::protocol_from_combo_idx(proto_row.selected());
             state.send_dsp(UiToDsp::SetNetworkSinkConfig {
                 hostname,
