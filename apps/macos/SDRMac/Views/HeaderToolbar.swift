@@ -12,6 +12,7 @@ import SdrCoreKit
 struct HeaderToolbar: ToolbarContent {
     @Environment(CoreModel.self) private var model
     @Binding var showingRadioReference: Bool
+    @Binding var showingTranscription: Bool
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
@@ -42,6 +43,27 @@ struct HeaderToolbar: ToolbarContent {
             }
             .pickerStyle(.menu)
             .frame(width: 110)
+        }
+
+        // Transcription panel toggle — mirrors the GTK transcript
+        // revealer button. Inline + Label-with-text for the same
+        // reason RadioReference below uses that shape (macOS
+        // toolbar display-mode quirks — see the comment on that
+        // button). `systemImage: "text.bubble"` renders a speech
+        // bubble, matches the intent of a live-transcription
+        // view.
+        ToolbarItem(placement: .automatic) {
+            Button {
+                showingTranscription.toggle()
+            } label: {
+                Label(
+                    "Transcription",
+                    systemImage: showingTranscription
+                        ? "text.bubble.fill"
+                        : "text.bubble"
+                )
+            }
+            .help(showingTranscription ? "Hide Transcription Panel" : "Show Transcription Panel")
         }
 
         // RadioReference button — mirrors the GTK header-bar

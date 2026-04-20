@@ -21,17 +21,38 @@ struct ContentView: View {
     /// attach to a plain View that renders the dialog.
     @State private var showingRadioReference: Bool = false
 
+    /// Right-side transcription panel visibility. Same pattern
+    /// as the RadioReference sheet: view-layer state, toggled
+    /// from the header toolbar. The driver runs independent of
+    /// panel visibility so the user can show/hide without
+    /// stopping transcription.
+    @State private var showingTranscription: Bool = false
+
     var body: some View {
         NavigationSplitView {
             SidebarView()
                 .navigationSplitViewColumnWidth(min: 240, ideal: 280)
         } detail: {
-            VStack(spacing: 0) {
-                CenterView()
-                StatusBar()
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    CenterView()
+                    StatusBar()
+                }
+                if showingTranscription {
+                    Divider()
+                    TranscriptionPanel()
+                        .transition(.move(edge: .trailing))
+                }
             }
+            // Match GTK's 200 ms Revealer SlideLeft animation.
+            .animation(.easeInOut(duration: 0.2), value: showingTranscription)
         }
-        .toolbar { HeaderToolbar(showingRadioReference: $showingRadioReference) }
+        .toolbar {
+            HeaderToolbar(
+                showingRadioReference: $showingRadioReference,
+                showingTranscription: $showingTranscription
+            )
+        }
         .sheet(isPresented: $showingRadioReference) {
             RadioReferenceDialog()
         }
