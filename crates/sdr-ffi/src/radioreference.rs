@@ -142,6 +142,28 @@ fn map_keyring_error(fn_name: &str, err: &KeyringError) -> SdrCoreError {
 //  Small utility shared by the command-style FFIs here.
 // ============================================================
 
+/// Enforce the credential contract (non-empty + within the
+/// round-trip cap) in one place so `save`, `test`, and `search`
+/// all agree. Without this shared guard, an inconsistent state
+/// was possible: a 1 KB password could be tested successfully
+/// against RadioReference but then fail the length check on
+/// save, or vice versa — confusing the user with different
+/// errors depending on button order. Per CodeRabbit round 8 on
+/// PR #346.
+fn validate_rr_credentials(fn_name: &str, user: &str, pass: &str) -> Result<(), SdrCoreError> {
+    if user.is_empty() || pass.is_empty() {
+        set_last_error(format!("{fn_name}: empty user or password"));
+        return Err(SdrCoreError::InvalidArg);
+    }
+    if user.len() > MAX_CREDENTIAL_FIELD_LEN || pass.len() > MAX_CREDENTIAL_FIELD_LEN {
+        set_last_error(format!(
+            "{fn_name}: user or password exceeds {MAX_CREDENTIAL_FIELD_LEN}-byte cap"
+        ));
+        return Err(SdrCoreError::InvalidArg);
+    }
+    Ok(())
+}
+
 /// Decode a caller-provided NUL-terminated UTF-8 pointer to an
 /// owned `String`. Returns `InvalidArg` on null / non-UTF-8.
 ///
@@ -222,29 +244,14 @@ pub unsafe extern "C" fn sdr_core_radioreference_save_credentials(
             Ok(s) => s,
             Err(e) => return e.as_int(),
         };
-        // Reject empty fields up front — see the function-level
-        // docstring above for the "not stored" sentinel
-        // consistency argument. Clean InvalidArg + descriptive
-        // message is friendlier than a successful-looking save
-        // that never actually appears on the next read.
-        if user.is_empty() || pass.is_empty() {
-            set_last_error(
-                "sdr_core_radioreference_save_credentials: empty user or password — both fields must be non-empty",
-            );
-            return SdrCoreError::InvalidArg.as_int();
-        }
-        // Reject values that the fixed-size load buffer can't
-        // round-trip. Without this cap, a user could save an
-        // over-long credential, and the next load would silently
-        // return a truncated value — which then fails auth at
-        // RadioReference and surfaces as "wrong password"
-        // instead of "your keychain got cut off at 512 bytes."
-        // Per CodeRabbit round 6 on PR #346.
-        if user.len() > MAX_CREDENTIAL_FIELD_LEN || pass.len() > MAX_CREDENTIAL_FIELD_LEN {
-            set_last_error(format!(
-                "sdr_core_radioreference_save_credentials: user or password exceeds {MAX_CREDENTIAL_FIELD_LEN}-byte cap"
-            ));
-            return SdrCoreError::InvalidArg.as_int();
+        // Enforce the shared credential contract (non-empty +
+        // within round-trip cap). Keeps save / test / search
+        // consistent — see `validate_rr_credentials` for the
+        // rationale. Per CodeRabbit rounds 3/6/8 on PR #346.
+        if let Err(e) =
+            validate_rr_credentials("sdr_core_radioreference_save_credentials", &user, &pass)
+        {
+            return e.as_int();
         }
 
         let store = KeyringStore::new(KEYRING_SERVICE);
@@ -476,9 +483,12 @@ pub unsafe extern "C" fn sdr_core_radioreference_test_credentials(
             Err(e) => return e.as_int(),
         };
 
-        if user.is_empty() || pass.is_empty() {
-            set_last_error("sdr_core_radioreference_test_credentials: empty user or password");
-            return SdrCoreError::InvalidArg.as_int();
+        // Match the save contract — reject empties and values
+        // longer than the round-trip cap before the network call.
+        if let Err(e) =
+            validate_rr_credentials("sdr_core_radioreference_test_credentials", &user, &pass)
+        {
+            return e.as_int();
         }
 
         let client = match RrClient::new(&user, &pass) {
@@ -631,15 +641,15 @@ pub unsafe extern "C" fn sdr_core_radioreference_search_zip(
             Err(e) => return e.as_int(),
         };
 
-        // Reject empty credentials before any network call. Save
-        // and test already do this; search was the last path
-        // that silently tried to HTTP with an empty auth header
-        // and returned an AuthFailed from RR, which looks like
-        // "wrong password" to the caller instead of "you didn't
-        // enter one." Per CodeRabbit round 4 on PR #346.
-        if user.is_empty() || pass.is_empty() {
-            set_last_error("sdr_core_radioreference_search_zip: empty user or password");
-            return SdrCoreError::InvalidArg.as_int();
+        // Match the save contract — reject empties and values
+        // longer than the round-trip cap before the network call.
+        // Previously search was the only credential-taking path
+        // that let an over-length value HTTP round-trip to
+        // RadioReference before failing, which was inconsistent
+        // with save's pre-check.
+        if let Err(e) = validate_rr_credentials("sdr_core_radioreference_search_zip", &user, &pass)
+        {
+            return e.as_int();
         }
 
         // RR expects a 5-digit US ZIP — validate on our side so a
