@@ -554,32 +554,52 @@ mod tests {
         // index pairs `_name(i)` with `_uid(i)` consistently.
         //
         // We can't force a hot-plug in a unit test, but we can
-        // verify that between `_count` and the per-index reads
-        // the same index always resolves to matching strings
-        // from a single backend call, regardless of what a
-        // parallel thread's own snapshot looks like.
+        // clone the thread-local snapshot right after `_count`
+        // and assert the FFI strings match it byte-for-byte
+        // across the whole index range. Per CodeRabbit round 5
+        // tightening on PR #344.
         let count = sdr_core_audio_device_count();
         assert!(count >= 1);
+        let expected = AUDIO_DEVICE_SNAPSHOT.with(|cell| cell.borrow().clone());
+        assert_eq!(
+            expected.len(),
+            usize::try_from(count).expect("u32 count should fit usize"),
+            "snapshot length should match _count() return"
+        );
 
-        for i in 0..count {
+        for (i, dev) in expected.iter().enumerate() {
+            let idx = u32::try_from(i).expect("index fits in u32");
             let mut name_buf = [0_u8; AUDIO_BUF_LEN];
             let mut uid_buf = [0_u8; AUDIO_BUF_LEN];
             let rc_name = unsafe {
                 sdr_core_audio_device_name(
-                    i,
+                    idx,
                     name_buf.as_mut_ptr().cast::<c_char>(),
                     name_buf.len(),
                 )
             };
             let rc_uid = unsafe {
-                sdr_core_audio_device_uid(i, uid_buf.as_mut_ptr().cast::<c_char>(), uid_buf.len())
+                sdr_core_audio_device_uid(idx, uid_buf.as_mut_ptr().cast::<c_char>(), uid_buf.len())
             };
             assert!(rc_name >= 0);
             assert!(rc_uid >= 0);
-            // Both calls must succeed for every index the count
-            // call reported — if `_uid` returned Device error while
-            // `_name` succeeded, that's the inconsistency the
-            // thread-local is meant to prevent.
+
+            // Assert byte-for-byte equality between the FFI
+            // strings and the snapshot's `display_name` /
+            // `node_name`. Catches any future regression where
+            // a getter stops reading from the thread-local
+            // (e.g. a refactor that re-introduced the per-call
+            // `list_audio_sinks()` round-trip).
+            let written_name = usize::try_from(rc_name).expect("name rc should be non-negative");
+            let written_uid = usize::try_from(rc_uid).expect("uid rc should be non-negative");
+            let got_name = CStr::from_bytes_with_nul(&name_buf[..=written_name])
+                .expect("name should be NUL-terminated")
+                .to_string_lossy();
+            let got_uid = CStr::from_bytes_with_nul(&uid_buf[..=written_uid])
+                .expect("uid should be NUL-terminated")
+                .to_string_lossy();
+            assert_eq!(got_name, dev.display_name);
+            assert_eq!(got_uid, dev.node_name);
         }
     }
 
