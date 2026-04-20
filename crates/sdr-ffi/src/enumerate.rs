@@ -232,6 +232,17 @@ pub extern "C" fn sdr_core_audio_device_count() -> u32 {
         u32::try_from(len).unwrap_or(u32::MAX)
     })
     .unwrap_or_else(|_| {
+        // Clear the stale snapshot on failure. Otherwise a prior
+        // successful `_count` that populated the thread-local
+        // could hand out stale name/uid data to subsequent
+        // `_name(i)` / `_uid(i)` calls on the same thread —
+        // getters lazy-refresh only when the snapshot is empty,
+        // so a non-empty-but-stale snapshot would silently
+        // disagree with the `0` count we're about to return.
+        // Per CodeRabbit round 4 on PR #344.
+        AUDIO_DEVICE_SNAPSHOT.with(|cell| {
+            cell.borrow_mut().clear();
+        });
         set_last_error("sdr_core_audio_device_count: panic during enumeration");
         0
     })
