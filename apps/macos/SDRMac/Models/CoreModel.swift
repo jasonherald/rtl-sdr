@@ -587,6 +587,14 @@ final class CoreModel {
         setCenter(centerFrequencyHz)
         setVfoOffset(vfoOffsetHz)
         setSampleRate(sourceSampleRateHz)
+        // Source (advanced) — #246. Replayed alongside the
+        // basic source fields so a reconnect doesn't leave the
+        // engine at its defaults while the UI shows the user's
+        // last-picked advanced settings.
+        setDecimation(decimationFactor)
+        setDcBlocking(dcBlockingEnabled)
+        setIqInversion(iqInversionEnabled)
+        setIqCorrection(iqCorrectionEnabled)
         setPpm(ppmCorrection)
         setGain(gainDb)
         setAgc(agcEnabled)
@@ -596,6 +604,15 @@ final class CoreModel {
         setSquelchDb(squelchDb)
         setAutoSquelch(autoSquelchEnabled)
         setDeemphasis(deemphasis)
+        // Demod (advanced) — #245. See above comment; replay
+        // keeps startup/reconnect in sync with the UI's
+        // optimistic state.
+        setNoiseBlankerEnabled(noiseBlankerEnabled)
+        setNoiseBlankerLevel(noiseBlankerLevel)
+        setFmIfNrEnabled(fmIfNrEnabled)
+        setWfmStereo(wfmStereoEnabled)
+        setNotchEnabled(notchEnabled)
+        setNotchFrequencyHz(notchFrequencyHz)
         setVolume(volume)
         // Route to the user's last-picked output device. The
         // engine default is "" (system default) so a fresh install
