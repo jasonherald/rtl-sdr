@@ -111,10 +111,13 @@ extension SdrCore {
         try checkRc(rc)
     }
 
-    /// Load the stored credentials. Returns `nil` if either field
-    /// is missing or empty (the FFI reports `.io` with a
-    /// "credential not found" message — we map that to `nil`
-    /// since "not stored" is a normal state, not an error).
+    /// Load the stored credentials. Returns `nil` when no
+    /// credentials are stored, throws on a genuine keyring
+    /// backend failure. Distinguishes the two cases via the
+    /// FFI contract:
+    ///   - rc == 0 and both buffers non-empty → `(user, pass)`
+    ///   - rc == 0 and either buffer empty → `nil` ("not stored")
+    ///   - rc != 0 → throws with the FFI error code + message
     public static func loadRadioReferenceCredentials() throws -> (user: String, password: String)? {
         var userBuf = [CChar](repeating: 0, count: Self.credentialBufferSize)
         var passBuf = [CChar](repeating: 0, count: Self.credentialBufferSize)
@@ -129,17 +132,20 @@ extension SdrCore {
                 )
             }
         }
-        if rc == 0 {
-            return (String(cString: userBuf), String(cString: passBuf))
-        }
-        // .io from the FFI specifically signals "not stored"
-        // (the FFI stashes "credential not found" in the last-
-        // error). Treat that as `nil`, not a thrown error.
-        let err = SdrCoreError.fromCurrentError(rawCode: rc)
-        if case .io = err.code {
+        try checkRc(rc)
+        let user = String(cString: userBuf)
+        let pass = String(cString: passBuf)
+        // FFI returns OK with empty buffers for the "not stored"
+        // case (see `sdr_core_radioreference_load_credentials`
+        // in `include/sdr_core.h`). Distinct from `.io` which is
+        // now reserved for real backend failures — the rabbit
+        // caught this on round 1 of PR #346: the earlier shape
+        // lumped both into the same error code, so a broken
+        // keychain looked identical to "no creds saved."
+        if user.isEmpty || pass.isEmpty {
             return nil
         }
-        throw err
+        return (user, pass)
     }
 
     /// Remove any stored credentials. Idempotent — calling this

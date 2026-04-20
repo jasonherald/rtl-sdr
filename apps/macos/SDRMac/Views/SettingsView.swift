@@ -237,8 +237,16 @@ private struct RadioReferencePane: View {
             username = ""
             password = ""
             model.refreshRadioReferenceCredentialsFlag()
+        } catch let err as SdrCoreError {
+            // Match the save path: surface the FFI message so
+            // backend failures stay actionable. `localizedDescription`
+            // on our SdrCoreError collapses to a generic "The
+            // operation couldn't be completed" string. Per
+            // CodeRabbit round 1 on PR #346.
+            statusMessage = "Delete failed: [\(err.code)] \(err.message)"
+            statusIsError = true
         } catch {
-            statusMessage = "Delete failed: \(error.localizedDescription)"
+            statusMessage = "Delete failed: \(error)"
             statusIsError = true
         }
     }

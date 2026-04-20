@@ -480,10 +480,21 @@ int32_t sdr_core_radioreference_save_credentials(
 /*
  * Load stored credentials into caller-allocated buffers. Both
  * buffers are NUL-terminated on success; values longer than the
- * buffer are truncated (not an error). Returns `SDR_CORE_OK`
- * when both fields were present, `SDR_CORE_ERR_IO` when either
- * is missing, `SDR_CORE_ERR_INVALID_ARG` on null buffers or
- * zero-length buffers.
+ * buffer are truncated (not an error).
+ *
+ * Return semantics:
+ *   - `SDR_CORE_OK` with both buffers filled → credentials
+ *     present and copied out.
+ *   - `SDR_CORE_OK` with either buffer containing only the NUL
+ *     terminator (empty string) → no credentials stored. This
+ *     is a normal state, not an error — callers check for an
+ *     empty output buffer to detect "not yet configured."
+ *   - `SDR_CORE_ERR_IO` → the keyring backend itself failed
+ *     (service unavailable, platform error, …). Distinct from
+ *     the empty-output "not stored" case so a broken backend
+ *     doesn't masquerade as "no credentials."
+ *   - `SDR_CORE_ERR_INVALID_ARG` → null buffers or zero-length
+ *     buffers.
  */
 int32_t sdr_core_radioreference_load_credentials(
     char*  out_user,

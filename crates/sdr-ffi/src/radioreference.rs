@@ -268,32 +268,38 @@ pub unsafe extern "C" fn sdr_core_radioreference_load_credentials(
         }
 
         let store = KeyringStore::new(KEYRING_SERVICE);
-        let user = match store.get(KEY_RR_USERNAME) {
-            Ok(Some(s)) if !s.is_empty() => s,
-            Ok(_) => {
-                set_last_error("sdr_core_radioreference_load_credentials: username not stored");
-                return SdrCoreError::Io.as_int();
-            }
+        // Distinguish three cases:
+        //   - `Ok(Some(non-empty))` → real stored value; copy out.
+        //   - `Ok(None)` or `Ok(Some(""))` → nothing stored;
+        //     return `OK` with an empty NUL-terminated buffer so
+        //     the caller can tell "no credentials" apart from a
+        //     keyring backend error. Per CodeRabbit round 1 on
+        //     PR #346 (the earlier shape collapsed both into
+        //     `SDR_CORE_ERR_IO`, which the Swift wrapper then
+        //     mapped to `nil` — masking real keyring failures).
+        //   - `Err(_)` → genuine keyring backend error; propagate
+        //     as `SDR_CORE_ERR_IO` with a descriptive last-error
+        //     message so hosts can surface it to the user.
+        let user_opt = match store.get(KEY_RR_USERNAME) {
+            Ok(v) => v.unwrap_or_default(),
             Err(e) => {
                 return map_keyring_error("sdr_core_radioreference_load_credentials", &e).as_int();
             }
         };
-        let pass = match store.get(KEY_RR_PASSWORD) {
-            Ok(Some(s)) if !s.is_empty() => s,
-            Ok(_) => {
-                set_last_error("sdr_core_radioreference_load_credentials: password not stored");
-                return SdrCoreError::Io.as_int();
-            }
+        let pass_opt = match store.get(KEY_RR_PASSWORD) {
+            Ok(v) => v.unwrap_or_default(),
             Err(e) => {
                 return map_keyring_error("sdr_core_radioreference_load_credentials", &e).as_int();
             }
         };
 
         // SAFETY: null + zero-length checked above; buffers are
-        // writable per the caller contract.
+        // writable per the caller contract. Empty `user_opt` /
+        // `pass_opt` produce a single NUL byte in each output
+        // buffer — the "no credentials stored" sentinel.
         unsafe {
-            write_cstr_to_buf(user.as_bytes(), out_user, user_buf_len);
-            write_cstr_to_buf(pass.as_bytes(), out_pass, pass_buf_len);
+            write_cstr_to_buf(user_opt.as_bytes(), out_user, user_buf_len);
+            write_cstr_to_buf(pass_opt.as_bytes(), out_pass, pass_buf_len);
         }
         clear_last_error();
         SdrCoreError::Ok.as_int()
@@ -310,10 +316,23 @@ pub unsafe extern "C" fn sdr_core_radioreference_load_credentials(
 pub extern "C" fn sdr_core_radioreference_delete_credentials() -> i32 {
     let result = std::panic::catch_unwind(|| {
         let store = KeyringStore::new(KEYRING_SERVICE);
-        if let Err(e) = store.delete(KEY_RR_USERNAME) {
-            return map_keyring_error("sdr_core_radioreference_delete_credentials", &e).as_int();
-        }
-        if let Err(e) = store.delete(KEY_RR_PASSWORD) {
+        // Attempt BOTH deletes even if the first raises a
+        // non-NotFound error — leaving one secret behind when
+        // the other is already removed is worse than reporting
+        // a partial failure. Then pick whichever real error
+        // happened (preferring the username path for message
+        // ordering). `KeyringError::NotFound` is treated as
+        // success — matches the header's "idempotent" contract.
+        // Per CodeRabbit round 1 on PR #346.
+        let user_err = match store.delete(KEY_RR_USERNAME) {
+            Ok(()) | Err(KeyringError::NotFound) => None,
+            Err(e) => Some(e),
+        };
+        let pass_err = match store.delete(KEY_RR_PASSWORD) {
+            Ok(()) | Err(KeyringError::NotFound) => None,
+            Err(e) => Some(e),
+        };
+        if let Some(e) = user_err.or(pass_err) {
             return map_keyring_error("sdr_core_radioreference_delete_credentials", &e).as_int();
         }
         clear_last_error();

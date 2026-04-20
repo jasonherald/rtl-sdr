@@ -205,11 +205,17 @@ struct RadioReferenceDialog: View {
 
     private func triggerSearch() {
         guard zipIsValid else { return }
+        // Clear the previous result set before kicking off the
+        // next search. Without this, the old rows + their
+        // import action stay live while the spinner runs — a
+        // user could import stale bookmarks from the previous
+        // ZIP mid-search. Per CodeRabbit round 1 on PR #346.
         selectedIds = []
         categoryFilter = ""
         agencyFilter = ""
         statusMessage = ""
         statusIsError = false
+        searchResult = nil
         isSearching = true
 
         let zip = zipInput
