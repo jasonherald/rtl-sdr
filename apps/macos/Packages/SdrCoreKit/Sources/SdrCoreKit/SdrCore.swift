@@ -37,8 +37,11 @@ import Foundation
 
 /// Swift-side handle for the sdr-core SDR engine.
 public final class SdrCore: @unchecked Sendable {
-    /// Opaque C pointer obtained from `sdr_core_create`.
-    private let handle: OpaquePointer
+    /// Opaque C pointer obtained from `sdr_core_create`. `internal`
+    /// rather than `private` so sibling files in SdrCoreKit (e.g.
+    /// `SdrCoreAudioTap`) can pass it to the FFI without forcing
+    /// those wrappers back into this file.
+    internal let handle: OpaquePointer
 
     /// Async stream of engine events. Consumers `for await`-loop
     /// this to receive the same events the C-side dispatcher
