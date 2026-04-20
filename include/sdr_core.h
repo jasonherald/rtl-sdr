@@ -564,14 +564,16 @@ int32_t sdr_core_radioreference_test_credentials(
  *     ]
  *   }
  *
- * If `out_required` is non-null, it is filled with the
- * serialized JSON size in bytes (not counting the NUL) whether
- * or not the buffer was large enough. Callers that got truncated
- * output can reallocate + retry.
+ * If `out_required` is non-null, it is filled with the exact
+ * number of bytes the caller must allocate to receive the full
+ * payload — **including the trailing NUL** — whether or not the
+ * buffer was large enough.
  *
  * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_AUTH` on
  * rejected credentials, `SDR_CORE_ERR_IO` on network failure,
- * `SDR_CORE_ERR_INVALID_ARG` on malformed ZIP or null buffers,
+ * `SDR_CORE_ERR_INVALID_ARG` on malformed ZIP, null buffers,
+ * **or a too-small output buffer** (the caller should read
+ * `out_required` and retry with a larger allocation),
  * `SDR_CORE_ERR_INTERNAL` on JSON encoding failure.
  *
  * Blocking: this is synchronous HTTP against RadioReference.com.

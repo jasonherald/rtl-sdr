@@ -249,9 +249,17 @@ extension SdrCore {
     /// `searchRadioReference(user:password:zip:)`.
     private static let initialSearchBufferSize = 64 * 1024
 
-    /// Invoke the FFI search twice when the first call reports a
-    /// larger-than-buffer payload. Returns the JSON bytes ready
-    /// for `Codable` decoding.
+    /// Invoke the FFI search, retrying once with a
+    /// larger buffer when the first call reports the payload
+    /// won't fit. Returns the JSON bytes ready for `Codable`
+    /// decoding.
+    ///
+    /// Retry contract: as of PR #346 round 3, the FFI returns
+    /// `INVALID_ARG` when `out_buf` is too small (previously it
+    /// returned OK and silently truncated the JSON). On that
+    /// specific error, `required` is set to the exact
+    /// NUL-inclusive size and we reallocate + retry once. Any
+    /// other error propagates as-is.
     private static func callSearchZip(
         user: String,
         password: String,
@@ -260,23 +268,27 @@ extension SdrCore {
         var buffer = [CChar](repeating: 0, count: initialSearchBufferSize)
         var required: Int = 0
 
-        let rc = runSearch(
+        var rc = runSearch(
             user: user, password: password, zip: zip,
             buffer: &buffer, required: &required
         )
-        try checkRc(rc)
 
-        // If the FFI reported a required size larger than our
-        // buffer, retry once with exactly that capacity (+1 for
-        // the NUL the FFI always writes).
-        if required >= buffer.count {
-            buffer = [CChar](repeating: 0, count: required + 1)
-            let retryRc = runSearch(
+        // Buffer too small → FFI returns InvalidArg with
+        // `required` filled in. Distinct from a genuine
+        // malformed-input InvalidArg because `required` is the
+        // signal: non-zero AND greater than the buffer we just
+        // passed means "grow and retry."
+        if rc == SdrCoreError.Code.invalidArg.rawValue
+            && required > 0
+            && required > buffer.count
+        {
+            buffer = [CChar](repeating: 0, count: required)
+            rc = runSearch(
                 user: user, password: password, zip: zip,
                 buffer: &buffer, required: &required
             )
-            try checkRc(retryRc)
         }
+        try checkRc(rc)
 
         // Convert to Data by reading up to the first NUL. The
         // FFI guarantees NUL termination when rc == 0.

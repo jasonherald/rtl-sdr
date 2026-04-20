@@ -164,11 +164,14 @@ unsafe fn write_cstr_to_buf(bytes: &[u8], out_buf: *mut c_char, buf_len: usize) 
 
 /// Save RadioReference credentials to the OS keyring.
 ///
-/// Both `user_utf8` and `pass_utf8` must be non-null NUL-terminated
-/// UTF-8 strings. Empty strings are accepted and stored as-is (the
-/// keyring backend doesn't distinguish "empty value" from "no
-/// value", so consumers should use `sdr_core_radioreference_has_credentials`
-/// to probe existence rather than round-tripping through load).
+/// Both `user_utf8` and `pass_utf8` must be non-null, NUL-terminated,
+/// **non-empty** UTF-8 strings. Empty inputs are rejected with
+/// `INVALID_ARG` — the rest of the ABI (has / load) treats
+/// "empty" as the "not stored" sentinel, so accepting an empty
+/// save would leave the credentials ABI self-inconsistent: save
+/// would succeed, but `has_credentials` would immediately return
+/// false and `load_credentials` would fall into the empty-buffer
+/// sentinel. Per CodeRabbit round 3 on PR #346.
 ///
 /// # Safety
 ///
@@ -192,6 +195,17 @@ pub unsafe extern "C" fn sdr_core_radioreference_save_credentials(
             Ok(s) => s,
             Err(e) => return e.as_int(),
         };
+        // Reject empty fields up front — see the function-level
+        // docstring above for the "not stored" sentinel
+        // consistency argument. Clean InvalidArg + descriptive
+        // message is friendlier than a successful-looking save
+        // that never actually appears on the next read.
+        if user.is_empty() || pass.is_empty() {
+            set_last_error(
+                "sdr_core_radioreference_save_credentials: empty user or password — both fields must be non-empty",
+            );
+            return SdrCoreError::InvalidArg.as_int();
+        }
 
         let store = KeyringStore::new(KEYRING_SERVICE);
         if let Err(e) = store.set(KEY_RR_USERNAME, &user) {
@@ -518,16 +532,19 @@ struct WireFrequency {
 /// }
 /// ```
 ///
-/// Buffer growth: `out_required` (optional) is filled with the
-/// JSON payload size **in bytes** (not counting the NUL). Callers
-/// that pass a too-small buffer get truncated JSON AND a non-zero
-/// `out_required` they can use to reallocate + retry. Pass NULL
-/// when you don't need it.
+/// Buffer sizing: `out_required` (optional — pass NULL to ignore)
+/// is filled with the exact number of bytes the caller must
+/// allocate to receive the full payload, **including the
+/// trailing NUL**. Callers that pass a too-small buffer get
+/// `INVALID_ARG` (not a silently-truncated body) with
+/// `out_required` set to the correct allocation size so they
+/// can retry.
 ///
 /// Returns `OK` on successful search + serialization, `AUTH` on
-/// bad credentials, `IO` on network failure, `INVALID_ARG` on bad
-/// inputs, `INTERNAL` on JSON encoding failure (shouldn't happen
-/// for the types involved).
+/// bad credentials, `IO` on network failure, `INVALID_ARG` on
+/// bad inputs **or a too-small output buffer** (check
+/// `out_required` to distinguish), `INTERNAL` on JSON encoding
+/// failure (shouldn't happen for the types involved).
 ///
 /// # Safety
 ///
@@ -535,6 +552,13 @@ struct WireFrequency {
 /// NUL-terminated UTF-8 C string. `out_buf` must point to at
 /// least `out_buf_len` writable bytes. `out_required` must be
 /// either null or point to a writable `usize`.
+///
+/// The `#[allow(clippy::too_many_lines)]` is deliberate — this
+/// function's body is a single top-to-bottom dispatch:
+/// validate → HTTP round-trip → map response → serialize →
+/// emit. Splitting it would just spread the same linear flow
+/// across helpers without any meaningful reuse.
+#[allow(clippy::too_many_lines)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_radioreference_search_zip(
     user_utf8: *const c_char,
@@ -637,17 +661,36 @@ pub unsafe extern "C" fn sdr_core_radioreference_search_zip(
         };
 
         let bytes = json.as_bytes();
-        // Report the required size regardless of buffer adequacy.
-        // Callers can detect truncation by comparing with buf_len.
+        // Total bytes the caller must allocate to receive the
+        // full payload — the JSON plus one byte for the trailing
+        // NUL that `write_cstr_to_buf` always emits. Report this
+        // whether or not we're about to truncate so callers can
+        // reallocate + retry. Per CodeRabbit round 3 on PR #346.
+        let required_len = bytes.len().saturating_add(1);
         if !out_required.is_null() {
             // SAFETY: non-null check above; caller contract says
             // the pointer is writable.
             unsafe {
-                *out_required = bytes.len();
+                *out_required = required_len;
             }
         }
 
-        // SAFETY: out_buf null + zero-length checked above.
+        // If the buffer isn't big enough for the payload plus
+        // NUL, return `INVALID_ARG` rather than OK with a
+        // silently-truncated body. The previous shape let C
+        // callers who passed `out_required = NULL` miss the
+        // truncation entirely — caller then parsed invalid JSON.
+        // Swift sees InvalidArg + a populated `out_required`,
+        // reallocates, and retries.
+        if required_len > out_buf_len {
+            set_last_error(format!(
+                "sdr_core_radioreference_search_zip: output buffer too small ({required_len} needed, got {out_buf_len})"
+            ));
+            return SdrCoreError::InvalidArg.as_int();
+        }
+
+        // SAFETY: out_buf null + zero-length checked above;
+        // size fit check immediately above.
         unsafe {
             write_cstr_to_buf(bytes, out_buf, out_buf_len);
         }
@@ -678,6 +721,29 @@ mod tests {
     fn save_rejects_null_pointers() {
         assert_eq!(
             unsafe { sdr_core_radioreference_save_credentials(std::ptr::null(), std::ptr::null()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+    }
+
+    #[test]
+    fn save_rejects_empty_fields() {
+        // Empty user or password must be rejected — otherwise
+        // save would succeed but `has_credentials` / `load_credentials`
+        // would immediately report "not stored" because they use
+        // the empty-buffer sentinel. Regression for CodeRabbit
+        // round 3 on PR #346.
+        let empty = CString::new("").unwrap();
+        let real = CString::new("jason").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_radioreference_save_credentials(empty.as_ptr(), real.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_radioreference_save_credentials(real.as_ptr(), empty.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_radioreference_save_credentials(empty.as_ptr(), empty.as_ptr()) },
             SdrCoreError::InvalidArg.as_int()
         );
     }
