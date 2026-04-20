@@ -646,6 +646,21 @@ mod tests {
     /// the command.
     const WAV_HEADER_BYTES: u64 = 44;
 
+    /// Build a collision-resistant temp WAV path. PID alone would
+    /// reuse the same filename across reruns of the same test
+    /// binary — if a prior run crashed before its cleanup, a
+    /// stale file could mask a broken `_start_*_recording` by
+    /// making the `metadata().expect(...)` assertion pass against
+    /// the old artifact. Adding a nanosecond timestamp gives each
+    /// test a unique name even when `cargo test` reuses a binary.
+    /// Per CodeRabbit round 4 on PR #345.
+    fn unique_temp_wav(prefix: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("{prefix}-{}-{nonce}.wav", std::process::id()))
+    }
+
     /// Helper: make a live engine handle for the duration of a test.
     fn make_handle() -> *mut SdrCore {
         let path = CString::new("").unwrap();
@@ -755,7 +770,7 @@ mod tests {
         // controller-side open failure would otherwise pass
         // silently here even though `send_command` returned OK.
         let h = make_handle();
-        let tmp = std::env::temp_dir().join(format!("sdr-ffi-test-{}.wav", std::process::id()));
+        let tmp = unique_temp_wav("sdr-ffi-test");
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
         assert_eq!(
             unsafe { sdr_core_start_audio_recording(h, path.as_ptr()) },
@@ -800,7 +815,7 @@ mod tests {
         // file, not just that `send_command` returned OK. Per
         // CodeRabbit round 2 on PR #345.
         let h = make_handle();
-        let tmp = std::env::temp_dir().join(format!("sdr-ffi-iq-test-{}.wav", std::process::id()));
+        let tmp = unique_temp_wav("sdr-ffi-iq-test");
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
         assert_eq!(
             unsafe { sdr_core_start_iq_recording(h, path.as_ptr()) },
