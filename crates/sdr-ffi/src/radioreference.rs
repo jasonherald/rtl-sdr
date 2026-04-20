@@ -60,13 +60,18 @@ const KEY_RR_PASSWORD: &str = "radioreference-password";
 const RR_ZIP_LEN: usize = 5;
 
 /// Upper bound on usernames / passwords we'll round-trip through
-/// the load call. RadioReference usernames and passwords don't
-/// have documented length limits, but 512 bytes each is
-/// comfortably more than any human typed. If a longer value shows
-/// up in the wild, `_load_credentials` truncates to `buf_len - 1`
-/// and the caller can bump its buffer — truncation does not set
-/// an error.
-#[allow(dead_code)]
+/// the save/load pair. This is the buffer size `load_credentials`
+/// uses on the Swift side, so any stored value that exceeds it
+/// would silently truncate on read — producing a different
+/// credential than the one saved, which then mysteriously fails
+/// auth.
+///
+/// Enforced on the SAVE side: `save_credentials` rejects inputs
+/// whose UTF-8 byte length exceeds this cap with `InvalidArg`.
+/// RadioReference has no documented limit but 512 bytes each is
+/// comfortably more than any human typed, and matches the
+/// SwiftUI wrapper's fixed buffer. Per CodeRabbit round 6 on
+/// PR #346.
 const MAX_CREDENTIAL_FIELD_LEN: usize = 512;
 
 // ============================================================
@@ -106,9 +111,18 @@ fn map_keyring_error(fn_name: &str, err: &KeyringError) -> SdrCoreError {
             SdrCoreError::Io
         }
         KeyringError::NoBackend => {
+            // Generic message is correct on every platform —
+            // on macOS, the Apple Keychain backend failing is
+            // a platform issue, not a missing install. Linux
+            // actually benefits from a remediation hint since
+            // the secret-service daemon might not be running.
+            // Per CodeRabbit round 6 on PR #346.
+            #[cfg(target_os = "linux")]
             set_last_error(format!(
-                "{fn_name}: no secure storage available — install GNOME Keyring or KeePassXC (Linux)"
+                "{fn_name}: no secure storage available — install GNOME Keyring or KeePassXC"
             ));
+            #[cfg(not(target_os = "linux"))]
+            set_last_error(format!("{fn_name}: no secure storage available"));
             SdrCoreError::Io
         }
         KeyringError::Platform(_) => {
@@ -211,6 +225,19 @@ pub unsafe extern "C" fn sdr_core_radioreference_save_credentials(
             set_last_error(
                 "sdr_core_radioreference_save_credentials: empty user or password — both fields must be non-empty",
             );
+            return SdrCoreError::InvalidArg.as_int();
+        }
+        // Reject values that the fixed-size load buffer can't
+        // round-trip. Without this cap, a user could save an
+        // over-long credential, and the next load would silently
+        // return a truncated value — which then fails auth at
+        // RadioReference and surfaces as "wrong password"
+        // instead of "your keychain got cut off at 512 bytes."
+        // Per CodeRabbit round 6 on PR #346.
+        if user.len() > MAX_CREDENTIAL_FIELD_LEN || pass.len() > MAX_CREDENTIAL_FIELD_LEN {
+            set_last_error(format!(
+                "sdr_core_radioreference_save_credentials: user or password exceeds {MAX_CREDENTIAL_FIELD_LEN}-byte cap"
+            ));
             return SdrCoreError::InvalidArg.as_int();
         }
 
@@ -747,6 +774,24 @@ mod tests {
     }
 
     #[test]
+    fn save_rejects_oversize_fields() {
+        // save_credentials must refuse values longer than
+        // MAX_CREDENTIAL_FIELD_LEN so they don't silently
+        // truncate on the next load. Regression for
+        // CodeRabbit round 6 on PR #346.
+        let real = CString::new("jason").unwrap();
+        let long = CString::new("x".repeat(MAX_CREDENTIAL_FIELD_LEN + 1)).unwrap();
+        assert_eq!(
+            unsafe { sdr_core_radioreference_save_credentials(long.as_ptr(), real.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_radioreference_save_credentials(real.as_ptr(), long.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+    }
+
+    #[test]
     fn save_rejects_empty_fields() {
         // Empty user or password must be rejected — otherwise
         // save would succeed but `has_credentials` / `load_credentials`
@@ -795,6 +840,41 @@ mod tests {
             },
             SdrCoreError::InvalidArg.as_int()
         );
+    }
+
+    /// Pin the "not stored" sentinel contract: after delete,
+    /// load must return OK with both buffers NUL-only (i.e.
+    /// first byte == 0). Distinct from IO (backend error) so
+    /// the Swift wrapper can return `nil` instead of throwing
+    /// — see the function-level docstring above. Per
+    /// CodeRabbit round 6 on PR #346.
+    ///
+    /// **Marked `#[ignore]`** because it deletes the
+    /// shared-service credentials from the user's real
+    /// keyring. A developer running `cargo test` with their
+    /// RadioReference login saved would lose it. Run
+    /// explicitly with `cargo test ... -- --ignored` when
+    /// vetting this contract; CI skips it.
+    #[test]
+    #[ignore = "deletes real keyring credentials — run only with --ignored after vetting"]
+    fn load_returns_ok_with_empty_buffers_when_not_stored() {
+        let handle = std::thread::spawn(|| {
+            let _ = sdr_core_radioreference_delete_credentials();
+            let mut u = [0_u8; CREDENTIAL_BUF_LEN];
+            let mut p = [0_u8; CREDENTIAL_BUF_LEN];
+            let rc = unsafe {
+                sdr_core_radioreference_load_credentials(
+                    u.as_mut_ptr().cast::<c_char>(),
+                    CREDENTIAL_BUF_LEN,
+                    p.as_mut_ptr().cast::<c_char>(),
+                    CREDENTIAL_BUF_LEN,
+                )
+            };
+            assert_eq!(rc, SdrCoreError::Ok.as_int());
+            assert_eq!(u[0], 0, "user buffer should be NUL-only when not stored");
+            assert_eq!(p[0], 0, "pass buffer should be NUL-only when not stored");
+        });
+        handle.join().expect("thread should exit cleanly");
     }
 
     #[test]
