@@ -589,6 +589,17 @@ pub unsafe extern "C" fn sdr_core_radioreference_search_zip(
             Err(e) => return e.as_int(),
         };
 
+        // Reject empty credentials before any network call. Save
+        // and test already do this; search was the last path
+        // that silently tried to HTTP with an empty auth header
+        // and returned an AuthFailed from RR, which looks like
+        // "wrong password" to the caller instead of "you didn't
+        // enter one." Per CodeRabbit round 4 on PR #346.
+        if user.is_empty() || pass.is_empty() {
+            set_last_error("sdr_core_radioreference_search_zip: empty user or password");
+            return SdrCoreError::InvalidArg.as_int();
+        }
+
         // RR expects a 5-digit US ZIP — validate on our side so a
         // typo doesn't round-trip to the network and come back as
         // a generic SOAP fault.

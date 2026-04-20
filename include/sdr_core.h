@@ -468,9 +468,12 @@ int32_t sdr_core_stop_iq_recording(SdrCore* handle);
 
 /*
  * Store RadioReference credentials in the OS keyring. Both
- * pointers must be non-null NUL-terminated UTF-8 strings.
- * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG`
- * on null pointers, `SDR_CORE_ERR_IO` on keyring backend errors.
+ * pointers must be non-null, non-empty, NUL-terminated UTF-8
+ * strings. Returns `SDR_CORE_OK` on success,
+ * `SDR_CORE_ERR_INVALID_ARG` on null pointers or empty fields
+ * (the rest of the ABI uses empty-buffer as the "not stored"
+ * sentinel, so an empty save would be self-inconsistent),
+ * `SDR_CORE_ERR_IO` on keyring backend errors.
  */
 int32_t sdr_core_radioreference_save_credentials(
     const char* user_utf8,
@@ -539,8 +542,14 @@ int32_t sdr_core_radioreference_test_credentials(
  * `getCountyFrequencies(county_id)` to fetch all tagged
  * frequencies.
  *
- * Writes a JSON document to `out_buf` (NUL-terminated,
- * truncated if the buffer is too small). The schema is:
+ * Writes a JSON document to `out_buf` when the buffer is
+ * large enough to hold the full payload plus a trailing NUL.
+ * If it isn't, the function returns
+ * `SDR_CORE_ERR_INVALID_ARG`, writes the required allocation
+ * size (NUL-inclusive) to `out_required` when non-null, and
+ * leaves `out_buf` untouched — callers should reallocate to
+ * `*out_required` bytes and retry. A truncated JSON body is
+ * never returned. The schema is:
  *
  *   {
  *     "county_id":   <u32>,

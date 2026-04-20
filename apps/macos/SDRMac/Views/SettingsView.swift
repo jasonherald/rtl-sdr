@@ -223,6 +223,9 @@ private struct RadioReferencePane: View {
         case .invalidCredentials(let msg):
             statusMessage = "Invalid credentials: \(msg)"
             statusIsError = true
+        case .invalidInput(let msg):
+            statusMessage = "\(msg)"
+            statusIsError = true
         case .networkError(let msg):
             statusMessage = "Network error: \(msg)"
             statusIsError = true

@@ -164,12 +164,22 @@ extension SdrCore {
     // MARK: - Test + search
 
     /// Outcome of `testRadioReferenceCredentials`. Split from
-    /// plain throw/no-throw so the Settings UI can render
-    /// "invalid credentials" (actionable by the user) distinctly
-    /// from network errors (retry might fix).
+    /// plain throw/no-throw so the Settings UI can render each
+    /// actionable case distinctly:
+    ///   - `.valid` — credentials work
+    ///   - `.invalidCredentials` — RadioReference rejected
+    ///     the login (user should fix their password)
+    ///   - `.invalidInput` — local validation failed before
+    ///     any network call (e.g. empty user / password). Keeps
+    ///     these out of the "network error" bucket so users
+    ///     don't think the API is down when they just forgot
+    ///     to fill in a field. Per CodeRabbit round 4.
+    ///   - `.networkError` — everything else (HTTP, SOAP,
+    ///     SSL, …). Retry might fix.
     public enum RadioReferenceTestResult: Sendable {
         case valid
         case invalidCredentials(String)
+        case invalidInput(String)
         case networkError(String)
     }
 
@@ -194,6 +204,8 @@ extension SdrCore {
         switch err.code {
         case .auth:
             return .invalidCredentials(err.message)
+        case .invalidArg:
+            return .invalidInput(err.message)
         default:
             return .networkError(err.message)
         }
