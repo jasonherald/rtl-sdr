@@ -151,8 +151,17 @@ sdr-ui = { path = "crates/sdr-ui" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 quick-xml = "0.37"
 
-# Secure credential storage
-keyring = { version = "3", features = ["sync-secret-service"] }
+# Secure credential storage.
+#
+# Keyring 3.x requires an explicit backend feature per target
+# OS. The defaults give you a silent **mock** backend that
+# accepts writes and returns Ok but persists nothing — learned
+# the hard way on PR #346 while building the RadioReference
+# credentials flow on macOS. Enable both native backends so
+# the same binary works on Linux and macOS:
+#   * `sync-secret-service` → Linux (GNOME Keyring / KeePassXC)
+#   * `apple-native`        → macOS Keychain (uses Security.framework)
+keyring = { version = "3", features = ["sync-secret-service", "apple-native"] }
 
 # Whisper speech-to-text
 whisper-rs = "0.16"

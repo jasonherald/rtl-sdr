@@ -12,6 +12,14 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(CoreModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
+    /// Sheet state lives up here (not inside the toolbar)
+    /// because the subview-wrapped version of the RR button
+    /// didn't render in the toolbar — inlining the button in
+    /// the ToolbarItem closure did. Hoisting `@State` here
+    /// keeps the toolbar closure flat while letting `.sheet`
+    /// attach to a plain View that renders the dialog.
+    @State private var showingRadioReference: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -23,7 +31,26 @@ struct ContentView: View {
                 StatusBar()
             }
         }
-        .toolbar { HeaderToolbar() }
+        .toolbar { HeaderToolbar(showingRadioReference: $showingRadioReference) }
+        .sheet(isPresented: $showingRadioReference) {
+            RadioReferenceDialog()
+        }
+        // Re-sync the RadioReference credentials flag whenever
+        // the main window becomes active. Handles the case where
+        // something outside the app's Settings flow changed the
+        // keychain (Keychain Access, another process, another
+        // build of the app) — the next time the user focuses
+        // this window, the toolbar reflects reality.
+        //
+        // The Settings save flow ALSO updates the flag directly,
+        // so in the happy path this is a no-op double-check. If
+        // cross-scene `@Observable` propagation ever drops an
+        // update, scenePhase change acts as the safety net.
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                model.refreshRadioReferenceCredentialsFlag()
+            }
+        }
         // Fatal ABI-mismatch modal. The binding's setter is a
         // no-op so dismissing the alert is impossible — the
         // only action is Quit. Matches the spec ("fail launch

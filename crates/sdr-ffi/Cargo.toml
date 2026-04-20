@@ -42,6 +42,15 @@ sdr-rtlsdr.workspace = true
 # `list_audio_sinks()` snapshots of CoreAudio / PipeWire state,
 # so they bypass the engine dispatch path.
 sdr-sink-audio.workspace = true
+# RadioReference integration for the SwiftUI panel (issue #241).
+# Handle-free: the SOAP client is stateless per-call and the
+# credential store (`sdr-config::KeyringStore`) has no engine
+# coupling. Network I/O means these never belong on the DSP
+# thread.
+sdr-radioreference.workspace = true
+sdr-config.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 libc.workspace = true

@@ -48,6 +48,7 @@ pub mod event;
 pub mod fft;
 pub mod handle;
 pub mod lifecycle;
+pub mod radioreference;
 
 // Re-export the FFI symbols at the crate root so consumers that link
 // the rlib (in-tree integration tests) can reference them via
@@ -75,4 +76,9 @@ pub use fft::{SdrFftCallback, SdrFftFrame, sdr_core_pull_fft};
 pub use handle::SdrCore;
 pub use lifecycle::{
     sdr_core_abi_version, sdr_core_create, sdr_core_destroy, sdr_core_init_logging,
+};
+pub use radioreference::{
+    sdr_core_radioreference_delete_credentials, sdr_core_radioreference_has_credentials,
+    sdr_core_radioreference_load_credentials, sdr_core_radioreference_save_credentials,
+    sdr_core_radioreference_search_zip, sdr_core_radioreference_test_credentials,
 };

@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 5
+#define SDR_CORE_ABI_VERSION_MINOR 6
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -83,6 +83,7 @@ typedef enum SdrCoreError {
     SDR_CORE_ERR_AUDIO          = -6, /* Audio backend error.           */
     SDR_CORE_ERR_IO             = -7, /* File / network I/O error.      */
     SDR_CORE_ERR_CONFIG         = -8, /* Config load/save error.        */
+    SDR_CORE_ERR_AUTH           = -9, /* Remote service rejected credentials (RadioReference). */
 } SdrCoreError;
 
 /*
@@ -443,6 +444,137 @@ int32_t sdr_core_stop_audio_recording(SdrCore* handle);
  */
 int32_t sdr_core_start_iq_recording(SdrCore* handle, const char* path_utf8);
 int32_t sdr_core_stop_iq_recording(SdrCore* handle);
+
+/* ================================================================ */
+/*  RadioReference integration                                      */
+/* ================================================================ */
+
+/*
+ * Credential storage and frequency lookups against RadioReference.com
+ * (issue #241). All handle-free — they don't touch the engine or
+ * DSP thread.
+ *
+ * Credentials are kept in the OS keyring (Keychain on macOS,
+ * libsecret / KeePassXC on Linux) under the SAME service name +
+ * key names the GTK UI uses, so a user running both apps on one
+ * machine shares a single login.
+ *
+ * Search (`_search_zip`) returns a JSON document in a caller-
+ * allocated buffer — see the function contract for the schema.
+ * Callers SHOULD dispatch these calls on a background thread; the
+ * underlying HTTP is synchronous blocking and can take multiple
+ * seconds on a slow connection.
+ */
+
+/*
+ * Store RadioReference credentials in the OS keyring. Both
+ * pointers must be non-null NUL-terminated UTF-8 strings.
+ * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG`
+ * on null pointers, `SDR_CORE_ERR_IO` on keyring backend errors.
+ */
+int32_t sdr_core_radioreference_save_credentials(
+    const char* user_utf8,
+    const char* pass_utf8
+);
+
+/*
+ * Load stored credentials into caller-allocated buffers. Both
+ * buffers are NUL-terminated on success; values longer than the
+ * buffer are truncated (not an error). Returns `SDR_CORE_OK`
+ * when both fields were present, `SDR_CORE_ERR_IO` when either
+ * is missing, `SDR_CORE_ERR_INVALID_ARG` on null buffers or
+ * zero-length buffers.
+ */
+int32_t sdr_core_radioreference_load_credentials(
+    char*  out_user,
+    size_t user_buf_len,
+    char*  out_pass,
+    size_t pass_buf_len
+);
+
+/*
+ * Delete any stored credentials. Idempotent — returns
+ * `SDR_CORE_OK` whether or not credentials were present.
+ */
+int32_t sdr_core_radioreference_delete_credentials(void);
+
+/*
+ * Cheap existence probe — returns `true` if both username and
+ * password are stored AND non-empty, `false` otherwise.
+ * Does not load the values into caller memory; use this to gate
+ * "show RadioReference panel" in the UI without surfacing the
+ * password.
+ */
+bool sdr_core_radioreference_has_credentials(void);
+
+/*
+ * Test credentials with a lightweight RadioReference API probe
+ * (ZIP 90210). Returns `SDR_CORE_OK` on valid credentials,
+ * `SDR_CORE_ERR_AUTH` when RR rejected the login,
+ * `SDR_CORE_ERR_IO` on network failure,
+ * `SDR_CORE_ERR_INVALID_ARG` on empty or null inputs.
+ *
+ * Does not touch the keyring — caller supplies the credentials
+ * to test (typically from a Settings-pane form before saving).
+ */
+int32_t sdr_core_radioreference_test_credentials(
+    const char* user_utf8,
+    const char* pass_utf8
+);
+
+/*
+ * Search RadioReference for frequencies covering a US ZIP code.
+ * Performs `getZipcodeInfo(zip)` to resolve the county, then
+ * `getCountyFrequencies(county_id)` to fetch all tagged
+ * frequencies.
+ *
+ * Writes a JSON document to `out_buf` (NUL-terminated,
+ * truncated if the buffer is too small). The schema is:
+ *
+ *   {
+ *     "county_id":   <u32>,
+ *     "county_name": "<string>",
+ *     "state_id":    <u32>,
+ *     "city":        "<string>",
+ *     "frequencies": [
+ *       {
+ *         "id":           "<string>",      // opaque RR frequency ID
+ *         "freq_hz":      <u64>,
+ *         "rr_mode":      "<string>",      // raw RR mode ("FM", "FMN", …)
+ *         "demod_mode":   "<string>",      // engine mode ("NFM", "WFM", …)
+ *         "bandwidth_hz": <f64>,           // mapped channel bandwidth
+ *         "tone_hz":      <f32 | null>,    // CTCSS / PL tone if present
+ *         "description":  "<string>",
+ *         "alpha_tag":    "<string>",
+ *         "category":     "<string>",      // first tag description
+ *         "tags":         ["<string>", …]  // all tag descriptions
+ *       },
+ *       ...
+ *     ]
+ *   }
+ *
+ * If `out_required` is non-null, it is filled with the
+ * serialized JSON size in bytes (not counting the NUL) whether
+ * or not the buffer was large enough. Callers that got truncated
+ * output can reallocate + retry.
+ *
+ * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_AUTH` on
+ * rejected credentials, `SDR_CORE_ERR_IO` on network failure,
+ * `SDR_CORE_ERR_INVALID_ARG` on malformed ZIP or null buffers,
+ * `SDR_CORE_ERR_INTERNAL` on JSON encoding failure.
+ *
+ * Blocking: this is synchronous HTTP against RadioReference.com.
+ * Callers MUST dispatch it on a background thread so the UI /
+ * event loop stays responsive.
+ */
+int32_t sdr_core_radioreference_search_zip(
+    const char* user_utf8,
+    const char* pass_utf8,
+    const char* zip_utf8,
+    char*       out_buf,
+    size_t      out_buf_len,
+    size_t*     out_required
+);
 
 /* --- IQ frontend -------------------------------------------------- */
 

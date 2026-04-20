@@ -33,6 +33,25 @@ public enum DemodMode: Int32, Sendable, CaseIterable, Codable {
         case .raw: return "RAW"
         }
     }
+
+    /// Parse the mode label the engine uses as a string (e.g. the
+    /// `demodMode` field returned by
+    /// `SdrCore.searchRadioReference` — which is already mapped
+    /// on the Rust side via `sdr_radioreference::mode_map`).
+    /// Returns `nil` for unknown strings.
+    public init?(engineLabel: String) {
+        switch engineLabel.uppercased() {
+        case "WFM": self = .wfm
+        case "NFM": self = .nfm
+        case "AM":  self = .am
+        case "USB": self = .usb
+        case "LSB": self = .lsb
+        case "DSB": self = .dsb
+        case "CW":  self = .cw
+        case "RAW": self = .raw
+        default: return nil
+        }
+    }
 }
 
 /// FM de-emphasis mode. Matches `SdrDeemphasis` in the C header.
