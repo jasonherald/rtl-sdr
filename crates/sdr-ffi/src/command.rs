@@ -461,6 +461,45 @@ pub unsafe extern "C" fn sdr_core_stop_audio_recording(handle: *mut SdrCore) -> 
     unsafe { with_core(handle, |core| send(core, UiToDsp::StopAudioRecording)) }
 }
 
+/// Start writing the raw IQ sample stream to a WAV file at
+/// `path_utf8`. Unlike audio recording, the IQ WAV is written at
+/// the current tuner sample rate (not a fixed 48 kHz) with two
+/// channels (I / Q), so the file size per second varies with the
+/// source sample rate selection.
+///
+/// The engine confirms start via `SDR_EVT_IQ_RECORDING_STARTED`
+/// or emits `SDR_EVT_ERROR` on failure (open error, disk full, etc.).
+///
+/// # Safety
+///
+/// `path_utf8` must be a NUL-terminated UTF-8 C string naming a
+/// writable filesystem path (the engine creates the file). Does
+/// not accept null or empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_start_iq_recording(
+    handle: *mut SdrCore,
+    path_utf8: *const c_char,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let path = cstr_to_string("sdr_core_start_iq_recording", path_utf8)?;
+            if path.is_empty() {
+                set_last_error("sdr_core_start_iq_recording: path is empty");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::StartIqRecording(PathBuf::from(path)))
+        })
+    }
+}
+
+/// Stop IQ recording. The engine finalizes the WAV header on
+/// writer drop and confirms via `SDR_EVT_IQ_RECORDING_STOPPED`.
+/// Safe to call when no recording is active (no-op + stop event).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_stop_iq_recording(handle: *mut SdrCore) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::StopIqRecording)) }
+}
+
 // ============================================================
 //  IQ frontend
 // ============================================================
@@ -616,6 +655,14 @@ mod tests {
             unsafe { sdr_core_stop_audio_recording(std::ptr::null_mut()) },
             SdrCoreError::InvalidHandle.as_int()
         );
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(std::ptr::null_mut(), empty.as_ptr()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_stop_iq_recording(std::ptr::null_mut()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
     }
 
     // ------------------------------------------------------
@@ -678,6 +725,42 @@ mod tests {
         // then clean up. If the file wasn't created (e.g., the DSP
         // thread hadn't processed the command yet) remove_file errs;
         // that's fine — test doesn't depend on it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = std::fs::remove_file(&tmp);
+        destroy(h);
+    }
+
+    #[test]
+    fn start_iq_recording_rejects_null_or_empty_path() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(h, std::ptr::null()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(h, empty.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn iq_recording_start_stop_round_trip() {
+        // Same shape as the audio recording round-trip test —
+        // exercise the command plumbing without inspecting the
+        // WAV output.
+        let h = make_handle();
+        let tmp = std::env::temp_dir().join(format!("sdr-ffi-iq-test-{}.wav", std::process::id()));
+        let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(h, path.as_ptr()) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_stop_iq_recording(h) },
+            SdrCoreError::Ok.as_int()
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = std::fs::remove_file(&tmp);
         destroy(h);

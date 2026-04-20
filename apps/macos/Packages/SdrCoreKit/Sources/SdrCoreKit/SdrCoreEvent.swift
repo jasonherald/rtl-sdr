@@ -39,6 +39,8 @@ private let kDisplayBandwidth      = Int32(SDR_EVT_DISPLAY_BANDWIDTH.rawValue)
 private let kError                 = Int32(SDR_EVT_ERROR.rawValue)
 private let kAudioRecordingStarted = Int32(SDR_EVT_AUDIO_RECORDING_STARTED.rawValue)
 private let kAudioRecordingStopped = Int32(SDR_EVT_AUDIO_RECORDING_STOPPED.rawValue)
+private let kIqRecordingStarted    = Int32(SDR_EVT_IQ_RECORDING_STARTED.rawValue)
+private let kIqRecordingStopped    = Int32(SDR_EVT_IQ_RECORDING_STOPPED.rawValue)
 
 /// High-level event from the engine.
 ///
@@ -82,6 +84,17 @@ public enum SdrCoreEvent: Sendable, Equatable {
     /// shutdown while a recording is active, so hosts can clear
     /// their "recording" UI without tracking teardown separately.
     case audioRecordingStopped
+
+    /// IQ recording to WAV has started. The associated path is
+    /// the file the engine opened for writing. Unlike audio
+    /// recording, the WAV is written at the current tuner sample
+    /// rate (two-channel I/Q), not a fixed 48 kHz, so file size
+    /// scales with the selected source rate.
+    case iqRecordingStarted(path: String)
+
+    /// IQ recording to WAV has stopped. Also fires on engine
+    /// shutdown while a recording is active.
+    case iqRecordingStopped
 
     /// Translate a C `SdrEvent` into a Swift value.
     ///
@@ -143,6 +156,18 @@ public enum SdrCoreEvent: Sendable, Equatable {
 
         case kAudioRecordingStopped:
             return .audioRecordingStopped
+
+        case kIqRecordingStarted:
+            // Same null/empty guard as audio. An empty path would
+            // flip CoreModel's `iqRecordingPath` into a bogus
+            // "recording" state with no file to display / reveal.
+            guard let cstr = payload.iq_recording.path_utf8 else { return nil }
+            let path = String(cString: cstr)
+            guard !path.isEmpty else { return nil }
+            return .iqRecordingStarted(path: path)
+
+        case kIqRecordingStopped:
+            return .iqRecordingStopped
 
         default:
             // Unknown kind — a future FFI may add variants we

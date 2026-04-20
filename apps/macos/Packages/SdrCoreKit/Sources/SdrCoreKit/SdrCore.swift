@@ -313,6 +313,22 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(sdr_core_stop_audio_recording(handle))
     }
 
+    /// Start recording the raw IQ stream to a WAV file at `path`.
+    /// The engine writes at the current tuner sample rate with
+    /// two channels (I / Q); file size per second scales with
+    /// the source rate, so fast source rates produce large files.
+    /// Emits `.iqRecordingStarted(path:)` on success or
+    /// `.error(...)` on failure.
+    public func startIqRecording(path: String) throws {
+        try checkRc(path.withCString { sdr_core_start_iq_recording(handle, $0) })
+    }
+
+    /// Stop IQ recording. Safe to call when nothing is active —
+    /// the engine always emits `.iqRecordingStopped` in response.
+    public func stopIqRecording() throws {
+        try checkRc(sdr_core_stop_iq_recording(handle))
+    }
+
     /// Enable or disable DC blocking on the IQ frontend.
     public func setDcBlocking(_ enabled: Bool) throws {
         try checkRc(sdr_core_set_dc_blocking(handle, enabled))
