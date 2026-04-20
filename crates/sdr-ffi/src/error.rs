@@ -42,6 +42,12 @@ pub enum SdrCoreError {
     Io = -7,
     /// Configuration load/save error.
     Config = -8,
+    /// Authentication failed — credentials rejected by a remote
+    /// service. Added for the RadioReference login path (issue
+    /// #241) so the host can distinguish "bad username/password"
+    /// (actionable: ask the user) from "server is down" (transient,
+    /// retry might work). ABI 0.5 → 0.6.
+    Auth = -9,
 }
 
 impl SdrCoreError {
@@ -175,5 +181,6 @@ mod tests {
         assert_eq!(SdrCoreError::Audio.as_int(), -6);
         assert_eq!(SdrCoreError::Io.as_int(), -7);
         assert_eq!(SdrCoreError::Config.as_int(), -8);
+        assert_eq!(SdrCoreError::Auth.as_int(), -9);
     }
 }

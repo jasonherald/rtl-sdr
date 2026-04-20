@@ -32,6 +32,7 @@ public struct SdrCoreError: Error, Equatable, CustomStringConvertible {
         case audio
         case io
         case config
+        case auth
         case unknown(Int32)
 
         init(raw: Int32) {
@@ -44,6 +45,7 @@ public struct SdrCoreError: Error, Equatable, CustomStringConvertible {
             case -6: self = .audio
             case -7: self = .io
             case -8: self = .config
+            case -9: self = .auth
             default: self = .unknown(raw)
             }
         }
@@ -59,6 +61,7 @@ public struct SdrCoreError: Error, Equatable, CustomStringConvertible {
             case .audio: return -6
             case .io: return -7
             case .config: return -8
+            case .auth: return -9
             case .unknown(let v): return v
             }
         }

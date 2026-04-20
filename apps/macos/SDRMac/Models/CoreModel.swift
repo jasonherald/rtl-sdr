@@ -196,6 +196,24 @@ final class CoreModel {
     var iqRecordingPath: String? = nil
 
     // ==========================================================
+    //  RadioReference
+    // ==========================================================
+
+    /// Cached "has stored credentials" flag so SwiftUI views that
+    /// gate on it (the sidebar RR section, the Settings pane's
+    /// "Clear stored" button) update reactively when credentials
+    /// are saved or deleted. `SdrCore.hasRadioReferenceCredentials`
+    /// is a static so it doesn't drive view invalidation on its
+    /// own — `refreshRadioReferenceCredentialsFlag()` is the
+    /// mutation hook that writes this @Observable field after
+    /// a save / delete.
+    ///
+    /// Initialized from the keyring at bootstrap; stays accurate
+    /// for the lifetime of the app as long as every mutation
+    /// path goes through `refreshRadioReferenceCredentialsFlag`.
+    var radioReferenceHasCredentials: Bool = false
+
+    // ==========================================================
     //  Display
     // ==========================================================
 
@@ -280,6 +298,12 @@ final class CoreModel {
             selectedAudioDeviceUid = saved
         }
         refreshAudioDevices()
+
+        // Seed the RadioReference credentials flag from the
+        // keyring so the sidebar panel / settings pane render
+        // correctly on first paint without waiting for a user
+        // action.
+        refreshRadioReferenceCredentialsFlag()
 
         do {
             let c = try SdrCore(configPath: configPath)
@@ -760,6 +784,14 @@ final class CoreModel {
     /// clears `iqRecordingPath`.
     func stopIqRecording() {
         capture { try core?.stopIqRecording() }
+    }
+
+    /// Re-read the keyring to sync the observable
+    /// `radioReferenceHasCredentials` flag. Callers that mutate
+    /// credentials (save/delete in Settings) must invoke this so
+    /// views depending on the flag redraw.
+    func refreshRadioReferenceCredentialsFlag() {
+        radioReferenceHasCredentials = SdrCore.hasRadioReferenceCredentials
     }
 
     func setFftSize(_ n: Int) {
