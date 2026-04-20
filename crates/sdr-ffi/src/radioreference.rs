@@ -104,10 +104,16 @@ fn map_keyring_error(fn_name: &str, err: &KeyringError) -> SdrCoreError {
     match err {
         KeyringError::NotFound => {
             set_last_error(format!("{fn_name}: credential not found"));
-            // Not strictly an error for some callers — but we return
-            // a distinct code and let the caller decide. The Swift
-            // wrapper maps `NotFound` to returning `nil` rather than
-            // throwing.
+            // Callers: `load_credentials` doesn't even reach this
+            // arm any more — it uses the OK-plus-empty-buffer
+            // sentinel for the "not stored" case and reserves
+            // `Io` strictly for backend failures. This branch is
+            // kept for other keyring operations (delete's
+            // `NotFound`, for instance, is absorbed upstream in
+            // `delete_credentials`'s idempotent handling). The
+            // Swift wrapper propagates every non-zero rc via
+            // `checkRc`, so anything hitting this path surfaces
+            // as an `SdrCoreError` with the message above.
             SdrCoreError::Io
         }
         KeyringError::NoBackend => {
@@ -765,6 +771,20 @@ mod tests {
     /// password — sanity, not a hard ABI bound.
     const CREDENTIAL_BUF_LEN: usize = 512;
 
+    /// Output-buffer size for `search_zip` rejection tests.
+    /// The tests fail before any JSON is written (bad zip,
+    /// null buffers, empty credentials), so this is never
+    /// filled — it just has to be nonzero so the initial
+    /// out_buf / out_buf_len validation doesn't trip on it.
+    /// Per CodeRabbit round 7 on PR #346.
+    const SEARCH_REJECTION_BUF_LEN: usize = 128;
+
+    /// `out_buf_len` passed alongside a null `out_buf` in
+    /// `search_zip_rejects_null_buf`. Nonzero so the null
+    /// check is what trips, not the `out_buf_len == 0`
+    /// check — the exact value is arbitrary.
+    const NULL_BUF_PROBE_LEN: usize = 64;
+
     #[test]
     fn save_rejects_null_pointers() {
         assert_eq!(
@@ -882,7 +902,7 @@ mod tests {
         let u = CString::new("user").unwrap();
         let p = CString::new("pass").unwrap();
         let bad = CString::new("9021").unwrap(); // 4 digits
-        let mut buf = [0_u8; 128];
+        let mut buf = [0_u8; SEARCH_REJECTION_BUF_LEN];
         let rc = unsafe {
             sdr_core_radioreference_search_zip(
                 u.as_ptr(),
@@ -901,7 +921,7 @@ mod tests {
         let u = CString::new("user").unwrap();
         let p = CString::new("pass").unwrap();
         let bad = CString::new("abcde").unwrap();
-        let mut buf = [0_u8; 128];
+        let mut buf = [0_u8; SEARCH_REJECTION_BUF_LEN];
         let rc = unsafe {
             sdr_core_radioreference_search_zip(
                 u.as_ptr(),
@@ -926,7 +946,7 @@ mod tests {
                 p.as_ptr(),
                 zip.as_ptr(),
                 std::ptr::null_mut(),
-                64,
+                NULL_BUF_PROBE_LEN,
                 std::ptr::null_mut(),
             )
         };
