@@ -4,6 +4,12 @@
 // MVP scope: RTL-SDR only (no device picker). Sample rate, gain
 // (discrete when AGC off), AGC, PPM. The device-picker and the
 // Network/File source forms land in v2 behind feature flags.
+//
+// Advanced controls (DC blocking, IQ inversion, IQ correction,
+// decimation) live in a collapsible "Advanced" DisclosureGroup
+// at the bottom, default-collapsed so the MVP layout stays
+// clean. Mirrors GTK's "Advanced" expander in its Source panel
+// (issue #246).
 
 import SwiftUI
 
@@ -14,6 +20,12 @@ private let rtlSdrSampleRates: [Double] = [
     2_048_000, 2_160_000, 2_400_000, 2_560_000, 2_880_000,
     3_200_000,
 ]
+
+/// Allowed decimation factors for the Advanced group. Must be
+/// powers of two — the engine's `SetDecimation` handler rejects
+/// non-power-of-two values. Mirrors GTK's
+/// `sdr-ui::sidebar::source_panel::DECIMATION_FACTORS`.
+private let decimationFactors: [UInt32] = [1, 2, 4, 8, 16]
 
 struct SourceSection: View {
     @Environment(CoreModel.self) private var model
@@ -62,6 +74,41 @@ struct SourceSection: View {
                     set: { model.setPpm($0) }
                 ), in: -100...100) {
                     Text("\(model.ppmCorrection)")
+                }
+            }
+
+            // Collapsible "Advanced" group — default-collapsed
+            // because most users never touch these toggles. The
+            // four FFI commands have existed since the M2 ABI;
+            // this commit just surfaces them. Mirrors the GTK
+            // Source panel's expander (#246).
+            DisclosureGroup("Advanced") {
+                Toggle("DC blocking", isOn: Binding(
+                    get: { model.dcBlockingEnabled },
+                    set: { model.setDcBlocking($0) }
+                ))
+
+                Toggle("IQ inversion", isOn: Binding(
+                    get: { model.iqInversionEnabled },
+                    set: { model.setIqInversion($0) }
+                ))
+
+                Toggle("IQ correction", isOn: Binding(
+                    get: { model.iqCorrectionEnabled },
+                    set: { model.setIqCorrection($0) }
+                ))
+
+                LabeledContent("Decimation") {
+                    Picker("", selection: Binding(
+                        get: { model.decimationFactor },
+                        set: { model.setDecimation($0) }
+                    )) {
+                        ForEach(decimationFactors, id: \.self) { f in
+                            Text(f == 1 ? "None" : "1/\(f)").tag(f)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
                 }
             }
         }
