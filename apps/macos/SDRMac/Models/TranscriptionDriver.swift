@@ -530,8 +530,26 @@ final class TranscriptionDriver {
                     pcmFormat: analyzerFormat,
                     frameCapacity: outCapacity
                 ) else { continue }
+                // AVAudioConverter calls the input block repeatedly
+                // during a single `convert(...)` until the output
+                // buffer is filled. Returning `.haveData` + the same
+                // tapBuffer on every invocation feeds the chunk
+                // multiple times and produces audible stutter /
+                // distorted transcription. Deliver the chunk once,
+                // then signal `.noDataNow` + nil so the converter
+                // knows there's no more input *for this call*.
+                // (`.noDataNow` is the correct per-call terminator;
+                // `.endOfStream` would permanently lock the
+                // converter and break the next chunk.) Per
+                // CodeRabbit round 4 on PR #349.
                 var error: NSError?
+                var delivered = false
                 let _ = converter.convert(to: converted, error: &error) { _, outStatus in
+                    if delivered {
+                        outStatus.pointee = .noDataNow
+                        return nil
+                    }
+                    delivered = true
                     outStatus.pointee = .haveData
                     return tapBuffer
                 }

@@ -85,7 +85,7 @@ Two mutually exclusive backends, selected at build time (see the install section
 ### Dependencies
 
 **Always required:**
-- **Rust** 1.85+ (2024 edition)
+- **Rust** — stable 1.95.0 is pinned via [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it up automatically on first `cargo` invocation. The workspace is 2024 edition.
 - **GTK 4.10+** and **libadwaita 1.5+**
 - **PipeWire** development libraries (Linux audio)
 - **libusb** (for RTL-SDR USB access)
@@ -170,7 +170,7 @@ make swift-test
 - Audio + IQ WAV recording
 - RadioReference browser (toolbar button → modal sheet, same credential keychain as the Linux build)
 - Bookmarks
-- **Transcription via Apple SpeechAnalyzer** (right slide-out panel) — uses macOS's built-in on-device speech framework; no model download, no Whisper/Sherpa build machinery needed
+- **Transcription via Apple SpeechAnalyzer** (right slide-out panel) — uses macOS's built-in on-device speech framework. No Whisper/Sherpa build machinery and no third-party models required; macOS may fetch a small locale asset on first use (handled transparently by the panel, which shows a "Downloading model…" status line while that happens)
 - Advanced demod controls (noise blanker, FM IF NR, WFM stereo, audio notch)
 - Advanced source controls (DC blocking, IQ inversion, IQ correction, decimation)
 - Auto-squelch with noise-floor tracking
