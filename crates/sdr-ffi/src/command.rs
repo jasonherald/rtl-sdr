@@ -612,6 +612,14 @@ mod tests {
     /// the mpsc hop plus file-close syscall on any CI host.
     const RECORDING_FLUSH_WAIT_MS: u64 = 50;
 
+    /// Minimum size of a well-formed empty WAV file: the 44-byte
+    /// header `WavWriter::new` writes before any samples arrive
+    /// (RIFF/WAVE + fmt chunk + data chunk header). Used by the
+    /// round-trip recording tests to prove the controller
+    /// actually opened + wrote the header, not just enqueued
+    /// the command.
+    const WAV_HEADER_BYTES: u64 = 44;
+
     /// Helper: make a live engine handle for the duration of a test.
     fn make_handle() -> *mut SdrCore {
         let path = CString::new("").unwrap();
@@ -716,8 +724,10 @@ mod tests {
     #[test]
     fn audio_recording_start_stop_round_trip() {
         // Write to a temp file path so the controller's WavWriter
-        // has somewhere it can open. We don't inspect the output —
-        // just exercise the command plumbing.
+        // has somewhere it can open. We verify the controller
+        // actually created + finalized the WAV header — a
+        // controller-side open failure would otherwise pass
+        // silently here even though `send_command` returned OK.
         let h = make_handle();
         let tmp = std::env::temp_dir().join(format!("sdr-ffi-test-{}.wav", std::process::id()));
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
@@ -729,12 +739,16 @@ mod tests {
             unsafe { sdr_core_stop_audio_recording(h) },
             SdrCoreError::Ok.as_int()
         );
-        // Give the controller a moment to process + drop the writer,
-        // then clean up. If the file wasn't created (e.g., the DSP
-        // thread hadn't processed the command yet) remove_file errs;
-        // that's fine — test doesn't depend on it.
+        // Give the controller a moment to process both commands
+        // and drop the writer (Drop finalizes the WAV header).
         std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
-        let _ = std::fs::remove_file(&tmp);
+        let metadata = std::fs::metadata(&tmp)
+            .expect("audio recording should create a WAV file before cleanup");
+        assert!(
+            metadata.len() >= WAV_HEADER_BYTES,
+            "audio recording should finalize at least a WAV header"
+        );
+        std::fs::remove_file(&tmp).unwrap();
         destroy(h);
     }
 
@@ -756,8 +770,9 @@ mod tests {
     #[test]
     fn iq_recording_start_stop_round_trip() {
         // Same shape as the audio recording round-trip test —
-        // exercise the command plumbing without inspecting the
-        // WAV output.
+        // verifies the controller opened + finalized the WAV
+        // file, not just that `send_command` returned OK. Per
+        // CodeRabbit round 2 on PR #345.
         let h = make_handle();
         let tmp = std::env::temp_dir().join(format!("sdr-ffi-iq-test-{}.wav", std::process::id()));
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
@@ -770,7 +785,13 @@ mod tests {
             SdrCoreError::Ok.as_int()
         );
         std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
-        let _ = std::fs::remove_file(&tmp);
+        let metadata =
+            std::fs::metadata(&tmp).expect("IQ recording should create a WAV file before cleanup");
+        assert!(
+            metadata.len() >= WAV_HEADER_BYTES,
+            "IQ recording should finalize at least a WAV header"
+        );
+        std::fs::remove_file(&tmp).unwrap();
         destroy(h);
     }
 
