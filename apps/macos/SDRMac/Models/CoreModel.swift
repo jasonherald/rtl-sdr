@@ -189,6 +189,12 @@ final class CoreModel {
     /// optimistically.
     var audioRecordingPath: String? = nil
 
+    /// Active IQ-recording state. Same engine-authoritative flip
+    /// as `audioRecordingPath` above, but for the raw IQ stream.
+    /// Mirrors `DspToUi::IqRecordingStarted/Stopped`. Independent
+    /// from audio recording — both can be active simultaneously.
+    var iqRecordingPath: String? = nil
+
     // ==========================================================
     //  Display
     // ==========================================================
@@ -393,6 +399,10 @@ final class CoreModel {
             audioRecordingPath = path
         case .audioRecordingStopped:
             audioRecordingPath = nil
+        case .iqRecordingStarted(let path):
+            iqRecordingPath = path
+        case .iqRecordingStopped:
+            iqRecordingPath = nil
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -735,6 +745,21 @@ final class CoreModel {
     /// clears `audioRecordingPath`.
     func stopAudioRecording() {
         capture { try core?.stopAudioRecording() }
+    }
+
+    /// Start writing the raw IQ stream to `path`. The engine
+    /// confirms via `.iqRecordingStarted` which flips
+    /// `iqRecordingPath` to non-nil. Failure comes back as an
+    /// `.error(...)` event and `iqRecordingPath` stays nil.
+    func startIqRecording(to path: String) {
+        capture { try core?.startIqRecording(path: path) }
+    }
+
+    /// Stop IQ recording. Safe to call at any time — the engine
+    /// always emits `.iqRecordingStopped` in response, which
+    /// clears `iqRecordingPath`.
+    func stopIqRecording() {
+        capture { try core?.stopIqRecording() }
     }
 
     func setFftSize(_ n: Int) {

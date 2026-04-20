@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 4
+#define SDR_CORE_ABI_VERSION_MINOR 5
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -425,6 +425,25 @@ int32_t sdr_core_set_audio_device(SdrCore* handle, const char* uid_utf8);
 int32_t sdr_core_start_audio_recording(SdrCore* handle, const char* path_utf8);
 int32_t sdr_core_stop_audio_recording(SdrCore* handle);
 
+/*
+ * Start / stop recording the raw IQ sample stream to a WAV file.
+ * Unlike audio recording — which writes at a fixed 48 kHz —
+ * the IQ WAV is written at the current tuner sample rate with
+ * two channels (I / Q), so file size per second varies with
+ * the source sample rate selection.
+ *
+ * `start` emits `SDR_EVT_IQ_RECORDING_STARTED` on success or
+ * `SDR_EVT_ERROR` if the file couldn't be opened / written.
+ * `stop` emits `SDR_EVT_IQ_RECORDING_STOPPED` (including when
+ * no recording was active — the event is the host's signal to
+ * clear its "recording" UI regardless of prior state).
+ *
+ * `path_utf8` must be a non-empty NUL-terminated UTF-8 path;
+ * the host is responsible for picking a writable location.
+ */
+int32_t sdr_core_start_iq_recording(SdrCore* handle, const char* path_utf8);
+int32_t sdr_core_stop_iq_recording(SdrCore* handle);
+
 /* --- IQ frontend -------------------------------------------------- */
 
 int32_t sdr_core_set_dc_blocking(SdrCore* handle, bool enabled);
@@ -498,6 +517,8 @@ typedef enum SdrEventKind {
     SDR_EVT_ERROR                   = 7,
     SDR_EVT_AUDIO_RECORDING_STARTED = 8,
     SDR_EVT_AUDIO_RECORDING_STOPPED = 9,
+    SDR_EVT_IQ_RECORDING_STARTED    = 10,
+    SDR_EVT_IQ_RECORDING_STOPPED    = 11,
 } SdrEventKind;
 
 /*
@@ -540,6 +561,20 @@ typedef struct SdrEventAudioRecording {
 } SdrEventAudioRecording;
 
 /*
+ * Payload for SDR_EVT_IQ_RECORDING_STARTED. Same layout as
+ * SdrEventAudioRecording but declared separately so hosts can
+ * switch cleanly on `kind` without needing to remember which
+ * union field to read, and so the two feature paths can diverge
+ * in a later version (e.g. if IQ recording grows a sample-rate
+ * field).
+ *
+ * SDR_EVT_IQ_RECORDING_STOPPED carries no payload.
+ */
+typedef struct SdrEventIqRecording {
+    const char* path_utf8;
+} SdrEventIqRecording;
+
+/*
  * Tagged union of all event payloads. Which union field is valid
  * is determined by the `kind` discriminant on the enclosing
  * SdrEvent (see the table below).
@@ -555,6 +590,8 @@ typedef struct SdrEventAudioRecording {
  * SDR_EVT_ERROR                       error.utf8
  * SDR_EVT_AUDIO_RECORDING_STARTED     audio_recording.path_utf8
  * SDR_EVT_AUDIO_RECORDING_STOPPED     none (all-zero payload)
+ * SDR_EVT_IQ_RECORDING_STARTED        iq_recording.path_utf8
+ * SDR_EVT_IQ_RECORDING_STOPPED        none (all-zero payload)
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
@@ -564,6 +601,7 @@ typedef union SdrEventPayload {
     SdrEventGainList       gain_list;
     SdrEventError          error;
     SdrEventAudioRecording audio_recording;
+    SdrEventIqRecording    iq_recording;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;

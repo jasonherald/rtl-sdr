@@ -60,14 +60,36 @@ struct SDRMacApp: App {
         appSupportDirectory().appendingPathComponent("bookmarks.json")
     }
 
-    /// Directory the app writes WAV recordings to, per #239:
-    /// `~/Documents/SDRMac/Audio/`. Created lazily on first
+    /// Directory the app writes audio WAV recordings to, per
+    /// #239: `~/Documents/SDRMac/Audio/`. Created lazily on first
     /// recording start so a user who never hits Record doesn't
     /// wind up with a stray empty folder.
     ///
     /// Returned as a URL, not just a path, so SwiftUI callers can
     /// `showInFinder` the destination directly.
-    static func audioRecordingsDirectory() -> URL {
+    ///
+    /// `nonisolated` because FileManager calls don't need the
+    /// main actor — lets the sibling `RecordingSection` generators
+    /// stay callable from a nonisolated context too.
+    nonisolated static func audioRecordingsDirectory() -> URL {
+        recordingsSubdirectory(named: "Audio")
+    }
+
+    /// Directory the app writes raw IQ WAV captures to, per #238:
+    /// `~/Documents/SDRMac/IQ/`. Separate from the audio folder
+    /// so the much larger IQ files are easy to audit / clean
+    /// without sifting through demodulated audio recordings.
+    /// Created lazily on first IQ-record start.
+    nonisolated static func iqRecordingsDirectory() -> URL {
+        recordingsSubdirectory(named: "IQ")
+    }
+
+    /// Shared creator for `~/Documents/SDRMac/<name>/`. Falls back
+    /// to the home directory if `.documentDirectory` can't be
+    /// resolved (shouldn't happen on a standard Mac install, but
+    /// guards against weird sandboxing / missing-entitlement edge
+    /// cases).
+    private nonisolated static func recordingsSubdirectory(named name: String) -> URL {
         let fm = FileManager.default
         let docs = (try? fm.url(
             for: .documentDirectory,
@@ -75,7 +97,7 @@ struct SDRMacApp: App {
             appropriateFor: nil,
             create: true
         )) ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Documents")
-        let dir = docs.appendingPathComponent("SDRMac/Audio")
+        let dir = docs.appendingPathComponent("SDRMac/\(name)")
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

@@ -424,6 +424,32 @@ pub unsafe extern "C" fn sdr_core_set_audio_device(
     }
 }
 
+/// Shared helper for the two `start_*_recording` commands. Validates
+/// `path_utf8` (non-null, UTF-8, non-empty) and dispatches the
+/// appropriate `UiToDsp` variant via `build_cmd`. Keeps the path
+/// validation in one place so a future rule (e.g., rejecting
+/// directory paths, normalizing trailing whitespace) lands in
+/// both start paths at once.
+///
+/// # Safety
+///
+/// `path_utf8` must be a NUL-terminated UTF-8 C string or null
+/// (null returns `SDR_CORE_ERR_INVALID_ARG`). `core` must be a
+/// valid engine reference.
+unsafe fn start_recording_with_path(
+    core: &SdrCore,
+    fn_name: &str,
+    path_utf8: *const c_char,
+    build_cmd: impl FnOnce(PathBuf) -> UiToDsp,
+) -> Result<(), SdrCoreError> {
+    let path = unsafe { cstr_to_string(fn_name, path_utf8) }?;
+    if path.is_empty() {
+        set_last_error(format!("{fn_name}: path is empty"));
+        return Err(SdrCoreError::InvalidArg);
+    }
+    send(core, build_cmd(PathBuf::from(path)))
+}
+
 /// Start writing the demodulated audio stream to a 16-bit PCM WAV
 /// file at `path_utf8`. If recording was already active the engine
 /// logs a warning and overwrites — callers should stop first.
@@ -443,12 +469,12 @@ pub unsafe extern "C" fn sdr_core_start_audio_recording(
 ) -> i32 {
     unsafe {
         with_core(handle, |core| {
-            let path = cstr_to_string("sdr_core_start_audio_recording", path_utf8)?;
-            if path.is_empty() {
-                set_last_error("sdr_core_start_audio_recording: path is empty");
-                return Err(SdrCoreError::InvalidArg);
-            }
-            send(core, UiToDsp::StartAudioRecording(PathBuf::from(path)))
+            start_recording_with_path(
+                core,
+                "sdr_core_start_audio_recording",
+                path_utf8,
+                UiToDsp::StartAudioRecording,
+            )
         })
     }
 }
@@ -459,6 +485,45 @@ pub unsafe extern "C" fn sdr_core_start_audio_recording(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_stop_audio_recording(handle: *mut SdrCore) -> i32 {
     unsafe { with_core(handle, |core| send(core, UiToDsp::StopAudioRecording)) }
+}
+
+/// Start writing the raw IQ sample stream to a WAV file at
+/// `path_utf8`. Unlike audio recording, the IQ WAV is written at
+/// the current tuner sample rate (not a fixed 48 kHz) with two
+/// channels (I / Q), so the file size per second varies with the
+/// source sample rate selection.
+///
+/// The engine confirms start via `SDR_EVT_IQ_RECORDING_STARTED`
+/// or emits `SDR_EVT_ERROR` on failure (open error, disk full, etc.).
+///
+/// # Safety
+///
+/// `path_utf8` must be a NUL-terminated UTF-8 C string naming a
+/// writable filesystem path (the engine creates the file). Does
+/// not accept null or empty.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_start_iq_recording(
+    handle: *mut SdrCore,
+    path_utf8: *const c_char,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            start_recording_with_path(
+                core,
+                "sdr_core_start_iq_recording",
+                path_utf8,
+                UiToDsp::StartIqRecording,
+            )
+        })
+    }
+}
+
+/// Stop IQ recording. The engine finalizes the WAV header on
+/// writer drop and confirms via `SDR_EVT_IQ_RECORDING_STOPPED`.
+/// Safe to call when no recording is active (no-op + stop event).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_stop_iq_recording(handle: *mut SdrCore) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::StopIqRecording)) }
 }
 
 // ============================================================
@@ -565,6 +630,37 @@ mod tests {
     use crate::lifecycle::sdr_core_create;
     use std::ffi::CString;
 
+    /// Small grace period the round-trip recording tests wait
+    /// after `stop` so the controller thread has time to drop
+    /// the writer (which finalizes the WAV header on `Drop`)
+    /// before the test cleans up the file. Sub-second so the
+    /// test suite stays fast; large enough to comfortably cover
+    /// the mpsc hop plus file-close syscall on any CI host.
+    const RECORDING_FLUSH_WAIT_MS: u64 = 50;
+
+    /// Minimum size of a well-formed empty WAV file: the 44-byte
+    /// header `WavWriter::new` writes before any samples arrive
+    /// (RIFF/WAVE + fmt chunk + data chunk header). Used by the
+    /// round-trip recording tests to prove the controller
+    /// actually opened + wrote the header, not just enqueued
+    /// the command.
+    const WAV_HEADER_BYTES: u64 = 44;
+
+    /// Build a collision-resistant temp WAV path. PID alone would
+    /// reuse the same filename across reruns of the same test
+    /// binary — if a prior run crashed before its cleanup, a
+    /// stale file could mask a broken `_start_*_recording` by
+    /// making the `metadata().expect(...)` assertion pass against
+    /// the old artifact. Adding a nanosecond timestamp gives each
+    /// test a unique name even when `cargo test` reuses a binary.
+    /// Per CodeRabbit round 4 on PR #345.
+    fn unique_temp_wav(prefix: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("{prefix}-{}-{nonce}.wav", std::process::id()))
+    }
+
     /// Helper: make a live engine handle for the duration of a test.
     fn make_handle() -> *mut SdrCore {
         let path = CString::new("").unwrap();
@@ -616,6 +712,14 @@ mod tests {
             unsafe { sdr_core_stop_audio_recording(std::ptr::null_mut()) },
             SdrCoreError::InvalidHandle.as_int()
         );
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(std::ptr::null_mut(), empty.as_ptr()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_stop_iq_recording(std::ptr::null_mut()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
     }
 
     // ------------------------------------------------------
@@ -661,10 +765,12 @@ mod tests {
     #[test]
     fn audio_recording_start_stop_round_trip() {
         // Write to a temp file path so the controller's WavWriter
-        // has somewhere it can open. We don't inspect the output —
-        // just exercise the command plumbing.
+        // has somewhere it can open. We verify the controller
+        // actually created + finalized the WAV header — a
+        // controller-side open failure would otherwise pass
+        // silently here even though `send_command` returned OK.
         let h = make_handle();
-        let tmp = std::env::temp_dir().join(format!("sdr-ffi-test-{}.wav", std::process::id()));
+        let tmp = unique_temp_wav("sdr-ffi-test");
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
         assert_eq!(
             unsafe { sdr_core_start_audio_recording(h, path.as_ptr()) },
@@ -674,12 +780,59 @@ mod tests {
             unsafe { sdr_core_stop_audio_recording(h) },
             SdrCoreError::Ok.as_int()
         );
-        // Give the controller a moment to process + drop the writer,
-        // then clean up. If the file wasn't created (e.g., the DSP
-        // thread hadn't processed the command yet) remove_file errs;
-        // that's fine — test doesn't depend on it.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = std::fs::remove_file(&tmp);
+        // Give the controller a moment to process both commands
+        // and drop the writer (Drop finalizes the WAV header).
+        std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
+        let metadata = std::fs::metadata(&tmp)
+            .expect("audio recording should create a WAV file before cleanup");
+        assert!(
+            metadata.len() >= WAV_HEADER_BYTES,
+            "audio recording should finalize at least a WAV header"
+        );
+        std::fs::remove_file(&tmp).unwrap();
+        destroy(h);
+    }
+
+    #[test]
+    fn start_iq_recording_rejects_null_or_empty_path() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(h, std::ptr::null()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(h, empty.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn iq_recording_start_stop_round_trip() {
+        // Same shape as the audio recording round-trip test —
+        // verifies the controller opened + finalized the WAV
+        // file, not just that `send_command` returned OK. Per
+        // CodeRabbit round 2 on PR #345.
+        let h = make_handle();
+        let tmp = unique_temp_wav("sdr-ffi-iq-test");
+        let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            unsafe { sdr_core_start_iq_recording(h, path.as_ptr()) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_stop_iq_recording(h) },
+            SdrCoreError::Ok.as_int()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
+        let metadata =
+            std::fs::metadata(&tmp).expect("IQ recording should create a WAV file before cleanup");
+        assert!(
+            metadata.len() >= WAV_HEADER_BYTES,
+            "IQ recording should finalize at least a WAV header"
+        );
+        std::fs::remove_file(&tmp).unwrap();
         destroy(h);
     }
 

@@ -55,6 +55,8 @@ pub const SDR_EVT_DISPLAY_BANDWIDTH: i32 = 6;
 pub const SDR_EVT_ERROR: i32 = 7;
 pub const SDR_EVT_AUDIO_RECORDING_STARTED: i32 = 8;
 pub const SDR_EVT_AUDIO_RECORDING_STOPPED: i32 = 9;
+pub const SDR_EVT_IQ_RECORDING_STARTED: i32 = 10;
+pub const SDR_EVT_IQ_RECORDING_STOPPED: i32 = 11;
 
 // ============================================================
 //  SdrEvent tagged union — `#[repr(C)]` layout matching the
@@ -95,6 +97,18 @@ pub struct SdrEventAudioRecording {
     pub path_utf8: *const c_char,
 }
 
+/// Payload for `SDR_EVT_IQ_RECORDING_STARTED`. Same layout as
+/// `SdrEventAudioRecording` but declared separately so the union
+/// field name stays self-documenting for hosts and so the two
+/// feature paths can diverge in the future (e.g. if IQ recording
+/// grows a sample-rate field in the payload) without touching the
+/// audio path.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventIqRecording {
+    pub path_utf8: *const c_char,
+}
+
 /// C-layout tagged union of event payloads. Which field is valid
 /// is determined by the `kind` discriminant on the enclosing
 /// `SdrEvent`:
@@ -110,6 +124,8 @@ pub struct SdrEventAudioRecording {
 /// | `SDR_EVT_ERROR`                   | `error.utf8`                 |
 /// | `SDR_EVT_AUDIO_RECORDING_STARTED` | `audio_recording.path_utf8`  |
 /// | `SDR_EVT_AUDIO_RECORDING_STOPPED` | none                         |
+/// | `SDR_EVT_IQ_RECORDING_STARTED`    | `iq_recording.path_utf8`     |
+/// | `SDR_EVT_IQ_RECORDING_STOPPED`    | none                         |
 ///
 /// `_placeholder` exists so `SOURCE_STOPPED` events (which carry
 /// no payload) can still construct the struct with a meaningful
@@ -124,6 +140,7 @@ pub union SdrEventPayload {
     pub gain_list: SdrEventGainList,
     pub error: SdrEventError,
     pub audio_recording: SdrEventAudioRecording,
+    pub iq_recording: SdrEventIqRecording,
     /// Placeholder for kinds that carry no payload (e.g.,
     /// `SDR_EVT_SOURCE_STOPPED`). Accessing this field is always
     /// valid as a zero-byte read.
@@ -199,6 +216,16 @@ fn dispatcher_loop(rx: &mpsc::Receiver<DspToUi>, callback_guard: &EventCallbackG
 /// paths. If profiling ever shows contention here, we can reuse
 /// per-dispatcher scratch buffers like the CoreAudio render
 /// callback does.
+///
+/// The `#[allow(clippy::too_many_lines)]` here is deliberate: the
+/// function is a single `match` on the `DspToUi` enum where each
+/// arm is the minimum translation for one variant. Splitting it
+/// into per-variant helpers would push the `owned_cstring` /
+/// `owned_vec` lifetime plumbing across function boundaries
+/// without making the logic easier to read. The length grows
+/// linearly with each new event kind — that's inherent to this
+/// file's job.
+#[allow(clippy::too_many_lines)]
 fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<Vec<f64>>)> {
     let mut owned_cstring: Option<CString> = None;
     let mut owned_vec: Option<Vec<f64>> = None;
@@ -299,6 +326,27 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
             payload: SdrEventPayload { _placeholder: 0 },
         },
 
+        DspToUi::IqRecordingStarted(path) => {
+            // Same sanitize-then-CString pattern as AudioRecordingStarted.
+            let sanitized = path.to_string_lossy().replace('\0', "?");
+            let Ok(cstr) = CString::new(sanitized) else {
+                return None;
+            };
+            let ptr = cstr.as_ptr();
+            owned_cstring = Some(cstr);
+            SdrEvent {
+                kind: SDR_EVT_IQ_RECORDING_STARTED,
+                payload: SdrEventPayload {
+                    iq_recording: SdrEventIqRecording { path_utf8: ptr },
+                },
+            }
+        }
+
+        DspToUi::IqRecordingStopped => SdrEvent {
+            kind: SDR_EVT_IQ_RECORDING_STOPPED,
+            payload: SdrEventPayload { _placeholder: 0 },
+        },
+
         // Variants not yet exposed at the FFI boundary. Silently
         // dropped in v1; a future ABI minor bump grows the surface
         // to cover them as each feature lands in the macOS SwiftUI
@@ -309,8 +357,6 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         //     event callback — FFT frames go through the dedicated
         //     pull function (`sdr_core_pull_fft`) instead so the
         //     render loop stays on the main thread.
-        //   - `IqRecordingStarted/Stopped` light up when IQ
-        //     recording controls land in the macOS UI (issue #238).
         //   - `DemodModeChanged` is the transcription-session
         //     boundary event. macOS transcription IS on the
         //     roadmap — it's currently blocked on a Metal
@@ -330,8 +376,6 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         // of existing ones), so a future minor bump won't break
         // older hosts that don't know about them.
         DspToUi::FftData(_)
-        | DspToUi::IqRecordingStarted(_)
-        | DspToUi::IqRecordingStopped
         | DspToUi::DemodModeChanged(_)
         | DspToUi::BandwidthChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
@@ -607,6 +651,8 @@ mod tests {
         assert_eq!(SDR_EVT_ERROR, 7);
         assert_eq!(SDR_EVT_AUDIO_RECORDING_STARTED, 8);
         assert_eq!(SDR_EVT_AUDIO_RECORDING_STOPPED, 9);
+        assert_eq!(SDR_EVT_IQ_RECORDING_STARTED, 10);
+        assert_eq!(SDR_EVT_IQ_RECORDING_STOPPED, 11);
     }
 
     #[test]
