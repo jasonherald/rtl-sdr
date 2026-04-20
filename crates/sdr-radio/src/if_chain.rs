@@ -177,6 +177,14 @@ impl IfChain {
 
         // Stage 2: Squelch (manual or auto)
         if squelch_active {
+            // Snapshot before processing so we can log
+            // open↔closed transitions when auto-squelch is
+            // active — rare (once per voice burst) and useful
+            // for diagnosing gate behavior in the field
+            // (e.g. issue #348). The snapshot is cheap and
+            // gated on `auto_squelch` so manual-only paths pay
+            // nothing.
+            let pre_snapshot = self.squelch.diagnostic_snapshot();
             if current_is_a {
                 self.squelch
                     .process(&self.buf_a[..n], &mut self.buf_b[..n])?;
@@ -185,6 +193,17 @@ impl IfChain {
                     .process(&self.buf_b[..n], &mut self.buf_a[..n])?;
             }
             current_is_a = !current_is_a;
+
+            if pre_snapshot.auto_squelch && pre_snapshot.open != self.squelch.is_open() {
+                let post = self.squelch.diagnostic_snapshot();
+                tracing::debug!(
+                    transition = if post.open { "open" } else { "closed" },
+                    measured_db = post.last_measured_db,
+                    noise_floor_db = post.noise_floor_db,
+                    settle_count = post.settle_count,
+                    "auto-squelch gate transition"
+                );
+            }
         }
 
         // Stage 3: FM IF noise reduction
