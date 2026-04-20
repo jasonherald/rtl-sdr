@@ -283,13 +283,17 @@ where
         // gets the right answer. This does a backend query per
         // call in that path; the atomic multi-index case still
         // uses the cached snapshot.
+        //
+        // Delegates to `refresh_audio_device_snapshot()` so the
+        // refresh logic stays in one place — avoids drift between
+        // the `_count` path and the lazy path. Per CodeRabbit
+        // round 6 on PR #344.
         let idx = usize::try_from(index).unwrap_or(usize::MAX);
+        let needs_refresh = AUDIO_DEVICE_SNAPSHOT.with(|cell| cell.borrow().is_empty());
+        if needs_refresh {
+            let _ = refresh_audio_device_snapshot();
+        }
         AUDIO_DEVICE_SNAPSHOT.with(|cell| {
-            if cell.borrow().is_empty() {
-                let fresh = sdr_sink_audio::list_audio_sinks();
-                *cell.borrow_mut() = fresh;
-            }
-
             let snap = cell.borrow();
             let Some(dev) = snap.get(idx) else {
                 set_last_error(format!(
