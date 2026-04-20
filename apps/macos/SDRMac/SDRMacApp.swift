@@ -18,6 +18,7 @@ import SwiftUI
 struct SDRMacApp: App {
     @State private var core = CoreModel()
     @State private var bookmarks = BookmarksStore(storagePath: SDRMacApp.defaultBookmarksPath())
+    @State private var transcription = TranscriptionDriver()
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
@@ -26,9 +27,15 @@ struct SDRMacApp: App {
             ContentView()
                 .environment(core)
                 .environment(bookmarks)
+                .environment(transcription)
                 .frame(minWidth: 900, minHeight: 600)
                 .task {
                     await core.bootstrap(configPath: Self.defaultConfigPath())
+                    // Driver needs the engine handle to start the
+                    // audio tap; attach AFTER bootstrap so a
+                    // bootstrap failure doesn't leave a half-wired
+                    // driver reaching into a nil core.
+                    transcription.attach(core: core)
                     appDelegate.model = core
                 }
         }
