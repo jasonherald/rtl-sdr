@@ -439,13 +439,27 @@ pub extern "C" fn sdr_core_radioreference_delete_credentials() -> i32 {
 /// password into memory until an actual search happens.
 #[unsafe(no_mangle)]
 pub extern "C" fn sdr_core_radioreference_has_credentials() -> bool {
+    // Clear the thread-local last-error slot on BOTH the success
+    // path and the catch_unwind path. Without this, a stale
+    // message from an earlier failing FFI call (e.g. a failed
+    // save) would remain visible through
+    // `sdr_core_last_error_message` after a later probe here
+    // succeeded — and since this is the only credential FFI
+    // that swallows backend failures into a bool rather than
+    // returning a non-zero rc, it was the one path that silently
+    // inherited whatever was in the slot. Per CodeRabbit round
+    // 9 on PR #346.
     std::panic::catch_unwind(|| {
         let store = KeyringStore::new(KEYRING_SERVICE);
         let user = matches!(store.get(KEY_RR_USERNAME), Ok(Some(s)) if !s.is_empty());
         let pass = matches!(store.get(KEY_RR_PASSWORD), Ok(Some(s)) if !s.is_empty());
+        clear_last_error();
         user && pass
     })
-    .unwrap_or(false)
+    .unwrap_or_else(|_| {
+        clear_last_error();
+        false
+    })
 }
 
 // ============================================================
