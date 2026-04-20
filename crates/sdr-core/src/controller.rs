@@ -240,6 +240,14 @@ struct DspState {
     network_sink_port: u16,
     /// Network sink protocol. Defaults to TCP server.
     network_sink_protocol: sdr_types::Protocol,
+    /// Latched after a terminal `write_samples` failure
+    /// (`SinkError::Disconnected` / `NotRunning`) so the next
+    /// audio block doesn't re-fire the same warning + status
+    /// event. Cleared on every successful `audio_sink.start()`
+    /// — which means a sink-type swap, a network reconfig
+    /// rebuild, or a fresh engine `Start` all rearm the path.
+    /// Per `CodeRabbit` round 2 on PR #351.
+    audio_sink_offline: bool,
     running: bool,
     center_freq: f64,
     sample_rate: f64,
@@ -377,6 +385,7 @@ impl DspState {
             network_sink_host: DEFAULT_NETWORK_SINK_HOST.to_string(),
             network_sink_port: DEFAULT_NETWORK_SINK_PORT,
             network_sink_protocol: DEFAULT_NETWORK_SINK_PROTOCOL,
+            audio_sink_offline: false,
             running: false,
             center_freq: DEFAULT_CENTER_FREQ,
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -437,6 +446,14 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     // the UI sees a real `NetworkSinkStatus::Error` event
                     // instead of a generic toast.
                     let start_result = state.audio_sink.start();
+                    // Successful start re-arms the write path —
+                    // see `audio_sink_offline` docstring. We
+                    // clear *before* discriminating success vs
+                    // failure so a successful start never leaves
+                    // the gate latched from a previous session.
+                    if start_result.is_ok() {
+                        state.audio_sink_offline = false;
+                    }
                     let is_network = matches!(state.audio_sink_type, AudioSinkType::Network);
                     if let Err(e) = start_result {
                         tracing::warn!(
@@ -938,6 +955,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if state.audio_sink_type == new_type {
                 return;
             }
+            // Snapshot the previous type so the post-swap
+            // status logic can emit the correct "transitioning
+            // away from network" event even when the
+            // replacement local sink fails to start. Per
+            // CodeRabbit round 2 on PR #351.
+            let prev_type = state.audio_sink_type;
             // Stop the current sink so it releases its underlying
             // resource (audio device handle / socket) before we
             // construct the replacement.
@@ -974,6 +997,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if state.running {
                 match state.audio_sink.start() {
                     Ok(()) => {
+                        // Successful start clears the offline
+                        // latch so the audio write path resumes.
+                        state.audio_sink_offline = false;
                         if matches!(new_type, AudioSinkType::Network) {
                             let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
                                 NetworkSinkStatus::Active {
@@ -1003,6 +1029,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         } else {
                             let _ = dsp_tx
                                 .send(DspToUi::Error(format!("Audio sink failed to start: {e}")));
+                            // Even on failure, the network sink
+                            // is gone — emit Inactive so the
+                            // panel's status row clears its
+                            // "Active" state. Per CodeRabbit
+                            // round 2 on PR #351.
+                            if matches!(prev_type, AudioSinkType::Network) {
+                                let _ = dsp_tx
+                                    .send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
+                            }
                         }
                     }
                 }
@@ -1041,6 +1076,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 if state.running {
                     match state.audio_sink.start() {
                         Ok(()) => {
+                            state.audio_sink_offline = false;
                             let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
                                 NetworkSinkStatus::Active {
                                     endpoint: format!("{hostname}:{port}"),
@@ -1774,9 +1810,21 @@ fn process_iq_block(
                                 .audio_frames_written
                                 .saturating_add(audio_count as u64);
                         }
-                        if let Err(e) = state
-                            .audio_sink
-                            .write_samples(&state.audio_buf[..audio_count])
+                        // Skip the write if the sink has already
+                        // gone offline this session. Without this
+                        // gate, every audio block would re-trip
+                        // the terminal-error branch below (the
+                        // sink stays in place after stop(), so
+                        // `write_samples` keeps returning
+                        // NotRunning) and re-emit the same
+                        // status/error event at DSP cadence —
+                        // ~50 events/sec of log noise + UI churn.
+                        // Per `CodeRabbit` round 2 on PR #351.
+                        // Cleared on the next successful start.
+                        if !state.audio_sink_offline
+                            && let Err(e) = state
+                                .audio_sink
+                                .write_samples(&state.audio_buf[..audio_count])
                         {
                             // Terminal failures: surface to UI once and stop the sink.
                             if matches!(e, SinkError::Disconnected | SinkError::NotRunning) {
@@ -1800,6 +1848,10 @@ fn process_iq_block(
                                     ));
                                 }
                                 let _ = state.audio_sink.stop();
+                                // Latch — see the docstring on
+                                // `audio_sink_offline` for the
+                                // full one-shot rationale.
+                                state.audio_sink_offline = true;
                             } else {
                                 tracing::debug!("audio write: {e}");
                             }

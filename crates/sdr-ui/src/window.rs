@@ -4500,11 +4500,22 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
         .audio
         .sink_type_row
         .connect_selected_notify(move |row| {
-            let idx = row.selected();
-            let new_type = if idx == sidebar::audio_panel::SINK_TYPE_NETWORK_IDX {
-                sdr_core::AudioSinkType::Network
-            } else {
-                sdr_core::AudioSinkType::Local
+            // Match explicitly against both legal indices and
+            // early-return on anything else. The previous shape
+            // mapped any non-Network value to Local, which would
+            // silently dispatch a sink swap on a transient or
+            // future-added combo entry that this handler doesn't
+            // know about. Per CodeRabbit round 2 on PR #351.
+            let new_type = match row.selected() {
+                sidebar::audio_panel::SINK_TYPE_LOCAL_IDX => sdr_core::AudioSinkType::Local,
+                sidebar::audio_panel::SINK_TYPE_NETWORK_IDX => sdr_core::AudioSinkType::Network,
+                unknown => {
+                    tracing::warn!(
+                        selected_idx = unknown,
+                        "audio sink-type combo emitted unknown index; ignoring"
+                    );
+                    return;
+                }
             };
             let network_visible = matches!(new_type, sdr_core::AudioSinkType::Network);
             host_row.set_visible(network_visible);
