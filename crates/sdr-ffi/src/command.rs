@@ -604,6 +604,14 @@ mod tests {
     use crate::lifecycle::sdr_core_create;
     use std::ffi::CString;
 
+    /// Small grace period the round-trip recording tests wait
+    /// after `stop` so the controller thread has time to drop
+    /// the writer (which finalizes the WAV header on `Drop`)
+    /// before the test cleans up the file. Sub-second so the
+    /// test suite stays fast; large enough to comfortably cover
+    /// the mpsc hop plus file-close syscall on any CI host.
+    const RECORDING_FLUSH_WAIT_MS: u64 = 50;
+
     /// Helper: make a live engine handle for the duration of a test.
     fn make_handle() -> *mut SdrCore {
         let path = CString::new("").unwrap();
@@ -725,7 +733,7 @@ mod tests {
         // then clean up. If the file wasn't created (e.g., the DSP
         // thread hadn't processed the command yet) remove_file errs;
         // that's fine — test doesn't depend on it.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
         let _ = std::fs::remove_file(&tmp);
         destroy(h);
     }
@@ -761,7 +769,7 @@ mod tests {
             unsafe { sdr_core_stop_iq_recording(h) },
             SdrCoreError::Ok.as_int()
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
         let _ = std::fs::remove_file(&tmp);
         destroy(h);
     }

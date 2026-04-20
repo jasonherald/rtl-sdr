@@ -111,9 +111,25 @@ private struct RecordingToggleRow: View {
     /// Start* commands (the controller replaces the writer on
     /// each start, dropping the first writer mid-write → two
     /// partial WAV files). Cleared in `.onChange(of:)` when the
-    /// engine confirms the transition, or when a `lastError`
-    /// arrives while we're pending (start failed).
+    /// engine confirms the transition, or by the watchdog below
+    /// if the engine never confirms (failed-start path).
     @State private var pendingTransition: Bool = false
+
+    /// Cancellable watchdog that force-unlocks `pendingTransition`
+    /// if the engine doesn't confirm the transition within a
+    /// grace period. Per CodeRabbit round 1 on PR #345: an earlier
+    /// approach watched `model.lastError`, but (a) that's a shared
+    /// slot so any app error would unlock the wrong row, and
+    /// (b) `onChange` doesn't fire when the same error value is
+    /// reassigned, so repeated identical failures would wedge
+    /// the toggle forever.
+    ///
+    /// The watchdog covers only the failed-**start** case. Stops
+    /// always emit `AudioRecordingStopped` / `IqRecordingStopped`
+    /// (including on shutdown), so `onChange(of: recordingPath)`
+    /// is reliable for them. Starts that fail at the WAV-open
+    /// stage emit only a `DspToUi::Error(...)` with no path flip.
+    @State private var watchdogTask: Task<Void, Never>?
 
     var body: some View {
         let recording = recordingPath != nil
@@ -128,16 +144,20 @@ private struct RecordingToggleRow: View {
                 } else {
                     stop()
                 }
+                armWatchdog()
             }
         ))
         .disabled(pendingTransition)
         .onChange(of: recordingPath) { _, _ in
+            // Engine confirmed the transition — happy path.
+            // Cancel the watchdog (harmless if it already fired)
+            // and unlock.
+            watchdogTask?.cancel()
+            watchdogTask = nil
             pendingTransition = false
         }
-        .onChange(of: model.lastError) { _, new in
-            if pendingTransition && new != nil {
-                pendingTransition = false
-            }
+        .onDisappear {
+            watchdogTask?.cancel()
         }
 
         if let path = recordingPath {
@@ -162,6 +182,32 @@ private struct RecordingToggleRow: View {
                 }
                 .buttonStyle(.plain)
                 .help(path)
+            }
+        }
+    }
+
+    /// Grace period before the watchdog force-unlocks the toggle.
+    /// Real confirmation latency is sub-millisecond — the engine
+    /// opens the WAV file synchronously on the controller thread
+    /// after the mpsc hop. 5 seconds is "much longer than any
+    /// healthy round-trip" so a legitimate slow start (e.g.,
+    /// controller queue is briefly backed up) still has headroom
+    /// to confirm before the watchdog intervenes.
+    private static let watchdogGrace: Duration = .seconds(5)
+
+    /// (Re)arm the watchdog. Cancels any previous pending task so
+    /// back-to-back start/stop clicks don't leave stale watchdogs
+    /// that would later clobber a newer `pendingTransition`.
+    private func armWatchdog() {
+        watchdogTask?.cancel()
+        watchdogTask = Task { @MainActor in
+            try? await Task.sleep(for: Self.watchdogGrace)
+            if !Task.isCancelled {
+                // Engine never confirmed. Unlock so the user can
+                // retry. A genuine (eventual) confirmation that
+                // arrives after this is a no-op — the path flip
+                // just sets pendingTransition = false again.
+                pendingTransition = false
             }
         }
     }
