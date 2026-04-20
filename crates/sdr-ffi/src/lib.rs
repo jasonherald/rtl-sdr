@@ -41,6 +41,7 @@
 #![allow(clippy::missing_safety_doc)] // safety contract is documented in include/sdr_core.h
 #![allow(clippy::doc_markdown)]
 
+pub mod audio_tap;
 pub mod command;
 pub mod enumerate;
 pub mod error;
@@ -53,6 +54,7 @@ pub mod radioreference;
 // Re-export the FFI symbols at the crate root so consumers that link
 // the rlib (in-tree integration tests) can reference them via
 // `sdr_ffi::sdr_core_*`.
+pub use audio_tap::{SdrAudioTapCallback, sdr_core_start_audio_tap, sdr_core_stop_audio_tap};
 pub use command::{
     sdr_core_set_agc, sdr_core_set_audio_device, sdr_core_set_auto_squelch, sdr_core_set_bandwidth,
     sdr_core_set_dc_blocking, sdr_core_set_decimation, sdr_core_set_deemphasis,

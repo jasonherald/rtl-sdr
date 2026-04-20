@@ -21,7 +21,7 @@ use crate::handle::SdrCore;
 /// time `const _` in the test module below asserts the two stay
 /// consistent.
 pub const ABI_VERSION_MAJOR: u32 = 0;
-pub const ABI_VERSION_MINOR: u32 = 7;
+pub const ABI_VERSION_MINOR: u32 = 8;
 
 /// Return the ABI version the library was built with.
 ///
@@ -212,7 +212,15 @@ pub unsafe extern "C" fn sdr_core_destroy(handle: *mut SdrCore) {
         // SAFETY: Caller contract guarantees `handle` is a
         // pointer previously returned by sdr_core_create and not
         // yet destroyed. Box::from_raw takes ownership back.
-        let core: Box<SdrCore> = unsafe { Box::from_raw(handle) };
+        let mut core: Box<SdrCore> = unsafe { Box::from_raw(handle) };
+
+        // Stop any active audio tap BEFORE engine shutdown. The
+        // tap's dispatcher thread holds the host's `user_data`
+        // pointer; if the host drops that state immediately
+        // after `sdr_core_destroy` returns, a still-live
+        // dispatcher would be use-after-free on the next chunk.
+        // Per issue #314. No-op when no tap is active.
+        let _ = crate::audio_tap::stop_audio_tap_internal(&mut core);
 
         // Best-effort Stop so the controller stops the active
         // source cleanly. If the channel is already closed
@@ -326,7 +334,7 @@ mod tests {
     /// build here rather than drifting silently.
     const _: () = {
         assert!(ABI_VERSION_MAJOR == 0);
-        assert!(ABI_VERSION_MINOR == 7);
+        assert!(ABI_VERSION_MINOR == 8);
     };
 
     #[test]

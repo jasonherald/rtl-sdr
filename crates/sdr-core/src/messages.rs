@@ -188,6 +188,18 @@ pub enum UiToDsp {
     EnableTranscription(std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>),
     /// Stop sending audio to the transcription engine.
     DisableTranscription,
+    /// Enable a generic audio tap that receives 16 kHz mono f32
+    /// samples downsampled from the post-demod 48 kHz stereo
+    /// stream. Distinct from `EnableTranscription` which pushes
+    /// 48 kHz interleaved stereo to the sdr-transcription backends;
+    /// this path targets FFI consumers that want a
+    /// speech-recognizer-ready stream (e.g. the macOS `SpeechAnalyzer`
+    /// path for issue #314) without pulling the sdr-transcription
+    /// dependency across the FFI.
+    EnableAudioTap(std::sync::mpsc::SyncSender<Vec<f32>>),
+    /// Disable the audio tap enabled by `EnableAudioTap`. No-op when
+    /// no tap is active.
+    DisableAudioTap,
     /// Stop the `rtl_tcp` client connection without changing the
     /// selected source type. Sends `source.stop()` so the manager
     /// thread tears down and the connection state transitions to
@@ -518,6 +530,18 @@ mod tests {
 
         let disable = UiToDsp::DisableTranscription;
         assert!(matches!(disable, UiToDsp::DisableTranscription));
+
+        // Audio tap (issue #314) — constructed here so a future
+        // signature tweak to the Vec<f32> payload or the
+        // SyncSender<...> type fails this regression net rather
+        // than silently going quiet at the FFI handler site. Per
+        // CodeRabbit round 1 on PR #349.
+        let (tap_tx, _tap_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let enable_tap = UiToDsp::EnableAudioTap(tap_tx);
+        assert!(matches!(enable_tap, UiToDsp::EnableAudioTap(_)));
+
+        let disable_tap = UiToDsp::DisableAudioTap;
+        assert!(matches!(disable_tap, UiToDsp::DisableAudioTap));
 
         // RTL-TCP connection controls (commit 3 of PR #335) —
         // constructed directly so a future signature change (e.g.
