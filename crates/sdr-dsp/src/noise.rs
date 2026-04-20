@@ -13,6 +13,23 @@ use sdr_types::{Complex, DspError};
 /// Small values track slowly, avoiding false adaptation to transient signals.
 const NOISE_FLOOR_ALPHA: f32 = 0.02;
 
+/// Slow-creep EMA coefficient used when auto-squelch is open
+/// AND the measured signal sits well above the tracked noise
+/// floor. Without this, the "only update when closed or near
+/// noise" rule below locks `noise_floor_db` at whatever it
+/// converged to at the end of the settle window. On a channel
+/// with a persistent carrier that settle often overshoots, and
+/// the gate stays open forever.
+///
+/// Picked so a carrier 25 dB above noise pulls the floor close
+/// enough to the close-margin in ~7 seconds (25 dB * 0.002 per
+/// block * 50 blocks/sec ≈ 2.5 dB/sec → needs ~8s to close the
+/// gap to the 6 dB close margin). Slow enough that a 1-2 sec
+/// voice burst doesn't materially shift the floor (EMA rise in
+/// 2s at this alpha ≈ 0.2 * gap → negligible for short bursts).
+/// Per issue #348.
+const NOISE_FLOOR_STUCK_RECOVERY_ALPHA: f32 = 0.002;
+
 /// Fast alpha used during the initial convergence period.
 ///
 /// Allows the noise floor to quickly reach the actual noise level from the
@@ -231,6 +248,10 @@ pub struct PowerSquelch {
     /// Number of blocks processed since auto-squelch was enabled.
     /// Used to detect the initial convergence period.
     settle_count: u32,
+    /// Last `measured_db` this processor computed. Exposed via
+    /// `diagnostic_snapshot` for issue #348 investigation; no
+    /// behavioral effect.
+    last_measured_db: f32,
 }
 
 impl PowerSquelch {
@@ -244,6 +265,7 @@ impl PowerSquelch {
             auto_squelch: false,
             noise_floor_db: NOISE_FLOOR_INITIAL_DB,
             settle_count: 0,
+            last_measured_db: NOISE_FLOOR_INITIAL_DB,
         }
     }
 
@@ -312,6 +334,7 @@ impl PowerSquelch {
         // Convert to standard dB: 20*log10(amplitude) = 10*log10(power).
         // This matches the standard dBFS convention used by most SDR tools.
         let measured_db = 20.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
+        self.last_measured_db = measured_db;
 
         let threshold_db = if self.auto_squelch {
             // During the initial settling period, use a fast alpha so the
@@ -338,8 +361,33 @@ impl PowerSquelch {
                 );
             } else if !self.open || measured_db < self.noise_floor_db + AUTO_SQUELCH_CLOSE_MARGIN_DB
             {
+                // Near-noise regime: gate is closed or the
+                // signal is within close-margin of the tracked
+                // floor. Track at the normal alpha; this is the
+                // hot path whenever the channel is actually
+                // quiet.
                 self.noise_floor_db = NOISE_FLOOR_ALPHA
                     .mul_add(measured_db, (1.0 - NOISE_FLOOR_ALPHA) * self.noise_floor_db);
+            } else {
+                // Gate is open AND signal is well above the
+                // tracked floor — typical mid-transmission
+                // case. Previous behavior: skip the update
+                // entirely (keeps the floor from being dragged
+                // up by a brief signal). Problem: on a channel
+                // with a persistent carrier, OR when the
+                // settle window happened to capture live
+                // signal, the floor never recovers and the
+                // gate is stuck open forever. Fix: creep
+                // upward at a much slower alpha so a truly
+                // persistent signal pulls the floor close
+                // enough to the close margin within ~7
+                // seconds, restoring normal gate dynamics.
+                // Brief voice bursts barely move the floor at
+                // this rate. Per issue #348.
+                self.noise_floor_db = NOISE_FLOOR_STUCK_RECOVERY_ALPHA.mul_add(
+                    measured_db,
+                    (1.0 - NOISE_FLOOR_STUCK_RECOVERY_ALPHA) * self.noise_floor_db,
+                );
             }
 
             // During settling, keep squelch open (pass audio through) so
@@ -376,6 +424,33 @@ impl PowerSquelch {
         }
         Ok(input.len())
     }
+
+    /// Snapshot of squelch internals for callers that want to
+    /// log state at their layer (tracing belongs in the crate
+    /// that already depends on it — `sdr-dsp` stays pure).
+    pub fn diagnostic_snapshot(&self) -> PowerSquelchDiagnostic {
+        PowerSquelchDiagnostic {
+            auto_squelch: self.auto_squelch,
+            open: self.open,
+            noise_floor_db: self.noise_floor_db,
+            settle_count: self.settle_count,
+            level_db: self.level_db,
+            last_measured_db: self.last_measured_db,
+        }
+    }
+}
+
+/// Snapshot of [`PowerSquelch`] internals for diagnostic logging
+/// by higher-level crates that already depend on `tracing`.
+/// Never correlated with audio content — just gate state.
+#[derive(Debug, Clone, Copy)]
+pub struct PowerSquelchDiagnostic {
+    pub auto_squelch: bool,
+    pub open: bool,
+    pub noise_floor_db: f32,
+    pub settle_count: u32,
+    pub level_db: f32,
+    pub last_measured_db: f32,
 }
 
 /// Noise blanker — attenuates impulse noise spikes.
@@ -710,6 +785,86 @@ mod tests {
         assert!(
             output[0].re.abs() < 1e-10,
             "output should be zeroed when squelch closed"
+        );
+    }
+
+    #[test]
+    fn test_auto_squelch_recovers_from_overshoot_settle() {
+        // Regression for issue #348.
+        //
+        // Scenario: user enables auto-squelch while a strong
+        // carrier is on the channel. The 50-block settle window
+        // pulls `noise_floor_db` UP to the carrier level, so
+        // post-settle the gate correctly reports open. Before
+        // the slow-creep recovery fix, `noise_floor_db` then
+        // locked at that elevated value because the post-settle
+        // update rule only fired when the gate was closed OR
+        // the measurement was within the close margin — neither
+        // is true for a persistent carrier above the close
+        // margin. The gate stayed open forever.
+        //
+        // This test: enable auto-squelch with strong signal
+        // throughout the settle window, then keep the same
+        // signal running for enough post-settle blocks to
+        // exercise the slow-creep path. Assert `noise_floor_db`
+        // visibly creeps toward the signal level — proving the
+        // recovery path is active — and that after enough time
+        // it's climbed far enough that a subsequent drop below
+        // the original floor closes the gate.
+        let mut squelch = PowerSquelch::new(-60.0);
+        squelch.set_auto_squelch(true);
+
+        // Strong signal (amplitude 0.1 → -20 dB).
+        let strong = vec![Complex::new(0.1, 0.0); 128];
+        let mut out = vec![Complex::default(); 128];
+
+        // Drive 50 settle blocks; capture the post-settle floor.
+        for _ in 0..50 {
+            squelch.process(&strong, &mut out).unwrap();
+        }
+        let floor_after_settle = squelch.noise_floor_db();
+        assert!(
+            squelch.is_open(),
+            "strong signal must open the gate during / after settle"
+        );
+
+        // Now 500 post-settle blocks of the same strong signal.
+        // With the stuck-recovery fix the slow-creep alpha
+        // pulls the floor upward toward the signal level;
+        // without it the floor stays frozen at the settle value
+        // forever.
+        for _ in 0..500 {
+            squelch.process(&strong, &mut out).unwrap();
+        }
+        let floor_after_creep = squelch.noise_floor_db();
+
+        // The exact delta depends on the settle overshoot and
+        // the recovery alpha; empirically ~35 dB of climb at
+        // alpha=0.002 over 500 blocks starting from the typical
+        // post-settle floor. Assert a conservative "it moved
+        // meaningfully" threshold (≥ 10 dB upward) rather than
+        // pinning the specific value, so minor tuning of the
+        // alpha doesn't force a test rewrite.
+        let climb_db = floor_after_creep - floor_after_settle;
+        assert!(
+            climb_db > 10.0,
+            "stuck-recovery must pull noise_floor up under persistent signal; \
+             observed climb of only {climb_db:.2} dB \
+             ({floor_after_settle:.2} dB → {floor_after_creep:.2} dB) (#348)"
+        );
+
+        // Now drop the signal well below the new floor. With
+        // the fix the gate closes promptly because the floor
+        // has already climbed (so the close-margin gate of the
+        // EMA update fires + fast track-down), returning the
+        // squelch to its normal closed-on-silence behavior.
+        let silence = vec![Complex::new(0.000_01, 0.0); 128];
+        for _ in 0..50 {
+            squelch.process(&silence, &mut out).unwrap();
+        }
+        assert!(
+            !squelch.is_open(),
+            "after recovery + silence the gate must close"
         );
     }
 
