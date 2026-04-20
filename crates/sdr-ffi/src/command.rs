@@ -365,6 +365,92 @@ pub unsafe extern "C" fn sdr_core_set_deemphasis(handle: *mut SdrCore, mode: i32
 }
 
 // ============================================================
+//  Advanced demod — #245 exposure
+// ============================================================
+//
+//  These route straight to the existing `UiToDsp` messages the
+//  GTK UI already drives. Mode-gating (e.g. WFM stereo only
+//  meaningful in WFM) lives on the host side — the engine
+//  accepts the setter in any mode but ignores it when the
+//  active demod doesn't care, which matches the GTK UI's
+//  pattern of still letting the user set the toggle ahead of a
+//  mode switch. Per ABI minor bump 0.7 on PR #347.
+
+/// Enable or disable the noise blanker.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_nb_enabled(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetNbEnabled(enabled))) }
+}
+
+/// Set the noise-blanker threshold multiplier. Must be finite
+/// and `>= 1.0` (the engine treats the level as a multiplier
+/// over the running sample amplitude; `< 1.0` would clip every
+/// sample). Values exceeding 1.0 loosen the blanking threshold.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_nb_level(handle: *mut SdrCore, level: f32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            require_finite("sdr_core_set_nb_level", f64::from(level))?;
+            if level < 1.0 {
+                set_last_error(format!(
+                    "sdr_core_set_nb_level: level must be >= 1.0, got {level}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::SetNbLevel(level))
+        })
+    }
+}
+
+/// Enable or disable FM IF noise reduction. No-op when the
+/// active demod is not an FM mode; host UIs typically hide the
+/// toggle outside WFM / NFM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_fm_if_nr_enabled(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            send(core, UiToDsp::SetFmIfNrEnabled(enabled))
+        })
+    }
+}
+
+/// Enable or disable WFM stereo decode. Only meaningful in WFM
+/// mode; the engine ignores the setting in other modes but the
+/// host UI should also gate visibility.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_wfm_stereo(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetWfmStereo(enabled))) }
+}
+
+/// Enable or disable the audio-stage notch filter.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_notch_enabled(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetNotchEnabled(enabled))) }
+}
+
+/// Set the audio-stage notch filter frequency in Hz. Must be
+/// finite and `> 0`. The engine clamps to the audio-rate
+/// Nyquist internally; passing a value above Nyquist is not an
+/// error here because the clamp is sample-rate dependent and
+/// the FFI has no stable reference to that without querying
+/// the engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_notch_frequency(handle: *mut SdrCore, freq_hz: f32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            require_finite("sdr_core_set_notch_frequency", f64::from(freq_hz))?;
+            if freq_hz <= 0.0 {
+                set_last_error(format!(
+                    "sdr_core_set_notch_frequency: frequency must be > 0 Hz, got {freq_hz}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::SetNotchFrequency(freq_hz))
+        })
+    }
+}
+
+// ============================================================
 //  Audio
 // ============================================================
 
