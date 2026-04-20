@@ -805,6 +805,17 @@ final class CoreModel {
     }
 
     func setNoiseBlankerLevel(_ level: Float) {
+        // Guard BEFORE the optimistic write so a programmatic
+        // caller passing NaN / Inf / < 1.0 (the UI slider itself
+        // is bounded at 1.0...10.0, but any Swift call path can
+        // reach this setter) doesn't leave the UI showing a
+        // value the engine rejected. Keeps the ABI-level
+        // constraint from NB_LEVEL_MIN in sync on both sides.
+        // Per CodeRabbit round 2 on PR #347.
+        guard level.isFinite, level >= 1.0 else {
+            lastError = "invalid noise blanker level: \(level)"
+            return
+        }
         noiseBlankerLevel = level
         capture { try core?.setNoiseBlankerLevel(level) }
     }
@@ -825,6 +836,13 @@ final class CoreModel {
     }
 
     func setNotchFrequencyHz(_ hz: Float) {
+        // Matches the FFI's `freq_hz > 0` contract — reject
+        // invalid input up front so UI state can't diverge from
+        // engine state when a caller bypasses the slider bounds.
+        guard hz.isFinite, hz > 0 else {
+            lastError = "invalid notch frequency: \(hz)"
+            return
+        }
         notchFrequencyHz = hz
         capture { try core?.setNotchFrequencyHz(hz) }
     }
@@ -849,6 +867,17 @@ final class CoreModel {
     }
 
     func setDecimation(_ factor: UInt32) {
+        // Engine's `SetDecimation` handler requires a nonzero
+        // power of two. `nonzeroBitCount == 1` is equivalent to
+        // "exactly one bit set," which captures both conditions
+        // in one expression. The UI picker only emits values
+        // from {1, 2, 4, 8, 16}, but a programmatic caller
+        // could pass anything — reject-with-lastError keeps the
+        // UI honest.
+        guard factor.nonzeroBitCount == 1 else {
+            lastError = "invalid decimation factor: \(factor)"
+            return
+        }
         decimationFactor = factor
         capture { try core?.setDecimation(factor) }
     }
