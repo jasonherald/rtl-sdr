@@ -20,9 +20,20 @@
 
 @preconcurrency import AVFoundation
 import Foundation
+import OSLog
 import Observation
 import SdrCoreKit
 import Speech
+
+/// Debug-level logger for the transcription feeder path. Kept
+/// content-free on purpose — we log error codes and counts,
+/// never transcript text or audio samples, so nothing the
+/// Responsible Use section in the README promises to keep
+/// local leaks through Apple's unified log.
+private let transcriptionLog = Logger(
+    subsystem: "com.sdr.rs",
+    category: "transcription"
+)
 
 @Observable
 @MainActor
@@ -553,7 +564,18 @@ final class TranscriptionDriver {
                     outStatus.pointee = .haveData
                     return tapBuffer
                 }
-                if error != nil { continue }
+                if let error {
+                    // Track conversion failures without sending
+                    // transcript content (responsible-use policy
+                    // — see the README). At the debug level so
+                    // release builds stay silent unless the user
+                    // opts in to verbose logging. Per CodeRabbit
+                    // round 5 on PR #349.
+                    transcriptionLog.debug(
+                        "AVAudioConverter failure: code=\(error.code) domain=\(error.domain, privacy: .public)"
+                    )
+                    continue
+                }
                 outBuffer = converted
             } else {
                 outBuffer = tapBuffer
