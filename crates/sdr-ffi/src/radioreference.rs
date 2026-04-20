@@ -52,6 +52,13 @@ const KEY_RR_USERNAME: &str = "radioreference-username";
 /// Keyring key for the RadioReference password.
 const KEY_RR_PASSWORD: &str = "radioreference-password";
 
+/// Expected length of a US ZIP code in ASCII digits.
+/// RadioReference only serves US frequencies, so callers must
+/// pass a 5-digit zip; we validate on our side before hitting
+/// the network so a typo doesn't round-trip to RR as a generic
+/// SOAP fault.
+const RR_ZIP_LEN: usize = 5;
+
 /// Upper bound on usernames / passwords we'll round-trip through
 /// the load call. RadioReference usernames and passwords don't
 /// have documented length limits, but 512 bytes each is
@@ -212,15 +219,17 @@ pub unsafe extern "C" fn sdr_core_radioreference_save_credentials(
             return map_keyring_error("sdr_core_radioreference_save_credentials", &e).as_int();
         }
         if let Err(e) = store.set(KEY_RR_PASSWORD, &pass) {
-            // If the password write fails, the username is
-            // already in the keyring — leaving it there paired
-            // with whatever stale password existed before would
-            // create a mixed-credentials state later (future
-            // load returns that stale pair as if it were valid).
-            // Clean up the username so the caller sees "no
-            // credentials stored" on the next load. Per
-            // CodeRabbit round 2 on PR #346.
+            // Break the pair from BOTH sides. Deleting only the
+            // username would leave a prior-session's stale
+            // password still sitting in the keyring, which —
+            // paired with the just-written username — would
+            // surface on the next load as valid credentials.
+            // Delete both so the caller sees "no credentials
+            // stored" on the next load, regardless of which
+            // delete succeeds. Per CodeRabbit round 2 + 5 on
+            // PR #346.
             let _ = store.delete(KEY_RR_USERNAME);
+            let _ = store.delete(KEY_RR_PASSWORD);
             return map_keyring_error("sdr_core_radioreference_save_credentials", &e).as_int();
         }
 
@@ -602,8 +611,9 @@ pub unsafe extern "C" fn sdr_core_radioreference_search_zip(
 
         // RR expects a 5-digit US ZIP — validate on our side so a
         // typo doesn't round-trip to the network and come back as
-        // a generic SOAP fault.
-        if zip.len() != 5 || !zip.chars().all(|c| c.is_ascii_digit()) {
+        // a generic SOAP fault. The exact length lives at the
+        // top of the module as `RR_ZIP_LEN`.
+        if zip.len() != RR_ZIP_LEN || !zip.chars().all(|c| c.is_ascii_digit()) {
             set_last_error(format!(
                 "sdr_core_radioreference_search_zip: zip must be 5 digits, got {zip:?}"
             ));

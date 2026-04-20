@@ -107,6 +107,14 @@ private struct RadioReferencePane: View {
     @State private var isWorking: Bool = false
     @State private var statusMessage: String = ""
     @State private var statusIsError: Bool = false
+    /// One-shot latch so `prefillFromKeychain` only runs on the
+    /// first `.onAppear`. In a TabView, switching tabs away and
+    /// back re-fires `.onAppear`, which would otherwise clobber
+    /// any username edits the user made (password isn't affected
+    /// because it's never prefilled, but that asymmetry was
+    /// exactly the mixed-pair risk the rabbit flagged in round 5
+    /// of PR #346).
+    @State private var didPrefill: Bool = false
 
     var body: some View {
         Form {
@@ -169,7 +177,11 @@ private struct RadioReferencePane: View {
                 }
             }
         }
-        .onAppear(perform: prefillFromKeychain)
+        .onAppear {
+            guard !didPrefill else { return }
+            didPrefill = true
+            prefillFromKeychain()
+        }
     }
 
     /// Load the stored username (if any) into the TextField so
