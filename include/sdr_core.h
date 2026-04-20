@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 7
+#define SDR_CORE_ABI_VERSION_MINOR 8
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -833,6 +833,86 @@ int32_t sdr_core_set_event_callback(
     SdrEventCallback callback,
     void*            user_data
 );
+
+/* ================================================================ */
+/*  Audio tap (ABI 0.8)                                             */
+/* ================================================================ */
+
+/*
+ * Stream post-demod audio to a host-side consumer at 16 kHz mono
+ * f32. Primary use case: feeding macOS `SpeechAnalyzer` /
+ * `SpeechTranscriber` for the transcription panel (issue #314).
+ *
+ * Shape: push-style via a C callback. Each time the engine
+ * finishes an audio block the DSP thread downsamples the stereo
+ * 48 kHz buffer to mono 16 kHz and hands the chunk to a bounded
+ * queue drained by a dedicated FFI dispatcher thread. The
+ * dispatcher invokes the host callback with a pointer into the
+ * chunk and the chunk length (sample count, not bytes).
+ *
+ * Only one tap can be active per handle at a time. Calling
+ * `_start_audio_tap` a second time without an intervening
+ * `_stop_audio_tap` returns `SDR_CORE_ERR_INVALID_HANDLE` with
+ * a descriptive last-error message. Callers are expected to tear
+ * down and restart if they want to swap callbacks.
+ *
+ * Lifetime: the registered callback + `user_data` must remain
+ * valid between `_start_audio_tap` and the matching
+ * `_stop_audio_tap` (or until `sdr_core_destroy`, which stops
+ * the tap as part of teardown). `_stop_audio_tap` joins the
+ * dispatcher thread before returning, so the host can
+ * deterministically free `user_data` immediately on the next
+ * line.
+ *
+ * Thread: the callback fires on the dispatcher thread (named
+ * `sdr-ffi-audio-tap-dispatcher`), NOT the host's main thread.
+ * Hosts that need main-actor work (SwiftUI state updates, etc.)
+ * must marshal across.
+ */
+
+/*
+ * Audio-tap callback.
+ *
+ * `samples` points into the dispatcher thread's stack; valid
+ * only for the duration of this call. `sample_count` is the
+ * number of `float` samples (not bytes). Format: 16 kHz mono
+ * f32. `user_data` is the opaque pointer the host passed at
+ * registration.
+ */
+typedef void (*SdrAudioTapCallback)(
+    const float* samples,
+    size_t       sample_count,
+    void*        user_data
+);
+
+/*
+ * Start streaming audio to `callback`. `callback` must be
+ * non-null. `user_data` may be null; it's opaque to the FFI.
+ *
+ * Returns `SDR_CORE_OK` on success,
+ * `SDR_CORE_ERR_INVALID_HANDLE` when `handle` is null or a tap
+ * is already active, `SDR_CORE_ERR_INVALID_ARG` when `callback`
+ * is null, or `SDR_CORE_ERR_NOT_RUNNING` when the engine's
+ * command channel is disconnected.
+ */
+int32_t sdr_core_start_audio_tap(
+    SdrCore*            handle,
+    SdrAudioTapCallback callback,
+    void*               user_data
+);
+
+/*
+ * Stop an active tap. Idempotent — returns `SDR_CORE_OK` when
+ * no tap is active. Blocks until the dispatcher thread has
+ * joined so the host can deterministically free `user_data`
+ * immediately after the call.
+ *
+ * Must NOT be called from inside the audio-tap callback — the
+ * implementation joins the dispatcher thread, which would
+ * self-deadlock against a callback still running on that
+ * thread.
+ */
+int32_t sdr_core_stop_audio_tap(SdrCore* handle);
 
 /* ================================================================ */
 /*  FFT frame pull                                                  */

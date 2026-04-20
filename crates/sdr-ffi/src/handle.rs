@@ -49,6 +49,15 @@ pub struct SdrCore {
     /// destroy can `take()` the handle out for joining without
     /// needing a `&mut SdrCore`.
     pub(crate) dispatcher_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+
+    /// FFI audio-tap dispatcher thread join handle. Distinct from
+    /// `dispatcher_handle` (the event dispatcher) because the audio
+    /// tap has a start/stop lifecycle — the thread is `Some` only
+    /// between a successful `sdr_core_start_audio_tap` and the
+    /// corresponding `sdr_core_stop_audio_tap` (or `destroy`, which
+    /// stops the tap as part of teardown so dangling `user_data`
+    /// never outlives the handle). Per issue #314.
+    pub(crate) audio_tap_dispatcher: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// Bundle of `(callback fn pointer, user_data void*)` so the
@@ -106,6 +115,7 @@ impl SdrCore {
             event_callback,
             config_path,
             dispatcher_handle: Mutex::new(Some(dispatcher_handle)),
+            audio_tap_dispatcher: Mutex::new(None),
         }
     }
 
