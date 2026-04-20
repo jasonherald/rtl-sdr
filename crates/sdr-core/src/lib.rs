@@ -39,9 +39,11 @@ mod controller;
 pub mod engine;
 pub mod fft_buffer;
 pub mod messages;
+pub mod sink_slot;
 pub mod wav_writer;
 
 pub use engine::{Engine, EngineError};
 pub use fft_buffer::SharedFftBuffer;
 pub use messages::{DspToUi, SourceType, UiToDsp};
+pub use sink_slot::{AudioSinkSlot, AudioSinkType, NetworkSinkStatus};
 pub use wav_writer::WavWriter;

@@ -1,7 +1,40 @@
-//! Audio output configuration panel — device and sink type selection.
+//! Audio output configuration panel — device, sink type, network
+//! sink config, and recording toggle.
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_types::Protocol;
+
+/// Sink-type combo discriminants. Keep stable so the
+/// `connect_selected_notify` handler in `window::connect_audio_panel`
+/// can dispatch the right `UiToDsp::SetAudioSinkType` value without
+/// fragile by-string matching.
+pub const SINK_TYPE_LOCAL_IDX: u32 = 0;
+pub const SINK_TYPE_NETWORK_IDX: u32 = 1;
+
+/// Protocol combo discriminants for the network sink. Order
+/// must match the model strings in `build_audio_panel`.
+pub const NETWORK_SINK_PROTOCOL_TCP_IDX: u32 = 0;
+pub const NETWORK_SINK_PROTOCOL_UDP_IDX: u32 = 1;
+
+/// Default endpoint values. Matches the IQ source-network
+/// defaults so a new install lands on familiar settings.
+pub const NETWORK_SINK_DEFAULT_HOST: &str = "localhost";
+pub const NETWORK_SINK_DEFAULT_PORT: u16 = 1234;
+
+/// Map a combo index to a `Protocol`. Returns `Protocol::TcpClient`
+/// (TCP server mode — see `sdr_sink_network` docs) for the TCP
+/// index, `Protocol::Udp` for the UDP index, and falls back to
+/// TCP server for any unknown index so a future combo expansion
+/// without this lookup updated still produces a sane default.
+#[must_use]
+pub fn protocol_from_combo_idx(idx: u32) -> Protocol {
+    match idx {
+        NETWORK_SINK_PROTOCOL_UDP_IDX => Protocol::Udp,
+        // TCP_IDX (0) and any unknown idx fall through to TCP.
+        _ => Protocol::TcpClient,
+    }
+}
 
 /// Audio output configuration panel with references to interactive rows.
 pub struct AudioPanel {
@@ -15,12 +48,26 @@ pub struct AudioPanel {
     pub device_node_names: Vec<String>,
     /// Toggle to start/stop audio recording.
     pub record_audio_row: adw::SwitchRow,
+    /// Hostname / IP for the network audio sink. Hidden unless
+    /// `Network` is the active sink type.
+    pub network_host_row: adw::EntryRow,
+    /// Port for the network audio sink (1..=65535).
+    pub network_port_row: adw::SpinRow,
+    /// Protocol picker — TCP server (default) or UDP unicast.
+    pub network_protocol_row: adw::ComboRow,
+    /// Status row showing the network sink's current state
+    /// (Active / Inactive / Error). Driven by
+    /// `DspToUi::NetworkSinkStatus` events.
+    pub network_status_row: adw::ActionRow,
 }
 
 /// Build the audio output configuration panel.
 ///
 /// Queries `PipeWire` for available audio output sinks and populates
-/// the device selector dropdown.
+/// the device selector dropdown. The network config rows are built
+/// up front (so the sidebar layout doesn't shift when the user
+/// toggles between sink types) but `set_visible(false)` until
+/// `Network` is the active sink type.
 pub fn build_audio_panel() -> AudioPanel {
     let group = adw::PreferencesGroup::builder()
         .title("Audio")
@@ -43,6 +90,42 @@ pub fn build_audio_panel() -> AudioPanel {
         .model(&sink_model)
         .build();
 
+    // Network config rows — built unconditionally so the
+    // visibility toggle in `connect_audio_panel` is a cheap
+    // `set_visible` rather than a structural insert/remove.
+    let network_host_row = adw::EntryRow::builder()
+        .title("Network host")
+        .text(NETWORK_SINK_DEFAULT_HOST)
+        .visible(false)
+        .build();
+
+    let port_adjustment = gtk4::Adjustment::new(
+        f64::from(NETWORK_SINK_DEFAULT_PORT),
+        1.0,
+        65535.0,
+        1.0,
+        100.0,
+        0.0,
+    );
+    let network_port_row = adw::SpinRow::builder()
+        .title("Port")
+        .adjustment(&port_adjustment)
+        .visible(false)
+        .build();
+
+    let protocol_model = gtk4::StringList::new(&["TCP (server)", "UDP"]);
+    let network_protocol_row = adw::ComboRow::builder()
+        .title("Protocol")
+        .model(&protocol_model)
+        .visible(false)
+        .build();
+
+    let network_status_row = adw::ActionRow::builder()
+        .title("Network sink")
+        .subtitle("Inactive")
+        .visible(false)
+        .build();
+
     let record_audio_row = adw::SwitchRow::builder()
         .title("Record Audio")
         .subtitle("48 kHz stereo WAV")
@@ -50,6 +133,10 @@ pub fn build_audio_panel() -> AudioPanel {
 
     group.add(&device_row);
     group.add(&sink_type_row);
+    group.add(&network_host_row);
+    group.add(&network_port_row);
+    group.add(&network_protocol_row);
+    group.add(&network_status_row);
     group.add(&record_audio_row);
 
     AudioPanel {
@@ -58,5 +145,9 @@ pub fn build_audio_panel() -> AudioPanel {
         sink_type_row,
         device_node_names: node_names,
         record_audio_row,
+        network_host_row,
+        network_port_row,
+        network_protocol_row,
+        network_status_row,
     }
 }

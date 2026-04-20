@@ -2,7 +2,9 @@
 
 use sdr_dsp::voice_squelch::VoiceSquelchMode;
 use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
-use sdr_types::{DemodMode, RtlTcpConnectionState};
+use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
+
+use crate::sink_slot::{AudioSinkType, NetworkSinkStatus};
 
 /// Messages sent from the DSP pipeline thread to the UI main loop.
 #[derive(Debug)]
@@ -75,6 +77,13 @@ pub enum DspToUi {
     /// value to reset on source-type changes without needing a
     /// separate "hide the row" signal.
     RtlTcpConnectionState(RtlTcpConnectionState),
+    /// Lifecycle/health update for the network audio sink.
+    /// Emitted on switch boundaries (`Active` / `Inactive`) and
+    /// on startup or write failure (`Error`). Hosts use it to
+    /// drive a status row in the audio settings panel — green
+    /// when streaming, red with the message on failure. Per
+    /// issue #247.
+    NetworkSinkStatus(NetworkSinkStatus),
 }
 
 /// Available source types for IQ input.
@@ -164,6 +173,24 @@ pub enum UiToDsp {
     SetVoiceSquelchThreshold(f32),
     /// Set the audio output device by `PipeWire` node name.
     SetAudioDevice(String),
+    /// Switch the audio sink type (local audio device vs network
+    /// stream). The controller stops the current sink, swaps to
+    /// the new variant using the persisted device/network config,
+    /// and restarts it if the engine is currently running. Per
+    /// issue #247.
+    SetAudioSinkType(AudioSinkType),
+    /// Configure the network audio sink hostname, port, and
+    /// protocol. The controller stores the config on `DspState`
+    /// so a future switch to `AudioSinkType::Network` (or a
+    /// rebuild of an already-active network sink) picks the new
+    /// values up. If the network sink is currently active, the
+    /// controller also rebuilds it inline so the new endpoint
+    /// takes effect immediately. Per issue #247.
+    SetNetworkSinkConfig {
+        hostname: String,
+        port: u16,
+        protocol: Protocol,
+    },
     /// Switch the source type (stops current source if running).
     SetSourceType(SourceType),
     /// Configure network source hostname, port, and protocol.

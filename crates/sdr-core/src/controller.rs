@@ -20,10 +20,14 @@ use std::time::Duration;
 
 use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
-use sdr_pipeline::sink_manager::Sink;
 use sdr_pipeline::source_manager::Source;
+
+use crate::sink_slot::{AudioSinkSlot, AudioSinkType, NetworkSinkStatus};
 use sdr_radio::RadioModule;
-use sdr_sink_audio::AudioSink;
+// `AudioSink` and `NetworkSink` are no longer used directly here —
+// both live behind `AudioSinkSlot` (see `crate::sink_slot`) so the
+// controller's audio path stays uniform regardless of which sink
+// the user has selected.
 use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, RtlTcpConnectionState, SinkError, Stereo};
 
@@ -211,7 +215,28 @@ struct DspState {
     source: Option<Box<dyn Source>>,
     frontend: IqFrontend,
     radio: RadioModule,
-    audio_sink: AudioSink,
+    audio_sink: AudioSinkSlot,
+    /// Which sink variant is currently active. Mirror of
+    /// `audio_sink.kind()` kept on the state so handlers can
+    /// branch on type without matching the enum every time. Per
+    /// issue #247.
+    audio_sink_type: AudioSinkType,
+    /// Last user-picked local audio device UID (`PipeWire` node
+    /// name on Linux, `AudioDevice` UID on macOS). Empty string =
+    /// system default. Persisted across sink-type swaps so a
+    /// Network → Local switch reapplies the user's prior device
+    /// pick instead of falling back to default.
+    audio_device_uid: String,
+    /// Network sink hostname. Defaults to `localhost` to match
+    /// the GTK source-network panel's defaults so switching to
+    /// the network sink without an explicit configure step still
+    /// produces a usable bind.
+    network_sink_host: String,
+    /// Network sink port. Defaults to `1234` matching the
+    /// existing IQ source-network port default.
+    network_sink_port: u16,
+    /// Network sink protocol. Defaults to TCP server.
+    network_sink_protocol: sdr_types::Protocol,
     running: bool,
     center_freq: f64,
     sample_rate: f64,
@@ -343,7 +368,12 @@ impl DspState {
             source: None,
             frontend,
             radio,
-            audio_sink: AudioSink::new(),
+            audio_sink: AudioSinkSlot::local_default(),
+            audio_sink_type: AudioSinkType::Local,
+            audio_device_uid: String::new(),
+            network_sink_host: "localhost".to_string(),
+            network_sink_port: 1234,
+            network_sink_protocol: sdr_types::Protocol::TcpClient,
             running: false,
             center_freq: DEFAULT_CENTER_FREQ,
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -847,9 +877,105 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetAudioDevice(node_name) => {
             tracing::info!(target_node = %node_name, "set audio device");
+            // Persist the UID so a future Network → Local
+            // sink-type swap can re-apply the user's pick
+            // instead of falling back to the system default.
+            // Per issue #247.
+            state.audio_device_uid.clone_from(&node_name);
             if let Err(e) = state.audio_sink.set_target(&node_name) {
                 tracing::warn!("audio device switch failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Audio device switch failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetAudioSinkType(new_type) => {
+            tracing::info!(?new_type, "set audio sink type");
+            if state.audio_sink_type == new_type {
+                return;
+            }
+            // Stop the current sink so it releases its underlying
+            // resource (audio device handle / socket) before we
+            // construct the replacement.
+            if let Err(e) = state.audio_sink.stop() {
+                tracing::warn!("audio sink stop during type swap failed: {e}");
+            }
+            // Build the new sink.
+            state.audio_sink = match new_type {
+                AudioSinkType::Local => AudioSinkSlot::local_default(),
+                AudioSinkType::Network => AudioSinkSlot::network(
+                    &state.network_sink_host,
+                    state.network_sink_port,
+                    state.network_sink_protocol,
+                ),
+            };
+            state.audio_sink_type = new_type;
+            // Re-apply the persisted local-device pick so the
+            // post-swap Local sink routes to the user's last
+            // choice instead of the system default. No-op for
+            // Network.
+            if matches!(new_type, AudioSinkType::Local) {
+                let target = state.audio_device_uid.clone();
+                if let Err(e) = state.audio_sink.set_target(&target) {
+                    tracing::warn!("post-swap set_target failed: {e}");
+                }
+            }
+            // Bring the new sink online if the engine is already
+            // running. Otherwise it'll start on the next Start
+            // command.
+            if state.running
+                && let Err(e) = state.audio_sink.start()
+            {
+                tracing::warn!("audio sink start after type swap failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Audio sink failed to start: {e}")));
+                if matches!(new_type, AudioSinkType::Network) {
+                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
+                        message: format!("{e}"),
+                    }));
+                }
+                return;
+            }
+            // Notify the UI of the new sink state.
+            let event = match new_type {
+                AudioSinkType::Local => NetworkSinkStatus::Inactive,
+                AudioSinkType::Network => NetworkSinkStatus::Active {
+                    endpoint: format!("{}:{}", state.network_sink_host, state.network_sink_port),
+                    protocol: state.network_sink_protocol,
+                },
+            };
+            let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(event));
+        }
+
+        UiToDsp::SetNetworkSinkConfig {
+            hostname,
+            port,
+            protocol,
+        } => {
+            tracing::info!(%hostname, port, ?protocol, "set network sink config");
+            // Persist on state so a future SetAudioSinkType swap
+            // picks the new values up.
+            state.network_sink_host.clone_from(&hostname);
+            state.network_sink_port = port;
+            state.network_sink_protocol = protocol;
+            // If the network sink is currently active, rebuild
+            // it inline so the new endpoint takes effect now.
+            if matches!(state.audio_sink_type, AudioSinkType::Network) {
+                if let Err(e) = state.audio_sink.stop() {
+                    tracing::warn!("network sink stop during reconfig failed: {e}");
+                }
+                state.audio_sink = AudioSinkSlot::network(&hostname, port, protocol);
+                if state.running
+                    && let Err(e) = state.audio_sink.start()
+                {
+                    tracing::warn!("network sink restart after reconfig failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
+                        message: format!("{e}"),
+                    }));
+                    return;
+                }
+                let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Active {
+                    endpoint: format!("{hostname}:{port}"),
+                    protocol,
+                }));
             }
         }
 
@@ -1569,10 +1695,25 @@ fn process_iq_block(
                         {
                             // Terminal failures: surface to UI once and stop the sink.
                             if matches!(e, SinkError::Disconnected | SinkError::NotRunning) {
-                                tracing::warn!("audio sink died: {e}");
-                                let _ = dsp_tx.send(DspToUi::Error(
-                                    "Audio output lost — restart playback".to_string(),
-                                ));
+                                tracing::warn!(
+                                    sink_type = ?state.audio_sink_type,
+                                    "audio sink died: {e}"
+                                );
+                                // Distinct event for the network sink so the
+                                // settings panel's status row can update
+                                // independently of the toast for local
+                                // device failures. Per issue #247.
+                                if matches!(state.audio_sink_type, AudioSinkType::Network) {
+                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                        NetworkSinkStatus::Error {
+                                            message: format!("{e}"),
+                                        },
+                                    ));
+                                } else {
+                                    let _ = dsp_tx.send(DspToUi::Error(
+                                        "Audio output lost — restart playback".to_string(),
+                                    ));
+                                }
                                 let _ = state.audio_sink.stop();
                             } else {
                                 tracing::debug!("audio write: {e}");
