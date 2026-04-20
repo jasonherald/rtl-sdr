@@ -111,6 +111,17 @@ final class TranscriptionDriver {
     /// could land later alongside `SpeechTranscriber.supportedLocales`.
     private let locale = Locale(identifier: "en-US")
 
+    /// Sample rate of the chunks we receive from the engine audio
+    /// tap. Matches `AUDIO_TAP_OUTPUT_RATE_HZ` in
+    /// `sdr-dsp::convert` (Rust side). Kept as a Swift constant
+    /// so a single-spot change here fails loudly instead of
+    /// silently diverging from the engine if the Rust constant
+    /// is ever retuned. A future improvement would expose the
+    /// rate via FFI so both sides pull from one source of
+    /// truth — tracked in the shared-constant follow-up on the
+    /// epic. Per CodeRabbit round 3 on PR #349.
+    private let audioTapSampleRateHz: Double = 16_000
+
     // MARK: - View-facing API
 
     /// Wire in the engine handle. Called once at bootstrap.
@@ -274,11 +285,13 @@ final class TranscriptionDriver {
 
         guard let tapFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
-            sampleRate: 16_000,
+            sampleRate: audioTapSampleRateHz,
             channels: 1,
             interleaved: false
         ) else {
-            status = .error("Failed to build 16 kHz mono Float32 AVAudioFormat")
+            status = .error(
+                "Failed to build \(Int(audioTapSampleRateHz)) Hz mono Float32 AVAudioFormat"
+            )
             enabled = false
             return
         }
@@ -503,9 +516,13 @@ final class TranscriptionDriver {
             // the pair.
             if let converter {
                 // Resample / reformat. Output buffer sized
-                // proportionally to the input/output rate ratio
-                // with 32 samples of slack for converter state.
+                // proportionally to the input/output rate ratio.
                 let ratio = analyzerFormat.sampleRate / tapFormat.sampleRate
+                // +32 frames of slack covers AVAudioConverter's
+                // internal state + boundary rounding on edge-case
+                // rate ratios; without it a slightly-too-small
+                // buffer can cause the convert call to return
+                // short of the actual resampled count.
                 let outCapacity = AVAudioFrameCount(
                     Double(tapBuffer.frameLength) * ratio + 32
                 )
