@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.2
 //
 // SdrCoreKit — Swift wrapper around the hand-rolled `sdr-ffi`
 // C ABI for the sdr-core SDR engine.
@@ -66,10 +66,13 @@ let workspaceTarget: String = {
 let package = Package(
     name: "SdrCoreKit",
     platforms: [
-        // macOS 14 (Sonoma) floor per the epic spec. Locks in
-        // the minimum OS for modern SwiftUI / @Observable /
-        // latest AsyncStream semantics.
-        .macOS(.v14),
+        // macOS 26 (Tahoe) floor. Bumped from macOS 14 for the
+        // transcription panel (issue #314) which uses the
+        // SpeechAnalyzer / SpeechTranscriber frameworks shipped
+        // in macOS 26 (WWDC 2025). Apple renumbered all platform
+        // versions to the release year at WWDC 2025, so macOS 26
+        // is the post-Sequoia release; no backwards-compat path.
+        .macOS(.v26),
     ],
     products: [
         .library(
