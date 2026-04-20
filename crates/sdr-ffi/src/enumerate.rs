@@ -221,6 +221,12 @@ pub extern "C" fn sdr_core_audio_device_count() -> u32 {
     // "0 devices" — the honest answer when enumeration failed.
     std::panic::catch_unwind(|| {
         let len = refresh_audio_device_snapshot();
+        // Clear the thread-local last-error on success — the
+        // header contract says `sdr_core_last_error_message`
+        // reflects the *most recent* sdr_core_* call on this
+        // thread, so a failed earlier probe must not leak into
+        // a successful refresh. Per CodeRabbit round 2 on PR #344.
+        clear_last_error();
         // Cap at u32::MAX defensively. In practice there are <100
         // devices on any real system.
         u32::try_from(len).unwrap_or(u32::MAX)
@@ -461,6 +467,36 @@ mod tests {
             sdr_core_audio_device_name(u32::MAX, buf.as_mut_ptr().cast::<c_char>(), buf.len())
         };
         assert_eq!(rc, SdrCoreError::Device.as_int());
+    }
+
+    #[test]
+    fn audio_device_count_clears_stale_last_error() {
+        // Regression: before the round 2 fix, a successful
+        // `_count` didn't clear a stale last-error from a prior
+        // failed probe. Run this on its own thread so the
+        // thread-local state is isolated from other tests.
+        let handle = std::thread::spawn(|| {
+            // Poison the thread-local with a known error — calling
+            // `_name` with a null buffer returns InvalidArg and
+            // sets the last-error message.
+            let rc = unsafe { sdr_core_audio_device_name(0, std::ptr::null_mut(), 64) };
+            assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+            let msg_ptr = crate::error::sdr_core_last_error_message();
+            assert!(
+                !msg_ptr.is_null(),
+                "last-error should be set after failed probe"
+            );
+
+            // Now run a successful `_count` — it must clear the
+            // last-error per the header contract.
+            let _ = sdr_core_audio_device_count();
+            let msg_ptr = crate::error::sdr_core_last_error_message();
+            assert!(
+                msg_ptr.is_null(),
+                "sdr_core_audio_device_count must clear the thread-local last-error on success"
+            );
+        });
+        handle.join().expect("thread should exit cleanly");
     }
 
     #[test]

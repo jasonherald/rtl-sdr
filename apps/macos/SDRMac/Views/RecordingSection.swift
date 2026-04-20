@@ -16,6 +16,16 @@ import SwiftUI
 struct RecordingSection: View {
     @Environment(CoreModel.self) private var model
 
+    /// True between firing a start/stop command and observing the
+    /// matching `audioRecordingPath` change. Locks the toggle in
+    /// the meantime so a rapid second click can't fire a second
+    /// `StartAudioRecording` — the controller replaces
+    /// `state.audio_writer` on each start, which would drop the
+    /// first writer mid-write and produce two partial WAV files.
+    /// Cleared in `.onChange(of:)` when the engine confirms the
+    /// transition.
+    @State private var pendingTransition: Bool = false
+
     var body: some View {
         Section("Recording") {
             let recording = model.audioRecordingPath != nil
@@ -23,6 +33,13 @@ struct RecordingSection: View {
             Toggle("Audio", isOn: Binding(
                 get: { recording },
                 set: { on in
+                    // Swallow re-entrant toggles until the engine
+                    // acknowledges the outstanding request via
+                    // `.audioRecordingStarted/Stopped`. Without
+                    // this, a double-click in the ~ms window
+                    // before the event lands creates two files.
+                    guard !pendingTransition else { return }
+                    pendingTransition = true
                     if on {
                         let path = Self.generateRecordingPath()
                         model.startAudioRecording(to: path)
@@ -31,6 +48,26 @@ struct RecordingSection: View {
                     }
                 }
             ))
+            .disabled(pendingTransition)
+            // Engine events are the authoritative transition
+            // signal; clear the lock when `audioRecordingPath`
+            // actually flips. If the engine fails to open the
+            // file, a `.error` event comes through CoreModel
+            // instead and this line never fires — that's handled
+            // separately below.
+            .onChange(of: model.audioRecordingPath) { _, _ in
+                pendingTransition = false
+            }
+            // If start failed (engine emitted `.error` without
+            // ever flipping `audioRecordingPath`), the state
+            // change above won't fire and the toggle would stay
+            // locked forever. Reset on any error surfacing while
+            // we're pending so the user can try again.
+            .onChange(of: model.lastError) { _, new in
+                if pendingTransition && new != nil {
+                    pendingTransition = false
+                }
+            }
 
             if let path = model.audioRecordingPath {
                 LabeledContent("File") {
