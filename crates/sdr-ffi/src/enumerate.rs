@@ -423,6 +423,35 @@ mod tests {
     // ------------------------------------------------------
     //  Audio output device enumeration (ABI 0.4)
     // ------------------------------------------------------
+    //
+    // Shared test constants. Workspace coding guideline is to
+    // name magic numbers (buffer sizes, thresholds); these are
+    // the values the audio_device_* tests below share. Per
+    // CodeRabbit round 3 on PR #344.
+
+    /// Buffer size used by the rejection tests that exercise the
+    /// null / zero-length / out-of-range paths. Larger than the
+    /// `buf_len` argument they pass — the buffer itself is
+    /// never written, so any reasonable size works.
+    const REJECTION_BUF_LEN: usize = 64;
+
+    /// Buffer size used by the round-trip and snapshot tests.
+    /// Covers every CoreAudio display name (real device names
+    /// top out around 60 chars) and the decimal-`AudioDeviceID`
+    /// UID form the v1 backend emits.
+    const AUDIO_BUF_LEN: usize = 256;
+
+    /// Inner `buf_len` passed to the rejection-path `_name` /
+    /// `_uid` calls that pass a null pointer. The exact value
+    /// doesn't matter — the null-check trips first — but it
+    /// should be nonzero to make the test target the null branch
+    /// specifically, not the `buf_len == 0` branch.
+    const REJECTION_INNER_BUF_LEN: usize = 32;
+
+    /// Sanity upper bound on `sdr_core_audio_device_count`. Real
+    /// systems rarely have more than a few dozen audio devices;
+    /// anything over this suggests enumeration went pathological.
+    const MAX_REASONABLE_AUDIO_DEVICE_COUNT: u32 = 1024;
 
     #[test]
     fn audio_device_count_is_at_least_one() {
@@ -431,14 +460,17 @@ mod tests {
         // always be >= 1 on any supported platform.
         let c = sdr_core_audio_device_count();
         assert!(c >= 1, "expected at least one audio device, got {c}");
-        assert!(c < 1024, "audio device count should be small, got {c}");
+        assert!(
+            c < MAX_REASONABLE_AUDIO_DEVICE_COUNT,
+            "audio device count should be small, got {c}"
+        );
     }
 
     #[test]
     fn audio_device_name_rejects_null_and_zero_len() {
-        let mut buf = [0_u8; 64];
+        let mut buf = [0_u8; REJECTION_BUF_LEN];
         assert_eq!(
-            unsafe { sdr_core_audio_device_name(0, std::ptr::null_mut(), 32) },
+            unsafe { sdr_core_audio_device_name(0, std::ptr::null_mut(), REJECTION_INNER_BUF_LEN) },
             SdrCoreError::InvalidArg.as_int()
         );
         assert_eq!(
@@ -449,9 +481,9 @@ mod tests {
 
     #[test]
     fn audio_device_uid_rejects_null_and_zero_len() {
-        let mut buf = [0_u8; 64];
+        let mut buf = [0_u8; REJECTION_BUF_LEN];
         assert_eq!(
-            unsafe { sdr_core_audio_device_uid(0, std::ptr::null_mut(), 32) },
+            unsafe { sdr_core_audio_device_uid(0, std::ptr::null_mut(), REJECTION_INNER_BUF_LEN) },
             SdrCoreError::InvalidArg.as_int()
         );
         assert_eq!(
@@ -462,7 +494,7 @@ mod tests {
 
     #[test]
     fn audio_device_name_out_of_range_returns_device_error() {
-        let mut buf = [0_u8; 64];
+        let mut buf = [0_u8; REJECTION_BUF_LEN];
         let rc = unsafe {
             sdr_core_audio_device_name(u32::MAX, buf.as_mut_ptr().cast::<c_char>(), buf.len())
         };
@@ -479,7 +511,8 @@ mod tests {
             // Poison the thread-local with a known error — calling
             // `_name` with a null buffer returns InvalidArg and
             // sets the last-error message.
-            let rc = unsafe { sdr_core_audio_device_name(0, std::ptr::null_mut(), 64) };
+            let rc =
+                unsafe { sdr_core_audio_device_name(0, std::ptr::null_mut(), REJECTION_BUF_LEN) };
             assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
             let msg_ptr = crate::error::sdr_core_last_error_message();
             assert!(
@@ -518,8 +551,8 @@ mod tests {
         assert!(count >= 1);
 
         for i in 0..count {
-            let mut name_buf = [0_u8; 256];
-            let mut uid_buf = [0_u8; 256];
+            let mut name_buf = [0_u8; AUDIO_BUF_LEN];
+            let mut uid_buf = [0_u8; AUDIO_BUF_LEN];
             let rc_name = unsafe {
                 sdr_core_audio_device_name(
                     i,
@@ -546,7 +579,7 @@ mod tests {
         // We exercise this on a fresh thread so there's no prior
         // snapshot in thread-local storage.
         let handle = std::thread::spawn(|| {
-            let mut buf = [0_u8; 256];
+            let mut buf = [0_u8; AUDIO_BUF_LEN];
             let rc = unsafe {
                 sdr_core_audio_device_name(0, buf.as_mut_ptr().cast::<c_char>(), buf.len())
             };
@@ -567,7 +600,7 @@ mod tests {
         let count = sdr_core_audio_device_count();
         assert!(count >= 1);
 
-        let mut buf = [0_u8; 256];
+        let mut buf = [0_u8; AUDIO_BUF_LEN];
         let rc =
             unsafe { sdr_core_audio_device_name(0, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
         assert!(rc >= 0, "expected success, got {rc}");
@@ -578,7 +611,7 @@ mod tests {
 
         // UID for index 0 is typically the empty string ("system default"),
         // but that's backend policy — we just check the call works.
-        let mut uid_buf = [0_u8; 256];
+        let mut uid_buf = [0_u8; AUDIO_BUF_LEN];
         let rc = unsafe {
             sdr_core_audio_device_uid(0, uid_buf.as_mut_ptr().cast::<c_char>(), uid_buf.len())
         };
