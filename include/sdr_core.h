@@ -873,8 +873,10 @@ int32_t sdr_core_set_event_callback(
 /*
  * Audio-tap callback.
  *
- * `samples` points into the dispatcher thread's stack; valid
- * only for the duration of this call. `sample_count` is the
+ * `samples` points to an audio chunk buffer owned by the
+ * dispatcher (not on its stack — it's a heap Vec borrowed
+ * for the duration of the call). Valid only for the duration
+ * of this call. `sample_count` is the
  * number of `float` samples (not bytes). Format: 16 kHz mono
  * f32. `user_data` is the opaque pointer the host passed at
  * registration.

@@ -217,9 +217,18 @@ pub unsafe extern "C" fn sdr_core_start_audio_tap(
             }
         };
 
+        // If we can't record the JoinHandle, roll back the
+        // already-started tap. Otherwise the DSP thread is still
+        // pushing into the channel and the dispatcher thread is
+        // still alive holding `user_data` — reporting failure
+        // without tearing those down would leak a live callback
+        // thread against state the host will assume it owns
+        // again. Per CodeRabbit round 1 on PR #349.
         if let Ok(mut guard) = core.audio_tap_dispatcher.lock() {
             *guard = Some(join_handle);
         } else {
+            let _ = core.engine.send_command(UiToDsp::DisableAudioTap);
+            let _ = join_handle.join();
             set_last_error("sdr_core_start_audio_tap: dispatcher mutex poisoned");
             return SdrCoreError::Internal.as_int();
         }

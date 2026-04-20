@@ -134,30 +134,82 @@ pub fn complex_to_stereo(input: &[Complex], output: &mut [Stereo]) -> Result<usi
     Ok(input.len())
 }
 
+/// Input sample rate expected by `stereo_48k_to_mono_16k`.
+///
+/// The engine's audio junction delivers samples at this rate — see
+/// `AUDIO_SAMPLE_RATE` in `sdr-core::controller`. Kept as a named
+/// constant so callers and tests share one source of truth.
+pub const AUDIO_TAP_INPUT_RATE_HZ: u32 = 48_000;
+
+/// Output sample rate produced by `stereo_48k_to_mono_16k`. Matches
+/// the rate speech recognizers (macOS `SpeechAnalyzer`, Whisper,
+/// sherpa-onnx) natively consume.
+pub const AUDIO_TAP_OUTPUT_RATE_HZ: u32 = 16_000;
+
+/// Integer decimation ratio = input / output. Must divide evenly —
+/// `const _: () = assert!(...)` enforces that so any future rate
+/// change that breaks the ratio fails the build.
+pub const AUDIO_TAP_DECIMATION_FACTOR: usize =
+    (AUDIO_TAP_INPUT_RATE_HZ / AUDIO_TAP_OUTPUT_RATE_HZ) as usize;
+
+const _: () = assert!(
+    AUDIO_TAP_INPUT_RATE_HZ.is_multiple_of(AUDIO_TAP_OUTPUT_RATE_HZ),
+    "AUDIO_TAP_INPUT_RATE_HZ must be an integer multiple of AUDIO_TAP_OUTPUT_RATE_HZ"
+);
+
 /// 48 kHz → 16 kHz mono f32 downsampler for stereo input.
 ///
 /// Input is the engine's post-demod stereo buffer (48 kHz). Output
 /// is mono at 16 kHz — the sample rate speech recognizers (macOS
 /// `SpeechAnalyzer`, whisper, sherpa-onnx) consume natively.
-/// Decimation factor is exactly 3:1 (48000 / 16000); every third
-/// stereo sample is averaged to mono and kept.
+/// Decimation factor is exactly 3:1; every third stereo sample is
+/// averaged to mono and kept.
 ///
-/// Number of output samples: `input.len().div_ceil(3)`. Callers
-/// should size `output` with that expression (the returned count
-/// is the exact number of samples written).
+/// # Phase
+///
+/// `phase` carries the decimation offset across calls so successive
+/// chunks form a continuous 3:1 stream even when the input block
+/// size isn't a multiple of 3. Pass `0` on the first call after
+/// enabling the tap (or after a reset); pass the same variable back
+/// on each subsequent call. On return, `*phase` is in `0..3` and is
+/// the starting index for the next call.
+///
+/// Without this, two consecutive calls of length 5 would each emit
+/// `ceil(5/3) = 2` samples (producing 4 outputs for 10 inputs → 2.5:1),
+/// which skews the 16 kHz timebase and causes duplicate/dropped
+/// samples at block boundaries.
+///
+/// # Output sizing
+///
+/// Number of output samples: `input.len().saturating_sub(*phase).div_ceil(DECIMATION)`.
+/// Callers that can't compute that ahead of time may size
+/// `output` at `input.len().div_ceil(DECIMATION)` — always an
+/// upper bound — and read the returned count.
+///
+/// # Errors
+///
+/// Returns `DspError::BufferTooSmall` if `output` is too small for
+/// the computed count.
 ///
 /// This is a naive keep-every-third-sample decimator — no
 /// anti-alias filter — because the engine's audio path has already
 /// produced a band-limited voice-rate signal by the time audio
 /// reaches this stage. Good enough for speech recognition; NOT
 /// suitable as a generic rate converter for arbitrary audio.
-///
-/// # Errors
-///
-/// Returns `DspError::BufferTooSmall` if `output` has fewer than
-/// `ceil(input.len() / 3)` elements.
-pub fn stereo_48k_to_mono_16k(input: &[Stereo], output: &mut [f32]) -> Result<usize, DspError> {
-    let needed = input.len().div_ceil(3);
+pub fn stereo_48k_to_mono_16k(
+    input: &[Stereo],
+    output: &mut [f32],
+    phase: &mut usize,
+) -> Result<usize, DspError> {
+    // Defensive clamp: a caller that passes a stale or garbage
+    // phase shouldn't be able to panic the function — just
+    // normalize and proceed.
+    if *phase >= AUDIO_TAP_DECIMATION_FACTOR {
+        *phase = 0;
+    }
+    let input_len = input.len();
+    let remaining = input_len.saturating_sub(*phase);
+    let needed = remaining.div_ceil(AUDIO_TAP_DECIMATION_FACTOR);
     if output.len() < needed {
         return Err(DspError::BufferTooSmall {
             need: needed,
@@ -165,13 +217,17 @@ pub fn stereo_48k_to_mono_16k(input: &[Stereo], output: &mut [f32]) -> Result<us
         });
     }
     let mut out_idx = 0;
-    let mut in_idx = 0;
-    while in_idx < input.len() {
+    let mut in_idx = *phase;
+    while in_idx < input_len {
         let s = input[in_idx];
         output[out_idx] = f32::midpoint(s.l, s.r);
         out_idx += 1;
-        in_idx += 3;
+        in_idx += AUDIO_TAP_DECIMATION_FACTOR;
     }
+    // `in_idx` now points one DECIMATION past the last kept
+    // sample. The offset past the input end is how far into the
+    // next chunk the next kept sample falls — i.e. the new phase.
+    *phase = in_idx - input_len;
     Ok(out_idx)
 }
 
@@ -263,8 +319,10 @@ mod tests {
     #[test]
     fn test_stereo_48k_to_mono_16k_empty() {
         let mut output = [0.0_f32; 0];
-        let count = stereo_48k_to_mono_16k(&[], &mut output).unwrap();
+        let mut phase = 0;
+        let count = stereo_48k_to_mono_16k(&[], &mut output, &mut phase).unwrap();
         assert_eq!(count, 0);
+        assert_eq!(phase, 0);
     }
 
     #[test]
@@ -272,9 +330,12 @@ mod tests {
         // One stereo sample → one mono output at 16k.
         let input = [Stereo::new(0.6, 0.4)];
         let mut output = [0.0_f32; 1];
-        let count = stereo_48k_to_mono_16k(&input, &mut output).unwrap();
+        let mut phase = 0;
+        let count = stereo_48k_to_mono_16k(&input, &mut output, &mut phase).unwrap();
         assert_eq!(count, 1);
         assert_eq!(output[0], 0.5);
+        // Consumed index 0; next kept index would be 3 — phase=2.
+        assert_eq!(phase, 2);
     }
 
     #[test]
@@ -286,9 +347,11 @@ mod tests {
             Stereo::new(0.0, 0.0),
         ];
         let mut output = [0.0_f32; 1];
-        let count = stereo_48k_to_mono_16k(&input, &mut output).unwrap();
+        let mut phase = 0;
+        let count = stereo_48k_to_mono_16k(&input, &mut output, &mut phase).unwrap();
         assert_eq!(count, 1);
         assert_eq!(output[0], 0.5);
+        assert_eq!(phase, 0);
     }
 
     #[test]
@@ -303,13 +366,15 @@ mod tests {
             Stereo::new(0.0, 0.0),
         ];
         let mut output = [0.0_f32; 2];
-        let count = stereo_48k_to_mono_16k(&input, &mut output).unwrap();
+        let mut phase = 0;
+        let count = stereo_48k_to_mono_16k(&input, &mut output, &mut phase).unwrap();
         assert_eq!(count, 2);
         // f32 midpoint — use epsilon tolerance since (0.2+0.4)/2
         // and (0.6+0.8)/2 don't round-trip exactly through
         // binary32.
         assert!((output[0] - 0.3).abs() < f32::EPSILON);
         assert!((output[1] - 0.7).abs() < f32::EPSILON);
+        assert_eq!(phase, 0);
     }
 
     #[test]
@@ -317,11 +382,74 @@ mod tests {
         // 3 samples → ceil(3/3) = 1 output; buffer of 0 must fail.
         let input = [Stereo::default(); 3];
         let mut output = [0.0_f32; 0];
-        let err = stereo_48k_to_mono_16k(&input, &mut output).unwrap_err();
+        let mut phase = 0;
+        let err = stereo_48k_to_mono_16k(&input, &mut output, &mut phase).unwrap_err();
         assert!(
             matches!(err, DspError::BufferTooSmall { need: 1, got: 0 }),
             "expected BufferTooSmall {{ need: 1, got: 0 }}, got {err:?}"
         );
+        // Phase must NOT advance on an error return, otherwise
+        // a retry would silently desynchronize the decimation
+        // across chunks.
+        assert_eq!(phase, 0);
+    }
+
+    #[test]
+    fn test_stereo_48k_to_mono_16k_phase_carries_across_chunks() {
+        // Simulate the DSP thread delivering 5-sample blocks
+        // (not a multiple of 3). Over three blocks the naïve
+        // stateless version would emit ceil(5/3)*3 = 6 samples,
+        // but the correct 3:1 count over 15 input samples is 5.
+        // This test pins the phase-carrying behavior — per
+        // CodeRabbit round 1 on PR #349.
+        let chunks: [[Stereo; 5]; 3] = [
+            [
+                Stereo::new(1.0, 1.0),
+                Stereo::new(2.0, 2.0),
+                Stereo::new(3.0, 3.0),
+                Stereo::new(4.0, 4.0),
+                Stereo::new(5.0, 5.0),
+            ],
+            [
+                Stereo::new(6.0, 6.0),
+                Stereo::new(7.0, 7.0),
+                Stereo::new(8.0, 8.0),
+                Stereo::new(9.0, 9.0),
+                Stereo::new(10.0, 10.0),
+            ],
+            [
+                Stereo::new(11.0, 11.0),
+                Stereo::new(12.0, 12.0),
+                Stereo::new(13.0, 13.0),
+                Stereo::new(14.0, 14.0),
+                Stereo::new(15.0, 15.0),
+            ],
+        ];
+
+        let mut phase = 0;
+        let mut all_out: Vec<f32> = Vec::new();
+        for chunk in &chunks {
+            let mut out = vec![0.0_f32; chunk.len()];
+            let n = stereo_48k_to_mono_16k(chunk, &mut out, &mut phase).unwrap();
+            all_out.extend_from_slice(&out[..n]);
+        }
+        // Expected kept indices in the concatenated 15-sample
+        // stream: 0, 3, 6, 9, 12 → values 1, 4, 7, 10, 13.
+        assert_eq!(all_out, vec![1.0, 4.0, 7.0, 10.0, 13.0]);
+        // 15 is a multiple of 3; phase ends at 0.
+        assert_eq!(phase, 0);
+    }
+
+    #[test]
+    fn test_stereo_48k_to_mono_16k_clamps_bogus_phase() {
+        // A garbage phase (>= DECIMATION) must be normalized,
+        // not panic.
+        let input = [Stereo::new(0.6, 0.4)];
+        let mut output = [0.0_f32; 1];
+        let mut phase = 99;
+        let count = stereo_48k_to_mono_16k(&input, &mut output, &mut phase).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(output[0], 0.5);
     }
 
     #[test]

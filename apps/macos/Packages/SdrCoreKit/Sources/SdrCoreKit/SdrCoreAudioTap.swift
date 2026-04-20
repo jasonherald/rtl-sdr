@@ -87,15 +87,36 @@ public final class AudioTapSession: @unchecked Sendable {
     /// thread has joined — by the time this returns, the
     /// `samples` stream has finished and no more callbacks will
     /// fire. Safe to call from `deinit`.
+    ///
+    /// If the underlying FFI stop returns a failure code other
+    /// than `invalidHandle` (which means there was nothing to
+    /// stop — treated as success), the session state is left
+    /// untouched so the caller can retry. That prevents the
+    /// Swift lifecycle from desynchronizing with the native
+    /// tap state when, e.g., a mutex is poisoned inside the
+    /// dispatcher. Per CodeRabbit round 1 on PR #349.
     public func stop() {
         stopLock.lock()
         defer { stopLock.unlock() }
         guard !stopped else { return }
-        stopped = true
         // FFI contract: stop joins the dispatcher before
         // returning. Any in-flight trampoline call completes
         // first; the Swift side then safely finishes the stream.
-        _ = sdr_core_stop_audio_tap(owner.handle)
+        let rc = sdr_core_stop_audio_tap(owner.handle)
+        let code = SdrCoreError.Code(raw: rc)
+        // `invalidHandle` on stop means the tap is already gone
+        // (handle destroyed, or the engine tore it down via
+        // sdr_core_destroy); treat as a successful stop so the
+        // session's retry path doesn't wedge.
+        let successful = rc == 0 || code == .invalidHandle
+        guard successful else {
+            // Don't flip `stopped` or finish the stream —
+            // leaves the session in a state the caller can
+            // retry. deinit will re-attempt.
+            assertionFailure("sdr_core_stop_audio_tap failed: rc=\(rc) code=\(code)")
+            return
+        }
+        stopped = true
         box.continuation.finish()
     }
 

@@ -531,6 +531,18 @@ mod tests {
         let disable = UiToDsp::DisableTranscription;
         assert!(matches!(disable, UiToDsp::DisableTranscription));
 
+        // Audio tap (issue #314) — constructed here so a future
+        // signature tweak to the Vec<f32> payload or the
+        // SyncSender<...> type fails this regression net rather
+        // than silently going quiet at the FFI handler site. Per
+        // CodeRabbit round 1 on PR #349.
+        let (tap_tx, _tap_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let enable_tap = UiToDsp::EnableAudioTap(tap_tx);
+        assert!(matches!(enable_tap, UiToDsp::EnableAudioTap(_)));
+
+        let disable_tap = UiToDsp::DisableAudioTap;
+        assert!(matches!(disable_tap, UiToDsp::DisableAudioTap));
+
         // RTL-TCP connection controls (commit 3 of PR #335) —
         // constructed directly so a future signature change (e.g.
         // adding an instance-selector param) fails this test

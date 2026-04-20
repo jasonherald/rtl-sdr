@@ -96,6 +96,17 @@ final class TranscriptionDriver {
     /// `finalizeAndFinishThroughEndOfInput()`.
     private var analyzer: SpeechAnalyzer?
 
+    /// Lifecycle serialization — see `toggle(_:)`.
+    ///
+    /// Every `toggle` bumps this counter and cancels any
+    /// prior `lifecycleTask`. The async `start(generation:)`
+    /// re-reads it after each suspension point; if the live
+    /// value has moved on, `start` aborts without touching
+    /// state (so a stale `start` can't resurrect a session the
+    /// user already stopped). Per CodeRabbit round 1 on PR #349.
+    private var lifecycleGeneration: UInt64 = 0
+    private var lifecycleTask: Task<Void, Never>?
+
     /// Locale we transcribe in. en-US default; a locale picker
     /// could land later alongside `SpeechTranscriber.supportedLocales`.
     private let locale = Locale(identifier: "en-US")
@@ -107,16 +118,31 @@ final class TranscriptionDriver {
         self.core = core
     }
 
-    /// Toggle transcription on/off. Routes to `start()` / `stop()`
-    /// and updates the observable `enabled` mirror.
+    /// Toggle transcription on/off. Serializes lifecycle
+    /// transitions — bumps the generation counter and cancels
+    /// any in-flight `start` / `stop` task so a rapid on→off→on
+    /// sequence can't end with a stale `start` resurrecting a
+    /// session that was already torn down.
     func toggle(_ on: Bool) {
-        if on {
-            enabled = true
-            Task { await self.start() }
-        } else {
-            enabled = false
-            Task { await self.stop() }
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        lifecycleTask?.cancel()
+        enabled = on
+        lifecycleTask = Task { [weak self] in
+            guard let self else { return }
+            if on {
+                await self.start(generation: generation)
+            } else {
+                await self.stop()
+            }
         }
+    }
+
+    /// True when the given generation has been superseded by a
+    /// later toggle, or the lifecycle task was cancelled. Called
+    /// after every suspension point in `start()`.
+    private func isStale(generation: UInt64) -> Bool {
+        Task.isCancelled || lifecycleGeneration != generation
     }
 
     /// Drop the current transcript. Doesn't affect the running
@@ -128,7 +154,7 @@ final class TranscriptionDriver {
 
     // MARK: - Session lifecycle
 
-    private func start() async {
+    private func start(generation: UInt64) async {
         guard let core = self.core else {
             status = .error("engine not attached")
             enabled = false
@@ -138,6 +164,7 @@ final class TranscriptionDriver {
         // 1. Authorization.
         status = .preparing("Requesting permission…")
         let authStatus = await Self.requestSpeechAuthorization()
+        if isStale(generation: generation) { return }
         permission = Self.mapAuth(authStatus)
         switch permission {
         case .authorized:
@@ -160,6 +187,7 @@ final class TranscriptionDriver {
 
         // 2. Ensure the locale asset is installed.
         let supported = await SpeechTranscriber.supportedLocales
+        if isStale(generation: generation) { return }
         guard supported.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
             status = .error("Locale \(locale.identifier) not supported by SpeechTranscriber")
             enabled = false
@@ -167,6 +195,7 @@ final class TranscriptionDriver {
         }
 
         let installed = await SpeechTranscriber.installedLocales
+        if isStale(generation: generation) { return }
         let alreadyInstalled = installed.contains {
             $0.identifier(.bcp47) == locale.identifier(.bcp47)
         }
@@ -184,9 +213,11 @@ final class TranscriptionDriver {
         if !alreadyInstalled {
             status = .preparing("Downloading model…")
             do {
-                if let downloader = try await AssetInventory.assetInstallationRequest(
+                let downloaderOpt = try await AssetInventory.assetInstallationRequest(
                     supporting: [transcriber]
-                ) {
+                )
+                if isStale(generation: generation) { return }
+                if let downloader = downloaderOpt {
                     // Poll the `Progress` fractionCompleted at
                     // ~5 Hz until the downloadAndInstall() call
                     // returns. KVO observation on Foundation's
@@ -210,6 +241,7 @@ final class TranscriptionDriver {
                     downloadProgressTask?.cancel()
                     downloadProgressTask = nil
                     downloadProgress = nil
+                    if isStale(generation: generation) { return }
                 }
             } catch {
                 downloadProgressTask?.cancel()
@@ -233,6 +265,7 @@ final class TranscriptionDriver {
         let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
             compatibleWith: [transcriber]
         )
+        if isStale(generation: generation) { return }
         guard let analyzerFormat else {
             status = .error("SpeechAnalyzer reports no compatible audio format")
             enabled = false
@@ -250,7 +283,28 @@ final class TranscriptionDriver {
             return
         }
 
-        let converter = AVAudioConverter(from: tapFormat, to: analyzerFormat)
+        // If the analyzer asked for a format AVAudioConverter
+        // can't handle (per Apple's docs, `init(from:to:)` returns
+        // nil for unsupported pairs rather than erroring at
+        // conversion time), reject the session up front — pushing
+        // source-format buffers through an unknown path would
+        // produce a runtime format mismatch inside SpeechAnalyzer.
+        // Only skip the converter entirely when the two formats
+        // are actually equal (the no-op passthrough case). Per
+        // CodeRabbit round 1 on PR #349.
+        let converter: AVAudioConverter?
+        if analyzerFormat.isEqual(tapFormat) {
+            converter = nil
+        } else {
+            guard let built = AVAudioConverter(from: tapFormat, to: analyzerFormat) else {
+                status = .error(
+                    "Unsupported audio format conversion (tap: \(tapFormat) → analyzer: \(analyzerFormat))"
+                )
+                enabled = false
+                return
+            }
+            converter = built
+        }
 
         // 4. Start the audio tap and the analyzer. The tap
         // lives on the underlying `SdrCore` handle, not the
@@ -261,24 +315,36 @@ final class TranscriptionDriver {
             enabled = false
             return
         }
+        // Keep `tap` as a scoped local — avoids a re-read of
+        // `self.audioTap!` below, which would crash if a
+        // concurrent stop() nils it between the assignment
+        // here and the feeder spawn. Per CodeRabbit round 1.
+        let tap: AudioTapSession
         do {
-            let tap = try handle.startAudioTap()
+            tap = try handle.startAudioTap()
             self.audioTap = tap
             self.analyzer = analyzer
             self.inputContinuation = inputBuilder
 
             try await analyzer.start(inputSequence: inputSequence)
-            status = .listening
         } catch {
             status = .error("Failed to start analyzer: \(error.localizedDescription)")
             enabled = false
             await teardown()
             return
         }
+        // Final staleness gate — if we've been superseded while
+        // building out the analyzer, roll back before spawning
+        // the feeder/results tasks instead of running a session
+        // the user already cancelled.
+        if isStale(generation: generation) {
+            await teardown()
+            return
+        }
+        status = .listening
 
         // 5. Spawn the feeder (tap → AnalyzerInput yield) and the
         // results consumer.
-        let tap = self.audioTap!
         feederTask = Task.detached(priority: .userInitiated) { [weak self] in
             await Self.runFeeder(
                 samples: tap.samples,
@@ -416,7 +482,11 @@ final class TranscriptionDriver {
             }
 
             let outBuffer: AVAudioPCMBuffer
-            if let converter, analyzerFormat != tapFormat {
+            // `converter` is `Some` only when analyzer format
+            // differs from the tap format; start() rejects the
+            // session up front if AVAudioConverter can't handle
+            // the pair.
+            if let converter {
                 // Resample / reformat. Output buffer sized
                 // proportionally to the input/output rate ratio
                 // with 32 samples of slack for converter state.

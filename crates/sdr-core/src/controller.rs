@@ -260,6 +260,14 @@ struct DspState {
     /// dependency cross-compiling into the FFI surface.
     audio_tap_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 
+    /// Decimation phase carried across `stereo_48k_to_mono_16k`
+    /// calls on the audio tap path. Without it, successive DSP
+    /// blocks whose lengths aren't multiples of 3 would produce
+    /// duplicate / dropped samples at block boundaries. Reset on
+    /// `EnableAudioTap` so a fresh session starts at phase 0. Per
+    /// `CodeRabbit` round 1 on PR #349.
+    audio_tap_phase: usize,
+
     /// Last known squelch gate state, used to detect open/close edge
     /// transitions so we only emit one `SquelchOpened` / `SquelchClosed`
     /// event per transition instead of one per audio chunk. Initialized
@@ -362,6 +370,7 @@ impl DspState {
             iq_writer: None,
             transcription_tx: None,
             audio_tap_tx: None,
+            audio_tap_phase: 0,
             squelch_was_open: false,
             ctcss_was_sustained: false,
             voice_squelch_was_open: true,
@@ -504,6 +513,21 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 // tap.
                 if old_mode != mode {
                     state.transcription_tx = None;
+                    // Same hard-boundary treatment for the generic
+                    // audio tap. The SpeechAnalyzer session on the
+                    // Mac side treats every mode change as an
+                    // utterance boundary — letting post-switch
+                    // audio leak into the old session until the
+                    // UI round-trip sends DisableAudioTap would
+                    // corrupt the transcript across the mode
+                    // transition. Per CodeRabbit round 1 on PR
+                    // #349.
+                    state.audio_tap_tx = None;
+                    // Reset the decimation phase so a subsequent
+                    // EnableAudioTap starts at a clean 3:1
+                    // alignment instead of carrying a stale phase
+                    // from before the mode switch.
+                    state.audio_tap_phase = 0;
                     state.squelch_was_open = false;
                     // Mode switch rebuilds the AF chain + CTCSS
                     // detector + voice squelch — edge trackers
@@ -987,6 +1011,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // samples without pulling the sdr-transcription dep across
             // the FFI.
             state.audio_tap_tx = Some(tx);
+            // Reset the decimation phase so a new tap session starts
+            // at clean 3:1 alignment — otherwise a stale phase from
+            // a previous session (disabled, then re-enabled) would
+            // desynchronize the 16 kHz timebase until the phase
+            // wraps.
+            state.audio_tap_phase = 0;
             tracing::info!("audio tap enabled");
         }
         UiToDsp::DisableAudioTap => {
@@ -1452,34 +1482,52 @@ fn process_iq_block(
                         // occasional frame drops; audio underruns are
                         // much worse.
                         if let Some(ref tx) = state.audio_tap_tx {
-                            let mono_len = state.audio_buf[..audio_count].len().div_ceil(3);
-                            let mut mono = vec![0.0_f32; mono_len];
+                            // Upper bound on output size — the phase-
+                            // carrying resampler may write fewer than
+                            // this depending on the carried phase, so
+                            // we truncate to the returned count
+                            // before sending.
+                            let mono_cap = state.audio_buf[..audio_count]
+                                .len()
+                                .div_ceil(sdr_dsp::convert::AUDIO_TAP_DECIMATION_FACTOR);
+                            let mut mono = vec![0.0_f32; mono_cap];
                             match sdr_dsp::convert::stereo_48k_to_mono_16k(
                                 &state.audio_buf[..audio_count],
                                 &mut mono,
+                                &mut state.audio_tap_phase,
                             ) {
                                 Ok(n) => {
                                     mono.truncate(n);
-                                    match tx.try_send(mono) {
-                                        Ok(()) => {}
-                                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                                            // Consumer is lagging; drop
-                                            // this chunk and carry on.
-                                            tracing::debug!(
-                                                "audio tap channel full; dropping chunk"
-                                            );
-                                        }
-                                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                                            state.audio_tap_tx = None;
-                                            tracing::info!(
-                                                "audio tap receiver disconnected, disabling"
-                                            );
+                                    // Skip the send on an empty chunk
+                                    // (short input + unfavorable phase
+                                    // can produce zero output on a
+                                    // given call). Sending an empty
+                                    // Vec would wake the dispatcher
+                                    // for no reason.
+                                    if mono.is_empty() {
+                                        // no-op
+                                    } else {
+                                        match tx.try_send(mono) {
+                                            Ok(()) => {}
+                                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                                // Consumer is lagging; drop
+                                                // this chunk and carry on.
+                                                tracing::debug!(
+                                                    "audio tap channel full; dropping chunk"
+                                                );
+                                            }
+                                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                                state.audio_tap_tx = None;
+                                                tracing::info!(
+                                                    "audio tap receiver disconnected, disabling"
+                                                );
+                                            }
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     // Sizing bug — the buffer is sized by
-                                    // the same `div_ceil(3)` as the
+                                    // the same div_ceil expression as the
                                     // resampler's own calculation, so
                                     // this arm should be unreachable.
                                     // Log once and disable the tap.
