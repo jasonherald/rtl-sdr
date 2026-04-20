@@ -198,23 +198,40 @@ pub unsafe extern "C" fn sdr_core_radioreference_save_credentials(
             return map_keyring_error("sdr_core_radioreference_save_credentials", &e).as_int();
         }
         if let Err(e) = store.set(KEY_RR_PASSWORD, &pass) {
+            // If the password write fails, the username is
+            // already in the keyring — leaving it there paired
+            // with whatever stale password existed before would
+            // create a mixed-credentials state later (future
+            // load returns that stale pair as if it were valid).
+            // Clean up the username so the caller sees "no
+            // credentials stored" on the next load. Per
+            // CodeRabbit round 2 on PR #346.
+            let _ = store.delete(KEY_RR_USERNAME);
             return map_keyring_error("sdr_core_radioreference_save_credentials", &e).as_int();
         }
 
-        // Defensive readback: a `set` success with a failing
-        // `get` is the smoking gun for a misconfigured keyring
-        // backend (notably keyring 3.x's mock fallback when
-        // `apple-native` / `sync-secret-service` isn't enabled —
-        // see the `feedback_keyring_crate_features` memory).
-        // Catching it here, right after the write, means a
-        // future regression never silently ships.
+        // Defensive readback: a `set` success whose `get`
+        // doesn't return the value we just wrote is the smoking
+        // gun for a misconfigured keyring backend — notably
+        // keyring 3.x's mock fallback when `apple-native` /
+        // `sync-secret-service` isn't enabled (see the
+        // `feedback_keyring_crate_features` memory). Strict
+        // equality, not just "non-empty": if the keyring
+        // silently ignored the password write and left a prior
+        // stored password in place, an "any non-empty" check
+        // would still pass and we'd ship a mixed pair. On any
+        // mismatch, delete both secrets so the next load
+        // reports "not stored" cleanly instead of returning a
+        // stale half-written pair. Per CodeRabbit round 2.
         let verify_user = store.get(KEY_RR_USERNAME);
         let verify_pass = store.get(KEY_RR_PASSWORD);
         match (verify_user, verify_pass) {
-            (Ok(Some(u)), Ok(Some(_))) if !u.is_empty() => {
-                // Save round-tripped.
+            (Ok(Some(u)), Ok(Some(p))) if u == user && p == pass => {
+                // Save round-tripped, values match exactly.
             }
             (u, p) => {
+                let _ = store.delete(KEY_RR_USERNAME);
+                let _ = store.delete(KEY_RR_PASSWORD);
                 set_last_error(format!(
                     "sdr_core_radioreference_save_credentials: set returned Ok but readback failed: user={:?} pass={:?}",
                     u.map(|o| o.is_some()),
@@ -243,11 +260,17 @@ pub unsafe extern "C" fn sdr_core_radioreference_save_credentials(
 /// buffers (`MAX_CREDENTIAL_FIELD_LEN` is a safe ceiling in
 /// practice).
 ///
-/// Returns `OK` if both fields were found and written. Returns
-/// `IO` (with a `"credential not found"` last-error) if either
-/// field is missing. Checking
-/// `sdr_core_radioreference_has_credentials` first avoids the
-/// error-message churn for the expected-empty case.
+/// Returns `OK` in both normal cases:
+///   - both fields non-empty → credentials are present and
+///     were written to the buffers
+///   - either field empty (only the NUL) → nothing is stored;
+///     this is the "not yet configured" sentinel, not an error
+///
+/// Returns `IO` only for genuine keyring backend failures
+/// (backend unavailable, platform error, …). Callers can use
+/// `sdr_core_radioreference_has_credentials` as a cheap probe
+/// that captures the presence-check in a single bool without
+/// round-tripping through this call.
 ///
 /// # Safety
 ///
