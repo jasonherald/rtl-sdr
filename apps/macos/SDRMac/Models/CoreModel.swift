@@ -169,6 +169,26 @@ final class CoreModel {
 
     var volume: Float = 0.5
 
+    /// Selected audio output device UID. Empty string routes to
+    /// the system default (engine-side behavior). The available
+    /// list is re-fetched on demand via
+    /// `refreshAudioDevices()` — this is a mirror of the user
+    /// selection, not a cached snapshot of the device list.
+    var selectedAudioDeviceUid: String = ""
+
+    /// Snapshot of output devices the backend enumerated. Filled
+    /// by `refreshAudioDevices()`; the AudioSection view calls
+    /// that on panel appear so a hot-plug between app launch and
+    /// panel open still shows the current list.
+    var audioDevices: [SdrCore.AudioDevice] = []
+
+    /// Active audio-recording state. `nil` = not recording,
+    /// `some(path)` = engine confirmed it opened `path` for
+    /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
+    /// — the engine is authoritative; the UI never flips this
+    /// optimistically.
+    var audioRecordingPath: String? = nil
+
     // ==========================================================
     //  Display
     // ==========================================================
@@ -243,6 +263,17 @@ final class CoreModel {
         // This is a handle-free libusb device-list query; no USB
         // control transfers, no hardware open.
         refreshDeviceInfo()
+
+        // Restore the previously-selected audio output device UID
+        // so the user's preference survives across launches.
+        // syncToEngine() (on Start) re-applies it; we don't call
+        // `core?.setAudioDevice` here because `core` doesn't exist
+        // yet — and the engine's default is the same empty-string
+        // "system default" sentinel anyway.
+        if let saved = UserDefaults.standard.string(forKey: Self.audioDeviceDefaultsKey) {
+            selectedAudioDeviceUid = saved
+        }
+        refreshAudioDevices()
 
         do {
             let c = try SdrCore(configPath: configPath)
@@ -358,6 +389,10 @@ final class CoreModel {
             }
         case .error(let msg):
             lastError = msg
+        case .audioRecordingStarted(let path):
+            audioRecordingPath = path
+        case .audioRecordingStopped:
+            audioRecordingPath = nil
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -475,6 +510,10 @@ final class CoreModel {
         setAutoSquelch(autoSquelchEnabled)
         setDeemphasis(deemphasis)
         setVolume(volume)
+        // Route to the user's last-picked output device. The
+        // engine default is "" (system default) so a fresh install
+        // re-applies that harmlessly.
+        setAudioDevice(selectedAudioDeviceUid)
         setFftSize(fftSize)
         setFftWindow(fftWindow)
         setFftRate(fftRateFps)
@@ -655,6 +694,47 @@ final class CoreModel {
     func setVolume(_ v: Float) {
         volume = v
         capture { try core?.setVolume(v) }
+    }
+
+    /// Select an audio output device by UID. Empty string routes
+    /// to the system default. The engine re-opens the sink
+    /// transactionally — on a failed swap the previous device is
+    /// restored (see `AudioSink::set_target` docs).
+    ///
+    /// The selection is persisted to `UserDefaults` so the same
+    /// device is picked on next launch; the Rust config layer
+    /// doesn't currently round-trip this value (v3 when config
+    /// JSON grows to match the GTK layout).
+    func setAudioDevice(_ uid: String) {
+        selectedAudioDeviceUid = uid
+        UserDefaults.standard.set(uid, forKey: Self.audioDeviceDefaultsKey)
+        capture { try core?.setAudioDevice(uid) }
+    }
+
+    /// UserDefaults key for the persisted audio device UID.
+    static let audioDeviceDefaultsKey = "SDRMac.selectedAudioDeviceUid"
+
+    /// Re-query the backend for the current output device list.
+    /// Called by the AudioSection view on appear; safe to call
+    /// any time. Handle-free (static on SdrCore).
+    func refreshAudioDevices() {
+        audioDevices = SdrCore.audioDevices
+    }
+
+    /// Start writing the demodulated audio stream to `path` (a
+    /// full filesystem path). The engine confirms via
+    /// `.audioRecordingStarted` which flips
+    /// `audioRecordingPath` to non-nil. Failure comes back as
+    /// an `.error(...)` event and `audioRecordingPath` stays nil.
+    func startAudioRecording(to path: String) {
+        capture { try core?.startAudioRecording(path: path) }
+    }
+
+    /// Stop recording. Safe to call at any time — the engine
+    /// always emits `.audioRecordingStopped` in response, which
+    /// clears `audioRecordingPath`.
+    func stopAudioRecording() {
+        capture { try core?.stopAudioRecording() }
     }
 
     func setFftSize(_ n: Int) {

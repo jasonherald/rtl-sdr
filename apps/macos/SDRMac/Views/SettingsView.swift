@@ -47,7 +47,33 @@ private struct AudioPane: View {
     var body: some View {
         Form {
             LabeledContent("Output device") {
-                Text("System default").foregroundStyle(.secondary)
+                // Picker rebuilds the device list on every appear —
+                // CoreAudio hot-plugs are common (Bluetooth headsets,
+                // USB interfaces); the user shouldn't have to restart
+                // the app to see a freshly-connected device. The
+                // engine's transactional swap guarantees a bad pick
+                // rolls back to the previous route automatically.
+                Picker("", selection: Binding(
+                    get: { model.selectedAudioDeviceUid },
+                    set: { model.setAudioDevice($0) }
+                )) {
+                    // "" is the engine's "system default" sentinel —
+                    // show it as a first-class option regardless of
+                    // backend so the user always has a guaranteed-
+                    // working route to fall back on.
+                    Text("System default").tag("")
+                    ForEach(model.audioDevices) { dev in
+                        // Skip a backend-emitted empty-UID duplicate
+                        // so we never show two "System default"
+                        // options (stub backend does emit one; real
+                        // backends typically don't).
+                        if !dev.uid.isEmpty {
+                            Text(dev.displayName).tag(dev.uid)
+                        }
+                    }
+                }
+                .labelsHidden()
+                .onAppear { model.refreshAudioDevices() }
             }
             LabeledContent("Volume") {
                 @Bindable var m = model

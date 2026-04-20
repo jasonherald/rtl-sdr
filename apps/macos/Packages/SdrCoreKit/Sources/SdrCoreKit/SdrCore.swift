@@ -293,6 +293,26 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(sdr_core_set_volume(handle, volume))
     }
 
+    /// Select the audio output device by UID. Pass `""` to route
+    /// to the system default output. The UID is the opaque string
+    /// returned by `SdrCore.audioDeviceUid(at:)`.
+    public func setAudioDevice(_ uid: String) throws {
+        try checkRc(uid.withCString { sdr_core_set_audio_device(handle, $0) })
+    }
+
+    /// Start recording the demodulated audio stream to a WAV file
+    /// at `path`. The engine emits `.audioRecordingStarted(path:)`
+    /// on success or `.error(...)` on failure.
+    public func startAudioRecording(path: String) throws {
+        try checkRc(path.withCString { sdr_core_start_audio_recording(handle, $0) })
+    }
+
+    /// Stop audio recording. Safe to call when nothing is active —
+    /// the engine always emits `.audioRecordingStopped` in response.
+    public func stopAudioRecording() throws {
+        try checkRc(sdr_core_stop_audio_recording(handle))
+    }
+
     /// Enable or disable DC blocking on the IQ frontend.
     public func setDcBlocking(_ enabled: Bool) throws {
         try checkRc(sdr_core_set_dc_blocking(handle, enabled))
@@ -468,6 +488,77 @@ public final class SdrCore: @unchecked Sendable {
         let rc = buf.withUnsafeMutableBufferPointer { ptr -> Int32 in
             guard let base = ptr.baseAddress else { return -1 }
             return sdr_core_device_name(index, base, ptr.count)
+        }
+        guard rc >= 0 else { return nil }
+        return String(cString: buf)
+    }
+
+    // ==========================================================
+    //  Audio device enumeration (static, no handle required)
+    // ==========================================================
+
+    /// Descriptor for an audio output device the backend knows about.
+    /// `uid` is the opaque identifier to pass to `setAudioDevice` —
+    /// empty string means "system default output".
+    public struct AudioDevice: Sendable, Hashable, Identifiable {
+        public let displayName: String
+        public let uid: String
+        public var id: String { uid }
+
+        public init(displayName: String, uid: String) {
+            self.displayName = displayName
+            self.uid = uid
+        }
+    }
+
+    /// Snapshot of audio output devices currently enumerable.
+    /// Safe to call before `SdrCore` is created — the list comes
+    /// from the backend (CoreAudio on macOS), not the engine.
+    ///
+    /// Each call re-runs the backend query; hosts typically call
+    /// this on Settings panel open. Index 0 is typically the
+    /// "system default" entry (UID `""`).
+    public static var audioDevices: [AudioDevice] {
+        let count = sdr_core_audio_device_count()
+        guard count > 0 else { return [] }
+        var result: [AudioDevice] = []
+        result.reserveCapacity(Int(count))
+        for i in 0..<count {
+            guard let name = audioDeviceName(at: i),
+                  let uid = audioDeviceUid(at: i) else {
+                continue
+            }
+            result.append(AudioDevice(displayName: name, uid: uid))
+        }
+        return result
+    }
+
+    /// Display name for the audio output device at `index`.
+    /// Returns `nil` if `index` is out of range.
+    public static func audioDeviceName(at index: UInt32) -> String? {
+        audioDeviceString(index: index, call: sdr_core_audio_device_name)
+    }
+
+    /// Opaque UID for the audio output device at `index`. Pass
+    /// this to `setAudioDevice` to route. Empty string means
+    /// "system default output".
+    public static func audioDeviceUid(at index: UInt32) -> String? {
+        audioDeviceString(index: index, call: sdr_core_audio_device_uid)
+    }
+
+    /// Shared fixed-buffer caller for `sdr_core_audio_device_name`
+    /// / `_uid`. 512 bytes covers any reasonable CoreAudio name —
+    /// real device names max out around 60 characters and UIDs
+    /// (once we migrate to `kAudioDevicePropertyDeviceUID`) are
+    /// typically <128 bytes.
+    private static func audioDeviceString(
+        index: UInt32,
+        call: (UInt32, UnsafeMutablePointer<CChar>?, Int) -> Int32
+    ) -> String? {
+        var buf = [CChar](repeating: 0, count: 512)
+        let rc = buf.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            guard let base = ptr.baseAddress else { return -1 }
+            return call(index, base, ptr.count)
         }
         guard rc >= 0 else { return nil }
         return String(cString: buf)

@@ -21,7 +21,7 @@ use crate::handle::SdrCore;
 /// time `const _` in the test module below asserts the two stay
 /// consistent.
 pub const ABI_VERSION_MAJOR: u32 = 0;
-pub const ABI_VERSION_MINOR: u32 = 3;
+pub const ABI_VERSION_MINOR: u32 = 4;
 
 /// Return the ABI version the library was built with.
 ///
@@ -326,7 +326,7 @@ mod tests {
     /// build here rather than drifting silently.
     const _: () = {
         assert!(ABI_VERSION_MAJOR == 0);
-        assert!(ABI_VERSION_MINOR == 3);
+        assert!(ABI_VERSION_MINOR == 4);
     };
 
     #[test]

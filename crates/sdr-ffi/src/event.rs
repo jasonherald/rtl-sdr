@@ -53,6 +53,8 @@ pub const SDR_EVT_DEVICE_INFO: i32 = 4;
 pub const SDR_EVT_GAIN_LIST: i32 = 5;
 pub const SDR_EVT_DISPLAY_BANDWIDTH: i32 = 6;
 pub const SDR_EVT_ERROR: i32 = 7;
+pub const SDR_EVT_AUDIO_RECORDING_STARTED: i32 = 8;
+pub const SDR_EVT_AUDIO_RECORDING_STOPPED: i32 = 9;
 
 // ============================================================
 //  SdrEvent tagged union — `#[repr(C)]` layout matching the
@@ -84,19 +86,30 @@ pub struct SdrEventError {
     pub utf8: *const c_char,
 }
 
+/// Payload for `SDR_EVT_AUDIO_RECORDING_STARTED`. Borrowed pointer
+/// to the filesystem path the engine opened for writing. Valid only
+/// for the duration of the callback.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventAudioRecording {
+    pub path_utf8: *const c_char,
+}
+
 /// C-layout tagged union of event payloads. Which field is valid
 /// is determined by the `kind` discriminant on the enclosing
 /// `SdrEvent`:
 ///
-/// | `kind`                          | Valid field              |
-/// |---------------------------------|--------------------------|
-/// | `SDR_EVT_SOURCE_STOPPED`        | none                     |
-/// | `SDR_EVT_SAMPLE_RATE_CHANGED`   | `sample_rate_hz`         |
-/// | `SDR_EVT_SIGNAL_LEVEL`          | `signal_level_db`        |
-/// | `SDR_EVT_DEVICE_INFO`           | `device_info.utf8`       |
-/// | `SDR_EVT_GAIN_LIST`             | `gain_list.{values,len}` |
-/// | `SDR_EVT_DISPLAY_BANDWIDTH`     | `display_bandwidth_hz`   |
-/// | `SDR_EVT_ERROR`                 | `error.utf8`             |
+/// | `kind`                            | Valid field                  |
+/// |-----------------------------------|------------------------------|
+/// | `SDR_EVT_SOURCE_STOPPED`          | none                         |
+/// | `SDR_EVT_SAMPLE_RATE_CHANGED`     | `sample_rate_hz`             |
+/// | `SDR_EVT_SIGNAL_LEVEL`            | `signal_level_db`            |
+/// | `SDR_EVT_DEVICE_INFO`             | `device_info.utf8`           |
+/// | `SDR_EVT_GAIN_LIST`               | `gain_list.{values,len}`     |
+/// | `SDR_EVT_DISPLAY_BANDWIDTH`       | `display_bandwidth_hz`       |
+/// | `SDR_EVT_ERROR`                   | `error.utf8`                 |
+/// | `SDR_EVT_AUDIO_RECORDING_STARTED` | `audio_recording.path_utf8`  |
+/// | `SDR_EVT_AUDIO_RECORDING_STOPPED` | none                         |
 ///
 /// `_placeholder` exists so `SOURCE_STOPPED` events (which carry
 /// no payload) can still construct the struct with a meaningful
@@ -110,6 +123,7 @@ pub union SdrEventPayload {
     pub device_info: SdrEventDeviceInfo,
     pub gain_list: SdrEventGainList,
     pub error: SdrEventError,
+    pub audio_recording: SdrEventAudioRecording,
     /// Placeholder for kinds that carry no payload (e.g.,
     /// `SDR_EVT_SOURCE_STOPPED`). Accessing this field is always
     /// valid as a zero-byte read.
@@ -263,9 +277,31 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
             }
         }
 
+        DspToUi::AudioRecordingStarted(path) => {
+            // Sanitize interior NULs rather than dropping the event
+            // on an unusual path (same policy as DeviceInfo).
+            let sanitized = path.to_string_lossy().replace('\0', "?");
+            let Ok(cstr) = CString::new(sanitized) else {
+                return None;
+            };
+            let ptr = cstr.as_ptr();
+            owned_cstring = Some(cstr);
+            SdrEvent {
+                kind: SDR_EVT_AUDIO_RECORDING_STARTED,
+                payload: SdrEventPayload {
+                    audio_recording: SdrEventAudioRecording { path_utf8: ptr },
+                },
+            }
+        }
+
+        DspToUi::AudioRecordingStopped => SdrEvent {
+            kind: SDR_EVT_AUDIO_RECORDING_STOPPED,
+            payload: SdrEventPayload { _placeholder: 0 },
+        },
+
         // Variants not yet exposed at the FFI boundary. Silently
-        // dropped in v1; a v2 ABI minor bump grows the surface to
-        // cover them as each feature lands in the macOS SwiftUI
+        // dropped in v1; a future ABI minor bump grows the surface
+        // to cover them as each feature lands in the macOS SwiftUI
         // host.
         //
         // Specifically:
@@ -273,9 +309,8 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         //     event callback — FFT frames go through the dedicated
         //     pull function (`sdr_core_pull_fft`) instead so the
         //     render loop stays on the main thread.
-        //   - `AudioRecordingStarted/Stopped` + `IqRecordingStarted/
-        //     Stopped` light up when recording controls land in
-        //     the macOS UI (v2 backlog issues #238 / #239).
+        //   - `IqRecordingStarted/Stopped` light up when IQ
+        //     recording controls land in the macOS UI (issue #238).
         //   - `DemodModeChanged` is the transcription-session
         //     boundary event. macOS transcription IS on the
         //     roadmap — it's currently blocked on a Metal
@@ -295,8 +330,6 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         // of existing ones), so a future minor bump won't break
         // older hosts that don't know about them.
         DspToUi::FftData(_)
-        | DspToUi::AudioRecordingStarted(_)
-        | DspToUi::AudioRecordingStopped
         | DspToUi::IqRecordingStarted(_)
         | DspToUi::IqRecordingStopped
         | DspToUi::DemodModeChanged(_)
@@ -572,6 +605,8 @@ mod tests {
         assert_eq!(SDR_EVT_GAIN_LIST, 5);
         assert_eq!(SDR_EVT_DISPLAY_BANDWIDTH, 6);
         assert_eq!(SDR_EVT_ERROR, 7);
+        assert_eq!(SDR_EVT_AUDIO_RECORDING_STARTED, 8);
+        assert_eq!(SDR_EVT_AUDIO_RECORDING_STOPPED, 9);
     }
 
     #[test]

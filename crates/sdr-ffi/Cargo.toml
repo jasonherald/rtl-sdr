@@ -36,6 +36,12 @@ sdr-radio.workspace = true
 # These are static (no handle required), so they don't fit the
 # engine-dispatch path; they go through `sdr-rtlsdr` directly.
 sdr-rtlsdr.workspace = true
+# Direct dep on sdr-sink-audio for the audio-device enumeration
+# functions (`sdr_core_audio_device_count` / `_name` / `_uid`).
+# Same rationale as `sdr-rtlsdr` above — these are handle-free
+# `list_audio_sinks()` snapshots of CoreAudio / PipeWire state,
+# so they bypass the engine dispatch path.
+sdr-sink-audio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 libc.workspace = true
