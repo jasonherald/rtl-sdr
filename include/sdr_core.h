@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 3
+#define SDR_CORE_ABI_VERSION_MINOR 4
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -143,6 +143,63 @@ uint32_t sdr_core_device_count(void);
  * `SdrCore` handle.
  */
 int32_t sdr_core_device_name(
+    uint32_t index,
+    char*    out_buf,
+    size_t   buf_len
+);
+
+/* ================================================================ */
+/*  Audio output device enumeration                                 */
+/* ================================================================ */
+
+/*
+ * These functions snapshot the backend's list of output devices
+ * (CoreAudio on macOS, PipeWire on Linux, stub on others) and let
+ * the host surface them in a Settings picker. They are handle-free
+ * and can be called before `sdr_core_create`.
+ *
+ * Atomicity (thread-local snapshot):
+ *   - `sdr_core_audio_device_count` runs the backend query and
+ *     stores the result in a per-thread snapshot.
+ *   - `sdr_core_audio_device_name` and `_uid` read from that
+ *     snapshot, so for a given thread, `_name(i)` and `_uid(i)`
+ *     always refer to the same device entry — even if a device
+ *     hot-plugs between the two calls. Callers get coherent
+ *     name/UID pairs for every index returned by `_count`.
+ *   - Calling `_name(i)` / `_uid(i)` without a prior `_count` on
+ *     this thread triggers a lazy refresh. That path doesn't
+ *     benefit from cross-index consistency (each call refreshes
+ *     if the snapshot was empty), but single-device pickers
+ *     still work.
+ *   - Each new `_count` call discards the previous snapshot and
+ *     takes a fresh one, so the pattern "call count, iterate
+ *     indices, call count again" gives the host two independent
+ *     views and lets it detect hot-plug by comparing sizes.
+ *
+ * A v3 hot-plug listener (pushed as a dedicated event variant)
+ * is on the roadmap for continuous device-presence tracking.
+ *
+ * `_name` returns the human-readable label (e.g. "MacBook Pro
+ * Speakers"). `_uid` returns the caller-opaque identifier that
+ * `sdr_core_set_audio_device` accepts. On macOS the UID is
+ * currently the `AudioDeviceID` as a decimal string and is
+ * session-scoped (stable within a process lifetime); a later PR
+ * migrates to the persistent `kAudioDevicePropertyDeviceUID`
+ * string without an ABI change since callers treat it as opaque.
+ *
+ * Empty string as UID means "system default output" on every
+ * backend — index 0 is typically that entry.
+ */
+
+uint32_t sdr_core_audio_device_count(void);
+
+int32_t sdr_core_audio_device_name(
+    uint32_t index,
+    char*    out_buf,
+    size_t   buf_len
+);
+
+int32_t sdr_core_audio_device_uid(
     uint32_t index,
     char*    out_buf,
     size_t   buf_len
@@ -335,6 +392,39 @@ int32_t sdr_core_set_deemphasis(SdrCore* handle, int32_t mode);
  */
 int32_t sdr_core_set_volume(SdrCore* handle, float volume_0_1);
 
+/*
+ * Select the audio output device by caller-opaque UID. The UID is
+ * the value previously obtained from `sdr_core_audio_device_uid`.
+ * Empty string ("") routes to the system default output — that is
+ * the engine default until the host calls this.
+ *
+ * `uid_utf8` must be a NUL-terminated UTF-8 C string (null returns
+ * `SDR_CORE_ERR_INVALID_ARG`). The device swap is engine-side
+ * transactional: on a failed swap the previous device is restored,
+ * so a rejected UID never leaves the sink silent.
+ */
+int32_t sdr_core_set_audio_device(SdrCore* handle, const char* uid_utf8);
+
+/*
+ * Start / stop recording the demodulated audio stream to a 16-bit
+ * PCM WAV file. The engine opens the file on `start`, writes every
+ * decoded frame while recording is active, and finalizes the WAV
+ * header when the writer drops on `stop`.
+ *
+ * `start` emits `SDR_EVT_AUDIO_RECORDING_STARTED` on success or
+ * `SDR_EVT_ERROR` if the file couldn't be opened / written.
+ * `stop` emits `SDR_EVT_AUDIO_RECORDING_STOPPED` (including when
+ * no recording was active — the event is the host's signal to
+ * clear its "recording" UI regardless of prior state).
+ *
+ * `path_utf8` must be a non-empty NUL-terminated UTF-8 path; the
+ * host is responsible for picking a writable location. Sample rate
+ * and channel count are engine-determined (currently
+ * AUDIO_SAMPLE_RATE at AUDIO_CHANNELS — see the engine constants).
+ */
+int32_t sdr_core_start_audio_recording(SdrCore* handle, const char* path_utf8);
+int32_t sdr_core_stop_audio_recording(SdrCore* handle);
+
 /* --- IQ frontend -------------------------------------------------- */
 
 int32_t sdr_core_set_dc_blocking(SdrCore* handle, bool enabled);
@@ -399,13 +489,15 @@ int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
  */
 
 typedef enum SdrEventKind {
-    SDR_EVT_SOURCE_STOPPED        = 1,
-    SDR_EVT_SAMPLE_RATE_CHANGED   = 2,
-    SDR_EVT_SIGNAL_LEVEL          = 3,
-    SDR_EVT_DEVICE_INFO           = 4,
-    SDR_EVT_GAIN_LIST             = 5,
-    SDR_EVT_DISPLAY_BANDWIDTH     = 6,
-    SDR_EVT_ERROR                 = 7,
+    SDR_EVT_SOURCE_STOPPED          = 1,
+    SDR_EVT_SAMPLE_RATE_CHANGED     = 2,
+    SDR_EVT_SIGNAL_LEVEL            = 3,
+    SDR_EVT_DEVICE_INFO             = 4,
+    SDR_EVT_GAIN_LIST               = 5,
+    SDR_EVT_DISPLAY_BANDWIDTH       = 6,
+    SDR_EVT_ERROR                   = 7,
+    SDR_EVT_AUDIO_RECORDING_STARTED = 8,
+    SDR_EVT_AUDIO_RECORDING_STOPPED = 9,
 } SdrEventKind;
 
 /*
@@ -436,6 +528,18 @@ typedef struct SdrEventError {
 } SdrEventError;
 
 /*
+ * Payload for SDR_EVT_AUDIO_RECORDING_STARTED. `path_utf8` is the
+ * NUL-terminated UTF-8 filesystem path the engine opened for
+ * writing — borrowed from dispatcher-owned storage; valid only
+ * for the duration of the callback.
+ *
+ * SDR_EVT_AUDIO_RECORDING_STOPPED carries no payload.
+ */
+typedef struct SdrEventAudioRecording {
+    const char* path_utf8;
+} SdrEventAudioRecording;
+
+/*
  * Tagged union of all event payloads. Which union field is valid
  * is determined by the `kind` discriminant on the enclosing
  * SdrEvent (see the table below).
@@ -449,14 +553,17 @@ typedef struct SdrEventError {
  * SDR_EVT_DEVICE_INFO                 device_info.utf8
  * SDR_EVT_GAIN_LIST                   gain_list.{values,len}
  * SDR_EVT_ERROR                       error.utf8
+ * SDR_EVT_AUDIO_RECORDING_STARTED     audio_recording.path_utf8
+ * SDR_EVT_AUDIO_RECORDING_STOPPED     none (all-zero payload)
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
     float  signal_level_db;
     double display_bandwidth_hz;
-    SdrEventDeviceInfo device_info;
-    SdrEventGainList   gain_list;
-    SdrEventError      error;
+    SdrEventDeviceInfo     device_info;
+    SdrEventGainList       gain_list;
+    SdrEventError          error;
+    SdrEventAudioRecording audio_recording;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;
