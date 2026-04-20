@@ -420,8 +420,23 @@ final class TranscriptionDriver {
     }
 
     private func onFeederEnded() async {
-        // The tap stream closed — the engine is torn down or the
-        // user hit Stop. Let the normal teardown path run.
+        // The tap stream closed. Two cases:
+        //   1. The user toggled transcription off — `enabled` is
+        //      already false and `stop()` is/will be running. Do
+        //      nothing; the standard teardown path handles it.
+        //   2. The DSP side dropped the tap unexpectedly (engine
+        //      teardown, or a mode change that clears audio_tap_tx
+        //      on the Rust side before the UI round-trip sends
+        //      DisableAudioTap). In that case `enabled` is still
+        //      true, and without this branch we'd leave
+        //      `status == .listening` with no live audio source
+        //      feeding the analyzer. Drive a normal stop so the
+        //      UI reflects reality and the resources get reclaimed.
+        // Per CodeRabbit round 2 on PR #349.
+        guard enabled else { return }
+        enabled = false
+        status = .error("Audio tap ended unexpectedly")
+        await stop()
     }
 
     // MARK: - Helpers

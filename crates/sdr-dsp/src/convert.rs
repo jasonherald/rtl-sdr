@@ -1,7 +1,20 @@
 //! Signal type conversion functions.
 //!
-//! Ports SDR++ `dsp::convert` namespace. All functions are stateless and
-//! operate on slices, converting between Complex, Stereo, and f32 types.
+//! Ports SDR++ `dsp::convert` namespace. Most functions are stateless
+//! and operate on slices, converting between Complex, Stereo, and f32
+//! types.
+//!
+//! # Caller-stateful helpers
+//!
+//! [`stereo_48k_to_mono_16k`] is the one exception — it carries a
+//! decimation phase across calls via a `&mut usize` parameter. Callers
+//! must preserve that variable between calls on the same stream so
+//! successive input chunks whose lengths aren't multiples of the
+//! decimation factor form a continuous 3:1 output instead of resetting
+//! the decimator's sample phase on every invocation. Initialize the
+//! phase to `0` on the first call after enabling the tap (or after a
+//! reset); the function leaves `*phase` in `0..DECIMATION_FACTOR` on
+//! return. See the function's docstring for the full contract.
 
 use sdr_types::{Complex, DspError, Stereo};
 
