@@ -253,9 +253,45 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(sdr_core_set_gain(handle, gainDb))
     }
 
-    /// Enable or disable tuner AGC.
+    /// Enable or disable tuner AGC (hardware loop only).
+    ///
+    /// Legacy two-state setter preserved for backward-compat.
+    /// Modern callers should use `setAgcType(_:)` which
+    /// dispatches both the hardware and software loops in
+    /// one call; this setter only touches hardware, so a
+    /// consumer calling `setAgc(false)` while software AGC
+    /// is on would leave software on unexpectedly.
     public func setAgc(_ enabled: Bool) throws {
         try checkRc(sdr_core_set_agc(handle, enabled))
+    }
+
+    /// Three-state AGC selector. `.off` / `.hardware` /
+    /// `.software` — the engine's two AGC loops are mutually
+    /// exclusive at the UI policy layer, and this setter
+    /// enforces that by dispatching both underlying commands
+    /// atomically. Default on fresh installs is `.software`
+    /// (sidesteps the tuner-AGC pumping behavior). Per issue
+    /// #357 (ABI 0.13).
+    public enum AgcType: Int32, Sendable, CaseIterable, Codable {
+        case off      = 0
+        case hardware = 1
+        case software = 2
+
+        public var label: String {
+            switch self {
+            case .off:      return "Off"
+            case .hardware: return "Hardware"
+            case .software: return "Software"
+            }
+        }
+    }
+
+    /// Set the active AGC type. See `AgcType` for the
+    /// single-loop-on policy — this call flips BOTH the
+    /// hardware (`set_agc`) and software (`set_software_agc`)
+    /// loops in one FFI transaction.
+    public func setAgcType(_ type: AgcType) throws {
+        try checkRc(sdr_core_set_agc_type(handle, type.rawValue))
     }
 
     /// Set the active demodulation mode.
@@ -377,6 +413,17 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(path.withCString { cPath in
             sdr_core_set_file_path(handle, cPath)
         })
+    }
+
+    /// Toggle loop-on-EOF for the file playback source.
+    /// `true` rewinds to the start of the WAV file at EOF
+    /// and keeps streaming; `false` stops the source at EOF.
+    /// Applies both to the running source (effective from
+    /// the next EOF onward) and to future source rebuilds.
+    /// No-op when the active source isn't `.file`. Per issue
+    /// #236 (ABI 0.13).
+    public func setFileLooping(_ looping: Bool) throws {
+        try checkRc(sdr_core_set_file_looping(handle, looping))
     }
 
     // ==========================================================
