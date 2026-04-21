@@ -440,6 +440,72 @@ final class CoreModel {
     /// concurrent stop's USB close.
     private var rtlTcpServerLifecycleTask: Task<Void, Never>? = nil
 
+    // ----------------------------------------------------------
+    //  rtl_tcp client — issue #326
+    //
+    //  Observable state for the SwiftUI client picker: discovered
+    //  servers from the mDNS browser, persisted favorites + last-
+    //  connected snapshot, and the live connection state surfaced
+    //  by the engine's `RtlTcpConnectionState` event. Mirrors the
+    //  Linux GTK `source_panel.rs` treatment (favorites keys,
+    //  bandwidth advisory threshold, state formatter) so both
+    //  frontends have parity.
+    // ----------------------------------------------------------
+
+    /// Live mDNS discoveries from `SdrRtlTcpBrowser`, sorted by
+    /// `instanceName` for stable ordering. Browser runs from
+    /// bootstrap to shutdown — discovering while the picker is
+    /// closed is harmless and means the list is already populated
+    /// the first time the user expands it.
+    var rtlTcpDiscoveredServers: [SdrRtlTcpBrowser.DiscoveredServer] = []
+
+    /// User-pinned favorite servers, persisted as a JSON array in
+    /// `UserDefaults`. Starred rows promote to the top of the
+    /// picker (UI layer) and survive across sessions even when
+    /// the server is offline. Mirrors the Linux `FavoriteEntry`
+    /// on-disk schema.
+    var rtlTcpFavorites: [RtlTcpClientFavorite] = []
+
+    /// Most recent server the user actually connected to — host,
+    /// port, nickname. Populated on successful connect, persisted
+    /// in `UserDefaults` so the next launch repopulates the
+    /// manual-entry fields + can auto-reconnect without waiting
+    /// for mDNS rediscovery.
+    var rtlTcpLastConnected: RtlTcpClientLastConnected? = nil
+
+    /// Live connection-state snapshot, mirrored from
+    /// `SdrCoreEvent.rtlTcpConnectionState`. `.disconnected`
+    /// initial value before the engine reports anything. Drives
+    /// the status row's subtitle and the disconnect/retry button
+    /// sensitivity in the UI.
+    var rtlTcpConnectionState: RtlTcpConnectionState = .disconnected
+
+    /// `true` when the selected sample rate is at or above 2.4
+    /// Msps AND the active source is `.rtlTcp`. At 8-bit I/Q
+    /// pairs that works out to ≈38 Mbps on the wire — below
+    /// typical Wi-Fi practical throughput for older routers. The
+    /// UI shows a caption warning about drops; the rate still
+    /// commits because wired gigabit handles it fine. Threshold
+    /// matches `HIGH_BANDWIDTH_SAMPLE_RATE_IDX` in
+    /// `sdr-ui/src/sidebar/source_panel.rs` (index 7 = 2.4 MHz).
+    var rtlTcpShowsBandwidthAdvisory: Bool {
+        sourceType == .rtlTcp
+            && effectiveSampleRateHz >= Self.rtlTcpHighBandwidthThresholdHz
+    }
+
+    /// Sample-rate threshold (Hz) at which `rtlTcpShowsBandwidthAdvisory`
+    /// kicks in. Matches the Linux constant. `Double` to match
+    /// the `effectiveSampleRateHz` @Observable field type.
+    static let rtlTcpHighBandwidthThresholdHz: Double = 2_400_000
+
+    /// Live mDNS browser handle. Started in `bootstrap()` and
+    /// stopped in `shutdown()`; `nil` if the OS denied browser
+    /// start (rare — mDNS doesn't need special entitlements on
+    /// macOS). Events land on a dispatcher thread and hop to
+    /// MainActor via `Task { @MainActor in … }` inside the
+    /// callback closure.
+    private var rtlTcpBrowser: SdrRtlTcpBrowser? = nil
+
     /// Active audio-recording state. `nil` = not recording,
     /// `some(path)` = engine confirmed it opened `path` for
     /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
@@ -545,6 +611,19 @@ final class CoreModel {
         // This is a handle-free libusb device-list query; no USB
         // control transfers, no hardware open.
         refreshDeviceInfo()
+
+        // Start the rtl_tcp mDNS browser early so the picker is
+        // already populated when the user first expands it. No-
+        // op on macOS without mDNS (Bonjour is always on), but
+        // the failure path is non-fatal either way. Per issue
+        // #326.
+        startRtlTcpBrowser()
+
+        // Restore persisted favorites + last-connected snapshot
+        // so the picker's "Known servers" list and the manual-
+        // entry defaults round-trip across launches. Per issue
+        // #326.
+        restoreRtlTcpClientState()
 
         // Restore the previously-selected audio output device UID
         // so the user's preference survives across launches.
@@ -714,6 +793,10 @@ final class CoreModel {
         // toggle; shutdown runs during app termination where
         // blocking briefly is the desired behavior.
         stopRtlTcpServerSync()
+        // Stop the rtl_tcp mDNS browser on shutdown — joins the
+        // dispatcher thread so no stray callbacks arrive after
+        // the model deinits. Per issue #326.
+        stopRtlTcpBrowser()
         if let core {
             // Best-effort stop — a thrown error shouldn't leave
             // the model claiming `isRunning == true` alongside a
@@ -816,6 +899,14 @@ final class CoreModel {
             // reads this field to render the status row; we don't
             // locally flip state on the setter return code.
             networkSinkStatus = status
+        case .rtlTcpConnectionState(let state):
+            // Engine is authoritative for rtl_tcp client state
+            // — `Connecting`, `Connected(tuner)`, `Retrying(n,
+            // secs)`, `Failed(reason)`, `Disconnected`. The UI
+            // status row subtitle renders `state` directly;
+            // disconnect / retry buttons gate on it. Per issue
+            // #326.
+            rtlTcpConnectionState = state
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -1723,6 +1814,157 @@ final class CoreModel {
     static let rtlTcpServerInitialPpmKey = "SDRMac.rtlTcpServer.initialPpm"
     static let rtlTcpServerInitialBiasTeeKey = "SDRMac.rtlTcpServer.initialBiasTee"
     static let rtlTcpServerInitialDirectSamplingKey = "SDRMac.rtlTcpServer.initialDirectSampling"
+
+    /// UserDefaults keys for the persisted rtl_tcp *client*
+    /// favorites and last-connected snapshot. Namespaced to
+    /// `SDRMac.rtlTcpClient.*` to stay distinct from the server
+    /// keys above. Stored as JSON strings (arrays / objects via
+    /// `JSONEncoder`) — matches the Linux `source_panel.rs`
+    /// on-disk shape where the same records live under
+    /// `rtl_tcp_client_favorites` / `rtl_tcp_client_last_connected`
+    /// inside the engine `ConfigManager` JSON.
+    static let rtlTcpClientFavoritesKey = "SDRMac.rtlTcpClient.favorites"
+    static let rtlTcpClientLastConnectedKey = "SDRMac.rtlTcpClient.lastConnected"
+
+    // ----------------------------------------------------------
+    //  rtl_tcp client — issue #326
+    // ----------------------------------------------------------
+
+    /// Start the mDNS browser for `_rtl_tcp._tcp.local.`
+    /// announcements. Called from `bootstrap()`; the browser
+    /// runs for the app's lifetime so the discovered list is
+    /// pre-populated the first time the user expands the
+    /// picker, matching the Linux GTK behavior. Failure here is
+    /// a warning — the picker still works via favorites and
+    /// manual entry, just without auto-discovery.
+    private func startRtlTcpBrowser() {
+        // Idempotent — a re-bootstrap (hypothetically) won't
+        // spawn a second browser.
+        if rtlTcpBrowser != nil { return }
+        do {
+            rtlTcpBrowser = try SdrRtlTcpBrowser { [weak self] event in
+                // Callback fires on the browser's dispatcher
+                // thread — hop to MainActor to mutate
+                // `@Observable` state.
+                Task { @MainActor [weak self] in
+                    self?.applyRtlTcpBrowserEvent(event)
+                }
+            }
+        } catch {
+            print("[CoreModel] rtl_tcp mDNS browser failed to start: \(error)")
+            rtlTcpBrowser = nil
+        }
+    }
+
+    /// Stop the browser. Called from `shutdown()` — the
+    /// `deinit` would also release the handle, but explicit
+    /// teardown joins the dispatcher thread before we exit.
+    private func stopRtlTcpBrowser() {
+        rtlTcpBrowser?.stop()
+        rtlTcpBrowser = nil
+    }
+
+    /// Merge one browser event into `rtlTcpDiscoveredServers`,
+    /// keyed on `instanceName` (the mDNS DNS-SD instance name
+    /// is the stable identity; same instance re-announcing from
+    /// a new IP replaces the existing row). Keeps the list
+    /// sorted by instance name for stable UI rendering.
+    private func applyRtlTcpBrowserEvent(_ event: SdrRtlTcpBrowser.Event) {
+        switch event {
+        case .announced(let server):
+            if let idx = rtlTcpDiscoveredServers.firstIndex(where: {
+                $0.instanceName == server.instanceName
+            }) {
+                rtlTcpDiscoveredServers[idx] = server
+            } else {
+                rtlTcpDiscoveredServers.append(server)
+                rtlTcpDiscoveredServers.sort { $0.instanceName < $1.instanceName }
+            }
+            // Refresh cached metadata on any favorite that
+            // matches this announce — so a reopened sidebar
+            // shows current tuner / gain-count / last-seen
+            // even when offline-starred earlier.
+            let key = "\(server.hostname):\(server.port)"
+            if let idx = rtlTcpFavorites.firstIndex(where: { $0.key == key }) {
+                var fav = rtlTcpFavorites[idx]
+                let newNickname = server.nickname.isEmpty
+                    ? server.instanceName
+                    : server.nickname
+                if !newNickname.isEmpty {
+                    fav.nickname = newNickname
+                }
+                if !server.tuner.isEmpty {
+                    fav.tunerName = server.tuner
+                }
+                if server.gains != 0 {
+                    fav.gainCount = server.gains
+                }
+                fav.lastSeenUnix = UInt64(Date().timeIntervalSince1970)
+                rtlTcpFavorites[idx] = fav
+                persistRtlTcpFavorites()
+            }
+        case .withdrawn(let instanceName):
+            rtlTcpDiscoveredServers.removeAll { $0.instanceName == instanceName }
+        }
+    }
+
+    /// Add (or refresh) a favorite for the given key. If an
+    /// entry with the same key already exists, its metadata is
+    /// updated in place rather than duplicated.
+    func addRtlTcpFavorite(_ favorite: RtlTcpClientFavorite) {
+        if let idx = rtlTcpFavorites.firstIndex(where: { $0.key == favorite.key }) {
+            rtlTcpFavorites[idx] = favorite
+        } else {
+            rtlTcpFavorites.append(favorite)
+        }
+        persistRtlTcpFavorites()
+    }
+
+    /// Remove a favorite by key. No-op if the key isn't found.
+    func removeRtlTcpFavorite(key: String) {
+        rtlTcpFavorites.removeAll { $0.key == key }
+        persistRtlTcpFavorites()
+    }
+
+    /// Persist the favorites array to `UserDefaults` as a JSON
+    /// string. Called from `add/removeRtlTcpFavorite` on any
+    /// mutation, and from the browser event handler when it
+    /// refreshes cached metadata for a starred entry.
+    func persistRtlTcpFavorites() {
+        if let data = try? JSONEncoder().encode(rtlTcpFavorites),
+           let json = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(json, forKey: Self.rtlTcpClientFavoritesKey)
+        }
+    }
+
+    /// Persist the last-connected snapshot to `UserDefaults`.
+    /// Called on a successful client connect (commit 2).
+    func persistRtlTcpLastConnected() {
+        if let last = rtlTcpLastConnected,
+           let data = try? JSONEncoder().encode(last),
+           let json = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(json, forKey: Self.rtlTcpClientLastConnectedKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.rtlTcpClientLastConnectedKey)
+        }
+    }
+
+    /// Restore favorites + last-connected from `UserDefaults`.
+    /// Called from `bootstrap()`. Absent or corrupt entries
+    /// degrade to empty / nil silently — a bad JSON blob should
+    /// never block the app from launching.
+    private func restoreRtlTcpClientState() {
+        if let json = UserDefaults.standard.string(forKey: Self.rtlTcpClientFavoritesKey),
+           let data = json.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([RtlTcpClientFavorite].self, from: data) {
+            rtlTcpFavorites = decoded
+        }
+        if let json = UserDefaults.standard.string(forKey: Self.rtlTcpClientLastConnectedKey),
+           let data = json.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(RtlTcpClientLastConnected.self, from: data) {
+            rtlTcpLastConnected = decoded
+        }
+    }
 
     // ----------------------------------------------------------
     //  Source selection setters — issues #235, #236
