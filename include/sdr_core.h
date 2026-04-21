@@ -672,7 +672,7 @@ typedef struct SdrRtlTcpServerConfig {
     int32_t  bind_address;               /* SdrBindAddress */
     uint16_t port;                       /* TCP listen port; 0 = crate default */
     uint32_t device_index;               /* RTL-SDR USB index (0 = first) */
-    uint32_t buffer_capacity;            /* 0 = crate default */
+    uint32_t buffer_capacity;            /* 0 = crate default (500); rejected above 4096 — each slot is ~256 KiB of USB transfer data */
     uint32_t initial_freq_hz;            /* center frequency */
     uint32_t initial_sample_rate_hz;     /* sample rate; MUST be > 0 — zero wedges the RTL-SDR USB controller */
     int32_t  initial_gain_tenths_db;     /* tuner gain in 0.1 dB, 0 = auto */
@@ -732,7 +732,8 @@ typedef struct SdrRtlTcpServerStats {
  *   SDR_CORE_ERR_INVALID_ARG — null cfg / out_handle, unknown
  *                              bind_address,
  *                              initial_sample_rate_hz == 0,
- *                              direct_sampling outside 0..=2.
+ *                              direct_sampling outside 0..=2,
+ *                              buffer_capacity > 4096.
  *   SDR_CORE_ERR_IO          — bind / address error.
  *   SDR_CORE_ERR_DEVICE      — USB open / device error.
  *   SDR_CORE_ERR_INTERNAL    — caught panic.

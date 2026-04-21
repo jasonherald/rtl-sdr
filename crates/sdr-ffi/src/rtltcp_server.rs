@@ -36,6 +36,17 @@ use crate::lifecycle::panic_message;
 pub const SDR_BIND_LOOPBACK: i32 = 0;
 pub const SDR_BIND_ALL_INTERFACES: i32 = 1;
 
+/// Upper bound for `SdrRtlTcpServerConfig::buffer_capacity`.
+/// The value becomes the slot count of the bounded
+/// `sync_channel::<Vec<u8>>` in `sdr-server-rtltcp`. Each
+/// slot holds one USB transfer (~256 KiB), so a bad FFI
+/// input could otherwise turn `_start` into a multi-GiB
+/// allocation / OOM path. 4096 slots ≈ 1 GiB — well past
+/// any reasonable use case (the crate default is 500 =
+/// 128 MiB) while keeping `u32::MAX` trivially rejected.
+/// Per `CodeRabbit` round 9 on PR #360.
+pub const SDR_RTLTCP_SERVER_MAX_BUFFER_CAPACITY: u32 = 4096;
+
 // ============================================================
 //  Public C struct layout — `SdrRtlTcpServerConfig`
 // ============================================================
@@ -288,6 +299,17 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
         };
         let buffer_capacity = if cfg.buffer_capacity == 0 {
             sdr_server_rtltcp::DEFAULT_BUFFER_CAPACITY
+        } else if cfg.buffer_capacity > SDR_RTLTCP_SERVER_MAX_BUFFER_CAPACITY {
+            // Reject at the boundary. Above this the
+            // allocation pressure dominates anything a
+            // real server would need. Per `CodeRabbit`
+            // round 9 on PR #360.
+            set_last_error(format!(
+                "sdr_rtltcp_server_start: buffer_capacity {} exceeds max {} \
+                 (each slot is ~256 KiB of USB transfer data)",
+                cfg.buffer_capacity, SDR_RTLTCP_SERVER_MAX_BUFFER_CAPACITY
+            ));
+            return SdrCoreError::InvalidArg.as_int();
         } else {
             cfg.buffer_capacity as usize
         };
@@ -786,6 +808,33 @@ mod tests {
         cfg.initial_gain_tenths_db = TEST_NONZERO_GAIN_TENTHS;
         let initial = initial_from_c(&cfg).unwrap();
         assert_eq!(initial.gain_tenths_db, Some(TEST_NONZERO_GAIN_TENTHS));
+    }
+
+    #[test]
+    fn start_rejects_oversized_buffer_capacity() {
+        // Pins the MAX_BUFFER_CAPACITY guard added in round 9
+        // per `CodeRabbit`. Construct options that would
+        // otherwise pass every earlier check (loopback bind,
+        // valid port, valid direct-sampling, non-zero sample
+        // rate) and drive `buffer_capacity` past the cap —
+        // `_start` must return `InvalidArg` before touching
+        // the device layer.
+        let opts = SdrRtlTcpServerConfig {
+            bind_address: SDR_BIND_LOOPBACK,
+            port: TEST_PORT,
+            device_index: TEST_DEVICE_INDEX,
+            buffer_capacity: SDR_RTLTCP_SERVER_MAX_BUFFER_CAPACITY + 1,
+            initial_freq_hz: TEST_FREQ_HZ,
+            initial_sample_rate_hz: TEST_SAMPLE_RATE_HZ,
+            initial_gain_tenths_db: 0,
+            initial_ppm: 0,
+            initial_bias_tee: false,
+            initial_direct_sampling: 0,
+        };
+        let mut handle: *mut SdrRtlTcpServer = std::ptr::null_mut();
+        let rc = unsafe { sdr_rtltcp_server_start(&raw const opts, &raw mut handle) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        assert!(handle.is_null());
     }
 
     #[test]
