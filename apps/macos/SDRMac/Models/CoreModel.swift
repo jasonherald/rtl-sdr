@@ -1949,6 +1949,81 @@ final class CoreModel {
         }
     }
 
+    /// Connect the engine's rtl_tcp client to `host:port`.
+    /// Mirrors `applyNetworkSourceConfig` + `setSourceType(.rtlTcp)`
+    /// — the engine uses the same stored host/port for both
+    /// `.network` and `.rtlTcp` sources, so this path writes
+    /// to that shared storage and then flips the source type.
+    /// On a successful dispatch, `rtlTcpLastConnected` is
+    /// updated and persisted so the next launch can repopulate
+    /// the manual-entry fields. Connection *progress* (actual
+    /// socket connect, handshake, ready-to-stream) arrives
+    /// asynchronously via `rtlTcpConnectionState` events from
+    /// the engine. Per issue #326.
+    func connectToRtlTcp(host: String, port: UInt16, nickname: String) {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            lastError = "rtl_tcp server host cannot be empty"
+            return
+        }
+        guard port != 0 else {
+            lastError = "rtl_tcp server port must be in 1…65535"
+            return
+        }
+        // Clear any stale error from a prior action so we can
+        // detect whether the FFI calls below introduce a new
+        // one (either validation inside `applyNetworkSourceConfig`
+        // or a `capture {}` failure on the setter).
+        lastError = nil
+        // Write through the shared network-source config path.
+        // `applyNetworkSourceConfig` persists host/port/protocol
+        // in UserDefaults and dispatches `set_network_config` —
+        // both the `.network` IQ source and `.rtlTcp` source
+        // read from the same slot, matching the engine side.
+        applyNetworkSourceConfig(host: trimmed, port: port, protocol: .tcp)
+        if lastError != nil { return }
+        // Remember this endpoint. The nickname falls back to
+        // `host:port` when the caller didn't have a better label
+        // (manual-entry without a matching mDNS announce).
+        let displayNickname = nickname.isEmpty ? "\(trimmed):\(port)" : nickname
+        rtlTcpLastConnected = RtlTcpClientLastConnected(
+            host: trimmed,
+            port: port,
+            nickname: displayNickname
+        )
+        persistRtlTcpLastConnected()
+        // Flip to `.rtlTcp` — the engine tears down whatever is
+        // currently open and builds the rtl_tcp client from the
+        // just-written network config.
+        setSourceType(.rtlTcp)
+    }
+
+    /// Render an `RtlTcpConnectionState` to a one-line status
+    /// string suitable for a picker subtitle row. Matches the
+    /// Linux `format_rtl_tcp_state()` wording (Connected /
+    /// Retrying / Failed / …). Static so views can render it
+    /// without reaching into the model. Per issue #326.
+    static func formatRtlTcpConnectionState(_ state: RtlTcpConnectionState) -> String {
+        switch state {
+        case .disconnected:
+            return "Not connected"
+        case .connecting:
+            return "Connecting…"
+        case .connected(let tunerName, let gainCount):
+            return "Connected — \(tunerName) (\(gainCount) gains)"
+        case .retrying(let attempt, let retryInSecs):
+            // Ceil, not floor — `retryInSecs` of 1.9 would read
+            // as 1 s and understate the wait. Clamp to ≥1 so
+            // sub-1 s retries still display something rather
+            // than "0 s" (which reads like the retry already
+            // fired). Matches Linux treatment.
+            let secs = max(Int(retryInSecs.rounded(.up)), 1)
+            return "Retrying in \(secs) s (attempt \(attempt))"
+        case .failed(let reason):
+            return "Failed — \(reason)"
+        }
+    }
+
     /// Restore favorites + last-connected from `UserDefaults`.
     /// Called from `bootstrap()`. Absent or corrupt entries
     /// degrade to empty / nil silently — a bad JSON blob should

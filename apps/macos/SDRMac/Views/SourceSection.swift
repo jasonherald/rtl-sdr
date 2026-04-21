@@ -1,12 +1,14 @@
 //
 // SourceSection.swift — sidebar panel for source/tuner controls.
 //
-// Device picker at top (RTL-SDR / Network IQ / File playback)
-// followed by per-source forms: RTL-SDR exposes the USB
-// tuner's sample rate / gain / AGC / PPM; Network exposes a
-// host/port/protocol triple with an Apply button; File exposes
-// a path text field with a "Choose WAV…" button. RTL-TCP is a
-// future source type (see issue #326 for its dedicated panel).
+// Device picker at top (RTL-SDR / Network IQ / File playback /
+// RTL-TCP) followed by per-source forms: RTL-SDR exposes the
+// USB tuner's sample rate / gain / AGC / PPM; Network exposes
+// a host/port/protocol triple with an Apply button; File
+// exposes a path text field with a "Choose WAV…" button;
+// RTL-TCP shows a client picker (discovered servers from mDNS,
+// favorites, manual entry) and a live connection-state row.
+// Per issue #326.
 //
 // Advanced controls (DC blocking, IQ inversion, IQ correction,
 // decimation) live in a collapsible "Advanced" DisclosureGroup
@@ -33,13 +35,11 @@ private let rtlSdrSampleRates: [Double] = [
 /// `sdr-ui::sidebar::source_panel::DECIMATION_FACTORS`.
 private let decimationFactors: [UInt32] = [1, 2, 4, 8, 16]
 
-/// Source types offered in the top-of-section picker. RTL-TCP
-/// is deliberately omitted — it gets its own dedicated panel in
-/// issue #326 with the full rtl_tcp control surface (client
-/// picker, connection state, per-command gains/ppm/bias-T).
-/// Putting it in this generic picker would imply equal
-/// treatment it doesn't have yet.
-private let supportedSourceTypes: [SourceType] = [.rtlSdr, .network, .file]
+/// Source types offered in the top-of-section picker. `.rtlTcp`
+/// is included; its form renders a discovered-server list +
+/// favorites + manual-entry path + connection-state row, not
+/// the generic per-command controls. Per issue #326.
+private let supportedSourceTypes: [SourceType] = [.rtlSdr, .network, .file, .rtlTcp]
 
 struct SourceSection: View {
     @Environment(CoreModel.self) private var model
@@ -65,6 +65,14 @@ struct SourceSection: View {
     /// Local edit buffer for the network port.
     @State private var portEdit: String = ""
 
+    /// Local edit buffers for the rtl_tcp client manual-entry
+    /// form. Kept separate from `hostEdit`/`portEdit` so the
+    /// two source types don't clobber each other's in-flight
+    /// edits even though both write to the same engine-side
+    /// storage on Connect.
+    @State private var rtlTcpHostEdit: String = ""
+    @State private var rtlTcpPortEdit: String = ""
+
     /// One-shot latch so the initial `.onAppear` seeds the
     /// local edit buffers from the model without clobbering
     /// in-progress user edits when SwiftUI re-fires `.onAppear`
@@ -86,10 +94,9 @@ struct SourceSection: View {
                         // so commit immediately — matches user
                         // expectation that "I picked RTL-SDR"
                         // means the engine switches now.
-                        // `.network` and `.file` defer to the
-                        // Apply / Choose buttons below. `.rtlTcp`
-                        // is filtered out of `supportedSourceTypes`
-                        // so we never see it as a user selection.
+                        // `.network`, `.file`, and `.rtlTcp`
+                        // defer to their respective Apply /
+                        // Choose / Connect action buttons.
                         if newType == .rtlSdr {
                             model.setSourceType(.rtlSdr)
                         }
@@ -131,17 +138,7 @@ struct SourceSection: View {
             case .rtlSdr: rtlSdrControls
             case .network: networkControls
             case .file: fileControls
-            case .rtlTcp:
-                // Defensive arm — filtered out of
-                // `supportedSourceTypes` so not reachable
-                // through the picker, but the persisted value
-                // from a future build could restore `.rtlTcp`
-                // into `model.sourceType` (and via the
-                // `.onAppear` sync into `pendingType`). Show a
-                // breadcrumb rather than a broken form.
-                Text("RTL-TCP has a dedicated panel (see issue #326).")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            case .rtlTcp: rtlTcpControls
             }
 
             // "Advanced" group applies to every source — lives
@@ -182,6 +179,18 @@ struct SourceSection: View {
             pendingType = model.sourceType
             hostEdit = model.networkSourceHost
             portEdit = String(model.networkSourcePort)
+            // Seed the rtl_tcp manual-entry fields from the
+            // persisted last-connected snapshot so the user's
+            // most recent server pre-fills on next launch.
+            // Falls back to the network-source host/port when
+            // no snapshot exists (first-time use). Per #326.
+            if let last = model.rtlTcpLastConnected {
+                rtlTcpHostEdit = last.host
+                rtlTcpPortEdit = String(last.port)
+            } else {
+                rtlTcpHostEdit = model.networkSourceHost
+                rtlTcpPortEdit = String(model.networkSourcePort)
+            }
         }
         .onChange(of: model.sourceType) { _, new in
             // Sync the picker back to engine-side changes
@@ -394,6 +403,112 @@ struct SourceSection: View {
         Text("Plays back a two-channel (I/Q) WAV file. Sample rate is read from the file header.")
             .font(.caption)
             .foregroundStyle(.secondary)
+    }
+
+    // ----------------------------------------------------------
+    //  rtl_tcp client form — issue #326
+    // ----------------------------------------------------------
+
+    @ViewBuilder
+    private var rtlTcpControls: some View {
+        // Connection-state status row. Always visible when the
+        // .rtlTcp arm renders so the user sees the current
+        // engine state — `Not connected` before the first
+        // Connect click, `Connecting…` / `Connected` /
+        // `Retrying in N s` / `Failed — …` after. Subtitle
+        // format matches Linux `format_rtl_tcp_state()`.
+        LabeledContent("Status") {
+            Text(CoreModel.formatRtlTcpConnectionState(model.rtlTcpConnectionState))
+                .foregroundStyle(rtlTcpStatusColor)
+                .font(.callout)
+                .lineLimit(2)
+                .multilineTextAlignment(.trailing)
+        }
+
+        // Manual-entry host + port + Connect. Discovered-server
+        // list and favorites land in the next commit; for now
+        // this is the minimally-useful form.
+        TextField("Host", text: $rtlTcpHostEdit)
+            .textFieldStyle(.roundedBorder)
+            .disableAutocorrection(true)
+            .textContentType(.URL)
+        LabeledContent("Port") {
+            TextField("1234", text: $rtlTcpPortEdit)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 90)
+        }
+        Button {
+            commitRtlTcpConnect()
+        } label: {
+            Label(
+                model.sourceType == .rtlTcp ? "Reconnect" : "Connect",
+                systemImage: "antenna.radiowaves.left.and.right"
+            )
+        }
+        .disabled(rtlTcpConnectDisabled)
+
+        if pendingType != model.sourceType {
+            Text("Source switches to RTL-TCP after you connect.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if let err = model.lastError, !err.isEmpty {
+            Text(err)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+        }
+    }
+
+    /// Color hint for the status row subtitle — red on failure,
+    /// yellow on in-flight states, secondary otherwise.
+    private var rtlTcpStatusColor: Color {
+        switch model.rtlTcpConnectionState {
+        case .failed: return .red
+        case .retrying, .connecting: return .orange
+        case .connected: return .secondary
+        case .disconnected: return .secondary
+        }
+    }
+
+    /// Parse `rtlTcpPortEdit` into a `UInt16` in `1…65535`.
+    /// Returns `nil` on empty / non-numeric / out-of-range.
+    private func rtlTcpPortValue() -> UInt16? {
+        guard let raw = Int(rtlTcpPortEdit.trimmingCharacters(in: .whitespaces)),
+              (1...Int(UInt16.max)).contains(raw) else {
+            return nil
+        }
+        return UInt16(raw)
+    }
+
+    private var rtlTcpConnectDisabled: Bool {
+        rtlTcpHostEdit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || rtlTcpPortValue() == nil
+    }
+
+    private func commitRtlTcpConnect() {
+        guard let port = rtlTcpPortValue() else { return }
+        let host = rtlTcpHostEdit.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Derive a nickname from a matching mDNS announce if one
+        // exists for this host:port, otherwise fall back to the
+        // raw host:port string. The model applies the same
+        // fallback but checking here lets us pass a better label
+        // through to persistence on first connect.
+        let nickname = discoveredNickname(host: host, port: port)
+        model.connectToRtlTcp(host: host, port: port, nickname: nickname)
+    }
+
+    /// Look up the nickname for an endpoint from the live mDNS
+    /// discovery list. Returns `""` if there's no match — the
+    /// model defaults to `host:port` in that case.
+    private func discoveredNickname(host: String, port: UInt16) -> String {
+        if let ds = model.rtlTcpDiscoveredServers.first(where: {
+            $0.hostname == host && $0.port == port
+        }) {
+            return ds.nickname.isEmpty ? ds.instanceName : ds.nickname
+        }
+        return ""
     }
 }
 
