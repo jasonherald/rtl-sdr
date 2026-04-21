@@ -793,9 +793,20 @@ fn build_bookmark_row(
                 entry_del.set_text("");
             }
         }
-        bm_rc
-            .borrow_mut()
-            .retain(|b| !(b.name == del_name && b.frequency == del_freq));
+        // Remove only the first matching bookmark rather than
+        // every entry with the same (name, frequency). Quick-add
+        // intentionally always creates a new `Bookmark`, so
+        // duplicates are a supported state — one click on the
+        // trash icon should delete the one row the user pointed
+        // at, not wipe the whole set. Stable bookmark IDs will
+        // supersede this first-match contract once they land.
+        let remove_idx = bm_rc
+            .borrow()
+            .iter()
+            .position(|b| b.name == del_name && b.frequency == del_freq);
+        if let Some(idx) = remove_idx {
+            bm_rc.borrow_mut().remove(idx);
+        }
         save_bookmarks(&bm_rc.borrow());
         if let Some(lb) = list_ref.upgrade()
             && let Some(sc) = scroll_ref.upgrade()
