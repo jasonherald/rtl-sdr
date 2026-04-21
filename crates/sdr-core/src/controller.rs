@@ -1288,9 +1288,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 // by the server. Surface it here instead.
                 let gains_len = source.gains().len();
                 if (index as usize) >= gains_len {
-                    tracing::warn!(
-                        "set gain by index rejected: {index} >= {gains_len}"
-                    );
+                    tracing::warn!("set gain by index rejected: {index} >= {gains_len}");
                     let _ = dsp_tx.send(DspToUi::Error(format!(
                         "Gain index {index} out of range (source has {gains_len} gains)"
                     )));
