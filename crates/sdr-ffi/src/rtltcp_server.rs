@@ -285,9 +285,22 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
     }
 }
 
-/// Stop and release the server. After this call the handle
-/// pointer is invalid — do not use it again. Passing null is a
-/// no-op.
+/// Stop and release the server. Blocks until the accept
+/// thread has joined and the RTL-SDR dongle is released — on
+/// return the device is free for the engine (or any other
+/// local consumer) to open immediately. After this call the
+/// handle pointer is invalid; do not use it again. Passing
+/// null is a no-op.
+///
+/// The earlier revision of this function off-loaded
+/// `Server::stop` onto a detached thread to keep Swift's
+/// `@MainActor` callers from wedging on the join. That turned
+/// out to be a correctness bug — callers had no way to know
+/// when the dongle actually released, so immediate handoff
+/// (flip the engine's source to the same dongle) was racy.
+/// The `Server`'s poll cadence is 100 ms, so the synchronous
+/// join completes in well under a frame on typical hardware.
+/// Per `CodeRabbit` round 2 on PR #360.
 ///
 /// # Safety
 ///
@@ -305,13 +318,24 @@ pub unsafe extern "C" fn sdr_rtltcp_server_stop(handle: *mut SdrRtlTcpServer) {
     let boxed = unsafe { Box::from_raw(handle) };
     let taken = boxed.inner.lock().ok().and_then(|mut g| g.take());
     if let Some(server) = taken {
-        std::thread::spawn(move || {
-            // `Server::stop` joins its accept thread which can
-            // block briefly while waiting for poll timeouts.
-            // Take it off the calling thread so a Swift `@MainActor`
-            // host doesn't wedge on the join.
+        // Wrap the join in `catch_unwind` so a panic inside
+        // `Server::stop` — e.g., a poisoned mutex on the
+        // stats ring — can't cross the FFI boundary into
+        // Swift. Mirrors the pattern used by every other
+        // entry point in this module.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             server.stop();
-        });
+        }));
+        if let Err(payload) = result {
+            // Best-effort diagnostic. We can't return an
+            // error code from `_stop` (its signature is
+            // void), so the payload goes to tracing where a
+            // host with log routing can see it.
+            tracing::warn!(
+                "sdr_rtltcp_server_stop: Server::stop panicked: {}",
+                panic_message(&payload)
+            );
+        }
     }
 }
 

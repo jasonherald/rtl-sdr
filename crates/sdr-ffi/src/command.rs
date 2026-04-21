@@ -588,11 +588,23 @@ pub unsafe extern "C" fn sdr_core_set_rtl_agc(handle: *mut SdrCore, enabled: boo
 }
 
 /// Set tuner gain by index into the advertised gains table.
+///
 /// Useful for rtl_tcp clients where the server publishes a
-/// gain count but not the individual dB values. Engine
-/// bounds-checks against the active source's `gains()` count;
-/// out-of-range indices become a `DspToUi::Error` event rather
-/// than silently being dropped on the wire.
+/// gain count but not the individual dB values.
+///
+/// The engine's `SetGainByIndex` handler bounds-checks using
+/// two sources, in order: (1) the active source's own
+/// `gains()` table length when non-empty (local RTL-SDR USB),
+/// and (2) the `gain_count` field of the rtl_tcp
+/// `Connected` connection state when `gains()` is empty
+/// (rtl_tcp clients — servers publish a count but not a
+/// table). If neither is available the command is dispatched
+/// unchecked and the source layer decides.
+///
+/// Out-of-range indices land as a `DspToUi::Error` event
+/// (surfaced to hosts via `SDR_EVT_ERROR`) rather than being
+/// silently dropped on the wire. Per `CodeRabbit` round 2 on
+/// PR #360.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_set_gain_by_index(handle: *mut SdrCore, index: u32) -> i32 {
     unsafe { with_core(handle, |core| send(core, UiToDsp::SetGainByIndex(index))) }

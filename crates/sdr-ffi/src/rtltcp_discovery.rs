@@ -100,6 +100,17 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
         // SAFETY: caller contract.
         let opts = unsafe { &*opts };
 
+        // Reject port 0 at the boundary — a zero-initialized
+        // `SdrRtlTcpAdvertiseOptions` would otherwise announce
+        // on port 0 and succeed, giving browsers a server they
+        // can never connect to. Mirrors the guard on
+        // `sdr_core_set_network_config` and the network-sink
+        // setter. Per `CodeRabbit` round 2 on PR #360.
+        if opts.port == 0 {
+            set_last_error("sdr_rtltcp_advertiser_start: port must be in 1..=65535, got 0");
+            return SdrCoreError::InvalidArg.as_int();
+        }
+
         let instance_name = match unsafe { cstr_to_string("instance_name", opts.instance_name) } {
             Ok(s) if !s.is_empty() => s,
             Ok(_) => {
@@ -108,7 +119,10 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
             }
             Err(code) => return code.as_int(),
         };
-        let hostname = unsafe { optional_cstr_to_string(opts.hostname) }.unwrap_or_default();
+        let hostname = match unsafe { optional_cstr_to_string("hostname", opts.hostname) } {
+            Ok(v) => v.unwrap_or_default(),
+            Err(code) => return code.as_int(),
+        };
         let tuner = match unsafe { cstr_to_string("tuner", opts.tuner) } {
             Ok(s) => s,
             Err(code) => return code.as_int(),
@@ -117,7 +131,10 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
             Ok(s) => s,
             Err(code) => return code.as_int(),
         };
-        let nickname = unsafe { optional_cstr_to_string(opts.nickname) }.unwrap_or_default();
+        let nickname = match unsafe { optional_cstr_to_string("nickname", opts.nickname) } {
+            Ok(v) => v.unwrap_or_default(),
+            Err(code) => return code.as_int(),
+        };
 
         let txbuf = if opts.has_txbuf {
             // `TxtRecord::txbuf` is `Option<usize>`. `u64 → usize`
@@ -497,23 +514,41 @@ unsafe fn cstr_to_string(field: &str, ptr: *const c_char) -> Result<String, SdrC
     })
 }
 
-/// Optional-string helper: null → None, empty → None,
-/// otherwise `Some(String)`. Invalid UTF-8 also degrades to None
-/// rather than failing the whole call — these fields are
-/// non-critical (hostname auto-derives; nickname falls back to
-/// empty).
+/// Optional-string helper: null → `Ok(None)`, empty → `Ok(None)`,
+/// otherwise `Ok(Some(String))`. Invalid UTF-8 propagates as
+/// `Err(SdrCoreError::InvalidArg)` — the earlier revision
+/// silently dropped malformed input, which masked host bugs and
+/// contradicted the documented UTF-8 contract on
+/// `SdrRtlTcpAdvertiseOptions`. Per `CodeRabbit` round 2 on
+/// PR #360.
+///
+/// Callers pass `field` so the last-error message can point at
+/// the specific field that failed (`hostname` vs `nickname`
+/// etc.).
 ///
 /// # Safety
 ///
 /// `ptr` must be null or a NUL-terminated UTF-8 C string.
-unsafe fn optional_cstr_to_string(ptr: *const c_char) -> Option<String> {
+unsafe fn optional_cstr_to_string(
+    field: &str,
+    ptr: *const c_char,
+) -> Result<Option<String>, SdrCoreError> {
     if ptr.is_null() {
-        return None;
+        return Ok(None);
     }
     // SAFETY: caller contract.
     let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
-    let s = cstr.to_str().ok()?.to_string();
-    if s.is_empty() { None } else { Some(s) }
+    let s = cstr.to_str().map_err(|_| {
+        set_last_error(format!(
+            "sdr_rtltcp_advertiser_start: optional field `{field}` is not valid UTF-8"
+        ));
+        SdrCoreError::InvalidArg
+    })?;
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(s.to_string()))
+    }
 }
 
 #[cfg(test)]
