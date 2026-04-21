@@ -981,11 +981,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // post-swap Local sink routes to the user's last
             // choice instead of the system default. No-op for
             // Network.
-            if matches!(new_type, AudioSinkType::Local) {
-                let target = state.audio_device_uid.clone();
-                if let Err(e) = state.audio_sink.set_target(&target) {
-                    tracing::warn!("post-swap set_target failed: {e}");
-                }
+            if matches!(new_type, AudioSinkType::Local)
+                && let Err(e) = state.audio_sink.set_target(&state.audio_device_uid)
+            {
+                tracing::warn!("post-swap set_target failed: {e}");
             }
             // Bring the new sink online if the engine is already
             // running. Otherwise it'll start on the next Start
