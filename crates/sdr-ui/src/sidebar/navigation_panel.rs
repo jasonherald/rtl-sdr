@@ -97,7 +97,12 @@ pub struct TuningProfile {
     pub auto_squelch_enabled: bool,
     pub squelch_level: f32,
     pub gain: f64,
-    pub agc: bool,
+    /// Three-way AGC selection — replaces the pre-#354 `agc: bool`.
+    /// The save path populates both the new `agc_type` and the
+    /// legacy `agc: Option<bool>` on the persisted `Bookmark` so
+    /// older builds loading the file still get a sensible
+    /// (if reduced) restore.
+    pub agc_type: crate::sidebar::source_panel::AgcType,
     pub volume: Option<f32>,
     pub deemphasis: u32,
     pub nb_enabled: bool,
@@ -140,8 +145,23 @@ pub struct Bookmark {
     pub squelch_level: Option<f32>,
     #[serde(default)]
     pub gain: Option<f64>,
+    /// Legacy hardware-AGC flag — `Some(true)` meant tuner AGC
+    /// on, `Some(false)` meant manual gain. Preserved for read-
+    /// path compatibility with bookmarks saved before #354
+    /// landed; superseded by `agc_type` for new bookmarks. Save
+    /// path writes both fields when AGC is `Off` or `Hardware`
+    /// so older builds loading a new bookmark still get a
+    /// sensible (if reduced) restore.
     #[serde(default)]
     pub agc: Option<bool>,
+    /// Three-way AGC selection (Off / Hardware / Software).
+    /// Added with #354 / #356. Pre-existing bookmarks deserialize
+    /// to `None`; the restore path falls back to the legacy
+    /// `agc: Option<bool>` field mapping `true → Hardware` and
+    /// `false → Off`. When both fields are present the new
+    /// `agc_type` wins.
+    #[serde(default)]
+    pub agc_type: Option<crate::sidebar::source_panel::AgcType>,
     #[serde(default)]
     pub volume: Option<f32>,
     #[serde(default)]
@@ -196,6 +216,7 @@ impl Bookmark {
             squelch_level: None,
             gain: None,
             agc: None,
+            agc_type: None,
             volume: None,
             deemphasis: None,
             nb_enabled: None,
@@ -228,7 +249,19 @@ impl Bookmark {
             auto_squelch_enabled: Some(profile.auto_squelch_enabled),
             squelch_level: Some(profile.squelch_level),
             gain: Some(profile.gain),
-            agc: Some(profile.agc),
+            // Populate both the new `agc_type` AND the legacy
+            // `agc` field so a bookmark saved on a post-#354
+            // build still round-trips through a pre-#354 build
+            // as a sensible (if reduced) setting. Software AGC
+            // has no legacy representation — map it to `false`
+            // (AGC off) on the legacy path, which is the safer
+            // default than "hardware on" for users who haven't
+            // opted into either AGC type.
+            agc: Some(matches!(
+                profile.agc_type,
+                crate::sidebar::source_panel::AgcType::Hardware
+            )),
+            agc_type: Some(profile.agc_type),
             volume: profile.volume,
             deemphasis: Some(profile.deemphasis),
             nb_enabled: Some(profile.nb_enabled),
@@ -746,7 +779,7 @@ mod tests {
             auto_squelch_enabled: true,
             squelch_level: -40.0,
             gain: 33.8,
-            agc: false,
+            agc_type: crate::sidebar::source_panel::AgcType::Off,
             volume: Some(0.75),
             deemphasis: 2,
             nb_enabled: false,
@@ -767,7 +800,17 @@ mod tests {
         assert_eq!(back.auto_squelch_enabled, Some(true));
         assert_eq!(back.squelch_level, Some(-40.0));
         assert_eq!(back.gain, Some(33.8));
+        // Legacy `agc` boolean is written alongside the new
+        // `agc_type` for forward-compat with older builds. For
+        // `AgcType::Off` that legacy value is `false`.
         assert_eq!(back.agc, Some(false));
+        // New `agc_type` round-trip. Regression guard against a
+        // serde-shape change on `AgcType` silently breaking the
+        // bookmark schema.
+        assert_eq!(
+            back.agc_type,
+            Some(crate::sidebar::source_panel::AgcType::Off)
+        );
         assert_eq!(back.volume, Some(0.75));
         assert_eq!(back.deemphasis, Some(2));
         assert_eq!(back.nb_enabled, Some(false));
