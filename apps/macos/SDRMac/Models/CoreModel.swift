@@ -710,9 +710,12 @@ final class CoreModel {
     /// "not found" string). Handle-free — calls straight into
     /// `sdr-rtlsdr` via the C ABI; no engine instance needed.
     ///
-    /// Called once from `bootstrap()` so the device state shows
-    /// up on first paint rather than only after Play. Safe to
-    /// call again later (hotplug detection is a future add).
+    /// Called from `bootstrap()` so the device state shows up
+    /// on first paint rather than only after Play, and from
+    /// `ContentView`'s `scenePhase` hook on main-window refocus
+    /// as a stop-gap for the "user plugged in a dongle after
+    /// launch" case. Proper IOKit USB hotplug monitoring is
+    /// tracked in issue #363.
     func refreshDeviceInfo() {
         let count = SdrCore.deviceCount
         hasLocalRtlSdr = count > 0
