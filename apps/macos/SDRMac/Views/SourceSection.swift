@@ -103,14 +103,14 @@ struct SourceSection: View {
                         Text(t.label)
                             .tag(t)
                             .disabled(
-                                t == .rtlSdr && model.rtlTcpServerRunning
+                                t == .rtlSdr && model.rtlTcpServerHoldsDongle
                             )
                     }
                 }
                 .labelsHidden()
             }
 
-            if model.rtlTcpServerRunning && pendingType == .rtlSdr {
+            if model.rtlTcpServerHoldsDongle && pendingType == .rtlSdr {
                 Text(
                     "Local dongle is being shared over the network. " +
                     "Stop the rtl_tcp server to use it here."

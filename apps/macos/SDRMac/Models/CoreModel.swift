@@ -326,6 +326,29 @@ final class CoreModel {
     /// accept thread running. Drives the UI toggle state.
     var rtlTcpServerRunning: Bool = false
 
+    /// `true` from the moment `stopRtlTcpServer()` is called
+    /// until its serialized `performStopRtlTcpServer()` (and the
+    /// detached `server.stop()` join) has returned. During that
+    /// window the UI toggle has already flipped to "off" — the
+    /// user's intent landed — but the dongle is still held by
+    /// the accept-thread drain, so we must NOT let the engine
+    /// selection re-open it as `.rtlSdr`. The mutex guards use
+    /// the computed `rtlTcpServerHoldsDongle` which is
+    /// `running || stopping`. Per `CodeRabbit` round 7 on PR
+    /// #362.
+    var rtlTcpServerStopping: Bool = false
+
+    /// `true` whenever the rtl_tcp path currently owns — or is
+    /// about to release — the local USB dongle. Engine-side
+    /// `.rtlSdr` paths and the sidebar picker both gate on this
+    /// rather than `rtlTcpServerRunning` alone; otherwise a
+    /// rapid "Stop sharing → Play" can try to open the dongle
+    /// while `server.stop()` is still draining the accept thread
+    /// and trip a transient busy/open error.
+    var rtlTcpServerHoldsDongle: Bool {
+        rtlTcpServerRunning || rtlTcpServerStopping
+    }
+
     /// Most-recent poll snapshot of server stats. `nil` while
     /// the server isn't running.
     var rtlTcpServerStats: SdrRtlTcpServer.Stats? = nil
@@ -826,7 +849,7 @@ final class CoreModel {
         // direction; the `SourceSection` picker disables
         // `.rtlSdr` cosmetically. Per `CodeRabbit` round 1 on
         // PR #362.
-        if rtlTcpServerRunning && sourceType == .rtlSdr {
+        if rtlTcpServerHoldsDongle && sourceType == .rtlSdr {
             lastError =
                 "Local dongle is shared over the network. Stop the rtl_tcp server " +
                 "or switch the source away from RTL-SDR before starting the engine."
@@ -1525,6 +1548,15 @@ final class CoreModel {
         rtlTcpPollTask?.cancel()
         rtlTcpPollTask = nil
         rtlTcpServerRunning = false
+        // Keep the USB mutex held (via `rtlTcpServerHoldsDongle`)
+        // until teardown actually finishes. Flipping `Running`
+        // to false already makes the Toggle snap to "off" so the
+        // user's intent is reflected instantly, but the accept-
+        // thread join inside the detached `server.stop()` can
+        // still take ~100-200 ms — during that window the engine
+        // must NOT be allowed to re-open the dongle as `.rtlSdr`.
+        // Per `CodeRabbit` round 7 on PR #362.
+        rtlTcpServerStopping = true
         rtlTcpServerStats = nil
         rtlTcpRecentCommands = []
 
@@ -1535,6 +1567,8 @@ final class CoreModel {
         }
         rtlTcpServerLifecycleTask = task
         await task.value
+        // Teardown fully drained — release the mutex.
+        rtlTcpServerStopping = false
     }
 
     /// Serialized body of `stopRtlTcpServer`. Runs on the main
@@ -1592,6 +1626,12 @@ final class CoreModel {
         rtlTcpServer = nil
         rtlTcpAdvertiser = nil
         rtlTcpServerRunning = false
+        // Clear any leftover `rtlTcpServerStopping` flag that an
+        // interrupted async `stopRtlTcpServer()` may have left
+        // set. Safe regardless of entry state — by the time the
+        // synchronous `server?.stop()` below returns, the dongle
+        // is released. Per `CodeRabbit` round 7 on PR #362.
+        rtlTcpServerStopping = false
         rtlTcpServerStats = nil
         rtlTcpRecentCommands = []
         advertiser?.stop()
@@ -1712,7 +1752,7 @@ final class CoreModel {
         // guard covers non-UI callers (bookmarks, menu
         // shortcuts, programmatic `syncToEngine` replay).
         // Per `CodeRabbit` round 1 on PR #362.
-        if type == .rtlSdr && rtlTcpServerRunning {
+        if type == .rtlSdr && rtlTcpServerHoldsDongle {
             lastError =
                 "Local dongle is shared over the network. Stop the rtl_tcp " +
                 "server before selecting RTL-SDR as the source."
