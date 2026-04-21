@@ -425,9 +425,36 @@ struct SourceSection: View {
                 .multilineTextAlignment(.trailing)
         }
 
-        // Manual-entry host + port + Connect. Discovered-server
-        // list and favorites land in the next commit; for now
-        // this is the minimally-useful form.
+        // Favorites — user-pinned servers that persist across
+        // sessions. Shown whenever non-empty so the user can
+        // one-tap recall even before any mDNS discovery lands.
+        if !model.rtlTcpFavorites.isEmpty {
+            DisclosureGroup("Known servers") {
+                ForEach(model.rtlTcpFavorites) { fav in
+                    rtlTcpFavoriteRow(fav)
+                }
+            }
+        }
+
+        // Nearby servers — live mDNS announcements. Collapsed
+        // when empty so the form stays compact on a LAN with
+        // no rtl_tcp peers. Otherwise default-expanded so the
+        // list is visible without an extra tap.
+        DisclosureGroup(
+            "Nearby servers\(model.rtlTcpDiscoveredServers.isEmpty ? "" : " (\(model.rtlTcpDiscoveredServers.count))")"
+        ) {
+            if model.rtlTcpDiscoveredServers.isEmpty {
+                Text("No rtl_tcp servers advertising on this network.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.rtlTcpDiscoveredServers, id: \.instanceName) { server in
+                    rtlTcpDiscoveredRow(server)
+                }
+            }
+        }
+
+        // Manual-entry host + port + Connect.
         TextField("Host", text: $rtlTcpHostEdit)
             .textFieldStyle(.roundedBorder)
             .disableAutocorrection(true)
@@ -509,6 +536,118 @@ struct SourceSection: View {
             return ds.nickname.isEmpty ? ds.instanceName : ds.nickname
         }
         return ""
+    }
+
+    // ----------------------------------------------------------
+    //  rtl_tcp row builders — favorites + nearby lists
+    // ----------------------------------------------------------
+
+    /// A row in the "Known servers" (favorites) list. Shows
+    /// nickname + tuner / gain-count / host:port subtitle,
+    /// with a trailing unstar button. Tap the row body to
+    /// prefill the manual-entry fields with this favorite's
+    /// host/port.
+    @ViewBuilder
+    private func rtlTcpFavoriteRow(_ fav: RtlTcpClientFavorite) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "star.fill")
+                .foregroundStyle(.yellow)
+                .font(.caption)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(fav.nickname)
+                    .font(.callout)
+                    .lineLimit(1)
+                Text(favoriteSubtitle(fav))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button {
+                model.removeRtlTcpFavorite(key: fav.key)
+            } label: {
+                Image(systemName: "star.slash")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove from favorites")
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard let (h, p) = fav.parsedEndpoint else { return }
+            rtlTcpHostEdit = h
+            rtlTcpPortEdit = String(p)
+        }
+    }
+
+    /// Subtitle for a favorite row. Prefers tuner + gain-count
+    /// when available (populated from a live announce), falls
+    /// back to the stable `host:port` key when offline and no
+    /// cached metadata is present.
+    private func favoriteSubtitle(_ fav: RtlTcpClientFavorite) -> String {
+        if let tuner = fav.tunerName, let gains = fav.gainCount {
+            return "\(fav.key) · \(tuner) (\(gains) gains)"
+        } else if let tuner = fav.tunerName {
+            return "\(fav.key) · \(tuner)"
+        } else {
+            return fav.key
+        }
+    }
+
+    /// A row in the "Nearby servers" (live mDNS) list. Shows
+    /// nickname + tuner / gain-count / host:port subtitle,
+    /// with a trailing star button to pin as a favorite. Tap
+    /// the row body to prefill the manual-entry fields.
+    @ViewBuilder
+    private func rtlTcpDiscoveredRow(_ server: SdrRtlTcpBrowser.DiscoveredServer) -> some View {
+        let key = "\(server.hostname):\(server.port)"
+        let isFavorited = model.rtlTcpFavorites.contains { $0.key == key }
+        HStack(spacing: 8) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(discoveredDisplayName(server))
+                    .font(.callout)
+                    .lineLimit(1)
+                Text(discoveredSubtitle(server))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button {
+                if isFavorited {
+                    model.removeRtlTcpFavorite(key: key)
+                } else {
+                    model.addRtlTcpFavorite(RtlTcpClientFavorite(from: server))
+                }
+            } label: {
+                Image(systemName: isFavorited ? "star.fill" : "star")
+                    .foregroundStyle(isFavorited ? .yellow : .secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(isFavorited ? "Remove from favorites" : "Add to favorites")
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            rtlTcpHostEdit = server.hostname
+            rtlTcpPortEdit = String(server.port)
+        }
+    }
+
+    private func discoveredDisplayName(_ s: SdrRtlTcpBrowser.DiscoveredServer) -> String {
+        s.nickname.isEmpty ? s.instanceName : s.nickname
+    }
+
+    private func discoveredSubtitle(_ s: SdrRtlTcpBrowser.DiscoveredServer) -> String {
+        let endpoint = "\(s.hostname):\(s.port)"
+        if !s.tuner.isEmpty && s.gains != 0 {
+            return "\(endpoint) · \(s.tuner) (\(s.gains) gains)"
+        } else if !s.tuner.isEmpty {
+            return "\(endpoint) · \(s.tuner)"
+        } else {
+            return endpoint
+        }
     }
 }
 
