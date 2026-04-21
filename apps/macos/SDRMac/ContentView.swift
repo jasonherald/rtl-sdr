@@ -68,16 +68,15 @@ struct ContentView: View {
         // cross-scene `@Observable` propagation ever drops an
         // update, scenePhase change acts as the safety net.
         //
-        // Also re-probe the USB bus for RTL-SDR hardware on
-        // refocus — without IOKit hotplug monitoring (tracked
-        // in issue #363) a dongle plugged in after launch would
-        // otherwise stay invisible to `hasLocalRtlSdr` and hide
-        // the rtl_tcp server panel until the next launch.
-        // Refocus covers the common "plug it in, return to the
-        // app" flow; a dongle inserted while the window is
-        // already focused still won't surface until focus
-        // flips, which is what #363 fixes properly. Per
-        // `CodeRabbit` round 6 on PR #362.
+        // Re-probe the USB bus for RTL-SDR hardware on refocus
+        // as a safety-net fallback alongside the live IOKit
+        // hotplug monitor wired in `CoreModel.bootstrap()`.
+        // The monitor delivers plug/unplug events immediately
+        // in the normal case (closed issue #363); this hook
+        // catches edge cases where the monitor might miss a
+        // transition (OS sleep/wake with a dongle swap,
+        // notification port restarted underneath us). Cheap
+        // enough to keep even if redundant.
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 model.refreshRadioReferenceCredentialsFlag()
