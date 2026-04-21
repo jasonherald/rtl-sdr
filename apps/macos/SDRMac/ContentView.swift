@@ -67,9 +67,21 @@ struct ContentView: View {
         // so in the happy path this is a no-op double-check. If
         // cross-scene `@Observable` propagation ever drops an
         // update, scenePhase change acts as the safety net.
+        //
+        // Also re-probe the USB bus for RTL-SDR hardware on
+        // refocus — without IOKit hotplug monitoring (tracked
+        // in issue #363) a dongle plugged in after launch would
+        // otherwise stay invisible to `hasLocalRtlSdr` and hide
+        // the rtl_tcp server panel until the next launch.
+        // Refocus covers the common "plug it in, return to the
+        // app" flow; a dongle inserted while the window is
+        // already focused still won't surface until focus
+        // flips, which is what #363 fixes properly. Per
+        // `CodeRabbit` round 6 on PR #362.
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 model.refreshRadioReferenceCredentialsFlag()
+                model.refreshDeviceInfo()
             }
         }
         // Fatal ABI-mismatch modal. The binding's setter is a
@@ -114,6 +126,13 @@ struct SidebarView: View {
             DisplaySection()
             RecordingSection()
             BookmarksSection()
+            // `RtlTcpServerSection` is visible only when a
+            // local RTL-SDR dongle is detected — the section
+            // itself is always included in the form, but the
+            // body collapses to a single "no dongle" caption
+            // otherwise so it doesn't clutter the sidebar on a
+            // network/file source setup.
+            RtlTcpServerSection()
         }
         .formStyle(.grouped)
     }

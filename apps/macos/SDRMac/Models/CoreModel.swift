@@ -199,6 +199,15 @@ final class CoreModel {
     var agcEnabled: Bool = false
     var deviceInfo: String = ""
 
+    /// `true` when a local RTL-SDR dongle was detected on the
+    /// USB bus at the last `refreshDeviceInfo` call. Drives the
+    /// rtl_tcp server panel's visibility. Kept separate from
+    /// `deviceInfo` (which doubles as a display string and is
+    /// overwritten by post-Play `.deviceInfo` engine events)
+    /// so the UI never has to parse wording to decide
+    /// availability. Per `CodeRabbit` round 1 on PR #362.
+    var hasLocalRtlSdr: Bool = false
+
     // ==========================================================
     //  Demod
     // ==========================================================
@@ -299,6 +308,137 @@ final class CoreModel {
     /// starts streaming; `.error(...)` on a startup or write
     /// failure.
     var networkSinkStatus: NetworkSinkStatus = .inactive
+
+    // ----------------------------------------------------------
+    //  rtl_tcp server — issue #353 (ABI 0.11)
+    //
+    //  Lets a host with a locally-connected RTL-SDR dongle
+    //  share it over the network so other SDR clients (GQRX,
+    //  SDR++, another `sdr-rs` instance) can tune it. Handles
+    //  live outside `SdrCore` because the server has its own
+    //  lifecycle and claims exclusive access to the dongle —
+    //  running the engine on the same dongle while the server
+    //  is up would deadlock on USB, so the UI enforces mutual
+    //  exclusivity on the engine source type.
+    // ----------------------------------------------------------
+
+    /// `true` while the rtl_tcp server has an open dongle and
+    /// accept thread running. Drives the UI toggle state.
+    var rtlTcpServerRunning: Bool = false
+
+    /// `true` from the moment `stopRtlTcpServer()` is called
+    /// until its serialized `performStopRtlTcpServer()` (and the
+    /// detached `server.stop()` join) has returned. During that
+    /// window the UI toggle has already flipped to "off" — the
+    /// user's intent landed — but the dongle is still held by
+    /// the accept-thread drain, so we must NOT let the engine
+    /// selection re-open it as `.rtlSdr`. The mutex guards use
+    /// the computed `rtlTcpServerHoldsDongle` which is
+    /// `running || stopping`. Per `CodeRabbit` round 7 on PR
+    /// #362.
+    var rtlTcpServerStopping: Bool = false
+
+    /// `true` whenever the rtl_tcp path currently owns — or is
+    /// about to release — the local USB dongle. Engine-side
+    /// `.rtlSdr` paths and the sidebar picker both gate on this
+    /// rather than `rtlTcpServerRunning` alone; otherwise a
+    /// rapid "Stop sharing → Play" can try to open the dongle
+    /// while `server.stop()` is still draining the accept thread
+    /// and trip a transient busy/open error.
+    var rtlTcpServerHoldsDongle: Bool {
+        rtlTcpServerRunning || rtlTcpServerStopping
+    }
+
+    /// Most-recent poll snapshot of server stats. `nil` while
+    /// the server isn't running.
+    var rtlTcpServerStats: SdrRtlTcpServer.Stats? = nil
+
+    /// Last ~50 commands the client issued, newest first. Fed
+    /// by the poll task that also refreshes `rtlTcpServerStats`.
+    var rtlTcpRecentCommands: [SdrRtlTcpServer.RecentCommand] = []
+
+    /// Last error surfaced from a rtl_tcp server start or poll
+    /// attempt. Cleared on successful start; mirrors into a
+    /// UI toast / status line.
+    var rtlTcpServerError: String? = nil
+
+    // Persisted config — these seed the `SdrRtlTcpServer.Config`
+    // passed on start. UserDefaults round-trip keeps them across
+    // launches; the Rust side has no config persistence yet.
+
+    var rtlTcpServerNickname: String = ""
+    var rtlTcpServerPort: UInt16 = 1234
+    var rtlTcpServerBindAddress: SdrRtlTcpServer.Config.BindAddress = .loopback
+    var rtlTcpServerMdnsEnabled: Bool = true
+
+    /// Center frequency the server applies on dongle open.
+    /// Defaults to 100.000 MHz matching the engine's
+    /// `DEFAULT_CENTER_FREQ`.
+    var rtlTcpServerInitialFreqHz: UInt32 = 100_000_000
+
+    /// Initial sample rate. 2.048 Msps matches the engine
+    /// default and is the safest RTL-SDR rate.
+    var rtlTcpServerInitialSampleRateHz: UInt32 = 2_048_000
+
+    /// Initial tuner gain in 0.1 dB steps. 0 = auto.
+    var rtlTcpServerInitialGainTenthsDb: Int32 = 0
+
+    /// Initial PPM correction.
+    var rtlTcpServerInitialPpm: Int32 = 0
+
+    /// Initial bias-tee state.
+    var rtlTcpServerInitialBiasTee: Bool = false
+
+    /// Initial direct-sampling mode. Typed so invalid values
+    /// can't reach the FFI.
+    var rtlTcpServerInitialDirectSampling: SdrCore.DirectSamplingMode = .off
+
+    /// Private handle to the running server. Observable
+    /// @Observable storage forbids holding non-`Sendable`
+    /// reference types through its macro-generated shadow
+    /// state, so this goes alongside the @Observable fields
+    /// via a nested private class indirection like `eventTask`
+    /// above.
+    private var rtlTcpServer: SdrRtlTcpServer? = nil
+
+    /// Matching mDNS advertiser handle. Started alongside the
+    /// server when `rtlTcpServerMdnsEnabled` is on; stopped
+    /// and dropped on server stop.
+    private var rtlTcpAdvertiser: SdrRtlTcpAdvertiser? = nil
+
+    /// Background poller that refreshes `rtlTcpServerStats` /
+    /// `rtlTcpRecentCommands` every second while the server
+    /// is running.
+    private var rtlTcpPollTask: Task<Void, Never>? = nil
+
+    /// Monotonic lifecycle token. Incremented on every
+    /// start/stop transition. A detached `startRtlTcpServer`
+    /// task captures the generation at kickoff and discards
+    /// its success result if the generation has moved on by
+    /// the time it publishes — otherwise a fast on → off → on
+    /// sequence could let an older start complete after a
+    /// subsequent stop, republishing stale handles and
+    /// restarting the poller while the user thinks the server
+    /// is off. Matches the pattern `TranscriptionDriver`
+    /// already uses in this repo. Per `CodeRabbit` round 2
+    /// on PR #362.
+    private var rtlTcpServerLifecycleGeneration: UInt64 = 0
+
+    /// Serializing chain for start/stop transitions. Each
+    /// public lifecycle method chains its real work behind the
+    /// previous task's `.value`, so a rapid off → on can't
+    /// launch a new `SdrRtlTcpServer(config:)` (USB open) while
+    /// the prior `server.stop()` accept-thread join is still
+    /// draining — that collision surfaces as a transient
+    /// "device busy" start failure. Per `CodeRabbit` round 3
+    /// on PR #362.
+    ///
+    /// The generation token (above) catches stale completions
+    /// within a single start's detached hop; the task chain
+    /// catches cross-transition overlap. Both are needed —
+    /// generation alone lets the start's USB open race with a
+    /// concurrent stop's USB close.
+    private var rtlTcpServerLifecycleTask: Task<Void, Never>? = nil
 
     /// Active audio-recording state. `nil` = not recording,
     /// `some(path)` = engine confirmed it opened `path` for
@@ -477,6 +617,65 @@ final class CoreModel {
         // action.
         refreshRadioReferenceCredentialsFlag()
 
+        // Restore rtl_tcp server config from UserDefaults —
+        // issue #353. Same "absent keys leave struct defaults
+        // intact" pattern as the audio sink restore above.
+        if let nickname = UserDefaults.standard.string(forKey: Self.rtlTcpServerNicknameKey) {
+            rtlTcpServerNickname = nickname
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerPortKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.rtlTcpServerPortKey)
+            if (1...Int(UInt16.max)).contains(stored) {
+                rtlTcpServerPort = UInt16(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerBindAddressKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.rtlTcpServerBindAddressKey))
+            rtlTcpServerBindAddress =
+                SdrRtlTcpServer.Config.BindAddress(rawValue: raw) ?? .loopback
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerMdnsKey) != nil {
+            rtlTcpServerMdnsEnabled = UserDefaults.standard.bool(forKey: Self.rtlTcpServerMdnsKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialFreqHzKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.rtlTcpServerInitialFreqHzKey)
+            if (0...Int(UInt32.max)).contains(stored) {
+                rtlTcpServerInitialFreqHz = UInt32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialSampleRateHzKey) != nil {
+            let stored = UserDefaults.standard.integer(
+                forKey: Self.rtlTcpServerInitialSampleRateHzKey
+            )
+            if (1...Int(UInt32.max)).contains(stored) {
+                rtlTcpServerInitialSampleRateHz = UInt32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialGainTenthsDbKey) != nil {
+            let stored = UserDefaults.standard.integer(
+                forKey: Self.rtlTcpServerInitialGainTenthsDbKey
+            )
+            if (Int(Int32.min)...Int(Int32.max)).contains(stored) {
+                rtlTcpServerInitialGainTenthsDb = Int32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialPpmKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.rtlTcpServerInitialPpmKey)
+            if (Int(Int32.min)...Int(Int32.max)).contains(stored) {
+                rtlTcpServerInitialPpm = Int32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialBiasTeeKey) != nil {
+            rtlTcpServerInitialBiasTee =
+                UserDefaults.standard.bool(forKey: Self.rtlTcpServerInitialBiasTeeKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialDirectSamplingKey) != nil {
+            let raw =
+                Int32(UserDefaults.standard.integer(forKey: Self.rtlTcpServerInitialDirectSamplingKey))
+            rtlTcpServerInitialDirectSampling =
+                SdrCore.DirectSamplingMode(rawValue: raw) ?? .off
+        }
+
         do {
             let c = try SdrCore(configPath: configPath)
             self.core = c
@@ -507,6 +706,14 @@ final class CoreModel {
     func shutdown() {
         eventTask?.cancel()
         eventTask = nil
+        // Stop any running rtl_tcp server before the engine
+        // tears down. Keeps the dongle free for whatever comes
+        // next and avoids the Drop-time join running after the
+        // model has gone out of scope. Uses the synchronous
+        // stop path here — the `async` variant is for the UI
+        // toggle; shutdown runs during app termination where
+        // blocking briefly is the desired behavior.
+        stopRtlTcpServerSync()
         if let core {
             // Best-effort stop — a thrown error shouldn't leave
             // the model claiming `isRunning == true` alongside a
@@ -526,11 +733,15 @@ final class CoreModel {
     /// "not found" string). Handle-free — calls straight into
     /// `sdr-rtlsdr` via the C ABI; no engine instance needed.
     ///
-    /// Called once from `bootstrap()` so the device state shows
-    /// up on first paint rather than only after Play. Safe to
-    /// call again later (hotplug detection is a future add).
+    /// Called from `bootstrap()` so the device state shows up
+    /// on first paint rather than only after Play, and from
+    /// `ContentView`'s `scenePhase` hook on main-window refocus
+    /// as a stop-gap for the "user plugged in a dongle after
+    /// launch" case. Proper IOKit USB hotplug monitoring is
+    /// tracked in issue #363.
     func refreshDeviceInfo() {
         let count = SdrCore.deviceCount
+        hasLocalRtlSdr = count > 0
         if count == 0 {
             deviceInfo = "No RTL-SDR device found"
             return
@@ -628,6 +839,22 @@ final class CoreModel {
         // already running", but cheaper to short-circuit here.
         if isRunning { return }
         guard let core else { lastError = "engine not initialized"; return }
+        // Reciprocal guard against the rtl_tcp server. Without
+        // this a user could toggle the server on with the
+        // source set to `.rtlSdr` (server claims dongle) and
+        // then hit Play — the engine would try to open the
+        // same USB device and deadlock. Either stop the
+        // server or switch source first. The server-side
+        // guard in `startRtlTcpServer` covers the opposite
+        // direction; the `SourceSection` picker disables
+        // `.rtlSdr` cosmetically. Per `CodeRabbit` round 1 on
+        // PR #362.
+        if rtlTcpServerHoldsDongle && sourceType == .rtlSdr {
+            lastError =
+                "Local dongle is shared over the network. Stop the rtl_tcp server " +
+                "or switch the source away from RTL-SDR before starting the engine."
+            return
+        }
         // Clear any stale error BEFORE syncing so a setter
         // failure inside syncToEngine() lands on a clean slate
         // and is detectable below.
@@ -1099,6 +1326,405 @@ final class CoreModel {
     }
 
     // ----------------------------------------------------------
+    //  rtl_tcp server — issue #353
+    // ----------------------------------------------------------
+
+    /// Start the rtl_tcp server from the current persisted
+    /// config. Async — the blocking FFI lifecycle work runs
+    /// off the `@MainActor` so the sidebar doesn't freeze for
+    /// the USB open + accept-thread spawn (100-500 ms on typical
+    /// hardware). The running flag flips optimistically so the
+    /// toggle reflects user intent immediately; a failed start
+    /// rolls it back and sets `rtlTcpServerError`. Per
+    /// `CodeRabbit` round 1 on PR #362.
+    ///
+    /// The actual work is serialized behind any in-flight
+    /// lifecycle transition via `rtlTcpServerLifecycleTask`, so
+    /// a fast stop→start can't open USB before the prior
+    /// server's accept-thread join has released the dongle. Per
+    /// `CodeRabbit` round 3 on PR #362.
+    func startRtlTcpServer() async {
+        if rtlTcpServerRunning {
+            return
+        }
+        // Guard: we only allow starting when the engine isn't
+        // currently tied to the local RTL-SDR dongle. The UI
+        // disables the toggle in that state too, but non-UI
+        // paths (tests, keyboard shortcuts) could bypass the
+        // visual guard.
+        if isRunning && sourceType == .rtlSdr {
+            rtlTcpServerError =
+                "Stop the engine or switch the source off RTL-SDR before starting the server."
+            return
+        }
+        // Reject port 0 before the optimistic flip. The UI
+        // Stepper clamps to 1024…65535, but non-UI paths
+        // (tests, keyboard shortcuts, stale UserDefaults) could
+        // stage a zero here; `SdrRtlTcpServer.Config` would
+        // interpret it as "use the crate default 1234", while
+        // the mDNS advertiser rejects 0 — split-brain where the
+        // server is live on 1234 but the UI still shows 0 and
+        // the panel surfaces an mDNS warning. Per `CodeRabbit`
+        // round 5 on PR #362.
+        guard rtlTcpServerPort != 0 else {
+            rtlTcpServerError = "rtl_tcp server port must be in 1…65535"
+            return
+        }
+        rtlTcpServerError = nil
+
+        // Optimistic: flip the flag now so the toggle settles
+        // on the "on" position and the config form disables
+        // itself. Rollback on failure inside `performStartRtlTcpServer`.
+        rtlTcpServerRunning = true
+
+        // Chain behind any in-flight stop/start. `await
+        // prior?.value` suspends until the previous lifecycle
+        // transition has fully drained its detached USB
+        // work — so when `performStartRtlTcpServer` runs, the
+        // dongle is guaranteed to be free.
+        let prior = rtlTcpServerLifecycleTask
+        let task = Task { [weak self] in
+            await prior?.value
+            await self?.performStartRtlTcpServer()
+        }
+        rtlTcpServerLifecycleTask = task
+        await task.value
+    }
+
+    /// Serialized body of `startRtlTcpServer`. Runs on the main
+    /// actor from inside `rtlTcpServerLifecycleTask` only — the
+    /// caller has already done the quick main-actor guards and
+    /// optimistic state flip.
+    @MainActor
+    private func performStartRtlTcpServer() async {
+        // Defensive double-check: if a stop flipped the flag
+        // between optimistic `rtlTcpServerRunning = true` and
+        // the chained task actually running (e.g. user spammed
+        // the toggle), bail rather than resurrect a session
+        // the user already cancelled.
+        guard rtlTcpServerRunning else { return }
+
+        // Bump the lifecycle token before kickoff so this
+        // start's completion can check whether a later stop /
+        // start has already moved past it. Overflow via
+        // wrapping-add — the stdlib can't reach `u64::MAX`
+        // flips in any realistic session, but the `&+=` keeps
+        // the code warning-free if that day ever came.
+        rtlTcpServerLifecycleGeneration &+= 1
+        let generation = rtlTcpServerLifecycleGeneration
+
+        // Snapshot the config on the main actor before we hop
+        // off — the fields are `@Observable` so reading them
+        // post-hop would require re-hopping.
+        let cfg = SdrRtlTcpServer.Config(
+            bindAddress: rtlTcpServerBindAddress,
+            port: rtlTcpServerPort,
+            deviceIndex: 0,
+            bufferCapacity: 0,
+            initialFreqHz: rtlTcpServerInitialFreqHz,
+            initialSampleRateHz: rtlTcpServerInitialSampleRateHz,
+            initialGainTenthsDb: rtlTcpServerInitialGainTenthsDb,
+            initialPpm: rtlTcpServerInitialPpm,
+            initialBiasTee: rtlTcpServerInitialBiasTee,
+            initialDirectSampling: rtlTcpServerInitialDirectSampling
+        )
+        let mdnsEnabled = rtlTcpServerMdnsEnabled
+        let nickname = rtlTcpServerNickname
+        let port = rtlTcpServerPort
+        // App version for the mDNS TXT record. Sourced from
+        // the bundle's `CFBundleShortVersionString` so the
+        // advertised version tracks the installed release
+        // rather than a hardcoded constant that rots on every
+        // bump. Per `CodeRabbit` round 4 on PR #362.
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+            ?? "0.1.0"
+
+        let result: StartResult = await Task.detached(priority: .userInitiated) {
+            let server: SdrRtlTcpServer
+            do {
+                server = try SdrRtlTcpServer(config: cfg)
+            } catch {
+                return .failed("Start failed: \(error)")
+            }
+
+            // Best-effort mDNS announce. Failure here doesn't
+            // block the server — a LAN without mDNS is still
+            // usable by direct host:port entry on the client.
+            var advertiser: SdrRtlTcpAdvertiser? = nil
+            var warning: String? = nil
+            if mdnsEnabled {
+                // Probe tuner metadata via a stats snapshot so
+                // the TXT record has accurate tuner +
+                // gain-count fields.
+                let tunerName: String
+                let gainCount: UInt32
+                if let s = try? server.stats() {
+                    tunerName = s.tunerName.isEmpty ? "unknown" : s.tunerName
+                    gainCount = s.gainCount
+                } else {
+                    tunerName = "unknown"
+                    gainCount = 0
+                }
+                let instanceName = nickname.isEmpty
+                    ? ProcessInfo.processInfo.hostName
+                    : nickname
+                let opts = SdrRtlTcpAdvertiser.Options(
+                    port: port,
+                    instanceName: instanceName,
+                    hostname: "",
+                    tuner: tunerName,
+                    version: appVersion,
+                    gains: gainCount,
+                    nickname: nickname
+                )
+                advertiser = try? SdrRtlTcpAdvertiser(options: opts)
+                if advertiser == nil {
+                    warning = "mDNS announce failed; server is still running on port \(port)"
+                }
+            }
+            return .succeeded(server: server, advertiser: advertiser, warning: warning)
+        }.value
+
+        // Back on @MainActor. Bail out if a later stop / start
+        // bumped the generation while this task was off-main —
+        // the result is stale. For a successful-but-stale
+        // result we still have to tear the handles down
+        // explicitly (otherwise the server keeps running
+        // despite `rtlTcpServerRunning == false`); failures
+        // are safe to drop on the floor. Per `CodeRabbit`
+        // round 2 on PR #362.
+        guard generation == rtlTcpServerLifecycleGeneration else {
+            if case .succeeded(let server, let advertiser, _) = result {
+                await Task.detached(priority: .userInitiated) {
+                    advertiser?.stop()
+                    server.stop()
+                }.value
+            }
+            return
+        }
+
+        switch result {
+        case .succeeded(let server, let advertiser, let warning):
+            rtlTcpServer = server
+            rtlTcpAdvertiser = advertiser
+            if let warning {
+                rtlTcpServerError = warning
+            }
+            startRtlTcpPoller()
+        case .failed(let message):
+            rtlTcpServerRunning = false
+            rtlTcpServerError = message
+        }
+    }
+
+    /// Private result shape for the off-main start task. Holds
+    /// the constructed handles in the success case so we can
+    /// publish them in one MainActor step.
+    private enum StartResult: Sendable {
+        case succeeded(server: SdrRtlTcpServer, advertiser: SdrRtlTcpAdvertiser?, warning: String?)
+        case failed(String)
+    }
+
+    /// Stop the server and the advertiser. Async — the
+    /// blocking accept-thread join happens off the main actor
+    /// so the toggle flip doesn't freeze the sidebar while the
+    /// poll-interval epilogue drains (~100-200 ms). Observable
+    /// state is cleared immediately so the UI reflects the
+    /// intent; the background task then tears down the
+    /// handles. Per `CodeRabbit` round 1 on PR #362.
+    ///
+    /// The actual teardown is serialized behind any in-flight
+    /// lifecycle transition via `rtlTcpServerLifecycleTask`, so
+    /// if a prior start's USB open is still running we wait for
+    /// it to publish before tearing down — otherwise stop would
+    /// read `nil` handles from the optimistic main-actor state,
+    /// and the start (when it finally lands) would republish a
+    /// live server that nobody is watching. Per `CodeRabbit`
+    /// round 3 on PR #362.
+    func stopRtlTcpServer() async {
+        // Bump the lifecycle token so any in-flight start
+        // treats itself as stale when it comes back to publish.
+        rtlTcpServerLifecycleGeneration &+= 1
+        rtlTcpPollTask?.cancel()
+        rtlTcpPollTask = nil
+        rtlTcpServerRunning = false
+        // Keep the USB mutex held (via `rtlTcpServerHoldsDongle`)
+        // until teardown actually finishes. Flipping `Running`
+        // to false already makes the Toggle snap to "off" so the
+        // user's intent is reflected instantly, but the accept-
+        // thread join inside the detached `server.stop()` can
+        // still take ~100-200 ms — during that window the engine
+        // must NOT be allowed to re-open the dongle as `.rtlSdr`.
+        // Per `CodeRabbit` round 7 on PR #362.
+        rtlTcpServerStopping = true
+        rtlTcpServerStats = nil
+        rtlTcpRecentCommands = []
+
+        let prior = rtlTcpServerLifecycleTask
+        let task = Task { [weak self] in
+            await prior?.value
+            await self?.performStopRtlTcpServer()
+        }
+        rtlTcpServerLifecycleTask = task
+        await task.value
+        // Teardown fully drained — release the mutex.
+        rtlTcpServerStopping = false
+    }
+
+    /// Serialized body of `stopRtlTcpServer`. Runs on the main
+    /// actor from inside `rtlTcpServerLifecycleTask` only — the
+    /// caller has already cleared observable state.
+    @MainActor
+    private func performStopRtlTcpServer() async {
+        let server = rtlTcpServer
+        let advertiser = rtlTcpAdvertiser
+        rtlTcpServer = nil
+        rtlTcpAdvertiser = nil
+
+        // If there's nothing to tear down, skip the detached
+        // task entirely — common case for rapid toggle flips
+        // where the prior start bailed on stale generation.
+        if server == nil && advertiser == nil {
+            return
+        }
+
+        await Task.detached(priority: .userInitiated) {
+            // Swift `deinit` would eventually call the same
+            // FFI stop, but we want the join to complete
+            // deterministically (so a follow-up start can
+            // reclaim the dongle without racing). Explicit
+            // `stop()` on each handle does that; dropping the
+            // locals after makes the `deinit` a no-op.
+            advertiser?.stop()
+            server?.stop()
+        }.value
+    }
+
+    /// Shutdown-time stop path. Synchronous — the app is
+    /// quitting, so the background-dispatch dance buys
+    /// nothing; we'd rather the dongle release deterministically
+    /// before process exit. Called from `shutdown()` which is
+    /// itself synchronous per the `AppDelegate.applicationWillTerminate`
+    /// contract.
+    private func stopRtlTcpServerSync() {
+        // Same lifecycle-token bump as the async variant so an
+        // in-flight start (e.g. user toggled on during app
+        // shutdown) still treats its completion as stale.
+        rtlTcpServerLifecycleGeneration &+= 1
+        // Cancel the serializing chain so any still-suspended
+        // tasks drop immediately rather than holding onto
+        // `self` past shutdown. The FFI stop below is
+        // idempotent (mutex-guarded in `sdr-ffi`), so a
+        // detached start/stop that finishes after this runs is
+        // safe — it just operates on already-consumed handles.
+        rtlTcpServerLifecycleTask?.cancel()
+        rtlTcpServerLifecycleTask = nil
+        rtlTcpPollTask?.cancel()
+        rtlTcpPollTask = nil
+        let server = rtlTcpServer
+        let advertiser = rtlTcpAdvertiser
+        rtlTcpServer = nil
+        rtlTcpAdvertiser = nil
+        rtlTcpServerRunning = false
+        // Clear any leftover `rtlTcpServerStopping` flag that an
+        // interrupted async `stopRtlTcpServer()` may have left
+        // set. Safe regardless of entry state — by the time the
+        // synchronous `server?.stop()` below returns, the dongle
+        // is released. Per `CodeRabbit` round 7 on PR #362.
+        rtlTcpServerStopping = false
+        rtlTcpServerStats = nil
+        rtlTcpRecentCommands = []
+        advertiser?.stop()
+        server?.stop()
+    }
+
+    /// Persist the rtl_tcp server config to UserDefaults so
+    /// the same values seed the next launch. Called from the
+    /// UI on field edits — start() reads from the persisted
+    /// state.
+    func persistRtlTcpServerConfig() {
+        UserDefaults.standard.set(rtlTcpServerNickname, forKey: Self.rtlTcpServerNicknameKey)
+        UserDefaults.standard.set(Int(rtlTcpServerPort), forKey: Self.rtlTcpServerPortKey)
+        UserDefaults.standard.set(
+            Int(rtlTcpServerBindAddress.rawValue),
+            forKey: Self.rtlTcpServerBindAddressKey
+        )
+        UserDefaults.standard.set(rtlTcpServerMdnsEnabled, forKey: Self.rtlTcpServerMdnsKey)
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialFreqHz),
+            forKey: Self.rtlTcpServerInitialFreqHzKey
+        )
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialSampleRateHz),
+            forKey: Self.rtlTcpServerInitialSampleRateHzKey
+        )
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialGainTenthsDb),
+            forKey: Self.rtlTcpServerInitialGainTenthsDbKey
+        )
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialPpm),
+            forKey: Self.rtlTcpServerInitialPpmKey
+        )
+        UserDefaults.standard.set(rtlTcpServerInitialBiasTee, forKey: Self.rtlTcpServerInitialBiasTeeKey)
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialDirectSampling.rawValue),
+            forKey: Self.rtlTcpServerInitialDirectSamplingKey
+        )
+    }
+
+    /// Background poller that refreshes `rtlTcpServerStats` +
+    /// `rtlTcpRecentCommands` on a one-second tick. Runs on
+    /// the main actor (the whole `CoreModel` is `@MainActor`)
+    /// which matches what `@Observable` needs for writes.
+    private func startRtlTcpPoller() {
+        rtlTcpPollTask = Task { [weak self] in
+            // Tick cadence slow enough to be negligible on the
+            // main thread, fast enough that "uptime" and data-
+            // rate look live. 1 Hz is the GTK panel's tick too.
+            let tickNanos: UInt64 = 1_000_000_000
+            // Poll-then-sleep ordering so `rtlTcpServerStats`
+            // and `rtlTcpRecentCommands` populate immediately on
+            // server start rather than after a full tick of nil.
+            // Per `CodeRabbit` round 4 on PR #362.
+            while !Task.isCancelled {
+                guard let self, let server = self.rtlTcpServer else { return }
+                do {
+                    self.rtlTcpServerStats = try server.stats()
+                    self.rtlTcpRecentCommands = try server.recentCommands()
+                } catch {
+                    // Server has gone away (stopped externally,
+                    // USB unplug, panic caught by the FFI). Tear
+                    // down the handles so the UI reflects reality.
+                    // Use the sync path — we're already on the
+                    // poll loop and blocking briefly on a single
+                    // `stop()` call is fine; the alternative
+                    // `await stopRtlTcpServer()` would race with
+                    // this Task's own cancellation inside stop.
+                    self.rtlTcpServerError = "Poll failed: \(error)"
+                    self.stopRtlTcpServerSync()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: tickNanos)
+            }
+        }
+    }
+
+    /// UserDefaults keys for the persisted rtl_tcp server
+    /// config. Namespaced to `SDRMac.rtlTcpServer.*` so they
+    /// don't collide with the regular engine config keys.
+    static let rtlTcpServerNicknameKey = "SDRMac.rtlTcpServer.nickname"
+    static let rtlTcpServerPortKey = "SDRMac.rtlTcpServer.port"
+    static let rtlTcpServerBindAddressKey = "SDRMac.rtlTcpServer.bindAddress"
+    static let rtlTcpServerMdnsKey = "SDRMac.rtlTcpServer.mdns"
+    static let rtlTcpServerInitialFreqHzKey = "SDRMac.rtlTcpServer.initialFreqHz"
+    static let rtlTcpServerInitialSampleRateHzKey = "SDRMac.rtlTcpServer.initialSampleRateHz"
+    static let rtlTcpServerInitialGainTenthsDbKey = "SDRMac.rtlTcpServer.initialGainTenthsDb"
+    static let rtlTcpServerInitialPpmKey = "SDRMac.rtlTcpServer.initialPpm"
+    static let rtlTcpServerInitialBiasTeeKey = "SDRMac.rtlTcpServer.initialBiasTee"
+    static let rtlTcpServerInitialDirectSamplingKey = "SDRMac.rtlTcpServer.initialDirectSampling"
+
+    // ----------------------------------------------------------
     //  Source selection setters — issues #235, #236
     // ----------------------------------------------------------
 
@@ -1116,6 +1742,20 @@ final class CoreModel {
     func setSourceType(_ type: SourceType) {
         if type == .file && filePath.isEmpty {
             lastError = "Choose a WAV file before switching to File playback"
+            return
+        }
+        // Second half of the rtl_tcp server / engine mutex.
+        // The server holds the USB device exclusively while
+        // running; flipping the engine source to `.rtlSdr`
+        // would then fight it on open. `SourceSection`
+        // disables the picker option cosmetically, but this
+        // guard covers non-UI callers (bookmarks, menu
+        // shortcuts, programmatic `syncToEngine` replay).
+        // Per `CodeRabbit` round 1 on PR #362.
+        if type == .rtlSdr && rtlTcpServerHoldsDongle {
+            lastError =
+                "Local dongle is shared over the network. Stop the rtl_tcp " +
+                "server before selecting RTL-SDR as the source."
             return
         }
         sourceType = type

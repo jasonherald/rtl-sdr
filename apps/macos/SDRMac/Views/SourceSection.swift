@@ -96,10 +96,27 @@ struct SourceSection: View {
                     }
                 )) {
                     ForEach(supportedSourceTypes, id: \.self) { t in
-                        Text(t.label).tag(t)
+                        // Disable the `.rtlSdr` entry while the
+                        // rtl_tcp server owns the local dongle.
+                        // Mutual exclusivity — the two paths
+                        // can't share USB access. Per #353.
+                        Text(t.label)
+                            .tag(t)
+                            .disabled(
+                                t == .rtlSdr && model.rtlTcpServerHoldsDongle
+                            )
                     }
                 }
                 .labelsHidden()
+            }
+
+            if model.rtlTcpServerHoldsDongle && pendingType == .rtlSdr {
+                Text(
+                    "Local dongle is being shared over the network. " +
+                    "Stop the rtl_tcp server to use it here."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             // Per-source content follows the **pending** type so
