@@ -2,6 +2,8 @@
 //!
 //! The transcript panel lives in a separate right-side revealer, not here.
 
+use std::rc::Rc;
+
 use gtk4::prelude::*;
 
 pub mod audio_panel;
@@ -51,7 +53,7 @@ pub struct SidebarPanels {
     /// internal `Rc` field. The Save closure uses `Rc::downgrade`
     /// to break the otherwise-cyclic `on_save → stored closure`
     /// reference chain.
-    pub bookmarks: std::rc::Rc<BookmarksPanel>,
+    pub bookmarks: Rc<BookmarksPanel>,
     /// Share-over-network (`rtl_tcp` server) controls. Hidden by
     /// default; `window.rs` reveals it when a local RTL-SDR dongle
     /// is plugged in and not currently the active source.
@@ -83,7 +85,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     // clone — wiring it through an `Rc<BookmarksPanel>` would
     // add an unnecessary upgrade dance on every preset click.
     navigation_panel::connect_preset_to_bookmarks(&navigation, &bookmarks);
-    let bookmarks = std::rc::Rc::new(bookmarks);
+    let bookmarks = Rc::new(bookmarks);
 
     let sidebar_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
