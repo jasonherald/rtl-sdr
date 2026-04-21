@@ -57,6 +57,28 @@ pub const SDR_EVT_AUDIO_RECORDING_STARTED: i32 = 8;
 pub const SDR_EVT_AUDIO_RECORDING_STOPPED: i32 = 9;
 pub const SDR_EVT_IQ_RECORDING_STARTED: i32 = 10;
 pub const SDR_EVT_IQ_RECORDING_STOPPED: i32 = 11;
+pub const SDR_EVT_NETWORK_SINK_STATUS: i32 = 12;
+
+// ============================================================
+//  Network sink status discriminants — must match the
+//  matching `SdrNetworkSinkStatusKind` enum in
+//  `include/sdr_core.h`. Never reorder or renumber.
+// ============================================================
+
+pub const SDR_NETWORK_SINK_STATUS_INACTIVE: i32 = 0;
+pub const SDR_NETWORK_SINK_STATUS_ACTIVE: i32 = 1;
+pub const SDR_NETWORK_SINK_STATUS_ERROR: i32 = 2;
+
+// ============================================================
+//  Network protocol discriminants — must match the matching
+//  `SdrNetworkProtocol` enum in `include/sdr_core.h`. Reused
+//  by both `sdr_core_set_network_sink_config` (command path)
+//  and the network-sink-status payload (event path). Never
+//  reorder or renumber.
+// ============================================================
+
+pub const SDR_NETWORK_PROTOCOL_TCP_SERVER: i32 = 0;
+pub const SDR_NETWORK_PROTOCOL_UDP: i32 = 1;
 
 // ============================================================
 //  SdrEvent tagged union — `#[repr(C)]` layout matching the
@@ -109,6 +131,25 @@ pub struct SdrEventIqRecording {
     pub path_utf8: *const c_char,
 }
 
+/// Payload for `SDR_EVT_NETWORK_SINK_STATUS`. Tagged by `kind`
+/// (one of `SDR_NETWORK_SINK_STATUS_*`):
+///
+/// | `kind`                                | `utf8`             | `protocol`              |
+/// |---------------------------------------|--------------------|-------------------------|
+/// | `SDR_NETWORK_SINK_STATUS_INACTIVE`    | NULL               | -1 (unused)             |
+/// | `SDR_NETWORK_SINK_STATUS_ACTIVE`      | endpoint host:port | `SDR_NETWORK_PROTOCOL_*`|
+/// | `SDR_NETWORK_SINK_STATUS_ERROR`       | error message      | -1 (unused)             |
+///
+/// `utf8` is a borrowed pointer into dispatcher-owned storage;
+/// valid only for the duration of the callback. Per issue #247.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventNetworkSinkStatus {
+    pub kind: i32,
+    pub utf8: *const c_char,
+    pub protocol: i32,
+}
+
 /// C-layout tagged union of event payloads. Which field is valid
 /// is determined by the `kind` discriminant on the enclosing
 /// `SdrEvent`:
@@ -141,6 +182,7 @@ pub union SdrEventPayload {
     pub error: SdrEventError,
     pub audio_recording: SdrEventAudioRecording,
     pub iq_recording: SdrEventIqRecording,
+    pub network_sink_status: SdrEventNetworkSinkStatus,
     /// Placeholder for kinds that carry no payload (e.g.,
     /// `SDR_EVT_SOURCE_STOPPED`). Accessing this field is always
     /// valid as a zero-byte read.
@@ -347,6 +389,51 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
             payload: SdrEventPayload { _placeholder: 0 },
         },
 
+        DspToUi::NetworkSinkStatus(status) => {
+            use sdr_core::NetworkSinkStatus;
+            // Translate the three status variants into the C
+            // tagged-payload shape. Borrowed strings get
+            // promoted to `CString` so they outlive the
+            // dispatcher's call into the host callback.
+            // Per issue #247 PR 2.
+            let (kind, message_cstr, protocol_int) = match status {
+                NetworkSinkStatus::Inactive => (SDR_NETWORK_SINK_STATUS_INACTIVE, None, -1_i32),
+                NetworkSinkStatus::Active { endpoint, protocol } => {
+                    let sanitized = endpoint.replace('\0', "?");
+                    let Ok(cstr) = CString::new(sanitized) else {
+                        // Unreachable: replace stripped NULs.
+                        return None;
+                    };
+                    let proto = match protocol {
+                        sdr_types::Protocol::TcpClient => SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                        sdr_types::Protocol::Udp => SDR_NETWORK_PROTOCOL_UDP,
+                    };
+                    (SDR_NETWORK_SINK_STATUS_ACTIVE, Some(cstr), proto)
+                }
+                NetworkSinkStatus::Error { message } => {
+                    let sanitized = message.replace('\0', "?");
+                    let Ok(cstr) = CString::new(sanitized) else {
+                        return None;
+                    };
+                    (SDR_NETWORK_SINK_STATUS_ERROR, Some(cstr), -1_i32)
+                }
+            };
+            let utf8 = message_cstr
+                .as_ref()
+                .map_or(std::ptr::null(), |c| c.as_ptr());
+            owned_cstring = message_cstr;
+            SdrEvent {
+                kind: SDR_EVT_NETWORK_SINK_STATUS,
+                payload: SdrEventPayload {
+                    network_sink_status: SdrEventNetworkSinkStatus {
+                        kind,
+                        utf8,
+                        protocol: protocol_int,
+                    },
+                },
+            }
+        }
+
         // Variants not yet exposed at the FFI boundary. Silently
         // dropped in v1; a future ABI minor bump grows the surface
         // to cover them as each feature lands in the macOS SwiftUI
@@ -380,14 +467,7 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::BandwidthChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
-        | DspToUi::RtlTcpConnectionState(_)
-        // `NetworkSinkStatus` is engine-only in PR 1 (issue #247
-        // engine-side plumbing). The FFI surface gains a
-        // matching `SDR_EVT_NETWORK_SINK_STATUS` variant in PR 2
-        // alongside the FFI command wrappers; until then drop
-        // the event silently rather than dispatching it as a
-        // generic error.
-        | DspToUi::NetworkSinkStatus(_) => return None,
+        | DspToUi::RtlTcpConnectionState(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 8
+#define SDR_CORE_ABI_VERSION_MINOR 9
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -444,6 +444,64 @@ int32_t sdr_core_set_volume(SdrCore* handle, float volume_0_1);
  */
 int32_t sdr_core_set_audio_device(SdrCore* handle, const char* uid_utf8);
 
+/* --- Audio sink selection (issue #247, ABI 0.9) --- */
+/*
+ * Switch between local audio output and TCP/UDP network
+ * streaming, and configure the network endpoint. Stops the
+ * current sink, builds the replacement using the persisted
+ * device / network config, and restarts it if the engine is
+ * running. Status updates are surfaced through the new
+ * `SDR_EVT_NETWORK_SINK_STATUS` event below — hosts use it
+ * to drive a status row in the audio settings panel.
+ */
+
+/*
+ * Active audio sink. Mirrors `crate::sink_slot::AudioSinkType`
+ * on the Rust side. Stable discriminants — never reorder.
+ */
+typedef enum SdrAudioSinkType {
+    SDR_AUDIO_SINK_LOCAL   = 0,
+    SDR_AUDIO_SINK_NETWORK = 1,
+} SdrAudioSinkType;
+
+/*
+ * Network stream protocol. Reused by the network audio sink
+ * config command and the matching status payload below. Stable
+ * discriminants — never reorder.
+ *
+ * Note: `TCP_SERVER` mirrors `sdr_types::Protocol::TcpClient`
+ * on the Rust side. The historical "client" naming there comes
+ * from SDR++ — the device acts as the TCP **server** accepting
+ * client connections. The C ABI uses the clearer name.
+ */
+typedef enum SdrNetworkProtocol {
+    SDR_NETWORK_PROTOCOL_TCP_SERVER = 0,
+    SDR_NETWORK_PROTOCOL_UDP        = 1,
+} SdrNetworkProtocol;
+
+/*
+ * Switch the active audio sink type. `sink_type` must be one
+ * of `SDR_AUDIO_SINK_*`. Returns `SDR_CORE_ERR_INVALID_ARG`
+ * for unknown values.
+ */
+int32_t sdr_core_set_audio_sink_type(SdrCore* handle, int32_t sink_type);
+
+/*
+ * Configure the network audio sink endpoint. `hostname_utf8`
+ * must be non-null, non-empty, NUL-terminated UTF-8.
+ * `protocol` must be one of `SDR_NETWORK_PROTOCOL_*`.
+ *
+ * If the network sink is currently active the engine rebuilds
+ * it inline so the new endpoint takes effect immediately;
+ * otherwise the values are stored for the next switch.
+ */
+int32_t sdr_core_set_network_sink_config(
+    SdrCore*    handle,
+    const char* hostname_utf8,
+    uint16_t    port,
+    int32_t     protocol
+);
+
 /*
  * Start / stop recording the demodulated audio stream to a 16-bit
  * PCM WAV file. The engine opens the file on `start`, writes every
@@ -715,7 +773,17 @@ typedef enum SdrEventKind {
     SDR_EVT_AUDIO_RECORDING_STOPPED = 9,
     SDR_EVT_IQ_RECORDING_STARTED    = 10,
     SDR_EVT_IQ_RECORDING_STOPPED    = 11,
+    SDR_EVT_NETWORK_SINK_STATUS     = 12, /* ABI 0.9 — issue #247 */
 } SdrEventKind;
+
+/* Discriminants for the `kind` field of `SdrEventNetworkSinkStatus`
+ * below. Stable — never reorder.
+ */
+typedef enum SdrNetworkSinkStatusKind {
+    SDR_NETWORK_SINK_STATUS_INACTIVE = 0,
+    SDR_NETWORK_SINK_STATUS_ACTIVE   = 1,
+    SDR_NETWORK_SINK_STATUS_ERROR    = 2,
+} SdrNetworkSinkStatusKind;
 
 /*
  * Payload for SDR_EVT_DEVICE_INFO. `utf8` is a NUL-terminated
@@ -771,6 +839,25 @@ typedef struct SdrEventIqRecording {
 } SdrEventIqRecording;
 
 /*
+ * Payload for SDR_EVT_NETWORK_SINK_STATUS. Tagged by `kind`
+ * (one of `SDR_NETWORK_SINK_STATUS_*`):
+ *
+ * | kind                              | utf8                  | protocol                |
+ * |-----------------------------------|-----------------------|-------------------------|
+ * | SDR_NETWORK_SINK_STATUS_INACTIVE  | NULL                  | -1 (unused)             |
+ * | SDR_NETWORK_SINK_STATUS_ACTIVE    | endpoint host:port    | SDR_NETWORK_PROTOCOL_*  |
+ * | SDR_NETWORK_SINK_STATUS_ERROR     | error message         | -1 (unused)             |
+ *
+ * `utf8` is borrowed from dispatcher-owned storage; valid only
+ * for the duration of the callback. Per issue #247.
+ */
+typedef struct SdrEventNetworkSinkStatus {
+    int32_t     kind;
+    const char* utf8;
+    int32_t     protocol;
+} SdrEventNetworkSinkStatus;
+
+/*
  * Tagged union of all event payloads. Which union field is valid
  * is determined by the `kind` discriminant on the enclosing
  * SdrEvent (see the table below).
@@ -788,16 +875,18 @@ typedef struct SdrEventIqRecording {
  * SDR_EVT_AUDIO_RECORDING_STOPPED     none (all-zero payload)
  * SDR_EVT_IQ_RECORDING_STARTED        iq_recording.path_utf8
  * SDR_EVT_IQ_RECORDING_STOPPED        none (all-zero payload)
+ * SDR_EVT_NETWORK_SINK_STATUS         network_sink_status.{kind,utf8,protocol}
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
     float  signal_level_db;
     double display_bandwidth_hz;
-    SdrEventDeviceInfo     device_info;
-    SdrEventGainList       gain_list;
-    SdrEventError          error;
-    SdrEventAudioRecording audio_recording;
-    SdrEventIqRecording    iq_recording;
+    SdrEventDeviceInfo        device_info;
+    SdrEventGainList          gain_list;
+    SdrEventError             error;
+    SdrEventAudioRecording    audio_recording;
+    SdrEventIqRecording       iq_recording;
+    SdrEventNetworkSinkStatus network_sink_status;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;

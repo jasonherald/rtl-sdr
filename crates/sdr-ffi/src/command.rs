@@ -526,6 +526,93 @@ pub unsafe extern "C" fn sdr_core_set_audio_device(
     }
 }
 
+// ============================================================
+//  Audio sink selection (#247) — switch between local audio
+//  device and network stream, configure the network endpoint.
+//
+//  Discriminants below mirror the matching `Sdr*` enums in
+//  `include/sdr_core.h`. Reordering would silently break ABI.
+// ============================================================
+
+pub const SDR_AUDIO_SINK_LOCAL: i32 = 0;
+pub const SDR_AUDIO_SINK_NETWORK: i32 = 1;
+
+fn audio_sink_type_from_c(v: i32) -> Option<sdr_core::AudioSinkType> {
+    match v {
+        SDR_AUDIO_SINK_LOCAL => Some(sdr_core::AudioSinkType::Local),
+        SDR_AUDIO_SINK_NETWORK => Some(sdr_core::AudioSinkType::Network),
+        _ => None,
+    }
+}
+
+fn protocol_from_c(v: i32) -> Option<sdr_types::Protocol> {
+    match v {
+        crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER => Some(sdr_types::Protocol::TcpClient),
+        crate::event::SDR_NETWORK_PROTOCOL_UDP => Some(sdr_types::Protocol::Udp),
+        _ => None,
+    }
+}
+
+/// Switch between the local audio device sink and the network
+/// stream sink. `sink_type` must be one of `SDR_AUDIO_SINK_*`.
+/// The engine stops the current sink, builds the replacement
+/// from the persisted device / network config, and restarts it
+/// if the engine is currently running. Returns `SDR_CORE_OK` on
+/// success or `SDR_CORE_ERR_INVALID_ARG` for an unknown
+/// `sink_type` value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_audio_sink_type(handle: *mut SdrCore, sink_type: i32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let Some(t) = audio_sink_type_from_c(sink_type) else {
+                set_last_error(format!(
+                    "sdr_core_set_audio_sink_type: unknown sink_type {sink_type}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            };
+            send(core, UiToDsp::SetAudioSinkType(t))
+        })
+    }
+}
+
+/// Configure the network audio sink endpoint. `hostname_utf8`
+/// must be a non-null NUL-terminated UTF-8 C string. `protocol`
+/// must be one of `SDR_NETWORK_PROTOCOL_*`. The engine stores
+/// the config; if the network sink is currently active the
+/// underlying `NetworkSink` is rebuilt inline so the new
+/// endpoint takes effect immediately.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_network_sink_config(
+    handle: *mut SdrCore,
+    hostname_utf8: *const c_char,
+    port: u16,
+    protocol: i32,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let hostname = cstr_to_string("sdr_core_set_network_sink_config", hostname_utf8)?;
+            if hostname.is_empty() {
+                set_last_error("sdr_core_set_network_sink_config: hostname is empty");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            let Some(proto) = protocol_from_c(protocol) else {
+                set_last_error(format!(
+                    "sdr_core_set_network_sink_config: unknown protocol {protocol}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            };
+            send(
+                core,
+                UiToDsp::SetNetworkSinkConfig {
+                    hostname,
+                    port,
+                    protocol: proto,
+                },
+            )
+        })
+    }
+}
+
 /// Shared helper for the two `start_*_recording` commands. Validates
 /// `path_utf8` (non-null, UTF-8, non-empty) and dispatches the
 /// appropriate `UiToDsp` variant via `build_cmd`. Keeps the path
