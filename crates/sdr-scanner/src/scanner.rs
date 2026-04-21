@@ -49,8 +49,17 @@ impl Phase {
             Phase::Dwelling { .. } => ScannerState::Dwelling,
             Phase::Listening { .. } => ScannerState::Listening,
             Phase::Hanging { .. } => ScannerState::Hanging,
+            // `AdvanceFromDwell` / `AdvanceFromHang` are synthetic
+            // transition markers returned from `handle_sample_tick`
+            // and immediately consumed by its downstream match — they
+            // should never appear here. Debug builds assert, release
+            // falls back to `Idle` rather than panicking a library.
             Phase::AdvanceFromDwell | Phase::AdvanceFromHang => {
-                unreachable!("advance markers should never sit as the phase")
+                debug_assert!(
+                    false,
+                    "advance markers should never sit as the active phase"
+                );
+                ScannerState::Idle
             }
         }
     }
@@ -388,7 +397,15 @@ impl Scanner {
                 }
             }
             Phase::AdvanceFromDwell | Phase::AdvanceFromHang => {
-                unreachable!("advance markers should never sit as the phase")
+                // Defensive: see comment on `Phase::as_state`. These
+                // markers are only ever returned from the inner
+                // match; hitting them here would be a state-machine
+                // bug, but panicking a library for it is wrong.
+                debug_assert!(
+                    false,
+                    "advance markers should never sit as the active phase"
+                );
+                None
             }
         };
 
@@ -436,7 +453,15 @@ impl Scanner {
     }
 
     fn handle_unlockout(&mut self, key: &ChannelKey) -> Vec<ScannerCommand> {
-        self.locked_out.remove(key);
+        let removed = self.locked_out.remove(key);
+        // If the scanner stalled into `Idle` because every channel
+        // was locked out (EmptyRotation → Idle), unlocking a
+        // channel while still enabled should resume scanning
+        // automatically — otherwise the user would have to
+        // disable + re-enable to kick it back into motion.
+        if removed && self.enabled && matches!(self.phase, Phase::Idle) {
+            return self.start_rotation();
+        }
         Vec::new()
     }
 }
@@ -785,6 +810,34 @@ mod tests {
         s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("B", 162_550_000, 0)]));
         // Internal set should have pruned.
         assert!(!s.locked_out.contains(&key_a));
+    }
+
+    #[test]
+    fn unlockout_resumes_scanning_from_empty_rotation_idle() {
+        // Scenario: scanner is enabled but all channels are locked
+        // out, so it drained to Idle via EmptyRotation. Unlocking
+        // a channel should kick rotation back into motion rather
+        // than leaving the scanner stuck until some unrelated
+        // event fires.
+        let mut s = Scanner::new();
+        let key_a = ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        };
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
+        s.handle_event(ScannerEvent::LockoutChannel(key_a.clone()));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        assert_eq!(s.state(), ScannerState::Idle);
+
+        let commands = s.handle_event(ScannerEvent::UnlockoutChannel(key_a));
+        assert_eq!(s.state(), ScannerState::Retuning);
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            ScannerCommand::Retune {
+                freq_hz: 146_520_000,
+                ..
+            }
+        )));
     }
 
     #[test]

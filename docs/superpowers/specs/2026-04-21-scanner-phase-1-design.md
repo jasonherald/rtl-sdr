@@ -70,10 +70,6 @@ pub enum ScannerEvent {
     /// Session-scoped lockout (not persisted to config or bookmarks).
     LockoutChannel(ChannelKey),
     UnlockoutChannel(ChannelKey),
-
-    /// Default dwell/hang timing changed (user moved the sidebar sliders).
-    SetDefaultDwellMs(u32),
-    SetDefaultHangMs(u32),
 }
 
 pub enum SquelchState { Open, Closed }
@@ -352,7 +348,7 @@ Estimate: ~600 lines including tests. One commit per logical piece (types, state
 ### PR 2 — `DspController` integration + bookmark schema
 
 - Extend `Bookmark` with 4 new fields + backward-compat tests.
-- New `UiToDsp` variants: `SetScannerEnabled(bool)`, `UpdateScannerChannels(Vec<ScannerChannel>)`, `LockoutScannerChannel(ChannelKey)`, `UnlockoutScannerChannel(ChannelKey)`, `SetScannerDefaultDwellMs(u32)`, `SetScannerDefaultHangMs(u32)`.
+- New `UiToDsp` variants: `SetScannerEnabled(bool)`, `UpdateScannerChannels(Vec<ScannerChannel>)`, `LockoutScannerChannel(ChannelKey)`, `UnlockoutScannerChannel(ChannelKey)`. Timing defaults are UI-side only — slider changes re-project bookmarks into `ScannerChannel`s with resolved `dwell_ms` / `hang_ms` and dispatch `UpdateScannerChannels`; the scanner itself has no "set default" event.
 - New `DspToUi` variants: `ScannerActiveChannelChanged { ... }`, `ScannerStateChanged(ScannerState)`.
 - `DspController` adds `scanner: Scanner` field, wires sample ticks + squelch edges + UI commands into it, applies scanner-emitted commands.
 - Mutex enforcement: `SetScannerEnabled(true)` stops recording + transcription with toasts. Recording / transcription start rejected when scanner is active.

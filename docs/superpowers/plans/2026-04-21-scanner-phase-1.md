@@ -229,12 +229,10 @@ pub enum ScannerEvent {
     /// until unlocked or scanner is disabled.
     LockoutChannel(ChannelKey),
     UnlockoutChannel(ChannelKey),
-
-    /// Global default dwell/hang changes from the UI sliders.
-    SetDefaultDwellMs(u32),
-    SetDefaultHangMs(u32),
 }
 ```
+
+Note: timing defaults (dwell, hang) live UI-side only. Slider changes re-project the bookmark list into `ScannerChannel`s with resolved per-channel `dwell_ms` / `hang_ms` and dispatch `UpdateScannerChannels` — there's no scanner-level "set default" event.
 
 - [ ] **Step 2: Write `commands.rs`**
 
@@ -336,7 +334,7 @@ use crate::channel::{ChannelKey, ScannerChannel};
 use crate::commands::ScannerCommand;
 use crate::events::{ScannerEvent, SquelchState};
 use crate::state::ScannerState;
-use crate::{DEFAULT_DWELL_MS, DEFAULT_HANG_MS, PRIORITY_CHECK_INTERVAL, SETTLE_MS};
+use crate::{PRIORITY_CHECK_INTERVAL, SETTLE_MS};
 
 /// Internal phase carrying per-phase bookkeeping. The outer
 /// `ScannerState` surfaced to the UI is a flattened view of this.
@@ -378,8 +376,6 @@ pub struct Scanner {
     enabled: bool,
     channels: Vec<ScannerChannel>,
     locked_out: HashSet<ChannelKey>,
-    default_dwell_ms: u32,
-    default_hang_ms: u32,
     phase: Phase,
     /// Rotation index into the current sub-list. Normal and
     /// priority rotations are advanced independently.
@@ -399,8 +395,6 @@ impl Default for Scanner {
             enabled: false,
             channels: Vec::new(),
             locked_out: HashSet::new(),
-            default_dwell_ms: DEFAULT_DWELL_MS,
-            default_hang_ms: DEFAULT_HANG_MS,
             phase: Phase::Idle,
             normal_cursor: 0,
             priority_cursor: 0,
@@ -433,15 +427,7 @@ impl Scanner {
                 sample_rate_hz,
             } => self.handle_sample_tick(samples_consumed, sample_rate_hz),
             ScannerEvent::LockoutChannel(key) => self.handle_lockout(key),
-            ScannerEvent::UnlockoutChannel(key) => self.handle_unlockout(key),
-            ScannerEvent::SetDefaultDwellMs(ms) => {
-                self.default_dwell_ms = ms;
-                Vec::new()
-            }
-            ScannerEvent::SetDefaultHangMs(ms) => {
-                self.default_hang_ms = ms;
-                Vec::new()
-            }
+            ScannerEvent::UnlockoutChannel(key) => self.handle_unlockout(&key),
         }
     }
 
@@ -1181,7 +1167,7 @@ And update `enter_retuning` initializer from `samples_until_settled: 0` to `samp
 - [ ] **Step 6: Run all tests**
 
 Run: `cargo test -p sdr-scanner --lib`
-Expected: 9/9 tests PASS.
+Expected: 9 tests PASS (3 from Task 1.5 + 6 new here).
 
 - [ ] **Step 7: Commit**
 
@@ -1360,7 +1346,7 @@ Expected: All 4 new tests PASS (the logic is already in place from Task 1.5/1.6)
 - [ ] **Step 4: Run all tests**
 
 Run: `cargo test -p sdr-scanner --lib`
-Expected: 13/13 tests PASS.
+Expected: all tests from Tasks 1.5 + 1.6 + 1.7 pass. Current baseline on shipped PR #368 is 17 tests (3 + 6 + 6 priority/lockout/edge + 1 `disable_clears_session_state` + 1 `unlockout_resumes_scanning_from_empty_rotation_idle`). If you're following the plan exactly, you'll see 15 at this checkpoint; the two regression tests landed via CR feedback after the initial task sequence.
 
 - [ ] **Step 5: Run clippy**
 
@@ -1525,10 +1511,9 @@ Open `crates/sdr-core/src/messages.rs`. Locate `pub enum UiToDsp`. Add new varia
     /// Session-scoped lockout.
     LockoutScannerChannel(sdr_scanner::ChannelKey),
     UnlockoutScannerChannel(sdr_scanner::ChannelKey),
-    /// Global default timings (user moved the sidebar sliders).
-    SetScannerDefaultDwellMs(u32),
-    SetScannerDefaultHangMs(u32),
 ```
+
+Timing defaults do NOT get their own UiToDsp variants — the UI folds them into each `ScannerChannel` at projection time (see Task 3.4 / PR 3) and dispatches `UpdateScannerChannels` on slider change.
 
 - [ ] **Step 3: Add `sdr-scanner` dependency on `sdr-core`**
 
@@ -1747,19 +1732,9 @@ And arms for the rest:
             .handle_event(sdr_scanner::ScannerEvent::UnlockoutChannel(key));
         self.apply_scanner_commands(cmds);
     }
-    UiToDsp::SetScannerDefaultDwellMs(ms) => {
-        let cmds = self
-            .scanner
-            .handle_event(sdr_scanner::ScannerEvent::SetDefaultDwellMs(ms));
-        self.apply_scanner_commands(cmds);
-    }
-    UiToDsp::SetScannerDefaultHangMs(ms) => {
-        let cmds = self
-            .scanner
-            .handle_event(sdr_scanner::ScannerEvent::SetDefaultHangMs(ms));
-        self.apply_scanner_commands(cmds);
-    }
 ```
+
+Defaults have no controller arm — they're UI-only. The UI reprojects bookmarks → `ScannerChannel`s with resolved per-channel `dwell_ms` / `hang_ms` and dispatches `UpdateScannerChannels` when a slider moves.
 
 - [ ] **Step 4: Feed SampleTick on every IQ block**
 
@@ -2173,34 +2148,47 @@ fn connect_scanner_panel(
         glib::Propagation::Proceed
     });
 
-    // Default dwell slider.
-    let state_dwell = Rc::clone(state);
+    // Default dwell + hang sliders. Each change persists to
+    // config AND triggers a bookmark re-projection — defaults
+    // are UI-side, folded into `ScannerChannel::dwell_ms` /
+    // `hang_ms` at projection time. We push the refreshed
+    // channel list via `UpdateScannerChannels` so the scanner
+    // picks up the new resolved values on its next rotation.
+    //
+    // `project_and_push_scanner_channels(panels, state, config)`
+    // is a small helper defined in Task 3.4 that:
+    //   1. reads the current bookmark list
+    //   2. reads the default dwell/hang from config
+    //   3. calls `project_scanner_channels(bookmarks, defaults)`
+    //   4. dispatches `UiToDsp::UpdateScannerChannels(channels)`
     let cfg_dwell = std::sync::Arc::clone(config);
+    let panels_dwell = panels.clone_for_scanner(); // or appropriate weak/clone pattern
+    let state_dwell = Rc::clone(state);
     scanner
         .default_dwell_row
         .connect_value_notify(move |row| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let ms = row.value() as u32;
-            state_dwell.send_dsp(UiToDsp::SetScannerDefaultDwellMs(ms));
             cfg_dwell.write(|v| {
                 v[sidebar::scanner_panel::CONFIG_KEY_DEFAULT_DWELL_MS] =
                     serde_json::json!(ms);
             });
+            project_and_push_scanner_channels(&panels_dwell, &state_dwell, &cfg_dwell);
         });
 
-    // Default hang slider.
-    let state_hang = Rc::clone(state);
     let cfg_hang = std::sync::Arc::clone(config);
+    let panels_hang = panels.clone_for_scanner();
+    let state_hang = Rc::clone(state);
     scanner
         .default_hang_row
         .connect_value_notify(move |row| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let ms = row.value() as u32;
-            state_hang.send_dsp(UiToDsp::SetScannerDefaultHangMs(ms));
             cfg_hang.write(|v| {
                 v[sidebar::scanner_panel::CONFIG_KEY_DEFAULT_HANG_MS] =
                     serde_json::json!(ms);
             });
+            project_and_push_scanner_channels(&panels_hang, &state_hang, &cfg_hang);
         });
 
     // Restore persisted defaults.
@@ -2403,10 +2391,9 @@ In `build_bookmark_row` (after the existing `delete_btn` append):
             b.scan_enabled = enabled;
         }
         save_bookmarks(&bms);
-        // Push the new channel list to the scanner.
-        let channels = project_scanner_channels(&bms);
         drop(bms);
-        state_scan.send_dsp(UiToDsp::UpdateScannerChannels(channels));
+        // Re-project with the current UI defaults and push.
+        project_and_push_scanner_channels(panels, state, config);
     });
     row.add_suffix(&scan_check);
 
@@ -2444,9 +2431,8 @@ In `build_bookmark_row` (after the existing `delete_btn` append):
             b.priority = priority;
         }
         save_bookmarks(&bms);
-        let channels = project_scanner_channels(&bms);
         drop(bms);
-        state_pri.send_dsp(UiToDsp::UpdateScannerChannels(channels));
+        project_and_push_scanner_channels(panels, state, config);
     });
     row.add_suffix(&pri_btn);
 ```
@@ -2457,12 +2443,14 @@ Update `build_bookmark_row`'s signature to take `state: &Rc<AppState>` so the to
 
 ```rust
 /// Project the bookmark list into `ScannerChannel`s. Only
-/// includes bookmarks with `scan_enabled = true`. Override
-/// fields are folded against the scanner defaults at projection
-/// time so the scanner state machine doesn't need to know about
-/// Options.
+/// includes bookmarks with `scan_enabled = true`. Defaults are
+/// UI-side — the caller reads them from config (or the live
+/// spin-row values) and passes them in. Override fields on the
+/// bookmark win; missing overrides fall back to the defaults.
 pub fn project_scanner_channels(
     bookmarks: &[Bookmark],
+    default_dwell_ms: u32,
+    default_hang_ms: u32,
 ) -> Vec<sdr_scanner::ScannerChannel> {
     bookmarks
         .iter()
@@ -2472,31 +2460,55 @@ pub fn project_scanner_channels(
                 name: b.name.clone(),
                 frequency_hz: b.frequency,
             },
-            frequency_hz: b.frequency,
             demod_mode: parse_demod_mode(&b.demod_mode),
             bandwidth: b.bandwidth,
-            ctcss: b.ctcss_mode.clone(),
+            ctcss: b.ctcss_mode,
             voice_squelch: b.voice_squelch_mode,
             priority: b.priority,
-            dwell_ms: b
-                .dwell_ms_override
-                .unwrap_or(sdr_scanner::DEFAULT_DWELL_MS),
-            hang_ms: b
-                .hang_ms_override
-                .unwrap_or(sdr_scanner::DEFAULT_HANG_MS),
+            dwell_ms: b.dwell_ms_override.unwrap_or(default_dwell_ms),
+            hang_ms: b.hang_ms_override.unwrap_or(default_hang_ms),
         })
         .collect()
+}
+
+/// Convenience helper: read current defaults from config, project
+/// the current bookmark list, and dispatch `UpdateScannerChannels`.
+/// Called from the default-slider handlers and the bookmark
+/// add/delete/import paths so every scanner-visible mutation
+/// refreshes the channel list atomically.
+pub fn project_and_push_scanner_channels(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let default_dwell = config.read(|v| {
+        v.get(sidebar::scanner_panel::CONFIG_KEY_DEFAULT_DWELL_MS)
+            .and_then(serde_json::Value::as_u64)
+            .map_or(sdr_scanner::DEFAULT_DWELL_MS, |v| v as u32)
+    });
+    let default_hang = config.read(|v| {
+        v.get(sidebar::scanner_panel::CONFIG_KEY_DEFAULT_HANG_MS)
+            .and_then(serde_json::Value::as_u64)
+            .map_or(sdr_scanner::DEFAULT_HANG_MS, |v| v as u32)
+    });
+    let channels = project_scanner_channels(
+        &panels.bookmarks.bookmarks.borrow(),
+        default_dwell,
+        default_hang,
+    );
+    state.send_dsp(UiToDsp::UpdateScannerChannels(channels));
 }
 ```
 
 - [ ] **Step 3: Also push `UpdateScannerChannels` on Add / Delete / RR import paths**
 
-Locate the add-bookmark click handler, delete-button click handler (inside `build_bookmark_row`), and the RR browse post-import callback. After each `save_bookmarks` call, add:
+Locate the add-bookmark click handler, delete-button click handler (inside `build_bookmark_row`), and the RR browse post-import callback. After each `save_bookmarks` call, invoke the helper:
 
 ```rust
-    let channels = project_scanner_channels(&bm_rc.borrow());
-    state_clone.send_dsp(UiToDsp::UpdateScannerChannels(channels));
+    sidebar::navigation_panel::project_and_push_scanner_channels(panels, state, config);
 ```
+
+This keeps every call site that mutates the bookmark list (including default-slider changes that re-resolve the per-channel timing) on one path.
 
 - [ ] **Step 4: Compile**
 
@@ -2591,14 +2603,13 @@ git commit -m "sdr-ui: lockout button + manual-tune force-disables scanner"
 In `build_window` after the panels are wired up, push the initial channel list to the scanner:
 
 ```rust
-    // Seed the scanner with the persisted bookmark list — scanner
-    // starts Idle so no retune happens, but the channels are in
-    // place if the user flips the switch on.
-    let initial_channels =
-        sidebar::navigation_panel::project_scanner_channels(
-            &panels.bookmarks.bookmarks.borrow(),
-        );
-    state.send_dsp(UiToDsp::UpdateScannerChannels(initial_channels));
+    // Seed the scanner with the persisted bookmark list —
+    // scanner starts Idle so no retune happens, but the channels
+    // are in place if the user flips the switch on. Defaults
+    // come from config via the shared helper.
+    sidebar::navigation_panel::project_and_push_scanner_channels(
+        &panels, &state, config,
+    );
 ```
 
 - [ ] **Step 2: Add F8 shortcut to toggle scanner**
