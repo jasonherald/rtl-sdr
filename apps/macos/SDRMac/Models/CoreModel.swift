@@ -161,6 +161,35 @@ final class CoreModel {
     /// engine default (`sdr_pipeline::iq_frontend::DEFAULT_DECIM`).
     var decimationFactor: UInt32 = 8
 
+    // ----------------------------------------------------------
+    //  Source selection — issues #235, #236 (ABI 0.10)
+    // ----------------------------------------------------------
+
+    /// Active IQ source. Default is `.rtlSdr` to match the
+    /// engine's startup state (`SourceType::RtlSdr` in
+    /// `crates/sdr-core/src/controller.rs`). Persisted to
+    /// `UserDefaults` so the pick survives relaunches.
+    var sourceType: SourceType = .rtlSdr
+
+    /// Network IQ source hostname. Default "localhost" mirrors
+    /// the GTK source panel's initial value.
+    var networkSourceHost: String = "localhost"
+
+    /// Network IQ source port. Default 1234 matches the
+    /// canonical rtl_tcp / IQ-server port convention.
+    var networkSourcePort: UInt16 = 1234
+
+    /// Network IQ source transport. Defaults to TCP (dial
+    /// outbound); UDP is the "device binds locally and receives
+    /// datagrams" mode.
+    var networkSourceProtocol: NetworkSourceProtocol = .tcp
+
+    /// File-playback source filesystem path. Empty until the
+    /// user picks a file. The engine rejects the source start
+    /// on an empty / nonexistent / non-WAV path; no local
+    /// validation here.
+    var filePath: String = ""
+
     // ==========================================================
     //  Tuner
     // ==========================================================
@@ -387,6 +416,33 @@ final class CoreModel {
             selectedAudioDeviceUid = saved
         }
         refreshAudioDevices()
+
+        // Restore source-selection preferences — issues #235, #236.
+        // Same additive pattern as the audio-sink block below:
+        // absent keys leave the SourceType default (.rtlSdr) and
+        // the Rust-side defaults intact.
+        if UserDefaults.standard.object(forKey: Self.sourceTypeDefaultsKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.sourceTypeDefaultsKey))
+            sourceType = SourceType(rawValue: raw) ?? .rtlSdr
+        }
+        if let host = UserDefaults.standard.string(forKey: Self.networkSourceHostDefaultsKey),
+           !host.isEmpty {
+            networkSourceHost = host
+        }
+        if UserDefaults.standard.object(forKey: Self.networkSourcePortDefaultsKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.networkSourcePortDefaultsKey)
+            if (1...Int(UInt16.max)).contains(stored) {
+                networkSourcePort = UInt16(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.networkSourceProtocolDefaultsKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.networkSourceProtocolDefaultsKey))
+            networkSourceProtocol = NetworkSourceProtocol(rawValue: raw) ?? .tcp
+        }
+        if let path = UserDefaults.standard.string(forKey: Self.filePathDefaultsKey),
+           !path.isEmpty {
+            filePath = path
+        }
 
         // Restore network audio sink preferences — issue #247.
         // Each field is independent; a partial write from a
@@ -653,6 +709,21 @@ final class CoreModel {
 
     func syncToEngine() {
         guard core != nil else { return }
+        // Push source-selection state first so the engine has
+        // the right network/file config in place before the
+        // source actually opens on Start. Per issues #235, #236.
+        // Host configs are pushed before the type switch so a
+        // restored `.network` / `.file` source opens with the
+        // user's values rather than the engine defaults.
+        applyNetworkSourceConfig(
+            host: networkSourceHost,
+            port: networkSourcePort,
+            protocol: networkSourceProtocol
+        )
+        if !filePath.isEmpty {
+            setFilePath(filePath)
+        }
+        setSourceType(sourceType)
         setCenter(centerFrequencyHz)
         setVfoOffset(vfoOffsetHz)
         setSampleRate(sourceSampleRateHz)
@@ -1026,6 +1097,71 @@ final class CoreModel {
             try core?.setNetworkSinkConfig(hostname: trimmed, port: port, protocol: proto)
         }
     }
+
+    // ----------------------------------------------------------
+    //  Source selection setters — issues #235, #236
+    // ----------------------------------------------------------
+
+    /// Switch the active IQ source. Optimistic — flips the UI
+    /// field before dispatching so dependent sections redraw
+    /// immediately. A source-open error lands later as an
+    /// `.error(...)` / `.sourceStopped` event.
+    func setSourceType(_ type: SourceType) {
+        sourceType = type
+        UserDefaults.standard.set(Int(type.rawValue), forKey: Self.sourceTypeDefaultsKey)
+        capture { try core?.setSourceType(type) }
+    }
+
+    /// Apply the current network-source host/port/protocol to
+    /// the engine. Called on explicit Apply in the Source pane
+    /// rather than per-keystroke — the engine rebuilds the
+    /// connection on receipt, so typing into the host field
+    /// shouldn't thrash it.
+    func applyNetworkSourceConfig(
+        host: String,
+        port: UInt16,
+        protocol proto: NetworkSourceProtocol
+    ) {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            lastError = "Network source host cannot be empty"
+            return
+        }
+        networkSourceHost = trimmed
+        networkSourcePort = port
+        networkSourceProtocol = proto
+        UserDefaults.standard.set(trimmed, forKey: Self.networkSourceHostDefaultsKey)
+        UserDefaults.standard.set(Int(port), forKey: Self.networkSourcePortDefaultsKey)
+        UserDefaults.standard.set(Int(proto.rawValue), forKey: Self.networkSourceProtocolDefaultsKey)
+        capture {
+            try core?.setNetworkConfig(hostname: trimmed, port: port, protocol: proto)
+        }
+    }
+
+    /// Set the file-playback source path. Empty input is
+    /// rejected locally to match the FFI contract — opening
+    /// with an empty path is an InvalidArg anyway, but failing
+    /// here keeps the UI responsive.
+    func setFilePath(_ path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            lastError = "File path cannot be empty"
+            return
+        }
+        filePath = trimmed
+        UserDefaults.standard.set(trimmed, forKey: Self.filePathDefaultsKey)
+        capture { try core?.setFilePath(trimmed) }
+    }
+
+    /// UserDefaults keys for the persisted source-selection
+    /// state. Matches the `audioDeviceDefaultsKey` / network-sink
+    /// pattern. The Rust config layer doesn't round-trip these
+    /// yet — tracked against the larger v3 config alignment.
+    static let sourceTypeDefaultsKey            = "SDRMac.sourceType"
+    static let networkSourceHostDefaultsKey     = "SDRMac.networkSourceHost"
+    static let networkSourcePortDefaultsKey     = "SDRMac.networkSourcePort"
+    static let networkSourceProtocolDefaultsKey = "SDRMac.networkSourceProtocol"
+    static let filePathDefaultsKey              = "SDRMac.filePath"
 
     /// UserDefaults keys for the persisted network-sink config.
     /// Matches the existing `audioDeviceDefaultsKey` pattern —

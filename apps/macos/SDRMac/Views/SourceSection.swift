@@ -1,17 +1,23 @@
 //
 // SourceSection.swift — sidebar panel for source/tuner controls.
 //
-// MVP scope: RTL-SDR only (no device picker). Sample rate, gain
-// (discrete when AGC off), AGC, PPM. The device-picker and the
-// Network/File source forms land in v2 behind feature flags.
+// Device picker at top (RTL-SDR / Network IQ / File playback)
+// followed by per-source forms: RTL-SDR exposes the USB
+// tuner's sample rate / gain / AGC / PPM; Network exposes a
+// host/port/protocol triple with an Apply button; File exposes
+// a path text field with a "Choose WAV…" button. RTL-TCP is a
+// future source type (see issue #326 for its dedicated panel).
 //
 // Advanced controls (DC blocking, IQ inversion, IQ correction,
 // decimation) live in a collapsible "Advanced" DisclosureGroup
-// at the bottom, default-collapsed so the MVP layout stays
-// clean. Mirrors GTK's "Advanced" expander in its Source panel
-// (issue #246).
+// at the bottom, default-collapsed so the layout stays clean.
+// They apply to every source type because they sit in the IQ
+// frontend, not in the source itself. Mirrors GTK's "Advanced"
+// expander in its Source panel (issues #235, #236, #246).
 
 import SwiftUI
+import SdrCoreKit
+import UniformTypeIdentifiers
 
 /// RTL-SDR supported sample rates (in Hz). Matches
 /// `crates/sdr-rtlsdr::RATE_OPTIONS`.
@@ -27,61 +33,69 @@ private let rtlSdrSampleRates: [Double] = [
 /// `sdr-ui::sidebar::source_panel::DECIMATION_FACTORS`.
 private let decimationFactors: [UInt32] = [1, 2, 4, 8, 16]
 
+/// Source types offered in the top-of-section picker. RTL-TCP
+/// is deliberately omitted — it gets its own dedicated panel in
+/// issue #326 with the full rtl_tcp control surface (client
+/// picker, connection state, per-command gains/ppm/bias-T).
+/// Putting it in this generic picker would imply equal
+/// treatment it doesn't have yet.
+private let supportedSourceTypes: [SourceType] = [.rtlSdr, .network, .file]
+
 struct SourceSection: View {
     @Environment(CoreModel.self) private var model
 
+    /// Local edit buffer for the network host. Mirrors the
+    /// pattern from `SettingsView.AudioPane` — TextField edits
+    /// shouldn't rebuild the connection per keystroke.
+    @State private var hostEdit: String = ""
+
+    /// Local edit buffer for the network port.
+    @State private var portEdit: String = ""
+
+    /// One-shot latch so the initial `.onAppear` seeds the
+    /// local edit buffers from the model without clobbering
+    /// in-progress user edits when SwiftUI re-fires `.onAppear`
+    /// on sibling state changes. Same pattern as the audio
+    /// pane.
+    @State private var didPrefill: Bool = false
+
+    /// Backing state for the `fileImporter` sheet.
+    @State private var fileImporterPresented: Bool = false
+
     var body: some View {
         Section("Source") {
-            LabeledContent("Device") {
-                Text(model.deviceInfo.isEmpty ? "—" : model.deviceInfo)
-                    .foregroundStyle(.secondary)
-            }
-
-            LabeledContent("Sample rate") {
+            LabeledContent("Type") {
                 Picker("", selection: Binding(
-                    get: { model.sourceSampleRateHz },
-                    set: { model.setSampleRate($0) }
+                    get: { model.sourceType },
+                    set: { model.setSourceType($0) }
                 )) {
-                    ForEach(rtlSdrSampleRates, id: \.self) {
-                        Text(formatRate($0)).tag($0)
+                    ForEach(supportedSourceTypes, id: \.self) { t in
+                        Text(t.label).tag(t)
                     }
                 }
                 .labelsHidden()
             }
 
-            LabeledContent("Gain") {
-                if model.agcEnabled {
-                    Text("AGC").foregroundStyle(.secondary)
-                } else if model.availableGains.isEmpty {
-                    Text("—").foregroundStyle(.secondary)
-                } else {
-                    GainSlider(
-                        steps: model.availableGains,
-                        value: model.gainDb,
-                        commit: { model.setGain($0) }
-                    )
-                }
+            // Per-source content — one `@ViewBuilder` block per
+            // type keeps the outer `body` readable. Only the
+            // active type's fields render; switching sources
+            // collapses the rest.
+            switch model.sourceType {
+            case .rtlSdr: rtlSdrControls
+            case .network: networkControls
+            case .file: fileControls
+            case .rtlTcp:
+                // Defensive arm — not reachable through the
+                // picker but the persisted `sourceType` could
+                // restore to `.rtlTcp` from a future build.
+                // Show a note pointing at the dedicated panel.
+                Text("RTL-TCP has a dedicated panel (see issue #326).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
-            Toggle("AGC", isOn: Binding(
-                get: { model.agcEnabled },
-                set: { model.setAgc($0) }
-            ))
-
-            LabeledContent("PPM") {
-                Stepper(value: Binding(
-                    get: { model.ppmCorrection },
-                    set: { model.setPpm($0) }
-                ), in: -100...100) {
-                    Text("\(model.ppmCorrection)")
-                }
-            }
-
-            // Collapsible "Advanced" group — default-collapsed
-            // because most users never touch these toggles. The
-            // four FFI commands have existed since the M2 ABI;
-            // this commit just surfaces them. Mirrors the GTK
-            // Source panel's expander (#246).
+            // "Advanced" group applies to every source — lives
+            // in the IQ frontend, not the source itself.
             DisclosureGroup("Advanced") {
                 Toggle("DC blocking", isOn: Binding(
                     get: { model.dcBlockingEnabled },
@@ -112,6 +126,173 @@ struct SourceSection: View {
                 }
             }
         }
+        .onAppear {
+            guard !didPrefill else { return }
+            didPrefill = true
+            hostEdit = model.networkSourceHost
+            portEdit = String(model.networkSourcePort)
+        }
+        .fileImporter(
+            isPresented: $fileImporterPresented,
+            allowedContentTypes: [.wav, .audio],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                model.setFilePath(url.path)
+            }
+        }
+    }
+
+    /// Parse `portEdit` into a `UInt16` in the legal range.
+    /// Returns `nil` on empty / non-numeric / out-of-range input.
+    /// Matches the audio-pane helper shape.
+    private func portValue() -> UInt16? {
+        guard let raw = Int(portEdit.trimmingCharacters(in: .whitespaces)),
+              (1...Int(UInt16.max)).contains(raw) else {
+            return nil
+        }
+        return UInt16(raw)
+    }
+
+    /// Host with leading/trailing whitespace stripped — single
+    /// source of truth for the normalization step.
+    private var normalizedHost: String {
+        hostEdit.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var applyButtonDisabled: Bool {
+        normalizedHost.isEmpty || portValue() == nil
+    }
+
+    // ----------------------------------------------------------
+    //  Per-source form fragments
+    // ----------------------------------------------------------
+
+    @ViewBuilder
+    private var rtlSdrControls: some View {
+        LabeledContent("Device") {
+            Text(model.deviceInfo.isEmpty ? "—" : model.deviceInfo)
+                .foregroundStyle(.secondary)
+        }
+
+        LabeledContent("Sample rate") {
+            Picker("", selection: Binding(
+                get: { model.sourceSampleRateHz },
+                set: { model.setSampleRate($0) }
+            )) {
+                ForEach(rtlSdrSampleRates, id: \.self) {
+                    Text(formatRate($0)).tag($0)
+                }
+            }
+            .labelsHidden()
+        }
+
+        LabeledContent("Gain") {
+            if model.agcEnabled {
+                Text("AGC").foregroundStyle(.secondary)
+            } else if model.availableGains.isEmpty {
+                Text("—").foregroundStyle(.secondary)
+            } else {
+                GainSlider(
+                    steps: model.availableGains,
+                    value: model.gainDb,
+                    commit: { model.setGain($0) }
+                )
+            }
+        }
+
+        Toggle("AGC", isOn: Binding(
+            get: { model.agcEnabled },
+            set: { model.setAgc($0) }
+        ))
+
+        LabeledContent("PPM") {
+            Stepper(value: Binding(
+                get: { model.ppmCorrection },
+                set: { model.setPpm($0) }
+            ), in: -100...100) {
+                Text("\(model.ppmCorrection)")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var networkControls: some View {
+        TextField("Host", text: $hostEdit)
+            .textFieldStyle(.roundedBorder)
+            .disableAutocorrection(true)
+        TextField("Port", text: $portEdit)
+            .textFieldStyle(.roundedBorder)
+        Picker("Protocol", selection: Binding(
+            get: { model.networkSourceProtocol },
+            set: { proto in
+                // Protocol changes count as endpoint changes —
+                // push through immediately if host/port parse.
+                let host = normalizedHost
+                if !host.isEmpty, let port = portValue() {
+                    model.applyNetworkSourceConfig(
+                        host: host,
+                        port: port,
+                        protocol: proto
+                    )
+                }
+            }
+        )) {
+            ForEach(NetworkSourceProtocol.allCases, id: \.self) { p in
+                Text(p.label).tag(p)
+            }
+        }
+
+        HStack {
+            Button {
+                let host = normalizedHost
+                guard !host.isEmpty, let port = portValue() else { return }
+                model.applyNetworkSourceConfig(
+                    host: host,
+                    port: port,
+                    protocol: model.networkSourceProtocol
+                )
+            } label: {
+                Label("Apply", systemImage: "arrow.up.circle")
+            }
+            .disabled(applyButtonDisabled)
+        }
+
+        Text(
+            "TCP dials outbound to a remote IQ server. UDP binds locally and receives datagrams."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private var fileControls: some View {
+        LabeledContent("File") {
+            // Path is read-only text; edits go through
+            // `fileImporter` below so we can round-trip a
+            // sandboxed URL if the app ever gets sandboxed.
+            Text(model.filePath.isEmpty ? "—" : (model.filePath as NSString).lastPathComponent)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+        Button {
+            fileImporterPresented = true
+        } label: {
+            Label("Choose WAV…", systemImage: "folder")
+        }
+        if !model.filePath.isEmpty {
+            Text(model.filePath)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+        Text("Plays back a two-channel (I/Q) WAV file. Sample rate is read from the file header.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 }
 
