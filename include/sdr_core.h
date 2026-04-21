@@ -771,6 +771,134 @@ int32_t sdr_rtltcp_server_recent_commands_json(
     size_t*          out_required
 );
 
+/* ================================================================ */
+/*  rtl_tcp discovery (mDNS — issue #325, ABI 0.11)                 */
+/* ================================================================ */
+
+/*
+ * mDNS service-type: `_rtl_tcp._tcp.local.`. Two standalone
+ * opaque handles — `SdrRtlTcpAdvertiser` publishes one
+ * advertisement on the LAN, `SdrRtlTcpBrowser` watches for
+ * advertisements and fires a callback for each change.
+ *
+ * Neither is engine-coupled; the same process can run the
+ * engine, advertise a server, and browse other servers
+ * independently.
+ */
+
+typedef struct SdrRtlTcpAdvertiser SdrRtlTcpAdvertiser;
+typedef struct SdrRtlTcpBrowser    SdrRtlTcpBrowser;
+
+/*
+ * Discovery-event discriminants. Stable — never reorder.
+ */
+typedef enum SdrRtlTcpDiscoveryEventKind {
+    SDR_RTLTCP_DISCOVERY_ANNOUNCED = 0,
+    SDR_RTLTCP_DISCOVERY_WITHDRAWN = 1,
+} SdrRtlTcpDiscoveryEventKind;
+
+/*
+ * Options for `sdr_rtltcp_advertiser_start`. String fields are
+ * copied into owned Rust storage before the call returns, so
+ * the caller may free them immediately.
+ */
+typedef struct SdrRtlTcpAdvertiseOptions {
+    uint16_t     port;
+    const char*  instance_name;  /* required, non-empty, UTF-8 */
+    const char*  hostname;       /* optional; NULL / "" = auto from system hostname */
+    const char*  tuner;          /* TXT: tuner family (e.g. "R820T"); required */
+    const char*  version;        /* TXT: advertiser version string; required */
+    uint32_t     gains;          /* TXT: discrete gain-step count */
+    const char*  nickname;       /* TXT: user-editable nickname; "" = empty */
+    bool         has_txbuf;      /* TXT: whether `txbuf` below is meaningful */
+    uint64_t     txbuf;          /* TXT: optional buffer-depth hint (bytes) */
+} SdrRtlTcpAdvertiseOptions;
+
+/*
+ * One entry in a discovery event. All pointer fields point
+ * into dispatcher-owned storage valid only for the duration of
+ * the callback call — copy out anything the host wants to
+ * retain.
+ */
+typedef struct SdrRtlTcpDiscoveredServer {
+    const char* instance_name;
+    const char* hostname;
+    uint16_t    port;
+    const char* address_ipv4;       /* dotted quad, or empty if none resolved */
+    const char* address_ipv6;       /* empty if none resolved */
+    const char* tuner;              /* TXT fields below */
+    const char* version;
+    uint32_t    gains;
+    const char* nickname;
+    bool        has_txbuf;
+    uint64_t    txbuf;
+    double      last_seen_secs_ago;
+} SdrRtlTcpDiscoveredServer;
+
+/*
+ * Tagged discovery event. `announced` is meaningful when
+ * `kind == SDR_RTLTCP_DISCOVERY_ANNOUNCED`;
+ * `withdrawn_instance_name` is meaningful when
+ * `kind == SDR_RTLTCP_DISCOVERY_WITHDRAWN`.
+ */
+typedef struct SdrRtlTcpDiscoveryEvent {
+    int32_t                   kind;
+    SdrRtlTcpDiscoveredServer announced;
+    const char*               withdrawn_instance_name;
+} SdrRtlTcpDiscoveryEvent;
+
+/*
+ * Callback invoked for every discovery event. Fires on a
+ * dedicated thread (`rtl_tcp-discovery-browser`), NOT the
+ * host's main thread — same threading contract as the main
+ * event callback.
+ */
+typedef void (*SdrRtlTcpDiscoveryCallback)(
+    const SdrRtlTcpDiscoveryEvent* event,
+    void*                          user_data
+);
+
+/*
+ * Start publishing an mDNS advertisement for a locally-hosted
+ * rtl_tcp server. Returns `SDR_CORE_OK` + handle on success.
+ * `SDR_CORE_ERR_INVALID_ARG` on null pointers or empty
+ * required fields; `SDR_CORE_ERR_IO` on mDNS daemon failure.
+ *
+ * The caller must eventually call `sdr_rtltcp_advertiser_stop`
+ * to unregister.
+ */
+int32_t sdr_rtltcp_advertiser_start(
+    const SdrRtlTcpAdvertiseOptions* opts,
+    SdrRtlTcpAdvertiser**            out_handle
+);
+
+/*
+ * Unregister and release. Passing null is a no-op.
+ */
+void sdr_rtltcp_advertiser_stop(SdrRtlTcpAdvertiser* handle);
+
+/*
+ * Start browsing for rtl_tcp advertisements. Returns
+ * `SDR_CORE_OK` + handle on success. `SDR_CORE_ERR_INVALID_ARG`
+ * on null callback / out_handle; `SDR_CORE_ERR_IO` on mDNS
+ * daemon failure.
+ *
+ * `user_data` is opaque — the caller owns its lifetime and
+ * must keep it valid between `_start` and `_stop`.
+ */
+int32_t sdr_rtltcp_browser_start(
+    SdrRtlTcpDiscoveryCallback callback,
+    void*                      user_data,
+    SdrRtlTcpBrowser**         out_handle
+);
+
+/*
+ * Stop browsing and release. Joins the dispatcher thread
+ * before returning, so the host can deterministically free
+ * `user_data` on the next line. Passing null is a no-op.
+ */
+void sdr_rtltcp_browser_stop(SdrRtlTcpBrowser* handle);
+
 /*
  * Start / stop recording the demodulated audio stream to a 16-bit
  * PCM WAV file. The engine opens the file on `start`, writes every

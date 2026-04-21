@@ -50,6 +50,7 @@ pub mod fft;
 pub mod handle;
 pub mod lifecycle;
 pub mod radioreference;
+pub mod rtltcp_discovery;
 pub mod rtltcp_server;
 
 // Re-export the FFI symbols at the crate root so consumers that link
@@ -84,6 +85,11 @@ pub use radioreference::{
     sdr_core_radioreference_delete_credentials, sdr_core_radioreference_has_credentials,
     sdr_core_radioreference_load_credentials, sdr_core_radioreference_save_credentials,
     sdr_core_radioreference_search_zip, sdr_core_radioreference_test_credentials,
+};
+pub use rtltcp_discovery::{
+    SdrRtlTcpAdvertiseOptions, SdrRtlTcpAdvertiser, SdrRtlTcpBrowser, SdrRtlTcpDiscoveredServer,
+    SdrRtlTcpDiscoveryCallback, SdrRtlTcpDiscoveryEvent, sdr_rtltcp_advertiser_start,
+    sdr_rtltcp_advertiser_stop, sdr_rtltcp_browser_start, sdr_rtltcp_browser_stop,
 };
 pub use rtltcp_server::{
     SdrRtlTcpServer, SdrRtlTcpServerConfig, SdrRtlTcpServerStats, sdr_rtltcp_server_has_stopped,
