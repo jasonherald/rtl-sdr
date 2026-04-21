@@ -283,6 +283,10 @@ struct SourceSection: View {
             set: { proto in
                 // Protocol changes count as endpoint changes —
                 // push through immediately if host/port parse.
+                // The picker is disabled below when that's not
+                // true, so this branch is always reachable, but
+                // the guard stays as defence against a future
+                // regression that loosens the `.disabled`.
                 let host = normalizedHost
                 if !host.isEmpty, let port = portValue() {
                     model.applyNetworkSourceConfig(
@@ -297,6 +301,11 @@ struct SourceSection: View {
                 Text(p.label).tag(p)
             }
         }
+        // Same validity gate as the Apply button — without
+        // this the picker visually flips on bad host/port and
+        // snaps back on the next SwiftUI pass, which reads as a
+        // flaky control. Per `CodeRabbit` round 2 on PR #358.
+        .disabled(applyButtonDisabled)
 
         HStack {
             Button {
