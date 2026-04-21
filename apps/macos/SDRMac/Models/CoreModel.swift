@@ -555,11 +555,6 @@ final class CoreModel {
     /// callback closure.
     private var rtlTcpBrowser: SdrRtlTcpBrowser? = nil
 
-    /// Active audio-recording state. `nil` = not recording,
-    /// `some(path)` = engine confirmed it opened `path` for
-    /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
-    /// — the engine is authoritative; the UI never flips this
-    /// optimistically.
     /// ID of the bookmark currently applied to the engine state.
     /// Set by `apply(_:)` after all its setters run; cleared by
     /// any user-facing setter a bookmark would also touch
@@ -570,6 +565,11 @@ final class CoreModel {
     /// highlight immediately. Per issue #339.
     var activeBookmarkId: UUID? = nil
 
+    /// Active audio-recording state. `nil` = not recording,
+    /// `some(path)` = engine confirmed it opened `path` for
+    /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
+    /// — the engine is authoritative; the UI never flips this
+    /// optimistically.
     var audioRecordingPath: String? = nil
 
     /// Active IQ-recording state. Same engine-authoritative flip

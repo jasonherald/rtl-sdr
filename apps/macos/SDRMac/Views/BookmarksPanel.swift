@@ -95,7 +95,7 @@ struct BookmarksPanel: View {
                 .font(.caption)
             TextField("Search bookmarks", text: $filterText)
                 .textFieldStyle(.roundedBorder)
-                .disableAutocorrection(true)
+                .autocorrectionDisabled()
             if !filterText.isEmpty {
                 Button {
                     filterText = ""
