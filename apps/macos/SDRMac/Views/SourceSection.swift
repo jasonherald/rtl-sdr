@@ -44,6 +44,19 @@ private let supportedSourceTypes: [SourceType] = [.rtlSdr, .network, .file]
 struct SourceSection: View {
     @Environment(CoreModel.self) private var model
 
+    /// User's currently-visible-but-possibly-uncommitted source
+    /// selection. Seeded from `model.sourceType` on first appear
+    /// and updated by the picker. Distinct from
+    /// `model.sourceType` so the picker can show the intended
+    /// type while the user is still configuring its endpoint —
+    /// switching to `.network` or `.file` **without** first
+    /// knowing a valid host/port or file path would tear down
+    /// the current source and leave the engine on a broken one
+    /// until the user manually fixed it. `.rtlSdr` commits
+    /// immediately since it needs no config. Per `CodeRabbit`
+    /// round 1 on PR #358.
+    @State private var pendingType: SourceType = .rtlSdr
+
     /// Local edit buffer for the network host. Mirrors the
     /// pattern from `SettingsView.AudioPane` — TextField edits
     /// shouldn't rebuild the connection per keystroke.
@@ -66,8 +79,21 @@ struct SourceSection: View {
         Section("Source") {
             LabeledContent("Type") {
                 Picker("", selection: Binding(
-                    get: { model.sourceType },
-                    set: { model.setSourceType($0) }
+                    get: { pendingType },
+                    set: { newType in
+                        pendingType = newType
+                        // `.rtlSdr` needs no per-source config,
+                        // so commit immediately — matches user
+                        // expectation that "I picked RTL-SDR"
+                        // means the engine switches now.
+                        // `.network` and `.file` defer to the
+                        // Apply / Choose buttons below. `.rtlTcp`
+                        // is filtered out of `supportedSourceTypes`
+                        // so we never see it as a user selection.
+                        if newType == .rtlSdr {
+                            model.setSourceType(.rtlSdr)
+                        }
+                    }
                 )) {
                     ForEach(supportedSourceTypes, id: \.self) { t in
                         Text(t.label).tag(t)
@@ -76,19 +102,26 @@ struct SourceSection: View {
                 .labelsHidden()
             }
 
-            // Per-source content — one `@ViewBuilder` block per
-            // type keeps the outer `body` readable. Only the
+            // Per-source content follows the **pending** type so
+            // the user can configure before commit. Only the
             // active type's fields render; switching sources
-            // collapses the rest.
-            switch model.sourceType {
+            // collapses the rest. `model.sourceType` still
+            // determines what the engine is actually running,
+            // and a small caption below flags an uncommitted
+            // change so the picker doesn't feel like a no-op
+            // while the user is mid-configure.
+            switch pendingType {
             case .rtlSdr: rtlSdrControls
             case .network: networkControls
             case .file: fileControls
             case .rtlTcp:
-                // Defensive arm — not reachable through the
-                // picker but the persisted `sourceType` could
-                // restore to `.rtlTcp` from a future build.
-                // Show a note pointing at the dedicated panel.
+                // Defensive arm — filtered out of
+                // `supportedSourceTypes` so not reachable
+                // through the picker, but the persisted value
+                // from a future build could restore `.rtlTcp`
+                // into `model.sourceType` (and via the
+                // `.onAppear` sync into `pendingType`). Show a
+                // breadcrumb rather than a broken form.
                 Text("RTL-TCP has a dedicated panel (see issue #326).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -129,16 +162,38 @@ struct SourceSection: View {
         .onAppear {
             guard !didPrefill else { return }
             didPrefill = true
+            pendingType = model.sourceType
             hostEdit = model.networkSourceHost
             portEdit = String(model.networkSourcePort)
         }
+        .onChange(of: model.sourceType) { _, new in
+            // Sync the picker back to engine-side changes
+            // (bookmark apply, programmatic updates, etc.)
+            // without clobbering an in-progress user selection:
+            // only track if the pending choice matches the
+            // previous committed value.
+            if pendingType != new { pendingType = new }
+        }
         .fileImporter(
             isPresented: $fileImporterPresented,
-            allowedContentTypes: [.wav, .audio],
+            // WAV-only. The playback path is documented as
+            // two-channel (I/Q) WAV; widening to `.audio` would
+            // let the user pick files that only fail at engine
+            // open time. Per `CodeRabbit` round 1 on PR #358.
+            allowedContentTypes: [.wav],
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
+                // Path first, then commit the source-type
+                // switch. `setFilePath` populates
+                // `model.filePath`; only then does
+                // `setSourceType(.file)`'s guard pass. Same
+                // engine-command ordering is important for
+                // correctness — the mpsc channel preserves
+                // order, so the engine sees the path update
+                // before the source-type change.
                 model.setFilePath(url.path)
+                model.setSourceType(.file)
             }
         }
     }
@@ -252,10 +307,25 @@ struct SourceSection: View {
                     port: port,
                     protocol: model.networkSourceProtocol
                 )
+                // Commit the source-type switch only AFTER the
+                // endpoint landed — avoids tearing down the
+                // current source before the new one has a
+                // valid address. When `.network` is already the
+                // active source this reduces to a no-op on the
+                // type but still triggers an engine-side
+                // reopen via the stored config. Per `CodeRabbit`
+                // round 1 on PR #358.
+                model.setSourceType(.network)
             } label: {
-                Label("Apply", systemImage: "arrow.up.circle")
+                Label(model.sourceType == .network ? "Apply" : "Use this source", systemImage: "arrow.up.circle")
             }
             .disabled(applyButtonDisabled)
+        }
+
+        if pendingType != model.sourceType {
+            Text("Source switches to Network IQ when you hit Apply.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
 
         Text(
@@ -280,7 +350,7 @@ struct SourceSection: View {
         Button {
             fileImporterPresented = true
         } label: {
-            Label("Choose WAV…", systemImage: "folder")
+            Label(model.sourceType == .file ? "Choose another WAV…" : "Choose WAV…", systemImage: "folder")
         }
         if !model.filePath.isEmpty {
             Text(model.filePath)
@@ -289,6 +359,11 @@ struct SourceSection: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
+        }
+        if pendingType != model.sourceType {
+            Text("Source switches to File playback after you pick a WAV.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         Text("Plays back a two-channel (I/Q) WAV file. Sample rate is read from the file header.")
             .font(.caption)

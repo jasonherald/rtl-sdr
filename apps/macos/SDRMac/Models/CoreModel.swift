@@ -1106,7 +1106,18 @@ final class CoreModel {
     /// field before dispatching so dependent sections redraw
     /// immediately. A source-open error lands later as an
     /// `.error(...)` / `.sourceStopped` event.
+    ///
+    /// Guards against `.file` with an empty `filePath` — that
+    /// would tear down the current source and immediately fail
+    /// at open time. Callers (including `syncToEngine` on a
+    /// fresh install where the user hasn't picked a WAV yet)
+    /// should either set the path first or stay on the previous
+    /// source. Per `CodeRabbit` round 1 on PR #358.
     func setSourceType(_ type: SourceType) {
+        if type == .file && filePath.isEmpty {
+            lastError = "Choose a WAV file before switching to File playback"
+            return
+        }
         sourceType = type
         UserDefaults.standard.set(Int(type.rawValue), forKey: Self.sourceTypeDefaultsKey)
         capture { try core?.setSourceType(type) }
@@ -1127,6 +1138,15 @@ final class CoreModel {
             lastError = "Network source host cannot be empty"
             return
         }
+        // Mirror the FFI boundary check (`sdr_core_set_network_config`
+        // rejects port 0) at the model so non-UI callers — e.g.
+        // `syncToEngine`, future programmatic paths — can't
+        // persist a bogus endpoint. Per `CodeRabbit` round 1 on
+        // PR #358.
+        guard port != 0 else {
+            lastError = "Network source port must be in 1…65535"
+            return
+        }
         networkSourceHost = trimmed
         networkSourcePort = port
         networkSourceProtocol = proto
@@ -1142,15 +1162,24 @@ final class CoreModel {
     /// rejected locally to match the FFI contract — opening
     /// with an empty path is an InvalidArg anyway, but failing
     /// here keeps the UI responsive.
+    ///
+    /// The path itself is **not** trimmed or otherwise
+    /// normalized. macOS filesystem paths can legally begin or
+    /// end with whitespace (or any non-NUL byte, really), and
+    /// silently rewriting the string would break playback for
+    /// a valid-but-unusual filename that `fileImporter`
+    /// returned. Validation uses a trimmed copy only; the
+    /// stored / persisted / dispatched value is the exact
+    /// caller-supplied string. Per `CodeRabbit` round 1 on
+    /// PR #358.
     func setFilePath(_ path: String) {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
+        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             lastError = "File path cannot be empty"
             return
         }
-        filePath = trimmed
-        UserDefaults.standard.set(trimmed, forKey: Self.filePathDefaultsKey)
-        capture { try core?.setFilePath(trimmed) }
+        filePath = path
+        UserDefaults.standard.set(path, forKey: Self.filePathDefaultsKey)
+        capture { try core?.setFilePath(path) }
     }
 
     /// UserDefaults keys for the persisted source-selection
