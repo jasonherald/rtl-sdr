@@ -3565,12 +3565,28 @@ fn connect_source_panel(
     // toggle` handler below and `apply_agc_gain_mutex` for the
     // reasoning (librtlsdr silently ignores gain writes when
     // tuner AGC is on; some variants also oscillate between
-    // manual and AGC targets on mixed writes). Updating
-    // `gain_row.set_value` from bookmark restore still works
-    // even when insensitive — the row just displays the value
-    // and stays locked against user edits.
+    // manual and AGC targets on mixed writes).
+    //
+    // The notify handler checks the AGC state and skips the
+    // DSP dispatch when AGC is not Off. `set_sensitive(false)`
+    // blocks user interaction but does NOT suppress the notify
+    // signal on programmatic `set_value` calls (bookmark
+    // restore, future preset-apply paths, etc.), so a pure-
+    // sensitivity gate would still let a stream of no-op
+    // `SetGain` commands hit the DSP every time a non-Off-AGC
+    // bookmark loads. The AGC-state check short-circuits those
+    // at the source — both hardware and software AGC
+    // renormalize the signal, so any gain write during those
+    // modes is discarded downstream anyway.
     let state_gain = Rc::clone(state);
+    let agc_row_for_gain = panels.source.agc_row.downgrade();
     panels.source.gain_row.connect_value_notify(move |row| {
+        if let Some(agc_row) = agc_row_for_gain.upgrade() {
+            let agc_type = sidebar::source_panel::agc_type_from_selected(agc_row.selected());
+            if !matches!(agc_type, Some(sidebar::source_panel::AgcType::Off)) {
+                return;
+            }
+        }
         state_gain.send_dsp(UiToDsp::SetGain(row.value()));
     });
 
@@ -4250,18 +4266,17 @@ fn restore_bookmark_profile(
         agc_row.set_selected(sidebar::source_panel::selected_from_agc_type(agc_type));
     }
     if let Some(gain) = bookmark.gain {
-        // Only dispatch `SetGain` when the restored AGC type is
-        // `Off` — both hardware and software AGC make manual
-        // gain ineffective (tuner AGC silently no-ops the write,
-        // software AGC renormalizes to the set point), and the
-        // UI mutex locks the row out in those modes.
-        let agc_is_off = matches!(
-            restored_agc_type,
-            Some(sidebar::source_panel::AgcType::Off) | None
-        );
-        if agc_is_off {
-            state.send_dsp(UiToDsp::SetGain(gain));
-        }
+        // `set_value` fires the gain row's `connect_value_notify`
+        // handler, which dispatches `SetGain` to the DSP — but
+        // only when AGC is currently Off (the handler checks the
+        // combo state and short-circuits otherwise). So a single
+        // `set_value` call here handles both the "AGC is Off,
+        // update the DSP too" path and the "AGC is active, just
+        // display the bookmarked value in the locked row" path.
+        // No explicit `state.send_dsp(SetGain(...))` needed — it
+        // would either duplicate the handler's dispatch (AGC Off
+        // case) or be a wasted write the DSP silently ignores
+        // (AGC active case).
         gain_row.set_value(gain);
     }
     if let Some(vol) = bookmark.volume {
