@@ -569,7 +569,7 @@ fn bookmark_matches_filter(bm: &Bookmark, needle: &str) -> bool {
 /// back to a flat list when all bookmarks are uncategorized so
 /// users who don't import from `RadioReference` keep the original
 /// single-level view.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn rebuild_bookmark_list(
     list_box: &gtk4::ListBox,
     scroll: &gtk4::ScrolledWindow,
@@ -580,6 +580,26 @@ pub fn rebuild_bookmark_list(
     on_save: &SaveCallback,
     filter_text: &std::rc::Rc<std::cell::RefCell<String>>,
 ) {
+    // Snapshot which categories are currently expanded so the
+    // rebuild can restore them. Without this the list collapses
+    // every expander on every rebuild — clicking a bookmark
+    // triggers a rebuild for the active-row highlight, and the
+    // user would watch the section they just clicked into snap
+    // closed.
+    let previously_expanded: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        let mut child = list_box.first_child();
+        while let Some(widget) = child {
+            if let Some(exp) = widget.downcast_ref::<adw::ExpanderRow>()
+                && exp.is_expanded()
+            {
+                set.insert(exp.title().to_string());
+            }
+            child = widget.next_sibling();
+        }
+        set
+    };
+
     // Remove all existing rows.
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
@@ -607,18 +627,41 @@ pub fn rebuild_bookmark_list(
                 .unwrap_or_else(|| UNCATEGORIZED_LABEL.to_string());
             groups.entry(cat).or_default().push(bm);
         }
+        // The category containing the active bookmark, so we can
+        // guarantee it stays expanded even if the user hadn't
+        // opened it before the recall (e.g., clicking through
+        // search results into a previously-collapsed section).
+        let active_category = bm_list
+            .iter()
+            .find(|b| {
+                b.name == current_active.name && b.frequency == current_active.frequency
+            })
+            .map(|b| {
+                b.rr_category
+                    .clone()
+                    .unwrap_or_else(|| UNCATEGORIZED_LABEL.to_string())
+            });
         for (cat, items) in groups {
             if items.is_empty() {
                 continue;
             }
             let expander = adw::ExpanderRow::builder()
                 .title(&cat)
-                .subtitle(format!("{} bookmark{}", items.len(), if items.len() == 1 { "" } else { "s" }))
+                .subtitle(format!(
+                    "{} bookmark{}",
+                    items.len(),
+                    if items.len() == 1 { "" } else { "s" }
+                ))
                 .build();
-            // Auto-expand when a filter is active so matches
-            // surface without a manual click; leave collapsed
-            // otherwise to keep long lists scannable.
-            expander.set_expanded(!needle.is_empty());
+            // Expand when: a filter is active (so matches
+            // surface without a manual click); this category
+            // was expanded before the rebuild (preserve user
+            // intent); or this category holds the active
+            // bookmark (so recall keeps its section open).
+            let keep_expanded = !needle.is_empty()
+                || previously_expanded.contains(&cat)
+                || active_category.as_deref() == Some(cat.as_str());
+            expander.set_expanded(keep_expanded);
             for bm in items {
                 let row = build_bookmark_row(
                     bm,
