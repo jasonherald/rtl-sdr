@@ -21,7 +21,8 @@
 //! - Layout scaffolding (prior commit).
 //! - List + row actions relocated from `NavigationPanel` (prior commit).
 //! - Filter / search row (prior commit).
-//! - Category grouping via `AdwExpanderRow` (THIS commit).
+//! - Category grouping via `AdwExpanderRow` (prior commit).
+//! - Persist flyout open/closed state across restarts (THIS commit).
 
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -37,6 +38,12 @@ use super::navigation_panel::{
 /// (320 px) because bookmark rows carry more suffix widgets (active
 /// indicator, save button, delete button) than transcript items.
 pub const BOOKMARKS_PANEL_WIDTH_PX: i32 = 360;
+
+/// Config key for whether the bookmarks flyout was open at last
+/// shutdown. Read once on startup to restore the reveal state +
+/// the header toggle button's visual pressed state; written on
+/// every toggle change.
+pub const CONFIG_KEY_FLYOUT_OPEN: &str = "bookmarks_flyout_open";
 
 /// Widget handles + shared state exposed from the bookmarks flyout.
 ///

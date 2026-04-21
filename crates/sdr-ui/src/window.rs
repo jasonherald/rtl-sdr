@@ -141,9 +141,30 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         .tooltip_text("Toggle bookmarks panel (Ctrl+B)")
         .build();
     header.pack_end(&bookmarks_toggle);
+
+    // Restore the flyout open/closed state saved at last shutdown.
+    // Set the toggle's `active` property before wiring the handler
+    // so the initial `set_active` doesn't feed a no-op write back
+    // through `connect_toggled` — `connect_toggled` fires only on
+    // changes, but explicitly wiring the handler after the initial
+    // state is set keeps the "saved state → initial reveal" path
+    // free of config round-trips.
+    let bookmarks_initial_open = config.read(|v| {
+        v.get(sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
+    bookmarks_toggle.set_active(bookmarks_initial_open);
+    bookmarks_revealer.set_reveal_child(bookmarks_initial_open);
+
     let bookmarks_revealer_clone = bookmarks_revealer.clone();
+    let bookmarks_config = std::sync::Arc::clone(config);
     bookmarks_toggle.connect_toggled(move |btn| {
-        bookmarks_revealer_clone.set_reveal_child(btn.is_active());
+        let open = btn.is_active();
+        bookmarks_revealer_clone.set_reveal_child(open);
+        bookmarks_config.write(|v| {
+            v[sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN] = serde_json::json!(open);
+        });
     });
 
     // Transcript toggle button in header bar.
