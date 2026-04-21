@@ -456,6 +456,32 @@ struct SourceSection: View {
             rtlTcpControlSurface(gainCount: gainCount)
         }
 
+        // High-bandwidth advisory. Fires when the effective
+        // sample rate is at or above 2.4 Msps and we're on
+        // the .rtlTcp source — at 8-bit I/Q that's ≈38 Mbps
+        // over the network, below typical Wi-Fi practical
+        // throughput for older routers. Matches the Linux
+        // threshold (`HIGH_BANDWIDTH_SAMPLE_RATE_IDX` in
+        // source_panel.rs). Per issue #326.
+        if model.rtlTcpShowsBandwidthAdvisory {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .font(.caption)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("High sample rate")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Text(
+                        "Your network may not keep up " +
+                        "(≈38 Mbps at 2.4 Msps with 8-bit I/Q)."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+
         // Favorites — user-pinned servers that persist across
         // sessions. Shown whenever non-empty so the user can
         // one-tap recall even before any mDNS discovery lands.
