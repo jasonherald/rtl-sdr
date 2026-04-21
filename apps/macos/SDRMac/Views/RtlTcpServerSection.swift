@@ -34,16 +34,19 @@ struct RtlTcpServerSection: View {
 
     var body: some View {
         Section("RTL-TCP server") {
-            // Device-presence gate. `deviceInfo` is filled by
-            // `refreshDeviceInfo()` on bootstrap; "No RTL-SDR
-            // device found" is the sentinel when none is
-            // plugged in.
-            if model.deviceInfo.hasPrefix("No RTL-SDR") {
+            // Device-presence gate driven by the dedicated
+            // `hasLocalRtlSdr` flag on `CoreModel` — the
+            // earlier version parsed `deviceInfo`'s wording,
+            // which bounced on each post-Play `.deviceInfo`
+            // engine event and left the section rendering the
+            // full form on first paint (before the probe). Per
+            // `CodeRabbit` round 1 on PR #362.
+            if model.hasLocalRtlSdr {
+                mainControls
+            } else {
                 Text("No local RTL-SDR dongle detected.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
-                mainControls
             }
         }
     }
@@ -52,16 +55,21 @@ struct RtlTcpServerSection: View {
     private var mainControls: some View {
         @Bindable var m = model
 
-        // Master toggle. Bound to the running flag via a
-        // binding that triggers start/stop on the model so the
-        // UI stays single-source-of-truth.
+        // Master toggle. Kicks the async lifecycle methods via
+        // a `Task` — the methods flip observable state
+        // optimistically and do the blocking USB / accept-
+        // thread work off-main, so the sidebar stays
+        // responsive through a 100-500 ms start window. Per
+        // `CodeRabbit` round 1 on PR #362.
         Toggle("Share over network", isOn: Binding(
             get: { model.rtlTcpServerRunning },
             set: { newValue in
-                if newValue {
-                    model.startRtlTcpServer()
-                } else {
-                    model.stopRtlTcpServer()
+                Task {
+                    if newValue {
+                        await model.startRtlTcpServer()
+                    } else {
+                        await model.stopRtlTcpServer()
+                    }
                 }
             }
         ))

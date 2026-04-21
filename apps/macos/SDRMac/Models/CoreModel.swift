@@ -199,6 +199,15 @@ final class CoreModel {
     var agcEnabled: Bool = false
     var deviceInfo: String = ""
 
+    /// `true` when a local RTL-SDR dongle was detected on the
+    /// USB bus at the last `refreshDeviceInfo` call. Drives the
+    /// rtl_tcp server panel's visibility. Kept separate from
+    /// `deviceInfo` (which doubles as a display string and is
+    /// overwritten by post-Play `.deviceInfo` engine events)
+    /// so the UI never has to parse wording to decide
+    /// availability. Per `CodeRabbit` round 1 on PR #362.
+    var hasLocalRtlSdr: Bool = false
+
     // ==========================================================
     //  Demod
     // ==========================================================
@@ -648,8 +657,11 @@ final class CoreModel {
         // Stop any running rtl_tcp server before the engine
         // tears down. Keeps the dongle free for whatever comes
         // next and avoids the Drop-time join running after the
-        // model has gone out of scope.
-        stopRtlTcpServer()
+        // model has gone out of scope. Uses the synchronous
+        // stop path here — the `async` variant is for the UI
+        // toggle; shutdown runs during app termination where
+        // blocking briefly is the desired behavior.
+        stopRtlTcpServerSync()
         if let core {
             // Best-effort stop — a thrown error shouldn't leave
             // the model claiming `isRunning == true` alongside a
@@ -674,6 +686,7 @@ final class CoreModel {
     /// call again later (hotplug detection is a future add).
     func refreshDeviceInfo() {
         let count = SdrCore.deviceCount
+        hasLocalRtlSdr = count > 0
         if count == 0 {
             deviceInfo = "No RTL-SDR device found"
             return
@@ -771,6 +784,22 @@ final class CoreModel {
         // already running", but cheaper to short-circuit here.
         if isRunning { return }
         guard let core else { lastError = "engine not initialized"; return }
+        // Reciprocal guard against the rtl_tcp server. Without
+        // this a user could toggle the server on with the
+        // source set to `.rtlSdr` (server claims dongle) and
+        // then hit Play — the engine would try to open the
+        // same USB device and deadlock. Either stop the
+        // server or switch source first. The server-side
+        // guard in `startRtlTcpServer` covers the opposite
+        // direction; the `SourceSection` picker disables
+        // `.rtlSdr` cosmetically. Per `CodeRabbit` round 1 on
+        // PR #362.
+        if rtlTcpServerRunning && sourceType == .rtlSdr {
+            lastError =
+                "Local dongle is shared over the network. Stop the rtl_tcp server " +
+                "or switch the source away from RTL-SDR before starting the engine."
+            return
+        }
         // Clear any stale error BEFORE syncing so a setter
         // failure inside syncToEngine() lands on a clean slate
         // and is detectable below.
@@ -1246,13 +1275,16 @@ final class CoreModel {
     // ----------------------------------------------------------
 
     /// Start the rtl_tcp server from the current persisted
-    /// config. Returns `true` on success; `false` leaves the
-    /// observable state in the "stopped" shape with
-    /// `rtlTcpServerError` set.
-    @discardableResult
-    func startRtlTcpServer() -> Bool {
+    /// config. Async — the blocking FFI lifecycle work runs
+    /// off the `@MainActor` so the sidebar doesn't freeze for
+    /// the USB open + accept-thread spawn (100-500 ms on typical
+    /// hardware). The running flag flips optimistically so the
+    /// toggle reflects user intent immediately; a failed start
+    /// rolls it back and sets `rtlTcpServerError`. Per
+    /// `CodeRabbit` round 1 on PR #362.
+    func startRtlTcpServer() async {
         if rtlTcpServerRunning {
-            return true
+            return
         }
         // Guard: we only allow starting when the engine isn't
         // currently tied to the local RTL-SDR dongle. The UI
@@ -1262,10 +1294,13 @@ final class CoreModel {
         if isRunning && sourceType == .rtlSdr {
             rtlTcpServerError =
                 "Stop the engine or switch the source off RTL-SDR before starting the server."
-            return false
+            return
         }
         rtlTcpServerError = nil
 
+        // Snapshot the config on the main actor before we hop
+        // off — the fields are `@Observable` so reading them
+        // post-hop would require re-hopping.
         let cfg = SdrRtlTcpServer.Config(
             bindAddress: rtlTcpServerBindAddress,
             port: rtlTcpServerPort,
@@ -1278,82 +1313,139 @@ final class CoreModel {
             initialBiasTee: rtlTcpServerInitialBiasTee,
             initialDirectSampling: rtlTcpServerInitialDirectSampling
         )
+        let mdnsEnabled = rtlTcpServerMdnsEnabled
+        let nickname = rtlTcpServerNickname
+        let port = rtlTcpServerPort
 
-        let server: SdrRtlTcpServer
-        do {
-            server = try SdrRtlTcpServer(config: cfg)
-        } catch {
-            rtlTcpServerError = "Start failed: \(error)"
-            return false
-        }
-
-        // Best-effort mDNS announce. Failure here doesn't
-        // block the server — a LAN without mDNS is still
-        // usable by direct host:port entry on the client.
-        var advertiser: SdrRtlTcpAdvertiser? = nil
-        if rtlTcpServerMdnsEnabled {
-            // Probe for tuner metadata via a stats snapshot so
-            // the TXT record has accurate tuner + gain-count
-            // fields for the discovery UI.
-            let tunerName: String
-            let gainCount: UInt32
-            if let s = try? server.stats() {
-                tunerName = s.tunerName.isEmpty ? "unknown" : s.tunerName
-                gainCount = s.gainCount
-            } else {
-                tunerName = "unknown"
-                gainCount = 0
-            }
-            // Default the mDNS instance name to the system
-            // hostname when the user hasn't set a nickname.
-            // `ProcessInfo.hostName` is Foundation-only so we
-            // don't drag AppKit into the model for a label.
-            let instanceName = rtlTcpServerNickname.isEmpty
-                ? ProcessInfo.processInfo.hostName
-                : rtlTcpServerNickname
-            let opts = SdrRtlTcpAdvertiser.Options(
-                port: rtlTcpServerPort,
-                instanceName: instanceName,
-                hostname: "",
-                tuner: tunerName,
-                version: "0.1.0",
-                gains: gainCount,
-                nickname: rtlTcpServerNickname
-            )
-            advertiser = try? SdrRtlTcpAdvertiser(options: opts)
-            if advertiser == nil {
-                // Non-fatal; keep the server running and note
-                // it for the status row.
-                rtlTcpServerError = "mDNS announce failed; server is still running on port \(rtlTcpServerPort)"
-            }
-        }
-
-        rtlTcpServer = server
-        rtlTcpAdvertiser = advertiser
+        // Optimistic: flip the flag now so the toggle settles
+        // on the "on" position and the config form disables
+        // itself. Rollback on failure below.
         rtlTcpServerRunning = true
-        startRtlTcpPoller()
-        return true
+
+        let result: StartResult = await Task.detached(priority: .userInitiated) {
+            let server: SdrRtlTcpServer
+            do {
+                server = try SdrRtlTcpServer(config: cfg)
+            } catch {
+                return .failed("Start failed: \(error)")
+            }
+
+            // Best-effort mDNS announce. Failure here doesn't
+            // block the server — a LAN without mDNS is still
+            // usable by direct host:port entry on the client.
+            var advertiser: SdrRtlTcpAdvertiser? = nil
+            var warning: String? = nil
+            if mdnsEnabled {
+                // Probe tuner metadata via a stats snapshot so
+                // the TXT record has accurate tuner +
+                // gain-count fields.
+                let tunerName: String
+                let gainCount: UInt32
+                if let s = try? server.stats() {
+                    tunerName = s.tunerName.isEmpty ? "unknown" : s.tunerName
+                    gainCount = s.gainCount
+                } else {
+                    tunerName = "unknown"
+                    gainCount = 0
+                }
+                let instanceName = nickname.isEmpty
+                    ? ProcessInfo.processInfo.hostName
+                    : nickname
+                let opts = SdrRtlTcpAdvertiser.Options(
+                    port: port,
+                    instanceName: instanceName,
+                    hostname: "",
+                    tuner: tunerName,
+                    version: "0.1.0",
+                    gains: gainCount,
+                    nickname: nickname
+                )
+                advertiser = try? SdrRtlTcpAdvertiser(options: opts)
+                if advertiser == nil {
+                    warning = "mDNS announce failed; server is still running on port \(port)"
+                }
+            }
+            return .succeeded(server: server, advertiser: advertiser, warning: warning)
+        }.value
+
+        // Back on @MainActor. Publish the result.
+        switch result {
+        case .succeeded(let server, let advertiser, let warning):
+            rtlTcpServer = server
+            rtlTcpAdvertiser = advertiser
+            if let warning {
+                rtlTcpServerError = warning
+            }
+            startRtlTcpPoller()
+        case .failed(let message):
+            rtlTcpServerRunning = false
+            rtlTcpServerError = message
+        }
     }
 
-    /// Stop the server and the advertiser if it's running.
-    /// Cancels the poll task and clears observable state.
-    /// Safe to call from any path — idempotent when already
-    /// stopped.
-    func stopRtlTcpServer() {
+    /// Private result shape for the off-main start task. Holds
+    /// the constructed handles in the success case so we can
+    /// publish them in one MainActor step.
+    private enum StartResult: Sendable {
+        case succeeded(server: SdrRtlTcpServer, advertiser: SdrRtlTcpAdvertiser?, warning: String?)
+        case failed(String)
+    }
+
+    /// Stop the server and the advertiser. Async — the
+    /// blocking accept-thread join happens off the main actor
+    /// so the toggle flip doesn't freeze the sidebar while the
+    /// poll-interval epilogue drains (~100-200 ms). Observable
+    /// state is cleared immediately so the UI reflects the
+    /// intent; the background task then tears down the
+    /// handles. Per `CodeRabbit` round 1 on PR #362.
+    func stopRtlTcpServer() async {
         rtlTcpPollTask?.cancel()
         rtlTcpPollTask = nil
-        // Drop the handles. Swift `deinit` triggers
-        // `sdr_rtltcp_*_stop` which blocks until the accept
-        // thread has joined (synchronous shutdown). 100ms
-        // poll cadence means the join completes well under a
-        // frame on typical hardware.
-        rtlTcpAdvertiser?.stop()
-        rtlTcpAdvertiser = nil
-        rtlTcpServer?.stop()
+        let server = rtlTcpServer
+        let advertiser = rtlTcpAdvertiser
         rtlTcpServer = nil
+        rtlTcpAdvertiser = nil
         rtlTcpServerRunning = false
         rtlTcpServerStats = nil
         rtlTcpRecentCommands = []
+
+        // If there's nothing to tear down, skip the detached
+        // task entirely — common case for rapid toggle flips
+        // or idempotent shutdown.
+        if server == nil && advertiser == nil {
+            return
+        }
+
+        await Task.detached(priority: .userInitiated) {
+            // Swift `deinit` would eventually call the same
+            // FFI stop, but we want the join to complete
+            // deterministically (so a follow-up start can
+            // reclaim the dongle without racing). Explicit
+            // `stop()` on each handle does that; dropping the
+            // locals after makes the `deinit` a no-op.
+            advertiser?.stop()
+            server?.stop()
+        }.value
+    }
+
+    /// Shutdown-time stop path. Synchronous — the app is
+    /// quitting, so the background-dispatch dance buys
+    /// nothing; we'd rather the dongle release deterministically
+    /// before process exit. Called from `shutdown()` which is
+    /// itself synchronous per the `AppDelegate.applicationWillTerminate`
+    /// contract.
+    private func stopRtlTcpServerSync() {
+        rtlTcpPollTask?.cancel()
+        rtlTcpPollTask = nil
+        let server = rtlTcpServer
+        let advertiser = rtlTcpAdvertiser
+        rtlTcpServer = nil
+        rtlTcpAdvertiser = nil
+        rtlTcpServerRunning = false
+        rtlTcpServerStats = nil
+        rtlTcpRecentCommands = []
+        advertiser?.stop()
+        server?.stop()
     }
 
     /// Persist the rtl_tcp server config to UserDefaults so
@@ -1411,8 +1503,13 @@ final class CoreModel {
                     // Server has gone away (stopped externally,
                     // USB unplug, panic caught by the FFI). Tear
                     // down the handles so the UI reflects reality.
+                    // Use the sync path — we're already on the
+                    // poll loop and blocking briefly on a single
+                    // `stop()` call is fine; the alternative
+                    // `await stopRtlTcpServer()` would race with
+                    // this Task's own cancellation inside stop.
                     self.rtlTcpServerError = "Poll failed: \(error)"
-                    self.stopRtlTcpServer()
+                    self.stopRtlTcpServerSync()
                     return
                 }
             }
@@ -1451,6 +1548,20 @@ final class CoreModel {
     func setSourceType(_ type: SourceType) {
         if type == .file && filePath.isEmpty {
             lastError = "Choose a WAV file before switching to File playback"
+            return
+        }
+        // Second half of the rtl_tcp server / engine mutex.
+        // The server holds the USB device exclusively while
+        // running; flipping the engine source to `.rtlSdr`
+        // would then fight it on open. `SourceSection`
+        // disables the picker option cosmetically, but this
+        // guard covers non-UI callers (bookmarks, menu
+        // shortcuts, programmatic `syncToEngine` replay).
+        // Per `CodeRabbit` round 1 on PR #362.
+        if type == .rtlSdr && rtlTcpServerRunning {
+            lastError =
+                "Local dongle is shared over the network. Stop the rtl_tcp " +
+                "server before selecting RTL-SDR as the source."
             return
         }
         sourceType = type
