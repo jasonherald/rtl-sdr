@@ -189,6 +189,13 @@ final class CoreModel {
     /// validation here.
     var filePath: String = ""
 
+    /// Loop-on-EOF for the file playback source. `false`
+    /// default matches the engine's `FileSource::new`
+    /// constructor default (stop at EOF). Persisted via
+    /// `UserDefaults` under `SDRMac.fileLooping`. Per issue
+    /// #236.
+    var fileLoopingEnabled: Bool = false
+
     // ==========================================================
     //  Tuner
     // ==========================================================
@@ -747,6 +754,9 @@ final class CoreModel {
             let raw = Int32(UserDefaults.standard.integer(forKey: Self.agcTypeDefaultsKey))
             agcType = SdrCore.AgcType(rawValue: raw) ?? .software
         }
+        if UserDefaults.standard.object(forKey: Self.fileLoopingDefaultsKey) != nil {
+            fileLoopingEnabled = UserDefaults.standard.bool(forKey: Self.fileLoopingDefaultsKey)
+        }
         if let host = UserDefaults.standard.string(forKey: Self.networkSourceHostDefaultsKey),
            !host.isEmpty {
             networkSourceHost = host
@@ -1181,6 +1191,11 @@ final class CoreModel {
         if !filePath.isEmpty {
             setFilePath(filePath)
         }
+        // File-loop flag is applied regardless of the current
+        // filePath — the engine stores it on DspState so a
+        // future `.file` source-type switch picks it up even
+        // if no path is set yet. Per issue #236.
+        setFileLooping(fileLoopingEnabled)
         setSourceType(sourceType)
         setCenter(centerFrequencyHz)
         setVfoOffset(vfoOffsetHz)
@@ -1407,6 +1422,22 @@ final class CoreModel {
     /// UserDefaults key for the persisted AGC type. Absent
     /// key leaves the default (`.software`) intact.
     static let agcTypeDefaultsKey = "SDRMac.agcType"
+
+    /// Toggle loop-on-EOF for the file playback source. `true`
+    /// rewinds to the start of the WAV file on EOF and keeps
+    /// streaming; `false` stops at EOF. Persisted so the user's
+    /// choice survives launches. Engine applies it both to the
+    /// running source (next EOF) and to future source rebuilds.
+    /// Per issue #236.
+    func setFileLooping(_ looping: Bool) {
+        fileLoopingEnabled = looping
+        UserDefaults.standard.set(looping, forKey: Self.fileLoopingDefaultsKey)
+        capture { try core?.setFileLooping(looping) }
+    }
+
+    /// UserDefaults key for the persisted file-loop flag.
+    /// Absent key leaves the default (`false`) intact.
+    static let fileLoopingDefaultsKey = "SDRMac.fileLooping"
 
     func setSquelchDb(_ db: Float) {
         clearActiveBookmark()

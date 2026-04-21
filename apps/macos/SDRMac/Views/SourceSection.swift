@@ -410,6 +410,18 @@ struct SourceSection: View {
                 .truncationMode(.middle)
                 .textSelection(.enabled)
         }
+
+        // Loop-on-EOF toggle — #236. Applies live to an active
+        // .file source (the engine flips `FileSource::set_looping`
+        // at next EOF) and is persisted via UserDefaults so the
+        // choice survives launches. Always visible in the .file
+        // arm so the user can pre-configure before picking a
+        // WAV, not just after.
+        Toggle("Loop playback", isOn: Binding(
+            get: { model.fileLoopingEnabled },
+            set: { model.setFileLooping($0) }
+        ))
+
         if pendingType != model.sourceType {
             Text("Source switches to File playback after you pick a WAV.")
                 .font(.caption)
