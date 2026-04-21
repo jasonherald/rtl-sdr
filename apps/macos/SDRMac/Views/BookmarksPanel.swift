@@ -358,36 +358,69 @@ struct BookmarksPanel: View {
 
 struct BookmarkListRow: View {
     @Environment(CoreModel.self) private var model
+    @Environment(BookmarksStore.self) private var store
     let bookmark: Bookmark
 
     var body: some View {
-        Button {
-            model.apply(bookmark)
-        } label: {
-            HStack(spacing: 8) {
-                if isActive {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(Color.accentColor)
-                        .font(.caption)
-                } else {
-                    Image(systemName: "bookmark")
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
+        HStack(spacing: 8) {
+            // Tap on the leading area applies the bookmark —
+            // split from the trailing delete button so the
+            // "click to recall" affordance stays obvious even
+            // when the delete icon is close by.
+            Button {
+                model.apply(bookmark)
+            } label: {
+                HStack(spacing: 8) {
+                    if isActive {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Color.accentColor)
+                            .font(.caption)
+                    } else {
+                        Image(systemName: "bookmark")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(bookmark.name)
+                            .lineLimit(1)
+                            .fontWeight(isActive ? .semibold : .regular)
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(bookmark.name)
-                        .lineLimit(1)
-                        .fontWeight(isActive ? .semibold : .regular)
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                Spacer()
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+
+            // Trailing per-row delete. Icon-only so it doesn't
+            // crowd the row, with both a tooltip AND an
+            // accessibility label — PR #361 round 1 flagged
+            // icon-only buttons missing both as a Minor
+            // finding (#3120080308, #3120155767). Deletes by
+            // UUID so duplicates-with-same-name only drop the
+            // clicked row, not every match.
+            Button {
+                store.remove(id: bookmark.id)
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Delete bookmark")
+            .accessibilityLabel("Delete bookmark")
         }
-        .buttonStyle(.plain)
+        // Right-click context menu — second surface for
+        // delete, matches the pre-refactor sidebar behavior.
+        .contextMenu {
+            Button(role: .destructive) {
+                store.remove(id: bookmark.id)
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        }
     }
 
     private var isActive: Bool {
