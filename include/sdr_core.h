@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 9
+#define SDR_CORE_ABI_VERSION_MINOR 10
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -501,6 +501,81 @@ int32_t sdr_core_set_network_sink_config(
     uint16_t    port,
     int32_t     protocol
 );
+
+/* --- Source selection (issues #235, #236, ABI 0.10) --- */
+/*
+ * Switch the active IQ source (RTL-SDR dongle / network IQ /
+ * WAV file / rtl_tcp) and configure the per-source connection
+ * details. The engine tears down the current source and
+ * rebuilds from the stored config on the next start (or inline
+ * if the engine is already running).
+ */
+
+/*
+ * Active IQ source. Mirrors `sdr_core::SourceType` on the Rust
+ * side. Stable discriminants — never reorder.
+ */
+typedef enum SdrSourceType {
+    SDR_SOURCE_RTLSDR  = 0,
+    SDR_SOURCE_NETWORK = 1,
+    SDR_SOURCE_FILE    = 2,
+    SDR_SOURCE_RTLTCP  = 3,
+} SdrSourceType;
+
+/*
+ * Network IQ source transport. Stable discriminants — never
+ * reorder.
+ *
+ * Intentionally separate from `SdrNetworkProtocol` above even
+ * though both map to `sdr_types::Protocol`. On the sink side
+ * `TcpClient` means "device listens as TCP **server** for
+ * audio clients"; on the source side it means "device connects
+ * outbound as TCP **client** to a remote IQ server". Same
+ * enum, opposite direction. Reusing the sink-side name here
+ * would be misleading.
+ */
+typedef enum SdrSourceProtocol {
+    SDR_SOURCE_PROTOCOL_TCP = 0,
+    SDR_SOURCE_PROTOCOL_UDP = 1,
+} SdrSourceProtocol;
+
+/*
+ * Switch the active IQ source. `source_type` must be one of
+ * `SDR_SOURCE_*`. Returns `SDR_CORE_ERR_INVALID_ARG` for
+ * unknown values. The engine re-opens the source from the
+ * per-type stored config (network host:port, file path, etc.).
+ */
+int32_t sdr_core_set_source_type(SdrCore* handle, int32_t source_type);
+
+/*
+ * Configure the network IQ source endpoint. `hostname_utf8`
+ * must be non-null, non-empty, NUL-terminated UTF-8.
+ * `port` must be in `1..=65535`. `protocol` must be one of
+ * `SDR_SOURCE_PROTOCOL_*`.
+ *
+ * The engine stores the values; a subsequent switch into
+ * `SDR_SOURCE_NETWORK` (or a source restart while Network is
+ * already active) uses them to open the connection.
+ */
+int32_t sdr_core_set_network_config(
+    SdrCore*    handle,
+    const char* hostname_utf8,
+    uint16_t    port,
+    int32_t     protocol
+);
+
+/*
+ * Set the filesystem path the file-playback source reads from
+ * the next time `SDR_SOURCE_FILE` is activated (or the source
+ * is restarted while File is already active). `path_utf8` must
+ * be a non-null, non-empty NUL-terminated UTF-8 path.
+ *
+ * The engine does not open the file here — only stores the
+ * path. Open errors (missing file, bad format, unsupported
+ * sample format) surface as `SDR_EVT_ERROR` / `SDR_EVT_SOURCE_STOPPED`
+ * when the source actually starts.
+ */
+int32_t sdr_core_set_file_path(SdrCore* handle, const char* path_utf8);
 
 /*
  * Start / stop recording the demodulated audio stream to a 16-bit

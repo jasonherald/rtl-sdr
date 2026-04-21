@@ -27,10 +27,10 @@
 use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
 
-use sdr_core::UiToDsp;
+use sdr_core::{SourceType, UiToDsp};
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
-use sdr_types::DemodMode;
+use sdr_types::{DemodMode, Protocol};
 
 use crate::error::{SdrCoreError, clear_last_error, set_last_error};
 use crate::handle::SdrCore;
@@ -522,6 +522,151 @@ pub unsafe extern "C" fn sdr_core_set_audio_device(
         with_core(handle, |core| {
             let uid = cstr_to_string("sdr_core_set_audio_device", uid_utf8)?;
             send(core, UiToDsp::SetAudioDevice(uid))
+        })
+    }
+}
+
+// ============================================================
+//  Source selection (#235, #236) — switch the active IQ
+//  source and configure the per-source connection details.
+//
+//  Discriminants mirror the matching `Sdr*` enums in
+//  `include/sdr_core.h`. Reordering would silently break ABI.
+// ============================================================
+
+pub const SDR_SOURCE_RTLSDR: i32 = 0;
+pub const SDR_SOURCE_NETWORK: i32 = 1;
+pub const SDR_SOURCE_FILE: i32 = 2;
+pub const SDR_SOURCE_RTLTCP: i32 = 3;
+
+fn source_type_from_c(v: i32) -> Option<SourceType> {
+    match v {
+        SDR_SOURCE_RTLSDR => Some(SourceType::RtlSdr),
+        SDR_SOURCE_NETWORK => Some(SourceType::Network),
+        SDR_SOURCE_FILE => Some(SourceType::File),
+        SDR_SOURCE_RTLTCP => Some(SourceType::RtlTcp),
+        _ => None,
+    }
+}
+
+// The network **source** protocol discriminants live next to the
+// source commands rather than piggy-backing on
+// `SDR_NETWORK_PROTOCOL_TCP_SERVER` from the audio sink side.
+// Why: same underlying `sdr_types::Protocol` enum, but the
+// wire direction is opposite. On the sink side `TcpClient`
+// means "device listens as TCP server for audio clients" — the
+// C ABI name `TCP_SERVER` reflects that. On the source side
+// the same `TcpClient` means "device connects outbound as TCP
+// client to a remote IQ server". Reusing `TCP_SERVER` here
+// would be actively misleading for host authors. Per #235.
+
+pub const SDR_SOURCE_PROTOCOL_TCP: i32 = 0;
+pub const SDR_SOURCE_PROTOCOL_UDP: i32 = 1;
+
+fn source_protocol_from_c(v: i32) -> Option<Protocol> {
+    match v {
+        SDR_SOURCE_PROTOCOL_TCP => Some(Protocol::TcpClient),
+        SDR_SOURCE_PROTOCOL_UDP => Some(Protocol::Udp),
+        _ => None,
+    }
+}
+
+/// Switch the active IQ source. `source_type` must be one of
+/// `SDR_SOURCE_*`. The engine tears down the current source,
+/// rebuilds from the persisted per-type config (network host /
+/// port / protocol for Network, file path for File, etc.), and
+/// restarts if the engine is currently running. Returns
+/// `SDR_CORE_ERR_INVALID_ARG` for an unknown value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_source_type(handle: *mut SdrCore, source_type: i32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let Some(t) = source_type_from_c(source_type) else {
+                set_last_error(format!(
+                    "sdr_core_set_source_type: unknown source_type {source_type}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            };
+            send(core, UiToDsp::SetSourceType(t))
+        })
+    }
+}
+
+/// Configure the network IQ source endpoint. `hostname_utf8`
+/// must be a non-null, non-empty NUL-terminated UTF-8 C string.
+/// `port` must be in `1..=65535`. `protocol` must be one of
+/// `SDR_SOURCE_PROTOCOL_*`. The engine stores the config; a
+/// subsequent `sdr_core_set_source_type(SDR_SOURCE_NETWORK)`
+/// (or a source restart while Network is already active) uses
+/// the stored values to open the connection.
+///
+/// # Safety
+///
+/// `hostname_utf8` must be a NUL-terminated UTF-8 C string or
+/// null (null returns `SDR_CORE_ERR_INVALID_ARG`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_network_config(
+    handle: *mut SdrCore,
+    hostname_utf8: *const c_char,
+    port: u16,
+    protocol: i32,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let hostname = cstr_to_string("sdr_core_set_network_config", hostname_utf8)?;
+            if hostname.is_empty() {
+                set_last_error("sdr_core_set_network_config: hostname is empty");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            // Same zero-port rejection as `sdr_core_set_network_sink_config`
+            // — unusable endpoint on either direction.
+            if port == 0 {
+                set_last_error("sdr_core_set_network_config: port must be in 1..=65535, got 0");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            let Some(proto) = source_protocol_from_c(protocol) else {
+                set_last_error(format!(
+                    "sdr_core_set_network_config: unknown protocol {protocol}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            };
+            send(
+                core,
+                UiToDsp::SetNetworkConfig {
+                    hostname,
+                    port,
+                    protocol: proto,
+                },
+            )
+        })
+    }
+}
+
+/// Set the filesystem path the file-playback source reads from
+/// the next time `SDR_SOURCE_FILE` is activated (or the source
+/// is restarted while File is already active). `path_utf8` must
+/// be a non-null, non-empty NUL-terminated UTF-8 C string. The
+/// engine does not open the file here — only stores the path.
+/// Open errors surface as `SDR_EVT_ERROR` / `SDR_EVT_SOURCE_STOPPED`
+/// when the source actually starts.
+///
+/// # Safety
+///
+/// `path_utf8` must be a NUL-terminated UTF-8 C string or null
+/// (null returns `SDR_CORE_ERR_INVALID_ARG`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_file_path(
+    handle: *mut SdrCore,
+    path_utf8: *const c_char,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let path = cstr_to_string("sdr_core_set_file_path", path_utf8)?;
+            if path.is_empty() {
+                set_last_error("sdr_core_set_file_path: path is empty");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::SetFilePath(std::path::PathBuf::from(path)))
         })
     }
 }
@@ -1384,6 +1529,177 @@ mod tests {
                 "notch_frequency must reject {bad}"
             );
         }
+        destroy(h);
+    }
+
+    // ------------------------------------------------------
+    //  Source selection (#235, #236, ABI 0.10)
+    // ------------------------------------------------------
+
+    #[test]
+    fn source_type_from_c_covers_all_variants() {
+        assert_eq!(
+            source_type_from_c(SDR_SOURCE_RTLSDR),
+            Some(SourceType::RtlSdr)
+        );
+        assert_eq!(
+            source_type_from_c(SDR_SOURCE_NETWORK),
+            Some(SourceType::Network)
+        );
+        assert_eq!(source_type_from_c(SDR_SOURCE_FILE), Some(SourceType::File));
+        assert_eq!(
+            source_type_from_c(SDR_SOURCE_RTLTCP),
+            Some(SourceType::RtlTcp)
+        );
+        assert_eq!(source_type_from_c(99), None);
+        assert_eq!(source_type_from_c(-1), None);
+    }
+
+    #[test]
+    fn source_protocol_from_c_covers_all_variants() {
+        assert_eq!(
+            source_protocol_from_c(SDR_SOURCE_PROTOCOL_TCP),
+            Some(Protocol::TcpClient)
+        );
+        assert_eq!(
+            source_protocol_from_c(SDR_SOURCE_PROTOCOL_UDP),
+            Some(Protocol::Udp)
+        );
+        assert_eq!(source_protocol_from_c(99), None);
+    }
+
+    #[test]
+    fn set_source_type_accepts_all_variants() {
+        let h = make_handle();
+        for t in [
+            SDR_SOURCE_RTLSDR,
+            SDR_SOURCE_NETWORK,
+            SDR_SOURCE_FILE,
+            SDR_SOURCE_RTLTCP,
+        ] {
+            assert_eq!(
+                unsafe { sdr_core_set_source_type(h, t) },
+                SdrCoreError::Ok.as_int(),
+                "source type {t} should be accepted"
+            );
+        }
+        destroy(h);
+    }
+
+    #[test]
+    fn set_source_type_rejects_out_of_range_value() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_source_type(h, 99) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_source_type(h, -1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_config_accepts_valid_input() {
+        let h = make_handle();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_config(
+                    h,
+                    host.as_ptr(),
+                    TEST_NETWORK_PORT_TCP,
+                    SDR_SOURCE_PROTOCOL_TCP,
+                )
+            },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_config(
+                    h,
+                    host.as_ptr(),
+                    TEST_NETWORK_PORT_UDP,
+                    SDR_SOURCE_PROTOCOL_UDP,
+                )
+            },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_config_rejects_null_and_empty_hostname() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_config(
+                    h,
+                    std::ptr::null(),
+                    TEST_NETWORK_PORT_TCP,
+                    SDR_SOURCE_PROTOCOL_TCP,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_config(
+                    h,
+                    empty.as_ptr(),
+                    TEST_NETWORK_PORT_TCP,
+                    SDR_SOURCE_PROTOCOL_TCP,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_config_rejects_zero_port_and_unknown_protocol() {
+        let h = make_handle();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
+        assert_eq!(
+            unsafe { sdr_core_set_network_config(h, host.as_ptr(), 0, SDR_SOURCE_PROTOCOL_TCP) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_network_config(h, host.as_ptr(), TEST_NETWORK_PORT_TCP, 99) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_network_config(h, host.as_ptr(), TEST_NETWORK_PORT_TCP, -1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_file_path_accepts_valid_path() {
+        let h = make_handle();
+        let path = CString::new("/tmp/some-iq.wav").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_set_file_path(h, path.as_ptr()) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_file_path_rejects_null_and_empty() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_file_path(h, std::ptr::null()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_set_file_path(h, empty.as_ptr()) },
+            SdrCoreError::InvalidArg.as_int()
+        );
         destroy(h);
     }
 
