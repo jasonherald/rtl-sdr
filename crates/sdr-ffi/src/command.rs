@@ -610,6 +610,50 @@ pub unsafe extern "C" fn sdr_core_set_gain_by_index(handle: *mut SdrCore, index:
     unsafe { with_core(handle, |core| send(core, UiToDsp::SetGainByIndex(index))) }
 }
 
+/// Disconnect the rtl_tcp client without changing source type.
+/// Stops the current source, drops the source instance (so the
+/// engine's `rtl_tcp_connection_state` returns `Disconnected`
+/// on the next poll), and emits `DspToUi::SourceStopped`. The
+/// source type stays `RtlTcp`, so a subsequent `sdr_core_start`
+/// (host's normal "Play" path) reopens a fresh rtl_tcp source
+/// from the stored network config.
+///
+/// Note: `sdr_core_rtl_tcp_retry_now` is **not** a reconnect
+/// path after an explicit disconnect — once the source has
+/// been dropped, `retry_now` silently returns. Hosts should
+/// use `sdr_core_start` to reopen.
+///
+/// Engine behavior when the active source is not rtl_tcp: the
+/// command is logged and dropped — safe to call regardless of
+/// current source, matching the `UiToDsp::DisconnectRtlTcp`
+/// contract in `sdr-core`. Per issue #326.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_rtl_tcp_disconnect(handle: *mut SdrCore) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::DisconnectRtlTcp)) }
+}
+
+/// Retry the rtl_tcp connection immediately, bypassing the
+/// exponential-backoff sleep that the reconnect loop is in
+/// after a transport failure. Useful for a user-visible
+/// "Retry now" button that shouldn't make the user wait out
+/// the countdown.
+///
+/// Only meaningful while an rtl_tcp source instance is still
+/// alive — i.e. `Retrying`, `Failed`, `Connecting`, or
+/// `Connected`. After an explicit `sdr_core_rtl_tcp_disconnect`
+/// the source instance is gone and this command silently
+/// returns; hosts should gate UI sensitivity on
+/// `RtlTcpConnectionState` not being `Disconnected`, and use
+/// `sdr_core_start` to reopen.
+///
+/// Engine behavior when the active source is not rtl_tcp:
+/// same as `sdr_core_rtl_tcp_disconnect` — logged + dropped.
+/// Per issue #326.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_rtl_tcp_retry_now(handle: *mut SdrCore) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::RetryRtlTcpNow)) }
+}
+
 // ============================================================
 //  Source selection (#235, #236) — switch the active IQ
 //  source and configure the per-source connection details.
@@ -1725,6 +1769,53 @@ mod tests {
             SdrCoreError::Ok.as_int()
         );
         destroy(h);
+    }
+
+    #[test]
+    fn rtl_tcp_disconnect_dispatches() {
+        // The engine drops `DisconnectRtlTcp` with a warn log
+        // when the active source isn't rtl_tcp — our test
+        // fixture builds a default core which starts on the
+        // RTL-SDR source, so we're exercising the FFI dispatch
+        // path + engine guard, not the actual socket teardown.
+        // That's the right scope for a unit test; the socket
+        // path is covered by `sdr-source-network` tests.
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_rtl_tcp_disconnect(h) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn rtl_tcp_retry_now_dispatches() {
+        // Same coverage as the disconnect test — the engine
+        // drops the message with a warn log outside rtl_tcp;
+        // we're checking that the FFI return code is `Ok`
+        // when the dispatch succeeds. Per issue #326.
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_rtl_tcp_retry_now(h) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn rtl_tcp_disconnect_rejects_null_handle() {
+        assert_eq!(
+            unsafe { sdr_core_rtl_tcp_disconnect(std::ptr::null_mut()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+    }
+
+    #[test]
+    fn rtl_tcp_retry_now_rejects_null_handle() {
+        assert_eq!(
+            unsafe { sdr_core_rtl_tcp_retry_now(std::ptr::null_mut()) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
     }
 
     // ------------------------------------------------------
