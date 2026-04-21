@@ -41,4 +41,36 @@ struct Bookmark: Codable, Identifiable, Hashable {
     var agcEnabled: Bool?
     var volume: Float?
     var deemphasis: Deemphasis?
+
+    // MARK: Organization
+
+    /// `RadioReference` category label (e.g. "Law Dispatch",
+    /// "Fire Tac"). Schema parity with the Linux `Bookmark`
+    /// struct's `rr_category` field — a future RadioReference
+    /// → bookmark import path on macOS will populate this.
+    /// Manually-created bookmarks leave it `nil`, which groups
+    /// them under the "Uncategorized" sentinel in the flyout.
+    /// Per issue #339 (flyout) / #241 (RadioReference import).
+    var rrCategory: String?
+
+    /// JSON key mapping so the on-disk schema matches the
+    /// Linux side's snake_case field name (`rr_category`).
+    /// Enables a user who runs both frontends to share the
+    /// same `bookmarks.json` without round-trip drift.
+    enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case updatedAt
+        case centerFrequencyHz
+        case demodMode
+        case bandwidthHz
+        case squelchEnabled
+        case autoSquelchEnabled
+        case squelchDb
+        case gainDb
+        case agcEnabled
+        case volume
+        case deemphasis
+        case rrCategory = "rr_category"
+    }
 }

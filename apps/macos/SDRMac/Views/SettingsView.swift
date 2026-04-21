@@ -118,7 +118,7 @@ private struct AudioPane: View {
                 if model.audioSinkType == .network {
                     TextField("Host", text: $hostEdit)
                         .textFieldStyle(.roundedBorder)
-                        .disableAutocorrection(true)
+                        .autocorrectionDisabled()
                     TextField("Port", text: $portEdit)
                         .textFieldStyle(.roundedBorder)
                     Picker("Protocol", selection: Binding(
@@ -264,7 +264,7 @@ private struct RadioReferencePane: View {
             Section {
                 TextField("Username", text: $username)
                     .textContentType(.username)
-                    .disableAutocorrection(true)
+                    .autocorrectionDisabled()
                 SecureField("Password", text: $password)
                     .textContentType(.password)
             } header: {

@@ -301,7 +301,7 @@ struct SourceSection: View {
     private var networkControls: some View {
         TextField("Host", text: $hostEdit)
             .textFieldStyle(.roundedBorder)
-            .disableAutocorrection(true)
+            .autocorrectionDisabled()
         TextField("Port", text: $portEdit)
             .textFieldStyle(.roundedBorder)
         Picker("Protocol", selection: Binding(
@@ -514,7 +514,7 @@ struct SourceSection: View {
         // Manual-entry host + port + Connect.
         TextField("Host", text: $rtlTcpHostEdit)
             .textFieldStyle(.roundedBorder)
-            .disableAutocorrection(true)
+            .autocorrectionDisabled()
             .textContentType(.URL)
         LabeledContent("Port") {
             TextField("1234", text: $rtlTcpPortEdit)
