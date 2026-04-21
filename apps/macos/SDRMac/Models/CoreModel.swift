@@ -300,6 +300,85 @@ final class CoreModel {
     /// failure.
     var networkSinkStatus: NetworkSinkStatus = .inactive
 
+    // ----------------------------------------------------------
+    //  rtl_tcp server — issue #353 (ABI 0.11)
+    //
+    //  Lets a host with a locally-connected RTL-SDR dongle
+    //  share it over the network so other SDR clients (GQRX,
+    //  SDR++, another `sdr-rs` instance) can tune it. Handles
+    //  live outside `SdrCore` because the server has its own
+    //  lifecycle and claims exclusive access to the dongle —
+    //  running the engine on the same dongle while the server
+    //  is up would deadlock on USB, so the UI enforces mutual
+    //  exclusivity on the engine source type.
+    // ----------------------------------------------------------
+
+    /// `true` while the rtl_tcp server has an open dongle and
+    /// accept thread running. Drives the UI toggle state.
+    var rtlTcpServerRunning: Bool = false
+
+    /// Most-recent poll snapshot of server stats. `nil` while
+    /// the server isn't running.
+    var rtlTcpServerStats: SdrRtlTcpServer.Stats? = nil
+
+    /// Last ~50 commands the client issued, newest first. Fed
+    /// by the poll task that also refreshes `rtlTcpServerStats`.
+    var rtlTcpRecentCommands: [SdrRtlTcpServer.RecentCommand] = []
+
+    /// Last error surfaced from a rtl_tcp server start or poll
+    /// attempt. Cleared on successful start; mirrors into a
+    /// UI toast / status line.
+    var rtlTcpServerError: String? = nil
+
+    // Persisted config — these seed the `SdrRtlTcpServer.Config`
+    // passed on start. UserDefaults round-trip keeps them across
+    // launches; the Rust side has no config persistence yet.
+
+    var rtlTcpServerNickname: String = ""
+    var rtlTcpServerPort: UInt16 = 1234
+    var rtlTcpServerBindAddress: SdrRtlTcpServer.Config.BindAddress = .loopback
+    var rtlTcpServerMdnsEnabled: Bool = true
+
+    /// Center frequency the server applies on dongle open.
+    /// Defaults to 100.000 MHz matching the engine's
+    /// `DEFAULT_CENTER_FREQ`.
+    var rtlTcpServerInitialFreqHz: UInt32 = 100_000_000
+
+    /// Initial sample rate. 2.048 Msps matches the engine
+    /// default and is the safest RTL-SDR rate.
+    var rtlTcpServerInitialSampleRateHz: UInt32 = 2_048_000
+
+    /// Initial tuner gain in 0.1 dB steps. 0 = auto.
+    var rtlTcpServerInitialGainTenthsDb: Int32 = 0
+
+    /// Initial PPM correction.
+    var rtlTcpServerInitialPpm: Int32 = 0
+
+    /// Initial bias-tee state.
+    var rtlTcpServerInitialBiasTee: Bool = false
+
+    /// Initial direct-sampling mode. Typed so invalid values
+    /// can't reach the FFI.
+    var rtlTcpServerInitialDirectSampling: SdrCore.DirectSamplingMode = .off
+
+    /// Private handle to the running server. Observable
+    /// @Observable storage forbids holding non-`Sendable`
+    /// reference types through its macro-generated shadow
+    /// state, so this goes alongside the @Observable fields
+    /// via a nested private class indirection like `eventTask`
+    /// above.
+    private var rtlTcpServer: SdrRtlTcpServer? = nil
+
+    /// Matching mDNS advertiser handle. Started alongside the
+    /// server when `rtlTcpServerMdnsEnabled` is on; stopped
+    /// and dropped on server stop.
+    private var rtlTcpAdvertiser: SdrRtlTcpAdvertiser? = nil
+
+    /// Background poller that refreshes `rtlTcpServerStats` /
+    /// `rtlTcpRecentCommands` every second while the server
+    /// is running.
+    private var rtlTcpPollTask: Task<Void, Never>? = nil
+
     /// Active audio-recording state. `nil` = not recording,
     /// `some(path)` = engine confirmed it opened `path` for
     /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
@@ -477,6 +556,65 @@ final class CoreModel {
         // action.
         refreshRadioReferenceCredentialsFlag()
 
+        // Restore rtl_tcp server config from UserDefaults —
+        // issue #353. Same "absent keys leave struct defaults
+        // intact" pattern as the audio sink restore above.
+        if let nickname = UserDefaults.standard.string(forKey: Self.rtlTcpServerNicknameKey) {
+            rtlTcpServerNickname = nickname
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerPortKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.rtlTcpServerPortKey)
+            if (1...Int(UInt16.max)).contains(stored) {
+                rtlTcpServerPort = UInt16(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerBindAddressKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.rtlTcpServerBindAddressKey))
+            rtlTcpServerBindAddress =
+                SdrRtlTcpServer.Config.BindAddress(rawValue: raw) ?? .loopback
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerMdnsKey) != nil {
+            rtlTcpServerMdnsEnabled = UserDefaults.standard.bool(forKey: Self.rtlTcpServerMdnsKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialFreqHzKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.rtlTcpServerInitialFreqHzKey)
+            if (0...Int(UInt32.max)).contains(stored) {
+                rtlTcpServerInitialFreqHz = UInt32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialSampleRateHzKey) != nil {
+            let stored = UserDefaults.standard.integer(
+                forKey: Self.rtlTcpServerInitialSampleRateHzKey
+            )
+            if (1...Int(UInt32.max)).contains(stored) {
+                rtlTcpServerInitialSampleRateHz = UInt32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialGainTenthsDbKey) != nil {
+            let stored = UserDefaults.standard.integer(
+                forKey: Self.rtlTcpServerInitialGainTenthsDbKey
+            )
+            if (Int(Int32.min)...Int(Int32.max)).contains(stored) {
+                rtlTcpServerInitialGainTenthsDb = Int32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialPpmKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.rtlTcpServerInitialPpmKey)
+            if (Int(Int32.min)...Int(Int32.max)).contains(stored) {
+                rtlTcpServerInitialPpm = Int32(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialBiasTeeKey) != nil {
+            rtlTcpServerInitialBiasTee =
+                UserDefaults.standard.bool(forKey: Self.rtlTcpServerInitialBiasTeeKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerInitialDirectSamplingKey) != nil {
+            let raw =
+                Int32(UserDefaults.standard.integer(forKey: Self.rtlTcpServerInitialDirectSamplingKey))
+            rtlTcpServerInitialDirectSampling =
+                SdrCore.DirectSamplingMode(rawValue: raw) ?? .off
+        }
+
         do {
             let c = try SdrCore(configPath: configPath)
             self.core = c
@@ -507,6 +645,11 @@ final class CoreModel {
     func shutdown() {
         eventTask?.cancel()
         eventTask = nil
+        // Stop any running rtl_tcp server before the engine
+        // tears down. Keeps the dongle free for whatever comes
+        // next and avoids the Drop-time join running after the
+        // model has gone out of scope.
+        stopRtlTcpServer()
         if let core {
             // Best-effort stop — a thrown error shouldn't leave
             // the model claiming `isRunning == true` alongside a
@@ -1097,6 +1240,198 @@ final class CoreModel {
             try core?.setNetworkSinkConfig(hostname: trimmed, port: port, protocol: proto)
         }
     }
+
+    // ----------------------------------------------------------
+    //  rtl_tcp server — issue #353
+    // ----------------------------------------------------------
+
+    /// Start the rtl_tcp server from the current persisted
+    /// config. Returns `true` on success; `false` leaves the
+    /// observable state in the "stopped" shape with
+    /// `rtlTcpServerError` set.
+    @discardableResult
+    func startRtlTcpServer() -> Bool {
+        if rtlTcpServerRunning {
+            return true
+        }
+        // Guard: we only allow starting when the engine isn't
+        // currently tied to the local RTL-SDR dongle. The UI
+        // disables the toggle in that state too, but non-UI
+        // paths (tests, keyboard shortcuts) could bypass the
+        // visual guard.
+        if isRunning && sourceType == .rtlSdr {
+            rtlTcpServerError =
+                "Stop the engine or switch the source off RTL-SDR before starting the server."
+            return false
+        }
+        rtlTcpServerError = nil
+
+        let cfg = SdrRtlTcpServer.Config(
+            bindAddress: rtlTcpServerBindAddress,
+            port: rtlTcpServerPort,
+            deviceIndex: 0,
+            bufferCapacity: 0,
+            initialFreqHz: rtlTcpServerInitialFreqHz,
+            initialSampleRateHz: rtlTcpServerInitialSampleRateHz,
+            initialGainTenthsDb: rtlTcpServerInitialGainTenthsDb,
+            initialPpm: rtlTcpServerInitialPpm,
+            initialBiasTee: rtlTcpServerInitialBiasTee,
+            initialDirectSampling: rtlTcpServerInitialDirectSampling
+        )
+
+        let server: SdrRtlTcpServer
+        do {
+            server = try SdrRtlTcpServer(config: cfg)
+        } catch {
+            rtlTcpServerError = "Start failed: \(error)"
+            return false
+        }
+
+        // Best-effort mDNS announce. Failure here doesn't
+        // block the server — a LAN without mDNS is still
+        // usable by direct host:port entry on the client.
+        var advertiser: SdrRtlTcpAdvertiser? = nil
+        if rtlTcpServerMdnsEnabled {
+            // Probe for tuner metadata via a stats snapshot so
+            // the TXT record has accurate tuner + gain-count
+            // fields for the discovery UI.
+            let tunerName: String
+            let gainCount: UInt32
+            if let s = try? server.stats() {
+                tunerName = s.tunerName.isEmpty ? "unknown" : s.tunerName
+                gainCount = s.gainCount
+            } else {
+                tunerName = "unknown"
+                gainCount = 0
+            }
+            // Default the mDNS instance name to the system
+            // hostname when the user hasn't set a nickname.
+            // `ProcessInfo.hostName` is Foundation-only so we
+            // don't drag AppKit into the model for a label.
+            let instanceName = rtlTcpServerNickname.isEmpty
+                ? ProcessInfo.processInfo.hostName
+                : rtlTcpServerNickname
+            let opts = SdrRtlTcpAdvertiser.Options(
+                port: rtlTcpServerPort,
+                instanceName: instanceName,
+                hostname: "",
+                tuner: tunerName,
+                version: "0.1.0",
+                gains: gainCount,
+                nickname: rtlTcpServerNickname
+            )
+            advertiser = try? SdrRtlTcpAdvertiser(options: opts)
+            if advertiser == nil {
+                // Non-fatal; keep the server running and note
+                // it for the status row.
+                rtlTcpServerError = "mDNS announce failed; server is still running on port \(rtlTcpServerPort)"
+            }
+        }
+
+        rtlTcpServer = server
+        rtlTcpAdvertiser = advertiser
+        rtlTcpServerRunning = true
+        startRtlTcpPoller()
+        return true
+    }
+
+    /// Stop the server and the advertiser if it's running.
+    /// Cancels the poll task and clears observable state.
+    /// Safe to call from any path — idempotent when already
+    /// stopped.
+    func stopRtlTcpServer() {
+        rtlTcpPollTask?.cancel()
+        rtlTcpPollTask = nil
+        // Drop the handles. Swift `deinit` triggers
+        // `sdr_rtltcp_*_stop` which blocks until the accept
+        // thread has joined (synchronous shutdown). 100ms
+        // poll cadence means the join completes well under a
+        // frame on typical hardware.
+        rtlTcpAdvertiser?.stop()
+        rtlTcpAdvertiser = nil
+        rtlTcpServer?.stop()
+        rtlTcpServer = nil
+        rtlTcpServerRunning = false
+        rtlTcpServerStats = nil
+        rtlTcpRecentCommands = []
+    }
+
+    /// Persist the rtl_tcp server config to UserDefaults so
+    /// the same values seed the next launch. Called from the
+    /// UI on field edits — start() reads from the persisted
+    /// state.
+    func persistRtlTcpServerConfig() {
+        UserDefaults.standard.set(rtlTcpServerNickname, forKey: Self.rtlTcpServerNicknameKey)
+        UserDefaults.standard.set(Int(rtlTcpServerPort), forKey: Self.rtlTcpServerPortKey)
+        UserDefaults.standard.set(
+            Int(rtlTcpServerBindAddress.rawValue),
+            forKey: Self.rtlTcpServerBindAddressKey
+        )
+        UserDefaults.standard.set(rtlTcpServerMdnsEnabled, forKey: Self.rtlTcpServerMdnsKey)
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialFreqHz),
+            forKey: Self.rtlTcpServerInitialFreqHzKey
+        )
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialSampleRateHz),
+            forKey: Self.rtlTcpServerInitialSampleRateHzKey
+        )
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialGainTenthsDb),
+            forKey: Self.rtlTcpServerInitialGainTenthsDbKey
+        )
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialPpm),
+            forKey: Self.rtlTcpServerInitialPpmKey
+        )
+        UserDefaults.standard.set(rtlTcpServerInitialBiasTee, forKey: Self.rtlTcpServerInitialBiasTeeKey)
+        UserDefaults.standard.set(
+            Int(rtlTcpServerInitialDirectSampling.rawValue),
+            forKey: Self.rtlTcpServerInitialDirectSamplingKey
+        )
+    }
+
+    /// Background poller that refreshes `rtlTcpServerStats` +
+    /// `rtlTcpRecentCommands` on a one-second tick. Runs on
+    /// the main actor (the whole `CoreModel` is `@MainActor`)
+    /// which matches what `@Observable` needs for writes.
+    private func startRtlTcpPoller() {
+        rtlTcpPollTask = Task { [weak self] in
+            // Tick cadence slow enough to be negligible on the
+            // main thread, fast enough that "uptime" and data-
+            // rate look live. 1 Hz is the GTK panel's tick too.
+            let tickNanos: UInt64 = 1_000_000_000
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: tickNanos)
+                guard let self, let server = self.rtlTcpServer else { return }
+                do {
+                    self.rtlTcpServerStats = try server.stats()
+                    self.rtlTcpRecentCommands = try server.recentCommands()
+                } catch {
+                    // Server has gone away (stopped externally,
+                    // USB unplug, panic caught by the FFI). Tear
+                    // down the handles so the UI reflects reality.
+                    self.rtlTcpServerError = "Poll failed: \(error)"
+                    self.stopRtlTcpServer()
+                    return
+                }
+            }
+        }
+    }
+
+    /// UserDefaults keys for the persisted rtl_tcp server
+    /// config. Namespaced to `SDRMac.rtlTcpServer.*` so they
+    /// don't collide with the regular engine config keys.
+    static let rtlTcpServerNicknameKey = "SDRMac.rtlTcpServer.nickname"
+    static let rtlTcpServerPortKey = "SDRMac.rtlTcpServer.port"
+    static let rtlTcpServerBindAddressKey = "SDRMac.rtlTcpServer.bindAddress"
+    static let rtlTcpServerMdnsKey = "SDRMac.rtlTcpServer.mdns"
+    static let rtlTcpServerInitialFreqHzKey = "SDRMac.rtlTcpServer.initialFreqHz"
+    static let rtlTcpServerInitialSampleRateHzKey = "SDRMac.rtlTcpServer.initialSampleRateHz"
+    static let rtlTcpServerInitialGainTenthsDbKey = "SDRMac.rtlTcpServer.initialGainTenthsDb"
+    static let rtlTcpServerInitialPpmKey = "SDRMac.rtlTcpServer.initialPpm"
+    static let rtlTcpServerInitialBiasTeeKey = "SDRMac.rtlTcpServer.initialBiasTee"
+    static let rtlTcpServerInitialDirectSamplingKey = "SDRMac.rtlTcpServer.initialDirectSampling"
 
     // ----------------------------------------------------------
     //  Source selection setters — issues #235, #236
