@@ -121,15 +121,156 @@ impl Scanner {
     // --- Event handlers (stub bodies; next tasks fill in) -----
 
     fn handle_set_enabled(&mut self, enabled: bool) -> Vec<ScannerCommand> {
-        // TODO (Task 1.5): Idle↔Retuning transitions.
-        let _ = enabled;
-        Vec::new()
+        if self.enabled == enabled {
+            return Vec::new();
+        }
+        self.enabled = enabled;
+        if enabled {
+            self.start_rotation()
+        } else {
+            self.stop_rotation()
+        }
     }
 
     fn handle_channels_changed(&mut self, channels: Vec<ScannerChannel>) -> Vec<ScannerCommand> {
-        // TODO (Task 1.5): list swap + rotation recovery.
         self.channels = channels;
-        Vec::new()
+        // Any stale lockout keys for channels that no longer exist
+        // are harmless (the set is only consulted against the
+        // live channel list), but we'll prune for cleanliness.
+        let valid: HashSet<ChannelKey> =
+            self.channels.iter().map(|c| c.key.clone()).collect();
+        self.locked_out.retain(|k| valid.contains(k));
+
+        if !self.enabled {
+            return Vec::new();
+        }
+        // Currently-scanning mid-list-change: recover from wherever
+        // the phase left us by re-starting rotation.
+        self.normal_cursor = 0;
+        self.priority_cursor = 0;
+        self.in_priority_sweep = false;
+        self.start_rotation()
+    }
+
+    /// Begin or resume rotation from the current cursor. Emits
+    /// Retune + MuteAudio + ActiveChannelChanged + StateChanged.
+    /// Returns EmptyRotation if no scannable + unlocked channels
+    /// exist, and transitions to Idle.
+    fn start_rotation(&mut self) -> Vec<ScannerCommand> {
+        let Some(idx) = self.pick_next_channel() else {
+            // No scannable channels available.
+            self.phase = Phase::Idle;
+            return vec![
+                ScannerCommand::EmptyRotation,
+                ScannerCommand::MuteAudio(false),
+                ScannerCommand::ActiveChannelChanged(None),
+                ScannerCommand::StateChanged(ScannerState::Idle),
+            ];
+        };
+        self.enter_retuning(idx)
+    }
+
+    fn stop_rotation(&mut self) -> Vec<ScannerCommand> {
+        self.phase = Phase::Idle;
+        vec![
+            ScannerCommand::MuteAudio(false),
+            ScannerCommand::ActiveChannelChanged(None),
+            ScannerCommand::StateChanged(ScannerState::Idle),
+        ]
+    }
+
+    /// Emit the retune command set for the given channel index
+    /// and move to Retuning phase. Settle window initialized on
+    /// the first SampleTick after entering Retuning (the sample
+    /// rate isn't known here).
+    fn enter_retuning(&mut self, idx: usize) -> Vec<ScannerCommand> {
+        let channel = &self.channels[idx];
+        self.phase = Phase::Retuning {
+            target_idx: idx,
+            samples_until_settled: 0, // seeded on first SampleTick
+        };
+        vec![
+            ScannerCommand::Retune {
+                freq_hz: channel.frequency_hz,
+                demod_mode: channel.demod_mode,
+                bandwidth: channel.bandwidth,
+                ctcss: channel.ctcss.clone(),
+                voice_squelch: channel.voice_squelch,
+            },
+            ScannerCommand::MuteAudio(true),
+            ScannerCommand::ActiveChannelChanged(Some(channel.key.clone())),
+            ScannerCommand::StateChanged(ScannerState::Retuning),
+        ]
+    }
+
+    /// Pick the next channel to scan given current cursor and
+    /// priority-sweep state. Returns None if no scannable+unlocked
+    /// channels exist.
+    fn pick_next_channel(&mut self) -> Option<usize> {
+        // Trigger priority sweep if due.
+        if !self.in_priority_sweep
+            && self.hops_since_priority_sweep >= PRIORITY_CHECK_INTERVAL
+            && self.channels.iter().any(|c| c.priority >= 1)
+        {
+            self.in_priority_sweep = true;
+            self.priority_cursor = 0;
+        }
+
+        if self.in_priority_sweep {
+            let pri_indices: Vec<usize> = self
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.priority >= 1 && !self.locked_out.contains(&c.key))
+                .map(|(i, _)| i)
+                .collect();
+            if self.priority_cursor < pri_indices.len() {
+                let chosen = pri_indices[self.priority_cursor];
+                self.priority_cursor += 1;
+                return Some(chosen);
+            }
+            // Priority sweep exhausted.
+            self.in_priority_sweep = false;
+            self.priority_cursor = 0;
+            self.hops_since_priority_sweep = 0;
+            // Fall through to normal rotation.
+        }
+
+        let normal_indices: Vec<usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.priority == 0 && !self.locked_out.contains(&c.key))
+            .map(|(i, _)| i)
+            .collect();
+
+        if normal_indices.is_empty() {
+            // If no normal channels, fall back to any unlocked
+            // channel (priority-only lists).
+            let any_unlocked: Vec<usize> = self
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !self.locked_out.contains(&c.key))
+                .map(|(i, _)| i)
+                .collect();
+            if any_unlocked.is_empty() {
+                return None;
+            }
+            if self.normal_cursor >= any_unlocked.len() {
+                self.normal_cursor = 0;
+            }
+            let chosen = any_unlocked[self.normal_cursor];
+            self.normal_cursor = (self.normal_cursor + 1) % any_unlocked.len();
+            return Some(chosen);
+        }
+
+        if self.normal_cursor >= normal_indices.len() {
+            self.normal_cursor = 0;
+        }
+        let chosen = normal_indices[self.normal_cursor];
+        self.normal_cursor = (self.normal_cursor + 1) % normal_indices.len();
+        Some(chosen)
     }
 
     fn handle_squelch_edge(&mut self, state: SquelchState) -> Vec<ScannerCommand> {
@@ -170,4 +311,75 @@ impl Scanner {
 fn ms_to_samples(ms: u32, sample_rate_hz: u32) -> u64 {
     // (ms * rate + 999) / 1000 — ceiling division.
     (u64::from(ms) * u64::from(sample_rate_hz) + 999) / 1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sdr_types::DemodMode;
+
+    fn ch(name: &str, freq: u64, priority: u8) -> ScannerChannel {
+        ScannerChannel {
+            key: ChannelKey {
+                name: name.to_string(),
+                frequency_hz: freq,
+            },
+            frequency_hz: freq,
+            demod_mode: DemodMode::Nfm,
+            bandwidth: 12_500.0,
+            ctcss: None,
+            voice_squelch: None,
+            priority,
+            dwell_ms: DEFAULT_DWELL_MS,
+            hang_ms: DEFAULT_HANG_MS,
+        }
+    }
+
+    #[test]
+    fn enable_with_channels_transitions_to_retuning() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        let commands = s.handle_event(ScannerEvent::SetEnabled(true));
+        assert_eq!(s.state(), ScannerState::Retuning);
+        // Expect Retune → MuteAudio(true) → ActiveChannelChanged → StateChanged
+        assert!(matches!(commands[0], ScannerCommand::Retune { freq_hz: 146_520_000, .. }));
+        assert!(matches!(commands[1], ScannerCommand::MuteAudio(true)));
+        assert!(matches!(
+            commands[2],
+            ScannerCommand::ActiveChannelChanged(Some(_))
+        ));
+        assert!(matches!(
+            commands[3],
+            ScannerCommand::StateChanged(ScannerState::Retuning)
+        ));
+    }
+
+    #[test]
+    fn disable_emits_idle_transition() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        let commands = s.handle_event(ScannerEvent::SetEnabled(false));
+        assert_eq!(s.state(), ScannerState::Idle);
+        assert!(matches!(commands[0], ScannerCommand::MuteAudio(false)));
+        assert!(matches!(
+            commands[1],
+            ScannerCommand::ActiveChannelChanged(None)
+        ));
+        assert!(matches!(
+            commands[2],
+            ScannerCommand::StateChanged(ScannerState::Idle)
+        ));
+    }
+
+    #[test]
+    fn enable_with_no_channels_emits_empty_rotation() {
+        let mut s = Scanner::new();
+        let commands = s.handle_event(ScannerEvent::SetEnabled(true));
+        assert_eq!(s.state(), ScannerState::Idle);
+        assert!(matches!(commands[0], ScannerCommand::EmptyRotation));
+    }
 }
