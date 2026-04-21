@@ -114,6 +114,13 @@ struct SidebarView: View {
             DisplaySection()
             RecordingSection()
             BookmarksSection()
+            // `RtlTcpServerSection` is visible only when a
+            // local RTL-SDR dongle is detected — the section
+            // itself is always included in the form, but the
+            // body collapses to a single "no dongle" caption
+            // otherwise so it doesn't clutter the sidebar on a
+            // network/file source setup.
+            RtlTcpServerSection()
         }
         .formStyle(.grouped)
     }
