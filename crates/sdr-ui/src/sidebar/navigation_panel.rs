@@ -550,15 +550,20 @@ pub type SaveCallback = std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn()>>>>;
 /// flat, skipping expander grouping entirely.
 const UNCATEGORIZED_LABEL: &str = "Uncategorized";
 
-/// Does the bookmark's name or subtitle contain the (already-
-/// lowercased) search needle? Empty needle matches everything.
+/// Does the bookmark's name, subtitle, or category contain the
+/// (already-lowercased) search needle? Empty needle matches
+/// everything. Category matching lets users filter by the
+/// `rr_category` label (e.g., typing "dispatch" or "fire")
+/// when bookmarks are imported from `RadioReference`, not just
+/// by name or demod/frequency.
 fn bookmark_matches_filter(bm: &Bookmark, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
     let name_lc = bm.name.to_lowercase();
     let subtitle_lc = bm.settings_subtitle().to_lowercase();
-    name_lc.contains(needle) || subtitle_lc.contains(needle)
+    let category_lc = bm.rr_category.as_deref().unwrap_or_default().to_lowercase();
+    name_lc.contains(needle) || subtitle_lc.contains(needle) || category_lc.contains(needle)
 }
 
 /// Rebuild the bookmark `ListBox` from the current bookmark list.
@@ -633,9 +638,7 @@ pub fn rebuild_bookmark_list(
         // search results into a previously-collapsed section).
         let active_category = bm_list
             .iter()
-            .find(|b| {
-                b.name == current_active.name && b.frequency == current_active.frequency
-            })
+            .find(|b| b.name == current_active.name && b.frequency == current_active.frequency)
             .map(|b| {
                 b.rr_category
                     .clone()
@@ -724,7 +727,7 @@ pub fn rebuild_bookmark_list(
 /// row's behavior is identical regardless of whether it's a
 /// top-level child of the `ListBox` or nested under an
 /// `AdwExpanderRow`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_bookmark_row(
     bm: &Bookmark,
     current_active: &ActiveBookmark,
@@ -767,6 +770,7 @@ fn build_bookmark_row(
     let delete_btn = gtk4::Button::builder()
         .icon_name("user-trash-symbolic")
         .valign(gtk4::Align::Center)
+        .tooltip_text("Delete bookmark")
         .css_classes(["flat"])
         .build();
 
@@ -797,7 +801,14 @@ fn build_bookmark_row(
             && let Some(sc) = scroll_ref.upgrade()
         {
             rebuild_bookmark_list(
-                &lb, &sc, &bm_rc, &nav_rc, &active_rc, &entry_del, &save_del, &filter_del,
+                &lb,
+                &sc,
+                &bm_rc,
+                &nav_rc,
+                &active_rc,
+                &entry_del,
+                &save_del,
+                &filter_del,
             );
         }
     });
@@ -1052,5 +1063,17 @@ mod tests {
     fn filter_no_match_hides_bookmark() {
         let bm = Bookmark::new("Weather", 162_550_000, DemodMode::Nfm, 12_500.0);
         assert!(!bookmark_matches_filter(&bm, "xyz-no-match"));
+    }
+
+    #[test]
+    fn filter_matches_rr_category() {
+        // Users who import from RadioReference expect to search
+        // by category ("dispatch", "fire") even when that text
+        // isn't in the bookmark's name or subtitle.
+        let mut bm = Bookmark::new("Unit 14", 462_562_500, DemodMode::Nfm, 12_500.0);
+        bm.rr_category = Some("Law Dispatch".to_string());
+        assert!(bookmark_matches_filter(&bm, "dispatch"));
+        assert!(bookmark_matches_filter(&bm, "law"));
+        assert!(!bookmark_matches_filter(&bm, "fire"));
     }
 }

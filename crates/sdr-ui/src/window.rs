@@ -44,6 +44,13 @@ const DEFAULT_HEIGHT: i32 = 800;
 /// Sidebar collapse breakpoint width in pixels.
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
+/// Slide-in/out duration for right-side flyouts (transcript,
+/// bookmarks) in milliseconds. Centralized so the two
+/// revealers stay in lockstep — drifting values would make
+/// one panel feel snappier than the other when the user
+/// toggles between them.
+const RIGHT_FLYOUT_TRANSITION_MS: u32 = 200;
+
 /// FFT sizes — re-exported from display panel (single source of truth).
 use crate::sidebar::display_panel::FFT_SIZES;
 #[cfg(feature = "sherpa")]
@@ -140,6 +147,12 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         .icon_name("user-bookmarks-symbolic")
         .tooltip_text("Toggle bookmarks panel (Ctrl+B)")
         .build();
+    // `tooltip_text` alone isn't reliably announced by screen
+    // readers — set the accessible label explicitly, matching
+    // the pattern used for the other icon-only controls in this
+    // file (pinned servers menu, copy server address, etc.).
+    bookmarks_toggle
+        .update_property(&[gtk4::accessible::Property::Label("Toggle bookmarks panel")]);
     header.pack_end(&bookmarks_toggle);
 
     // Restore the flyout open/closed state saved at last shutdown.
@@ -857,7 +870,7 @@ fn build_split_view(
 
     let transcript_revealer = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .transition_duration(200)
+        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
         .reveal_child(false)
         .child(&transcript_scroll)
         .hexpand(false)
@@ -865,9 +878,10 @@ fn build_split_view(
 
     // Bookmarks flyout — slides out from the right, outermost of
     // the two right-side panels so the header `Ctrl+B` toggle
-    // reveals an unambiguously right-edge element. Uses the same
-    // `SlideLeft` + 200 ms transition as the transcript revealer
-    // for visual consistency when either panel opens.
+    // reveals an unambiguously right-edge element. Shares the
+    // `SlideLeft` + `RIGHT_FLYOUT_TRANSITION_MS` transition with
+    // the transcript revealer for visual consistency when either
+    // panel opens.
     //
     // The flyout widget is built by `build_sidebar` (so it can
     // share state with the left-sidebar `NavigationPanel`) and
@@ -877,7 +891,7 @@ fn build_split_view(
     // wrap is needed.
     let bookmarks_revealer = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .transition_duration(200)
+        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
         .reveal_child(false)
         .child(&panels.bookmarks.widget)
         .hexpand(false)

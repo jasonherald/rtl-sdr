@@ -128,12 +128,15 @@ impl BookmarksPanel {
 /// Build the bookmarks flyout panel.
 ///
 /// Takes a reference to the left sidebar's `name_entry` so the list
-/// rebuild path — which lives in this module and is called from both
-/// panels — can keep the entry field in sync (e.g. clearing it on
-/// delete-of-active-bookmark, populating it when the user clicks a
-/// row to prepare for a rename). The entry field belongs to
-/// `NavigationPanel` because the Add button is packed with it; this
-/// panel just holds a reference.
+/// rebuild path — which lives in this module and is called from
+/// both panels — can keep the entry field in sync with the active
+/// bookmark. The entry is **create-only context** for the Add
+/// Bookmark button: recall populates it as an informational
+/// reminder of which bookmark is loaded (and cleared on
+/// delete-of-active), but the Add button always pushes a new
+/// `Bookmark` — there's no in-place rename path. The entry field
+/// belongs to `NavigationPanel` because the Add button is packed
+/// with it; this panel just holds a reference.
 #[must_use]
 pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     let widget = gtk4::Box::builder()
