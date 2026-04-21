@@ -47,29 +47,27 @@ private struct GeneralPane: View {
 private struct AudioPane: View {
     @Environment(CoreModel.self) private var model
 
+    /// Local edit buffer for the network sink port. Bound to a
+    /// `TextField` so the user can backspace through the value
+    /// without triggering a per-keystroke engine command. An
+    /// empty string parses as "no port chosen" and the Apply
+    /// button disables. Committed on Apply.
+    @State private var portEdit: String = ""
+
+    /// Local edit buffer for the host. Same rationale as
+    /// `portEdit` — host edits shouldn't rebuild the listener on
+    /// every character.
+    @State private var hostEdit: String = ""
+
     var body: some View {
         Form {
             LabeledContent("Output device") {
-                // Picker rebuilds the device list on every appear —
-                // CoreAudio hot-plugs are common (Bluetooth headsets,
-                // USB interfaces); the user shouldn't have to restart
-                // the app to see a freshly-connected device. The
-                // engine's transactional swap guarantees a bad pick
-                // rolls back to the previous route automatically.
                 Picker("", selection: Binding(
                     get: { model.selectedAudioDeviceUid },
                     set: { model.setAudioDevice($0) }
                 )) {
-                    // "" is the engine's "system default" sentinel —
-                    // show it as a first-class option regardless of
-                    // backend so the user always has a guaranteed-
-                    // working route to fall back on.
                     Text("System default").tag("")
                     ForEach(model.audioDevices) { dev in
-                        // Skip a backend-emitted empty-UID duplicate
-                        // so we never show two "System default"
-                        // options (stub backend does emit one; real
-                        // backends typically don't).
                         if !dev.uid.isEmpty {
                             Text(dev.displayName).tag(dev.uid)
                         }
@@ -77,6 +75,11 @@ private struct AudioPane: View {
                 }
                 .labelsHidden()
                 .onAppear { model.refreshAudioDevices() }
+                // Greyed out while the network sink is active —
+                // the setting still round-trips to the engine, but
+                // it only affects audio once the user switches the
+                // sink back to `.local`.
+                .disabled(model.audioSinkType == .network)
             }
             LabeledContent("Volume") {
                 @Bindable var m = model
@@ -90,6 +93,127 @@ private struct AudioPane: View {
                     }
                 )
             }
+
+            // --------------------------------------------------
+            //  Network audio sink — issue #247
+            // --------------------------------------------------
+            Section {
+                Picker("Sink", selection: Binding(
+                    get: { model.audioSinkType },
+                    set: { model.setAudioSinkType($0) }
+                )) {
+                    ForEach(AudioSinkType.allCases, id: \.self) { t in
+                        Text(t.label).tag(t)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                if model.audioSinkType == .network {
+                    TextField("Host", text: $hostEdit)
+                        .textFieldStyle(.roundedBorder)
+                        .disableAutocorrection(true)
+                    TextField("Port", text: $portEdit)
+                        .textFieldStyle(.roundedBorder)
+                    Picker("Protocol", selection: Binding(
+                        get: { model.networkSinkProtocol },
+                        set: { proto in
+                            // Protocol changes count as endpoint
+                            // changes — rebuild with the buffered
+                            // host/port instead of letting the
+                            // picker drift out of sync with the
+                            // engine. Bad port input keeps the
+                            // engine's current endpoint.
+                            if let port = portValue() {
+                                model.applyNetworkSinkConfig(
+                                    host: hostEdit,
+                                    port: port,
+                                    protocol: proto
+                                )
+                            }
+                        }
+                    )) {
+                        ForEach(NetworkProtocol.allCases, id: \.self) { p in
+                            Text(p.label).tag(p)
+                        }
+                    }
+
+                    HStack {
+                        Button {
+                            guard let port = portValue() else { return }
+                            model.applyNetworkSinkConfig(
+                                host: hostEdit,
+                                port: port,
+                                protocol: model.networkSinkProtocol
+                            )
+                        } label: {
+                            Label("Apply", systemImage: "arrow.up.circle")
+                        }
+                        .disabled(applyButtonDisabled)
+                    }
+
+                    networkStatusRow
+                }
+            } header: {
+                Text("Network stream")
+            } footer: {
+                Text(
+                    """
+                    Stream post-demod audio (48 kHz stereo) to a TCP or UDP \
+                    endpoint. TCP server mode has the app listen on the \
+                    configured port for client connections. UDP sends \
+                    unicast packets to the chosen host.
+                    """
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear {
+            // Seed the local edit buffers from the model on
+            // every appear — picks up external mutations (e.g.
+            // bookmark restore, programmatic updates) that
+            // happened while the pane was off-screen.
+            hostEdit = model.networkSinkHost
+            portEdit = String(model.networkSinkPort)
+        }
+    }
+
+    /// Parse the current port-edit buffer into a `UInt16`.
+    /// Returns `nil` on empty / out-of-range / non-numeric
+    /// input; the Apply button and protocol-change side effect
+    /// disable/no-op in that case instead of pushing a bad value.
+    private func portValue() -> UInt16? {
+        guard let raw = Int(portEdit.trimmingCharacters(in: .whitespaces)),
+              (1...Int(UInt16.max)).contains(raw) else {
+            return nil
+        }
+        return UInt16(raw)
+    }
+
+    private var applyButtonDisabled: Bool {
+        let trimmedHost = hostEdit.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedHost.isEmpty || portValue() == nil
+    }
+
+    /// Render the engine-reported network sink status below the
+    /// form. Colors mirror the RadioReference pane's convention
+    /// (red = error, green = success, secondary = idle).
+    @ViewBuilder
+    private var networkStatusRow: some View {
+        switch model.networkSinkStatus {
+        case .inactive:
+            Text("Status: inactive")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .active(let endpoint, let proto):
+            Text("Status: streaming to \(endpoint) over \(proto.label)")
+                .font(.caption)
+                .foregroundStyle(.green)
+        case .error(let msg):
+            Text("Status: \(msg)")
+                .font(.caption)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
         }
     }
 }
