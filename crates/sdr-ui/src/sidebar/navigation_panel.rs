@@ -498,6 +498,7 @@ pub fn connect_preset_to_bookmarks(
     let bm_rc = std::rc::Rc::clone(&bookmarks.bookmarks);
     let on_save = std::rc::Rc::clone(&bookmarks.on_save);
     let filter_text = std::rc::Rc::clone(&bookmarks.filter_text);
+    let manual_expanded = std::rc::Rc::clone(&bookmarks.manual_expanded);
     let list_weak = bookmarks.bookmark_list.downgrade();
     let scroll_weak = bookmarks.bookmark_scroll.downgrade();
     let name_entry = navigation.name_entry.clone();
@@ -530,6 +531,7 @@ pub fn connect_preset_to_bookmarks(
                     &name_entry,
                     &on_save,
                     &filter_text,
+                    &manual_expanded,
                 );
             }
         }
@@ -574,7 +576,12 @@ fn bookmark_matches_filter(bm: &Bookmark, needle: &str) -> bool {
 /// back to a flat list when all bookmarks are uncategorized so
 /// users who don't import from `RadioReference` keep the original
 /// single-level view.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::implicit_hasher,
+    reason = "manual_expanded is a private handle passed Rc-clone-style between internal callers — the default `RandomState` hasher is fine and genericizing would force every caller site to spell the hasher"
+)]
 pub fn rebuild_bookmark_list(
     list_box: &gtk4::ListBox,
     scroll: &gtk4::ScrolledWindow,
@@ -584,27 +591,8 @@ pub fn rebuild_bookmark_list(
     name_entry: &adw::EntryRow,
     on_save: &SaveCallback,
     filter_text: &std::rc::Rc<std::cell::RefCell<String>>,
+    manual_expanded: &std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
 ) {
-    // Snapshot which categories are currently expanded so the
-    // rebuild can restore them. Without this the list collapses
-    // every expander on every rebuild — clicking a bookmark
-    // triggers a rebuild for the active-row highlight, and the
-    // user would watch the section they just clicked into snap
-    // closed.
-    let previously_expanded: std::collections::HashSet<String> = {
-        let mut set = std::collections::HashSet::new();
-        let mut child = list_box.first_child();
-        while let Some(widget) = child {
-            if let Some(exp) = widget.downcast_ref::<adw::ExpanderRow>()
-                && exp.is_expanded()
-            {
-                set.insert(exp.title().to_string());
-            }
-            child = widget.next_sibling();
-        }
-        set
-    };
-
     // Remove all existing rows.
     while let Some(child) = list_box.first_child() {
         list_box.remove(&child);
@@ -614,6 +602,16 @@ pub fn rebuild_bookmark_list(
     let current_active = active.borrow().clone();
     let needle = filter_text.borrow().clone();
     let uses_categories = bm_list.iter().any(|b| b.rr_category.is_some());
+    // Read manual expansion state separately from widget state.
+    // We can't snapshot widget expansion on every rebuild: the
+    // search path force-opens every expander, and if the user
+    // then clears the search, we'd treat those forced opens as
+    // manual intent. Instead `manual_expanded` is only mutated
+    // by the `expanded-notify` handler below, and only when no
+    // filter is active — so programmatic expansions (search,
+    // active-category restore, initial apply on rebuild) never
+    // pollute it.
+    let manual_open: std::collections::HashSet<String> = manual_expanded.borrow().clone();
 
     if uses_categories {
         // Collect bookmarks into category buckets, preserving
@@ -657,14 +655,41 @@ pub fn rebuild_bookmark_list(
                 ))
                 .build();
             // Expand when: a filter is active (so matches
-            // surface without a manual click); this category
-            // was expanded before the rebuild (preserve user
-            // intent); or this category holds the active
-            // bookmark (so recall keeps its section open).
+            // surface without a manual click); the user
+            // manually expanded this category before (preserved
+            // across rebuilds via `manual_expanded`); or this
+            // category holds the active bookmark (so recall
+            // keeps its section open).
             let keep_expanded = !needle.is_empty()
-                || previously_expanded.contains(&cat)
+                || manual_open.contains(&cat)
                 || active_category.as_deref() == Some(cat.as_str());
             expander.set_expanded(keep_expanded);
+
+            // Track user-driven expansion toggles. Connects
+            // *after* the initial `set_expanded` above so the
+            // programmatic apply doesn't fire the handler —
+            // GLib signals only reach handlers connected at the
+            // time of emission. Gated on filter being empty
+            // because during search all expanders are force-
+            // open; a user toggle under those conditions
+            // reflects "show/hide matches in this category
+            // right now", not lasting intent.
+            let manual_for_notify = std::rc::Rc::clone(manual_expanded);
+            let filter_for_notify = std::rc::Rc::clone(filter_text);
+            let cat_for_notify = cat.clone();
+            expander.connect_expanded_notify(move |row| {
+                if !filter_for_notify.borrow().is_empty() {
+                    return;
+                }
+                if row.is_expanded() {
+                    manual_for_notify
+                        .borrow_mut()
+                        .insert(cat_for_notify.clone());
+                } else {
+                    manual_for_notify.borrow_mut().remove(&cat_for_notify);
+                }
+            });
+
             for bm in items {
                 let row = build_bookmark_row(
                     bm,
@@ -677,6 +702,7 @@ pub fn rebuild_bookmark_list(
                     name_entry,
                     on_save,
                     filter_text,
+                    manual_expanded,
                 );
                 expander.add_row(&row);
             }
@@ -698,6 +724,7 @@ pub fn rebuild_bookmark_list(
                 name_entry,
                 on_save,
                 filter_text,
+                manual_expanded,
             );
             list_box.append(&row);
         }
@@ -707,12 +734,18 @@ pub fn rebuild_bookmark_list(
     // the flyout is vexpand and doesn't need a min height. Keep
     // the 3-row cap for flat lists (where this function is still
     // called from the sidebar's pre-flyout code path) and skip
-    // entirely for expander-grouped views.
+    // entirely for expander-grouped views. Use the filtered row
+    // count, not the total — when a search is active the scroll
+    // region should shrink with the visible list rather than
+    // reserving space for filtered-out rows.
     if uses_categories {
         scroll.set_height_request(-1);
     } else {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let count = bm_list.len() as i32;
+        let count = bm_list
+            .iter()
+            .filter(|bm| bookmark_matches_filter(bm, &needle))
+            .count() as i32;
         let visible = count.clamp(0, MAX_VISIBLE_BOOKMARKS);
         let height = visible * BOOKMARK_ROW_HEIGHT;
         scroll.set_height_request(height);
@@ -739,6 +772,7 @@ fn build_bookmark_row(
     name_entry: &adw::EntryRow,
     on_save: &SaveCallback,
     filter_text: &std::rc::Rc<std::cell::RefCell<String>>,
+    manual_expanded: &std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
 ) -> adw::ActionRow {
     let is_active = bm.name == current_active.name && bm.frequency == current_active.frequency;
     let row = adw::ActionRow::builder()
@@ -783,6 +817,7 @@ fn build_bookmark_row(
     let active_rc = std::rc::Rc::clone(active);
     let save_del = std::rc::Rc::clone(on_save);
     let filter_del = std::rc::Rc::clone(filter_text);
+    let manual_expanded_del = std::rc::Rc::clone(manual_expanded);
     let list_ref = list_box.downgrade();
     let scroll_ref = scroll.downgrade();
     let entry_del = name_entry.clone();
@@ -824,6 +859,7 @@ fn build_bookmark_row(
                 &entry_del,
                 &save_del,
                 &filter_del,
+                &manual_expanded_del,
             );
         }
     });
@@ -834,6 +870,7 @@ fn build_bookmark_row(
     let active_recall = std::rc::Rc::clone(active);
     let save_recall = std::rc::Rc::clone(on_save);
     let filter_recall = std::rc::Rc::clone(filter_text);
+    let manual_expanded_recall = std::rc::Rc::clone(manual_expanded);
     let bm_recall = std::rc::Rc::clone(bookmarks);
     let list_recall = list_box.downgrade();
     let scroll_recall = scroll.downgrade();
@@ -862,6 +899,7 @@ fn build_bookmark_row(
                 &entry_recall,
                 &save_recall,
                 &filter_recall,
+                &manual_expanded_recall,
             );
             let adj = sc.vadjustment();
             glib::idle_add_local_once(move || {

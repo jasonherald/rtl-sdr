@@ -92,6 +92,16 @@ pub struct BookmarksPanel {
     /// rebuilds triggered by external mutations (add, delete,
     /// `RadioReference` import) respect the active filter.
     pub filter_text: std::rc::Rc<std::cell::RefCell<String>>,
+    /// Category titles the user has manually expanded, tracked
+    /// across rebuilds. Distinct from "currently expanded
+    /// widgets" because the search path force-opens every
+    /// expander — snapshotting widget state on every rebuild
+    /// would treat those search-forced opens as manual intent
+    /// and keep them open after the search clears. Only updated
+    /// when the user toggles an expander while no filter is
+    /// active (see `expanded-notify` handler in
+    /// `rebuild_bookmark_list`).
+    pub manual_expanded: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
 }
 
 impl BookmarksPanel {
@@ -121,6 +131,7 @@ impl BookmarksPanel {
             name_entry,
             &self.on_save,
             &self.filter_text,
+            &self.manual_expanded,
         );
     }
 }
@@ -185,6 +196,9 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     let active_bookmark = std::rc::Rc::new(std::cell::RefCell::new(ActiveBookmark::default()));
     let on_save: SaveCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
     let filter_text = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let manual_expanded = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::<
+        String,
+    >::new()));
 
     // Search-changed → update needle + rebuild. We rebuild the
     // list instead of using `ListBox::set_filter_func` because
@@ -201,6 +215,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     let on_navigate_for_entry = std::rc::Rc::clone(&on_navigate);
     let active_for_entry = std::rc::Rc::clone(&active_bookmark);
     let on_save_for_entry = std::rc::Rc::clone(&on_save);
+    let manual_expanded_for_entry = std::rc::Rc::clone(&manual_expanded);
     let name_entry_for_entry = name_entry.clone();
     search_entry.connect_search_changed(move |entry| {
         *filter_for_entry.borrow_mut() = entry.text().to_lowercase();
@@ -213,6 +228,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
             &name_entry_for_entry,
             &on_save_for_entry,
             &filter_for_entry,
+            &manual_expanded_for_entry,
         );
     });
 
@@ -226,6 +242,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         name_entry,
         &on_save,
         &filter_text,
+        &manual_expanded,
     );
 
     BookmarksPanel {
@@ -237,5 +254,6 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         on_navigate,
         on_save,
         filter_text,
+        manual_expanded,
     }
 }
