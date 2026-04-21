@@ -2,7 +2,9 @@
 
 use sdr_dsp::voice_squelch::VoiceSquelchMode;
 use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
-use sdr_types::{DemodMode, RtlTcpConnectionState};
+use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
+
+use crate::sink_slot::{AudioSinkType, NetworkSinkStatus};
 
 /// Messages sent from the DSP pipeline thread to the UI main loop.
 #[derive(Debug)]
@@ -75,6 +77,13 @@ pub enum DspToUi {
     /// value to reset on source-type changes without needing a
     /// separate "hide the row" signal.
     RtlTcpConnectionState(RtlTcpConnectionState),
+    /// Lifecycle/health update for the network audio sink.
+    /// Emitted on switch boundaries (`Active` / `Inactive`) and
+    /// on startup or write failure (`Error`). Hosts use it to
+    /// drive a status row in the audio settings panel — green
+    /// when streaming, red with the message on failure. Per
+    /// issue #247.
+    NetworkSinkStatus(NetworkSinkStatus),
 }
 
 /// Available source types for IQ input.
@@ -164,6 +173,24 @@ pub enum UiToDsp {
     SetVoiceSquelchThreshold(f32),
     /// Set the audio output device by `PipeWire` node name.
     SetAudioDevice(String),
+    /// Switch the audio sink type (local audio device vs network
+    /// stream). The controller stops the current sink, swaps to
+    /// the new variant using the persisted device/network config,
+    /// and restarts it if the engine is currently running. Per
+    /// issue #247.
+    SetAudioSinkType(AudioSinkType),
+    /// Configure the network audio sink hostname, port, and
+    /// protocol. The controller stores the config on `DspState`
+    /// so a future switch to `AudioSinkType::Network` (or a
+    /// rebuild of an already-active network sink) picks the new
+    /// values up. If the network sink is currently active, the
+    /// controller also rebuilds it inline so the new endpoint
+    /// takes effect immediately. Per issue #247.
+    SetNetworkSinkConfig {
+        hostname: String,
+        port: u16,
+        protocol: Protocol,
+    },
     /// Switch the source type (stops current source if running).
     SetSourceType(SourceType),
     /// Configure network source hostname, port, and protocol.
@@ -338,6 +365,39 @@ mod tests {
         assert!(matches!(
             failed,
             DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Failed { .. })
+        ));
+
+        // Network audio sink status (issue #247) — three
+        // variants exercising each shape so a future payload
+        // tweak (e.g. adding a bytes_sent counter) trips this
+        // regression net rather than silently going quiet at
+        // the GTK status-row renderer. Per CodeRabbit round 1
+        // on PR #351.
+        let net_active = DspToUi::NetworkSinkStatus(NetworkSinkStatus::Active {
+            endpoint: "0.0.0.0:1234".to_string(),
+            protocol: sdr_types::Protocol::TcpClient,
+        });
+        assert!(matches!(
+            &net_active,
+            DspToUi::NetworkSinkStatus(NetworkSinkStatus::Active {
+                endpoint,
+                protocol: sdr_types::Protocol::TcpClient,
+            }) if endpoint == "0.0.0.0:1234"
+        ));
+
+        let net_inactive = DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive);
+        assert!(matches!(
+            net_inactive,
+            DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive)
+        ));
+
+        let net_err = DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
+            message: "bind: Address already in use".to_string(),
+        });
+        assert!(matches!(
+            &net_err,
+            DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error { message })
+                if message == "bind: Address already in use"
         ));
     }
 
@@ -542,6 +602,37 @@ mod tests {
 
         let disable_tap = UiToDsp::DisableAudioTap;
         assert!(matches!(disable_tap, UiToDsp::DisableAudioTap));
+
+        // Network audio sink (issue #247) — constructed here so a
+        // future signature tweak to AudioSinkType, the
+        // SetNetworkSinkConfig field set, or the Protocol type
+        // fails this regression net rather than silently going
+        // quiet at the controller's handler. Per CodeRabbit
+        // round 1 on PR #351.
+        let set_sink_local = UiToDsp::SetAudioSinkType(crate::sink_slot::AudioSinkType::Local);
+        assert!(matches!(
+            set_sink_local,
+            UiToDsp::SetAudioSinkType(crate::sink_slot::AudioSinkType::Local)
+        ));
+        let set_sink_network = UiToDsp::SetAudioSinkType(crate::sink_slot::AudioSinkType::Network);
+        assert!(matches!(
+            set_sink_network,
+            UiToDsp::SetAudioSinkType(crate::sink_slot::AudioSinkType::Network)
+        ));
+
+        let net_cfg = UiToDsp::SetNetworkSinkConfig {
+            hostname: "192.0.2.1".to_string(),
+            port: 4242,
+            protocol: sdr_types::Protocol::Udp,
+        };
+        assert!(matches!(
+            &net_cfg,
+            UiToDsp::SetNetworkSinkConfig {
+                hostname,
+                port: 4242,
+                protocol: sdr_types::Protocol::Udp,
+            } if hostname == "192.0.2.1"
+        ));
 
         // RTL-TCP connection controls (commit 3 of PR #335) —
         // constructed directly so a future signature change (e.g.

@@ -366,6 +366,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let rtl_tcp_status_row_weak = panels.source.rtl_tcp_status_row.downgrade();
     let rtl_tcp_disconnect_button_weak = panels.source.rtl_tcp_disconnect_button.downgrade();
     let rtl_tcp_retry_button_weak = panels.source.rtl_tcp_retry_button.downgrade();
+    // Network audio sink status row — same weak-ref pattern as
+    // the rtl_tcp status row above so a window close can't keep
+    // the row alive past its useful life. Per issue #247.
+    let network_sink_status_row_weak = panels.audio.network_status_row.downgrade();
     let transcription_enable_for_dsp = transcript_panel.enable_row.clone();
     #[cfg(feature = "sherpa")]
     let auto_break_row_for_dsp = transcript_panel.auto_break_row.clone();
@@ -422,6 +426,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &rtl_tcp_status_row_weak,
                         &rtl_tcp_disconnect_button_weak,
                         &rtl_tcp_retry_button_weak,
+                        &network_sink_status_row_weak,
                         &transcription_enable_for_dsp,
                         #[cfg(feature = "sherpa")]
                         &auto_break_row_for_dsp,
@@ -464,6 +469,7 @@ fn handle_dsp_message(
     rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
     rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
+    network_sink_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     transcription_enable_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_min_open_row: &adw::SpinRow,
@@ -646,7 +652,36 @@ fn handle_dsp_message(
                 apply_rtl_tcp_connection_state(&status_row, &disconnect, &retry, &conn_state);
             }
         }
+        DspToUi::NetworkSinkStatus(status) => {
+            tracing::debug!(?status, "network sink status");
+            if let Some(row) = network_sink_status_row_weak.upgrade() {
+                apply_network_sink_status(&row, &status);
+            }
+        }
     }
+}
+
+/// Render a `NetworkSinkStatus` into the audio panel's status row.
+/// Three states map to three subtitles + colors:
+///   - `Active` → "Streaming to host:port (TCP/UDP)"
+///   - `Inactive` → "Inactive" (e.g. just switched back to local)
+///   - `Error { message }` → "Error: <message>"
+///
+/// Per issue #247.
+fn apply_network_sink_status(row: &adw::ActionRow, status: &sdr_core::NetworkSinkStatus) {
+    use sdr_core::NetworkSinkStatus;
+    let subtitle = match status {
+        NetworkSinkStatus::Active { endpoint, protocol } => {
+            let proto_label = match protocol {
+                sdr_types::Protocol::TcpClient => "TCP",
+                sdr_types::Protocol::Udp => "UDP",
+            };
+            format!("Streaming to {endpoint} ({proto_label})")
+        }
+        NetworkSinkStatus::Inactive => "Inactive".to_string(),
+        NetworkSinkStatus::Error { message } => format!("Error: {message}"),
+    };
+    row.set_subtitle(&subtitle);
 }
 
 /// Render a `RtlTcpConnectionState` into the status row + button
@@ -4451,6 +4486,104 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             state_dev.send_dsp(UiToDsp::SetAudioDevice(node_name.clone()));
         }
     });
+
+    // Sink type selector — toggles the engine between local
+    // audio device and network stream, and shows/hides the
+    // network config rows so the sidebar layout reflects the
+    // active mode. Per issue #247.
+    let state_sink_type = Rc::clone(state);
+    let host_row = panels.audio.network_host_row.clone();
+    let port_row = panels.audio.network_port_row.clone();
+    let proto_row = panels.audio.network_protocol_row.clone();
+    let status_row = panels.audio.network_status_row.clone();
+    panels
+        .audio
+        .sink_type_row
+        .connect_selected_notify(move |row| {
+            // Match explicitly against both legal indices and
+            // early-return on anything else. The previous shape
+            // mapped any non-Network value to Local, which would
+            // silently dispatch a sink swap on a transient or
+            // future-added combo entry that this handler doesn't
+            // know about. Per CodeRabbit round 2 on PR #351.
+            let new_type = match row.selected() {
+                sidebar::audio_panel::SINK_TYPE_LOCAL_IDX => sdr_core::AudioSinkType::Local,
+                sidebar::audio_panel::SINK_TYPE_NETWORK_IDX => sdr_core::AudioSinkType::Network,
+                unknown => {
+                    tracing::warn!(
+                        selected_idx = unknown,
+                        "audio sink-type combo emitted unknown index; ignoring"
+                    );
+                    return;
+                }
+            };
+            let network_visible = matches!(new_type, sdr_core::AudioSinkType::Network);
+            host_row.set_visible(network_visible);
+            port_row.set_visible(network_visible);
+            proto_row.set_visible(network_visible);
+            status_row.set_visible(network_visible);
+            state_sink_type.send_dsp(UiToDsp::SetAudioSinkType(new_type));
+        });
+
+    // Helper closure-builder: any change to the network host /
+    // port / protocol triple re-sends the full SetNetworkSinkConfig
+    // so the controller can rebuild the sink atomically. The
+    // engine handler is idempotent — sending the same values
+    // again is harmless. Per issue #247.
+    let push_network_config = {
+        let state = Rc::clone(state);
+        let host_row = panels.audio.network_host_row.clone();
+        let port_row = panels.audio.network_port_row.clone();
+        let proto_row = panels.audio.network_protocol_row.clone();
+        move || {
+            let hostname = host_row.text().to_string();
+            // SpinRow's adjustment is bounded (1..=65535), and
+            // we explicitly clamp again here as belt-and-
+            // suspenders against any future code path that
+            // hands us a different adjustment. After the clamp
+            // the value is finite and in [0, 65535] so the
+            // narrowing cast is exact — the clippy lints below
+            // are safe to silence with that justification.
+            let port_clamped = port_row
+                .value()
+                .round()
+                .clamp(f64::from(u16::MIN), f64::from(u16::MAX));
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to [0, u16::MAX] above"
+            )]
+            let port = port_clamped as u16;
+            let protocol = sidebar::audio_panel::protocol_from_combo_idx(proto_row.selected());
+            state.send_dsp(UiToDsp::SetNetworkSinkConfig {
+                hostname,
+                port,
+                protocol,
+            });
+        }
+    };
+
+    // Hostname commits on Enter / focus-out (the AdwEntryRow's
+    // `connect_apply` signal). connect_changed would fire per
+    // keystroke and reconnect-on-every-character is bad UX.
+    {
+        let push = push_network_config.clone();
+        panels.audio.network_host_row.connect_apply(move |_| push());
+    }
+    {
+        let push = push_network_config.clone();
+        panels
+            .audio
+            .network_port_row
+            .connect_value_notify(move |_| push());
+    }
+    {
+        let push = push_network_config.clone();
+        panels
+            .audio
+            .network_protocol_row
+            .connect_selected_notify(move |_| push());
+    }
 
     // Audio recording toggle
     let state_rec = Rc::clone(state);

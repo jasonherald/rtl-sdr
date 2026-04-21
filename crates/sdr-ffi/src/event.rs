@@ -380,7 +380,14 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::BandwidthChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
-        | DspToUi::RtlTcpConnectionState(_) => return None,
+        | DspToUi::RtlTcpConnectionState(_)
+        // `NetworkSinkStatus` is engine-only in PR 1 (issue #247
+        // engine-side plumbing). The FFI surface gains a
+        // matching `SDR_EVT_NETWORK_SINK_STATUS` variant in PR 2
+        // alongside the FFI command wrappers; until then drop
+        // the event silently rather than dispatching it as a
+        // generic error.
+        | DspToUi::NetworkSinkStatus(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

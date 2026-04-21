@@ -20,10 +20,17 @@ use std::time::Duration;
 
 use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
-use sdr_pipeline::sink_manager::Sink;
 use sdr_pipeline::source_manager::Source;
+
+use crate::sink_slot::{
+    AudioSinkSlot, AudioSinkType, DEFAULT_NETWORK_SINK_HOST, DEFAULT_NETWORK_SINK_PORT,
+    DEFAULT_NETWORK_SINK_PROTOCOL, NetworkSinkStatus,
+};
 use sdr_radio::RadioModule;
-use sdr_sink_audio::AudioSink;
+// `AudioSink` and `NetworkSink` are no longer used directly here —
+// both live behind `AudioSinkSlot` (see `crate::sink_slot`) so the
+// controller's audio path stays uniform regardless of which sink
+// the user has selected.
 use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, RtlTcpConnectionState, SinkError, Stereo};
 
@@ -132,7 +139,7 @@ fn dsp_thread_main(
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         tracing::info!("UI channel disconnected — DSP thread exiting");
-                        cleanup(&mut state);
+                        cleanup(&mut state, &dsp_tx);
                         return;
                     }
                 }
@@ -211,7 +218,36 @@ struct DspState {
     source: Option<Box<dyn Source>>,
     frontend: IqFrontend,
     radio: RadioModule,
-    audio_sink: AudioSink,
+    audio_sink: AudioSinkSlot,
+    /// Which sink variant is currently active. Mirror of
+    /// `audio_sink.kind()` kept on the state so handlers can
+    /// branch on type without matching the enum every time. Per
+    /// issue #247.
+    audio_sink_type: AudioSinkType,
+    /// Last user-picked local audio device UID (`PipeWire` node
+    /// name on Linux, `AudioDevice` UID on macOS). Empty string =
+    /// system default. Persisted across sink-type swaps so a
+    /// Network → Local switch reapplies the user's prior device
+    /// pick instead of falling back to default.
+    audio_device_uid: String,
+    /// Network sink hostname. Defaults to `localhost` to match
+    /// the GTK source-network panel's defaults so switching to
+    /// the network sink without an explicit configure step still
+    /// produces a usable bind.
+    network_sink_host: String,
+    /// Network sink port. Defaults to `1234` matching the
+    /// existing IQ source-network port default.
+    network_sink_port: u16,
+    /// Network sink protocol. Defaults to TCP server.
+    network_sink_protocol: sdr_types::Protocol,
+    /// Latched after a terminal `write_samples` failure
+    /// (`SinkError::Disconnected` / `NotRunning`) so the next
+    /// audio block doesn't re-fire the same warning + status
+    /// event. Cleared on every successful `audio_sink.start()`
+    /// — which means a sink-type swap, a network reconfig
+    /// rebuild, or a fresh engine `Start` all rearm the path.
+    /// Per `CodeRabbit` round 2 on PR #351.
+    audio_sink_offline: bool,
     running: bool,
     center_freq: f64,
     sample_rate: f64,
@@ -343,7 +379,13 @@ impl DspState {
             source: None,
             frontend,
             radio,
-            audio_sink: AudioSink::new(),
+            audio_sink: AudioSinkSlot::local_default(),
+            audio_sink_type: AudioSinkType::Local,
+            audio_device_uid: String::new(),
+            network_sink_host: DEFAULT_NETWORK_SINK_HOST.to_string(),
+            network_sink_port: DEFAULT_NETWORK_SINK_PORT,
+            network_sink_protocol: DEFAULT_NETWORK_SINK_PROTOCOL,
+            audio_sink_offline: false,
             running: false,
             center_freq: DEFAULT_CENTER_FREQ,
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -399,10 +441,51 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             match open_source(state) {
                 Ok(()) => {
                     // Start the audio sink -- if it fails, log but continue
-                    // so the spectrum display still works.
-                    if let Err(e) = state.audio_sink.start() {
-                        tracing::warn!("audio sink failed to start (spectrum still works): {e}");
-                        let _ = dsp_tx.send(DspToUi::Error(format!("Audio output failed: {e}")));
+                    // so the spectrum display still works. Discriminate the
+                    // error path by sink type so the network status row in
+                    // the UI sees a real `NetworkSinkStatus::Error` event
+                    // instead of a generic toast.
+                    let start_result = state.audio_sink.start();
+                    // Re-arm or latch the write path based on
+                    // the start outcome. See the
+                    // `audio_sink_offline` docstring for the
+                    // full one-shot rationale — failed starts
+                    // must latch, otherwise the next DSP block
+                    // would re-fire the same terminal error
+                    // when `write_samples` hits the stopped
+                    // sink. Per CodeRabbit round 6 on PR #351.
+                    state.audio_sink_offline = start_result.is_err();
+                    let is_network = matches!(state.audio_sink_type, AudioSinkType::Network);
+                    if let Err(e) = start_result {
+                        tracing::warn!(
+                            sink_type = ?state.audio_sink_type,
+                            "audio sink failed to start (spectrum still works): {e}"
+                        );
+                        if is_network {
+                            let _ =
+                                dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
+                                    message: format!("{e}"),
+                                }));
+                        } else {
+                            let _ =
+                                dsp_tx.send(DspToUi::Error(format!("Audio output failed: {e}")));
+                        }
+                    } else if is_network {
+                        // Successful start of a network sink — this is the
+                        // moment the panel's status row should flip to
+                        // "Streaming to ...". Driving status from real
+                        // start/stop transitions (rather than the
+                        // sink-type swap) keeps the UI honest about what's
+                        // actually on the wire. Per CodeRabbit round 1 on
+                        // PR #351.
+                        let _ =
+                            dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Active {
+                                endpoint: format!(
+                                    "{}:{}",
+                                    state.network_sink_host, state.network_sink_port
+                                ),
+                                protocol: state.network_sink_protocol,
+                            }));
                     }
                     state.running = true;
                     tracing::info!("DSP pipeline started");
@@ -450,7 +533,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // is tearing down and any registered FFI consumer is about to
             // see a `Disconnected` on their next pull regardless.
             state.audio_tap_tx = None;
-            cleanup(state);
+            // `cleanup` now emits `NetworkSinkStatus::Inactive` itself
+            // when the active sink was Network — same path used by the
+            // file-EOF, fatal-source-error, and source-type restart
+            // sites so every real stop transition reports Inactive.
+            cleanup(state, dsp_tx);
             state.running = false;
             let _ = dsp_tx.send(DspToUi::SourceStopped);
         }
@@ -847,9 +934,169 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetAudioDevice(node_name) => {
             tracing::info!(target_node = %node_name, "set audio device");
+            // Persist the UID so a future Network → Local
+            // sink-type swap can re-apply the user's pick
+            // instead of falling back to the system default.
+            // Per issue #247.
+            state.audio_device_uid.clone_from(&node_name);
             if let Err(e) = state.audio_sink.set_target(&node_name) {
                 tracing::warn!("audio device switch failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Audio device switch failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetAudioSinkType(new_type) => {
+            tracing::info!(?new_type, "set audio sink type");
+            if state.audio_sink_type == new_type {
+                return;
+            }
+            // Snapshot the previous type so the post-swap
+            // status logic can emit the correct "transitioning
+            // away from network" event even when the
+            // replacement local sink fails to start. Per
+            // CodeRabbit round 2 on PR #351.
+            let prev_type = state.audio_sink_type;
+            // Stop the current sink so it releases its underlying
+            // resource (audio device handle / socket) before we
+            // construct the replacement.
+            if let Err(e) = state.audio_sink.stop() {
+                tracing::warn!("audio sink stop during type swap failed: {e}");
+            }
+            // Build the new sink.
+            state.audio_sink = match new_type {
+                AudioSinkType::Local => AudioSinkSlot::local_default(),
+                AudioSinkType::Network => AudioSinkSlot::network(
+                    &state.network_sink_host,
+                    state.network_sink_port,
+                    state.network_sink_protocol,
+                ),
+            };
+            state.audio_sink_type = new_type;
+            // Re-apply the persisted local-device pick so the
+            // post-swap Local sink routes to the user's last
+            // choice instead of the system default. No-op for
+            // Network.
+            if matches!(new_type, AudioSinkType::Local)
+                && let Err(e) = state.audio_sink.set_target(&state.audio_device_uid)
+            {
+                tracing::warn!("post-swap set_target failed: {e}");
+            }
+            // Bring the new sink online if the engine is already
+            // running. Otherwise it'll start on the next Start
+            // command — and we emit `Inactive` rather than
+            // `Active` because the sink isn't really on the wire
+            // yet. Per CodeRabbit round 1 on PR #351, status
+            // events must reflect REAL lifecycle, not just the
+            // user's selected type.
+            if state.running {
+                match state.audio_sink.start() {
+                    Ok(()) => {
+                        // Successful start clears the offline
+                        // latch so the audio write path resumes.
+                        state.audio_sink_offline = false;
+                        if matches!(new_type, AudioSinkType::Network) {
+                            let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                NetworkSinkStatus::Active {
+                                    endpoint: format!(
+                                        "{}:{}",
+                                        state.network_sink_host, state.network_sink_port
+                                    ),
+                                    protocol: state.network_sink_protocol,
+                                },
+                            ));
+                        } else {
+                            // Switched away from network → that
+                            // sink is no longer streaming. Emit
+                            // Inactive so the panel's status row
+                            // clears.
+                            let _ = dsp_tx
+                                .send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
+                        }
+                    }
+                    Err(e) => {
+                        // Latch so the next DSP block doesn't re-fire
+                        // the same terminal error against a stopped
+                        // sink. Per CodeRabbit round 6 on PR #351.
+                        state.audio_sink_offline = true;
+                        tracing::warn!("audio sink start after type swap failed: {e}");
+                        if matches!(new_type, AudioSinkType::Network) {
+                            let _ =
+                                dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
+                                    message: format!("{e}"),
+                                }));
+                        } else {
+                            let _ = dsp_tx
+                                .send(DspToUi::Error(format!("Audio sink failed to start: {e}")));
+                            // Even on failure, the network sink
+                            // is gone — emit Inactive so the
+                            // panel's status row clears its
+                            // "Active" state. Per CodeRabbit
+                            // round 2 on PR #351.
+                            if matches!(prev_type, AudioSinkType::Network) {
+                                let _ = dsp_tx
+                                    .send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Engine not running — nothing is on the wire.
+                // Always emit Inactive so the panel doesn't
+                // misreport a not-yet-bound sink as Active. The
+                // matching Active will fire from the Start
+                // handler if/when the user starts the engine.
+                let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
+            }
+        }
+
+        UiToDsp::SetNetworkSinkConfig {
+            hostname,
+            port,
+            protocol,
+        } => {
+            tracing::info!(%hostname, port, ?protocol, "set network sink config");
+            // Persist on state so a future SetAudioSinkType swap
+            // picks the new values up.
+            state.network_sink_host.clone_from(&hostname);
+            state.network_sink_port = port;
+            state.network_sink_protocol = protocol;
+            // If the network sink is currently selected, rebuild
+            // it inline so the new endpoint takes effect now.
+            // Status events fire only on the real start
+            // outcome (Active on success, Error on failure,
+            // Inactive when the engine isn't running yet) — per
+            // CodeRabbit round 1 on PR #351.
+            if matches!(state.audio_sink_type, AudioSinkType::Network) {
+                if let Err(e) = state.audio_sink.stop() {
+                    tracing::warn!("network sink stop during reconfig failed: {e}");
+                }
+                state.audio_sink = AudioSinkSlot::network(&hostname, port, protocol);
+                if state.running {
+                    match state.audio_sink.start() {
+                        Ok(()) => {
+                            state.audio_sink_offline = false;
+                            let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                NetworkSinkStatus::Active {
+                                    endpoint: format!("{hostname}:{port}"),
+                                    protocol,
+                                },
+                            ));
+                        }
+                        Err(e) => {
+                            // Latch — per CodeRabbit round 6 on PR #351.
+                            state.audio_sink_offline = true;
+                            tracing::warn!("network sink restart after reconfig failed: {e}");
+                            let _ =
+                                dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
+                                    message: format!("{e}"),
+                                }));
+                        }
+                    }
+                } else {
+                    // Engine not running — sink rebuilt but not
+                    // bound. Status stays Inactive.
+                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
+                }
             }
         }
 
@@ -857,7 +1104,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::info!(?source_type, "switching source type");
             let was_running = state.running;
             if was_running {
-                cleanup(state);
+                cleanup(state, dsp_tx);
                 state.running = false;
             }
             state.source_type = source_type;
@@ -882,10 +1129,57 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if was_running {
                 match open_source(state) {
                     Ok(()) => {
-                        if let Err(e) = state.audio_sink.start() {
-                            tracing::warn!("audio sink restart failed: {e}");
-                            let _ =
-                                dsp_tx.send(DspToUi::Error(format!("Audio output failed: {e}")));
+                        // Clear the audio-sink offline latch on
+                        // a successful restart, same as the
+                        // other successful-start paths (engine
+                        // Start, SetAudioSinkType,
+                        // SetNetworkSinkConfig). Without this,
+                        // a prior-session terminal write
+                        // failure could leave the latch set
+                        // through a source-type swap and gate
+                        // writes off until the next explicit
+                        // Start command. Per `CodeRabbit`
+                        // round 3 on PR #351.
+                        // Mirror the network-specific lifecycle
+                        // events the other start paths emit
+                        // (engine Start, SetAudioSinkType,
+                        // SetNetworkSinkConfig). Without these,
+                        // a source-type swap could leave the
+                        // GTK network status row stuck on a
+                        // stale Active or Error from before the
+                        // swap. Per `CodeRabbit` round 5 on
+                        // PR #351.
+                        let is_network = matches!(state.audio_sink_type, AudioSinkType::Network);
+                        match state.audio_sink.start() {
+                            Ok(()) => {
+                                state.audio_sink_offline = false;
+                                if is_network {
+                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                        NetworkSinkStatus::Active {
+                                            endpoint: format!(
+                                                "{}:{}",
+                                                state.network_sink_host, state.network_sink_port
+                                            ),
+                                            protocol: state.network_sink_protocol,
+                                        },
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                // Latch — per CodeRabbit round 6 on PR #351.
+                                state.audio_sink_offline = true;
+                                tracing::warn!("audio sink restart failed: {e}");
+                                if is_network {
+                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                        NetworkSinkStatus::Error {
+                                            message: format!("{e}"),
+                                        },
+                                    ));
+                                } else {
+                                    let _ = dsp_tx
+                                        .send(DspToUi::Error(format!("Audio output failed: {e}")));
+                                }
+                            }
                         }
                         state.running = true;
                         // Refresh UI with new source capabilities
@@ -1139,14 +1433,27 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
 }
 
 /// Stop the source and release resources.
-fn cleanup(state: &mut DspState) {
+fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     if let Some(source) = &mut state.source {
         let _ = source.stop();
     }
 
+    // Snapshot whether the network sink was active BEFORE we
+    // stop it so the post-stop status emit reports the right
+    // discriminant. Centralized here (rather than at each
+    // caller) so file-EOF, fatal-source-error, and source-type
+    // restart paths all emit the matching `Inactive` event
+    // alongside the explicit `UiToDsp::Stop` path. Per
+    // `CodeRabbit` round 6 on PR #351.
+    let was_network_sink = matches!(state.audio_sink_type, AudioSinkType::Network);
+
     // Stop the audio sink so it doesn't try to read stale data.
     if let Err(e) = state.audio_sink.stop() {
         tracing::debug!("audio sink stop: {e}");
+    }
+
+    if was_network_sink {
+        let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
     }
 
     // Finalize any active recordings (Drop patches the WAV header sizes).
@@ -1247,7 +1554,7 @@ fn process_iq_block(
             // File sources return Ok(0) at EOF — stop playback cleanly
             if state.source_type == SourceType::File {
                 tracing::info!("file source reached EOF");
-                cleanup(state);
+                cleanup(state, dsp_tx);
                 state.running = false;
                 let _ = dsp_tx.send(DspToUi::SourceStopped);
             }
@@ -1297,7 +1604,7 @@ fn process_iq_block(
                 sdr_types::SourceError::ReadFailed(_) | sdr_types::SourceError::NotRunning
             ) {
                 tracing::error!("fatal source error: {e}");
-                cleanup(state);
+                cleanup(state, dsp_tx);
                 state.running = false;
                 let _ = dsp_tx.send(DspToUi::Error(format!("Source error: {e}")));
                 let _ = dsp_tx.send(DspToUi::SourceStopped);
@@ -1563,17 +1870,48 @@ fn process_iq_block(
                                 .audio_frames_written
                                 .saturating_add(audio_count as u64);
                         }
-                        if let Err(e) = state
-                            .audio_sink
-                            .write_samples(&state.audio_buf[..audio_count])
+                        // Skip the write if the sink has already
+                        // gone offline this session. Without this
+                        // gate, every audio block would re-trip
+                        // the terminal-error branch below (the
+                        // sink stays in place after stop(), so
+                        // `write_samples` keeps returning
+                        // NotRunning) and re-emit the same
+                        // status/error event at DSP cadence —
+                        // ~50 events/sec of log noise + UI churn.
+                        // Per `CodeRabbit` round 2 on PR #351.
+                        // Cleared on the next successful start.
+                        if !state.audio_sink_offline
+                            && let Err(e) = state
+                                .audio_sink
+                                .write_samples(&state.audio_buf[..audio_count])
                         {
                             // Terminal failures: surface to UI once and stop the sink.
                             if matches!(e, SinkError::Disconnected | SinkError::NotRunning) {
-                                tracing::warn!("audio sink died: {e}");
-                                let _ = dsp_tx.send(DspToUi::Error(
-                                    "Audio output lost — restart playback".to_string(),
-                                ));
+                                tracing::warn!(
+                                    sink_type = ?state.audio_sink_type,
+                                    "audio sink died: {e}"
+                                );
+                                // Distinct event for the network sink so the
+                                // settings panel's status row can update
+                                // independently of the toast for local
+                                // device failures. Per issue #247.
+                                if matches!(state.audio_sink_type, AudioSinkType::Network) {
+                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                        NetworkSinkStatus::Error {
+                                            message: format!("{e}"),
+                                        },
+                                    ));
+                                } else {
+                                    let _ = dsp_tx.send(DspToUi::Error(
+                                        "Audio output lost — restart playback".to_string(),
+                                    ));
+                                }
                                 let _ = state.audio_sink.stop();
+                                // Latch — see the docstring on
+                                // `audio_sink_offline` for the
+                                // full one-shot rationale.
+                                state.audio_sink_offline = true;
                             } else {
                                 tracing::debug!("audio write: {e}");
                             }
