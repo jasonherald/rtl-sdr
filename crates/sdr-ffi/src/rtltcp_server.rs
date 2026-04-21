@@ -206,9 +206,17 @@ fn initial_from_c(cfg: &SdrRtlTcpServerConfig) -> Result<InitialDeviceState, Sdr
         set_last_error("sdr_rtltcp_server_start: initial_sample_rate_hz must be > 0");
         return Err(SdrCoreError::InvalidArg);
     }
-    if !(0..=2).contains(&cfg.initial_direct_sampling) {
+    // Reuse the bounds the `sdr_core_set_direct_sampling`
+    // command FFI exposes so both entry points validate
+    // identically. Per `CodeRabbit` round 8 on PR #360.
+    if !(crate::command::SDR_DIRECT_SAMPLING_MIN..=crate::command::SDR_DIRECT_SAMPLING_MAX)
+        .contains(&cfg.initial_direct_sampling)
+    {
         set_last_error(format!(
-            "sdr_rtltcp_server_start: initial_direct_sampling must be 0..=2, got {}",
+            "sdr_rtltcp_server_start: initial_direct_sampling must be \
+             {}..={}, got {}",
+            crate::command::SDR_DIRECT_SAMPLING_MIN,
+            crate::command::SDR_DIRECT_SAMPLING_MAX,
             cfg.initial_direct_sampling
         ));
         return Err(SdrCoreError::InvalidArg);
@@ -693,6 +701,11 @@ mod tests {
     /// that's unambiguously "manual."
     const TEST_NONZERO_GAIN_TENTHS: i32 = 256;
 
+    /// R820T discrete gain-step count, used by the stats
+    /// fixture when constructing a synthetic
+    /// `TunerAdvertiseInfo`.
+    const TEST_TUNER_GAIN_COUNT: u32 = 29;
+
     /// Sentinel that trips the direct-sampling validation.
     const TEST_INVALID_DIRECT_SAMPLING: i32 = 3;
 
@@ -801,6 +814,51 @@ mod tests {
     fn stop_handles_null_gracefully() {
         // No crash, no panic.
         unsafe { sdr_rtltcp_server_stop(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn stats_to_c_preserves_independent_gain_validity() {
+        // Four-state matrix for the two gain Options on
+        // `ServerStats`. Pins the "don't collapse into a
+        // single `has_current_gain` bit" behavior landed in
+        // round 7. Per `CodeRabbit` round 8 on PR #360.
+        let tuner = TunerAdvertiseInfo {
+            name: "R820T".into(),
+            gain_count: TEST_TUNER_GAIN_COUNT,
+        };
+
+        // (None, None) → neither set (Default leaves both at None).
+        let mut stats = ServerStats::default();
+        let c = stats_to_c(&stats, &tuner);
+        assert!(!c.has_current_gain_value);
+        assert!(!c.has_current_gain_mode);
+
+        // (Some(v), None) → value set, mode unknown
+        stats.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
+        stats.current_gain_auto = None;
+        let c = stats_to_c(&stats, &tuner);
+        assert!(c.has_current_gain_value);
+        assert!(!c.has_current_gain_mode);
+        assert_eq!(c.current_gain_tenths_db, TEST_NONZERO_GAIN_TENTHS);
+        assert!(!c.current_gain_auto);
+
+        // (None, Some(auto)) → mode set, value unknown
+        stats.current_gain_tenths_db = None;
+        stats.current_gain_auto = Some(true);
+        let c = stats_to_c(&stats, &tuner);
+        assert!(!c.has_current_gain_value);
+        assert!(c.has_current_gain_mode);
+        assert!(c.current_gain_auto);
+
+        // (Some(v), Some(manual)) → both set, explicit manual
+        stats.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
+        stats.current_gain_auto = Some(false);
+        let c = stats_to_c(&stats, &tuner);
+        assert!(c.has_current_gain_value);
+        assert!(c.has_current_gain_mode);
+        assert_eq!(c.current_gain_tenths_db, TEST_NONZERO_GAIN_TENTHS);
+        assert!(!c.current_gain_auto);
+        assert_eq!(c.gain_count, TEST_TUNER_GAIN_COUNT);
     }
 
     #[test]

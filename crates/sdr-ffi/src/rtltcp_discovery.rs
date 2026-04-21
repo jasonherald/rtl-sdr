@@ -314,6 +314,13 @@ unsafe impl Send for BrowserUserData {}
 /// `out_handle` must be non-null. `user_data` is opaque to the
 /// FFI — the caller owns its lifetime and must ensure it
 /// remains valid from `_start` through `_stop`.
+///
+/// **`user_data` is accessed from the discovery dispatcher
+/// thread,** not the host's main thread. Any shared state the
+/// callback reaches through `user_data` must be safe for
+/// concurrent access (e.g. `Send + Sync`, guarded by a lock,
+/// or an atomic) or externally synchronized by the host.
+/// Per `CodeRabbit` round 8 on PR #360.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_rtltcp_browser_start(
     callback: SdrRtlTcpDiscoveryCallback,
@@ -751,6 +758,39 @@ mod tests {
         let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
         let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, &raw mut handle) };
         assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+    }
+
+    #[test]
+    fn advertiser_start_invalid_utf8_hostname_rejected() {
+        // Pins `optional_cstr_to_string`'s "propagate UTF-8
+        // errors" behavior added in round 2. A non-UTF-8
+        // optional field must fail with `InvalidArg` rather
+        // than be silently dropped. Per `CodeRabbit` round 8
+        // on PR #360.
+        //
+        // Build a lone 0xFF byte + NUL via `from_vec_with_nul`
+        // so the CStr underlying pointer has length 1 of
+        // invalid UTF-8.
+        let bad = CString::from_vec_with_nul(vec![0xFF, 0]).unwrap();
+        let mut fixture = AdvertiseFixture::happy_path();
+        fixture.opts.hostname = bad.as_ptr();
+        let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
+        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, &raw mut handle) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn advertiser_start_invalid_utf8_nickname_rejected() {
+        // Same shape as the hostname case — the second optional
+        // field also propagates UTF-8 errors.
+        let bad = CString::from_vec_with_nul(vec![0xFE, 0]).unwrap();
+        let mut fixture = AdvertiseFixture::happy_path();
+        fixture.opts.nickname = bad.as_ptr();
+        let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
+        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, &raw mut handle) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        assert!(handle.is_null());
     }
 
     #[test]

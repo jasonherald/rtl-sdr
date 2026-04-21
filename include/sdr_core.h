@@ -617,10 +617,16 @@ int32_t sdr_core_set_rtl_agc(SdrCore* handle, bool enabled);
 /*
  * Set tuner gain by index into the advertised gains table.
  * Useful for rtl_tcp clients where the server publishes only
- * a gain count (no individual dB values). Engine bounds-checks
- * against the active source's `gains()` count; out-of-range
- * indices become a `SDR_EVT_ERROR` event rather than silently
- * being dropped on the wire.
+ * a gain count (no individual dB values).
+ *
+ * Bounds-checking happens only when a gain count is available:
+ * the engine prefers `source.gains().len()` (local RTL-SDR
+ * USB), falls back to the rtl_tcp `Connected{gain_count}`
+ * state, and in those cases surfaces out-of-range indices via
+ * `SDR_EVT_ERROR`. When neither count is available (e.g. the
+ * rtl_tcp client hasn't completed its handshake yet) the
+ * command is dispatched unchecked and the source / remote
+ * server decides how to handle it.
  */
 int32_t sdr_core_set_gain_by_index(SdrCore* handle, uint32_t index);
 
@@ -841,13 +847,13 @@ typedef enum SdrRtlTcpDiscoveryEventKind {
  * the caller may free them immediately.
  */
 typedef struct SdrRtlTcpAdvertiseOptions {
-    uint16_t     port;
+    uint16_t     port;           /* required, must be in 1..=65535 (0 rejected as InvalidArg) */
     const char*  instance_name;  /* required, non-empty, UTF-8 */
     const char*  hostname;       /* optional; NULL / "" = auto from system hostname */
     const char*  tuner;          /* TXT: tuner family (e.g. "R820T"); required */
     const char*  version;        /* TXT: advertiser version string; required */
     uint32_t     gains;          /* TXT: discrete gain-step count */
-    const char*  nickname;       /* TXT: user-editable nickname; "" = empty */
+    const char*  nickname;       /* TXT: user-editable nickname; optional (NULL / "" = no nickname) */
     bool         has_txbuf;      /* TXT: whether `txbuf` below is meaningful */
     uint64_t     txbuf;          /* TXT: optional buffer-depth hint (bytes) */
 } SdrRtlTcpAdvertiseOptions;
@@ -899,8 +905,10 @@ typedef void (*SdrRtlTcpDiscoveryCallback)(
 /*
  * Start publishing an mDNS advertisement for a locally-hosted
  * rtl_tcp server. Returns `SDR_CORE_OK` + handle on success.
- * `SDR_CORE_ERR_INVALID_ARG` on null pointers or empty
- * required fields; `SDR_CORE_ERR_IO` on mDNS daemon failure.
+ * `SDR_CORE_ERR_INVALID_ARG` on null pointers, `port == 0`,
+ * empty required fields (`instance_name` / `tuner` /
+ * `version`), or invalid UTF-8 in optional fields;
+ * `SDR_CORE_ERR_IO` on mDNS daemon failure.
  *
  * The caller must eventually call `sdr_rtltcp_advertiser_stop`
  * to unregister.
