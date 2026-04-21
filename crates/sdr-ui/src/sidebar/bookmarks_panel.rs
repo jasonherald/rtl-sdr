@@ -20,12 +20,11 @@
 //! Commits that land on this file:
 //! - Layout scaffolding (prior commit).
 //! - List + row actions relocated from `NavigationPanel` (prior commit).
-//! - Filter / search row (THIS commit).
-//! - Category grouping via `AdwExpanderRow` (later commit).
+//! - Filter / search row (prior commit).
+//! - Category grouping via `AdwExpanderRow` (THIS commit).
 
 use gtk4::prelude::*;
 use libadwaita as adw;
-use libadwaita::prelude::*;
 
 use super::navigation_panel::{
     ActiveBookmark, Bookmark, NavigationCallback, SaveCallback, load_bookmarks,
@@ -79,6 +78,13 @@ pub struct BookmarksPanel {
     /// active" button on the active list row. Captures current
     /// tuning state at call time.
     pub on_save: SaveCallback,
+    /// Current search needle (lowercased). Shared between the
+    /// search-entry `search-changed` handler and the list
+    /// rebuild path — the rebuild consults this on every call
+    /// and omits non-matching rows. Stored on the panel so
+    /// rebuilds triggered by external mutations (add, delete,
+    /// `RadioReference` import) respect the active filter.
+    pub filter_text: std::rc::Rc<std::cell::RefCell<String>>,
 }
 
 impl BookmarksPanel {
@@ -90,6 +96,25 @@ impl BookmarksPanel {
     /// Register a callback invoked when the user clicks save on the active bookmark.
     pub fn connect_save<F: Fn() + 'static>(&self, f: F) {
         *self.on_save.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Rebuild the flyout's bookmark list from the backing store,
+    /// honoring the current search filter. Preferred over calling
+    /// [`rebuild_bookmark_list`](super::navigation_panel::rebuild_bookmark_list)
+    /// directly — packs up all the shared `Rc` state owned by
+    /// this panel so callers only need to hand in the
+    /// `NavigationPanel`-owned `name_entry` reference.
+    pub fn rebuild(&self, name_entry: &adw::EntryRow) {
+        super::navigation_panel::rebuild_bookmark_list(
+            &self.bookmark_list,
+            &self.bookmark_scroll,
+            &self.bookmarks,
+            &self.on_navigate,
+            &self.active_bookmark,
+            name_entry,
+            &self.on_save,
+            &self.filter_text,
+        );
     }
 }
 
@@ -149,40 +174,36 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let active_bookmark = std::rc::Rc::new(std::cell::RefCell::new(ActiveBookmark::default()));
     let on_save: SaveCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
-
-    // Current search needle (lowercased). Shared between the
-    // filter function (which reads it per row) and the search
-    // entry (which writes it on every keystroke). Persists
-    // across list rebuilds — `set_filter_func` is sticky, and
-    // newly-appended rows inherit the active filter.
     let filter_text = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
 
-    let filter_text_for_filter = std::rc::Rc::clone(&filter_text);
-    bookmark_list.set_filter_func(move |row| {
-        let needle = filter_text_for_filter.borrow();
-        if needle.is_empty() {
-            return true;
-        }
-        let Some(action_row) = row.downcast_ref::<adw::ActionRow>() else {
-            // Non-ActionRow children shouldn't exist in this list,
-            // but don't hide anything unexpectedly.
-            return true;
-        };
-        let title = action_row.title().to_lowercase();
-        let subtitle = action_row
-            .subtitle()
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-        title.contains(needle.as_str()) || subtitle.contains(needle.as_str())
-    });
-
-    let filter_text_for_entry = std::rc::Rc::clone(&filter_text);
-    let list_weak = bookmark_list.downgrade();
+    // Search-changed → update needle + rebuild. We rebuild the
+    // list instead of using `ListBox::set_filter_func` because
+    // the categorized view uses nested `AdwExpanderRow` widgets:
+    // the outer `ListBox` filter function only sees expanders,
+    // not the child rows inside them, so it cannot drive child
+    // visibility. Rebuilding on keystroke is cheap (dozens of
+    // rows in practice) and keeps the filter + grouping logic
+    // in one place.
+    let filter_for_entry = std::rc::Rc::clone(&filter_text);
+    let list_for_entry = bookmark_list.clone();
+    let scroll_for_entry = bookmark_scroll.clone();
+    let bookmarks_for_entry = std::rc::Rc::clone(&bookmarks);
+    let on_navigate_for_entry = std::rc::Rc::clone(&on_navigate);
+    let active_for_entry = std::rc::Rc::clone(&active_bookmark);
+    let on_save_for_entry = std::rc::Rc::clone(&on_save);
+    let name_entry_for_entry = name_entry.clone();
     search_entry.connect_search_changed(move |entry| {
-        *filter_text_for_entry.borrow_mut() = entry.text().to_lowercase();
-        if let Some(lb) = list_weak.upgrade() {
-            lb.invalidate_filter();
-        }
+        *filter_for_entry.borrow_mut() = entry.text().to_lowercase();
+        rebuild_bookmark_list(
+            &list_for_entry,
+            &scroll_for_entry,
+            &bookmarks_for_entry,
+            &on_navigate_for_entry,
+            &active_for_entry,
+            &name_entry_for_entry,
+            &on_save_for_entry,
+            &filter_for_entry,
+        );
     });
 
     // Seed the list with the restored bookmarks.
@@ -194,6 +215,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         &active_bookmark,
         name_entry,
         &on_save,
+        &filter_text,
     );
 
     BookmarksPanel {
@@ -204,5 +226,6 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         active_bookmark,
         on_navigate,
         on_save,
+        filter_text,
     }
 }

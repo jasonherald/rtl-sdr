@@ -273,6 +273,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         let active_bm = panels.bookmarks.active_bookmark.clone();
         let name_entry = panels.navigation.name_entry.clone();
         let on_save = panels.bookmarks.on_save.clone();
+        let filter_text = panels.bookmarks.filter_text.clone();
 
         rr_button.connect_clicked(move |btn| {
             let bm_list = bm_list.clone();
@@ -282,6 +283,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
             let active_bm = active_bm.clone();
             let name_entry = name_entry.clone();
             let on_save = on_save.clone();
+            let filter_text = filter_text.clone();
 
             crate::radioreference::show_browse_dialog(btn, move || {
                 // Reload bookmarks from disk and rebuild the sidebar list.
@@ -294,6 +296,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                     &active_bm,
                     &name_entry,
                     &on_save,
+                    &filter_text,
                 );
             });
         });
@@ -4492,6 +4495,7 @@ fn connect_navigation_panel(
     let on_nav = bm.on_navigate.clone();
     let active_bm = bm.active_bookmark.clone();
     let on_save_bm = bm.on_save.clone();
+    let filter_text_add = bm.filter_text.clone();
     let name_entry = nav.name_entry.clone();
 
     nav.add_button.connect_clicked(move |_| {
@@ -4552,6 +4556,7 @@ fn connect_navigation_panel(
             &active_bm,
             &name_entry,
             &on_save_bm,
+            &filter_text_add,
         );
         name_entry.set_text("");
     });
@@ -4563,6 +4568,7 @@ fn connect_navigation_panel(
     let save_bm_scroll = bm.bookmark_scroll.clone();
     let save_on_nav = bm.on_navigate.clone();
     let save_on_save = bm.on_save.clone();
+    let save_filter_text = bm.filter_text.clone();
     let save_name_entry = nav.name_entry.clone();
     let save_state = Rc::clone(state);
     let save_radio_bw = panels.radio.bandwidth_row.clone();
@@ -4674,6 +4680,7 @@ fn connect_navigation_panel(
             &save_active,
             &save_name_entry,
             &save_on_save,
+            &save_filter_text,
         );
         tracing::info!("bookmark saved: {}", active.name);
     });
