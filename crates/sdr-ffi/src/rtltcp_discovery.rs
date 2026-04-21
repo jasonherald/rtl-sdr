@@ -56,8 +56,11 @@ pub struct SdrRtlTcpAdvertiseOptions {
     pub version: *const c_char,
     /// TXT: discrete gain-step count.
     pub gains: u32,
-    /// TXT: user-editable nickname. Required — caller can pass
-    /// `""` to skip, the Rust side treats empty as "no nickname."
+    /// TXT: user-editable nickname. Optional — null or an
+    /// empty C string means "no nickname." Host bindings that
+    /// marked this as required were enforcing a stricter ABI
+    /// than `sdr_rtltcp_advertiser_start` actually implements.
+    /// Per `CodeRabbit` round 7 on PR #360.
     pub nickname: *const c_char,
     /// TXT: whether `txbuf` below is meaningful.
     pub has_txbuf: bool,
@@ -367,6 +370,15 @@ pub unsafe extern "C" fn sdr_rtltcp_browser_start(
 /// dispatcher thread before returning, so the host may
 /// deterministically free `user_data` on the next line.
 /// Passing null is a no-op.
+///
+/// **Must NOT be called from inside the discovery callback.**
+/// The callback runs on the dispatcher thread, and `_stop`
+/// joins that thread — calling from the callback asks the
+/// thread to join itself, which will panic/abort through this
+/// `extern "C"` entrypoint. Hosts that want to stop in
+/// response to a discovered server should marshal the call
+/// out to another thread (GCD, Swift `Task`, a host-owned
+/// channel). Per `CodeRabbit` round 7 on PR #360.
 ///
 /// # Safety
 ///

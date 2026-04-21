@@ -101,16 +101,27 @@ pub struct SdrRtlTcpServerStats {
     /// initial).
     pub current_sample_rate_hz: u32,
     /// Most recent client-issued tuner-gain request in 0.1 dB.
-    /// Valid only when `has_current_gain == true`.
+    /// Valid only when `has_current_gain_value == true` — a
+    /// zero value here is ambiguous otherwise (could mean
+    /// "zero-dB manual gain" or "client never set gain").
     pub current_gain_tenths_db: i32,
     /// `true` when the client's last gain-mode request was
     /// auto; `false` when manual. Valid only when
-    /// `has_current_gain == true`.
+    /// `has_current_gain_mode == true`.
     pub current_gain_auto: bool,
-    /// `true` when the client has issued any gain command this
-    /// session. Lets hosts distinguish "not set yet" from
-    /// "zero-dB manual gain."
-    pub has_current_gain: bool,
+    /// `true` once the client has issued at least one
+    /// `SetTunerGain` command this session. The two gain
+    /// validity bits are tracked independently because a
+    /// client can send `SetGainMode(auto)` without a preceding
+    /// `SetTunerGain` (and vice versa). Per `CodeRabbit`
+    /// round 7 on PR #360.
+    pub has_current_gain_value: bool,
+    /// `true` once the client has issued at least one
+    /// `SetGainMode` command this session. Valid companion to
+    /// `current_gain_auto` — without this flag a `false`
+    /// value would be indistinguishable from "client hasn't
+    /// asked for a gain mode yet."
+    pub has_current_gain_mode: bool,
     /// Tuner's advertised discrete gain count (from
     /// `dongle_info_t`). Populated by `Server::start` during
     /// the dongle-open phase — non-zero for the entire server
@@ -571,8 +582,8 @@ fn stats_to_c(stats: &ServerStats, tuner: &TunerAdvertiseInfo) -> SdrRtlTcpServe
         current_sample_rate_hz: stats.current_sample_rate_hz.unwrap_or(0),
         current_gain_tenths_db: stats.current_gain_tenths_db.unwrap_or(0),
         current_gain_auto: stats.current_gain_auto.unwrap_or(false),
-        has_current_gain: stats.current_gain_tenths_db.is_some()
-            || stats.current_gain_auto.is_some(),
+        has_current_gain_value: stats.current_gain_tenths_db.is_some(),
+        has_current_gain_mode: stats.current_gain_auto.is_some(),
         gain_count: tuner.gain_count,
         #[allow(
             clippy::cast_possible_truncation,

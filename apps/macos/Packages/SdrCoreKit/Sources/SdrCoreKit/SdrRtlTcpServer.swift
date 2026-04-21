@@ -145,7 +145,19 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
         public var currentSampleRateHz: UInt32
         public var currentGainTenthsDb: Int32
         public var currentGainAuto: Bool
-        public var hasCurrentGain: Bool
+        /// `true` once the client has issued at least one
+        /// `SetTunerGain` command this session. Tracked
+        /// independently from the mode flag below so hosts can
+        /// distinguish "genuine 0 dB manual gain" from "client
+        /// hasn't asked yet." Per `CodeRabbit` round 7 on
+        /// PR #360.
+        public var hasCurrentGainValue: Bool
+        /// `true` once the client has issued at least one
+        /// `SetGainMode` command this session. Companion to
+        /// `currentGainAuto` — without this flag a `false`
+        /// reading would be indistinguishable from "no mode
+        /// requested yet."
+        public var hasCurrentGainMode: Bool
         public var tunerName: String
         public var gainCount: UInt32
         public var recentCommandsCount: UInt32
@@ -250,7 +262,8 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
                 currentSampleRateHz: cStats.current_sample_rate_hz,
                 currentGainTenthsDb: cStats.current_gain_tenths_db,
                 currentGainAuto: cStats.current_gain_auto,
-                hasCurrentGain: cStats.has_current_gain,
+                hasCurrentGainValue: cStats.has_current_gain_value,
+                hasCurrentGainMode: cStats.has_current_gain_mode,
                 tunerName: cStringToSwiftString(tunerBuf),
                 gainCount: cStats.gain_count,
                 recentCommandsCount: cStats.recent_commands_count

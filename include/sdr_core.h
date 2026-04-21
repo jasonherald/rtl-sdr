@@ -668,7 +668,7 @@ typedef struct SdrRtlTcpServerConfig {
     uint32_t device_index;               /* RTL-SDR USB index (0 = first) */
     uint32_t buffer_capacity;            /* 0 = crate default */
     uint32_t initial_freq_hz;            /* center frequency */
-    uint32_t initial_sample_rate_hz;     /* sample rate */
+    uint32_t initial_sample_rate_hz;     /* sample rate; MUST be > 0 — zero wedges the RTL-SDR USB controller */
     int32_t  initial_gain_tenths_db;     /* tuner gain in 0.1 dB, 0 = auto */
     int32_t  initial_ppm;                /* frequency correction (ppm) */
     bool     initial_bias_tee;
@@ -696,9 +696,21 @@ typedef struct SdrRtlTcpServerStats {
     /* Client-issued sample-rate override, same semantics as
      * current_freq_hz above. */
     uint32_t current_sample_rate_hz;
-    int32_t  current_gain_tenths_db;   /* valid only when has_current_gain */
-    bool     current_gain_auto;        /* valid only when has_current_gain */
-    bool     has_current_gain;
+    int32_t  current_gain_tenths_db;   /* valid only when has_current_gain_value */
+    bool     current_gain_auto;        /* valid only when has_current_gain_mode */
+    /* `true` once the client sent at least one SetTunerGain
+     * command this session. Tracked separately from the mode
+     * flag below because a client can set one without the
+     * other — without the separate validity bits, a genuine
+     * 0 dB manual gain would be indistinguishable from
+     * "client hasn't set gain yet." */
+    bool     has_current_gain_value;
+    /* `true` once the client sent at least one SetGainMode
+     * command this session. Valid companion to
+     * current_gain_auto — without this flag a `false` value
+     * would be indistinguishable from "client hasn't asked
+     * for a gain mode yet." */
+    bool     has_current_gain_mode;
     /* Tuner's advertised discrete gain count (from
      * dongle_info_t). Populated by Server::start during the
      * dongle-open phase — non-zero for the entire server
@@ -712,8 +724,9 @@ typedef struct SdrRtlTcpServerStats {
  * `*out_handle` and returns `SDR_CORE_OK`. On failure returns
  * one of:
  *   SDR_CORE_ERR_INVALID_ARG — null cfg / out_handle, unknown
- *                              bind_address, direct_sampling
- *                              outside 0..=2.
+ *                              bind_address,
+ *                              initial_sample_rate_hz == 0,
+ *                              direct_sampling outside 0..=2.
  *   SDR_CORE_ERR_IO          — bind / address error.
  *   SDR_CORE_ERR_DEVICE      — USB open / device error.
  *   SDR_CORE_ERR_INTERNAL    — caught panic.
