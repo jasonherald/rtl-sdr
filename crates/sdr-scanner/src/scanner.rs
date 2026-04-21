@@ -422,8 +422,11 @@ impl Scanner {
 
     fn handle_lockout(&mut self, key: ChannelKey) -> Vec<ScannerCommand> {
         self.locked_out.insert(key);
-        // TODO (Task 1.7): if active channel got locked out,
-        // advance rotation.
+        // Locked-out channels are filtered at `pick_next_channel`
+        // time, so the currently-active channel (if locked) will
+        // be skipped on the next rotation advance (dwell timeout,
+        // hang timeout, or squelch close → hang → advance). No
+        // explicit eviction needed here for Phase 1.
         Vec::new()
     }
 
@@ -623,5 +626,137 @@ mod tests {
             c,
             ScannerCommand::Retune { freq_hz: 162_550_000, .. }
         )));
+    }
+
+    #[test]
+    fn priority_sweep_triggers_after_interval_hops() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+            ch("P", 121_500_000, 1), // priority
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+
+        // Burn through 5+ normal hops. Each hop = Retuning→Dwelling→advance.
+        // Need to settle (tick past 30ms), then timeout dwell (tick past 100ms).
+        let mut retune_freqs: Vec<u64> = Vec::new();
+        for _ in 0..6 {
+            s.handle_event(tick(1500)); // settle
+            let cmds = s.handle_event(tick(5000)); // dwell timeout → next retune
+            for c in &cmds {
+                if let ScannerCommand::Retune { freq_hz, .. } = c {
+                    retune_freqs.push(*freq_hz);
+                }
+            }
+        }
+        // After 5 normal hops, the priority channel should have appeared.
+        assert!(
+            retune_freqs.contains(&121_500_000),
+            "priority channel should have appeared after 5 normal hops, got {retune_freqs:?}"
+        );
+    }
+
+    #[test]
+    fn lockout_skips_channel() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::LockoutChannel(ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        }));
+        let commands = s.handle_event(ScannerEvent::SetEnabled(true));
+        // First retune should skip A and go to B.
+        let first_retune = commands.iter().find_map(|c| match c {
+            ScannerCommand::Retune { freq_hz, .. } => Some(*freq_hz),
+            _ => None,
+        });
+        assert_eq!(first_retune, Some(162_550_000));
+    }
+
+    #[test]
+    fn all_channels_locked_emits_empty_rotation() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
+        s.handle_event(ScannerEvent::LockoutChannel(ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        }));
+        let commands = s.handle_event(ScannerEvent::SetEnabled(true));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScannerCommand::EmptyRotation)));
+        assert_eq!(s.state(), ScannerState::Idle);
+    }
+
+    #[test]
+    fn channel_override_respected_for_dwell() {
+        let mut s = Scanner::new();
+        let mut longer = ch("L", 146_520_000, 0);
+        longer.dwell_ms = 500;
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            longer,
+            ch("N", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        // Settle.
+        s.handle_event(tick(1500));
+        // Default dwell would be 100ms = 4800 samples. Channel
+        // overrides to 500ms = 24000 samples. Tick 5000 — should
+        // still be Dwelling (not advanced) because override kicks in.
+        s.handle_event(tick(5000));
+        assert_eq!(s.state(), ScannerState::Dwelling);
+        // Tick past 500ms → advance.
+        s.handle_event(tick(25_000));
+        assert_eq!(s.state(), ScannerState::Retuning);
+    }
+
+    #[test]
+    fn channels_changed_mid_scan_recovers() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(1500));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        assert_eq!(s.state(), ScannerState::Listening);
+        // User deletes channel B and adds C.
+        let commands = s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("C", 28_400_000, 0),
+        ]));
+        // Scanner recovers by restarting rotation at cursor 0.
+        assert_eq!(s.state(), ScannerState::Retuning);
+        // First retune after list change goes to A.
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, ScannerCommand::Retune { freq_hz: 146_520_000, .. })));
+    }
+
+    #[test]
+    fn lockout_cleared_when_channel_removed() {
+        let mut s = Scanner::new();
+        let key_a = ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        };
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::LockoutChannel(key_a.clone()));
+        // Remove A.
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch(
+            "B",
+            162_550_000,
+            0,
+        )]));
+        // Internal set should have pruned.
+        assert!(!s.locked_out.contains(&key_a));
     }
 }
