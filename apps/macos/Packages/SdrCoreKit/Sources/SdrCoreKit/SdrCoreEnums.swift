@@ -69,6 +69,53 @@ public enum Deemphasis: Int32, Sendable, CaseIterable, Codable {
     }
 }
 
+/// Active IQ source. Matches `SdrSourceType` in the C header.
+/// `.rtlSdr` drives a locally-connected dongle over USB,
+/// `.network` streams IQ from a remote server via TCP or UDP,
+/// `.file` replays a WAV file on disk, `.rtlTcp` is a
+/// protocol-level rtl_tcp client (separate pipeline from
+/// `.network`, see issue #304). Per issues #235, #236.
+public enum SourceType: Int32, Sendable, CaseIterable, Codable {
+    case rtlSdr  = 0
+    case network = 1
+    case file    = 2
+    case rtlTcp  = 3
+
+    public var label: String {
+        switch self {
+        case .rtlSdr:  return "RTL-SDR (USB)"
+        case .network: return "Network IQ"
+        case .file:    return "File playback"
+        case .rtlTcp:  return "RTL-TCP"
+        }
+    }
+}
+
+/// Transport for the network IQ source. Matches
+/// `SdrSourceProtocol` in the C header.
+///
+/// Note: this is **not** the same enum as the audio-sink
+/// `NetworkProtocol`. Both map to the same underlying Rust
+/// `Protocol` variant, but the wire direction is opposite:
+/// on the sink side `Protocol::TcpClient` means "device
+/// listens as TCP server for audio clients" (hence the sink
+/// label `.tcpServer`), while on the source side the same
+/// variant means "device connects outbound as TCP client to
+/// a remote IQ server". The C ABI uses the neutral names
+/// `SDR_SOURCE_PROTOCOL_TCP` / `_UDP` on this side to avoid
+/// importing the sink-side confusion. Per issue #235.
+public enum NetworkSourceProtocol: Int32, Sendable, CaseIterable, Codable {
+    case tcp = 0
+    case udp = 1
+
+    public var label: String {
+        switch self {
+        case .tcp: return "TCP"
+        case .udp: return "UDP"
+        }
+    }
+}
+
 /// Active audio sink selection. Matches `SdrAudioSinkType` in the
 /// C header. `.local` routes to a `CoreAudio` output device; `.network`
 /// streams post-demod audio to the configured host:port over

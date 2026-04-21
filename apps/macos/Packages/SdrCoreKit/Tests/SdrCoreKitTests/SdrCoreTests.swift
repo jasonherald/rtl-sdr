@@ -17,14 +17,15 @@ final class SdrCoreTests: XCTestCase {
 
     func testAbiVersionMatchesCurrent() {
         // Lock in that the Swift wrapper parses the packed
-        // version from the C side consistently. Current: 0.9
+        // version from the C side consistently. Current: 0.10
         // (0.2 device enumeration; 0.3 auto-squelch;
         // 0.4 audio routing + recording; 0.5 IQ recording;
         // 0.6 RadioReference; 0.7 advanced demod; 0.8 audio tap;
-        // 0.9 network audio sink — issue #247.)
+        // 0.9 network audio sink; 0.10 source selection + network
+        // / file config — issues #235, #236.)
         let v = SdrCore.abiVersion
         XCTAssertEqual(v.major, 0)
-        XCTAssertEqual(v.minor, 9)
+        XCTAssertEqual(v.minor, 10)
     }
 
     func testInitLoggingIsIdempotent() {
@@ -177,6 +178,49 @@ final class SdrCoreTests: XCTestCase {
     // ==========================================================
     //  Error message round-trip
     // ==========================================================
+
+    // ==========================================================
+    //  Source selection (ABI 0.10, issues #235, #236)
+    // ==========================================================
+
+    func testSetSourceTypeRoundTripsAllVariants() throws {
+        let core = try SdrCore(configPath: nil)
+        for t in SourceType.allCases {
+            try core.setSourceType(t)
+        }
+    }
+
+    func testSetNetworkConfigAcceptsValidInput() throws {
+        let core = try SdrCore(configPath: nil)
+        try core.setNetworkConfig(hostname: "127.0.0.1", port: 1234, protocol: .tcp)
+        try core.setNetworkConfig(hostname: "iq.example.com", port: 9000, protocol: .udp)
+    }
+
+    func testSetNetworkConfigRejectsEmptyHostAndZeroPort() throws {
+        let core = try SdrCore(configPath: nil)
+        XCTAssertThrowsError(
+            try core.setNetworkConfig(hostname: "", port: 1234, protocol: .tcp)
+        ) { error in
+            XCTAssertEqual((error as? SdrCoreError)?.code, .invalidArg)
+        }
+        XCTAssertThrowsError(
+            try core.setNetworkConfig(hostname: "127.0.0.1", port: 0, protocol: .tcp)
+        ) { error in
+            XCTAssertEqual((error as? SdrCoreError)?.code, .invalidArg)
+        }
+    }
+
+    func testSetFilePathAcceptsValidPath() throws {
+        let core = try SdrCore(configPath: nil)
+        try core.setFilePath("/tmp/some-iq.wav")
+    }
+
+    func testSetFilePathRejectsEmpty() throws {
+        let core = try SdrCore(configPath: nil)
+        XCTAssertThrowsError(try core.setFilePath("")) { error in
+            XCTAssertEqual((error as? SdrCoreError)?.code, .invalidArg)
+        }
+    }
 
     // ==========================================================
     //  Network audio sink (ABI 0.9, issue #247)

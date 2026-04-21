@@ -341,6 +341,44 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(uid.withCString { sdr_core_set_audio_device(handle, $0) })
     }
 
+    /// Switch the active IQ source between the local RTL-SDR
+    /// dongle, a network IQ stream, a WAV file, or an rtl_tcp
+    /// client. The engine stops the current source, rebuilds
+    /// from the persisted per-type config (network host/port,
+    /// file path, etc.), and restarts if the engine is running.
+    /// Per issues #235, #236.
+    public func setSourceType(_ type: SourceType) throws {
+        try checkRc(sdr_core_set_source_type(handle, type.rawValue))
+    }
+
+    /// Configure the network IQ source endpoint. `hostname`
+    /// must be non-empty; `port` is the TCP / UDP port;
+    /// `protocol` picks the transport. The engine stores the
+    /// values; they take effect on the next switch into
+    /// `.network` (or when the engine restarts while `.network`
+    /// is already active).
+    public func setNetworkConfig(
+        hostname: String,
+        port: UInt16,
+        protocol proto: NetworkSourceProtocol
+    ) throws {
+        try checkRc(hostname.withCString { cHost in
+            sdr_core_set_network_config(handle, cHost, port, proto.rawValue)
+        })
+    }
+
+    /// Set the filesystem path the file-playback source reads
+    /// from the next time `.file` is activated (or the source
+    /// is restarted while `.file` is already active). The
+    /// engine does not open the file here — only stores the
+    /// path. Open errors surface as `.error(...)` /
+    /// `.sourceStopped` events once the source actually starts.
+    public func setFilePath(_ path: String) throws {
+        try checkRc(path.withCString { cPath in
+            sdr_core_set_file_path(handle, cPath)
+        })
+    }
+
     /// Switch the active audio sink between the local output
     /// device and the network stream. The engine stops the
     /// current sink, builds the replacement from the persisted
