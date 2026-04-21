@@ -42,6 +42,7 @@ private let kAudioRecordingStopped = Int32(SDR_EVT_AUDIO_RECORDING_STOPPED.rawVa
 private let kIqRecordingStarted    = Int32(SDR_EVT_IQ_RECORDING_STARTED.rawValue)
 private let kIqRecordingStopped    = Int32(SDR_EVT_IQ_RECORDING_STOPPED.rawValue)
 private let kNetworkSinkStatus     = Int32(SDR_EVT_NETWORK_SINK_STATUS.rawValue)
+private let kRtlTcpConnectionState = Int32(SDR_EVT_RTL_TCP_CONNECTION_STATE.rawValue)
 
 /// High-level event from the engine.
 ///
@@ -103,6 +104,12 @@ public enum SdrCoreEvent: Sendable, Equatable {
     /// engine stops (`.inactive`), or when a startup / write
     /// failure takes it offline (`.error`). Per issue #247.
     case networkSinkStatus(NetworkSinkStatus)
+
+    /// rtl_tcp client connection-state transition. Fires on
+    /// every state edge the engine's 500 ms poller detects
+    /// (connect / disconnect / retry countdown tick) so hosts
+    /// can drive a live status row. Per issue #325.
+    case rtlTcpConnectionState(RtlTcpConnectionState)
 
     /// Translate a C `SdrEvent` into a Swift value.
     ///
@@ -176,6 +183,42 @@ public enum SdrCoreEvent: Sendable, Equatable {
 
         case kIqRecordingStopped:
             return .iqRecordingStopped
+
+        case kRtlTcpConnectionState:
+            let payload = event.pointee.payload.rtl_tcp_connection_state
+            switch payload.kind {
+            case Int32(SDR_RTL_TCP_STATE_DISCONNECTED.rawValue):
+                return .rtlTcpConnectionState(.disconnected)
+            case Int32(SDR_RTL_TCP_STATE_CONNECTING.rawValue):
+                return .rtlTcpConnectionState(.connecting)
+            case Int32(SDR_RTL_TCP_STATE_CONNECTED.rawValue):
+                // `connected` always carries a non-empty tuner
+                // name from the Rust side. Drop the event if the
+                // string is missing — same policy as the network
+                // sink status `.active` arm (#247).
+                guard let cstr = payload.utf8 else { return nil }
+                let tuner = String(cString: cstr)
+                guard !tuner.isEmpty else { return nil }
+                return .rtlTcpConnectionState(.connected(
+                    tunerName: tuner, gainCount: payload.gain_count
+                ))
+            case Int32(SDR_RTL_TCP_STATE_RETRYING.rawValue):
+                return .rtlTcpConnectionState(.retrying(
+                    attempt: payload.attempt, retryInSecs: payload.retry_in_secs
+                ))
+            case Int32(SDR_RTL_TCP_STATE_FAILED.rawValue):
+                let message: String
+                if let cstr = payload.utf8 {
+                    message = String(cString: cstr)
+                } else {
+                    message = ""
+                }
+                return .rtlTcpConnectionState(.failed(reason: message))
+            default:
+                // Unknown sub-kind — future ABI extension. Drop
+                // silently, matches the outer `default` policy.
+                return nil
+            }
 
         case kNetworkSinkStatus:
             let status = payload.network_sink_status

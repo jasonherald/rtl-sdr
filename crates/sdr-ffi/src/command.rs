@@ -527,6 +527,69 @@ pub unsafe extern "C" fn sdr_core_set_audio_device(
 }
 
 // ============================================================
+//  rtl_tcp-specific client commands (#325, ABI 0.11)
+//
+//  Cover the wire-protocol knobs that aren't on the generic
+//  `Source` surface (tune / set_gain / set_sample_rate /
+//  set_ppm are already handled by the existing commands).
+//  Non-rtl_tcp active sources silently accept these — the
+//  `Source` trait's default no-op impl keeps the ABI callable
+//  at all times, so UI toggles don't need to gate on the
+//  current source type.
+// ============================================================
+
+/// Enable or disable the dongle's bias tee (powers an inline
+/// LNA over the coax).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_bias_tee(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetBiasTee(enabled))) }
+}
+
+/// Set RTL2832 direct-sampling mode. `mode` must be one of
+/// `0` (off), `1` (I branch), or `2` (Q branch). Returns
+/// `SDR_CORE_ERR_INVALID_ARG` for values outside that range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_direct_sampling(handle: *mut SdrCore, mode: i32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            if !(0..=2).contains(&mode) {
+                set_last_error(format!(
+                    "sdr_core_set_direct_sampling: mode must be 0..=2, got {mode}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            }
+            send(core, UiToDsp::SetDirectSampling(mode))
+        })
+    }
+}
+
+/// Enable or disable tuner offset-tuning (shifts the LO away
+/// from the tuned frequency to avoid DC spur).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_offset_tuning(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetOffsetTuning(enabled))) }
+}
+
+/// Enable or disable RTL2832 digital AGC. Distinct from the
+/// tuner (analog) AGC loop that `sdr_core_set_agc` controls —
+/// RTL-SDR dongles expose both independently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_rtl_agc(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetRtlAgc(enabled))) }
+}
+
+/// Set tuner gain by index into the advertised gains table.
+/// Useful for rtl_tcp clients where the server publishes a
+/// gain count but not the individual dB values. Engine
+/// bounds-checks against the active source's `gains()` count;
+/// out-of-range indices become a `DspToUi::Error` event rather
+/// than silently being dropped on the wire.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_gain_by_index(handle: *mut SdrCore, index: u32) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetGainByIndex(index))) }
+}
+
+// ============================================================
 //  Source selection (#235, #236) — switch the active IQ
 //  source and configure the per-source connection details.
 //
@@ -1529,6 +1592,89 @@ mod tests {
                 "notch_frequency must reject {bad}"
             );
         }
+        destroy(h);
+    }
+
+    // ------------------------------------------------------
+    //  rtl_tcp-specific client commands (#325, ABI 0.11)
+    // ------------------------------------------------------
+
+    #[test]
+    fn set_bias_tee_round_trips() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_bias_tee(h, true) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_bias_tee(h, false) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_direct_sampling_accepts_valid_modes() {
+        let h = make_handle();
+        for mode in 0..=2 {
+            assert_eq!(
+                unsafe { sdr_core_set_direct_sampling(h, mode) },
+                SdrCoreError::Ok.as_int(),
+                "direct-sampling mode {mode} should be accepted"
+            );
+        }
+        destroy(h);
+    }
+
+    #[test]
+    fn set_direct_sampling_rejects_out_of_range() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_direct_sampling(h, 3) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_direct_sampling(h, -1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_offset_tuning_round_trips() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_offset_tuning(h, true) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_rtl_agc_round_trips() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_rtl_agc(h, true) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_gain_by_index_accepts_nonnegative_indices() {
+        // Engine bounds-checks against the source's `gains()`
+        // length; a bad index becomes a `DspToUi::Error` event.
+        // The FFI itself accepts any u32 — we're testing the
+        // dispatch path here.
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_gain_by_index(h, 0) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_gain_by_index(h, 28) },
+            SdrCoreError::Ok.as_int()
+        );
         destroy(h);
     }
 

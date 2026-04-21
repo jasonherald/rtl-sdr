@@ -17,15 +17,16 @@ final class SdrCoreTests: XCTestCase {
 
     func testAbiVersionMatchesCurrent() {
         // Lock in that the Swift wrapper parses the packed
-        // version from the C side consistently. Current: 0.10
+        // version from the C side consistently. Current: 0.11
         // (0.2 device enumeration; 0.3 auto-squelch;
         // 0.4 audio routing + recording; 0.5 IQ recording;
         // 0.6 RadioReference; 0.7 advanced demod; 0.8 audio tap;
-        // 0.9 network audio sink; 0.10 source selection + network
-        // / file config — issues #235, #236.)
+        // 0.9 network audio sink; 0.10 source selection +
+        // network / file config; 0.11 rtl_tcp client commands +
+        // connection-state event — issue #325.)
         let v = SdrCore.abiVersion
         XCTAssertEqual(v.major, 0)
-        XCTAssertEqual(v.minor, 10)
+        XCTAssertEqual(v.minor, 11)
     }
 
     func testInitLoggingIsIdempotent() {
@@ -178,6 +179,38 @@ final class SdrCoreTests: XCTestCase {
     // ==========================================================
     //  Error message round-trip
     // ==========================================================
+
+    // ==========================================================
+    //  rtl_tcp-specific client commands (ABI 0.11, issue #325)
+    // ==========================================================
+
+    func testSetBiasTeeRoundTrips() throws {
+        let core = try SdrCore(configPath: nil)
+        try core.setBiasTee(true)
+        try core.setBiasTee(false)
+    }
+
+    func testSetDirectSamplingAcceptsAllModes() throws {
+        let core = try SdrCore(configPath: nil)
+        for mode in SdrCore.DirectSamplingMode.allCases {
+            try core.setDirectSampling(mode)
+        }
+    }
+
+    func testSetRtlAgcRoundTrips() throws {
+        let core = try SdrCore(configPath: nil)
+        try core.setRtlAgc(true)
+        try core.setRtlAgc(false)
+    }
+
+    func testSetGainByIndexRoundTrips() throws {
+        let core = try SdrCore(configPath: nil)
+        // Engine bounds-checks; without an active source the
+        // dispatch just becomes a no-op — what we're verifying
+        // here is that the FFI ok-paths don't throw.
+        try core.setGainByIndex(0)
+        try core.setGainByIndex(28)
+    }
 
     // ==========================================================
     //  Source selection (ABI 0.10, issues #235, #236)

@@ -379,6 +379,60 @@ public final class SdrCore: @unchecked Sendable {
         })
     }
 
+    // ==========================================================
+    //  rtl_tcp-specific client commands (ABI 0.11, issue #325)
+    //
+    //  Non-rtl_tcp active sources silently accept these — the
+    //  Rust `Source` trait's default no-op impl keeps the ABI
+    //  callable regardless of current source. Hosts don't need
+    //  to gate UI toggles on the active source type.
+    // ==========================================================
+
+    /// Enable or disable the dongle's bias tee.
+    public func setBiasTee(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_bias_tee(handle, enabled))
+    }
+
+    /// RTL2832 direct-sampling mode.
+    public enum DirectSamplingMode: Int32, Sendable, CaseIterable, Codable {
+        case off = 0
+        case iBranch = 1
+        case qBranch = 2
+
+        public var label: String {
+            switch self {
+            case .off: return "Off"
+            case .iBranch: return "I branch"
+            case .qBranch: return "Q branch"
+            }
+        }
+    }
+
+    /// Set direct-sampling mode.
+    public func setDirectSampling(_ mode: DirectSamplingMode) throws {
+        try checkRc(sdr_core_set_direct_sampling(handle, mode.rawValue))
+    }
+
+    /// Enable or disable tuner offset-tuning.
+    public func setOffsetTuning(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_offset_tuning(handle, enabled))
+    }
+
+    /// Enable or disable RTL2832 digital AGC. Distinct from the
+    /// analog tuner AGC that `setAgc(_:)` controls.
+    public func setRtlAgc(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_rtl_agc(handle, enabled))
+    }
+
+    /// Set tuner gain by index. Useful for rtl_tcp clients
+    /// where the server publishes a gain count but not the dB
+    /// values. Engine bounds-checks against the active source's
+    /// `gains()` count; out-of-range indices surface as
+    /// `.error(...)` events rather than silent drops.
+    public func setGainByIndex(_ index: UInt32) throws {
+        try checkRc(sdr_core_set_gain_by_index(handle, index))
+    }
+
     /// Switch the active audio sink between the local output
     /// device and the network stream. The engine stops the
     /// current sink, builds the replacement from the persisted

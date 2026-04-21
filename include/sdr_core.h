@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 10
+#define SDR_CORE_ABI_VERSION_MINOR 11
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -577,6 +577,53 @@ int32_t sdr_core_set_network_config(
  */
 int32_t sdr_core_set_file_path(SdrCore* handle, const char* path_utf8);
 
+/* --- rtl_tcp-specific client commands (issue #325, ABI 0.11) --- */
+/*
+ * Cover the wire-protocol knobs the rtl_tcp client exposes
+ * that aren't on the generic source surface (tune / set_gain
+ * / set_sample_rate / set_ppm_correction are already covered
+ * by existing commands and flow through to `RtlTcpSource`).
+ *
+ * Non-rtl_tcp active sources silently accept these — the
+ * `Source` trait's default no-op impl keeps the calls valid
+ * at all times, so UI toggles don't need to gate on the
+ * current source type.
+ */
+
+/* Enable or disable the tuner's bias tee (powers an inline LNA
+ * over the coax). Only meaningful on RTL-SDR hardware. */
+int32_t sdr_core_set_bias_tee(SdrCore* handle, bool enabled);
+
+/*
+ * Set RTL2832 direct-sampling mode. `mode` must be one of:
+ *   0 — off (normal tuner path)
+ *   1 — I branch
+ *   2 — Q branch
+ * Returns `SDR_CORE_ERR_INVALID_ARG` for values outside this
+ * range.
+ */
+int32_t sdr_core_set_direct_sampling(SdrCore* handle, int32_t mode);
+
+/* Enable or disable tuner offset-tuning. */
+int32_t sdr_core_set_offset_tuning(SdrCore* handle, bool enabled);
+
+/*
+ * Enable or disable RTL2832 digital AGC. Distinct from the
+ * tuner (analog) AGC loop that `sdr_core_set_agc` controls —
+ * RTL-SDR dongles expose both independently.
+ */
+int32_t sdr_core_set_rtl_agc(SdrCore* handle, bool enabled);
+
+/*
+ * Set tuner gain by index into the advertised gains table.
+ * Useful for rtl_tcp clients where the server publishes only
+ * a gain count (no individual dB values). Engine bounds-checks
+ * against the active source's `gains()` count; out-of-range
+ * indices become a `SDR_EVT_ERROR` event rather than silently
+ * being dropped on the wire.
+ */
+int32_t sdr_core_set_gain_by_index(SdrCore* handle, uint32_t index);
+
 /*
  * Start / stop recording the demodulated audio stream to a 16-bit
  * PCM WAV file. The engine opens the file on `start`, writes every
@@ -849,7 +896,19 @@ typedef enum SdrEventKind {
     SDR_EVT_IQ_RECORDING_STARTED    = 10,
     SDR_EVT_IQ_RECORDING_STOPPED    = 11,
     SDR_EVT_NETWORK_SINK_STATUS     = 12, /* ABI 0.9 — issue #247 */
+    SDR_EVT_RTL_TCP_CONNECTION_STATE = 13, /* ABI 0.11 — issue #325 */
 } SdrEventKind;
+
+/* Discriminants for the `kind` field of
+ * `SdrEventRtlTcpConnectionState` below. Stable — never reorder.
+ */
+typedef enum SdrRtlTcpConnectionStateKind {
+    SDR_RTL_TCP_STATE_DISCONNECTED = 0,
+    SDR_RTL_TCP_STATE_CONNECTING   = 1,
+    SDR_RTL_TCP_STATE_CONNECTED    = 2,
+    SDR_RTL_TCP_STATE_RETRYING     = 3,
+    SDR_RTL_TCP_STATE_FAILED       = 4,
+} SdrRtlTcpConnectionStateKind;
 
 /* Discriminants for the `kind` field of `SdrEventNetworkSinkStatus`
  * below. Stable — never reorder.
@@ -933,6 +992,29 @@ typedef struct SdrEventNetworkSinkStatus {
 } SdrEventNetworkSinkStatus;
 
 /*
+ * Payload for SDR_EVT_RTL_TCP_CONNECTION_STATE. Tagged by
+ * `kind` (one of `SDR_RTL_TCP_STATE_*`):
+ *
+ * | kind                              | utf8           | attempt | retry_in_secs | gain_count |
+ * |-----------------------------------|----------------|---------|---------------|------------|
+ * | SDR_RTL_TCP_STATE_DISCONNECTED    | NULL           | 0       | 0.0           | 0          |
+ * | SDR_RTL_TCP_STATE_CONNECTING      | NULL           | 0       | 0.0           | 0          |
+ * | SDR_RTL_TCP_STATE_CONNECTED       | tuner name     | 0       | 0.0           | gain steps |
+ * | SDR_RTL_TCP_STATE_RETRYING        | NULL           | attempt | seconds       | 0          |
+ * | SDR_RTL_TCP_STATE_FAILED          | reason         | 0       | 0.0           | 0          |
+ *
+ * `utf8` is borrowed from dispatcher-owned storage; valid only
+ * for the duration of the callback. Per issue #325.
+ */
+typedef struct SdrEventRtlTcpConnectionState {
+    int32_t     kind;
+    const char* utf8;
+    uint32_t    attempt;
+    double      retry_in_secs;
+    uint32_t    gain_count;
+} SdrEventRtlTcpConnectionState;
+
+/*
  * Tagged union of all event payloads. Which union field is valid
  * is determined by the `kind` discriminant on the enclosing
  * SdrEvent (see the table below).
@@ -951,6 +1033,7 @@ typedef struct SdrEventNetworkSinkStatus {
  * SDR_EVT_IQ_RECORDING_STARTED        iq_recording.path_utf8
  * SDR_EVT_IQ_RECORDING_STOPPED        none (all-zero payload)
  * SDR_EVT_NETWORK_SINK_STATUS         network_sink_status.{kind,utf8,protocol}
+ * SDR_EVT_RTL_TCP_CONNECTION_STATE    rtl_tcp_connection_state.{kind,utf8,attempt,retry_in_secs,gain_count}
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
@@ -961,7 +1044,8 @@ typedef union SdrEventPayload {
     SdrEventError             error;
     SdrEventAudioRecording    audio_recording;
     SdrEventIqRecording       iq_recording;
-    SdrEventNetworkSinkStatus network_sink_status;
+    SdrEventNetworkSinkStatus      network_sink_status;
+    SdrEventRtlTcpConnectionState  rtl_tcp_connection_state;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;
