@@ -560,6 +560,16 @@ final class CoreModel {
     /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
     /// — the engine is authoritative; the UI never flips this
     /// optimistically.
+    /// ID of the bookmark currently applied to the engine state.
+    /// Set by `apply(_:)` after all its setters run; cleared by
+    /// any user-facing setter a bookmark would also touch
+    /// (`setCenter`, `setDemodMode`, `setBandwidth`, …) via
+    /// `clearActiveBookmark()`, so tuning away from a recalled
+    /// bookmark — through ANY path (slider, picker, keyboard
+    /// shortcut, spectrum click) — invalidates the flyout's
+    /// highlight immediately. Per issue #339.
+    var activeBookmarkId: UUID? = nil
+
     var audioRecordingPath: String? = nil
 
     /// Active IQ-recording state. Same engine-authoritative flip
@@ -1098,6 +1108,16 @@ final class CoreModel {
     /// bookmark saved without a squelch setting won't unintentionally
     /// flip the user's current squelch state.
     func apply(_ bookmark: Bookmark) {
+        // Each setter below calls `clearActiveBookmark()` as
+        // its first line — that's the normal "user tuned away"
+        // path. For bookmark recall we re-set the id at the
+        // tail after all setters have run, so the flyout
+        // highlight lands on this bookmark even though the
+        // setters cleared it transiently.
+        //
+        // NOTE: if a new field is added to `Bookmark`, the
+        // matching setter here AND its `clearActiveBookmark()`
+        // call must both land to keep the highlight coherent.
         if let hz = bookmark.centerFrequencyHz { setCenter(hz) }
         if let m = bookmark.demodMode          { setDemodMode(m) }
         if let bw = bookmark.bandwidthHz       { setBandwidth(bw) }
@@ -1108,6 +1128,16 @@ final class CoreModel {
         if let agc = bookmark.agcEnabled       { setAgc(agc) }
         if let v = bookmark.volume             { setVolume(v) }
         if let d = bookmark.deemphasis         { setDeemphasis(d) }
+        activeBookmarkId = bookmark.id
+    }
+
+    /// Clear the active-bookmark highlight. Called at the top
+    /// of every setter a bookmark would also touch so tuning
+    /// away from a recalled bookmark via any path invalidates
+    /// the flyout indicator immediately. `apply(_:)` re-sets
+    /// the id at its tail.
+    private func clearActiveBookmark() {
+        activeBookmarkId = nil
     }
 
     func syncToEngine() {
@@ -1202,6 +1232,7 @@ final class CoreModel {
     static let maxCenterFrequencyHz: Double = 999_999_999_999
 
     func setCenter(_ hz: Double) {
+        clearActiveBookmark()
         // Clamp non-finite and out-of-range values before both
         // the UI write and the engine call. Prevents NaN / Inf /
         // negative tune commands from any caller (per #327 review).
@@ -1309,41 +1340,49 @@ final class CoreModel {
     }
 
     func setDemodMode(_ m: DemodMode) {
+        clearActiveBookmark()
         demodMode = m
         capture { try core?.setDemodMode(m) }
     }
 
     func setBandwidth(_ hz: Double) {
+        clearActiveBookmark()
         bandwidthHz = hz
         capture { try core?.setBandwidth(hz) }
     }
 
     func setGain(_ db: Double) {
+        clearActiveBookmark()
         gainDb = db
         capture { try core?.setGain(db) }
     }
 
     func setAgc(_ on: Bool) {
+        clearActiveBookmark()
         agcEnabled = on
         capture { try core?.setAgc(on) }
     }
 
     func setSquelchDb(_ db: Float) {
+        clearActiveBookmark()
         squelchDb = db
         capture { try core?.setSquelchDb(db) }
     }
 
     func setSquelchEnabled(_ on: Bool) {
+        clearActiveBookmark()
         squelchEnabled = on
         capture { try core?.setSquelchEnabled(on) }
     }
 
     func setAutoSquelch(_ on: Bool) {
+        clearActiveBookmark()
         autoSquelchEnabled = on
         capture { try core?.setAutoSquelch(on) }
     }
 
     func setDeemphasis(_ m: Deemphasis) {
+        clearActiveBookmark()
         deemphasis = m
         capture { try core?.setDeemphasis(m) }
     }
@@ -1436,6 +1475,7 @@ final class CoreModel {
     }
 
     func setVolume(_ v: Float) {
+        clearActiveBookmark()
         volume = v
         capture { try core?.setVolume(v) }
     }
