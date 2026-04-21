@@ -228,7 +228,7 @@ pub enum ScannerEvent {
     /// Session-scoped lockout — channel is skipped in rotation
     /// until unlocked or scanner is disabled.
     LockoutChannel(ChannelKey),
-    UnlockoutChannel(ChannelKey),
+    UnlockChannel(ChannelKey),
 }
 ```
 
@@ -427,7 +427,7 @@ impl Scanner {
                 sample_rate_hz,
             } => self.handle_sample_tick(samples_consumed, sample_rate_hz),
             ScannerEvent::LockoutChannel(key) => self.handle_lockout(key),
-            ScannerEvent::UnlockoutChannel(key) => self.handle_unlockout(&key),
+            ScannerEvent::UnlockChannel(key) => self.handle_unlockout(&key),
         }
     }
 
@@ -1510,7 +1510,7 @@ Open `crates/sdr-core/src/messages.rs`. Locate `pub enum UiToDsp`. Add new varia
     UpdateScannerChannels(Vec<sdr_scanner::ScannerChannel>),
     /// Session-scoped lockout.
     LockoutScannerChannel(sdr_scanner::ChannelKey),
-    UnlockoutScannerChannel(sdr_scanner::ChannelKey),
+    UnlockScannerChannel(sdr_scanner::ChannelKey),
 ```
 
 Timing defaults do NOT get their own UiToDsp variants — the UI folds them into each `ScannerChannel` at projection time (see Task 3.4 / PR 3) and dispatches `UpdateScannerChannels` on slider change.
@@ -1726,10 +1726,10 @@ And arms for the rest:
             .handle_event(sdr_scanner::ScannerEvent::LockoutChannel(key));
         self.apply_scanner_commands(cmds);
     }
-    UiToDsp::UnlockoutScannerChannel(key) => {
+    UiToDsp::UnlockScannerChannel(key) => {
         let cmds = self
             .scanner
-            .handle_event(sdr_scanner::ScannerEvent::UnlockoutChannel(key));
+            .handle_event(sdr_scanner::ScannerEvent::UnlockChannel(key));
         self.apply_scanner_commands(cmds);
     }
 ```

@@ -34,7 +34,7 @@ crates/sdr-scanner/
     state.rs           -- ScannerState enum (Idle / Retuning / Dwelling / Listening / Hanging)
 ```
 
-Dependencies (workspace-pinned): `sdr-types` (for `DemodMode`), `sdr-radio` (for `CtcssMode`, `VoiceSquelchMode`), `thiserror`. No GTK, no tokio, no I/O crates. Workspace lints inherited.
+Dependencies (workspace-pinned): `sdr-types` (for `DemodMode`), `sdr-radio` (for `CtcssMode`), `sdr-dsp` (for `VoiceSquelchMode`), `thiserror`. No GTK, no tokio, no I/O crates. Workspace lints inherited.
 
 ### Integration via `sdr-core::DspController`
 
@@ -69,7 +69,7 @@ pub enum ScannerEvent {
 
     /// Session-scoped lockout (not persisted to config or bookmarks).
     LockoutChannel(ChannelKey),
-    UnlockoutChannel(ChannelKey),
+    UnlockChannel(ChannelKey),
 }
 
 pub enum SquelchState { Open, Closed }
@@ -169,7 +169,7 @@ The scanner internally maintains the rotation index in two sub-lists (`normal_in
 
 ### Channel lockout
 
-`LockoutChannel(key)` adds the key to an in-memory `HashSet<ChannelKey>`. The rotation step skips locked channels. `UnlockoutChannel(key)` removes it. State resets on `SetEnabled(false)` or when `ChannelsChanged` fires (a channel gone from the bookmark list can't be locked out of a list that doesn't include it anymore).
+`LockoutChannel(key)` adds the key to an in-memory `HashSet<ChannelKey>`. The rotation step skips locked channels. `UnlockChannel(key)` removes it. State resets on `SetEnabled(false)` or when `ChannelsChanged` fires (a channel gone from the bookmark list can't be locked out of a list that doesn't include it anymore).
 
 ### Edge cases
 
@@ -348,7 +348,7 @@ Estimate: ~600 lines including tests. One commit per logical piece (types, state
 ### PR 2 — `DspController` integration + bookmark schema
 
 - Extend `Bookmark` with 4 new fields + backward-compat tests.
-- New `UiToDsp` variants: `SetScannerEnabled(bool)`, `UpdateScannerChannels(Vec<ScannerChannel>)`, `LockoutScannerChannel(ChannelKey)`, `UnlockoutScannerChannel(ChannelKey)`. Timing defaults are UI-side only — slider changes re-project bookmarks into `ScannerChannel`s with resolved `dwell_ms` / `hang_ms` and dispatch `UpdateScannerChannels`; the scanner itself has no "set default" event.
+- New `UiToDsp` variants: `SetScannerEnabled(bool)`, `UpdateScannerChannels(Vec<ScannerChannel>)`, `LockoutScannerChannel(ChannelKey)`, `UnlockScannerChannel(ChannelKey)`. Timing defaults are UI-side only — slider changes re-project bookmarks into `ScannerChannel`s with resolved `dwell_ms` / `hang_ms` and dispatch `UpdateScannerChannels`; the scanner itself has no "set default" event.
 - New `DspToUi` variants: `ScannerActiveChannelChanged { ... }`, `ScannerStateChanged(ScannerState)`.
 - `DspController` adds `scanner: Scanner` field, wires sample ticks + squelch edges + UI commands into it, applies scanner-emitted commands.
 - Mutex enforcement: `SetScannerEnabled(true)` stops recording + transcription with toasts. Recording / transcription start rejected when scanner is active.

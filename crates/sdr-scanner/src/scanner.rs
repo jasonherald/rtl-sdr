@@ -11,6 +11,14 @@ use crate::events::{ScannerEvent, SquelchState};
 use crate::state::ScannerState;
 use crate::{PRIORITY_CHECK_INTERVAL, SETTLE_MS};
 
+/// Lowest `ScannerChannel::priority` value that counts as
+/// "priority" for the priority-sweep logic. Channels at or above
+/// this tier are pulled into the priority sub-list; below are
+/// normal rotation. Single-tier in Phase 1 — `1` is the only
+/// promoted value — but centralizing the threshold makes the
+/// multi-tier #365 work a one-constant change.
+const MIN_PRIORITY_TIER: u8 = 1;
+
 /// Internal phase carrying per-phase bookkeeping. The outer
 /// `ScannerState` surfaced to the UI is a flattened view of this.
 #[derive(Debug, Clone)]
@@ -89,6 +97,13 @@ pub struct Scanner {
     hops_since_priority_sweep: u32,
     /// Set while a priority sweep is in progress.
     in_priority_sweep: bool,
+    /// Latched squelch state. Updated on every `SquelchEdge`
+    /// event regardless of phase so a persistent-open carrier
+    /// that triggered during the settle window (where phase
+    /// transitions ignore edges) isn't forgotten — we consult
+    /// this at settle expiry to decide Dwelling vs direct
+    /// Listening. Reset to `false` on every retune entry.
+    squelch_open: bool,
 }
 
 impl Default for Scanner {
@@ -102,6 +117,7 @@ impl Default for Scanner {
             priority_cursor: 0,
             hops_since_priority_sweep: 0,
             in_priority_sweep: false,
+            squelch_open: false,
         }
     }
 }
@@ -129,7 +145,7 @@ impl Scanner {
                 sample_rate_hz,
             } => self.handle_sample_tick(samples_consumed, sample_rate_hz),
             ScannerEvent::LockoutChannel(key) => self.handle_lockout(key),
-            ScannerEvent::UnlockoutChannel(key) => self.handle_unlockout(&key),
+            ScannerEvent::UnlockChannel(key) => self.handle_unlockout(&key),
         }
     }
 
@@ -211,6 +227,12 @@ impl Scanner {
     /// rate isn't known here).
     fn enter_retuning(&mut self, idx: usize) -> Vec<ScannerCommand> {
         let channel = &self.channels[idx];
+        // Clear the latched squelch state — previous channel's
+        // open/closed state is irrelevant post-retune, and samples
+        // arriving during the new channel's settle window will
+        // update the latch so the settle-expiry decision has the
+        // right information.
+        self.squelch_open = false;
         self.phase = Phase::Retuning {
             target_idx: idx,
             samples_until_settled: None, // seeded on first SampleTick
@@ -236,7 +258,10 @@ impl Scanner {
         // Trigger priority sweep if due.
         if !self.in_priority_sweep
             && self.hops_since_priority_sweep >= PRIORITY_CHECK_INTERVAL
-            && self.channels.iter().any(|c| c.priority >= 1)
+            && self
+                .channels
+                .iter()
+                .any(|c| c.priority >= MIN_PRIORITY_TIER)
         {
             self.in_priority_sweep = true;
             self.priority_cursor = 0;
@@ -247,7 +272,9 @@ impl Scanner {
                 .channels
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| c.priority >= 1 && !self.locked_out.contains(&c.key))
+                .filter(|(_, c)| {
+                    c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key)
+                })
                 .map(|(i, _)| i)
                 .collect();
             if self.priority_cursor < pri_indices.len() {
@@ -300,9 +327,18 @@ impl Scanner {
     }
 
     fn handle_squelch_edge(&mut self, state: SquelchState) -> Vec<ScannerCommand> {
+        // Always latch the current squelch state, regardless of
+        // phase. Retuning drops the phase transition (transients
+        // would false-trigger) but must still remember that a
+        // carrier is present, otherwise settle-expiry on a
+        // persistent-open channel would hop straight to
+        // `Dwelling` and wait indefinitely for an edge that
+        // already fired.
+        self.squelch_open = matches!(state, SquelchState::Open);
         match (&self.phase, state) {
             (Phase::Retuning { .. }, _) => {
-                // Ignore edges during settle window.
+                // Ignore edges during settle window — `squelch_open`
+                // latch is consulted when settle expires.
                 Vec::new()
             }
             (Phase::Dwelling { idx, .. } | Phase::Hanging { idx, .. }, SquelchState::Open) => {
@@ -354,11 +390,22 @@ impl Scanner {
                 };
                 if remaining == 0 {
                     let idx = *target_idx;
-                    let dwell_ms = self.channels[idx].dwell_ms;
-                    Some(Phase::Dwelling {
-                        idx,
-                        samples_until_timeout: ms_to_samples(dwell_ms, sample_rate_hz),
-                    })
+                    // Settle complete. If the channel's squelch was
+                    // already open (persistent carrier, tracked via
+                    // the `squelch_open` latch through the ignored-
+                    // edges settle window), jump directly to
+                    // Listening rather than Dwelling — otherwise
+                    // we'd sit silent waiting for a second edge
+                    // that the squelch detector already fired.
+                    if self.squelch_open {
+                        Some(Phase::Listening { idx })
+                    } else {
+                        let dwell_ms = self.channels[idx].dwell_ms;
+                        Some(Phase::Dwelling {
+                            idx,
+                            samples_until_timeout: ms_to_samples(dwell_ms, sample_rate_hz),
+                        })
+                    }
                 } else {
                     None
                 }
@@ -419,6 +466,14 @@ impl Scanner {
                     samples_until_timeout,
                 };
                 vec![ScannerCommand::StateChanged(ScannerState::Dwelling)]
+            }
+            Some(Phase::Listening { idx }) => {
+                // Persistent-open-carrier path from settle expiry.
+                self.phase = Phase::Listening { idx };
+                vec![
+                    ScannerCommand::MuteAudio(false),
+                    ScannerCommand::StateChanged(ScannerState::Listening),
+                ]
             }
             Some(Phase::AdvanceFromDwell | Phase::AdvanceFromHang) => {
                 self.hops_since_priority_sweep += 1;
@@ -813,6 +868,34 @@ mod tests {
     }
 
     #[test]
+    fn persistent_open_during_settle_goes_directly_to_listening() {
+        // Real-world scenario: scanner hops to a channel that
+        // already has a carrier active. The squelch detector
+        // fires Open during the retune's settle window, which
+        // phase transitions ignore — but the latch still
+        // records it. Settle expiry must consult the latch and
+        // go straight to Listening, not sit in Dwelling waiting
+        // for an edge that already fired.
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        // During settle: feed a squelch-open edge. Phase stays
+        // Retuning; latch moves to open.
+        s.handle_event(tick(500));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        assert_eq!(s.state(), ScannerState::Retuning);
+        // Settle expires. Scanner should land in Listening
+        // directly, with audio unmuted.
+        let commands = s.handle_event(tick(2000));
+        assert_eq!(s.state(), ScannerState::Listening);
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(false)))
+        );
+    }
+
+    #[test]
     fn unlockout_resumes_scanning_from_empty_rotation_idle() {
         // Scenario: scanner is enabled but all channels are locked
         // out, so it drained to Idle via EmptyRotation. Unlocking
@@ -829,7 +912,7 @@ mod tests {
         s.handle_event(ScannerEvent::SetEnabled(true));
         assert_eq!(s.state(), ScannerState::Idle);
 
-        let commands = s.handle_event(ScannerEvent::UnlockoutChannel(key_a));
+        let commands = s.handle_event(ScannerEvent::UnlockChannel(key_a));
         assert_eq!(s.state(), ScannerState::Retuning);
         assert!(commands.iter().any(|c| matches!(
             c,

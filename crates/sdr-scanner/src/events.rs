@@ -35,5 +35,5 @@ pub enum ScannerEvent {
     /// Session-scoped lockout — channel is skipped in rotation
     /// until unlocked or scanner is disabled.
     LockoutChannel(ChannelKey),
-    UnlockoutChannel(ChannelKey),
+    UnlockChannel(ChannelKey),
 }
