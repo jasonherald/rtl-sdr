@@ -401,6 +401,22 @@ final class CoreModel {
     /// on PR #362.
     private var rtlTcpServerLifecycleGeneration: UInt64 = 0
 
+    /// Serializing chain for start/stop transitions. Each
+    /// public lifecycle method chains its real work behind the
+    /// previous task's `.value`, so a rapid off → on can't
+    /// launch a new `SdrRtlTcpServer(config:)` (USB open) while
+    /// the prior `server.stop()` accept-thread join is still
+    /// draining — that collision surfaces as a transient
+    /// "device busy" start failure. Per `CodeRabbit` round 3
+    /// on PR #362.
+    ///
+    /// The generation token (above) catches stale completions
+    /// within a single start's detached hop; the task chain
+    /// catches cross-transition overlap. Both are needed —
+    /// generation alone lets the start's USB open race with a
+    /// concurrent stop's USB close.
+    private var rtlTcpServerLifecycleTask: Task<Void, Never>? = nil
+
     /// Active audio-recording state. `nil` = not recording,
     /// `some(path)` = engine confirmed it opened `path` for
     /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
@@ -1295,6 +1311,12 @@ final class CoreModel {
     /// toggle reflects user intent immediately; a failed start
     /// rolls it back and sets `rtlTcpServerError`. Per
     /// `CodeRabbit` round 1 on PR #362.
+    ///
+    /// The actual work is serialized behind any in-flight
+    /// lifecycle transition via `rtlTcpServerLifecycleTask`, so
+    /// a fast stop→start can't open USB before the prior
+    /// server's accept-thread join has released the dongle. Per
+    /// `CodeRabbit` round 3 on PR #362.
     func startRtlTcpServer() async {
         if rtlTcpServerRunning {
             return
@@ -1310,6 +1332,38 @@ final class CoreModel {
             return
         }
         rtlTcpServerError = nil
+
+        // Optimistic: flip the flag now so the toggle settles
+        // on the "on" position and the config form disables
+        // itself. Rollback on failure inside `performStartRtlTcpServer`.
+        rtlTcpServerRunning = true
+
+        // Chain behind any in-flight stop/start. `await
+        // prior?.value` suspends until the previous lifecycle
+        // transition has fully drained its detached USB
+        // work — so when `performStartRtlTcpServer` runs, the
+        // dongle is guaranteed to be free.
+        let prior = rtlTcpServerLifecycleTask
+        let task = Task { [weak self] in
+            await prior?.value
+            await self?.performStartRtlTcpServer()
+        }
+        rtlTcpServerLifecycleTask = task
+        await task.value
+    }
+
+    /// Serialized body of `startRtlTcpServer`. Runs on the main
+    /// actor from inside `rtlTcpServerLifecycleTask` only — the
+    /// caller has already done the quick main-actor guards and
+    /// optimistic state flip.
+    @MainActor
+    private func performStartRtlTcpServer() async {
+        // Defensive double-check: if a stop flipped the flag
+        // between optimistic `rtlTcpServerRunning = true` and
+        // the chained task actually running (e.g. user spammed
+        // the toggle), bail rather than resurrect a session
+        // the user already cancelled.
+        guard rtlTcpServerRunning else { return }
 
         // Bump the lifecycle token before kickoff so this
         // start's completion can check whether a later stop /
@@ -1338,11 +1392,6 @@ final class CoreModel {
         let mdnsEnabled = rtlTcpServerMdnsEnabled
         let nickname = rtlTcpServerNickname
         let port = rtlTcpServerPort
-
-        // Optimistic: flip the flag now so the toggle settles
-        // on the "on" position and the config form disables
-        // itself. Rollback on failure below.
-        rtlTcpServerRunning = true
 
         let result: StartResult = await Task.detached(priority: .userInitiated) {
             let server: SdrRtlTcpServer
@@ -1437,23 +1486,47 @@ final class CoreModel {
     /// state is cleared immediately so the UI reflects the
     /// intent; the background task then tears down the
     /// handles. Per `CodeRabbit` round 1 on PR #362.
+    ///
+    /// The actual teardown is serialized behind any in-flight
+    /// lifecycle transition via `rtlTcpServerLifecycleTask`, so
+    /// if a prior start's USB open is still running we wait for
+    /// it to publish before tearing down — otherwise stop would
+    /// read `nil` handles from the optimistic main-actor state,
+    /// and the start (when it finally lands) would republish a
+    /// live server that nobody is watching. Per `CodeRabbit`
+    /// round 3 on PR #362.
     func stopRtlTcpServer() async {
         // Bump the lifecycle token so any in-flight start
         // treats itself as stale when it comes back to publish.
         rtlTcpServerLifecycleGeneration &+= 1
         rtlTcpPollTask?.cancel()
         rtlTcpPollTask = nil
-        let server = rtlTcpServer
-        let advertiser = rtlTcpAdvertiser
-        rtlTcpServer = nil
-        rtlTcpAdvertiser = nil
         rtlTcpServerRunning = false
         rtlTcpServerStats = nil
         rtlTcpRecentCommands = []
 
+        let prior = rtlTcpServerLifecycleTask
+        let task = Task { [weak self] in
+            await prior?.value
+            await self?.performStopRtlTcpServer()
+        }
+        rtlTcpServerLifecycleTask = task
+        await task.value
+    }
+
+    /// Serialized body of `stopRtlTcpServer`. Runs on the main
+    /// actor from inside `rtlTcpServerLifecycleTask` only — the
+    /// caller has already cleared observable state.
+    @MainActor
+    private func performStopRtlTcpServer() async {
+        let server = rtlTcpServer
+        let advertiser = rtlTcpAdvertiser
+        rtlTcpServer = nil
+        rtlTcpAdvertiser = nil
+
         // If there's nothing to tear down, skip the detached
         // task entirely — common case for rapid toggle flips
-        // or idempotent shutdown.
+        // where the prior start bailed on stale generation.
         if server == nil && advertiser == nil {
             return
         }
@@ -1481,6 +1554,14 @@ final class CoreModel {
         // in-flight start (e.g. user toggled on during app
         // shutdown) still treats its completion as stale.
         rtlTcpServerLifecycleGeneration &+= 1
+        // Cancel the serializing chain so any still-suspended
+        // tasks drop immediately rather than holding onto
+        // `self` past shutdown. The FFI stop below is
+        // idempotent (mutex-guarded in `sdr-ffi`), so a
+        // detached start/stop that finishes after this runs is
+        // safe — it just operates on already-consumed handles.
+        rtlTcpServerLifecycleTask?.cancel()
+        rtlTcpServerLifecycleTask = nil
         rtlTcpPollTask?.cancel()
         rtlTcpPollTask = nil
         let server = rtlTcpServer
