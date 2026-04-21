@@ -195,7 +195,20 @@ final class CoreModel {
 
     var availableGains: [Double] = []
     var gainDb: Double = 0
-    var agcEnabled: Bool = false
+
+    /// Active AGC type — tristate selector that replaced the
+    /// two-state `agcEnabled: Bool`. Default `.software` on
+    /// fresh installs (sidesteps tuner-AGC pumping behavior).
+    /// Persisted via `UserDefaults` under `SDRMac.agcType`.
+    /// Per issue #357.
+    var agcType: SdrCore.AgcType = .software
+
+    /// `true` when either AGC loop is on. Convenience shim for
+    /// call sites that previously read `agcEnabled: Bool` —
+    /// gain-slider disable, bookmark capture, etc. The source
+    /// of truth is `agcType`; this is a computed view.
+    var agcEnabled: Bool { agcType != .off }
+
     var deviceInfo: String = ""
 
     /// `true` when a local RTL-SDR dongle was detected on the
@@ -730,6 +743,10 @@ final class CoreModel {
             let raw = Int32(UserDefaults.standard.integer(forKey: Self.sourceTypeDefaultsKey))
             sourceType = SourceType(rawValue: raw) ?? .rtlSdr
         }
+        if UserDefaults.standard.object(forKey: Self.agcTypeDefaultsKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.agcTypeDefaultsKey))
+            agcType = SdrCore.AgcType(rawValue: raw) ?? .software
+        }
         if let host = UserDefaults.standard.string(forKey: Self.networkSourceHostDefaultsKey),
            !host.isEmpty {
             networkSourceHost = host
@@ -1094,9 +1111,13 @@ final class CoreModel {
             autoSquelchEnabled: autoSquelchEnabled,
             squelchDb: squelchDb,
             gainDb: gainDb,
+            // Legacy boolean kept for backward-compat with
+            // pre-#357 bookmarks.json (same dual-field pattern
+            // the Linux side uses — agc_type alongside agc).
             agcEnabled: agcEnabled,
             volume: nil,       // feels more like env setting than per-bookmark
-            deemphasis: deemphasis
+            deemphasis: deemphasis,
+            agcType: agcType
         )
     }
 
@@ -1124,7 +1145,12 @@ final class CoreModel {
         if let db = bookmark.squelchDb         { setSquelchDb(db) }
         if let auto = bookmark.autoSquelchEnabled { setAutoSquelch(auto) }
         if let g = bookmark.gainDb             { setGain(g) }
-        if let agc = bookmark.agcEnabled       { setAgc(agc) }
+        // Prefer the tristate `agcType` field when present —
+        // pre-#357 bookmarks only carry the legacy `agcEnabled`
+        // boolean, which `setAgc(_:)` forwards to the tristate
+        // as a fallback.
+        if let type = bookmark.agcType         { setAgcType(type) }
+        else if let agc = bookmark.agcEnabled  { setAgc(agc) }
         if let v = bookmark.volume             { setVolume(v) }
         if let d = bookmark.deemphasis         { setDeemphasis(d) }
         activeBookmarkId = bookmark.id
@@ -1169,7 +1195,7 @@ final class CoreModel {
         setIqCorrection(iqCorrectionEnabled)
         setPpm(ppmCorrection)
         setGain(gainDb)
-        setAgc(agcEnabled)
+        setAgcType(agcType)
         setDemodMode(demodMode)
         setBandwidth(bandwidthHz)
         setSquelchEnabled(squelchEnabled)
@@ -1356,11 +1382,31 @@ final class CoreModel {
         capture { try core?.setGain(db) }
     }
 
+    /// Legacy two-state AGC setter — now a thin forwarder
+    /// onto the tristate `setAgcType(_:)` so a bookmark saved
+    /// under the old `agcEnabled: Bool` schema still recalls
+    /// correctly. `true` maps to `.hardware` (the pre-#357
+    /// default); `false` maps to `.off`. New call sites should
+    /// use `setAgcType(_:)` directly.
     func setAgc(_ on: Bool) {
-        clearActiveBookmark()
-        agcEnabled = on
-        capture { try core?.setAgc(on) }
+        setAgcType(on ? .hardware : .off)
     }
+
+    /// Tristate AGC setter. Persists to `UserDefaults` so the
+    /// user's choice survives launches (fresh install default:
+    /// `.software` — see `agcType` field docs). Dispatches
+    /// both the hardware and software AGC loops atomically
+    /// through the ABI 0.13 `setAgcType` FFI.
+    func setAgcType(_ type: SdrCore.AgcType) {
+        clearActiveBookmark()
+        agcType = type
+        UserDefaults.standard.set(Int(type.rawValue), forKey: Self.agcTypeDefaultsKey)
+        capture { try core?.setAgcType(type) }
+    }
+
+    /// UserDefaults key for the persisted AGC type. Absent
+    /// key leaves the default (`.software`) intact.
+    static let agcTypeDefaultsKey = "SDRMac.agcType"
 
     func setSquelchDb(_ db: Float) {
         clearActiveBookmark()
