@@ -41,6 +41,7 @@ private let kAudioRecordingStarted = Int32(SDR_EVT_AUDIO_RECORDING_STARTED.rawVa
 private let kAudioRecordingStopped = Int32(SDR_EVT_AUDIO_RECORDING_STOPPED.rawValue)
 private let kIqRecordingStarted    = Int32(SDR_EVT_IQ_RECORDING_STARTED.rawValue)
 private let kIqRecordingStopped    = Int32(SDR_EVT_IQ_RECORDING_STOPPED.rawValue)
+private let kNetworkSinkStatus     = Int32(SDR_EVT_NETWORK_SINK_STATUS.rawValue)
 
 /// High-level event from the engine.
 ///
@@ -95,6 +96,13 @@ public enum SdrCoreEvent: Sendable, Equatable {
     /// IQ recording to WAV has stopped. Also fires on engine
     /// shutdown while a recording is active.
     case iqRecordingStopped
+
+    /// Network audio sink lifecycle / error update. Fires when
+    /// the network sink becomes the active audio output
+    /// (`.active`), when it is replaced by another sink or the
+    /// engine stops (`.inactive`), or when a startup / write
+    /// failure takes it offline (`.error`). Per issue #247.
+    case networkSinkStatus(NetworkSinkStatus)
 
     /// Translate a C `SdrEvent` into a Swift value.
     ///
@@ -168,6 +176,35 @@ public enum SdrCoreEvent: Sendable, Equatable {
 
         case kIqRecordingStopped:
             return .iqRecordingStopped
+
+        case kNetworkSinkStatus:
+            let status = payload.network_sink_status
+            switch status.kind {
+            case Int32(SDR_NETWORK_SINK_STATUS_INACTIVE.rawValue):
+                return .networkSinkStatus(.inactive)
+            case Int32(SDR_NETWORK_SINK_STATUS_ACTIVE.rawValue):
+                // `active` always carries a non-null endpoint
+                // string from the Rust side. Drop the event if
+                // the string is somehow missing rather than
+                // fabricate an empty endpoint that the UI would
+                // render as "Streaming to :" — clearer to skip.
+                guard let cstr = status.utf8 else { return nil }
+                let endpoint = String(cString: cstr)
+                let proto = NetworkProtocol(rawValue: status.protocol) ?? .tcpServer
+                return .networkSinkStatus(.active(endpoint: endpoint, protocol: proto))
+            case Int32(SDR_NETWORK_SINK_STATUS_ERROR.rawValue):
+                let message: String
+                if let cstr = status.utf8 {
+                    message = String(cString: cstr)
+                } else {
+                    message = ""
+                }
+                return .networkSinkStatus(.error(message: message))
+            default:
+                // Unknown sub-kind — future ABI extension. Drop
+                // silently, same policy as the outer `default`.
+                return nil
+            }
 
         default:
             // Unknown kind — a future FFI may add variants we

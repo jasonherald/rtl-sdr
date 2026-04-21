@@ -133,8 +133,8 @@ extension SdrCore {
             }
         }
         try checkRc(rc)
-        let user = String(cString: userBuf)
-        let pass = String(cString: passBuf)
+        let user = cStringToSwiftString(userBuf)
+        let pass = cStringToSwiftString(passBuf)
         // FFI returns OK with empty buffers for the "not stored"
         // case (see `sdr_core_radioreference_load_credentials`
         // in `include/sdr_core.h`). Distinct from `.io` which is

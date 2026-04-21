@@ -69,6 +69,62 @@ public enum Deemphasis: Int32, Sendable, CaseIterable, Codable {
     }
 }
 
+/// Active audio sink selection. Matches `SdrAudioSinkType` in the
+/// C header. `.local` routes to a `CoreAudio` output device; `.network`
+/// streams post-demod audio to the configured host:port over
+/// TCP or UDP (see `NetworkProtocol`). Per issue #247.
+public enum AudioSinkType: Int32, Sendable, CaseIterable, Codable {
+    case local   = 0
+    case network = 1
+
+    public var label: String {
+        switch self {
+        case .local:   return "Local device"
+        case .network: return "Network stream"
+        }
+    }
+}
+
+/// Network stream protocol for the network audio sink. Matches
+/// `SdrNetworkProtocol` in the C header.
+///
+/// The `.tcpServer` name reflects the actual wire role: the
+/// device listens on the configured port and streams to clients
+/// that connect. (The Rust side spells the same thing as
+/// `Protocol::TcpClient` for historical SDR++ compatibility;
+/// the C ABI uses the clearer name.)
+public enum NetworkProtocol: Int32, Sendable, CaseIterable, Codable {
+    case tcpServer = 0
+    case udp       = 1
+
+    public var label: String {
+        switch self {
+        case .tcpServer: return "TCP server"
+        case .udp:       return "UDP"
+        }
+    }
+}
+
+/// Network sink status surfaced via the `networkSinkStatus`
+/// engine event. Mirrors
+/// `sdr_core::sink_slot::NetworkSinkStatus` on the Rust side.
+///
+/// - `.inactive` — the network sink is not currently the
+///   active audio output (either never selected, replaced by
+///   another sink, or the engine stopped).
+/// - `.active(endpoint:protocol:)` — the network sink started
+///   successfully. `endpoint` is the host:port the engine is
+///   bound to (TCP) or sending to (UDP); hosts typically show
+///   it in a Settings status row.
+/// - `.error(message:)` — a startup or write failure took the
+///   network sink offline. `message` is a human-readable
+///   description suitable for a toast or status line.
+public enum NetworkSinkStatus: Sendable, Equatable {
+    case inactive
+    case active(endpoint: String, protocol: NetworkProtocol)
+    case error(message: String)
+}
+
 /// FFT window function. Matches `SdrFftWindow` in the C header.
 ///
 /// Only three variants because that's what

@@ -17,13 +17,14 @@ final class SdrCoreTests: XCTestCase {
 
     func testAbiVersionMatchesCurrent() {
         // Lock in that the Swift wrapper parses the packed
-        // version from the C side consistently. Current: 0.3
-        // (0.2 added device enumeration: sdr_core_device_count
-        // + sdr_core_device_name. 0.3 added
-        // sdr_core_set_auto_squelch.)
+        // version from the C side consistently. Current: 0.9
+        // (0.2 device enumeration; 0.3 auto-squelch;
+        // 0.4 audio routing + recording; 0.5 IQ recording;
+        // 0.6 RadioReference; 0.7 advanced demod; 0.8 audio tap;
+        // 0.9 network audio sink — issue #247.)
         let v = SdrCore.abiVersion
         XCTAssertEqual(v.major, 0)
-        XCTAssertEqual(v.minor, 3)
+        XCTAssertEqual(v.minor, 9)
     }
 
     func testInitLoggingIsIdempotent() {
@@ -176,6 +177,32 @@ final class SdrCoreTests: XCTestCase {
     // ==========================================================
     //  Error message round-trip
     // ==========================================================
+
+    // ==========================================================
+    //  Network audio sink (ABI 0.9, issue #247)
+    // ==========================================================
+
+    func testSetAudioSinkTypeRoundTrips() throws {
+        let core = try SdrCore(configPath: nil)
+        try core.setAudioSinkType(.local)
+        try core.setAudioSinkType(.network)
+        try core.setAudioSinkType(.local)
+    }
+
+    func testSetNetworkSinkConfigAcceptsValidInput() throws {
+        let core = try SdrCore(configPath: nil)
+        try core.setNetworkSinkConfig(hostname: "127.0.0.1", port: 1234, protocol: .tcpServer)
+        try core.setNetworkSinkConfig(hostname: "localhost", port: 9000, protocol: .udp)
+    }
+
+    func testSetNetworkSinkConfigRejectsEmptyHostname() throws {
+        let core = try SdrCore(configPath: nil)
+        XCTAssertThrowsError(
+            try core.setNetworkSinkConfig(hostname: "", port: 1234, protocol: .tcpServer)
+        ) { error in
+            XCTAssertEqual((error as? SdrCoreError)?.code, .invalidArg)
+        }
+    }
 
     func testErrorMessageIsCopiedIntoOwnedString() throws {
         let core = try SdrCore(configPath: nil)
