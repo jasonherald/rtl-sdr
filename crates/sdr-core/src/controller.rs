@@ -1129,10 +1129,26 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if was_running {
                 match open_source(state) {
                     Ok(()) => {
-                        if let Err(e) = state.audio_sink.start() {
-                            tracing::warn!("audio sink restart failed: {e}");
-                            let _ =
-                                dsp_tx.send(DspToUi::Error(format!("Audio output failed: {e}")));
+                        // Clear the audio-sink offline latch on
+                        // a successful restart, same as the
+                        // other successful-start paths (engine
+                        // Start, SetAudioSinkType,
+                        // SetNetworkSinkConfig). Without this,
+                        // a prior-session terminal write
+                        // failure could leave the latch set
+                        // through a source-type swap and gate
+                        // writes off until the next explicit
+                        // Start command. Per `CodeRabbit`
+                        // round 3 on PR #351.
+                        match state.audio_sink.start() {
+                            Ok(()) => {
+                                state.audio_sink_offline = false;
+                            }
+                            Err(e) => {
+                                tracing::warn!("audio sink restart failed: {e}");
+                                let _ = dsp_tx
+                                    .send(DspToUi::Error(format!("Audio output failed: {e}")));
+                            }
                         }
                         state.running = true;
                         // Refresh UI with new source capabilities
