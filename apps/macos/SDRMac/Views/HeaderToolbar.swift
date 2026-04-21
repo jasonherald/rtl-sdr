@@ -13,6 +13,7 @@ struct HeaderToolbar: ToolbarContent {
     @Environment(CoreModel.self) private var model
     @Binding var showingRadioReference: Bool
     @Binding var showingTranscription: Bool
+    @Binding var showingBookmarks: Bool
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
@@ -64,6 +65,34 @@ struct HeaderToolbar: ToolbarContent {
                 )
             }
             .help(showingTranscription ? "Hide Transcription Panel" : "Show Transcription Panel")
+        }
+
+        // Bookmarks panel toggle — mirrors the GTK bookmarks
+        // flyout button (issue #339). Same inline-Button +
+        // Label-with-text shape as the other right-flyout and
+        // RadioReference buttons; see the comment block on the
+        // RadioReference item below for the macOS-toolbar
+        // display-mode rationale. `⌘B` opens or closes the
+        // flyout, matching the Linux `Ctrl+B` binding.
+        //
+        // Mutual exclusivity with the transcription panel is
+        // handled at the ContentView level via `.onChange`
+        // handlers — the content area has room for one
+        // right-side flyout at a time, and coordinating the
+        // two `Binding<Bool>`s inside this toolbar closure
+        // would pull ContentView state into the toolbar
+        // struct unnecessarily.
+        ToolbarItem(placement: .automatic) {
+            Button {
+                showingBookmarks.toggle()
+            } label: {
+                Label(
+                    "Bookmarks",
+                    systemImage: showingBookmarks ? "bookmark.fill" : "bookmark"
+                )
+            }
+            .keyboardShortcut("b", modifiers: .command)
+            .help(showingBookmarks ? "Hide Bookmarks Panel (⌘B)" : "Show Bookmarks Panel (⌘B)")
         }
 
         // RadioReference button — mirrors the GTK header-bar

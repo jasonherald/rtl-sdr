@@ -28,6 +28,27 @@ struct ContentView: View {
     /// stopping transcription.
     @State private var showingTranscription: Bool = false
 
+    /// Right-side bookmarks flyout visibility. Mirrors the GTK
+    /// bookmarks_panel.rs flyout (issue #339). Toggled from the
+    /// header toolbar / `⌘B`, persisted across launches in
+    /// UserDefaults so the user's last-chosen layout sticks.
+    /// Mutually exclusive with `showingTranscription` — the
+    /// content area only has room for one right-side flyout;
+    /// the `.onChange` handlers below enforce that.
+    @State private var showingBookmarks: Bool =
+        UserDefaults.standard.bool(forKey: ContentView.bookmarksFlyoutOpenKey)
+
+    /// UserDefaults key for persisting the bookmarks flyout's
+    /// open/closed state. Matches the Linux `bookmarks_flyout_open`
+    /// config key so both frontends share wording.
+    static let bookmarksFlyoutOpenKey = "SDRMac.bookmarks.flyoutOpen"
+
+    /// Right-side flyout slide transition duration, in seconds.
+    /// Shared between the transcription and bookmarks revealers
+    /// so they stay in lockstep if one is tweaked. Matches GTK's
+    /// 200 ms `Revealer.transition_duration`.
+    static let rightFlyoutTransitionSeconds: Double = 0.2
+
     var body: some View {
         NavigationSplitView {
             SidebarView()
@@ -43,15 +64,48 @@ struct ContentView: View {
                     TranscriptionPanel()
                         .transition(.move(edge: .trailing))
                 }
+                if showingBookmarks {
+                    Divider()
+                    BookmarksPanel(isPresented: $showingBookmarks)
+                        .transition(.move(edge: .trailing))
+                }
             }
-            // Match GTK's 200 ms Revealer SlideLeft animation.
-            .animation(.easeInOut(duration: 0.2), value: showingTranscription)
+            // Match GTK's Revealer SlideLeft animation. Shared
+            // duration constant so both flyouts stay in lockstep.
+            .animation(
+                .easeInOut(duration: ContentView.rightFlyoutTransitionSeconds),
+                value: showingTranscription
+            )
+            .animation(
+                .easeInOut(duration: ContentView.rightFlyoutTransitionSeconds),
+                value: showingBookmarks
+            )
         }
         .toolbar {
             HeaderToolbar(
                 showingRadioReference: $showingRadioReference,
-                showingTranscription: $showingTranscription
+                showingTranscription: $showingTranscription,
+                showingBookmarks: $showingBookmarks
             )
+        }
+        // Mutual exclusivity between the two right-side flyouts.
+        // Opening one closes the other rather than stacking,
+        // matching the Linux treatment (a793cdc) and fitting
+        // the content area's single-flyout width budget. Also
+        // persists the bookmarks flyout's open/closed state —
+        // the transcription panel is ephemeral, but bookmarks
+        // is a durable browse surface the user wants back where
+        // they left it.
+        .onChange(of: showingBookmarks) { _, newValue in
+            if newValue && showingTranscription {
+                showingTranscription = false
+            }
+            UserDefaults.standard.set(newValue, forKey: ContentView.bookmarksFlyoutOpenKey)
+        }
+        .onChange(of: showingTranscription) { _, newValue in
+            if newValue && showingBookmarks {
+                showingBookmarks = false
+            }
         }
         .sheet(isPresented: $showingRadioReference) {
             RadioReferenceDialog()
