@@ -269,17 +269,15 @@ impl Scanner {
         }
 
         if self.in_priority_sweep {
-            let pri_indices: Vec<usize> = self
-                .channels
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| {
-                    c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key)
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if self.priority_cursor < pri_indices.len() {
-                let chosen = pri_indices[self.priority_cursor];
+            let pri_count = self.count_matching(|c| {
+                c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key)
+            });
+            if self.priority_cursor < pri_count {
+                let chosen = self
+                    .nth_matching(self.priority_cursor, |c| {
+                        c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key)
+                    })
+                    .expect("priority_cursor < pri_count guarantees a match");
                 self.priority_cursor += 1;
                 return Some(chosen);
             }
@@ -290,41 +288,60 @@ impl Scanner {
             // Fall through to normal rotation.
         }
 
-        let normal_indices: Vec<usize> = self
-            .channels
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.priority == 0 && !self.locked_out.contains(&c.key))
-            .map(|(i, _)| i)
-            .collect();
+        let normal_count =
+            self.count_matching(|c| c.priority == 0 && !self.locked_out.contains(&c.key));
 
-        if normal_indices.is_empty() {
-            // If no normal channels, fall back to any unlocked
-            // channel (priority-only lists).
-            let any_unlocked: Vec<usize> = self
-                .channels
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| !self.locked_out.contains(&c.key))
-                .map(|(i, _)| i)
-                .collect();
-            if any_unlocked.is_empty() {
+        if normal_count == 0 {
+            // No normal channels — fall back to any unlocked channel
+            // (priority-only lists).
+            let any_count = self.count_matching(|c| !self.locked_out.contains(&c.key));
+            if any_count == 0 {
                 return None;
             }
-            if self.normal_cursor >= any_unlocked.len() {
+            if self.normal_cursor >= any_count {
                 self.normal_cursor = 0;
             }
-            let chosen = any_unlocked[self.normal_cursor];
-            self.normal_cursor = (self.normal_cursor + 1) % any_unlocked.len();
+            let chosen = self
+                .nth_matching(self.normal_cursor, |c| !self.locked_out.contains(&c.key))
+                .expect("normal_cursor < any_count guarantees a match");
+            self.normal_cursor = (self.normal_cursor + 1) % any_count;
             return Some(chosen);
         }
 
-        if self.normal_cursor >= normal_indices.len() {
+        if self.normal_cursor >= normal_count {
             self.normal_cursor = 0;
         }
-        let chosen = normal_indices[self.normal_cursor];
-        self.normal_cursor = (self.normal_cursor + 1) % normal_indices.len();
+        let chosen = self
+            .nth_matching(self.normal_cursor, |c| {
+                c.priority == 0 && !self.locked_out.contains(&c.key)
+            })
+            .expect("normal_cursor < normal_count guarantees a match");
+        self.normal_cursor = (self.normal_cursor + 1) % normal_count;
         Some(chosen)
+    }
+
+    /// Count channels matching `predicate`. Allocation-free —
+    /// single pass over `self.channels`.
+    fn count_matching<F>(&self, predicate: F) -> usize
+    where
+        F: Fn(&ScannerChannel) -> bool,
+    {
+        self.channels.iter().filter(|c| predicate(c)).count()
+    }
+
+    /// Index (into `self.channels`) of the `n`th channel matching
+    /// `predicate`. Allocation-free — uses `Iterator::nth` which
+    /// streams without collecting.
+    fn nth_matching<F>(&self, n: usize, predicate: F) -> Option<usize>
+    where
+        F: Fn(&ScannerChannel) -> bool,
+    {
+        self.channels
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| predicate(c))
+            .nth(n)
+            .map(|(i, _)| i)
     }
 
     fn handle_squelch_edge(&mut self, state: SquelchState) -> Vec<ScannerCommand> {
@@ -506,13 +523,36 @@ impl Scanner {
     }
 
     fn handle_lockout(&mut self, key: ChannelKey) -> Vec<ScannerCommand> {
+        // If the user locks out the currently-active channel, the
+        // "skip on next rotation advance" strategy isn't enough:
+        // a persistent-open carrier never triggers an advance
+        // (no dwell-timeout / hang-elapse / squelch-close fires),
+        // so the scanner would sit indefinitely on a channel the
+        // user just asked to skip. Force-advance now.
+        let lock_current = self.enabled
+            && self
+                .current_channel_key()
+                .is_some_and(|current| current == &key);
         self.locked_out.insert(key);
-        // Locked-out channels are filtered at `pick_next_channel`
-        // time, so the currently-active channel (if locked) will
-        // be skipped on the next rotation advance (dwell timeout,
-        // hang timeout, or squelch close → hang → advance). No
-        // explicit eviction needed here for Phase 1.
-        Vec::new()
+        if lock_current {
+            self.advance_rotation()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Identity of the channel the scanner currently considers
+    /// active, regardless of phase. Returns `None` when idle or
+    /// mid-transition-marker (which should never persist in
+    /// `self.phase` anyway).
+    fn current_channel_key(&self) -> Option<&ChannelKey> {
+        match &self.phase {
+            Phase::Retuning { target_idx, .. } => self.channels.get(*target_idx).map(|c| &c.key),
+            Phase::Dwelling { idx, .. } | Phase::Listening { idx } | Phase::Hanging { idx, .. } => {
+                self.channels.get(*idx).map(|c| &c.key)
+            }
+            Phase::Idle | Phase::AdvanceFromDwell | Phase::AdvanceFromHang => None,
+        }
     }
 
     fn handle_unlockout(&mut self, key: &ChannelKey) -> Vec<ScannerCommand> {
@@ -941,6 +981,40 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, ScannerCommand::MuteAudio(false)))
         );
+    }
+
+    #[test]
+    fn lockout_of_active_channel_advances_immediately() {
+        // Real scenario: scanner stopped on a channel with a
+        // persistent-open carrier; user hits "lockout current
+        // channel" to escape. Without force-advance the scanner
+        // would sit forever — no dwell timeout, no hang-elapse,
+        // no squelch-close fires.
+        let mut s = Scanner::new();
+        let key_a = ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        };
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_PAST_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        // Lockout the channel the scanner is currently listening on.
+        let commands = s.handle_event(ScannerEvent::LockoutChannel(key_a));
+        assert_eq!(s.state(), ScannerState::Retuning);
+        // Next channel in rotation is B.
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            ScannerCommand::Retune {
+                freq_hz: 162_550_000,
+                ..
+            }
+        )));
     }
 
     #[test]
