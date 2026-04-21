@@ -1392,6 +1392,13 @@ final class CoreModel {
         let mdnsEnabled = rtlTcpServerMdnsEnabled
         let nickname = rtlTcpServerNickname
         let port = rtlTcpServerPort
+        // App version for the mDNS TXT record. Sourced from
+        // the bundle's `CFBundleShortVersionString` so the
+        // advertised version tracks the installed release
+        // rather than a hardcoded constant that rots on every
+        // bump. Per `CodeRabbit` round 4 on PR #362.
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+            ?? "0.1.0"
 
         let result: StartResult = await Task.detached(priority: .userInitiated) {
             let server: SdrRtlTcpServer
@@ -1427,7 +1434,7 @@ final class CoreModel {
                     instanceName: instanceName,
                     hostname: "",
                     tuner: tunerName,
-                    version: "0.1.0",
+                    version: appVersion,
                     gains: gainCount,
                     nickname: nickname
                 )
@@ -1620,8 +1627,11 @@ final class CoreModel {
             // main thread, fast enough that "uptime" and data-
             // rate look live. 1 Hz is the GTK panel's tick too.
             let tickNanos: UInt64 = 1_000_000_000
+            // Poll-then-sleep ordering so `rtlTcpServerStats`
+            // and `rtlTcpRecentCommands` populate immediately on
+            // server start rather than after a full tick of nil.
+            // Per `CodeRabbit` round 4 on PR #362.
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: tickNanos)
                 guard let self, let server = self.rtlTcpServer else { return }
                 do {
                     self.rtlTcpServerStats = try server.stats()
@@ -1639,6 +1649,7 @@ final class CoreModel {
                     self.stopRtlTcpServerSync()
                     return
                 }
+                try? await Task.sleep(nanoseconds: tickNanos)
             }
         }
     }
