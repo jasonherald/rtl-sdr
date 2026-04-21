@@ -15,6 +15,7 @@ pub fn setup_shortcuts(
     window: &adw::ApplicationWindow,
     play_button: &gtk4::ToggleButton,
     sidebar_toggle: &gtk4::ToggleButton,
+    bookmarks_toggle: &gtk4::ToggleButton,
     demod_dropdown: &gtk4::DropDown,
 ) {
     let controller = gtk4::ShortcutController::new();
@@ -72,6 +73,26 @@ pub fn setup_shortcuts(
         controller.add_shortcut(shortcut);
     }
 
+    // Ctrl+B: Toggle bookmarks flyout. Routed through the header
+    // toggle button so the button's visual state stays in sync
+    // with the flyout — same indirection pattern as F9 /
+    // sidebar_toggle above. "B" is the bookmarks mnemonic; F10
+    // was considered but conflicts with the GNOME menu
+    // convention some shell extensions bind.
+    let bookmarks_toggle_weak = bookmarks_toggle.downgrade();
+    let trigger_ctrl_b = gtk4::ShortcutTrigger::parse_string("<Ctrl>b");
+    if let Some(trigger) = trigger_ctrl_b {
+        let action = gtk4::CallbackAction::new(move |_widget, _args| {
+            if let Some(btn) = bookmarks_toggle_weak.upgrade() {
+                btn.set_active(!btn.is_active());
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        let shortcut = gtk4::Shortcut::new(Some(trigger), Some(action));
+        controller.add_shortcut(shortcut);
+    }
+
     window.add_controller(controller);
 }
 
@@ -81,7 +102,13 @@ const SHORTCUT_CATALOG: &[(&str, &[(&str, &str)])] = &[
         "Playback",
         &[("Space", "Play / Stop"), ("M", "Cycle demod mode")],
     ),
-    ("Navigation", &[("F9", "Toggle sidebar")]),
+    (
+        "Navigation",
+        &[
+            ("F9", "Toggle sidebar"),
+            ("Ctrl+B", "Toggle bookmarks panel"),
+        ],
+    ),
     (
         "Application",
         &[

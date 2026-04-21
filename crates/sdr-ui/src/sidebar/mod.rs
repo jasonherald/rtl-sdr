@@ -5,6 +5,7 @@
 use gtk4::prelude::*;
 
 pub mod audio_panel;
+pub mod bookmarks_panel;
 pub mod display_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
@@ -13,6 +14,7 @@ pub mod source_panel;
 pub mod transcript_panel;
 
 pub use audio_panel::{AudioPanel, build_audio_panel};
+pub use bookmarks_panel::{BookmarksPanel, build_bookmarks_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};

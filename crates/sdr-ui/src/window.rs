@@ -115,6 +115,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar,
         transcript_panel,
         transcript_revealer,
+        bookmarks_revealer,
     ) = build_split_view(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
@@ -127,6 +128,23 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         rr_button,
         favorites_handle,
     ) = build_header_bar(&sidebar_toggle, &state);
+
+    // Bookmarks flyout toggle — packed `pack_end` first so it
+    // ends up LEFT of the transcript toggle in the header's
+    // right cluster. `pack_end` stacks right-to-left, so the
+    // last `pack_end` call sits furthest from the right edge.
+    // Keeping bookmarks near the far edge matches the visual
+    // mapping "click the icon → panel slides in from directly
+    // under it on the right."
+    let bookmarks_toggle = gtk4::ToggleButton::builder()
+        .icon_name("user-bookmarks-symbolic")
+        .tooltip_text("Toggle bookmarks panel (Ctrl+B)")
+        .build();
+    header.pack_end(&bookmarks_toggle);
+    let bookmarks_revealer_clone = bookmarks_revealer.clone();
+    bookmarks_toggle.connect_toggled(move |btn| {
+        bookmarks_revealer_clone.set_reveal_child(btn.is_active());
+    });
 
     // Transcript toggle button in header bar.
     let transcript_button = gtk4::ToggleButton::builder()
@@ -186,7 +204,13 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     });
 
     // --- Keyboard shortcuts ---
-    shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
+    shortcuts::setup_shortcuts(
+        &window,
+        &play_button,
+        &sidebar_toggle,
+        &bookmarks_toggle,
+        &demod_dropdown,
+    );
 
     // Ctrl+? shows keyboard shortcuts dialog.
     let window_for_shortcuts = window.downgrade();
@@ -725,6 +749,10 @@ fn apply_rtl_tcp_connection_state(
 /// and status bar.
 ///
 /// Returns the split view, sidebar panels, spectrum display handle, and status bar.
+#[allow(
+    clippy::type_complexity,
+    reason = "splitting into a struct would trade one named return for one named struct whose fields are used exactly once by the caller — net neutral for readability, net negative for locality of widget construction"
+)]
 fn build_split_view(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -734,6 +762,7 @@ fn build_split_view(
     spectrum::SpectrumHandle,
     StatusBar,
     sidebar::transcript_panel::TranscriptPanel,
+    gtk4::Revealer,
     gtk4::Revealer,
 ) {
     // Sidebar — configuration panels.
@@ -780,12 +809,35 @@ fn build_split_view(
         .hexpand(false)
         .build();
 
-    // Wrap content + transcript revealer in an HBox.
+    // Bookmarks flyout — slides out from the right, outermost of
+    // the two right-side panels so the header `Ctrl+B` toggle
+    // reveals an unambiguously right-edge element. Uses the same
+    // `SlideLeft` + 200 ms transition as the transcript revealer
+    // for visual consistency when either panel opens.
+    let bookmarks_panel = sidebar::bookmarks_panel::build_bookmarks_panel();
+    let bookmarks_scroll = gtk4::ScrolledWindow::builder()
+        .child(&bookmarks_panel.widget)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    let bookmarks_revealer = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
+        .transition_duration(200)
+        .reveal_child(false)
+        .child(&bookmarks_scroll)
+        .hexpand(false)
+        .build();
+
+    // Wrap content + both side revealers in an HBox. Bookmarks
+    // sits rightmost so the header-bar bookmark icon (which is
+    // itself at the far right of the header via `pack_end`) maps
+    // visually to the panel that appears when the user clicks it.
     let content_with_transcript = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
     content_with_transcript.append(&content_box);
     content_with_transcript.append(&transcript_revealer);
+    content_with_transcript.append(&bookmarks_revealer);
 
     let split_view = adw::OverlaySplitView::builder()
         .sidebar(&sidebar_scroll)
@@ -800,6 +852,7 @@ fn build_split_view(
         status_bar,
         transcript_panel,
         transcript_revealer,
+        bookmarks_revealer,
     )
 }
 
