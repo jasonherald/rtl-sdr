@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 10
+#define SDR_CORE_ABI_VERSION_MINOR 11
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -577,6 +577,393 @@ int32_t sdr_core_set_network_config(
  */
 int32_t sdr_core_set_file_path(SdrCore* handle, const char* path_utf8);
 
+/* --- rtl_tcp-specific client commands (issue #325, ABI 0.11) --- */
+/*
+ * Cover the wire-protocol knobs the rtl_tcp client exposes
+ * that aren't on the generic source surface (tune / set_gain
+ * / set_sample_rate / set_ppm_correction are already covered
+ * by existing commands and flow through to `RtlTcpSource`).
+ *
+ * Non-rtl_tcp active sources silently accept these — the
+ * `Source` trait's default no-op impl keeps the calls valid
+ * at all times, so UI toggles don't need to gate on the
+ * current source type.
+ */
+
+/* Enable or disable the tuner's bias tee (powers an inline LNA
+ * over the coax). Only meaningful on RTL-SDR hardware. */
+int32_t sdr_core_set_bias_tee(SdrCore* handle, bool enabled);
+
+/*
+ * Set RTL2832 direct-sampling mode. `mode` must be one of:
+ *   0 — off (normal tuner path)
+ *   1 — I branch
+ *   2 — Q branch
+ * Returns `SDR_CORE_ERR_INVALID_ARG` for values outside this
+ * range.
+ */
+int32_t sdr_core_set_direct_sampling(SdrCore* handle, int32_t mode);
+
+/* Enable or disable tuner offset-tuning. */
+int32_t sdr_core_set_offset_tuning(SdrCore* handle, bool enabled);
+
+/*
+ * Enable or disable RTL2832 digital AGC. Distinct from the
+ * tuner (analog) AGC loop that `sdr_core_set_agc` controls —
+ * RTL-SDR dongles expose both independently.
+ */
+int32_t sdr_core_set_rtl_agc(SdrCore* handle, bool enabled);
+
+/*
+ * Set tuner gain by index into the advertised gains table.
+ * Useful for rtl_tcp clients where the server publishes only
+ * a gain count (no individual dB values).
+ *
+ * Bounds-checking happens only when a gain count is available:
+ * the engine prefers `source.gains().len()` (local RTL-SDR
+ * USB), falls back to the rtl_tcp `Connected{gain_count}`
+ * state, and in those cases surfaces out-of-range indices via
+ * `SDR_EVT_ERROR`. When neither count is available (e.g. the
+ * rtl_tcp client hasn't completed its handshake yet) the
+ * command is dispatched unchecked and the source / remote
+ * server decides how to handle it.
+ */
+int32_t sdr_core_set_gain_by_index(SdrCore* handle, uint32_t index);
+
+/* ================================================================ */
+/*  rtl_tcp server (issue #325, ABI 0.11)                           */
+/* ================================================================ */
+
+/*
+ * Lets a host with a locally-attached RTL-SDR dongle share
+ * the device over the network so other SDR clients (GQRX,
+ * SDR++, dump1090, another `sdr-rs` instance) can connect and
+ * tune it. Wraps the `sdr-server-rtltcp` crate.
+ *
+ * The server owns exclusive access to the dongle while it's
+ * running, so it's mutually exclusive with the engine using
+ * that same dongle as its active source. The UI is expected
+ * to enforce that — the server FFI does not cross-check.
+ *
+ * Separate from `SdrCore`: the server has its own opaque
+ * handle (`SdrRtlTcpServer`), its own lifecycle, and no
+ * engine coupling. `SdrCore` can be running a network or file
+ * source while this server shares the local dongle.
+ */
+
+typedef struct SdrRtlTcpServer SdrRtlTcpServer;
+
+/* Bind-address mode. Stable discriminants — never reorder. */
+typedef enum SdrBindAddress {
+    SDR_BIND_LOOPBACK       = 0, /* 127.0.0.1 — default, safest on shared networks. */
+    SDR_BIND_ALL_INTERFACES = 1, /* 0.0.0.0 — exposes the server beyond localhost. */
+} SdrBindAddress;
+
+/*
+ * Server-start configuration. Mirrors
+ * `sdr_server_rtltcp::ServerConfig` + `InitialDeviceState`.
+ *
+ * `buffer_capacity == 0` uses the crate default (500 blocks).
+ * `initial_gain_tenths_db == 0` means "auto" (no manual gain).
+ * `initial_direct_sampling` must be one of 0 / 1 / 2.
+ * `port == 0` falls back to the crate default port (1234).
+ */
+typedef struct SdrRtlTcpServerConfig {
+    int32_t  bind_address;               /* SdrBindAddress */
+    uint16_t port;                       /* TCP listen port; 0 = crate default */
+    uint32_t device_index;               /* RTL-SDR USB index (0 = first) */
+    uint32_t buffer_capacity;            /* 0 = crate default (500); rejected above 4096 — each slot is ~256 KiB of USB transfer data */
+    uint32_t initial_freq_hz;            /* center frequency */
+    uint32_t initial_sample_rate_hz;     /* sample rate; MUST be > 0 — zero wedges the RTL-SDR USB controller */
+    int32_t  initial_gain_tenths_db;     /* tuner gain in 0.1 dB, 0 = auto */
+    int32_t  initial_ppm;                /* frequency correction (ppm) */
+    bool     initial_bias_tee;
+    int32_t  initial_direct_sampling;    /* 0 = off, 1 = I, 2 = Q */
+} SdrRtlTcpServerConfig;
+
+/*
+ * Scalar server statistics snapshot. String fields
+ * (connected-client address, tuner name) are written to
+ * caller-allocated buffers by `sdr_rtltcp_server_stats`.
+ */
+typedef struct SdrRtlTcpServerStats {
+    bool     has_client;
+    double   uptime_secs;              /* 0 when no client connected */
+    uint64_t bytes_sent;
+    uint64_t buffers_dropped;
+    /* Client-issued center-frequency override. 0 before the
+     * connected client has sent SetCenterFreq; resets on
+     * disconnect. Does NOT reflect the server's applied
+     * initial_freq_hz or the live device register — hosts
+     * that want "what the dongle is actually tuned to" should
+     * fall back to SdrRtlTcpServerConfig.initial_freq_hz when
+     * has_client && current_freq_hz == 0. */
+    uint32_t current_freq_hz;
+    /* Client-issued sample-rate override, same semantics as
+     * current_freq_hz above. */
+    uint32_t current_sample_rate_hz;
+    int32_t  current_gain_tenths_db;   /* valid only when has_current_gain_value */
+    bool     current_gain_auto;        /* valid only when has_current_gain_mode */
+    /* `true` once the client sent at least one SetTunerGain
+     * command this session. Tracked separately from the mode
+     * flag below because a client can set one without the
+     * other — without the separate validity bits, a genuine
+     * 0 dB manual gain would be indistinguishable from
+     * "client hasn't set gain yet." */
+    bool     has_current_gain_value;
+    /* `true` once the client sent at least one SetGainMode
+     * command this session. Valid companion to
+     * current_gain_auto — without this flag a `false` value
+     * would be indistinguishable from "client hasn't asked
+     * for a gain mode yet." */
+    bool     has_current_gain_mode;
+    /* Tuner's advertised discrete gain count (from
+     * dongle_info_t). Populated by Server::start during the
+     * dongle-open phase — non-zero for the entire server
+     * lifetime, including before the first client connects. */
+    uint32_t gain_count;
+    uint32_t recent_commands_count;    /* size of the recent-commands ring */
+} SdrRtlTcpServerStats;
+
+/*
+ * Start an rtl_tcp server. On success writes the handle to
+ * `*out_handle` and returns `SDR_CORE_OK`. On failure returns
+ * one of:
+ *   SDR_CORE_ERR_INVALID_ARG — null cfg / out_handle, unknown
+ *                              bind_address,
+ *                              initial_sample_rate_hz == 0,
+ *                              direct_sampling outside 0..=2,
+ *                              buffer_capacity > 4096.
+ *   SDR_CORE_ERR_IO          — bind / address error.
+ *   SDR_CORE_ERR_DEVICE      — USB open / device error.
+ *   SDR_CORE_ERR_INTERNAL    — caught panic.
+ *
+ * The caller is responsible for eventually calling
+ * `sdr_rtltcp_server_stop` to release the handle.
+ */
+int32_t sdr_rtltcp_server_start(
+    const SdrRtlTcpServerConfig* cfg,
+    SdrRtlTcpServer**            out_handle
+);
+
+/*
+ * Stop and release the server. Blocks until the accept thread
+ * has joined and the RTL-SDR dongle is released — on return
+ * the device is free for the engine (or any other local
+ * consumer) to open immediately. After this call the handle
+ * pointer is invalid; do not use it again. Passing null is
+ * a no-op.
+ *
+ * **Caller must serialize `_stop` against every other FFI
+ * call on the same handle.** The handle is reclaimed via
+ * `Box::from_raw`, so a concurrent `_stats` /
+ * `_recent_commands_json` / `_has_stopped` racing with
+ * `_stop` is a use-after-free. Same contract as
+ * `sdr_core_destroy`. Typical hosts only need this when
+ * polling stats from a background thread — stop the poller
+ * first, then call `_stop`.
+ */
+void sdr_rtltcp_server_stop(SdrRtlTcpServer* handle);
+
+/*
+ * Returns `true` once the server's accept thread has exited.
+ * Useful for hosts polling for a clean shutdown or a crashed
+ * server. Null handle also returns `true`.
+ */
+bool sdr_rtltcp_server_has_stopped(SdrRtlTcpServer* handle);
+
+/*
+ * Snapshot the server's live stats.
+ *
+ * `out_stats` must be non-null. `out_client_addr` and
+ * `out_tuner_name` are optional NUL-terminated string buffers
+ * (pass NULL with `*_len = 0` to skip). Strings longer than
+ * the buffer are truncated; NOT an error. A 64-byte buffer
+ * handles any realistic `"ip:port"` or tuner name.
+ *
+ * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG`
+ * on null out_stats, `SDR_CORE_ERR_INVALID_HANDLE` on null
+ * handle, `SDR_CORE_ERR_NOT_RUNNING` if the server was already
+ * stopped.
+ */
+int32_t sdr_rtltcp_server_stats(
+    SdrRtlTcpServer*      handle,
+    SdrRtlTcpServerStats* out_stats,
+    char*                 out_client_addr,
+    size_t                client_addr_len,
+    char*                 out_tuner_name,
+    size_t                tuner_name_len
+);
+
+/*
+ * Write the recent-commands ring to `out_buf` as a JSON
+ * array. Each entry: `{"op": "<name>", "seconds_ago": <f64>}`.
+ * The entries are ordered oldest-first.
+ *
+ * Returns:
+ *   SDR_CORE_OK              — buffer was big enough; filled and NUL-terminated.
+ *   SDR_CORE_ERR_INVALID_ARG — buffer too small or null with nonzero len. `*out_required`
+ *                              (when non-null) receives the exact size (incl. NUL) the
+ *                              caller should allocate and retry. `out_buf` is untouched.
+ *   SDR_CORE_ERR_INVALID_HANDLE — null handle.
+ *   SDR_CORE_ERR_NOT_RUNNING    — server already stopped.
+ *   SDR_CORE_ERR_INTERNAL       — JSON encoding failure (shouldn't reach here).
+ */
+int32_t sdr_rtltcp_server_recent_commands_json(
+    SdrRtlTcpServer* handle,
+    char*            out_buf,
+    size_t           buf_len,
+    size_t*          out_required
+);
+
+/* ================================================================ */
+/*  rtl_tcp discovery (mDNS — issue #325, ABI 0.11)                 */
+/* ================================================================ */
+
+/*
+ * mDNS service-type: `_rtl_tcp._tcp.local.`. Two standalone
+ * opaque handles — `SdrRtlTcpAdvertiser` publishes one
+ * advertisement on the LAN, `SdrRtlTcpBrowser` watches for
+ * advertisements and fires a callback for each change.
+ *
+ * Neither is engine-coupled; the same process can run the
+ * engine, advertise a server, and browse other servers
+ * independently.
+ */
+
+typedef struct SdrRtlTcpAdvertiser SdrRtlTcpAdvertiser;
+typedef struct SdrRtlTcpBrowser    SdrRtlTcpBrowser;
+
+/*
+ * Discovery-event discriminants. Stable — never reorder.
+ */
+typedef enum SdrRtlTcpDiscoveryEventKind {
+    SDR_RTLTCP_DISCOVERY_ANNOUNCED = 0,
+    SDR_RTLTCP_DISCOVERY_WITHDRAWN = 1,
+} SdrRtlTcpDiscoveryEventKind;
+
+/*
+ * Options for `sdr_rtltcp_advertiser_start`. String fields are
+ * copied into owned Rust storage before the call returns, so
+ * the caller may free them immediately.
+ */
+typedef struct SdrRtlTcpAdvertiseOptions {
+    uint16_t     port;           /* required, must be in 1..=65535 (0 rejected as InvalidArg) */
+    const char*  instance_name;  /* required, non-empty, UTF-8 */
+    const char*  hostname;       /* optional; NULL / "" = auto from system hostname */
+    const char*  tuner;          /* TXT: tuner family (e.g. "R820T"); required */
+    const char*  version;        /* TXT: advertiser version string; required */
+    uint32_t     gains;          /* TXT: discrete gain-step count */
+    const char*  nickname;       /* TXT: user-editable nickname; optional (NULL / "" = no nickname) */
+    bool         has_txbuf;      /* TXT: whether `txbuf` below is meaningful */
+    uint64_t     txbuf;          /* TXT: optional buffer-depth hint (bytes) */
+} SdrRtlTcpAdvertiseOptions;
+
+/*
+ * One entry in a discovery event. All pointer fields point
+ * into dispatcher-owned storage valid only for the duration of
+ * the callback call — copy out anything the host wants to
+ * retain.
+ */
+typedef struct SdrRtlTcpDiscoveredServer {
+    const char* instance_name;
+    const char* hostname;
+    uint16_t    port;
+    const char* address_ipv4;       /* dotted quad, or empty if none resolved */
+    const char* address_ipv6;       /* empty if none resolved */
+    const char* tuner;              /* TXT fields below */
+    const char* version;
+    uint32_t    gains;
+    const char* nickname;
+    bool        has_txbuf;
+    uint64_t    txbuf;
+    double      last_seen_secs_ago;
+} SdrRtlTcpDiscoveredServer;
+
+/*
+ * Tagged discovery event. `announced` is meaningful when
+ * `kind == SDR_RTLTCP_DISCOVERY_ANNOUNCED`;
+ * `withdrawn_instance_name` is meaningful when
+ * `kind == SDR_RTLTCP_DISCOVERY_WITHDRAWN`.
+ */
+typedef struct SdrRtlTcpDiscoveryEvent {
+    int32_t                   kind;
+    SdrRtlTcpDiscoveredServer announced;
+    const char*               withdrawn_instance_name;
+} SdrRtlTcpDiscoveryEvent;
+
+/*
+ * Callback invoked for every discovery event. Fires on a
+ * dedicated thread (`rtl_tcp-discovery-browser`), NOT the
+ * host's main thread — same threading contract as the main
+ * event callback.
+ */
+typedef void (*SdrRtlTcpDiscoveryCallback)(
+    const SdrRtlTcpDiscoveryEvent* event,
+    void*                          user_data
+);
+
+/*
+ * Start publishing an mDNS advertisement for a locally-hosted
+ * rtl_tcp server. Returns `SDR_CORE_OK` + handle on success.
+ * `SDR_CORE_ERR_INVALID_ARG` on null pointers, `port == 0`,
+ * empty required fields (`instance_name` / `tuner` /
+ * `version`), or invalid UTF-8 in optional fields;
+ * `SDR_CORE_ERR_IO` on mDNS daemon failure.
+ *
+ * The caller must eventually call `sdr_rtltcp_advertiser_stop`
+ * to unregister.
+ */
+int32_t sdr_rtltcp_advertiser_start(
+    const SdrRtlTcpAdvertiseOptions* opts,
+    SdrRtlTcpAdvertiser**            out_handle
+);
+
+/*
+ * Unregister and release. Passing null is a no-op.
+ *
+ * **Caller must serialize `_stop` against every other FFI
+ * call on the same handle.** The handle is reclaimed via
+ * `Box::from_raw` — same use-after-free contract as
+ * `sdr_rtltcp_server_stop` and `sdr_core_destroy`.
+ */
+void sdr_rtltcp_advertiser_stop(SdrRtlTcpAdvertiser* handle);
+
+/*
+ * Start browsing for rtl_tcp advertisements. Returns
+ * `SDR_CORE_OK` + handle on success. `SDR_CORE_ERR_INVALID_ARG`
+ * on null callback / out_handle; `SDR_CORE_ERR_IO` on mDNS
+ * daemon failure.
+ *
+ * `user_data` is opaque — the caller owns its lifetime and
+ * must keep it valid between `_start` and `_stop`.
+ */
+int32_t sdr_rtltcp_browser_start(
+    SdrRtlTcpDiscoveryCallback callback,
+    void*                      user_data,
+    SdrRtlTcpBrowser**         out_handle
+);
+
+/*
+ * Stop browsing and release. Joins the dispatcher thread
+ * before returning, so the host can deterministically free
+ * `user_data` on the next line. Passing null is a no-op.
+ *
+ * **Must NOT be called from inside the discovery callback.**
+ * The dispatcher thread that runs the callback is the same
+ * thread `_stop` joins, so calling this from within the
+ * callback self-deadlocks against the in-flight dispatch.
+ * Hosts that want to stop browsing in response to a
+ * discovered server should marshal the call out to another
+ * thread (GCD, a Swift `Task`, etc.).
+ *
+ * **Caller must serialize `_stop` against every other FFI
+ * call on the same handle.** The handle is reclaimed via
+ * `Box::from_raw` — same use-after-free contract as
+ * `sdr_rtltcp_server_stop` and `sdr_core_destroy`.
+ */
+void sdr_rtltcp_browser_stop(SdrRtlTcpBrowser* handle);
+
 /*
  * Start / stop recording the demodulated audio stream to a 16-bit
  * PCM WAV file. The engine opens the file on `start`, writes every
@@ -849,7 +1236,19 @@ typedef enum SdrEventKind {
     SDR_EVT_IQ_RECORDING_STARTED    = 10,
     SDR_EVT_IQ_RECORDING_STOPPED    = 11,
     SDR_EVT_NETWORK_SINK_STATUS     = 12, /* ABI 0.9 — issue #247 */
+    SDR_EVT_RTL_TCP_CONNECTION_STATE = 13, /* ABI 0.11 — issue #325 */
 } SdrEventKind;
+
+/* Discriminants for the `kind` field of
+ * `SdrEventRtlTcpConnectionState` below. Stable — never reorder.
+ */
+typedef enum SdrRtlTcpConnectionStateKind {
+    SDR_RTL_TCP_STATE_DISCONNECTED = 0,
+    SDR_RTL_TCP_STATE_CONNECTING   = 1,
+    SDR_RTL_TCP_STATE_CONNECTED    = 2,
+    SDR_RTL_TCP_STATE_RETRYING     = 3,
+    SDR_RTL_TCP_STATE_FAILED       = 4,
+} SdrRtlTcpConnectionStateKind;
 
 /* Discriminants for the `kind` field of `SdrEventNetworkSinkStatus`
  * below. Stable — never reorder.
@@ -933,6 +1332,29 @@ typedef struct SdrEventNetworkSinkStatus {
 } SdrEventNetworkSinkStatus;
 
 /*
+ * Payload for SDR_EVT_RTL_TCP_CONNECTION_STATE. Tagged by
+ * `kind` (one of `SDR_RTL_TCP_STATE_*`):
+ *
+ * | kind                              | utf8           | attempt | retry_in_secs | gain_count |
+ * |-----------------------------------|----------------|---------|---------------|------------|
+ * | SDR_RTL_TCP_STATE_DISCONNECTED    | NULL           | 0       | 0.0           | 0          |
+ * | SDR_RTL_TCP_STATE_CONNECTING      | NULL           | 0       | 0.0           | 0          |
+ * | SDR_RTL_TCP_STATE_CONNECTED       | tuner name     | 0       | 0.0           | gain steps |
+ * | SDR_RTL_TCP_STATE_RETRYING        | NULL           | attempt | seconds       | 0          |
+ * | SDR_RTL_TCP_STATE_FAILED          | reason         | 0       | 0.0           | 0          |
+ *
+ * `utf8` is borrowed from dispatcher-owned storage; valid only
+ * for the duration of the callback. Per issue #325.
+ */
+typedef struct SdrEventRtlTcpConnectionState {
+    int32_t     kind;
+    const char* utf8;
+    uint32_t    attempt;
+    double      retry_in_secs;
+    uint32_t    gain_count;
+} SdrEventRtlTcpConnectionState;
+
+/*
  * Tagged union of all event payloads. Which union field is valid
  * is determined by the `kind` discriminant on the enclosing
  * SdrEvent (see the table below).
@@ -951,6 +1373,7 @@ typedef struct SdrEventNetworkSinkStatus {
  * SDR_EVT_IQ_RECORDING_STARTED        iq_recording.path_utf8
  * SDR_EVT_IQ_RECORDING_STOPPED        none (all-zero payload)
  * SDR_EVT_NETWORK_SINK_STATUS         network_sink_status.{kind,utf8,protocol}
+ * SDR_EVT_RTL_TCP_CONNECTION_STATE    rtl_tcp_connection_state.{kind,utf8,attempt,retry_in_secs,gain_count}
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
@@ -961,7 +1384,8 @@ typedef union SdrEventPayload {
     SdrEventError             error;
     SdrEventAudioRecording    audio_recording;
     SdrEventIqRecording       iq_recording;
-    SdrEventNetworkSinkStatus network_sink_status;
+    SdrEventNetworkSinkStatus      network_sink_status;
+    SdrEventRtlTcpConnectionState  rtl_tcp_connection_state;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;

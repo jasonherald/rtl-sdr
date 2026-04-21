@@ -1129,6 +1129,37 @@ impl Source for RtlTcpSource {
             Err(_) => Some(sdr_types::RtlTcpConnectionState::Disconnected),
         }
     }
+
+    // ----------------------------------------------------------
+    //  rtl_tcp-specific command hooks — forward the generic
+    //  `Source` trait calls to the typed wire-command methods
+    //  so the controller can dispatch uniformly (see the same
+    //  pattern for `set_gain` / `set_gain_mode` above).
+    // ----------------------------------------------------------
+
+    fn set_bias_tee(&mut self, enabled: bool) -> Result<(), SourceError> {
+        RtlTcpSource::set_bias_tee(self, enabled)
+    }
+
+    fn set_direct_sampling(&mut self, mode: i32) -> Result<(), SourceError> {
+        RtlTcpSource::set_direct_sampling(self, mode)
+    }
+
+    fn set_offset_tuning(&mut self, enabled: bool) -> Result<(), SourceError> {
+        RtlTcpSource::set_offset_tuning(self, enabled)
+    }
+
+    fn set_rtl_agc(&mut self, enabled: bool) -> Result<(), SourceError> {
+        // Upstream rtl_tcp naming is `set_agc_mode` for the RTL2832
+        // digital AGC — distinct from the analog tuner AGC that
+        // `set_gain_mode` above controls. Our trait uses
+        // `set_rtl_agc` for clarity.
+        self.set_agc_mode(enabled)
+    }
+
+    fn set_gain_by_index(&mut self, index: u32) -> Result<(), SourceError> {
+        RtlTcpSource::set_gain_by_index(self, index)
+    }
 }
 
 #[cfg(test)]

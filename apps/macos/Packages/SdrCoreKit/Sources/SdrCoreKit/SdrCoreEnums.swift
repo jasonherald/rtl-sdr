@@ -152,6 +152,34 @@ public enum NetworkProtocol: Int32, Sendable, CaseIterable, Codable {
     }
 }
 
+/// rtl_tcp client connection-state snapshot surfaced via the
+/// `rtlTcpConnectionState` engine event. Mirrors
+/// `sdr_types::RtlTcpConnectionState` on the Rust side. Per
+/// issue #325.
+public enum RtlTcpConnectionState: Sendable, Equatable {
+    /// No connection attempt has begun yet. Initial state on
+    /// source construction, before `start()`.
+    case disconnected
+
+    /// First TCP connect is in flight.
+    case connecting
+
+    /// Handshake succeeded and data is streaming. Carries tuner
+    /// metadata (name, gain-step count) for a status row.
+    case connected(tunerName: String, gainCount: UInt32)
+
+    /// Transport-level error; the source is in its reconnect-
+    /// with-backoff loop. `attempt` is the monotonically
+    /// increasing retry counter; `retryInSecs` is how long
+    /// until the next attempt (seconds). Plain `Double` —
+    /// avoids dragging `Foundation` into this enum file.
+    case retrying(attempt: UInt32, retryInSecs: Double)
+
+    /// Terminal protocol-level failure (non-RTL0 handshake,
+    /// etc.). The UI should show "needs user action."
+    case failed(reason: String)
+}
+
 /// Network sink status surfaced via the `networkSinkStatus`
 /// engine event. Mirrors
 /// `sdr_core::sink_slot::NetworkSinkStatus` on the Rust side.

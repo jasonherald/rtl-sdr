@@ -58,6 +58,7 @@ pub const SDR_EVT_AUDIO_RECORDING_STOPPED: i32 = 9;
 pub const SDR_EVT_IQ_RECORDING_STARTED: i32 = 10;
 pub const SDR_EVT_IQ_RECORDING_STOPPED: i32 = 11;
 pub const SDR_EVT_NETWORK_SINK_STATUS: i32 = 12;
+pub const SDR_EVT_RTL_TCP_CONNECTION_STATE: i32 = 13;
 
 // ============================================================
 //  Network sink status discriminants — must match the
@@ -79,6 +80,18 @@ pub const SDR_NETWORK_SINK_STATUS_ERROR: i32 = 2;
 
 pub const SDR_NETWORK_PROTOCOL_TCP_SERVER: i32 = 0;
 pub const SDR_NETWORK_PROTOCOL_UDP: i32 = 1;
+
+// ============================================================
+//  rtl_tcp connection-state discriminants — must match
+//  `SdrRtlTcpConnectionStateKind` in `include/sdr_core.h`.
+//  Never reorder or renumber. ABI 0.11.
+// ============================================================
+
+pub const SDR_RTL_TCP_STATE_DISCONNECTED: i32 = 0;
+pub const SDR_RTL_TCP_STATE_CONNECTING: i32 = 1;
+pub const SDR_RTL_TCP_STATE_CONNECTED: i32 = 2;
+pub const SDR_RTL_TCP_STATE_RETRYING: i32 = 3;
+pub const SDR_RTL_TCP_STATE_FAILED: i32 = 4;
 
 // ============================================================
 //  SdrEvent tagged union — `#[repr(C)]` layout matching the
@@ -129,6 +142,29 @@ pub struct SdrEventAudioRecording {
 #[derive(Clone, Copy)]
 pub struct SdrEventIqRecording {
     pub path_utf8: *const c_char,
+}
+
+/// Payload for `SDR_EVT_RTL_TCP_CONNECTION_STATE`. Tagged by
+/// `kind` (one of `SDR_RTL_TCP_STATE_*`):
+///
+/// | `kind`                          | `utf8`            | `attempt` | `retry_in_secs` | `gain_count` |
+/// |---------------------------------|-------------------|-----------|-----------------|--------------|
+/// | `SDR_RTL_TCP_STATE_DISCONNECTED`| NULL              | 0         | 0.0             | 0            |
+/// | `SDR_RTL_TCP_STATE_CONNECTING`  | NULL              | 0         | 0.0             | 0            |
+/// | `SDR_RTL_TCP_STATE_CONNECTED`   | tuner name        | 0         | 0.0             | gain steps   |
+/// | `SDR_RTL_TCP_STATE_RETRYING`    | NULL              | attempt#  | seconds         | 0            |
+/// | `SDR_RTL_TCP_STATE_FAILED`      | reason            | 0         | 0.0             | 0            |
+///
+/// `utf8` is a borrowed pointer into dispatcher-owned storage;
+/// valid only for the duration of the callback. Per issue #325.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventRtlTcpConnectionState {
+    pub kind: i32,
+    pub utf8: *const c_char,
+    pub attempt: u32,
+    pub retry_in_secs: f64,
+    pub gain_count: u32,
 }
 
 /// Payload for `SDR_EVT_NETWORK_SINK_STATUS`. Tagged by `kind`
@@ -183,6 +219,7 @@ pub union SdrEventPayload {
     pub audio_recording: SdrEventAudioRecording,
     pub iq_recording: SdrEventIqRecording,
     pub network_sink_status: SdrEventNetworkSinkStatus,
+    pub rtl_tcp_connection_state: SdrEventRtlTcpConnectionState,
     /// Placeholder for kinds that carry no payload (e.g.,
     /// `SDR_EVT_SOURCE_STOPPED`). Accessing this field is always
     /// valid as a zero-byte read.
@@ -462,12 +499,68 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         // `SDR_EVT_*` discriminant + new payload struct or reuse
         // of existing ones), so a future minor bump won't break
         // older hosts that don't know about them.
+        DspToUi::RtlTcpConnectionState(state) => {
+            use sdr_types::RtlTcpConnectionState;
+            // Translate into the C tagged-payload shape.
+            // Variants with a borrowed string promote to
+            // `CString` so the pointer stays valid for the
+            // duration of the host callback (same ownership
+            // pattern as the network sink status event).
+            let (kind, message_cstr, attempt, retry_in_secs, gain_count) = match state {
+                RtlTcpConnectionState::Disconnected => {
+                    (SDR_RTL_TCP_STATE_DISCONNECTED, None, 0_u32, 0.0_f64, 0_u32)
+                }
+                RtlTcpConnectionState::Connecting => {
+                    (SDR_RTL_TCP_STATE_CONNECTING, None, 0, 0.0, 0)
+                }
+                RtlTcpConnectionState::Connected {
+                    tuner_name,
+                    gain_count,
+                } => {
+                    let sanitized = tuner_name.replace('\0', "?");
+                    let Ok(cstr) = CString::new(sanitized) else {
+                        return None;
+                    };
+                    (SDR_RTL_TCP_STATE_CONNECTED, Some(cstr), 0, 0.0, *gain_count)
+                }
+                RtlTcpConnectionState::Retrying { attempt, retry_in } => (
+                    SDR_RTL_TCP_STATE_RETRYING,
+                    None,
+                    *attempt,
+                    retry_in.as_secs_f64(),
+                    0,
+                ),
+                RtlTcpConnectionState::Failed { reason } => {
+                    let sanitized = reason.replace('\0', "?");
+                    let Ok(cstr) = CString::new(sanitized) else {
+                        return None;
+                    };
+                    (SDR_RTL_TCP_STATE_FAILED, Some(cstr), 0, 0.0, 0)
+                }
+            };
+            let utf8 = message_cstr
+                .as_ref()
+                .map_or(std::ptr::null(), |c| c.as_ptr());
+            owned_cstring = message_cstr;
+            SdrEvent {
+                kind: SDR_EVT_RTL_TCP_CONNECTION_STATE,
+                payload: SdrEventPayload {
+                    rtl_tcp_connection_state: SdrEventRtlTcpConnectionState {
+                        kind,
+                        utf8,
+                        attempt,
+                        retry_in_secs,
+                        gain_count,
+                    },
+                },
+            }
+        }
+
         DspToUi::FftData(_)
         | DspToUi::DemodModeChanged(_)
         | DspToUi::BandwidthChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
-        | DspToUi::VoiceSquelchOpenChanged(_)
-        | DspToUi::RtlTcpConnectionState(_) => return None,
+        | DspToUi::VoiceSquelchOpenChanged(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))
@@ -741,6 +834,90 @@ mod tests {
         assert_eq!(SDR_EVT_IQ_RECORDING_STARTED, 10);
         assert_eq!(SDR_EVT_IQ_RECORDING_STOPPED, 11);
         assert_eq!(SDR_EVT_NETWORK_SINK_STATUS, 12);
+        assert_eq!(SDR_EVT_RTL_TCP_CONNECTION_STATE, 13);
+    }
+
+    #[test]
+    fn rtl_tcp_state_discriminants_match_header() {
+        assert_eq!(SDR_RTL_TCP_STATE_DISCONNECTED, 0);
+        assert_eq!(SDR_RTL_TCP_STATE_CONNECTING, 1);
+        assert_eq!(SDR_RTL_TCP_STATE_CONNECTED, 2);
+        assert_eq!(SDR_RTL_TCP_STATE_RETRYING, 3);
+        assert_eq!(SDR_RTL_TCP_STATE_FAILED, 4);
+    }
+
+    #[test]
+    fn translate_rtl_tcp_connection_state_disconnected() {
+        use sdr_types::RtlTcpConnectionState;
+        let (event, owned_cstring, _) = translate_event(&DspToUi::RtlTcpConnectionState(
+            RtlTcpConnectionState::Disconnected,
+        ))
+        .expect("Disconnected event should translate");
+        assert_eq!(event.kind, SDR_EVT_RTL_TCP_CONNECTION_STATE);
+        let payload = unsafe { event.payload.rtl_tcp_connection_state };
+        assert_eq!(payload.kind, SDR_RTL_TCP_STATE_DISCONNECTED);
+        assert!(payload.utf8.is_null());
+        assert_eq!(payload.attempt, 0);
+        // `retry_in_secs` is populated from `Duration::as_secs_f64`
+        // only on the Retrying arm; Disconnected leaves it at the
+        // struct's zero-init. Exact-zero compare is fine here —
+        // we put the 0.0 there deterministically.
+        assert!(payload.retry_in_secs.abs() < f64::EPSILON);
+        assert_eq!(payload.gain_count, 0);
+        assert!(owned_cstring.is_none());
+    }
+
+    #[test]
+    fn translate_rtl_tcp_connection_state_connected_carries_tuner() {
+        use sdr_types::RtlTcpConnectionState;
+        let (event, owned_cstring, _) = translate_event(&DspToUi::RtlTcpConnectionState(
+            RtlTcpConnectionState::Connected {
+                tuner_name: "R820T".to_string(),
+                gain_count: 29,
+            },
+        ))
+        .expect("Connected event should translate");
+        let payload = unsafe { event.payload.rtl_tcp_connection_state };
+        assert_eq!(payload.kind, SDR_RTL_TCP_STATE_CONNECTED);
+        assert_eq!(payload.gain_count, 29);
+        assert!(!payload.utf8.is_null());
+        let cstr = unsafe { std::ffi::CStr::from_ptr(payload.utf8) };
+        assert_eq!(cstr.to_str().unwrap(), "R820T");
+        assert!(owned_cstring.is_some());
+    }
+
+    #[test]
+    fn translate_rtl_tcp_connection_state_retrying_carries_attempt_and_seconds() {
+        use sdr_types::RtlTcpConnectionState;
+        let (event, _, _) = translate_event(&DspToUi::RtlTcpConnectionState(
+            RtlTcpConnectionState::Retrying {
+                attempt: 7,
+                retry_in: std::time::Duration::from_millis(2_500),
+            },
+        ))
+        .expect("Retrying event should translate");
+        let payload = unsafe { event.payload.rtl_tcp_connection_state };
+        assert_eq!(payload.kind, SDR_RTL_TCP_STATE_RETRYING);
+        assert_eq!(payload.attempt, 7);
+        assert!((payload.retry_in_secs - 2.5).abs() < 1e-9);
+        assert!(payload.utf8.is_null());
+    }
+
+    #[test]
+    fn translate_rtl_tcp_connection_state_failed_carries_reason() {
+        use sdr_types::RtlTcpConnectionState;
+        let (event, owned_cstring, _) = translate_event(&DspToUi::RtlTcpConnectionState(
+            RtlTcpConnectionState::Failed {
+                reason: "handshake rejected: not RTL0".to_string(),
+            },
+        ))
+        .expect("Failed event should translate");
+        let payload = unsafe { event.payload.rtl_tcp_connection_state };
+        assert_eq!(payload.kind, SDR_RTL_TCP_STATE_FAILED);
+        assert!(!payload.utf8.is_null());
+        let cstr = unsafe { std::ffi::CStr::from_ptr(payload.utf8) };
+        assert_eq!(cstr.to_str().unwrap(), "handshake rejected: not RTL0");
+        assert!(owned_cstring.is_some());
     }
 
     #[test]
@@ -867,15 +1044,19 @@ mod tests {
 
     #[test]
     fn sdr_event_payload_size_is_reasonable() {
-        // Sanity check on the union layout. On 64-bit targets,
-        // the largest payload (gain_list with {ptr, usize}) is
-        // 16 bytes; the event struct adds i32 kind plus padding.
-        // We expect total <= 32 bytes which is the C-side
-        // expectation too.
+        // Sanity check on the union layout. The largest payload
+        // today is `SdrEventRtlTcpConnectionState` (kind i32 +
+        // utf8 ptr + attempt u32 + retry_in_secs f64 + gain_count
+        // u32) which lands at 40 bytes with natural alignment on
+        // 64-bit targets. Budget is 48 so a future connection-
+        // state extension (e.g. endpoint string alongside tuner
+        // name) has a little headroom before the size check
+        // tightens. Past budgets: 32 (pre-ABI-0.11 with only the
+        // network sink status payload).
         let size = std::mem::size_of::<SdrEvent>();
         assert!(
-            size <= 32,
-            "SdrEvent size {size} exceeds 32-byte budget — may indicate an unintended union growth"
+            size <= 48,
+            "SdrEvent size {size} exceeds 48-byte budget — may indicate an unintended union growth"
         );
     }
 }

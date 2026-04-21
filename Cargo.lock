@@ -1989,6 +1989,8 @@ dependencies = [
  "sdr-radio",
  "sdr-radioreference",
  "sdr-rtlsdr",
+ "sdr-rtltcp-discovery",
+ "sdr-server-rtltcp",
  "sdr-sink-audio",
  "sdr-types",
  "serde",

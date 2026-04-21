@@ -77,6 +77,15 @@ const VFO_OUTPUT_PADDING: usize = 64;
 /// RTL-SDR device index to open.
 const DEVICE_INDEX: u32 = 0;
 
+/// Legal range for the `SetDirectSampling` command's `mode`
+/// argument. Mirrors the RTL2832 direct-sampling mode register:
+/// `0` = off (normal tuner path), `1` = I branch, `2` = Q
+/// branch. Named so the FFI validation, the controller's
+/// handler, and the diagnostic message all reference the same
+/// bounds — per `CodeRabbit` round 1 on PR #360.
+const DIRECT_SAMPLING_MIN: i32 = 0;
+const DIRECT_SAMPLING_MAX: i32 = 2;
+
 /// Audio recording sample rate in Hz (matches `PipeWire` output).
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
@@ -1230,6 +1239,104 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetFilePath(path) => {
             tracing::debug!(?path, "set file path");
             state.file_path = path;
+        }
+
+        UiToDsp::SetBiasTee(enabled) => {
+            tracing::debug!(enabled, "set bias tee");
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_bias_tee(enabled)
+            {
+                tracing::warn!("set bias tee failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Bias tee failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetDirectSampling(mode) => {
+            tracing::debug!(mode, "set direct sampling");
+            if !(DIRECT_SAMPLING_MIN..=DIRECT_SAMPLING_MAX).contains(&mode) {
+                tracing::warn!(
+                    "set direct sampling rejected: mode {mode} out of range \
+                     ({DIRECT_SAMPLING_MIN}..={DIRECT_SAMPLING_MAX})"
+                );
+                let _ = dsp_tx.send(DspToUi::Error(format!(
+                    "Direct sampling mode {mode} out of range \
+                     ({DIRECT_SAMPLING_MIN}..={DIRECT_SAMPLING_MAX})"
+                )));
+            } else if let Some(source) = &mut state.source
+                && let Err(e) = source.set_direct_sampling(mode)
+            {
+                tracing::warn!("set direct sampling failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetOffsetTuning(enabled) => {
+            tracing::debug!(enabled, "set offset tuning");
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_offset_tuning(enabled)
+            {
+                tracing::warn!("set offset tuning failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Offset tuning failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetRtlAgc(enabled) => {
+            tracing::debug!(enabled, "set RTL AGC");
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_rtl_agc(enabled)
+            {
+                tracing::warn!("set RTL AGC failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("RTL AGC failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetGainByIndex(index) => {
+            tracing::debug!(index, "set gain by index");
+            if let Some(source) = &mut state.source {
+                // Bounds-check the index. Two sources of truth for
+                // the legal count:
+                //
+                //   1. `source.gains()` — populated for local
+                //      RTL-SDR USB (the tuner's discrete gain
+                //      table).
+                //   2. The rtl_tcp `Connected` connection state's
+                //      `gain_count` field — servers publish the
+                //      count but not the values, and
+                //      `RtlTcpSource::gains()` returns an empty
+                //      slice.
+                //
+                // Prefer (1) when it's non-empty; fall back to
+                // (2) for the rtl_tcp case. If neither is
+                // available we dispatch the command unchecked —
+                // the source may no-op (default trait impl) or
+                // surface a wire-level error later. Per
+                // `CodeRabbit` round 1 on PR #360.
+                let max_count = {
+                    let gains_len = source.gains().len();
+                    if gains_len > 0 {
+                        Some(gains_len)
+                    } else {
+                        match source.rtl_tcp_connection_state() {
+                            Some(sdr_types::RtlTcpConnectionState::Connected {
+                                gain_count,
+                                ..
+                            }) => Some(gain_count as usize),
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some(max) = max_count
+                    && (index as usize) >= max
+                {
+                    tracing::warn!("set gain by index rejected: {index} >= {max}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!(
+                        "Gain index {index} out of range (source has {max} gains)"
+                    )));
+                } else if let Err(e) = source.set_gain_by_index(index) {
+                    tracing::warn!("set gain by index failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
+                }
+            }
         }
 
         UiToDsp::SetPpmCorrection(ppm) => {
