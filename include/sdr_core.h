@@ -624,6 +624,153 @@ int32_t sdr_core_set_rtl_agc(SdrCore* handle, bool enabled);
  */
 int32_t sdr_core_set_gain_by_index(SdrCore* handle, uint32_t index);
 
+/* ================================================================ */
+/*  rtl_tcp server (issue #325, ABI 0.11)                           */
+/* ================================================================ */
+
+/*
+ * Lets a host with a locally-attached RTL-SDR dongle share
+ * the device over the network so other SDR clients (GQRX,
+ * SDR++, dump1090, another `sdr-rs` instance) can connect and
+ * tune it. Wraps the `sdr-server-rtltcp` crate.
+ *
+ * The server owns exclusive access to the dongle while it's
+ * running, so it's mutually exclusive with the engine using
+ * that same dongle as its active source. The UI is expected
+ * to enforce that — the server FFI does not cross-check.
+ *
+ * Separate from `SdrCore`: the server has its own opaque
+ * handle (`SdrRtlTcpServer`), its own lifecycle, and no
+ * engine coupling. `SdrCore` can be running a network or file
+ * source while this server shares the local dongle.
+ */
+
+typedef struct SdrRtlTcpServer SdrRtlTcpServer;
+
+/* Bind-address mode. Stable discriminants — never reorder. */
+typedef enum SdrBindAddress {
+    SDR_BIND_LOOPBACK       = 0, /* 127.0.0.1 — default, safest on shared networks. */
+    SDR_BIND_ALL_INTERFACES = 1, /* 0.0.0.0 — exposes the server beyond localhost. */
+} SdrBindAddress;
+
+/*
+ * Server-start configuration. Mirrors
+ * `sdr_server_rtltcp::ServerConfig` + `InitialDeviceState`.
+ *
+ * `buffer_capacity == 0` uses the crate default (500 blocks).
+ * `initial_gain_tenths_db == 0` means "auto" (no manual gain).
+ * `initial_direct_sampling` must be one of 0 / 1 / 2.
+ * `port == 0` falls back to the crate default port (1234).
+ */
+typedef struct SdrRtlTcpServerConfig {
+    int32_t  bind_address;               /* SdrBindAddress */
+    uint16_t port;                       /* TCP listen port; 0 = crate default */
+    uint32_t device_index;               /* RTL-SDR USB index (0 = first) */
+    uint32_t buffer_capacity;            /* 0 = crate default */
+    uint32_t initial_freq_hz;            /* center frequency */
+    uint32_t initial_sample_rate_hz;     /* sample rate */
+    int32_t  initial_gain_tenths_db;     /* tuner gain in 0.1 dB, 0 = auto */
+    int32_t  initial_ppm;                /* frequency correction (ppm) */
+    bool     initial_bias_tee;
+    int32_t  initial_direct_sampling;    /* 0 = off, 1 = I, 2 = Q */
+} SdrRtlTcpServerConfig;
+
+/*
+ * Scalar server statistics snapshot. String fields
+ * (connected-client address, tuner name) are written to
+ * caller-allocated buffers by `sdr_rtltcp_server_stats`.
+ */
+typedef struct SdrRtlTcpServerStats {
+    bool     has_client;
+    double   uptime_secs;              /* 0 when no client connected */
+    uint64_t bytes_sent;
+    uint64_t buffers_dropped;
+    uint32_t current_freq_hz;          /* 0 = client hasn't tuned this session */
+    uint32_t current_sample_rate_hz;   /* 0 = unset this session */
+    int32_t  current_gain_tenths_db;   /* valid only when has_current_gain */
+    bool     current_gain_auto;        /* valid only when has_current_gain */
+    bool     has_current_gain;
+    uint32_t gain_count;               /* advertised in dongle_info_t; 0 until first client */
+    uint32_t recent_commands_count;    /* size of the recent-commands ring */
+} SdrRtlTcpServerStats;
+
+/*
+ * Start an rtl_tcp server. On success writes the handle to
+ * `*out_handle` and returns `SDR_CORE_OK`. On failure returns
+ * one of:
+ *   SDR_CORE_ERR_INVALID_ARG — null cfg / out_handle, unknown
+ *                              bind_address, direct_sampling
+ *                              outside 0..=2.
+ *   SDR_CORE_ERR_IO          — bind / address error.
+ *   SDR_CORE_ERR_DEVICE      — USB open / device error.
+ *   SDR_CORE_ERR_INTERNAL    — caught panic.
+ *
+ * The caller is responsible for eventually calling
+ * `sdr_rtltcp_server_stop` to release the handle.
+ */
+int32_t sdr_rtltcp_server_start(
+    const SdrRtlTcpServerConfig* cfg,
+    SdrRtlTcpServer**            out_handle
+);
+
+/*
+ * Stop and release the server. After this call the handle
+ * pointer is invalid — do not use it again. Passing null is
+ * a no-op.
+ */
+void sdr_rtltcp_server_stop(SdrRtlTcpServer* handle);
+
+/*
+ * Returns `true` once the server's accept thread has exited.
+ * Useful for hosts polling for a clean shutdown or a crashed
+ * server. Null handle also returns `true`.
+ */
+bool sdr_rtltcp_server_has_stopped(SdrRtlTcpServer* handle);
+
+/*
+ * Snapshot the server's live stats.
+ *
+ * `out_stats` must be non-null. `out_client_addr` and
+ * `out_tuner_name` are optional NUL-terminated string buffers
+ * (pass NULL with `*_len = 0` to skip). Strings longer than
+ * the buffer are truncated; NOT an error. A 64-byte buffer
+ * handles any realistic `"ip:port"` or tuner name.
+ *
+ * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG`
+ * on null out_stats, `SDR_CORE_ERR_INVALID_HANDLE` on null
+ * handle, `SDR_CORE_ERR_NOT_RUNNING` if the server was already
+ * stopped.
+ */
+int32_t sdr_rtltcp_server_stats(
+    SdrRtlTcpServer*      handle,
+    SdrRtlTcpServerStats* out_stats,
+    char*                 out_client_addr,
+    size_t                client_addr_len,
+    char*                 out_tuner_name,
+    size_t                tuner_name_len
+);
+
+/*
+ * Write the recent-commands ring to `out_buf` as a JSON
+ * array. Each entry: `{"op": "<name>", "seconds_ago": <f64>}`.
+ * The entries are ordered oldest-first.
+ *
+ * Returns:
+ *   SDR_CORE_OK              — buffer was big enough; filled and NUL-terminated.
+ *   SDR_CORE_ERR_INVALID_ARG — buffer too small or null with nonzero len. `*out_required`
+ *                              (when non-null) receives the exact size (incl. NUL) the
+ *                              caller should allocate and retry. `out_buf` is untouched.
+ *   SDR_CORE_ERR_INVALID_HANDLE — null handle.
+ *   SDR_CORE_ERR_NOT_RUNNING    — server already stopped.
+ *   SDR_CORE_ERR_INTERNAL       — JSON encoding failure (shouldn't reach here).
+ */
+int32_t sdr_rtltcp_server_recent_commands_json(
+    SdrRtlTcpServer* handle,
+    char*            out_buf,
+    size_t           buf_len,
+    size_t*          out_required
+);
+
 /*
  * Start / stop recording the demodulated audio stream to a 16-bit
  * PCM WAV file. The engine opens the file on `start`, writes every

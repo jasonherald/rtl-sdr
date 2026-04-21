@@ -49,6 +49,14 @@ sdr-sink-audio.workspace = true
 # thread.
 sdr-radioreference.workspace = true
 sdr-config.workspace = true
+# Direct deps on the rtl_tcp crates for issue #325.
+# - sdr-server-rtltcp: server lifecycle + stats (no engine coupling)
+# - sdr-rtltcp-discovery: mDNS announce + browse (no engine coupling)
+# Both wrap native APIs that don't fit the DSP thread's message
+# loop, so they go through standalone FFI handles rather than
+# piggy-backing on `SdrCore`.
+sdr-server-rtltcp.workspace = true
+sdr-rtltcp-discovery.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 tracing.workspace = true
