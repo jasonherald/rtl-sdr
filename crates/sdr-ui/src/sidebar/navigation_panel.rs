@@ -758,6 +758,9 @@ fn build_bookmark_row(
             .tooltip_text("Save current settings to this bookmark")
             .css_classes(["flat"])
             .build();
+        save_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Save current settings to this bookmark",
+        )]);
         let save_cb = std::rc::Rc::clone(on_save);
         save_btn.connect_clicked(move |_| {
             if let Some(cb) = save_cb.borrow().as_ref() {
@@ -773,6 +776,7 @@ fn build_bookmark_row(
         .tooltip_text("Delete bookmark")
         .css_classes(["flat"])
         .build();
+    delete_btn.update_property(&[gtk4::accessible::Property::Label("Delete bookmark")]);
 
     let bm_rc = std::rc::Rc::clone(bookmarks);
     let nav_rc = std::rc::Rc::clone(on_navigate);
