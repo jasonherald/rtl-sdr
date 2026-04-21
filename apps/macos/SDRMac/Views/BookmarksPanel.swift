@@ -33,14 +33,89 @@ struct BookmarksPanel: View {
     /// open/closed flag in `ContentView`.
     @Binding var isPresented: Bool
 
+    /// Live search filter. Case-insensitive substring match
+    /// against `name`, the formatted frequency subtitle, and
+    /// `rrCategory`. Mirrors the Linux predicate in
+    /// `navigation_panel.rs::bookmark_matches_filter` — PR
+    /// #361 round 1 flagged category-missing as a Major
+    /// finding; landing it from day one here.
+    @State private var filterText: String = ""
+
     var body: some View {
         VStack(spacing: 0) {
             header
+            Divider()
+            searchRow
             Divider()
             body_list
         }
         .frame(width: BookmarksPanel.width)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    // MARK: - Search
+
+    private var searchRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+            TextField("Search bookmarks", text: $filterText)
+                .textFieldStyle(.roundedBorder)
+                .disableAutocorrection(true)
+            if !filterText.isEmpty {
+                Button {
+                    filterText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("Clear search")
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    /// Filtered list reflecting `filterText`. Case-insensitive
+    /// substring match against name, subtitle string, and
+    /// `rrCategory`. Empty `filterText` passes everything
+    /// through untouched.
+    private var filteredBookmarks: [Bookmark] {
+        let needle = filterText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !needle.isEmpty else { return store.bookmarks }
+        return store.bookmarks.filter { Self.matchesFilter($0, needle: needle) }
+    }
+
+    /// Shared filter predicate — exposed as a `static` so
+    /// future category-header renderers (next commit) can
+    /// reuse the same match rules without diverging. Matches
+    /// the Linux `bookmark_matches_filter` intent.
+    static func matchesFilter(_ bm: Bookmark, needle: String) -> Bool {
+        if needle.isEmpty { return true }
+        if bm.name.lowercased().contains(needle) { return true }
+        if Self.subtitleFor(bm).lowercased().contains(needle) { return true }
+        if let cat = bm.rrCategory?.lowercased(), cat.contains(needle) { return true }
+        return false
+    }
+
+    /// Formatted subtitle used by the filter predicate AND by
+    /// `BookmarkListRow` below. Single source of truth so a
+    /// row that visually matches "145.7 MHz · NFM" is also
+    /// findable by searching that string.
+    static func subtitleFor(_ bm: Bookmark) -> String {
+        var parts: [String] = []
+        if let hz = bm.centerFrequencyHz {
+            parts.append(formatRate(hz))
+        }
+        if let mode = bm.demodMode {
+            parts.append(mode.label)
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// Panel width. Matches the Linux flyout's 360 px — wide
@@ -74,34 +149,49 @@ struct BookmarksPanel: View {
     @ViewBuilder
     private var body_list: some View {
         if store.bookmarks.isEmpty {
-            emptyState
+            emptyState(.empty)
         } else {
-            // Placeholder pending search + category grouping
-            // in the next commits. Flat List of names so the
-            // shell is visually complete while we land the
-            // richer behavior in pieces.
-            List {
-                ForEach(store.bookmarks) { bm in
-                    BookmarkListRow(bookmark: bm)
+            let filtered = filteredBookmarks
+            if filtered.isEmpty {
+                emptyState(.noMatches)
+            } else {
+                // Flat list for this commit; category grouping
+                // via DisclosureGroup lands in the next.
+                List {
+                    ForEach(filtered) { bm in
+                        BookmarkListRow(bookmark: bm)
+                    }
                 }
+                .listStyle(.inset)
             }
-            .listStyle(.inset)
         }
     }
 
-    private var emptyState: some View {
+    /// Two flavors of empty state so the user gets a helpful
+    /// prompt rather than a mysterious blank pane.
+    private enum EmptyStateKind {
+        case empty       // Zero bookmarks saved
+        case noMatches   // Filter matches nothing
+    }
+
+    @ViewBuilder
+    private func emptyState(_ kind: EmptyStateKind) -> some View {
         VStack(spacing: 8) {
-            Image(systemName: "bookmark")
+            Image(systemName: kind == .empty ? "bookmark" : "magnifyingglass")
                 .font(.largeTitle)
                 .foregroundStyle(.tertiary)
-            Text("No bookmarks yet")
+            Text(kind == .empty ? "No bookmarks yet" : "No matches")
                 .font(.headline)
                 .foregroundStyle(.secondary)
-            Text("Save the current tuning from the sidebar to start a list.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 24)
+            Text(
+                kind == .empty
+                    ? "Save the current tuning from the sidebar to start a list."
+                    : "No bookmarks match \"\(filterText)\"."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 24)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -155,19 +245,11 @@ struct BookmarkListRow: View {
         model.activeBookmarkId == bookmark.id
     }
 
-    /// Format used by the frequency column. Matches the
-    /// sidebar's pre-refactor format (`formatRate(_:)` in
-    /// SourceSection) so users see identical strings across
-    /// both surfaces. Falls back to the demod-mode label
-    /// alone if the bookmark has no center frequency.
+    /// Use the panel's shared subtitle formatter so the
+    /// displayed string and the filter predicate always see
+    /// the same text (a row visually labelled "145.7 MHz ·
+    /// NFM" is findable by searching that string).
     private var subtitle: String {
-        var parts: [String] = []
-        if let hz = bookmark.centerFrequencyHz {
-            parts.append(formatRate(hz))
-        }
-        if let mode = bookmark.demodMode {
-            parts.append(mode.label)
-        }
-        return parts.joined(separator: " · ")
+        BookmarksPanel.subtitleFor(bookmark)
     }
 }
