@@ -425,6 +425,37 @@ struct SourceSection: View {
                 .multilineTextAlignment(.trailing)
         }
 
+        // Disconnect + Retry row. Only rendered when the source
+        // type is actually .rtlTcp so the buttons don't appear
+        // on a picker that's mid-configure (the engine would
+        // log and drop the commands anyway, but showing the
+        // controls is misleading). Per issue #326.
+        if model.sourceType == .rtlTcp {
+            HStack(spacing: 8) {
+                Button {
+                    model.disconnectRtlTcp()
+                } label: {
+                    Label("Disconnect", systemImage: "xmark.circle")
+                }
+                .disabled(disconnectDisabled)
+                Button {
+                    model.retryRtlTcpNow()
+                } label: {
+                    Label("Retry now", systemImage: "arrow.clockwise")
+                }
+                .disabled(retryDisabled)
+            }
+        }
+
+        // Tuner control surface — only meaningful when actually
+        // connected (the 0x02-0x0e wire commands need an open
+        // socket). Hidden otherwise so the form doesn't imply
+        // "you can fiddle these pre-connection and they'll
+        // take effect later" (they would be silently dropped).
+        if case .connected(_, let gainCount) = model.rtlTcpConnectionState {
+            rtlTcpControlSurface(gainCount: gainCount)
+        }
+
         // Favorites — user-pinned servers that persist across
         // sessions. Shown whenever non-empty so the user can
         // one-tap recall even before any mDNS discovery lands.
@@ -647,6 +678,130 @@ struct SourceSection: View {
             return "\(endpoint) · \(s.tuner)"
         } else {
             return endpoint
+        }
+    }
+
+    // ----------------------------------------------------------
+    //  Disconnect / Retry enablement
+    // ----------------------------------------------------------
+
+    /// Disconnect is only actionable when there's something to
+    /// disconnect from — .connected, .connecting, or .retrying.
+    private var disconnectDisabled: Bool {
+        switch model.rtlTcpConnectionState {
+        case .connected, .connecting, .retrying: return false
+        case .disconnected, .failed: return true
+        }
+    }
+
+    /// Retry-now is only useful when we're between attempts —
+    /// .retrying (skip the backoff sleep), .failed (manual
+    /// restart), or .disconnected (reopen after an explicit
+    /// disconnect). Active .connected / .connecting states
+    /// have nothing to retry.
+    private var retryDisabled: Bool {
+        switch model.rtlTcpConnectionState {
+        case .retrying, .failed, .disconnected: return false
+        case .connecting, .connected: return true
+        }
+    }
+
+    // ----------------------------------------------------------
+    //  Tuner control surface — issue #326
+    // ----------------------------------------------------------
+
+    /// Wire-protocol command controls exposed when the rtl_tcp
+    /// client is connected: sample rate, gain-by-index, PPM,
+    /// bias-T, offset tuning, direct sampling, RTL (digital)
+    /// AGC, tuner (analog) AGC. Mirrors the Linux GTK panel's
+    /// control set; see the rtl_tcp protocol's 0x01-0x0e
+    /// command map in `crates/sdr-source-network/src/rtl_tcp.rs`.
+    @ViewBuilder
+    private func rtlTcpControlSurface(gainCount: UInt32) -> some View {
+        DisclosureGroup("Tuner controls") {
+            LabeledContent("Sample rate") {
+                Picker("", selection: Binding(
+                    get: { model.sourceSampleRateHz },
+                    set: { model.setSampleRate($0) }
+                )) {
+                    ForEach(rtlSdrSampleRates, id: \.self) {
+                        Text(formatRate($0)).tag($0)
+                    }
+                }
+                .labelsHidden()
+            }
+
+            // Gain — rtl_tcp clients address the server's gain
+            // table by index (the server doesn't publish dB
+            // values over the wire, only a count). Linux shows
+            // this as a slider; matching here with a Stepper +
+            // read-out so the discrete selections feel
+            // concrete. Hidden when gainCount == 0 (rare, but
+            // some servers publish no tuner).
+            if gainCount > 0 {
+                LabeledContent("Gain") {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Stepper(
+                            value: Binding(
+                                get: { Int(model.rtlTcpGainIndex) },
+                                set: {
+                                    let clamped = min(max($0, 0), Int(gainCount - 1))
+                                    model.setRtlTcpGainIndex(UInt32(clamped))
+                                }
+                            ),
+                            in: 0...Int(gainCount - 1)
+                        ) {
+                            Text("#\(model.rtlTcpGainIndex + 1) of \(gainCount)")
+                                .monospacedDigit()
+                        }
+                    }
+                }
+            }
+
+            LabeledContent("PPM") {
+                Stepper(
+                    value: Binding(
+                        get: { model.ppmCorrection },
+                        set: { model.setPpm(Int($0)) }
+                    ),
+                    in: -200...200
+                ) {
+                    Text("\(model.ppmCorrection) ppm").monospacedDigit()
+                }
+            }
+
+            Toggle("Bias-T", isOn: Binding(
+                get: { model.biasTeeEnabled },
+                set: { model.setBiasTee($0) }
+            ))
+
+            Toggle("Offset tuning", isOn: Binding(
+                get: { model.offsetTuningEnabled },
+                set: { model.setOffsetTuning($0) }
+            ))
+
+            LabeledContent("Direct sampling") {
+                Picker("", selection: Binding(
+                    get: { model.directSamplingMode },
+                    set: { model.setDirectSampling($0) }
+                )) {
+                    ForEach(SdrCore.DirectSamplingMode.allCases, id: \.self) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+
+            Toggle("RTL AGC", isOn: Binding(
+                get: { model.rtlAgcEnabled },
+                set: { model.setRtlAgc($0) }
+            ))
+
+            Toggle("Tuner AGC", isOn: Binding(
+                get: { model.agcEnabled },
+                set: { model.setAgc($0) }
+            ))
         }
     }
 }

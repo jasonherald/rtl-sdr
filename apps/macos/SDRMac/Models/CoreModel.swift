@@ -498,6 +498,39 @@ final class CoreModel {
     /// the `effectiveSampleRateHz` @Observable field type.
     static let rtlTcpHighBandwidthThresholdHz: Double = 2_400_000
 
+    /// Bias-T power on the LNA coax. `false` = off (dongle
+    /// default). Optimistic — the UI flip commits immediately
+    /// and the FFI dispatch follows; the engine has no
+    /// observable state event for this toggle so we treat the
+    /// model as the source of truth.
+    var biasTeeEnabled: Bool = false
+
+    /// Tuner offset-tuning. `false` = off.
+    var offsetTuningEnabled: Bool = false
+
+    /// RTL2832 direct-sampling mode. `.off` = normal tuner path.
+    /// Distinct from the analog tuner AGC (`agcEnabled`) which
+    /// controls the gain loop inside the tuner chip; direct
+    /// sampling bypasses the tuner entirely and samples the
+    /// antenna input straight into the ADC.
+    var directSamplingMode: SdrCore.DirectSamplingMode = .off
+
+    /// RTL2832 digital AGC loop. Distinct from the analog tuner
+    /// AGC (`agcEnabled`); an RTL-SDR dongle exposes both
+    /// independently and most real-world setups want tuner
+    /// AGC ON and RTL AGC OFF. Default follows the engine's
+    /// `rtlsdr_set_agc_mode(dev, 0)`.
+    var rtlAgcEnabled: Bool = false
+
+    /// Current rtl_tcp gain-by-index selection. `gain_count`
+    /// from the `Connected` state is the list length; values
+    /// are `0..<gainCount`. Stays at `0` between sessions
+    /// because gain tables aren't comparable across servers
+    /// (a Mini-2+ and an R820T have different tables), so
+    /// persisting the last index would restore a meaningless
+    /// slider position on reconnect to a different server.
+    var rtlTcpGainIndex: UInt32 = 0
+
     /// Live mDNS browser handle. Started in `bootstrap()` and
     /// stopped in `shutdown()`; `nil` if the OS denied browser
     /// start (rare — mDNS doesn't need special entitlements on
@@ -624,6 +657,24 @@ final class CoreModel {
         // entry defaults round-trip across launches. Per issue
         // #326.
         restoreRtlTcpClientState()
+
+        // Restore rtl_tcp-specific toggle state (bias-T, offset
+        // tuning, direct-sampling mode, RTL AGC). Absent keys
+        // leave the defaults intact. Gain index is per-session
+        // so it's not persisted — see `rtlTcpGainIndex` docs.
+        if UserDefaults.standard.object(forKey: Self.rtlTcpBiasTeeKey) != nil {
+            biasTeeEnabled = UserDefaults.standard.bool(forKey: Self.rtlTcpBiasTeeKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpOffsetTuningKey) != nil {
+            offsetTuningEnabled = UserDefaults.standard.bool(forKey: Self.rtlTcpOffsetTuningKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpDirectSamplingKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.rtlTcpDirectSamplingKey))
+            directSamplingMode = SdrCore.DirectSamplingMode(rawValue: raw) ?? .off
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpRtlAgcKey) != nil {
+            rtlAgcEnabled = UserDefaults.standard.bool(forKey: Self.rtlTcpRtlAgcKey)
+        }
 
         // Restore the previously-selected audio output device UID
         // so the user's preference survives across launches.
@@ -1997,6 +2048,81 @@ final class CoreModel {
         // just-written network config.
         setSourceType(.rtlTcp)
     }
+
+    /// Disconnect the rtl_tcp client without changing source
+    /// type. The engine tears down the current TCP socket and
+    /// the connection-state machine transitions to
+    /// `.disconnected` (which arrives asynchronously on the
+    /// event stream). Source type stays `.rtlTcp` so a
+    /// subsequent `retryRtlTcpNow()` reopens against the same
+    /// host/port from stored config. Per issue #326.
+    func disconnectRtlTcp() {
+        capture { try core?.disconnectRtlTcp() }
+    }
+
+    /// Retry the rtl_tcp connection immediately, bypassing the
+    /// exponential-backoff sleep the reconnect loop is in after
+    /// a transport failure. Useful wired to a "Retry now"
+    /// button that shouldn't make the user wait out the
+    /// countdown. Per issue #326.
+    func retryRtlTcpNow() {
+        capture { try core?.retryRtlTcpNow() }
+    }
+
+    // ----------------------------------------------------------
+    //  rtl_tcp-specific command setters (ABI 0.11/0.12)
+    //
+    //  These apply to ANY active source per the engine's
+    //  silent-accept contract — but only the .rtlTcp arm of
+    //  SourceSection surfaces the UI. Optimistic pattern:
+    //  flip the observable field first for input responsiveness,
+    //  then dispatch through the FFI. The engine doesn't publish
+    //  state events for these, so the model field is the
+    //  source of truth once it's flipped.
+    // ----------------------------------------------------------
+
+    func setBiasTee(_ on: Bool) {
+        biasTeeEnabled = on
+        UserDefaults.standard.set(on, forKey: Self.rtlTcpBiasTeeKey)
+        capture { try core?.setBiasTee(on) }
+    }
+
+    func setOffsetTuning(_ on: Bool) {
+        offsetTuningEnabled = on
+        UserDefaults.standard.set(on, forKey: Self.rtlTcpOffsetTuningKey)
+        capture { try core?.setOffsetTuning(on) }
+    }
+
+    func setDirectSampling(_ mode: SdrCore.DirectSamplingMode) {
+        directSamplingMode = mode
+        UserDefaults.standard.set(Int(mode.rawValue), forKey: Self.rtlTcpDirectSamplingKey)
+        capture { try core?.setDirectSampling(mode) }
+    }
+
+    func setRtlAgc(_ on: Bool) {
+        rtlAgcEnabled = on
+        UserDefaults.standard.set(on, forKey: Self.rtlTcpRtlAgcKey)
+        capture { try core?.setRtlAgc(on) }
+    }
+
+    /// Dispatch rtl_tcp `set_gain_by_index` (protocol cmd 0x0d).
+    /// The index is bounds-checked by the engine against the
+    /// `Connected` state's `gain_count` field — out-of-range
+    /// surfaces as an `.error(...)` event rather than silently
+    /// failing on the wire. Not persisted across sessions (see
+    /// the `rtlTcpGainIndex` field docs).
+    func setRtlTcpGainIndex(_ index: UInt32) {
+        rtlTcpGainIndex = index
+        capture { try core?.setGainByIndex(index) }
+    }
+
+    // ----------------------------------------------------------
+    //  UserDefaults keys for rtl_tcp-specific command toggles
+    // ----------------------------------------------------------
+    static let rtlTcpBiasTeeKey = "SDRMac.rtlTcpClient.biasTee"
+    static let rtlTcpOffsetTuningKey = "SDRMac.rtlTcpClient.offsetTuning"
+    static let rtlTcpDirectSamplingKey = "SDRMac.rtlTcpClient.directSampling"
+    static let rtlTcpRtlAgcKey = "SDRMac.rtlTcpClient.rtlAgc"
 
     /// Render an `RtlTcpConnectionState` to a one-line status
     /// string suitable for a picker subtitle row. Matches the
