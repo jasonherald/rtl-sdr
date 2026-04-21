@@ -203,6 +203,33 @@ pub enum UiToDsp {
     SetFilePath(std::path::PathBuf),
     /// Set PPM frequency correction for RTL-SDR crystal offset.
     SetPpmCorrection(i32),
+    // ------------------------------------------------------
+    //  rtl_tcp-specific commands (#325)
+    //
+    //  These dispatch to the active `Source` via the new hook
+    //  methods on `sdr_pipeline::source_manager::Source`. Non-
+    //  rtl_tcp sources no-op; the rtl_tcp client forwards each
+    //  to the matching wire command. Generic tuning commands
+    //  (tune / set_gain / set_ppm_correction / etc.) still flow
+    //  through `Source::set_*` — these cover only the knobs the
+    //  rtl_tcp wire protocol exposes that aren't on the generic
+    //  source surface.
+    // ------------------------------------------------------
+    /// Enable or disable the tuner's bias tee (powers an LNA
+    /// over coax).
+    SetBiasTee(bool),
+    /// Set direct-sampling mode (0 = off, 1 = I branch, 2 = Q
+    /// branch). Engine rejects values outside that range.
+    SetDirectSampling(i32),
+    /// Enable or disable tuner offset-tuning mode.
+    SetOffsetTuning(bool),
+    /// Enable or disable RTL2832 digital AGC. Distinct from
+    /// the tuner (analog) AGC that `SetAgc` controls.
+    SetRtlAgc(bool),
+    /// Set tuner gain by index into the tuner's discrete gain
+    /// table. Index is bounds-checked against `Source::gains()`
+    /// at dispatch time.
+    SetGainByIndex(u32),
     /// Start recording demodulated audio to a WAV file.
     StartAudioRecording(std::path::PathBuf),
     /// Stop audio recording and finalize the WAV file.

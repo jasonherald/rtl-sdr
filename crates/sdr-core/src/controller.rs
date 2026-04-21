@@ -1224,6 +1224,75 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.file_path = path;
         }
 
+        UiToDsp::SetBiasTee(enabled) => {
+            tracing::debug!(enabled, "set bias tee");
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_bias_tee(enabled)
+            {
+                tracing::warn!("set bias tee failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Bias tee failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetDirectSampling(mode) => {
+            tracing::debug!(mode, "set direct sampling");
+            if !(0..=2).contains(&mode) {
+                tracing::warn!("set direct sampling rejected: mode {mode} out of range (0..=2)");
+                let _ = dsp_tx.send(DspToUi::Error(format!(
+                    "Direct sampling mode {mode} out of range (0..=2)"
+                )));
+            } else if let Some(source) = &mut state.source
+                && let Err(e) = source.set_direct_sampling(mode)
+            {
+                tracing::warn!("set direct sampling failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetOffsetTuning(enabled) => {
+            tracing::debug!(enabled, "set offset tuning");
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_offset_tuning(enabled)
+            {
+                tracing::warn!("set offset tuning failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Offset tuning failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetRtlAgc(enabled) => {
+            tracing::debug!(enabled, "set RTL AGC");
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_rtl_agc(enabled)
+            {
+                tracing::warn!("set RTL AGC failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("RTL AGC failed: {e}")));
+            }
+        }
+
+        UiToDsp::SetGainByIndex(index) => {
+            tracing::debug!(index, "set gain by index");
+            if let Some(source) = &mut state.source {
+                // Bounds-check against the source's advertised
+                // gain count. Rtl_tcp servers publish the count
+                // but not the values, so the host has no local
+                // way to know the legal range otherwise — an
+                // out-of-range index would be silently dropped
+                // by the server. Surface it here instead.
+                let gains_len = source.gains().len();
+                if (index as usize) >= gains_len {
+                    tracing::warn!(
+                        "set gain by index rejected: {index} >= {gains_len}"
+                    );
+                    let _ = dsp_tx.send(DspToUi::Error(format!(
+                        "Gain index {index} out of range (source has {gains_len} gains)"
+                    )));
+                } else if let Err(e) = source.set_gain_by_index(index) {
+                    tracing::warn!("set gain by index failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
+                }
+            }
+        }
+
         UiToDsp::SetPpmCorrection(ppm) => {
             tracing::debug!(ppm, "set PPM correction");
             if let Some(source) = &mut state.source

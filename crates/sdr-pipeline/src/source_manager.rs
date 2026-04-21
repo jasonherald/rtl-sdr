@@ -65,6 +65,54 @@ pub trait Source: Send {
     fn rtl_tcp_connection_state(&self) -> Option<sdr_types::RtlTcpConnectionState> {
         None
     }
+
+    // ----------------------------------------------------------
+    //  rtl_tcp-specific command hooks
+    //
+    //  Only `RtlTcpSource` overrides these. Other sources get
+    //  the default no-op so the controller can dispatch a
+    //  `UiToDsp::SetBiasTee(true)` uniformly — an active RTL-SDR
+    //  USB source simply ignores the command rather than the
+    //  controller having to branch on `SourceType`. Mirrors the
+    //  established pattern for `set_gain` / `set_gain_mode` /
+    //  `set_ppm_correction` above.
+    // ----------------------------------------------------------
+
+    /// Enable or disable the dongle's bias tee (powers an inline
+    /// LNA over the coax). Only meaningful on RTL-SDR hardware;
+    /// sources that don't control a dongle silently accept.
+    fn set_bias_tee(&mut self, _enabled: bool) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// Set the RTL2832 direct-sampling mode (0 = off, 1 = I
+    /// branch, 2 = Q branch). Only the `rtl_tcp` client and a
+    /// direct RTL-SDR USB source honor this; other sources
+    /// accept silently.
+    fn set_direct_sampling(&mut self, _mode: i32) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// Enable or disable the tuner's offset-tuning mode (shifts
+    /// the LO away from the tuned frequency to dodge DC spur).
+    fn set_offset_tuning(&mut self, _enabled: bool) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// Enable or disable RTL2832 digital AGC. Distinct from the
+    /// analog tuner AGC already handled by `set_gain_mode` — an
+    /// RTL-SDR dongle exposes both independent loops.
+    fn set_rtl_agc(&mut self, _enabled: bool) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// Set tuner gain by index into the `gains()` table. Useful
+    /// for the `rtl_tcp` client where the server advertises the
+    /// gain count but the caller may not know the individual dB
+    /// values (see `dongle_info_t` — count without table).
+    fn set_gain_by_index(&mut self, _index: u32) -> Result<(), SourceError> {
+        Ok(())
+    }
 }
 
 /// Manages available IQ sources and the active source lifecycle.
