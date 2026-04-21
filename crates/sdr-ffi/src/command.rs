@@ -841,6 +841,31 @@ mod tests {
     /// the mpsc hop plus file-close syscall on any CI host.
     const RECORDING_FLUSH_WAIT_MS: u64 = 50;
 
+    /// Loopback host string reused across the network-sink
+    /// setter tests. Plain IPv4 loopback avoids any resolver
+    /// step so the tests don't depend on `/etc/hosts` entries
+    /// or DNS availability on the CI host.
+    const TEST_NETWORK_HOST_LOOPBACK: &str = "127.0.0.1";
+
+    /// Default port the network-sink defaults advertise (see
+    /// `sdr_core::sink_slot::DEFAULT_NETWORK_SINK_PORT`). Used
+    /// in the TCP-path happy case. Named so a future default
+    /// change flows through the tests.
+    const TEST_NETWORK_PORT_TCP: u16 = 1234;
+
+    /// A second distinct port for the UDP-path happy case —
+    /// keeps the two setter tests exercising different values
+    /// so a silently-ignored parameter won't pass both by
+    /// coincidence.
+    const TEST_NETWORK_PORT_UDP: u16 = 9000;
+
+    /// Smallest legal UDP / TCP port (port 0 is reserved at
+    /// the ABI boundary — see the zero-port rejection test).
+    /// Named so the "minimum accepted" assertion expresses
+    /// intent instead of using a bare `1`. Per `CodeRabbit`
+    /// round 3 on PR #352.
+    const TEST_NETWORK_MIN_VALID_PORT: u16 = 1;
+
     /// Minimum size of a well-formed empty WAV file: the 44-byte
     /// header `WavWriter::new` writes before any samples arrive
     /// (RIFF/WAVE + fmt chunk + data chunk header). Used by the
@@ -1397,13 +1422,13 @@ mod tests {
     #[test]
     fn set_network_sink_config_accepts_valid_input() {
         let h = make_handle();
-        let host = CString::new("127.0.0.1").unwrap();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
         assert_eq!(
             unsafe {
                 sdr_core_set_network_sink_config(
                     h,
                     host.as_ptr(),
-                    1234,
+                    TEST_NETWORK_PORT_TCP,
                     crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
                 )
             },
@@ -1414,7 +1439,7 @@ mod tests {
                 sdr_core_set_network_sink_config(
                     h,
                     host.as_ptr(),
-                    9000,
+                    TEST_NETWORK_PORT_UDP,
                     crate::event::SDR_NETWORK_PROTOCOL_UDP,
                 )
             },
@@ -1431,7 +1456,7 @@ mod tests {
                 sdr_core_set_network_sink_config(
                     h,
                     std::ptr::null(),
-                    1234,
+                    TEST_NETWORK_PORT_TCP,
                     crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
                 )
             },
@@ -1449,7 +1474,7 @@ mod tests {
                 sdr_core_set_network_sink_config(
                     h,
                     empty.as_ptr(),
-                    1234,
+                    TEST_NETWORK_PORT_TCP,
                     crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
                 )
             },
@@ -1465,7 +1490,7 @@ mod tests {
         // mode would bind an undiscoverable ephemeral port.
         // Per `CodeRabbit` round 2 on PR #352.
         let h = make_handle();
-        let host = CString::new("127.0.0.1").unwrap();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
         assert_eq!(
             unsafe {
                 sdr_core_set_network_sink_config(
@@ -1477,13 +1502,13 @@ mod tests {
             },
             SdrCoreError::InvalidArg.as_int()
         );
-        // And accepts 1 at the boundary as a sanity check.
+        // And accepts the minimum legal port as a boundary check.
         assert_eq!(
             unsafe {
                 sdr_core_set_network_sink_config(
                     h,
                     host.as_ptr(),
-                    1,
+                    TEST_NETWORK_MIN_VALID_PORT,
                     crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
                 )
             },
@@ -1495,13 +1520,17 @@ mod tests {
     #[test]
     fn set_network_sink_config_rejects_out_of_range_protocol() {
         let h = make_handle();
-        let host = CString::new("127.0.0.1").unwrap();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
         assert_eq!(
-            unsafe { sdr_core_set_network_sink_config(h, host.as_ptr(), 1234, 99) },
+            unsafe {
+                sdr_core_set_network_sink_config(h, host.as_ptr(), TEST_NETWORK_PORT_TCP, 99)
+            },
             SdrCoreError::InvalidArg.as_int()
         );
         assert_eq!(
-            unsafe { sdr_core_set_network_sink_config(h, host.as_ptr(), 1234, -1) },
+            unsafe {
+                sdr_core_set_network_sink_config(h, host.as_ptr(), TEST_NETWORK_PORT_TCP, -1)
+            },
             SdrCoreError::InvalidArg.as_int()
         );
         destroy(h);
