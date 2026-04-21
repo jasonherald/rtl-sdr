@@ -204,6 +204,64 @@ final class SdrCoreTests: XCTestCase {
         }
     }
 
+    /// Switching to the network sink on a stopped engine must
+    /// not fabricate an `.active` status — the engine only
+    /// emits `.active` after `audio_sink.start()` succeeds with
+    /// the engine running. Before then the status is either
+    /// `.inactive` (initial state) or `.error(...)` (startup
+    /// failure). We subscribe to the event stream, flip the
+    /// sink type, and assert no `.active` arrives. Per
+    /// `CodeRabbit` round 1 on PR #352.
+    func testSwitchingSinkToNetworkOnStoppedEngineDoesNotEmitActive() async throws {
+        // Same lifetime trick as `testEventStreamDelivers…`:
+        // launch the drain task up top, bound the engine's
+        // strong reference inside a `do { }` block so its
+        // deinit (and thus the stream's `finish()`) fires
+        // when the block ends. Awaiting `drainTask.value`
+        // outside the block then returns cleanly once the
+        // stream terminates, instead of blocking forever on
+        // a live engine that isn't producing events.
+        let drainTask: Task<[NetworkSinkStatus], Never>
+        do {
+            let core = try SdrCore(configPath: nil)
+            let events = core.events
+
+            drainTask = Task {
+                var collected: [NetworkSinkStatus] = []
+                for await event in events {
+                    if case .networkSinkStatus(let s) = event {
+                        collected.append(s)
+                    }
+                    // Defensive cap: terminate if the controller
+                    // ever emits an unreasonable flood.
+                    if collected.count > 32 { break }
+                }
+                return collected
+            }
+
+            try core.setNetworkSinkConfig(hostname: "127.0.0.1", port: 1234, protocol: .tcpServer)
+            try core.setAudioSinkType(.network)
+
+            // Small window for the controller to react before
+            // we drop the engine.
+            try await Task.sleep(nanoseconds: 150_000_000)
+        }
+        // Engine dropped above → stream finishes → drain exits.
+        // Bound the wait so a regression can't hang the suite.
+        let statuses = try await withTimeout(seconds: 3) {
+            await drainTask.value
+        }
+
+        // Engine was never started, so no `.active` event
+        // should fire. `.inactive` / `.error` are fine —
+        // we only guard against a bogus `.active`.
+        for status in statuses {
+            if case .active = status {
+                XCTFail("unexpected .active status on stopped engine: \(statuses)")
+            }
+        }
+    }
+
     func testErrorMessageIsCopiedIntoOwnedString() throws {
         let core = try SdrCore(configPath: nil)
         do {

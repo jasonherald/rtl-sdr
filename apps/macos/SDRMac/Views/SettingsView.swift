@@ -59,6 +59,13 @@ private struct AudioPane: View {
     /// every character.
     @State private var hostEdit: String = ""
 
+    /// One-shot latch so `.onAppear` only seeds `hostEdit` /
+    /// `portEdit` from the model the first time this pane is
+    /// rendered. Without it, tabbing away from Audio and back
+    /// clobbers any in-progress endpoint edits (same pattern
+    /// `RadioReferencePane` uses). Per `CodeRabbit` round 1.
+    @State private var didPrefill: Bool = false
+
     var body: some View {
         Form {
             LabeledContent("Output device") {
@@ -121,11 +128,13 @@ private struct AudioPane: View {
                             // changes — rebuild with the buffered
                             // host/port instead of letting the
                             // picker drift out of sync with the
-                            // engine. Bad port input keeps the
-                            // engine's current endpoint.
-                            if let port = portValue() {
+                            // engine. Empty / whitespace-only host
+                            // or bad port input keeps the engine's
+                            // current endpoint.
+                            let host = normalizedHost
+                            if !host.isEmpty, let port = portValue() {
                                 model.applyNetworkSinkConfig(
-                                    host: hostEdit,
+                                    host: host,
                                     port: port,
                                     protocol: proto
                                 )
@@ -139,9 +148,10 @@ private struct AudioPane: View {
 
                     HStack {
                         Button {
-                            guard let port = portValue() else { return }
+                            let host = normalizedHost
+                            guard !host.isEmpty, let port = portValue() else { return }
                             model.applyNetworkSinkConfig(
-                                host: hostEdit,
+                                host: host,
                                 port: port,
                                 protocol: model.networkSinkProtocol
                             )
@@ -169,10 +179,13 @@ private struct AudioPane: View {
             }
         }
         .onAppear {
-            // Seed the local edit buffers from the model on
-            // every appear — picks up external mutations (e.g.
-            // bookmark restore, programmatic updates) that
-            // happened while the pane was off-screen.
+            // One-shot prefill: seed the local edit buffers from
+            // the model only on first appear. Repeated .onAppear
+            // fires when tabbing away and back in the TabView
+            // would otherwise clobber any in-progress edits the
+            // user hadn't hit Apply on yet.
+            guard !didPrefill else { return }
+            didPrefill = true
             hostEdit = model.networkSinkHost
             portEdit = String(model.networkSinkPort)
         }
@@ -190,9 +203,15 @@ private struct AudioPane: View {
         return UInt16(raw)
     }
 
+    /// Host with leading/trailing whitespace stripped. Single
+    /// source of truth for the normalization step every
+    /// push-to-engine path runs through.
+    private var normalizedHost: String {
+        hostEdit.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private var applyButtonDisabled: Bool {
-        let trimmedHost = hostEdit.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedHost.isEmpty || portValue() == nil
+        normalizedHost.isEmpty || portValue() == nil
     }
 
     /// Render the engine-reported network sink status below the

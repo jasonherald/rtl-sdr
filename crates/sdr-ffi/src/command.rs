@@ -1348,6 +1348,144 @@ mod tests {
         destroy(h);
     }
 
+    // ------------------------------------------------------
+    //  Audio sink selection (#247, ABI 0.9)
+    // ------------------------------------------------------
+
+    #[test]
+    fn set_audio_sink_type_accepts_both_variants() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, SDR_AUDIO_SINK_LOCAL) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, SDR_AUDIO_SINK_NETWORK) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_audio_sink_type_rejects_out_of_range_value() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, 99) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, -1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_accepts_valid_input() {
+        let h = make_handle();
+        let host = CString::new("127.0.0.1").unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    1234,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    9000,
+                    crate::event::SDR_NETWORK_PROTOCOL_UDP,
+                )
+            },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_null_hostname() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    std::ptr::null(),
+                    1234,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_empty_hostname() {
+        let h = make_handle();
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    empty.as_ptr(),
+                    1234,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_out_of_range_protocol() {
+        let h = make_handle();
+        let host = CString::new("127.0.0.1").unwrap();
+        assert_eq!(
+            unsafe { sdr_core_set_network_sink_config(h, host.as_ptr(), 1234, 99) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_network_sink_config(h, host.as_ptr(), 1234, -1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn audio_sink_type_from_c_covers_all_variants() {
+        assert_eq!(
+            audio_sink_type_from_c(SDR_AUDIO_SINK_LOCAL),
+            Some(sdr_core::AudioSinkType::Local)
+        );
+        assert_eq!(
+            audio_sink_type_from_c(SDR_AUDIO_SINK_NETWORK),
+            Some(sdr_core::AudioSinkType::Network)
+        );
+        assert_eq!(audio_sink_type_from_c(99), None);
+        assert_eq!(audio_sink_type_from_c(-1), None);
+    }
+
+    #[test]
+    fn protocol_from_c_covers_all_variants() {
+        assert_eq!(
+            protocol_from_c(crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER),
+            Some(sdr_types::Protocol::TcpClient)
+        );
+        assert_eq!(
+            protocol_from_c(crate::event::SDR_NETWORK_PROTOCOL_UDP),
+            Some(sdr_types::Protocol::Udp)
+        );
+        assert_eq!(protocol_from_c(99), None);
+    }
+
     #[test]
     fn advanced_demod_bool_setters_accept_both_polarities() {
         // The four bool-typed advanced setters have no validation

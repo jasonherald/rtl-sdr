@@ -183,14 +183,18 @@ public enum SdrCoreEvent: Sendable, Equatable {
             case Int32(SDR_NETWORK_SINK_STATUS_INACTIVE.rawValue):
                 return .networkSinkStatus(.inactive)
             case Int32(SDR_NETWORK_SINK_STATUS_ACTIVE.rawValue):
-                // `active` always carries a non-null endpoint
-                // string from the Rust side. Drop the event if
-                // the string is somehow missing rather than
-                // fabricate an empty endpoint that the UI would
-                // render as "Streaming to :" — clearer to skip.
+                // `active` requires both a non-null, non-empty
+                // endpoint string AND a known protocol value.
+                // Defaulting an unknown protocol to `.tcpServer`
+                // would let a future ABI extension masquerade as
+                // a plausible-but-wrong status row — drop the
+                // event instead. Per `CodeRabbit` round 1.
                 guard let cstr = status.utf8 else { return nil }
                 let endpoint = String(cString: cstr)
-                let proto = NetworkProtocol(rawValue: status.protocol) ?? .tcpServer
+                guard !endpoint.isEmpty,
+                      let proto = NetworkProtocol(rawValue: status.protocol) else {
+                    return nil
+                }
                 return .networkSinkStatus(.active(endpoint: endpoint, protocol: proto))
             case Int32(SDR_NETWORK_SINK_STATUS_ERROR.rawValue):
                 let message: String
