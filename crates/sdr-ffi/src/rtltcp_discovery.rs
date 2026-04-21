@@ -585,6 +585,31 @@ mod tests {
     }
 
     #[test]
+    fn advertiser_start_port_zero_rejected() {
+        // Pins the port-0 guard added in round 2 per
+        // `CodeRabbit` — a zero-init `SdrRtlTcpAdvertiseOptions`
+        // must not slip through and announce on port 0.
+        let instance = CString::new("test").unwrap();
+        let tuner = CString::new("R820T").unwrap();
+        let version = CString::new("0.1.0").unwrap();
+        let opts = SdrRtlTcpAdvertiseOptions {
+            port: 0,
+            instance_name: instance.as_ptr(),
+            hostname: std::ptr::null(),
+            tuner: tuner.as_ptr(),
+            version: version.as_ptr(),
+            gains: 29,
+            nickname: std::ptr::null(),
+            has_txbuf: false,
+            txbuf: 0,
+        };
+        let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
+        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const opts, &raw mut handle) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        assert!(handle.is_null());
+    }
+
+    #[test]
     fn advertiser_start_empty_instance_name_rejected() {
         let empty = CString::new("").unwrap();
         let tuner = CString::new("R820T").unwrap();

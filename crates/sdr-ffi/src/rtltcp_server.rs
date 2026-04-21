@@ -18,7 +18,7 @@
 
 use std::ffi::{CString, c_char};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use sdr_server_rtltcp::{
     InitialDeviceState, Server, ServerConfig, ServerError, ServerStats, TunerAdvertiseInfo,
@@ -132,13 +132,30 @@ impl SdrRtlTcpServer {
         }
     }
 
+    /// Lock the inner server, recovering from mutex poisoning.
+    /// A caught panic inside a prior `with_server` body poisons
+    /// the mutex; `.ok()` would then collapse every subsequent
+    /// call into `None` and the caller would see "server
+    /// already stopped" even though the `Server` is still
+    /// alive. Use `PoisonError::into_inner` to keep going.
+    /// Per `CodeRabbit` round 3 on PR #360.
+    fn lock_inner(&self) -> MutexGuard<'_, Option<Server>> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("SdrRtlTcpServer: recovering poisoned handle mutex");
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Lock the inner server. Returns `None` when the server
     /// has been stopped already.
     fn with_server<F, R>(&self, f: F) -> Option<R>
     where
         F: FnOnce(&Server) -> R,
     {
-        let guard = self.inner.lock().ok()?;
+        let guard = self.lock_inner();
         guard.as_ref().map(f)
     }
 
@@ -316,7 +333,13 @@ pub unsafe extern "C" fn sdr_rtltcp_server_stop(handle: *mut SdrRtlTcpServer) {
     // if the caller already stopped it the `Option` is `None`
     // and drop is a no-op.
     let boxed = unsafe { Box::from_raw(handle) };
-    let taken = boxed.inner.lock().ok().and_then(|mut g| g.take());
+    // Use the same poison-recovery path as `lock_inner` — a
+    // prior caught panic inside `with_server` would otherwise
+    // leave the mutex poisoned and cause `_stop` to skip
+    // `Server::stop(self)` and fall back to `Drop`, breaking
+    // the synchronous-stop contract on exactly the
+    // panic-recovery path. Per `CodeRabbit` round 3 on PR #360.
+    let taken = boxed.lock_inner().take();
     if let Some(server) = taken {
         // Wrap the join in `catch_unwind` so a panic inside
         // `Server::stop` — e.g., a poisoned mutex on the
@@ -424,7 +447,11 @@ pub unsafe extern "C" fn sdr_rtltcp_server_stats(
 }
 
 /// Write the recent-commands ring to `out_buf` as a JSON array.
-/// Each entry is `{"op": "<name>", "param": <u32>, "seconds_ago": <f64>}`.
+/// Each entry is `{"op": "<name>", "seconds_ago": <f64>}`.
+/// The wire-level 4-byte command param is not in the upstream
+/// `ServerStats::recent_commands` payload (only the opcode +
+/// dispatch time are captured), so the param field is not
+/// surfaced here — matches the contract in `include/sdr_core.h`.
 ///
 /// On success returns `SDR_CORE_OK` and NUL-terminates the
 /// buffer. On too-small buffer returns `SDR_CORE_ERR_INVALID_ARG`

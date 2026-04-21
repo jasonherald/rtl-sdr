@@ -1095,6 +1095,18 @@ mod tests {
     /// round 3 on PR #352.
     const TEST_NETWORK_MIN_VALID_PORT: u16 = 1;
 
+    /// Lowest legal gain index (`gains()` slot 0). Covers the
+    /// "minimum valid index" boundary for the gain-by-index
+    /// round-trip test.
+    const TEST_GAIN_INDEX_BASELINE: u32 = 0;
+
+    /// A representative "large but plausible" gain index. The
+    /// R820T tuner advertises 29 discrete gain steps, so index
+    /// 28 is the last legal slot — used to exercise a non-zero
+    /// value without hardcoding a magic literal. Per
+    /// `CodeRabbit` round 3 on PR #360.
+    const TEST_GAIN_INDEX_REPRESENTATIVE_HIGH: u32 = 28;
+
     /// Minimum size of a well-formed empty WAV file: the 44-byte
     /// header `WavWriter::new` writes before any samples arrive
     /// (RIFF/WAVE + fmt chunk + data chunk header). Used by the
@@ -1667,9 +1679,16 @@ mod tests {
 
     #[test]
     fn set_offset_tuning_round_trips() {
+        // Exercise both polarities so a future regression that
+        // silently breaks one branch is caught. Per `CodeRabbit`
+        // round 3 on PR #360.
         let h = make_handle();
         assert_eq!(
             unsafe { sdr_core_set_offset_tuning(h, true) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_offset_tuning(h, false) },
             SdrCoreError::Ok.as_int()
         );
         destroy(h);
@@ -1682,22 +1701,27 @@ mod tests {
             unsafe { sdr_core_set_rtl_agc(h, true) },
             SdrCoreError::Ok.as_int()
         );
+        assert_eq!(
+            unsafe { sdr_core_set_rtl_agc(h, false) },
+            SdrCoreError::Ok.as_int()
+        );
         destroy(h);
     }
 
     #[test]
     fn set_gain_by_index_accepts_nonnegative_indices() {
         // Engine bounds-checks against the source's `gains()`
-        // length; a bad index becomes a `DspToUi::Error` event.
-        // The FFI itself accepts any u32 — we're testing the
-        // dispatch path here.
+        // length (or the rtl_tcp advertised gain_count); a bad
+        // index becomes a `DspToUi::Error` event. The FFI
+        // itself accepts any u32 — we're testing the dispatch
+        // path here, not the bounds check.
         let h = make_handle();
         assert_eq!(
-            unsafe { sdr_core_set_gain_by_index(h, 0) },
+            unsafe { sdr_core_set_gain_by_index(h, TEST_GAIN_INDEX_BASELINE) },
             SdrCoreError::Ok.as_int()
         );
         assert_eq!(
-            unsafe { sdr_core_set_gain_by_index(h, 28) },
+            unsafe { sdr_core_set_gain_by_index(h, TEST_GAIN_INDEX_REPRESENTATIVE_HIGH) },
             SdrCoreError::Ok.as_int()
         );
         destroy(h);
