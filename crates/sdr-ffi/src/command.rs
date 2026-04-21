@@ -611,16 +611,22 @@ pub unsafe extern "C" fn sdr_core_set_gain_by_index(handle: *mut SdrCore, index:
 }
 
 /// Disconnect the rtl_tcp client without changing source type.
-/// Tears down the current TCP socket and transitions the
-/// connection-state machine to `Disconnected`. A subsequent
-/// `sdr_core_rtl_tcp_retry_now` (or any engine restart) will
-/// reopen with the same host/port.
+/// Stops the current source, drops the source instance (so the
+/// engine's `rtl_tcp_connection_state` returns `Disconnected`
+/// on the next poll), and emits `DspToUi::SourceStopped`. The
+/// source type stays `RtlTcp`, so a subsequent `sdr_core_start`
+/// (host's normal "Play" path) reopens a fresh rtl_tcp source
+/// from the stored network config.
 ///
-/// Engine behavior when the active source is not rtl_tcp:
-/// the command is logged at `warn` and dropped — safe to
-/// call regardless of current source, matching the
-/// `UiToDsp::DisconnectRtlTcp` contract in `sdr-core`. Per
-/// issue #326.
+/// Note: `sdr_core_rtl_tcp_retry_now` is **not** a reconnect
+/// path after an explicit disconnect — once the source has
+/// been dropped, `retry_now` silently returns. Hosts should
+/// use `sdr_core_start` to reopen.
+///
+/// Engine behavior when the active source is not rtl_tcp: the
+/// command is logged and dropped — safe to call regardless of
+/// current source, matching the `UiToDsp::DisconnectRtlTcp`
+/// contract in `sdr-core`. Per issue #326.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_rtl_tcp_disconnect(handle: *mut SdrCore) -> i32 {
     unsafe { with_core(handle, |core| send(core, UiToDsp::DisconnectRtlTcp)) }
@@ -631,6 +637,14 @@ pub unsafe extern "C" fn sdr_core_rtl_tcp_disconnect(handle: *mut SdrCore) -> i3
 /// after a transport failure. Useful for a user-visible
 /// "Retry now" button that shouldn't make the user wait out
 /// the countdown.
+///
+/// Only meaningful while an rtl_tcp source instance is still
+/// alive — i.e. `Retrying`, `Failed`, `Connecting`, or
+/// `Connected`. After an explicit `sdr_core_rtl_tcp_disconnect`
+/// the source instance is gone and this command silently
+/// returns; hosts should gate UI sensitivity on
+/// `RtlTcpConnectionState` not being `Disconnected`, and use
+/// `sdr_core_start` to reopen.
 ///
 /// Engine behavior when the active source is not rtl_tcp:
 /// same as `sdr_core_rtl_tcp_disconnect` — logged + dropped.

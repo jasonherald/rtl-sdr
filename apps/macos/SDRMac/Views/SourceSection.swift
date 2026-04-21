@@ -720,15 +720,17 @@ struct SourceSection: View {
         }
     }
 
-    /// Retry-now is only useful when we're between attempts —
-    /// .retrying (skip the backoff sleep), .failed (manual
-    /// restart), or .disconnected (reopen after an explicit
-    /// disconnect). Active .connected / .connecting states
-    /// have nothing to retry.
+    /// Retry-now is only useful when there's still a live
+    /// rtl_tcp source instance to bounce — `.retrying` (skip
+    /// the backoff sleep) or `.failed` (manual restart).
+    /// `.disconnected` explicitly excluded because the engine
+    /// drops the source instance on disconnect, so `retry_now`
+    /// is a silent no-op there; the Play path is the right
+    /// surface to reopen. Per `CodeRabbit` round 1 on PR #366.
     private var retryDisabled: Bool {
         switch model.rtlTcpConnectionState {
-        case .retrying, .failed, .disconnected: return false
-        case .connecting, .connected: return true
+        case .retrying, .failed: return false
+        case .connecting, .connected, .disconnected: return true
         }
     }
 

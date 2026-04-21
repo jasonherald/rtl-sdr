@@ -438,12 +438,18 @@ public final class SdrCore: @unchecked Sendable {
     // ==========================================================
 
     /// Disconnect the rtl_tcp client without changing source
-    /// type. The engine drops the current TCP socket and
-    /// transitions the connection-state machine to
-    /// `.disconnected`. A subsequent `retryRtlTcpNow()` (or any
-    /// engine restart) reopens against the same stored host /
-    /// port. Safe to call when the active source is not
-    /// rtl_tcp — the engine logs and drops the command.
+    /// type. The engine stops the current source, drops the
+    /// source instance, and transitions the connection-state
+    /// machine to `.disconnected`. Source type stays `.rtlTcp`,
+    /// so a subsequent `start()` (normal "Play" path) reopens
+    /// a fresh source from the stored network config.
+    ///
+    /// Note: `retryRtlTcpNow()` is NOT a reconnect path after
+    /// this call — once the source has been dropped, retry is
+    /// a no-op. Call `start()` to reopen.
+    ///
+    /// Safe to call when the active source is not rtl_tcp —
+    /// the engine logs and drops the command.
     public func disconnectRtlTcp() throws {
         try checkRc(sdr_core_rtl_tcp_disconnect(handle))
     }
@@ -451,6 +457,15 @@ public final class SdrCore: @unchecked Sendable {
     /// Retry the rtl_tcp connection immediately, bypassing the
     /// exponential-backoff sleep inside the reconnect loop.
     /// Useful wired to a "Retry now" button on the status row.
+    ///
+    /// Only meaningful while an rtl_tcp source instance is
+    /// still alive — states `.retrying`, `.failed`,
+    /// `.connecting`, or `.connected`. After an explicit
+    /// `disconnectRtlTcp()`, the source instance is gone and
+    /// this call silently returns; hosts should disable the
+    /// Retry button in `.disconnected` and use `start()` to
+    /// reopen.
+    ///
     /// Safe to call when the active source is not rtl_tcp —
     /// the engine logs and drops the command.
     public func retryRtlTcpNow() throws {

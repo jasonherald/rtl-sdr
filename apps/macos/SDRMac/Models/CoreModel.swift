@@ -480,17 +480,24 @@ final class CoreModel {
     /// sensitivity in the UI.
     var rtlTcpConnectionState: RtlTcpConnectionState = .disconnected
 
-    /// `true` when the selected sample rate is at or above 2.4
-    /// Msps AND the active source is `.rtlTcp`. At 8-bit I/Q
-    /// pairs that works out to ≈38 Mbps on the wire — below
-    /// typical Wi-Fi practical throughput for older routers. The
-    /// UI shows a caption warning about drops; the rate still
-    /// commits because wired gigabit handles it fine. Threshold
-    /// matches `HIGH_BANDWIDTH_SAMPLE_RATE_IDX` in
+    /// `true` when the selected **source** sample rate is at or
+    /// above 2.4 Msps AND the active source is `.rtlTcp`. At
+    /// 8-bit I/Q pairs that works out to ≈38 Mbps on the wire —
+    /// below typical Wi-Fi practical throughput for older
+    /// routers. The UI shows a caption warning about drops; the
+    /// rate still commits because wired gigabit handles it fine.
+    /// Threshold matches `HIGH_BANDWIDTH_SAMPLE_RATE_IDX` in
     /// `sdr-ui/src/sidebar/source_panel.rs` (index 7 = 2.4 MHz).
+    ///
+    /// Keyed on `sourceSampleRateHz` (pre-decimation) NOT
+    /// `effectiveSampleRateHz` (post-decimation) — rtl_tcp
+    /// streams raw IQ samples at the source rate over the
+    /// wire; decimation is applied locally after receive, so
+    /// the network bitrate is insensitive to the decimation
+    /// factor. Per `CodeRabbit` round 1 on PR #366.
     var rtlTcpShowsBandwidthAdvisory: Bool {
         sourceType == .rtlTcp
-            && effectiveSampleRateHz >= Self.rtlTcpHighBandwidthThresholdHz
+            && sourceSampleRateHz >= Self.rtlTcpHighBandwidthThresholdHz
     }
 
     /// Sample-rate threshold (Hz) at which `rtlTcpShowsBandwidthAdvisory`
