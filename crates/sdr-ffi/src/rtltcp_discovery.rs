@@ -434,9 +434,18 @@ fn dispatch_discovery_event(
         }
     };
 
-    // Wrap the host callback in `catch_unwind` — a panic
-    // across the FFI boundary is UB, and mDNS events should
-    // never tear down the browser.
+    // `catch_unwind` here isolates the invocation frame but
+    // cannot actually catch a panic from the host callback: a
+    // Rust panic crossing an `extern "C"` ABI boundary is
+    // defined to abort since Rust 1.81 unless the callback
+    // uses `extern "C-unwind"`. In practice hosts are Swift or
+    // C so they don't raise Rust panics at all — the guard is
+    // defence-in-depth for a future Rust-side caller (tests,
+    // in-process dispatch) that might panic inside the
+    // callback's translation shim before the call crosses the
+    // ABI. On actual cross-ABI panic the process aborts
+    // before this `if` runs. Per `CodeRabbit` round 6 on PR
+    // #360.
     let event_ptr: *const SdrRtlTcpDiscoveryEvent = &raw const c_event;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: host contract — cb + user_data are valid for
@@ -444,7 +453,10 @@ fn dispatch_discovery_event(
         unsafe { cb(event_ptr, user_data) };
     }));
     if result.is_err() {
-        tracing::warn!("sdr-rtltcp-discovery callback panicked (payload swallowed)");
+        tracing::warn!(
+            "sdr-rtltcp-discovery callback panicked before the ABI crossing \
+             (cross-ABI panics would already have aborted the process)"
+        );
     }
 
     // Keep `strings` alive until here so the pointers the
@@ -456,19 +468,23 @@ fn discovered_server_to_c(
     server: &DiscoveredServer,
     strings: &mut Vec<CString>,
 ) -> SdrRtlTcpDiscoveredServer {
-    let push = |s: String, strings: &mut Vec<CString>| -> *const c_char {
+    // Borrow-taking shape + valid-empty-string fallback:
+    //
+    // - `&str` instead of `String` avoids a clone at every
+    //   callsite (tuner / version / nickname / hostname /
+    //   instance_name).
+    // - On the CString-construction-failure path (unreachable
+    //   after the NUL replace but still handled) we push an
+    //   empty CString into the storage vec and return its
+    //   pointer. Returning a raw null here would violate the
+    //   "non-null C string" expectation every host's callback
+    //   decodes with. Per `CodeRabbit` round 6 on PR #360.
+    let push = |s: &str, strings: &mut Vec<CString>| -> *const c_char {
         let sanitized = s.replace('\0', "?");
-        match CString::new(sanitized) {
-            Ok(cstr) => {
-                let ptr = cstr.as_ptr();
-                strings.push(cstr);
-                ptr
-            }
-            // Unreachable — replace() stripped NULs. Fall back
-            // to an empty string pointer rather than dropping
-            // the whole event.
-            Err(_) => std::ptr::null(),
-        }
+        let cstr = CString::new(sanitized).unwrap_or_default();
+        let ptr = cstr.as_ptr();
+        strings.push(cstr);
+        ptr
     };
 
     let ipv4 = server
@@ -494,15 +510,15 @@ fn discovered_server_to_c(
     };
 
     SdrRtlTcpDiscoveredServer {
-        instance_name: push(server.instance_name.clone(), strings),
-        hostname: push(server.hostname.clone(), strings),
+        instance_name: push(&server.instance_name, strings),
+        hostname: push(&server.hostname, strings),
         port: server.port,
-        address_ipv4: push(ipv4, strings),
-        address_ipv6: push(ipv6, strings),
-        tuner: push(server.txt.tuner.clone(), strings),
-        version: push(server.txt.version.clone(), strings),
+        address_ipv4: push(&ipv4, strings),
+        address_ipv6: push(&ipv6, strings),
+        tuner: push(&server.txt.tuner, strings),
+        version: push(&server.txt.version, strings),
         gains: server.txt.gains,
-        nickname: push(server.txt.nickname.clone(), strings),
+        nickname: push(&server.txt.nickname, strings),
         has_txbuf,
         txbuf,
         last_seen_secs_ago,

@@ -85,14 +85,23 @@ pub struct SdrRtlTcpServerStats {
     pub bytes_sent: u64,
     /// Buffer-drop count this session.
     pub buffers_dropped: u64,
-    /// Most recent center frequency the client requested, in
-    /// Hz. 0 if the client hasn't set it this session.
+    /// **Client-issued** center frequency override in Hz —
+    /// what the connected client most recently requested via
+    /// `SetCenterFreq`. 0 before the client has issued the
+    /// command; reset on client disconnect. Does **not**
+    /// reflect the server's configured `initial_freq_hz` or
+    /// the live device register — hosts that want "what the
+    /// dongle is actually tuned to" should combine this with
+    /// `SdrRtlTcpServerConfig::initial_freq_hz` when
+    /// `has_client && current_freq_hz == 0`.
     pub current_freq_hz: u32,
-    /// Most recent sample rate the client requested, in Hz. 0
-    /// if unset.
+    /// **Client-issued** sample-rate override, same semantics
+    /// as `current_freq_hz` above (0 until the client sets it;
+    /// resets on disconnect; doesn't reflect the applied
+    /// initial).
     pub current_sample_rate_hz: u32,
-    /// Most recent tuner-gain request in 0.1 dB. Valid only
-    /// when `has_current_gain == true`.
+    /// Most recent client-issued tuner-gain request in 0.1 dB.
+    /// Valid only when `has_current_gain == true`.
     pub current_gain_tenths_db: i32,
     /// `true` when the client's last gain-mode request was
     /// auto; `false` when manual. Valid only when
@@ -103,8 +112,9 @@ pub struct SdrRtlTcpServerStats {
     /// "zero-dB manual gain."
     pub has_current_gain: bool,
     /// Tuner's advertised discrete gain count (from
-    /// `dongle_info_t`). 0 until the first client connects and
-    /// the initial handshake exchanges the header.
+    /// `dongle_info_t`). Populated by `Server::start` during
+    /// the dongle-open phase — non-zero for the entire server
+    /// lifetime, including before the first client connects.
     pub gain_count: u32,
     /// Number of entries in the recent-commands ring — lets
     /// hosts size a follow-up `_recent_commands_json` buffer.

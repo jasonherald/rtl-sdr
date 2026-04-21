@@ -685,12 +685,25 @@ typedef struct SdrRtlTcpServerStats {
     double   uptime_secs;              /* 0 when no client connected */
     uint64_t bytes_sent;
     uint64_t buffers_dropped;
-    uint32_t current_freq_hz;          /* 0 = client hasn't tuned this session */
-    uint32_t current_sample_rate_hz;   /* 0 = unset this session */
+    /* Client-issued center-frequency override. 0 before the
+     * connected client has sent SetCenterFreq; resets on
+     * disconnect. Does NOT reflect the server's applied
+     * initial_freq_hz or the live device register — hosts
+     * that want "what the dongle is actually tuned to" should
+     * fall back to SdrRtlTcpServerConfig.initial_freq_hz when
+     * has_client && current_freq_hz == 0. */
+    uint32_t current_freq_hz;
+    /* Client-issued sample-rate override, same semantics as
+     * current_freq_hz above. */
+    uint32_t current_sample_rate_hz;
     int32_t  current_gain_tenths_db;   /* valid only when has_current_gain */
     bool     current_gain_auto;        /* valid only when has_current_gain */
     bool     has_current_gain;
-    uint32_t gain_count;               /* advertised in dongle_info_t; 0 until first client */
+    /* Tuner's advertised discrete gain count (from
+     * dongle_info_t). Populated by Server::start during the
+     * dongle-open phase — non-zero for the entire server
+     * lifetime, including before the first client connects. */
+    uint32_t gain_count;
     uint32_t recent_commands_count;    /* size of the recent-commands ring */
 } SdrRtlTcpServerStats;
 
@@ -913,6 +926,14 @@ int32_t sdr_rtltcp_browser_start(
  * Stop browsing and release. Joins the dispatcher thread
  * before returning, so the host can deterministically free
  * `user_data` on the next line. Passing null is a no-op.
+ *
+ * **Must NOT be called from inside the discovery callback.**
+ * The dispatcher thread that runs the callback is the same
+ * thread `_stop` joins, so calling this from within the
+ * callback self-deadlocks against the in-flight dispatch.
+ * Hosts that want to stop browsing in response to a
+ * discovered server should marshal the call out to another
+ * thread (GCD, a Swift `Task`, etc.).
  *
  * **Caller must serialize `_stop` against every other FFI
  * call on the same handle.** The handle is reclaimed via
