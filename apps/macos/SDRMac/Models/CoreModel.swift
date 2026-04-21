@@ -538,6 +538,15 @@ final class CoreModel {
     /// slider position on reconnect to a different server.
     var rtlTcpGainIndex: UInt32 = 0
 
+    /// Live USB hotplug monitor. Calls `refreshDeviceInfo()`
+    /// on any plug / unplug event so `hasLocalRtlSdr` stays
+    /// in sync with reality without the user having to flip
+    /// focus or restart the app. Per issue #363. `nil` if
+    /// IOKit registration failed at bootstrap — the
+    /// scenePhase-on-active probe in `ContentView` remains as
+    /// a fallback safety net either way.
+    private var usbHotplugMonitor: UsbHotplugMonitor? = nil
+
     /// Live mDNS browser handle. Started in `bootstrap()` and
     /// stopped in `shutdown()`; `nil` if the OS denied browser
     /// start (rare — mDNS doesn't need special entitlements on
@@ -651,6 +660,16 @@ final class CoreModel {
         // This is a handle-free libusb device-list query; no USB
         // control transfers, no hardware open.
         refreshDeviceInfo()
+
+        // Wire up live USB hotplug notifications via IOKit so
+        // plug / unplug events flip `hasLocalRtlSdr` without
+        // waiting for a window-focus refresh. `onChange` is
+        // already MainActor-isolated (the IOKit notification
+        // port is attached to the main run loop) so we can
+        // call refreshDeviceInfo() directly. Per issue #363.
+        usbHotplugMonitor = UsbHotplugMonitor { [weak self] in
+            self?.refreshDeviceInfo()
+        }
 
         // Start the rtl_tcp mDNS browser early so the picker is
         // already populated when the user first expands it. No-
@@ -855,6 +874,14 @@ final class CoreModel {
         // dispatcher thread so no stray callbacks arrive after
         // the model deinits. Per issue #326.
         stopRtlTcpBrowser()
+
+        // Release the USB hotplug monitor's IOKit notification
+        // port so no stray plug/unplug callbacks fire after
+        // shutdown. `deinit` would do this too, but dropping
+        // the reference explicitly here removes any ambiguity
+        // about when the IOKit resources get released. Per
+        // issue #363.
+        usbHotplugMonitor = nil
         if let core {
             // Best-effort stop — a thrown error shouldn't leave
             // the model claiming `isRunning == true` alongside a
@@ -874,12 +901,12 @@ final class CoreModel {
     /// "not found" string). Handle-free — calls straight into
     /// `sdr-rtlsdr` via the C ABI; no engine instance needed.
     ///
-    /// Called from `bootstrap()` so the device state shows up
-    /// on first paint rather than only after Play, and from
-    /// `ContentView`'s `scenePhase` hook on main-window refocus
-    /// as a stop-gap for the "user plugged in a dongle after
-    /// launch" case. Proper IOKit USB hotplug monitoring is
-    /// tracked in issue #363.
+    /// Called from `bootstrap()` for the initial probe, from
+    /// the live `UsbHotplugMonitor` on every USB plug/unplug
+    /// event (closed issue #363), and from `ContentView`'s
+    /// `scenePhase` hook on main-window refocus as a safety-net
+    /// fallback. Safe to call repeatedly — the underlying
+    /// libusb device-list query is cheap (<1 ms typical).
     func refreshDeviceInfo() {
         let count = SdrCore.deviceCount
         hasLocalRtlSdr = count > 0
