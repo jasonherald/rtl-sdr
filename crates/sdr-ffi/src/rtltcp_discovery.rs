@@ -358,17 +358,14 @@ fn dispatch_discovery_event(
     // keeps every CString alive until this function returns.
     let mut strings: Vec<CString> = Vec::new();
 
-    let (c_event, _owned_withdrawn) = match event {
+    let c_event = match event {
         DiscoveryEvent::ServerAnnounced(server) => {
             let announced = discovered_server_to_c(&server, &mut strings);
-            (
-                SdrRtlTcpDiscoveryEvent {
-                    kind: SDR_RTLTCP_DISCOVERY_ANNOUNCED,
-                    announced,
-                    withdrawn_instance_name: std::ptr::null(),
-                },
-                None::<CString>,
-            )
+            SdrRtlTcpDiscoveryEvent {
+                kind: SDR_RTLTCP_DISCOVERY_ANNOUNCED,
+                announced,
+                withdrawn_instance_name: std::ptr::null(),
+            }
         }
         DiscoveryEvent::ServerWithdrawn { instance_name } => {
             let sanitized = instance_name.replace('\0', "?");
@@ -377,14 +374,11 @@ fn dispatch_discovery_event(
             };
             let ptr = cstr.as_ptr();
             strings.push(cstr);
-            (
-                SdrRtlTcpDiscoveryEvent {
-                    kind: SDR_RTLTCP_DISCOVERY_WITHDRAWN,
-                    announced: zeroed_discovered_server(),
-                    withdrawn_instance_name: ptr,
-                },
-                None,
-            )
+            SdrRtlTcpDiscoveryEvent {
+                kind: SDR_RTLTCP_DISCOVERY_WITHDRAWN,
+                announced: zeroed_discovered_server(),
+                withdrawn_instance_name: ptr,
+            }
         }
     };
 

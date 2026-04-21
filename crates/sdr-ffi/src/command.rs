@@ -545,6 +545,14 @@ pub unsafe extern "C" fn sdr_core_set_bias_tee(handle: *mut SdrCore, enabled: bo
     unsafe { with_core(handle, |core| send(core, UiToDsp::SetBiasTee(enabled))) }
 }
 
+/// Inclusive legal bounds for `sdr_core_set_direct_sampling`'s
+/// `mode` argument. Mirrors `controller::DIRECT_SAMPLING_{MIN,MAX}`
+/// on the engine side — both sites reference these named
+/// constants so the ABI contract can't drift. Per `CodeRabbit`
+/// round 1 on PR #360.
+pub const SDR_DIRECT_SAMPLING_MIN: i32 = 0;
+pub const SDR_DIRECT_SAMPLING_MAX: i32 = 2;
+
 /// Set RTL2832 direct-sampling mode. `mode` must be one of
 /// `0` (off), `1` (I branch), or `2` (Q branch). Returns
 /// `SDR_CORE_ERR_INVALID_ARG` for values outside that range.
@@ -552,9 +560,10 @@ pub unsafe extern "C" fn sdr_core_set_bias_tee(handle: *mut SdrCore, enabled: bo
 pub unsafe extern "C" fn sdr_core_set_direct_sampling(handle: *mut SdrCore, mode: i32) -> i32 {
     unsafe {
         with_core(handle, |core| {
-            if !(0..=2).contains(&mode) {
+            if !(SDR_DIRECT_SAMPLING_MIN..=SDR_DIRECT_SAMPLING_MAX).contains(&mode) {
                 set_last_error(format!(
-                    "sdr_core_set_direct_sampling: mode must be 0..=2, got {mode}"
+                    "sdr_core_set_direct_sampling: mode must be \
+                     {SDR_DIRECT_SAMPLING_MIN}..={SDR_DIRECT_SAMPLING_MAX}, got {mode}"
                 ));
                 return Err(SdrCoreError::InvalidArg);
             }
@@ -1616,7 +1625,7 @@ mod tests {
     #[test]
     fn set_direct_sampling_accepts_valid_modes() {
         let h = make_handle();
-        for mode in 0..=2 {
+        for mode in SDR_DIRECT_SAMPLING_MIN..=SDR_DIRECT_SAMPLING_MAX {
             assert_eq!(
                 unsafe { sdr_core_set_direct_sampling(h, mode) },
                 SdrCoreError::Ok.as_int(),
@@ -1628,13 +1637,17 @@ mod tests {
 
     #[test]
     fn set_direct_sampling_rejects_out_of_range() {
+        // Reference the MIN/MAX constants so the test stays in
+        // sync with the FFI contract instead of hardcoding
+        // boundary literals that could drift. Per `CodeRabbit`
+        // round 1 on PR #360.
         let h = make_handle();
         assert_eq!(
-            unsafe { sdr_core_set_direct_sampling(h, 3) },
+            unsafe { sdr_core_set_direct_sampling(h, SDR_DIRECT_SAMPLING_MAX + 1) },
             SdrCoreError::InvalidArg.as_int()
         );
         assert_eq!(
-            unsafe { sdr_core_set_direct_sampling(h, -1) },
+            unsafe { sdr_core_set_direct_sampling(h, SDR_DIRECT_SAMPLING_MIN - 1) },
             SdrCoreError::InvalidArg.as_int()
         );
         destroy(h);

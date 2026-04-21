@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use sdr_server_rtltcp::{
-    InitialDeviceState, Server, ServerConfig, ServerStats, TunerAdvertiseInfo,
+    InitialDeviceState, Server, ServerConfig, ServerError, ServerStats, TunerAdvertiseInfo,
     protocol::{CommandOp, DEFAULT_PORT},
 };
 
@@ -160,6 +160,14 @@ impl SdrRtlTcpServer {
 // ============================================================
 
 fn initial_from_c(cfg: &SdrRtlTcpServerConfig) -> Result<InitialDeviceState, SdrCoreError> {
+    // Zero sample-rate wedges the RTL-SDR USB controller — the
+    // server CLI already rejects it at parse time for the same
+    // reason. Catch it at the FFI boundary before we open the
+    // device. Per `CodeRabbit` round 1 on PR #360.
+    if cfg.initial_sample_rate_hz == 0 {
+        set_last_error("sdr_rtltcp_server_start: initial_sample_rate_hz must be > 0");
+        return Err(SdrCoreError::InvalidArg);
+    }
     if !(0..=2).contains(&cfg.initial_direct_sampling) {
         set_last_error(format!(
             "sdr_rtltcp_server_start: initial_direct_sampling must be 0..=2, got {}",
@@ -253,15 +261,14 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             }
             Err(e) => {
                 set_last_error(format!("sdr_rtltcp_server_start: {e}"));
-                // Map the server's error into one of the
-                // generic FFI codes. Most failures here are
-                // either a USB device error (Device) or a
-                // port-bind / permission issue (Io).
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("bind") || msg.contains("address") {
-                    SdrCoreError::Io.as_int()
-                } else {
-                    SdrCoreError::Device.as_int()
+                // Map `ServerError` variants to stable FFI codes
+                // by shape, not by parsing the `Display` string.
+                // Per `CodeRabbit` round 1 on PR #360.
+                match e {
+                    ServerError::PortInUse(_) | ServerError::Io(_) => SdrCoreError::Io.as_int(),
+                    ServerError::Device(_)
+                    | ServerError::NoDevice
+                    | ServerError::BadDeviceIndex { .. } => SdrCoreError::Device.as_int(),
                 }
             }
         }
@@ -422,7 +429,15 @@ pub unsafe extern "C" fn sdr_rtltcp_server_recent_commands_json(
             set_last_error("sdr_rtltcp_server_recent_commands_json: server already stopped");
             return SdrCoreError::NotRunning.as_int();
         };
-        let json = recent_commands_to_json(&stats);
+        let json = match recent_commands_to_json(&stats) {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(format!(
+                    "sdr_rtltcp_server_recent_commands_json: JSON encoding failed: {e}"
+                ));
+                return SdrCoreError::Internal.as_int();
+            }
+        };
         let Ok(cstr) = CString::new(json) else {
             set_last_error("sdr_rtltcp_server_recent_commands_json: interior NUL (unreachable)");
             return SdrCoreError::Internal.as_int();
@@ -486,7 +501,7 @@ fn stats_to_c(stats: &ServerStats, tuner: &TunerAdvertiseInfo) -> SdrRtlTcpServe
     }
 }
 
-fn recent_commands_to_json(stats: &ServerStats) -> String {
+fn recent_commands_to_json(stats: &ServerStats) -> Result<String, serde_json::Error> {
     use serde_json::json;
     let now = std::time::Instant::now();
     let entries: Vec<_> = stats
@@ -499,7 +514,13 @@ fn recent_commands_to_json(stats: &ServerStats) -> String {
             })
         })
         .collect();
-    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+    // Propagate serialization failure to the caller. The FFI
+    // layer surfaces it as `SDR_CORE_ERR_INTERNAL` — the
+    // header advertises that error code for this path, so
+    // collapsing the failure into `"[]"` would turn a real
+    // ABI-contract violation into a plausible empty result.
+    // Per `CodeRabbit` round 1 on PR #360.
+    serde_json::to_string(&entries)
 }
 
 fn command_op_label(op: CommandOp) -> &'static str {
@@ -692,7 +713,7 @@ mod tests {
     #[test]
     fn recent_commands_json_empty_when_no_commands() {
         let stats = ServerStats::default();
-        let json = recent_commands_to_json(&stats);
+        let json = recent_commands_to_json(&stats).expect("serialize empty ring");
         assert_eq!(json, "[]");
     }
 
@@ -708,7 +729,7 @@ mod tests {
                 .checked_sub(Duration::from_secs(3))
                 .expect("Instant::now - 3s is representable"),
         ));
-        let json = recent_commands_to_json(&stats);
+        let json = recent_commands_to_json(&stats).expect("serialize populated ring");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 2);

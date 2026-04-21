@@ -35,11 +35,17 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
         }
 
         /// Run `body` with the live handle if it hasn't been
-        /// stopped yet; returns `nil` after stop.
-        func withHandle<T>(_ body: (OpaquePointer) -> T) -> T? {
+        /// stopped yet; returns `nil` after stop. Holds the lock
+        /// for the **entire** duration of `body` so a concurrent
+        /// `stop()` can't take the handle out from under an
+        /// in-flight FFI call — doing so would pass a freed
+        /// pointer into the C layer. Per `CodeRabbit` round 1
+        /// on PR #360.
+        func withHandle<T>(_ body: (OpaquePointer) throws -> T) rethrows -> T? {
             lock.lock()
             defer { lock.unlock() }
-            return handle.map(body)
+            guard let handle else { return nil }
+            return try body(handle)
         }
 
         /// Take the handle out of the box, leaving `nil` behind.
@@ -80,8 +86,12 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
         public var initialGainTenthsDb: Int32
         public var initialPpm: Int32
         public var initialBiasTee: Bool
-        /// Direct-sampling mode: 0 off / 1 I / 2 Q.
-        public var initialDirectSampling: Int32
+        /// Direct-sampling mode. Shares the same enum as the
+        /// client-side `SdrCore.setDirectSampling(_:)` so the
+        /// two paths can't drift and a caller can't construct
+        /// an invalid raw mode. Per `CodeRabbit` round 1 on
+        /// PR #360.
+        public var initialDirectSampling: SdrCore.DirectSamplingMode
 
         public init(
             bindAddress: BindAddress = .loopback,
@@ -93,7 +103,7 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
             initialGainTenthsDb: Int32 = 0,
             initialPpm: Int32 = 0,
             initialBiasTee: Bool = false,
-            initialDirectSampling: Int32 = 0
+            initialDirectSampling: SdrCore.DirectSamplingMode = .off
         ) {
             self.bindAddress = bindAddress
             self.port = port
@@ -118,7 +128,7 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
                 initial_gain_tenths_db: initialGainTenthsDb,
                 initial_ppm: initialPpm,
                 initial_bias_tee: initialBiasTee,
-                initial_direct_sampling: initialDirectSampling
+                initial_direct_sampling: initialDirectSampling.rawValue
             )
         }
     }
@@ -208,77 +218,103 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
 
     /// Capture a stats snapshot. Throws `SdrCoreError` on a
     /// stopped server or other FFI error.
+    ///
+    /// The full FFI call runs inside the handle-box lock so a
+    /// concurrent `stop()` can't free the pointer mid-call. Per
+    /// `CodeRabbit` round 1 on PR #360.
     public func stats() throws -> Stats {
-        guard let handle = handleBox.withHandle({ $0 }) else {
+        let result: Stats? = try handleBox.withHandle { handle -> Stats in
+            var cStats = SdrRtlTcpServerStats()
+            var clientBuf = [CChar](repeating: 0, count: Self.statsStringBufferLen)
+            var tunerBuf = [CChar](repeating: 0, count: Self.statsStringBufferLen)
+            let rc = clientBuf.withUnsafeMutableBufferPointer { clientPtr in
+                tunerBuf.withUnsafeMutableBufferPointer { tunerPtr in
+                    sdr_rtltcp_server_stats(
+                        handle,
+                        &cStats,
+                        clientPtr.baseAddress,
+                        clientPtr.count,
+                        tunerPtr.baseAddress,
+                        tunerPtr.count
+                    )
+                }
+            }
+            try checkRc(rc)
+            return Stats(
+                hasClient: cStats.has_client,
+                connectedClientAddr: cStringToSwiftString(clientBuf),
+                uptimeSecs: cStats.uptime_secs,
+                bytesSent: cStats.bytes_sent,
+                buffersDropped: cStats.buffers_dropped,
+                currentFreqHz: cStats.current_freq_hz,
+                currentSampleRateHz: cStats.current_sample_rate_hz,
+                currentGainTenthsDb: cStats.current_gain_tenths_db,
+                currentGainAuto: cStats.current_gain_auto,
+                hasCurrentGain: cStats.has_current_gain,
+                tunerName: cStringToSwiftString(tunerBuf),
+                gainCount: cStats.gain_count,
+                recentCommandsCount: cStats.recent_commands_count
+            )
+        }
+        guard let stats = result else {
             throw SdrCoreError(code: .notRunning, message: "server already stopped")
         }
-        var cStats = SdrRtlTcpServerStats()
-        var clientBuf = [CChar](repeating: 0, count: Self.statsStringBufferLen)
-        var tunerBuf = [CChar](repeating: 0, count: Self.statsStringBufferLen)
-        let rc = clientBuf.withUnsafeMutableBufferPointer { clientPtr in
-            tunerBuf.withUnsafeMutableBufferPointer { tunerPtr in
-                sdr_rtltcp_server_stats(
-                    handle,
-                    &cStats,
-                    clientPtr.baseAddress,
-                    clientPtr.count,
-                    tunerPtr.baseAddress,
-                    tunerPtr.count
-                )
-            }
-        }
-        try checkRc(rc)
-        return Stats(
-            hasClient: cStats.has_client,
-            connectedClientAddr: cStringToSwiftString(clientBuf),
-            uptimeSecs: cStats.uptime_secs,
-            bytesSent: cStats.bytes_sent,
-            buffersDropped: cStats.buffers_dropped,
-            currentFreqHz: cStats.current_freq_hz,
-            currentSampleRateHz: cStats.current_sample_rate_hz,
-            currentGainTenthsDb: cStats.current_gain_tenths_db,
-            currentGainAuto: cStats.current_gain_auto,
-            hasCurrentGain: cStats.has_current_gain,
-            tunerName: cStringToSwiftString(tunerBuf),
-            gainCount: cStats.gain_count,
-            recentCommandsCount: cStats.recent_commands_count
-        )
+        return stats
     }
 
     /// Fetch the recent-commands ring as decoded rows. Calls
     /// through `sdr_rtltcp_server_recent_commands_json` with a
-    /// start-4 KiB buffer and retries once if the server says
-    /// it needs more.
+    /// start-4 KiB buffer and retries if the server reports it
+    /// needs more. Decode failures (bad UTF-8, malformed JSON)
+    /// propagate as `SdrCoreError` — an empty array is a valid
+    /// "no commands" result and shouldn't mask a real
+    /// serialization bug. Per `CodeRabbit` round 1 on PR #360.
     public func recentCommands() throws -> [RecentCommand] {
-        guard let handle = handleBox.withHandle({ $0 }) else {
+        let result: [RecentCommand]? = try handleBox.withHandle { handle -> [RecentCommand] in
+            var capacity = 4096
+            while true {
+                var buf = [CChar](repeating: 0, count: capacity)
+                var required: Int = 0
+                let rc = buf.withUnsafeMutableBufferPointer { ptr in
+                    sdr_rtltcp_server_recent_commands_json(
+                        handle, ptr.baseAddress, ptr.count, &required
+                    )
+                }
+                // OK (0): buffer was big enough — parse + return.
+                if rc == 0 {
+                    let json = cStringToSwiftString(buf)
+                    guard let data = json.data(using: .utf8) else {
+                        throw SdrCoreError(
+                            code: .internal,
+                            message: "recent-commands JSON is not valid UTF-8"
+                        )
+                    }
+                    do {
+                        return try JSONDecoder().decode([RecentCommand].self, from: data)
+                    } catch {
+                        throw SdrCoreError(
+                            code: .internal,
+                            message: "recent-commands JSON decode failed: \(error)"
+                        )
+                    }
+                }
+                // Too-small-buffer contract: `InvalidArg` with
+                // `required > buf_len`. Any other combination is
+                // a real failure and propagates.
+                if rc == SdrCoreError.Code.invalidArg.rawValue && required > capacity {
+                    // Retry with the server's reported required
+                    // size + a little slack so a race that
+                    // appends a command between calls doesn't
+                    // loop twice.
+                    capacity = required + 128
+                    continue
+                }
+                try checkRc(rc)
+            }
+        }
+        guard let commands = result else {
             throw SdrCoreError(code: .notRunning, message: "server already stopped")
         }
-        var capacity = 4096
-        while true {
-            var buf = [CChar](repeating: 0, count: capacity)
-            var required: Int = 0
-            let rc = buf.withUnsafeMutableBufferPointer { ptr in
-                sdr_rtltcp_server_recent_commands_json(
-                    handle, ptr.baseAddress, ptr.count, &required
-                )
-            }
-            // OK (0): buffer was big enough — parse + return.
-            if rc == 0 {
-                let json = cStringToSwiftString(buf)
-                guard let data = json.data(using: .utf8) else { return [] }
-                return (try? JSONDecoder().decode([RecentCommand].self, from: data)) ?? []
-            }
-            // Too-small-buffer contract: `InvalidArg` with
-            // `required > buf_len`. Any other combination is a
-            // real failure and propagates.
-            if rc == SdrCoreError.Code.invalidArg.rawValue && required > capacity {
-                // Retry with the server's reported required
-                // size + a little slack so a race that appends
-                // a command between calls doesn't loop twice.
-                capacity = required + 128
-                continue
-            }
-            try checkRc(rc)
-        }
+        return commands
     }
 }
