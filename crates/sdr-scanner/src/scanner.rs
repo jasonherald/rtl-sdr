@@ -269,55 +269,71 @@ impl Scanner {
         }
 
         if self.in_priority_sweep {
-            let pri_count = self.count_matching(|c| {
+            let is_priority = |c: &ScannerChannel| {
                 c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key)
-            });
+            };
+            let pri_count = self.count_matching(is_priority);
             if self.priority_cursor < pri_count {
-                let chosen = self
-                    .nth_matching(self.priority_cursor, |c| {
-                        c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key)
-                    })
-                    .expect("priority_cursor < pri_count guarantees a match");
-                self.priority_cursor += 1;
-                return Some(chosen);
+                if let Some(chosen) = self.nth_matching(self.priority_cursor, is_priority) {
+                    self.priority_cursor += 1;
+                    return Some(chosen);
+                }
+                // Invariant violation: cursor < count but nth returned
+                // None. Should be impossible — assert in debug, recover
+                // in release by treating the sweep as exhausted and
+                // falling through to normal rotation.
+                debug_assert!(
+                    false,
+                    "priority_cursor < pri_count but nth_matching returned None"
+                );
             }
-            // Priority sweep exhausted.
+            // Priority sweep exhausted (or invariant-fallback).
             self.in_priority_sweep = false;
             self.priority_cursor = 0;
             self.hops_since_priority_sweep = 0;
             // Fall through to normal rotation.
         }
 
-        let normal_count =
-            self.count_matching(|c| c.priority == 0 && !self.locked_out.contains(&c.key));
+        let is_normal = |c: &ScannerChannel| c.priority == 0 && !self.locked_out.contains(&c.key);
+        let normal_count = self.count_matching(is_normal);
 
         if normal_count == 0 {
             // No normal channels — fall back to any unlocked channel
             // (priority-only lists).
-            let any_count = self.count_matching(|c| !self.locked_out.contains(&c.key));
+            let is_unlocked = |c: &ScannerChannel| !self.locked_out.contains(&c.key);
+            let any_count = self.count_matching(is_unlocked);
             if any_count == 0 {
                 return None;
             }
             if self.normal_cursor >= any_count {
                 self.normal_cursor = 0;
             }
-            let chosen = self
-                .nth_matching(self.normal_cursor, |c| !self.locked_out.contains(&c.key))
-                .expect("normal_cursor < any_count guarantees a match");
-            self.normal_cursor = (self.normal_cursor + 1) % any_count;
-            return Some(chosen);
+            let chosen = self.nth_matching(self.normal_cursor, is_unlocked);
+            debug_assert!(
+                chosen.is_some(),
+                "normal_cursor < any_count but nth_matching returned None"
+            );
+            if let Some(chosen) = chosen {
+                self.normal_cursor = (self.normal_cursor + 1) % any_count;
+                return Some(chosen);
+            }
+            return None;
         }
 
         if self.normal_cursor >= normal_count {
             self.normal_cursor = 0;
         }
-        let chosen = self
-            .nth_matching(self.normal_cursor, |c| {
-                c.priority == 0 && !self.locked_out.contains(&c.key)
-            })
-            .expect("normal_cursor < normal_count guarantees a match");
-        self.normal_cursor = (self.normal_cursor + 1) % normal_count;
-        Some(chosen)
+        let chosen = self.nth_matching(self.normal_cursor, is_normal);
+        debug_assert!(
+            chosen.is_some(),
+            "normal_cursor < normal_count but nth_matching returned None"
+        );
+        if let Some(chosen) = chosen {
+            self.normal_cursor = (self.normal_cursor + 1) % normal_count;
+            Some(chosen)
+        } else {
+            None
+        }
     }
 
     /// Count channels matching `predicate`. Allocation-free —
