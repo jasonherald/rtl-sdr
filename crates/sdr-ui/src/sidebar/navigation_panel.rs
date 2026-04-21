@@ -388,46 +388,44 @@ pub struct ActiveBookmark {
     pub frequency: u64,
 }
 
-/// Navigation panel containing band presets and frequency bookmarks.
+/// Navigation panel containing band presets and the left-sidebar
+/// "Add Bookmark" quick-entry controls.
+///
+/// The full bookmark list (browse, recall, delete, save-over-active)
+/// lives in [`crate::sidebar::BookmarksPanel`] — the right-side
+/// flyout — so this panel intentionally does **not** own the list
+/// widget or the backing store. Both panels share the `name_entry`:
+/// this struct owns it, the flyout panel borrows it at build time
+/// and captures clones in its row callbacks.
 pub struct NavigationPanel {
     /// Band presets group widget.
     pub presets_widget: adw::PreferencesGroup,
-    /// Bookmarks container widget.
+    /// Left-sidebar bookmark quick-add container (heading +
+    /// name entry + Add button). The full list is in the flyout
+    /// — see [`crate::sidebar::BookmarksPanel`].
     pub bookmarks_widget: gtk4::Box,
     /// Band preset combo row (for connection in window.rs).
     pub preset_row: adw::ComboRow,
     /// Bookmark name entry (user-editable, defaults to formatted frequency).
+    /// Owned here because the Add button sits next to it; the
+    /// flyout panel borrows a reference for its row actions.
     pub name_entry: adw::EntryRow,
-    /// Add bookmark button.
+    /// Add bookmark button. Lives on the left sidebar so users
+    /// can stash a bookmark without opening the flyout.
     pub add_button: gtk4::Button,
-    /// Bookmark scroll container (height adjusted dynamically).
-    pub bookmark_scroll: gtk4::ScrolledWindow,
-    /// Bookmark list box (rebuilt on add/remove).
-    pub bookmark_list: gtk4::ListBox,
-    /// Current bookmarks (shared state for closures).
-    pub bookmarks: std::rc::Rc<std::cell::RefCell<Vec<Bookmark>>>,
-    /// Callback fired when a preset or bookmark is recalled.
-    pub on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>>,
-    /// Currently active bookmark identity (for visual highlighting).
-    pub active_bookmark: std::rc::Rc<std::cell::RefCell<ActiveBookmark>>,
-    /// Callback fired when the user clicks save on the active bookmark.
-    pub on_save: SaveCallback,
 }
 
-impl NavigationPanel {
-    /// Register a callback invoked when the user selects a preset or bookmark.
-    pub fn connect_navigate<F: Fn(&Bookmark) + 'static>(&self, f: F) {
-        *self.on_navigate.borrow_mut() = Some(Box::new(f));
-    }
-
-    /// Register a callback invoked when the user clicks save on the active bookmark.
-    pub fn connect_save<F: Fn() + 'static>(&self, f: F) {
-        *self.on_save.borrow_mut() = Some(Box::new(f));
-    }
-}
-
-/// Build the complete navigation panel (band presets + bookmarks).
-#[allow(clippy::too_many_lines)]
+/// Build the navigation panel — band presets + left-sidebar
+/// bookmark quick-add.
+///
+/// Does not build the bookmark list widget; that lives in the
+/// right-side flyout and is constructed by
+/// [`build_bookmarks_panel`](crate::sidebar::build_bookmarks_panel).
+/// The preset row's selection handler also lives outside this
+/// function — see [`connect_preset_to_bookmarks`] — because it
+/// needs access to the flyout's shared state (active-bookmark
+/// highlight, list rebuild, navigation callback) which only
+/// exists after both panels have been built.
 pub fn build_navigation_panel() -> NavigationPanel {
     // --- Band Presets ---
     let presets_group = adw::PreferencesGroup::builder()
@@ -444,8 +442,7 @@ pub fn build_navigation_panel() -> NavigationPanel {
         .build();
     presets_group.add(&preset_row);
 
-    // --- Bookmarks ---
-    // Use a plain Box instead of PreferencesGroup so ScrolledWindow sizing works.
+    // --- Left-sidebar bookmark quick-add ---
     let bookmarks_group = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(8)
@@ -458,20 +455,16 @@ pub fn build_navigation_panel() -> NavigationPanel {
         .build();
     bookmarks_group.append(&bookmarks_label);
 
+    let bookmarks_hint = gtk4::Label::builder()
+        .label("Use the bookmark icon or keyboard shortcut to browse")
+        .css_classes(["caption", "dim-label"])
+        .halign(gtk4::Align::Start)
+        .wrap(true)
+        .build();
+    bookmarks_group.append(&bookmarks_hint);
+
     let name_entry = adw::EntryRow::builder().title("Name").build();
     bookmarks_group.append(&name_entry);
-
-    let bookmark_list = gtk4::ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
-
-    let bookmark_scroll = gtk4::ScrolledWindow::builder()
-        .child(&bookmark_list)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .build();
-    bookmarks_group.append(&bookmark_scroll);
 
     let add_button = gtk4::Button::builder()
         .label("Add Bookmark")
@@ -479,77 +472,78 @@ pub fn build_navigation_panel() -> NavigationPanel {
         .build();
     bookmarks_group.append(&add_button);
 
-    let bookmarks = std::rc::Rc::new(std::cell::RefCell::new(load_bookmarks()));
-    let on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-
-    let active_bookmark = std::rc::Rc::new(std::cell::RefCell::new(ActiveBookmark::default()));
-    let on_save: SaveCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
-
-    // Build initial bookmark list
-    rebuild_bookmark_list(
-        &bookmark_list,
-        &bookmark_scroll,
-        &bookmarks,
-        &on_navigate,
-        &active_bookmark,
-        &name_entry,
-        &on_save,
-    );
-
-    // Connect preset row — auto-tune on selection, clear active bookmark
-    let on_nav_preset = std::rc::Rc::clone(&on_navigate);
-    let active_for_preset = std::rc::Rc::clone(&active_bookmark);
-    let entry_for_preset = name_entry.clone();
-    let list_for_preset = bookmark_list.downgrade();
-    let scroll_for_preset = bookmark_scroll.downgrade();
-    let bm_for_preset = std::rc::Rc::clone(&bookmarks);
-    let save_for_preset = std::rc::Rc::clone(&on_save);
-    preset_row.connect_selected_notify(move |row| {
-        let idx = row.selected() as usize;
-        if let Some(preset) = BAND_PRESETS.get(idx)
-            && let Some(cb) = on_nav_preset.borrow().as_ref()
-        {
-            // Clear active bookmark — we're tuning via preset, not bookmark.
-            *active_for_preset.borrow_mut() = ActiveBookmark::default();
-            entry_for_preset.set_text("");
-            let bm = Bookmark::new(
-                preset.name,
-                preset.frequency,
-                preset.demod_mode,
-                preset.bandwidth,
-            );
-            cb(&bm);
-            // Rebuild to remove stale highlight
-            if let Some(lb) = list_for_preset.upgrade()
-                && let Some(sc) = scroll_for_preset.upgrade()
-            {
-                rebuild_bookmark_list(
-                    &lb,
-                    &sc,
-                    &bm_for_preset,
-                    &on_nav_preset,
-                    &active_for_preset,
-                    &entry_for_preset,
-                    &save_for_preset,
-                );
-            }
-        }
-    });
-
     NavigationPanel {
         presets_widget: presets_group,
         bookmarks_widget: bookmarks_group,
         preset_row,
         name_entry,
         add_button,
-        bookmark_scroll,
-        bookmark_list,
-        bookmarks,
-        on_navigate,
-        active_bookmark,
-        on_save,
     }
+}
+
+/// Wire the band-preset combo row to the bookmark flyout state.
+///
+/// Selecting a preset clears the active-bookmark highlight,
+/// clears the name entry, fires the shared navigate callback,
+/// and rebuilds the flyout's bookmark list. This wiring can't
+/// live inside [`build_navigation_panel`] because the state it
+/// closes over is owned by the flyout panel, which is built
+/// afterwards.
+pub fn connect_preset_to_bookmarks(
+    navigation: &NavigationPanel,
+    bookmarks: &crate::sidebar::BookmarksPanel,
+) {
+    let on_nav = std::rc::Rc::clone(&bookmarks.on_navigate);
+    let active = std::rc::Rc::clone(&bookmarks.active_bookmark);
+    let bm_rc = std::rc::Rc::clone(&bookmarks.bookmarks);
+    let on_save = std::rc::Rc::clone(&bookmarks.on_save);
+    let filter_text = std::rc::Rc::clone(&bookmarks.filter_text);
+    let manual_expanded = std::rc::Rc::clone(&bookmarks.manual_expanded);
+    let list_weak = bookmarks.bookmark_list.downgrade();
+    let scroll_weak = bookmarks.bookmark_scroll.downgrade();
+    let name_entry = navigation.name_entry.clone();
+
+    navigation.preset_row.connect_selected_notify(move |row| {
+        let idx = row.selected() as usize;
+        let Some(preset) = BAND_PRESETS.get(idx) else {
+            return;
+        };
+        // Apply preset-driven UI state regardless of whether a
+        // navigate callback is registered — the active-bookmark
+        // reset, name-entry clear, and list rebuild describe
+        // "we're tuning via preset, not bookmark" and that's
+        // true whether or not anyone's listening. Gating these
+        // on `on_nav` being Some would leave stale highlight /
+        // name-entry state visible in the rare window between
+        // panel construction and callback registration.
+        *active.borrow_mut() = ActiveBookmark::default();
+        name_entry.set_text("");
+        let bm = Bookmark::new(
+            preset.name,
+            preset.frequency,
+            preset.demod_mode,
+            preset.bandwidth,
+        );
+        if let Some(cb) = on_nav.borrow().as_ref() {
+            cb(&bm);
+        }
+        // Rebuild to remove stale highlight
+        if let Some(lb) = list_weak.upgrade()
+            && let Some(sc) = scroll_weak.upgrade()
+        {
+            rebuild_bookmark_list(
+                &lb,
+                &sc,
+                &bm_rc,
+                &on_nav,
+                &active,
+                &name_entry,
+                &on_save,
+                &filter_text,
+                &manual_expanded,
+            );
+        }
+    });
 }
 
 /// Approximate height of one `AdwActionRow` with subtitle in pixels.
@@ -560,8 +554,44 @@ const MAX_VISIBLE_BOOKMARKS: i32 = 3;
 /// Callback type for save actions on the active bookmark.
 pub type SaveCallback = std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn()>>>>;
 
+/// Sentinel category title for bookmarks without an `rr_category`.
+/// Only shown when the list contains a mix of categorized and
+/// uncategorized bookmarks — pure-uncategorized lists render
+/// flat, skipping expander grouping entirely.
+const UNCATEGORIZED_LABEL: &str = "Uncategorized";
+
+/// Does the bookmark's name, subtitle, or category contain the
+/// (already-lowercased) search needle? Empty needle matches
+/// everything. Category matching lets users filter by the
+/// `rr_category` label (e.g., typing "dispatch" or "fire")
+/// when bookmarks are imported from `RadioReference`, not just
+/// by name or demod/frequency.
+fn bookmark_matches_filter(bm: &Bookmark, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let name_lc = bm.name.to_lowercase();
+    let subtitle_lc = bm.settings_subtitle().to_lowercase();
+    let category_lc = bm.rr_category.as_deref().unwrap_or_default().to_lowercase();
+    name_lc.contains(needle) || subtitle_lc.contains(needle) || category_lc.contains(needle)
+}
+
 /// Rebuild the bookmark `ListBox` from the current bookmark list.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+///
+/// Honors the search filter in `filter_text` by delegating to
+/// [`bookmark_matches_filter`] — lowercase substring match
+/// against the bookmark's name, subtitle (demod + frequency),
+/// and `rr_category`. Emits an `AdwExpanderRow` per unique
+/// `rr_category` when any bookmark is categorized; falls back
+/// to a flat list when all bookmarks are uncategorized so users
+/// who don't import from `RadioReference` keep the original
+/// single-level view.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::implicit_hasher,
+    reason = "manual_expanded is a private handle passed Rc-clone-style between internal callers — the default `RandomState` hasher is fine and genericizing would force every caller site to spell the hasher"
+)]
 pub fn rebuild_bookmark_list(
     list_box: &gtk4::ListBox,
     scroll: &gtk4::ScrolledWindow,
@@ -570,6 +600,8 @@ pub fn rebuild_bookmark_list(
     active: &std::rc::Rc<std::cell::RefCell<ActiveBookmark>>,
     name_entry: &adw::EntryRow,
     on_save: &SaveCallback,
+    filter_text: &std::rc::Rc<std::cell::RefCell<String>>,
+    manual_expanded: &std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
 ) {
     // Remove all existing rows.
     while let Some(child) = list_box.first_child() {
@@ -578,130 +610,315 @@ pub fn rebuild_bookmark_list(
 
     let bm_list = bookmarks.borrow();
     let current_active = active.borrow().clone();
-    for bm in bm_list.iter() {
-        let is_active = bm.name == current_active.name && bm.frequency == current_active.frequency;
-        let row = adw::ActionRow::builder()
-            .title(&bm.name)
-            .subtitle(bm.settings_subtitle())
-            .activatable(true)
-            .build();
+    let needle = filter_text.borrow().clone();
+    let uses_categories = bm_list.iter().any(|b| b.rr_category.is_some());
+    // Read manual expansion state separately from widget state.
+    // We can't snapshot widget expansion on every rebuild: the
+    // search path force-opens every expander, and if the user
+    // then clears the search, we'd treat those forced opens as
+    // manual intent. Instead `manual_expanded` is only mutated
+    // by the `expanded-notify` handler below, and only when no
+    // filter is active — so programmatic expansions (search,
+    // active-category restore, initial apply on rebuild) never
+    // pollute it.
+    let manual_open: std::collections::HashSet<String> = manual_expanded.borrow().clone();
 
-        // Highlight the active bookmark with an accent icon + save button.
-        if is_active {
-            let icon = gtk4::Image::from_icon_name("media-playback-start-symbolic");
-            icon.set_valign(gtk4::Align::Center);
-            row.add_prefix(&icon);
-
-            // Save button — updates the active bookmark with current settings.
-            let save_btn = gtk4::Button::builder()
-                .icon_name("media-floppy-symbolic")
-                .valign(gtk4::Align::Center)
-                .tooltip_text("Save current settings to this bookmark")
-                .css_classes(["flat"])
+    if uses_categories {
+        // Collect bookmarks into category buckets, preserving
+        // within-category insertion order. `BTreeMap` gives
+        // deterministic alphabetical category ordering; use
+        // a single `Uncategorized` bucket for loose bookmarks.
+        let mut groups: std::collections::BTreeMap<String, Vec<&Bookmark>> =
+            std::collections::BTreeMap::new();
+        for bm in bm_list.iter() {
+            if !bookmark_matches_filter(bm, &needle) {
+                continue;
+            }
+            let cat = bm
+                .rr_category
+                .clone()
+                .unwrap_or_else(|| UNCATEGORIZED_LABEL.to_string());
+            groups.entry(cat).or_default().push(bm);
+        }
+        // The category containing the active bookmark, so we can
+        // guarantee it stays expanded even if the user hadn't
+        // opened it before the recall (e.g., clicking through
+        // search results into a previously-collapsed section).
+        let active_category = bm_list
+            .iter()
+            .find(|b| b.name == current_active.name && b.frequency == current_active.frequency)
+            .map(|b| {
+                b.rr_category
+                    .clone()
+                    .unwrap_or_else(|| UNCATEGORIZED_LABEL.to_string())
+            });
+        for (cat, items) in groups {
+            if items.is_empty() {
+                continue;
+            }
+            let expander = adw::ExpanderRow::builder()
+                .title(&cat)
+                .subtitle(format!(
+                    "{} bookmark{}",
+                    items.len(),
+                    if items.len() == 1 { "" } else { "s" }
+                ))
                 .build();
-            let save_cb = std::rc::Rc::clone(on_save);
-            save_btn.connect_clicked(move |_| {
-                if let Some(cb) = save_cb.borrow().as_ref() {
-                    cb();
+            // Expand when: a filter is active (so matches
+            // surface without a manual click); the user
+            // manually expanded this category before (preserved
+            // across rebuilds via `manual_expanded`); or this
+            // category holds the active bookmark (so recall
+            // keeps its section open).
+            let keep_expanded = !needle.is_empty()
+                || manual_open.contains(&cat)
+                || active_category.as_deref() == Some(cat.as_str());
+            expander.set_expanded(keep_expanded);
+
+            // Track user-driven expansion toggles. Connects
+            // *after* the initial `set_expanded` above so the
+            // programmatic apply doesn't fire the handler —
+            // GLib signals only reach handlers connected at the
+            // time of emission. Gated on filter being empty
+            // because during search all expanders are force-
+            // open; a user toggle under those conditions
+            // reflects "show/hide matches in this category
+            // right now", not lasting intent.
+            let manual_for_notify = std::rc::Rc::clone(manual_expanded);
+            let filter_for_notify = std::rc::Rc::clone(filter_text);
+            let cat_for_notify = cat.clone();
+            expander.connect_expanded_notify(move |row| {
+                if !filter_for_notify.borrow().is_empty() {
+                    return;
+                }
+                if row.is_expanded() {
+                    manual_for_notify
+                        .borrow_mut()
+                        .insert(cat_for_notify.clone());
+                } else {
+                    manual_for_notify.borrow_mut().remove(&cat_for_notify);
                 }
             });
-            row.add_suffix(&save_btn);
-        }
 
-        // Delete button — identify by name + frequency rather than index
-        let delete_btn = gtk4::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .valign(gtk4::Align::Center)
-            .css_classes(["flat"])
-            .build();
-
-        let bm_rc = std::rc::Rc::clone(bookmarks);
-        let nav_rc = std::rc::Rc::clone(on_navigate);
-        let active_rc = std::rc::Rc::clone(active);
-        let save_del = std::rc::Rc::clone(on_save);
-        let list_ref = list_box.downgrade();
-        let scroll_ref = scroll.downgrade();
-        let entry_del = name_entry.clone();
-        let del_name = bm.name.clone();
-        let del_freq = bm.frequency;
-        delete_btn.connect_clicked(move |_| {
-            // Clear active state if deleting the active bookmark.
-            {
-                let active = active_rc.borrow();
-                if active.name == del_name && active.frequency == del_freq {
-                    drop(active);
-                    *active_rc.borrow_mut() = ActiveBookmark::default();
-                    entry_del.set_text("");
-                }
-            }
-            bm_rc
-                .borrow_mut()
-                .retain(|b| !(b.name == del_name && b.frequency == del_freq));
-            save_bookmarks(&bm_rc.borrow());
-            if let Some(lb) = list_ref.upgrade()
-                && let Some(sc) = scroll_ref.upgrade()
-            {
-                rebuild_bookmark_list(&lb, &sc, &bm_rc, &nav_rc, &active_rc, &entry_del, &save_del);
-            }
-        });
-        row.add_suffix(&delete_btn);
-
-        // Recall on row activation — set active, update name entry, rebuild list
-        let recall_bookmark = bm.clone();
-        let on_nav_recall = std::rc::Rc::clone(on_navigate);
-        let active_recall = std::rc::Rc::clone(active);
-        let save_recall = std::rc::Rc::clone(on_save);
-        let bm_recall = std::rc::Rc::clone(bookmarks);
-        let list_recall = list_box.downgrade();
-        let scroll_recall = scroll.downgrade();
-        let entry_recall = name_entry.clone();
-        row.connect_activated(move |_| {
-            // Set this bookmark as active
-            *active_recall.borrow_mut() = ActiveBookmark {
-                name: recall_bookmark.name.clone(),
-                frequency: recall_bookmark.frequency,
-            };
-            // Show the active bookmark name in the entry (read-only indication)
-            entry_recall.set_text(&recall_bookmark.name);
-
-            // Fire the navigate callback with the full bookmark
-            if let Some(cb) = on_nav_recall.borrow().as_ref() {
-                cb(&recall_bookmark);
-            }
-
-            // Rebuild list to update active highlighting, preserving scroll position.
-            if let Some(lb) = list_recall.upgrade()
-                && let Some(sc) = scroll_recall.upgrade()
-            {
-                let saved_scroll = sc.vadjustment().value();
-                rebuild_bookmark_list(
-                    &lb,
-                    &sc,
-                    &bm_recall,
-                    &on_nav_recall,
-                    &active_recall,
-                    &entry_recall,
-                    &save_recall,
+            for bm in items {
+                let row = build_bookmark_row(
+                    bm,
+                    &current_active,
+                    list_box,
+                    scroll,
+                    bookmarks,
+                    on_navigate,
+                    active,
+                    name_entry,
+                    on_save,
+                    filter_text,
+                    manual_expanded,
                 );
-                // Restore scroll position after GTK finishes re-laying out the
-                // rebuilt list — an idle callback ensures the adjustment range
-                // has been recalculated.
-                let adj = sc.vadjustment();
-                glib::idle_add_local_once(move || {
-                    adj.set_value(saved_scroll);
-                });
+                expander.add_row(&row);
             }
-        });
-
-        list_box.append(&row);
+            list_box.append(&expander);
+        }
+    } else {
+        for bm in bm_list.iter() {
+            if !bookmark_matches_filter(bm, &needle) {
+                continue;
+            }
+            let row = build_bookmark_row(
+                bm,
+                &current_active,
+                list_box,
+                scroll,
+                bookmarks,
+                on_navigate,
+                active,
+                name_entry,
+                on_save,
+                filter_text,
+                manual_expanded,
+            );
+            list_box.append(&row);
+        }
     }
 
-    // Dynamically size: show all items up to 3, then scroll.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let count = bm_list.len() as i32;
-    let visible = count.clamp(0, MAX_VISIBLE_BOOKMARKS);
-    let height = visible * BOOKMARK_ROW_HEIGHT;
-    scroll.set_height_request(height);
+    // Left-sidebar legacy sizing only makes sense in flat mode —
+    // the flyout is vexpand and doesn't need a min height. Keep
+    // the 3-row cap for flat lists (where this function is still
+    // called from the sidebar's pre-flyout code path) and skip
+    // entirely for expander-grouped views. Use the filtered row
+    // count, not the total — when a search is active the scroll
+    // region should shrink with the visible list rather than
+    // reserving space for filtered-out rows.
+    if uses_categories {
+        scroll.set_height_request(-1);
+    } else {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let count = bm_list
+            .iter()
+            .filter(|bm| bookmark_matches_filter(bm, &needle))
+            .count() as i32;
+        let visible = count.clamp(0, MAX_VISIBLE_BOOKMARKS);
+        let height = visible * BOOKMARK_ROW_HEIGHT;
+        scroll.set_height_request(height);
+    }
+}
+
+/// Build a single bookmark `ActionRow` with its active-highlight
+/// prefix, save/delete suffix buttons, and recall-on-activate
+/// handler wired up.
+///
+/// Shared between the flat and categorized rebuild paths so the
+/// row's behavior is identical regardless of whether it's a
+/// top-level child of the `ListBox` or nested under an
+/// `AdwExpanderRow`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn build_bookmark_row(
+    bm: &Bookmark,
+    current_active: &ActiveBookmark,
+    list_box: &gtk4::ListBox,
+    scroll: &gtk4::ScrolledWindow,
+    bookmarks: &std::rc::Rc<std::cell::RefCell<Vec<Bookmark>>>,
+    on_navigate: &std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>>,
+    active: &std::rc::Rc<std::cell::RefCell<ActiveBookmark>>,
+    name_entry: &adw::EntryRow,
+    on_save: &SaveCallback,
+    filter_text: &std::rc::Rc<std::cell::RefCell<String>>,
+    manual_expanded: &std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+) -> adw::ActionRow {
+    let is_active = bm.name == current_active.name && bm.frequency == current_active.frequency;
+    let row = adw::ActionRow::builder()
+        .title(&bm.name)
+        .subtitle(bm.settings_subtitle())
+        .activatable(true)
+        .build();
+
+    if is_active {
+        let icon = gtk4::Image::from_icon_name("media-playback-start-symbolic");
+        icon.set_valign(gtk4::Align::Center);
+        row.add_prefix(&icon);
+
+        let save_btn = gtk4::Button::builder()
+            .icon_name("media-floppy-symbolic")
+            .valign(gtk4::Align::Center)
+            .tooltip_text("Save current settings to this bookmark")
+            .css_classes(["flat"])
+            .build();
+        save_btn.update_property(&[gtk4::accessible::Property::Label(
+            "Save current settings to this bookmark",
+        )]);
+        let save_cb = std::rc::Rc::clone(on_save);
+        save_btn.connect_clicked(move |_| {
+            if let Some(cb) = save_cb.borrow().as_ref() {
+                cb();
+            }
+        });
+        row.add_suffix(&save_btn);
+    }
+
+    let delete_btn = gtk4::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .valign(gtk4::Align::Center)
+        .tooltip_text("Delete bookmark")
+        .css_classes(["flat"])
+        .build();
+    delete_btn.update_property(&[gtk4::accessible::Property::Label("Delete bookmark")]);
+
+    let bm_rc = std::rc::Rc::clone(bookmarks);
+    let nav_rc = std::rc::Rc::clone(on_navigate);
+    let active_rc = std::rc::Rc::clone(active);
+    let save_del = std::rc::Rc::clone(on_save);
+    let filter_del = std::rc::Rc::clone(filter_text);
+    let manual_expanded_del = std::rc::Rc::clone(manual_expanded);
+    let list_ref = list_box.downgrade();
+    let scroll_ref = scroll.downgrade();
+    let entry_del = name_entry.clone();
+    let del_name = bm.name.clone();
+    let del_freq = bm.frequency;
+    delete_btn.connect_clicked(move |_| {
+        {
+            let active = active_rc.borrow();
+            if active.name == del_name && active.frequency == del_freq {
+                drop(active);
+                *active_rc.borrow_mut() = ActiveBookmark::default();
+                entry_del.set_text("");
+            }
+        }
+        // Remove only the first matching bookmark rather than
+        // every entry with the same (name, frequency). Quick-add
+        // intentionally always creates a new `Bookmark`, so
+        // duplicates are a supported state — one click on the
+        // trash icon should delete the one row the user pointed
+        // at, not wipe the whole set. Stable bookmark IDs will
+        // supersede this first-match contract once they land.
+        let remove_idx = bm_rc
+            .borrow()
+            .iter()
+            .position(|b| b.name == del_name && b.frequency == del_freq);
+        if let Some(idx) = remove_idx {
+            bm_rc.borrow_mut().remove(idx);
+        }
+        save_bookmarks(&bm_rc.borrow());
+        if let Some(lb) = list_ref.upgrade()
+            && let Some(sc) = scroll_ref.upgrade()
+        {
+            rebuild_bookmark_list(
+                &lb,
+                &sc,
+                &bm_rc,
+                &nav_rc,
+                &active_rc,
+                &entry_del,
+                &save_del,
+                &filter_del,
+                &manual_expanded_del,
+            );
+        }
+    });
+    row.add_suffix(&delete_btn);
+
+    let recall_bookmark = bm.clone();
+    let on_nav_recall = std::rc::Rc::clone(on_navigate);
+    let active_recall = std::rc::Rc::clone(active);
+    let save_recall = std::rc::Rc::clone(on_save);
+    let filter_recall = std::rc::Rc::clone(filter_text);
+    let manual_expanded_recall = std::rc::Rc::clone(manual_expanded);
+    let bm_recall = std::rc::Rc::clone(bookmarks);
+    let list_recall = list_box.downgrade();
+    let scroll_recall = scroll.downgrade();
+    let entry_recall = name_entry.clone();
+    row.connect_activated(move |_| {
+        *active_recall.borrow_mut() = ActiveBookmark {
+            name: recall_bookmark.name.clone(),
+            frequency: recall_bookmark.frequency,
+        };
+        entry_recall.set_text(&recall_bookmark.name);
+
+        if let Some(cb) = on_nav_recall.borrow().as_ref() {
+            cb(&recall_bookmark);
+        }
+
+        if let Some(lb) = list_recall.upgrade()
+            && let Some(sc) = scroll_recall.upgrade()
+        {
+            let saved_scroll = sc.vadjustment().value();
+            rebuild_bookmark_list(
+                &lb,
+                &sc,
+                &bm_recall,
+                &on_nav_recall,
+                &active_recall,
+                &entry_recall,
+                &save_recall,
+                &filter_recall,
+                &manual_expanded_recall,
+            );
+            let adj = sc.vadjustment();
+            glib::idle_add_local_once(move || {
+                adj.set_value(saved_scroll);
+            });
+        }
+    });
+
+    row
 }
 
 #[cfg(test)]
@@ -879,5 +1096,47 @@ mod tests {
         // Compact format: "NFM 162.550 MHz"
         assert!(sub.contains("NFM"));
         assert!(sub.contains("162.550 MHz"));
+    }
+
+    #[test]
+    fn filter_empty_needle_matches_everything() {
+        let bm = Bookmark::new("Anything", 162_550_000, DemodMode::Nfm, 12_500.0);
+        assert!(bookmark_matches_filter(&bm, ""));
+    }
+
+    #[test]
+    fn filter_matches_name_case_insensitive() {
+        let bm = Bookmark::new("Weather", 162_550_000, DemodMode::Nfm, 12_500.0);
+        // `bookmark_matches_filter` assumes the caller has already
+        // lowercased the needle (the search-entry handler does so).
+        assert!(bookmark_matches_filter(&bm, "weather"));
+        assert!(!bookmark_matches_filter(&bm, "aviation"));
+    }
+
+    #[test]
+    fn filter_matches_subtitle_demod_and_frequency() {
+        let bm = Bookmark::new("Stuff", 162_550_000, DemodMode::Nfm, 12_500.0);
+        // Subtitle is "NFM 162.550 MHz" — lowercase matches both parts.
+        assert!(bookmark_matches_filter(&bm, "nfm"));
+        assert!(bookmark_matches_filter(&bm, "162.550"));
+        assert!(bookmark_matches_filter(&bm, "mhz"));
+    }
+
+    #[test]
+    fn filter_no_match_hides_bookmark() {
+        let bm = Bookmark::new("Weather", 162_550_000, DemodMode::Nfm, 12_500.0);
+        assert!(!bookmark_matches_filter(&bm, "xyz-no-match"));
+    }
+
+    #[test]
+    fn filter_matches_rr_category() {
+        // Users who import from RadioReference expect to search
+        // by category ("dispatch", "fire") even when that text
+        // isn't in the bookmark's name or subtitle.
+        let mut bm = Bookmark::new("Unit 14", 462_562_500, DemodMode::Nfm, 12_500.0);
+        bm.rr_category = Some("Law Dispatch".to_string());
+        assert!(bookmark_matches_filter(&bm, "dispatch"));
+        assert!(bookmark_matches_filter(&bm, "law"));
+        assert!(!bookmark_matches_filter(&bm, "fire"));
     }
 }
