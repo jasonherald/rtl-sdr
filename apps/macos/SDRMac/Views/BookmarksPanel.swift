@@ -41,6 +41,38 @@ struct BookmarksPanel: View {
     /// finding; landing it from day one here.
     @State private var filterText: String = ""
 
+    /// User's manual per-category expansion preference —
+    /// category name (or the `uncategorizedKey` sentinel)
+    /// maps to `true` for expanded, `false` for collapsed.
+    /// Persisted to UserDefaults so it survives across
+    /// sessions; absent keys default to expanded.
+    ///
+    /// Kept SEPARATE from search-driven force-open: while
+    /// `filterText` is non-empty, every matching group is
+    /// rendered expanded regardless of this map, and the map
+    /// is NOT updated from those force-open toggles. So
+    /// clearing search snaps groups back to the user's
+    /// manual preference — PR #361 round 2 caught a Major
+    /// regression where the Linux side conflated the two
+    /// states and collapsed groups stayed stuck open after
+    /// search cleared.
+    @State private var manuallyExpanded: [String: Bool] = [:]
+
+    /// Sentinel key for bookmarks without an `rrCategory`.
+    /// Matches the Linux `"Uncategorized"` title; used both
+    /// as the DisclosureGroup label AND as the dictionary
+    /// key above. Any real category label that happens to
+    /// equal this string collides — acceptable risk; the
+    /// Linux side makes the same call.
+    private static let uncategorizedKey = "Uncategorized"
+
+    /// UserDefaults key for `manuallyExpanded`. JSON-encoded
+    /// `[String: Bool]` so the whole map round-trips in one
+    /// value. Shape matches nothing on the Linux side yet —
+    /// GTK state lives in widget memory, not config — so no
+    /// cross-frontend parity concern here.
+    private static let expansionStateKey = "SDRMac.bookmarks.manualExpansionState"
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -51,6 +83,7 @@ struct BookmarksPanel: View {
         }
         .frame(width: BookmarksPanel.width)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear { loadManuallyExpanded() }
     }
 
     // MARK: - Search
@@ -154,9 +187,32 @@ struct BookmarksPanel: View {
             let filtered = filteredBookmarks
             if filtered.isEmpty {
                 emptyState(.noMatches)
+            } else if usesCategories {
+                // Grouped rendering — one DisclosureGroup per
+                // unique rrCategory, plus an "Uncategorized"
+                // sentinel group if any bookmark lacks a
+                // category. Mirrors the Linux GTK panel's
+                // AdwExpanderRow grouping (#339).
+                List {
+                    ForEach(groupedBookmarks(filtered), id: \.0) { (category, bms) in
+                        Section {
+                            DisclosureGroup(isExpanded: expansionBinding(for: category)) {
+                                ForEach(bms) { bm in
+                                    BookmarkListRow(bookmark: bm)
+                                }
+                            } label: {
+                                categoryHeader(category, count: bms.count)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.inset)
             } else {
-                // Flat list for this commit; category grouping
-                // via DisclosureGroup lands in the next.
+                // Flat list when no bookmark has a category —
+                // matches the Linux `uses_categories` fallback
+                // so first-time users don't see a single
+                // "Uncategorized" group swallowing the whole
+                // list.
                 List {
                     ForEach(filtered) { bm in
                         BookmarkListRow(bookmark: bm)
@@ -165,6 +221,99 @@ struct BookmarksPanel: View {
                 .listStyle(.inset)
             }
         }
+    }
+
+    /// `true` when at least one bookmark carries an
+    /// `rrCategory`. Matches the Linux `uses_categories`
+    /// check — only the grouped rendering path kicks in when
+    /// categorization is actually in use; a fresh install
+    /// with hand-saved bookmarks stays as a flat list.
+    private var usesCategories: Bool {
+        store.bookmarks.contains { $0.rrCategory != nil }
+    }
+
+    /// Group bookmarks by `rrCategory`, returning sorted
+    /// tuples for stable UI rendering. Nil categories bucket
+    /// into the `uncategorizedKey` sentinel at the end so
+    /// named categories sort alphabetically at the top and
+    /// the catch-all always lands last.
+    private func groupedBookmarks(
+        _ bookmarks: [Bookmark]
+    ) -> [(String, [Bookmark])] {
+        var buckets: [String: [Bookmark]] = [:]
+        for bm in bookmarks {
+            let key = bm.rrCategory ?? Self.uncategorizedKey
+            buckets[key, default: []].append(bm)
+        }
+        // Stable category order: alphabetical, sentinel last.
+        let named = buckets.keys
+            .filter { $0 != Self.uncategorizedKey }
+            .sorted()
+        var ordered: [(String, [Bookmark])] = named.map { ($0, buckets[$0] ?? []) }
+        if let uncat = buckets[Self.uncategorizedKey] {
+            ordered.append((Self.uncategorizedKey, uncat))
+        }
+        return ordered
+    }
+
+    /// Header row for a category DisclosureGroup. Shows the
+    /// category name + bookmark count; count label lets the
+    /// user see at a glance how large a collapsed category is.
+    private func categoryHeader(_ category: String, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(category)
+                .font(.callout)
+                .fontWeight(.medium)
+            Text("(\(count))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Expansion state (manual vs. search-forced)
+
+    /// Build the `isExpanded` binding for a category.
+    ///
+    /// - Read: while search is active, always `true` so
+    ///   every group is visible (the list is already filtered
+    ///   to matches). While search is empty, consult the
+    ///   user's persisted manual preference (default: expanded).
+    /// - Write: only persist when search is empty. Writes
+    ///   during search would capture the force-open state as
+    ///   manual intent and leave groups stuck open after
+    ///   search clears — the exact regression PR #361 round
+    ///   2 caught on the Linux side.
+    private func expansionBinding(for category: String) -> Binding<Bool> {
+        Binding(
+            get: {
+                if !filterText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return true
+                }
+                return manuallyExpanded[category] ?? true
+            },
+            set: { newValue in
+                guard filterText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return
+                }
+                manuallyExpanded[category] = newValue
+                persistManuallyExpanded()
+            }
+        )
+    }
+
+    private func loadManuallyExpanded() {
+        guard let json = UserDefaults.standard.string(forKey: Self.expansionStateKey),
+              let data = json.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) else {
+            return
+        }
+        manuallyExpanded = decoded
+    }
+
+    private func persistManuallyExpanded() {
+        guard let data = try? JSONEncoder().encode(manuallyExpanded),
+              let json = String(data: data, encoding: .utf8) else { return }
+        UserDefaults.standard.set(json, forKey: Self.expansionStateKey)
     }
 
     /// Two flavors of empty state so the user gets a helpful
