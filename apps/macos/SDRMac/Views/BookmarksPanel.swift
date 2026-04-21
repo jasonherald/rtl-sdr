@@ -14,10 +14,6 @@
 // Mutual-exclusive with the transcription panel (the sidebar
 // has room for one right-side flyout at a time). Open/closed
 // state persists across launches via `UserDefaults`.
-//
-// This commit ships the shell + empty state + header chrome.
-// Search row, category grouping, and per-row actions land in
-// the next two commits.
 
 import SwiftUI
 // `DemodMode.label` lives in SdrCoreKit — used by the row
@@ -56,7 +52,21 @@ struct BookmarksPanel: View {
     /// regression where the Linux side conflated the two
     /// states and collapsed groups stayed stuck open after
     /// search cleared.
-    @State private var manuallyExpanded: [String: Bool] = [:]
+    ///
+    /// Hydrated synchronously in `init` rather than
+    /// `.onAppear` so categories persisted as collapsed
+    /// render collapsed on the first frame. Loading post-
+    /// appear caused a visible snap (every group drew as
+    /// expanded then closed on the next tick). Per
+    /// `CodeRabbit` round 3 on PR #369.
+    @State private var manuallyExpanded: [String: Bool]
+
+    init(isPresented: Binding<Bool>) {
+        self._isPresented = isPresented
+        self._manuallyExpanded = State(
+            initialValue: Self.loadPersistedExpansionState()
+        )
+    }
 
     /// Sentinel key for bookmarks without an `rrCategory`.
     /// Matches the Linux `"Uncategorized"` title; used both
@@ -83,7 +93,6 @@ struct BookmarksPanel: View {
         }
         .frame(width: BookmarksPanel.width)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { loadManuallyExpanded() }
     }
 
     // MARK: - Search
@@ -301,13 +310,17 @@ struct BookmarksPanel: View {
         )
     }
 
-    private func loadManuallyExpanded() {
+    /// Static so it can be called from `init` before `self`
+    /// is available — synchronously seeding `@State` avoids
+    /// the first-frame expand-then-snap flicker that an
+    /// `onAppear` loader creates.
+    private static func loadPersistedExpansionState() -> [String: Bool] {
         guard let json = UserDefaults.standard.string(forKey: Self.expansionStateKey),
               let data = json.data(using: .utf8),
               let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) else {
-            return
+            return [:]
         }
-        manuallyExpanded = decoded
+        return decoded
     }
 
     private func persistManuallyExpanded() {
@@ -347,14 +360,13 @@ struct BookmarksPanel: View {
 }
 
 // ============================================================
-//  BookmarkListRow — placeholder shell
+//  BookmarkListRow
 // ============================================================
 //
-//  Minimal row for the shell commit. Displays name + frequency
-//  subtitle + an "active" checkmark when this bookmark matches
-//  the engine's current `activeBookmarkId`. Tap applies. Real
-//  per-row actions (save-over, delete, context menu) land in a
-//  follow-up commit.
+//  Displays name + frequency subtitle with an "active"
+//  checkmark when this bookmark matches the engine's current
+//  `activeBookmarkId`. Tap the label area to apply; trailing
+//  icon button and right-click context menu both delete.
 
 struct BookmarkListRow: View {
     @Environment(CoreModel.self) private var model
