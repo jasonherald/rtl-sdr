@@ -153,7 +153,6 @@ pub struct ChannelKey {
 #[derive(Debug, Clone)]
 pub struct ScannerChannel {
     pub key: ChannelKey,
-    pub frequency_hz: u64,
     pub demod_mode: DemodMode,
     pub bandwidth: f64,
     pub ctcss: Option<sdr_radio::af_chain::CtcssMode>,
@@ -164,6 +163,14 @@ pub struct ScannerChannel {
     pub dwell_ms: u32,
     /// Resolved hang time in ms (per-channel override folded in).
     pub hang_ms: u32,
+}
+
+impl ScannerChannel {
+    #[inline]
+    #[must_use]
+    pub fn frequency_hz(&self) -> u64 {
+        self.key.frequency_hz
+    }
 }
 ```
 
@@ -1632,9 +1639,25 @@ In the controller's message dispatch (match over `UiToDsp`), add arms forwarding
                     }
                     self.radio_module.set_demod_mode(demod_mode);
                     self.radio_module.set_bandwidth(bandwidth);
-                    if let Some(m) = ctcss {
-                        self.radio_module.set_ctcss_mode(m);
+                    // CTCSS is per-channel: if the target channel
+                    // has no tone configured, explicitly clear to
+                    // `Off`. Otherwise a channel with a tone
+                    // configured earlier in the scan would leave
+                    // its tone gate active when the scanner hops
+                    // to a plain-FM channel, silencing that
+                    // channel even though no tone was set on it.
+                    match ctcss {
+                        Some(m) => self.radio_module.set_ctcss_mode(m),
+                        None => self
+                            .radio_module
+                            .set_ctcss_mode(sdr_radio::af_chain::CtcssMode::Off),
                     }
+                    // Voice squelch is device-level (a speech-
+                    // detection policy, not per-frequency
+                    // configuration). Apply when the channel
+                    // overrides it; preserve the currently-live
+                    // setting when `None`. Matches the established
+                    // per-channel vs global pattern from #290.
                     if let Some(m) = voice_squelch {
                         self.radio_module.set_voice_squelch_mode(m);
                     }

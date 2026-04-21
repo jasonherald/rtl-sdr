@@ -104,6 +104,14 @@ pub enum ScannerCommand {
     /// UI-facing: scanner phase indicator ("Scanning" / "Listening" /
     /// "Hanging" / "Off"). Emitted on every phase transition.
     StateChanged(ScannerState),
+
+    /// Rotation is fully exhausted — every scannable channel is
+    /// either absent, lockoutʼd, or otherwise unreachable.
+    /// Emitted before the accompanying `ActiveChannelChanged(None)`
+    /// + `StateChanged(Idle)` so the UI can surface a toast or
+    /// status hint ("All scannable channels are locked out")
+    /// before the display resets.
+    EmptyRotation,
 }
 ```
 
@@ -149,13 +157,13 @@ pub enum ScannerCommand {
 
 **`Idle`**: Scanner off, or enabled but no channels. Mute off (user might be listening to manually-tuned audio). No retunes, no commands emitted except state/active-channel transitions on entry.
 
-**`Retuning { target_idx, samples_until_settled }`**: Emit `Retune(...)` command on entry, `MuteAudio(true)`, `ActiveChannelChanged(Some(target))`, `StateChanged(Retuning)`. Count down `SETTLE_MS`-worth of samples. Ignore all `SquelchEdge` events during this window — retune transients produce spurious squelch behavior we don't want to act on. Transition to `Dwelling` when settled.
+**`Retuning { target_idx, samples_until_settled }`**: Emit `Retune(...)` command on entry, `MuteAudio(true)`, `ActiveChannelChanged(Some(target))`, `StateChanged(Retuning)`. `enter_retuning` resets the `squelch_open` latch to `false` (previous-channel state is irrelevant after retune). Count down `SETTLE_MS`-worth of samples. During this window, `SquelchEdge` events DO NOT drive phase transitions (retune transients would false-trip), but they DO update the `squelch_open` latch. On settle expiry, consult the latch: if `true` → transition directly to `Listening` + emit `MuteAudio(false)` (captures persistent-open carriers); if `false` → transition to `Dwelling`.
 
-**`Dwelling { idx, samples_until_timeout }`**: Audio still muted. Listen for `SquelchEdge(Open)` to transition to `Listening`. If `DEFAULT_DWELL_MS` (or channel's `dwell_ms_override`) elapses without an open, hop to next channel via `Retuning`.
+**`Dwelling { idx, samples_until_timeout }`**: Audio still muted. Listen for `SquelchEdge(Open)` to transition to `Listening`. If the channel's resolved `dwell_ms` (per `ScannerChannel`) elapses without an open, hop to next channel via `Retuning`.
 
 **`Listening { idx }`**: Emit `MuteAudio(false)` on entry, `StateChanged(Listening)`. No sample counter running — we stay here as long as the squelch holds open. On `SquelchEdge(Closed)` transition to `Hanging`.
 
-**`Hanging { idx, samples_until_timeout }`**: Emit `MuteAudio(true)` on entry (user said cut immediately on squelch close — classic scanner). `StateChanged(Hanging)`. Count down hang window. If squelch reopens before timeout → back to `Listening`. If hang elapses → `Retuning` to next channel.
+**`Hanging { idx, samples_until_timeout }`**: Emit `MuteAudio(true)` on entry (user said cut immediately on squelch close — classic scanner). `StateChanged(Hanging)`. Count down the channel's resolved `hang_ms` (per `ScannerChannel`). If squelch reopens before timeout → back to `Listening`. If hang elapses → `Retuning` to next channel.
 
 ### Priority cycling (single tier)
 

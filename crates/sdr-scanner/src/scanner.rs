@@ -364,11 +364,24 @@ impl Scanner {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "state-machine match arms with per-phase countdown logic + downstream dispatch — splitting would fragment a single conceptual transition"
+    )]
     fn handle_sample_tick(
         &mut self,
         samples_consumed: u32,
         sample_rate_hz: u32,
     ) -> Vec<ScannerCommand> {
+        if sample_rate_hz == 0 {
+            // `ms_to_samples(_, 0)` returns 0, which would make
+            // every seeded timer expire on first tick — settle
+            // immediately "complete", dwell immediately "time
+            // out", etc. Drop the tick; debug builds assert the
+            // caller invariant.
+            debug_assert!(false, "sample_rate_hz must be > 0");
+            return Vec::new();
+        }
         let samples = u64::from(samples_consumed);
         let next_phase: Option<Phase> = match &mut self.phase {
             Phase::Idle | Phase::Listening { .. } => return Vec::new(),
@@ -605,8 +618,48 @@ mod tests {
         assert!(matches!(commands[0], ScannerCommand::EmptyRotation));
     }
 
-    /// 48 kHz rate, so 30ms settle = 1440 samples, 100ms dwell = 4800 samples.
+    /// Test sample rate. At 48 kHz, `SETTLE_MS = 30` resolves to
+    /// 1440 samples, `DEFAULT_DWELL_MS = 100` to 4800 samples,
+    /// and `DEFAULT_HANG_MS = 2000` to 96000 samples — the
+    /// constants below are sized to land inside / past those
+    /// windows with a small margin.
     const RATE: u32 = 48_000;
+
+    /// Sample count well short of the 1440-sample settle window.
+    /// Used when a test needs the scanner to be mid-settle
+    /// (ignoring edges, not yet transitioning to Dwelling).
+    const TICK_IN_SETTLE: u32 = 500;
+
+    /// Sample count that clears the 1440-sample settle window
+    /// with margin. Most tests use this to get past settle into
+    /// `Dwelling` (or directly `Listening` if squelch latched
+    /// open during settle).
+    const TICK_PAST_SETTLE: u32 = 1500;
+
+    /// Slightly larger settle-clearing tick used in the
+    /// persistent-open-carrier test, where two ticks are fed in
+    /// sequence and the second one must finish draining the
+    /// settle counter that was partially consumed by the first.
+    const TICK_SETTLE_COMPLETE: u32 = 2000;
+
+    /// Sample count that clears the 4800-sample default dwell
+    /// window (`DEFAULT_DWELL_MS = 100` at 48 kHz). Causes a
+    /// Dwelling → advance transition when squelch never opened.
+    const TICK_PAST_DWELL: u32 = 5000;
+
+    /// Sample count well inside the 96000-sample default hang
+    /// window. Used to advance part of the hang before a
+    /// squelch-reopen event.
+    const TICK_INSIDE_HANG: u32 = 10_000;
+
+    /// Sample count that clears a 500 ms channel-level dwell
+    /// override (= 24000 samples at 48 kHz) with margin. Used
+    /// by the `dwell_ms_override` test.
+    const TICK_PAST_OVERRIDE_DWELL: u32 = 25_000;
+
+    /// Sample count that clears the 96000-sample default hang
+    /// window with margin.
+    const TICK_PAST_HANG: u32 = 100_000;
 
     fn tick(samples: u32) -> ScannerEvent {
         ScannerEvent::SampleTick {
@@ -621,7 +674,7 @@ mod tests {
         s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
         s.handle_event(ScannerEvent::SetEnabled(true));
         // Feed a squelch open during the settle window.
-        s.handle_event(tick(500));
+        s.handle_event(tick(TICK_IN_SETTLE));
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Retuning);
         // No MuteAudio(false) should have been emitted.
@@ -639,7 +692,7 @@ mod tests {
         s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
         s.handle_event(ScannerEvent::SetEnabled(true));
         // Elapse the settle window (1440 samples for 30ms at 48kHz).
-        s.handle_event(tick(1500));
+        s.handle_event(tick(TICK_PAST_SETTLE));
         assert_eq!(s.state(), ScannerState::Dwelling);
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Listening);
@@ -659,10 +712,10 @@ mod tests {
         ]));
         s.handle_event(ScannerEvent::SetEnabled(true));
         // Skip settle window.
-        s.handle_event(tick(1500));
+        s.handle_event(tick(TICK_PAST_SETTLE));
         assert_eq!(s.state(), ScannerState::Dwelling);
         // Dwell is 100ms = 4800 samples at 48kHz. Tick past it.
-        let commands = s.handle_event(tick(5000));
+        let commands = s.handle_event(tick(TICK_PAST_DWELL));
         assert_eq!(s.state(), ScannerState::Retuning);
         // Should have retuned to channel B (frequency 162_550_000).
         assert!(commands.iter().any(|c| matches!(
@@ -679,7 +732,7 @@ mod tests {
         let mut s = Scanner::new();
         s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
         s.handle_event(ScannerEvent::SetEnabled(true));
-        s.handle_event(tick(1500));
+        s.handle_event(tick(TICK_PAST_SETTLE));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Listening);
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
@@ -696,12 +749,12 @@ mod tests {
         let mut s = Scanner::new();
         s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
         s.handle_event(ScannerEvent::SetEnabled(true));
-        s.handle_event(tick(1500));
+        s.handle_event(tick(TICK_PAST_SETTLE));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
         assert_eq!(s.state(), ScannerState::Hanging);
         // Advance partway into hang (2000ms hang = 96000 samples).
-        s.handle_event(tick(10_000));
+        s.handle_event(tick(TICK_INSIDE_HANG));
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Listening);
         assert!(
@@ -719,10 +772,10 @@ mod tests {
             ch("B", 162_550_000, 0),
         ]));
         s.handle_event(ScannerEvent::SetEnabled(true));
-        s.handle_event(tick(1500));
+        s.handle_event(tick(TICK_PAST_SETTLE));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
-        let commands = s.handle_event(tick(100_000));
+        let commands = s.handle_event(tick(TICK_PAST_HANG));
         assert_eq!(s.state(), ScannerState::Retuning);
         assert!(commands.iter().any(|c| matches!(
             c,
@@ -747,8 +800,8 @@ mod tests {
         // Need to settle (tick past 30ms), then timeout dwell (tick past 100ms).
         let mut retune_freqs: Vec<u64> = Vec::new();
         for _ in 0..6 {
-            s.handle_event(tick(1500)); // settle
-            let cmds = s.handle_event(tick(5000)); // dwell timeout → next retune
+            s.handle_event(tick(TICK_PAST_SETTLE)); // settle
+            let cmds = s.handle_event(tick(TICK_PAST_DWELL)); // dwell timeout → next retune
             for c in &cmds {
                 if let ScannerCommand::Retune { freq_hz, .. } = c {
                     retune_freqs.push(*freq_hz);
@@ -810,14 +863,14 @@ mod tests {
         ]));
         s.handle_event(ScannerEvent::SetEnabled(true));
         // Settle.
-        s.handle_event(tick(1500));
+        s.handle_event(tick(TICK_PAST_SETTLE));
         // Default dwell would be 100ms = 4800 samples. Channel
         // overrides to 500ms = 24000 samples. Tick 5000 — should
         // still be Dwelling (not advanced) because override kicks in.
-        s.handle_event(tick(5000));
+        s.handle_event(tick(TICK_PAST_DWELL));
         assert_eq!(s.state(), ScannerState::Dwelling);
         // Tick past 500ms → advance.
-        s.handle_event(tick(25_000));
+        s.handle_event(tick(TICK_PAST_OVERRIDE_DWELL));
         assert_eq!(s.state(), ScannerState::Retuning);
     }
 
@@ -829,7 +882,7 @@ mod tests {
             ch("B", 162_550_000, 0),
         ]));
         s.handle_event(ScannerEvent::SetEnabled(true));
-        s.handle_event(tick(1500));
+        s.handle_event(tick(TICK_PAST_SETTLE));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Listening);
         // User deletes channel B and adds C.
@@ -881,12 +934,12 @@ mod tests {
         s.handle_event(ScannerEvent::SetEnabled(true));
         // During settle: feed a squelch-open edge. Phase stays
         // Retuning; latch moves to open.
-        s.handle_event(tick(500));
+        s.handle_event(tick(TICK_IN_SETTLE));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Retuning);
         // Settle expires. Scanner should land in Listening
         // directly, with audio unmuted.
-        let commands = s.handle_event(tick(2000));
+        let commands = s.handle_event(tick(TICK_SETTLE_COMPLETE));
         assert_eq!(s.state(), ScannerState::Listening);
         assert!(
             commands
@@ -939,8 +992,8 @@ mod tests {
         s.handle_event(ScannerEvent::SetEnabled(true));
         s.handle_event(ScannerEvent::LockoutChannel(key_a.clone()));
         // Advance through a few hops so cursors + priority counter are non-zero.
-        s.handle_event(tick(1500));
-        s.handle_event(tick(5000));
+        s.handle_event(tick(TICK_PAST_SETTLE));
+        s.handle_event(tick(TICK_PAST_DWELL));
         assert!(s.locked_out.contains(&key_a));
         assert!(s.hops_since_priority_sweep > 0);
 
