@@ -372,11 +372,31 @@ pub unsafe extern "C" fn sdr_rtltcp_server_stop(handle: *mut SdrRtlTcpServer) {
 /// `sdr_rtltcp_server_start` and not yet stopped.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_rtltcp_server_has_stopped(handle: *mut SdrRtlTcpServer) -> bool {
-    // SAFETY: caller contract.
-    let Some(h) = (unsafe { SdrRtlTcpServer::from_raw(handle) }) else {
-        return true;
-    };
-    h.with_server(Server::has_stopped).unwrap_or(true)
+    // Wrap in `catch_unwind` so a panic inside
+    // `Server::has_stopped` can't cross the FFI boundary into
+    // Swift. Matches the pattern every other entry point in
+    // this module uses. Per `CodeRabbit` round 4 on PR #360.
+    let result = std::panic::catch_unwind(|| {
+        // SAFETY: caller contract.
+        let Some(h) = (unsafe { SdrRtlTcpServer::from_raw(handle) }) else {
+            return true;
+        };
+        h.with_server(Server::has_stopped).unwrap_or(true)
+    });
+    match result {
+        Ok(stopped) => stopped,
+        Err(payload) => {
+            tracing::warn!(
+                "sdr_rtltcp_server_has_stopped: panic: {}",
+                panic_message(&payload)
+            );
+            // Treat a panic as "stopped" — the alternative
+            // would be to report a likely-broken server as
+            // healthy, which is worse for callers that poll
+            // this to detect shutdown.
+            true
+        }
+    }
 }
 
 /// Snapshot the server's live stats into a caller-provided
@@ -648,6 +668,26 @@ mod tests {
     fn bind_socket_addr_zero_port_uses_default() {
         let addr = bind_socket_addr(SDR_BIND_LOOPBACK, 0).unwrap();
         assert_eq!(addr.port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn initial_from_c_rejects_zero_sample_rate() {
+        // Pins the guard added in round 2 per `CodeRabbit` —
+        // a zero-init `SdrRtlTcpServerConfig` must not slip
+        // through and wedge the RTL-SDR USB controller.
+        let cfg = SdrRtlTcpServerConfig {
+            bind_address: 0,
+            port: 1234,
+            device_index: 0,
+            buffer_capacity: 0,
+            initial_freq_hz: 100_000_000,
+            initial_sample_rate_hz: 0, // zero — must reject
+            initial_gain_tenths_db: 0,
+            initial_ppm: 0,
+            initial_bias_tee: false,
+            initial_direct_sampling: 0,
+        };
+        assert!(initial_from_c(&cfg).is_err());
     }
 
     #[test]

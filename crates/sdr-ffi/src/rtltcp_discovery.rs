@@ -198,7 +198,19 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_stop(handle: *mut SdrRtlTcpAdvert
         return;
     }
     let boxed = unsafe { Box::from_raw(handle) };
-    let taken = boxed.inner.lock().ok().and_then(|mut g| g.take());
+    // Recover from mutex poisoning the same way
+    // `rtltcp_server::lock_inner` does — `.ok()` would skip the
+    // explicit `Advertiser::stop` entirely on a prior caught
+    // panic, falling through to `Drop`. Per `CodeRabbit` round
+    // 4 on PR #360.
+    let taken = boxed
+        .inner
+        .lock()
+        .unwrap_or_else(|poison| {
+            tracing::warn!("sdr_rtltcp_advertiser_stop: mutex poisoned, recovering");
+            poison.into_inner()
+        })
+        .take();
     if let Some(adv) = taken {
         // The Rust `stop` can return an error; we've committed
         // to releasing regardless. Log on failure so the host
@@ -354,7 +366,17 @@ pub unsafe extern "C" fn sdr_rtltcp_browser_stop(handle: *mut SdrRtlTcpBrowser) 
         return;
     }
     let boxed = unsafe { Box::from_raw(handle) };
-    let taken = boxed.inner.lock().ok().and_then(|mut g| g.take());
+    // Poison recovery, same pattern as
+    // `sdr_rtltcp_advertiser_stop` and `rtltcp_server`. Per
+    // `CodeRabbit` round 4 on PR #360.
+    let taken = boxed
+        .inner
+        .lock()
+        .unwrap_or_else(|poison| {
+            tracing::warn!("sdr_rtltcp_browser_stop: mutex poisoned, recovering");
+            poison.into_inner()
+        })
+        .take();
     if let Some(browser) = taken {
         browser.stop();
     }
