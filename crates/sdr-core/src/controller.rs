@@ -1139,14 +1139,43 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         // writes off until the next explicit
                         // Start command. Per `CodeRabbit`
                         // round 3 on PR #351.
+                        // Mirror the network-specific lifecycle
+                        // events the other start paths emit
+                        // (engine Start, SetAudioSinkType,
+                        // SetNetworkSinkConfig). Without these,
+                        // a source-type swap could leave the
+                        // GTK network status row stuck on a
+                        // stale Active or Error from before the
+                        // swap. Per `CodeRabbit` round 5 on
+                        // PR #351.
+                        let is_network = matches!(state.audio_sink_type, AudioSinkType::Network);
                         match state.audio_sink.start() {
                             Ok(()) => {
                                 state.audio_sink_offline = false;
+                                if is_network {
+                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                        NetworkSinkStatus::Active {
+                                            endpoint: format!(
+                                                "{}:{}",
+                                                state.network_sink_host, state.network_sink_port
+                                            ),
+                                            protocol: state.network_sink_protocol,
+                                        },
+                                    ));
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("audio sink restart failed: {e}");
-                                let _ = dsp_tx
-                                    .send(DspToUi::Error(format!("Audio output failed: {e}")));
+                                if is_network {
+                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
+                                        NetworkSinkStatus::Error {
+                                            message: format!("{e}"),
+                                        },
+                                    ));
+                                } else {
+                                    let _ = dsp_tx
+                                        .send(DspToUi::Error(format!("Audio output failed: {e}")));
+                                }
                             }
                         }
                         state.running = true;
