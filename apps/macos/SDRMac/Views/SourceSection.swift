@@ -282,10 +282,25 @@ struct SourceSection: View {
             }
         }
 
-        Toggle("AGC", isOn: Binding(
-            get: { model.agcEnabled },
-            set: { model.setAgc($0) }
-        ))
+        // Three-way AGC selector — #357. Replaced the former
+        // binary Toggle so users can pick Software (new default,
+        // sidesteps tuner-AGC pumping) while still letting the
+        // tuner's hardware loop drive gain when preferred. The
+        // gain slider above reads `agcEnabled` (a computed
+        // `agcType != .off`) so either AGC type disables the
+        // manual slider the same way.
+        LabeledContent("AGC") {
+            Picker("", selection: Binding(
+                get: { model.agcType },
+                set: { model.setAgcType($0) }
+            )) {
+                ForEach(SdrCore.AgcType.allCases, id: \.self) { t in
+                    Text(t.label).tag(t)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+        }
 
         LabeledContent("PPM") {
             Stepper(value: Binding(
