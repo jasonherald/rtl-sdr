@@ -714,9 +714,21 @@ int32_t sdr_rtltcp_server_start(
 );
 
 /*
- * Stop and release the server. After this call the handle
- * pointer is invalid — do not use it again. Passing null is
+ * Stop and release the server. Blocks until the accept thread
+ * has joined and the RTL-SDR dongle is released — on return
+ * the device is free for the engine (or any other local
+ * consumer) to open immediately. After this call the handle
+ * pointer is invalid; do not use it again. Passing null is
  * a no-op.
+ *
+ * **Caller must serialize `_stop` against every other FFI
+ * call on the same handle.** The handle is reclaimed via
+ * `Box::from_raw`, so a concurrent `_stats` /
+ * `_recent_commands_json` / `_has_stopped` racing with
+ * `_stop` is a use-after-free. Same contract as
+ * `sdr_core_destroy`. Typical hosts only need this when
+ * polling stats from a background thread — stop the poller
+ * first, then call `_stop`.
  */
 void sdr_rtltcp_server_stop(SdrRtlTcpServer* handle);
 
@@ -874,6 +886,11 @@ int32_t sdr_rtltcp_advertiser_start(
 
 /*
  * Unregister and release. Passing null is a no-op.
+ *
+ * **Caller must serialize `_stop` against every other FFI
+ * call on the same handle.** The handle is reclaimed via
+ * `Box::from_raw` — same use-after-free contract as
+ * `sdr_rtltcp_server_stop` and `sdr_core_destroy`.
  */
 void sdr_rtltcp_advertiser_stop(SdrRtlTcpAdvertiser* handle);
 
@@ -896,6 +913,11 @@ int32_t sdr_rtltcp_browser_start(
  * Stop browsing and release. Joins the dispatcher thread
  * before returning, so the host can deterministically free
  * `user_data` on the next line. Passing null is a no-op.
+ *
+ * **Caller must serialize `_stop` against every other FFI
+ * call on the same handle.** The handle is reclaimed via
+ * `Box::from_raw` — same use-after-free contract as
+ * `sdr_rtltcp_server_stop` and `sdr_core_destroy`.
  */
 void sdr_rtltcp_browser_stop(SdrRtlTcpBrowser* handle);
 

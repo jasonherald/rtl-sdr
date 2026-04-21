@@ -123,12 +123,25 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
             Ok(v) => v.unwrap_or_default(),
             Err(code) => return code.as_int(),
         };
+        // `tuner` / `version` are documented as required. Reject
+        // empty strings alongside null so a caller can't publish
+        // a discovery record with blank TXT metadata (browsers
+        // would surface the server with "unknown" fields). Per
+        // `CodeRabbit` round 5 on PR #360.
         let tuner = match unsafe { cstr_to_string("tuner", opts.tuner) } {
-            Ok(s) => s,
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                set_last_error("sdr_rtltcp_advertiser_start: tuner is empty");
+                return SdrCoreError::InvalidArg.as_int();
+            }
             Err(code) => return code.as_int(),
         };
         let version = match unsafe { cstr_to_string("version", opts.version) } {
-            Ok(s) => s,
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                set_last_error("sdr_rtltcp_advertiser_start: version is empty");
+                return SdrCoreError::InvalidArg.as_int();
+            }
             Err(code) => return code.as_int(),
         };
         let nickname = match unsafe { optional_cstr_to_string("nickname", opts.nickname) } {
@@ -579,6 +592,78 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
+    // --------------------------------------------------------
+    //  Shared test fixtures — per `CodeRabbit` round 5 on
+    //  PR #360. Hoisted out of per-test literals so future
+    //  fixture changes don't require spot-patching every case.
+    // --------------------------------------------------------
+
+    /// Non-privileged port used when the value isn't the thing
+    /// under test.
+    const TEST_PORT: u16 = 1234;
+
+    /// Tuner name advertised in the happy-path fixtures —
+    /// matches the R820T strings the upstream rtl_tcp servers
+    /// publish.
+    const TEST_TUNER: &str = "R820T";
+
+    /// Advertiser-version string; deliberately a non-empty
+    /// placeholder so the "empty required field" tests are a
+    /// clean contrast.
+    const TEST_VERSION: &str = "0.1.0";
+
+    /// Discrete gain-step count the R820T tuner exposes.
+    const TEST_GAIN_COUNT: u32 = 29;
+
+    /// TXT buffer-depth hint used by the `DiscoveredServer → C`
+    /// projection tests. 64 KiB is the value the sample server
+    /// in `sdr-server-rtltcp` reports.
+    const TEST_TXBUF_BYTES: u64 = 65_536;
+
+    /// Short instance name for round-trip checks. Real servers
+    /// compose hostname + nickname; the tests just need a
+    /// unique non-empty string.
+    const TEST_INSTANCE_NAME: &str = "test-instance";
+
+    /// Build a happy-path `SdrRtlTcpAdvertiseOptions` backed by
+    /// a bundle of `CString`s the caller keeps alive for the
+    /// duration of the FFI call. Tests tweak individual fields
+    /// (e.g. flip `port` to 0, null out `instance_name`) after
+    /// construction to target a specific validation branch.
+    struct AdvertiseFixture {
+        // Keep the CStrings alive so the pointers stored on
+        // `opts` remain valid. The struct must outlive `opts`.
+        _instance: CString,
+        _tuner: CString,
+        _version: CString,
+        opts: SdrRtlTcpAdvertiseOptions,
+    }
+
+    impl AdvertiseFixture {
+        fn happy_path() -> Self {
+            let instance = CString::new(TEST_INSTANCE_NAME).unwrap();
+            let tuner = CString::new(TEST_TUNER).unwrap();
+            let version = CString::new(TEST_VERSION).unwrap();
+            let opts = SdrRtlTcpAdvertiseOptions {
+                port: TEST_PORT,
+                instance_name: instance.as_ptr(),
+                hostname: std::ptr::null(),
+                tuner: tuner.as_ptr(),
+                version: version.as_ptr(),
+                gains: TEST_GAIN_COUNT,
+                nickname: std::ptr::null(),
+                has_txbuf: false,
+                txbuf: 0,
+            };
+            Self {
+                _instance: instance,
+                _tuner: tuner,
+                _version: version,
+                opts,
+            }
+        }
+    }
+
     #[test]
     fn advertiser_start_null_options_returns_invalid_arg() {
         let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
@@ -588,21 +673,9 @@ mod tests {
 
     #[test]
     fn advertiser_start_null_out_handle_returns_invalid_arg() {
-        let instance = CString::new("x").unwrap();
-        let tuner = CString::new("R820T").unwrap();
-        let version = CString::new("0.1.0").unwrap();
-        let opts = SdrRtlTcpAdvertiseOptions {
-            port: 1234,
-            instance_name: instance.as_ptr(),
-            hostname: std::ptr::null(),
-            tuner: tuner.as_ptr(),
-            version: version.as_ptr(),
-            gains: 29,
-            nickname: std::ptr::null(),
-            has_txbuf: false,
-            txbuf: 0,
-        };
-        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const opts, std::ptr::null_mut()) };
+        let fixture = AdvertiseFixture::happy_path();
+        let rc =
+            unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, std::ptr::null_mut()) };
         assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
     }
 
@@ -611,22 +684,10 @@ mod tests {
         // Pins the port-0 guard added in round 2 per
         // `CodeRabbit` — a zero-init `SdrRtlTcpAdvertiseOptions`
         // must not slip through and announce on port 0.
-        let instance = CString::new("test").unwrap();
-        let tuner = CString::new("R820T").unwrap();
-        let version = CString::new("0.1.0").unwrap();
-        let opts = SdrRtlTcpAdvertiseOptions {
-            port: 0,
-            instance_name: instance.as_ptr(),
-            hostname: std::ptr::null(),
-            tuner: tuner.as_ptr(),
-            version: version.as_ptr(),
-            gains: 29,
-            nickname: std::ptr::null(),
-            has_txbuf: false,
-            txbuf: 0,
-        };
+        let mut fixture = AdvertiseFixture::happy_path();
+        fixture.opts.port = 0;
         let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
-        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const opts, &raw mut handle) };
+        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, &raw mut handle) };
         assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
         assert!(handle.is_null());
     }
@@ -634,21 +695,33 @@ mod tests {
     #[test]
     fn advertiser_start_empty_instance_name_rejected() {
         let empty = CString::new("").unwrap();
-        let tuner = CString::new("R820T").unwrap();
-        let version = CString::new("0.1.0").unwrap();
-        let opts = SdrRtlTcpAdvertiseOptions {
-            port: 1234,
-            instance_name: empty.as_ptr(),
-            hostname: std::ptr::null(),
-            tuner: tuner.as_ptr(),
-            version: version.as_ptr(),
-            gains: 0,
-            nickname: std::ptr::null(),
-            has_txbuf: false,
-            txbuf: 0,
-        };
+        let mut fixture = AdvertiseFixture::happy_path();
+        fixture.opts.instance_name = empty.as_ptr();
         let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
-        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const opts, &raw mut handle) };
+        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, &raw mut handle) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+    }
+
+    #[test]
+    fn advertiser_start_empty_tuner_rejected() {
+        // Per `CodeRabbit` round 5 — `tuner` is documented as
+        // required; empty-string must be rejected so the
+        // discovery record never publishes blank TXT metadata.
+        let empty = CString::new("").unwrap();
+        let mut fixture = AdvertiseFixture::happy_path();
+        fixture.opts.tuner = empty.as_ptr();
+        let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
+        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, &raw mut handle) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+    }
+
+    #[test]
+    fn advertiser_start_empty_version_rejected() {
+        let empty = CString::new("").unwrap();
+        let mut fixture = AdvertiseFixture::happy_path();
+        fixture.opts.version = empty.as_ptr();
+        let mut handle: *mut SdrRtlTcpAdvertiser = std::ptr::null_mut();
+        let rc = unsafe { sdr_rtltcp_advertiser_start(&raw const fixture.opts, &raw mut handle) };
         assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
     }
 
@@ -691,27 +764,46 @@ mod tests {
         assert!(!z.has_txbuf);
     }
 
+    /// Build a `DiscoveredServer` with the TXT fields wired to
+    /// the shared `TEST_*` constants, caller-supplied addresses,
+    /// and `last_seen = now`. Keeps the test cases focused on
+    /// the piece they actually exercise (address preference,
+    /// txbuf presence, etc.).
+    fn sample_discovered_server(addresses: Vec<IpAddr>, txbuf: Option<usize>) -> DiscoveredServer {
+        DiscoveredServer {
+            instance_name: format!("{TEST_INSTANCE_NAME}._rtl_tcp._tcp.local."),
+            hostname: "test.local.".into(),
+            port: TEST_PORT,
+            addresses,
+            txt: TxtRecord {
+                tuner: TEST_TUNER.into(),
+                version: TEST_VERSION.into(),
+                gains: TEST_GAIN_COUNT,
+                nickname: if txbuf.is_some() {
+                    "dev".into()
+                } else {
+                    String::new()
+                },
+                txbuf,
+            },
+            last_seen: Instant::now(),
+        }
+    }
+
     #[test]
     fn discovered_server_to_c_picks_ipv4_first() {
         use std::net::{Ipv4Addr, Ipv6Addr};
-        let server = DiscoveredServer {
-            instance_name: "test._rtl_tcp._tcp.local.".into(),
-            hostname: "test.local.".into(),
-            port: 1234,
-            addresses: vec![
+        let server = sample_discovered_server(
+            vec![
                 IpAddr::V6(Ipv6Addr::LOCALHOST),
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)),
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 43)),
             ],
-            txt: TxtRecord {
-                tuner: "R820T".into(),
-                version: "0.1.0".into(),
-                gains: 29,
-                nickname: "dev".into(),
-                txbuf: Some(65536),
-            },
-            last_seen: Instant::now(),
-        };
+            // `u64 → usize` would truncate on 32-bit targets;
+            // use the same saturating conversion as the FFI
+            // translation path.
+            Some(usize::try_from(TEST_TXBUF_BYTES).unwrap_or(usize::MAX)),
+        );
         let mut strings = Vec::new();
         let c = discovered_server_to_c(&server, &mut strings);
         assert!(!c.address_ipv4.is_null());
@@ -721,26 +813,13 @@ mod tests {
         assert_eq!(ipv4, "192.168.1.42");
         assert!(!c.address_ipv6.is_null());
         assert!(c.has_txbuf);
-        assert_eq!(c.txbuf, 65536);
+        assert_eq!(c.txbuf, TEST_TXBUF_BYTES);
     }
 
     #[test]
     fn discovered_server_to_c_empty_ipv4_when_only_ipv6() {
         use std::net::Ipv6Addr;
-        let server = DiscoveredServer {
-            instance_name: "test._rtl_tcp._tcp.local.".into(),
-            hostname: "test.local.".into(),
-            port: 1234,
-            addresses: vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
-            txt: TxtRecord {
-                tuner: "R820T".into(),
-                version: "0.1.0".into(),
-                gains: 29,
-                nickname: String::new(),
-                txbuf: None,
-            },
-            last_seen: Instant::now(),
-        };
+        let server = sample_discovered_server(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)], None);
         let mut strings = Vec::new();
         let c = discovered_server_to_c(&server, &mut strings);
         let ipv4 = unsafe { std::ffi::CStr::from_ptr(c.address_ipv4) }

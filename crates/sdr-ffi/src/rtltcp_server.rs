@@ -645,23 +645,75 @@ mod tests {
     use std::ffi::CStr;
     use std::time::Duration;
 
+    // --------------------------------------------------------
+    //  Shared test fixtures — per `CodeRabbit` round 5 on
+    //  PR #360. Repeated literals across the `initial_from_c`
+    //  and `bind_socket_addr` tests funnel through these.
+    // --------------------------------------------------------
+
+    /// TCP port used in happy-path configs. Matches the
+    /// `sdr_server_rtltcp::DEFAULT_PORT` convention (1234).
+    const TEST_PORT: u16 = 1234;
+
+    /// Second test port used to prove `bind_socket_addr` honors
+    /// the caller-supplied value on the all-interfaces path.
+    const TEST_ALT_PORT: u16 = 9000;
+
+    /// Default center frequency in Hz — 100 MHz WFM band.
+    const TEST_FREQ_HZ: u32 = 100_000_000;
+
+    /// Default sample rate — 2.048 Msps (canonical RTL-SDR
+    /// value that doesn't starve the USB controller).
+    const TEST_SAMPLE_RATE_HZ: u32 = 2_048_000;
+
+    /// Non-zero tuner gain in tenths of dB. 256 = 25.6 dB —
+    /// well inside the R820T's table so the
+    /// "auto vs manual" gain-round-trip assertion has a value
+    /// that's unambiguously "manual."
+    const TEST_NONZERO_GAIN_TENTHS: i32 = 256;
+
+    /// Sentinel that trips the direct-sampling validation.
+    const TEST_INVALID_DIRECT_SAMPLING: i32 = 3;
+
+    /// Device index = 0 matches the first attached dongle.
+    const TEST_DEVICE_INDEX: u32 = 0;
+
+    /// Build a happy-path `SdrRtlTcpServerConfig`. Tests tweak
+    /// a single field to target one validation branch at a
+    /// time — that way a future schema addition lands in one
+    /// place instead of N tests.
+    fn base_test_config() -> SdrRtlTcpServerConfig {
+        SdrRtlTcpServerConfig {
+            bind_address: SDR_BIND_LOOPBACK,
+            port: TEST_PORT,
+            device_index: TEST_DEVICE_INDEX,
+            buffer_capacity: 0,
+            initial_freq_hz: TEST_FREQ_HZ,
+            initial_sample_rate_hz: TEST_SAMPLE_RATE_HZ,
+            initial_gain_tenths_db: 0,
+            initial_ppm: 0,
+            initial_bias_tee: false,
+            initial_direct_sampling: 0,
+        }
+    }
+
     #[test]
     fn bind_socket_addr_loopback() {
-        let addr = bind_socket_addr(SDR_BIND_LOOPBACK, 1234).unwrap();
+        let addr = bind_socket_addr(SDR_BIND_LOOPBACK, TEST_PORT).unwrap();
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
-        assert_eq!(addr.port(), 1234);
+        assert_eq!(addr.port(), TEST_PORT);
     }
 
     #[test]
     fn bind_socket_addr_all_interfaces() {
-        let addr = bind_socket_addr(SDR_BIND_ALL_INTERFACES, 9000).unwrap();
+        let addr = bind_socket_addr(SDR_BIND_ALL_INTERFACES, TEST_ALT_PORT).unwrap();
         assert_eq!(addr.ip().to_string(), "0.0.0.0");
-        assert_eq!(addr.port(), 9000);
+        assert_eq!(addr.port(), TEST_ALT_PORT);
     }
 
     #[test]
     fn bind_socket_addr_rejects_unknown() {
-        assert!(bind_socket_addr(99, 1234).is_err());
+        assert!(bind_socket_addr(99, TEST_PORT).is_err());
     }
 
     #[test]
@@ -675,72 +727,31 @@ mod tests {
         // Pins the guard added in round 2 per `CodeRabbit` —
         // a zero-init `SdrRtlTcpServerConfig` must not slip
         // through and wedge the RTL-SDR USB controller.
-        let cfg = SdrRtlTcpServerConfig {
-            bind_address: 0,
-            port: 1234,
-            device_index: 0,
-            buffer_capacity: 0,
-            initial_freq_hz: 100_000_000,
-            initial_sample_rate_hz: 0, // zero — must reject
-            initial_gain_tenths_db: 0,
-            initial_ppm: 0,
-            initial_bias_tee: false,
-            initial_direct_sampling: 0,
-        };
+        let mut cfg = base_test_config();
+        cfg.initial_sample_rate_hz = 0;
         assert!(initial_from_c(&cfg).is_err());
     }
 
     #[test]
     fn initial_from_c_rejects_out_of_range_direct_sampling() {
-        let cfg = SdrRtlTcpServerConfig {
-            bind_address: 0,
-            port: 1234,
-            device_index: 0,
-            buffer_capacity: 0,
-            initial_freq_hz: 100_000_000,
-            initial_sample_rate_hz: 2_048_000,
-            initial_gain_tenths_db: 0,
-            initial_ppm: 0,
-            initial_bias_tee: false,
-            initial_direct_sampling: 3, // out of range
-        };
+        let mut cfg = base_test_config();
+        cfg.initial_direct_sampling = TEST_INVALID_DIRECT_SAMPLING;
         assert!(initial_from_c(&cfg).is_err());
     }
 
     #[test]
     fn initial_from_c_zero_gain_maps_to_auto() {
-        let cfg = SdrRtlTcpServerConfig {
-            bind_address: 0,
-            port: 1234,
-            device_index: 0,
-            buffer_capacity: 0,
-            initial_freq_hz: 100_000_000,
-            initial_sample_rate_hz: 2_048_000,
-            initial_gain_tenths_db: 0,
-            initial_ppm: 0,
-            initial_bias_tee: false,
-            initial_direct_sampling: 0,
-        };
+        let cfg = base_test_config();
         let initial = initial_from_c(&cfg).unwrap();
         assert_eq!(initial.gain_tenths_db, None);
     }
 
     #[test]
     fn initial_from_c_nonzero_gain_preserved() {
-        let cfg = SdrRtlTcpServerConfig {
-            bind_address: 0,
-            port: 1234,
-            device_index: 0,
-            buffer_capacity: 0,
-            initial_freq_hz: 100_000_000,
-            initial_sample_rate_hz: 2_048_000,
-            initial_gain_tenths_db: 256, // 25.6 dB
-            initial_ppm: 0,
-            initial_bias_tee: false,
-            initial_direct_sampling: 0,
-        };
+        let mut cfg = base_test_config();
+        cfg.initial_gain_tenths_db = TEST_NONZERO_GAIN_TENTHS;
         let initial = initial_from_c(&cfg).unwrap();
-        assert_eq!(initial.gain_tenths_db, Some(256));
+        assert_eq!(initial.gain_tenths_db, Some(TEST_NONZERO_GAIN_TENTHS));
     }
 
     #[test]
