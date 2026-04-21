@@ -1331,6 +1331,19 @@ final class CoreModel {
                 "Stop the engine or switch the source off RTL-SDR before starting the server."
             return
         }
+        // Reject port 0 before the optimistic flip. The UI
+        // Stepper clamps to 1024…65535, but non-UI paths
+        // (tests, keyboard shortcuts, stale UserDefaults) could
+        // stage a zero here; `SdrRtlTcpServer.Config` would
+        // interpret it as "use the crate default 1234", while
+        // the mDNS advertiser rejects 0 — split-brain where the
+        // server is live on 1234 but the UI still shows 0 and
+        // the panel surfaces an mDNS warning. Per `CodeRabbit`
+        // round 5 on PR #362.
+        guard rtlTcpServerPort != 0 else {
+            rtlTcpServerError = "rtl_tcp server port must be in 1…65535"
+            return
+        }
         rtlTcpServerError = nil
 
         // Optimistic: flip the flag now so the toggle settles
