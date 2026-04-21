@@ -9,7 +9,7 @@ use crate::channel::{ChannelKey, ScannerChannel};
 use crate::commands::ScannerCommand;
 use crate::events::{ScannerEvent, SquelchState};
 use crate::state::ScannerState;
-use crate::{DEFAULT_DWELL_MS, DEFAULT_HANG_MS, PRIORITY_CHECK_INTERVAL, SETTLE_MS};
+use crate::{PRIORITY_CHECK_INTERVAL, SETTLE_MS};
 
 /// Internal phase carrying per-phase bookkeeping. The outer
 /// `ScannerState` surfaced to the UI is a flattened view of this.
@@ -58,12 +58,17 @@ impl Phase {
 
 /// Scanner state machine. Instantiate once, feed events, apply
 /// emitted commands. All methods are synchronous and cheap.
+///
+/// Timing defaults (dwell, hang) live OUTSIDE the scanner — the
+/// UI folds them into each `ScannerChannel` at projection time.
+/// Scanner only sees resolved per-channel `dwell_ms` / `hang_ms`,
+/// so a default-slider change on the UI side triggers a fresh
+/// `ChannelsChanged` push rather than a separate "update defaults"
+/// signal the scanner would otherwise have to propagate.
 pub struct Scanner {
     enabled: bool,
     channels: Vec<ScannerChannel>,
     locked_out: HashSet<ChannelKey>,
-    default_dwell_ms: u32,
-    default_hang_ms: u32,
     phase: Phase,
     /// Rotation index into the current sub-list. Normal and
     /// priority rotations are advanced independently.
@@ -83,8 +88,6 @@ impl Default for Scanner {
             enabled: false,
             channels: Vec::new(),
             locked_out: HashSet::new(),
-            default_dwell_ms: DEFAULT_DWELL_MS,
-            default_hang_ms: DEFAULT_HANG_MS,
             phase: Phase::Idle,
             normal_cursor: 0,
             priority_cursor: 0,
@@ -118,14 +121,6 @@ impl Scanner {
             } => self.handle_sample_tick(samples_consumed, sample_rate_hz),
             ScannerEvent::LockoutChannel(key) => self.handle_lockout(key),
             ScannerEvent::UnlockoutChannel(key) => self.handle_unlockout(&key),
-            ScannerEvent::SetDefaultDwellMs(ms) => {
-                self.default_dwell_ms = ms;
-                Vec::new()
-            }
-            ScannerEvent::SetDefaultHangMs(ms) => {
-                self.default_hang_ms = ms;
-                Vec::new()
-            }
         }
     }
 
@@ -139,6 +134,14 @@ impl Scanner {
         if enabled {
             self.start_rotation()
         } else {
+            // Session-scoped state clears on disable so re-enabling
+            // starts fresh rather than carrying stale lockouts or
+            // mid-cycle rotation cursors into the next session.
+            self.locked_out.clear();
+            self.normal_cursor = 0;
+            self.priority_cursor = 0;
+            self.hops_since_priority_sweep = 0;
+            self.in_priority_sweep = false;
             self.stop_rotation()
         }
     }
@@ -148,17 +151,20 @@ impl Scanner {
         // Any stale lockout keys for channels that no longer exist
         // are harmless (the set is only consulted against the
         // live channel list), but we'll prune for cleanliness.
-        let valid: HashSet<ChannelKey> =
-            self.channels.iter().map(|c| c.key.clone()).collect();
+        let valid: HashSet<ChannelKey> = self.channels.iter().map(|c| c.key.clone()).collect();
         self.locked_out.retain(|k| valid.contains(k));
 
         if !self.enabled {
             return Vec::new();
         }
         // Currently-scanning mid-list-change: recover from wherever
-        // the phase left us by re-starting rotation.
+        // the phase left us by re-starting rotation. Also reset
+        // the priority-hop counter so a list edit doesn't trigger
+        // an immediate priority sweep just because the pre-edit
+        // session had accumulated hops.
         self.normal_cursor = 0;
         self.priority_cursor = 0;
+        self.hops_since_priority_sweep = 0;
         self.in_priority_sweep = false;
         self.start_rotation()
     }
@@ -202,7 +208,7 @@ impl Scanner {
         };
         vec![
             ScannerCommand::Retune {
-                freq_hz: channel.frequency_hz,
+                freq_hz: channel.key.frequency_hz,
                 demod_mode: channel.demod_mode,
                 bandwidth: channel.bandwidth,
                 ctcss: channel.ctcss,
@@ -327,8 +333,8 @@ impl Scanner {
             } => {
                 let remaining = match samples_until_settled {
                     None => {
-                        let seeded = ms_to_samples(SETTLE_MS, sample_rate_hz)
-                            .saturating_sub(samples);
+                        let seeded =
+                            ms_to_samples(SETTLE_MS, sample_rate_hz).saturating_sub(samples);
                         *samples_until_settled = Some(seeded);
                         seeded
                     }
@@ -366,8 +372,7 @@ impl Scanner {
                 let remaining = match samples_until_timeout {
                     None => {
                         let hang_ms = self.channels[*idx].hang_ms;
-                        let seeded = ms_to_samples(hang_ms, sample_rate_hz)
-                            .saturating_sub(samples);
+                        let seeded = ms_to_samples(hang_ms, sample_rate_hz).saturating_sub(samples);
                         *samples_until_timeout = Some(seeded);
                         seeded
                     }
@@ -447,6 +452,7 @@ fn ms_to_samples(ms: u32, sample_rate_hz: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DEFAULT_DWELL_MS, DEFAULT_HANG_MS};
     use sdr_types::DemodMode;
 
     fn ch(name: &str, freq: u64, priority: u8) -> ScannerChannel {
@@ -455,7 +461,6 @@ mod tests {
                 name: name.to_string(),
                 frequency_hz: freq,
             },
-            frequency_hz: freq,
             demod_mode: DemodMode::Nfm,
             bandwidth: 12_500.0,
             ctcss: None,
@@ -476,7 +481,13 @@ mod tests {
         let commands = s.handle_event(ScannerEvent::SetEnabled(true));
         assert_eq!(s.state(), ScannerState::Retuning);
         // Expect Retune → MuteAudio(true) → ActiveChannelChanged → StateChanged
-        assert!(matches!(commands[0], ScannerCommand::Retune { freq_hz: 146_520_000, .. }));
+        assert!(matches!(
+            commands[0],
+            ScannerCommand::Retune {
+                freq_hz: 146_520_000,
+                ..
+            }
+        ));
         assert!(matches!(commands[1], ScannerCommand::MuteAudio(true)));
         assert!(matches!(
             commands[2],
@@ -535,7 +546,9 @@ mod tests {
         assert_eq!(s.state(), ScannerState::Retuning);
         // No MuteAudio(false) should have been emitted.
         assert!(
-            !commands.iter().any(|c| matches!(c, ScannerCommand::MuteAudio(false))),
+            !commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(false))),
             "mute was released during settle window"
         );
     }
@@ -550,9 +563,11 @@ mod tests {
         assert_eq!(s.state(), ScannerState::Dwelling);
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Listening);
-        assert!(commands
-            .iter()
-            .any(|c| matches!(c, ScannerCommand::MuteAudio(false))));
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(false)))
+        );
     }
 
     #[test]
@@ -572,7 +587,10 @@ mod tests {
         // Should have retuned to channel B (frequency 162_550_000).
         assert!(commands.iter().any(|c| matches!(
             c,
-            ScannerCommand::Retune { freq_hz: 162_550_000, .. }
+            ScannerCommand::Retune {
+                freq_hz: 162_550_000,
+                ..
+            }
         )));
     }
 
@@ -586,9 +604,11 @@ mod tests {
         assert_eq!(s.state(), ScannerState::Listening);
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
         assert_eq!(s.state(), ScannerState::Hanging);
-        assert!(commands
-            .iter()
-            .any(|c| matches!(c, ScannerCommand::MuteAudio(true))));
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(true)))
+        );
     }
 
     #[test]
@@ -604,9 +624,11 @@ mod tests {
         s.handle_event(tick(10_000));
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Listening);
-        assert!(commands
-            .iter()
-            .any(|c| matches!(c, ScannerCommand::MuteAudio(false))));
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(false)))
+        );
     }
 
     #[test]
@@ -624,7 +646,10 @@ mod tests {
         assert_eq!(s.state(), ScannerState::Retuning);
         assert!(commands.iter().any(|c| matches!(
             c,
-            ScannerCommand::Retune { freq_hz: 162_550_000, .. }
+            ScannerCommand::Retune {
+                freq_hz: 162_550_000,
+                ..
+            }
         )));
     }
 
@@ -686,9 +711,11 @@ mod tests {
             frequency_hz: 146_520_000,
         }));
         let commands = s.handle_event(ScannerEvent::SetEnabled(true));
-        assert!(commands
-            .iter()
-            .any(|c| matches!(c, ScannerCommand::EmptyRotation)));
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::EmptyRotation))
+        );
         assert_eq!(s.state(), ScannerState::Idle);
     }
 
@@ -733,9 +760,13 @@ mod tests {
         // Scanner recovers by restarting rotation at cursor 0.
         assert_eq!(s.state(), ScannerState::Retuning);
         // First retune after list change goes to A.
-        assert!(commands
-            .iter()
-            .any(|c| matches!(c, ScannerCommand::Retune { freq_hz: 146_520_000, .. })));
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            ScannerCommand::Retune {
+                freq_hz: 146_520_000,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -751,12 +782,38 @@ mod tests {
         ]));
         s.handle_event(ScannerEvent::LockoutChannel(key_a.clone()));
         // Remove A.
-        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch(
-            "B",
-            162_550_000,
-            0,
-        )]));
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("B", 162_550_000, 0)]));
         // Internal set should have pruned.
         assert!(!s.locked_out.contains(&key_a));
+    }
+
+    #[test]
+    fn disable_clears_session_state() {
+        // Re-enabling after a disable should start fresh — no
+        // carried-over lockouts, cursors, or hop counter.
+        let mut s = Scanner::new();
+        let key_a = ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        };
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(ScannerEvent::LockoutChannel(key_a.clone()));
+        // Advance through a few hops so cursors + priority counter are non-zero.
+        s.handle_event(tick(1500));
+        s.handle_event(tick(5000));
+        assert!(s.locked_out.contains(&key_a));
+        assert!(s.hops_since_priority_sweep > 0);
+
+        s.handle_event(ScannerEvent::SetEnabled(false));
+        // Session state should be fully clear after disable.
+        assert!(s.locked_out.is_empty(), "locked_out not cleared on disable");
+        assert_eq!(s.normal_cursor, 0);
+        assert_eq!(s.priority_cursor, 0);
+        assert_eq!(s.hops_since_priority_sweep, 0);
+        assert!(!s.in_priority_sweep);
     }
 }

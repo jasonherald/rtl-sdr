@@ -108,10 +108,9 @@ And in `[workspace.dependencies]` after `sdr-rtltcp-discovery`:
 sdr-scanner = { path = "crates/sdr-scanner" }
 ```
 
-- [ ] **Step 4: Verify crate compiles**
+- [ ] **Step 4: Verify crate compiles (skip — expected to fail)**
 
-Run: `cargo build -p sdr-scanner`
-Expected: Clean build (just the empty `lib.rs` + submodule stubs, which we'll fill next). The submodule files don't exist yet, so this will fail — that's fine, proceed to Step 5.
+Running `cargo build -p sdr-scanner` at this stage will FAIL because `lib.rs` declares five submodules (`channel`, `commands`, `events`, `scanner`, `state`) that don't exist yet. Tasks 1.2 and 1.3 create them. Don't try to fix the build here; skip the `cargo build` check and proceed directly to Step 5. `cargo check` / `cargo metadata` on the workspace root will still succeed and validate your Cargo.toml syntax.
 
 - [ ] **Step 5: Commit scaffolding**
 
@@ -1882,12 +1881,17 @@ git commit -m "sdr-core: scanner ↔ recording/transcription mutex"
 **Files:**
 - Modify: `crates/sdr-core/src/sink_manager.rs` (or wherever `SinkManager` lives)
 
-- [ ] **Step 1: Add `scanner_mute: bool` field**
+- [ ] **Step 1: Add `scanner_mute: bool` + reusable silence scratch buffer**
 
 ```rust
 pub struct SinkManager {
     // ... existing fields ...
     scanner_mute: bool,
+    /// Reusable silence buffer grown-in-place during mute windows.
+    /// `Vec` initialized empty and only resized on the mute path;
+    /// capacity is sticky across calls so the steady-state has no
+    /// allocation. Only touched on the audio thread via `&mut self`.
+    scanner_silence_scratch: Vec<f32>,
 }
 
 impl SinkManager {
@@ -1899,20 +1903,24 @@ impl SinkManager {
 
 - [ ] **Step 2: Gate in the audio write path**
 
-Wherever the manager writes PCM to the audio device, wrap the buffer:
+Wherever the manager writes PCM to the audio device, swap the buffer on mute. Do NOT allocate a fresh `vec![0.0; len]` per block — reuse the scratch buffer:
 
 ```rust
     pub fn write_audio(&mut self, audio: &[f32]) {
-        if self.scanner_mute {
-            let silence = vec![0.0_f32; audio.len()];
-            // ... write silence to current sink ...
+        let out = if self.scanner_mute {
+            // Ensure capacity matches; `resize` reuses existing
+            // allocation when the buffer is already large enough,
+            // so steady-state mute is allocation-free.
+            self.scanner_silence_scratch.resize(audio.len(), 0.0);
+            &self.scanner_silence_scratch[..]
         } else {
-            // ... write audio as-is ...
-        }
+            audio
+        };
+        // ... write `out` to current sink ...
     }
 ```
 
-If there's a single hot path, hoist the branch out of the per-sample loop.
+If there's a single hot path, hoist the branch out of the per-sample loop. Never allocate per block — real-time audio pipelines can't tolerate heap churn on every buffer.
 
 - [ ] **Step 3: Compile**
 

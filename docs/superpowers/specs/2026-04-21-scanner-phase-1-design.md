@@ -1,7 +1,7 @@
 # Scanner Phase 1 — Sequential Scanner Design
 
 **Issue**: #317 (Phase 1 of scanner epic #316)
-**Status**: Design approved; implementation plan next
+**Status**: Design + plan approved; execution in progress (PR 1 of 3 filed as #368)
 **Date**: 2026-04-21
 
 ---
@@ -22,7 +22,7 @@ A pure state machine with zero I/O, zero threading, no GTK, no audio, no USB. Co
 
 **Workspace entry**:
 
-```
+```text
 crates/sdr-scanner/
   Cargo.toml
   src/
@@ -113,7 +113,7 @@ pub enum ScannerCommand {
 
 ### Phases
 
-```
+```text
                 +--------+
                 |  Idle  |
                 +---+----+
@@ -253,15 +253,13 @@ Scanner projects each scannable bookmark into a `ScannerChannel`:
 
 ```rust
 pub struct ScannerChannel {
-    pub key: ChannelKey,                              // (name, freq_hz) for identity
-    pub name: String,
-    pub frequency_hz: u64,
+    pub key: ChannelKey,           // (name, freq_hz) — sole owner of freq + name
     pub demod_mode: DemodMode,
     pub bandwidth: f64,
     pub ctcss: Option<CtcssMode>,
     pub voice_squelch: Option<VoiceSquelchMode>,
     pub priority: u8,
-    pub dwell_ms: u32,  // resolved: override or default
+    pub dwell_ms: u32,             // resolved: override or UI default
     pub hang_ms: u32,
 }
 
@@ -270,6 +268,8 @@ pub struct ChannelKey {
     pub frequency_hz: u64,
 }
 ```
+
+Frequency is NOT duplicated on `ScannerChannel` — it lives only on `key`, so identity (used for lockout + active-channel tracking) and the retune target can't drift apart. `ScannerChannel::frequency_hz()` is an accessor on the struct that reads through to the key.
 
 Projection happens in `sdr-ui` at scanner-start and on `ChannelsChanged` pushes. Scanner is decoupled from bookmark persistence format; future non-bookmark channel sources slot in at the same projection boundary.
 
@@ -283,7 +283,7 @@ Lockout state lives inside the scanner (`HashSet<ChannelKey>`), never serialized
 
 Rough layout (Adwaita widgets):
 
-```
+```text
 ┌─ Scanner ──────────────────────────┐
 │  [•] Scanner On/Off      (Switch)  │
 │                                    │

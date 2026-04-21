@@ -36,8 +36,4 @@ pub enum ScannerEvent {
     /// until unlocked or scanner is disabled.
     LockoutChannel(ChannelKey),
     UnlockoutChannel(ChannelKey),
-
-    /// Global default dwell/hang changes from the UI sliders.
-    SetDefaultDwellMs(u32),
-    SetDefaultHangMs(u32),
 }
