@@ -44,7 +44,14 @@ pub struct SidebarPanels {
     /// Right-side bookmarks flyout — owns the bookmark list,
     /// backing store, and row-action callbacks. Toggled via
     /// the header bookmark button / `Ctrl+B`.
-    pub bookmarks: BookmarksPanel,
+    ///
+    /// Wrapped in `Rc` so long-lived GTK closures (RR import,
+    /// Add button, Save button) can capture a clone and call
+    /// [`BookmarksPanel::rebuild`] without hand-threading each
+    /// internal `Rc` field. The Save closure uses `Rc::downgrade`
+    /// to break the otherwise-cyclic `on_save → stored closure`
+    /// reference chain.
+    pub bookmarks: std::rc::Rc<BookmarksPanel>,
     /// Share-over-network (`rtl_tcp` server) controls. Hidden by
     /// default; `window.rs` reveals it when a local RTL-SDR dongle
     /// is plugged in and not currently the active source.
@@ -71,8 +78,12 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     // Preset selection clears the active-bookmark highlight and
     // rebuilds the flyout list. Wiring lives outside
     // `build_navigation_panel` because it closes over state owned
-    // by the flyout.
+    // by the flyout. Done before the `Rc` wrap below so the
+    // preset handler keeps capturing individual `Rc` fields by
+    // clone — wiring it through an `Rc<BookmarksPanel>` would
+    // add an unnecessary upgrade dance on every preset click.
     navigation_panel::connect_preset_to_bookmarks(&navigation, &bookmarks);
+    let bookmarks = std::rc::Rc::new(bookmarks);
 
     let sidebar_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)

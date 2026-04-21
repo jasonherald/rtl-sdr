@@ -330,41 +330,21 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 
     // Wire RadioReference browse button.
     {
-        let bm_list = panels.bookmarks.bookmark_list.clone();
-        let bm_scroll = panels.bookmarks.bookmark_scroll.clone();
-        let bm_rc = panels.bookmarks.bookmarks.clone();
-        let on_nav = panels.bookmarks.on_navigate.clone();
-        let active_bm = panels.bookmarks.active_bookmark.clone();
-        let name_entry = panels.navigation.name_entry.clone();
-        let on_save = panels.bookmarks.on_save.clone();
-        let filter_text = panels.bookmarks.filter_text.clone();
-        let manual_expanded = panels.bookmarks.manual_expanded.clone();
+        let bookmarks_for_rr = Rc::clone(&panels.bookmarks);
+        let name_entry_for_rr = panels.navigation.name_entry.clone();
 
         rr_button.connect_clicked(move |btn| {
-            let bm_list = bm_list.clone();
-            let bm_scroll = bm_scroll.clone();
-            let bm_rc = bm_rc.clone();
-            let on_nav = on_nav.clone();
-            let active_bm = active_bm.clone();
-            let name_entry = name_entry.clone();
-            let on_save = on_save.clone();
-            let filter_text = filter_text.clone();
-            let manual_expanded = manual_expanded.clone();
+            let bookmarks_for_rr = Rc::clone(&bookmarks_for_rr);
+            let name_entry_for_rr = name_entry_for_rr.clone();
 
             crate::radioreference::show_browse_dialog(btn, move || {
-                // Reload bookmarks from disk and rebuild the sidebar list.
-                *bm_rc.borrow_mut() = sidebar::navigation_panel::load_bookmarks();
-                sidebar::navigation_panel::rebuild_bookmark_list(
-                    &bm_list,
-                    &bm_scroll,
-                    &bm_rc,
-                    &on_nav,
-                    &active_bm,
-                    &name_entry,
-                    &on_save,
-                    &filter_text,
-                    &manual_expanded,
-                );
+                // Reload bookmarks from disk and rebuild the flyout.
+                // `BookmarksPanel::rebuild` keeps this call site on
+                // the panel boundary rather than reaching through
+                // the panel's individual `Rc` fields.
+                *bookmarks_for_rr.bookmarks.borrow_mut() =
+                    sidebar::navigation_panel::load_bookmarks();
+                bookmarks_for_rr.rebuild(&name_entry_for_rr);
             });
         });
     }
@@ -4557,14 +4537,7 @@ fn connect_navigation_panel(
     let source_agc_bm = panels.source.agc_row.clone();
     let nav = &panels.navigation;
     let bm = &panels.bookmarks;
-    let bm_rc = bm.bookmarks.clone();
-    let bm_list = bm.bookmark_list.clone();
-    let bm_scroll = bm.bookmark_scroll.clone();
-    let on_nav = bm.on_navigate.clone();
-    let active_bm = bm.active_bookmark.clone();
-    let on_save_bm = bm.on_save.clone();
-    let filter_text_add = bm.filter_text.clone();
-    let manual_expanded_add = bm.manual_expanded.clone();
+    let bm_for_add = Rc::clone(bm);
     let name_entry = nav.name_entry.clone();
 
     nav.add_button.connect_clicked(move |_| {
@@ -4615,31 +4588,19 @@ fn connect_navigation_panel(
         };
         let bookmark =
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
-        bm_rc.borrow_mut().push(bookmark);
-        sidebar::navigation_panel::save_bookmarks(&bm_rc.borrow());
-        sidebar::navigation_panel::rebuild_bookmark_list(
-            &bm_list,
-            &bm_scroll,
-            &bm_rc,
-            &on_nav,
-            &active_bm,
-            &name_entry,
-            &on_save_bm,
-            &filter_text_add,
-            &manual_expanded_add,
-        );
+        bm_for_add.bookmarks.borrow_mut().push(bookmark);
+        sidebar::navigation_panel::save_bookmarks(&bm_for_add.bookmarks.borrow());
+        bm_for_add.rebuild(&name_entry);
         name_entry.set_text("");
     });
 
     // Save button — update the active bookmark with current settings.
-    let save_bm_rc = bm.bookmarks.clone();
-    let save_active = bm.active_bookmark.clone();
-    let save_bm_list = bm.bookmark_list.clone();
-    let save_bm_scroll = bm.bookmark_scroll.clone();
-    let save_on_nav = bm.on_navigate.clone();
-    let save_on_save = bm.on_save.clone();
-    let save_filter_text = bm.filter_text.clone();
-    let save_manual_expanded = bm.manual_expanded.clone();
+    // Capture the bookmarks panel via `Weak` so the stored closure
+    // doesn't keep the panel alive: the closure lives inside
+    // `panel.on_save`, and cloning `Rc<BookmarksPanel>` into it
+    // would form a cycle (panel → on_save → closure → panel)
+    // that prevents the panel from dropping on window teardown.
+    let save_bm_weak = std::rc::Rc::downgrade(bm);
     let save_name_entry = nav.name_entry.clone();
     let save_state = Rc::clone(state);
     let save_radio_bw = panels.radio.bandwidth_row.clone();
@@ -4658,7 +4619,16 @@ fn connect_navigation_panel(
     let save_source_gain = panels.source.gain_row.clone();
     let save_source_agc = panels.source.agc_row.clone();
     bm.connect_save(move || {
-        let active = save_active.borrow().clone();
+        // `save_bm_weak` is the ONLY reference this closure holds
+        // to the panel. Upgrading on entry gives us a live handle
+        // for the duration of the save; dropping it at the end of
+        // the call lets the panel drop cleanly on teardown even
+        // though the closure itself is stored inside
+        // `panel.on_save`.
+        let Some(save_bm) = save_bm_weak.upgrade() else {
+            return;
+        };
+        let active = save_bm.active_bookmark.borrow().clone();
         if active.name.is_empty() && active.frequency == 0 {
             return; // No active bookmark to save.
         }
@@ -4701,7 +4671,7 @@ fn connect_navigation_panel(
             }),
         };
         // Find and update the active bookmark in the list.
-        let mut bms = save_bm_rc.borrow_mut();
+        let mut bms = save_bm.bookmarks.borrow_mut();
         if let Some(bm) = bms
             .iter_mut()
             .find(|b| b.name == active.name && b.frequency == active.frequency)
@@ -4735,7 +4705,7 @@ fn connect_navigation_panel(
             bm.ctcss_threshold = profile.ctcss_threshold;
             bm.voice_squelch_mode = profile.voice_squelch_mode;
             // Keep ActiveBookmark in sync with the updated frequency.
-            *save_active.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
+            *save_bm.active_bookmark.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
                 name: active.name.clone(),
                 frequency: freq_u64,
             };
@@ -4743,17 +4713,7 @@ fn connect_navigation_panel(
         sidebar::navigation_panel::save_bookmarks(&bms);
         drop(bms);
         // Rebuild to update subtitle.
-        sidebar::navigation_panel::rebuild_bookmark_list(
-            &save_bm_list,
-            &save_bm_scroll,
-            &save_bm_rc,
-            &save_on_nav,
-            &save_active,
-            &save_name_entry,
-            &save_on_save,
-            &save_filter_text,
-            &save_manual_expanded,
-        );
+        save_bm.rebuild(&save_name_entry);
         tracing::info!("bookmark saved: {}", active.name);
     });
 }

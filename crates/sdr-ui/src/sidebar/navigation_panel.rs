@@ -456,7 +456,7 @@ pub fn build_navigation_panel() -> NavigationPanel {
     bookmarks_group.append(&bookmarks_label);
 
     let bookmarks_hint = gtk4::Label::builder()
-        .label("Press Ctrl+B or use the bookmark icon to browse")
+        .label("Use the bookmark icon or keyboard shortcut to browse")
         .css_classes(["caption", "dim-label"])
         .halign(gtk4::Align::Start)
         .wrap(true)
