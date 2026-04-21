@@ -800,7 +800,17 @@ mod tests {
         assert_eq!(back.auto_squelch_enabled, Some(true));
         assert_eq!(back.squelch_level, Some(-40.0));
         assert_eq!(back.gain, Some(33.8));
+        // Legacy `agc` boolean is written alongside the new
+        // `agc_type` for forward-compat with older builds. For
+        // `AgcType::Off` that legacy value is `false`.
         assert_eq!(back.agc, Some(false));
+        // New `agc_type` round-trip. Regression guard against a
+        // serde-shape change on `AgcType` silently breaking the
+        // bookmark schema.
+        assert_eq!(
+            back.agc_type,
+            Some(crate::sidebar::source_panel::AgcType::Off)
+        );
         assert_eq!(back.volume, Some(0.75));
         assert_eq!(back.deemphasis, Some(2));
         assert_eq!(back.nb_enabled, Some(false));

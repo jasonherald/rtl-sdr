@@ -3590,21 +3590,21 @@ fn connect_source_panel(
     //    this mutex users see "all static all the time" the
     //    moment they enable AGC with squelch on.
     //
-    // Restore persisted AGC type from config. Fresh installs get
-    // `AgcType::DEFAULT` (Software) via `load_agc_type`'s
-    // fallback; upgrades from a pre-#354 build migrate the
-    // legacy `rtl_sdr_agc_enabled` boolean in-read. Calling
-    // `set_selected` below fires the notify handler we wire up
-    // right after, which in turn dispatches the right
-    // `SetAgc` / `SetSoftwareAgc` pair and applies the mutexes
-    // — so no separate seeding dispatch is needed here.
-    {
-        let persisted = sidebar::source_panel::load_agc_type(config);
-        panels
-            .source
-            .agc_row
-            .set_selected(sidebar::source_panel::selected_from_agc_type(persisted));
-    }
+    // Register the AGC notify handler BEFORE restoring the
+    // persisted selection. `set_selected` only fires
+    // `selected-notify` when the new index differs from the
+    // current one, so the startup-restore path relies on the
+    // handler being registered first to dispatch the persisted
+    // mode. Without this ordering, fresh installs (persisted
+    // matches build-time default) or config match would leave
+    // DSP stuck in its all-off default state until the user
+    // touched the selector.
+    //
+    // Handler drops transient out-of-range indices —
+    // `agc_type_from_selected` now returns `Option<AgcType>`
+    // and we early-return on `None` rather than coercing them
+    // to a fallback and persisting a bogus config write during
+    // widget-teardown churn.
     let state_agc = Rc::clone(state);
     let config_for_agc = std::sync::Arc::clone(config);
     let gain_row_for_agc = panels.source.gain_row.clone();
@@ -3612,7 +3612,18 @@ fn connect_source_panel(
     let squelch_level_for_agc = panels.radio.squelch_level_row.clone();
     let auto_squelch_for_agc = panels.radio.auto_squelch_row.clone();
     panels.source.agc_row.connect_selected_notify(move |row| {
-        let agc_type = sidebar::source_panel::agc_type_from_selected(row.selected());
+        let Some(agc_type) = sidebar::source_panel::agc_type_from_selected(row.selected()) else {
+            // Transient GTK value (e.g., `INVALID_LIST_POSITION`
+            // during model swap). Skip dispatch AND persistence
+            // — we'll pick up the next real selection from the
+            // follow-up notify event.
+            tracing::trace!(
+                selected = row.selected(),
+                "AGC combo notify with out-of-range index, ignoring"
+            );
+            return;
+        };
+
         // Dispatch both messages every time so exactly one
         // enable path is active and the other is cleanly off.
         // The engine treats hardware and software AGC as
@@ -3640,6 +3651,49 @@ fn connect_source_panel(
             agc_active,
         );
     });
+
+    // Restore persisted AGC type from config now that the
+    // notify handler is wired up. Two scenarios:
+    //
+    // 1. Persisted index differs from the combo's build-time
+    //    default (Software) — `set_selected` fires
+    //    `selected-notify`, the handler runs, DSP is
+    //    dispatched, mutexes applied.
+    // 2. Persisted index matches the default (fresh install
+    //    or user previously selected Software) —
+    //    `set_selected` is a no-op and `selected-notify`
+    //    does NOT fire. We explicitly dispatch so DSP still
+    //    gets the initial-state sync and mutexes are applied
+    //    against the seeded selection.
+    //
+    // Both paths run the same dispatch logic; the explicit
+    // post-`set_selected` call is idempotent with the notify
+    // handler (both `SetAgc` and `SetSoftwareAgc` are
+    // idempotent at the controller), so the double-dispatch
+    // in scenario 1 is cheap and correct.
+    {
+        let persisted = sidebar::source_panel::load_agc_type(config);
+        panels
+            .source
+            .agc_row
+            .set_selected(sidebar::source_panel::selected_from_agc_type(persisted));
+
+        let (hw, sw) = match persisted {
+            sidebar::source_panel::AgcType::Off => (false, false),
+            sidebar::source_panel::AgcType::Hardware => (true, false),
+            sidebar::source_panel::AgcType::Software => (false, true),
+        };
+        state.send_dsp(UiToDsp::SetAgc(hw));
+        state.send_dsp(UiToDsp::SetSoftwareAgc(sw));
+        let agc_active = !matches!(persisted, sidebar::source_panel::AgcType::Off);
+        apply_agc_gain_mutex(&panels.source.gain_row, agc_active);
+        apply_agc_squelch_mutex(
+            &panels.radio.squelch_enabled_row,
+            &panels.radio.squelch_level_row,
+            &panels.radio.auto_squelch_row,
+            agc_active,
+        );
+    }
 
     // IQ correction toggle
     let state_iq_corr = Rc::clone(state);
@@ -4390,7 +4444,14 @@ fn connect_navigation_panel(
             auto_squelch_enabled: radio_bm.auto_squelch_row.is_active(),
             squelch_level: radio_bm.squelch_level_row.value() as f32,
             gain: source_gain_bm.value(),
-            agc_type: sidebar::source_panel::agc_type_from_selected(source_agc_bm.selected()),
+            // Snapshot the AGC selection at save time. On a
+            // transient out-of-range combo index (rare, e.g.
+            // user triggering save during a model-swap animation)
+            // fall back to the configured default rather than
+            // refusing to save — the save is user-initiated and
+            // should always produce a bookmark.
+            agc_type: sidebar::source_panel::agc_type_from_selected(source_agc_bm.selected())
+                .unwrap_or(sidebar::source_panel::AgcType::DEFAULT),
             volume: None, // Volume ScaleButton not in sidebar — don't persist.
             deemphasis: radio_bm.deemphasis_row.selected(),
             nb_enabled: radio_bm.noise_blanker_row.is_active(),
@@ -4465,7 +4526,11 @@ fn connect_navigation_panel(
             #[allow(clippy::cast_possible_truncation)]
             squelch_level: save_radio_sq_lvl.value() as f32,
             gain: save_source_gain.value(),
-            agc_type: sidebar::source_panel::agc_type_from_selected(save_source_agc.selected()),
+            // Same transient-index fallback as the new-bookmark
+            // path above — user-initiated save always produces
+            // a bookmark.
+            agc_type: sidebar::source_panel::agc_type_from_selected(save_source_agc.selected())
+                .unwrap_or(sidebar::source_panel::AgcType::DEFAULT),
             volume: None,
             deemphasis: save_radio_deemp.selected(),
             nb_enabled: save_radio_nben.is_active(),

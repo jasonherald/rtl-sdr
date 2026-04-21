@@ -301,10 +301,24 @@ impl IfChain {
         // squelch threshold reads a non-normalized amplitude and
         // can still distinguish signal from noise — see the
         // processing-order docstring on `IfChain` for why this
-        // ordering matters. No-op fast path: `process_complex`
-        // is cheap but the block copy isn't; skip the stage
-        // entirely when the flag is off.
-        if self.software_agc_enabled {
+        // ordering matters.
+        //
+        // Skip the stage entirely when the squelch is closed:
+        // the buffer is already all-zero from `PowerSquelch`, so
+        // `Agc::process_complex` would hit its `in_amp == 0.0`
+        // fast path for every sample and preserve state without
+        // modifying it — correct but wasteful. Skipping saves
+        // the per-sample loop during silent stretches AND defends
+        // against any future `Agc` refactor that loses the fast-
+        // path short-circuit (which would otherwise wind the
+        // envelope tracker toward `SOFTWARE_AGC_MAX_GAIN` on the
+        // zero input, producing a gain burst on squelch reopen).
+        //
+        // `current_is_a` stays as-is when we skip so the pass-
+        // through zeros land in the output buffer at the final
+        // copy below.
+        let squelch_is_muting = squelch_active && !self.squelch.is_open();
+        if self.software_agc_enabled && !squelch_is_muting {
             if current_is_a {
                 self.software_agc
                     .process_complex(&self.buf_a[..n], &mut self.buf_b[..n])?;
@@ -453,6 +467,52 @@ mod tests {
     }
 
     // --- Software IF AGC tests (#354) ---
+    //
+    // Named test fixtures. Centralized here so a future AGC
+    // retune touches exactly one block — the literals are
+    // load-bearing against the shipped `SOFTWARE_AGC_ATTACK`
+    // and `SOFTWARE_AGC_DECAY` coefficients (1/300 and 1/3000).
+
+    /// Number of samples used by the weak / strong convergence
+    /// tests. ~10 decay time constants at the current coefficients,
+    /// enough for the envelope tracker to converge close to the
+    /// target set point without the test taking forever.
+    const AGC_CONVERGENCE_BLOCK_LEN: usize = 30_000;
+    /// Short block used by the disable-revert and squelch-interop
+    /// tests where full convergence isn't needed.
+    const AGC_SHORT_BLOCK_LEN: usize = 1_000;
+    /// Input amplitude 40 dB below the `SOFTWARE_AGC_SET_POINT = 1.0`
+    /// target. Used by the weak-signal amplification test.
+    const AGC_WEAK_INPUT_AMP: f32 = 0.01;
+    /// Input amplitude 20 dB above the `SOFTWARE_AGC_SET_POINT = 1.0`
+    /// target. Used by the strong-signal attenuation test.
+    const AGC_STRONG_INPUT_AMP: f32 = 10.0;
+    /// Pass-through sample amplitude used by the disable-revert test.
+    /// Arbitrary non-zero value; the assertion is equality to this.
+    const AGC_PASSTHROUGH_AMP: f32 = 5.0;
+    /// Squelch threshold used by the interop test. Set above the
+    /// weak-input `-40 dBFS` level so the gate closes on the test
+    /// input, exercising the AGC-after-squelch ordering.
+    const AGC_SQUELCH_TEST_THRESHOLD_DB: f32 = -20.0;
+    /// Float tolerance for the passthrough assertion. Tight —
+    /// scaling by 1.0 should preserve the input exactly in f32.
+    const AGC_PASSTHROUGH_EPSILON: f32 = 1e-5;
+    /// Float tolerance for the "gate is zeroed" assertion. Tighter
+    /// than the passthrough tolerance because the expected value
+    /// is literal 0.0, not a scaled input.
+    const AGC_ZERO_EPSILON: f32 = 1e-10;
+    /// Fraction of the block used as the tail window for
+    /// convergence assertions. The last quarter captures steady
+    /// state after the envelope has converged.
+    const AGC_TAIL_FRACTION: usize = 4;
+    /// Minimum gain factor for the weak-signal convergence
+    /// assertion. Well below the theoretical `1.0 / 0.01 = 100×`
+    /// so the test stays robust against coefficient tweaks.
+    const AGC_WEAK_MIN_GAIN: f32 = 5.0;
+    /// Maximum residual factor for the strong-signal attenuation
+    /// assertion. Well above the theoretical `1.0 / 10.0 = 0.1×`
+    /// floor so the test stays robust against coefficient tweaks.
+    const AGC_STRONG_MAX_RESIDUAL: f32 = 0.5;
 
     /// Default state: software AGC is off. A fresh `IfChain` with
     /// no other stages active should passthrough IQ unchanged —
@@ -470,70 +530,50 @@ mod tests {
     /// Pins the core "AGC actually moves gain toward set point"
     /// contract — a bypassed or broken AGC would leave output =
     /// input, a too-aggressive one would overshoot.
-    ///
-    /// The exact convergence time depends on the tuning
-    /// coefficients (currently 1/300 attack, 1/3000 decay, so
-    /// reaching set point from a 40-dB-low input takes ~4
-    /// decay time constants ≈ 12000 samples). This test asserts
-    /// PROGRESS rather than full settling to keep the test fast
-    /// and resilient to coefficient tweaks: average output over
-    /// the final quarter must be at least 5× the input (14 dB
-    /// gain).
     #[test]
     fn software_agc_amplifies_weak_signal() {
         let mut chain = IfChain::new().unwrap();
         chain.set_software_agc_enabled(true);
 
-        // 0.01 amplitude = -40 dBFS, 40 dB below set point.
-        // 30 000 samples ≈ 10 decay time constants → amp
-        // tracker well-converged.
-        let n = 30_000;
-        let input_amp = 0.01_f32;
-        let input = vec![Complex::new(input_amp, 0.0); n];
+        let n = AGC_CONVERGENCE_BLOCK_LEN;
+        let input = vec![Complex::new(AGC_WEAK_INPUT_AMP, 0.0); n];
         let mut output = vec![Complex::default(); n];
         chain.process(&input, &mut output).unwrap();
 
-        let tail = &output[3 * n / 4..];
+        let tail = &output[n - n / AGC_TAIL_FRACTION..];
         let mean_out: f32 = tail
             .iter()
             .map(|s| (s.re * s.re + s.im * s.im).sqrt())
             .sum::<f32>()
             / tail.len() as f32;
         assert!(
-            mean_out > input_amp * 5.0,
-            "software AGC should amplify weak signal, input = {input_amp}, mean output = {mean_out}"
+            mean_out > AGC_WEAK_INPUT_AMP * AGC_WEAK_MIN_GAIN,
+            "software AGC should amplify weak signal, input = {AGC_WEAK_INPUT_AMP}, mean output = {mean_out}"
         );
     }
 
     /// With software AGC enabled, a high-amplitude input should
     /// be attenuated toward the set point. Complements the
-    /// amplification test — the same AGC must handle both
-    /// directions for the advertised "normalize loudness across
-    /// strong and weak signals" UX. Uses the same progress-
-    /// based assertion style as the weak-signal case.
+    /// amplification test.
     #[test]
     fn software_agc_attenuates_strong_signal() {
         let mut chain = IfChain::new().unwrap();
         chain.set_software_agc_enabled(true);
 
-        // 10.0 amplitude = +20 dBFS, 20 dB above set point.
-        // Attack coefficient (1/300) is 10× faster than decay,
-        // so this converges faster than the weak-signal case.
-        let n = 30_000;
-        let input_amp = 10.0_f32;
-        let input = vec![Complex::new(input_amp, 0.0); n];
+        let n = AGC_CONVERGENCE_BLOCK_LEN;
+        let input = vec![Complex::new(AGC_STRONG_INPUT_AMP, 0.0); n];
         let mut output = vec![Complex::default(); n];
         chain.process(&input, &mut output).unwrap();
 
-        let tail = &output[3 * n / 4..];
+        let tail = &output[n - n / AGC_TAIL_FRACTION..];
         let mean_out: f32 = tail
             .iter()
             .map(|s| (s.re * s.re + s.im * s.im).sqrt())
             .sum::<f32>()
             / tail.len() as f32;
         assert!(
-            mean_out < input_amp * 0.5,
-            "software AGC should attenuate strong signal, input = {input_amp}, mean output = {mean_out}"
+            mean_out < AGC_STRONG_INPUT_AMP * AGC_STRONG_MAX_RESIDUAL,
+            "software AGC should attenuate strong signal, input = {AGC_STRONG_INPUT_AMP}, mean output = {mean_out}"
         );
     }
 
@@ -546,9 +586,8 @@ mod tests {
         let mut chain = IfChain::new().unwrap();
         chain.set_software_agc_enabled(true);
 
-        // Run one block with AGC on.
-        let n = 1000;
-        let input = vec![Complex::new(5.0, 0.0); n];
+        let n = AGC_SHORT_BLOCK_LEN;
+        let input = vec![Complex::new(AGC_PASSTHROUGH_AMP, 0.0); n];
         let mut output = vec![Complex::default(); n];
         chain.process(&input, &mut output).unwrap();
 
@@ -558,7 +597,8 @@ mod tests {
         chain.process(&input, &mut output).unwrap();
         for (i, s) in output.iter().enumerate() {
             assert!(
-                (s.re - 5.0).abs() < 1e-5 && s.im.abs() < 1e-5,
+                (s.re - AGC_PASSTHROUGH_AMP).abs() < AGC_PASSTHROUGH_EPSILON
+                    && s.im.abs() < AGC_PASSTHROUGH_EPSILON,
                 "sample {i} should be pure passthrough after disable, got ({}, {})",
                 s.re,
                 s.im
@@ -568,23 +608,19 @@ mod tests {
 
     /// Software AGC + squelch must interoperate: the squelch
     /// reads pre-AGC amplitude (so it can distinguish signal
-    /// from noise) and the AGC reads the post-squelch output.
-    /// Pins the processing order documented on `IfChain`. A
-    /// quiet signal below the manual threshold should close
-    /// the gate even with AGC active — if AGC ran first, the
-    /// normalized output would always read "above threshold"
-    /// and the gate would stay stuck open.
+    /// from noise) and AGC only runs when the gate is open.
+    /// Pins the processing order documented on `IfChain`.
     #[test]
     fn software_agc_after_squelch_preserves_gating() {
         let mut chain = IfChain::new().unwrap();
         chain.set_software_agc_enabled(true);
         chain.set_squelch_enabled(true);
-        chain.set_squelch_level(-20.0); // threshold = -20 dBFS
+        chain.set_squelch_level(AGC_SQUELCH_TEST_THRESHOLD_DB);
 
         // Quiet input: 0.01 amplitude = -40 dBFS, below the
         // -20 dB threshold. Gate must close.
-        let n = 1000;
-        let input = vec![Complex::new(0.01, 0.0); n];
+        let n = AGC_SHORT_BLOCK_LEN;
+        let input = vec![Complex::new(AGC_WEAK_INPUT_AMP, 0.0); n];
         let mut output = vec![Complex::default(); n];
         chain.process(&input, &mut output).unwrap();
 
@@ -593,10 +629,60 @@ mod tests {
             "squelch should still close on quiet pre-AGC signal"
         );
         // When gate is closed, output is IQ-zero regardless of
-        // AGC state — AGC runs after squelch so it multiplies
-        // zeros by gain and emits zeros.
+        // AGC state — AGC skips the block entirely when squelch
+        // is muting, and PowerSquelch's zero output propagates
+        // through.
         for s in &output {
-            assert!(s.re.abs() < 1e-10 && s.im.abs() < 1e-10);
+            assert!(s.re.abs() < AGC_ZERO_EPSILON && s.im.abs() < AGC_ZERO_EPSILON);
         }
+    }
+
+    /// AGC state must survive a squelch close/reopen cycle
+    /// without winding toward max gain or producing a burst on
+    /// reopen. Runs one block of loud signal (AGC converges
+    /// toward attenuation), one block of quiet below-threshold
+    /// noise (gate closes, AGC skipped), then another loud
+    /// block. The first post-reopen sample's magnitude must
+    /// stay bounded — a wind-up bug would push it into the
+    /// `SOFTWARE_AGC_MAX_OUTPUT = 10.0` look-ahead clipping
+    /// cap or beyond.
+    #[test]
+    fn software_agc_survives_squelch_cycle_without_burst() {
+        let mut chain = IfChain::new().unwrap();
+        chain.set_software_agc_enabled(true);
+        chain.set_squelch_enabled(true);
+        chain.set_squelch_level(AGC_SQUELCH_TEST_THRESHOLD_DB);
+
+        let n = AGC_SHORT_BLOCK_LEN;
+        let mut output = vec![Complex::default(); n];
+
+        // Block 1: loud signal — gate open, AGC attacks.
+        let loud = vec![Complex::new(AGC_STRONG_INPUT_AMP, 0.0); n];
+        chain.process(&loud, &mut output).unwrap();
+        assert!(chain.squelch_open(), "loud signal should open gate");
+
+        // Block 2: quiet noise — gate closes, AGC should be
+        // skipped entirely so its state is frozen at block 1's
+        // convergence rather than being fed zeros.
+        let quiet = vec![Complex::new(AGC_WEAK_INPUT_AMP, 0.0); n];
+        chain.process(&quiet, &mut output).unwrap();
+        assert!(!chain.squelch_open(), "quiet signal should close gate");
+        for s in &output {
+            assert!(
+                s.re.abs() < AGC_ZERO_EPSILON && s.im.abs() < AGC_ZERO_EPSILON,
+                "gate-closed output should be zero"
+            );
+        }
+
+        // Block 3: loud signal returns — gate reopens, AGC
+        // resumes from block 1's state. First sample amplitude
+        // must be bounded by the look-ahead clipping cap; a
+        // wind-up bug would push it well above that.
+        chain.process(&loud, &mut output).unwrap();
+        let first_mag = (output[0].re * output[0].re + output[0].im * output[0].im).sqrt();
+        assert!(
+            first_mag < AGC_STRONG_INPUT_AMP,
+            "first post-reopen sample should not burst above the input level, got mag = {first_mag}"
+        );
     }
 }

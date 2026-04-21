@@ -89,16 +89,20 @@ pub const AGC_TYPE_HARDWARE_IDX: u32 = 1;
 pub const AGC_TYPE_SOFTWARE_IDX: u32 = 2;
 
 /// Translate a combo row `selected()` index into an `AgcType`.
-/// Defaults to [`AgcType::DEFAULT`] on an unknown index — GTK can
-/// emit transient out-of-range values during widget teardown, and
-/// the AGC selector shouldn't crash on that.
+/// Returns `None` on an unknown index — GTK can emit transient
+/// out-of-range values (e.g. `gtk4::INVALID_LIST_POSITION`)
+/// during widget teardown or model-swap churn. Returning
+/// `Option` forces call sites to make an explicit choice rather
+/// than silently coercing a transient to [`AgcType::DEFAULT`]
+/// and dispatching it as a real mode change (which would
+/// corrupt the persisted config).
 #[must_use]
-pub fn agc_type_from_selected(idx: u32) -> AgcType {
+pub fn agc_type_from_selected(idx: u32) -> Option<AgcType> {
     match idx {
-        AGC_TYPE_OFF_IDX => AgcType::Off,
-        AGC_TYPE_HARDWARE_IDX => AgcType::Hardware,
-        AGC_TYPE_SOFTWARE_IDX => AgcType::Software,
-        _ => AgcType::DEFAULT,
+        AGC_TYPE_OFF_IDX => Some(AgcType::Off),
+        AGC_TYPE_HARDWARE_IDX => Some(AgcType::Hardware),
+        AGC_TYPE_SOFTWARE_IDX => Some(AgcType::Software),
+        _ => None,
     }
 }
 
@@ -1223,21 +1227,21 @@ mod tests {
         assert_eq!(load_agc_type(&config), AgcType::Hardware);
     }
 
-    /// `agc_type_from_selected` round-trips each index, and
-    /// unknown indices fall back to the default rather than
-    /// panicking. Guards the combo-row dispatch path against
-    /// GTK's transient out-of-range values during widget
-    /// teardown.
+    /// `agc_type_from_selected` round-trips each legal index
+    /// and returns `None` on unknown indices so callers can
+    /// reject transient GTK teardown values instead of
+    /// silently dispatching a fallback as a real user choice.
     #[test]
     fn agc_type_selected_index_helpers_round_trip() {
         for variant in [AgcType::Off, AgcType::Hardware, AgcType::Software] {
             let idx = selected_from_agc_type(variant);
-            assert_eq!(agc_type_from_selected(idx), variant);
+            assert_eq!(agc_type_from_selected(idx), Some(variant));
         }
-        // Unknown index → default.
-        assert_eq!(agc_type_from_selected(99), AgcType::DEFAULT);
-        // u32::MAX is the sentinel GTK uses for "no selection"
-        // on some widgets; make sure we don't panic.
-        assert_eq!(agc_type_from_selected(u32::MAX), AgcType::DEFAULT);
+        // Unknown index → `None`. Notify handler early-returns
+        // on this to avoid corrupting persisted config.
+        assert_eq!(agc_type_from_selected(99), None);
+        // `u32::MAX` is the `gtk4::INVALID_LIST_POSITION`
+        // sentinel; make sure we don't panic or coerce.
+        assert_eq!(agc_type_from_selected(u32::MAX), None);
     }
 }
