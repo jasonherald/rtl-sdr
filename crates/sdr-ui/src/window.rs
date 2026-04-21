@@ -179,6 +179,36 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         revealer_clone.set_reveal_child(btn.is_active());
     });
 
+    // Mutual exclusion between the two right-side flyouts —
+    // opening one closes the other so the content area doesn't
+    // end up with both panels stacked. Each toggle's mutex
+    // handler is added AFTER its primary handler (which does the
+    // reveal + config write), so on activation the primary fires
+    // first and the mutex then deactivates the sibling toggle;
+    // the sibling's primary handler in turn hides its revealer.
+    // `set_active(false)` on an already-inactive toggle is a
+    // no-op (GTK suppresses the `toggled` signal when the state
+    // doesn't change), so closing either panel manually doesn't
+    // cascade.
+    let transcript_btn_weak = transcript_button.downgrade();
+    bookmarks_toggle.connect_toggled(move |btn| {
+        if btn.is_active()
+            && let Some(other) = transcript_btn_weak.upgrade()
+            && other.is_active()
+        {
+            other.set_active(false);
+        }
+    });
+    let bookmarks_toggle_weak = bookmarks_toggle.downgrade();
+    transcript_button.connect_toggled(move |btn| {
+        if btn.is_active()
+            && let Some(other) = bookmarks_toggle_weak.upgrade()
+            && other.is_active()
+        {
+            other.set_active(false);
+        }
+    });
+
     let toolbar_view = build_toolbar_view(&header, &split_view);
     let breakpoint = build_breakpoint(&split_view);
 
