@@ -266,13 +266,13 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 
     // Wire RadioReference browse button.
     {
-        let bm_list = panels.navigation.bookmark_list.clone();
-        let bm_scroll = panels.navigation.bookmark_scroll.clone();
-        let bm_rc = panels.navigation.bookmarks.clone();
-        let on_nav = panels.navigation.on_navigate.clone();
-        let active_bm = panels.navigation.active_bookmark.clone();
+        let bm_list = panels.bookmarks.bookmark_list.clone();
+        let bm_scroll = panels.bookmarks.bookmark_scroll.clone();
+        let bm_rc = panels.bookmarks.bookmarks.clone();
+        let on_nav = panels.bookmarks.on_navigate.clone();
+        let active_bm = panels.bookmarks.active_bookmark.clone();
         let name_entry = panels.navigation.name_entry.clone();
-        let on_save = panels.navigation.on_save.clone();
+        let on_save = panels.bookmarks.on_save.clone();
 
         rr_button.connect_clicked(move |btn| {
             let bm_list = bm_list.clone();
@@ -814,17 +814,18 @@ fn build_split_view(
     // reveals an unambiguously right-edge element. Uses the same
     // `SlideLeft` + 200 ms transition as the transcript revealer
     // for visual consistency when either panel opens.
-    let bookmarks_panel = sidebar::bookmarks_panel::build_bookmarks_panel();
-    let bookmarks_scroll = gtk4::ScrolledWindow::builder()
-        .child(&bookmarks_panel.widget)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vexpand(true)
-        .build();
+    //
+    // The flyout widget is built by `build_sidebar` (so it can
+    // share state with the left-sidebar `NavigationPanel`) and
+    // returned on `panels.bookmarks`; here we just pack it into
+    // the revealer. The panel widget already contains its own
+    // vertical scroll for the bookmark list, so no outer scroll
+    // wrap is needed.
     let bookmarks_revealer = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideLeft)
         .transition_duration(200)
         .reveal_child(false)
-        .child(&bookmarks_scroll)
+        .child(&panels.bookmarks.widget)
         .hexpand(false)
         .build();
 
@@ -4424,7 +4425,7 @@ fn connect_navigation_panel(
     let source_nav_gain = panels.source.gain_row.clone();
     let source_nav_agc = panels.source.agc_row.clone();
 
-    panels.navigation.connect_navigate(move |bookmark| {
+    panels.bookmarks.connect_navigate(move |bookmark| {
         let freq = bookmark.frequency;
         let mode = sidebar::navigation_panel::parse_demod_mode(&bookmark.demod_mode);
         let bw = bookmark.bandwidth;
@@ -4484,12 +4485,13 @@ fn connect_navigation_panel(
     let source_gain_bm = panels.source.gain_row.clone();
     let source_agc_bm = panels.source.agc_row.clone();
     let nav = &panels.navigation;
-    let bm_rc = nav.bookmarks.clone();
-    let bm_list = nav.bookmark_list.clone();
-    let bm_scroll = nav.bookmark_scroll.clone();
-    let on_nav = nav.on_navigate.clone();
-    let active_bm = nav.active_bookmark.clone();
-    let on_save_bm = nav.on_save.clone();
+    let bm = &panels.bookmarks;
+    let bm_rc = bm.bookmarks.clone();
+    let bm_list = bm.bookmark_list.clone();
+    let bm_scroll = bm.bookmark_scroll.clone();
+    let on_nav = bm.on_navigate.clone();
+    let active_bm = bm.active_bookmark.clone();
+    let on_save_bm = bm.on_save.clone();
     let name_entry = nav.name_entry.clone();
 
     nav.add_button.connect_clicked(move |_| {
@@ -4555,12 +4557,12 @@ fn connect_navigation_panel(
     });
 
     // Save button — update the active bookmark with current settings.
-    let save_bm_rc = nav.bookmarks.clone();
-    let save_active = nav.active_bookmark.clone();
-    let save_bm_list = nav.bookmark_list.clone();
-    let save_bm_scroll = nav.bookmark_scroll.clone();
-    let save_on_nav = nav.on_navigate.clone();
-    let save_on_save = nav.on_save.clone();
+    let save_bm_rc = bm.bookmarks.clone();
+    let save_active = bm.active_bookmark.clone();
+    let save_bm_list = bm.bookmark_list.clone();
+    let save_bm_scroll = bm.bookmark_scroll.clone();
+    let save_on_nav = bm.on_navigate.clone();
+    let save_on_save = bm.on_save.clone();
     let save_name_entry = nav.name_entry.clone();
     let save_state = Rc::clone(state);
     let save_radio_bw = panels.radio.bandwidth_row.clone();
@@ -4578,7 +4580,7 @@ fn connect_navigation_panel(
     let save_radio_voice_squelch_threshold = panels.radio.voice_squelch_threshold_row.clone();
     let save_source_gain = panels.source.gain_row.clone();
     let save_source_agc = panels.source.agc_row.clone();
-    nav.connect_save(move || {
+    bm.connect_save(move || {
         let active = save_active.borrow().clone();
         if active.name.is_empty() && active.frequency == 0 {
             return; // No active bookmark to save.

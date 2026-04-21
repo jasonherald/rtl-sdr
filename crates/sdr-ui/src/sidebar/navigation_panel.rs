@@ -388,46 +388,44 @@ pub struct ActiveBookmark {
     pub frequency: u64,
 }
 
-/// Navigation panel containing band presets and frequency bookmarks.
+/// Navigation panel containing band presets and the left-sidebar
+/// "Add Bookmark" quick-entry controls.
+///
+/// The full bookmark list (browse, recall, delete, save-over-active)
+/// lives in [`crate::sidebar::BookmarksPanel`] — the right-side
+/// flyout — so this panel intentionally does **not** own the list
+/// widget or the backing store. Both panels share the `name_entry`:
+/// this struct owns it, the flyout panel borrows it at build time
+/// and captures clones in its row callbacks.
 pub struct NavigationPanel {
     /// Band presets group widget.
     pub presets_widget: adw::PreferencesGroup,
-    /// Bookmarks container widget.
+    /// Left-sidebar bookmark quick-add container (heading +
+    /// name entry + Add button). The full list is in the flyout
+    /// — see [`crate::sidebar::BookmarksPanel`].
     pub bookmarks_widget: gtk4::Box,
     /// Band preset combo row (for connection in window.rs).
     pub preset_row: adw::ComboRow,
     /// Bookmark name entry (user-editable, defaults to formatted frequency).
+    /// Owned here because the Add button sits next to it; the
+    /// flyout panel borrows a reference for its row actions.
     pub name_entry: adw::EntryRow,
-    /// Add bookmark button.
+    /// Add bookmark button. Lives on the left sidebar so users
+    /// can stash a bookmark without opening the flyout.
     pub add_button: gtk4::Button,
-    /// Bookmark scroll container (height adjusted dynamically).
-    pub bookmark_scroll: gtk4::ScrolledWindow,
-    /// Bookmark list box (rebuilt on add/remove).
-    pub bookmark_list: gtk4::ListBox,
-    /// Current bookmarks (shared state for closures).
-    pub bookmarks: std::rc::Rc<std::cell::RefCell<Vec<Bookmark>>>,
-    /// Callback fired when a preset or bookmark is recalled.
-    pub on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>>,
-    /// Currently active bookmark identity (for visual highlighting).
-    pub active_bookmark: std::rc::Rc<std::cell::RefCell<ActiveBookmark>>,
-    /// Callback fired when the user clicks save on the active bookmark.
-    pub on_save: SaveCallback,
 }
 
-impl NavigationPanel {
-    /// Register a callback invoked when the user selects a preset or bookmark.
-    pub fn connect_navigate<F: Fn(&Bookmark) + 'static>(&self, f: F) {
-        *self.on_navigate.borrow_mut() = Some(Box::new(f));
-    }
-
-    /// Register a callback invoked when the user clicks save on the active bookmark.
-    pub fn connect_save<F: Fn() + 'static>(&self, f: F) {
-        *self.on_save.borrow_mut() = Some(Box::new(f));
-    }
-}
-
-/// Build the complete navigation panel (band presets + bookmarks).
-#[allow(clippy::too_many_lines)]
+/// Build the navigation panel — band presets + left-sidebar
+/// bookmark quick-add.
+///
+/// Does not build the bookmark list widget; that lives in the
+/// right-side flyout and is constructed by
+/// [`build_bookmarks_panel`](crate::sidebar::build_bookmarks_panel).
+/// The preset row's selection handler also lives outside this
+/// function — see [`connect_preset_to_bookmarks`] — because it
+/// needs access to the flyout's shared state (active-bookmark
+/// highlight, list rebuild, navigation callback) which only
+/// exists after both panels have been built.
 pub fn build_navigation_panel() -> NavigationPanel {
     // --- Band Presets ---
     let presets_group = adw::PreferencesGroup::builder()
@@ -444,8 +442,7 @@ pub fn build_navigation_panel() -> NavigationPanel {
         .build();
     presets_group.add(&preset_row);
 
-    // --- Bookmarks ---
-    // Use a plain Box instead of PreferencesGroup so ScrolledWindow sizing works.
+    // --- Left-sidebar bookmark quick-add ---
     let bookmarks_group = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(8)
@@ -458,20 +455,16 @@ pub fn build_navigation_panel() -> NavigationPanel {
         .build();
     bookmarks_group.append(&bookmarks_label);
 
+    let bookmarks_hint = gtk4::Label::builder()
+        .label("Press Ctrl+B or use the bookmark icon to browse")
+        .css_classes(["caption", "dim-label"])
+        .halign(gtk4::Align::Start)
+        .wrap(true)
+        .build();
+    bookmarks_group.append(&bookmarks_hint);
+
     let name_entry = adw::EntryRow::builder().title("Name").build();
     bookmarks_group.append(&name_entry);
-
-    let bookmark_list = gtk4::ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
-
-    let bookmark_scroll = gtk4::ScrolledWindow::builder()
-        .child(&bookmark_list)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vscrollbar_policy(gtk4::PolicyType::Automatic)
-        .build();
-    bookmarks_group.append(&bookmark_scroll);
 
     let add_button = gtk4::Button::builder()
         .label("Add Bookmark")
@@ -479,40 +472,43 @@ pub fn build_navigation_panel() -> NavigationPanel {
         .build();
     bookmarks_group.append(&add_button);
 
-    let bookmarks = std::rc::Rc::new(std::cell::RefCell::new(load_bookmarks()));
-    let on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
+    NavigationPanel {
+        presets_widget: presets_group,
+        bookmarks_widget: bookmarks_group,
+        preset_row,
+        name_entry,
+        add_button,
+    }
+}
 
-    let active_bookmark = std::rc::Rc::new(std::cell::RefCell::new(ActiveBookmark::default()));
-    let on_save: SaveCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
+/// Wire the band-preset combo row to the bookmark flyout state.
+///
+/// Selecting a preset clears the active-bookmark highlight,
+/// clears the name entry, fires the shared navigate callback,
+/// and rebuilds the flyout's bookmark list. This wiring can't
+/// live inside [`build_navigation_panel`] because the state it
+/// closes over is owned by the flyout panel, which is built
+/// afterwards.
+pub fn connect_preset_to_bookmarks(
+    navigation: &NavigationPanel,
+    bookmarks: &crate::sidebar::BookmarksPanel,
+) {
+    let on_nav = std::rc::Rc::clone(&bookmarks.on_navigate);
+    let active = std::rc::Rc::clone(&bookmarks.active_bookmark);
+    let bm_rc = std::rc::Rc::clone(&bookmarks.bookmarks);
+    let on_save = std::rc::Rc::clone(&bookmarks.on_save);
+    let list_weak = bookmarks.bookmark_list.downgrade();
+    let scroll_weak = bookmarks.bookmark_scroll.downgrade();
+    let name_entry = navigation.name_entry.clone();
 
-    // Build initial bookmark list
-    rebuild_bookmark_list(
-        &bookmark_list,
-        &bookmark_scroll,
-        &bookmarks,
-        &on_navigate,
-        &active_bookmark,
-        &name_entry,
-        &on_save,
-    );
-
-    // Connect preset row — auto-tune on selection, clear active bookmark
-    let on_nav_preset = std::rc::Rc::clone(&on_navigate);
-    let active_for_preset = std::rc::Rc::clone(&active_bookmark);
-    let entry_for_preset = name_entry.clone();
-    let list_for_preset = bookmark_list.downgrade();
-    let scroll_for_preset = bookmark_scroll.downgrade();
-    let bm_for_preset = std::rc::Rc::clone(&bookmarks);
-    let save_for_preset = std::rc::Rc::clone(&on_save);
-    preset_row.connect_selected_notify(move |row| {
+    navigation.preset_row.connect_selected_notify(move |row| {
         let idx = row.selected() as usize;
         if let Some(preset) = BAND_PRESETS.get(idx)
-            && let Some(cb) = on_nav_preset.borrow().as_ref()
+            && let Some(cb) = on_nav.borrow().as_ref()
         {
             // Clear active bookmark — we're tuning via preset, not bookmark.
-            *active_for_preset.borrow_mut() = ActiveBookmark::default();
-            entry_for_preset.set_text("");
+            *active.borrow_mut() = ActiveBookmark::default();
+            name_entry.set_text("");
             let bm = Bookmark::new(
                 preset.name,
                 preset.frequency,
@@ -521,35 +517,15 @@ pub fn build_navigation_panel() -> NavigationPanel {
             );
             cb(&bm);
             // Rebuild to remove stale highlight
-            if let Some(lb) = list_for_preset.upgrade()
-                && let Some(sc) = scroll_for_preset.upgrade()
+            if let Some(lb) = list_weak.upgrade()
+                && let Some(sc) = scroll_weak.upgrade()
             {
                 rebuild_bookmark_list(
-                    &lb,
-                    &sc,
-                    &bm_for_preset,
-                    &on_nav_preset,
-                    &active_for_preset,
-                    &entry_for_preset,
-                    &save_for_preset,
+                    &lb, &sc, &bm_rc, &on_nav, &active, &name_entry, &on_save,
                 );
             }
         }
     });
-
-    NavigationPanel {
-        presets_widget: presets_group,
-        bookmarks_widget: bookmarks_group,
-        preset_row,
-        name_entry,
-        add_button,
-        bookmark_scroll,
-        bookmark_list,
-        bookmarks,
-        on_navigate,
-        active_bookmark,
-        on_save,
-    }
 }
 
 /// Approximate height of one `AdwActionRow` with subtitle in pixels.
