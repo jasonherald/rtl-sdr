@@ -79,7 +79,7 @@ struct BookmarksPanel: View {
             Divider()
             searchRow
             Divider()
-            body_list
+            bodyList
         }
         .frame(width: BookmarksPanel.width)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -180,7 +180,7 @@ struct BookmarksPanel: View {
     // MARK: - List
 
     @ViewBuilder
-    private var body_list: some View {
+    private var bodyList: some View {
         if store.bookmarks.isEmpty {
             emptyState(.empty)
         } else {
