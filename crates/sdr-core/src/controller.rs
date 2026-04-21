@@ -139,7 +139,7 @@ fn dsp_thread_main(
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         tracing::info!("UI channel disconnected — DSP thread exiting");
-                        cleanup(&mut state);
+                        cleanup(&mut state, &dsp_tx);
                         return;
                     }
                 }
@@ -446,14 +446,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     // the UI sees a real `NetworkSinkStatus::Error` event
                     // instead of a generic toast.
                     let start_result = state.audio_sink.start();
-                    // Successful start re-arms the write path —
-                    // see `audio_sink_offline` docstring. We
-                    // clear *before* discriminating success vs
-                    // failure so a successful start never leaves
-                    // the gate latched from a previous session.
-                    if start_result.is_ok() {
-                        state.audio_sink_offline = false;
-                    }
+                    // Re-arm or latch the write path based on
+                    // the start outcome. See the
+                    // `audio_sink_offline` docstring for the
+                    // full one-shot rationale — failed starts
+                    // must latch, otherwise the next DSP block
+                    // would re-fire the same terminal error
+                    // when `write_samples` hits the stopped
+                    // sink. Per CodeRabbit round 6 on PR #351.
+                    state.audio_sink_offline = start_result.is_err();
                     let is_network = matches!(state.audio_sink_type, AudioSinkType::Network);
                     if let Err(e) = start_result {
                         tracing::warn!(
@@ -532,18 +533,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // is tearing down and any registered FFI consumer is about to
             // see a `Disconnected` on their next pull regardless.
             state.audio_tap_tx = None;
-            // If a network sink was streaming, snapshot the type
-            // BEFORE cleanup() takes the sink offline so the
-            // post-cleanup Inactive event reports the right
-            // discriminant. Per CodeRabbit round 1 on PR #351 —
-            // status events must reflect real lifecycle, not
-            // just selected-type.
-            let was_network_sink = matches!(state.audio_sink_type, AudioSinkType::Network);
-            cleanup(state);
+            // `cleanup` now emits `NetworkSinkStatus::Inactive` itself
+            // when the active sink was Network — same path used by the
+            // file-EOF, fatal-source-error, and source-type restart
+            // sites so every real stop transition reports Inactive.
+            cleanup(state, dsp_tx);
             state.running = false;
-            if was_network_sink {
-                let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
-            }
             let _ = dsp_tx.send(DspToUi::SourceStopped);
         }
 
@@ -1019,6 +1014,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         }
                     }
                     Err(e) => {
+                        // Latch so the next DSP block doesn't re-fire
+                        // the same terminal error against a stopped
+                        // sink. Per CodeRabbit round 6 on PR #351.
+                        state.audio_sink_offline = true;
                         tracing::warn!("audio sink start after type swap failed: {e}");
                         if matches!(new_type, AudioSinkType::Network) {
                             let _ =
@@ -1084,6 +1083,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                             ));
                         }
                         Err(e) => {
+                            // Latch — per CodeRabbit round 6 on PR #351.
+                            state.audio_sink_offline = true;
                             tracing::warn!("network sink restart after reconfig failed: {e}");
                             let _ =
                                 dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
@@ -1103,7 +1104,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::info!(?source_type, "switching source type");
             let was_running = state.running;
             if was_running {
-                cleanup(state);
+                cleanup(state, dsp_tx);
                 state.running = false;
             }
             state.source_type = source_type;
@@ -1165,6 +1166,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 }
                             }
                             Err(e) => {
+                                // Latch — per CodeRabbit round 6 on PR #351.
+                                state.audio_sink_offline = true;
                                 tracing::warn!("audio sink restart failed: {e}");
                                 if is_network {
                                     let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
@@ -1430,14 +1433,27 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
 }
 
 /// Stop the source and release resources.
-fn cleanup(state: &mut DspState) {
+fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     if let Some(source) = &mut state.source {
         let _ = source.stop();
     }
 
+    // Snapshot whether the network sink was active BEFORE we
+    // stop it so the post-stop status emit reports the right
+    // discriminant. Centralized here (rather than at each
+    // caller) so file-EOF, fatal-source-error, and source-type
+    // restart paths all emit the matching `Inactive` event
+    // alongside the explicit `UiToDsp::Stop` path. Per
+    // `CodeRabbit` round 6 on PR #351.
+    let was_network_sink = matches!(state.audio_sink_type, AudioSinkType::Network);
+
     // Stop the audio sink so it doesn't try to read stale data.
     if let Err(e) = state.audio_sink.stop() {
         tracing::debug!("audio sink stop: {e}");
+    }
+
+    if was_network_sink {
+        let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
     }
 
     // Finalize any active recordings (Drop patches the WAV header sizes).
@@ -1538,7 +1554,7 @@ fn process_iq_block(
             // File sources return Ok(0) at EOF — stop playback cleanly
             if state.source_type == SourceType::File {
                 tracing::info!("file source reached EOF");
-                cleanup(state);
+                cleanup(state, dsp_tx);
                 state.running = false;
                 let _ = dsp_tx.send(DspToUi::SourceStopped);
             }
@@ -1588,7 +1604,7 @@ fn process_iq_block(
                 sdr_types::SourceError::ReadFailed(_) | sdr_types::SourceError::NotRunning
             ) {
                 tracing::error!("fatal source error: {e}");
-                cleanup(state);
+                cleanup(state, dsp_tx);
                 state.running = false;
                 let _ = dsp_tx.send(DspToUi::Error(format!("Source error: {e}")));
                 let _ = dsp_tx.send(DspToUi::SourceStopped);
