@@ -278,9 +278,63 @@ pub unsafe extern "C" fn sdr_core_set_gain(handle: *mut SdrCore, gain_db: f64) -
 }
 
 /// Enable or disable tuner AGC.
+///
+/// Legacy two-state setter preserved for backward-compat with
+/// hosts that don't need the tristate selector. Only touches the
+/// hardware (tuner) AGC; does NOT turn off software AGC. Modern
+/// hosts should use `sdr_core_set_agc_type` which dispatches both
+/// loops atomically according to the requested type. Per issue
+/// #357.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_set_agc(handle: *mut SdrCore, enabled: bool) -> i32 {
     unsafe { with_core(handle, |core| send(core, UiToDsp::SetAgc(enabled))) }
+}
+
+// --- AGC type selector (#357, ABI 0.13) -------------------
+//
+// Discriminants mirror `SdrAgcType` in `include/sdr_core.h`.
+// Reordering would silently break ABI — add new variants at the
+// end with a minor version bump.
+
+/// AGC Off — both hardware (tuner) and software IF loops
+/// disabled. Gain slider controls the tuner gain directly.
+pub const SDR_AGC_OFF: i32 = 0;
+/// AGC Hardware — tuner's internal AGC loop on, software IF
+/// AGC off. The RTL2832 sets gain automatically in hardware.
+pub const SDR_AGC_HARDWARE: i32 = 1;
+/// AGC Software — software IF AGC on (engine-side post-IQ
+/// AGC), hardware tuner AGC off. Gives finer control than
+/// hardware at the cost of CPU. Default on fresh installs.
+pub const SDR_AGC_SOFTWARE: i32 = 2;
+
+/// Set the active AGC type. Dispatches both the hardware
+/// (`UiToDsp::SetAgc`) and software (`UiToDsp::SetSoftwareAgc`)
+/// variants in one call — the two loops are mutually exclusive
+/// at the UI policy layer but independent at the DSP layer, so
+/// the FFI enforces the policy by always issuing both commands.
+///
+/// Accepts `SDR_AGC_OFF` / `SDR_AGC_HARDWARE` / `SDR_AGC_SOFTWARE`;
+/// any other value returns `SDR_CORE_ERR_INVALID_ARG`. Per
+/// issue #357 (ABI 0.13).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_agc_type(handle: *mut SdrCore, agc_type: i32) -> i32 {
+    unsafe {
+        with_core(handle, |core| match agc_type {
+            SDR_AGC_OFF => send(core, UiToDsp::SetAgc(false))
+                .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false))),
+            SDR_AGC_HARDWARE => send(core, UiToDsp::SetAgc(true))
+                .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false))),
+            SDR_AGC_SOFTWARE => send(core, UiToDsp::SetAgc(false))
+                .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(true))),
+            _ => {
+                set_last_error(format!(
+                    "sdr_core_set_agc_type: invalid type {agc_type} \
+                     (expected {SDR_AGC_OFF}..={SDR_AGC_SOFTWARE})"
+                ));
+                Err(SdrCoreError::InvalidArg)
+            }
+        })
+    }
 }
 
 // ============================================================
@@ -797,6 +851,24 @@ pub unsafe extern "C" fn sdr_core_set_file_path(
             send(core, UiToDsp::SetFilePath(std::path::PathBuf::from(path)))
         })
     }
+}
+
+/// Toggle loop-on-EOF for the file playback source. When
+/// `looping` is `true` the source rewinds to the start of the
+/// WAV file on EOF and keeps streaming; when `false` the source
+/// stops at EOF.
+///
+/// Applies both to the running source (effective from the next
+/// EOF onward) and to future source rebuilds — the engine keeps
+/// the latest value on its state so a source-type switch or
+/// file-path change doesn't reset to the constructor default.
+///
+/// No-op when the active source isn't `SDR_SOURCE_FILE`; the
+/// trait's default `set_looping` impl silently accepts. Per
+/// issue #236 (ABI 0.13).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_file_looping(handle: *mut SdrCore, looping: bool) -> i32 {
+    unsafe { with_core(handle, |core| send(core, UiToDsp::SetFileLooping(looping))) }
 }
 
 // ============================================================
@@ -1987,6 +2059,67 @@ mod tests {
             SdrCoreError::InvalidArg.as_int()
         );
         destroy(h);
+    }
+
+    #[test]
+    fn set_file_looping_round_trips() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_file_looping(h, true) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_file_looping(h, false) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_file_looping_rejects_null_handle() {
+        assert_eq!(
+            unsafe { sdr_core_set_file_looping(std::ptr::null_mut(), true) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+    }
+
+    // ------------------------------------------------------
+    //  AGC type selector (#357, ABI 0.13)
+    // ------------------------------------------------------
+
+    #[test]
+    fn set_agc_type_accepts_valid_variants() {
+        let h = make_handle();
+        for t in [SDR_AGC_OFF, SDR_AGC_HARDWARE, SDR_AGC_SOFTWARE] {
+            assert_eq!(
+                unsafe { sdr_core_set_agc_type(h, t) },
+                SdrCoreError::Ok.as_int(),
+                "AGC type {t} should be accepted"
+            );
+        }
+        destroy(h);
+    }
+
+    #[test]
+    fn set_agc_type_rejects_out_of_range() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_agc_type(h, SDR_AGC_SOFTWARE + 1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_agc_type(h, SDR_AGC_OFF - 1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_agc_type_rejects_null_handle() {
+        assert_eq!(
+            unsafe { sdr_core_set_agc_type(std::ptr::null_mut(), SDR_AGC_OFF) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
     }
 
     // ------------------------------------------------------

@@ -213,6 +213,11 @@ pub enum UiToDsp {
     },
     /// Set the file path for file source playback.
     SetFilePath(std::path::PathBuf),
+    /// Toggle loop-on-EOF for the file playback source. `true`
+    /// rewinds to the start of the file on EOF and keeps
+    /// streaming; `false` stops the source at EOF. No-op when
+    /// the active source isn't `.file`. Per issue #236.
+    SetFileLooping(bool),
     /// Set PPM frequency correction for RTL-SDR crystal offset.
     SetPpmCorrection(i32),
     // ------------------------------------------------------

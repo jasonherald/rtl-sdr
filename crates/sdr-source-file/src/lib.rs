@@ -225,6 +225,15 @@ impl Source for FileSource {
     fn read_samples(&mut self, output: &mut [Complex]) -> Result<usize, SourceError> {
         self.read_samples_impl(output)
     }
+
+    /// Override the trait's no-op default — route through the
+    /// inherent `set_looping` setter (line 71) so the read loop
+    /// honors the new value from the next EOF onward. Per issue
+    /// #236.
+    fn set_looping(&mut self, looping: bool) -> Result<(), SourceError> {
+        self.set_looping(looping);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

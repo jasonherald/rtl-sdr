@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 12
+#define SDR_CORE_ABI_VERSION_MINOR 13
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -346,7 +346,42 @@ int32_t sdr_core_set_ppm_correction(SdrCore* handle, int32_t ppm);
 /* --- Tuner gain --------------------------------------------------- */
 
 int32_t sdr_core_set_gain(SdrCore* handle, double gain_db);
+
+/*
+ * Legacy two-state AGC setter (retained for ABI compat). Only
+ * touches the hardware (tuner) AGC; does NOT turn off software
+ * AGC. Modern hosts should use `sdr_core_set_agc_type` below
+ * which dispatches both loops atomically.
+ */
 int32_t sdr_core_set_agc(SdrCore* handle, bool enabled);
+
+/* --- AGC type selector (issue #357, ABI 0.13) -------------- */
+/*
+ * Three-state AGC selector mirroring `UiToDsp::SetAgc` +
+ * `UiToDsp::SetSoftwareAgc` on the engine side. The two loops
+ * are mutually exclusive at the UI policy layer but independent
+ * at the DSP layer, so this FFI dispatches BOTH commands based
+ * on the requested type and leaves the engine in a consistent
+ * single-loop-on state.
+ *
+ * Stable discriminants — never reorder. Add new variants at the
+ * end with a minor ABI bump.
+ */
+typedef enum SdrAgcType {
+    /* Both loops disabled — gain slider controls tuner directly. */
+    SDR_AGC_OFF      = 0,
+    /* Hardware (tuner) AGC on, software IF AGC off. */
+    SDR_AGC_HARDWARE = 1,
+    /* Software IF AGC on, hardware tuner AGC off. Default on
+     * fresh installs — sidesteps tuner AGC's pumping behavior. */
+    SDR_AGC_SOFTWARE = 2,
+} SdrAgcType;
+
+/*
+ * Set the active AGC type. Any value outside `SDR_AGC_*`
+ * returns `SDR_CORE_ERR_INVALID_ARG`.
+ */
+int32_t sdr_core_set_agc_type(SdrCore* handle, int32_t agc_type);
 
 /* --- Demodulation ------------------------------------------------- */
 
@@ -576,6 +611,22 @@ int32_t sdr_core_set_network_config(
  * when the source actually starts.
  */
 int32_t sdr_core_set_file_path(SdrCore* handle, const char* path_utf8);
+
+/*
+ * Toggle loop-on-EOF for the file playback source (issue #236,
+ * ABI 0.13). When `looping` is `true` the source rewinds to the
+ * start of the WAV file on EOF and keeps streaming; when
+ * `false` it stops at EOF.
+ *
+ * Applies both to the running source (effective from the next
+ * EOF onward) and to future source rebuilds — the engine keeps
+ * the latest value on its state so a source-type switch or
+ * file-path change doesn't reset to the constructor default.
+ *
+ * No-op when the active source isn't `SDR_SOURCE_FILE` — the
+ * `Source` trait's default `set_looping` impl silently accepts.
+ */
+int32_t sdr_core_set_file_looping(SdrCore* handle, bool looping);
 
 /* --- rtl_tcp-specific client commands (issue #325, ABI 0.11) --- */
 /*
