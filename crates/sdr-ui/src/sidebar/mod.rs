@@ -2,9 +2,12 @@
 //!
 //! The transcript panel lives in a separate right-side revealer, not here.
 
+use std::rc::Rc;
+
 use gtk4::prelude::*;
 
 pub mod audio_panel;
+pub mod bookmarks_panel;
 pub mod display_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
@@ -13,6 +16,7 @@ pub mod source_panel;
 pub mod transcript_panel;
 
 pub use audio_panel::{AudioPanel, build_audio_panel};
+pub use bookmarks_panel::{BookmarksPanel, build_bookmarks_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
@@ -35,8 +39,21 @@ pub struct SidebarPanels {
     pub radio: RadioPanel,
     /// Display / spectrum settings.
     pub display: DisplayPanel,
-    /// Navigation — band presets and bookmarks.
+    /// Navigation — band presets and the left-sidebar bookmark
+    /// quick-add (name entry + Add button). The full bookmark
+    /// list lives in [`bookmarks`](Self::bookmarks).
     pub navigation: NavigationPanel,
+    /// Right-side bookmarks flyout — owns the bookmark list,
+    /// backing store, and row-action callbacks. Toggled via
+    /// the header bookmark button / `Ctrl+B`.
+    ///
+    /// Wrapped in `Rc` so long-lived GTK closures (RR import,
+    /// Add button, Save button) can capture a clone and call
+    /// [`BookmarksPanel::rebuild`] without hand-threading each
+    /// internal `Rc` field. The Save closure uses `Rc::downgrade`
+    /// to break the otherwise-cyclic `on_save → stored closure`
+    /// reference chain.
+    pub bookmarks: Rc<BookmarksPanel>,
     /// Share-over-network (`rtl_tcp` server) controls. Hidden by
     /// default; `window.rs` reveals it when a local RTL-SDR dongle
     /// is plugged in and not currently the active source.
@@ -47,6 +64,8 @@ pub struct SidebarPanels {
 ///
 /// Returns both the scroll widget (for embedding in the split view) and the
 /// `SidebarPanels` struct (for DSP bridge signal wiring — see issue #92).
+/// The returned `SidebarPanels::bookmarks` is the right-side flyout widget;
+/// `window.rs` packs it into the bookmarks revealer.
 pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let source = build_source_panel();
     let server = build_server_panel();
@@ -54,6 +73,20 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let radio = build_radio_panel();
     let display = build_display_panel();
     let navigation = build_navigation_panel();
+    // Flyout is built after navigation because it borrows the
+    // left-sidebar `name_entry` — its row actions (recall,
+    // delete-of-active) sync the entry field.
+    let bookmarks = build_bookmarks_panel(&navigation.name_entry);
+    // Preset selection clears the active-bookmark highlight and
+    // rebuilds the flyout list. Wiring lives outside
+    // `build_navigation_panel` because it closes over state owned
+    // by the flyout. Done before the `Rc` wrap below so the
+    // preset handler keeps capturing individual `Rc` fields by
+    // clone — wiring it through an `Rc<BookmarksPanel>` would
+    // add an unnecessary upgrade dance on every preset click.
+    navigation_panel::connect_preset_to_bookmarks(&navigation, &bookmarks);
+    let bookmarks = Rc::new(bookmarks);
+
     let sidebar_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(SIDEBAR_SPACING)
@@ -85,6 +118,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         radio,
         display,
         navigation,
+        bookmarks,
         server,
     };
 

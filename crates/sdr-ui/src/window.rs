@@ -44,6 +44,13 @@ const DEFAULT_HEIGHT: i32 = 800;
 /// Sidebar collapse breakpoint width in pixels.
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
+/// Slide-in/out duration for right-side flyouts (transcript,
+/// bookmarks) in milliseconds. Centralized so the two
+/// revealers stay in lockstep — drifting values would make
+/// one panel feel snappier than the other when the user
+/// toggles between them.
+const RIGHT_FLYOUT_TRANSITION_MS: u32 = 200;
+
 /// FFT sizes — re-exported from display panel (single source of truth).
 use crate::sidebar::display_panel::FFT_SIZES;
 #[cfg(feature = "sherpa")]
@@ -115,6 +122,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar,
         transcript_panel,
         transcript_revealer,
+        bookmarks_revealer,
     ) = build_split_view(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&split_view);
@@ -128,6 +136,50 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         favorites_handle,
     ) = build_header_bar(&sidebar_toggle, &state);
 
+    // Bookmarks flyout toggle — packed `pack_end` first so it
+    // ends up LEFT of the transcript toggle in the header's
+    // right cluster. `pack_end` stacks right-to-left, so the
+    // last `pack_end` call sits furthest from the right edge.
+    // Keeping bookmarks near the far edge matches the visual
+    // mapping "click the icon → panel slides in from directly
+    // under it on the right."
+    let bookmarks_toggle = gtk4::ToggleButton::builder()
+        .icon_name("user-bookmarks-symbolic")
+        .tooltip_text("Toggle bookmarks panel (Ctrl+B)")
+        .build();
+    // `tooltip_text` alone isn't reliably announced by screen
+    // readers — set the accessible label explicitly, matching
+    // the pattern used for the other icon-only controls in this
+    // file (pinned servers menu, copy server address, etc.).
+    bookmarks_toggle
+        .update_property(&[gtk4::accessible::Property::Label("Toggle bookmarks panel")]);
+    header.pack_end(&bookmarks_toggle);
+
+    // Restore the flyout open/closed state saved at last shutdown.
+    // Set the toggle's `active` property before wiring the handler
+    // so the initial `set_active` doesn't feed a no-op write back
+    // through `connect_toggled` — `connect_toggled` fires only on
+    // changes, but explicitly wiring the handler after the initial
+    // state is set keeps the "saved state → initial reveal" path
+    // free of config round-trips.
+    let bookmarks_initial_open = config.read(|v| {
+        v.get(sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
+    bookmarks_toggle.set_active(bookmarks_initial_open);
+    bookmarks_revealer.set_reveal_child(bookmarks_initial_open);
+
+    let bookmarks_revealer_clone = bookmarks_revealer.clone();
+    let bookmarks_config = std::sync::Arc::clone(config);
+    bookmarks_toggle.connect_toggled(move |btn| {
+        let open = btn.is_active();
+        bookmarks_revealer_clone.set_reveal_child(open);
+        bookmarks_config.write(|v| {
+            v[sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN] = serde_json::json!(open);
+        });
+    });
+
     // Transcript toggle button in header bar.
     let transcript_button = gtk4::ToggleButton::builder()
         .icon_name("document-page-setup-symbolic")
@@ -138,6 +190,36 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let revealer_clone = transcript_revealer.clone();
     transcript_button.connect_toggled(move |btn| {
         revealer_clone.set_reveal_child(btn.is_active());
+    });
+
+    // Mutual exclusion between the two right-side flyouts —
+    // opening one closes the other so the content area doesn't
+    // end up with both panels stacked. Each toggle's mutex
+    // handler is added AFTER its primary handler (which does the
+    // reveal + config write), so on activation the primary fires
+    // first and the mutex then deactivates the sibling toggle;
+    // the sibling's primary handler in turn hides its revealer.
+    // `set_active(false)` on an already-inactive toggle is a
+    // no-op (GTK suppresses the `toggled` signal when the state
+    // doesn't change), so closing either panel manually doesn't
+    // cascade.
+    let transcript_btn_weak = transcript_button.downgrade();
+    bookmarks_toggle.connect_toggled(move |btn| {
+        if btn.is_active()
+            && let Some(other) = transcript_btn_weak.upgrade()
+            && other.is_active()
+        {
+            other.set_active(false);
+        }
+    });
+    let bookmarks_toggle_weak = bookmarks_toggle.downgrade();
+    transcript_button.connect_toggled(move |btn| {
+        if btn.is_active()
+            && let Some(other) = bookmarks_toggle_weak.upgrade()
+            && other.is_active()
+        {
+            other.set_active(false);
+        }
     });
 
     let toolbar_view = build_toolbar_view(&header, &split_view);
@@ -186,7 +268,13 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     });
 
     // --- Keyboard shortcuts ---
-    shortcuts::setup_shortcuts(&window, &play_button, &sidebar_toggle, &demod_dropdown);
+    shortcuts::setup_shortcuts(
+        &window,
+        &play_button,
+        &sidebar_toggle,
+        &bookmarks_toggle,
+        &demod_dropdown,
+    );
 
     // Ctrl+? shows keyboard shortcuts dialog.
     let window_for_shortcuts = window.downgrade();
@@ -242,35 +330,21 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 
     // Wire RadioReference browse button.
     {
-        let bm_list = panels.navigation.bookmark_list.clone();
-        let bm_scroll = panels.navigation.bookmark_scroll.clone();
-        let bm_rc = panels.navigation.bookmarks.clone();
-        let on_nav = panels.navigation.on_navigate.clone();
-        let active_bm = panels.navigation.active_bookmark.clone();
-        let name_entry = panels.navigation.name_entry.clone();
-        let on_save = panels.navigation.on_save.clone();
+        let bookmarks_for_rr = Rc::clone(&panels.bookmarks);
+        let name_entry_for_rr = panels.navigation.name_entry.clone();
 
         rr_button.connect_clicked(move |btn| {
-            let bm_list = bm_list.clone();
-            let bm_scroll = bm_scroll.clone();
-            let bm_rc = bm_rc.clone();
-            let on_nav = on_nav.clone();
-            let active_bm = active_bm.clone();
-            let name_entry = name_entry.clone();
-            let on_save = on_save.clone();
+            let bookmarks_for_rr = Rc::clone(&bookmarks_for_rr);
+            let name_entry_for_rr = name_entry_for_rr.clone();
 
             crate::radioreference::show_browse_dialog(btn, move || {
-                // Reload bookmarks from disk and rebuild the sidebar list.
-                *bm_rc.borrow_mut() = sidebar::navigation_panel::load_bookmarks();
-                sidebar::navigation_panel::rebuild_bookmark_list(
-                    &bm_list,
-                    &bm_scroll,
-                    &bm_rc,
-                    &on_nav,
-                    &active_bm,
-                    &name_entry,
-                    &on_save,
-                );
+                // Reload bookmarks from disk and rebuild the flyout.
+                // `BookmarksPanel::rebuild` keeps this call site on
+                // the panel boundary rather than reaching through
+                // the panel's individual `Rc` fields.
+                *bookmarks_for_rr.bookmarks.borrow_mut() =
+                    sidebar::navigation_panel::load_bookmarks();
+                bookmarks_for_rr.rebuild(&name_entry_for_rr);
             });
         });
     }
@@ -725,6 +799,10 @@ fn apply_rtl_tcp_connection_state(
 /// and status bar.
 ///
 /// Returns the split view, sidebar panels, spectrum display handle, and status bar.
+#[allow(
+    clippy::type_complexity,
+    reason = "splitting into a struct would trade one named return for one named struct whose fields are used exactly once by the caller — net neutral for readability, net negative for locality of widget construction"
+)]
 fn build_split_view(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -734,6 +812,7 @@ fn build_split_view(
     spectrum::SpectrumHandle,
     StatusBar,
     sidebar::transcript_panel::TranscriptPanel,
+    gtk4::Revealer,
     gtk4::Revealer,
 ) {
     // Sidebar — configuration panels.
@@ -774,18 +853,43 @@ fn build_split_view(
 
     let transcript_revealer = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .transition_duration(200)
+        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
         .reveal_child(false)
         .child(&transcript_scroll)
         .hexpand(false)
         .build();
 
-    // Wrap content + transcript revealer in an HBox.
+    // Bookmarks flyout — slides out from the right, outermost of
+    // the two right-side panels so the header `Ctrl+B` toggle
+    // reveals an unambiguously right-edge element. Shares the
+    // `SlideLeft` + `RIGHT_FLYOUT_TRANSITION_MS` transition with
+    // the transcript revealer for visual consistency when either
+    // panel opens.
+    //
+    // The flyout widget is built by `build_sidebar` (so it can
+    // share state with the left-sidebar `NavigationPanel`) and
+    // returned on `panels.bookmarks`; here we just pack it into
+    // the revealer. The panel widget already contains its own
+    // vertical scroll for the bookmark list, so no outer scroll
+    // wrap is needed.
+    let bookmarks_revealer = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
+        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
+        .reveal_child(false)
+        .child(&panels.bookmarks.widget)
+        .hexpand(false)
+        .build();
+
+    // Wrap content + both side revealers in an HBox. Bookmarks
+    // sits rightmost so the header-bar bookmark icon (which is
+    // itself at the far right of the header via `pack_end`) maps
+    // visually to the panel that appears when the user clicks it.
     let content_with_transcript = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
     content_with_transcript.append(&content_box);
     content_with_transcript.append(&transcript_revealer);
+    content_with_transcript.append(&bookmarks_revealer);
 
     let split_view = adw::OverlaySplitView::builder()
         .sidebar(&sidebar_scroll)
@@ -800,6 +904,7 @@ fn build_split_view(
         status_bar,
         transcript_panel,
         transcript_revealer,
+        bookmarks_revealer,
     )
 }
 
@@ -4371,7 +4476,7 @@ fn connect_navigation_panel(
     let source_nav_gain = panels.source.gain_row.clone();
     let source_nav_agc = panels.source.agc_row.clone();
 
-    panels.navigation.connect_navigate(move |bookmark| {
+    panels.bookmarks.connect_navigate(move |bookmark| {
         let freq = bookmark.frequency;
         let mode = sidebar::navigation_panel::parse_demod_mode(&bookmark.demod_mode);
         let bw = bookmark.bandwidth;
@@ -4431,12 +4536,8 @@ fn connect_navigation_panel(
     let source_gain_bm = panels.source.gain_row.clone();
     let source_agc_bm = panels.source.agc_row.clone();
     let nav = &panels.navigation;
-    let bm_rc = nav.bookmarks.clone();
-    let bm_list = nav.bookmark_list.clone();
-    let bm_scroll = nav.bookmark_scroll.clone();
-    let on_nav = nav.on_navigate.clone();
-    let active_bm = nav.active_bookmark.clone();
-    let on_save_bm = nav.on_save.clone();
+    let bm = &panels.bookmarks;
+    let bm_for_add = Rc::clone(bm);
     let name_entry = nav.name_entry.clone();
 
     nav.add_button.connect_clicked(move |_| {
@@ -4487,27 +4588,19 @@ fn connect_navigation_panel(
         };
         let bookmark =
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
-        bm_rc.borrow_mut().push(bookmark);
-        sidebar::navigation_panel::save_bookmarks(&bm_rc.borrow());
-        sidebar::navigation_panel::rebuild_bookmark_list(
-            &bm_list,
-            &bm_scroll,
-            &bm_rc,
-            &on_nav,
-            &active_bm,
-            &name_entry,
-            &on_save_bm,
-        );
+        bm_for_add.bookmarks.borrow_mut().push(bookmark);
+        sidebar::navigation_panel::save_bookmarks(&bm_for_add.bookmarks.borrow());
+        bm_for_add.rebuild(&name_entry);
         name_entry.set_text("");
     });
 
     // Save button — update the active bookmark with current settings.
-    let save_bm_rc = nav.bookmarks.clone();
-    let save_active = nav.active_bookmark.clone();
-    let save_bm_list = nav.bookmark_list.clone();
-    let save_bm_scroll = nav.bookmark_scroll.clone();
-    let save_on_nav = nav.on_navigate.clone();
-    let save_on_save = nav.on_save.clone();
+    // Capture the bookmarks panel via `Weak` so the stored closure
+    // doesn't keep the panel alive: the closure lives inside
+    // `panel.on_save`, and cloning `Rc<BookmarksPanel>` into it
+    // would form a cycle (panel → on_save → closure → panel)
+    // that prevents the panel from dropping on window teardown.
+    let save_bm_weak = std::rc::Rc::downgrade(bm);
     let save_name_entry = nav.name_entry.clone();
     let save_state = Rc::clone(state);
     let save_radio_bw = panels.radio.bandwidth_row.clone();
@@ -4525,8 +4618,17 @@ fn connect_navigation_panel(
     let save_radio_voice_squelch_threshold = panels.radio.voice_squelch_threshold_row.clone();
     let save_source_gain = panels.source.gain_row.clone();
     let save_source_agc = panels.source.agc_row.clone();
-    nav.connect_save(move || {
-        let active = save_active.borrow().clone();
+    bm.connect_save(move || {
+        // `save_bm_weak` is the ONLY reference this closure holds
+        // to the panel. Upgrading on entry gives us a live handle
+        // for the duration of the save; dropping it at the end of
+        // the call lets the panel drop cleanly on teardown even
+        // though the closure itself is stored inside
+        // `panel.on_save`.
+        let Some(save_bm) = save_bm_weak.upgrade() else {
+            return;
+        };
+        let active = save_bm.active_bookmark.borrow().clone();
         if active.name.is_empty() && active.frequency == 0 {
             return; // No active bookmark to save.
         }
@@ -4569,7 +4671,7 @@ fn connect_navigation_panel(
             }),
         };
         // Find and update the active bookmark in the list.
-        let mut bms = save_bm_rc.borrow_mut();
+        let mut bms = save_bm.bookmarks.borrow_mut();
         if let Some(bm) = bms
             .iter_mut()
             .find(|b| b.name == active.name && b.frequency == active.frequency)
@@ -4603,7 +4705,7 @@ fn connect_navigation_panel(
             bm.ctcss_threshold = profile.ctcss_threshold;
             bm.voice_squelch_mode = profile.voice_squelch_mode;
             // Keep ActiveBookmark in sync with the updated frequency.
-            *save_active.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
+            *save_bm.active_bookmark.borrow_mut() = sidebar::navigation_panel::ActiveBookmark {
                 name: active.name.clone(),
                 frequency: freq_u64,
             };
@@ -4611,15 +4713,7 @@ fn connect_navigation_panel(
         sidebar::navigation_panel::save_bookmarks(&bms);
         drop(bms);
         // Rebuild to update subtitle.
-        sidebar::navigation_panel::rebuild_bookmark_list(
-            &save_bm_list,
-            &save_bm_scroll,
-            &save_bm_rc,
-            &save_on_nav,
-            &save_active,
-            &save_name_entry,
-            &save_on_save,
-        );
+        save_bm.rebuild(&save_name_entry);
         tracing::info!("bookmark saved: {}", active.name);
     });
 }
