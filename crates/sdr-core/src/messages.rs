@@ -141,8 +141,20 @@ pub enum UiToDsp {
     SetFmIfNrEnabled(bool),
     /// Set the RTL-SDR tuner gain (dB). Converted to tenths internally.
     SetGain(f64),
-    /// Enable or disable RTL-SDR AGC.
+    /// Enable or disable the RTL-SDR **hardware** tuner AGC
+    /// (tuner's internal VGA switches to AGC mode). Mutually
+    /// exclusive with the software AGC path via the UI selector
+    /// shipping in #356 / #357 — not at the DSP layer, though,
+    /// since in principle both could run simultaneously (the
+    /// tuner-side AGC would normalize the RF level and the
+    /// software AGC would further refine on the IQ side). The
+    /// UI mutex is the policy layer.
     SetAgc(bool),
+    /// Enable or disable the **software** IF AGC — a pure-DSP
+    /// envelope follower on the IQ stream inside `IfChain`. Well-
+    /// behaved alternative to the tuner's hardware AGC for the
+    /// strong-signal distortion case documented in #332 / #354.
+    SetSoftwareAgc(bool),
     /// Enable or disable IQ correction.
     SetIqCorrection(bool),
     /// Set the FFT window function.
@@ -463,6 +475,14 @@ mod tests {
 
         let agc = UiToDsp::SetAgc(true);
         assert!(matches!(agc, UiToDsp::SetAgc(true)));
+
+        // Software AGC runs alongside hardware AGC — the UI
+        // selector (#356 / #357) mutually excludes them, but
+        // the engine-side messages are independent.
+        let sw_agc_on = UiToDsp::SetSoftwareAgc(true);
+        assert!(matches!(sw_agc_on, UiToDsp::SetSoftwareAgc(true)));
+        let sw_agc_off = UiToDsp::SetSoftwareAgc(false);
+        assert!(matches!(sw_agc_off, UiToDsp::SetSoftwareAgc(false)));
 
         let iq_corr = UiToDsp::SetIqCorrection(false);
         assert!(matches!(iq_corr, UiToDsp::SetIqCorrection(false)));
