@@ -526,6 +526,107 @@ pub unsafe extern "C" fn sdr_core_set_audio_device(
     }
 }
 
+// ============================================================
+//  Audio sink selection (#247) — switch between local audio
+//  device and network stream, configure the network endpoint.
+//
+//  Discriminants below mirror the matching `Sdr*` enums in
+//  `include/sdr_core.h`. Reordering would silently break ABI.
+// ============================================================
+
+pub const SDR_AUDIO_SINK_LOCAL: i32 = 0;
+pub const SDR_AUDIO_SINK_NETWORK: i32 = 1;
+
+fn audio_sink_type_from_c(v: i32) -> Option<sdr_core::AudioSinkType> {
+    match v {
+        SDR_AUDIO_SINK_LOCAL => Some(sdr_core::AudioSinkType::Local),
+        SDR_AUDIO_SINK_NETWORK => Some(sdr_core::AudioSinkType::Network),
+        _ => None,
+    }
+}
+
+fn protocol_from_c(v: i32) -> Option<sdr_types::Protocol> {
+    match v {
+        crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER => Some(sdr_types::Protocol::TcpClient),
+        crate::event::SDR_NETWORK_PROTOCOL_UDP => Some(sdr_types::Protocol::Udp),
+        _ => None,
+    }
+}
+
+/// Switch between the local audio device sink and the network
+/// stream sink. `sink_type` must be one of `SDR_AUDIO_SINK_*`.
+/// The engine stops the current sink, builds the replacement
+/// from the persisted device / network config, and restarts it
+/// if the engine is currently running. Returns `SDR_CORE_OK` on
+/// success or `SDR_CORE_ERR_INVALID_ARG` for an unknown
+/// `sink_type` value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_audio_sink_type(handle: *mut SdrCore, sink_type: i32) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let Some(t) = audio_sink_type_from_c(sink_type) else {
+                set_last_error(format!(
+                    "sdr_core_set_audio_sink_type: unknown sink_type {sink_type}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            };
+            send(core, UiToDsp::SetAudioSinkType(t))
+        })
+    }
+}
+
+/// Configure the network audio sink endpoint. `hostname_utf8`
+/// must be a non-null NUL-terminated UTF-8 C string. `protocol`
+/// must be one of `SDR_NETWORK_PROTOCOL_*`. The engine stores
+/// the config; if the network sink is currently active the
+/// underlying `NetworkSink` is rebuilt inline so the new
+/// endpoint takes effect immediately.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_network_sink_config(
+    handle: *mut SdrCore,
+    hostname_utf8: *const c_char,
+    port: u16,
+    protocol: i32,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let hostname = cstr_to_string("sdr_core_set_network_sink_config", hostname_utf8)?;
+            if hostname.is_empty() {
+                set_last_error("sdr_core_set_network_sink_config: hostname is empty");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            // Port 0 has no useful meaning here: UDP would
+            // silently drop packets to a bogus destination, and
+            // TCP server mode would bind a random ephemeral
+            // port the host can't discover. The Swift UI
+            // already constrains the picker to 1..=65535, but
+            // non-Swift hosts and direct FFI callers go through
+            // this path too — reject at the boundary.
+            // Per `CodeRabbit` round 2 on PR #352.
+            if port == 0 {
+                set_last_error(
+                    "sdr_core_set_network_sink_config: port must be in 1..=65535, got 0",
+                );
+                return Err(SdrCoreError::InvalidArg);
+            }
+            let Some(proto) = protocol_from_c(protocol) else {
+                set_last_error(format!(
+                    "sdr_core_set_network_sink_config: unknown protocol {protocol}"
+                ));
+                return Err(SdrCoreError::InvalidArg);
+            };
+            send(
+                core,
+                UiToDsp::SetNetworkSinkConfig {
+                    hostname,
+                    port,
+                    protocol: proto,
+                },
+            )
+        })
+    }
+}
+
 /// Shared helper for the two `start_*_recording` commands. Validates
 /// `path_utf8` (non-null, UTF-8, non-empty) and dispatches the
 /// appropriate `UiToDsp` variant via `build_cmd`. Keeps the path
@@ -739,6 +840,31 @@ mod tests {
     /// test suite stays fast; large enough to comfortably cover
     /// the mpsc hop plus file-close syscall on any CI host.
     const RECORDING_FLUSH_WAIT_MS: u64 = 50;
+
+    /// Loopback host string reused across the network-sink
+    /// setter tests. Plain IPv4 loopback avoids any resolver
+    /// step so the tests don't depend on `/etc/hosts` entries
+    /// or DNS availability on the CI host.
+    const TEST_NETWORK_HOST_LOOPBACK: &str = "127.0.0.1";
+
+    /// Default port the network-sink defaults advertise (see
+    /// `sdr_core::sink_slot::DEFAULT_NETWORK_SINK_PORT`). Used
+    /// in the TCP-path happy case. Named so a future default
+    /// change flows through the tests.
+    const TEST_NETWORK_PORT_TCP: u16 = 1234;
+
+    /// A second distinct port for the UDP-path happy case —
+    /// keeps the two setter tests exercising different values
+    /// so a silently-ignored parameter won't pass both by
+    /// coincidence.
+    const TEST_NETWORK_PORT_UDP: u16 = 9000;
+
+    /// Smallest legal UDP / TCP port (port 0 is reserved at
+    /// the ABI boundary — see the zero-port rejection test).
+    /// Named so the "minimum accepted" assertion expresses
+    /// intent instead of using a bare `1`. Per `CodeRabbit`
+    /// round 3 on PR #352.
+    const TEST_NETWORK_MIN_VALID_PORT: u16 = 1;
 
     /// Minimum size of a well-formed empty WAV file: the 44-byte
     /// header `WavWriter::new` writes before any samples arrive
@@ -1259,6 +1385,182 @@ mod tests {
             );
         }
         destroy(h);
+    }
+
+    // ------------------------------------------------------
+    //  Audio sink selection (#247, ABI 0.9)
+    // ------------------------------------------------------
+
+    #[test]
+    fn set_audio_sink_type_accepts_both_variants() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, SDR_AUDIO_SINK_LOCAL) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, SDR_AUDIO_SINK_NETWORK) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_audio_sink_type_rejects_out_of_range_value() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, 99) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_audio_sink_type(h, -1) },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_accepts_valid_input() {
+        let h = make_handle();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    TEST_NETWORK_PORT_TCP,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    TEST_NETWORK_PORT_UDP,
+                    crate::event::SDR_NETWORK_PROTOCOL_UDP,
+                )
+            },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_null_hostname() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    std::ptr::null(),
+                    TEST_NETWORK_PORT_TCP,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_empty_hostname() {
+        let h = make_handle();
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    empty.as_ptr(),
+                    TEST_NETWORK_PORT_TCP,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_zero_port() {
+        // Port 0 is rejected at the ABI boundary — UDP would
+        // silently drop to a bogus destination and TCP server
+        // mode would bind an undiscoverable ephemeral port.
+        // Per `CodeRabbit` round 2 on PR #352.
+        let h = make_handle();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    0,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        // And accepts the minimum legal port as a boundary check.
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    TEST_NETWORK_MIN_VALID_PORT,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_out_of_range_protocol() {
+        let h = make_handle();
+        let host = CString::new(TEST_NETWORK_HOST_LOOPBACK).unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(h, host.as_ptr(), TEST_NETWORK_PORT_TCP, 99)
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(h, host.as_ptr(), TEST_NETWORK_PORT_TCP, -1)
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn audio_sink_type_from_c_covers_all_variants() {
+        assert_eq!(
+            audio_sink_type_from_c(SDR_AUDIO_SINK_LOCAL),
+            Some(sdr_core::AudioSinkType::Local)
+        );
+        assert_eq!(
+            audio_sink_type_from_c(SDR_AUDIO_SINK_NETWORK),
+            Some(sdr_core::AudioSinkType::Network)
+        );
+        assert_eq!(audio_sink_type_from_c(99), None);
+        assert_eq!(audio_sink_type_from_c(-1), None);
+    }
+
+    #[test]
+    fn protocol_from_c_covers_all_variants() {
+        assert_eq!(
+            protocol_from_c(crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER),
+            Some(sdr_types::Protocol::TcpClient)
+        );
+        assert_eq!(
+            protocol_from_c(crate::event::SDR_NETWORK_PROTOCOL_UDP),
+            Some(sdr_types::Protocol::Udp)
+        );
+        assert_eq!(protocol_from_c(99), None);
     }
 
     #[test]

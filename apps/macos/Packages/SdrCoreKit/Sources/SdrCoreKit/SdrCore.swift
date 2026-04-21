@@ -341,6 +341,35 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(uid.withCString { sdr_core_set_audio_device(handle, $0) })
     }
 
+    /// Switch the active audio sink between the local output
+    /// device and the network stream. The engine stops the
+    /// current sink, builds the replacement from the persisted
+    /// device / network config, and restarts it if the engine is
+    /// currently running. Status transitions land on the
+    /// `events` stream as `.networkSinkStatus(...)` — hosts use
+    /// them to drive a status row in the audio settings panel.
+    /// Per issue #247.
+    public func setAudioSinkType(_ type: AudioSinkType) throws {
+        try checkRc(sdr_core_set_audio_sink_type(handle, type.rawValue))
+    }
+
+    /// Configure the network audio sink endpoint. `hostname`
+    /// must be non-empty; `port` is the TCP / UDP port the
+    /// engine should listen / send on; `protocol` picks the
+    /// transport. If the network sink is currently active the
+    /// engine rebuilds it inline so the new endpoint takes
+    /// effect immediately; otherwise the values are stored for
+    /// the next `setAudioSinkType(.network)` switch.
+    public func setNetworkSinkConfig(
+        hostname: String,
+        port: UInt16,
+        protocol proto: NetworkProtocol
+    ) throws {
+        try checkRc(hostname.withCString { cHost in
+            sdr_core_set_network_sink_config(handle, cHost, port, proto.rawValue)
+        })
+    }
+
     /// Start recording the demodulated audio stream to a WAV file
     /// at `path`. The engine emits `.audioRecordingStarted(path:)`
     /// on success or `.error(...)` on failure.
@@ -547,7 +576,7 @@ public final class SdrCore: @unchecked Sendable {
             return sdr_core_device_name(index, base, ptr.count)
         }
         guard rc >= 0 else { return nil }
-        return String(cString: buf)
+        return cStringToSwiftString(buf)
     }
 
     // ==========================================================
@@ -618,6 +647,20 @@ public final class SdrCore: @unchecked Sendable {
             return call(index, base, ptr.count)
         }
         guard rc >= 0 else { return nil }
-        return String(cString: buf)
+        return cStringToSwiftString(buf)
+    }
+}
+
+/// Shared helper that decodes a NUL-terminated `[CChar]` buffer
+/// into a Swift `String`. Used in place of `String(cString: [CChar])`
+/// which was deprecated in the Swift 6.2 standard library in favor
+/// of a bring-your-own-truncation API. Using the `UnsafePointer`
+/// form of `init(cString:)` is still valid and picks the NUL up
+/// natively, so route the array through its base pointer.
+@inline(__always)
+func cStringToSwiftString(_ buf: [CChar]) -> String {
+    buf.withUnsafeBufferPointer { ptr in
+        guard let base = ptr.baseAddress else { return "" }
+        return String(cString: base)
     }
 }

@@ -235,6 +235,42 @@ final class CoreModel {
     /// panel open still shows the current list.
     var audioDevices: [SdrCore.AudioDevice] = []
 
+    // ----------------------------------------------------------
+    //  Network audio sink — issue #247 (ABI 0.9)
+    // ----------------------------------------------------------
+
+    /// Active audio sink. `.local` routes to the selected
+    /// CoreAudio device (the default); `.network` streams to a
+    /// configured host:port. Optimistic — the engine applies on
+    /// the next command cycle; status confirmation arrives via
+    /// the `.networkSinkStatus` event below. Persisted to
+    /// `UserDefaults` so the choice survives relaunches.
+    var audioSinkType: AudioSinkType = .local
+
+    /// Network sink host. Defaults to "localhost" to mirror the
+    /// engine's `DEFAULT_NETWORK_SINK_HOST`. Edited via the
+    /// Settings Audio pane; committed on explicit Apply (avoids
+    /// per-keystroke engine rebuilds).
+    var networkSinkHost: String = "localhost"
+
+    /// Network sink port. Default 1234 matches the engine's
+    /// `DEFAULT_NETWORK_SINK_PORT` and the historical SDR++
+    /// convention.
+    var networkSinkPort: UInt16 = 1234
+
+    /// Network sink protocol. TCP server by default (engine
+    /// accepts client connections); UDP is unicast to the
+    /// configured endpoint.
+    var networkSinkProtocol: NetworkProtocol = .tcpServer
+
+    /// Last status the engine reported for the network sink.
+    /// Drives the status row in the Settings Audio pane —
+    /// `.inactive` on first launch / after a switch back to
+    /// local; `.active(...)` once the engine successfully
+    /// starts streaming; `.error(...)` on a startup or write
+    /// failure.
+    var networkSinkStatus: NetworkSinkStatus = .inactive
+
     /// Active audio-recording state. `nil` = not recording,
     /// `some(path)` = engine confirmed it opened `path` for
     /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
@@ -351,6 +387,33 @@ final class CoreModel {
             selectedAudioDeviceUid = saved
         }
         refreshAudioDevices()
+
+        // Restore network audio sink preferences — issue #247.
+        // Each field is independent; a partial write from a
+        // previous version (e.g., only host was set) still
+        // upgrades cleanly because the `.object(forKey:)` nil
+        // branch leaves the Rust-default value untouched.
+        if UserDefaults.standard.object(forKey: Self.audioSinkTypeDefaultsKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.audioSinkTypeDefaultsKey))
+            audioSinkType = AudioSinkType(rawValue: raw) ?? .local
+        }
+        if let host = UserDefaults.standard.string(forKey: Self.networkSinkHostDefaultsKey),
+           !host.isEmpty {
+            networkSinkHost = host
+        }
+        if UserDefaults.standard.object(forKey: Self.networkSinkPortDefaultsKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.networkSinkPortDefaultsKey)
+            // Clamp to UInt16 range — a stored value outside that
+            // range would come from a previous bug or a manual
+            // defaults write; fall back to the default port.
+            if (0...Int(UInt16.max)).contains(stored) {
+                networkSinkPort = UInt16(stored)
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.networkSinkProtocolDefaultsKey) != nil {
+            let raw = Int32(UserDefaults.standard.integer(forKey: Self.networkSinkProtocolDefaultsKey))
+            networkSinkProtocol = NetworkProtocol(rawValue: raw) ?? .tcpServer
+        }
 
         // Seed the RadioReference credentials flag from the
         // keyring so the sidebar panel / settings pane render
@@ -480,6 +543,12 @@ final class CoreModel {
             iqRecordingPath = path
         case .iqRecordingStopped:
             iqRecordingPath = nil
+        case .networkSinkStatus(let status):
+            // Engine is authoritative — trust its view of whether
+            // the network sink is up, down, or errored. The UI
+            // reads this field to render the status row; we don't
+            // locally flip state on the setter return code.
+            networkSinkStatus = status
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -618,6 +687,16 @@ final class CoreModel {
         // engine default is "" (system default) so a fresh install
         // re-applies that harmlessly.
         setAudioDevice(selectedAudioDeviceUid)
+        // Audio sink type + network endpoint — issue #247.
+        // Push the endpoint first so a switch to `.network` lands
+        // with the user's chosen host/port instead of the engine
+        // defaults.
+        applyNetworkSinkConfig(
+            host: networkSinkHost,
+            port: networkSinkPort,
+            protocol: networkSinkProtocol
+        )
+        setAudioSinkType(audioSinkType)
         setFftSize(fftSize)
         setFftWindow(fftWindow)
         setFftRate(fftRateFps)
@@ -904,6 +983,59 @@ final class CoreModel {
 
     /// UserDefaults key for the persisted audio device UID.
     static let audioDeviceDefaultsKey = "SDRMac.selectedAudioDeviceUid"
+
+    // ----------------------------------------------------------
+    //  Network audio sink setters — issue #247
+    // ----------------------------------------------------------
+
+    /// Switch between local and network audio sinks. Optimistic:
+    /// flip the UI field before dispatching so the Settings
+    /// picker tracks the tap immediately. Engine status
+    /// transitions come back via `.networkSinkStatus` events.
+    func setAudioSinkType(_ type: AudioSinkType) {
+        audioSinkType = type
+        UserDefaults.standard.set(Int(type.rawValue), forKey: Self.audioSinkTypeDefaultsKey)
+        capture { try core?.setAudioSinkType(type) }
+    }
+
+    /// Apply the current host/port/protocol to the engine.
+    /// Called on explicit Apply in the Settings pane rather than
+    /// on every keystroke — the engine rebuilds the listener /
+    /// socket on receipt, so per-keystroke commits would thrash
+    /// TCP/UDP state while the user is still typing.
+    func applyNetworkSinkConfig(
+        host: String,
+        port: UInt16,
+        protocol proto: NetworkProtocol
+    ) {
+        // Guard against an empty host that the FFI would reject
+        // anyway — surface a local error without the FFI round-trip
+        // so the Settings pane can point at the field cleanly.
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            lastError = "Network sink host cannot be empty"
+            return
+        }
+        networkSinkHost = trimmed
+        networkSinkPort = port
+        networkSinkProtocol = proto
+        UserDefaults.standard.set(trimmed, forKey: Self.networkSinkHostDefaultsKey)
+        UserDefaults.standard.set(Int(port), forKey: Self.networkSinkPortDefaultsKey)
+        UserDefaults.standard.set(Int(proto.rawValue), forKey: Self.networkSinkProtocolDefaultsKey)
+        capture {
+            try core?.setNetworkSinkConfig(hostname: trimmed, port: port, protocol: proto)
+        }
+    }
+
+    /// UserDefaults keys for the persisted network-sink config.
+    /// Matches the existing `audioDeviceDefaultsKey` pattern —
+    /// the Rust config layer doesn't round-trip these values yet
+    /// (tracked against the larger v3 config alignment), so the
+    /// Mac app persists locally in the meantime.
+    static let audioSinkTypeDefaultsKey      = "SDRMac.audioSinkType"
+    static let networkSinkHostDefaultsKey    = "SDRMac.networkSinkHost"
+    static let networkSinkPortDefaultsKey    = "SDRMac.networkSinkPort"
+    static let networkSinkProtocolDefaultsKey = "SDRMac.networkSinkProtocol"
 
     /// Re-query the backend for the current output device list.
     /// Called by the AudioSection view on appear; safe to call

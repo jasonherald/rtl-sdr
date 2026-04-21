@@ -57,6 +57,28 @@ pub const SDR_EVT_AUDIO_RECORDING_STARTED: i32 = 8;
 pub const SDR_EVT_AUDIO_RECORDING_STOPPED: i32 = 9;
 pub const SDR_EVT_IQ_RECORDING_STARTED: i32 = 10;
 pub const SDR_EVT_IQ_RECORDING_STOPPED: i32 = 11;
+pub const SDR_EVT_NETWORK_SINK_STATUS: i32 = 12;
+
+// ============================================================
+//  Network sink status discriminants — must match the
+//  matching `SdrNetworkSinkStatusKind` enum in
+//  `include/sdr_core.h`. Never reorder or renumber.
+// ============================================================
+
+pub const SDR_NETWORK_SINK_STATUS_INACTIVE: i32 = 0;
+pub const SDR_NETWORK_SINK_STATUS_ACTIVE: i32 = 1;
+pub const SDR_NETWORK_SINK_STATUS_ERROR: i32 = 2;
+
+// ============================================================
+//  Network protocol discriminants — must match the matching
+//  `SdrNetworkProtocol` enum in `include/sdr_core.h`. Reused
+//  by both `sdr_core_set_network_sink_config` (command path)
+//  and the network-sink-status payload (event path). Never
+//  reorder or renumber.
+// ============================================================
+
+pub const SDR_NETWORK_PROTOCOL_TCP_SERVER: i32 = 0;
+pub const SDR_NETWORK_PROTOCOL_UDP: i32 = 1;
 
 // ============================================================
 //  SdrEvent tagged union — `#[repr(C)]` layout matching the
@@ -109,6 +131,25 @@ pub struct SdrEventIqRecording {
     pub path_utf8: *const c_char,
 }
 
+/// Payload for `SDR_EVT_NETWORK_SINK_STATUS`. Tagged by `kind`
+/// (one of `SDR_NETWORK_SINK_STATUS_*`):
+///
+/// | `kind`                                | `utf8`             | `protocol`              |
+/// |---------------------------------------|--------------------|-------------------------|
+/// | `SDR_NETWORK_SINK_STATUS_INACTIVE`    | NULL               | -1 (unused)             |
+/// | `SDR_NETWORK_SINK_STATUS_ACTIVE`      | endpoint host:port | `SDR_NETWORK_PROTOCOL_*`|
+/// | `SDR_NETWORK_SINK_STATUS_ERROR`       | error message      | -1 (unused)             |
+///
+/// `utf8` is a borrowed pointer into dispatcher-owned storage;
+/// valid only for the duration of the callback. Per issue #247.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventNetworkSinkStatus {
+    pub kind: i32,
+    pub utf8: *const c_char,
+    pub protocol: i32,
+}
+
 /// C-layout tagged union of event payloads. Which field is valid
 /// is determined by the `kind` discriminant on the enclosing
 /// `SdrEvent`:
@@ -141,6 +182,7 @@ pub union SdrEventPayload {
     pub error: SdrEventError,
     pub audio_recording: SdrEventAudioRecording,
     pub iq_recording: SdrEventIqRecording,
+    pub network_sink_status: SdrEventNetworkSinkStatus,
     /// Placeholder for kinds that carry no payload (e.g.,
     /// `SDR_EVT_SOURCE_STOPPED`). Accessing this field is always
     /// valid as a zero-byte read.
@@ -347,6 +389,51 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
             payload: SdrEventPayload { _placeholder: 0 },
         },
 
+        DspToUi::NetworkSinkStatus(status) => {
+            use sdr_core::NetworkSinkStatus;
+            // Translate the three status variants into the C
+            // tagged-payload shape. Borrowed strings get
+            // promoted to `CString` so they outlive the
+            // dispatcher's call into the host callback.
+            // Per issue #247 PR 2.
+            let (kind, message_cstr, protocol_int) = match status {
+                NetworkSinkStatus::Inactive => (SDR_NETWORK_SINK_STATUS_INACTIVE, None, -1_i32),
+                NetworkSinkStatus::Active { endpoint, protocol } => {
+                    let sanitized = endpoint.replace('\0', "?");
+                    let Ok(cstr) = CString::new(sanitized) else {
+                        // Unreachable: replace stripped NULs.
+                        return None;
+                    };
+                    let proto = match protocol {
+                        sdr_types::Protocol::TcpClient => SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                        sdr_types::Protocol::Udp => SDR_NETWORK_PROTOCOL_UDP,
+                    };
+                    (SDR_NETWORK_SINK_STATUS_ACTIVE, Some(cstr), proto)
+                }
+                NetworkSinkStatus::Error { message } => {
+                    let sanitized = message.replace('\0', "?");
+                    let Ok(cstr) = CString::new(sanitized) else {
+                        return None;
+                    };
+                    (SDR_NETWORK_SINK_STATUS_ERROR, Some(cstr), -1_i32)
+                }
+            };
+            let utf8 = message_cstr
+                .as_ref()
+                .map_or(std::ptr::null(), |c| c.as_ptr());
+            owned_cstring = message_cstr;
+            SdrEvent {
+                kind: SDR_EVT_NETWORK_SINK_STATUS,
+                payload: SdrEventPayload {
+                    network_sink_status: SdrEventNetworkSinkStatus {
+                        kind,
+                        utf8,
+                        protocol: protocol_int,
+                    },
+                },
+            }
+        }
+
         // Variants not yet exposed at the FFI boundary. Silently
         // dropped in v1; a future ABI minor bump grows the surface
         // to cover them as each feature lands in the macOS SwiftUI
@@ -380,14 +467,7 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::BandwidthChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
-        | DspToUi::RtlTcpConnectionState(_)
-        // `NetworkSinkStatus` is engine-only in PR 1 (issue #247
-        // engine-side plumbing). The FFI surface gains a
-        // matching `SDR_EVT_NETWORK_SINK_STATUS` variant in PR 2
-        // alongside the FFI command wrappers; until then drop
-        // the event silently rather than dispatching it as a
-        // generic error.
-        | DspToUi::NetworkSinkStatus(_) => return None,
+        | DspToUi::RtlTcpConnectionState(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))
@@ -660,6 +740,129 @@ mod tests {
         assert_eq!(SDR_EVT_AUDIO_RECORDING_STOPPED, 9);
         assert_eq!(SDR_EVT_IQ_RECORDING_STARTED, 10);
         assert_eq!(SDR_EVT_IQ_RECORDING_STOPPED, 11);
+        assert_eq!(SDR_EVT_NETWORK_SINK_STATUS, 12);
+    }
+
+    #[test]
+    fn network_sink_status_discriminants_match_header() {
+        // Same lock-in for the tagged-payload sub-discriminants
+        // and the protocol values — these are part of the ABI
+        // just like the outer event kinds. Per `CodeRabbit`
+        // round 1 on PR #352.
+        assert_eq!(SDR_NETWORK_SINK_STATUS_INACTIVE, 0);
+        assert_eq!(SDR_NETWORK_SINK_STATUS_ACTIVE, 1);
+        assert_eq!(SDR_NETWORK_SINK_STATUS_ERROR, 2);
+        assert_eq!(SDR_NETWORK_PROTOCOL_TCP_SERVER, 0);
+        assert_eq!(SDR_NETWORK_PROTOCOL_UDP, 1);
+    }
+
+    // ------------------------------------------------------
+    //  translate_event — network sink status (ABI 0.9, #247)
+    //
+    //  Direct Rust-side coverage of the three NetworkSinkStatus
+    //  arms, including NULL vs non-NULL string cases and the
+    //  `Protocol::TcpClient` → `SDR_NETWORK_PROTOCOL_TCP_SERVER`
+    //  name-bridge. Locks the contract in before Swift decoding
+    //  sees it. Per `CodeRabbit` round 1 on PR #352.
+    // ------------------------------------------------------
+
+    #[test]
+    fn translate_network_sink_status_inactive_has_null_utf8_and_unused_protocol() {
+        use sdr_core::{DspToUi, NetworkSinkStatus};
+        let (event, owned_cstring, owned_vec) =
+            translate_event(&DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive))
+                .expect("inactive event should translate");
+        assert_eq!(event.kind, SDR_EVT_NETWORK_SINK_STATUS);
+        // SAFETY: kind dispatch above narrows the union field.
+        let payload = unsafe { event.payload.network_sink_status };
+        assert_eq!(payload.kind, SDR_NETWORK_SINK_STATUS_INACTIVE);
+        assert!(payload.utf8.is_null());
+        assert_eq!(payload.protocol, -1);
+        assert!(owned_cstring.is_none());
+        assert!(owned_vec.is_none());
+    }
+
+    #[test]
+    fn translate_network_sink_status_active_tcp_maps_to_tcp_server() {
+        use sdr_core::{DspToUi, NetworkSinkStatus};
+        let status = NetworkSinkStatus::Active {
+            endpoint: "127.0.0.1:1234".to_string(),
+            protocol: sdr_types::Protocol::TcpClient,
+        };
+        let (event, owned_cstring, _) = translate_event(&DspToUi::NetworkSinkStatus(status))
+            .expect("active event should translate");
+        assert_eq!(event.kind, SDR_EVT_NETWORK_SINK_STATUS);
+        let payload = unsafe { event.payload.network_sink_status };
+        assert_eq!(payload.kind, SDR_NETWORK_SINK_STATUS_ACTIVE);
+        assert!(!payload.utf8.is_null());
+        // Rust-side `TcpClient` bridges to the clearer C name
+        // `TCP_SERVER`. This is the contract the Swift side
+        // relies on — lock it here.
+        assert_eq!(payload.protocol, SDR_NETWORK_PROTOCOL_TCP_SERVER);
+
+        // SAFETY: utf8 points into `owned_cstring` which is kept
+        // alive by the `_` binding in the destructure above for
+        // the duration of this test.
+        let cstr = unsafe { std::ffi::CStr::from_ptr(payload.utf8) };
+        assert_eq!(cstr.to_str().unwrap(), "127.0.0.1:1234");
+        assert!(owned_cstring.is_some(), "endpoint CString must be owned");
+    }
+
+    #[test]
+    fn translate_network_sink_status_active_udp_maps_to_udp_constant() {
+        use sdr_core::{DspToUi, NetworkSinkStatus};
+        let status = NetworkSinkStatus::Active {
+            endpoint: "192.168.1.10:9000".to_string(),
+            protocol: sdr_types::Protocol::Udp,
+        };
+        let (event, _owned_cstring, _) = translate_event(&DspToUi::NetworkSinkStatus(status))
+            .expect("active event should translate");
+        let payload = unsafe { event.payload.network_sink_status };
+        assert_eq!(payload.kind, SDR_NETWORK_SINK_STATUS_ACTIVE);
+        assert_eq!(payload.protocol, SDR_NETWORK_PROTOCOL_UDP);
+    }
+
+    #[test]
+    fn translate_network_sink_status_error_carries_message_and_unused_protocol() {
+        use sdr_core::{DspToUi, NetworkSinkStatus};
+        let status = NetworkSinkStatus::Error {
+            message: "bind failed: address already in use".to_string(),
+        };
+        let (event, owned_cstring, _) = translate_event(&DspToUi::NetworkSinkStatus(status))
+            .expect("error event should translate");
+        let payload = unsafe { event.payload.network_sink_status };
+        assert_eq!(payload.kind, SDR_NETWORK_SINK_STATUS_ERROR);
+        assert!(!payload.utf8.is_null());
+        // Protocol is unused for the error arm per the ABI doc.
+        assert_eq!(payload.protocol, -1);
+        let cstr = unsafe { std::ffi::CStr::from_ptr(payload.utf8) };
+        assert_eq!(
+            cstr.to_str().unwrap(),
+            "bind failed: address already in use"
+        );
+        assert!(
+            owned_cstring.is_some(),
+            "error message CString must be owned"
+        );
+    }
+
+    #[test]
+    fn translate_network_sink_status_sanitizes_interior_nul_in_endpoint() {
+        // Regression guard: a stray NUL in an endpoint string
+        // must not drop the event silently. The translate path
+        // replaces interior NULs with `?` before `CString::new`,
+        // same as the DeviceInfo and Error paths.
+        use sdr_core::{DspToUi, NetworkSinkStatus};
+        let status = NetworkSinkStatus::Active {
+            endpoint: "host\0injected:1234".to_string(),
+            protocol: sdr_types::Protocol::TcpClient,
+        };
+        let (event, _owned, _) = translate_event(&DspToUi::NetworkSinkStatus(status))
+            .expect("sanitized active event should translate");
+        let payload = unsafe { event.payload.network_sink_status };
+        assert!(!payload.utf8.is_null());
+        let cstr = unsafe { std::ffi::CStr::from_ptr(payload.utf8) };
+        assert_eq!(cstr.to_str().unwrap(), "host?injected:1234");
     }
 
     #[test]

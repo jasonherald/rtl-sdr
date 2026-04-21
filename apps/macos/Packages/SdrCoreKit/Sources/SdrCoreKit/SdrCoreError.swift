@@ -23,7 +23,7 @@ public struct SdrCoreError: Error, Equatable, CustomStringConvertible {
     /// `SdrCoreError` enum in `include/sdr_core.h` byte-for-byte;
     /// unknown values are mapped to `.unknown(Int32)` so a future
     /// FFI that grows the enum doesn't crash an older host.
-    public enum Code: Equatable {
+    public enum Code: Equatable, Sendable {
         case `internal`
         case invalidHandle
         case invalidArg
