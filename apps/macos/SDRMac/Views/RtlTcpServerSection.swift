@@ -171,7 +171,7 @@ struct RtlTcpServerSection: View {
     private var deviceDefaults: some View {
         LabeledContent("Frequency") {
             TextField(
-                "Hz",
+                "MHz",
                 value: Binding(
                     get: { Double(model.rtlTcpServerInitialFreqHz) / 1_000_000.0 },
                     set: {

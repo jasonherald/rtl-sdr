@@ -388,6 +388,19 @@ final class CoreModel {
     /// is running.
     private var rtlTcpPollTask: Task<Void, Never>? = nil
 
+    /// Monotonic lifecycle token. Incremented on every
+    /// start/stop transition. A detached `startRtlTcpServer`
+    /// task captures the generation at kickoff and discards
+    /// its success result if the generation has moved on by
+    /// the time it publishes — otherwise a fast on → off → on
+    /// sequence could let an older start complete after a
+    /// subsequent stop, republishing stale handles and
+    /// restarting the poller while the user thinks the server
+    /// is off. Matches the pattern `TranscriptionDriver`
+    /// already uses in this repo. Per `CodeRabbit` round 2
+    /// on PR #362.
+    private var rtlTcpServerLifecycleGeneration: UInt64 = 0
+
     /// Active audio-recording state. `nil` = not recording,
     /// `some(path)` = engine confirmed it opened `path` for
     /// writing. Mirrors `DspToUi::AudioRecordingStarted/Stopped`
@@ -1298,6 +1311,15 @@ final class CoreModel {
         }
         rtlTcpServerError = nil
 
+        // Bump the lifecycle token before kickoff so this
+        // start's completion can check whether a later stop /
+        // start has already moved past it. Overflow via
+        // wrapping-add — the stdlib can't reach `u64::MAX`
+        // flips in any realistic session, but the `&+=` keeps
+        // the code warning-free if that day ever came.
+        rtlTcpServerLifecycleGeneration &+= 1
+        let generation = rtlTcpServerLifecycleGeneration
+
         // Snapshot the config on the main actor before we hop
         // off — the fields are `@Observable` so reading them
         // post-hop would require re-hopping.
@@ -1368,7 +1390,24 @@ final class CoreModel {
             return .succeeded(server: server, advertiser: advertiser, warning: warning)
         }.value
 
-        // Back on @MainActor. Publish the result.
+        // Back on @MainActor. Bail out if a later stop / start
+        // bumped the generation while this task was off-main —
+        // the result is stale. For a successful-but-stale
+        // result we still have to tear the handles down
+        // explicitly (otherwise the server keeps running
+        // despite `rtlTcpServerRunning == false`); failures
+        // are safe to drop on the floor. Per `CodeRabbit`
+        // round 2 on PR #362.
+        guard generation == rtlTcpServerLifecycleGeneration else {
+            if case .succeeded(let server, let advertiser, _) = result {
+                await Task.detached(priority: .userInitiated) {
+                    advertiser?.stop()
+                    server.stop()
+                }.value
+            }
+            return
+        }
+
         switch result {
         case .succeeded(let server, let advertiser, let warning):
             rtlTcpServer = server
@@ -1399,6 +1438,9 @@ final class CoreModel {
     /// intent; the background task then tears down the
     /// handles. Per `CodeRabbit` round 1 on PR #362.
     func stopRtlTcpServer() async {
+        // Bump the lifecycle token so any in-flight start
+        // treats itself as stale when it comes back to publish.
+        rtlTcpServerLifecycleGeneration &+= 1
         rtlTcpPollTask?.cancel()
         rtlTcpPollTask = nil
         let server = rtlTcpServer
@@ -1435,6 +1477,10 @@ final class CoreModel {
     /// itself synchronous per the `AppDelegate.applicationWillTerminate`
     /// contract.
     private func stopRtlTcpServerSync() {
+        // Same lifecycle-token bump as the async variant so an
+        // in-flight start (e.g. user toggled on during app
+        // shutdown) still treats its completion as stale.
+        rtlTcpServerLifecycleGeneration &+= 1
         rtlTcpPollTask?.cancel()
         rtlTcpPollTask = nil
         let server = rtlTcpServer
