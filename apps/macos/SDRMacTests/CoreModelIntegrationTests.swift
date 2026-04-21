@@ -126,6 +126,47 @@ final class CoreModelIntegrationTests: XCTestCase {
         XCTAssertFalse(m.isRunning, "stop() should clear isRunning")
     }
 
+    func testDeinitReleasesModelWithoutShutdown() async {
+        // Regression guard for issue #293: a CoreModel that is
+        // bootstrapped but dropped without an explicit
+        // `shutdown()` (test scopes, hypothetical multi-window
+        // future) must still release cleanly. The `@MainActor
+        // deinit` cancels the event-consumer Task so its
+        // `for await` loop exits — without that cancel, the
+        // Task's [weak self] capture wouldn't pin the model
+        // (so this test would pass as a pure refcount check),
+        // BUT the Task would dangle holding the engine's
+        // AsyncStream until SdrCore.deinit eventually closed
+        // the channel. Cancelling up front unwinds
+        // deterministically.
+        //
+        // Verify the model releases: use a `do { }` scope so
+        // `m` definitely goes out of scope before we assert
+        // on the weak ref. `let _ = m` inside a single test
+        // method does NOT release until the method returns —
+        // tracked in the feedback_swift_release memory.
+        weak var weakModel: CoreModel?
+        do {
+            let m = CoreModel()
+            await m.bootstrap(configPath: inMemoryConfigPath())
+            weakModel = m
+            XCTAssertNotNil(weakModel, "model alive inside scope")
+            // Explicitly do NOT call shutdown() — deinit is
+            // the safety net we're exercising.
+        }
+        // Give the cancelled Task a few runloop hops to
+        // unwind its `for await` loop so nothing holds a
+        // strong reference back to the model through the
+        // Swift runtime's task pool.
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+        XCTAssertNil(
+            weakModel,
+            "CoreModel should release after scope exit even without an explicit shutdown()"
+        )
+    }
+
     func testClearErrorDismissesLastError() {
         let m = CoreModel()
         m.lastError = "synthetic"

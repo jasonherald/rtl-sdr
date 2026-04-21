@@ -35,15 +35,14 @@ final class CoreModel {
     private(set) var core: SdrCore?
 
     /// Event-consuming task. Created in `bootstrap`, cancelled
-    /// by `shutdown`. Also self-ends naturally when the
-    /// underlying `SdrCore` handle is released — see the
-    /// "No explicit deinit" comment below and issue #293 for
-    /// the teardown story. This property stays @MainActor-
-    /// isolated like the rest of the model; we experimented
-    /// with making it `nonisolated` to allow deinit access
-    /// and backed off (the `@ObservationTracked` macro that
-    /// backs `@Observable` forbids `nonisolated` on its
-    /// generated storage).
+    /// by `shutdown` on the normal path and by the class
+    /// `deinit` as a fallback safety net (see the deinit
+    /// further down — closed #293 once Swift 6 isolated-deinit
+    /// support landed). Also self-ends naturally when the
+    /// underlying `SdrCore` handle is released:
+    /// `sdr_core_destroy` closes the engine's event channel,
+    /// the AsyncStream completes, and the `for await` loop
+    /// exits cleanly.
     private var eventTask: Task<Void, Never>?
 
     // ==========================================================
@@ -2436,26 +2435,30 @@ final class CoreModel {
         lastError = nil
     }
 
-    // No explicit `deinit` on CoreModel — tracked by issue #293.
-    // The `@MainActor
-    // @Observable` class gets @ObservationTracked-macro-generated
-    // storage for every `var`, and Swift's current rules don't
-    // let macro-generated mutable stored properties be
-    // `nonisolated`, which would be required for a `deinit` on a
-    // MainActor class to access them. Cleanup relies on:
-    //   1. The event-consumer Task's `[weak self]` capture,
-    //      which makes `self?.handleEvent` a no-op after the
-    //      model is dropped.
-    //   2. `SdrCore.deinit` firing when `self.core` is released,
-    //      which calls `sdr_core_destroy` → closes the engine's
-    //      event channel → the AsyncStream completes → the Task
-    //      exits its `for await` loop cleanly.
-    //
-    // In practice, app shutdown goes through
-    // `AppDelegate.applicationWillTerminate → shutdown()` which
-    // cancels the task explicitly, so the fallback path only
-    // runs in tests that let the model dealloc without calling
-    // shutdown.
+    /// Explicit `deinit` safety net — closes issue #293.
+    ///
+    /// The `@MainActor` isolation on this class applies to
+    /// `deinit` too (Swift 6 / SE-0371 isolated-deinit
+    /// semantics), so we can read `@ObservationTracked`-
+    /// generated storage here without fighting the macro.
+    /// That wasn't allowed when the model was first written —
+    /// see the original PR #292 round 2 thread linked from
+    /// #293 — but the Swift 6.3 / Xcode 26 toolchain the app
+    /// now builds against has caught up.
+    ///
+    /// Cancels the event-consumer Task so a model drop
+    /// without an explicit `shutdown()` (test scopes, a
+    /// hypothetical multi-window future) releases the
+    /// background `for await` loop deterministically rather
+    /// than waiting for `SdrCore.deinit` → `sdr_core_destroy`
+    /// → channel-close → AsyncStream-end to unwind it.
+    /// The normal shutdown path still goes through
+    /// `shutdown()` and this deinit runs after — the
+    /// second-cancel is a no-op on an already-cancelled task.
+    @MainActor
+    deinit {
+        eventTask?.cancel()
+    }
 
     // ==========================================================
     //  Internal helpers
