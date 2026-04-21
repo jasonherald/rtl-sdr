@@ -595,6 +595,20 @@ pub unsafe extern "C" fn sdr_core_set_network_sink_config(
                 set_last_error("sdr_core_set_network_sink_config: hostname is empty");
                 return Err(SdrCoreError::InvalidArg);
             }
+            // Port 0 has no useful meaning here: UDP would
+            // silently drop packets to a bogus destination, and
+            // TCP server mode would bind a random ephemeral
+            // port the host can't discover. The Swift UI
+            // already constrains the picker to 1..=65535, but
+            // non-Swift hosts and direct FFI callers go through
+            // this path too — reject at the boundary.
+            // Per `CodeRabbit` round 2 on PR #352.
+            if port == 0 {
+                set_last_error(
+                    "sdr_core_set_network_sink_config: port must be in 1..=65535, got 0",
+                );
+                return Err(SdrCoreError::InvalidArg);
+            }
             let Some(proto) = protocol_from_c(protocol) else {
                 set_last_error(format!(
                     "sdr_core_set_network_sink_config: unknown protocol {protocol}"
@@ -1440,6 +1454,40 @@ mod tests {
                 )
             },
             SdrCoreError::InvalidArg.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_network_sink_config_rejects_zero_port() {
+        // Port 0 is rejected at the ABI boundary — UDP would
+        // silently drop to a bogus destination and TCP server
+        // mode would bind an undiscoverable ephemeral port.
+        // Per `CodeRabbit` round 2 on PR #352.
+        let h = make_handle();
+        let host = CString::new("127.0.0.1").unwrap();
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    0,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::InvalidArg.as_int()
+        );
+        // And accepts 1 at the boundary as a sanity check.
+        assert_eq!(
+            unsafe {
+                sdr_core_set_network_sink_config(
+                    h,
+                    host.as_ptr(),
+                    1,
+                    crate::event::SDR_NETWORK_PROTOCOL_TCP_SERVER,
+                )
+            },
+            SdrCoreError::Ok.as_int()
         );
         destroy(h);
     }
