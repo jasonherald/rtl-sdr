@@ -48,7 +48,7 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 11
+#define SDR_CORE_ABI_VERSION_MINOR 12
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -629,6 +629,34 @@ int32_t sdr_core_set_rtl_agc(SdrCore* handle, bool enabled);
  * server decides how to handle it.
  */
 int32_t sdr_core_set_gain_by_index(SdrCore* handle, uint32_t index);
+
+/* --- rtl_tcp client lifecycle (issue #326, ABI 0.12) --- */
+/*
+ * Disconnect the rtl_tcp client without changing source type.
+ * Tears down the current TCP socket and drops the connection-
+ * state machine back to `Disconnected`. A subsequent
+ * `sdr_core_rtl_tcp_retry_now` (or any engine restart) reopens
+ * the socket against the same host/port from the stored
+ * network config.
+ *
+ * Engine behavior when the active source is not rtl_tcp: the
+ * command is logged at `warn` and dropped — safe to call
+ * regardless of current source, so hosts don't need to gate
+ * UI buttons on source type. Matches the
+ * `UiToDsp::DisconnectRtlTcp` contract in `sdr-core`.
+ */
+int32_t sdr_core_rtl_tcp_disconnect(SdrCore* handle);
+
+/*
+ * Retry the rtl_tcp connection immediately, bypassing the
+ * exponential-backoff sleep that the reconnect loop is in
+ * after a transport failure. Useful for a "Retry now" button
+ * that shouldn't make the user wait out the countdown.
+ *
+ * Engine behavior when the active source is not rtl_tcp:
+ * same as `sdr_core_rtl_tcp_disconnect` — logged and dropped.
+ */
+int32_t sdr_core_rtl_tcp_retry_now(SdrCore* handle);
 
 /* ================================================================ */
 /*  rtl_tcp server (issue #325, ABI 0.11)                           */

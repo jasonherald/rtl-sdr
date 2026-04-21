@@ -433,6 +433,30 @@ public final class SdrCore: @unchecked Sendable {
         try checkRc(sdr_core_set_gain_by_index(handle, index))
     }
 
+    // ==========================================================
+    //  rtl_tcp client lifecycle (ABI 0.12, issue #326)
+    // ==========================================================
+
+    /// Disconnect the rtl_tcp client without changing source
+    /// type. The engine drops the current TCP socket and
+    /// transitions the connection-state machine to
+    /// `.disconnected`. A subsequent `retryRtlTcpNow()` (or any
+    /// engine restart) reopens against the same stored host /
+    /// port. Safe to call when the active source is not
+    /// rtl_tcp — the engine logs and drops the command.
+    public func disconnectRtlTcp() throws {
+        try checkRc(sdr_core_rtl_tcp_disconnect(handle))
+    }
+
+    /// Retry the rtl_tcp connection immediately, bypassing the
+    /// exponential-backoff sleep inside the reconnect loop.
+    /// Useful wired to a "Retry now" button on the status row.
+    /// Safe to call when the active source is not rtl_tcp —
+    /// the engine logs and drops the command.
+    public func retryRtlTcpNow() throws {
+        try checkRc(sdr_core_rtl_tcp_retry_now(handle))
+    }
+
     /// Switch the active audio sink between the local output
     /// device and the network stream. The engine stops the
     /// current sink, builds the replacement from the persisted
