@@ -505,35 +505,43 @@ pub fn connect_preset_to_bookmarks(
 
     navigation.preset_row.connect_selected_notify(move |row| {
         let idx = row.selected() as usize;
-        if let Some(preset) = BAND_PRESETS.get(idx)
-            && let Some(cb) = on_nav.borrow().as_ref()
-        {
-            // Clear active bookmark — we're tuning via preset, not bookmark.
-            *active.borrow_mut() = ActiveBookmark::default();
-            name_entry.set_text("");
-            let bm = Bookmark::new(
-                preset.name,
-                preset.frequency,
-                preset.demod_mode,
-                preset.bandwidth,
-            );
+        let Some(preset) = BAND_PRESETS.get(idx) else {
+            return;
+        };
+        // Apply preset-driven UI state regardless of whether a
+        // navigate callback is registered — the active-bookmark
+        // reset, name-entry clear, and list rebuild describe
+        // "we're tuning via preset, not bookmark" and that's
+        // true whether or not anyone's listening. Gating these
+        // on `on_nav` being Some would leave stale highlight /
+        // name-entry state visible in the rare window between
+        // panel construction and callback registration.
+        *active.borrow_mut() = ActiveBookmark::default();
+        name_entry.set_text("");
+        let bm = Bookmark::new(
+            preset.name,
+            preset.frequency,
+            preset.demod_mode,
+            preset.bandwidth,
+        );
+        if let Some(cb) = on_nav.borrow().as_ref() {
             cb(&bm);
-            // Rebuild to remove stale highlight
-            if let Some(lb) = list_weak.upgrade()
-                && let Some(sc) = scroll_weak.upgrade()
-            {
-                rebuild_bookmark_list(
-                    &lb,
-                    &sc,
-                    &bm_rc,
-                    &on_nav,
-                    &active,
-                    &name_entry,
-                    &on_save,
-                    &filter_text,
-                    &manual_expanded,
-                );
-            }
+        }
+        // Rebuild to remove stale highlight
+        if let Some(lb) = list_weak.upgrade()
+            && let Some(sc) = scroll_weak.upgrade()
+        {
+            rebuild_bookmark_list(
+                &lb,
+                &sc,
+                &bm_rc,
+                &on_nav,
+                &active,
+                &name_entry,
+                &on_save,
+                &filter_text,
+                &manual_expanded,
+            );
         }
     });
 }
@@ -570,11 +578,13 @@ fn bookmark_matches_filter(bm: &Bookmark, needle: &str) -> bool {
 
 /// Rebuild the bookmark `ListBox` from the current bookmark list.
 ///
-/// Honors the search filter in `filter_text` (lowercase substring
-/// match against name + subtitle). Emits an `AdwExpanderRow` per
-/// unique `rr_category` when any bookmark is categorized; falls
-/// back to a flat list when all bookmarks are uncategorized so
-/// users who don't import from `RadioReference` keep the original
+/// Honors the search filter in `filter_text` by delegating to
+/// [`bookmark_matches_filter`] — lowercase substring match
+/// against the bookmark's name, subtitle (demod + frequency),
+/// and `rr_category`. Emits an `AdwExpanderRow` per unique
+/// `rr_category` when any bookmark is categorized; falls back
+/// to a flat list when all bookmarks are uncategorized so users
+/// who don't import from `RadioReference` keep the original
 /// single-level view.
 #[allow(
     clippy::too_many_arguments,

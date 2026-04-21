@@ -167,11 +167,13 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         .build();
     widget.append(&heading);
 
-    // Search entry — live-filters the list via
-    // `ListBox::set_filter_func` below. Case-insensitive substring
-    // match against the row's title (bookmark name) and subtitle
-    // (demod + frequency). `gtk4::SearchEntry` already handles the
-    // clear-button affordance and Ctrl+F keyboard shortcut.
+    // Search entry — live-filters the list by updating
+    // `filter_text` and rebuilding on every `search-changed`
+    // (see handler below). Case-insensitive substring match
+    // against the bookmark's name, subtitle (demod + frequency),
+    // and `rr_category` — see `bookmark_matches_filter`.
+    // `gtk4::SearchEntry` already handles the clear-button
+    // affordance and `Ctrl+F` keyboard shortcut.
     let search_entry = gtk4::SearchEntry::builder()
         .placeholder_text("Search bookmarks")
         .build();
