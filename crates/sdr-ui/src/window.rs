@@ -1108,7 +1108,13 @@ fn connect_sidebar_panels(
     // closures.
     let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
-    connect_source_panel(panels, state, toast_overlay, Rc::clone(&server_running));
+    connect_source_panel(
+        panels,
+        state,
+        toast_overlay,
+        Rc::clone(&server_running),
+        config,
+    );
     connect_source_rtlsdr_probe(panels);
     connect_rtl_tcp_discovery(panels, state, config, favorites_header);
     connect_server_panel(panels, toast_overlay, server_running);
@@ -3457,6 +3463,7 @@ fn connect_source_panel(
     state: &Rc<AppState>,
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
     // Sample rate selector + bandwidth advisory re-render.
     // The advisory visibility depends on BOTH the sample-rate
@@ -3567,38 +3574,64 @@ fn connect_source_panel(
         state_gain.send_dsp(UiToDsp::SetGain(row.value()));
     });
 
-    // AGC toggle. In addition to dispatching the DSP command,
-    // toggle two mutexes so the UI doesn't lie about controls
-    // that tuner AGC actually disables:
+    // AGC type selector (Off / Hardware / Software). Dispatches
+    // the right `UiToDsp::SetAgc` / `UiToDsp::SetSoftwareAgc`
+    // pair on every selection and also fires two mutexes so
+    // the UI doesn't lie about controls that EITHER AGC type
+    // disables:
     //
     // 1. Gain row — `rtlsdr_set_tuner_gain` silently no-ops on
-    //    most RTL variants when AGC is on.
-    // 2. Squelch rows — RTL-SDR's tuner AGC auto-normalizes IF
+    //    most RTL variants when hardware AGC is on; software
+    //    AGC makes manual gain pointless because the DSP stage
+    //    would renormalize it immediately.
+    // 2. Squelch rows — both AGC types auto-normalize IF
     //    amplitude, so amplitude-based squelch can't distinguish
     //    signal from noise and the gate just stays open. Without
     //    this mutex users see "all static all the time" the
     //    moment they enable AGC with squelch on.
     //
-    // Initial state: `AdwSwitchRow` defaults to `active = false`,
-    // which means the gated rows start sensitive. Bookmark
-    // restore sets agc via `agc_row.set_active(agc)`, which
-    // fires this handler and reapplies the mutexes — no
-    // separate seeding path needed.
-    apply_agc_gain_mutex(&panels.source.gain_row, panels.source.agc_row.is_active());
-    apply_agc_squelch_mutex(
-        &panels.radio.squelch_enabled_row,
-        &panels.radio.squelch_level_row,
-        &panels.radio.auto_squelch_row,
-        panels.source.agc_row.is_active(),
-    );
+    // Restore persisted AGC type from config. Fresh installs get
+    // `AgcType::DEFAULT` (Software) via `load_agc_type`'s
+    // fallback; upgrades from a pre-#354 build migrate the
+    // legacy `rtl_sdr_agc_enabled` boolean in-read. Calling
+    // `set_selected` below fires the notify handler we wire up
+    // right after, which in turn dispatches the right
+    // `SetAgc` / `SetSoftwareAgc` pair and applies the mutexes
+    // — so no separate seeding dispatch is needed here.
+    {
+        let persisted = sidebar::source_panel::load_agc_type(config);
+        panels
+            .source
+            .agc_row
+            .set_selected(sidebar::source_panel::selected_from_agc_type(persisted));
+    }
     let state_agc = Rc::clone(state);
+    let config_for_agc = std::sync::Arc::clone(config);
     let gain_row_for_agc = panels.source.gain_row.clone();
     let squelch_enabled_for_agc = panels.radio.squelch_enabled_row.clone();
     let squelch_level_for_agc = panels.radio.squelch_level_row.clone();
     let auto_squelch_for_agc = panels.radio.auto_squelch_row.clone();
-    panels.source.agc_row.connect_active_notify(move |row| {
-        let agc_active = row.is_active();
-        state_agc.send_dsp(UiToDsp::SetAgc(agc_active));
+    panels.source.agc_row.connect_selected_notify(move |row| {
+        let agc_type = sidebar::source_panel::agc_type_from_selected(row.selected());
+        // Dispatch both messages every time so exactly one
+        // enable path is active and the other is cleanly off.
+        // The engine treats hardware and software AGC as
+        // independent flags; the UI is the policy layer that
+        // mutually excludes them.
+        let (hw, sw) = match agc_type {
+            sidebar::source_panel::AgcType::Off => (false, false),
+            sidebar::source_panel::AgcType::Hardware => (true, false),
+            sidebar::source_panel::AgcType::Software => (false, true),
+        };
+        state_agc.send_dsp(UiToDsp::SetAgc(hw));
+        state_agc.send_dsp(UiToDsp::SetSoftwareAgc(sw));
+
+        // Persist the new selection so the choice sticks
+        // across restarts. Cheap — `ConfigManager::write` is an
+        // in-memory update with a debounced flush to disk.
+        sidebar::source_panel::save_agc_type(&config_for_agc, agc_type);
+
+        let agc_active = !matches!(agc_type, sidebar::source_panel::AgcType::Off);
         apply_agc_gain_mutex(&gain_row_for_agc, agc_active);
         apply_agc_squelch_mutex(
             &squelch_enabled_for_agc,
@@ -4124,7 +4157,7 @@ fn restore_bookmark_profile(
     state: &AppState,
     radio: &sidebar::RadioPanel,
     gain_row: &adw::SpinRow,
-    agc_row: &adw::SwitchRow,
+    agc_row: &adw::ComboRow,
 ) {
     if let Some(sq_en) = bookmark.squelch_enabled {
         state.send_dsp(UiToDsp::SetSquelchEnabled(sq_en));
@@ -4141,12 +4174,38 @@ fn restore_bookmark_profile(
     }
     // AGC must be set before gain — switching to manual mode first
     // ensures the saved gain value actually takes effect.
-    if let Some(agc) = bookmark.agc {
-        state.send_dsp(UiToDsp::SetAgc(agc));
-        agc_row.set_active(agc);
+    //
+    // New bookmarks carry `agc_type` directly; older ones only
+    // have the legacy `agc: Option<bool>` field, which we map to
+    // `Hardware` (true) or `Off` (false). The new field wins
+    // when both are present. The notify handler on `agc_row`
+    // dispatches the right `SetAgc` / `SetSoftwareAgc` pair and
+    // applies the mutexes, so we only need to flip the combo
+    // selector — no explicit dispatch here.
+    let restored_agc_type: Option<sidebar::source_panel::AgcType> =
+        bookmark.agc_type.or_else(|| {
+            bookmark.agc.map(|on| {
+                if on {
+                    sidebar::source_panel::AgcType::Hardware
+                } else {
+                    sidebar::source_panel::AgcType::Off
+                }
+            })
+        });
+    if let Some(agc_type) = restored_agc_type {
+        agc_row.set_selected(sidebar::source_panel::selected_from_agc_type(agc_type));
     }
     if let Some(gain) = bookmark.gain {
-        if bookmark.agc != Some(true) {
+        // Only dispatch `SetGain` when the restored AGC type is
+        // `Off` — both hardware and software AGC make manual
+        // gain ineffective (tuner AGC silently no-ops the write,
+        // software AGC renormalizes to the set point), and the
+        // UI mutex locks the row out in those modes.
+        let agc_is_off = matches!(
+            restored_agc_type,
+            Some(sidebar::source_panel::AgcType::Off) | None
+        );
+        if agc_is_off {
             state.send_dsp(UiToDsp::SetGain(gain));
         }
         gain_row.set_value(gain);
@@ -4331,7 +4390,7 @@ fn connect_navigation_panel(
             auto_squelch_enabled: radio_bm.auto_squelch_row.is_active(),
             squelch_level: radio_bm.squelch_level_row.value() as f32,
             gain: source_gain_bm.value(),
-            agc: source_agc_bm.is_active(),
+            agc_type: sidebar::source_panel::agc_type_from_selected(source_agc_bm.selected()),
             volume: None, // Volume ScaleButton not in sidebar — don't persist.
             deemphasis: radio_bm.deemphasis_row.selected(),
             nb_enabled: radio_bm.noise_blanker_row.is_active(),
@@ -4406,7 +4465,7 @@ fn connect_navigation_panel(
             #[allow(clippy::cast_possible_truncation)]
             squelch_level: save_radio_sq_lvl.value() as f32,
             gain: save_source_gain.value(),
-            agc: save_source_agc.is_active(),
+            agc_type: sidebar::source_panel::agc_type_from_selected(save_source_agc.selected()),
             volume: None,
             deemphasis: save_radio_deemp.selected(),
             nb_enabled: save_radio_nben.is_active(),
@@ -4442,7 +4501,17 @@ fn connect_navigation_panel(
             bm.auto_squelch_enabled = Some(profile.auto_squelch_enabled);
             bm.squelch_level = Some(profile.squelch_level);
             bm.gain = Some(profile.gain);
-            bm.agc = Some(profile.agc);
+            // Legacy-compatible AGC save: write both the new
+            // `agc_type` AND the legacy `agc: Option<bool>` so
+            // a post-#354 bookmark still round-trips through
+            // older builds. Software AGC maps to `false` on the
+            // legacy path (safer than `true` since hardware AGC
+            // is the documented-problem path in #332).
+            bm.agc = Some(matches!(
+                profile.agc_type,
+                sidebar::source_panel::AgcType::Hardware
+            ));
+            bm.agc_type = Some(profile.agc_type);
             bm.volume = profile.volume;
             bm.deemphasis = Some(profile.deemphasis);
             bm.nb_enabled = Some(profile.nb_enabled);

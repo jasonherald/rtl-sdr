@@ -27,6 +27,23 @@ pub const KEY_RTL_TCP_CLIENT_FAVORITES: &str = "rtl_tcp_client_favorites";
 /// mDNS to rediscover.
 pub const KEY_RTL_TCP_CLIENT_LAST_CONNECTED: &str = "rtl_tcp_client_last_connected";
 
+/// Config key for the persisted AGC type selection (Off /
+/// Hardware / Software). Written by the source panel's AGC
+/// combo on every user change, read back at startup so the
+/// combo repopulates with the user's last choice instead of
+/// the fresh-install default.
+///
+/// Legacy compat: pre-#354 builds persisted a boolean under
+/// `rtl_sdr_agc_enabled` representing "hardware AGC on/off".
+/// [`load_agc_type`] migrates it to `Hardware` (true) or `Off`
+/// (false) on first read when the new key is absent.
+pub const KEY_AGC_TYPE: &str = "rtl_sdr_agc_type";
+/// Legacy config key for the pre-#354 boolean AGC switch.
+/// Read-only now — the new `KEY_AGC_TYPE` supersedes it on
+/// write. Preserved so users upgrading from an older version
+/// don't lose their AGC setting on first launch.
+pub const KEY_LEGACY_AGC_ENABLED: &str = "rtl_sdr_agc_enabled";
+
 /// Device selector index for RTL-SDR.
 pub const DEVICE_RTLSDR: u32 = 0;
 /// Device selector index for Network.
@@ -35,6 +52,66 @@ pub const DEVICE_NETWORK: u32 = 1;
 pub const DEVICE_FILE: u32 = 2;
 /// Device selector index for RTL-TCP (rtl_tcp-protocol network client).
 pub const DEVICE_RTLTCP: u32 = 3;
+
+/// AGC type for the source panel's three-way selector. Users pick
+/// between the tuner's hardware AGC (overshoots on strong signals,
+/// see #332), the pure-DSP software AGC on the IQ stream (well-
+/// behaved, see #354), or Off (manual gain). Fresh installs
+/// default to `Software` — hardware AGC is the documented-problem
+/// path, so new users get the well-behaved option out of the box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgcType {
+    /// No AGC — manual gain is the user's sole control.
+    Off,
+    /// RTL-SDR hardware tuner AGC (VGA auto-mode via
+    /// `rtlsdr_set_tuner_gain_mode(false)`).
+    Hardware,
+    /// Pure-DSP envelope follower on IQ inside `IfChain`.
+    Software,
+}
+
+impl AgcType {
+    /// Default AGC type for fresh installs. Software-first rule
+    /// described on the enum docstring — hardware AGC is the
+    /// documented-problem path, software is the smooth default.
+    pub const DEFAULT: Self = Self::Software;
+}
+
+/// Combo row index for `AgcType::Off`. Load-bearing — must match
+/// the order of the `StringList` entries built in
+/// `build_rtlsdr_rows`, and the `agc_type_from_selected` /
+/// `selected_from_agc_type` helpers.
+pub const AGC_TYPE_OFF_IDX: u32 = 0;
+/// Combo row index for `AgcType::Hardware`.
+pub const AGC_TYPE_HARDWARE_IDX: u32 = 1;
+/// Combo row index for `AgcType::Software`.
+pub const AGC_TYPE_SOFTWARE_IDX: u32 = 2;
+
+/// Translate a combo row `selected()` index into an `AgcType`.
+/// Defaults to [`AgcType::DEFAULT`] on an unknown index — GTK can
+/// emit transient out-of-range values during widget teardown, and
+/// the AGC selector shouldn't crash on that.
+#[must_use]
+pub fn agc_type_from_selected(idx: u32) -> AgcType {
+    match idx {
+        AGC_TYPE_OFF_IDX => AgcType::Off,
+        AGC_TYPE_HARDWARE_IDX => AgcType::Hardware,
+        AGC_TYPE_SOFTWARE_IDX => AgcType::Software,
+        _ => AgcType::DEFAULT,
+    }
+}
+
+/// Inverse of [`agc_type_from_selected`]: translate an `AgcType`
+/// into the combo row index to call `set_selected` with.
+#[must_use]
+pub fn selected_from_agc_type(agc_type: AgcType) -> u32 {
+    match agc_type {
+        AgcType::Off => AGC_TYPE_OFF_IDX,
+        AgcType::Hardware => AGC_TYPE_HARDWARE_IDX,
+        AgcType::Software => AGC_TYPE_SOFTWARE_IDX,
+    }
+}
 
 /// Label shown in the source combo's RTL-SDR slot when no dongle
 /// is detected on the USB bus. Kept as a pub const so the hotplug
@@ -151,7 +228,12 @@ pub struct SourcePanel {
     /// RTL-SDR gain control.
     pub gain_row: adw::SpinRow,
     /// RTL-SDR AGC toggle.
-    pub agc_row: adw::SwitchRow,
+    /// Three-way AGC selector (Off / Hardware / Software). See
+    /// [`AgcType`] for the enum shape and `AGC_TYPE_*_IDX` for
+    /// the combo indices. Dispatch wiring in `window.rs` reads
+    /// `.selected()` and routes to the appropriate `UiToDsp`
+    /// message.
+    pub agc_row: adw::ComboRow,
     /// RTL-SDR PPM frequency correction.
     pub ppm_row: adw::SpinRow,
     /// Network hostname entry.
@@ -239,7 +321,7 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
 const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
 
 /// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM correction.
-fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::SwitchRow, adw::SpinRow) {
+fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::ComboRow, adw::SpinRow) {
     let sample_rate_model = gtk4::StringList::new(&[
         "250 kHz",
         "1.024 MHz",
@@ -274,9 +356,17 @@ fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::SwitchRow, adw::Spi
         .digits(1)
         .build();
 
-    let agc_row = adw::SwitchRow::builder()
+    // AGC type selector: Off / Hardware / Software. Labels are
+    // terse but qualify each option so the user understands what
+    // "Hardware" and "Software" mean in context. Order is load-
+    // bearing — must match the `AGC_TYPE_*_IDX` constants and
+    // the `agc_type_from_selected` mapping.
+    let agc_type_model = gtk4::StringList::new(&["Off", "Hardware (tuner)", "Software (IQ)"]);
+    let agc_row = adw::ComboRow::builder()
         .title("AGC")
         .subtitle("Automatic gain control")
+        .model(&agc_type_model)
+        .selected(selected_from_agc_type(AgcType::DEFAULT))
         .build();
 
     let ppm_adj = gtk4::Adjustment::new(DEFAULT_PPM, MIN_PPM, MAX_PPM, PPM_STEP, PPM_PAGE, 0.0);
@@ -352,7 +442,7 @@ fn connect_device_visibility(
     device_row: &adw::ComboRow,
     sample_rate_row: &adw::ComboRow,
     gain_row: &adw::SpinRow,
-    agc_row: &adw::SwitchRow,
+    agc_row: &adw::ComboRow,
     ppm_row: &adw::SpinRow,
     hostname_row: &adw::EntryRow,
     port_row: &adw::SpinRow,
@@ -770,6 +860,43 @@ pub fn save_last_connected(config: &Arc<ConfigManager>, server: &LastConnectedSe
     });
 }
 
+/// Load the persisted AGC type selection. Returns
+/// [`AgcType::DEFAULT`] on first launch / absent / corrupt
+/// config. Falls back to the legacy `KEY_LEGACY_AGC_ENABLED`
+/// boolean when the new key is absent — mapping `true →
+/// Hardware` and `false → Off` so users upgrading from a
+/// pre-#354 build keep their AGC setting on first startup.
+pub fn load_agc_type(config: &Arc<ConfigManager>) -> AgcType {
+    config.read(|v| {
+        if let Some(entry) = v.get(KEY_AGC_TYPE) {
+            // New key present — trust it.
+            if let Ok(t) = serde_json::from_value::<AgcType>(entry.clone()) {
+                return t;
+            }
+        }
+        // Fall back to the legacy boolean, then to the default
+        // if that's absent too.
+        v.get(KEY_LEGACY_AGC_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .map_or(AgcType::DEFAULT, |on| {
+                if on { AgcType::Hardware } else { AgcType::Off }
+            })
+    })
+}
+
+/// Persist the AGC type selection. Written on every
+/// `agc_row.connect_selected_notify` event in `window.rs`.
+/// Does NOT write the legacy `KEY_LEGACY_AGC_ENABLED` key —
+/// that one is read-only from here on, so a downgrade to a
+/// pre-#354 build would see a stale legacy value, but we
+/// accept that trade-off rather than maintaining two keys in
+/// lockstep forever.
+pub fn save_agc_type(config: &Arc<ConfigManager>, agc_type: AgcType) {
+    config.write(|v| {
+        v[KEY_AGC_TYPE] = serde_json::to_value(agc_type).unwrap_or(serde_json::Value::Null);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,5 +1143,101 @@ mod tests {
             v[KEY_RTL_TCP_CLIENT_LAST_CONNECTED] = serde_json::json!("shack-pi:1234");
         });
         assert!(load_last_connected(&config).is_none());
+    }
+
+    // --- AGC type persistence tests (#356) ---
+
+    /// Fresh config with no AGC key and no legacy key returns
+    /// the default (Software). Matches the "fresh-install user
+    /// gets the well-behaved path" contract from the issue.
+    #[test]
+    fn load_agc_type_defaults_to_software_on_fresh_config() {
+        let config = make_config();
+        assert_eq!(load_agc_type(&config), AgcType::Software);
+        assert_eq!(AgcType::DEFAULT, AgcType::Software);
+    }
+
+    /// Round-trip: save each variant, load returns it. Pins the
+    /// serde representation against future rename / enum
+    /// reordering.
+    #[test]
+    fn agc_type_save_load_round_trips_all_variants() {
+        for variant in [AgcType::Off, AgcType::Hardware, AgcType::Software] {
+            let config = make_config();
+            save_agc_type(&config, variant);
+            assert_eq!(
+                load_agc_type(&config),
+                variant,
+                "round-trip failed for {variant:?}"
+            );
+        }
+    }
+
+    /// Legacy migration: a pre-#354 config has only the boolean
+    /// `rtl_sdr_agc_enabled` key. Loader maps `true → Hardware`,
+    /// `false → Off`. Preserves the user's upgrade path without
+    /// a one-shot migration job.
+    #[test]
+    fn load_agc_type_migrates_legacy_boolean_on() {
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_LEGACY_AGC_ENABLED] = serde_json::json!(true);
+        });
+        assert_eq!(load_agc_type(&config), AgcType::Hardware);
+    }
+
+    #[test]
+    fn load_agc_type_migrates_legacy_boolean_off() {
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_LEGACY_AGC_ENABLED] = serde_json::json!(false);
+        });
+        assert_eq!(load_agc_type(&config), AgcType::Off);
+    }
+
+    /// When both the new key and the legacy key are present,
+    /// the new key wins. Guards against a mis-migration that
+    /// could silently revert a user's post-upgrade selection.
+    #[test]
+    fn load_agc_type_new_key_wins_over_legacy_key() {
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_LEGACY_AGC_ENABLED] = serde_json::json!(true);
+        });
+        save_agc_type(&config, AgcType::Software);
+        assert_eq!(load_agc_type(&config), AgcType::Software);
+    }
+
+    /// Corrupt `agc_type` value (e.g. renamed-since enum variant
+    /// that's no longer recognized) falls back to the legacy
+    /// key then the default, without panicking.
+    #[test]
+    fn load_agc_type_tolerates_corrupt_new_key() {
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_AGC_TYPE] = serde_json::json!("this_is_not_a_valid_variant");
+            v[KEY_LEGACY_AGC_ENABLED] = serde_json::json!(true);
+        });
+        // Corrupt new key skipped → fall through to legacy →
+        // Hardware.
+        assert_eq!(load_agc_type(&config), AgcType::Hardware);
+    }
+
+    /// `agc_type_from_selected` round-trips each index, and
+    /// unknown indices fall back to the default rather than
+    /// panicking. Guards the combo-row dispatch path against
+    /// GTK's transient out-of-range values during widget
+    /// teardown.
+    #[test]
+    fn agc_type_selected_index_helpers_round_trip() {
+        for variant in [AgcType::Off, AgcType::Hardware, AgcType::Software] {
+            let idx = selected_from_agc_type(variant);
+            assert_eq!(agc_type_from_selected(idx), variant);
+        }
+        // Unknown index → default.
+        assert_eq!(agc_type_from_selected(99), AgcType::DEFAULT);
+        // u32::MAX is the sentinel GTK uses for "no selection"
+        // on some widgets; make sure we don't panic.
+        assert_eq!(agc_type_from_selected(u32::MAX), AgcType::DEFAULT);
     }
 }
