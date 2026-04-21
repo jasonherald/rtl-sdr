@@ -19,12 +19,13 @@
 //!
 //! Commits that land on this file:
 //! - Layout scaffolding (prior commit).
-//! - List + row actions relocated from `NavigationPanel` (THIS commit).
-//! - Filter / search row (next commit).
+//! - List + row actions relocated from `NavigationPanel` (prior commit).
+//! - Filter / search row (THIS commit).
 //! - Category grouping via `AdwExpanderRow` (later commit).
 
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 
 use super::navigation_panel::{
     ActiveBookmark, Bookmark, NavigationCallback, SaveCallback, load_bookmarks,
@@ -120,6 +121,16 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         .build();
     widget.append(&heading);
 
+    // Search entry — live-filters the list via
+    // `ListBox::set_filter_func` below. Case-insensitive substring
+    // match against the row's title (bookmark name) and subtitle
+    // (demod + frequency). `gtk4::SearchEntry` already handles the
+    // clear-button affordance and Ctrl+F keyboard shortcut.
+    let search_entry = gtk4::SearchEntry::builder()
+        .placeholder_text("Search bookmarks")
+        .build();
+    widget.append(&search_entry);
+
     let bookmark_list = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::None)
         .css_classes(["boxed-list"])
@@ -138,6 +149,41 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let active_bookmark = std::rc::Rc::new(std::cell::RefCell::new(ActiveBookmark::default()));
     let on_save: SaveCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+    // Current search needle (lowercased). Shared between the
+    // filter function (which reads it per row) and the search
+    // entry (which writes it on every keystroke). Persists
+    // across list rebuilds — `set_filter_func` is sticky, and
+    // newly-appended rows inherit the active filter.
+    let filter_text = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+
+    let filter_text_for_filter = std::rc::Rc::clone(&filter_text);
+    bookmark_list.set_filter_func(move |row| {
+        let needle = filter_text_for_filter.borrow();
+        if needle.is_empty() {
+            return true;
+        }
+        let Some(action_row) = row.downcast_ref::<adw::ActionRow>() else {
+            // Non-ActionRow children shouldn't exist in this list,
+            // but don't hide anything unexpectedly.
+            return true;
+        };
+        let title = action_row.title().to_lowercase();
+        let subtitle = action_row
+            .subtitle()
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        title.contains(needle.as_str()) || subtitle.contains(needle.as_str())
+    });
+
+    let filter_text_for_entry = std::rc::Rc::clone(&filter_text);
+    let list_weak = bookmark_list.downgrade();
+    search_entry.connect_search_changed(move |entry| {
+        *filter_text_for_entry.borrow_mut() = entry.text().to_lowercase();
+        if let Some(lb) = list_weak.upgrade() {
+            lb.invalidate_filter();
+        }
+    });
 
     // Seed the list with the restored bookmarks.
     rebuild_bookmark_list(
