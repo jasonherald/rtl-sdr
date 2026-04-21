@@ -4,6 +4,7 @@
 //! returned commands.
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 
 use crate::channel::{ChannelKey, ScannerChannel};
 use crate::commands::ScannerCommand;
@@ -371,17 +372,11 @@ impl Scanner {
     fn handle_sample_tick(
         &mut self,
         samples_consumed: u32,
-        sample_rate_hz: u32,
+        sample_rate_hz: NonZeroU32,
     ) -> Vec<ScannerCommand> {
-        if sample_rate_hz == 0 {
-            // `ms_to_samples(_, 0)` returns 0, which would make
-            // every seeded timer expire on first tick — settle
-            // immediately "complete", dwell immediately "time
-            // out", etc. Drop the tick; debug builds assert the
-            // caller invariant.
-            debug_assert!(false, "sample_rate_hz must be > 0");
-            return Vec::new();
-        }
+        // `sample_rate_hz > 0` is now enforced at the event-type
+        // level via `NonZeroU32` — no runtime guard needed.
+        let sample_rate_hz = sample_rate_hz.get();
         let samples = u64::from(samples_consumed);
         let next_phase: Option<Phase> = match &mut self.phase {
             Phase::Idle | Phase::Listening { .. } => return Vec::new(),
@@ -664,7 +659,7 @@ mod tests {
     fn tick(samples: u32) -> ScannerEvent {
         ScannerEvent::SampleTick {
             samples_consumed: samples,
-            sample_rate_hz: RATE,
+            sample_rate_hz: NonZeroU32::new(RATE).expect("RATE > 0"),
         }
     }
 

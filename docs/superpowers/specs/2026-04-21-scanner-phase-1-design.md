@@ -185,7 +185,7 @@ The scanner internally maintains the rotation index in two sub-lists (`normal_in
 - **Active channel removed**: if user deletes the currently-`Listening`-on bookmark, treat as squelch close → move to `Hanging` with shortened hang? Or just transition directly to next `Retuning`? Pick the latter — cleaner model, no surprise silence after a bookmark delete.
 - **All remaining channels locked out**: transition to `Idle` with a `ScannerCommand::EmptyRotation` signal (UI can toast "All scannable channels are locked out").
 - **SampleTick before Retune acknowledged**: scanner accumulates the tick but emits no command. SETTLE_MS accumulates from the first tick after entering `Retuning`.
-- **SquelchEdge during Retuning**: ignored (documented; covered by a specific unit test).
+- **SquelchEdge during Retuning**: latched into `squelch_open` but does NOT drive a phase transition (retune transients would false-trip). The latch is consulted at settle expiry — `true` → direct to `Listening`, `false` → `Dwelling`. Two unit tests: `settle_window_ignores_squelch_open` (verifies no phase transition mid-settle) and `persistent_open_during_settle_goes_directly_to_listening` (verifies the latched-open settle-expiry branch).
 
 ---
 

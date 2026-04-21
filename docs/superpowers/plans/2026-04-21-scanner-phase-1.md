@@ -394,6 +394,13 @@ pub struct Scanner {
     hops_since_priority_sweep: u32,
     /// Set while a priority sweep is in progress.
     in_priority_sweep: bool,
+    /// Latched squelch state, updated on every `SquelchEdge`
+    /// regardless of phase. Retuning drops phase transitions
+    /// (retune-transient suppression) but the latch carries
+    /// open/closed through to `handle_sample_tick`'s settle-
+    /// expiry decision: `true` → direct Listening; `false` →
+    /// Dwelling. Reset to `false` on retune entry.
+    squelch_open: bool,
 }
 
 impl Default for Scanner {
@@ -407,6 +414,7 @@ impl Default for Scanner {
             priority_cursor: 0,
             hops_since_priority_sweep: 0,
             in_priority_sweep: false,
+            squelch_open: false,
         }
     }
 }
@@ -528,7 +536,6 @@ mod tests {
                 name: name.to_string(),
                 frequency_hz: freq,
             },
-            frequency_hz: freq,
             demod_mode: DemodMode::Nfm,
             bandwidth: 12_500.0,
             ctcss: None,
@@ -638,16 +645,21 @@ Replace `handle_set_enabled`, `handle_channels_changed` stub bodies and add new 
     /// rate isn't known here).
     fn enter_retuning(&mut self, idx: usize) -> Vec<ScannerCommand> {
         let channel = &self.channels[idx];
+        // Clear the squelch latch — previous channel's state
+        // is irrelevant after retune, and edges arriving during
+        // the new channel's settle window will update the latch
+        // so settle-expiry has accurate information.
+        self.squelch_open = false;
         self.phase = Phase::Retuning {
             target_idx: idx,
             samples_until_settled: 0, // seeded on first SampleTick
         };
         vec![
             ScannerCommand::Retune {
-                freq_hz: channel.frequency_hz,
+                freq_hz: channel.key.frequency_hz,
                 demod_mode: channel.demod_mode,
                 bandwidth: channel.bandwidth,
-                ctcss: channel.ctcss.clone(),
+                ctcss: channel.ctcss,
                 voice_squelch: channel.voice_squelch,
             },
             ScannerCommand::MuteAudio(true),
@@ -932,11 +944,20 @@ Replace the stub body:
                 *samples_until_settled = samples_until_settled.saturating_sub(samples);
                 if *samples_until_settled == 0 {
                     let idx = *target_idx;
-                    let dwell_ms = self.channels[idx].dwell_ms;
-                    Some(Phase::Dwelling {
-                        idx,
-                        samples_until_timeout: ms_to_samples(dwell_ms, sample_rate_hz),
-                    })
+                    // Settle complete. If the squelch latched open
+                    // during settle (persistent carrier), skip
+                    // Dwelling and jump straight to Listening —
+                    // otherwise we'd wait forever for a second
+                    // edge that already fired.
+                    if self.squelch_open {
+                        Some(Phase::Listening { idx })
+                    } else {
+                        let dwell_ms = self.channels[idx].dwell_ms;
+                        Some(Phase::Dwelling {
+                            idx,
+                            samples_until_timeout: ms_to_samples(dwell_ms, sample_rate_hz),
+                        })
+                    }
                 } else {
                     None
                 }
@@ -979,6 +1000,14 @@ Replace the stub body:
                     samples_until_timeout,
                 };
                 vec![ScannerCommand::StateChanged(ScannerState::Dwelling)]
+            }
+            Some(Phase::Listening { idx }) => {
+                // Persistent-open-carrier path from settle expiry.
+                self.phase = Phase::Listening { idx };
+                vec![
+                    ScannerCommand::MuteAudio(false),
+                    ScannerCommand::StateChanged(ScannerState::Listening),
+                ]
             }
             Some(Phase::__AdvanceFromDwell) | Some(Phase::__AdvanceFromHang) => {
                 self.hops_since_priority_sweep += 1;
@@ -1033,9 +1062,21 @@ Replace stub body:
 
 ```rust
     fn handle_squelch_edge(&mut self, state: SquelchState) -> Vec<ScannerCommand> {
+        // Always latch the current squelch state, regardless of
+        // phase. Retuning drops phase transitions (transients
+        // would false-trigger) but must still track carrier
+        // presence — a persistent-open channel must be visible
+        // to `handle_sample_tick`'s settle-expiry decision, which
+        // consults `self.squelch_open` to choose direct Listening
+        // vs standard Dwelling. `enter_retuning` resets the
+        // latch so previous-channel state doesn't bleed in.
+        self.squelch_open = matches!(state, SquelchState::Open);
         match (&self.phase, state) {
             (Phase::Retuning { .. }, _) => {
-                // Ignore edges during settle window.
+                // Ignore edges for phase transitions during the
+                // settle window — latch above is the mechanism
+                // that carries the open/closed information to
+                // settle expiry.
                 Vec::new()
             }
             (Phase::Dwelling { idx, .. }, SquelchState::Open) => {
@@ -1353,7 +1394,7 @@ Expected: All 4 new tests PASS (the logic is already in place from Task 1.5/1.6)
 - [ ] **Step 4: Run all tests**
 
 Run: `cargo test -p sdr-scanner --lib`
-Expected: all tests from Tasks 1.5 + 1.6 + 1.7 pass. Current baseline on shipped PR #368 is 17 tests (3 + 6 + 6 priority/lockout/edge + 1 `disable_clears_session_state` + 1 `unlockout_resumes_scanning_from_empty_rotation_idle`). If you're following the plan exactly, you'll see 15 at this checkpoint; the two regression tests landed via CR feedback after the initial task sequence.
+Expected: all tests from Tasks 1.5 + 1.6 + 1.7 pass. Baseline on shipped PR #368 (as of April 2026) is 18 tests (3 + 6 + 6 priority/lockout/edge + 1 `disable_clears_session_state` + 1 `unlockout_resumes_scanning_from_empty_rotation_idle` + 1 `persistent_open_during_settle_goes_directly_to_listening`). If you're following the plan exactly, you'll see 15 at this checkpoint; the three regression tests landed via CR feedback rounds 2–3 after the initial task sequence.
 
 - [ ] **Step 5: Run clippy**
 

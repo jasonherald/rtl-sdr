@@ -2,6 +2,8 @@
 //! No wall-clock time anywhere — sample-count is the only timing
 //! primitive, matching the `AutoBreakMachine` pattern.
 
+use std::num::NonZeroU32;
+
 use crate::channel::{ChannelKey, ScannerChannel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,9 +17,16 @@ pub enum ScannerEvent {
     /// Fired by the DSP controller on every IQ block arrival.
     /// `samples_consumed` is block length; `sample_rate_hz`
     /// anchors the ms→sample conversion for dwell/hang/settle.
+    ///
+    /// Typed as `NonZeroU32` so the ms→sample math's zero-rate
+    /// invariant is enforced at compile time rather than via a
+    /// runtime debug-assert that silently degrades in release
+    /// builds. Callers wrap the source sample rate with
+    /// `NonZeroU32::new(rate).expect("source rate > 0")` — this
+    /// is always true for any live SDR source.
     SampleTick {
         samples_consumed: u32,
-        sample_rate_hz: u32,
+        sample_rate_hz: NonZeroU32,
     },
 
     /// Edge-triggered squelch transition, identical to the stream
