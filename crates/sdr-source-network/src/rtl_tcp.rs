@@ -682,8 +682,28 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
                 attempt = 0;
                 // At this point handshake has completed successfully.
                 replay_sticky_commands(&shared);
-                run_data_pump(stream, codec, &shared, &config);
-                // run_data_pump returned — connection dropped.
+                // `run_data_pump` returns `Ok(())` on a normal
+                // transient dropout (EOF, stall, generic socket
+                // error — all reconnect-worthy) and
+                // `Err(SourceError::Protocol(_))` on unrecoverable
+                // stream corruption (LZ4 mid-stream decode
+                // failure — the next reconnect would hit the same
+                // issue). Terminal errors route to `Failed` the
+                // same way a non-recoverable `attempt_connect`
+                // error does; transient errors fall through to
+                // the reconnect-with-backoff loop below. Per
+                // CodeRabbit round 5 on PR #399.
+                if let Err(e) = run_data_pump(stream, codec, &shared, &config) {
+                    tracing::warn!(%e, "rtl_tcp data pump terminated with non-recoverable error");
+                    set_state(
+                        &shared,
+                        ConnectionState::Failed {
+                            reason: format!("{e}"),
+                        },
+                    );
+                    return;
+                }
+                // run_data_pump returned Ok — connection dropped transiently.
             }
             Err(e) => {
                 tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
@@ -845,9 +865,15 @@ fn attempt_connect(
         ));
     };
     let tuner = TunerInfo::from(info);
-    if let Ok(mut slot) = shared.tuner.lock() {
-        *slot = Some(tuner);
-    }
+    // NOTE: `shared.tuner` is NOT published here. Writing it
+    // before the extension read would expose stale tuner metadata
+    // via `tuner_info()` if the extension fails or the server
+    // rejects with a non-OK status — callers would see a
+    // "tuner = R820T" readback for a session that never actually
+    // reached `Connected`. The cache write now lives next to the
+    // `set_state(Connected)` call below, so the tuner is visible
+    // only once the handshake has fully succeeded. Per CodeRabbit
+    // round 5 on PR #399.
 
     // Read the server's `ServerExtension` block BEFORE publishing
     // `Connected` state — the codec is part of the state the UI
@@ -897,6 +923,15 @@ fn attempt_connect(
         Codec::None
     };
 
+    // Publish tuner metadata + Connected state together — both
+    // reflect the same "handshake fully succeeded" point. Order
+    // matters: tuner cache first, then state transition, so any
+    // UI listener that observes Connected and immediately reads
+    // `tuner_info()` sees the fresh value rather than a None
+    // (initial) or stale (previous-session) snapshot.
+    if let Ok(mut slot) = shared.tuner.lock() {
+        *slot = Some(tuner);
+    }
     set_state(shared, ConnectionState::Connected { tuner, codec });
 
     // Publish a clone of the stream for the command sender. Install a
@@ -995,7 +1030,7 @@ fn run_data_pump(
     codec: Codec,
     shared: &Arc<SharedState>,
     config: &RtlTcpConfig,
-) {
+) -> Result<(), SourceError> {
     // Wrap the TCP stream in the negotiated decoder. Legacy /
     // vanilla-server paths hit `Codec::None` which is a
     // zero-overhead pass-through; only LZ4 connections pay the
@@ -1008,6 +1043,11 @@ fn run_data_pump(
     let mut reader = Decoder::new(codec, stream);
     let mut buf = [0u8; RECV_CHUNK_BYTES];
     let mut consecutive_timeouts: u32 = 0;
+    // Default Ok path: any break out of the loop (EOF, stall,
+    // generic socket error) is a reconnect-worthy dropout, not
+    // a terminal failure. Only explicit `return Err(...)` below
+    // for LZ4 decode corruption escapes as terminal.
+    let mut outcome: Result<(), SourceError> = Ok(());
     while !shared.shutdown.load(Ordering::Relaxed) {
         match reader.read(&mut buf) {
             Ok(0) => {
@@ -1039,6 +1079,24 @@ fn run_data_pump(
                     break;
                 }
             }
+            Err(e) if codec != Codec::None && e.kind() == std::io::ErrorKind::InvalidData => {
+                // LZ4 frame corruption mid-stream — either a codec
+                // mismatch we negotiated wrong (server lied about
+                // capability) or an on-the-wire bit flip under a
+                // transport that doesn't guarantee integrity. The
+                // stream state is unrecoverable: the next read
+                // would start mid-block, so every subsequent
+                // reconnect would hit the same corruption.
+                // Surface as `SourceError::Protocol` so the
+                // connection manager routes to terminal
+                // `ConnectionState::Failed` instead of spinning
+                // on the backoff schedule forever. Per CodeRabbit
+                // round 5 on PR #399.
+                outcome = Err(SourceError::Protocol(format!(
+                    "rtl_tcp {codec} decode failed mid-stream (unrecoverable): {e}"
+                )));
+                break;
+            }
             Err(e) => {
                 tracing::info!(%e, "rtl_tcp socket read failed, will reconnect");
                 break;
@@ -1062,6 +1120,8 @@ fn run_data_pump(
     // stalls, the warning logs again rather than being suppressed by a
     // stale flag left over from the previous session.
     shared.rx_in_overflow.store(false, Ordering::Relaxed);
+
+    outcome
 }
 
 fn replay_sticky_commands(shared: &Arc<SharedState>) {
