@@ -1,6 +1,6 @@
 //! Application state shared across GTK closures.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -40,6 +40,16 @@ pub struct AppState {
     /// accidentally tear down the scanner-driven retune the UI is
     /// only trying to reflect.
     pub suppress_demod_notify: Cell<bool>,
+    /// Scanner's currently-active channel key (or `None` when
+    /// scanner is Idle / Retuning). Written by the
+    /// `ScannerActiveChannelChanged` fan-out in `handle_dsp_message`
+    /// and read by the lockout button's click handler so a lockout
+    /// click targets whichever channel the scanner latched onto
+    /// most recently. `RefCell` rather than `Cell` because
+    /// `ChannelKey` owns a `String` — `Cell::set` would require
+    /// moving the stored value out, which interferes with the
+    /// borrow-and-clone pattern the button handler uses.
+    pub scanner_active_key: RefCell<Option<sdr_scanner::ChannelKey>>,
 }
 
 impl AppState {
@@ -54,6 +64,7 @@ impl AppState {
             ui_tx,
             suppress_bandwidth_notify: Cell::new(false),
             suppress_demod_notify: Cell::new(false),
+            scanner_active_key: RefCell::new(None),
         })
     }
 
