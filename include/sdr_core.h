@@ -933,13 +933,19 @@ typedef struct SdrRtlTcpClientInfo {
      * the opcode locally or call
      * sdr_rtltcp_server_recent_commands_json for the ring. */
     uint8_t  last_command_op;
-    /* Seconds elapsed since the client's most recent command
-     * was dispatched. Measured at the moment this snapshot was
-     * assembled; increases monotonically between polls. Valid
-     * only when has_last_command == true. Hosts that want to
-     * replicate "most recent commander" selection across the
-     * connected-client list pick the entry with the smallest
-     * last_command_age_secs. */
+    /* Seconds elapsed between the client's most recent command
+     * and the moment this snapshot was assembled. A pure
+     * snapshot-time age — NOT a monotonic counter: a fresh
+     * command from the client resets it back near zero on the
+     * next poll, so consumers should not rely on it increasing
+     * between consecutive samples. Intended use: compare recency
+     * *across clients within a single snapshot* — the entry with
+     * the smallest last_command_age_secs is the most recent
+     * commander (mirrors the Rust UI's
+     * pick_most_recent_commander helper). Valid only when
+     * has_last_command == true. All entries in the same
+     * sdr_rtltcp_server_client_list call reference a single
+     * snapshot clock, so the ordering is consistent. */
     double   last_command_age_secs;
 } SdrRtlTcpClientInfo;
 

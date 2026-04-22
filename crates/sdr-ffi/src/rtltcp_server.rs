@@ -218,10 +218,16 @@ pub struct SdrRtlTcpClientInfo {
     /// label via [`sdr_rtltcp_server_recent_commands_json`] or
     /// their own opcode table.
     pub last_command_op: u8,
-    /// Seconds elapsed since the client's most recent command
-    /// was dispatched. Measured at the moment this snapshot was
-    /// assembled; increases monotonically between polls.
-    /// Valid only when `has_last_command == true`.
+    /// Seconds elapsed between the client's most recent command
+    /// and the moment this snapshot was assembled. A pure
+    /// snapshot-time age — NOT a monotonic counter: a fresh
+    /// command from the client resets it back near zero on the
+    /// next poll, so don't rely on it increasing between
+    /// consecutive samples. Intended for comparing *recency
+    /// across clients within a single snapshot* (smallest age
+    /// wins — replicates the Rust UI's
+    /// `pick_most_recent_commander`). Valid only when
+    /// `has_last_command == true`.
     pub last_command_age_secs: f64,
 }
 
@@ -685,13 +691,22 @@ pub unsafe extern "C" fn sdr_rtltcp_server_client_list(
         // SAFETY: out_count null-checked above.
         unsafe { *out_count = total };
 
+        // Capture the snapshot clock once for the entire array.
+        // Every projected `last_command_age_secs` / `uptime_secs`
+        // references this same `Instant`, so FFI hosts comparing
+        // ages across clients in one snapshot see a consistent
+        // ordering — per-entry `Instant::now()` calls would drift
+        // by a few microseconds across the loop and could flip
+        // the "smallest age wins" selection. Per `CodeRabbit`
+        // round 7 on PR #402.
+        let snapshot_at = std::time::Instant::now();
         let to_write = total.min(capacity);
         for (i, info) in stats.connected_clients.iter().take(to_write).enumerate() {
             // SAFETY: `i < to_write <= capacity` and the caller
             // guaranteed `out_clients` points at `capacity`
             // entries.
             unsafe {
-                *out_clients.add(i) = client_info_to_c(info);
+                *out_clients.add(i) = client_info_to_c(info, snapshot_at);
             }
         }
 
@@ -821,18 +836,21 @@ fn stats_to_c(stats: &ServerStats, tuner: &TunerAdvertiseInfo) -> SdrRtlTcpServe
     }
 }
 
-fn client_info_to_c(info: &ClientInfo) -> SdrRtlTcpClientInfo {
+fn client_info_to_c(info: &ClientInfo, snapshot_at: std::time::Instant) -> SdrRtlTcpClientInfo {
     // Project `last_command` onto the flat FFI trio:
-    // `(has_last_command, last_command_op, last_command_age_secs)`.
-    // Computed against `Instant::now()` at projection time so the
-    // reported age reflects the moment the snapshot was assembled,
-    // matching how UI callers interpret the analogous fields on
-    // `ClientInfo`. Per `CodeRabbit` round 6 on PR #402.
+    // `(has_last_command, last_command_op, last_command_age_secs)`,
+    // and compute `uptime_secs` the same way. Both ages reference
+    // `snapshot_at` — a single `Instant::now()` captured once by
+    // `sdr_rtltcp_server_client_list` — so every entry in the
+    // emitted array is measured against the same clock. Per-client
+    // `Instant::now()` calls would drift by a few microseconds
+    // across the projection loop, which is enough to flip the
+    // "smallest `last_command_age_secs` wins" ordering FFI hosts
+    // use to replicate `pick_most_recent_commander`. Per
+    // `CodeRabbit` round 7 on PR #402.
     let (has_last_command, last_command_op, last_command_age_secs) =
         if let Some((op, at)) = info.last_command {
-            let age = std::time::Instant::now()
-                .saturating_duration_since(at)
-                .as_secs_f64();
+            let age = snapshot_at.saturating_duration_since(at).as_secs_f64();
             (true, op as u8, age)
         } else {
             (false, 0u8, 0.0)
@@ -840,7 +858,9 @@ fn client_info_to_c(info: &ClientInfo) -> SdrRtlTcpClientInfo {
     let mut out = SdrRtlTcpClientInfo {
         id: info.id,
         peer_addr: [0; SDR_RTLTCP_CLIENT_PEER_LEN],
-        uptime_secs: info.connected_since.elapsed().as_secs_f64(),
+        uptime_secs: snapshot_at
+            .saturating_duration_since(info.connected_since)
+            .as_secs_f64(),
         codec: info.codec.to_wire(),
         bytes_sent: info.bytes_sent,
         buffers_dropped: info.buffers_dropped,
@@ -1215,6 +1235,7 @@ mod tests {
         // pre-#391 server-wide struct (CR round 7 on PR #360),
         // now preserved per-client.
         use sdr_server_rtltcp::codec::Codec;
+        let snapshot_at = std::time::Instant::now();
         let mut info = ClientInfo {
             id: TEST_CLIENT_ID,
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
@@ -1231,7 +1252,7 @@ mod tests {
         };
 
         // (None, None) → neither set
-        let c = client_info_to_c(&info);
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(!c.has_current_gain_value);
         assert!(!c.has_current_gain_mode);
         assert_eq!(c.id, TEST_CLIENT_ID);
@@ -1257,7 +1278,7 @@ mod tests {
         // (Some(v), None) → value set, mode unknown
         info.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
         info.current_gain_auto = None;
-        let c = client_info_to_c(&info);
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(c.has_current_gain_value);
         assert!(!c.has_current_gain_mode);
         assert_eq!(c.current_gain_tenths_db, TEST_NONZERO_GAIN_TENTHS);
@@ -1266,7 +1287,7 @@ mod tests {
         // (None, Some(auto)) → mode set, value unknown
         info.current_gain_tenths_db = None;
         info.current_gain_auto = Some(true);
-        let c = client_info_to_c(&info);
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(!c.has_current_gain_value);
         assert!(c.has_current_gain_mode);
         assert!(c.current_gain_auto);
@@ -1274,7 +1295,7 @@ mod tests {
         // (Some(v), Some(manual)) → both set, explicit manual
         info.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
         info.current_gain_auto = Some(false);
-        let c = client_info_to_c(&info);
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(c.has_current_gain_value);
         assert!(c.has_current_gain_mode);
         assert_eq!(c.current_gain_tenths_db, TEST_NONZERO_GAIN_TENTHS);
@@ -1283,27 +1304,38 @@ mod tests {
 
     #[test]
     fn client_info_to_c_projects_last_command_fields() {
-        // **Regression test for `CodeRabbit` round 6 on PR #402.**
-        // `SdrRtlTcpClientInfo` now carries
+        // **Regression test for `CodeRabbit` round 6 on PR #402**
+        // (initial projection) **+ round 7** (deterministic age
+        // via injected `snapshot_at` — the function now takes
+        // the snapshot clock as a parameter so per-entry drift
+        // can't flip the "smallest age wins" ordering).
+        //
+        // `SdrRtlTcpClientInfo` carries
         // `(has_last_command, last_command_op, last_command_age_secs)`
         // so FFI hosts can replicate the Rust UI's
         // `pick_most_recent_commander` selection without parsing
         // every client's JSON ring. Verify the projection:
         //
         //   `ClientInfo.last_command = None`             → flag=false, op=0, age=0.0
-        //   `ClientInfo.last_command = Some((op, at))`   → flag=true, op=op_byte, age>0
+        //   `ClientInfo.last_command = Some((op, at))`   → flag=true, op=op_byte, age=snapshot_at-at
         //
         // The `None` case is already covered by the default path
         // in `client_info_to_c_preserves_independent_gain_validity`;
         // this test pins the `Some` case — opcode byte maps to
-        // the wire value, and the age is a positive number
-        // matching the injected delta.
+        // the wire value, and the age is exactly the delta
+        // between the injected `snapshot_at` and the dispatched
+        // timestamp (measured in `f64` seconds).
         use sdr_server_rtltcp::codec::Codec;
         use sdr_server_rtltcp::protocol::CommandOp;
         let command_age = Duration::from_secs(TEST_COMMAND_AGE_SECS);
-        let dispatched_at = std::time::Instant::now()
+        let base = std::time::Instant::now();
+        let dispatched_at = base
             .checked_sub(command_age)
             .expect("Instant::now - TEST_COMMAND_AGE_SECS is representable");
+        // `snapshot_at = dispatched_at + command_age` gives an
+        // age of *exactly* TEST_COMMAND_AGE_SECS, so the
+        // assertion doesn't depend on wall-clock jitter.
+        let snapshot_at = dispatched_at + command_age;
         let info = ClientInfo {
             id: TEST_CLIENT_ID,
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
@@ -1321,22 +1353,27 @@ mod tests {
             current_gain_auto: None,
             recent_commands: std::collections::VecDeque::new(),
         };
-        let c = client_info_to_c(&info);
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(c.has_last_command);
         assert_eq!(c.last_command_op, CommandOp::SetBiasTee as u8);
         assert_eq!(c.last_command_op, 0x0e, "opcode wire byte");
-        // The projection computes `Instant::now().saturating_duration_since(at)`
-        // so the age is at least `TEST_COMMAND_AGE_SECS` (and a
-        // few microseconds over, but we don't pin an upper bound
-        // because CI schedulers vary).
         #[allow(
             clippy::cast_precision_loss,
             reason = "seconds count fits in f64 mantissa"
         )]
-        let min_age = TEST_COMMAND_AGE_SECS as f64;
+        let expected_age = TEST_COMMAND_AGE_SECS as f64;
+        // Exact-equality float comparison is correct here
+        // because `snapshot_at - dispatched_at` is a whole number
+        // of seconds converted through `Duration::as_secs_f64` —
+        // no accumulated arithmetic, no wall-clock jitter.
+        #[allow(
+            clippy::float_cmp,
+            reason = "deterministic snapshot_at + exact-seconds command_age"
+        )]
+        let age_matches = c.last_command_age_secs == expected_age;
         assert!(
-            c.last_command_age_secs >= min_age,
-            "expected age >= {min_age}s, got {}s",
+            age_matches,
+            "expected age == {expected_age}s with injected snapshot_at, got {}s",
             c.last_command_age_secs
         );
     }
@@ -1361,7 +1398,7 @@ mod tests {
             current_gain_auto: None,
             recent_commands: std::collections::VecDeque::new(),
         };
-        let c = client_info_to_c(&info);
+        let c = client_info_to_c(&info, std::time::Instant::now());
         // Find the NUL byte and decode what's before. `c_char`
         // is `i8` on most platforms; reinterpret-cast the raw
         // bytes as u8 for the UTF-8 decode since ASCII is
