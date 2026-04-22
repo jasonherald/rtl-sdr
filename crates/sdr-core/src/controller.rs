@@ -584,6 +584,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::Tune(freq) => {
             tracing::debug!(frequency_hz = freq, "tune command");
+            on_tune_change(state);
             state.center_freq = freq;
             if let Some(source) = &mut state.source
                 && let Err(e) = source.tune(freq)
@@ -595,6 +596,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetDemodMode(mode) => {
             tracing::debug!(?mode, "set demod mode");
+            on_tune_change(state);
             let old_mode = state.radio.current_mode();
             if let Err(e) = state.radio.set_mode(mode) {
                 tracing::warn!("set demod mode failed: {e}");
@@ -674,6 +676,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetBandwidth(bw) => {
             tracing::debug!(bandwidth_hz = bw, "set bandwidth");
+            on_tune_change(state);
             // Update the VFO channel filter first; only persist on success.
             if let Some(vfo) = &mut state.vfo {
                 match vfo.set_bandwidth(bw) {
@@ -1619,6 +1622,32 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
     }
 }
 
+/// Reset the per-tune engine state that MUST NOT carry over a
+/// frequency / demod / bandwidth change:
+///
+/// 1. The controller-side squelch-edge tracker
+///    (`state.squelch_was_open`) — so a fresh `SquelchEdge::Open`
+///    at the new channel isn't suppressed by the previous
+///    channel's trailing open state. Originally added for the
+///    scanner retune path (PR #372 round 3); the same risk
+///    applies to every manual tune / mode / bandwidth change.
+///
+/// 2. Auto-squelch noise-floor tracking
+///    (`state.radio.rearm_auto_squelch`) — the floor estimate
+///    settles over seconds; carrying it from one band to
+///    another leaves the threshold pinned to the wrong value,
+///    so the new channel hard-opens (old floor was louder) or
+///    stays hard-closed (old floor was quieter). No-op when
+///    auto-squelch is disabled. Per issue #374.
+///
+/// Call from every UI-origin retune site (`UiToDsp::Tune`,
+/// `SetDemodMode`, `SetBandwidth`) and the scanner retune
+/// path. Cheap — two field writes plus an `if`-guarded reset.
+fn on_tune_change(state: &mut DspState) {
+    state.squelch_was_open = false;
+    state.radio.rearm_auto_squelch();
+}
+
 /// Is audio or IQ recording currently active?
 ///
 /// Used by future scanner tasks; suppress the unused-function lint
@@ -1692,18 +1721,19 @@ fn apply_scanner_commands(
                 // UI handler fans out to the same widgets; emitting
                 // both paths would double-drive the sync.
 
-                // Re-arm the controller's squelch-edge tracker for
-                // the new channel. Without this, if the previous
-                // channel ended open and the new channel is also
-                // open during settle, the `now_open != squelch_was_open`
-                // comparison in the IQ loop would suppress the
-                // fresh `SquelchEdge::Open` — scanner's latch
-                // would stay `false`, settle expiry would go to
-                // `Dwelling` instead of directly to `Listening`,
-                // and the `persistent_open_during_settle_goes_directly_to_listening`
-                // invariant the scanner crate tests would break
-                // at integration.
-                state.squelch_was_open = false;
+                // Reset the squelch edge tracker AND re-arm the
+                // auto-squelch noise-floor estimate for the new
+                // channel. See `on_tune_change` for the full
+                // rationale — both are critical: without the
+                // edge reset a fresh `SquelchEdge::Open` would
+                // be suppressed by a trailing-open state from
+                // the previous channel (scanner invariant
+                // `persistent_open_during_settle_goes_directly_to_listening`
+                // relies on this); without the auto-squelch
+                // re-arm the scanner inherits the previous
+                // band's noise floor, which is the same bug
+                // issue #374 describes for manual tunes.
+                on_tune_change(state);
 
                 // 1. Center frequency (mirrors `UiToDsp::Tune`).
                 #[allow(clippy::cast_precision_loss)]

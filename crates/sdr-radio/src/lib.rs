@@ -459,6 +459,16 @@ impl RadioModule {
         self.if_chain.set_auto_squelch_enabled(enabled);
     }
 
+    /// Re-arm auto-squelch noise-floor tracking so it re-converges
+    /// at the current tuning context. No-op when auto-squelch is
+    /// disabled. Call on every engine-side retune — frequency
+    /// change, demod switch, bandwidth change — so the tracker
+    /// doesn't carry a prior channel's settled floor into a new
+    /// noise environment. Per issue #374.
+    pub fn rearm_auto_squelch(&mut self) {
+        self.if_chain.rearm_auto_squelch();
+    }
+
     /// Set the deemphasis mode.
     ///
     /// # Errors
