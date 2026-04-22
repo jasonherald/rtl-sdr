@@ -17,6 +17,13 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 - CTCSS tone squelch — 51 standard sub-audible tones (67.0–254.1 Hz), Goertzel-filter detection with neighbor-dominance gating and sustained-hit debouncing; per-bookmark tone selection and threshold tuning
 - Voice-activity squelch — syllabic envelope detector (2–10 Hz speech cadence) and SNR-ratio detector (voice-band vs out-of-band power), gates the speaker path alongside CTCSS and power squelch
 - Bookmark tuning profiles with full state capture/restore (including CTCSS + voice squelch per-channel)
+- **Scanner** — classic sequential scanner (scan-enabled bookmarks, priority channels, configurable dwell/hang, session lockout, empty-rotation recovery). Mutex with recording + transcription so only one is active at a time. F8 toggles the master switch. Manual tune / bookmark recall / demod change auto-stops the scanner.
+
+### Networking
+
+- **rtl_tcp server** — stream the local RTL-SDR over TCP to other machines on your LAN. Single-client model (one user at a time; second connection rejected with FIN). mDNS `_rtl_tcp._tcp.local.` announce so clients find you without typing `host:port`. Compatible with GQRX / SDR++ / any rtl_tcp client.
+- **rtl_tcp client** — connect to a remote rtl_tcp server (ours, or stock `rtl_tcp`, SpyServer TCP, etc.). Live mDNS browser lists servers on the LAN; pin favorites for one-click reconnect with last-connection metadata (tuner, gains) shown in the favorites menu. Auto-reconnect on transient network blips.
+- **Optional LZ4 stream compression** — between two sdr-rs peers, the rtl_tcp server and client negotiate LZ4 on the data stream via a backwards-compatible `RTLX` handshake. Wire-compatible with every vanilla client (default off; opt in per-server from the "Share over network" panel). Useful on Wi-Fi / hotel / congested links where uncompressed 2.4 Msps saturates the pipe; mDNS advertises `codecs=` so compression-capable clients know when to send the extended hello.
 
 ### Display
 
@@ -24,6 +31,7 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 - Frequency axis with smart Hz/kHz/MHz/GHz labels
 - Spectrum zoom (scroll to zoom, clamped to FFT bandwidth)
 - VFO overlay with drag-to-tune and bandwidth handles
+- Floating "Reset VFO" button when bandwidth or offset drifts from defaults; per-field bandwidth reset icon on the spin row for one-dimension undo
 - Configurable FFT size, window function, colormap, and dB range
 
 ### Recording
@@ -37,7 +45,7 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 Two mutually exclusive backends, selected at build time (see the install section below):
 
 **Whisper backend** — OpenAI's Whisper via `whisper-rs`, multilingual, mature GPU support
-- 5 model sizes from tiny (75 MB) to large-v3 (3.1 GB)
+- 6 model sizes: tiny (75 MB), base (142 MB), small (466 MB), medium (1.5 GB), large-v3 (3.1 GB), and **large-v3-turbo** (1.6 GB, ~8× faster than large-v3 with near-equivalent English accuracy)
 - Optional GPU acceleration: CUDA (NVIDIA), ROCm/HIP (AMD), Vulkan, Metal
 - RMS-gated chunked inference with configurable silence threshold
 
@@ -48,6 +56,7 @@ Two mutually exclusive backends, selected at build time (see the install section
 - **Runtime model swap** — change models from the dropdown without restarting the app
 - **Live captions with display mode toggle** — streaming models render an in-place italic line below the commit log; user can switch to "Final only" mode
 - **Silero VAD** — offline models use Silero voice activity detection with a user-tunable threshold slider for noisy RF audio (NFM/scanner)
+- **Auto Break segmentation** — with an offline transcription model on an NFM channel, Auto Break segments long recordings on squelch-closed edges so each transmission becomes its own transcript commit instead of a wall of text. The toggle appears automatically when both conditions are met.
 - Auto-downloads models and VAD on first use with a bundled progress splash
 
 **Both backends share:**
@@ -73,7 +82,7 @@ Two mutually exclusive backends, selected at build time (see the install section
 
 ### Under the Hood
 
-- 18-member workspace (root binary + 17 library crates) with clear dependency boundaries
+- 22-member workspace (root binary + 21 library crates) with clear dependency boundaries
 - Pure DSP functions (no threading, no I/O, no side effects)
 - Zero per-frame heap allocations on hot paths
 - Lock-based SPSC audio ring buffer between DSP and audio threads
@@ -240,13 +249,15 @@ sdr-rs
 |-----|--------|
 | Space | Play / Stop |
 | M | Cycle demod mode |
+| F8 | Toggle scanner |
 | F9 | Toggle sidebar |
+| Ctrl+B | Toggle bookmarks flyout |
 | Ctrl+, | Preferences |
 | Ctrl+/ | Keyboard shortcuts |
 
 ## Architecture
 
-18-member Rust workspace (root binary + 17 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
+22-member Rust workspace (root binary + 21 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
 
 ```text
 sdr (binary)              Linux entry point
@@ -264,10 +275,13 @@ sdr-transcription         Whisper / Sherpa-onnx backends + spectral denoiser + S
 sdr-splash                Cross-platform splash controller (subprocess driver)
 sdr-splash-gtk            Linux GTK4 splash window implementation
 sdr-source-rtlsdr         RTL-SDR source module
-sdr-source-network        TCP/UDP IQ source
+sdr-source-network        TCP/UDP IQ source (including rtl_tcp client)
 sdr-source-file           WAV file playback source
 sdr-sink-audio            PipeWire/CoreAudio audio output
 sdr-sink-network          TCP/UDP audio output
+sdr-server-rtltcp         rtl_tcp server — stream local dongle over TCP + CLI binary
+sdr-rtltcp-discovery      mDNS _rtl_tcp._tcp.local. announce + browse
+sdr-scanner               Classic sequential scanner state machine (pure, no I/O)
 
 apps/macos/
 ├── SDRMac                   Native SwiftUI app (macOS 26+)
