@@ -1502,6 +1502,19 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 }
             }
         }
+        // --- Scanner (#317) — handlers wired in Task 2.4 ---
+        UiToDsp::SetScannerEnabled(_enabled) => {
+            tracing::debug!("SetScannerEnabled: handler not yet wired (Task 2.4)");
+        }
+        UiToDsp::UpdateScannerChannels(_channels) => {
+            tracing::debug!("UpdateScannerChannels: handler not yet wired (Task 2.4)");
+        }
+        UiToDsp::LockoutScannerChannel(_key) => {
+            tracing::debug!("LockoutScannerChannel: handler not yet wired (Task 2.4)");
+        }
+        UiToDsp::UnlockScannerChannel(_key) => {
+            tracing::debug!("UnlockScannerChannel: handler not yet wired (Task 2.4)");
+        }
     }
 }
 

@@ -283,6 +283,21 @@ pub enum UiToDsp {
     /// wait for the current exponential-backoff delay to expire.
     /// No-op when the active source is not `RtlTcp`.
     RetryRtlTcpNow,
+    // --- Scanner (#317) ---
+    /// Master scanner on/off toggle.
+    SetScannerEnabled(bool),
+    /// Replace the scanner's channel list. UI projects bookmarks
+    /// with `scan_enabled = true` into `ScannerChannel`s (folding
+    /// defaults + overrides at projection time) and dispatches
+    /// this on startup + any bookmark/default change.
+    UpdateScannerChannels(Vec<sdr_scanner::ScannerChannel>),
+    /// Session-scoped lockout — scanner skips this channel until
+    /// unlocked or scanner is disabled.
+    LockoutScannerChannel(sdr_scanner::ChannelKey),
+    /// Clear a lockout. If scanner stalled into `Idle` via
+    /// `EmptyRotation` (all channels locked) this resumes
+    /// rotation automatically.
+    UnlockScannerChannel(sdr_scanner::ChannelKey),
 }
 
 #[cfg(test)]
