@@ -112,6 +112,12 @@ pub struct RadioPanel {
     pub widget: adw::PreferencesGroup,
     /// Bandwidth control.
     pub bandwidth_row: adw::SpinRow,
+    /// "Reset bandwidth to default for current demod mode" button,
+    /// packed as a suffix on `bandwidth_row`. Sensitive only when
+    /// the current bandwidth differs from the mode's default;
+    /// otherwise the button grays out so it doesn't lie about
+    /// having something to do. Per issue #341.
+    pub bandwidth_reset_button: gtk4::Button,
     /// Squelch enable toggle.
     pub squelch_enabled_row: adw::SwitchRow,
     /// Squelch level control.
@@ -481,6 +487,25 @@ pub fn build_radio_panel() -> RadioPanel {
         .digits(0)
         .build();
 
+    // "Reset bandwidth to default for current demod mode" —
+    // packed as a suffix so it sits inline with the spin row.
+    // Flat + valign(Center) matches the affordance pattern other
+    // sidebar rows use for secondary actions.
+    let bandwidth_reset_button = gtk4::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Reset bandwidth to default for current demod mode")
+        .css_classes(["flat"])
+        .valign(gtk4::Align::Center)
+        // Start insensitive — the initial bandwidth is the
+        // mode default. The value-notify + DemodModeChanged
+        // handlers in window.rs update sensitivity from here.
+        .sensitive(false)
+        .build();
+    bandwidth_reset_button.update_property(&[gtk4::accessible::Property::Label(
+        "Reset bandwidth to default",
+    )]);
+    bandwidth_row.add_suffix(&bandwidth_reset_button);
+
     // --- Squelch ---
     let squelch_enabled_row = adw::SwitchRow::builder().title("Squelch").build();
 
@@ -695,6 +720,7 @@ pub fn build_radio_panel() -> RadioPanel {
     RadioPanel {
         widget: group,
         bandwidth_row,
+        bandwidth_reset_button,
         squelch_enabled_row,
         squelch_level_row,
         auto_squelch_row,

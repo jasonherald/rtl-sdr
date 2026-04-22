@@ -149,6 +149,25 @@ pub fn create_demodulator(
     }
 }
 
+/// Default passband bandwidth (Hz) for a given demod mode.
+///
+/// Instantiates a demodulator and reads its `config().default_bandwidth`
+/// — keeps a single source of truth (the per-demod module constants)
+/// without re-declaring them here. Cost is one `Box::new` per call;
+/// callers should cache if they need it in a hot path, but UI
+/// comparisons on every demod-mode change are cheap enough.
+///
+/// # Errors
+///
+/// Returns `DspError` if demod construction fails. This isn't
+/// expected for any variant in [`sdr_types::DemodMode`] — every
+/// mode has a valid constructor today — but propagating the error
+/// is better than coercing to `0.0`, which would leave callers
+/// dispatching `SetBandwidth(0.0)` and silently break the radio.
+pub fn default_bandwidth_for_mode(mode: sdr_types::DemodMode) -> Result<f64, DspError> {
+    Ok(create_demodulator(mode)?.config().default_bandwidth)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

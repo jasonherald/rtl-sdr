@@ -69,6 +69,14 @@ pub enum DspToUi {
     /// negligible and emitting unconditionally keeps the controller
     /// free of per-field before/after comparisons.
     BandwidthChanged(f64),
+    /// VFO offset (Hz from tuner center) changed by the DSP.
+    /// Symmetric with [`Self::BandwidthChanged`] — lets UI paths
+    /// that trigger a VFO offset change indirectly (e.g. a
+    /// "reset VFO" button that dispatches `SetVfoOffset(0)`)
+    /// receive an echo and update the spectrum overlay without
+    /// having to optimistically guess the new value locally.
+    /// Per issue #341.
+    VfoOffsetChanged(f64),
     /// CTCSS sustained-gate state changed. Emitted only on edges
     /// (closed → open / open → closed), not per-window, so the UI
     /// status indicator can subscribe without flooding the channel.
@@ -359,6 +367,13 @@ mod tests {
     /// construct + match and documents the choice of value.
     const TEST_BANDWIDTH_HZ: f64 = 12_500.0;
 
+    /// Fixed VFO offset used by the `VfoOffsetChanged` round-trip
+    /// test. 25 kHz is a representative non-zero offset that
+    /// click-to-tune / drag flows routinely emit — same hoisting
+    /// rationale as `TEST_BANDWIDTH_HZ`: avoids a magic-number
+    /// duplicated between construct and match.
+    const TEST_VFO_OFFSET_HZ: f64 = 25_000.0;
+
     #[test]
     fn test_dsp_to_ui_variants() {
         let fft = DspToUi::FftData(vec![1.0, 2.0, 3.0]);
@@ -410,6 +425,18 @@ mod tests {
         assert!(
             matches!(bw, DspToUi::BandwidthChanged(v) if (v - TEST_BANDWIDTH_HZ).abs() < f64::EPSILON)
         );
+    }
+
+    #[test]
+    fn vfo_offset_changed_message_constructs() {
+        // Same shape regression as `bandwidth_changed_message_constructs`
+        // — future refactors that change the f64 carrier type
+        // fail here first.
+        let offset = DspToUi::VfoOffsetChanged(TEST_VFO_OFFSET_HZ);
+        assert!(matches!(
+            offset,
+            DspToUi::VfoOffsetChanged(v) if (v - TEST_VFO_OFFSET_HZ).abs() < f64::EPSILON
+        ));
     }
 
     #[test]

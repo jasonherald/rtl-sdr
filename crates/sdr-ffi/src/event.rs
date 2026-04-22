@@ -494,6 +494,11 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         //     light up in the macOS UI whenever the CTCSS / voice-
         //     squelch panels get ported (no specific backlog issue
         //     yet — part of the full-parity backlog under #228).
+        //   - `BandwidthChanged` and `VfoOffsetChanged` are the
+        //     VFO-drag + "reset VFO" feedback-echo events
+        //     (#336 / #341). Linux-only for now; macOS SwiftUI
+        //     gets them when the equivalent VFO overlay +
+        //     reset affordances land on that side.
         //   - `ScannerActiveChannelChanged`, `ScannerStateChanged`,
         //     `ScannerEmptyRotation`, `ScannerMutexStopped` are the
         //     scanner Phase 1 UI events (#317). Intentionally
@@ -566,6 +571,7 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         DspToUi::FftData(_)
         | DspToUi::DemodModeChanged(_)
         | DspToUi::BandwidthChanged(_)
+        | DspToUi::VfoOffsetChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
         | DspToUi::ScannerActiveChannelChanged { .. }
@@ -1051,6 +1057,24 @@ mod tests {
         assert!(!payload.utf8.is_null());
         let cstr = unsafe { std::ffi::CStr::from_ptr(payload.utf8) };
         assert_eq!(cstr.to_str().unwrap(), "host?injected:1234");
+    }
+
+    #[test]
+    fn vfo_offset_changed_is_intentionally_dropped_at_ffi() {
+        // Regression guard for the ABI-v1 "intentionally withheld"
+        // contract. `VfoOffsetChanged` is the VFO-reset feedback
+        // echo (#341) — Linux-only for now; macOS SwiftUI gets it
+        // when the equivalent VFO overlay + reset affordances
+        // land on that side. If a future refactor accidentally
+        // routes this variant through `translate_event`, the
+        // assertion below flips and the ABI change becomes
+        // visible at test time rather than at a downstream host
+        // that suddenly starts receiving an unknown event kind.
+        /// Representative non-zero VFO offset — 25 kHz is typical
+        /// of what click-to-tune and drag flows emit in practice.
+        const TEST_VFO_OFFSET_HZ: f64 = 25_000.0;
+        use sdr_core::DspToUi;
+        assert!(translate_event(&DspToUi::VfoOffsetChanged(TEST_VFO_OFFSET_HZ)).is_none());
     }
 
     #[test]
