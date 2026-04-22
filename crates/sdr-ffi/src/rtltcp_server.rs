@@ -266,7 +266,7 @@ impl Default for SdrRtlTcpClientInfo {
             has_last_command: false,
             last_command_op: 0,
             last_command_age_secs: 0.0,
-            role: 0, // Role::Control wire byte
+            role: sdr_server_rtltcp::extension::Role::Control.to_wire(),
         }
     }
 }
