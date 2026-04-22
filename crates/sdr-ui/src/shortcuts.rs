@@ -17,6 +17,7 @@ pub fn setup_shortcuts(
     sidebar_toggle: &gtk4::ToggleButton,
     bookmarks_toggle: &gtk4::ToggleButton,
     demod_dropdown: &gtk4::DropDown,
+    scanner_switch: &gtk4::Switch,
 ) {
     let controller = gtk4::ShortcutController::new();
     controller.set_scope(gtk4::ShortcutScope::Managed);
@@ -93,6 +94,28 @@ pub fn setup_shortcuts(
         controller.add_shortcut(shortcut);
     }
 
+    // F8: Toggle scanner master switch. The master switch is
+    // wired via `connect_active_notify` in `connect_scanner_panel`
+    // — `set_active` changes the active property and fires that
+    // notify, which dispatches `SetScannerEnabled` to the engine.
+    // (Earlier iterations of this code claimed `set_active`
+    // triggers `state-set` on programmatic changes; that's
+    // binding-version-dependent, so we sidestep the ambiguity by
+    // listening to notify::active instead.)
+    let scanner_switch_weak = scanner_switch.downgrade();
+    let trigger_f8 = gtk4::ShortcutTrigger::parse_string("F8");
+    if let Some(trigger) = trigger_f8 {
+        let action = gtk4::CallbackAction::new(move |_widget, _args| {
+            if let Some(sw) = scanner_switch_weak.upgrade() {
+                sw.set_active(!sw.is_active());
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        let shortcut = gtk4::Shortcut::new(Some(trigger), Some(action));
+        controller.add_shortcut(shortcut);
+    }
+
     window.add_controller(controller);
 }
 
@@ -107,6 +130,7 @@ const SHORTCUT_CATALOG: &[(&str, &[(&str, &str)])] = &[
         &[
             ("F9", "Toggle sidebar"),
             ("Ctrl+B", "Toggle bookmarks panel"),
+            ("F8", "Toggle scanner"),
         ],
     ),
     (

@@ -62,6 +62,53 @@ const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
 /// Interval in milliseconds for polling the DSP→UI channel.
 const DSP_POLL_INTERVAL_MS: u64 = 16;
 
+/// Toast display time (seconds) for scanner "force-disable" notices.
+const SCANNER_TOAST_TIMEOUT_SECS: u32 = 3;
+
+/// Shared "kill the scanner on a manual tune" hook. Built once in
+/// `build_window` and cloned into every manual-change handler
+/// (frequency selector, demod dropdown, bandwidth row, bookmark
+/// recall / preset selection). Calling [`Self::trigger`] is a
+/// no-op when the scanner is already off, so wiring it into a
+/// handler that fires during programmatic widget updates is
+/// cheap and idempotent.
+///
+/// Holds `glib::WeakRef`s rather than owned widget clones —
+/// each clone of this helper is captured by a signal handler
+/// that lives on a widget in the window, so a strong ref chain
+/// (handler → this helper → widget → handler) would keep the
+/// window alive after teardown. Upgrade-or-early-return in
+/// `trigger` handles the post-teardown case.
+struct ScannerForceDisable {
+    master_switch: glib::WeakRef<gtk4::Switch>,
+    toast_overlay: glib::WeakRef<adw::ToastOverlay>,
+}
+
+impl ScannerForceDisable {
+    /// Force the scanner off and toast the user about why. No-op
+    /// when the master switch has been dropped (post-teardown)
+    /// or when the scanner is already off. Calls `set_active(false)`
+    /// on the master switch — the switch's `connect_active_notify`
+    /// handler dispatches `SetScannerEnabled(false)` to the
+    /// engine, so no explicit DSP send is needed here.
+    fn trigger(&self, reason: &str) {
+        let Some(master_switch) = self.master_switch.upgrade() else {
+            return;
+        };
+        if !master_switch.is_active() {
+            return;
+        }
+        master_switch.set_active(false);
+        if let Some(overlay) = self.toast_overlay.upgrade() {
+            let toast = adw::Toast::builder()
+                .title(format!("Scanner stopped — {reason}"))
+                .timeout(SCANNER_TOAST_TIMEOUT_SECS)
+                .build();
+            overlay.add_toast(toast);
+        }
+    }
+}
+
 /// Build and present the main application window.
 #[allow(clippy::too_many_lines)]
 pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::ConfigManager>) {
@@ -274,6 +321,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &sidebar_toggle,
         &bookmarks_toggle,
         &demod_dropdown,
+        &panels.scanner.master_switch,
     );
 
     // Ctrl+? shows keyboard shortcuts dialog.
@@ -290,6 +338,16 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // --- Wire sidebar panels and frequency/demod to DSP + status bar ---
     let status_bar_demod = Rc::new(status_bar);
 
+    // Shared force-disable hook — cloned into every manual-change
+    // handler so a user tune / demod switch / bandwidth tweak /
+    // bookmark recall drops the scanner out of rotation. Rc so
+    // each handler can hold an independent clone without fighting
+    // over ownership; internals are cheap GObject refcount bumps.
+    let scanner_force_disable = Rc::new(ScannerForceDisable {
+        master_switch: panels.scanner.master_switch.downgrade(),
+        toast_overlay: toast_overlay.downgrade(),
+    });
+
     connect_sidebar_panels(
         &panels,
         &state,
@@ -300,6 +358,19 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &toast_overlay,
         config,
         &favorites_handle,
+        &scanner_force_disable,
+    );
+
+    // Seed the scanner with the persisted bookmark list on
+    // startup. Scanner starts Idle so no retune happens, but
+    // the channels are in place if the user flips F8 or the
+    // master switch. Defaults come from config via the shared
+    // projection helper — matches the on-mutation re-projection
+    // path so initial-load and post-edit semantics are identical.
+    sidebar::navigation_panel::project_and_push_scanner_channels(
+        &panels.bookmarks.bookmarks.borrow(),
+        &state,
+        config,
     );
 
     // Wire waterfall screenshot button.
@@ -344,7 +415,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                 // the panel's individual `Rc` fields.
                 *bookmarks_for_rr.bookmarks.borrow_mut() =
                     sidebar::navigation_panel::load_bookmarks();
-                bookmarks_for_rr.rebuild(&name_entry_for_rr);
+                bookmarks_for_rr.rebuild_after_mutation(&name_entry_for_rr);
             });
         });
     }
@@ -372,8 +443,14 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let status_bar_for_freq = Rc::clone(&status_bar_demod);
     let state_freq = Rc::clone(&state);
     let spectrum_for_freq = Rc::clone(&spectrum_handle);
+    let force_disable_freq = Rc::clone(&scanner_force_disable);
     freq_selector.connect_frequency_changed(move |freq| {
         tracing::debug!(frequency_hz = freq, "frequency changed");
+        // Flip scanner off before dispatching the tune so the
+        // engine receives the `SetScannerEnabled(false)` first —
+        // the subsequent `Tune` then lands on an Idle scanner and
+        // doesn't race a retune command.
+        force_disable_freq.trigger("manual tune");
         #[allow(clippy::cast_precision_loss)]
         let freq_f64 = freq as f64;
         state_freq.center_frequency.set(freq_f64);
@@ -381,16 +458,41 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar_for_freq.update_frequency(freq_f64);
         spectrum_for_freq.set_center_frequency(freq_f64);
     });
+    // Single demod-change handler: gate → force-disable → dispatch
+    // → cosmetic UI updates. Order matters: force-disable must
+    // reach the engine BEFORE SetDemodMode so the scanner isn't
+    // still rotating when the new demod lands. Previously the
+    // dispatch lived in build_header_bar and force-disable here,
+    // which left a race because GTK fires handlers in
+    // registration order.
     let status_bar_for_demod = Rc::clone(&status_bar_demod);
     let bw_row_for_demod = panels.radio.bandwidth_row.clone();
     let radio_for_demod = panels.radio.clone();
+    let force_disable_demod = Rc::clone(&scanner_force_disable);
+    let state_demod = Rc::clone(&state);
     demod_dropdown.connect_selected_notify(move |dd| {
-        if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
-            let label = header::demod_mode_label(mode);
-            let bw = bw_row_for_demod.value();
-            status_bar_for_demod.update_demod(label, bw);
-            radio_for_demod.apply_demod_visibility(mode);
+        // DSP-origin guard — when the scanner's
+        // ScannerActiveChannelChanged fan-out programmatically
+        // changes the dropdown, skip EVERYTHING (dispatch and
+        // force-disable and cosmetic updates are all paid for
+        // by the scanner's own widget-sync code).
+        if state_demod.suppress_demod_notify.get() {
+            return;
         }
+        let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) else {
+            return;
+        };
+        // Stop scanner BEFORE queuing SetDemodMode so the engine
+        // receives the commands in the right order.
+        force_disable_demod.trigger("manual demod change");
+        state_demod.demod_mode.set(mode);
+        state_demod.send_dsp(UiToDsp::SetDemodMode(mode));
+        tracing::debug!(?mode, "demod mode sent to DSP");
+        // Cosmetic UI sync last.
+        let label = header::demod_mode_label(mode);
+        let bw = bw_row_for_demod.value();
+        status_bar_for_demod.update_demod(label, bw);
+        radio_for_demod.apply_demod_visibility(mode);
     });
 
     // --- Wire radio panel bandwidth changes to status bar ---
@@ -432,6 +534,9 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let radio_panel_for_dsp = panels.radio.clone();
+    let scanner_panel_for_dsp = panels.scanner.clone();
+    let freq_selector_for_dsp = freq_selector.clone();
+    let demod_dropdown_for_dsp = demod_dropdown.clone();
     // Just the three widgets the rtl_tcp status renderer touches —
     // cloning the whole SourcePanel would be a lot of refcount
     // traffic for one signal handler. Weak refs, upgraded per
@@ -497,6 +602,9 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
                         &radio_panel_for_dsp,
+                        &scanner_panel_for_dsp,
+                        &freq_selector_for_dsp,
+                        &demod_dropdown_for_dsp,
                         &rtl_tcp_status_row_weak,
                         &rtl_tcp_disconnect_button_weak,
                         &rtl_tcp_retry_button_weak,
@@ -527,6 +635,29 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     window.present();
 }
 
+/// Clear the scanner's active-channel UI surfaces back to the
+/// idle look: empty cache, placeholder label, hidden lockout
+/// button. Shared between the four events that mean "scanner
+/// isn't parked on a channel anymore":
+///   - `ScannerActiveChannelChanged { key: None }` (explicit
+///     idle edge)
+///   - `ScannerEmptyRotation` (rotation exhausted)
+///   - `ScannerMutexStopped::ScannerStoppedFor{Recording,Transcription}`
+///     (mutex fired)
+///
+/// Without the helper, those stop paths would depend on the
+/// engine sending a separate `ActiveChannelChanged { key: None }`
+/// event in the same tick — which it does today, but relying on
+/// that ordering across four sites was brittle.
+fn clear_scanner_active_channel_ui(
+    scanner_panel: &sidebar::scanner_panel::ScannerPanel,
+    state: &AppState,
+) {
+    *state.scanner_active_key.borrow_mut() = None;
+    scanner_panel.active_channel_label.set_text("Active: —");
+    scanner_panel.lockout_button.set_visible(false);
+}
+
 /// Handle a single message from the DSP thread.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_dsp_message(
@@ -540,6 +671,9 @@ fn handle_dsp_message(
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
     radio_panel: &sidebar::radio_panel::RadioPanel,
+    scanner_panel: &sidebar::scanner_panel::ScannerPanel,
+    freq_selector: &header::frequency_selector::FrequencySelector,
+    demod_dropdown: &gtk4::DropDown,
     rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
     rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
@@ -733,38 +867,115 @@ fn handle_dsp_message(
             }
         }
         // --- Scanner (#317) ---
-        //
-        // `ScannerActiveChannelChanged` and `ScannerStateChanged`
-        // are still stubs here — their fan-out to the frequency
-        // selector, spectrum, status bar, demod dropdown, and
-        // bandwidth row is PR 3 work. `ScannerEmptyRotation` and
-        // `ScannerMutexStopped` ARE promoted to real toasts +
-        // widget deactivation in this PR because they fire
-        // immediately as soon as the mutex kicks in (which
-        // happens as soon as a future caller dispatches
-        // `UiToDsp::SetScannerEnabled(true)`, which could be
-        // driven by a test harness before the PR 3 panel lands).
         DspToUi::ScannerActiveChannelChanged {
             key,
             freq_hz,
             demod_mode,
             bandwidth,
             name,
+            ctcss,
+            voice_squelch,
         } => {
-            tracing::debug!(
-                ?key,
-                freq_hz,
-                ?demod_mode,
-                bandwidth,
-                name,
-                "scanner active channel changed — UI fan-out lands in PR 3"
-            );
+            // Cache the active channel key for the lockout button
+            // click handler in `connect_scanner_panel`. Written
+            // before the widget sync below so a racing user click
+            // during this frame sees the latest key.
+            state.scanner_active_key.borrow_mut().clone_from(&key);
+            if key.is_some() {
+                // Update the cached tuning state so downstream
+                // reads (bandwidth notify's status-bar rewrite,
+                // Add / Save Bookmark, anything else that reads
+                // `state.center_frequency` / `state.demod_mode`)
+                // see the scanner's current channel, not the
+                // channel the user last tuned manually.
+                #[allow(clippy::cast_precision_loss)]
+                let freq_f64 = freq_hz as f64;
+                state.center_frequency.set(freq_f64);
+                state.demod_mode.set(demod_mode);
+
+                scanner_panel.active_channel_label.set_text(&format!(
+                    "Active: {} — {}",
+                    name,
+                    sidebar::navigation_panel::format_frequency(freq_hz),
+                ));
+                // Sync every widget that mirrors the current tune.
+                // The selector's `set_frequency` does NOT fire its
+                // own callback, so no SetFrequency bounces back.
+                freq_selector.set_frequency(freq_hz);
+                spectrum_handle.set_center_frequency(freq_f64);
+                status_bar.update_frequency(freq_f64);
+                let label = header::demod_selector::demod_mode_label(demod_mode);
+                status_bar.update_demod(label, bandwidth);
+                // Programmatic updates of the demod dropdown +
+                // bandwidth row — suppress the notify handlers so
+                // the scanner's retune doesn't ricochet back into
+                // `SetDemodMode` / `SetBandwidth` commands.
+                state.suppress_demod_notify.set(true);
+                if let Some(idx) = header::demod_selector::demod_mode_to_index(demod_mode) {
+                    demod_dropdown.set_selected(idx);
+                }
+                state.suppress_demod_notify.set(false);
+                // Mode-specific row visibility (WFM stereo,
+                // FM-IF-NR, etc.) is normally driven by the
+                // dropdown's `connect_selected_notify` handler,
+                // which we just suppressed. Call it directly so
+                // the radio panel reflects the scanner's channel
+                // instead of the previous mode's row set.
+                radio_panel.apply_demod_visibility(demod_mode);
+                state.suppress_bandwidth_notify.set(true);
+                radio_panel.bandwidth_row.set_value(bandwidth);
+                state.suppress_bandwidth_notify.set(false);
+
+                // CTCSS + voice-squelch widget sync — keeps
+                // Add/Save Bookmark honest when the user stashes
+                // a channel the scanner landed on. The set calls
+                // bounce back through the widgets'
+                // connect_selected_notify handlers as redundant
+                // `SetCtcssMode` / `SetVoiceSquelchMode`
+                // dispatches, which are idempotent at the
+                // engine (the scanner retune has already applied
+                // the same values). Same trade-off the master-
+                // switch `connect_active_notify` migration made
+                // in round 1.
+                //
+                // `None` on the channel:
+                // - CTCSS: scanner forces engine to Off, so the
+                //   row tracks that and goes to Off.
+                // - voice-squelch: scanner leaves engine alone,
+                //   so we leave the widget alone too (what's on
+                //   the widget matches what's on the engine).
+                let ctcss_for_widget = ctcss.unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
+                let ctcss_idx =
+                    sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(ctcss_for_widget);
+                radio_panel.ctcss_row.set_selected(ctcss_idx);
+                if let Some(vs_mode) = voice_squelch {
+                    radio_panel.apply_voice_squelch_mode_ui(vs_mode);
+                    // Reset the open/closed badge too — mode
+                    // change rebuilds the voice-squelch detector,
+                    // so a stale "open" from the previous channel
+                    // must not carry over. The next
+                    // `VoiceSquelchOpenChanged` edge from DSP
+                    // repaints it accurately. Mirrors the manual
+                    // selector path at `voice_squelch_row.connect_selected_notify`.
+                    radio_panel.set_voice_squelch_open(false);
+                }
+
+                scanner_panel.lockout_button.set_visible(true);
+            } else {
+                clear_scanner_active_channel_ui(scanner_panel, state);
+            }
         }
         DspToUi::ScannerStateChanged(scanner_state) => {
-            tracing::debug!(
-                ?scanner_state,
-                "scanner state changed — scanner-panel wiring lands in PR 3"
-            );
+            let label = match scanner_state {
+                sdr_scanner::ScannerState::Idle => "Off",
+                sdr_scanner::ScannerState::Retuning => "Scanning…",
+                sdr_scanner::ScannerState::Dwelling => "Dwelling…",
+                sdr_scanner::ScannerState::Listening => "Listening",
+                sdr_scanner::ScannerState::Hanging => "Hang…",
+            };
+            scanner_panel
+                .state_label
+                .set_text(&format!("State: {label}"));
         }
         DspToUi::ScannerEmptyRotation => {
             tracing::info!("scanner rotation empty");
@@ -773,15 +984,29 @@ fn handle_dsp_message(
                     "Scanner has no active channels (all locked or disabled)",
                 ));
             }
+            // Engine is already back to Idle — drop the master
+            // switch to match. `set_state` propagates to `active`
+            // and fires `notify::active`, which the master switch's
+            // `connect_active_notify` handler dispatches as a
+            // redundant `SetScannerEnabled(false)` — idempotent on
+            // the engine side (scanner's already Idle), so no harm.
+            scanner_panel.master_switch.set_state(false);
+            // Clear the active-channel surfaces locally rather
+            // than waiting for a separate `ActiveChannelChanged
+            // { key: None }` event — the engine sends it today,
+            // but relying on that ordering across four stop
+            // sites was brittle.
+            clear_scanner_active_channel_ui(scanner_panel, state);
         }
         DspToUi::ScannerMutexStopped(reason) => {
             tracing::info!(?reason, "scanner mutex stopped");
-            // Widget state for recording deactivates automatically
-            // via the paired `AudioRecordingStopped` /
-            // `IqRecordingStopped` events that `stop_any_recording`
-            // emits in the controller. Transcription doesn't have
-            // a matching stopped-event — deactivate the enable row
-            // explicitly here.
+            // Widget-state sync for recording comes for free via
+            // the paired `AudioRecordingStopped` / `IqRecordingStopped`
+            // events that `stop_any_recording` emits in the
+            // controller. Transcription has no matching stopped
+            // event; deactivate the switch here. Scanner sync for
+            // the `ScannerStoppedFor*` variants flips the master
+            // switch so the sidebar reflects the engine state.
             let message = match reason {
                 sdr_core::messages::ScannerMutexReason::RecordingStoppedForScanner => {
                     "Recording stopped — Scanner activated"
@@ -791,10 +1016,13 @@ fn handle_dsp_message(
                     "Transcription stopped — Scanner activated"
                 }
                 sdr_core::messages::ScannerMutexReason::ScannerStoppedForRecording => {
-                    // Scanner widget state sync lands in PR 3.
+                    scanner_panel.master_switch.set_state(false);
+                    clear_scanner_active_channel_ui(scanner_panel, state);
                     "Scanner stopped — recording started"
                 }
                 sdr_core::messages::ScannerMutexReason::ScannerStoppedForTranscription => {
+                    scanner_panel.master_switch.set_state(false);
+                    clear_scanner_active_channel_ui(scanner_panel, state);
                     "Scanner stopped — transcription started"
                 }
             };
@@ -1058,16 +1286,13 @@ fn build_header_bar(
     // so it can also update the status bar.
     let freq_selector = header::build_frequency_selector();
 
-    // Demod selector dropdown
+    // Demod selector dropdown. The DSP-dispatch handler used to
+    // live here, but it would race the scanner force-disable
+    // that runs from build_window's handler — scanner would hear
+    // SetDemodMode first, then the stop command. Dispatch wiring
+    // moved to build_window so force-disable + send_dsp can run
+    // in a single handler in the right order.
     let (demod_dropdown, _demod_mode_cell) = header::build_demod_selector();
-    let state_demod = Rc::clone(state);
-    demod_dropdown.connect_selected_notify(move |dd| {
-        if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
-            state_demod.demod_mode.set(mode);
-            state_demod.send_dsp(UiToDsp::SetDemodMode(mode));
-            tracing::debug!(?mode, "demod mode sent to DSP");
-        }
-    });
 
     // Volume button (ScaleButton with audio icons)
     let volume_button = gtk4::ScaleButton::new(
@@ -1272,6 +1497,7 @@ fn connect_sidebar_panels(
     toast_overlay: &adw::ToastOverlay,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     favorites_header: &FavoritesHeaderHandle,
+    scanner_force_disable: &Rc<ScannerForceDisable>,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -1293,9 +1519,10 @@ fn connect_sidebar_panels(
     connect_source_rtlsdr_probe(panels);
     connect_rtl_tcp_discovery(panels, state, config, favorites_header);
     connect_server_panel(panels, toast_overlay, server_running);
-    connect_radio_panel(panels, state);
+    connect_radio_panel(panels, state, scanner_force_disable);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
+    connect_scanner_panel(panels, state, config);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -1304,7 +1531,38 @@ fn connect_sidebar_panels(
         demod_dropdown,
         status_bar,
         spectrum_handle,
+        scanner_force_disable,
     );
+
+    // Mutation-triggered scanner re-projection. Fires on scan
+    // checkbox, priority star, and delete — every per-bookmark
+    // change that affects the projected channel list. Install
+    // this *after* `connect_sidebar_panels` finishes the other
+    // panel wiring so early construction-time rebuilds (which
+    // pre-date the callback) don't dispatch a spurious empty
+    // `UpdateScannerChannels`.
+    //
+    // The callback lives inside `BookmarksPanel.on_mutated`, so
+    // capturing a strong `Rc<BookmarksPanel>` would close a
+    // retain cycle (panel → on_mutated → closure → panel) and
+    // leak on teardown. Downgrade to `Weak` and upgrade-or-return
+    // inside the closure — reads `.bookmarks` via the upgraded
+    // handle so the projection still lands against the live
+    // backing store. Same pattern the Save closure uses in
+    // `sidebar::build_sidebar`.
+    let bookmarks_weak = Rc::downgrade(&panels.bookmarks);
+    let state_for_mutated = Rc::clone(state);
+    let config_for_mutated = std::sync::Arc::clone(config);
+    panels.bookmarks.connect_mutated(move || {
+        let Some(bookmarks) = bookmarks_weak.upgrade() else {
+            return;
+        };
+        sidebar::navigation_panel::project_and_push_scanner_channels(
+            &bookmarks.bookmarks.borrow(),
+            &state_for_mutated,
+            &config_for_mutated,
+        );
+    });
 }
 
 /// Connect source panel controls to DSP commands.
@@ -4062,7 +4320,11 @@ fn connect_source_panel(
 
 /// Connect radio panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
-fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
+fn connect_radio_panel(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    scanner_force_disable: &Rc<ScannerForceDisable>,
+) {
     // Bandwidth. The DSP can originate a change too (VFO drag on
     // the spectrum dispatches `UiToDsp::SetBandwidth` directly,
     // and the controller echoes `DspToUi::BandwidthChanged` so the
@@ -4072,10 +4334,16 @@ fn connect_radio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // handler to skip the DSP dispatch when the change originated
     // on the DSP side.
     let state_bw = Rc::clone(state);
+    let force_disable_bw = Rc::clone(scanner_force_disable);
     panels.radio.bandwidth_row.connect_value_notify(move |row| {
         if state_bw.suppress_bandwidth_notify.get() {
             return;
         }
+        // Not a DSP echo → this is the user turning the spin row.
+        // Force-disable scanner so the new bandwidth applies to
+        // the user's chosen channel instead of the scanner's next
+        // hop.
+        force_disable_bw.trigger("manual bandwidth change");
         state_bw.send_dsp(UiToDsp::SetBandwidth(row.value()));
     });
 
@@ -4535,6 +4803,7 @@ fn connect_navigation_panel(
     demod_dropdown: &gtk4::DropDown,
     status_bar: &Rc<StatusBar>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    scanner_force_disable: &Rc<ScannerForceDisable>,
 ) {
     // Navigation callback: restore full tuning profile from bookmark.
     let state_nav = Rc::clone(state);
@@ -4545,8 +4814,16 @@ fn connect_navigation_panel(
     let radio_nav = panels.radio.clone();
     let source_nav_gain = panels.source.gain_row.clone();
     let source_nav_agc = panels.source.agc_row.clone();
+    let force_disable_nav = Rc::clone(scanner_force_disable);
 
     panels.bookmarks.connect_navigate(move |bookmark| {
+        // Both bookmark recall AND band-preset selection come in
+        // through this callback (the preset handler in
+        // `connect_preset_to_bookmarks` invokes `on_navigate` with
+        // a synthesized Bookmark). Keep the toast reason neutral
+        // so a preset click doesn't claim "bookmark recall".
+        force_disable_nav.trigger("preset/bookmark selection");
+
         let freq = bookmark.frequency;
         let mode = sidebar::navigation_panel::parse_demod_mode(&bookmark.demod_mode);
         let bw = bookmark.bandwidth;
@@ -4660,7 +4937,7 @@ fn connect_navigation_panel(
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
         bm_for_add.bookmarks.borrow_mut().push(bookmark);
         sidebar::navigation_panel::save_bookmarks(&bm_for_add.bookmarks.borrow());
-        bm_for_add.rebuild(&name_entry);
+        bm_for_add.rebuild_after_mutation(&name_entry);
         name_entry.set_text("");
     });
 
@@ -4782,8 +5059,10 @@ fn connect_navigation_panel(
         }
         sidebar::navigation_panel::save_bookmarks(&bms);
         drop(bms);
-        // Rebuild to update subtitle.
-        save_bm.rebuild(&save_name_entry);
+        // Rebuild to update subtitle. Fires `on_mutated` so the
+        // scanner re-projects — Save can change `scan_enabled` /
+        // `priority` / override fields on the bookmark.
+        save_bm.rebuild_after_mutation(&save_name_entry);
         tracing::info!("bookmark saved: {}", active.name);
     });
 }
@@ -4984,6 +5263,103 @@ fn unlock_transcription_session_rows(
     if let Some(row) = auto_break_min_segment_row.upgrade() {
         row.set_sensitive(true);
     }
+}
+
+/// Connect scanner panel controls to DSP commands.
+///
+/// Wiring:
+/// - master switch → `UiToDsp::SetScannerEnabled`
+/// - default dwell / hang sliders → persist to `ConfigManager`
+///   and re-project the bookmark list into
+///   `UiToDsp::UpdateScannerChannels` so a running scanner picks
+///   up the new per-channel dwell/hang on its next tick.
+fn connect_scanner_panel(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let scanner = &panels.scanner;
+
+    // Master switch → SetScannerEnabled. Using `connect_active_notify`
+    // (not `connect_state_set`) so programmatic toggles fire too:
+    //   - F8 shortcut calls `set_active` which changes the active
+    //     property and fires notify::active.
+    //   - `ScannerForceDisable::trigger` calls `set_active(false)`
+    //     on the same switch for manual-tune force-disable.
+    //   - DSP-origin widget syncs (ScannerEmptyRotation,
+    //     ScannerMutexStopped::ScannerStopped*) call `set_state`,
+    //     which also propagates to active and fires notify::active.
+    //     The resulting redundant `SetScannerEnabled(false)`
+    //     dispatch is idempotent at the engine — it's cheaper to
+    //     pay one extra message per event than to add a suppress
+    //     flag for every DSP-origin sync site.
+    let state_switch = Rc::clone(state);
+    scanner.master_switch.connect_active_notify(move |sw| {
+        state_switch.send_dsp(UiToDsp::SetScannerEnabled(sw.is_active()));
+    });
+
+    // Restore persisted slider values BEFORE wiring the notify
+    // handlers below. `set_value` on a SpinRow fires
+    // `value-changed`, so if we wired first and restored after
+    // we'd trigger a spurious `save_default_*_ms` +
+    // `project_and_push_scanner_channels` during window
+    // construction — plus `build_window` re-seeds the scanner
+    // right after `connect_sidebar_panels` returns, which would
+    // pile on a second redundant dispatch per slider.
+    let dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
+    scanner.default_dwell_row.set_value(f64::from(dwell_ms));
+    let hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
+    scanner.default_hang_row.set_value(f64::from(hang_ms));
+
+    // Default dwell slider: persist on every value change, then
+    // re-project the bookmark list so `ScannerChannel::dwell_ms`
+    // picks up the new default on channels without an override.
+    let config_dwell = std::sync::Arc::clone(config);
+    let bookmarks_dwell = Rc::clone(&panels.bookmarks);
+    let state_dwell = Rc::clone(state);
+    let config_dwell_project = std::sync::Arc::clone(config);
+    scanner.default_dwell_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ms = row.value() as u32;
+        sidebar::scanner_panel::save_default_dwell_ms(&config_dwell, ms);
+        sidebar::navigation_panel::project_and_push_scanner_channels(
+            &bookmarks_dwell.bookmarks.borrow(),
+            &state_dwell,
+            &config_dwell_project,
+        );
+    });
+
+    // Default hang slider: same pattern as dwell.
+    let config_hang = std::sync::Arc::clone(config);
+    let bookmarks_hang = Rc::clone(&panels.bookmarks);
+    let state_hang = Rc::clone(state);
+    let config_hang_project = std::sync::Arc::clone(config);
+    scanner.default_hang_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ms = row.value() as u32;
+        sidebar::scanner_panel::save_default_hang_ms(&config_hang, ms);
+        sidebar::navigation_panel::project_and_push_scanner_channels(
+            &bookmarks_hang.bookmarks.borrow(),
+            &state_hang,
+            &config_hang_project,
+        );
+    });
+
+    // Lockout button → `LockoutScannerChannel(key)`. The active
+    // channel key is updated on every `ScannerActiveChannelChanged`
+    // in `handle_dsp_message` and stashed on `state.scanner_active_key`.
+    // The button is hidden whenever that key is `None` (same
+    // handler), so a click here is guaranteed to have a key —
+    // but we check and early-return defensively in case a click
+    // races a state change.
+    let state_lockout = Rc::clone(state);
+    scanner.lockout_button.connect_clicked(move |_| {
+        let Some(key) = state_lockout.scanner_active_key.borrow().clone() else {
+            tracing::debug!("lockout clicked with no active key — no-op");
+            return;
+        };
+        state_lockout.send_dsp(UiToDsp::LockoutScannerChannel(key));
+    });
 }
 
 /// Connect transcript panel controls to DSP commands.

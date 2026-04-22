@@ -6,6 +6,8 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_types::DemodMode;
 
+use crate::messages::UiToDsp;
+
 // ---------------------------------------------------------------------------
 // Band presets — static, well-known frequency bands
 // ---------------------------------------------------------------------------
@@ -382,6 +384,63 @@ pub fn save_bookmarks(bookmarks: &[Bookmark]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scanner projection — bookmark list → `Vec<ScannerChannel>`
+// ---------------------------------------------------------------------------
+
+/// Project the in-memory bookmark list into the
+/// [`sdr_scanner::ScannerChannel`] form the scanner state machine
+/// expects. Filters to `scan_enabled == true`, parses the bookmark's
+/// string-form demod mode, and folds per-channel dwell/hang overrides
+/// on top of the UI-provided defaults (the scanner itself has no
+/// notion of defaults — resolution happens at projection time).
+///
+/// Pure function: no I/O, no threading, no global state. The channel
+/// list order mirrors the bookmark list order, which in turn mirrors
+/// save order — keeping the scanner rotation predictable and under
+/// user control.
+#[must_use]
+pub fn project_scanner_channels(
+    bookmarks: &[Bookmark],
+    default_dwell_ms: u32,
+    default_hang_ms: u32,
+) -> Vec<sdr_scanner::ScannerChannel> {
+    bookmarks
+        .iter()
+        .filter(|b| b.scan_enabled)
+        .map(|b| sdr_scanner::ScannerChannel {
+            key: sdr_scanner::ChannelKey {
+                name: b.name.clone(),
+                frequency_hz: b.frequency,
+            },
+            demod_mode: parse_demod_mode(&b.demod_mode),
+            bandwidth: b.bandwidth,
+            ctcss: b.ctcss_mode,
+            voice_squelch: b.voice_squelch_mode,
+            priority: b.priority,
+            dwell_ms: b.dwell_ms_override.unwrap_or(default_dwell_ms),
+            hang_ms: b.hang_ms_override.unwrap_or(default_hang_ms),
+        })
+        .collect()
+}
+
+/// Convenience: read the persisted default dwell/hang from config,
+/// project the bookmark list into scanner channels, and dispatch
+/// `UiToDsp::UpdateScannerChannels` so the running scanner picks up
+/// the change on its next tick. Call sites are every bookmark-list
+/// mutation (Add, Delete, RR import, scan-toggle, priority-toggle)
+/// plus both default-slider notify handlers.
+pub fn project_and_push_scanner_channels(
+    bookmarks: &[Bookmark],
+    state: &std::rc::Rc<crate::state::AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let default_dwell_ms = crate::sidebar::scanner_panel::load_default_dwell_ms(config);
+    let default_hang_ms = crate::sidebar::scanner_panel::load_default_hang_ms(config);
+    let channels = project_scanner_channels(bookmarks, default_dwell_ms, default_hang_ms);
+    state.send_dsp(UiToDsp::UpdateScannerChannels(channels));
+}
+
 /// Format a frequency as a human-readable string (e.g., "98.100 MHz").
 pub fn format_frequency(freq: u64) -> String {
     #[allow(clippy::cast_precision_loss)]
@@ -526,6 +585,7 @@ pub fn connect_preset_to_bookmarks(
     let on_save = std::rc::Rc::clone(&bookmarks.on_save);
     let filter_text = std::rc::Rc::clone(&bookmarks.filter_text);
     let manual_expanded = std::rc::Rc::clone(&bookmarks.manual_expanded);
+    let on_mutated = std::rc::Rc::clone(&bookmarks.on_mutated);
     let list_weak = bookmarks.bookmark_list.downgrade();
     let scroll_weak = bookmarks.bookmark_scroll.downgrade();
     let name_entry = navigation.name_entry.clone();
@@ -568,6 +628,7 @@ pub fn connect_preset_to_bookmarks(
                 &on_save,
                 &filter_text,
                 &manual_expanded,
+                &on_mutated,
             );
         }
     });
@@ -580,6 +641,15 @@ const MAX_VISIBLE_BOOKMARKS: i32 = 3;
 
 /// Callback type for save actions on the active bookmark.
 pub type SaveCallback = std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn()>>>>;
+
+/// Callback invoked whenever the in-memory bookmark list mutates in
+/// a way that affects scanner projection (scan checkbox toggled,
+/// priority star toggled, row deleted). Window-level wiring installs
+/// a closure that re-projects the bookmark list and dispatches
+/// `UiToDsp::UpdateScannerChannels`; the callback is `Option`-wrapped
+/// so panels can be built standalone (and in tests) without requiring
+/// a live `AppState` / `ConfigManager` pair to register it.
+pub type BookmarksMutatedCallback = std::rc::Rc<std::cell::RefCell<Option<Box<dyn Fn()>>>>;
 
 /// Sentinel category title for bookmarks without an `rr_category`.
 /// Only shown when the list contains a mix of categorized and
@@ -629,6 +699,7 @@ pub fn rebuild_bookmark_list(
     on_save: &SaveCallback,
     filter_text: &std::rc::Rc<std::cell::RefCell<String>>,
     manual_expanded: &std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    on_mutated: &BookmarksMutatedCallback,
 ) {
     // Remove all existing rows.
     while let Some(child) = list_box.first_child() {
@@ -740,6 +811,7 @@ pub fn rebuild_bookmark_list(
                     on_save,
                     filter_text,
                     manual_expanded,
+                    on_mutated,
                 );
                 expander.add_row(&row);
             }
@@ -762,6 +834,7 @@ pub fn rebuild_bookmark_list(
                 on_save,
                 filter_text,
                 manual_expanded,
+                on_mutated,
             );
             list_box.append(&row);
         }
@@ -810,6 +883,7 @@ fn build_bookmark_row(
     on_save: &SaveCallback,
     filter_text: &std::rc::Rc<std::cell::RefCell<String>>,
     manual_expanded: &std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    on_mutated: &BookmarksMutatedCallback,
 ) -> adw::ActionRow {
     let is_active = bm.name == current_active.name && bm.frequency == current_active.frequency;
     let row = adw::ActionRow::builder()
@@ -855,6 +929,7 @@ fn build_bookmark_row(
     let save_del = std::rc::Rc::clone(on_save);
     let filter_del = std::rc::Rc::clone(filter_text);
     let manual_expanded_del = std::rc::Rc::clone(manual_expanded);
+    let on_mutated_del = std::rc::Rc::clone(on_mutated);
     let list_ref = list_box.downgrade();
     let scroll_ref = scroll.downgrade();
     let entry_del = name_entry.clone();
@@ -884,6 +959,13 @@ fn build_bookmark_row(
             bm_rc.borrow_mut().remove(idx);
         }
         save_bookmarks(&bm_rc.borrow());
+        // Fire the mutation callback *before* the rebuild so the
+        // scanner sees the post-delete channel list in the same
+        // tick the UI re-renders — no transient "channel still
+        // present" window.
+        if let Some(cb) = on_mutated_del.borrow().as_ref() {
+            cb();
+        }
         if let Some(lb) = list_ref.upgrade()
             && let Some(sc) = scroll_ref.upgrade()
         {
@@ -897,10 +979,89 @@ fn build_bookmark_row(
                 &save_del,
                 &filter_del,
                 &manual_expanded_del,
+                &on_mutated_del,
             );
         }
     });
     row.add_suffix(&delete_btn);
+
+    // --- Scanner scan-enable checkbox ---
+    // Checked = include this bookmark in scanner rotation. Drop
+    // the borrow before firing `on_mutated` so the callback can
+    // itself borrow the bookmarks list (for projection) without
+    // panicking on a nested mutable + immutable borrow.
+    let scan_check = gtk4::CheckButton::builder()
+        .tooltip_text("Include in scanner")
+        .active(bm.scan_enabled)
+        .valign(gtk4::Align::Center)
+        .build();
+    scan_check.update_property(&[gtk4::accessible::Property::Label("Include in scanner")]);
+    let bm_scan = std::rc::Rc::clone(bookmarks);
+    let on_mutated_scan = std::rc::Rc::clone(on_mutated);
+    let scan_name = bm.name.clone();
+    let scan_freq = bm.frequency;
+    scan_check.connect_toggled(move |btn| {
+        let active = btn.is_active();
+        {
+            let mut bms = bm_scan.borrow_mut();
+            if let Some(b) = bms
+                .iter_mut()
+                .find(|b| b.name == scan_name && b.frequency == scan_freq)
+            {
+                b.scan_enabled = active;
+            }
+            save_bookmarks(&bms);
+        }
+        if let Some(cb) = on_mutated_scan.borrow().as_ref() {
+            cb();
+        }
+    });
+    row.add_suffix(&scan_check);
+
+    // --- Scanner priority star toggle ---
+    // Toggled = priority 1 (checked more often by the scanner).
+    // Phase 1 is binary — higher tiers are reserved for later
+    // phases, so the UI exposes on/off rather than a spinner.
+    let pri_btn = gtk4::ToggleButton::builder()
+        .icon_name(if bm.priority >= 1 {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        })
+        .tooltip_text("Scanner priority channel")
+        .css_classes(["flat"])
+        .valign(gtk4::Align::Center)
+        .active(bm.priority >= 1)
+        .build();
+    pri_btn.update_property(&[gtk4::accessible::Property::Label(
+        "Scanner priority channel",
+    )]);
+    let bm_pri = std::rc::Rc::clone(bookmarks);
+    let on_mutated_pri = std::rc::Rc::clone(on_mutated);
+    let pri_name = bm.name.clone();
+    let pri_freq = bm.frequency;
+    pri_btn.connect_toggled(move |btn| {
+        let active = btn.is_active();
+        btn.set_icon_name(if active {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        });
+        {
+            let mut bms = bm_pri.borrow_mut();
+            if let Some(b) = bms
+                .iter_mut()
+                .find(|b| b.name == pri_name && b.frequency == pri_freq)
+            {
+                b.priority = u8::from(active);
+            }
+            save_bookmarks(&bms);
+        }
+        if let Some(cb) = on_mutated_pri.borrow().as_ref() {
+            cb();
+        }
+    });
+    row.add_suffix(&pri_btn);
 
     let recall_bookmark = bm.clone();
     let on_nav_recall = std::rc::Rc::clone(on_navigate);
@@ -908,6 +1069,7 @@ fn build_bookmark_row(
     let save_recall = std::rc::Rc::clone(on_save);
     let filter_recall = std::rc::Rc::clone(filter_text);
     let manual_expanded_recall = std::rc::Rc::clone(manual_expanded);
+    let on_mutated_recall = std::rc::Rc::clone(on_mutated);
     let bm_recall = std::rc::Rc::clone(bookmarks);
     let list_recall = list_box.downgrade();
     let scroll_recall = scroll.downgrade();
@@ -937,6 +1099,7 @@ fn build_bookmark_row(
                 &save_recall,
                 &filter_recall,
                 &manual_expanded_recall,
+                &on_mutated_recall,
             );
             let adj = sc.vadjustment();
             glib::idle_add_local_once(move || {
@@ -1201,5 +1364,81 @@ mod tests {
         assert_eq!(back.priority, 1);
         assert_eq!(back.dwell_ms_override, Some(TEST_SCANNER_DWELL_MS));
         assert_eq!(back.hang_ms_override, Some(TEST_SCANNER_HANG_MS));
+    }
+
+    // ---- project_scanner_channels ----
+
+    /// Test default dwell, distinct from `sdr_scanner::DEFAULT_DWELL_MS`
+    /// (100) so the default-vs-override assertions can tell which one
+    /// the projector resolved.
+    const TEST_DEFAULT_DWELL_MS: u32 = 125;
+    /// Test default hang, distinct from `sdr_scanner::DEFAULT_HANG_MS`
+    /// (2000) for the same reason.
+    const TEST_DEFAULT_HANG_MS: u32 = 1_500;
+    /// A per-channel dwell override distinct from both the scanner
+    /// default and `TEST_DEFAULT_DWELL_MS`, so "override wins" is
+    /// observable as a unique value in assertions.
+    const TEST_OVERRIDE_DWELL_MS: u32 = 250;
+    /// A per-channel hang override distinct from both the scanner
+    /// default and `TEST_DEFAULT_HANG_MS`, same rationale.
+    const TEST_OVERRIDE_HANG_MS: u32 = 3_250;
+
+    #[test]
+    fn project_scanner_channels_filters_disabled() {
+        let mut enabled = Bookmark::new("On", 146_520_000, DemodMode::Nfm, 12_500.0);
+        enabled.scan_enabled = true;
+        let disabled = Bookmark::new("Off", 162_550_000, DemodMode::Nfm, 12_500.0);
+        let bms = vec![enabled, disabled];
+
+        let channels = project_scanner_channels(&bms, TEST_DEFAULT_DWELL_MS, TEST_DEFAULT_HANG_MS);
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].key.name, "On");
+        assert_eq!(channels[0].key.frequency_hz, 146_520_000);
+    }
+
+    #[test]
+    fn project_scanner_channels_override_wins_over_default() {
+        let mut with_overrides = Bookmark::new("Overrides", 146_520_000, DemodMode::Nfm, 12_500.0);
+        with_overrides.scan_enabled = true;
+        with_overrides.dwell_ms_override = Some(TEST_OVERRIDE_DWELL_MS);
+        with_overrides.hang_ms_override = Some(TEST_OVERRIDE_HANG_MS);
+        let mut no_overrides = Bookmark::new("Defaults", 162_550_000, DemodMode::Nfm, 12_500.0);
+        no_overrides.scan_enabled = true;
+        let bms = vec![with_overrides, no_overrides];
+
+        let channels = project_scanner_channels(&bms, TEST_DEFAULT_DWELL_MS, TEST_DEFAULT_HANG_MS);
+
+        assert_eq!(channels.len(), 2);
+        // First bookmark: override wins.
+        assert_eq!(channels[0].dwell_ms, TEST_OVERRIDE_DWELL_MS);
+        assert_eq!(channels[0].hang_ms, TEST_OVERRIDE_HANG_MS);
+        // Second bookmark: no overrides, default folds in.
+        assert_eq!(channels[1].dwell_ms, TEST_DEFAULT_DWELL_MS);
+        assert_eq!(channels[1].hang_ms, TEST_DEFAULT_HANG_MS);
+    }
+
+    #[test]
+    fn project_scanner_channels_propagates_priority_and_squelch() {
+        let mut bm = Bookmark::new("Priority", 146_520_000, DemodMode::Nfm, 12_500.0);
+        bm.scan_enabled = true;
+        bm.priority = 1;
+        bm.ctcss_mode = Some(sdr_radio::af_chain::CtcssMode::Tone(100.0));
+        bm.voice_squelch_mode =
+            Some(sdr_dsp::voice_squelch::VoiceSquelchMode::Snr { threshold_db: 9.0 });
+
+        let channels = project_scanner_channels(&[bm], TEST_DEFAULT_DWELL_MS, TEST_DEFAULT_HANG_MS);
+
+        assert_eq!(channels.len(), 1);
+        let ch = &channels[0];
+        assert_eq!(ch.priority, 1);
+        assert_eq!(ch.ctcss, Some(sdr_radio::af_chain::CtcssMode::Tone(100.0)));
+        assert_eq!(
+            ch.voice_squelch,
+            Some(sdr_dsp::voice_squelch::VoiceSquelchMode::Snr { threshold_db: 9.0 })
+        );
+        // Demod mode is parsed from the string form on the bookmark.
+        assert_eq!(ch.demod_mode, DemodMode::Nfm);
+        assert!((ch.bandwidth - 12_500.0).abs() < f64::EPSILON);
     }
 }

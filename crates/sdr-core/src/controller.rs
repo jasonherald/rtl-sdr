@@ -1854,6 +1854,14 @@ fn emit_scanner_active_channel(
             demod_mode: c.demod_mode,
             bandwidth: c.bandwidth,
             name: c.key.name.clone(),
+            // CTCSS + voice-squelch mirror the channel record
+            // verbatim (including `None`). The UI decides how to
+            // interpret `None` — CTCSS forces the row to Off to
+            // match the scanner's engine-side behavior;
+            // voice-squelch leaves the row alone, also matching
+            // the scanner's "no override → preserve" contract.
+            ctcss: c.ctcss,
+            voice_squelch: c.voice_squelch,
             key: Some(c.key),
         },
         None => DspToUi::ScannerActiveChannelChanged {
@@ -1861,6 +1869,8 @@ fn emit_scanner_active_channel(
             demod_mode: sdr_types::DemodMode::Nfm,
             bandwidth: 0.0,
             name: String::new(),
+            ctcss: None,
+            voice_squelch: None,
             key: None,
         },
     };
