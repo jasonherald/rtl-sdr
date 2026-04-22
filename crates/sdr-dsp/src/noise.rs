@@ -279,6 +279,17 @@ impl PowerSquelch {
         self.level_db = level_db;
     }
 
+    /// Reset the auto-squelch tracking state — noise floor back
+    /// to the initial sentinel, settle counter to zero — so the
+    /// next block starts converging from scratch. Shared between
+    /// `set_auto_squelch(true)` (enabling the tracker) and
+    /// `rearm_auto_squelch` (re-converging on a new band without
+    /// flipping the enabled flag).
+    fn reset_auto_squelch_tracking(&mut self) {
+        self.noise_floor_db = NOISE_FLOOR_INITIAL_DB;
+        self.settle_count = 0;
+    }
+
     /// Enable or disable auto-squelch (noise floor tracking).
     ///
     /// When enabled, the manual `level_db` is ignored and the threshold
@@ -287,8 +298,7 @@ impl PowerSquelch {
         self.auto_squelch = enabled;
         if enabled {
             // Reset the noise floor estimate so it adapts to the current band.
-            self.noise_floor_db = NOISE_FLOOR_INITIAL_DB;
-            self.settle_count = 0;
+            self.reset_auto_squelch_tracking();
         }
     }
 
@@ -304,8 +314,7 @@ impl PowerSquelch {
     /// disabled (manual threshold doesn't track floor).
     pub fn rearm_auto_squelch(&mut self) {
         if self.auto_squelch {
-            self.noise_floor_db = NOISE_FLOOR_INITIAL_DB;
-            self.settle_count = 0;
+            self.reset_auto_squelch_tracking();
         }
     }
 
@@ -1400,6 +1409,21 @@ mod tests {
     const STRONG_AMP: f32 = 1.0;
     const BORDERLINE_AMP: f32 = 0.003;
 
+    // Manual squelch thresholds used by the rearm tests. Both are
+    // "effectively open" compared to the expected noise amplitude
+    // so the process loop always runs the auto-squelch logic
+    // rather than short-circuiting on the manual gate.
+    const REARM_MANUAL_FLOOR_DB: f32 = -100.0;
+    /// Manual threshold used specifically by the
+    /// rearm-while-disabled test. Sits between `NOISE_AMP` and
+    /// the initial sentinel so a disabled squelch clearly
+    /// distinguishes from the enabled-and-settled-at-floor state.
+    const REARM_DISABLED_MANUAL_DB: f32 = -50.0;
+    /// Minimum rise above `NOISE_FLOOR_INITIAL_DB` (dB) that counts
+    /// as "the EMA converged off the sentinel" — used to confirm
+    /// the settle loop actually moved the floor before we re-arm.
+    const REARM_SETTLED_MARGIN_DB: f32 = 1.0;
+
     #[test]
     fn test_auto_squelch_tracks_noise_floor() {
         let mut squelch = PowerSquelch::new(-100.0);
@@ -1520,7 +1544,7 @@ mod tests {
         // back to the initial sentinel so the next block starts
         // re-converging from scratch — while leaving
         // `auto_squelch_enabled` untouched.
-        let mut squelch = PowerSquelch::new(-100.0);
+        let mut squelch = PowerSquelch::new(REARM_MANUAL_FLOOR_DB);
         squelch.set_auto_squelch(true);
 
         // Settle band A's noise floor via repeated blocks.
@@ -1531,7 +1555,7 @@ mod tests {
         }
         let settled_floor = squelch.noise_floor_db();
         assert!(
-            settled_floor > NOISE_FLOOR_INITIAL_DB + 1.0,
+            settled_floor > NOISE_FLOOR_INITIAL_DB + REARM_SETTLED_MARGIN_DB,
             "sanity: noise floor should have converged above the sentinel (got {settled_floor})",
         );
         assert!(squelch.auto_squelch_enabled());
@@ -1558,7 +1582,7 @@ mod tests {
         // either — cheap guard against a future edit making
         // rearm quietly enable auto-squelch behind the user's
         // back.
-        let mut squelch = PowerSquelch::new(-50.0);
+        let mut squelch = PowerSquelch::new(REARM_DISABLED_MANUAL_DB);
         // Starts with auto_squelch = false, floor at sentinel.
         assert!(!squelch.auto_squelch_enabled());
         let floor_before = squelch.noise_floor_db();
