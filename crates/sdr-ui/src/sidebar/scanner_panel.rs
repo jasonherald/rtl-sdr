@@ -64,15 +64,36 @@ pub const DEFAULT_DWELL_MS: u32 = 100;
 /// Default-hang initial value (ms) when no persisted value exists.
 pub const DEFAULT_HANG_MS: u32 = 2_000;
 
+/// Dwell `SpinRow` step increment (ms). Drives arrow-key nudges
+/// and the ± buttons on the spin row.
+pub const DWELL_STEP_MS: f64 = 10.0;
+/// Dwell `SpinRow` page increment (ms). Drives Page Up/Down and
+/// the scroll-wheel bump.
+pub const DWELL_PAGE_MS: f64 = 50.0;
+/// Hang `SpinRow` step increment (ms) — larger than dwell since
+/// hang is in whole seconds range.
+pub const HANG_STEP_MS: f64 = 100.0;
+/// Hang `SpinRow` page increment (ms).
+pub const HANG_PAGE_MS: f64 = 500.0;
+
 /// Load the persisted default-dwell value, or return
 /// [`DEFAULT_DWELL_MS`] if the key is missing or malformed.
+/// Clamps to `[DWELL_MIN_MS, DWELL_MAX_MS]` so a hand-edited
+/// config with an out-of-range value doesn't hand the `SpinRow`
+/// a value it can't display.
 #[must_use]
 pub fn load_default_dwell_ms(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
-        v.get(CONFIG_KEY_DEFAULT_DWELL_MS)
+        let raw = v
+            .get(CONFIG_KEY_DEFAULT_DWELL_MS)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(DEFAULT_DWELL_MS)
+            .unwrap_or(DEFAULT_DWELL_MS);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let min = DWELL_MIN_MS as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max = DWELL_MAX_MS as u32;
+        raw.clamp(min, max)
     })
 }
 
@@ -85,13 +106,21 @@ pub fn save_default_dwell_ms(config: &Arc<ConfigManager>, ms: u32) {
 
 /// Load the persisted default-hang value, or return
 /// [`DEFAULT_HANG_MS`] if the key is missing or malformed.
+/// Clamps to `[HANG_MIN_MS, HANG_MAX_MS]` — same rationale as
+/// `load_default_dwell_ms`.
 #[must_use]
 pub fn load_default_hang_ms(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
-        v.get(CONFIG_KEY_DEFAULT_HANG_MS)
+        let raw = v
+            .get(CONFIG_KEY_DEFAULT_HANG_MS)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(DEFAULT_HANG_MS)
+            .unwrap_or(DEFAULT_HANG_MS);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let min = HANG_MIN_MS as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max = HANG_MAX_MS as u32;
+        raw.clamp(min, max)
     })
 }
 
@@ -180,8 +209,8 @@ pub fn build_scanner_panel() -> ScannerPanel {
             f64::from(DEFAULT_DWELL_MS),
             DWELL_MIN_MS,
             DWELL_MAX_MS,
-            10.0,
-            50.0,
+            DWELL_STEP_MS,
+            DWELL_PAGE_MS,
             0.0,
         ))
         .digits(0)
@@ -192,8 +221,8 @@ pub fn build_scanner_panel() -> ScannerPanel {
             f64::from(DEFAULT_HANG_MS),
             HANG_MIN_MS,
             HANG_MAX_MS,
-            100.0,
-            500.0,
+            HANG_STEP_MS,
+            HANG_PAGE_MS,
             0.0,
         ))
         .digits(0)

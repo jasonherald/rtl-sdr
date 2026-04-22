@@ -72,27 +72,40 @@ const SCANNER_TOAST_TIMEOUT_SECS: u32 = 3;
 /// no-op when the scanner is already off, so wiring it into a
 /// handler that fires during programmatic widget updates is
 /// cheap and idempotent.
+///
+/// Holds `glib::WeakRef`s rather than owned widget clones —
+/// each clone of this helper is captured by a signal handler
+/// that lives on a widget in the window, so a strong ref chain
+/// (handler → this helper → widget → handler) would keep the
+/// window alive after teardown. Upgrade-or-early-return in
+/// `trigger` handles the post-teardown case.
 struct ScannerForceDisable {
-    scanner_panel: sidebar::scanner_panel::ScannerPanel,
-    toast_overlay: adw::ToastOverlay,
+    master_switch: glib::WeakRef<gtk4::Switch>,
+    toast_overlay: glib::WeakRef<adw::ToastOverlay>,
 }
 
 impl ScannerForceDisable {
     /// Force the scanner off and toast the user about why. No-op
-    /// when scanner is already off. Calls `set_active(false)` on
-    /// the master switch — the switch's `connect_active_notify`
+    /// when the master switch has been dropped (post-teardown)
+    /// or when the scanner is already off. Calls `set_active(false)`
+    /// on the master switch — the switch's `connect_active_notify`
     /// handler dispatches `SetScannerEnabled(false)` to the
     /// engine, so no explicit DSP send is needed here.
     fn trigger(&self, reason: &str) {
-        if !self.scanner_panel.master_switch.is_active() {
+        let Some(master_switch) = self.master_switch.upgrade() else {
+            return;
+        };
+        if !master_switch.is_active() {
             return;
         }
-        self.scanner_panel.master_switch.set_active(false);
-        let toast = adw::Toast::builder()
-            .title(format!("Scanner stopped — {reason}"))
-            .timeout(SCANNER_TOAST_TIMEOUT_SECS)
-            .build();
-        self.toast_overlay.add_toast(toast);
+        master_switch.set_active(false);
+        if let Some(overlay) = self.toast_overlay.upgrade() {
+            let toast = adw::Toast::builder()
+                .title(format!("Scanner stopped — {reason}"))
+                .timeout(SCANNER_TOAST_TIMEOUT_SECS)
+                .build();
+            overlay.add_toast(toast);
+        }
     }
 }
 
@@ -331,8 +344,8 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // each handler can hold an independent clone without fighting
     // over ownership; internals are cheap GObject refcount bumps.
     let scanner_force_disable = Rc::new(ScannerForceDisable {
-        scanner_panel: panels.scanner.clone(),
-        toast_overlay: toast_overlay.clone(),
+        master_switch: panels.scanner.master_switch.downgrade(),
+        toast_overlay: toast_overlay.downgrade(),
     });
 
     connect_sidebar_panels(
@@ -445,26 +458,41 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar_for_freq.update_frequency(freq_f64);
         spectrum_for_freq.set_center_frequency(freq_f64);
     });
+    // Single demod-change handler: gate → force-disable → dispatch
+    // → cosmetic UI updates. Order matters: force-disable must
+    // reach the engine BEFORE SetDemodMode so the scanner isn't
+    // still rotating when the new demod lands. Previously the
+    // dispatch lived in build_header_bar and force-disable here,
+    // which left a race because GTK fires handlers in
+    // registration order.
     let status_bar_for_demod = Rc::clone(&status_bar_demod);
     let bw_row_for_demod = panels.radio.bandwidth_row.clone();
     let radio_for_demod = panels.radio.clone();
     let force_disable_demod = Rc::clone(&scanner_force_disable);
-    let state_demod_suppress = Rc::clone(&state);
+    let state_demod = Rc::clone(&state);
     demod_dropdown.connect_selected_notify(move |dd| {
-        if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
-            let label = header::demod_mode_label(mode);
-            let bw = bw_row_for_demod.value();
-            status_bar_for_demod.update_demod(label, bw);
-            radio_for_demod.apply_demod_visibility(mode);
-            // Force-disable scanner — but only on a genuinely
-            // user-initiated change. The ScannerActiveChannelChanged
-            // fan-out uses `state.suppress_demod_notify` to mark
-            // scanner-driven dropdown updates; mirror that gate
-            // here so scanner's own retunes don't self-disable.
-            if !state_demod_suppress.suppress_demod_notify.get() {
-                force_disable_demod.trigger("manual demod change");
-            }
+        // DSP-origin guard — when the scanner's
+        // ScannerActiveChannelChanged fan-out programmatically
+        // changes the dropdown, skip EVERYTHING (dispatch and
+        // force-disable and cosmetic updates are all paid for
+        // by the scanner's own widget-sync code).
+        if state_demod.suppress_demod_notify.get() {
+            return;
         }
+        let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) else {
+            return;
+        };
+        // Stop scanner BEFORE queuing SetDemodMode so the engine
+        // receives the commands in the right order.
+        force_disable_demod.trigger("manual demod change");
+        state_demod.demod_mode.set(mode);
+        state_demod.send_dsp(UiToDsp::SetDemodMode(mode));
+        tracing::debug!(?mode, "demod mode sent to DSP");
+        // Cosmetic UI sync last.
+        let label = header::demod_mode_label(mode);
+        let bw = bw_row_for_demod.value();
+        status_bar_for_demod.update_demod(label, bw);
+        radio_for_demod.apply_demod_visibility(mode);
     });
 
     // --- Wire radio panel bandwidth changes to status bar ---
@@ -1182,24 +1210,13 @@ fn build_header_bar(
     // so it can also update the status bar.
     let freq_selector = header::build_frequency_selector();
 
-    // Demod selector dropdown
+    // Demod selector dropdown. The DSP-dispatch handler used to
+    // live here, but it would race the scanner force-disable
+    // that runs from build_window's handler — scanner would hear
+    // SetDemodMode first, then the stop command. Dispatch wiring
+    // moved to build_window so force-disable + send_dsp can run
+    // in a single handler in the right order.
     let (demod_dropdown, _demod_mode_cell) = header::build_demod_selector();
-    let state_demod = Rc::clone(state);
-    demod_dropdown.connect_selected_notify(move |dd| {
-        // `suppress_demod_notify` is the DSP-origin guard — when
-        // the scanner's `ScannerActiveChannelChanged` fan-out sets
-        // the dropdown programmatically, we do NOT want to dispatch
-        // `SetDemodMode` back to the engine (it'd tear down the
-        // scanner-driven retune the UI is only trying to reflect).
-        if state_demod.suppress_demod_notify.get() {
-            return;
-        }
-        if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
-            state_demod.demod_mode.set(mode);
-            state_demod.send_dsp(UiToDsp::SetDemodMode(mode));
-            tracing::debug!(?mode, "demod mode sent to DSP");
-        }
-    });
 
     // Volume button (ScaleButton with audio icons)
     let volume_button = gtk4::ScaleButton::new(
