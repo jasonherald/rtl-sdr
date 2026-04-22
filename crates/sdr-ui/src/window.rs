@@ -635,6 +635,29 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     window.present();
 }
 
+/// Clear the scanner's active-channel UI surfaces back to the
+/// idle look: empty cache, placeholder label, hidden lockout
+/// button. Shared between the four events that mean "scanner
+/// isn't parked on a channel anymore":
+///   - `ScannerActiveChannelChanged { key: None }` (explicit
+///     idle edge)
+///   - `ScannerEmptyRotation` (rotation exhausted)
+///   - `ScannerMutexStopped::ScannerStoppedFor{Recording,Transcription}`
+///     (mutex fired)
+///
+/// Without the helper, those stop paths would depend on the
+/// engine sending a separate `ActiveChannelChanged { key: None }`
+/// event in the same tick — which it does today, but relying on
+/// that ordering across four sites was brittle.
+fn clear_scanner_active_channel_ui(
+    scanner_panel: &sidebar::scanner_panel::ScannerPanel,
+    state: &AppState,
+) {
+    *state.scanner_active_key.borrow_mut() = None;
+    scanner_panel.active_channel_label.set_text("Active: —");
+    scanner_panel.lockout_button.set_visible(false);
+}
+
 /// Handle a single message from the DSP thread.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_dsp_message(
@@ -939,8 +962,7 @@ fn handle_dsp_message(
 
                 scanner_panel.lockout_button.set_visible(true);
             } else {
-                scanner_panel.active_channel_label.set_text("Active: —");
-                scanner_panel.lockout_button.set_visible(false);
+                clear_scanner_active_channel_ui(scanner_panel, state);
             }
         }
         DspToUi::ScannerStateChanged(scanner_state) => {
@@ -969,6 +991,12 @@ fn handle_dsp_message(
             // redundant `SetScannerEnabled(false)` — idempotent on
             // the engine side (scanner's already Idle), so no harm.
             scanner_panel.master_switch.set_state(false);
+            // Clear the active-channel surfaces locally rather
+            // than waiting for a separate `ActiveChannelChanged
+            // { key: None }` event — the engine sends it today,
+            // but relying on that ordering across four stop
+            // sites was brittle.
+            clear_scanner_active_channel_ui(scanner_panel, state);
         }
         DspToUi::ScannerMutexStopped(reason) => {
             tracing::info!(?reason, "scanner mutex stopped");
@@ -989,10 +1017,12 @@ fn handle_dsp_message(
                 }
                 sdr_core::messages::ScannerMutexReason::ScannerStoppedForRecording => {
                     scanner_panel.master_switch.set_state(false);
+                    clear_scanner_active_channel_ui(scanner_panel, state);
                     "Scanner stopped — recording started"
                 }
                 sdr_core::messages::ScannerMutexReason::ScannerStoppedForTranscription => {
                     scanner_panel.master_switch.set_state(false);
+                    clear_scanner_active_channel_ui(scanner_panel, state);
                     "Scanner stopped — transcription started"
                 }
             };
@@ -5268,6 +5298,19 @@ fn connect_scanner_panel(
         state_switch.send_dsp(UiToDsp::SetScannerEnabled(sw.is_active()));
     });
 
+    // Restore persisted slider values BEFORE wiring the notify
+    // handlers below. `set_value` on a SpinRow fires
+    // `value-changed`, so if we wired first and restored after
+    // we'd trigger a spurious `save_default_*_ms` +
+    // `project_and_push_scanner_channels` during window
+    // construction — plus `build_window` re-seeds the scanner
+    // right after `connect_sidebar_panels` returns, which would
+    // pile on a second redundant dispatch per slider.
+    let dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
+    scanner.default_dwell_row.set_value(f64::from(dwell_ms));
+    let hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
+    scanner.default_hang_row.set_value(f64::from(hang_ms));
+
     // Default dwell slider: persist on every value change, then
     // re-project the bookmark list so `ScannerChannel::dwell_ms`
     // picks up the new default on channels without an override.
@@ -5317,14 +5360,6 @@ fn connect_scanner_panel(
         };
         state_lockout.send_dsp(UiToDsp::LockoutScannerChannel(key));
     });
-
-    // Restore persisted slider values. Runs after the notify
-    // handlers are wired, so `set_value` on a non-default
-    // persisted value re-saves the same value — idempotent.
-    let dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
-    scanner.default_dwell_row.set_value(f64::from(dwell_ms));
-    let hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
-    scanner.default_hang_row.set_value(f64::from(hang_ms));
 }
 
 /// Connect transcript panel controls to DSP commands.
