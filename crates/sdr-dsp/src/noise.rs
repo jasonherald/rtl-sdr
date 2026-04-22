@@ -1409,15 +1409,22 @@ mod tests {
     const STRONG_AMP: f32 = 1.0;
     const BORDERLINE_AMP: f32 = 0.003;
 
-    // Manual squelch thresholds used by the rearm tests. Both are
-    // "effectively open" compared to the expected noise amplitude
-    // so the process loop always runs the auto-squelch logic
-    // rather than short-circuiting on the manual gate.
+    // Manual squelch thresholds used by the rearm tests. The two
+    // constants are NOT interchangeable — they're deliberately
+    // picked at different points on the dB scale.
+    //
+    /// "Effectively open" manual threshold versus the expected
+    /// noise amplitude — used by the enabled-rearm test so the
+    /// process loop always exercises the auto-squelch logic
+    /// rather than short-circuiting on the manual gate.
     const REARM_MANUAL_FLOOR_DB: f32 = -100.0;
     /// Manual threshold used specifically by the
-    /// rearm-while-disabled test. Sits between `NOISE_AMP` and
-    /// the initial sentinel so a disabled squelch clearly
-    /// distinguishes from the enabled-and-settled-at-floor state.
+    /// rearm-while-disabled test. Intentionally sits between
+    /// `NOISE_AMP` and `NOISE_FLOOR_INITIAL_DB` so
+    /// "disabled squelch" is unambiguously distinct from
+    /// "enabled and settled at the floor" — protects the test
+    /// against accidentally passing if a future edit makes the
+    /// disabled path mirror the enabled-at-sentinel state.
     const REARM_DISABLED_MANUAL_DB: f32 = -50.0;
     /// Minimum rise above `NOISE_FLOOR_INITIAL_DB` (dB) that counts
     /// as "the EMA converged off the sentinel" — used to confirm
