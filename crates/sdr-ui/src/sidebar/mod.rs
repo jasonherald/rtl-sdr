@@ -11,6 +11,7 @@ pub mod bookmarks_panel;
 pub mod display_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
+pub mod scanner_panel;
 pub mod server_panel;
 pub mod source_panel;
 pub mod transcript_panel;
@@ -20,6 +21,7 @@ pub use bookmarks_panel::{BookmarksPanel, build_bookmarks_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
+pub use scanner_panel::{ScannerPanel, build_scanner_panel};
 pub use server_panel::{ServerPanel, build_server_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
 pub use transcript_panel::{TranscriptPanel, build_transcript_panel};
@@ -58,6 +60,10 @@ pub struct SidebarPanels {
     /// default; `window.rs` reveals it when a local RTL-SDR dongle
     /// is plugged in and not currently the active source.
     pub server: ServerPanel,
+    /// Scanner control panel at bottom of left sidebar (Phase 1,
+    /// issue #317). Master switch, active-channel / state
+    /// display, lockout button, default dwell/hang sliders.
+    pub scanner: ScannerPanel,
 }
 
 /// Build the complete sidebar `ScrolledWindow` containing all configuration panels.
@@ -73,6 +79,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     let radio = build_radio_panel();
     let display = build_display_panel();
     let navigation = build_navigation_panel();
+    let scanner = build_scanner_panel();
     // Flyout is built after navigation because it borrows the
     // left-sidebar `name_entry` — its row actions (recall,
     // delete-of-active) sync the entry field.
@@ -106,6 +113,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     sidebar_box.append(&audio.widget);
     sidebar_box.append(&radio.widget);
     sidebar_box.append(&display.widget);
+    sidebar_box.append(&scanner.widget);
 
     let scroll = gtk4::ScrolledWindow::builder()
         .child(&sidebar_box)
@@ -120,6 +128,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         navigation,
         bookmarks,
         server,
+        scanner,
     };
 
     (scroll, panels)
