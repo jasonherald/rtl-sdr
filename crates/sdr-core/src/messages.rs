@@ -6,6 +6,21 @@ use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
 
 use crate::sink_slot::{AudioSinkType, NetworkSinkStatus};
 
+/// Why the scanner↔recording/transcription mutex fired.
+/// Surfaced to the UI via `DspToUi::ScannerMutexStopped` so the
+/// appropriate toast can be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerMutexReason {
+    /// Scanner activation stopped a running recording.
+    RecordingStoppedForScanner,
+    /// Scanner activation stopped a running transcription.
+    TranscriptionStoppedForScanner,
+    /// Recording start stopped an active scanner.
+    ScannerStoppedForRecording,
+    /// Transcription start stopped an active scanner.
+    ScannerStoppedForTranscription,
+}
+
 /// Messages sent from the DSP pipeline thread to the UI main loop.
 #[derive(Debug)]
 pub enum DspToUi {
@@ -84,6 +99,28 @@ pub enum DspToUi {
     /// when streaming, red with the message on failure. Per
     /// issue #247.
     NetworkSinkStatus(NetworkSinkStatus),
+    // --- Scanner (#317) ---
+    /// Scanner's active channel changed. UI uses this to sync
+    /// the frequency selector, spectrum center, status bar,
+    /// demod dropdown, and bandwidth row. `key = None` means
+    /// scanner went idle (clear the display).
+    ScannerActiveChannelChanged {
+        key: Option<sdr_scanner::ChannelKey>,
+        freq_hz: u64,
+        demod_mode: sdr_types::DemodMode,
+        bandwidth: f64,
+        name: String,
+    },
+    /// Scanner phase transition — UI updates the state label.
+    ScannerStateChanged(sdr_scanner::ScannerState),
+    /// Rotation exhausted because all channels are absent or
+    /// locked out. UI surfaces a toast before the sidebar
+    /// display resets.
+    ScannerEmptyRotation,
+    /// Scanner stopped recording/transcription (or vice versa)
+    /// via the mutex. UI shows a toast describing the
+    /// transition.
+    ScannerMutexStopped(ScannerMutexReason),
 }
 
 /// Available source types for IQ input.
