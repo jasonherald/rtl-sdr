@@ -4752,9 +4752,9 @@ fn connect_navigation_panel(
         // Both bookmark recall AND band-preset selection come in
         // through this callback (the preset handler in
         // `connect_preset_to_bookmarks` invokes `on_navigate` with
-        // a synthesized Bookmark). Treat both as manual tunes
-        // that preempt the scanner.
-        force_disable_nav.trigger("bookmark recall");
+        // a synthesized Bookmark). Keep the toast reason neutral
+        // so a preset click doesn't claim "bookmark recall".
+        force_disable_nav.trigger("preset/bookmark selection");
 
         let freq = bookmark.frequency;
         let mode = sidebar::navigation_panel::parse_demod_mode(&bookmark.demod_mode);

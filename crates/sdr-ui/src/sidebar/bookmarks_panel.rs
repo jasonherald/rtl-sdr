@@ -137,6 +137,16 @@ impl BookmarksPanel {
     /// directly — packs up all the shared `Rc` state owned by
     /// this panel so callers only need to hand in the
     /// `NavigationPanel`-owned `name_entry` reference.
+    ///
+    /// This is the method the external mutation paths (Add, Save,
+    /// `RadioReference` import) call after persisting changes —
+    /// they get scanner re-projection for free because `rebuild`
+    /// fires `on_mutated` after the list rebuild. Internal row
+    /// actions (delete, scan checkbox, priority star) call
+    /// [`rebuild_bookmark_list`](super::navigation_panel::rebuild_bookmark_list)
+    /// directly and dispatch `on_mutated` themselves; the
+    /// search-entry handler bypasses both and does not invoke
+    /// `on_mutated` (filter changes aren't mutations).
     pub fn rebuild(&self, name_entry: &adw::EntryRow) {
         super::navigation_panel::rebuild_bookmark_list(
             &self.bookmark_list,
@@ -150,6 +160,13 @@ impl BookmarksPanel {
             &self.manual_expanded,
             &self.on_mutated,
         );
+        // Fire the mutation callback so external callers (Add,
+        // Save, RR import) trigger scanner re-projection without
+        // needing to know the callback's wiring. Idempotent —
+        // the window-level closure just re-projects + dispatches.
+        if let Some(cb) = self.on_mutated.borrow().as_ref() {
+            cb();
+        }
     }
 }
 
