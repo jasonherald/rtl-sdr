@@ -28,8 +28,13 @@ use std::time::{Duration, Instant};
 
 use sdr_rtlsdr::device::RtlSdrDevice;
 
+use crate::codec::{Codec, CodecMask, Encoder};
 use crate::dispatch::dispatch;
 use crate::error::ServerError;
+use crate::extension::{
+    CLIENT_HELLO_LEN, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension,
+    Status,
+};
 use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode};
 
 /// USB read buffer size (bytes). Matches `DEFAULT_BUF_LENGTH` upstream
@@ -106,6 +111,17 @@ pub struct ServerConfig {
     /// Max queued buffers between USB reader and TCP writer. 0 = use
     /// [`DEFAULT_BUFFER_CAPACITY`].
     pub buffer_capacity: usize,
+
+    /// Codecs this server is willing to offer to sdr-rs clients
+    /// that speak the extended `"RTLX"` handshake (#307). Per-
+    /// connection negotiation is the intersection of this mask
+    /// and the client's advertised mask (`CodecMask::pick`):
+    /// legacy / vanilla-rtl_tcp clients that don't send a hello
+    /// always get `Codec::None`; sdr-rs clients supporting LZ4
+    /// get LZ4 iff this mask advertises it. Default:
+    /// [`CodecMask::NONE_ONLY`] — compression is opt-in per-
+    /// server so existing deployments behave identically.
+    pub compression: crate::codec::CodecMask,
 }
 
 impl ServerConfig {
@@ -118,6 +134,7 @@ impl ServerConfig {
             device_index: 0,
             initial: InitialDeviceState::default(),
             buffer_capacity: DEFAULT_BUFFER_CAPACITY,
+            compression: crate::codec::CodecMask::NONE_ONLY,
         }
     }
 }
@@ -299,6 +316,7 @@ impl Server {
             stats.clone(),
             capacity,
             config.initial.clone(),
+            config.compression,
         )?;
 
         Ok(Server {
@@ -424,6 +442,12 @@ fn apply_initial_state(
 ///
 /// Returns `Err` on thread spawn failure (rare — kernel resource
 /// exhaustion). Callers propagate up to the user.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "#307 grew the accept-thread signature with `compression`; \
+              refactoring to a context struct would churn every caller \
+              without improving readability"
+)]
 fn spawn_accept_thread(
     listener: TcpListener,
     device: Arc<Mutex<RtlSdrDevice>>,
@@ -432,6 +456,7 @@ fn spawn_accept_thread(
     stats: Arc<Mutex<ServerStats>>,
     buffer_capacity: usize,
     initial_state: InitialDeviceState,
+    compression: CodecMask,
 ) -> std::io::Result<JoinHandle<()>> {
     // Poll-accept cadence means the listener must be nonblocking.
     // Configure it BEFORE spawning so failures surface through
@@ -506,6 +531,7 @@ fn spawn_accept_thread(
                         let session_shutdown = shutdown.clone();
                         let session_stats = stats.clone();
                         let session_busy = busy.clone();
+                        let session_compression = compression;
                         match thread::Builder::new().name("rtl_tcp-session".into()).spawn(
                             move || {
                                 handle_client(
@@ -514,6 +540,7 @@ fn spawn_accept_thread(
                                     session_shutdown,
                                     session_stats.clone(),
                                     buffer_capacity,
+                                    session_compression,
                                 );
                                 update_stats_on_disconnect(&session_stats);
                                 tracing::info!(%peer, "rtl_tcp client disconnected");
@@ -641,15 +668,116 @@ fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
     }
 }
 
+/// How long the server waits on a fresh TCP connection for a
+/// `ClientHello` before assuming the client is a legacy vanilla
+/// `rtl_tcp` peer and falling through to the unchanged legacy
+/// path. Short enough to be invisible to the user (RTL-SDR init
+/// takes full seconds anyway); long enough to cover LAN RTT
+/// jitter. Per #307.
+const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Try to read + parse an extended-protocol [`ClientHello`] from
+/// `stream` within [`HELLO_SNIFF_TIMEOUT`]. Returns `Ok(Some)` on
+/// a valid hello (consuming 8 bytes), `Ok(None)` on timeout or
+/// non-`"RTLX"` leading bytes (legacy path; bytes remain in the
+/// receive buffer for the command reader if they were a command),
+/// `Err` on fatal socket state.
+///
+/// Uses `peek()` first so non-hello traffic stays intact — a
+/// legacy command starting with an opcode that happens to be
+/// shorter than 8 bytes isn't lost to a partial `read_exact`.
+/// If the magic matches, only then do we commit to consuming
+/// the full 8-byte hello.
+fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHello>> {
+    stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
+    // Peek the first 4 bytes (magic-only check). `peek` maps to
+    // `recv(…, MSG_PEEK)` which respects `SO_RCVTIMEO`, so this
+    // returns WouldBlock / TimedOut after the timeout without
+    // consuming bytes.
+    let mut peek_buf = [0u8; 4];
+    let peeked = match stream.peek(&mut peek_buf) {
+        Ok(n) => n,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            stream.set_read_timeout(None)?;
+            return Ok(None);
+        }
+        Err(e) => {
+            // Other errors (ECONNRESET, etc.) → propagate so the
+            // caller tears down cleanly.
+            stream.set_read_timeout(None)?;
+            return Err(e);
+        }
+    };
+    if peeked < 4 || peek_buf[..4] != EXTENSION_MAGIC {
+        // Legacy client — either sent fewer than 4 bytes (most
+        // likely zero; legacy clients idle waiting for
+        // `dongle_info`) or the first bytes aren't the sdr-rs
+        // magic. Either way, leave the bytes in the kernel
+        // buffer for the command reader and return None.
+        stream.set_read_timeout(None)?;
+        return Ok(None);
+    }
+    // Magic matched — commit to consuming 8 bytes. `read_exact`
+    // may block up to the timeout for the remaining 4 bytes;
+    // if the client sent only 4 bytes and is hanging, we treat
+    // that as a protocol error (return None and fall through).
+    let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+    let read_result = stream.read_exact(&mut hello_buf);
+    stream.set_read_timeout(None)?;
+    match read_result {
+        Ok(()) => Ok(ClientHello::from_bytes(&hello_buf)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Serve exactly one client. Spawns the three worker threads, waits for
 /// the first to exit, signals the others, joins all.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "#307 grew the session signature with compression_offer; \
+              refactoring to a context struct would churn every rtl_tcp \
+              server test without improving readability"
+)]
 fn handle_client(
     stream: TcpStream,
     device: Arc<Mutex<RtlSdrDevice>>,
     global_shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
     buffer_capacity: usize,
+    compression_offer: CodecMask,
 ) {
+    // Extended handshake (#307). Must happen BEFORE we write the
+    // legacy `dongle_info_t` — if the client sent an `"RTLX"`
+    // hello, we want to write the server response block
+    // immediately after the legacy header, all in one atomic
+    // stretch, so the client's `peek` for the `"RTLX"` magic
+    // lands on our bytes and not on IQ samples the data worker
+    // has queued up.
+    let negotiated_codec = match sniff_client_hello(&stream) {
+        Ok(Some(hello)) => {
+            let codec = compression_offer.pick(hello.codec_mask);
+            tracing::info!(
+                client_mask = hello.codec_mask.to_wire(),
+                server_mask = compression_offer.to_wire(),
+                chosen = %codec,
+                "rtl_tcp extended-handshake negotiated"
+            );
+            Some(codec)
+        }
+        Ok(None) => {
+            tracing::debug!("rtl_tcp no extended-handshake hello — legacy client path");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(%e, "rtl_tcp handshake sniff failed — dropping client");
+            return;
+        }
+    };
+
     // Send the 12-byte dongle_info_t header first (rtl_tcp.c:576-594).
     let header = {
         let Ok(dev) = device.lock() else {
@@ -662,16 +790,36 @@ fn handle_client(
         }
     };
     let header_bytes = header.to_bytes();
-    let mut writer = match stream.try_clone() {
+    let writer_stream = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
             tracing::error!(%e, "failed to clone client stream for writer — dropping client");
             return;
         }
     };
+    let mut writer = writer_stream;
     if let Err(e) = writer.write_all(&header_bytes) {
         tracing::warn!(%e, "failed to send dongle_info_t — client gone");
         return;
+    }
+
+    // If we negotiated the extended protocol, emit the
+    // `ServerExtension` block immediately after `dongle_info_t`.
+    // Must land before any IQ data or the client's magic-peek
+    // after `dongle_info` will read random samples instead.
+    if let Some(codec) = negotiated_codec {
+        let ext = ServerExtension {
+            codec,
+            // #307 is single-client; role and status are reserved
+            // for #392/#394 and always report OK / Control here.
+            granted_role: Some(Role::Control),
+            status: Status::Ok,
+            version: PROTOCOL_VERSION,
+        };
+        if let Err(e) = writer.write_all(&ext.to_bytes()) {
+            tracing::warn!(%e, "failed to send RTLX server extension — client gone");
+            return;
+        }
     }
 
     // Per-client shutdown flag. Flipped when any worker exits, so the
@@ -695,12 +843,30 @@ fn handle_client(
         return;
     };
 
+    // Install the write timeout on the underlying TcpStream
+    // BEFORE wrapping in the codec's encoder — the encoder's
+    // `write()` delegates to the inner stream's `write()`, which
+    // in turn enforces `SO_SNDTIMEO`. Setting after-wrap would
+    // lose visibility into the inner stream.
+    if let Err(e) = writer.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
+        tracing::warn!(%e, "set_write_timeout on data channel failed; dropping client");
+        merged_shutdown.set_client();
+        let _ = reader_handle.join();
+        return;
+    }
+    // Wrap the writer in the negotiated codec. Legacy clients
+    // get a pass-through (`Codec::None`) so the write path
+    // stays byte-identical to the pre-#307 behavior.
+    let encoded_writer = Encoder::new(
+        negotiated_codec.unwrap_or(Codec::None),
+        writer,
+    );
     let writer_shutdown = merged_shutdown.clone();
     let writer_stats = stats.clone();
     let Ok(writer_handle) = thread::Builder::new()
         .name("rtl_tcp-writer".into())
         .spawn(move || {
-            tcp_writer(writer, rx, writer_shutdown, writer_stats);
+            tcp_writer(encoded_writer, rx, writer_shutdown, writer_stats);
         })
     else {
         tracing::error!("failed to spawn rtl_tcp writer thread — tearing down client");
@@ -855,26 +1021,20 @@ fn data_worker(
     }
 }
 
-fn tcp_writer(
-    mut stream: TcpStream,
+fn tcp_writer<W: Write + Send>(
+    mut stream: W,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
     shutdown: MergedShutdown,
     stats: Arc<Mutex<ServerStats>>,
 ) {
-    // A slow peer that stops reading will fill its kernel receive
-    // buffer → our kernel send buffer saturates → `write_all` blocks
-    // indefinitely. Since the write path can't re-check shutdown while
-    // blocked, a wedged writer would deadlock the
-    // writer.join → handle_client → accept.join → Server::Drop chain.
-    // Setting a write timeout mirrors what `command_worker` does for
-    // reads so the same shutdown-responsiveness guarantee applies here.
-    if let Err(e) = stream.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
-        tracing::warn!(%e, "set_write_timeout on data channel failed; dropping client");
-        shutdown.set_client();
-        return;
-    }
-    // `recv_timeout` lets us notice shutdown even when the USB reader is
-    // starving (e.g., dongle unplug).
+    // Write timeout is installed by the caller on the underlying
+    // `TcpStream` before wrapping in the codec — see the comment
+    // in `handle_client` where the timeout is set up. Putting it
+    // here would lose visibility into the inner stream when
+    // `stream` is an `Encoder`.
+    //
+    // `recv_timeout` lets us notice shutdown even when the USB
+    // reader is starving (e.g., dongle unplug).
     loop {
         if shutdown.is_set() {
             return;
@@ -1042,6 +1202,7 @@ mod tests {
             device_index: 0,
             initial: InitialDeviceState::default(),
             buffer_capacity: 0,
+            compression: CodecMask::NONE_ONLY,
         };
         match Server::start(config) {
             Err(ServerError::PortInUse(ref addr)) => {
