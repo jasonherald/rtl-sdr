@@ -304,7 +304,19 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
         RtlTcpConnectionState::Connected {
             tuner_name,
             gain_count,
-        } => format!("Connected — {tuner_name} ({gain_count} gains)"),
+            codec,
+        } => {
+            // Only surface the codec when it's actually compressing —
+            // the common "None" case (every legacy server, plus our
+            // own server with compression off) stays at the existing
+            // short form so the subtitle doesn't grow a meaningless
+            // "codec: None" suffix on every connection.
+            if codec == "None" {
+                format!("Connected — {tuner_name} ({gain_count} gains)")
+            } else {
+                format!("Connected — {tuner_name} ({gain_count} gains, {codec})")
+            }
+        }
         RtlTcpConnectionState::Retrying { attempt, retry_in } => {
             // Ceil, not floor — `as_secs` truncates fractional
             // seconds, so `1.9 s` would read as "1 s" and the row
@@ -967,14 +979,29 @@ mod tests {
             format_rtl_tcp_state(&RtlTcpConnectionState::Connecting),
             "Connecting…"
         );
-        // Connected carries tuner metadata both the user and the
-        // debugging eye can parse.
+        // Connected with `None` codec keeps the short form — the
+        // common path every legacy server hits, and the default for
+        // our own client. Adding a "(None)" suffix here would noise
+        // up every single connection in exchange for zero signal.
         assert_eq!(
             format_rtl_tcp_state(&RtlTcpConnectionState::Connected {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
+                codec: "None".into(),
             }),
             "Connected — R820T (29 gains)"
+        );
+        // Connected with a non-`None` codec gets an extra suffix so
+        // the user can see which codec actually landed. Signals
+        // that compression is active without forcing them to hunt
+        // through logs.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::Connected {
+                tuner_name: "R820T".into(),
+                gain_count: 29,
+                codec: "LZ4".into(),
+            }),
+            "Connected — R820T (29 gains, LZ4)"
         );
         // Retrying ceils fractional seconds so the row never
         // understates the delay: 250 ms remaining → "1 s", not

@@ -132,8 +132,11 @@ pub enum ConnectionState {
     Disconnected,
     /// `start()` in progress — first TCP connect attempt.
     Connecting,
-    /// Handshake complete, handler streaming I/Q.
-    Connected { tuner: TunerInfo },
+    /// Handshake complete, handler streaming I/Q. `codec` reflects
+    /// the negotiated stream codec from the extended `"RTLX"`
+    /// handshake (#307); legacy / uncompressed paths land on
+    /// `Codec::None`.
+    Connected { tuner: TunerInfo, codec: Codec },
     /// Connection dropped, backoff pending. Transport-level errors
     /// (TCP connect refused, EOF, stall) stay in this state — the
     /// manager retries forever with exponential backoff up to the
@@ -150,12 +153,13 @@ impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
         match value {
             ConnectionState::Disconnected => Self::Disconnected,
             ConnectionState::Connecting => Self::Connecting,
-            ConnectionState::Connected { tuner } => Self::Connected {
+            ConnectionState::Connected { tuner, codec } => Self::Connected {
                 // `TunerTypeCode`'s `Debug` renders the upstream
                 // tuner name ("R820T", "E4000", etc.) directly —
                 // what the UI wants for the status row subtitle.
                 tuner_name: format!("{:?}", tuner.tuner),
                 gain_count: tuner.gain_count,
+                codec: codec.label().to_string(),
             },
             ConnectionState::Retrying { attempt, next_at } => Self::Retrying {
                 attempt: *attempt,
@@ -849,12 +853,14 @@ fn attempt_connect(
     if let Ok(mut slot) = shared.tuner.lock() {
         *slot = Some(tuner);
     }
-    set_state(shared, ConnectionState::Connected { tuner });
 
-    // Peek for the server's `ServerExtension` block — only when
-    // we sent a hello. If we didn't, the server can't have replied
-    // with an extension block, and a rogue peek would risk
-    // consuming IQ data. Sticks the client to legacy path whenever
+    // Peek for the server's `ServerExtension` block BEFORE publishing
+    // `Connected` state — the codec is part of the state the UI
+    // renders, and landing in `Connected { codec: None }` first and
+    // then updating would cause a subtitle flicker. Only peek when we
+    // sent a hello; otherwise the server can't have replied with an
+    // extension block, and a rogue peek would risk consuming IQ
+    // bytes. Sticks the client to legacy path whenever
     // `compression = NONE_ONLY`.
     let codec = if extension_enabled {
         match sniff_server_extension(&stream) {
@@ -880,6 +886,8 @@ fn attempt_connect(
     } else {
         Codec::None
     };
+
+    set_state(shared, ConnectionState::Connected { tuner, codec });
 
     // Publish a clone of the stream for the command sender. Install a
     // write timeout on the clone so `send_command`'s blocking
@@ -1688,7 +1696,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut tuner = None;
         while Instant::now() < deadline {
-            if let ConnectionState::Connected { tuner: t } = src.connection_state() {
+            if let ConnectionState::Connected { tuner: t, .. } = src.connection_state() {
                 tuner = Some(t);
                 break;
             }
@@ -1808,7 +1816,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut got = None;
         while Instant::now() < deadline {
-            if let ConnectionState::Connected { tuner } = src.connection_state() {
+            if let ConnectionState::Connected { tuner, .. } = src.connection_state() {
                 got = Some(tuner);
                 break;
             }

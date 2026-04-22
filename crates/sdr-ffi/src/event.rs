@@ -528,6 +528,7 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
                 RtlTcpConnectionState::Connected {
                     tuner_name,
                     gain_count,
+                    ..
                 } => {
                     let sanitized = tuner_name.replace('\0', "?");
                     let Ok(cstr) = CString::new(sanitized) else {
@@ -891,6 +892,7 @@ mod tests {
             RtlTcpConnectionState::Connected {
                 tuner_name: "R820T".to_string(),
                 gain_count: 29,
+                codec: "None".to_string(),
             },
         ))
         .expect("Connected event should translate");
