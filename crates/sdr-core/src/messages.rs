@@ -6,6 +6,21 @@ use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
 
 use crate::sink_slot::{AudioSinkType, NetworkSinkStatus};
 
+/// Why the scanner↔recording/transcription mutex fired.
+/// Surfaced to the UI via `DspToUi::ScannerMutexStopped` so the
+/// appropriate toast can be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerMutexReason {
+    /// Scanner activation stopped a running recording.
+    RecordingStoppedForScanner,
+    /// Scanner activation stopped a running transcription.
+    TranscriptionStoppedForScanner,
+    /// Recording start stopped an active scanner.
+    ScannerStoppedForRecording,
+    /// Transcription start stopped an active scanner.
+    ScannerStoppedForTranscription,
+}
+
 /// Messages sent from the DSP pipeline thread to the UI main loop.
 #[derive(Debug)]
 pub enum DspToUi {
@@ -84,6 +99,28 @@ pub enum DspToUi {
     /// when streaming, red with the message on failure. Per
     /// issue #247.
     NetworkSinkStatus(NetworkSinkStatus),
+    // --- Scanner (#317) ---
+    /// Scanner's active channel changed. UI uses this to sync
+    /// the frequency selector, spectrum center, status bar,
+    /// demod dropdown, and bandwidth row. `key = None` means
+    /// scanner went idle (clear the display).
+    ScannerActiveChannelChanged {
+        key: Option<sdr_scanner::ChannelKey>,
+        freq_hz: u64,
+        demod_mode: sdr_types::DemodMode,
+        bandwidth: f64,
+        name: String,
+    },
+    /// Scanner phase transition — UI updates the state label.
+    ScannerStateChanged(sdr_scanner::ScannerState),
+    /// Rotation exhausted because all channels are absent or
+    /// locked out. UI surfaces a toast before the sidebar
+    /// display resets.
+    ScannerEmptyRotation,
+    /// Scanner stopped recording/transcription (or vice versa)
+    /// via the mutex. UI shows a toast describing the
+    /// transition.
+    ScannerMutexStopped(ScannerMutexReason),
 }
 
 /// Available source types for IQ input.
@@ -283,6 +320,21 @@ pub enum UiToDsp {
     /// wait for the current exponential-backoff delay to expire.
     /// No-op when the active source is not `RtlTcp`.
     RetryRtlTcpNow,
+    // --- Scanner (#317) ---
+    /// Master scanner on/off toggle.
+    SetScannerEnabled(bool),
+    /// Replace the scanner's channel list. UI projects bookmarks
+    /// with `scan_enabled = true` into `ScannerChannel`s (folding
+    /// defaults + overrides at projection time) and dispatches
+    /// this on startup + any bookmark/default change.
+    UpdateScannerChannels(Vec<sdr_scanner::ScannerChannel>),
+    /// Session-scoped lockout — scanner skips this channel until
+    /// unlocked or scanner is disabled.
+    LockoutScannerChannel(sdr_scanner::ChannelKey),
+    /// Clear a lockout. If scanner stalled into `Idle` via
+    /// `EmptyRotation` (all channels locked) this resumes
+    /// rotation automatically.
+    UnlockScannerChannel(sdr_scanner::ChannelKey),
 }
 
 #[cfg(test)]
@@ -734,5 +786,111 @@ mod tests {
         // this test suite.
         let msg = UiToDsp::SetSourceType(SourceType::RtlTcp);
         assert!(matches!(msg, UiToDsp::SetSourceType(SourceType::RtlTcp)));
+    }
+
+    #[test]
+    fn test_scanner_dsp_to_ui_variants() {
+        // Shape regression for the four scanner events added in
+        // PR 2 of #317. Catches silent payload changes — if a
+        // field gets renamed or the tuple arity changes, the
+        // pattern match here fails at compile or runtime.
+        let key = sdr_scanner::ChannelKey {
+            name: "Test".to_string(),
+            frequency_hz: 162_550_000,
+        };
+        let active = DspToUi::ScannerActiveChannelChanged {
+            key: Some(key.clone()),
+            freq_hz: 162_550_000,
+            demod_mode: sdr_types::DemodMode::Nfm,
+            bandwidth: TEST_BANDWIDTH_HZ,
+            name: "Test".to_string(),
+        };
+        assert!(matches!(
+            active,
+            DspToUi::ScannerActiveChannelChanged {
+                key: Some(_),
+                freq_hz: 162_550_000,
+                demod_mode: sdr_types::DemodMode::Nfm,
+                ..
+            }
+        ));
+
+        let idle = DspToUi::ScannerActiveChannelChanged {
+            key: None,
+            freq_hz: 0,
+            demod_mode: sdr_types::DemodMode::Nfm,
+            bandwidth: 0.0,
+            name: String::new(),
+        };
+        assert!(matches!(
+            idle,
+            DspToUi::ScannerActiveChannelChanged { key: None, .. }
+        ));
+
+        let state_changed = DspToUi::ScannerStateChanged(sdr_scanner::ScannerState::Listening);
+        assert!(matches!(
+            state_changed,
+            DspToUi::ScannerStateChanged(sdr_scanner::ScannerState::Listening)
+        ));
+
+        let empty = DspToUi::ScannerEmptyRotation;
+        assert!(matches!(empty, DspToUi::ScannerEmptyRotation));
+
+        // Pin each mutex-reason variant — the UI toast text is
+        // selected by matching these, so a silent rename would
+        // misroute toasts rather than fail compilation.
+        let mutex_rec =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::RecordingStoppedForScanner);
+        assert!(matches!(
+            mutex_rec,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::RecordingStoppedForScanner)
+        ));
+        let mutex_trans =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::TranscriptionStoppedForScanner);
+        assert!(matches!(
+            mutex_trans,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::TranscriptionStoppedForScanner)
+        ));
+        let mutex_scan_rec =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForRecording);
+        assert!(matches!(
+            mutex_scan_rec,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForRecording)
+        ));
+        let mutex_scan_trans =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForTranscription);
+        assert!(matches!(
+            mutex_scan_trans,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForTranscription)
+        ));
+    }
+
+    #[test]
+    fn test_scanner_ui_to_dsp_variants() {
+        // Shape regression for the four scanner commands the UI
+        // dispatches. Same rationale as the DspToUi test above —
+        // enum-shape drift fails here first.
+        let key = sdr_scanner::ChannelKey {
+            name: "Test".to_string(),
+            frequency_hz: 146_520_000,
+        };
+
+        let enable = UiToDsp::SetScannerEnabled(true);
+        assert!(matches!(enable, UiToDsp::SetScannerEnabled(true)));
+
+        let disable = UiToDsp::SetScannerEnabled(false);
+        assert!(matches!(disable, UiToDsp::SetScannerEnabled(false)));
+
+        let update = UiToDsp::UpdateScannerChannels(Vec::new());
+        assert!(matches!(
+            update,
+            UiToDsp::UpdateScannerChannels(ref v) if v.is_empty()
+        ));
+
+        let lockout = UiToDsp::LockoutScannerChannel(key.clone());
+        assert!(matches!(lockout, UiToDsp::LockoutScannerChannel(_)));
+
+        let unlock = UiToDsp::UnlockScannerChannel(key);
+        assert!(matches!(unlock, UiToDsp::UnlockScannerChannel(_)));
     }
 }
