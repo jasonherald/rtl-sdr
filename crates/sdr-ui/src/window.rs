@@ -927,6 +927,14 @@ fn handle_dsp_message(
                 radio_panel.ctcss_row.set_selected(ctcss_idx);
                 if let Some(vs_mode) = voice_squelch {
                     radio_panel.apply_voice_squelch_mode_ui(vs_mode);
+                    // Reset the open/closed badge too — mode
+                    // change rebuilds the voice-squelch detector,
+                    // so a stale "open" from the previous channel
+                    // must not carry over. The next
+                    // `VoiceSquelchOpenChanged` edge from DSP
+                    // repaints it accurately. Mirrors the manual
+                    // selector path at `voice_squelch_row.connect_selected_notify`.
+                    radio_panel.set_voice_squelch_open(false);
                 }
 
                 scanner_panel.lockout_button.set_visible(true);
