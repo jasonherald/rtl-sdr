@@ -57,12 +57,6 @@
 //! [`ServerConfig`]: crate::server::ServerConfig
 //! [`crate::server`]: crate::server
 
-// Keep module-level `dead_code` allowed for the short window between
-// this commit (types + registry, no wiring) and the data-path flip
-// commit that consumes them. Removed once `server.rs` wires the
-// registry into the accept loop.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

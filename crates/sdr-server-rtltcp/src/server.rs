@@ -1,33 +1,52 @@
-//! TCP server — accept loop, per-client data/command/writer threads.
+//! TCP server — accept loop, shared USB broadcaster, per-client worker threads.
 //!
-//! Faithful port of the upstream rtl_tcp threading model with one Rust
-//! tweak: upstream uses a pthread condvar + linked list to decouple the
-//! libusb async callback from the TCP writer (dropping buffers when the
-//! list exceeds `llbuf_num`, default 500). We use a bounded
-//! `std::sync::mpsc::sync_channel` with identical drop-on-full semantics —
-//! simpler and no `unsafe`, same backpressure behavior.
+//! Multi-client port of the upstream `rtl_tcp` threading model (#391, epic
+//! #390). Upstream's model is strictly single-client: one USB reader
+//! decoupled from one TCP writer via a condvar + linked list, gated by
+//! `llbuf_num` (default 500). Ours keeps the 500-chunk bound but:
 //!
-//! Upstream layout (rtl_tcp.c:498-720):
+//! - **One USB reader thread** (`broadcaster_worker`) runs for the
+//!   server's lifetime. It fans every USB chunk out to N per-client
+//!   bounded channels via [`ClientRegistry::broadcast`].
+//! - **Per-client writer** drains its own channel to an encoded TCP
+//!   socket. A slow listener only drops chunks against its own
+//!   counter; other clients keep receiving uninterrupted.
+//! - **Per-client command worker** reads 5-byte command frames from
+//!   the client's socket and dispatches to the shared device mutex.
+//!
+//! Pre-#391 upstream layout (`rtl_tcp.c:498-720`):
 //!   main: bind → accept → apply defaults → reset_buffer → spawn
 //!         tcp_worker + command_worker → rtlsdr_read_async (blocks) →
 //!         cancel_async on SIGINT → join → accept again
 //!
-//! Our layout: accept thread owns the outer loop; each accepted client
-//! spawns data_worker (USB → channel), writer (channel → TCP send), and
-//! command_worker (TCP recv → dispatch). First worker to exit signals
-//! the others via the shutdown flag.
+//! Our layout post-#391:
+//!   Server::start: bind → open device → apply defaults → spawn
+//!                  broadcaster_worker → spawn accept thread
+//!   accept thread: accept → handshake → register ClientSlot → spawn
+//!                  per-client writer + command → accept again
+//!   broadcaster:   one shared thread, USB bulk read → ClientRegistry::broadcast
+//!
+//! `apply_initial_state` is called ONCE at [`Server::start`] — not
+//! re-applied on every client accept. Previously (single-client), each
+//! new client got a fresh tune/gain reset so sequential clients didn't
+//! inherit each other's state. In the new multi-client model, every
+//! client shares the live device state — a controller tuning to 145 MHz
+//! means new listeners join on 145 MHz. Matches broadcast-radio
+//! semantics and the epic's "one dongle, shared state" model. Role
+//! enforcement (listeners can't tune) lands in #392.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use sdr_rtlsdr::device::RtlSdrDevice;
 
+use crate::broadcaster::{ClientRegistry, ClientSlot};
 use crate::codec::{Codec, CodecMask, Encoder};
 use crate::dispatch::dispatch;
 use crate::error::ServerError;
@@ -43,14 +62,21 @@ use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode
 pub const READ_BUFFER_LEN: u32 = 256 * 1024;
 
 /// Maximum number of 256 KiB buffers allowed to queue between the USB
-/// reader and the TCP writer. Matches upstream's default `llbuf_num = 500`
-/// (rtl_tcp.c:61). When the queue is full, new USB buffers are dropped and
-/// a warning is logged — exactly upstream's drop-on-overflow policy.
-pub const DEFAULT_BUFFER_CAPACITY: usize = 500;
+/// reader and the per-client TCP writer. Same bound as upstream's
+/// `llbuf_num = 500` (rtl_tcp.c:61) — now per-client after #391 instead
+/// of shared. When a client's queue fills, subsequent broadcasts drop
+/// for THAT client only; other clients keep draining normally.
+///
+/// Named `DEFAULT_BUFFER_CAPACITY` historically (single-client crate);
+/// preserved as an alias for the `DEFAULT_PER_CLIENT_BUFFER_DEPTH`
+/// broadcaster constant so external callers that referenced it by name
+/// don't have to rename in the same PR that introduces the refactor.
+pub use crate::broadcaster::DEFAULT_PER_CLIENT_BUFFER_DEPTH as DEFAULT_BUFFER_CAPACITY;
 
-/// Socket receive timeout for the command worker select loop. Upstream
+/// Socket receive timeout for the command worker read loop. Upstream
 /// uses a 1-second select timeout so the loop re-checks `do_exit` even
-/// when no commands arrive (rtl_tcp.c:293-304).
+/// when no commands arrive (rtl_tcp.c:293-304). Ours re-checks the
+/// shutdown flag AND the per-slot disconnection flag.
 const COMMAND_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Sleep between non-blocking `accept()` polls. Small enough that the
@@ -66,13 +92,20 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
 
 /// `recv_timeout` in the TCP writer so it notices shutdown even when
-/// the USB reader is starving (dongle unplug, no data incoming).
+/// the broadcaster is starving (dongle unplug, no data incoming).
 const WRITER_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Timeout on each USB bulk read in the data worker. Matches upstream's
-/// 1-second poll interval in the `rtlsdr_read_async` loop. The data
-/// worker re-checks the shutdown flag between reads.
+/// Timeout on each USB bulk read in the broadcaster thread. Matches
+/// upstream's 1-second poll interval in the `rtlsdr_read_async` loop.
+/// The broadcaster re-checks the shutdown flag between reads.
 const USB_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often the broadcaster calls [`ClientRegistry::prune_disconnected`]
+/// to reap slots whose workers have exited. Measured in USB-read ticks
+/// rather than wall clock — at ~10 ms per tick under normal traffic
+/// this prunes every ~2.5 s, which is plenty fast without making the
+/// lock + retain work happen per chunk.
+const BROADCASTER_PRUNE_EVERY_N_TICKS: u32 = 256;
 
 /// Default sample rate in Hz. Matches upstream `rtl_tcp.c:DEFAULT_SAMPLE_RATE_HZ`.
 ///
@@ -86,12 +119,10 @@ pub const DEFAULT_SAMPLE_RATE_HZ: u32 = 2_048_000;
 pub const DEFAULT_CENTER_FREQ_HZ: u32 = 100_000_000;
 
 /// Maximum number of recent `(CommandOp, Instant)` entries retained
-/// in `ServerStats::recent_commands`. 50 covers a typical rtl_tcp
-/// session's worth of tuning / gain / mode changes — enough to
-/// debug "why didn't my tune command land?" scenarios without
-/// unbounded memory growth on long-running servers. Oldest entries
-/// are popped when the ring fills.
-pub const RECENT_COMMANDS_CAPACITY: usize = 50;
+/// per-client (see `broadcaster::RECENT_COMMANDS_CAPACITY`). Exposed
+/// at this path for the `stats()` contract — same 50-entry bound as
+/// the pre-#391 server-wide ring.
+pub use crate::broadcaster::RECENT_COMMANDS_CAPACITY;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -107,8 +138,10 @@ pub struct ServerConfig {
     /// Initial device state applied after open.
     pub initial: InitialDeviceState,
 
-    /// Max queued buffers between USB reader and TCP writer. 0 = use
-    /// [`DEFAULT_BUFFER_CAPACITY`].
+    /// Max queued buffers **per connected client** between the shared
+    /// USB broadcaster and that client's TCP writer. 0 = use
+    /// [`DEFAULT_BUFFER_CAPACITY`]. Per-client after #391: a slow
+    /// listener can't stall the controller.
     pub buffer_capacity: usize,
 
     /// Codecs this server is willing to offer to sdr-rs clients
@@ -172,55 +205,44 @@ impl Default for InitialDeviceState {
 
 /// Live server statistics for UI consumption.
 ///
-/// Each field is either a session-scoped counter (reset when the
-/// current client disconnects — `bytes_sent`, `buffers_dropped`,
-/// `last_command`, and the `current_*` commanded fields) or a
-/// session-identity hint (`connected_client`, `connected_since`).
+/// **Transitional single-client projection** (#391 commit 2a): still
+/// shaped like the pre-multi-client struct, populated from
+/// [`ClientRegistry::snapshot`] via [`project_to_legacy_stats`]. The
+/// "first connected client" fills the per-session fields; second/third
+/// clients are invisible to this view. Commit 2b replaces this with
+/// a per-client `Vec<ClientInfo>` schema and updates all in-tree
+/// consumers (Linux UI + sdr-ffi + C header) in the same change.
+///
 /// UI callers snapshot the struct via `Server::stats()` on a timer
 /// and compute deltas (e.g. data-rate) across consecutive snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct ServerStats {
-    /// Socket address of the currently-connected client. `None`
-    /// means the accept loop is waiting.
+    /// Socket address of the first connected client. `None` means no
+    /// clients are connected.
     pub connected_client: Option<SocketAddr>,
-    /// Wall-clock moment the current session began. Paired with
-    /// `connected_client`: both are `Some` or both are `None`.
+    /// Wall-clock moment the first client's session began. Paired
+    /// with `connected_client`: both are `Some` or both are `None`.
     pub connected_since: Option<Instant>,
-    /// Bytes written to the client socket across the current
-    /// session. Reset to 0 on connect / disconnect.
+    /// Bytes written to the first client's TCP socket for the current
+    /// session. Only reflects one client's traffic in commit 2a — the
+    /// total-across-all-clients rendering ships in 2b.
     pub bytes_sent: u64,
-    /// Buffer-drop count: how many times the USB→TCP queue was
-    /// full when a new IQ block arrived, forcing us to discard.
-    /// Reset to 0 on connect / disconnect.
+    /// Buffer-drop count for the first client. Per-client counter;
+    /// other clients' drops are invisible to this view.
     pub buffers_dropped: u64,
-    /// Most recent command received from the client, with the
-    /// moment it was dispatched. UI renders this as the "activity
-    /// log" preview. Reset to `None` on disconnect.
+    /// Most recent command dispatched for the first client.
     pub last_command: Option<(CommandOp, Instant)>,
-    /// Most recent `SetCenterFreq` value requested by the client,
-    /// in Hz. Populated from the wire param so it reflects what
-    /// the client asked for even if the device layer rejected it;
-    /// UI treats this as "the client thinks we're tuned here."
-    /// Reset on disconnect.
+    /// First client's most recent `SetCenterFreq` request, in Hz.
     pub current_freq_hz: Option<u32>,
-    /// Most recent `SetSampleRate` request, in Hz. Same "client's
-    /// view" semantics as `current_freq_hz`.
+    /// First client's most recent `SetSampleRate` request, in Hz.
     pub current_sample_rate_hz: Option<u32>,
-    /// Most recent `SetTunerGain` request, in tenths of dB
-    /// (negative is legal per upstream). `None` means the client
-    /// hasn't requested a manual gain since connecting.
+    /// First client's most recent `SetTunerGain` request, in tenths
+    /// of dB.
     pub current_gain_tenths_db: Option<i32>,
-    /// `true` when the client most recently sent
-    /// `SetGainMode(auto)`, `false` on `SetGainMode(manual)`,
-    /// `None` when it hasn't sent one this session. UI renders
-    /// "auto" vs "manual" accordingly.
+    /// First client's most recent `SetGainMode` request.
     pub current_gain_auto: Option<bool>,
-    /// Ring buffer of recent commands received this session, bounded
-    /// at `RECENT_COMMANDS_CAPACITY` entries. Newest-first ordering
-    /// is the UI's responsibility; this preserves insertion order
-    /// (oldest at front, newest at back) so the producer stays cheap
-    /// (`push_back` + `pop_front` at cap). Reset on connect /
-    /// disconnect along with the other per-session counters.
+    /// Ring buffer of the first client's recent commands. Bounded at
+    /// [`RECENT_COMMANDS_CAPACITY`].
     pub recent_commands: VecDeque<(CommandOp, Instant)>,
 }
 
@@ -241,7 +263,8 @@ pub struct Server {
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
-    stats: Arc<Mutex<ServerStats>>,
+    broadcaster_thread: Option<JoinHandle<()>>,
+    registry: Arc<ClientRegistry>,
     bind: SocketAddr,
     tuner: TunerAdvertiseInfo,
     compression: crate::codec::CodecMask,
@@ -251,8 +274,9 @@ impl Server {
     /// Bind the listener, open the RTL-SDR, apply initial defaults, and
     /// start accepting clients.
     ///
-    /// The returned handle owns the accept thread. Dropping it signals
-    /// shutdown and waits for the current client (if any) to disconnect.
+    /// The returned handle owns the broadcaster thread and the accept
+    /// thread. Dropping it signals shutdown and waits for both — plus
+    /// any currently-connected clients — to exit cleanly.
     pub fn start(config: ServerConfig) -> Result<Self, ServerError> {
         // Bind first — surface port-in-use before touching the USB device
         // so we don't leave a dongle claimed after a failed bind.
@@ -268,9 +292,6 @@ impl Server {
         // back from the socket so `bind_address()` returns the real
         // port the UI/logs can show.
         let actual_bind = listener.local_addr().map_err(ServerError::Io)?;
-        // The listener is already blocking by default from `bind` —
-        // no need to force it here. The accept thread flips it to
-        // nonblocking immediately on entry.
 
         let device_count = sdr_rtlsdr::get_device_count();
         if device_count == 0 {
@@ -299,23 +320,28 @@ impl Server {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
-        let stats = Arc::new(Mutex::new(ServerStats::default()));
-
+        let registry = Arc::new(ClientRegistry::new());
         let dev_mutex = Arc::new(Mutex::new(device));
-        let capacity = if config.buffer_capacity == 0 {
+        let per_client_depth = if config.buffer_capacity == 0 {
             DEFAULT_BUFFER_CAPACITY
         } else {
             config.buffer_capacity
         };
 
+        // Broadcaster runs for the server's lifetime regardless of
+        // connected-client count. Starting it BEFORE the accept thread
+        // means the first client that connects already has a live
+        // broadcaster ready to fan their channel's worth of data.
+        let broadcaster_thread =
+            spawn_broadcaster_thread(dev_mutex.clone(), registry.clone(), shutdown.clone())?;
+
         let accept_thread = spawn_accept_thread(
             listener,
             dev_mutex,
+            registry.clone(),
             shutdown.clone(),
             stopped.clone(),
-            stats.clone(),
-            capacity,
-            config.initial.clone(),
+            per_client_depth,
             config.compression,
         )?;
 
@@ -323,16 +349,22 @@ impl Server {
             shutdown,
             stopped,
             accept_thread: Some(accept_thread),
-            stats,
+            broadcaster_thread: Some(broadcaster_thread),
+            registry,
             bind: actual_bind,
             tuner,
             compression: config.compression,
         })
     }
 
-    /// Current server statistics.
+    /// Current server statistics (transitional single-client projection).
+    ///
+    /// Projects the [`ClientRegistry`] to the old `ServerStats` shape
+    /// via [`project_to_legacy_stats`] so commit 2a keeps the workspace
+    /// compiling. Commit 2b swaps this for a per-client `Vec<ClientInfo>`
+    /// API and updates every consumer in the same change.
     pub fn stats(&self) -> ServerStats {
-        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
+        project_to_legacy_stats(&self.registry)
     }
 
     /// The address the server is bound to.
@@ -357,8 +389,8 @@ impl Server {
         self.compression
     }
 
-    /// Has the accept thread exited (either via `stop()` or an
-    /// unrecoverable error like USB device loss)?
+    /// Has the server exited? Set to `true` after the accept thread
+    /// AND broadcaster thread have joined.
     ///
     /// CLI callers poll this alongside their own Ctrl-C handler so the
     /// process exits when serving actually stops, instead of sleeping
@@ -367,14 +399,18 @@ impl Server {
         self.stopped.load(Ordering::Relaxed)
     }
 
-    /// Signal shutdown and wait for the accept thread to exit.
+    /// Signal shutdown and wait for both the accept and broadcaster
+    /// threads to exit.
     ///
-    /// Equivalent to dropping the `Server`. Any panic from the accept
+    /// Equivalent to dropping the `Server`. Any panic from either
     /// thread is silently swallowed — if you need to observe panics,
     /// keep the `JoinHandle` yourself instead of calling `stop()`.
     pub fn stop(mut self) {
         self.initiate_shutdown();
         if let Some(h) = self.accept_thread.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.broadcaster_thread.take() {
             let _ = h.join();
         }
     }
@@ -390,38 +426,29 @@ impl Drop for Server {
         if let Some(h) = self.accept_thread.take() {
             let _ = h.join();
         }
+        if let Some(h) = self.broadcaster_thread.take() {
+            let _ = h.join();
+        }
     }
-}
-
-/// Lock the device and reapply initial state for a new client session.
-/// Exists so the accept loop has a small surface that wraps the lock
-/// acquisition; `apply_initial_state` itself stays lock-agnostic.
-fn reset_device_to_initial(
-    device: &Arc<Mutex<RtlSdrDevice>>,
-    initial: &InitialDeviceState,
-) -> Result<(), ServerError> {
-    let mut dev = device
-        .lock()
-        .map_err(|_| ServerError::Io(std::io::Error::other("device mutex poisoned")))?;
-    apply_initial_state(&mut dev, initial)
 }
 
 /// Apply the user's initial settings to the freshly-opened device.
 ///
 /// Mirrors the setup block in rtl_tcp.c:490-520. Called once at
-/// `Server::start` so the dongle is in a sane state even before any
-/// client connects, and again on every new client session via
-/// `reset_device_to_initial` so sequential clients don't inherit each
-/// other's tuning.
+/// `Server::start` so the dongle is in a sane state before any client
+/// connects. **Not re-called on client accept** post-#391 — every
+/// client shares the device state, so resetting on accept would
+/// disrupt clients already listening.
 fn apply_initial_state(
     dev: &mut RtlSdrDevice,
     initial: &InitialDeviceState,
 ) -> Result<(), ServerError> {
     // 0 is a valid direct-sampling state (off) and MUST be applied —
-    // not skipped — so a previous session that enabled direct sampling
-    // doesn't leak its mode into the next client's session. Previously
-    // the `!= 0` guard treated 0 as "leave alone," which broke
-    // reset_device_to_initial's promise of a clean slate per client.
+    // not skipped — so the device starts on a known state regardless
+    // of whatever mode the previous process (or a crashed prior run)
+    // left the dongle in. Previously the `!= 0` guard treated 0 as
+    // "leave alone," which broke Server::start's promise of a clean
+    // slate per process.
     dev.set_direct_sampling(initial.direct_sampling)?;
     dev.set_freq_correction(initial.ppm)?;
     dev.set_sample_rate(initial.sample_rate_hz)?;
@@ -441,129 +468,72 @@ fn apply_initial_state(
     Ok(())
 }
 
-/// Spawn the outer accept loop. Upstream's main runs this inline; we run
-/// it on a thread so `Server::start` can return a handle to the caller.
+/// Spawn the server-lifetime broadcaster thread. Pulls from USB and
+/// calls [`ClientRegistry::broadcast`] once per chunk. Runs even when
+/// there are zero connected clients — the dongle streams regardless,
+/// matching upstream's always-on async read. When clients connect
+/// they join the stream mid-flow (no per-client reset).
+fn spawn_broadcaster_thread(
+    device: Arc<Mutex<RtlSdrDevice>>,
+    registry: Arc<ClientRegistry>,
+    shutdown: Arc<AtomicBool>,
+) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("rtl_tcp-broadcaster".into())
+        .spawn(move || {
+            broadcaster_worker(device, registry, shutdown);
+        })
+}
+
+/// Spawn the outer accept loop. Per accepted client:
+///   1. handshake (RTLX sniff + dongle_info_t + optional ServerExtension)
+///   2. build `ClientSlot` + register in the `ClientRegistry`
+///   3. spawn a writer thread (drains slot.rx → encoded socket)
+///   4. spawn a command thread (reads socket → dispatches to device)
 ///
-/// `initial_state` is reapplied on every new client session so sequential
-/// clients start from a clean slate rather than inheriting the prior
-/// client's tuning / gain / direct-sampling state. Matches upstream's
-/// `accept → apply defaults → reset_buffer → spawn workers` shape,
-/// extended to the multi-client accept loop.
+/// No `busy` flag, no second-connection reject — that was the
+/// single-client constraint #391 removes. Client lifecycle is
+/// observed by the `ClientSlot::disconnected` flag; the broadcaster
+/// prunes disconnected slots on its own schedule.
 ///
 /// Returns `Err` on thread spawn failure (rare — kernel resource
 /// exhaustion). Callers propagate up to the user.
 #[allow(
     clippy::too_many_arguments,
-    reason = "#307 grew the accept-thread signature with `compression`; \
-              refactoring to a context struct would churn every caller \
-              without improving readability"
+    reason = "accept thread fans state into per-client workers; \
+              refactoring to a context struct would churn every test"
 )]
 fn spawn_accept_thread(
     listener: TcpListener,
     device: Arc<Mutex<RtlSdrDevice>>,
+    registry: Arc<ClientRegistry>,
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
-    stats: Arc<Mutex<ServerStats>>,
-    buffer_capacity: usize,
-    initial_state: InitialDeviceState,
+    per_client_buffer_depth: usize,
     compression: CodecMask,
 ) -> std::io::Result<JoinHandle<()>> {
-    // Poll-accept cadence means the listener must be nonblocking.
-    // Configure it BEFORE spawning so failures surface through
-    // `Server::start`'s `?` rather than getting buried inside the
-    // spawned thread body — burying it would return `Ok` to the caller
-    // and the accept thread would die without ever setting `stopped`,
-    // leaving callers polling `has_stopped()` stuck forever.
     listener.set_nonblocking(true)?;
     thread::Builder::new()
         .name("rtl_tcp-accept".into())
         .spawn(move || {
-            // Session slot: set to true while a client is being served.
-            // Kept in an Arc so the session thread can clear it on exit.
-            // Using `swap(true, ...)` to claim the slot atomically — if
-            // it returns true, we were already busy and this new accept
-            // must be rejected immediately (kernel had queued it in the
-            // backlog, but we refuse to hold it).
-            let busy = Arc::new(AtomicBool::new(false));
-            let mut session_handle: Option<JoinHandle<()>> = None;
-
             while !shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, peer)) => {
-                        if busy.swap(true, Ordering::SeqCst) {
-                            tracing::info!(
-                                %peer,
-                                "rtl_tcp already serving a client — rejecting new connection"
-                            );
-                            // Close the socket immediately so the client
-                            // sees FIN instead of hanging in backlog.
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                            // swap set busy=true, but we weren't actually
-                            // idle — the already-active session will
-                            // eventually clear busy when it exits. Leave
-                            // the flag set; don't reset.
-                            continue;
-                        }
-                        // We now own the session slot. Reap the previous
-                        // session handle if any (it must be finished,
-                        // because the session thread clears busy at its
-                        // tail — we got false from the swap, which means
-                        // the prior session already cleared it).
-                        if let Some(h) = session_handle.take() {
-                            let _ = h.join();
-                        }
-
                         tracing::info!(%peer, "rtl_tcp client connected");
                         if let Err(e) = stream.set_nonblocking(false) {
                             tracing::error!(%e, "failed to set client socket blocking");
-                            busy.store(false, Ordering::SeqCst);
                             continue;
                         }
                         configure_client_socket(&stream);
-                        update_stats_on_connect(&stats, peer);
-
-                        // Reapply initial state BEFORE spawning workers
-                        // so this client starts on clean tuning/gain
-                        // rather than inheriting the prior session's
-                        // state. Matches upstream's per-accept setup
-                        // block (rtl_tcp.c:490-520).
-                        if let Err(e) = reset_device_to_initial(&device, &initial_state) {
-                            tracing::error!(
-                                %e, %peer,
-                                "rtl_tcp failed to reset device to initial state, dropping client"
-                            );
-                            busy.store(false, Ordering::SeqCst);
-                            update_stats_on_disconnect(&stats);
-                            continue;
-                        }
-
-                        let session_device = device.clone();
-                        let session_shutdown = shutdown.clone();
-                        let session_stats = stats.clone();
-                        let session_busy = busy.clone();
-                        let session_compression = compression;
-                        match thread::Builder::new().name("rtl_tcp-session".into()).spawn(
-                            move || {
-                                handle_client(
-                                    stream,
-                                    session_device,
-                                    session_shutdown,
-                                    session_stats.clone(),
-                                    buffer_capacity,
-                                    session_compression,
-                                );
-                                update_stats_on_disconnect(&session_stats);
-                                tracing::info!(%peer, "rtl_tcp client disconnected");
-                                session_busy.store(false, Ordering::SeqCst);
-                            },
-                        ) {
-                            Ok(h) => session_handle = Some(h),
-                            Err(e) => {
-                                tracing::error!(%e, "failed to spawn session thread");
-                                busy.store(false, Ordering::SeqCst);
-                                update_stats_on_disconnect(&stats);
-                            }
-                        }
+                        spawn_client_workers(
+                            stream,
+                            peer,
+                            device.clone(),
+                            registry.clone(),
+                            shutdown.clone(),
+                            per_client_buffer_depth,
+                            compression,
+                        );
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -574,19 +544,182 @@ fn spawn_accept_thread(
                     }
                 }
             }
-
-            // Shutdown: wait for the active session (if any) to finish
-            // before returning, so Server::drop sees all workers done.
-            if let Some(h) = session_handle.take() {
-                let _ = h.join();
-            }
-            // Signal to CLI / UI callers polling `Server::has_stopped()`
-            // that the server is no longer serving. Set AFTER the
-            // session join so a caller that observes `has_stopped() ==
-            // true` can safely assume all workers have exited.
+            // Mark stopped AFTER the loop exits so callers polling
+            // `has_stopped()` observe the server is fully done. The
+            // broadcaster thread is joined by `Server::drop` — we
+            // don't wait for it here because `Server` owns that
+            // handle.
             stopped.store(true, Ordering::SeqCst);
             tracing::debug!("rtl_tcp accept thread exiting");
         })
+}
+
+/// Do the handshake on a freshly-accepted socket, build a
+/// [`ClientSlot`], register it, and spawn this client's writer +
+/// command threads. Fire-and-forget — the accept thread doesn't wait
+/// for this client's workers; lifecycle is observed via the slot's
+/// disconnection flag.
+///
+/// If the handshake fails at any step (sniff error, socket clone
+/// fails, header write fails, thread spawn fails), the client is
+/// silently dropped — no slot is registered, no stats are updated.
+/// The caller (accept thread) moves on to the next accept.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "accept-time client setup fans state"
+)]
+fn spawn_client_workers(
+    stream: TcpStream,
+    peer: SocketAddr,
+    device: Arc<Mutex<RtlSdrDevice>>,
+    registry: Arc<ClientRegistry>,
+    shutdown: Arc<AtomicBool>,
+    per_client_buffer_depth: usize,
+    compression_offer: CodecMask,
+) {
+    // Extended handshake (#307). Must run BEFORE we write the legacy
+    // `dongle_info_t` — if the client sent an `"RTLX"` hello, the
+    // server response block must be emitted immediately after the
+    // legacy header, all in one atomic stretch, so the client's peek
+    // for the `"RTLX"` magic lands on our bytes and not on IQ samples
+    // a racing broadcaster may have queued.
+    let negotiated_codec = match sniff_client_hello(&stream) {
+        Ok(Some(hello)) => {
+            let codec = compression_offer.pick(hello.codec_mask);
+            tracing::info!(
+                %peer,
+                client_mask = hello.codec_mask.to_wire(),
+                server_mask = compression_offer.to_wire(),
+                chosen = %codec,
+                "rtl_tcp extended-handshake negotiated"
+            );
+            Some(codec)
+        }
+        Ok(None) => {
+            tracing::debug!(%peer, "rtl_tcp no extended-handshake hello — legacy client path");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(%peer, %e, "rtl_tcp handshake sniff failed — dropping client");
+            return;
+        }
+    };
+
+    // Send the 12-byte dongle_info_t header (rtl_tcp.c:576-594).
+    let header = {
+        let Ok(dev) = device.lock() else {
+            tracing::error!(%peer, "device mutex poisoned, aborting client");
+            return;
+        };
+        DongleInfo {
+            tuner: TunerTypeCode::from(dev.tuner_type()),
+            gain_count: dev.tuner_gains().len() as u32,
+        }
+    };
+    let header_bytes = header.to_bytes();
+    let writer_stream = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(%peer, %e, "failed to clone client stream for writer — dropping client");
+            return;
+        }
+    };
+    let mut writer = writer_stream;
+    if let Err(e) = writer.write_all(&header_bytes) {
+        tracing::warn!(%peer, %e, "failed to send dongle_info_t — client gone");
+        return;
+    }
+
+    // Emit the `ServerExtension` block immediately after
+    // `dongle_info_t` when we negotiated the extended protocol. Must
+    // land before any IQ data or the client's magic-peek will read
+    // random samples instead.
+    if let Some(codec) = negotiated_codec {
+        let ext = ServerExtension {
+            codec,
+            // #391 is still single-controller; role always reports
+            // Control until #392 plugs in the actual role gate.
+            granted_role: Some(Role::Control),
+            status: Status::Ok,
+            version: PROTOCOL_VERSION,
+        };
+        if let Err(e) = writer.write_all(&ext.to_bytes()) {
+            tracing::warn!(%peer, %e, "failed to send RTLX server extension — client gone");
+            return;
+        }
+    }
+
+    // Install the write timeout BEFORE wrapping in the codec's
+    // encoder — the encoder's `write()` delegates to the inner
+    // stream's `write()`, which in turn enforces `SO_SNDTIMEO`.
+    // Setting after-wrap would lose visibility into the inner stream.
+    if let Err(e) = writer.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
+        tracing::warn!(%peer, %e, "set_write_timeout on data channel failed; dropping client");
+        return;
+    }
+
+    // Build the slot, allocating a fresh id + per-client channel.
+    let id = registry.allocate_id();
+    let codec = negotiated_codec.unwrap_or(Codec::None);
+    let (slot, rx) = ClientSlot::new(id, peer, codec, per_client_buffer_depth);
+
+    // Spawn the writer first so that by the time we register, the
+    // receiver end of the slot's channel is already being drained.
+    // If spawn fails, bail without registering — no half-registered
+    // clients to clean up.
+    let writer_slot = slot.clone();
+    let writer_shutdown = shutdown.clone();
+    let tracked_writer = StatsTrackingWrite {
+        inner: writer,
+        slot: slot.clone(),
+    };
+    let encoded_writer = Encoder::new(codec, tracked_writer);
+    let writer_handle = match thread::Builder::new()
+        .name(format!("rtl_tcp-writer-{id}"))
+        .spawn(move || {
+            tcp_writer(encoded_writer, rx, writer_slot, writer_shutdown);
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(%peer, %e, "failed to spawn rtl_tcp writer thread — dropping client");
+            return;
+        }
+    };
+
+    // Spawn the command thread. If it fails, mark the slot
+    // disconnected so the writer exits too — don't leak it.
+    let command_slot = slot.clone();
+    let command_shutdown = shutdown.clone();
+    let command_device = device;
+    let command_stream = stream;
+    let command_result = thread::Builder::new()
+        .name(format!("rtl_tcp-command-{id}"))
+        .spawn(move || {
+            command_worker(
+                command_stream,
+                command_device,
+                command_slot,
+                command_shutdown,
+            );
+        });
+    if let Err(e) = command_result {
+        tracing::error!(%peer, %e, "failed to spawn rtl_tcp command thread — tearing down client");
+        slot.mark_disconnected();
+        let _ = writer_handle.join();
+        return;
+    }
+
+    // All three threads (writer, command, broadcaster-observing-this-slot)
+    // are now set up. Register the slot so the broadcaster starts
+    // fanning out to it. Registration order matters: before register,
+    // the broadcaster can't find the slot; after register, the
+    // broadcaster discovers it on its next tick.
+    registry.register(slot);
+
+    // Fire and forget — neither the writer nor the command handle is
+    // joined here. Both exit independently when they observe the
+    // shutdown flag or the slot's disconnection flag. The slot itself
+    // is retained by the registry until it's pruned.
 }
 
 fn configure_client_socket(stream: &TcpStream) {
@@ -643,38 +776,37 @@ fn set_keepalive(_stream: &TcpStream, _on: bool) -> std::io::Result<()> {
     ))
 }
 
-fn update_stats_on_connect(stats: &Arc<Mutex<ServerStats>>, peer: SocketAddr) {
-    if let Ok(mut s) = stats.lock() {
-        s.connected_client = Some(peer);
-        s.connected_since = Some(Instant::now());
-        s.bytes_sent = 0;
-        s.buffers_dropped = 0;
-        s.last_command = None;
-        s.current_freq_hz = None;
-        s.current_sample_rate_hz = None;
-        s.current_gain_tenths_db = None;
-        s.current_gain_auto = None;
-        s.recent_commands.clear();
-    }
-}
-
-fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
-    if let Ok(mut s) = stats.lock() {
-        // `update_stats_on_connect` treats every counter below as
-        // session-scoped (resets them on new connect), so the
-        // disconnect path must clear them too — otherwise a UI polling
-        // `ServerStats` while no client is connected would see stale
-        // traffic / command data from the previous session.
-        s.connected_client = None;
-        s.connected_since = None;
-        s.bytes_sent = 0;
-        s.buffers_dropped = 0;
-        s.last_command = None;
-        s.current_freq_hz = None;
-        s.current_sample_rate_hz = None;
-        s.current_gain_tenths_db = None;
-        s.current_gain_auto = None;
-        s.recent_commands.clear();
+/// **Transitional**: project the multi-client registry snapshot into
+/// the legacy single-client [`ServerStats`] shape so commit 2a of
+/// #391 can land without breaking downstream consumers. Takes the
+/// oldest-still-connected client as "the client" for every
+/// per-session field, and zeroes everything else when no clients
+/// are connected.
+///
+/// Commit 2b replaces this with a direct `Vec<ClientInfo>` on
+/// `ServerStats` and updates every consumer (Linux UI + FFI).
+fn project_to_legacy_stats(registry: &Arc<ClientRegistry>) -> ServerStats {
+    // `ClientRegistry::snapshot` includes disconnected-but-not-yet-
+    // pruned slots by design (so UI rows survive one poll tick
+    // after a client drops). The legacy projection picks the
+    // first-registered slot regardless — commit 2b introduces a
+    // per-client Vec where disconnected slots render with a "just
+    // left" hint explicitly.
+    let clients = registry.snapshot();
+    let Some(first) = clients.into_iter().next() else {
+        return ServerStats::default();
+    };
+    ServerStats {
+        connected_client: Some(first.peer),
+        connected_since: Some(first.connected_since),
+        bytes_sent: first.bytes_sent,
+        buffers_dropped: first.buffers_dropped,
+        last_command: first.last_command,
+        current_freq_hz: first.current_freq_hz,
+        current_sample_rate_hz: first.current_sample_rate_hz,
+        current_gain_tenths_db: first.current_gain_tenths_db,
+        current_gain_auto: first.current_gain_auto,
+        recent_commands: first.recent_commands,
     }
 }
 
@@ -785,320 +917,24 @@ fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHe
         })
 }
 
-/// Serve exactly one client. Spawns the three worker threads, waits for
-/// the first to exit, signals the others, joins all.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "#307 grew the session signature with compression_offer; \
-              refactoring to a context struct would churn every rtl_tcp \
-              server test without improving readability"
-)]
-fn handle_client(
-    stream: TcpStream,
-    device: Arc<Mutex<RtlSdrDevice>>,
-    global_shutdown: Arc<AtomicBool>,
-    stats: Arc<Mutex<ServerStats>>,
-    buffer_capacity: usize,
-    compression_offer: CodecMask,
-) {
-    // Extended handshake (#307). Must happen BEFORE we write the
-    // legacy `dongle_info_t` — if the client sent an `"RTLX"`
-    // hello, we want to write the server response block
-    // immediately after the legacy header, all in one atomic
-    // stretch, so the client's `peek` for the `"RTLX"` magic
-    // lands on our bytes and not on IQ samples the data worker
-    // has queued up.
-    let negotiated_codec = match sniff_client_hello(&stream) {
-        Ok(Some(hello)) => {
-            let codec = compression_offer.pick(hello.codec_mask);
-            tracing::info!(
-                client_mask = hello.codec_mask.to_wire(),
-                server_mask = compression_offer.to_wire(),
-                chosen = %codec,
-                "rtl_tcp extended-handshake negotiated"
-            );
-            Some(codec)
-        }
-        Ok(None) => {
-            tracing::debug!("rtl_tcp no extended-handshake hello — legacy client path");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(%e, "rtl_tcp handshake sniff failed — dropping client");
-            return;
-        }
-    };
-
-    // Send the 12-byte dongle_info_t header first (rtl_tcp.c:576-594).
-    let header = {
-        let Ok(dev) = device.lock() else {
-            tracing::error!("device mutex poisoned, aborting client");
-            return;
-        };
-        DongleInfo {
-            tuner: TunerTypeCode::from(dev.tuner_type()),
-            gain_count: dev.tuner_gains().len() as u32,
-        }
-    };
-    let header_bytes = header.to_bytes();
-    let writer_stream = match stream.try_clone() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::error!(%e, "failed to clone client stream for writer — dropping client");
-            return;
-        }
-    };
-    let mut writer = writer_stream;
-    if let Err(e) = writer.write_all(&header_bytes) {
-        tracing::warn!(%e, "failed to send dongle_info_t — client gone");
-        return;
-    }
-
-    // If we negotiated the extended protocol, emit the
-    // `ServerExtension` block immediately after `dongle_info_t`.
-    // Must land before any IQ data or the client's magic-peek
-    // after `dongle_info` will read random samples instead.
-    if let Some(codec) = negotiated_codec {
-        let ext = ServerExtension {
-            codec,
-            // #307 is single-client; role and status are reserved
-            // for #392/#394 and always report OK / Control here.
-            granted_role: Some(Role::Control),
-            status: Status::Ok,
-            version: PROTOCOL_VERSION,
-        };
-        if let Err(e) = writer.write_all(&ext.to_bytes()) {
-            tracing::warn!(%e, "failed to send RTLX server extension — client gone");
-            return;
-        }
-    }
-
-    // Per-client shutdown flag. Flipped when any worker exits, so the
-    // others stop quickly. Honors the global flag too.
-    let client_shutdown = Arc::new(AtomicBool::new(false));
-    let merged_shutdown = MergedShutdown::new(global_shutdown, client_shutdown);
-
-    // Buffer data path: USB bulk → bounded channel → TCP writer.
-    let (tx, rx) = sync_channel::<Vec<u8>>(buffer_capacity);
-
-    let reader_shutdown = merged_shutdown.clone();
-    let reader_device = device.clone();
-    let reader_stats = stats.clone();
-    let Ok(reader_handle) = thread::Builder::new()
-        .name("rtl_tcp-reader".into())
-        .spawn(move || {
-            data_worker(reader_device, tx, reader_shutdown, reader_stats);
-        })
-    else {
-        tracing::error!("failed to spawn rtl_tcp reader thread — dropping client");
-        return;
-    };
-
-    // Install the write timeout on the underlying TcpStream
-    // BEFORE wrapping in the codec's encoder — the encoder's
-    // `write()` delegates to the inner stream's `write()`, which
-    // in turn enforces `SO_SNDTIMEO`. Setting after-wrap would
-    // lose visibility into the inner stream.
-    if let Err(e) = writer.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
-        tracing::warn!(%e, "set_write_timeout on data channel failed; dropping client");
-        merged_shutdown.set_client();
-        let _ = reader_handle.join();
-        return;
-    }
-    // Wrap the socket in the stats-tracking adapter BEFORE the
-    // encoder so `bytes_sent` reflects post-compression bytes
-    // (what actually hit the wire), then wrap in the negotiated
-    // codec. Legacy clients get a pass-through (`Codec::None`),
-    // so the write path stays byte-identical to the pre-#307
-    // behavior — on-wire bytes equal payload bytes in that case.
-    let tracked_writer = StatsTrackingWrite {
-        inner: writer,
-        stats: stats.clone(),
-    };
-    let encoded_writer = Encoder::new(negotiated_codec.unwrap_or(Codec::None), tracked_writer);
-    let writer_shutdown = merged_shutdown.clone();
-    let Ok(writer_handle) = thread::Builder::new()
-        .name("rtl_tcp-writer".into())
-        .spawn(move || {
-            tcp_writer(encoded_writer, rx, writer_shutdown);
-        })
-    else {
-        tracing::error!("failed to spawn rtl_tcp writer thread — tearing down client");
-        merged_shutdown.set_client();
-        let _ = reader_handle.join();
-        return;
-    };
-
-    let command_shutdown = merged_shutdown.clone();
-    let command_device = device;
-    let command_stats = stats;
-    let command_stream = stream;
-    let Ok(command_handle) =
-        thread::Builder::new()
-            .name("rtl_tcp-command".into())
-            .spawn(move || {
-                command_worker(
-                    command_stream,
-                    command_device,
-                    command_shutdown,
-                    command_stats,
-                );
-            })
-    else {
-        tracing::error!("failed to spawn rtl_tcp command thread — tearing down client");
-        merged_shutdown.set_client();
-        let _ = reader_handle.join();
-        let _ = writer_handle.join();
-        return;
-    };
-
-    // Wait for any worker to exit, then cancel the others.
-    let _ = command_handle.join();
-    merged_shutdown.set_client();
-    let _ = reader_handle.join();
-    let _ = writer_handle.join();
-}
-
-/// Combines the server-wide shutdown flag with a per-client flag so we can
-/// tear down one client without stopping the server, and vice versa.
-#[derive(Clone)]
-struct MergedShutdown {
-    global: Arc<AtomicBool>,
-    client: Arc<AtomicBool>,
-}
-
-impl MergedShutdown {
-    fn new(global: Arc<AtomicBool>, client: Arc<AtomicBool>) -> Self {
-        Self { global, client }
-    }
-    fn is_set(&self) -> bool {
-        self.global.load(Ordering::Relaxed) || self.client.load(Ordering::Relaxed)
-    }
-    fn set_client(&self) {
-        self.client.store(true, Ordering::SeqCst);
-    }
-    /// Escalate to server-wide shutdown: the accept thread exits after
-    /// the current session tears down, and `Server::has_stopped()`
-    /// eventually observes `true`. Used for unrecoverable errors that
-    /// can't be remedied by just dropping the current client, such as
-    /// a lost USB dongle (`rusb::Error::NoDevice`).
-    fn set_global(&self) {
-        self.global.store(true, Ordering::SeqCst);
-        self.client.store(true, Ordering::SeqCst);
-    }
-}
-
-/// Continuously pull USB bulk buffers and push into the bounded queue.
-/// Drops on full, matching upstream's `llbuf_num` cap behavior.
-fn data_worker(
-    device: Arc<Mutex<RtlSdrDevice>>,
-    tx: SyncSender<Vec<u8>>,
-    shutdown: MergedShutdown,
-    stats: Arc<Mutex<ServerStats>>,
-) {
-    // Pull an Arc<DeviceHandle> once so we don't have to lock the device
-    // mutex on every USB read (bulk read is &self-safe via usb_handle).
-    let handle = {
-        let Ok(dev) = device.lock() else {
-            // Poisoned mutex is unrecoverable shared state — close out
-            // the whole session so the writer/command workers exit too
-            // instead of spinning on a dead channel.
-            tracing::error!("device mutex poisoned, data worker aborting and closing session");
-            shutdown.set_client();
-            return;
-        };
-        dev.usb_handle()
-    };
-    let timeout = USB_READ_TIMEOUT;
-    // Scratch buffer reused across iterations — only the Vec we actually
-    // send to the writer gets a fresh allocation, sized to the data the
-    // USB read returned. This avoids allocating 256 KiB on every timeout
-    // tick (reviewed on PR #313).
-    let mut scratch = vec![0u8; READ_BUFFER_LEN as usize];
-    // Edge-trigger flag for the tx-queue-full warning. Set when a
-    // drop happens, cleared on the first successful send after — so
-    // we log once per stall-and-drain cycle rather than per buffer.
-    let mut was_dropping = false;
-
-    while !shutdown.is_set() {
-        match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut scratch, timeout) {
-            Ok(n) if n > 0 => {
-                // Allocate only when we have real data to hand off.
-                let buf = scratch[..n].to_vec();
-                match tx.try_send(buf) {
-                    Ok(()) => {
-                        // Rearm the overflow edge so a future stall
-                        // logs again.
-                        was_dropping = false;
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        // Queue is full — drop this buffer (upstream does
-                        // the same when the linked list exceeds llbuf_num;
-                        // rtl_tcp.c:137-152). `buffers_dropped` in the
-                        // shared stats is the authoritative cumulative
-                        // counter; the warn is just an edge signal.
-                        if let Ok(mut s) = stats.lock() {
-                            s.buffers_dropped = s.buffers_dropped.saturating_add(1);
-                        }
-                        if !was_dropping {
-                            tracing::warn!(
-                                "rtl_tcp tx queue full — dropping USB buffers (further drops accumulate silently; see ServerStats::buffers_dropped)"
-                            );
-                            was_dropping = true;
-                        }
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        tracing::debug!("writer gone, data worker exiting");
-                        return;
-                    }
-                }
-            }
-            Ok(_) | Err(rusb::Error::Timeout) => {
-                // No data — loop and re-check shutdown.
-            }
-            Err(rusb::Error::NoDevice) => {
-                // Dongle unplug is unrecoverable at the server level —
-                // the accept loop has nothing to serve. Escalate to a
-                // global shutdown so the accept thread exits, the CLI
-                // sees `has_stopped() == true`, and new clients don't
-                // connect to a dead-device server.
-                tracing::error!("rtl_tcp: USB device lost mid-stream, stopping server");
-                shutdown.set_global();
-                return;
-            }
-            Err(e) => {
-                tracing::error!(%e, "rtl_tcp bulk read error");
-                shutdown.set_client();
-                return;
-            }
-        }
-    }
-}
-
-/// `Write` adapter that mirrors the underlying [`TcpStream`] but
-/// updates [`ServerStats::bytes_sent`] with the post-compression
-/// byte count from each successful write. Placed between the
-/// [`Encoder`] and the socket so the stat reflects **on-wire**
-/// throughput instead of pre-compression payload size — otherwise
-/// the server-panel's data-rate row would show raw sample rate
-/// even when LZ4 is active and operators couldn't see whether
-/// compression was actually saving bandwidth.
-///
-/// Per CodeRabbit round 1 on PR #399.
+/// `Write` adapter sitting between the negotiated `Encoder` and the
+/// raw `TcpStream`. Updates the slot's per-client `bytes_sent` counter
+/// with the on-wire (post-compression) byte count from each
+/// successful write, so the UI's data-rate row reflects actual
+/// bandwidth rather than pre-compression payload size.
 struct StatsTrackingWrite {
     inner: TcpStream,
-    stats: Arc<Mutex<ServerStats>>,
+    slot: Arc<ClientSlot>,
 }
 
 impl Write for StatsTrackingWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
         // Poisoned mutex only happens if a stats reader panicked
-        // while holding the lock — we'd rather keep streaming and
-        // let the stats drift than tear the session down. Matches
-        // the existing lock-use pattern in data_worker.
-        if let Ok(mut s) = self.stats.lock() {
+        // while holding the lock — keep streaming and let the
+        // stats drift; a crashed UI thread is worse than a dropped
+        // counter bump.
+        if let Ok(mut s) = self.slot.stats.lock() {
             s.bytes_sent = s.bytes_sent.saturating_add(n as u64);
         }
         Ok(n)
@@ -1111,30 +947,25 @@ impl Write for StatsTrackingWrite {
 
 fn tcp_writer<W: Write + Send>(
     mut stream: W,
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    shutdown: MergedShutdown,
+    rx: Receiver<Vec<u8>>,
+    slot: Arc<ClientSlot>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    // Write timeout is installed by the caller on the underlying
-    // `TcpStream` before wrapping in the codec — see the comment
-    // in `handle_client` where the timeout is set up. Putting it
-    // here would lose visibility into the inner stream when
-    // `stream` is an `Encoder`.
+    // Write timeout installed by the caller on the underlying
+    // `TcpStream` before wrapping in the codec — see
+    // `spawn_client_workers` where the timeout is set up.
     //
-    // `bytes_sent` bookkeeping is handled by `StatsTrackingWrite`
-    // one layer below the encoder, so this function no longer
-    // needs a `stats` arg. On-wire counts land there directly.
-    //
-    // `recv_timeout` lets us notice shutdown even when the USB
-    // reader is starving (e.g., dongle unplug).
+    // `recv_timeout` lets us notice shutdown even when the
+    // broadcaster is starving (e.g., dongle unplug).
     loop {
-        if shutdown.is_set() {
+        if shutdown.load(Ordering::Relaxed) || slot.is_disconnected() {
             return;
         }
         match rx.recv_timeout(WRITER_RECV_TIMEOUT) {
             Ok(buf) => {
                 if let Err(e) = stream.write_all(&buf) {
-                    tracing::debug!(%e, "rtl_tcp client socket write failed, closing");
-                    shutdown.set_client();
+                    tracing::debug!(%e, client_id = slot.id, "rtl_tcp client socket write failed, closing");
+                    slot.mark_disconnected();
                     return;
                 }
                 // Flush after every chunk so the LZ4 frame encoder
@@ -1149,15 +980,19 @@ fn tcp_writer<W: Write + Send>(
                 // buffer), so the legacy path pays nothing. Per
                 // CodeRabbit round 1 on PR #399.
                 if let Err(e) = stream.flush() {
-                    tracing::debug!(%e, "rtl_tcp client socket flush failed, closing");
-                    shutdown.set_client();
+                    tracing::debug!(%e, client_id = slot.id, "rtl_tcp client socket flush failed, closing");
+                    slot.mark_disconnected();
                     return;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Re-check shutdown flag above.
+                // Re-check shutdown + slot flags above.
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Broadcaster dropped our sender. Only happens when
+                // the registry prunes our slot AFTER our sender got
+                // dropped, which in turn requires slot.disconnected
+                // to be set. The writer exits cleanly.
                 return;
             }
         }
@@ -1167,64 +1002,64 @@ fn tcp_writer<W: Write + Send>(
 fn command_worker(
     mut stream: TcpStream,
     device: Arc<Mutex<RtlSdrDevice>>,
-    shutdown: MergedShutdown,
-    stats: Arc<Mutex<ServerStats>>,
+    slot: Arc<ClientSlot>,
+    shutdown: Arc<AtomicBool>,
 ) {
     // Upstream loops on a 1 s select() so shutdown is noticed promptly.
     // Our equivalent is the socket read timeout. If we can't install it,
     // `read_full` would block indefinitely in `stream.read()` without
     // ever re-checking the shutdown flag — which would deadlock
-    // `handle_client`'s join on this worker, then the accept thread's
-    // join on handle_client, then `Server::Drop`. Treat the failure as
-    // fatal for this client session.
+    // `Server::drop`. Treat the failure as fatal for this client.
     if let Err(e) = stream.set_read_timeout(Some(COMMAND_READ_TIMEOUT)) {
-        tracing::warn!(%e, "set_read_timeout on command channel failed; dropping client");
-        shutdown.set_client();
+        tracing::warn!(%e, client_id = slot.id, "set_read_timeout on command channel failed; dropping client");
+        slot.mark_disconnected();
         return;
     }
     let mut buf = [0u8; COMMAND_LEN];
-    while !shutdown.is_set() {
-        match read_full(&mut stream, &mut buf, &shutdown) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) || slot.is_disconnected() {
+            return;
+        }
+        match read_full(&mut stream, &mut buf, &slot, &shutdown) {
             ReadResult::Ok => {}
             ReadResult::Eof => {
-                tracing::debug!("rtl_tcp command channel EOF");
-                shutdown.set_client();
+                tracing::debug!(client_id = slot.id, "rtl_tcp command channel EOF");
+                slot.mark_disconnected();
                 return;
             }
             ReadResult::Shutdown => return,
             ReadResult::Err(e) => {
-                tracing::warn!(%e, "rtl_tcp command recv error");
-                shutdown.set_client();
+                tracing::warn!(%e, client_id = slot.id, "rtl_tcp command recv error");
+                slot.mark_disconnected();
                 return;
             }
         }
         let Some(cmd) = Command::from_bytes(&buf) else {
             // Upstream silently drops unknown opcodes (switch has no default).
-            tracing::debug!(op = buf[0], "rtl_tcp unknown command opcode, dropping");
+            tracing::debug!(
+                op = buf[0],
+                client_id = slot.id,
+                "rtl_tcp unknown command opcode, dropping"
+            );
             continue;
         };
         let Ok(mut dev) = device.lock() else {
-            // Same rationale as data_worker: a poisoned device mutex
-            // is unrecoverable, and silently dropping commands here
-            // would leave the client driving the UI with no visible
-            // effect on the server. Close the session.
-            tracing::error!("device mutex poisoned, command worker aborting and closing session");
-            shutdown.set_client();
+            // Same rationale as the broadcaster: a poisoned device
+            // mutex is unrecoverable, and silently dropping commands
+            // here would leave the client driving the UI with no
+            // visible effect on the server. Close this client.
+            tracing::error!(
+                client_id = slot.id,
+                "device mutex poisoned, command worker aborting and closing this client"
+            );
+            slot.mark_disconnected();
             return;
         };
         dispatch(&mut dev, cmd);
         drop(dev);
-        if let Ok(mut s) = stats.lock() {
+        if let Ok(mut s) = slot.stats.lock() {
             let now = Instant::now();
-            s.last_command = Some((cmd.op, now));
-            // Push onto the bounded ring. Pop the oldest entry when
-            // we'd otherwise exceed the cap — keeps memory bounded
-            // on long-running sessions without a dedicated ring-
-            // buffer crate.
-            if s.recent_commands.len() >= RECENT_COMMANDS_CAPACITY {
-                s.recent_commands.pop_front();
-            }
-            s.recent_commands.push_back((cmd.op, now));
+            s.record_command(cmd.op, now);
             // Capture the commanded state alongside the
             // last-command stamp. We record what the CLIENT
             // requested (not what the device ultimately applied)
@@ -1255,6 +1090,75 @@ fn command_worker(
     }
 }
 
+fn broadcaster_worker(
+    device: Arc<Mutex<RtlSdrDevice>>,
+    registry: Arc<ClientRegistry>,
+    shutdown: Arc<AtomicBool>,
+) {
+    // Pull the USB handle once so we don't lock the device mutex on
+    // every bulk read. The handle is Arc-cloneable and thread-safe
+    // for bulk reads; the mutex-guarded device is still required for
+    // command dispatch and configuration changes, which run on
+    // per-client command workers.
+    let handle = {
+        let Ok(dev) = device.lock() else {
+            tracing::error!(
+                "device mutex poisoned, broadcaster aborting and signalling server shutdown"
+            );
+            shutdown.store(true, Ordering::SeqCst);
+            return;
+        };
+        dev.usb_handle()
+    };
+    // Scratch buffer reused across iterations — only the Vec<u8>
+    // that the registry clones per-client gets a fresh allocation,
+    // sized to the data the USB read actually returned.
+    let mut scratch = vec![0u8; READ_BUFFER_LEN as usize];
+    let mut ticks_since_prune: u32 = 0;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        match handle.read_bulk(
+            sdr_rtlsdr::constants::BULK_ENDPOINT,
+            &mut scratch,
+            USB_READ_TIMEOUT,
+        ) {
+            Ok(n) if n > 0 => {
+                registry.broadcast(&scratch[..n]);
+                ticks_since_prune = ticks_since_prune.saturating_add(1);
+                if ticks_since_prune >= BROADCASTER_PRUNE_EVERY_N_TICKS {
+                    let removed = registry.prune_disconnected();
+                    if removed > 0 {
+                        tracing::debug!(removed, "rtl_tcp pruned disconnected client slots");
+                    }
+                    ticks_since_prune = 0;
+                }
+            }
+            Ok(_) | Err(rusb::Error::Timeout) => {
+                // No data — loop and re-check shutdown.
+            }
+            Err(rusb::Error::NoDevice) => {
+                // Dongle unplug is unrecoverable at the server level.
+                // Escalate to a global shutdown so the accept thread
+                // exits, the CLI sees `has_stopped() == true`, and
+                // connected clients' command / writer loops observe
+                // the flag and tear down.
+                tracing::error!("rtl_tcp: USB device lost mid-stream, stopping server");
+                shutdown.store(true, Ordering::SeqCst);
+                return;
+            }
+            Err(e) => {
+                tracing::error!(%e, "rtl_tcp bulk read error — stopping server");
+                shutdown.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    }
+    // Final prune on exit so the pruned-slots metric doesn't
+    // indefinitely lag behind truth when the server stops with
+    // dead slots still registered.
+    registry.prune_disconnected();
+}
+
 enum ReadResult {
     Ok,
     Eof,
@@ -1265,10 +1169,15 @@ enum ReadResult {
 /// Read exactly `buf.len()` bytes, splitting across multiple `read`s but
 /// re-checking the shutdown flag on each timeout. Mirrors the upstream
 /// `while(left > 0)` loop in rtl_tcp.c:297-313.
-fn read_full(stream: &mut TcpStream, buf: &mut [u8], shutdown: &MergedShutdown) -> ReadResult {
+fn read_full(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    slot: &Arc<ClientSlot>,
+    shutdown: &Arc<AtomicBool>,
+) -> ReadResult {
     let mut filled = 0;
     while filled < buf.len() {
-        if shutdown.is_set() {
+        if shutdown.load(Ordering::Relaxed) || slot.is_disconnected() {
             return ReadResult::Shutdown;
         }
         match stream.read(&mut buf[filled..]) {
@@ -1339,46 +1248,6 @@ mod tests {
     }
 
     #[test]
-    fn update_stats_on_disconnect_clears_per_session_counters() {
-        // Session-scoped counters (bytes_sent, buffers_dropped,
-        // last_command, current_* commanded fields) must be cleared
-        // when the client disconnects — otherwise a UI polling
-        // ServerStats would see stale data from the prior session
-        // while connected_client = None, e.g. the status row would
-        // still show "100.3 MHz @ 2.4 MHz" for a dead session.
-        let mut recent = VecDeque::new();
-        recent.push_back((CommandOp::SetCenterFreq, Instant::now()));
-        recent.push_back((CommandOp::SetTunerGain, Instant::now()));
-        let stats = Arc::new(Mutex::new(ServerStats {
-            connected_client: Some(SocketAddr::from(([127, 0, 0, 1], 42_000))),
-            connected_since: Some(Instant::now()),
-            bytes_sent: 12345,
-            buffers_dropped: 7,
-            last_command: Some((CommandOp::SetCenterFreq, Instant::now())),
-            current_freq_hz: Some(100_300_000),
-            current_sample_rate_hz: Some(2_400_000),
-            current_gain_tenths_db: Some(200),
-            current_gain_auto: Some(false),
-            recent_commands: recent,
-        }));
-        update_stats_on_disconnect(&stats);
-        let s = stats.lock().unwrap();
-        assert!(s.connected_client.is_none());
-        assert!(s.connected_since.is_none());
-        assert_eq!(s.bytes_sent, 0);
-        assert_eq!(s.buffers_dropped, 0);
-        assert!(s.last_command.is_none());
-        assert!(s.current_freq_hz.is_none());
-        assert!(s.current_sample_rate_hz.is_none());
-        assert!(s.current_gain_tenths_db.is_none());
-        assert!(s.current_gain_auto.is_none());
-        assert!(
-            s.recent_commands.is_empty(),
-            "activity log ring must clear on disconnect to avoid stale entries in the next session"
-        );
-    }
-
-    #[test]
     fn server_stats_default_is_not_connected() {
         let stats = ServerStats::default();
         assert!(stats.connected_client.is_none());
@@ -1402,32 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn merged_shutdown_set_global_escalates_to_both_flags() {
-        // set_client() → client=true, global unchanged.
-        // set_global() → both flags true, so accept loop also exits.
-        // Regression test for the "NoDevice flips client only" bug:
-        // unplug used to stop the current session but leave the accept
-        // thread polling forever against a dead dongle.
-        let ms = MergedShutdown::new(
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert!(!ms.is_set());
-
-        ms.set_client();
-        assert!(ms.is_set());
-        assert!(!ms.global.load(Ordering::Relaxed));
-        assert!(ms.client.load(Ordering::Relaxed));
-
-        // Reset client so we can see set_global set BOTH.
-        ms.client.store(false, Ordering::SeqCst);
-        assert!(!ms.is_set());
-        ms.set_global();
-        assert!(ms.global.load(Ordering::Relaxed));
-        assert!(ms.client.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn has_stopped_is_false_before_accept_thread_exits() {
         // We can't stand up a real Server without hardware, but we CAN
         // sanity-check the `stopped` flag contract: `has_stopped()`
@@ -1448,11 +1291,70 @@ mod tests {
         assert_eq!(DEFAULT_BUFFER_CAPACITY, 500);
     }
 
+    #[test]
+    fn project_to_legacy_stats_empty_registry_returns_default() {
+        // No clients connected → the legacy-shape projection must
+        // return the same zero-filled struct a fresh
+        // `ServerStats::default()` returns. Guards the UI's
+        // "Waiting for client" rendering: a non-None connected_client
+        // in the projection would be a phantom client.
+        let registry = Arc::new(ClientRegistry::new());
+        let stats = project_to_legacy_stats(&registry);
+        let expected = ServerStats::default();
+        assert_eq!(stats.connected_client, expected.connected_client);
+        assert_eq!(stats.bytes_sent, expected.bytes_sent);
+        assert_eq!(stats.buffers_dropped, expected.buffers_dropped);
+        assert!(stats.recent_commands.is_empty());
+    }
+
+    #[test]
+    fn project_to_legacy_stats_picks_first_registered_client() {
+        // Multiple clients → the projection returns the FIRST (oldest)
+        // registered client's session fields. Second+ clients are
+        // invisible in the legacy shape; commit 2b makes all clients
+        // visible via `Vec<ClientInfo>`.
+        use crate::broadcaster::ClientSlot;
+        let registry = Arc::new(ClientRegistry::new());
+
+        let (slot_a, _rx_a) = ClientSlot::new(
+            registry.allocate_id(),
+            SocketAddr::from(([127, 0, 0, 1], 42_001)),
+            Codec::None,
+            4,
+        );
+        if let Ok(mut s) = slot_a.stats.lock() {
+            s.bytes_sent = 100;
+            s.current_freq_hz = Some(145_500_000);
+        }
+        registry.register(slot_a);
+
+        let (slot_b, _rx_b) = ClientSlot::new(
+            registry.allocate_id(),
+            SocketAddr::from(([127, 0, 0, 1], 42_002)),
+            Codec::Lz4,
+            4,
+        );
+        if let Ok(mut s) = slot_b.stats.lock() {
+            s.bytes_sent = 999;
+            s.current_freq_hz = Some(100_000_000);
+        }
+        registry.register(slot_b);
+
+        let stats = project_to_legacy_stats(&registry);
+        // First client's peer + session fields.
+        assert_eq!(
+            stats.connected_client,
+            Some(SocketAddr::from(([127, 0, 0, 1], 42_001)))
+        );
+        assert_eq!(stats.bytes_sent, 100);
+        assert_eq!(stats.current_freq_hz, Some(145_500_000));
+    }
+
     // ============================================================
     // sniff_client_hello regression tests (CodeRabbit round 2 on PR #399)
     //
-    // The sniff is the only piece of `handle_client` that can run
-    // without a real RTL-SDR dongle, so unit tests live here.
+    // The sniff is the only piece of the per-client handshake that
+    // can run without a real RTL-SDR dongle, so unit tests live here.
     // Each test pairs a server-side accept with a client-side TCP
     // connect + controlled write pattern, verifying that
     // `sniff_client_hello` classifies the stream correctly.
