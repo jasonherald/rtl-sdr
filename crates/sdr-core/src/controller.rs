@@ -382,6 +382,15 @@ struct DspState {
     /// scanner itself emits only the `ChannelKey` and the UI
     /// payload needs the full freq/demod/bandwidth/name tuple.
     scanner_channels: Vec<sdr_scanner::ScannerChannel>,
+    /// Scanner-driven audio mute flag. Set by
+    /// `ScannerCommand::MuteAudio(true)` during Retuning /
+    /// Dwelling / Hanging phases, cleared on Listening entry.
+    /// When `true`, the audio-sink write path fills `audio_buf`
+    /// with silence in-place so the user hears nothing during
+    /// retune / no-activity windows while the DSP chain still
+    /// runs (squelch edges still fire → scanner state machine
+    /// stays live).
+    scanner_muted: bool,
 }
 
 impl DspState {
@@ -451,6 +460,7 @@ impl DspState {
             rtl_tcp_poll_at: std::time::Instant::now(),
             scanner: sdr_scanner::Scanner::new(),
             scanner_channels: Vec::new(),
+            scanner_muted: false,
         })
     }
 }
@@ -1670,10 +1680,7 @@ fn apply_scanner_commands(
                 }
             }
             sdr_scanner::ScannerCommand::MuteAudio(muted) => {
-                // Sink-side mute plumbing lands in Task 2.6;
-                // for now just record intent via log so Task
-                // 2.6's integration verification can observe.
-                tracing::debug!(?muted, "scanner mute — sink wiring in Task 2.6");
+                state.scanner_muted = muted;
             }
             sdr_scanner::ScannerCommand::ActiveChannelChanged(key) => {
                 emit_scanner_active_channel(state, dsp_tx, key);
@@ -2242,6 +2249,18 @@ fn process_iq_block(
                             let _ = dsp_tx
                                 .send(DspToUi::Error("Audio recording write failed".to_string()));
                             let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
+                        }
+
+                        // Scanner mute: fill the audio buffer with
+                        // silence in-place when the scanner is in a
+                        // non-Listening phase (Retuning / Dwelling /
+                        // Hanging). The DSP chain still runs — we only
+                        // silence the PCM that reaches the audio device.
+                        // No allocation per block; `slice.fill` overwrites
+                        // existing contents.
+                        if state.scanner_muted {
+                            state.audio_buf[..audio_count]
+                                .fill(sdr_types::Stereo::default());
                         }
 
                         // Send to the audio sink (PipeWire on Linux,
