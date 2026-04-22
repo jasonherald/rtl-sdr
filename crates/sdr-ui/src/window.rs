@@ -2957,6 +2957,7 @@ struct ServerSwitchWidgetsWeak {
     port_row: glib::WeakRef<adw::SpinRow>,
     bind_row: glib::WeakRef<adw::ComboRow>,
     advertise_row: glib::WeakRef<adw::SwitchRow>,
+    compression_row: glib::WeakRef<adw::ComboRow>,
     device_defaults_row: glib::WeakRef<adw::ExpanderRow>,
     center_freq_row: glib::WeakRef<adw::SpinRow>,
     sample_rate_row: glib::WeakRef<adw::ComboRow>,
@@ -2984,6 +2985,7 @@ struct ServerSwitchWidgets {
     port_row: adw::SpinRow,
     bind_row: adw::ComboRow,
     advertise_row: adw::SwitchRow,
+    compression_row: adw::ComboRow,
     device_defaults_row: adw::ExpanderRow,
     center_freq_row: adw::SpinRow,
     sample_rate_row: adw::ComboRow,
@@ -3009,6 +3011,7 @@ impl ServerSwitchWidgetsWeak {
             port_row: s.port_row.downgrade(),
             bind_row: s.bind_row.downgrade(),
             advertise_row: s.advertise_row.downgrade(),
+            compression_row: s.compression_row.downgrade(),
             device_defaults_row: s.device_defaults_row.downgrade(),
             center_freq_row: s.center_freq_row.downgrade(),
             sample_rate_row: s.sample_rate_row.downgrade(),
@@ -3035,6 +3038,7 @@ impl ServerSwitchWidgetsWeak {
             port_row: self.port_row.upgrade()?,
             bind_row: self.bind_row.upgrade()?,
             advertise_row: self.advertise_row.upgrade()?,
+            compression_row: self.compression_row.upgrade()?,
             device_defaults_row: self.device_defaults_row.upgrade()?,
             center_freq_row: self.center_freq_row.upgrade()?,
             sample_rate_row: self.sample_rate_row.upgrade()?,
@@ -3671,6 +3675,17 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
         DIRECT_SAMPLING_OFF
     };
 
+    // Compression combo maps index → CodecMask. Unknown / transient
+    // indices (GTK can emit garbage during widget-model churn) fall
+    // back to `NONE_ONLY` — the wire-safe default that preserves
+    // compatibility with every existing rtl_tcp client.
+    let compression = match panel.compression_row.selected() {
+        crate::sidebar::server_panel::COMPRESSION_LZ4_IDX => {
+            sdr_server_rtltcp::codec::CodecMask::NONE_AND_LZ4
+        }
+        _ => sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
+    };
+
     ServerConfig {
         bind,
         device_index: 0,
@@ -3683,6 +3698,7 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
             direct_sampling,
         },
         buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
+        compression,
     }
 }
 
@@ -3721,6 +3737,12 @@ fn build_advertiser(
             gains: tuner_info.gain_count,
             nickname,
             txbuf: None,
+            // Advertise the codec bitmask so our own clients
+            // know up-front whether to send an extended-protocol
+            // hello (`NONE_ONLY` → no hello, vanilla path).
+            // Vanilla mDNS consumers (non-sdr-rs clients that
+            // don't know this key) just ignore it. #307.
+            codecs: Some(server.compression().to_wire()),
         },
     };
     Advertiser::announce(opts)
@@ -3736,6 +3758,7 @@ fn set_controls_locked(panel: &ServerSwitchWidgets, locked: bool) {
     panel.port_row.set_sensitive(sensitive);
     panel.bind_row.set_sensitive(sensitive);
     panel.advertise_row.set_sensitive(sensitive);
+    panel.compression_row.set_sensitive(sensitive);
     panel.device_defaults_row.set_sensitive(sensitive);
 }
 
@@ -6608,6 +6631,7 @@ mod rtl_tcp_discovery_format_tests {
                 gains: 29,
                 nickname: "weather".into(),
                 txbuf: None,
+                codecs: None,
             },
             last_seen: Instant::now(),
         }

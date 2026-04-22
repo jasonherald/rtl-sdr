@@ -43,6 +43,13 @@ pub enum RtlTcpConnectionState {
         /// the dongle-info header. Lets the UI show
         /// `"R820T, 29 gain steps"` without a second lookup.
         gain_count: u32,
+        /// Human-readable label for the negotiated stream codec
+        /// (e.g. `"None"`, `"LZ4"`). Pre-projected to a plain
+        /// `String` so this type doesn't pull in the codec enum
+        /// from `sdr-server-rtltcp`. Legacy servers and
+        /// uncompressed-by-choice paths both land on `"None"`.
+        /// Issue #307.
+        codec: String,
     },
 
     /// Transport-level error (connect refused, EOF, stall). The
@@ -100,6 +107,7 @@ mod tests {
             RtlTcpConnectionState::Connected {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
+                codec: "None".into(),
             }
             .is_connected()
         );
@@ -126,6 +134,7 @@ mod tests {
             !RtlTcpConnectionState::Connected {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
+                codec: "None".into(),
             }
             .is_in_progress()
         );

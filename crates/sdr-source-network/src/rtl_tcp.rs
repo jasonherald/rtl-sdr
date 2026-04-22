@@ -45,6 +45,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use sdr_pipeline::source_manager::Source;
+use sdr_server_rtltcp::codec::{Codec, CodecMask, Decoder};
+use sdr_server_rtltcp::extension::{
+    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role,
+    SERVER_EXTENSION_LEN, ServerExtension, Status,
+};
 use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
 use sdr_types::{Complex, SourceError};
 
@@ -128,8 +133,11 @@ pub enum ConnectionState {
     Disconnected,
     /// `start()` in progress — first TCP connect attempt.
     Connecting,
-    /// Handshake complete, handler streaming I/Q.
-    Connected { tuner: TunerInfo },
+    /// Handshake complete, handler streaming I/Q. `codec` reflects
+    /// the negotiated stream codec from the extended `"RTLX"`
+    /// handshake (#307); legacy / uncompressed paths land on
+    /// `Codec::None`.
+    Connected { tuner: TunerInfo, codec: Codec },
     /// Connection dropped, backoff pending. Transport-level errors
     /// (TCP connect refused, EOF, stall) stay in this state — the
     /// manager retries forever with exponential backoff up to the
@@ -146,12 +154,13 @@ impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
         match value {
             ConnectionState::Disconnected => Self::Disconnected,
             ConnectionState::Connecting => Self::Connecting,
-            ConnectionState::Connected { tuner } => Self::Connected {
+            ConnectionState::Connected { tuner, codec } => Self::Connected {
                 // `TunerTypeCode`'s `Debug` renders the upstream
                 // tuner name ("R820T", "E4000", etc.) directly —
                 // what the UI wants for the status row subtitle.
                 tuner_name: format!("{:?}", tuner.tuner),
                 gain_count: tuner.gain_count,
+                codec: codec.label().to_string(),
             },
             ConnectionState::Retrying { attempt, next_at } => Self::Retrying {
                 attempt: *attempt,
@@ -197,6 +206,27 @@ pub struct RtlTcpConfig {
     /// drops packets rather than replying RST), leaving the manager
     /// thread stuck.
     pub connect_timeout: Duration,
+
+    /// Codecs this client is willing to negotiate in the extended
+    /// `"RTLX"` handshake (#307). Defaults to [`CodecMask::NONE_ONLY`]
+    /// — no hello sent, behaves identically to the pre-#307 client
+    /// against any server (vanilla rtl_tcp / GQRX / SDR++ / our own).
+    ///
+    /// Opting in with [`CodecMask::NONE_AND_LZ4`] causes the client
+    /// to prepend an 8-byte `ClientHello` to the connection. sdr-rs
+    /// servers parse it and respond with a `ServerExtension` block;
+    /// **vanilla rtl_tcp servers misinterpret those 8 bytes** as
+    /// two 5-byte commands (with hello bytes straddling the
+    /// command-framing boundary), which can cause garbage command
+    /// dispatches. The UI / client-side discovery layer should only
+    /// flip this bit when it has out-of-band evidence that the
+    /// target server speaks the extension — the shipped signal is
+    /// the `codecs=` value in the server's mDNS TXT record (see
+    /// `sdr-rtltcp-discovery::TxtRecord::codecs`): `codecs=3`
+    /// means the server advertises both `None` and `Lz4` so it's
+    /// safe to send a hello; an absent or `codecs=1` value means
+    /// legacy-only and we should leave this at `NONE_ONLY`.
+    pub compression: sdr_server_rtltcp::codec::CodecMask,
 }
 
 impl Default for RtlTcpConfig {
@@ -205,6 +235,7 @@ impl Default for RtlTcpConfig {
             data_read_timeout: DEFAULT_DATA_READ_TIMEOUT,
             max_consecutive_timeouts: DEFAULT_MAX_CONSECUTIVE_TIMEOUTS,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
         }
     }
 }
@@ -647,17 +678,23 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
         set_state(&shared, ConnectionState::Connecting);
 
         match attempt_connect(&host, port, &shared, &config) {
-            Ok(stream) => {
+            Ok(HandshakeOutcome { stream, codec }) => {
                 attempt = 0;
                 // At this point handshake has completed successfully.
                 replay_sticky_commands(&shared);
-                run_data_pump(stream, &shared, &config);
-                // run_data_pump returned — connection dropped.
-            }
-            Err(e) => {
-                tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
-                if let SourceError::Protocol(_) = e {
-                    // Non-recoverable: server isn't speaking rtl_tcp.
+                // `run_data_pump` returns `Ok(())` on a normal
+                // transient dropout (EOF, stall, generic socket
+                // error — all reconnect-worthy) and
+                // `Err(SourceError::Protocol(_))` on unrecoverable
+                // stream corruption (LZ4 mid-stream decode
+                // failure — the next reconnect would hit the same
+                // issue). Terminal errors route to `Failed` the
+                // same way a non-recoverable `attempt_connect`
+                // error does; transient errors fall through to
+                // the reconnect-with-backoff loop below. Per
+                // CodeRabbit round 5 on PR #399.
+                if let Err(e) = run_data_pump(stream, codec, &shared, &config) {
+                    tracing::warn!(%e, "rtl_tcp data pump terminated with non-recoverable error");
                     set_state(
                         &shared,
                         ConnectionState::Failed {
@@ -666,6 +703,30 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
                     );
                     return;
                 }
+                // run_data_pump returned Ok — connection dropped transiently.
+            }
+            Err(e) => {
+                tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
+                if let SourceError::Protocol(_) = e {
+                    // Non-recoverable: server isn't speaking
+                    // rtl_tcp, or the extended handshake was
+                    // rejected for a reason that won't clear on
+                    // retry (auth required/failed, parse error).
+                    set_state(
+                        &shared,
+                        ConnectionState::Failed {
+                            reason: format!("{e}"),
+                        },
+                    );
+                    return;
+                }
+                // `TemporarilyUnavailable` (e.g. server responded
+                // with `ControllerBusy`) and every other
+                // `SourceError` variant fall through to the
+                // backoff loop below. The condition is expected
+                // to clear on its own — retrying with the normal
+                // schedule is the right behavior. Per CodeRabbit
+                // round 7 on PR #399.
             }
         }
 
@@ -696,12 +757,62 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
     set_state(&shared, ConnectionState::Disconnected);
 }
 
+/// Read the server's 8-byte [`ServerExtension`] block, invoked
+/// immediately after the legacy 12-byte `dongle_info_t`.
+///
+/// **Only call this when the client has sent a `ClientHello`.**
+/// Once we've committed to the extended protocol the server is
+/// contractually obligated to respond with an 8-byte block whose
+/// first four bytes are [`EXTENSION_MAGIC`]. This function reads
+/// that block with `read_exact` — not `peek` — so partial TCP
+/// deliveries (magic-only first, body later) can't race us into
+/// parsing zero-padded scratch memory and silently mis-negotiating
+/// as `Codec::None` while the server is actually streaming LZ4.
+///
+/// A short read, a magic mismatch, or a malformed body all surface
+/// as [`std::io::ErrorKind::InvalidData`]; the caller promotes
+/// these to `SourceError::Protocol` and aborts the connection
+/// rather than falling back to a legacy path that would read
+/// compressed bytes as raw I/Q. Per CodeRabbit round 1 on PR #399.
+fn read_server_extension(stream: &TcpStream) -> std::io::Result<ServerExtension> {
+    let mut buf = [0u8; SERVER_EXTENSION_LEN];
+    // `Read` is implemented for `&TcpStream`, so shadow into a
+    // local mut binding and call `read_exact` through the trait
+    // directly — cleaner than a fully-qualified turbofish and
+    // avoids the temporary-rvalue gotcha of `(&*stream).read_exact(…)`.
+    (&mut &*stream).read_exact(&mut buf)?;
+    if buf[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "rtl_tcp extension handshake: expected `RTLX` magic after dongle_info_t, got {:02x?}",
+                &buf[..EXTENSION_MAGIC.len()]
+            ),
+        ));
+    }
+    ServerExtension::from_bytes(&buf).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rtl_tcp extension handshake: `RTLX` magic matched but server-extension body failed to parse",
+        )
+    })
+}
+
+/// Outcome of an extended-protocol handshake. `stream` is the
+/// TCP socket (still plain `TcpStream`; the caller wraps it in a
+/// [`Decoder`] for reads). `codec` tells the caller which
+/// decoder to use for the IQ stream.
+struct HandshakeOutcome {
+    stream: TcpStream,
+    codec: Codec,
+}
+
 fn attempt_connect(
     host: &str,
     port: u16,
     shared: &Arc<SharedState>,
     config: &RtlTcpConfig,
-) -> Result<TcpStream, SourceError> {
+) -> Result<HandshakeOutcome, SourceError> {
     // `(host, port).to_socket_addrs()` handles both IPv4 dotted
     // quads AND IPv6 literals like `::1` correctly — the naïve
     // `format!("{host}:{port}")` that we had before would build
@@ -728,6 +839,32 @@ fn attempt_connect(
         tracing::warn!(%e, "SO_KEEPALIVE not applied (non-fatal)");
     }
 
+    // Send the extended-protocol `ClientHello` only if the caller
+    // opted into compression. A hello sent to a vanilla
+    // `rtl_tcp` server straddles its 5-byte command-read
+    // framing (hello is 8 bytes = 1.6 commands) and can cause
+    // garbage dispatches, so we only send it when we have
+    // out-of-band evidence the server speaks the extension
+    // (e.g., mDNS TXT `codecs=3` or an explicit per-server
+    // profile setting — see the `RtlTcpConfig.compression`
+    // doc for the full signal). Default `compression = NONE_ONLY`
+    // → no hello → wire-compatible with every rtl_tcp server on
+    // earth. Per #307.
+    let extension_enabled = config.compression != CodecMask::NONE_ONLY;
+    if extension_enabled {
+        let hello = ClientHello {
+            codec_mask: config.compression,
+            // #307 is single-client on the server side; role and
+            // flags are reserved for #390's multi-client follow-ups.
+            role: Role::Control,
+            flags: CLIENT_HELLO_FLAGS_NONE,
+            version: PROTOCOL_VERSION,
+        };
+        if let Err(e) = (&stream).write_all(&hello.to_bytes()) {
+            return Err(SourceError::Io(e));
+        }
+    }
+
     // Read and verify the 12-byte dongle_info_t header.
     let mut header_buf = [0u8; DONGLE_INFO_LEN];
     read_exact_with_context(&stream, &mut header_buf)?;
@@ -738,10 +875,88 @@ fn attempt_connect(
         ));
     };
     let tuner = TunerInfo::from(info);
+    // NOTE: `shared.tuner` is NOT published here. Writing it
+    // before the extension read would expose stale tuner metadata
+    // via `tuner_info()` if the extension fails or the server
+    // rejects with a non-OK status — callers would see a
+    // "tuner = R820T" readback for a session that never actually
+    // reached `Connected`. The cache write now lives next to the
+    // `set_state(Connected)` call below, so the tuner is visible
+    // only once the handshake has fully succeeded. Per CodeRabbit
+    // round 5 on PR #399.
+
+    // Read the server's `ServerExtension` block BEFORE publishing
+    // `Connected` state — the codec is part of the state the UI
+    // renders, and landing in `Connected { codec: None }` first and
+    // then updating would cause a subtitle flicker.
+    //
+    // Only runs when we sent a hello. Once we've committed to the
+    // extended protocol the server MUST respond with an 8-byte block
+    // starting with `RTLX`; any short read, magic mismatch, or
+    // malformed body is a protocol error (not a legacy fallback) —
+    // silently falling back would let a server that picked LZ4
+    // stream compressed bytes into our IQ decoder. Per CodeRabbit
+    // round 1 on PR #399.
+    let codec = if extension_enabled {
+        match read_server_extension(&stream) {
+            Ok(ext) => {
+                // A non-OK status means the server parsed our hello
+                // but rejected the session. Two flavors:
+                //
+                // - `ControllerBusy` (#392): another client owns the
+                //   control slot right now. This is **transient** —
+                //   that client will eventually disconnect, so we
+                //   return `SourceError::TemporarilyUnavailable` and
+                //   let the connection manager retry on the normal
+                //   backoff schedule. Per CodeRabbit round 7 on
+                //   PR #399.
+                // - `AuthRequired` / `AuthFailed` (#394) and any
+                //   future non-OK status: terminal. The user must
+                //   take action (set the right auth key) before
+                //   retries have any chance of succeeding, so we
+                //   surface `SourceError::Protocol` and the manager
+                //   transitions to `Failed`.
+                if ext.status == Status::ControllerBusy {
+                    return Err(SourceError::TemporarilyUnavailable(format!(
+                        "rtl_tcp server controller busy: status={:?} (wire={})",
+                        ext.status,
+                        ext.status.to_wire()
+                    )));
+                }
+                if ext.status != Status::Ok {
+                    return Err(SourceError::Protocol(format!(
+                        "rtl_tcp extension rejected by server: status={:?} (wire={})",
+                        ext.status,
+                        ext.status.to_wire()
+                    )));
+                }
+                tracing::info!(
+                    codec = %ext.codec,
+                    status = ext.status.to_wire(),
+                    "rtl_tcp extended-handshake accepted by server"
+                );
+                ext.codec
+            }
+            Err(e) => {
+                return Err(SourceError::Protocol(format!(
+                    "rtl_tcp extension handshake failed after sending ClientHello: {e}"
+                )));
+            }
+        }
+    } else {
+        Codec::None
+    };
+
+    // Publish tuner metadata + Connected state together — both
+    // reflect the same "handshake fully succeeded" point. Order
+    // matters: tuner cache first, then state transition, so any
+    // UI listener that observes Connected and immediately reads
+    // `tuner_info()` sees the fresh value rather than a None
+    // (initial) or stale (previous-session) snapshot.
     if let Ok(mut slot) = shared.tuner.lock() {
         *slot = Some(tuner);
     }
-    set_state(shared, ConnectionState::Connected { tuner });
+    set_state(shared, ConnectionState::Connected { tuner, codec });
 
     // Publish a clone of the stream for the command sender. Install a
     // write timeout on the clone so `send_command`'s blocking
@@ -749,6 +964,11 @@ fn attempt_connect(
     // saturates our kernel send buffer — tune/gain changes must stay
     // responsive. Socket options propagate across `try_clone` on the
     // same underlying fd, so this applies to every subsequent write.
+    //
+    // The command sink is ALWAYS the raw TCP stream regardless of
+    // negotiated codec — rtl_tcp commands are 5-byte fixed-width and
+    // are not encoded under the `"RTLX"` extension. Only the
+    // server→client data direction is compressed.
     let sink = stream.try_clone().map_err(SourceError::Io)?;
     if let Err(e) = sink.set_write_timeout(Some(config.data_read_timeout)) {
         tracing::warn!(%e, "set_write_timeout on command sink failed — command sends may block");
@@ -757,7 +977,7 @@ fn attempt_connect(
         *slot = Some(sink);
     }
 
-    Ok(stream)
+    Ok(HandshakeOutcome { stream, codec })
 }
 
 /// Run `TcpStream::connect_timeout` on a helper thread, polling a
@@ -829,11 +1049,31 @@ fn connect_cancellable(
     }
 }
 
-fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlTcpConfig) {
+fn run_data_pump(
+    stream: TcpStream,
+    codec: Codec,
+    shared: &Arc<SharedState>,
+    config: &RtlTcpConfig,
+) -> Result<(), SourceError> {
+    // Wrap the TCP stream in the negotiated decoder. Legacy /
+    // vanilla-server paths hit `Codec::None` which is a
+    // zero-overhead pass-through; only LZ4 connections pay the
+    // framing cost.
+    //
+    // Read timeout was installed in `attempt_connect` on the
+    // underlying TcpStream; `Decoder::Lz4` delegates its `read()`
+    // to the inner stream so `SO_RCVTIMEO` still enforces the
+    // stall-detection path below unchanged.
+    let mut reader = Decoder::new(codec, stream);
     let mut buf = [0u8; RECV_CHUNK_BYTES];
     let mut consecutive_timeouts: u32 = 0;
+    // Default Ok path: any break out of the loop (EOF, stall,
+    // generic socket error) is a reconnect-worthy dropout, not
+    // a terminal failure. Only explicit `return Err(...)` below
+    // for LZ4 decode corruption escapes as terminal.
+    let mut outcome: Result<(), SourceError> = Ok(());
     while !shared.shutdown.load(Ordering::Relaxed) {
-        match stream.read(&mut buf) {
+        match reader.read(&mut buf) {
             Ok(0) => {
                 tracing::info!("rtl_tcp server closed connection");
                 break;
@@ -863,6 +1103,24 @@ fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlT
                     break;
                 }
             }
+            Err(e) if codec != Codec::None && e.kind() == std::io::ErrorKind::InvalidData => {
+                // LZ4 frame corruption mid-stream — either a codec
+                // mismatch we negotiated wrong (server lied about
+                // capability) or an on-the-wire bit flip under a
+                // transport that doesn't guarantee integrity. The
+                // stream state is unrecoverable: the next read
+                // would start mid-block, so every subsequent
+                // reconnect would hit the same corruption.
+                // Surface as `SourceError::Protocol` so the
+                // connection manager routes to terminal
+                // `ConnectionState::Failed` instead of spinning
+                // on the backoff schedule forever. Per CodeRabbit
+                // round 5 on PR #399.
+                outcome = Err(SourceError::Protocol(format!(
+                    "rtl_tcp {codec} decode failed mid-stream (unrecoverable): {e}"
+                )));
+                break;
+            }
             Err(e) => {
                 tracing::info!(%e, "rtl_tcp socket read failed, will reconnect");
                 break;
@@ -886,6 +1144,8 @@ fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlT
     // stalls, the warning logs again rather than being suppressed by a
     // stale flag left over from the previous session.
     shared.rx_in_overflow.store(false, Ordering::Relaxed);
+
+    outcome
 }
 
 fn replay_sticky_commands(shared: &Arc<SharedState>) {
@@ -1163,10 +1423,14 @@ impl Source for RtlTcpSource {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    // `CLIENT_HELLO_LEN` is only consumed by the loopback fixtures
+    // in the RTLX handshake tests below — keep it in test scope
+    // so the lib build doesn't warn it as unused.
+    use sdr_server_rtltcp::extension::CLIENT_HELLO_LEN;
 
     /// Placeholder host/port for tests that never actually connect —
     /// just exercise builder state or buffer logic. The string "127.0.0.1"
@@ -1339,6 +1603,7 @@ mod tests {
             data_read_timeout: Duration::from_millis(200),
             max_consecutive_timeouts: 2,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -1529,7 +1794,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut tuner = None;
         while Instant::now() < deadline {
-            if let ConnectionState::Connected { tuner: t } = src.connection_state() {
+            if let ConnectionState::Connected { tuner: t, .. } = src.connection_state() {
                 tuner = Some(t);
                 break;
             }
@@ -1545,6 +1810,245 @@ mod tests {
         let received = cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(received.op, CommandOp::SetCenterFreq);
         assert_eq!(received.param, 99_500_000);
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    // ============================================================
+    // RTLX handshake fixture constants (CodeRabbit round 7 on PR #399)
+    //
+    // Pulled out of the individual tests so the acceptance,
+    // rejection, and retry paths all use the same gain count,
+    // socket timeouts, and state-observation deadlines — avoiding
+    // silent drift between the fixtures.
+    // ============================================================
+
+    /// Gain step count the fixture dongle advertises in its
+    /// `dongle_info_t` header. R820T's published table is 29
+    /// steps; matches upstream rtl-sdr exactly.
+    const RTLX_TEST_GAIN_COUNT: u32 = 29;
+    /// Read timeout the client uses against the fixture server.
+    /// Short (200 ms) so a stalled test exits quickly rather than
+    /// holding the whole suite up.
+    const RTLX_TEST_DATA_READ_TIMEOUT: Duration = Duration::from_millis(200);
+    /// How long the fixture server holds the accepted-connection
+    /// socket open after writing its responses. Must exceed
+    /// `RTLX_TEST_DATA_READ_TIMEOUT` so the client finishes
+    /// reading the extension body before EOF, but short enough
+    /// that the server thread joins quickly at test teardown.
+    const RTLX_TEST_SERVER_HOLD: Duration = Duration::from_millis(400);
+    /// Wall-clock deadline the tests give the client to reach
+    /// its expected state (Connected / Failed / non-Failed).
+    /// Generous enough to absorb CI scheduling jitter.
+    const RTLX_TEST_STATE_DEADLINE: Duration = Duration::from_secs(2);
+    /// Poll interval inside the state-observation loops. Short
+    /// enough to catch brief state visits without pegging a core.
+    const RTLX_TEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    /// Shared fixture setup: listener on loopback + config that
+    /// opts into the extended handshake. Keeps the three RTLX
+    /// handshake tests aligned on compression mask + timeouts.
+    fn rtlx_test_listener_and_config() -> (TcpListener, RtlTcpConfig) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = RtlTcpConfig {
+            data_read_timeout: RTLX_TEST_DATA_READ_TIMEOUT,
+            max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: CodecMask::NONE_AND_LZ4,
+        };
+        (listener, config)
+    }
+
+    /// Loopback server behavior for a single RTLX accept: read
+    /// the 8-byte `ClientHello`, write `dongle_info_t`, write the
+    /// caller-supplied `ServerExtension`, then hold the socket
+    /// open for `RTLX_TEST_SERVER_HOLD` so the client reads the
+    /// extension body before EOF.
+    fn rtlx_test_serve_one(listener: &TcpListener, ext: ServerExtension) {
+        let (mut sock, _) = listener.accept().expect("accept");
+        sock.set_read_timeout(Some(RTLX_TEST_STATE_DEADLINE))
+            .unwrap();
+        let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+        sock.read_exact(&mut hello_buf).expect("read hello");
+        assert_eq!(&hello_buf[..EXTENSION_MAGIC.len()], &EXTENSION_MAGIC);
+        let header = DongleInfo {
+            tuner: TunerTypeCode::R820t,
+            gain_count: RTLX_TEST_GAIN_COUNT,
+        }
+        .to_bytes();
+        sock.write_all(&header).unwrap();
+        sock.write_all(&ext.to_bytes()).unwrap();
+        thread::sleep(RTLX_TEST_SERVER_HOLD);
+    }
+
+    #[test]
+    fn rtlx_handshake_accepted_publishes_codec_and_tuner() {
+        // Regression test for CodeRabbit round 5 on PR #399.
+        // A server that accepts the extended handshake
+        // (`ServerExtension { codec: Lz4, status: Ok }`) must result
+        // in the client reaching `Connected { codec: Lz4, .. }` with
+        // `tuner_info()` populated. This locks in two ordering rules
+        // that earlier rounds introduced:
+        //
+        //   - The negotiated codec is part of the `Connected` state
+        //     (surfaces as the status-row suffix in the UI).
+        //   - `shared.tuner` is published atomically with the
+        //     `Connected` transition, not earlier during
+        //     `dongle_info_t` parsing.
+        let (listener, config) = rtlx_test_listener_and_config();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let ext = ServerExtension {
+                codec: Codec::Lz4,
+                granted_role: Some(Role::Control),
+                status: Status::Ok,
+                version: PROTOCOL_VERSION,
+            };
+            rtlx_test_serve_one(&listener, ext);
+        });
+
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        // Before starting the manager, tuner_info must be None —
+        // guards against a false positive where the delayed-publish
+        // ordering is broken but the test happens to read after an
+        // earlier session populated the cache.
+        assert!(src.tuner_info().is_none());
+
+        src.start_manager().unwrap();
+
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut connected_codec: Option<Codec> = None;
+        while Instant::now() < deadline {
+            if let ConnectionState::Connected { codec, .. } = src.connection_state() {
+                connected_codec = Some(codec);
+                break;
+            }
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert_eq!(connected_codec, Some(Codec::Lz4));
+        // `shared.tuner` is published together with the Connected
+        // state, so once we observe Connected, `tuner_info()` must
+        // return the R820T metadata from the dongle_info_t header.
+        let ti = src.tuner_info();
+        assert!(ti.is_some(), "tuner_info should be Some after Connected");
+        let ti = ti.unwrap();
+        assert_eq!(ti.tuner, TunerTypeCode::R820t);
+        assert_eq!(ti.gain_count, RTLX_TEST_GAIN_COUNT);
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_auth_failed_is_terminal_and_leaves_tuner_none() {
+        // Regression test for CodeRabbit round 5 + round 7 on
+        // PR #399. Originally this test used `ControllerBusy`,
+        // but round 7 correctly pointed out that a busy server is
+        // transient — the other controller will eventually
+        // disconnect and we should retry. `AuthFailed` is the
+        // right terminal substitute: a wrong key will not start
+        // working on retry, so the manager must transition to
+        // `Failed` and stop looping.
+        //
+        // The test also guards the delayed-tuner-publish ordering:
+        // `tuner_info()` must stay `None` because the handshake
+        // never reached the `set_state(Connected)` path where the
+        // cache write lives.
+        let (listener, config) = rtlx_test_listener_and_config();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: None,
+                status: Status::AuthFailed,
+                version: PROTOCOL_VERSION,
+            };
+            rtlx_test_serve_one(&listener, ext);
+        });
+
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        assert!(src.tuner_info().is_none());
+
+        src.start_manager().unwrap();
+
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut reached_failed = false;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
+                reached_failed = true;
+                break;
+            }
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(
+            reached_failed,
+            "client should transition to Failed on `AuthFailed` ServerExtension status"
+        );
+        assert!(
+            src.tuner_info().is_none(),
+            "tuner_info must stay None when the extension handshake is rejected"
+        );
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_controller_busy_is_transient_not_terminal() {
+        // Regression test for CodeRabbit round 7 on PR #399.
+        // `ControllerBusy` means another client currently owns the
+        // control slot (#392). That condition resolves on its own
+        // when the other client disconnects, so the rtl_tcp source
+        // must NOT transition to `Failed` — the connection manager
+        // should keep cycling through the backoff + reconnect path.
+        //
+        // We assert two things:
+        //   1. State never reaches `Failed` within the observation
+        //      window (CR #17 regression guard).
+        //   2. `tuner_info()` stays `None` (the delayed-publish
+        //      ordering holds regardless of status).
+        let (listener, config) = rtlx_test_listener_and_config();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            // Accept a single connection and reject it. The client
+            // will then loop; subsequent accepts would require an
+            // accept loop we don't need for this assertion.
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: None,
+                status: Status::ControllerBusy,
+                version: PROTOCOL_VERSION,
+            };
+            rtlx_test_serve_one(&listener, ext);
+        });
+
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        assert!(src.tuner_info().is_none());
+
+        src.start_manager().unwrap();
+
+        // Poll for the entire window. If `Failed` shows up at any
+        // point, that's the round-7 regression (ControllerBusy
+        // being treated as terminal).
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
+                panic!(
+                    "ControllerBusy must not route to Failed — the server condition \
+                     is transient and the manager should keep retrying. \
+                     Observed state: Failed."
+                );
+            }
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(
+            src.tuner_info().is_none(),
+            "tuner_info must stay None across transient busy retries"
+        );
 
         src.stop_manager();
         let _ = server_thread.join();
@@ -1649,7 +2153,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut got = None;
         while Instant::now() < deadline {
-            if let ConnectionState::Connected { tuner } = src.connection_state() {
+            if let ConnectionState::Connected { tuner, .. } = src.connection_state() {
                 got = Some(tuner);
                 break;
             }

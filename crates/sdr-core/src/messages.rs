@@ -478,10 +478,15 @@ mod tests {
         let connected = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connected {
             tuner_name: "R820T".into(),
             gain_count: 29,
+            codec: "None".into(),
         });
         assert!(matches!(
             connected,
-            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connected { gain_count: 29, .. })
+            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connected {
+                gain_count: 29,
+                ref codec,
+                ..
+            }) if codec == "None"
         ));
 
         let retrying = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Retrying {

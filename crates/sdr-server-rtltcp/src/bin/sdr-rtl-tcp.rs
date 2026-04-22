@@ -383,6 +383,10 @@ fn announce_over_mdns(
         gains: tuner.gain_count,
         nickname: nickname.clone(),
         txbuf: None,
+        // CLI server advertises whatever mask the user configured,
+        // so compression-capable clients can decide up-front
+        // whether to send an extended hello. #307.
+        codecs: Some(server.compression().to_wire()),
     };
     Advertiser::announce(AdvertiseOptions {
         port: server.bind_address().port(),

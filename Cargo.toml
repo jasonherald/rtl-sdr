@@ -218,6 +218,14 @@ hound = "3"
 # Avahi/Bonjour system dependency, no async runtime required.
 mdns-sd = "0.19"
 
+# LZ4 streaming compression for the rtl_tcp extended protocol
+# (#307). Pure-Rust implementation of the LZ4 block + frame
+# formats, no C dependency. Chosen over `lz4-sys` / `lz4_flex`
+# for its first-class frame-format streaming API that
+# transparently handles chunk framing for our per-connection
+# codec wrapper.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+
 # Zero-copy type casting
 bytemuck = { version = "1", features = ["derive"] }
 

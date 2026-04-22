@@ -42,6 +42,11 @@ const KEY_SERVER_DEFAULT_PPM: &str = "rtl_tcp_server_default_ppm";
 const KEY_SERVER_DEFAULT_BIAS_TEE: &str = "rtl_tcp_server_default_bias_tee";
 /// Config key for the persisted default direct-sampling toggle.
 const KEY_SERVER_DEFAULT_DIRECT_SAMPLING: &str = "rtl_tcp_server_default_direct_sampling";
+/// Config key for the persisted compression-codec selector index
+/// (`COMPRESSION_OFF_IDX` / `COMPRESSION_LZ4_IDX`). Stored as an
+/// index so a future addition (e.g. Zstd) doesn't invalidate old
+/// configs — unknown indices fall back to `Off` on restore.
+const KEY_SERVER_COMPRESSION_IDX: &str = "rtl_tcp_server_compression_idx";
 
 /// Default TCP port for `rtl_tcp`. Matches upstream `rtl_tcp.c` and
 /// every ecosystem client's default. Changing it means users have to
@@ -65,6 +70,23 @@ const SERVER_PORT_PAGE: f64 = 100.0;
 pub const BIND_LOOPBACK_IDX: u32 = 0;
 /// Bind-address selector index: all interfaces (0.0.0.0).
 pub const BIND_ALL_INTERFACES_IDX: u32 = 1;
+
+/// Compression selector index: off — advertise `CodecMask::NONE_ONLY`.
+/// Default; preserves wire compatibility with every existing
+/// `rtl_tcp` client (vanilla clients never send a hello, and our own
+/// client refuses to send one when the server's mDNS TXT says
+/// `codecs=1`). See #307.
+pub const COMPRESSION_OFF_IDX: u32 = 0;
+/// Compression selector index: LZ4 available — advertise
+/// `CodecMask::NONE_AND_LZ4`. The server still falls back to
+/// uncompressed for clients that don't hello (legacy) or hello
+/// without the LZ4 bit set (ours with `NONE_ONLY`).
+pub const COMPRESSION_LZ4_IDX: u32 = 1;
+/// Number of entries in the compression `StringList`. Load-bearing
+/// for the persistence validator — indices `>=` this count are
+/// dropped on restore so a future "Zstd" entry doesn't land as
+/// garbage in an older build.
+const COMPRESSION_COUNT: u32 = 2;
 
 /// Server device-defaults: center frequency default (Hz) applied on
 /// start, before the first client connects. Upstream `rtl_tcp.c:389`
@@ -172,6 +194,12 @@ pub struct ServerPanel {
     /// on; the user can turn it off to run locally without LAN
     /// advertisement.
     pub advertise_row: adw::SwitchRow,
+    /// Compression-codec selector. Default `COMPRESSION_OFF_IDX`
+    /// — wire-compatible with every `rtl_tcp` client. `COMPRESSION_LZ4_IDX`
+    /// opts in to offering LZ4 to clients that send a hello; legacy
+    /// clients and our own `NONE_ONLY` clients still get uncompressed
+    /// via the mutual-codec intersection. See #307.
+    pub compression_row: adw::ComboRow,
     /// Collapsible group of device-defaults (freq / sample rate /
     /// gain / PPM / bias tee / direct sampling) applied on server
     /// start. Clients override these live via the `rtl_tcp` command
@@ -494,6 +522,19 @@ pub fn build_server_panel() -> ServerPanel {
         .active(true)
         .build();
 
+    // Compression model — order matches COMPRESSION_OFF_IDX / _LZ4_IDX.
+    // Default is Off to stay wire-compatible with every existing
+    // rtl_tcp client on the LAN; opting in is a deliberate click,
+    // and even then vanilla clients fall through to uncompressed
+    // via the mutual-codec intersection on the server side.
+    let compression_model = gtk4::StringList::new(&["Off", "LZ4 (if client supports)"]);
+    let compression_row = adw::ComboRow::builder()
+        .title("Compression")
+        .subtitle("Negotiated per client — legacy clients always get uncompressed")
+        .model(&compression_model)
+        .selected(COMPRESSION_OFF_IDX)
+        .build();
+
     let device_defaults_row = adw::ExpanderRow::builder()
         .title("Device defaults")
         .subtitle("Applied when the server opens the dongle — clients override live")
@@ -543,6 +584,7 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&port_row);
     widget.add(&bind_row);
     widget.add(&advertise_row);
+    widget.add(&compression_row);
     widget.add(&device_defaults_row);
     widget.add(&status_row);
     widget.add(&activity_log_row);
@@ -555,6 +597,7 @@ pub fn build_server_panel() -> ServerPanel {
         port_row,
         bind_row,
         advertise_row,
+        compression_row,
         device_defaults_row,
         center_freq_row,
         sample_rate_row,
@@ -683,6 +726,17 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
         {
             panel.direct_sampling_row.set_active(ds);
         }
+        if let Some(idx) = v
+            .get(KEY_SERVER_COMPRESSION_IDX)
+            .and_then(serde_json::Value::as_u64)
+            && let Ok(idx_u32) = u32::try_from(idx)
+            && idx_u32 < COMPRESSION_COUNT
+        {
+            // Strict bounds check: unknown stored indices fall
+            // back to the widget's build-time default (`Off`) so
+            // a corrupt config can't silently enable compression.
+            panel.compression_row.set_selected(idx_u32);
+        }
     });
 
     // ---- Phase 2: subscribe ----
@@ -787,5 +841,17 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
         cfg_ds.write(|v| {
             v[KEY_SERVER_DEFAULT_DIRECT_SAMPLING] = serde_json::json!(row.is_active());
         });
+    });
+    // Compression codec combo. Same strict-gate policy as
+    // `bind_row` / `sample_rate_row` — only persist in-range
+    // indices so widget-model churn can't corrupt the stored value.
+    let cfg_comp = Arc::clone(config);
+    panel.compression_row.connect_selected_notify(move |row| {
+        let selected = row.selected();
+        if selected < COMPRESSION_COUNT {
+            cfg_comp.write(|v| {
+                v[KEY_SERVER_COMPRESSION_IDX] = serde_json::json!(selected);
+            });
+        }
     });
 }

@@ -28,8 +28,12 @@ use std::time::{Duration, Instant};
 
 use sdr_rtlsdr::device::RtlSdrDevice;
 
+use crate::codec::{Codec, CodecMask, Encoder};
 use crate::dispatch::dispatch;
 use crate::error::ServerError;
+use crate::extension::{
+    CLIENT_HELLO_LEN, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension, Status,
+};
 use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode};
 
 /// USB read buffer size (bytes). Matches `DEFAULT_BUF_LENGTH` upstream
@@ -106,6 +110,17 @@ pub struct ServerConfig {
     /// Max queued buffers between USB reader and TCP writer. 0 = use
     /// [`DEFAULT_BUFFER_CAPACITY`].
     pub buffer_capacity: usize,
+
+    /// Codecs this server is willing to offer to sdr-rs clients
+    /// that speak the extended `"RTLX"` handshake (#307). Per-
+    /// connection negotiation is the intersection of this mask
+    /// and the client's advertised mask (`CodecMask::pick`):
+    /// legacy / vanilla-rtl_tcp clients that don't send a hello
+    /// always get `Codec::None`; sdr-rs clients supporting LZ4
+    /// get LZ4 iff this mask advertises it. Default:
+    /// [`CodecMask::NONE_ONLY`] — compression is opt-in per-
+    /// server so existing deployments behave identically.
+    pub compression: crate::codec::CodecMask,
 }
 
 impl ServerConfig {
@@ -118,6 +133,7 @@ impl ServerConfig {
             device_index: 0,
             initial: InitialDeviceState::default(),
             buffer_capacity: DEFAULT_BUFFER_CAPACITY,
+            compression: crate::codec::CodecMask::NONE_ONLY,
         }
     }
 }
@@ -228,6 +244,7 @@ pub struct Server {
     stats: Arc<Mutex<ServerStats>>,
     bind: SocketAddr,
     tuner: TunerAdvertiseInfo,
+    compression: crate::codec::CodecMask,
 }
 
 impl Server {
@@ -299,6 +316,7 @@ impl Server {
             stats.clone(),
             capacity,
             config.initial.clone(),
+            config.compression,
         )?;
 
         Ok(Server {
@@ -308,6 +326,7 @@ impl Server {
             stats,
             bind: actual_bind,
             tuner,
+            compression: config.compression,
         })
     }
 
@@ -327,6 +346,15 @@ impl Server {
     /// to keep the server crate free of mDNS deps.
     pub fn tuner_info(&self) -> &TunerAdvertiseInfo {
         &self.tuner
+    }
+
+    /// Codec mask the server is willing to negotiate. The mDNS
+    /// advertiser calls this to stamp a `codecs=` TXT entry so
+    /// clients can decide up-front whether to send the extended
+    /// `"RTLX"` hello (a vanilla client that doesn't recognize the
+    /// key just connects the legacy way — see #307).
+    pub fn compression(&self) -> crate::codec::CodecMask {
+        self.compression
     }
 
     /// Has the accept thread exited (either via `stop()` or an
@@ -424,6 +452,12 @@ fn apply_initial_state(
 ///
 /// Returns `Err` on thread spawn failure (rare — kernel resource
 /// exhaustion). Callers propagate up to the user.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "#307 grew the accept-thread signature with `compression`; \
+              refactoring to a context struct would churn every caller \
+              without improving readability"
+)]
 fn spawn_accept_thread(
     listener: TcpListener,
     device: Arc<Mutex<RtlSdrDevice>>,
@@ -432,6 +466,7 @@ fn spawn_accept_thread(
     stats: Arc<Mutex<ServerStats>>,
     buffer_capacity: usize,
     initial_state: InitialDeviceState,
+    compression: CodecMask,
 ) -> std::io::Result<JoinHandle<()>> {
     // Poll-accept cadence means the listener must be nonblocking.
     // Configure it BEFORE spawning so failures surface through
@@ -506,6 +541,7 @@ fn spawn_accept_thread(
                         let session_shutdown = shutdown.clone();
                         let session_stats = stats.clone();
                         let session_busy = busy.clone();
+                        let session_compression = compression;
                         match thread::Builder::new().name("rtl_tcp-session".into()).spawn(
                             move || {
                                 handle_client(
@@ -514,6 +550,7 @@ fn spawn_accept_thread(
                                     session_shutdown,
                                     session_stats.clone(),
                                     buffer_capacity,
+                                    session_compression,
                                 );
                                 update_stats_on_disconnect(&session_stats);
                                 tracing::info!(%peer, "rtl_tcp client disconnected");
@@ -641,15 +678,158 @@ fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
     }
 }
 
+/// How long the server waits on a fresh TCP connection for a
+/// `ClientHello` before assuming the client is a legacy vanilla
+/// `rtl_tcp` peer and falling through to the unchanged legacy
+/// path. Short enough to be invisible to the user (RTL-SDR init
+/// takes full seconds anyway); long enough to cover LAN RTT
+/// jitter. Per #307.
+const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Try to read + parse an extended-protocol [`ClientHello`] from
+/// `stream` within [`HELLO_SNIFF_TIMEOUT`].
+///
+/// Return cases:
+///
+/// - `Ok(Some(hello))` — valid 8-byte hello, fully consumed.
+/// - `Ok(None)` — legacy fallback. Reached either on a zero-byte
+///   timeout/EOF (idle client never sent anything) OR on a
+///   non-zero peek whose prefix doesn't match [`EXTENSION_MAGIC`]
+///   (legacy client sent a command; the bytes stay queued in the
+///   receive buffer so `command_worker` can parse the 5-byte
+///   frame). Nothing is consumed in either sub-case.
+/// - `Err(_)` — protocol error, raised only after the magic
+///   already matched and we committed to reading a full 8 bytes.
+///   Covers `read_exact` timeout or EOF mid-hello (partial hello,
+///   bytes already drained from the stream) and parse failure
+///   on a complete 8-byte block (unknown role, unknown protocol
+///   version, etc.). Falling back to legacy from either of these
+///   states would desync the command stream, so the caller drops
+///   the client.
+///
+/// Uses `peek()` for the initial magic check so legitimate legacy
+/// traffic stays intact. Once the magic matches we commit to
+/// reading the full 8 bytes; partial reads are fatal because we
+/// can't un-consume the half we already read. Per CodeRabbit
+/// round 2 on PR #399 (initial fix) + round 3 (doc alignment).
+fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHello>> {
+    stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
+    // Peek the first 4 bytes (magic-only check). `peek` maps to
+    // `recv(…, MSG_PEEK)` which respects `SO_RCVTIMEO`, so this
+    // returns WouldBlock / TimedOut after the timeout without
+    // consuming bytes.
+    let mut peek_buf = [0u8; EXTENSION_MAGIC.len()];
+    let peeked = match stream.peek(&mut peek_buf) {
+        Ok(n) => n,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            // Pure timeout with zero bytes observed — the client
+            // never sent anything, so this is an idle legacy peer
+            // (or a port scanner). Safe to fall back; no bytes
+            // were consumed.
+            stream.set_read_timeout(None)?;
+            return Ok(None);
+        }
+        Err(e) => {
+            // Other errors (ECONNRESET, etc.) → propagate so the
+            // caller tears down cleanly.
+            stream.set_read_timeout(None)?;
+            return Err(e);
+        }
+    };
+    if peeked == 0 {
+        // Peer closed cleanly before sending anything. Same
+        // safety as a timeout-with-zero-bytes: no bytes consumed,
+        // nothing to desync.
+        stream.set_read_timeout(None)?;
+        return Ok(None);
+    }
+    if peeked < EXTENSION_MAGIC.len() || peek_buf[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
+        // Legacy client — either sent fewer than 4 bytes but
+        // something (so we can't tell if they might still be
+        // sending a hello), or the first bytes aren't the
+        // sdr-rs magic. Preserving bytes for the command reader
+        // is only safe when we know they're the start of a
+        // command: a vanilla `SetCenterFreq` starts with 0x01,
+        // no documented opcode begins with 'R' (0x52), so a
+        // mismatch on a full 4-byte peek is a legitimate legacy
+        // command. A short prefix that doesn't match magic is
+        // ambiguous but benign — the command reader will parse
+        // it as a 5-byte command frame and dispatch or log
+        // unknown-opcode.
+        stream.set_read_timeout(None)?;
+        return Ok(None);
+    }
+    // Magic matched — commit to consuming 8 bytes. A timeout or
+    // EOF here is no longer a safe fallback: we've verified the
+    // client started an extended hello and consumed `read_exact`
+    // will have eaten whatever bytes arrived before the stall.
+    // Returning `Ok(None)` would let the legacy path start
+    // against a shifted command stream — exactly the desync
+    // CodeRabbit round 2 flagged. Treat every failure mode as a
+    // protocol error and drop the client.
+    let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+    let read_result = stream.read_exact(&mut hello_buf);
+    stream.set_read_timeout(None)?;
+    read_result?;
+    ClientHello::from_bytes(&hello_buf)
+        .map(Some)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTLX magic matched but ClientHello body failed to parse (unknown role or \
+             malformed field)",
+            )
+        })
+}
+
 /// Serve exactly one client. Spawns the three worker threads, waits for
 /// the first to exit, signals the others, joins all.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "#307 grew the session signature with compression_offer; \
+              refactoring to a context struct would churn every rtl_tcp \
+              server test without improving readability"
+)]
 fn handle_client(
     stream: TcpStream,
     device: Arc<Mutex<RtlSdrDevice>>,
     global_shutdown: Arc<AtomicBool>,
     stats: Arc<Mutex<ServerStats>>,
     buffer_capacity: usize,
+    compression_offer: CodecMask,
 ) {
+    // Extended handshake (#307). Must happen BEFORE we write the
+    // legacy `dongle_info_t` — if the client sent an `"RTLX"`
+    // hello, we want to write the server response block
+    // immediately after the legacy header, all in one atomic
+    // stretch, so the client's `peek` for the `"RTLX"` magic
+    // lands on our bytes and not on IQ samples the data worker
+    // has queued up.
+    let negotiated_codec = match sniff_client_hello(&stream) {
+        Ok(Some(hello)) => {
+            let codec = compression_offer.pick(hello.codec_mask);
+            tracing::info!(
+                client_mask = hello.codec_mask.to_wire(),
+                server_mask = compression_offer.to_wire(),
+                chosen = %codec,
+                "rtl_tcp extended-handshake negotiated"
+            );
+            Some(codec)
+        }
+        Ok(None) => {
+            tracing::debug!("rtl_tcp no extended-handshake hello — legacy client path");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(%e, "rtl_tcp handshake sniff failed — dropping client");
+            return;
+        }
+    };
+
     // Send the 12-byte dongle_info_t header first (rtl_tcp.c:576-594).
     let header = {
         let Ok(dev) = device.lock() else {
@@ -662,16 +842,36 @@ fn handle_client(
         }
     };
     let header_bytes = header.to_bytes();
-    let mut writer = match stream.try_clone() {
+    let writer_stream = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
             tracing::error!(%e, "failed to clone client stream for writer — dropping client");
             return;
         }
     };
+    let mut writer = writer_stream;
     if let Err(e) = writer.write_all(&header_bytes) {
         tracing::warn!(%e, "failed to send dongle_info_t — client gone");
         return;
+    }
+
+    // If we negotiated the extended protocol, emit the
+    // `ServerExtension` block immediately after `dongle_info_t`.
+    // Must land before any IQ data or the client's magic-peek
+    // after `dongle_info` will read random samples instead.
+    if let Some(codec) = negotiated_codec {
+        let ext = ServerExtension {
+            codec,
+            // #307 is single-client; role and status are reserved
+            // for #392/#394 and always report OK / Control here.
+            granted_role: Some(Role::Control),
+            status: Status::Ok,
+            version: PROTOCOL_VERSION,
+        };
+        if let Err(e) = writer.write_all(&ext.to_bytes()) {
+            tracing::warn!(%e, "failed to send RTLX server extension — client gone");
+            return;
+        }
     }
 
     // Per-client shutdown flag. Flipped when any worker exits, so the
@@ -695,12 +895,33 @@ fn handle_client(
         return;
     };
 
+    // Install the write timeout on the underlying TcpStream
+    // BEFORE wrapping in the codec's encoder — the encoder's
+    // `write()` delegates to the inner stream's `write()`, which
+    // in turn enforces `SO_SNDTIMEO`. Setting after-wrap would
+    // lose visibility into the inner stream.
+    if let Err(e) = writer.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
+        tracing::warn!(%e, "set_write_timeout on data channel failed; dropping client");
+        merged_shutdown.set_client();
+        let _ = reader_handle.join();
+        return;
+    }
+    // Wrap the socket in the stats-tracking adapter BEFORE the
+    // encoder so `bytes_sent` reflects post-compression bytes
+    // (what actually hit the wire), then wrap in the negotiated
+    // codec. Legacy clients get a pass-through (`Codec::None`),
+    // so the write path stays byte-identical to the pre-#307
+    // behavior — on-wire bytes equal payload bytes in that case.
+    let tracked_writer = StatsTrackingWrite {
+        inner: writer,
+        stats: stats.clone(),
+    };
+    let encoded_writer = Encoder::new(negotiated_codec.unwrap_or(Codec::None), tracked_writer);
     let writer_shutdown = merged_shutdown.clone();
-    let writer_stats = stats.clone();
     let Ok(writer_handle) = thread::Builder::new()
         .name("rtl_tcp-writer".into())
         .spawn(move || {
-            tcp_writer(writer, rx, writer_shutdown, writer_stats);
+            tcp_writer(encoded_writer, rx, writer_shutdown);
         })
     else {
         tracing::error!("failed to spawn rtl_tcp writer thread — tearing down client");
@@ -855,26 +1076,56 @@ fn data_worker(
     }
 }
 
-fn tcp_writer(
-    mut stream: TcpStream,
+/// `Write` adapter that mirrors the underlying [`TcpStream`] but
+/// updates [`ServerStats::bytes_sent`] with the post-compression
+/// byte count from each successful write. Placed between the
+/// [`Encoder`] and the socket so the stat reflects **on-wire**
+/// throughput instead of pre-compression payload size — otherwise
+/// the server-panel's data-rate row would show raw sample rate
+/// even when LZ4 is active and operators couldn't see whether
+/// compression was actually saving bandwidth.
+///
+/// Per CodeRabbit round 1 on PR #399.
+struct StatsTrackingWrite {
+    inner: TcpStream,
+    stats: Arc<Mutex<ServerStats>>,
+}
+
+impl Write for StatsTrackingWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        // Poisoned mutex only happens if a stats reader panicked
+        // while holding the lock — we'd rather keep streaming and
+        // let the stats drift than tear the session down. Matches
+        // the existing lock-use pattern in data_worker.
+        if let Ok(mut s) = self.stats.lock() {
+            s.bytes_sent = s.bytes_sent.saturating_add(n as u64);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn tcp_writer<W: Write + Send>(
+    mut stream: W,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
     shutdown: MergedShutdown,
-    stats: Arc<Mutex<ServerStats>>,
 ) {
-    // A slow peer that stops reading will fill its kernel receive
-    // buffer → our kernel send buffer saturates → `write_all` blocks
-    // indefinitely. Since the write path can't re-check shutdown while
-    // blocked, a wedged writer would deadlock the
-    // writer.join → handle_client → accept.join → Server::Drop chain.
-    // Setting a write timeout mirrors what `command_worker` does for
-    // reads so the same shutdown-responsiveness guarantee applies here.
-    if let Err(e) = stream.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
-        tracing::warn!(%e, "set_write_timeout on data channel failed; dropping client");
-        shutdown.set_client();
-        return;
-    }
-    // `recv_timeout` lets us notice shutdown even when the USB reader is
-    // starving (e.g., dongle unplug).
+    // Write timeout is installed by the caller on the underlying
+    // `TcpStream` before wrapping in the codec — see the comment
+    // in `handle_client` where the timeout is set up. Putting it
+    // here would lose visibility into the inner stream when
+    // `stream` is an `Encoder`.
+    //
+    // `bytes_sent` bookkeeping is handled by `StatsTrackingWrite`
+    // one layer below the encoder, so this function no longer
+    // needs a `stats` arg. On-wire counts land there directly.
+    //
+    // `recv_timeout` lets us notice shutdown even when the USB
+    // reader is starving (e.g., dongle unplug).
     loop {
         if shutdown.is_set() {
             return;
@@ -886,8 +1137,21 @@ fn tcp_writer(
                     shutdown.set_client();
                     return;
                 }
-                if let Ok(mut s) = stats.lock() {
-                    s.bytes_sent = s.bytes_sent.saturating_add(buf.len() as u64);
+                // Flush after every chunk so the LZ4 frame encoder
+                // (when active) doesn't hold a partial block in its
+                // internal buffer waiting for the next USB chunk to
+                // fill it out to the 64 KiB frame-block size. On
+                // low-rate streams that buffering adds minutes of
+                // audio latency and can trip the client's stall-
+                // detection timeout. Pass-through `Codec::None`
+                // flushes to `TcpStream::flush()`, which is a no-op
+                // on Linux (writes go direct to the kernel send
+                // buffer), so the legacy path pays nothing. Per
+                // CodeRabbit round 1 on PR #399.
+                if let Err(e) = stream.flush() {
+                    tracing::debug!(%e, "rtl_tcp client socket flush failed, closing");
+                    shutdown.set_client();
+                    return;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1042,6 +1306,7 @@ mod tests {
             device_index: 0,
             initial: InitialDeviceState::default(),
             buffer_capacity: 0,
+            compression: CodecMask::NONE_ONLY,
         };
         match Server::start(config) {
             Err(ServerError::PortInUse(ref addr)) => {
@@ -1181,5 +1446,147 @@ mod tests {
         // DEFAULT_BUFFER_CAPACITY matches upstream's llbuf_num = 500
         // (rtl_tcp.c:61).
         assert_eq!(DEFAULT_BUFFER_CAPACITY, 500);
+    }
+
+    // ============================================================
+    // sniff_client_hello regression tests (CodeRabbit round 2 on PR #399)
+    //
+    // The sniff is the only piece of `handle_client` that can run
+    // without a real RTL-SDR dongle, so unit tests live here.
+    // Each test pairs a server-side accept with a client-side TCP
+    // connect + controlled write pattern, verifying that
+    // `sniff_client_hello` classifies the stream correctly.
+    // ============================================================
+
+    /// Accept one TCP client on a loopback listener and hand the
+    /// accepted socket to `sniff_client_hello`. Factored out so
+    /// each scenario test stays focused on what bytes the client
+    /// writes, not the boilerplate of setting up sockets.
+    fn run_sniff_against<F>(client_behavior: F) -> std::io::Result<Option<ClientHello>>
+    where
+        F: FnOnce(TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_thread = thread::spawn(move || {
+            let client = TcpStream::connect(addr).unwrap();
+            client_behavior(client);
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let result = sniff_client_hello(&server_stream);
+        // Join best-effort — the client thread may legitimately still
+        // be holding the connection open (partial-hello test). Drop
+        // the server side first so any pending write on the client
+        // side unblocks, then join.
+        drop(server_stream);
+        let _ = client_thread.join();
+        result
+    }
+
+    #[test]
+    fn sniff_client_hello_full_hello_parses_correctly() {
+        // Happy path: client sends a complete 8-byte hello, sniff
+        // returns `Ok(Some)` with the parsed struct. Regression
+        // guard against a future refactor breaking the common case.
+        use crate::codec::CodecMask;
+        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, Role};
+        let hello = ClientHello {
+            codec_mask: CodecMask::NONE_AND_LZ4,
+            role: Role::Control,
+            flags: CLIENT_HELLO_FLAGS_NONE,
+            version: PROTOCOL_VERSION,
+        };
+        let bytes = hello.to_bytes();
+        let result = run_sniff_against(move |mut client| {
+            client.write_all(&bytes).unwrap();
+            // Let the server finish reading before the client
+            // stream drops (which would EOF mid-read).
+            thread::sleep(Duration::from_millis(50));
+        });
+        assert_eq!(result.unwrap(), Some(hello));
+    }
+
+    #[test]
+    fn sniff_client_hello_idle_client_returns_legacy_fallback() {
+        // Legacy rtl_tcp client: connects, then idles waiting for
+        // the server's `dongle_info_t`. Zero bytes reach the sniff
+        // before the timeout fires, so `Ok(None)` is the safe
+        // fallback — nothing consumed, no desync risk.
+        let result = run_sniff_against(|client| {
+            // Hold the socket open well past the sniff timeout.
+            thread::sleep(HELLO_SNIFF_TIMEOUT * 3);
+            drop(client);
+        });
+        match result {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) for idle client, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sniff_client_hello_non_magic_prefix_is_legacy_fallback() {
+        // Vanilla client sends a `SetCenterFreq` command
+        // immediately after connect (opcode 0x01 + 4-byte arg).
+        // Peek reads 4 bytes, magic doesn't match, sniff returns
+        // `Ok(None)` without consuming — so the command_worker
+        // reads the full 5-byte frame cleanly.
+        let result = run_sniff_against(|mut client| {
+            // 5-byte vanilla SetCenterFreq command: opcode=0x01,
+            // freq=100_000_000 Hz big-endian.
+            let cmd: [u8; 5] = [0x01, 0x05, 0xF5, 0xE1, 0x00];
+            client.write_all(&cmd).unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+        match result {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) for non-RTLX prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sniff_client_hello_partial_hello_is_protocol_error() {
+        // **Regression test for CodeRabbit round 2 on PR #399.**
+        // A client that sends the 4-byte `RTLX` magic and then
+        // stalls without sending the remaining 4 hello bytes used
+        // to fall back to the legacy path — which desynced the
+        // command stream by 4 bytes (those magic bytes were
+        // already consumed by `read_exact` before it timed out).
+        // The fix promotes partial-hello to `Err` so the client
+        // gets dropped instead.
+        let result = run_sniff_against(|mut client| {
+            // Send magic only; hold the connection open past the
+            // sniff timeout so `read_exact` observes partial data.
+            client.write_all(&EXTENSION_MAGIC).unwrap();
+            thread::sleep(HELLO_SNIFF_TIMEOUT * 5);
+            drop(client);
+        });
+        assert!(
+            result.is_err(),
+            "partial hello (magic only, body stalled) must surface as Err — \
+             got {result:?} which would desync the command stream on fallback"
+        );
+    }
+
+    #[test]
+    fn sniff_client_hello_malformed_body_is_protocol_error() {
+        // Client sends a full 8 bytes starting with `RTLX` but with
+        // an unknown role byte (0x99). Body parses as `None` →
+        // protocol error. Previously returned `Ok(None)` (legacy
+        // fallback on a shifted stream — desync risk).
+        let mut garbled = [0u8; CLIENT_HELLO_LEN];
+        garbled[..EXTENSION_MAGIC.len()].copy_from_slice(&EXTENSION_MAGIC);
+        garbled[4] = 0x03; // codec mask (NONE+LZ4)
+        garbled[5] = 0x99; // invalid role — from_bytes returns None
+        garbled[6] = 0x00; // flags
+        garbled[7] = PROTOCOL_VERSION;
+        let result = run_sniff_against(move |mut client| {
+            client.write_all(&garbled).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        assert!(
+            result.is_err(),
+            "malformed hello body (magic matched, unknown role) must surface as Err — \
+             got {result:?}"
+        );
     }
 }

@@ -43,8 +43,23 @@ pub enum SourceError {
     /// that was supposed to speak `rtl_tcp` but didn't return the expected
     /// 12-byte `RTL0` header. Distinct from `Io` so UI can surface
     /// "not an `rtl_tcp` server" rather than a generic socket error.
+    ///
+    /// Treated as **terminal** by the `rtl_tcp` client's connection manager:
+    /// the backoff loop exits and the state transitions to
+    /// `ConnectionState::Failed`. Use this for errors that won't be fixed
+    /// by retrying (bad server, wrong protocol version, auth rejection).
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// Transient, retryable failure from a network source — e.g. the
+    /// `rtl_tcp` server's extended handshake returned `ControllerBusy`
+    /// because another client is currently controlling the dongle.
+    /// The condition is expected to resolve without user action once
+    /// the other client disconnects, so the connection manager keeps
+    /// retrying on the normal backoff schedule rather than
+    /// transitioning to `Failed`. Distinct from `Protocol` so callers
+    /// can route terminal vs. retry-worthy rejections correctly.
+    #[error("temporarily unavailable: {0}")]
+    TemporarilyUnavailable(String),
 }
 
 /// Errors from sink modules.

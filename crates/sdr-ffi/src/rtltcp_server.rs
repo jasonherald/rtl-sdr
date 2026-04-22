@@ -22,6 +22,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use sdr_server_rtltcp::{
     InitialDeviceState, Server, ServerConfig, ServerError, ServerStats, TunerAdvertiseInfo,
+    codec::CodecMask,
     protocol::{CommandOp, DEFAULT_PORT},
 };
 
@@ -318,6 +319,12 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             device_index: cfg.device_index,
             initial,
             buffer_capacity,
+            // Compression stays off for the C ABI until the host
+            // adds a codec-mask field to `SdrRtlTcpServerConfig`
+            // (issue #400 tracks extending the C struct). Vanilla
+            // clients keep working; the Linux GTK path is the only
+            // one that currently offers LZ4.
+            compression: CodecMask::NONE_ONLY,
         };
         match Server::start(server_cfg) {
             Ok(server) => {

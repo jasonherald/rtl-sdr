@@ -28,8 +28,10 @@
 //! threading model in [`server`]; command-to-device translation in
 //! [`dispatch`]. See module docs for the upstream line-number references.
 
+pub mod codec;
 pub mod dispatch;
 pub mod error;
+pub mod extension;
 pub mod protocol;
 pub mod server;
 

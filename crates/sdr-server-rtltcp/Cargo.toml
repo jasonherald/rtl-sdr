@@ -34,6 +34,13 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # Optional — only pulled in when `mdns-advertise` is enabled. The bin
 # target requires this feature (see `required-features` below).
 sdr-rtltcp-discovery = { workspace = true, optional = true }
+# LZ4 streaming compression for the extended handshake (#307). Pulled
+# in unconditionally because the protocol types + codec enum need to
+# know about LZ4 regardless of whether a given build actually uses it
+# — the server declines LZ4 cleanly by advertising a None-only codec
+# mask at handshake time, which doesn't require the codec trait impls
+# to be absent.
+lz4_flex.workspace = true
 
 [lints]
 workspace = true
