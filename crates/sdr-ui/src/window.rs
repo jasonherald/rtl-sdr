@@ -3414,23 +3414,71 @@ fn render_status_rows(
         |info| format_uptime(info.connected_since.elapsed()),
     ));
 
-    // Data-rate row. Uses the cumulative `total_bytes_sent` counter
-    // (monotonic across the server's lifetime) so the delta here
-    // reflects aggregate traffic across ALL clients. No clamping
-    // needed — monotonic means the delta is always >= 0.
+    // Data-rate row. Uses the cumulative `total_bytes_sent`
+    // counter, which is monotonic within a single Server lifetime.
+    // After a stop+start cycle the counter resets to 0 while
+    // `last_bytes_sent` still holds the previous server's final
+    // value — in that case `current < previous` is the restart
+    // signal: rebase `last_bytes_sent` to the new counter and
+    // report 0 bytes this tick rather than a bogus huge delta or
+    // a long "0.0 kbps" flatline until the new server catches up
+    // past the old final byte count. Per `CodeRabbit` round 2 on
+    // PR #402.
     let current_bytes = stats.total_bytes_sent;
-    let delta = current_bytes.saturating_sub(last_bytes_sent.get());
+    let previous_bytes = last_bytes_sent.get();
+    let delta = if current_bytes < previous_bytes {
+        // Restart detected — the new server has already
+        // accumulated `current_bytes` worth of traffic since its
+        // start, so that's the best available estimate for
+        // "bytes this tick". Reporting 0 or the saturating sub
+        // would flatline the row until the new server exceeds
+        // the old final count. Per `CodeRabbit` round 2 on
+        // PR #402.
+        current_bytes
+    } else {
+        current_bytes - previous_bytes
+    };
     last_bytes_sent.set(current_bytes);
     widgets
         .status_data_rate_row
         .set_subtitle(&format_data_rate(delta, SERVER_STATUS_POLL_INTERVAL));
 
-    // Commanded-state row — first client's state. Once #392's role
-    // gate lands this becomes "the controller's state" and the
-    // listener rows render with a "listening" badge instead.
+    // Commanded-state row — the most-recently-commanding client's
+    // state. Pre-#392 any connected client can send `SetX`
+    // commands, so picking the oldest client would let a later
+    // peer's tune show up as the oldest peer's "stale" state.
+    // `pick_most_recent_commander` resolves this by finding the
+    // client whose `last_command` timestamp is newest (falls back
+    // to the first connected client when nobody has commanded
+    // yet). Post-#392, role-gated dispatch means only the
+    // controller can record a command, so this helper naturally
+    // resolves to the controller. Per `CodeRabbit` round 2 on
+    // PR #402.
+    let commander = pick_most_recent_commander(&stats.connected_clients);
     widgets
         .status_commanded_row
-        .set_subtitle(&format_commanded_state(first, &stats.initial));
+        .set_subtitle(&format_commanded_state(commander, &stats.initial));
+}
+
+/// Select the client whose most recent `last_command` timestamp is
+/// newest. Falls back to the first connected client when nobody
+/// has issued a command yet, and to `None` when no clients are
+/// connected.
+///
+/// Shared between the commanded-state row and the activity-log
+/// renderer so both surfaces track the same "who's actually
+/// driving the dongle" peer. Pre-#392 this matters because any
+/// client can command; post-#392 role-gated dispatch will make
+/// this resolve to the controller every time.
+fn pick_most_recent_commander(
+    clients: &[sdr_server_rtltcp::ClientInfo],
+) -> Option<&sdr_server_rtltcp::ClientInfo> {
+    clients
+        .iter()
+        .filter_map(|c| c.last_command.map(|(_, t)| (c, t)))
+        .max_by_key(|&(_, t)| t)
+        .map(|(c, _)| c)
+        .or_else(|| clients.first())
 }
 
 /// Render a `Duration` as `Nh Nm Ns` / `Nm Ns` / `Ns` depending on
@@ -3535,19 +3583,20 @@ fn format_hz(hz: u32) -> String {
     }
 }
 
-/// Rebuild the activity-log list from the first connected client's
-/// `recent_commands` ring if it has actually changed since the last
-/// render. The "changed?" check uses the ring length + the
+/// Rebuild the activity-log list from the most-recently-commanding
+/// client's `recent_commands` ring if it has actually changed since
+/// the last render. The "changed?" check uses the ring length + the
 /// timestamp of the newest entry so we skip the clear-and-rebuild
 /// on idle ticks — preserves any scroll position the user has in
 /// the `ListBox`.
 ///
-/// Renders the FIRST client's activity log in #391 (PR A). PR B
-/// replaces this with a per-client log tab so each connected
-/// client's commands show under their own row. When #392's role
-/// gate lands, only the controller can issue commands — the
-/// activity log then implicitly means "controller's commands"
-/// regardless of which client that is at any given moment.
+/// Uses [`pick_most_recent_commander`] rather than just the first
+/// connected client because pre-#392 any client can send commands
+/// — the oldest client would shadow a newer peer's activity. Per
+/// `CodeRabbit` round 2 on PR #402. PR B of #391 replaces this with
+/// a per-client log tab so every client's commands show under
+/// their own row; until then, tracking "whoever's driving right
+/// now" is the right single-row compromise.
 fn render_activity_log(
     widgets: &ServerStatusWidgets,
     stats: &sdr_server_rtltcp::ServerStats,
@@ -3555,7 +3604,7 @@ fn render_activity_log(
 ) {
     use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
 
-    let Some(first_client) = stats.connected_clients.first() else {
+    let Some(commander) = pick_most_recent_commander(&stats.connected_clients) else {
         // No connected client → clear + show empty subtitle if
         // we're not already in that state. Track the idle cache
         // key as (0, None) so the render skips on subsequent
@@ -3574,7 +3623,7 @@ fn render_activity_log(
         return;
     };
     let ring: &std::collections::VecDeque<(sdr_server_rtltcp::CommandOp, Instant)> =
-        &first_client.recent_commands;
+        &commander.recent_commands;
 
     let newest = ring.back().map(|(_, t)| *t);
     let current_key = (ring.len(), newest);
@@ -5358,7 +5407,7 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
             // mapped any non-Network value to Local, which would
             // silently dispatch a sink swap on a transient or
             // future-added combo entry that this handler doesn't
-            // know about. Per CodeRabbit round 2 on PR #351.
+            // know about. Per `CodeRabbit` round 2 on PR #351.
             let new_type = match row.selected() {
                 sidebar::audio_panel::SINK_TYPE_LOCAL_IDX => sdr_core::AudioSinkType::Local,
                 sidebar::audio_panel::SINK_TYPE_NETWORK_IDX => sdr_core::AudioSinkType::Network,
@@ -6804,6 +6853,39 @@ mod server_panel_format_tests {
         format_uptime,
     };
 
+    // ============================================================
+    // Test fixture constants (`CodeRabbit` round 2 on PR #402).
+    // Names make each scenario's intent obvious at a glance:
+    // "is this testing 145 MHz 2m-band tune or 100 MHz WFM"
+    // reads clearer when the literal has a rationale.
+    // ============================================================
+
+    /// Placeholder peer port for `ClientInfo` fixtures that don't
+    /// exercise the peer address field — any non-privileged port
+    /// works, so pick one well above the well-known range.
+    const FIXTURE_PEER_PORT: u16 = 42_000;
+    /// 2-meter amateur band test frequency (145.5 MHz) — stands in
+    /// for "non-default freq the user commanded" in fallback tests.
+    const FIXTURE_FREQ_2M_HZ: u32 = 145_500_000;
+    /// 100 MHz WFM broadcast band test frequency — second sample
+    /// to catch tests that pass on the 2m fixture by coincidence.
+    const FIXTURE_FREQ_WFM_HZ: u32 = 100_000_000;
+    /// Typical RTL-SDR sample rate (2.4 Msps) — used across tune
+    /// fixtures.
+    const FIXTURE_SAMPLE_RATE_HZ: u32 = 2_400_000;
+    /// Mid-range tuner gain in tenths-of-dB (29.6 dB) — well
+    /// inside the R820T table so "auto vs manual" branches aren't
+    /// ambiguous.
+    const FIXTURE_GAIN_MID_TENTHS: i32 = 296;
+    /// Upper-range tuner gain in tenths-of-dB (49.6 dB) — matches
+    /// the R820T's documented top step so the "manual gain in dB"
+    /// formatter has a realistic ceiling value.
+    const FIXTURE_GAIN_TOP_TENTHS: i32 = 496;
+    /// Low-but-visible manual gain in tenths-of-dB (20 dB) —
+    /// used specifically in the "auto overrides manual" test to
+    /// prove the auto flag wins over any set value.
+    const FIXTURE_GAIN_LOW_TENTHS: i32 = 200;
+
     /// Fresh `InitialDeviceState` matching what `Server::start`
     /// stores when the user takes the upstream-default path. Most
     /// format tests use this; the ones that want to prove
@@ -6824,7 +6906,7 @@ mod server_panel_format_tests {
     ) -> ClientInfo {
         ClientInfo {
             id: 0,
-            peer: SocketAddr::from(([127, 0, 0, 1], 42_000)),
+            peer: SocketAddr::from(([127, 0, 0, 1], FIXTURE_PEER_PORT)),
             connected_since: Instant::now(),
             codec: Codec::None,
             bytes_sent: 0,
@@ -6909,9 +6991,9 @@ mod server_panel_format_tests {
         // client hasn't sent any SetX commands yet.
         // Per `CodeRabbit` round 1 on PR #402.
         let initial = InitialDeviceState {
-            center_freq_hz: 145_500_000,
-            sample_rate_hz: 2_400_000,
-            gain_tenths_db: Some(296),
+            center_freq_hz: FIXTURE_FREQ_2M_HZ,
+            sample_rate_hz: FIXTURE_SAMPLE_RATE_HZ,
+            gain_tenths_db: Some(FIXTURE_GAIN_MID_TENTHS),
             ..InitialDeviceState::default()
         };
         let subtitle = format_commanded_state(Some(&info(None, None, None, None)), &initial);
@@ -6952,7 +7034,12 @@ mod server_panel_format_tests {
         // When the client has sent SetGainMode(auto), "auto" wins
         // regardless of any previous manual gain value OR the
         // server's configured initial gain.
-        let client = info(Some(145_500_000), Some(2_400_000), Some(200), Some(true));
+        let client = info(
+            Some(FIXTURE_FREQ_2M_HZ),
+            Some(FIXTURE_SAMPLE_RATE_HZ),
+            Some(FIXTURE_GAIN_LOW_TENTHS),
+            Some(true),
+        );
         let subtitle = format_commanded_state(Some(&client), &default_initial());
         assert!(subtitle.contains("145.500 MHz"));
         assert!(subtitle.contains("2.400 MHz"));
@@ -6966,7 +7053,12 @@ mod server_panel_format_tests {
     fn format_commanded_state_renders_manual_gain_in_db() {
         // SetTunerGain records tenths-of-dB; the render converts to
         // full dB with one decimal.
-        let client = info(Some(100_000_000), Some(2_400_000), Some(496), Some(false));
+        let client = info(
+            Some(FIXTURE_FREQ_WFM_HZ),
+            Some(FIXTURE_SAMPLE_RATE_HZ),
+            Some(FIXTURE_GAIN_TOP_TENTHS),
+            Some(false),
+        );
         let subtitle = format_commanded_state(Some(&client), &default_initial());
         assert!(
             subtitle.contains("gain 49.6 dB"),

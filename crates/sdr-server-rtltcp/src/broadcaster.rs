@@ -494,16 +494,23 @@ impl ClientRegistry {
         before - guard.len()
     }
 
-    /// Project every live slot to a [`ClientInfo`] snapshot for stats
-    /// consumers. Disconnected-but-not-yet-pruned slots are included
-    /// so the UI can render "client 7 last seen at X" continuity
-    /// before the broadcaster's next prune cycle clears it. Order
-    /// preserved from the underlying slot list.
+    /// Project every **live** slot to a [`ClientInfo`] snapshot for
+    /// stats consumers. Disconnected-but-not-yet-pruned slots are
+    /// filtered out — otherwise UI and FFI consumers would briefly
+    /// see dead sessions as live and the FFI could hand callers
+    /// `client_id`s that are already disconnected. Per CodeRabbit
+    /// round 2 on PR #402.
+    ///
+    /// Order preserved from the underlying slot list (oldest-first).
     pub fn snapshot(&self) -> Vec<ClientInfo> {
         let Ok(guard) = self.slots.lock() else {
             return Vec::new();
         };
-        guard.iter().map(|s| s.snapshot()).collect()
+        guard
+            .iter()
+            .filter(|s| !s.is_disconnected())
+            .map(|s| s.snapshot())
+            .collect()
     }
 }
 
@@ -720,18 +727,26 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_includes_disconnected_slots_before_prune() {
-        // Document the contract: snapshot reflects CURRENT slot list,
-        // including disconnected-but-not-yet-pruned entries. This
-        // lets the UI render "client X just disconnected, gone on
-        // next poll" continuity.
+    fn snapshot_excludes_disconnected_slots() {
+        // The contract after CodeRabbit round 2: `snapshot()`
+        // returns only LIVE clients. Disconnected-but-not-yet-pruned
+        // slots are filtered out so UI / FFI consumers don't
+        // briefly see dead sessions as live (FFI clients would
+        // otherwise get stale ids that are already disconnected).
         let reg = ClientRegistry::new();
-        let (slot, _rx) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
-        reg.register(slot.clone());
-        slot.mark_disconnected();
+        let (live, _live_rx) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
+        let (dead, _dead_rx) = ClientSlot::new(reg.allocate_id(), test_peer(2), Codec::None, 4);
+        reg.register(live);
+        reg.register(dead.clone());
 
+        // Both registered → len() == 2 (raw slot count).
+        assert_eq!(reg.len(), 2);
+        // But snapshot() excludes the disconnected one.
+        dead.mark_disconnected();
         assert_eq!(reg.snapshot().len(), 1);
+        // Pruning removes it from `len()` too.
         reg.prune_disconnected();
-        assert_eq!(reg.snapshot().len(), 0);
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.snapshot().len(), 1);
     }
 }

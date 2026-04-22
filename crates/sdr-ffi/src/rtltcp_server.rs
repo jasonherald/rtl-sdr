@@ -179,8 +179,12 @@ pub struct SdrRtlTcpClientInfo {
     /// `current_gain_auto`.
     pub has_current_gain_mode: bool,
     /// Number of entries in this client's recent-commands ring.
-    /// Sizes a follow-up `_recent_commands_json(client_id, …)`
-    /// buffer.
+    /// An entry count, not a byte count — callers that want to
+    /// serialize the ring as JSON use
+    /// [`sdr_rtltcp_server_recent_commands_json`]'s `out_required`
+    /// size-probe path for buffer sizing (length depends on opcode
+    /// names and float formatting, not a fixed per-entry byte
+    /// count). Per `CodeRabbit` round 2 on PR #402.
     pub recent_commands_count: u32,
 }
 

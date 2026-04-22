@@ -421,12 +421,24 @@ impl Server {
         self.compression
     }
 
-    /// Has the server exited? Set to `true` after the accept thread
-    /// AND broadcaster thread have joined.
+    /// Has the **accept thread** exited?
     ///
-    /// CLI callers poll this alongside their own Ctrl-C handler so the
-    /// process exits when serving actually stops, instead of sleeping
-    /// forever after the dongle is unplugged.
+    /// Narrowly scoped signal, despite the name — flipped by the
+    /// accept thread itself right before it returns (after
+    /// observing the global shutdown flag, typically on dongle
+    /// unplug or a caller-initiated stop). Does **not** imply that
+    /// the broadcaster and per-client worker threads have joined
+    /// or that the RTL-SDR dongle has been released. Full shutdown
+    /// only happens inside [`Self::stop`] or `Drop` (both of which
+    /// join every owned thread via `join_all_threads`).
+    ///
+    /// CLI callers poll this alongside their own Ctrl-C handler so
+    /// the poll loop exits when serving stops on its own (e.g.,
+    /// dongle unplug), then drop the `Server` which blocks until
+    /// every worker has joined and the dongle is actually released.
+    /// Per `CodeRabbit` round 2 on PR #402 (doc clarified; narrow
+    /// semantic preserved to avoid breaking the CLI's
+    /// `has_stopped() → drop(server)` coupling).
     pub fn has_stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
     }
@@ -1396,7 +1408,7 @@ mod tests {
     }
 
     // ============================================================
-    // sniff_client_hello regression tests (CodeRabbit round 2 on PR #399)
+    // sniff_client_hello regression tests (`CodeRabbit` round 2 on PR #399)
     //
     // The sniff is the only piece of the per-client handshake that
     // can run without a real RTL-SDR dongle, so unit tests live here.
@@ -1492,7 +1504,7 @@ mod tests {
 
     #[test]
     fn sniff_client_hello_partial_hello_is_protocol_error() {
-        // **Regression test for CodeRabbit round 2 on PR #399.**
+        // **Regression test for `CodeRabbit` round 2 on PR #399.**
         // A client that sends the 4-byte `RTLX` magic and then
         // stalls without sending the remaining 4 hello bytes used
         // to fall back to the legacy path — which desynced the

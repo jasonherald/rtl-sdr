@@ -48,7 +48,22 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 13
+#define SDR_CORE_ABI_VERSION_MINOR 14
+/*
+ * 0.14 (#391 / PR #402) — breaking change to the rtl_tcp server
+ * surface. `SdrRtlTcpServerStats` layout changed to aggregate-only
+ * counters (per-client session state moved to the new
+ * `SdrRtlTcpClientInfo` struct, fetched via
+ * `sdr_rtltcp_server_client_list`), and
+ * `sdr_rtltcp_server_recent_commands_json` gained a required
+ * `client_id` parameter. Older hosts built against 0.13 MUST fail
+ * fast on the ABI-version check — the new struct is shorter than
+ * the old one, and the new `_recent_commands_json` signature
+ * would silently mis-interpret the `out_buf` pointer as a
+ * `client_id`. Per `CodeRabbit` round 2 on PR #402: we're pre-1.0
+ * so MINOR bumps are breaking by convention on this project;
+ * full semver respect starts at MAJOR >= 1.
+ */
 
 /*
  * Return the ABI version the library was built with, packed as
@@ -863,9 +878,14 @@ typedef struct SdrRtlTcpClientInfo {
     /* true once the client has issued at least one SetGainMode
      * command. */
     bool     has_current_gain_mode;
-    /* Number of entries in this client's recent-commands ring.
-     * Sizes a follow-up _recent_commands_json(client_id, ...)
-     * buffer. */
+    /* Number of entries in this client's recent-commands ring
+     * (an entry count, not a byte count). Useful for UI hints
+     * ("N commands since connect") and for deciding whether a
+     * follow-up sdr_rtltcp_server_recent_commands_json call is
+     * worthwhile; use THAT function's `out_required` size-probe
+     * path to allocate the JSON buffer — length depends on opcode
+     * names and float formatting and isn't a fixed per-entry
+     * byte count. Per `CodeRabbit` round 2 on PR #402. */
     uint32_t recent_commands_count;
 } SdrRtlTcpClientInfo;
 
