@@ -44,6 +44,11 @@ const DEFAULT_MIN_DB: f32 = -70.0;
 /// Default maximum display level in dB.
 const DEFAULT_MAX_DB: f32 = 0.0;
 
+/// Margin (px) between the floating "Reset VFO" overlay button
+/// and the top-right edge of the spectrum area. 8 px is a visual
+/// match with the GNOME Adwaita toast-overlay button inset.
+const VFO_RESET_BUTTON_MARGIN_PX: i32 = 8;
+
 /// Exponential moving average smoothing factor for `RunningAvg` mode.
 const AVERAGING_ALPHA: f32 = 0.3;
 
@@ -432,8 +437,8 @@ pub fn build_spectrum_view(
         .css_classes(["osd", "circular"])
         .halign(gtk4::Align::End)
         .valign(gtk4::Align::Start)
-        .margin_top(8)
-        .margin_end(8)
+        .margin_top(VFO_RESET_BUTTON_MARGIN_PX)
+        .margin_end(VFO_RESET_BUTTON_MARGIN_PX)
         .visible(false)
         .build();
     vfo_reset_button.update_property(&[gtk4::accessible::Property::Label(

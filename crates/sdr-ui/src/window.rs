@@ -524,10 +524,30 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // reflection. No direct widget manipulation that would
     // skip the DSP / scanner-mutex / force-disable machinery.
     let state_for_vfo_reset = Rc::clone(&state);
+    let force_disable_vfo_reset = Rc::clone(&scanner_force_disable);
     spectrum_handle.vfo_reset_button.connect_clicked(move |_| {
+        // Reset is a manual change — stop the scanner first so a
+        // retune on the user's cleaned-up channel doesn't race
+        // with the reset dispatch (same contract every other
+        // manual-change site in `build_window` obeys).
+        force_disable_vfo_reset.trigger("manual VFO reset");
         let mode = state_for_vfo_reset.demod_mode.get();
-        let default_bw = sdr_radio::demod::default_bandwidth_for_mode(mode);
-        state_for_vfo_reset.send_dsp(UiToDsp::SetBandwidth(default_bw));
+        // If the mode default is unresolvable (unreachable for
+        // any current variant), skip the bandwidth reset rather
+        // than dispatching `SetBandwidth(0.0)`; the offset reset
+        // still lands. Error already logged by the helper.
+        match sdr_radio::demod::default_bandwidth_for_mode(mode) {
+            Ok(default_bw) => {
+                state_for_vfo_reset.send_dsp(UiToDsp::SetBandwidth(default_bw));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?mode,
+                    error = %e,
+                    "default_bandwidth_for_mode failed on VFO reset — skipping bandwidth dispatch"
+                );
+            }
+        }
         state_for_vfo_reset.send_dsp(UiToDsp::SetVfoOffset(0.0));
     });
 
@@ -4384,7 +4404,18 @@ const BANDWIDTH_RESET_TOLERANCE_HZ: f64 = 0.5;
 /// issue #341.
 fn update_bandwidth_reset_sensitivity(radio: &sidebar::radio_panel::RadioPanel, state: &AppState) {
     let mode = state.demod_mode.get();
-    let default = sdr_radio::demod::default_bandwidth_for_mode(mode);
+    // Conservative fallback: if we can't resolve the mode's
+    // default (unreachable today — every DemodMode has a valid
+    // ctor), keep the reset button inactive rather than claim
+    // a comparison we can't actually compute.
+    let Ok(default) = sdr_radio::demod::default_bandwidth_for_mode(mode) else {
+        tracing::warn!(
+            ?mode,
+            "default_bandwidth_for_mode failed — disabling bandwidth reset button"
+        );
+        radio.bandwidth_reset_button.set_sensitive(false);
+        return;
+    };
     let current = radio.bandwidth_row.value();
     let at_default = (current - default).abs() < BANDWIDTH_RESET_TOLERANCE_HZ;
     radio.bandwidth_reset_button.set_sensitive(!at_default);
@@ -4404,7 +4435,18 @@ fn update_vfo_reset_button_visibility(
     state: &AppState,
 ) {
     let mode = state.demod_mode.get();
-    let default_bw = sdr_radio::demod::default_bandwidth_for_mode(mode);
+    // Same conservative fallback as `update_bandwidth_reset_sensitivity`
+    // — if we can't resolve the mode's default bandwidth, hide
+    // the button rather than showing it with a broken click
+    // action.
+    let Ok(default_bw) = sdr_radio::demod::default_bandwidth_for_mode(mode) else {
+        tracing::warn!(
+            ?mode,
+            "default_bandwidth_for_mode failed — hiding floating reset button"
+        );
+        spectrum.vfo_reset_button.set_visible(false);
+        return;
+    };
     let current_bw = radio.bandwidth_row.value();
     let bandwidth_at_default = (current_bw - default_bw).abs() < BANDWIDTH_RESET_TOLERANCE_HZ;
     let offset_at_zero = spectrum.vfo_offset_hz().abs() < VFO_OFFSET_RESET_TOLERANCE_HZ;
@@ -4447,13 +4489,29 @@ fn connect_radio_panel(
     // — no direct `set_value` manipulation that would skip the
     // DSP / scanner-mutex / force-disable machinery.
     let state_bw_reset = Rc::clone(state);
+    let force_disable_bw_reset = Rc::clone(scanner_force_disable);
     panels
         .radio
         .bandwidth_reset_button
         .connect_clicked(move |_| {
+            // Reset is a manual change — stop the scanner first
+            // so the cleaned-up bandwidth doesn't race the next
+            // scanner retune. Same contract as the manual
+            // bandwidth-row edit above.
+            force_disable_bw_reset.trigger("manual bandwidth reset");
             let mode = state_bw_reset.demod_mode.get();
-            let default = sdr_radio::demod::default_bandwidth_for_mode(mode);
-            state_bw_reset.send_dsp(UiToDsp::SetBandwidth(default));
+            match sdr_radio::demod::default_bandwidth_for_mode(mode) {
+                Ok(default) => {
+                    state_bw_reset.send_dsp(UiToDsp::SetBandwidth(default));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        ?mode,
+                        error = %e,
+                        "default_bandwidth_for_mode failed on reset click — no dispatch"
+                    );
+                }
+            }
         });
 
     // Squelch enable

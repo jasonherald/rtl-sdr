@@ -1060,6 +1060,21 @@ mod tests {
     }
 
     #[test]
+    fn vfo_offset_changed_is_intentionally_dropped_at_ffi() {
+        // Regression guard for the ABI-v1 "intentionally withheld"
+        // contract. `VfoOffsetChanged` is the VFO-reset feedback
+        // echo (#341) — Linux-only for now; macOS SwiftUI gets it
+        // when the equivalent VFO overlay + reset affordances
+        // land on that side. If a future refactor accidentally
+        // routes this variant through `translate_event`, the
+        // assertion below flips and the ABI change becomes
+        // visible at test time rather than at a downstream host
+        // that suddenly starts receiving an unknown event kind.
+        use sdr_core::DspToUi;
+        assert!(translate_event(&DspToUi::VfoOffsetChanged(25_000.0)).is_none());
+    }
+
+    #[test]
     fn sdr_event_payload_size_is_reasonable() {
         // Sanity check on the union layout. The largest payload
         // today is `SdrEventRtlTcpConnectionState` (kind i32 +
