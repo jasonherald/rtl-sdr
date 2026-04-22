@@ -1502,16 +1502,15 @@ fn connect_sidebar_panels(
     // this *after* `connect_sidebar_panels` finishes the other
     // panel wiring so early construction-time rebuilds (which
     // pre-date the callback) don't dispatch a spurious empty
-    // `UpdateScannerChannels`. The closure holds an `Rc` clone
-    // of `BookmarksPanel` and reads `.bookmarks` at call time —
-    // keeps the projection against the live backing store
-    // without having to capture the `Rc<RefCell<Vec<Bookmark>>>`
-    // separately.
-    // The callback is stored inside `BookmarksPanel.on_mutated`,
-    // so capturing a strong `Rc<BookmarksPanel>` here would close
-    // a retain cycle (panel → on_mutated → closure → panel) and
-    // leak on teardown. Downgrade to `Weak` + upgrade-or-return
-    // inside the closure — same pattern the Save closure uses in
+    // `UpdateScannerChannels`.
+    //
+    // The callback lives inside `BookmarksPanel.on_mutated`, so
+    // capturing a strong `Rc<BookmarksPanel>` would close a
+    // retain cycle (panel → on_mutated → closure → panel) and
+    // leak on teardown. Downgrade to `Weak` and upgrade-or-return
+    // inside the closure — reads `.bookmarks` via the upgraded
+    // handle so the projection still lands against the live
+    // backing store. Same pattern the Save closure uses in
     // `sidebar::build_sidebar`.
     let bookmarks_weak = Rc::downgrade(&panels.bookmarks);
     let state_for_mutated = Rc::clone(state);
