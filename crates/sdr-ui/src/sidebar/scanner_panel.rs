@@ -76,6 +76,28 @@ pub const HANG_STEP_MS: f64 = 100.0;
 /// Hang `SpinRow` page increment (ms).
 pub const HANG_PAGE_MS: f64 = 500.0;
 
+/// Shared parse-fallback-clamp pipeline used by the
+/// default-dwell and default-hang loaders. Pulls a `u64` out of
+/// the config at `key`, narrows to `u32` (silently falling back
+/// to `default` on overflow or missing / non-numeric values),
+/// then clamps into `[min, max]` so an out-of-range persisted
+/// value can't hand the consumer a nonsense number.
+fn load_clamped_u32(
+    config: &Arc<ConfigManager>,
+    key: &str,
+    default: u32,
+    min: u32,
+    max: u32,
+) -> u32 {
+    config.read(|v| {
+        v.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(default)
+            .clamp(min, max)
+    })
+}
+
 /// Load the persisted default-dwell value, or return
 /// [`DEFAULT_DWELL_MS`] if the key is missing or malformed.
 /// Clamps to `[DWELL_MIN_MS, DWELL_MAX_MS]` so a hand-edited
@@ -83,18 +105,17 @@ pub const HANG_PAGE_MS: f64 = 500.0;
 /// a value it can't display.
 #[must_use]
 pub fn load_default_dwell_ms(config: &Arc<ConfigManager>) -> u32 {
-    config.read(|v| {
-        let raw = v
-            .get(CONFIG_KEY_DEFAULT_DWELL_MS)
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(DEFAULT_DWELL_MS);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let min = DWELL_MIN_MS as u32;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let max = DWELL_MAX_MS as u32;
-        raw.clamp(min, max)
-    })
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let min = DWELL_MIN_MS as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let max = DWELL_MAX_MS as u32;
+    load_clamped_u32(
+        config,
+        CONFIG_KEY_DEFAULT_DWELL_MS,
+        DEFAULT_DWELL_MS,
+        min,
+        max,
+    )
 }
 
 /// Persist the default-dwell value.
@@ -110,18 +131,17 @@ pub fn save_default_dwell_ms(config: &Arc<ConfigManager>, ms: u32) {
 /// `load_default_dwell_ms`.
 #[must_use]
 pub fn load_default_hang_ms(config: &Arc<ConfigManager>) -> u32 {
-    config.read(|v| {
-        let raw = v
-            .get(CONFIG_KEY_DEFAULT_HANG_MS)
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(DEFAULT_HANG_MS);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let min = HANG_MIN_MS as u32;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let max = HANG_MAX_MS as u32;
-        raw.clamp(min, max)
-    })
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let min = HANG_MIN_MS as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let max = HANG_MAX_MS as u32;
+    load_clamped_u32(
+        config,
+        CONFIG_KEY_DEFAULT_HANG_MS,
+        DEFAULT_HANG_MS,
+        min,
+        max,
+    )
 }
 
 /// Persist the default-hang value.
@@ -245,5 +265,109 @@ pub fn build_scanner_panel() -> ScannerPanel {
         default_dwell_row,
         default_hang_row,
         lockout_button,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config() -> Arc<ConfigManager> {
+        Arc::new(ConfigManager::in_memory(&serde_json::json!({})))
+    }
+
+    #[test]
+    fn dwell_missing_key_returns_default() {
+        let config = make_config();
+        assert_eq!(load_default_dwell_ms(&config), DEFAULT_DWELL_MS);
+    }
+
+    #[test]
+    fn hang_missing_key_returns_default() {
+        let config = make_config();
+        assert_eq!(load_default_hang_ms(&config), DEFAULT_HANG_MS);
+    }
+
+    #[test]
+    fn dwell_malformed_value_falls_back_to_default() {
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            CONFIG_KEY_DEFAULT_DWELL_MS: "not-a-number",
+        })));
+        assert_eq!(load_default_dwell_ms(&config), DEFAULT_DWELL_MS);
+    }
+
+    #[test]
+    fn hang_malformed_value_falls_back_to_default() {
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            CONFIG_KEY_DEFAULT_HANG_MS: [1, 2, 3],
+        })));
+        assert_eq!(load_default_hang_ms(&config), DEFAULT_HANG_MS);
+    }
+
+    #[test]
+    fn dwell_below_min_clamps_up() {
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            CONFIG_KEY_DEFAULT_DWELL_MS: 1_u64,
+        })));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let min = DWELL_MIN_MS as u32;
+        assert_eq!(load_default_dwell_ms(&config), min);
+    }
+
+    #[test]
+    fn dwell_above_max_clamps_down() {
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            CONFIG_KEY_DEFAULT_DWELL_MS: 999_999_u64,
+        })));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max = DWELL_MAX_MS as u32;
+        assert_eq!(load_default_dwell_ms(&config), max);
+    }
+
+    #[test]
+    fn hang_below_min_clamps_up() {
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            CONFIG_KEY_DEFAULT_HANG_MS: 0_u64,
+        })));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let min = HANG_MIN_MS as u32;
+        assert_eq!(load_default_hang_ms(&config), min);
+    }
+
+    #[test]
+    fn hang_above_max_clamps_down() {
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            CONFIG_KEY_DEFAULT_HANG_MS: 9_999_999_u64,
+        })));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max = HANG_MAX_MS as u32;
+        assert_eq!(load_default_hang_ms(&config), max);
+    }
+
+    #[test]
+    fn dwell_save_then_load_round_trips_in_range_value() {
+        let config = make_config();
+        // 150 is inside [DWELL_MIN_MS, DWELL_MAX_MS] = [50, 500].
+        save_default_dwell_ms(&config, 150);
+        assert_eq!(load_default_dwell_ms(&config), 150);
+    }
+
+    #[test]
+    fn hang_save_then_load_round_trips_in_range_value() {
+        let config = make_config();
+        // 3000 is inside [HANG_MIN_MS, HANG_MAX_MS] = [500, 5000].
+        save_default_hang_ms(&config, 3_000);
+        assert_eq!(load_default_hang_ms(&config), 3_000);
+    }
+
+    #[test]
+    fn u32_overflow_from_u64_falls_back_to_default() {
+        // u32::MAX + 1 survives as u64 but can't narrow to u32,
+        // so the `try_from` guard returns `None` and we fall
+        // back to DEFAULT_DWELL_MS (which then clamps into range).
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            CONFIG_KEY_DEFAULT_DWELL_MS: u64::from(u32::MAX) + 1,
+        })));
+        assert_eq!(load_default_dwell_ms(&config), DEFAULT_DWELL_MS);
     }
 }

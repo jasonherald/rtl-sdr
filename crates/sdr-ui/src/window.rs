@@ -890,6 +890,13 @@ fn handle_dsp_message(
                     demod_dropdown.set_selected(idx);
                 }
                 state.suppress_demod_notify.set(false);
+                // Mode-specific row visibility (WFM stereo,
+                // FM-IF-NR, etc.) is normally driven by the
+                // dropdown's `connect_selected_notify` handler,
+                // which we just suppressed. Call it directly so
+                // the radio panel reflects the scanner's channel
+                // instead of the previous mode's row set.
+                radio_panel.apply_demod_visibility(demod_mode);
                 state.suppress_bandwidth_notify.set(true);
                 radio_panel.bandwidth_row.set_value(bandwidth);
                 state.suppress_bandwidth_notify.set(false);
