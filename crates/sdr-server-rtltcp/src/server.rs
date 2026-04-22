@@ -687,30 +687,45 @@ fn update_stats_on_disconnect(stats: &Arc<Mutex<ServerStats>>) {
 const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Try to read + parse an extended-protocol [`ClientHello`] from
-/// `stream` within [`HELLO_SNIFF_TIMEOUT`]. Returns `Ok(Some)` on
-/// a valid hello (consuming 8 bytes), `Ok(None)` on timeout or
-/// non-`"RTLX"` leading bytes (legacy path; bytes remain in the
-/// receive buffer for the command reader if they were a command),
-/// `Err` on fatal socket state.
+/// `stream` within [`HELLO_SNIFF_TIMEOUT`].
 ///
-/// Uses `peek()` first so non-hello traffic stays intact — a
-/// legacy command starting with an opcode that happens to be
-/// shorter than 8 bytes isn't lost to a partial `read_exact`.
-/// If the magic matches, only then do we commit to consuming
-/// the full 8-byte hello.
+/// Return cases:
+///
+/// - `Ok(Some(hello))` — valid 8-byte hello, fully consumed.
+/// - `Ok(None)` — **only** when the peek returned zero bytes or
+///   timed out before any magic prefix arrived. Safe legacy
+///   fallback: bytes (of which there are none) stay in the
+///   receive buffer and the command reader takes over.
+/// - `Err(_)` — protocol error (drop the client). Covers: any
+///   non-zero peek whose prefix doesn't match [`EXTENSION_MAGIC`]
+///   but that we've nonetheless observed; a `read_exact` timeout
+///   or EOF after the magic already matched (partial-hello); a
+///   parse failure on a fully-received 8-byte block. All of
+///   these would otherwise desync the command stream.
+///
+/// Uses `peek()` first so legitimate legacy traffic (a zero-byte
+/// idle client, or a command whose opcode happens to precede the
+/// magic prefix) stays intact. Once the magic matches we commit
+/// to reading the full 8 bytes; partial reads are fatal because
+/// we can't un-consume the half we already read. Per CodeRabbit
+/// round 2 on PR #399.
 fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHello>> {
     stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
     // Peek the first 4 bytes (magic-only check). `peek` maps to
     // `recv(…, MSG_PEEK)` which respects `SO_RCVTIMEO`, so this
     // returns WouldBlock / TimedOut after the timeout without
     // consuming bytes.
-    let mut peek_buf = [0u8; 4];
+    let mut peek_buf = [0u8; EXTENSION_MAGIC.len()];
     let peeked = match stream.peek(&mut peek_buf) {
         Ok(n) => n,
         Err(e)
             if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut =>
         {
+            // Pure timeout with zero bytes observed — the client
+            // never sent anything, so this is an idle legacy peer
+            // (or a port scanner). Safe to fall back; no bytes
+            // were consumed.
             stream.set_read_timeout(None)?;
             return Ok(None);
         }
@@ -721,26 +736,50 @@ fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHe
             return Err(e);
         }
     };
-    if peeked < 4 || peek_buf[..4] != EXTENSION_MAGIC {
-        // Legacy client — either sent fewer than 4 bytes (most
-        // likely zero; legacy clients idle waiting for
-        // `dongle_info`) or the first bytes aren't the sdr-rs
-        // magic. Either way, leave the bytes in the kernel
-        // buffer for the command reader and return None.
+    if peeked == 0 {
+        // Peer closed cleanly before sending anything. Same
+        // safety as a timeout-with-zero-bytes: no bytes consumed,
+        // nothing to desync.
         stream.set_read_timeout(None)?;
         return Ok(None);
     }
-    // Magic matched — commit to consuming 8 bytes. `read_exact`
-    // may block up to the timeout for the remaining 4 bytes;
-    // if the client sent only 4 bytes and is hanging, we treat
-    // that as a protocol error (return None and fall through).
+    if peeked < EXTENSION_MAGIC.len() || peek_buf[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
+        // Legacy client — either sent fewer than 4 bytes but
+        // something (so we can't tell if they might still be
+        // sending a hello), or the first bytes aren't the
+        // sdr-rs magic. Preserving bytes for the command reader
+        // is only safe when we know they're the start of a
+        // command: a vanilla `SetCenterFreq` starts with 0x01,
+        // no documented opcode begins with 'R' (0x52), so a
+        // mismatch on a full 4-byte peek is a legitimate legacy
+        // command. A short prefix that doesn't match magic is
+        // ambiguous but benign — the command reader will parse
+        // it as a 5-byte command frame and dispatch or log
+        // unknown-opcode.
+        stream.set_read_timeout(None)?;
+        return Ok(None);
+    }
+    // Magic matched — commit to consuming 8 bytes. A timeout or
+    // EOF here is no longer a safe fallback: we've verified the
+    // client started an extended hello and consumed `read_exact`
+    // will have eaten whatever bytes arrived before the stall.
+    // Returning `Ok(None)` would let the legacy path start
+    // against a shifted command stream — exactly the desync
+    // CodeRabbit round 2 flagged. Treat every failure mode as a
+    // protocol error and drop the client.
     let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
     let read_result = stream.read_exact(&mut hello_buf);
     stream.set_read_timeout(None)?;
-    match read_result {
-        Ok(()) => Ok(ClientHello::from_bytes(&hello_buf)),
-        Err(_) => Ok(None),
-    }
+    read_result?;
+    ClientHello::from_bytes(&hello_buf)
+        .map(Some)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTLX magic matched but ClientHello body failed to parse (unknown role or \
+             malformed field)",
+            )
+        })
 }
 
 /// Serve exactly one client. Spawns the three worker threads, waits for
@@ -1404,5 +1443,147 @@ mod tests {
         // DEFAULT_BUFFER_CAPACITY matches upstream's llbuf_num = 500
         // (rtl_tcp.c:61).
         assert_eq!(DEFAULT_BUFFER_CAPACITY, 500);
+    }
+
+    // ============================================================
+    // sniff_client_hello regression tests (CodeRabbit round 2 on PR #399)
+    //
+    // The sniff is the only piece of `handle_client` that can run
+    // without a real RTL-SDR dongle, so unit tests live here.
+    // Each test pairs a server-side accept with a client-side TCP
+    // connect + controlled write pattern, verifying that
+    // `sniff_client_hello` classifies the stream correctly.
+    // ============================================================
+
+    /// Accept one TCP client on a loopback listener and hand the
+    /// accepted socket to `sniff_client_hello`. Factored out so
+    /// each scenario test stays focused on what bytes the client
+    /// writes, not the boilerplate of setting up sockets.
+    fn run_sniff_against<F>(client_behavior: F) -> std::io::Result<Option<ClientHello>>
+    where
+        F: FnOnce(TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_thread = thread::spawn(move || {
+            let client = TcpStream::connect(addr).unwrap();
+            client_behavior(client);
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let result = sniff_client_hello(&server_stream);
+        // Join best-effort — the client thread may legitimately still
+        // be holding the connection open (partial-hello test). Drop
+        // the server side first so any pending write on the client
+        // side unblocks, then join.
+        drop(server_stream);
+        let _ = client_thread.join();
+        result
+    }
+
+    #[test]
+    fn sniff_client_hello_full_hello_parses_correctly() {
+        // Happy path: client sends a complete 8-byte hello, sniff
+        // returns `Ok(Some)` with the parsed struct. Regression
+        // guard against a future refactor breaking the common case.
+        use crate::codec::CodecMask;
+        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, Role};
+        let hello = ClientHello {
+            codec_mask: CodecMask::NONE_AND_LZ4,
+            role: Role::Control,
+            flags: CLIENT_HELLO_FLAGS_NONE,
+            version: PROTOCOL_VERSION,
+        };
+        let bytes = hello.to_bytes();
+        let result = run_sniff_against(move |mut client| {
+            client.write_all(&bytes).unwrap();
+            // Let the server finish reading before the client
+            // stream drops (which would EOF mid-read).
+            thread::sleep(Duration::from_millis(50));
+        });
+        assert_eq!(result.unwrap(), Some(hello));
+    }
+
+    #[test]
+    fn sniff_client_hello_idle_client_returns_legacy_fallback() {
+        // Legacy rtl_tcp client: connects, then idles waiting for
+        // the server's `dongle_info_t`. Zero bytes reach the sniff
+        // before the timeout fires, so `Ok(None)` is the safe
+        // fallback — nothing consumed, no desync risk.
+        let result = run_sniff_against(|client| {
+            // Hold the socket open well past the sniff timeout.
+            thread::sleep(HELLO_SNIFF_TIMEOUT * 3);
+            drop(client);
+        });
+        match result {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) for idle client, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sniff_client_hello_non_magic_prefix_is_legacy_fallback() {
+        // Vanilla client sends a `SetCenterFreq` command
+        // immediately after connect (opcode 0x01 + 4-byte arg).
+        // Peek reads 4 bytes, magic doesn't match, sniff returns
+        // `Ok(None)` without consuming — so the command_worker
+        // reads the full 5-byte frame cleanly.
+        let result = run_sniff_against(|mut client| {
+            // 5-byte vanilla SetCenterFreq command: opcode=0x01,
+            // freq=100_000_000 Hz big-endian.
+            let cmd: [u8; 5] = [0x01, 0x05, 0xF5, 0xE1, 0x00];
+            client.write_all(&cmd).unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+        match result {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) for non-RTLX prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sniff_client_hello_partial_hello_is_protocol_error() {
+        // **Regression test for CodeRabbit round 2 on PR #399.**
+        // A client that sends the 4-byte `RTLX` magic and then
+        // stalls without sending the remaining 4 hello bytes used
+        // to fall back to the legacy path — which desynced the
+        // command stream by 4 bytes (those magic bytes were
+        // already consumed by `read_exact` before it timed out).
+        // The fix promotes partial-hello to `Err` so the client
+        // gets dropped instead.
+        let result = run_sniff_against(|mut client| {
+            // Send magic only; hold the connection open past the
+            // sniff timeout so `read_exact` observes partial data.
+            client.write_all(&EXTENSION_MAGIC).unwrap();
+            thread::sleep(HELLO_SNIFF_TIMEOUT * 5);
+            drop(client);
+        });
+        assert!(
+            result.is_err(),
+            "partial hello (magic only, body stalled) must surface as Err — \
+             got {result:?} which would desync the command stream on fallback"
+        );
+    }
+
+    #[test]
+    fn sniff_client_hello_malformed_body_is_protocol_error() {
+        // Client sends a full 8 bytes starting with `RTLX` but with
+        // an unknown role byte (0x99). Body parses as `None` →
+        // protocol error. Previously returned `Ok(None)` (legacy
+        // fallback on a shifted stream — desync risk).
+        let mut garbled = [0u8; CLIENT_HELLO_LEN];
+        garbled[..EXTENSION_MAGIC.len()].copy_from_slice(&EXTENSION_MAGIC);
+        garbled[4] = 0x03; // codec mask (NONE+LZ4)
+        garbled[5] = 0x99; // invalid role — from_bytes returns None
+        garbled[6] = 0x00; // flags
+        garbled[7] = PROTOCOL_VERSION;
+        let result = run_sniff_against(move |mut client| {
+            client.write_all(&garbled).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        assert!(
+            result.is_err(),
+            "malformed hello body (magic matched, unknown role) must surface as Err — \
+             got {result:?}"
+        );
     }
 }

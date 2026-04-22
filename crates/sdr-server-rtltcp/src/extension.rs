@@ -171,6 +171,13 @@ pub struct ClientHello {
 /// controller if the slot is occupied. Reserved for #393.
 pub const FLAG_REQUEST_TAKEOVER: u8 = 1 << 0;
 
+/// Full [`ClientHello::flags`] value for the "no flags set" case —
+/// the #307 common path, where the client isn't requesting a
+/// takeover and has no other bits to assert. Named constant so
+/// callers don't litter the codebase with bare `0` literals that
+/// silently mean "don't set any flag bit".
+pub const CLIENT_HELLO_FLAGS_NONE: u8 = 0;
+
 impl ClientHello {
     /// Serialize to its 8-byte wire representation.
     #[must_use]

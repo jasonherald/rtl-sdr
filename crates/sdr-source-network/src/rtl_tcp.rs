@@ -47,7 +47,8 @@ use std::time::{Duration, Instant};
 use sdr_pipeline::source_manager::Source;
 use sdr_server_rtltcp::codec::{Codec, CodecMask, Decoder};
 use sdr_server_rtltcp::extension::{
-    ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, SERVER_EXTENSION_LEN, ServerExtension,
+    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role,
+    SERVER_EXTENSION_LEN, ServerExtension, Status,
 };
 use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
 use sdr_types::{Complex, SourceError};
@@ -743,12 +744,12 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
 fn read_server_extension(stream: &TcpStream) -> std::io::Result<ServerExtension> {
     let mut buf = [0u8; SERVER_EXTENSION_LEN];
     <&TcpStream as std::io::Read>::read_exact(&mut &*stream, &mut buf)?;
-    if buf[..4] != EXTENSION_MAGIC {
+    if buf[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "rtl_tcp extension handshake: expected `RTLX` magic after dongle_info_t, got {:02x?}",
-                &buf[..4]
+                &buf[..EXTENSION_MAGIC.len()]
             ),
         ));
     }
@@ -817,7 +818,7 @@ fn attempt_connect(
             // #307 is single-client on the server side; role and
             // flags are reserved for #390's multi-client follow-ups.
             role: Role::Control,
-            flags: 0,
+            flags: CLIENT_HELLO_FLAGS_NONE,
             version: PROTOCOL_VERSION,
         };
         if let Err(e) = (&stream).write_all(&hello.to_bytes()) {
@@ -854,6 +855,22 @@ fn attempt_connect(
     let codec = if extension_enabled {
         match read_server_extension(&stream) {
             Ok(ext) => {
+                // A non-OK status means the server parsed our hello
+                // but rejected the session (ControllerBusy,
+                // AuthRequired, AuthFailed — reserved for #392/#394
+                // but forward-compatible here). Proceeding would
+                // surface as "Connected" in the UI for what is in
+                // fact a denial. Abort so the manager retries (or
+                // the user sees the error), rather than silently
+                // appearing connected. Per CodeRabbit round 2 on
+                // PR #399.
+                if ext.status != Status::Ok {
+                    return Err(SourceError::Protocol(format!(
+                        "rtl_tcp extension rejected by server: status={:?} (wire={})",
+                        ext.status,
+                        ext.status.to_wire()
+                    )));
+                }
                 tracing::info!(
                     codec = %ext.codec,
                     status = ext.status.to_wire(),
