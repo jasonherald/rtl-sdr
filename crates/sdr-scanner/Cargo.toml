@@ -1,0 +1,16 @@
+[package]
+name = "sdr-scanner"
+version = "0.1.0"
+description = "Scanner state machine — sequential channel monitoring for SDR pipelines"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+sdr-dsp.workspace = true
+sdr-radio.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

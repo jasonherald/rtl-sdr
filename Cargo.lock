@@ -2055,6 +2055,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-scanner"
+version = "0.1.0"
+dependencies = [
+ "sdr-dsp",
+ "sdr-radio",
+ "sdr-types",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sdr-server-rtltcp"
 version = "0.1.0"
 dependencies = [
