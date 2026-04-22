@@ -321,7 +321,9 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             buffer_capacity,
             // Compression stays off for the C ABI until the host
             // adds a codec-mask field to `SdrRtlTcpServerConfig`
-            // (issue #307 follow-up). Vanilla clients keep working.
+            // (issue #400 tracks extending the C struct). Vanilla
+            // clients keep working; the Linux GTK path is the only
+            // one that currently offers LZ4.
             compression: CodecMask::NONE_ONLY,
         };
         match Server::start(server_cfg) {

@@ -864,16 +864,22 @@ fn handle_client(
         let _ = reader_handle.join();
         return;
     }
-    // Wrap the writer in the negotiated codec. Legacy clients
-    // get a pass-through (`Codec::None`) so the write path
-    // stays byte-identical to the pre-#307 behavior.
-    let encoded_writer = Encoder::new(negotiated_codec.unwrap_or(Codec::None), writer);
+    // Wrap the socket in the stats-tracking adapter BEFORE the
+    // encoder so `bytes_sent` reflects post-compression bytes
+    // (what actually hit the wire), then wrap in the negotiated
+    // codec. Legacy clients get a pass-through (`Codec::None`),
+    // so the write path stays byte-identical to the pre-#307
+    // behavior — on-wire bytes equal payload bytes in that case.
+    let tracked_writer = StatsTrackingWrite {
+        inner: writer,
+        stats: stats.clone(),
+    };
+    let encoded_writer = Encoder::new(negotiated_codec.unwrap_or(Codec::None), tracked_writer);
     let writer_shutdown = merged_shutdown.clone();
-    let writer_stats = stats.clone();
     let Ok(writer_handle) = thread::Builder::new()
         .name("rtl_tcp-writer".into())
         .spawn(move || {
-            tcp_writer(encoded_writer, rx, writer_shutdown, writer_stats);
+            tcp_writer(encoded_writer, rx, writer_shutdown);
         })
     else {
         tracing::error!("failed to spawn rtl_tcp writer thread — tearing down client");
@@ -1028,17 +1034,53 @@ fn data_worker(
     }
 }
 
+/// `Write` adapter that mirrors the underlying [`TcpStream`] but
+/// updates [`ServerStats::bytes_sent`] with the post-compression
+/// byte count from each successful write. Placed between the
+/// [`Encoder`] and the socket so the stat reflects **on-wire**
+/// throughput instead of pre-compression payload size — otherwise
+/// the server-panel's data-rate row would show raw sample rate
+/// even when LZ4 is active and operators couldn't see whether
+/// compression was actually saving bandwidth.
+///
+/// Per CodeRabbit round 1 on PR #399.
+struct StatsTrackingWrite {
+    inner: TcpStream,
+    stats: Arc<Mutex<ServerStats>>,
+}
+
+impl Write for StatsTrackingWrite {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        // Poisoned mutex only happens if a stats reader panicked
+        // while holding the lock — we'd rather keep streaming and
+        // let the stats drift than tear the session down. Matches
+        // the existing lock-use pattern in data_worker.
+        if let Ok(mut s) = self.stats.lock() {
+            s.bytes_sent = s.bytes_sent.saturating_add(n as u64);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn tcp_writer<W: Write + Send>(
     mut stream: W,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
     shutdown: MergedShutdown,
-    stats: Arc<Mutex<ServerStats>>,
 ) {
     // Write timeout is installed by the caller on the underlying
     // `TcpStream` before wrapping in the codec — see the comment
     // in `handle_client` where the timeout is set up. Putting it
     // here would lose visibility into the inner stream when
     // `stream` is an `Encoder`.
+    //
+    // `bytes_sent` bookkeeping is handled by `StatsTrackingWrite`
+    // one layer below the encoder, so this function no longer
+    // needs a `stats` arg. On-wire counts land there directly.
     //
     // `recv_timeout` lets us notice shutdown even when the USB
     // reader is starving (e.g., dongle unplug).
@@ -1053,8 +1095,21 @@ fn tcp_writer<W: Write + Send>(
                     shutdown.set_client();
                     return;
                 }
-                if let Ok(mut s) = stats.lock() {
-                    s.bytes_sent = s.bytes_sent.saturating_add(buf.len() as u64);
+                // Flush after every chunk so the LZ4 frame encoder
+                // (when active) doesn't hold a partial block in its
+                // internal buffer waiting for the next USB chunk to
+                // fill it out to the 64 KiB frame-block size. On
+                // low-rate streams that buffering adds minutes of
+                // audio latency and can trip the client's stall-
+                // detection timeout. Pass-through `Codec::None`
+                // flushes to `TcpStream::flush()`, which is a no-op
+                // on Linux (writes go direct to the kernel send
+                // buffer), so the legacy path pays nothing. Per
+                // CodeRabbit round 1 on PR #399.
+                if let Err(e) = stream.flush() {
+                    tracing::debug!(%e, "rtl_tcp client socket flush failed, closing");
+                    shutdown.set_client();
+                    return;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {

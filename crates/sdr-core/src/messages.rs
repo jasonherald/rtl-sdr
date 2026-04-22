@@ -482,7 +482,11 @@ mod tests {
         });
         assert!(matches!(
             connected,
-            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connected { gain_count: 29, .. })
+            DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Connected {
+                gain_count: 29,
+                ref codec,
+                ..
+            }) if codec == "None"
         ));
 
         let retrying = DspToUi::RtlTcpConnectionState(RtlTcpConnectionState::Retrying {

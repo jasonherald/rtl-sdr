@@ -174,8 +174,10 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
                 txbuf,
                 // C ABI host has no codec picker yet — advertise
                 // "unknown / legacy" so vanilla clients keep
-                // working unchanged. #307 follow-up will extend
-                // `SdrRtlTcpAdvertiseOptions` with a `codecs` byte.
+                // working unchanged. Issue #400 tracks extending
+                // `SdrRtlTcpAdvertiseOptions` with `has_codecs` +
+                // `codecs` fields so the Swift macOS app can
+                // advertise compression capability.
                 codecs: None,
             },
         };

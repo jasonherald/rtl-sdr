@@ -723,56 +723,41 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
     set_state(&shared, ConnectionState::Disconnected);
 }
 
-/// Try to read + parse the server's 8-byte [`ServerExtension`]
-/// block. The caller invokes this immediately after reading the
-/// legacy 12-byte `dongle_info_t`. Returns `Ok(Some)` on a valid
-/// extension block (consumed), `Ok(None)` when the server didn't
-/// send one (legacy `rtl_tcp`, or our own server with the
-/// negotiated codec being `None` but the hello not seen — the
-/// magic-peek still correctly falls through).
+/// Read the server's 8-byte [`ServerExtension`] block, invoked
+/// immediately after the legacy 12-byte `dongle_info_t`.
 ///
-/// Uses `peek()` so non-extension bytes stay in the TCP receive
-/// buffer for the IQ stream reader: on a legacy server, the
-/// bytes after `dongle_info_t` are raw I/Q samples and the
-/// fallback path must not lose them.
-fn sniff_server_extension(stream: &TcpStream) -> std::io::Result<Option<ServerExtension>> {
-    let mut peek_buf = [0u8; 4];
-    let peeked = match stream.peek(&mut peek_buf) {
-        Ok(n) => n,
-        Err(e)
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
-        {
-            // No bytes in the receive buffer yet — the server
-            // might be a vanilla rtl_tcp that hasn't produced
-            // IQ samples in the intervening microseconds. Treat
-            // as "no extension" and let the data pump block on
-            // its first real IQ read.
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
-    };
-    if peeked < 4 || peek_buf[..4] != EXTENSION_MAGIC {
-        // Vanilla server — no extension block. Peeked bytes
-        // stay in the buffer for the IQ stream reader.
-        return Ok(None);
+/// **Only call this when the client has sent a `ClientHello`.**
+/// Once we've committed to the extended protocol the server is
+/// contractually obligated to respond with an 8-byte block whose
+/// first four bytes are [`EXTENSION_MAGIC`]. This function reads
+/// that block with `read_exact` — not `peek` — so partial TCP
+/// deliveries (magic-only first, body later) can't race us into
+/// parsing zero-padded scratch memory and silently mis-negotiating
+/// as `Codec::None` while the server is actually streaming LZ4.
+///
+/// A short read, a magic mismatch, or a malformed body all surface
+/// as [`std::io::ErrorKind::InvalidData`]; the caller promotes
+/// these to `SourceError::Protocol` and aborts the connection
+/// rather than falling back to a legacy path that would read
+/// compressed bytes as raw I/Q. Per CodeRabbit round 1 on PR #399.
+fn read_server_extension(stream: &TcpStream) -> std::io::Result<ServerExtension> {
+    let mut buf = [0u8; SERVER_EXTENSION_LEN];
+    <&TcpStream as std::io::Read>::read_exact(&mut &*stream, &mut buf)?;
+    if buf[..4] != EXTENSION_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "rtl_tcp extension handshake: expected `RTLX` magic after dongle_info_t, got {:02x?}",
+                &buf[..4]
+            ),
+        ));
     }
-    let mut ext_buf = [0u8; SERVER_EXTENSION_LEN];
-    stream.peek(&mut ext_buf)?;
-    // Only consume the 8 bytes once we've parsed successfully;
-    // a partial server-extension write (magic matched but
-    // payload malformed) leaves the magic bytes in the buffer
-    // and the data pump will fail with a loud protocol error,
-    // which is better than swallowing bytes silently.
-    match ServerExtension::from_bytes(&ext_buf) {
-        Some(ext) => {
-            // Consume the 8 bytes now that parse succeeded.
-            let mut sink = [0u8; SERVER_EXTENSION_LEN];
-            <&TcpStream as std::io::Read>::read_exact(&mut &*stream, &mut sink)?;
-            Ok(Some(ext))
-        }
-        None => Ok(None),
-    }
+    ServerExtension::from_bytes(&buf).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rtl_tcp extension handshake: `RTLX` magic matched but server-extension body failed to parse",
+        )
+    })
 }
 
 /// Outcome of an extended-protocol handshake. `stream` is the
@@ -854,17 +839,21 @@ fn attempt_connect(
         *slot = Some(tuner);
     }
 
-    // Peek for the server's `ServerExtension` block BEFORE publishing
+    // Read the server's `ServerExtension` block BEFORE publishing
     // `Connected` state — the codec is part of the state the UI
     // renders, and landing in `Connected { codec: None }` first and
-    // then updating would cause a subtitle flicker. Only peek when we
-    // sent a hello; otherwise the server can't have replied with an
-    // extension block, and a rogue peek would risk consuming IQ
-    // bytes. Sticks the client to legacy path whenever
-    // `compression = NONE_ONLY`.
+    // then updating would cause a subtitle flicker.
+    //
+    // Only runs when we sent a hello. Once we've committed to the
+    // extended protocol the server MUST respond with an 8-byte block
+    // starting with `RTLX`; any short read, magic mismatch, or
+    // malformed body is a protocol error (not a legacy fallback) —
+    // silently falling back would let a server that picked LZ4
+    // stream compressed bytes into our IQ decoder. Per CodeRabbit
+    // round 1 on PR #399.
     let codec = if extension_enabled {
-        match sniff_server_extension(&stream) {
-            Ok(Some(ext)) => {
+        match read_server_extension(&stream) {
+            Ok(ext) => {
                 tracing::info!(
                     codec = %ext.codec,
                     status = ext.status.to_wire(),
@@ -872,15 +861,10 @@ fn attempt_connect(
                 );
                 ext.codec
             }
-            Ok(None) => {
-                tracing::debug!(
-                    "rtl_tcp server sent no extension block — legacy / uncompressed path"
-                );
-                Codec::None
-            }
             Err(e) => {
-                tracing::warn!(%e, "rtl_tcp extension sniff failed — treating as legacy");
-                Codec::None
+                return Err(SourceError::Protocol(format!(
+                    "rtl_tcp extension handshake failed after sending ClientHello: {e}"
+                )));
             }
         }
     } else {
