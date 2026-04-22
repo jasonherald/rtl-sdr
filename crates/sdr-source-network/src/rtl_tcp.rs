@@ -220,9 +220,12 @@ pub struct RtlTcpConfig {
     /// command-framing boundary), which can cause garbage command
     /// dispatches. The UI / client-side discovery layer should only
     /// flip this bit when it has out-of-band evidence that the
-    /// target server speaks the extension — e.g., mDNS TXT
-    /// advertising `rtlx=1` (future commit), or an explicit
-    /// per-server profile setting.
+    /// target server speaks the extension — the shipped signal is
+    /// the `codecs=` value in the server's mDNS TXT record (see
+    /// `sdr-rtltcp-discovery::TxtRecord::codecs`): `codecs=3`
+    /// means the server advertises both `None` and `Lz4` so it's
+    /// safe to send a hello; an absent or `codecs=1` value means
+    /// legacy-only and we should leave this at `NONE_ONLY`.
     pub compression: sdr_server_rtltcp::codec::CodecMask,
 }
 

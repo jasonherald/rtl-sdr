@@ -192,11 +192,23 @@ impl ClientHello {
     }
 
     /// Parse from its 8-byte wire representation. Returns `None`
-    /// if the magic doesn't match or the role byte is unknown —
-    /// the server falls through to the legacy path in either case.
+    /// if the magic doesn't match, the schema version doesn't
+    /// match [`PROTOCOL_VERSION`], or the role byte is unknown.
+    /// Callers surface `None` as a protocol error and drop the
+    /// client — letting a peer built for a future wire layout
+    /// through would cause silent mis-negotiation rather than a
+    /// clean version break. Per CodeRabbit round 3 on PR #399.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; CLIENT_HELLO_LEN]) -> Option<Self> {
-        if bytes[..4] != EXTENSION_MAGIC {
+        if bytes[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
+            return None;
+        }
+        // Version gate is strict: peers built against a newer
+        // layout must be rejected, not silently parsed as v1.
+        // If we ever bump PROTOCOL_VERSION we'll add a wider
+        // accept-set here (e.g., `matches!(bytes[7], 1 | 2)`)
+        // once both sides of the upgrade have shipped.
+        if bytes[7] != PROTOCOL_VERSION {
             return None;
         }
         let role = Role::from_wire(bytes[5])?;
@@ -251,12 +263,21 @@ impl ServerExtension {
     }
 
     /// Parse from its 8-byte wire representation. Returns `None`
-    /// when the magic doesn't match (client peeked random IQ
-    /// data) or any enum-typed byte is unknown. Callers fall back
-    /// to the legacy uncompressed path on `None`.
+    /// when the magic doesn't match, the schema version doesn't
+    /// match [`PROTOCOL_VERSION`], or any enum-typed byte is
+    /// unknown. Callers surface `None` as a protocol error and
+    /// drop the connection — a peer built for a future wire
+    /// layout should trigger a clean version break rather than
+    /// silent mis-negotiation as v1. Per CodeRabbit round 3 on
+    /// PR #399.
     #[must_use]
     pub fn from_bytes(bytes: &[u8; SERVER_EXTENSION_LEN]) -> Option<Self> {
-        if bytes[..4] != EXTENSION_MAGIC {
+        if bytes[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
+            return None;
+        }
+        // Strict version gate — see the matching comment in
+        // `ClientHello::from_bytes`.
+        if bytes[7] != PROTOCOL_VERSION {
             return None;
         }
         let codec = Codec::from_wire(bytes[4])?;
@@ -316,6 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_rejects_unknown_version() {
+        // Regression test for CodeRabbit round 3 on PR #399: a
+        // future peer that bumps the wire layout must be rejected
+        // so we don't silently mis-negotiate it as v1. Otherwise
+        // `PROTOCOL_VERSION` is dead metadata and a clean protocol
+        // break turns into a subtle runtime bug.
+        let mut bytes = [0u8; CLIENT_HELLO_LEN];
+        bytes[..4].copy_from_slice(&EXTENSION_MAGIC);
+        bytes[4] = CodecMask::NONE_ONLY.to_wire();
+        bytes[5] = Role::Control.to_wire();
+        bytes[6] = 0;
+        bytes[7] = PROTOCOL_VERSION.wrapping_add(1);
+        assert!(ClientHello::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
     fn server_extension_round_trip() {
         let ext = ServerExtension {
             codec: Codec::Lz4,
@@ -352,6 +389,22 @@ mod tests {
         // stay in the TCP read buffer for the next stream read.
         let mut bytes = [0u8; SERVER_EXTENSION_LEN];
         bytes[..4].copy_from_slice(b"\x00\x01\x02\x03"); // unlikely in IQ; arbitrary
+        assert!(ServerExtension::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn server_extension_rejects_unknown_version() {
+        // Same rationale as `client_hello_rejects_unknown_version`
+        // — a newer server's response with an unknown schema
+        // version must cause a clean protocol error at parse time
+        // rather than silently coercing forward-compat fields into
+        // v1 semantics. Per CodeRabbit round 3 on PR #399.
+        let mut bytes = [0u8; SERVER_EXTENSION_LEN];
+        bytes[..4].copy_from_slice(&EXTENSION_MAGIC);
+        bytes[4] = Codec::None.to_wire();
+        bytes[5] = Role::Control.to_wire();
+        bytes[6] = Status::Ok.to_wire();
+        bytes[7] = PROTOCOL_VERSION.wrapping_add(1);
         assert!(ServerExtension::from_bytes(&bytes).is_none());
     }
 

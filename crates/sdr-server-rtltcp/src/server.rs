@@ -692,23 +692,26 @@ const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// Return cases:
 ///
 /// - `Ok(Some(hello))` — valid 8-byte hello, fully consumed.
-/// - `Ok(None)` — **only** when the peek returned zero bytes or
-///   timed out before any magic prefix arrived. Safe legacy
-///   fallback: bytes (of which there are none) stay in the
-///   receive buffer and the command reader takes over.
-/// - `Err(_)` — protocol error (drop the client). Covers: any
+/// - `Ok(None)` — legacy fallback. Reached either on a zero-byte
+///   timeout/EOF (idle client never sent anything) OR on a
 ///   non-zero peek whose prefix doesn't match [`EXTENSION_MAGIC`]
-///   but that we've nonetheless observed; a `read_exact` timeout
-///   or EOF after the magic already matched (partial-hello); a
-///   parse failure on a fully-received 8-byte block. All of
-///   these would otherwise desync the command stream.
+///   (legacy client sent a command; the bytes stay queued in the
+///   receive buffer so `command_worker` can parse the 5-byte
+///   frame). Nothing is consumed in either sub-case.
+/// - `Err(_)` — protocol error, raised only after the magic
+///   already matched and we committed to reading a full 8 bytes.
+///   Covers `read_exact` timeout or EOF mid-hello (partial hello,
+///   bytes already drained from the stream) and parse failure
+///   on a complete 8-byte block (unknown role, unknown protocol
+///   version, etc.). Falling back to legacy from either of these
+///   states would desync the command stream, so the caller drops
+///   the client.
 ///
-/// Uses `peek()` first so legitimate legacy traffic (a zero-byte
-/// idle client, or a command whose opcode happens to precede the
-/// magic prefix) stays intact. Once the magic matches we commit
-/// to reading the full 8 bytes; partial reads are fatal because
-/// we can't un-consume the half we already read. Per CodeRabbit
-/// round 2 on PR #399.
+/// Uses `peek()` for the initial magic check so legitimate legacy
+/// traffic stays intact. Once the magic matches we commit to
+/// reading the full 8 bytes; partial reads are fatal because we
+/// can't un-consume the half we already read. Per CodeRabbit
+/// round 2 on PR #399 (initial fix) + round 3 (doc alignment).
 fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHello>> {
     stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
     // Peek the first 4 bytes (magic-only check). `peek` maps to
