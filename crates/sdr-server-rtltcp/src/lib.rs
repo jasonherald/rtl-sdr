@@ -31,6 +31,7 @@
 pub mod codec;
 pub mod dispatch;
 pub mod error;
+pub mod extension;
 pub mod protocol;
 pub mod server;
 
