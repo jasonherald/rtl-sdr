@@ -201,6 +201,20 @@ pub struct Bookmark {
     /// squelch setting alone."
     #[serde(default)]
     pub voice_squelch_mode: Option<sdr_dsp::voice_squelch::VoiceSquelchMode>,
+    /// Include in scanner rotation. Default false so existing
+    /// bookmarks don't start getting scanned without opt-in.
+    #[serde(default)]
+    pub scan_enabled: bool,
+    /// Priority tier. 0 = normal, 1 = priority (checked more
+    /// often). Higher tiers reserved for future phases.
+    #[serde(default)]
+    pub priority: u8,
+    /// Per-channel dwell override in ms. None → scanner default.
+    #[serde(default)]
+    pub dwell_ms_override: Option<u32>,
+    /// Per-channel hang override in ms. None → scanner default.
+    #[serde(default)]
+    pub hang_ms_override: Option<u32>,
 }
 
 impl Bookmark {
@@ -229,6 +243,10 @@ impl Bookmark {
             ctcss_mode: None,
             ctcss_threshold: None,
             voice_squelch_mode: None,
+            scan_enabled: false,
+            priority: 0,
+            dwell_ms_override: None,
+            hang_ms_override: None,
         }
     }
 
@@ -274,6 +292,10 @@ impl Bookmark {
             ctcss_mode: profile.ctcss_mode,
             ctcss_threshold: profile.ctcss_threshold,
             voice_squelch_mode: profile.voice_squelch_mode,
+            scan_enabled: false,
+            priority: 0,
+            dwell_ms_override: None,
+            hang_ms_override: None,
         }
     }
 
@@ -1138,5 +1160,31 @@ mod tests {
         assert!(bookmark_matches_filter(&bm, "dispatch"));
         assert!(bookmark_matches_filter(&bm, "law"));
         assert!(!bookmark_matches_filter(&bm, "fire"));
+    }
+
+    #[test]
+    fn bookmark_scanner_fields_default_on_old_json() {
+        // Old pre-scanner bookmark JSON (no scanner fields present).
+        let old_json = r#"{"name":"Old","frequency":162550000,"demod_mode":"NFM","bandwidth":12500.0}"#;
+        let bm: Bookmark = serde_json::from_str(old_json).unwrap();
+        assert!(!bm.scan_enabled);
+        assert_eq!(bm.priority, 0);
+        assert!(bm.dwell_ms_override.is_none());
+        assert!(bm.hang_ms_override.is_none());
+    }
+
+    #[test]
+    fn bookmark_scanner_fields_roundtrip() {
+        let mut bm = Bookmark::new("Test", 146_520_000, DemodMode::Nfm, 12_500.0);
+        bm.scan_enabled = true;
+        bm.priority = 1;
+        bm.dwell_ms_override = Some(200);
+        bm.hang_ms_override = Some(3000);
+        let json = serde_json::to_string(&bm).unwrap();
+        let back: Bookmark = serde_json::from_str(&json).unwrap();
+        assert!(back.scan_enabled);
+        assert_eq!(back.priority, 1);
+        assert_eq!(back.dwell_ms_override, Some(200));
+        assert_eq!(back.hang_ms_override, Some(3000));
     }
 }

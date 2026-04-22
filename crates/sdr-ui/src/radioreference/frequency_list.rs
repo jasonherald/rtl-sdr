@@ -281,6 +281,10 @@ mod tests {
             ctcss_mode: None,
             ctcss_threshold: None,
             voice_squelch_mode: None,
+            scan_enabled: false,
+            priority: 0,
+            dwell_ms_override: None,
+            hang_ms_override: None,
         };
 
         let freq = sample_freq("42", 999_999_999, "FM", "test");
@@ -312,6 +316,10 @@ mod tests {
             ctcss_mode: None,
             ctcss_threshold: None,
             voice_squelch_mode: None,
+            scan_enabled: false,
+            priority: 0,
+            dwell_ms_override: None,
+            hang_ms_override: None,
         };
 
         let freq = sample_freq("99", 155_000_000, "FM", "test");
@@ -343,6 +351,10 @@ mod tests {
             ctcss_mode: None,
             ctcss_threshold: None,
             voice_squelch_mode: None,
+            scan_enabled: false,
+            priority: 0,
+            dwell_ms_override: None,
+            hang_ms_override: None,
         };
 
         let freq = sample_freq("99", 155_000_000, "FM", "test");
