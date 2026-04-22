@@ -933,6 +933,44 @@ mod tests {
     /// Device index = 0 matches the first attached dongle.
     const TEST_DEVICE_INDEX: u32 = 0;
 
+    // ------------------------------------------------------------
+    // `ClientInfo` fixture constants (`CodeRabbit` round 4 on
+    // PR #402). Extracted so the multi-client ABI tests stay
+    // declarative and future per-client assertions inherit the
+    // same values.
+    // ------------------------------------------------------------
+
+    /// Stable test `ClientId`. Arbitrary non-zero — the registry
+    /// allocates ids starting at 0, so a mid-range value here
+    /// proves the FFI path isn't accidentally hard-coding the
+    /// first-slot assumption.
+    const TEST_CLIENT_ID: u64 = 42;
+    /// Peer port for the gain-validity test — high ephemeral
+    /// range so it doesn't collide with anything real, and
+    /// disjoint from `TEST_CLIENT_PEER_ADDR_PORT` below.
+    const TEST_CLIENT_GAIN_PEER_PORT: u16 = 50_100;
+    /// Peer port + full IP for the NUL-termination test. Uses a
+    /// private-range IP to match typical LAN-server scenarios so
+    /// the packed peer string reads like a real deployment.
+    const TEST_CLIENT_PEER_IP: [u8; 4] = [192, 168, 1, 100];
+    const TEST_CLIENT_PEER_PORT: u16 = 1234;
+    /// Synthetic per-client `bytes_sent` used by the gain test
+    /// so the `client_info_to_c` readback confirms the counter
+    /// propagated through the projection.
+    const TEST_CLIENT_BYTES_SENT: u64 = 9_999;
+    /// Synthetic per-client `buffers_dropped` — non-zero so it
+    /// can't pass from a zero-initialized struct by accident.
+    const TEST_CLIENT_BUFFERS_DROPPED: u64 = 1;
+    /// JSON serialization test: how many seconds back in time
+    /// to place the second `recent_commands` entry so the
+    /// `"seconds_ago"` field has a non-trivial value.
+    const TEST_COMMAND_AGE_SECS: u64 = 3;
+    /// Peer port for the JSON serialization tests' synthetic
+    /// `ClientInfo` — arbitrary, just needs to differ from the
+    /// other fixture ports so a cross-test regression pins to
+    /// the right test.
+    const TEST_CLIENT_JSON_PEER_PORT: u16 = 50_200;
+
     /// Build a happy-path `SdrRtlTcpServerConfig`. Tests tweak
     /// a single field to target one validation branch at a
     /// time — that way a future schema addition lands in one
@@ -1123,12 +1161,12 @@ mod tests {
         // now preserved per-client.
         use sdr_server_rtltcp::codec::Codec;
         let mut info = ClientInfo {
-            id: 42,
-            peer: SocketAddr::from(([127, 0, 0, 1], 50_100)),
+            id: TEST_CLIENT_ID,
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::Lz4,
-            bytes_sent: 9_999,
-            buffers_dropped: 1,
+            bytes_sent: TEST_CLIENT_BYTES_SENT,
+            buffers_dropped: TEST_CLIENT_BUFFERS_DROPPED,
             last_command: None,
             current_freq_hz: None,
             current_sample_rate_hz: None,
@@ -1141,8 +1179,8 @@ mod tests {
         let c = client_info_to_c(&info);
         assert!(!c.has_current_gain_value);
         assert!(!c.has_current_gain_mode);
-        assert_eq!(c.id, 42);
-        assert_eq!(c.bytes_sent, 9_999);
+        assert_eq!(c.id, TEST_CLIENT_ID);
+        assert_eq!(c.bytes_sent, TEST_CLIENT_BYTES_SENT);
         assert_eq!(c.codec, 1); // LZ4 wire value
 
         // (Some(v), None) → value set, mode unknown
@@ -1180,7 +1218,7 @@ mod tests {
         use sdr_server_rtltcp::codec::Codec;
         let info = ClientInfo {
             id: 1,
-            peer: SocketAddr::from(([192, 168, 1, 100], 1234)),
+            peer: SocketAddr::from((TEST_CLIENT_PEER_IP, TEST_CLIENT_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
             bytes_sent: 0,
@@ -1243,7 +1281,7 @@ mod tests {
         use sdr_server_rtltcp::codec::Codec;
         ClientInfo {
             id: 1,
-            peer: SocketAddr::from(([127, 0, 0, 1], 50_200)),
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_JSON_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
             bytes_sent: 0,
@@ -1272,7 +1310,7 @@ mod tests {
         info.recent_commands.push_back((
             CommandOp::SetBiasTee,
             std::time::Instant::now()
-                .checked_sub(Duration::from_secs(3))
+                .checked_sub(Duration::from_secs(TEST_COMMAND_AGE_SECS))
                 .expect("Instant::now - 3s is representable"),
         ));
         let json = recent_commands_to_json(&info).expect("serialize populated ring");
@@ -1282,6 +1320,14 @@ mod tests {
         assert_eq!(arr[0]["op"], "SetCenterFreq");
         assert_eq!(arr[1]["op"], "SetBiasTee");
         let seconds_ago = arr[1]["seconds_ago"].as_f64().unwrap();
-        assert!(seconds_ago >= 3.0, "expected >=3s, got {seconds_ago}");
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "seconds count fits in f64 mantissa"
+        )]
+        let min_seconds_ago = TEST_COMMAND_AGE_SECS as f64;
+        assert!(
+            seconds_ago >= min_seconds_ago,
+            "expected >={min_seconds_ago}s, got {seconds_ago}"
+        );
     }
 }

@@ -618,10 +618,17 @@ fn spawn_accept_thread(
                 }
             }
             // Mark stopped AFTER the loop exits so callers polling
-            // `has_stopped()` observe the server is fully done. The
-            // broadcaster thread is joined by `Server::drop` — we
-            // don't wait for it here because `Server` owns that
-            // handle.
+            // `has_stopped()` observe that the accept thread is
+            // gone. **Narrow semantic** — this flag is set before
+            // `join_all_threads()` runs in `stop()` / `Drop`, so
+            // the broadcaster + per-client workers may still be
+            // running (and still holding the device mutex) when
+            // `has_stopped()` first returns true. Callers that
+            // need "dongle is actually free" must wait for
+            // `stop()` / `Drop` to return — the CLI's
+            // `while !has_stopped() ...; drop(server)` pattern
+            // does exactly that. Per `CodeRabbit` round 4 on
+            // PR #402 (comment clarity; no behavior change).
             stopped.store(true, Ordering::SeqCst);
             tracing::debug!("rtl_tcp accept thread exiting");
         })
@@ -1263,6 +1270,43 @@ fn read_full(
 mod tests {
     use super::*;
 
+    // ============================================================
+    // Test fixture constants (CodeRabbit round 4 on PR #402).
+    // Extracted so each test's intent reads at a glance —
+    // `42_001` on its own is noise, `TEST_CLIENT_A_PORT` plus a
+    // bounds docstring is self-documenting.
+    // ============================================================
+
+    /// Loopback peer port for the "client A" side of two-client
+    /// fixtures. Non-privileged, doesn't overlap with anything
+    /// well-known, and disjoint from `TEST_CLIENT_B_PORT`.
+    const TEST_CLIENT_A_PORT: u16 = 42_001;
+    /// Loopback peer port for "client B". Disjoint from
+    /// `TEST_CLIENT_A_PORT` so snapshot assertions can verify
+    /// ordering / identity.
+    const TEST_CLIENT_B_PORT: u16 = 42_002;
+    /// Small per-client channel depth used by tests that don't
+    /// exercise the full/drop path — just needs to fit the few
+    /// chunks a test sends. Anything ≥ the chunk count is fine.
+    const TEST_CLIENT_CHANNEL_DEPTH: usize = 4;
+    /// Synthetic `bytes_sent` value for client A's stats —
+    /// arbitrary small number, just has to differ from B's value
+    /// so the per-client readback assertions prove the right
+    /// entry landed in `connected_clients[0]`.
+    const TEST_CLIENT_A_BYTES: u64 = 100;
+    /// Synthetic `bytes_sent` value for client B. Differs from
+    /// A's by an order of magnitude so a cross-over bug stands out.
+    const TEST_CLIENT_B_BYTES: u64 = 999;
+    /// 2-meter amateur band frequency (145.5 MHz) stamped into
+    /// client A's `current_freq_hz` — stand-in for "non-default
+    /// freq client A commanded".
+    const TEST_CLIENT_A_FREQ_HZ: u32 = 145_500_000;
+    /// WFM broadcast band frequency (100 MHz) stamped into
+    /// client B's `current_freq_hz`. Second distinct sample so
+    /// cross-client bugs show up as the wrong freq under
+    /// `connected_clients[1]`.
+    const TEST_CLIENT_B_FREQ_HZ: u32 = 100_000_000;
+
     #[test]
     fn start_surfaces_port_conflict_as_typed_error() {
         // Hold a port before calling Server::start — the second bind must
@@ -1365,25 +1409,25 @@ mod tests {
 
         let (slot_a, _rx_a) = ClientSlot::new(
             registry.allocate_id(),
-            SocketAddr::from(([127, 0, 0, 1], 42_001)),
+            SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_A_PORT)),
             Codec::None,
-            4,
+            TEST_CLIENT_CHANNEL_DEPTH,
         );
         if let Ok(mut s) = slot_a.stats.lock() {
-            s.bytes_sent = 100;
-            s.current_freq_hz = Some(145_500_000);
+            s.bytes_sent = TEST_CLIENT_A_BYTES;
+            s.current_freq_hz = Some(TEST_CLIENT_A_FREQ_HZ);
         }
         registry.register(slot_a);
 
         let (slot_b, _rx_b) = ClientSlot::new(
             registry.allocate_id(),
-            SocketAddr::from(([127, 0, 0, 1], 42_002)),
+            SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_B_PORT)),
             Codec::Lz4,
-            4,
+            TEST_CLIENT_CHANNEL_DEPTH,
         );
         if let Ok(mut s) = slot_b.stats.lock() {
-            s.bytes_sent = 999;
-            s.current_freq_hz = Some(100_000_000);
+            s.bytes_sent = TEST_CLIENT_B_BYTES;
+            s.current_freq_hz = Some(TEST_CLIENT_B_FREQ_HZ);
         }
         registry.register(slot_b);
 
@@ -1401,12 +1445,12 @@ mod tests {
         assert_eq!(stats.connected_clients.len(), 2);
         assert_eq!(
             stats.connected_clients[0].peer,
-            SocketAddr::from(([127, 0, 0, 1], 42_001))
+            SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_A_PORT))
         );
-        assert_eq!(stats.connected_clients[0].bytes_sent, 100);
+        assert_eq!(stats.connected_clients[0].bytes_sent, TEST_CLIENT_A_BYTES);
         assert_eq!(
             stats.connected_clients[1].peer,
-            SocketAddr::from(([127, 0, 0, 1], 42_002))
+            SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_B_PORT))
         );
         assert_eq!(stats.connected_clients[1].codec, Codec::Lz4);
         assert_eq!(stats.lifetime_accepted, 2);

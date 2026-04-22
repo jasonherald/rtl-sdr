@@ -23,13 +23,21 @@
  *     observed the error code.
  *
  * ABI versioning:
- *   - Minor bump = additive (new function, new event variant, new
- *     error code). Old hosts keep working; they just don't see new
- *     things.
- *   - Major bump = breaking (signature change, struct layout, etc.).
- *     Old hosts must fail to start against a newer library.
- *   - Hosts should call `sdr_core_abi_version()` once at startup and
- *     abort cleanly on a major mismatch.
+ *   - While `SDR_CORE_ABI_VERSION_MAJOR == 0` (pre-1.0), BOTH
+ *     major AND minor bumps may be breaking. Hosts must require an
+ *     exact `(major, minor)` match at startup and refuse to run
+ *     against any other combination. This project doesn't yet
+ *     commit to additive-only minors — the rtl_tcp server surface
+ *     was reshaped in 0.14, for example, which would have been
+ *     silent UB against a 0.13 host if MINOR were treated as
+ *     additive.
+ *   - Once `SDR_CORE_ABI_VERSION_MAJOR >= 1` the standard SemVer
+ *     rules apply: MINOR is additive (new functions / event
+ *     variants / error codes; old hosts keep working), MAJOR is
+ *     breaking.
+ *   - Hosts should call `sdr_core_abi_version()` once at startup.
+ *     In pre-1.0 builds, abort on any mismatch; in 1.x+ builds,
+ *     abort only on MAJOR mismatch.
  */
 
 #ifndef SDR_CORE_H
@@ -68,8 +76,10 @@ extern "C" {
 /*
  * Return the ABI version the library was built with, packed as
  * `(major << 16) | minor`. Hosts call this once at startup and
- * abort (or show a "library mismatch" dialog) on a major mismatch
- * against what they were compiled against.
+ * abort (or show a "library mismatch" dialog) on any mismatch.
+ * See the "ABI versioning" block above for the pre-1.0 vs 1.x+
+ * match rules — pre-1.0 requires an exact `(major, minor)` match,
+ * 1.x+ allows MINOR drift but not MAJOR.
  */
 uint32_t sdr_core_abi_version(void);
 
