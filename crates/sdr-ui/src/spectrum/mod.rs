@@ -245,9 +245,21 @@ impl SpectrumHandle {
     }
 
     /// Update the tuner center frequency for frequency axis labels.
+    ///
+    /// Also resets the VFO overlay offset to 0 so the passband rectangle
+    /// tracks the new center. Every caller that sets the tuner center
+    /// is placing the tuner ON a specific channel (manual header tune,
+    /// click-to-tune, bookmark recall, preset, scanner retune), so the
+    /// VFO's offset-from-center should be zero afterwards. Without this
+    /// reset the rectangle would stick at the previous center-relative
+    /// offset — visually drifting across the waterfall as center moves,
+    /// even though the tuner is centered on the new frequency. Per
+    /// issue #376.
     pub fn set_center_frequency(&self, freq_hz: f64) {
         self.center_freq.set(freq_hz);
+        self.vfo_state.borrow_mut().offset_hz = 0.0;
         self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
     }
 
     /// Push a signal level sample (in dB) into the history graph.
