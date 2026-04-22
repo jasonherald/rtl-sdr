@@ -15,6 +15,23 @@ pub enum WhisperModel {
     SmallEn,
     MediumEn,
     LargeV3,
+    /// Large v3 turbo — distilled-decoder variant of `LargeV3`.
+    /// Roughly half the disk footprint (~1.6 GB vs 3.1 GB) and
+    /// ~8× faster inference for near-`LargeV3` English accuracy.
+    /// Fills the "medium is too weak, large-v3 is too slow" gap.
+    ///
+    /// Appended at the end of [`Self::ALL`] rather than inserted
+    /// between `MediumEn` and `LargeV3` because the UI persists
+    /// the user's model choice as an index into `ALL`; inserting
+    /// mid-list would silently upgrade every existing `LargeV3`
+    /// user to turbo on next launch. Order follows stability
+    /// over aesthetics.
+    ///
+    /// Naming follows the upstream ggerganov filename
+    /// (`ggml-large-v3-turbo.bin`, no `.en` suffix — turbo is
+    /// English-focused by design rather than being an `.en`
+    /// fine-tune of multilingual weights).
+    LargeV3Turbo,
 }
 
 impl WhisperModel {
@@ -26,6 +43,7 @@ impl WhisperModel {
             Self::SmallEn => "ggml-small.en.bin",
             Self::MediumEn => "ggml-medium.en.bin",
             Self::LargeV3 => "ggml-large-v3.bin",
+            Self::LargeV3Turbo => "ggml-large-v3-turbo.bin",
         }
     }
 
@@ -42,16 +60,21 @@ impl WhisperModel {
             Self::SmallEn => "Small — 466 MB",
             Self::MediumEn => "Medium — 1.5 GB (GPU)",
             Self::LargeV3 => "Large v3 — 3.1 GB (GPU)",
+            Self::LargeV3Turbo => "Large v3 Turbo — 1.6 GB (GPU, ~8× faster than Large v3)",
         }
     }
 
-    /// All available variants in order.
+    /// All available variants in order. Append-only by contract —
+    /// the UI persists the user's model choice as an index into
+    /// this slice, so reordering or inserting mid-list would
+    /// silently remap every existing user's selection.
     pub const ALL: &[Self] = &[
         Self::TinyEn,
         Self::BaseEn,
         Self::SmallEn,
         Self::MediumEn,
         Self::LargeV3,
+        Self::LargeV3Turbo,
     ];
 }
 
@@ -167,5 +190,40 @@ mod tests {
         for model in WhisperModel::ALL {
             assert!(model.url().contains(model.filename()));
         }
+    }
+
+    #[test]
+    fn large_v3_turbo_filename_matches_upstream() {
+        // Upstream ggerganov HF filename pin — deliberate literal
+        // test rather than deriving from the enum, so a future
+        // edit that accidentally changes the filename fails here
+        // rather than silently breaking every user's download.
+        assert_eq!(
+            WhisperModel::LargeV3Turbo.filename(),
+            "ggml-large-v3-turbo.bin"
+        );
+        assert!(
+            WhisperModel::LargeV3Turbo
+                .url()
+                .ends_with("ggml-large-v3-turbo.bin"),
+            "url must resolve to the canonical turbo filename"
+        );
+    }
+
+    #[test]
+    fn all_models_preserves_legacy_indices() {
+        // Persistence contract: `ALL` is append-only. The UI
+        // stores the user's model choice as an index into this
+        // slice, so reordering or inserting mid-list would
+        // silently change existing users' selections on next
+        // launch. Pinning the leading indices here catches any
+        // accidental reordering.
+        let models = WhisperModel::ALL;
+        assert_eq!(models[0], WhisperModel::TinyEn);
+        assert_eq!(models[1], WhisperModel::BaseEn);
+        assert_eq!(models[2], WhisperModel::SmallEn);
+        assert_eq!(models[3], WhisperModel::MediumEn);
+        assert_eq!(models[4], WhisperModel::LargeV3);
+        assert_eq!(models[5], WhisperModel::LargeV3Turbo);
     }
 }
