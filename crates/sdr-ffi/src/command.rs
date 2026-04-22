@@ -277,32 +277,6 @@ pub unsafe extern "C" fn sdr_core_set_gain(handle: *mut SdrCore, gain_db: f64) -
     }
 }
 
-/// Enable or disable tuner AGC.
-///
-/// Legacy two-state setter preserved for backward-compat with
-/// hosts that don't need the tristate selector. Forwards to the
-/// `sdr_core_set_agc_type` semantics so the engine's single-
-/// loop-on policy is preserved: `true` maps to
-/// `SDR_AGC_HARDWARE` (tuner on, software off), `false` maps to
-/// `SDR_AGC_OFF` (both loops off). A pre-0.13 host dropping to
-/// `false` after software AGC had been enabled elsewhere still
-/// gets a true "manual gain, no AGC" state. Per `CodeRabbit`
-/// round 1 on PR #371 and issue #357.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn sdr_core_set_agc(handle: *mut SdrCore, enabled: bool) -> i32 {
-    unsafe {
-        with_core(handle, |core| {
-            if enabled {
-                send(core, UiToDsp::SetAgc(true))
-                    .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false)))
-            } else {
-                send(core, UiToDsp::SetAgc(false))
-                    .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false)))
-            }
-        })
-    }
-}
-
 // --- AGC type selector (#357, ABI 0.13) -------------------
 //
 // Discriminants mirror `SdrAgcType` in `include/sdr_core.h`.
@@ -320,6 +294,57 @@ pub const SDR_AGC_HARDWARE: i32 = 1;
 /// hardware at the cost of CPU. Default on fresh installs.
 pub const SDR_AGC_SOFTWARE: i32 = 2;
 
+/// Shared AGC-policy dispatch — the single source of truth
+/// for which pair of `UiToDsp::SetAgc` + `UiToDsp::SetSoftwareAgc`
+/// commands maps to each tristate value. Both the legacy
+/// `sdr_core_set_agc(bool)` shim and the modern
+/// `sdr_core_set_agc_type(i32)` call through here so a future
+/// policy change (e.g. allowing both loops on) only needs to be
+/// written once. Per `CodeRabbit` round 2 on PR #371.
+///
+/// Returns `Err(InvalidArg)` on an unknown `agc_type` and sets
+/// the last-error message. Caller is responsible for not
+/// passing a tristate value that isn't one of the `SDR_AGC_*`
+/// constants.
+fn send_agc_policy(core: &SdrCore, agc_type: i32) -> Result<(), SdrCoreError> {
+    match agc_type {
+        SDR_AGC_OFF => send(core, UiToDsp::SetAgc(false))
+            .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false))),
+        SDR_AGC_HARDWARE => send(core, UiToDsp::SetAgc(true))
+            .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false))),
+        SDR_AGC_SOFTWARE => send(core, UiToDsp::SetAgc(false))
+            .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(true))),
+        _ => {
+            set_last_error(format!(
+                "sdr_core_set_agc_type: invalid type {agc_type} \
+                 (expected {SDR_AGC_OFF}..={SDR_AGC_SOFTWARE})"
+            ));
+            Err(SdrCoreError::InvalidArg)
+        }
+    }
+}
+
+/// Enable or disable tuner AGC.
+///
+/// Legacy two-state setter preserved for backward-compat with
+/// hosts that don't need the tristate selector. Forwards to the
+/// `sdr_core_set_agc_type` semantics via the shared
+/// `send_agc_policy` helper: `true` → `SDR_AGC_HARDWARE`
+/// (tuner on, software off), `false` → `SDR_AGC_OFF` (both off).
+/// A pre-0.13 host dropping to `false` after software AGC had
+/// been enabled elsewhere still gets a true "manual gain, no
+/// AGC" state. Per `CodeRabbit` round 1 on PR #371 and issue
+/// #357.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_agc(handle: *mut SdrCore, enabled: bool) -> i32 {
+    let agc_type = if enabled {
+        SDR_AGC_HARDWARE
+    } else {
+        SDR_AGC_OFF
+    };
+    unsafe { with_core(handle, |core| send_agc_policy(core, agc_type)) }
+}
+
 /// Set the active AGC type. Dispatches both the hardware
 /// (`UiToDsp::SetAgc`) and software (`UiToDsp::SetSoftwareAgc`)
 /// variants in one call — the two loops are mutually exclusive
@@ -331,23 +356,7 @@ pub const SDR_AGC_SOFTWARE: i32 = 2;
 /// issue #357 (ABI 0.13).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_set_agc_type(handle: *mut SdrCore, agc_type: i32) -> i32 {
-    unsafe {
-        with_core(handle, |core| match agc_type {
-            SDR_AGC_OFF => send(core, UiToDsp::SetAgc(false))
-                .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false))),
-            SDR_AGC_HARDWARE => send(core, UiToDsp::SetAgc(true))
-                .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false))),
-            SDR_AGC_SOFTWARE => send(core, UiToDsp::SetAgc(false))
-                .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(true))),
-            _ => {
-                set_last_error(format!(
-                    "sdr_core_set_agc_type: invalid type {agc_type} \
-                     (expected {SDR_AGC_OFF}..={SDR_AGC_SOFTWARE})"
-                ));
-                Err(SdrCoreError::InvalidArg)
-            }
-        })
-    }
+    unsafe { with_core(handle, |core| send_agc_policy(core, agc_type)) }
 }
 
 // ============================================================
@@ -2103,6 +2112,31 @@ mod tests {
     // ------------------------------------------------------
     //  AGC type selector (#357, ABI 0.13)
     // ------------------------------------------------------
+
+    // Legacy bool entry point — pins the tristate-forwarding
+    // semantics so a future refactor can't silently break
+    // pre-0.13 hosts. Per `CodeRabbit` round 2 on PR #371.
+    #[test]
+    fn set_agc_legacy_bool_round_trips() {
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_set_agc(h, true) },
+            SdrCoreError::Ok.as_int()
+        );
+        assert_eq!(
+            unsafe { sdr_core_set_agc(h, false) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn set_agc_legacy_bool_rejects_null_handle() {
+        assert_eq!(
+            unsafe { sdr_core_set_agc(std::ptr::null_mut(), false) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+    }
 
     #[test]
     fn set_agc_type_accepts_valid_variants() {
