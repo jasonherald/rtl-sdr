@@ -1165,7 +1165,8 @@ mod tests {
     #[test]
     fn bookmark_scanner_fields_default_on_old_json() {
         // Old pre-scanner bookmark JSON (no scanner fields present).
-        let old_json = r#"{"name":"Old","frequency":162550000,"demod_mode":"NFM","bandwidth":12500.0}"#;
+        let old_json =
+            r#"{"name":"Old","frequency":162550000,"demod_mode":"NFM","bandwidth":12500.0}"#;
         let bm: Bookmark = serde_json::from_str(old_json).unwrap();
         assert!(!bm.scan_enabled);
         assert_eq!(bm.priority, 0);

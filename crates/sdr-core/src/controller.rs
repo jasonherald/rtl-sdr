@@ -1666,8 +1666,7 @@ fn apply_scanner_commands(
                 // CTCSS is per-channel: force-Off when the new
                 // channel doesn't carry a tone, otherwise stale
                 // tone gates would silence the new channel.
-                let ctcss_mode = ctcss
-                    .unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
+                let ctcss_mode = ctcss.unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
                 if let Err(e) = state.radio.set_ctcss_mode(ctcss_mode) {
                     tracing::warn!(?e, "scanner retune: set_ctcss_mode failed");
                 }
@@ -1703,13 +1702,9 @@ fn emit_scanner_active_channel(
     dsp_tx: &mpsc::Sender<DspToUi>,
     key: Option<sdr_scanner::ChannelKey>,
 ) {
-    let channel = key.as_ref().and_then(|k| {
-        state
-            .scanner_channels
-            .iter()
-            .find(|c| c.key == *k)
-            .cloned()
-    });
+    let channel = key
+        .as_ref()
+        .and_then(|k| state.scanner_channels.iter().find(|c| c.key == *k).cloned());
     let msg = DspToUi::ScannerActiveChannelChanged {
         freq_hz: channel.as_ref().map_or(0, |c| c.key.frequency_hz),
         demod_mode: channel
@@ -2083,9 +2078,9 @@ fn process_iq_block(
                             } else {
                                 sdr_scanner::SquelchState::Closed
                             };
-                            let scan_cmds = state.scanner.handle_event(
-                                sdr_scanner::ScannerEvent::SquelchEdge(scanner_edge),
-                            );
+                            let scan_cmds = state
+                                .scanner
+                                .handle_event(sdr_scanner::ScannerEvent::SquelchEdge(scanner_edge));
                             apply_scanner_commands(state, dsp_tx, scan_cmds);
                         }
 
@@ -2259,8 +2254,7 @@ fn process_iq_block(
                         // No allocation per block; `slice.fill` overwrites
                         // existing contents.
                         if state.scanner_muted {
-                            state.audio_buf[..audio_count]
-                                .fill(sdr_types::Stereo::default());
+                            state.audio_buf[..audio_count].fill(sdr_types::Stereo::default());
                         }
 
                         // Send to the audio sink (PipeWire on Linux,
@@ -2334,12 +2328,12 @@ fn process_iq_block(
             let sample_rate_hz = std::num::NonZeroU32::new(state.sample_rate as u32)
                 .expect("source sample rate must be > 0");
             #[allow(clippy::cast_possible_truncation)]
-            let tick_cmds = state.scanner.handle_event(
-                sdr_scanner::ScannerEvent::SampleTick {
+            let tick_cmds = state
+                .scanner
+                .handle_event(sdr_scanner::ScannerEvent::SampleTick {
                     samples_consumed: iq_count as u32,
                     sample_rate_hz,
-                },
-            );
+                });
             apply_scanner_commands(state, dsp_tx, tick_cmds);
         }
         Err(e) => {
