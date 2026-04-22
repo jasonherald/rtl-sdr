@@ -1403,6 +1403,10 @@ impl Source for RtlTcpSource {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    // `CLIENT_HELLO_LEN` is only consumed by the loopback fixtures
+    // in the RTLX handshake tests below — keep it in test scope
+    // so the lib build doesn't warn it as unused.
+    use sdr_server_rtltcp::extension::CLIENT_HELLO_LEN;
 
     /// Placeholder host/port for tests that never actually connect —
     /// just exercise builder state or buffer logic. The string "127.0.0.1"
@@ -1782,6 +1786,164 @@ mod tests {
         let received = cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(received.op, CommandOp::SetCenterFreq);
         assert_eq!(received.param, 99_500_000);
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_accepted_publishes_codec_and_tuner() {
+        // Regression test for CodeRabbit round 5 on PR #399.
+        // A server that accepts the extended handshake
+        // (`ServerExtension { codec: Lz4, status: Ok }`) must result
+        // in the client reaching `Connected { codec: Lz4, .. }` with
+        // `tuner_info()` populated. This locks in two ordering rules
+        // that earlier rounds introduced:
+        //
+        //   - The negotiated codec is part of the `Connected` state
+        //     (surfaces as the status-row suffix in the UI).
+        //   - `shared.tuner` is published atomically with the
+        //     `Connected` transition, not earlier during
+        //     `dongle_info_t` parsing.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            // Consume the 8-byte `ClientHello` — we just want to
+            // verify the client sent one with the extension magic.
+            let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+            sock.read_exact(&mut hello_buf).expect("read hello");
+            assert_eq!(&hello_buf[..EXTENSION_MAGIC.len()], &EXTENSION_MAGIC);
+            // Send dongle_info_t + ServerExtension back-to-back so
+            // the client sees both before the read_timeout window.
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: 29,
+            }
+            .to_bytes();
+            sock.write_all(&header).unwrap();
+            let ext = ServerExtension {
+                codec: Codec::Lz4,
+                granted_role: Some(Role::Control),
+                status: Status::Ok,
+                version: PROTOCOL_VERSION,
+            };
+            sock.write_all(&ext.to_bytes()).unwrap();
+            // Hold the connection briefly so the client state
+            // observer has time to reach Connected before EOF. No
+            // IQ bytes are sent (the LZ4 decoder would need a real
+            // frame); the test only exercises the handshake path.
+            thread::sleep(Duration::from_millis(400));
+        });
+
+        let config = RtlTcpConfig {
+            data_read_timeout: Duration::from_millis(200),
+            max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: CodecMask::NONE_AND_LZ4,
+        };
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        // Before starting the manager, tuner_info must be None —
+        // guards against a false positive where the delayed-publish
+        // ordering is broken but the test happens to read after an
+        // earlier session populated the cache.
+        assert!(src.tuner_info().is_none());
+
+        src.start_manager().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut connected_codec: Option<Codec> = None;
+        while Instant::now() < deadline {
+            if let ConnectionState::Connected { codec, .. } = src.connection_state() {
+                connected_codec = Some(codec);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(connected_codec, Some(Codec::Lz4));
+        // `shared.tuner` is published together with the Connected
+        // state, so once we observe Connected, `tuner_info()` must
+        // return the R820T metadata from the dongle_info_t header.
+        let ti = src.tuner_info();
+        assert!(ti.is_some(), "tuner_info should be Some after Connected");
+        let ti = ti.unwrap();
+        assert_eq!(ti.tuner, TunerTypeCode::R820t);
+        assert_eq!(ti.gain_count, 29);
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_rejected_fails_and_leaves_tuner_none() {
+        // Regression test for CodeRabbit round 5 on PR #399.
+        // A server that parses our hello but responds with a non-OK
+        // status (`ControllerBusy` here, reserved for #392) must
+        // transition the client to `Failed` and leave `tuner_info()`
+        // at its initial `None`. Failing to gate the tuner write
+        // behind a successful handshake would cache R820T metadata
+        // for a session that never actually connected.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+            sock.read_exact(&mut hello_buf).expect("read hello");
+            // Send dongle_info_t (so we pass the first parse step)
+            // and a ServerExtension rejecting the session.
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: 29,
+            }
+            .to_bytes();
+            sock.write_all(&header).unwrap();
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: None,
+                status: Status::ControllerBusy,
+                version: PROTOCOL_VERSION,
+            };
+            sock.write_all(&ext.to_bytes()).unwrap();
+            // Brief hold to ensure the client finishes reading the
+            // 8-byte extension body before the socket EOFs.
+            thread::sleep(Duration::from_millis(200));
+        });
+
+        let config = RtlTcpConfig {
+            data_read_timeout: Duration::from_millis(200),
+            max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: CodecMask::NONE_AND_LZ4,
+        };
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        assert!(src.tuner_info().is_none());
+
+        src.start_manager().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reached_failed = false;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
+                reached_failed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            reached_failed,
+            "client should transition to Failed on non-OK ServerExtension status"
+        );
+        // The critical ordering check: `tuner_info()` stays at its
+        // initial `None` because the handshake never reached the
+        // `set_state(Connected)` path where the cache write lives.
+        assert!(
+            src.tuner_info().is_none(),
+            "tuner_info must stay None when the extension handshake is rejected"
+        );
 
         src.stop_manager();
         let _ = server_thread.join();
