@@ -1070,8 +1070,11 @@ mod tests {
         // assertion below flips and the ABI change becomes
         // visible at test time rather than at a downstream host
         // that suddenly starts receiving an unknown event kind.
+        /// Representative non-zero VFO offset — 25 kHz is typical
+        /// of what click-to-tune and drag flows emit in practice.
+        const TEST_VFO_OFFSET_HZ: f64 = 25_000.0;
         use sdr_core::DspToUi;
-        assert!(translate_event(&DspToUi::VfoOffsetChanged(25_000.0)).is_none());
+        assert!(translate_event(&DspToUi::VfoOffsetChanged(TEST_VFO_OFFSET_HZ)).is_none());
     }
 
     #[test]

@@ -4435,21 +4435,25 @@ fn update_vfo_reset_button_visibility(
     state: &AppState,
 ) {
     let mode = state.demod_mode.get();
-    // Same conservative fallback as `update_bandwidth_reset_sensitivity`
-    // — if we can't resolve the mode's default bandwidth, hide
-    // the button rather than showing it with a broken click
-    // action.
+    // Offset-at-zero is resolvable without the demod lookup, so
+    // compute it first. If the bandwidth lookup below fails, we
+    // can still decide visibility based on offset alone — the
+    // click handler's `SetVfoOffset(0.0)` dispatch remains
+    // useful even when the bandwidth reset path is broken.
+    let offset_at_zero = spectrum.vfo_offset_hz().abs() < VFO_OFFSET_RESET_TOLERANCE_HZ;
     let Ok(default_bw) = sdr_radio::demod::default_bandwidth_for_mode(mode) else {
         tracing::warn!(
             ?mode,
-            "default_bandwidth_for_mode failed — hiding floating reset button"
+            "default_bandwidth_for_mode failed — floating reset button \
+             falls back to offset-only visibility"
         );
-        spectrum.vfo_reset_button.set_visible(false);
+        // Button stays available when the user has a nonzero
+        // offset to clear; hides when both paths would no-op.
+        spectrum.vfo_reset_button.set_visible(!offset_at_zero);
         return;
     };
     let current_bw = radio.bandwidth_row.value();
     let bandwidth_at_default = (current_bw - default_bw).abs() < BANDWIDTH_RESET_TOLERANCE_HZ;
-    let offset_at_zero = spectrum.vfo_offset_hz().abs() < VFO_OFFSET_RESET_TOLERANCE_HZ;
     spectrum
         .vfo_reset_button
         .set_visible(!(bandwidth_at_default && offset_at_zero));
