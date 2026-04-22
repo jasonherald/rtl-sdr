@@ -498,10 +498,18 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // --- Wire radio panel bandwidth changes to status bar ---
     let status_bar_for_bw = Rc::clone(&status_bar_demod);
     let state_for_bw = Rc::clone(&state);
+    let radio_for_bw_reset = panels.radio.clone();
     panels.radio.bandwidth_row.connect_value_notify(move |row| {
         let mode = state_for_bw.demod_mode.get();
         let label = header::demod_mode_label(mode);
         status_bar_for_bw.update_demod(label, row.value());
+        // Reset button tracks the spin-row value on EVERY
+        // change — user-initiated edits AND DSP echoes. Lives
+        // in this handler (not the `connect_radio_panel` one)
+        // because that one short-circuits on the
+        // `suppress_bandwidth_notify` flag and would miss VFO
+        // drag echoes. Per issue #341.
+        update_bandwidth_reset_sensitivity(&radio_for_bw_reset, &state_for_bw);
     });
 
     // --- Poll DspToUi channel and shared FFT buffer from the GTK main loop ---
@@ -821,6 +829,11 @@ fn handle_dsp_message(
                     overlay.add_toast(toast);
                 }
             }
+
+            // Mode change shifts the default bandwidth — refresh
+            // the reset button's sensitivity so it tracks the new
+            // mode's default. Per issue #341.
+            update_bandwidth_reset_sensitivity(radio_panel, state);
         }
         DspToUi::BandwidthChanged(bw) => {
             // DSP-originated bandwidth change (typically a VFO drag
@@ -4332,6 +4345,25 @@ fn connect_source_panel(
         });
 }
 
+/// Tolerance (Hz) for the "bandwidth is at its mode default"
+/// comparison. The bandwidth `SpinRow` uses `digits(0)` so values
+/// are already integer-aligned; this tolerance is just a
+/// float-comparison guard, not a user-visible fuzziness.
+const BANDWIDTH_RESET_TOLERANCE_HZ: f64 = 0.5;
+
+/// Update the bandwidth reset button's sensitivity: active only
+/// when the spin row's current value differs from the current
+/// demod mode's default bandwidth. Called from anywhere either
+/// input (current bandwidth OR demod mode) can change. Per
+/// issue #341.
+fn update_bandwidth_reset_sensitivity(radio: &sidebar::radio_panel::RadioPanel, state: &AppState) {
+    let mode = state.demod_mode.get();
+    let default = sdr_radio::demod::default_bandwidth_for_mode(mode);
+    let current = radio.bandwidth_row.value();
+    let at_default = (current - default).abs() < BANDWIDTH_RESET_TOLERANCE_HZ;
+    radio.bandwidth_reset_button.set_sensitive(!at_default);
+}
+
 /// Connect radio panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
 fn connect_radio_panel(
@@ -4360,6 +4392,20 @@ fn connect_radio_panel(
         force_disable_bw.trigger("manual bandwidth change");
         state_bw.send_dsp(UiToDsp::SetBandwidth(row.value()));
     });
+
+    // Bandwidth reset button → `SetBandwidth(mode_default)`. Per
+    // #341. Routes through DSP so the echo updates the spin row
+    // — no direct `set_value` manipulation that would skip the
+    // DSP / scanner-mutex / force-disable machinery.
+    let state_bw_reset = Rc::clone(state);
+    panels
+        .radio
+        .bandwidth_reset_button
+        .connect_clicked(move |_| {
+            let mode = state_bw_reset.demod_mode.get();
+            let default = sdr_radio::demod::default_bandwidth_for_mode(mode);
+            state_bw_reset.send_dsp(UiToDsp::SetBandwidth(default));
+        });
 
     // Squelch enable
     let state_squelch_en = Rc::clone(state);
