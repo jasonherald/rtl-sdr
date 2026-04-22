@@ -88,16 +88,38 @@ pub struct Scanner {
     channels: Vec<ScannerChannel>,
     locked_out: HashSet<ChannelKey>,
     phase: Phase,
-    /// Rotation index into the current sub-list. Normal and
-    /// priority rotations are advanced independently.
-    normal_cursor: usize,
-    priority_cursor: usize,
-    /// Count of completed normal hops since the last priority
-    /// sweep. When this hits `PRIORITY_CHECK_INTERVAL`, the next
-    /// rotation pass runs priority before normal.
+    /// Absolute position in `self.channels` to consider first on
+    /// the next `pick_next_channel` call. Wrap-around semantics
+    /// (`(i + 1) % channels.len()`) after every pick.
+    ///
+    /// Deliberately an absolute index rather than a position
+    /// inside a filtered sub-list: lockouts and channel-list
+    /// edits change the sub-list shape, but the absolute index
+    /// remains a stable anchor. Any channel that no longer
+    /// matches the selection criteria (locked / priority filter
+    /// mismatch) is just skipped by the forward scan — no
+    /// cursor rebase needed.
+    next_channel_idx: usize,
+    /// Count of completed NORMAL-ROTATION hops since the last
+    /// priority sweep. Only incremented in the normal-pick
+    /// branch of `pick_next_channel` — fallback (any-unlocked)
+    /// and priority-sweep picks do NOT advance this counter.
+    /// When it reaches `PRIORITY_CHECK_INTERVAL` AND there's at
+    /// least one unlocked priority channel, a priority sweep is
+    /// armed on the next pick.
     hops_since_priority_sweep: u32,
-    /// Set while a priority sweep is in progress.
-    in_priority_sweep: bool,
+    /// Channel keys visited during the current priority sweep.
+    /// `None` means no sweep in progress; `Some(set)` means the
+    /// scanner is mid-sweep and the set tracks which priority
+    /// channels have already been picked this sweep. When the
+    /// set size equals the count of priority+unlocked channels,
+    /// the sweep ends and normal rotation resumes.
+    ///
+    /// Using `Option<HashSet>` rather than `HashSet::new()` as a
+    /// sentinel because an empty in-progress sweep (just
+    /// started, no picks yet) and a non-sweep state must be
+    /// distinguishable.
+    priority_sweep_visited: Option<HashSet<ChannelKey>>,
     /// Latched squelch state. Updated on every `SquelchEdge`
     /// event regardless of phase so a persistent-open carrier
     /// that triggered during the settle window (where phase
@@ -114,10 +136,9 @@ impl Default for Scanner {
             channels: Vec::new(),
             locked_out: HashSet::new(),
             phase: Phase::Idle,
-            normal_cursor: 0,
-            priority_cursor: 0,
+            next_channel_idx: 0,
             hops_since_priority_sweep: 0,
-            in_priority_sweep: false,
+            priority_sweep_visited: None,
             squelch_open: false,
         }
     }
@@ -164,10 +185,9 @@ impl Scanner {
             // starts fresh rather than carrying stale lockouts or
             // mid-cycle rotation cursors into the next session.
             self.locked_out.clear();
-            self.normal_cursor = 0;
-            self.priority_cursor = 0;
+            self.next_channel_idx = 0;
             self.hops_since_priority_sweep = 0;
-            self.in_priority_sweep = false;
+            self.priority_sweep_visited = None;
             self.stop_rotation()
         }
     }
@@ -185,13 +205,13 @@ impl Scanner {
         }
         // Currently-scanning mid-list-change: recover from wherever
         // the phase left us by re-starting rotation. Also reset
-        // the priority-hop counter so a list edit doesn't trigger
-        // an immediate priority sweep just because the pre-edit
+        // the rotation cursor + sweep state + hops counter so a
+        // list edit doesn't leave stale pointers or trigger an
+        // immediate priority sweep just because the pre-edit
         // session had accumulated hops.
-        self.normal_cursor = 0;
-        self.priority_cursor = 0;
+        self.next_channel_idx = 0;
         self.hops_since_priority_sweep = 0;
-        self.in_priority_sweep = false;
+        self.priority_sweep_visited = None;
         self.start_rotation()
     }
 
@@ -256,108 +276,101 @@ impl Scanner {
     /// priority-sweep state. Returns None if no scannable+unlocked
     /// channels exist.
     fn pick_next_channel(&mut self) -> Option<usize> {
-        // Trigger priority sweep if due.
-        if !self.in_priority_sweep
+        if self.channels.is_empty() {
+            return None;
+        }
+
+        // Arm a priority sweep if hops since last sweep crossed
+        // the threshold AND at least one unlocked priority
+        // channel exists.
+        if self.priority_sweep_visited.is_none()
             && self.hops_since_priority_sweep >= PRIORITY_CHECK_INTERVAL
             && self
                 .channels
                 .iter()
-                .any(|c| c.priority >= MIN_PRIORITY_TIER)
+                .any(|c| c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key))
         {
-            self.in_priority_sweep = true;
-            self.priority_cursor = 0;
+            self.priority_sweep_visited = Some(HashSet::new());
         }
 
-        if self.in_priority_sweep {
-            let is_priority = |c: &ScannerChannel| {
-                c.priority >= MIN_PRIORITY_TIER && !self.locked_out.contains(&c.key)
-            };
-            let pri_count = self.count_matching(is_priority);
-            if self.priority_cursor < pri_count {
-                if let Some(chosen) = self.nth_matching(self.priority_cursor, is_priority) {
-                    self.priority_cursor += 1;
-                    return Some(chosen);
+        // --- Priority sweep path ---
+        if self.priority_sweep_visited.is_some() {
+            let chosen = self.scan_forward(|c| {
+                c.priority >= MIN_PRIORITY_TIER
+                    && !self.locked_out.contains(&c.key)
+                    && !self
+                        .priority_sweep_visited
+                        .as_ref()
+                        .is_some_and(|v| v.contains(&c.key))
+            });
+            if let Some(idx) = chosen {
+                let key = self.channels[idx].key.clone();
+                if let Some(visited) = self.priority_sweep_visited.as_mut() {
+                    visited.insert(key);
                 }
-                // Invariant violation: cursor < count but nth returned
-                // None. Should be impossible — assert in debug, recover
-                // in release by treating the sweep as exhausted and
-                // falling through to normal rotation.
-                debug_assert!(
-                    false,
-                    "priority_cursor < pri_count but nth_matching returned None"
-                );
+                self.advance_cursor_past(idx);
+                return Some(idx);
             }
-            // Priority sweep exhausted (or invariant-fallback).
-            self.in_priority_sweep = false;
-            self.priority_cursor = 0;
+            // Sweep exhausted — no more unvisited + unlocked priorities.
+            self.priority_sweep_visited = None;
             self.hops_since_priority_sweep = 0;
             // Fall through to normal rotation.
         }
 
-        let is_normal = |c: &ScannerChannel| c.priority == 0 && !self.locked_out.contains(&c.key);
-        let normal_count = self.count_matching(is_normal);
+        // --- Normal rotation path ---
+        if let Some(idx) =
+            self.scan_forward(|c| c.priority == 0 && !self.locked_out.contains(&c.key))
+        {
+            self.advance_cursor_past(idx);
+            // Only normal-rotation picks count toward the next
+            // priority sweep. Fallback (any-unlocked) and sweep
+            // picks do NOT — they don't represent "normal hops
+            // seen between sweeps."
+            self.hops_since_priority_sweep = self.hops_since_priority_sweep.saturating_add(1);
+            return Some(idx);
+        }
 
-        if normal_count == 0 {
-            // No normal channels — fall back to any unlocked channel
-            // (priority-only lists).
-            let is_unlocked = |c: &ScannerChannel| !self.locked_out.contains(&c.key);
-            let any_count = self.count_matching(is_unlocked);
-            if any_count == 0 {
-                return None;
-            }
-            if self.normal_cursor >= any_count {
-                self.normal_cursor = 0;
-            }
-            let chosen = self.nth_matching(self.normal_cursor, is_unlocked);
-            debug_assert!(
-                chosen.is_some(),
-                "normal_cursor < any_count but nth_matching returned None"
-            );
-            if let Some(chosen) = chosen {
-                self.normal_cursor = (self.normal_cursor + 1) % any_count;
-                return Some(chosen);
-            }
+        // --- Fallback: any unlocked channel (priority-only lists) ---
+        if let Some(idx) = self.scan_forward(|c| !self.locked_out.contains(&c.key)) {
+            self.advance_cursor_past(idx);
+            // Deliberately NOT incrementing `hops_since_priority_sweep`
+            // here: on a priority-only list there is no "normal
+            // rotation" to count against, and arming another
+            // sweep would be redundant (the fallback is already
+            // visiting priorities) — could cause out-of-order
+            // replay via sweep↔fallback mode flipping.
+            return Some(idx);
+        }
+
+        None
+    }
+
+    /// Scan `self.channels` starting at `next_channel_idx`, wrapping
+    /// around once, returning the index of the first channel that
+    /// satisfies `predicate`. Allocation-free; single pass.
+    fn scan_forward<F>(&self, predicate: F) -> Option<usize>
+    where
+        F: Fn(&ScannerChannel) -> bool,
+    {
+        let n = self.channels.len();
+        if n == 0 {
             return None;
         }
-
-        if self.normal_cursor >= normal_count {
-            self.normal_cursor = 0;
-        }
-        let chosen = self.nth_matching(self.normal_cursor, is_normal);
-        debug_assert!(
-            chosen.is_some(),
-            "normal_cursor < normal_count but nth_matching returned None"
-        );
-        if let Some(chosen) = chosen {
-            self.normal_cursor = (self.normal_cursor + 1) % normal_count;
-            Some(chosen)
-        } else {
-            None
-        }
+        (0..n)
+            .map(|offset| (self.next_channel_idx + offset) % n)
+            .find(|&idx| predicate(&self.channels[idx]))
     }
 
-    /// Count channels matching `predicate`. Allocation-free —
-    /// single pass over `self.channels`.
-    fn count_matching<F>(&self, predicate: F) -> usize
-    where
-        F: Fn(&ScannerChannel) -> bool,
-    {
-        self.channels.iter().filter(|c| predicate(c)).count()
-    }
-
-    /// Index (into `self.channels`) of the `n`th channel matching
-    /// `predicate`. Allocation-free — uses `Iterator::nth` which
-    /// streams without collecting.
-    fn nth_matching<F>(&self, n: usize, predicate: F) -> Option<usize>
-    where
-        F: Fn(&ScannerChannel) -> bool,
-    {
-        self.channels
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| predicate(c))
-            .nth(n)
-            .map(|(i, _)| i)
+    /// Advance the absolute cursor past the just-picked index so
+    /// the next `scan_forward` starts at the subsequent position
+    /// (with wrap).
+    fn advance_cursor_past(&mut self, idx: usize) {
+        let n = self.channels.len();
+        if n == 0 {
+            self.next_channel_idx = 0;
+            return;
+        }
+        self.next_channel_idx = (idx + 1) % n;
     }
 
     fn handle_squelch_edge(&mut self, state: SquelchState) -> Vec<ScannerCommand> {
@@ -1085,9 +1098,11 @@ mod tests {
         s.handle_event(ScannerEvent::SetEnabled(false));
         // Session state should be fully clear after disable.
         assert!(s.locked_out.is_empty(), "locked_out not cleared on disable");
-        assert_eq!(s.normal_cursor, 0);
-        assert_eq!(s.priority_cursor, 0);
+        assert_eq!(s.next_channel_idx, 0);
         assert_eq!(s.hops_since_priority_sweep, 0);
-        assert!(!s.in_priority_sweep);
+        assert!(
+            s.priority_sweep_visited.is_none(),
+            "priority sweep state not cleared on disable"
+        );
     }
 }
