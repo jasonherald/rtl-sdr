@@ -560,7 +560,11 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::DemodModeChanged(_)
         | DspToUi::BandwidthChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
-        | DspToUi::VoiceSquelchOpenChanged(_) => return None,
+        | DspToUi::VoiceSquelchOpenChanged(_)
+        | DspToUi::ScannerActiveChannelChanged { .. }
+        | DspToUi::ScannerStateChanged(_)
+        | DspToUi::ScannerEmptyRotation
+        | DspToUi::ScannerMutexStopped(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

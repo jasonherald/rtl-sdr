@@ -370,6 +370,18 @@ struct DspState {
     /// UI cadence doesn't need sub-second resolution to render the
     /// "Connecting… / Connected / Retrying in N s" text.
     rtl_tcp_poll_at: std::time::Instant,
+
+    /// Scanner state machine. Fed sample ticks + squelch edges
+    /// from the IQ loop + UI command events from `handle_command`.
+    /// Emitted commands are applied inline via
+    /// `apply_scanner_commands`.
+    scanner: sdr_scanner::Scanner,
+    /// Cache of the last-pushed `ScannerChannel` list — read by
+    /// `emit_scanner_active_channel` when building the
+    /// `DspToUi::ScannerActiveChannelChanged` payload, since the
+    /// scanner itself emits only the `ChannelKey` and the UI
+    /// payload needs the full freq/demod/bandwidth/name tuple.
+    scanner_channels: Vec<sdr_scanner::ScannerChannel>,
 }
 
 impl DspState {
@@ -437,6 +449,8 @@ impl DspState {
             diag_log_at: std::time::Instant::now(),
             last_rtl_tcp_state: RtlTcpConnectionState::Disconnected,
             rtl_tcp_poll_at: std::time::Instant::now(),
+            scanner: sdr_scanner::Scanner::new(),
+            scanner_channels: Vec::new(),
         })
     }
 }
@@ -1502,20 +1516,122 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 }
             }
         }
-        // --- Scanner (#317) — handlers wired in Task 2.4 ---
-        UiToDsp::SetScannerEnabled(_enabled) => {
-            tracing::debug!("SetScannerEnabled: handler not yet wired (Task 2.4)");
+        // --- Scanner (#317) ---
+        UiToDsp::SetScannerEnabled(enabled) => {
+            let cmds = state
+                .scanner
+                .handle_event(sdr_scanner::ScannerEvent::SetEnabled(enabled));
+            apply_scanner_commands(state, dsp_tx, cmds);
         }
-        UiToDsp::UpdateScannerChannels(_channels) => {
-            tracing::debug!("UpdateScannerChannels: handler not yet wired (Task 2.4)");
+        UiToDsp::UpdateScannerChannels(channels) => {
+            state.scanner_channels.clone_from(&channels);
+            let cmds = state
+                .scanner
+                .handle_event(sdr_scanner::ScannerEvent::ChannelsChanged(channels));
+            apply_scanner_commands(state, dsp_tx, cmds);
         }
-        UiToDsp::LockoutScannerChannel(_key) => {
-            tracing::debug!("LockoutScannerChannel: handler not yet wired (Task 2.4)");
+        UiToDsp::LockoutScannerChannel(key) => {
+            let cmds = state
+                .scanner
+                .handle_event(sdr_scanner::ScannerEvent::LockoutChannel(key));
+            apply_scanner_commands(state, dsp_tx, cmds);
         }
-        UiToDsp::UnlockScannerChannel(_key) => {
-            tracing::debug!("UnlockScannerChannel: handler not yet wired (Task 2.4)");
+        UiToDsp::UnlockScannerChannel(key) => {
+            let cmds = state
+                .scanner
+                .handle_event(sdr_scanner::ScannerEvent::UnlockChannel(key));
+            apply_scanner_commands(state, dsp_tx, cmds);
         }
     }
+}
+
+/// Apply scanner-emitted commands to the DSP state.
+fn apply_scanner_commands(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    commands: Vec<sdr_scanner::ScannerCommand>,
+) {
+    for cmd in commands {
+        match cmd {
+            sdr_scanner::ScannerCommand::Retune {
+                freq_hz,
+                demod_mode,
+                bandwidth,
+                ctcss,
+                voice_squelch,
+            } => {
+                // Apply to source + radio module directly. Same
+                // path as the manual `Tune` / `SetBandwidth` /
+                // `SetDemodMode` handlers above.
+                if let Some(source) = state.source.as_mut() {
+                    #[allow(clippy::cast_precision_loss)]
+                    let freq_f64 = freq_hz as f64;
+                    let _ = source.tune(freq_f64);
+                }
+                if let Err(e) = state.radio.set_mode(demod_mode) {
+                    tracing::warn!(?e, "scanner retune: set_mode failed");
+                }
+                state.radio.set_bandwidth(bandwidth);
+                // CTCSS is per-channel: force-Off when the new
+                // channel doesn't carry a tone, otherwise stale
+                // tone gates would silence the new channel.
+                let ctcss_mode = ctcss
+                    .unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
+                if let Err(e) = state.radio.set_ctcss_mode(ctcss_mode) {
+                    tracing::warn!(?e, "scanner retune: set_ctcss_mode failed");
+                }
+                // Voice squelch is device-level — preserve
+                // current setting when `None`.
+                if let Some(m) = voice_squelch
+                    && let Err(e) = state.radio.set_voice_squelch_mode(m)
+                {
+                    tracing::warn!(?e, "scanner retune: set_voice_squelch_mode failed");
+                }
+            }
+            sdr_scanner::ScannerCommand::MuteAudio(muted) => {
+                // Sink-side mute plumbing lands in Task 2.6;
+                // for now just record intent via log so Task
+                // 2.6's integration verification can observe.
+                tracing::debug!(?muted, "scanner mute — sink wiring in Task 2.6");
+            }
+            sdr_scanner::ScannerCommand::ActiveChannelChanged(key) => {
+                emit_scanner_active_channel(state, dsp_tx, key);
+            }
+            sdr_scanner::ScannerCommand::StateChanged(scanner_state) => {
+                let _ = dsp_tx.send(DspToUi::ScannerStateChanged(scanner_state));
+            }
+            sdr_scanner::ScannerCommand::EmptyRotation => {
+                let _ = dsp_tx.send(DspToUi::ScannerEmptyRotation);
+            }
+        }
+    }
+}
+
+/// Build the `ScannerActiveChannelChanged` payload by looking
+/// up the full channel info for the given key in the cached
+/// channel list.
+fn emit_scanner_active_channel(
+    state: &DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    key: Option<sdr_scanner::ChannelKey>,
+) {
+    let channel = key.as_ref().and_then(|k| {
+        state
+            .scanner_channels
+            .iter()
+            .find(|c| c.key == *k)
+            .cloned()
+    });
+    let msg = DspToUi::ScannerActiveChannelChanged {
+        freq_hz: channel.as_ref().map_or(0, |c| c.key.frequency_hz),
+        demod_mode: channel
+            .as_ref()
+            .map_or(sdr_types::DemodMode::Nfm, |c| c.demod_mode),
+        bandwidth: channel.as_ref().map_or(0.0, |c| c.bandwidth),
+        name: channel.map_or_else(String::new, |c| c.key.name),
+        key,
+    };
+    let _ = dsp_tx.send(msg);
 }
 
 /// Open the active IQ source and configure it for streaming.
@@ -1866,6 +1982,25 @@ fn process_iq_block(
                             state.voice_squelch_was_open = now_voice;
                         }
 
+                        // Feed the scanner the squelch edge regardless of demod
+                        // mode — the scanner's rotation state transitions
+                        // (Dwelling→Listening, Listening→Hanging) apply to any
+                        // mode. This runs outside the transcription gate below so
+                        // the scanner sees every transition even when the
+                        // transcription tap is inactive.
+                        let now_open = state.radio.if_chain().squelch_open();
+                        if now_open != state.squelch_was_open {
+                            let scanner_edge = if now_open {
+                                sdr_scanner::SquelchState::Open
+                            } else {
+                                sdr_scanner::SquelchState::Closed
+                            };
+                            let scan_cmds = state.scanner.handle_event(
+                                sdr_scanner::ScannerEvent::SquelchEdge(scanner_edge),
+                            );
+                            apply_scanner_commands(state, dsp_tx, scan_cmds);
+                        }
+
                         // Send audio copy to transcription worker BEFORE volume
                         // scaling so recognition isn't affected by the volume knob. Also
                         // emit squelch edge events on open/close transitions so offline
@@ -1873,7 +2008,6 @@ fn process_iq_block(
                         // boundaries. Edge events are NFM-only — WFM and other modes
                         // don't have meaningful squelch transitions for speech.
                         if let Some(ref tx) = state.transcription_tx {
-                            let now_open = state.radio.if_chain().squelch_open();
                             let mut send_error = false;
                             // True unless we tried to send an edge event and hit
                             // `TrySendError::Full`. Squelch edges are one-shot
@@ -1937,6 +2071,11 @@ fn process_iq_block(
                                     "transcription receiver disconnected, disabling tap"
                                 );
                             }
+                        } else {
+                            // No transcription tap: advance the tracker
+                            // unconditionally so the scanner doesn't see
+                            // the same edge repeatedly on every block.
+                            state.squelch_was_open = now_open;
                         }
 
                         // Generic audio tap: downsample to 16 kHz mono
@@ -2083,6 +2222,25 @@ fn process_iq_block(
                     }
                 }
             } // end if processed_count > 0
+
+            // Feed the sample tick into the scanner. Scanner uses this to
+            // drive settle/dwell/hang countdowns — decoupled from radio
+            // output. `NonZeroU32` is enforced at the event type level;
+            // expect here is OK because any live source has a non-zero
+            // rate (source.sample_rate() always > 0 in practice).
+            // Uses `iq_count` (source-rate samples) paired with
+            // `state.sample_rate` so the ms→sample math is consistent.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let sample_rate_hz = std::num::NonZeroU32::new(state.sample_rate as u32)
+                .expect("source sample rate must be > 0");
+            #[allow(clippy::cast_possible_truncation)]
+            let tick_cmds = state.scanner.handle_event(
+                sdr_scanner::ScannerEvent::SampleTick {
+                    samples_consumed: iq_count as u32,
+                    sample_rate_hz,
+                },
+            );
+            apply_scanner_commands(state, dsp_tx, tick_cmds);
         }
         Err(e) => {
             tracing::warn!("frontend processing error: {e}");

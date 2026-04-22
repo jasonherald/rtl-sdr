@@ -732,6 +732,32 @@ fn handle_dsp_message(
                 apply_network_sink_status(&row, &status);
             }
         }
+        // --- Scanner (#317) — UI integration wired in Task 2.7+ ---
+        DspToUi::ScannerActiveChannelChanged {
+            key,
+            freq_hz,
+            demod_mode,
+            bandwidth,
+            name,
+        } => {
+            tracing::debug!(
+                ?key,
+                freq_hz,
+                ?demod_mode,
+                bandwidth,
+                name,
+                "scanner active channel changed"
+            );
+        }
+        DspToUi::ScannerStateChanged(scanner_state) => {
+            tracing::debug!(?scanner_state, "scanner state changed");
+        }
+        DspToUi::ScannerEmptyRotation => {
+            tracing::debug!("scanner rotation empty");
+        }
+        DspToUi::ScannerMutexStopped(reason) => {
+            tracing::debug!(?reason, "scanner mutex stopped");
+        }
     }
 }
 
