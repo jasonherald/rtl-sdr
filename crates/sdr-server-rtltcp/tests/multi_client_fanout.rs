@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use sdr_server_rtltcp::broadcaster::{ClientRegistry, ClientSlot};
 use sdr_server_rtltcp::codec::Codec;
+use sdr_server_rtltcp::extension::Role;
 
 /// How many distinct chunks the producer thread fans out in each
 /// test. 32 is small enough for tests to finish quickly, large
@@ -153,12 +154,14 @@ fn two_clients_receive_identical_byte_streams() {
         registry.allocate_id(),
         test_peer(TEST_PEER_A_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
     let (slot_b, rx_b) = ClientSlot::new(
         registry.allocate_id(),
         test_peer(TEST_PEER_B_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
     registry.register(slot_a);
@@ -226,6 +229,7 @@ fn slow_client_drops_do_not_block_fast_client() {
         registry.allocate_id(),
         test_peer(TEST_SLOW_PEER_PORT),
         Codec::None,
+        Role::Control,
         TEST_SLOW_CHANNEL_DEPTH,
     );
     let slow_id = slow.id;
@@ -233,6 +237,7 @@ fn slow_client_drops_do_not_block_fast_client() {
         registry.allocate_id(),
         test_peer(TEST_FAST_PEER_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
     registry.register(slow);
@@ -308,12 +313,14 @@ fn disconnected_client_is_skipped_by_broadcaster_fanout() {
         registry.allocate_id(),
         test_peer(TEST_DISCONNECT_A_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
     let (slot_b, rx_b) = ClientSlot::new(
         registry.allocate_id(),
         test_peer(TEST_DISCONNECT_B_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
     let slot_b_handle = slot_b.clone();

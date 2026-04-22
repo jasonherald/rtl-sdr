@@ -6909,6 +6909,7 @@ mod server_panel_format_tests {
             peer: SocketAddr::from(([127, 0, 0, 1], FIXTURE_PEER_PORT)),
             connected_since: Instant::now(),
             codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: 0,
             buffers_dropped: 0,
             last_command: None,

@@ -744,7 +744,11 @@ fn spawn_client_workers(
     // Build the slot, allocating a fresh id + per-client channel.
     let id = registry.allocate_id();
     let codec = negotiated_codec.unwrap_or(Codec::None);
-    let (slot, rx) = ClientSlot::new(id, peer, codec, per_client_buffer_depth);
+    // Role grant defaults to `Control` for this commit — #392's
+    // next commit adds the atomic role/cap decision and feeds the
+    // actual granted role here. Leaving `Control` preserves
+    // pre-#392 single-client behavior while the field is wired up.
+    let (slot, rx) = ClientSlot::new(id, peer, codec, Role::Control, per_client_buffer_depth);
 
     // Spawn the writer first so that by the time we register, the
     // receiver end of the slot's channel is already being drained.
@@ -1490,6 +1494,7 @@ mod tests {
             registry.allocate_id(),
             SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_A_PORT)),
             Codec::None,
+            Role::Control,
             TEST_CLIENT_CHANNEL_DEPTH,
         );
         if let Ok(mut s) = slot_a.stats.lock() {
@@ -1502,6 +1507,7 @@ mod tests {
             registry.allocate_id(),
             SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_B_PORT)),
             Codec::Lz4,
+            Role::Control,
             TEST_CLIENT_CHANNEL_DEPTH,
         );
         if let Ok(mut s) = slot_b.stats.lock() {

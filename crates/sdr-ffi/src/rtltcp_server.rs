@@ -229,6 +229,16 @@ pub struct SdrRtlTcpClientInfo {
     /// `pick_most_recent_commander`). Valid only when
     /// `has_last_command == true`.
     pub last_command_age_secs: f64,
+    /// Role the server granted to this client: `0 = Control` (can
+    /// tune / change gain / etc.), `1 = Listen` (receives the IQ
+    /// stream; server drops any commands they send). Matches
+    /// `sdr_server_rtltcp::extension::Role::to_wire`. Hosts that
+    /// want to render a "Controller" / "Listener" badge in the
+    /// client list read this byte directly; the `Role::Control`
+    /// value is the default for vanilla `rtl_tcp` clients that
+    /// don't speak the RTLX extension (they always land in the
+    /// Control slot when it's free, never as listeners). #392.
+    pub role: u8,
 }
 
 impl Default for SdrRtlTcpClientInfo {
@@ -250,6 +260,7 @@ impl Default for SdrRtlTcpClientInfo {
             has_last_command: false,
             last_command_op: 0,
             last_command_age_secs: 0.0,
+            role: 0, // Role::Control wire byte
         }
     }
 }
@@ -878,6 +889,7 @@ fn client_info_to_c(info: &ClientInfo, snapshot_at: std::time::Instant) -> SdrRt
         has_last_command,
         last_command_op,
         last_command_age_secs,
+        role: info.role.to_wire(),
     };
     // Write peer_addr into the inline byte array, truncating at
     // `len - 1` to leave room for a NUL. Cast via &mut raw ptr
@@ -1241,6 +1253,7 @@ mod tests {
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::Lz4,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: TEST_CLIENT_BYTES_SENT,
             buffers_dropped: TEST_CLIENT_BUFFERS_DROPPED,
             last_command: None,
@@ -1341,6 +1354,7 @@ mod tests {
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: 0,
             buffers_dropped: 0,
             // `SetBiasTee` (0x0e) chosen because it's the highest
@@ -1389,6 +1403,7 @@ mod tests {
             peer: SocketAddr::from((TEST_CLIENT_PEER_IP, TEST_CLIENT_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: 0,
             buffers_dropped: 0,
             last_command: None,
@@ -1452,6 +1467,7 @@ mod tests {
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_JSON_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: 0,
             buffers_dropped: 0,
             last_command: None,

@@ -66,6 +66,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::codec::Codec;
+use crate::extension::Role;
 use crate::protocol::CommandOp;
 
 /// Default per-client bounded-channel capacity measured in 256 KiB USB
@@ -168,6 +169,16 @@ pub struct ClientSlot {
     /// lifetime — if the client wants to change codec they must
     /// reconnect.
     pub codec: Codec,
+    /// Role granted by the server during handshake. `Control` =
+    /// commands dispatched to the device; `Listen` = commands
+    /// dropped server-side (the command worker observes this and
+    /// logs + skips the dispatch). Immutable for the slot's
+    /// lifetime — if the client wants to change role they must
+    /// reconnect (or, once #393 lands, send a takeover request).
+    /// Vanilla `rtl_tcp` clients (no RTLX hello) always land here
+    /// as `Control`; they have no way to request `Listen` and the
+    /// server only admits them when the Control slot is free. #392.
+    pub role: Role,
     /// Write half of this client's bounded channel. The broadcaster
     /// calls [`SyncSender::try_send`] to push USB chunks; the
     /// client's writer thread owns the matching `Receiver` and
@@ -188,11 +199,14 @@ pub struct ClientSlot {
 impl ClientSlot {
     /// Construct a slot with a freshly-created bounded channel.
     /// Returns both the slot (ready to register) and the `Receiver`
-    /// that the writer thread consumes.
+    /// that the writer thread consumes. `role` is the server's
+    /// grant (not the client's request — the server may deny the
+    /// request, in which case no slot is built at all). #392.
     pub fn new(
         id: ClientId,
         peer: SocketAddr,
         codec: Codec,
+        role: Role,
         channel_depth: usize,
     ) -> (Arc<Self>, Receiver<Vec<u8>>) {
         let (tx, rx) = sync_channel::<Vec<u8>>(channel_depth);
@@ -201,6 +215,7 @@ impl ClientSlot {
             peer,
             connected_since: Instant::now(),
             codec,
+            role,
             tx,
             stats: Mutex::new(ClientStats::default()),
             disconnected: AtomicBool::new(false),
@@ -237,6 +252,7 @@ impl ClientSlot {
             peer: self.peer,
             connected_since: self.connected_since,
             codec: self.codec,
+            role: self.role,
             bytes_sent: stats_clone.bytes_sent,
             buffers_dropped: stats_clone.buffers_dropped,
             last_command: stats_clone.last_command,
@@ -259,6 +275,11 @@ pub struct ClientInfo {
     pub peer: SocketAddr,
     pub connected_since: Instant,
     pub codec: Codec,
+    /// Role the server granted to this client (`Control` dispatches
+    /// commands to the device; `Listen` drops them at the command
+    /// worker). Stats consumers render this as "Controller" /
+    /// "Listener" in the client list. #392.
+    pub role: Role,
     pub bytes_sent: u64,
     pub buffers_dropped: u64,
     pub last_command: Option<(CommandOp, Instant)>,
@@ -647,6 +668,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_GENERIC_A),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot);
@@ -657,6 +679,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_GENERIC_B),
             Codec::Lz4,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot2);
@@ -671,6 +694,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot);
@@ -692,12 +716,14 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let (s2, rx2) = ClientSlot::new(
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::Lz4,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(s1);
@@ -736,6 +762,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH,
         );
         // Fast client with generous room — shouldn't drop anything.
@@ -743,6 +770,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_GENEROUS,
         );
         let slow_id = slow.id;
@@ -777,6 +805,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot.clone());
@@ -796,6 +825,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot.clone());
@@ -820,12 +850,14 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let (dead, _dead_rx) = ClientSlot::new(
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         dead.mark_disconnected();
@@ -845,6 +877,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_SNAPSHOT),
             Codec::Lz4,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let slot_id = slot.id;
@@ -944,12 +977,14 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let (dead, _dead_rx) = ClientSlot::new(
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(live);
