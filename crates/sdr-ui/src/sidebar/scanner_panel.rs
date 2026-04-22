@@ -177,7 +177,7 @@ pub fn build_scanner_panel() -> ScannerPanel {
     let default_dwell_row = adw::SpinRow::builder()
         .title("Default dwell (ms)")
         .adjustment(&gtk4::Adjustment::new(
-            100.0,
+            f64::from(DEFAULT_DWELL_MS),
             DWELL_MIN_MS,
             DWELL_MAX_MS,
             10.0,
@@ -189,7 +189,7 @@ pub fn build_scanner_panel() -> ScannerPanel {
     let default_hang_row = adw::SpinRow::builder()
         .title("Default hang (ms)")
         .adjustment(&gtk4::Adjustment::new(
-            2000.0,
+            f64::from(DEFAULT_HANG_MS),
             HANG_MIN_MS,
             HANG_MAX_MS,
             100.0,

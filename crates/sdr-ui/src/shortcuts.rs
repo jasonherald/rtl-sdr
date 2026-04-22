@@ -94,11 +94,14 @@ pub fn setup_shortcuts(
         controller.add_shortcut(shortcut);
     }
 
-    // F8: Toggle scanner master switch. Uses `set_active` (not
-    // `set_state`) so the switch's `state-set` handler fires and
-    // dispatches `SetScannerEnabled` to the engine — otherwise
-    // the widget would flip visually but the scanner wouldn't
-    // actually start or stop.
+    // F8: Toggle scanner master switch. The master switch is
+    // wired via `connect_active_notify` in `connect_scanner_panel`
+    // — `set_active` changes the active property and fires that
+    // notify, which dispatches `SetScannerEnabled` to the engine.
+    // (Earlier iterations of this code claimed `set_active`
+    // triggers `state-set` on programmatic changes; that's
+    // binding-version-dependent, so we sidestep the ambiguity by
+    // listening to notify::active instead.)
     let scanner_switch_weak = scanner_switch.downgrade();
     let trigger_f8 = gtk4::ShortcutTrigger::parse_string("F8");
     if let Some(trigger) = trigger_f8 {

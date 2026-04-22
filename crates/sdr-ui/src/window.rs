@@ -75,21 +75,19 @@ const SCANNER_TOAST_TIMEOUT_SECS: u32 = 3;
 struct ScannerForceDisable {
     scanner_panel: sidebar::scanner_panel::ScannerPanel,
     toast_overlay: adw::ToastOverlay,
-    state: Rc<AppState>,
 }
 
 impl ScannerForceDisable {
     /// Force the scanner off and toast the user about why. No-op
-    /// when scanner is already off. Uses the explicit dispatch +
-    /// `set_state` pattern so the engine-side teardown lands
-    /// regardless of GTK binding semantics around whether
-    /// `set_state` re-fires `state-set`.
+    /// when scanner is already off. Calls `set_active(false)` on
+    /// the master switch — the switch's `connect_active_notify`
+    /// handler dispatches `SetScannerEnabled(false)` to the
+    /// engine, so no explicit DSP send is needed here.
     fn trigger(&self, reason: &str) {
-        if !self.scanner_panel.master_switch.state() {
+        if !self.scanner_panel.master_switch.is_active() {
             return;
         }
-        self.state.send_dsp(UiToDsp::SetScannerEnabled(false));
-        self.scanner_panel.master_switch.set_state(false);
+        self.scanner_panel.master_switch.set_active(false);
         let toast = adw::Toast::builder()
             .title(format!("Scanner stopped — {reason}"))
             .timeout(SCANNER_TOAST_TIMEOUT_SECS)
@@ -335,7 +333,6 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let scanner_force_disable = Rc::new(ScannerForceDisable {
         scanner_panel: panels.scanner.clone(),
         toast_overlay: toast_overlay.clone(),
-        state: Rc::clone(&state),
     });
 
     connect_sidebar_panels(
@@ -832,6 +829,17 @@ fn handle_dsp_message(
             // during this frame sees the latest key.
             state.scanner_active_key.borrow_mut().clone_from(&key);
             if key.is_some() {
+                // Update the cached tuning state so downstream
+                // reads (bandwidth notify's status-bar rewrite,
+                // Add / Save Bookmark, anything else that reads
+                // `state.center_frequency` / `state.demod_mode`)
+                // see the scanner's current channel, not the
+                // channel the user last tuned manually.
+                #[allow(clippy::cast_precision_loss)]
+                let freq_f64 = freq_hz as f64;
+                state.center_frequency.set(freq_f64);
+                state.demod_mode.set(demod_mode);
+
                 scanner_panel.active_channel_label.set_text(&format!(
                     "Active: {} — {}",
                     name,
@@ -841,8 +849,6 @@ fn handle_dsp_message(
                 // The selector's `set_frequency` does NOT fire its
                 // own callback, so no SetFrequency bounces back.
                 freq_selector.set_frequency(freq_hz);
-                #[allow(clippy::cast_precision_loss)]
-                let freq_f64 = freq_hz as f64;
                 spectrum_handle.set_center_frequency(freq_f64);
                 status_bar.update_frequency(freq_f64);
                 let label = header::demod_selector::demod_mode_label(demod_mode);
@@ -1446,12 +1452,21 @@ fn connect_sidebar_panels(
     // keeps the projection against the live backing store
     // without having to capture the `Rc<RefCell<Vec<Bookmark>>>`
     // separately.
-    let bookmarks_for_mutated = Rc::clone(&panels.bookmarks);
+    // The callback is stored inside `BookmarksPanel.on_mutated`,
+    // so capturing a strong `Rc<BookmarksPanel>` here would close
+    // a retain cycle (panel → on_mutated → closure → panel) and
+    // leak on teardown. Downgrade to `Weak` + upgrade-or-return
+    // inside the closure — same pattern the Save closure uses in
+    // `sidebar::build_sidebar`.
+    let bookmarks_weak = Rc::downgrade(&panels.bookmarks);
     let state_for_mutated = Rc::clone(state);
     let config_for_mutated = std::sync::Arc::clone(config);
     panels.bookmarks.connect_mutated(move || {
+        let Some(bookmarks) = bookmarks_weak.upgrade() else {
+            return;
+        };
         sidebar::navigation_panel::project_and_push_scanner_channels(
-            &bookmarks_for_mutated.bookmarks.borrow(),
+            &bookmarks.bookmarks.borrow(),
             &state_for_mutated,
             &config_for_mutated,
         );
@@ -5171,15 +5186,22 @@ fn connect_scanner_panel(
 ) {
     let scanner = &panels.scanner;
 
-    // Master switch → SetScannerEnabled. `connect_state_set`
-    // fires before the internal state change commits, letting
-    // future work (Task 3.3's empty-rotation recovery) reject a
-    // toggle by returning `glib::Propagation::Stop`. Today every
-    // user toggle proceeds.
+    // Master switch → SetScannerEnabled. Using `connect_active_notify`
+    // (not `connect_state_set`) so programmatic toggles fire too:
+    //   - F8 shortcut calls `set_active` which changes the active
+    //     property and fires notify::active.
+    //   - `ScannerForceDisable::trigger` calls `set_active(false)`
+    //     on the same switch for manual-tune force-disable.
+    //   - DSP-origin widget syncs (ScannerEmptyRotation,
+    //     ScannerMutexStopped::ScannerStopped*) call `set_state`,
+    //     which also propagates to active and fires notify::active.
+    //     The resulting redundant `SetScannerEnabled(false)`
+    //     dispatch is idempotent at the engine — it's cheaper to
+    //     pay one extra message per event than to add a suppress
+    //     flag for every DSP-origin sync site.
     let state_switch = Rc::clone(state);
-    scanner.master_switch.connect_state_set(move |_, active| {
-        state_switch.send_dsp(UiToDsp::SetScannerEnabled(active));
-        glib::Propagation::Proceed
+    scanner.master_switch.connect_active_notify(move |sw| {
+        state_switch.send_dsp(UiToDsp::SetScannerEnabled(sw.is_active()));
     });
 
     // Default dwell slider: persist on every value change, then
