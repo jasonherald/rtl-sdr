@@ -23,6 +23,7 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 
 - **rtl_tcp server** — stream the local RTL-SDR over TCP to other machines on your LAN. Single-client model (one user at a time; second connection rejected with FIN). mDNS `_rtl_tcp._tcp.local.` announce so clients find you without typing `host:port`. Compatible with GQRX / SDR++ / any rtl_tcp client.
 - **rtl_tcp client** — connect to a remote rtl_tcp server (ours, or stock `rtl_tcp`, SpyServer TCP, etc.). Live mDNS browser lists servers on the LAN; pin favorites for one-click reconnect with last-connection metadata (tuner, gains) shown in the favorites menu. Auto-reconnect on transient network blips.
+- **Optional LZ4 stream compression** — between two sdr-rs peers, the rtl_tcp server and client negotiate LZ4 on the data stream via a backwards-compatible `RTLX` handshake. Wire-compatible with every vanilla client (default off; opt in per-server from the "Share over network" panel). Useful on Wi-Fi / hotel / congested links where uncompressed 2.4 Msps saturates the pipe; mDNS advertises `codecs=` so compression-capable clients know when to send the extended hello.
 
 ### Display
 
@@ -256,7 +257,7 @@ sdr-rs
 
 ## Architecture
 
-18-member Rust workspace (root binary + 17 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
+22-member Rust workspace (root binary + 21 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
 
 ```text
 sdr (binary)              Linux entry point
