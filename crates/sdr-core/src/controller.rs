@@ -35,7 +35,7 @@ use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, RtlTcpConnectionState, SinkError, Stereo};
 
 use crate::fft_buffer::SharedFftBuffer;
-use crate::messages::{DspToUi, SourceType, UiToDsp};
+use crate::messages::{DspToUi, ScannerMutexReason, SourceType, UiToDsp};
 use crate::wav_writer::WavWriter;
 
 /// Number of IQ sample pairs per USB bulk read.
@@ -1388,6 +1388,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::StartAudioRecording(path) => {
+            // If scanner is active, stop it first — scanner and
+            // per-hit recording are mutually exclusive in Phase 1.
+            if state.scanner.state() != sdr_scanner::ScannerState::Idle {
+                let cmds = state
+                    .scanner
+                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
+                apply_scanner_commands(state, dsp_tx, cmds);
+                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                    ScannerMutexReason::ScannerStoppedForRecording,
+                ));
+            }
             tracing::info!(?path, "start audio recording");
             match WavWriter::new(&path, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS) {
                 Ok(writer) => {
@@ -1409,6 +1420,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::StartIqRecording(path) => {
+            // If scanner is active, stop it first — scanner and
+            // per-hit recording are mutually exclusive in Phase 1.
+            if state.scanner.state() != sdr_scanner::ScannerState::Idle {
+                let cmds = state
+                    .scanner
+                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
+                apply_scanner_commands(state, dsp_tx, cmds);
+                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                    ScannerMutexReason::ScannerStoppedForRecording,
+                ));
+            }
             tracing::info!(?path, "start IQ recording");
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let iq_rate = state.sample_rate as u32;
@@ -1431,6 +1453,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::EnableTranscription(tx) => {
+            if state.scanner.state() != sdr_scanner::ScannerState::Idle {
+                let cmds = state
+                    .scanner
+                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
+                apply_scanner_commands(state, dsp_tx, cmds);
+                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                    ScannerMutexReason::ScannerStoppedForTranscription,
+                ));
+            }
             // Reset the squelch edge tracker when a new tap is wired up.
             // Without this, a previous session that ended with squelch open
             // leaves `squelch_was_open == true`, so the first chunk of the
@@ -1518,6 +1549,18 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
         // --- Scanner (#317) ---
         UiToDsp::SetScannerEnabled(enabled) => {
+            if enabled {
+                if stop_any_recording(state, dsp_tx) {
+                    let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                        ScannerMutexReason::RecordingStoppedForScanner,
+                    ));
+                }
+                if stop_transcription(state) {
+                    let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                        ScannerMutexReason::TranscriptionStoppedForScanner,
+                    ));
+                }
+            }
             let cmds = state
                 .scanner
                 .handle_event(sdr_scanner::ScannerEvent::SetEnabled(enabled));
@@ -1542,6 +1585,44 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 .handle_event(sdr_scanner::ScannerEvent::UnlockChannel(key));
             apply_scanner_commands(state, dsp_tx, cmds);
         }
+    }
+}
+
+/// Is audio or IQ recording currently active?
+///
+/// Used by future scanner tasks; suppress the unused-function lint
+/// so it survives until the first call site arrives.
+#[allow(dead_code)]
+fn recording_active(state: &DspState) -> bool {
+    state.audio_writer.is_some() || state.iq_writer.is_some()
+}
+
+/// Stop any active recording. Returns `true` if anything was
+/// actually stopped (caller emits a mutex-stopped event only in
+/// that case, avoiding spurious toasts when scanner enables
+/// with nothing to stop).
+fn stop_any_recording(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> bool {
+    let mut stopped = false;
+    if state.audio_writer.take().is_some() {
+        let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
+        stopped = true;
+    }
+    if state.iq_writer.take().is_some() {
+        let _ = dsp_tx.send(DspToUi::IqRecordingStopped);
+        stopped = true;
+    }
+    stopped
+}
+
+/// Stop the transcription tap. Returns `true` if it was active.
+fn stop_transcription(state: &mut DspState) -> bool {
+    if state.transcription_tx.take().is_some() {
+        // Mirror the reset from the explicit DisableTranscription
+        // handler — next EnableTranscription starts fresh.
+        state.squelch_was_open = false;
+        true
+    } else {
+        false
     }
 }
 
