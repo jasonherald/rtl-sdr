@@ -499,17 +499,36 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let status_bar_for_bw = Rc::clone(&status_bar_demod);
     let state_for_bw = Rc::clone(&state);
     let radio_for_bw_reset = panels.radio.clone();
+    let spectrum_for_bw_reset = Rc::clone(&spectrum_handle);
     panels.radio.bandwidth_row.connect_value_notify(move |row| {
         let mode = state_for_bw.demod_mode.get();
         let label = header::demod_mode_label(mode);
         status_bar_for_bw.update_demod(label, row.value());
-        // Reset button tracks the spin-row value on EVERY
+        // Reset affordances track the spin-row value on EVERY
         // change — user-initiated edits AND DSP echoes. Lives
         // in this handler (not the `connect_radio_panel` one)
         // because that one short-circuits on the
         // `suppress_bandwidth_notify` flag and would miss VFO
         // drag echoes. Per issue #341.
         update_bandwidth_reset_sensitivity(&radio_for_bw_reset, &state_for_bw);
+        update_vfo_reset_button_visibility(
+            &radio_for_bw_reset,
+            &spectrum_for_bw_reset,
+            &state_for_bw,
+        );
+    });
+
+    // Floating "Reset VFO" button on the spectrum — routes
+    // through the DSP for both dispatches so the echoes
+    // (`BandwidthChanged`, `VfoOffsetChanged`) drive the UI
+    // reflection. No direct widget manipulation that would
+    // skip the DSP / scanner-mutex / force-disable machinery.
+    let state_for_vfo_reset = Rc::clone(&state);
+    spectrum_handle.vfo_reset_button.connect_clicked(move |_| {
+        let mode = state_for_vfo_reset.demod_mode.get();
+        let default_bw = sdr_radio::demod::default_bandwidth_for_mode(mode);
+        state_for_vfo_reset.send_dsp(UiToDsp::SetBandwidth(default_bw));
+        state_for_vfo_reset.send_dsp(UiToDsp::SetVfoOffset(0.0));
     });
 
     // --- Poll DspToUi channel and shared FFT buffer from the GTK main loop ---
@@ -831,9 +850,11 @@ fn handle_dsp_message(
             }
 
             // Mode change shifts the default bandwidth — refresh
-            // the reset button's sensitivity so it tracks the new
-            // mode's default. Per issue #341.
+            // both the per-field sensitivity AND the floating
+            // button's visibility so they track the new mode's
+            // default. Per issue #341.
             update_bandwidth_reset_sensitivity(radio_panel, state);
+            update_vfo_reset_button_visibility(radio_panel, spectrum_handle, state);
         }
         DspToUi::BandwidthChanged(bw) => {
             // DSP-originated bandwidth change (typically a VFO drag
@@ -865,6 +886,11 @@ fn handle_dsp_message(
             let tuned_u64 = tuned.max(0.0) as u64;
             freq_selector.set_frequency(tuned_u64);
             status_bar.update_frequency(tuned);
+            // Offset change is one of the two inputs to the
+            // floating reset button's visibility — refresh it so
+            // clicking reset hides the button and a subsequent
+            // user drag re-shows it. Per issue #341.
+            update_vfo_reset_button_visibility(radio_panel, spectrum_handle, state);
         }
         DspToUi::CtcssSustainedChanged(sustained) => {
             tracing::debug!(sustained, "CTCSS sustained-gate edge");
@@ -4362,6 +4388,29 @@ fn update_bandwidth_reset_sensitivity(radio: &sidebar::radio_panel::RadioPanel, 
     let current = radio.bandwidth_row.value();
     let at_default = (current - default).abs() < BANDWIDTH_RESET_TOLERANCE_HZ;
     radio.bandwidth_reset_button.set_sensitive(!at_default);
+}
+
+/// Tolerance (Hz) for the "VFO offset is at 0" comparison in
+/// the floating reset button's visibility logic.
+const VFO_OFFSET_RESET_TOLERANCE_HZ: f64 = 0.5;
+
+/// Update the floating "Reset VFO" button's visibility — shown
+/// only when the VFO is in a non-default state, i.e. bandwidth
+/// differs from the mode default OR offset is nonzero. Per
+/// issue #341.
+fn update_vfo_reset_button_visibility(
+    radio: &sidebar::radio_panel::RadioPanel,
+    spectrum: &spectrum::SpectrumHandle,
+    state: &AppState,
+) {
+    let mode = state.demod_mode.get();
+    let default_bw = sdr_radio::demod::default_bandwidth_for_mode(mode);
+    let current_bw = radio.bandwidth_row.value();
+    let bandwidth_at_default = (current_bw - default_bw).abs() < BANDWIDTH_RESET_TOLERANCE_HZ;
+    let offset_at_zero = spectrum.vfo_offset_hz().abs() < VFO_OFFSET_RESET_TOLERANCE_HZ;
+    spectrum
+        .vfo_reset_button
+        .set_visible(!(bandwidth_at_default && offset_at_zero));
 }
 
 /// Connect radio panel controls to DSP commands.

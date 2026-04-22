@@ -106,6 +106,13 @@ pub struct SpectrumHandle {
     full_bandwidth: Rc<Cell<f64>>,
     /// Tuner center frequency in Hz (for absolute frequency labels).
     center_freq: Rc<Cell<f64>>,
+    /// Floating "Reset VFO" button overlaid on the top-right of
+    /// the spectrum area. Visibility is driven by window.rs:
+    /// visible when bandwidth ≠ mode default OR vfo offset ≠ 0.
+    /// `window.rs` also wires the click handler (needs access to
+    /// `AppState` to compute the mode's default bandwidth).
+    /// Per issue #341.
+    pub vfo_reset_button: gtk4::Button,
 }
 
 impl SpectrumHandle {
@@ -413,6 +420,33 @@ pub fn build_spectrum_view(
         }
     });
 
+    // Floating "Reset VFO" button in the top-right of the
+    // spectrum area. Hidden by default; `window.rs` toggles
+    // visibility whenever the VFO enters or leaves a non-default
+    // state. Uses the `osd` CSS class for a translucent overlay
+    // feel that doesn't steal too much visual weight from the
+    // spectrum underneath.
+    let vfo_reset_button = gtk4::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Reset VFO to defaults")
+        .css_classes(["osd", "circular"])
+        .halign(gtk4::Align::End)
+        .valign(gtk4::Align::Start)
+        .margin_top(8)
+        .margin_end(8)
+        .visible(false)
+        .build();
+    vfo_reset_button.update_property(&[gtk4::accessible::Property::Label(
+        "Reset VFO bandwidth and offset to defaults",
+    )]);
+
+    // Wrap the paned in an Overlay so the floating button can
+    // sit on top of both the FFT plot and the waterfall without
+    // shifting their layout.
+    let spectrum_overlay = gtk4::Overlay::builder().hexpand(true).vexpand(true).build();
+    spectrum_overlay.set_child(Some(&paned));
+    spectrum_overlay.add_overlay(&vfo_reset_button);
+
     // Wrap the signal history DrawingArea in a collapsible expander.
     let expander = gtk4::Expander::builder()
         .label("Signal History")
@@ -420,14 +454,14 @@ pub fn build_spectrum_view(
         .build();
     expander.set_child(Some(&signal_history_area));
 
-    // Combine the FFT+waterfall paned and the signal history expander
-    // into a vertical box.
+    // Combine the FFT+waterfall overlay and the signal history
+    // expander into a vertical box.
     let outer_box = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
         .hexpand(true)
         .vexpand(true)
         .build();
-    outer_box.append(&paned);
+    outer_box.append(&spectrum_overlay);
     outer_box.append(&expander);
 
     let handle = SpectrumHandle {
@@ -447,6 +481,7 @@ pub fn build_spectrum_view(
         vfo_offset_callback,
         full_bandwidth,
         center_freq,
+        vfo_reset_button,
     };
 
     (outer_box, handle)
