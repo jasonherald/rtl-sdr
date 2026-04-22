@@ -391,6 +391,23 @@ fn bind_socket_addr(bind: i32, port: u16) -> Result<SocketAddr, SdrCoreError> {
     }
 }
 
+/// Translate the C-ABI `listener_cap` field into the Rust
+/// `ServerConfig::listener_cap`. Zero means "use the crate
+/// default" per the header docs — the `0 → DEFAULT_LISTENER_CAP`
+/// rule is the public contract, so pulling it out of
+/// `sdr_rtltcp_server_start` makes it unit-testable without the
+/// hardware-backed start path. Non-zero values passthrough as
+/// `u32 → usize` (widening cast, always lossless on 32- and
+/// 64-bit targets we build for). Per `CodeRabbit` round 2 on
+/// PR #403.
+fn listener_cap_from_c(listener_cap: u32) -> usize {
+    if listener_cap == 0 {
+        sdr_server_rtltcp::DEFAULT_LISTENER_CAP
+    } else {
+        listener_cap as usize
+    }
+}
+
 // ============================================================
 //  FFI entry points
 // ============================================================
@@ -441,11 +458,7 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
         } else {
             cfg.buffer_capacity as usize
         };
-        let listener_cap = if cfg.listener_cap == 0 {
-            sdr_server_rtltcp::DEFAULT_LISTENER_CAP
-        } else {
-            cfg.listener_cap as usize
-        };
+        let listener_cap = listener_cap_from_c(cfg.listener_cap);
         let server_cfg = ServerConfig {
             bind,
             device_index: cfg.device_index,
@@ -1113,6 +1126,28 @@ mod tests {
     fn bind_socket_addr_zero_port_uses_default() {
         let addr = bind_socket_addr(SDR_BIND_LOOPBACK, 0).unwrap();
         assert_eq!(addr.port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn listener_cap_from_c_zero_uses_default() {
+        // Contract: `SdrRtlTcpServerConfig::listener_cap == 0` is
+        // the "use the crate default" sentinel. Extracted helper
+        // lets this rule be verified without the hardware-backed
+        // `sdr_rtltcp_server_start` path. Per `CodeRabbit` round 2
+        // on PR #403.
+        assert_eq!(
+            listener_cap_from_c(0),
+            sdr_server_rtltcp::DEFAULT_LISTENER_CAP
+        );
+    }
+
+    #[test]
+    fn listener_cap_from_c_nonzero_is_preserved() {
+        // Non-zero values widen from u32 to usize without
+        // modification. Picking a mid-range value rules out an
+        // off-by-one that would have passed `listener_cap_from_c(1)
+        // == 1` trivially.
+        assert_eq!(listener_cap_from_c(7), 7);
     }
 
     #[test]
