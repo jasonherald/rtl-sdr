@@ -48,6 +48,6 @@ pub use protocol::{
     TunerTypeCode,
 };
 pub use server::{
-    DEFAULT_BUFFER_CAPACITY, DEFAULT_CENTER_FREQ_HZ, DEFAULT_SAMPLE_RATE_HZ, InitialDeviceState,
-    READ_BUFFER_LEN, Server, ServerConfig, ServerStats, TunerAdvertiseInfo,
+    DEFAULT_BUFFER_CAPACITY, DEFAULT_CENTER_FREQ_HZ, DEFAULT_LISTENER_CAP, DEFAULT_SAMPLE_RATE_HZ,
+    InitialDeviceState, READ_BUFFER_LEN, Server, ServerConfig, ServerStats, TunerAdvertiseInfo,
 };

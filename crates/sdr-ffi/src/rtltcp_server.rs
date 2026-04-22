@@ -78,6 +78,12 @@ pub struct SdrRtlTcpServerConfig {
     /// Direct-sampling mode: 0 = off, 1 = I, 2 = Q. Rejected
     /// outside this range by `sdr_rtltcp_server_start`.
     pub initial_direct_sampling: i32,
+    /// Maximum concurrent `Role::Listen` clients. 0 = use
+    /// [`sdr_server_rtltcp::DEFAULT_LISTENER_CAP`] (10). Vanilla
+    /// `rtl_tcp` clients and the single Control client are NOT
+    /// counted — they occupy the controller slot, which is
+    /// separate from the listener pool. #392.
+    pub listener_cap: u32,
 }
 
 /// Aggregate server-lifetime statistics snapshot.
@@ -435,6 +441,11 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
         } else {
             cfg.buffer_capacity as usize
         };
+        let listener_cap = if cfg.listener_cap == 0 {
+            sdr_server_rtltcp::DEFAULT_LISTENER_CAP
+        } else {
+            cfg.listener_cap as usize
+        };
         let server_cfg = ServerConfig {
             bind,
             device_index: cfg.device_index,
@@ -446,6 +457,7 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             // clients keep working; the Linux GTK path is the only
             // one that currently offers LZ4.
             compression: CodecMask::NONE_ONLY,
+            listener_cap,
         };
         match Server::start(server_cfg) {
             Ok(server) => {
@@ -1074,6 +1086,7 @@ mod tests {
             initial_ppm: 0,
             initial_bias_tee: false,
             initial_direct_sampling: 0,
+            listener_cap: 0, // 0 → use DEFAULT_LISTENER_CAP
         }
     }
 
@@ -1154,6 +1167,7 @@ mod tests {
             initial_ppm: 0,
             initial_bias_tee: false,
             initial_direct_sampling: 0,
+            listener_cap: 0,
         };
         let mut handle: *mut SdrRtlTcpServer = std::ptr::null_mut();
         let rc = unsafe { sdr_rtltcp_server_start(&raw const opts, &raw mut handle) };

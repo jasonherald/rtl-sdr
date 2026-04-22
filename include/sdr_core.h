@@ -805,6 +805,7 @@ typedef enum SdrBindAddress {
  * `initial_gain_tenths_db == 0` means "auto" (no manual gain).
  * `initial_direct_sampling` must be one of 0 / 1 / 2.
  * `port == 0` falls back to the crate default port (1234).
+ * `listener_cap == 0` uses the crate default (10).
  */
 typedef struct SdrRtlTcpServerConfig {
     int32_t  bind_address;               /* SdrBindAddress */
@@ -817,6 +818,7 @@ typedef struct SdrRtlTcpServerConfig {
     int32_t  initial_ppm;                /* frequency correction (ppm) */
     bool     initial_bias_tee;
     int32_t  initial_direct_sampling;    /* 0 = off, 1 = I, 2 = Q */
+    uint32_t listener_cap;               /* max concurrent Role::Listen clients; 0 = crate default (10); the single Control client is separate */
 } SdrRtlTcpServerConfig;
 
 /*

@@ -3815,6 +3815,7 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
         },
         buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
         compression,
+        listener_cap: sdr_server_rtltcp::DEFAULT_LISTENER_CAP,
     }
 }
 

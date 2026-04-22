@@ -106,6 +106,13 @@ const USB_READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// lock + retain work happen per chunk.
 const BROADCASTER_PRUNE_EVERY_N_TICKS: u32 = 256;
 
+/// Default cap on concurrent `Role::Listen` clients. Vanilla / Control
+/// clients are counted separately (they allocate the single controller
+/// slot). 10 is a generous default — real deployments pushing past this
+/// are either relay/broadcast scenarios where the UI gives the user an
+/// explicit "max listeners" knob, or a test setup. Per #390 decisions.
+pub const DEFAULT_LISTENER_CAP: usize = 10;
+
 /// Default sample rate in Hz. Matches upstream `rtl_tcp.c:DEFAULT_SAMPLE_RATE_HZ`.
 ///
 /// Exposed so the CLI can share the same constant instead of hard-coding
@@ -153,6 +160,17 @@ pub struct ServerConfig {
     /// [`CodecMask::NONE_ONLY`] — compression is opt-in per-
     /// server so existing deployments behave identically.
     pub compression: crate::codec::CodecMask,
+
+    /// Maximum concurrent `Role::Listen` clients. The Control client
+    /// is separate (always exactly one when occupied), so the total
+    /// live-client ceiling is `listener_cap + 1`. When the cap is
+    /// already filled, an RTLX client requesting `Role::Listen`
+    /// receives `granted_role=denied, status=ListenerCapReached` and
+    /// the connection is closed. Vanilla `rtl_tcp` clients never
+    /// enter the listener path — they're always Control-or-denied —
+    /// so the cap doesn't apply to them. Default:
+    /// [`DEFAULT_LISTENER_CAP`]. #392.
+    pub listener_cap: usize,
 }
 
 impl ServerConfig {
@@ -166,6 +184,7 @@ impl ServerConfig {
             initial: InitialDeviceState::default(),
             buffer_capacity: DEFAULT_BUFFER_CAPACITY,
             compression: crate::codec::CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
         }
     }
 }
@@ -1406,6 +1425,7 @@ mod tests {
             initial: InitialDeviceState::default(),
             buffer_capacity: 0,
             compression: CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
         };
         match Server::start(config) {
             Err(ServerError::PortInUse(ref addr)) => {
