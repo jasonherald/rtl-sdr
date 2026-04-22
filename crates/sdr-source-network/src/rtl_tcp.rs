@@ -45,6 +45,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use sdr_pipeline::source_manager::Source;
+use sdr_server_rtltcp::codec::{Codec, CodecMask, Decoder};
+use sdr_server_rtltcp::extension::{
+    ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, SERVER_EXTENSION_LEN, ServerExtension,
+};
 use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
 use sdr_types::{Complex, SourceError};
 
@@ -197,6 +201,24 @@ pub struct RtlTcpConfig {
     /// drops packets rather than replying RST), leaving the manager
     /// thread stuck.
     pub connect_timeout: Duration,
+
+    /// Codecs this client is willing to negotiate in the extended
+    /// `"RTLX"` handshake (#307). Defaults to [`CodecMask::NONE_ONLY`]
+    /// — no hello sent, behaves identically to the pre-#307 client
+    /// against any server (vanilla rtl_tcp / GQRX / SDR++ / our own).
+    ///
+    /// Opting in with [`CodecMask::NONE_AND_LZ4`] causes the client
+    /// to prepend an 8-byte `ClientHello` to the connection. sdr-rs
+    /// servers parse it and respond with a `ServerExtension` block;
+    /// **vanilla rtl_tcp servers misinterpret those 8 bytes** as
+    /// two 5-byte commands (with hello bytes straddling the
+    /// command-framing boundary), which can cause garbage command
+    /// dispatches. The UI / client-side discovery layer should only
+    /// flip this bit when it has out-of-band evidence that the
+    /// target server speaks the extension — e.g., mDNS TXT
+    /// advertising `rtlx=1` (future commit), or an explicit
+    /// per-server profile setting.
+    pub compression: sdr_server_rtltcp::codec::CodecMask,
 }
 
 impl Default for RtlTcpConfig {
@@ -205,6 +227,7 @@ impl Default for RtlTcpConfig {
             data_read_timeout: DEFAULT_DATA_READ_TIMEOUT,
             max_consecutive_timeouts: DEFAULT_MAX_CONSECUTIVE_TIMEOUTS,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
         }
     }
 }
@@ -647,11 +670,11 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
         set_state(&shared, ConnectionState::Connecting);
 
         match attempt_connect(&host, port, &shared, &config) {
-            Ok(stream) => {
+            Ok(HandshakeOutcome { stream, codec }) => {
                 attempt = 0;
                 // At this point handshake has completed successfully.
                 replay_sticky_commands(&shared);
-                run_data_pump(stream, &shared, &config);
+                run_data_pump(stream, codec, &shared, &config);
                 // run_data_pump returned — connection dropped.
             }
             Err(e) => {
@@ -696,12 +719,73 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
     set_state(&shared, ConnectionState::Disconnected);
 }
 
+/// Try to read + parse the server's 8-byte [`ServerExtension`]
+/// block. The caller invokes this immediately after reading the
+/// legacy 12-byte `dongle_info_t`. Returns `Ok(Some)` on a valid
+/// extension block (consumed), `Ok(None)` when the server didn't
+/// send one (legacy `rtl_tcp`, or our own server with the
+/// negotiated codec being `None` but the hello not seen — the
+/// magic-peek still correctly falls through).
+///
+/// Uses `peek()` so non-extension bytes stay in the TCP receive
+/// buffer for the IQ stream reader: on a legacy server, the
+/// bytes after `dongle_info_t` are raw I/Q samples and the
+/// fallback path must not lose them.
+fn sniff_server_extension(stream: &TcpStream) -> std::io::Result<Option<ServerExtension>> {
+    let mut peek_buf = [0u8; 4];
+    let peeked = match stream.peek(&mut peek_buf) {
+        Ok(n) => n,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            // No bytes in the receive buffer yet — the server
+            // might be a vanilla rtl_tcp that hasn't produced
+            // IQ samples in the intervening microseconds. Treat
+            // as "no extension" and let the data pump block on
+            // its first real IQ read.
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    if peeked < 4 || peek_buf[..4] != EXTENSION_MAGIC {
+        // Vanilla server — no extension block. Peeked bytes
+        // stay in the buffer for the IQ stream reader.
+        return Ok(None);
+    }
+    let mut ext_buf = [0u8; SERVER_EXTENSION_LEN];
+    stream.peek(&mut ext_buf)?;
+    // Only consume the 8 bytes once we've parsed successfully;
+    // a partial server-extension write (magic matched but
+    // payload malformed) leaves the magic bytes in the buffer
+    // and the data pump will fail with a loud protocol error,
+    // which is better than swallowing bytes silently.
+    match ServerExtension::from_bytes(&ext_buf) {
+        Some(ext) => {
+            // Consume the 8 bytes now that parse succeeded.
+            let mut sink = [0u8; SERVER_EXTENSION_LEN];
+            <&TcpStream as std::io::Read>::read_exact(&mut &*stream, &mut sink)?;
+            Ok(Some(ext))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Outcome of an extended-protocol handshake. `stream` is the
+/// TCP socket (still plain `TcpStream`; the caller wraps it in a
+/// [`Decoder`] for reads). `codec` tells the caller which
+/// decoder to use for the IQ stream.
+struct HandshakeOutcome {
+    stream: TcpStream,
+    codec: Codec,
+}
+
 fn attempt_connect(
     host: &str,
     port: u16,
     shared: &Arc<SharedState>,
     config: &RtlTcpConfig,
-) -> Result<TcpStream, SourceError> {
+) -> Result<HandshakeOutcome, SourceError> {
     // `(host, port).to_socket_addrs()` handles both IPv4 dotted
     // quads AND IPv6 literals like `::1` correctly — the naïve
     // `format!("{host}:{port}")` that we had before would build
@@ -728,6 +812,30 @@ fn attempt_connect(
         tracing::warn!(%e, "SO_KEEPALIVE not applied (non-fatal)");
     }
 
+    // Send the extended-protocol `ClientHello` only if the caller
+    // opted into compression. A hello sent to a vanilla
+    // `rtl_tcp` server straddles its 5-byte command-read
+    // framing (hello is 8 bytes = 1.6 commands) and can cause
+    // garbage dispatches, so we only send it when we have
+    // out-of-band evidence the server speaks the extension
+    // (e.g., mDNS TXT `rtlx=1` or an explicit per-server profile
+    // setting). Default `compression = NONE_ONLY` → no hello →
+    // wire-compatible with every rtl_tcp server on earth. Per #307.
+    let extension_enabled = config.compression != CodecMask::NONE_ONLY;
+    if extension_enabled {
+        let hello = ClientHello {
+            codec_mask: config.compression,
+            // #307 is single-client on the server side; role and
+            // flags are reserved for #390's multi-client follow-ups.
+            role: Role::Control,
+            flags: 0,
+            version: PROTOCOL_VERSION,
+        };
+        if let Err(e) = (&stream).write_all(&hello.to_bytes()) {
+            return Err(SourceError::Io(e));
+        }
+    }
+
     // Read and verify the 12-byte dongle_info_t header.
     let mut header_buf = [0u8; DONGLE_INFO_LEN];
     read_exact_with_context(&stream, &mut header_buf)?;
@@ -743,12 +851,47 @@ fn attempt_connect(
     }
     set_state(shared, ConnectionState::Connected { tuner });
 
+    // Peek for the server's `ServerExtension` block — only when
+    // we sent a hello. If we didn't, the server can't have replied
+    // with an extension block, and a rogue peek would risk
+    // consuming IQ data. Sticks the client to legacy path whenever
+    // `compression = NONE_ONLY`.
+    let codec = if extension_enabled {
+        match sniff_server_extension(&stream) {
+            Ok(Some(ext)) => {
+                tracing::info!(
+                    codec = %ext.codec,
+                    status = ext.status.to_wire(),
+                    "rtl_tcp extended-handshake accepted by server"
+                );
+                ext.codec
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    "rtl_tcp server sent no extension block — legacy / uncompressed path"
+                );
+                Codec::None
+            }
+            Err(e) => {
+                tracing::warn!(%e, "rtl_tcp extension sniff failed — treating as legacy");
+                Codec::None
+            }
+        }
+    } else {
+        Codec::None
+    };
+
     // Publish a clone of the stream for the command sender. Install a
     // write timeout on the clone so `send_command`'s blocking
     // `write_all` can't hang indefinitely if a zero-window peer
     // saturates our kernel send buffer — tune/gain changes must stay
     // responsive. Socket options propagate across `try_clone` on the
     // same underlying fd, so this applies to every subsequent write.
+    //
+    // The command sink is ALWAYS the raw TCP stream regardless of
+    // negotiated codec — rtl_tcp commands are 5-byte fixed-width and
+    // are not encoded under the `"RTLX"` extension. Only the
+    // server→client data direction is compressed.
     let sink = stream.try_clone().map_err(SourceError::Io)?;
     if let Err(e) = sink.set_write_timeout(Some(config.data_read_timeout)) {
         tracing::warn!(%e, "set_write_timeout on command sink failed — command sends may block");
@@ -757,7 +900,7 @@ fn attempt_connect(
         *slot = Some(sink);
     }
 
-    Ok(stream)
+    Ok(HandshakeOutcome { stream, codec })
 }
 
 /// Run `TcpStream::connect_timeout` on a helper thread, polling a
@@ -829,11 +972,26 @@ fn connect_cancellable(
     }
 }
 
-fn run_data_pump(mut stream: TcpStream, shared: &Arc<SharedState>, config: &RtlTcpConfig) {
+fn run_data_pump(
+    stream: TcpStream,
+    codec: Codec,
+    shared: &Arc<SharedState>,
+    config: &RtlTcpConfig,
+) {
+    // Wrap the TCP stream in the negotiated decoder. Legacy /
+    // vanilla-server paths hit `Codec::None` which is a
+    // zero-overhead pass-through; only LZ4 connections pay the
+    // framing cost.
+    //
+    // Read timeout was installed in `attempt_connect` on the
+    // underlying TcpStream; `Decoder::Lz4` delegates its `read()`
+    // to the inner stream so `SO_RCVTIMEO` still enforces the
+    // stall-detection path below unchanged.
+    let mut reader = Decoder::new(codec, stream);
     let mut buf = [0u8; RECV_CHUNK_BYTES];
     let mut consecutive_timeouts: u32 = 0;
     while !shared.shutdown.load(Ordering::Relaxed) {
-        match stream.read(&mut buf) {
+        match reader.read(&mut buf) {
             Ok(0) => {
                 tracing::info!("rtl_tcp server closed connection");
                 break;
@@ -1339,6 +1497,7 @@ mod tests {
             data_read_timeout: Duration::from_millis(200),
             max_consecutive_timeouts: 2,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();

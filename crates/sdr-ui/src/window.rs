@@ -3683,6 +3683,11 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
             direct_sampling,
         },
         buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
+        // Compression stays off by default — the UI picker lands
+        // in a follow-up commit (#307). Once the picker exists,
+        // this is read from the panel widget alongside the other
+        // initial-state fields.
+        compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
     }
 }
 
