@@ -945,11 +945,16 @@ fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHe
                 // fallback) would shift the command reader by
                 // the 1–3 prefix bytes still queued in the
                 // receive buffer — parsing `R` / `RT` / `RTL`
-                // as opcodes corrupts the command stream. Same
-                // reasoning as the post-magic-match failure
-                // modes below; drop the client.
+                // as opcodes corrupts the command stream. Surface
+                // as `InvalidData` (not `TimedOut`) to match the
+                // post-magic-match `read_exact` and body-parse
+                // failure paths below: both are protocol-desync
+                // errors from the host's perspective — the socket
+                // isn't "idle", it sent bytes that commit to the
+                // extended protocol and then stalled. Per
+                // `CodeRabbit` round 6 on PR #402.
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
+                    std::io::ErrorKind::InvalidData,
                     "RTLX magic prefix observed but full 4-byte magic did not complete \
                      within HELLO_SNIFF_TIMEOUT",
                 ));
@@ -1690,7 +1695,10 @@ mod tests {
 
     #[test]
     fn sniff_client_hello_stalled_magic_prefix_is_protocol_error() {
-        // **Regression test for `CodeRabbit` round 5 on PR #402.**
+        // **Regression test for `CodeRabbit` round 5 on PR #402**
+        // (initial promotion to `Err`) **+ round 6** (pinning
+        // the error kind to `InvalidData`, not `TimedOut`).
+        //
         // A client that starts sending the magic (e.g. `RT`)
         // and then stalls without completing the remaining 2
         // bytes must NOT fall back to legacy: the prefix bytes
@@ -1698,16 +1706,24 @@ mod tests {
         // them to `command_worker` would start the legacy
         // command stream at `R` (0x52) which isn't any valid
         // opcode — poisoning every subsequent command. Promote
-        // to `Err` so the client gets dropped.
+        // to `Err` with `ErrorKind::InvalidData` so it lands in
+        // the same classification bucket as `read_exact`
+        // timeout mid-hello and a malformed body — all three
+        // are protocol-desync errors from the host's POV.
         let result = run_sniff_against(|mut client| {
             client.write_all(&EXTENSION_MAGIC[..2]).unwrap();
             thread::sleep(HELLO_SNIFF_TIMEOUT * 5);
             drop(client);
         });
-        assert!(
-            result.is_err(),
-            "stalled magic prefix must surface as Err (dropping the client) — got \
-             {result:?} which would desync the command stream on legacy fallback"
+        let err = result.expect_err(
+            "stalled magic prefix must surface as Err (dropping the client) — legacy \
+             fallback would desync the command stream",
+        );
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "stalled RTLX prefix classifies as InvalidData (protocol desync), not \
+             TimedOut (idle-socket semantics) — got {err:?}"
         );
     }
 

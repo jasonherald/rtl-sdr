@@ -194,8 +194,35 @@ pub struct SdrRtlTcpClientInfo {
     /// [`sdr_rtltcp_server_recent_commands_json`]'s `out_required`
     /// size-probe path for buffer sizing (length depends on opcode
     /// names and float formatting, not a fixed per-entry byte
-    /// count). Per `CodeRabbit` round 2 on PR #402.
+    /// count).
     pub recent_commands_count: u32,
+    /// `true` once the client has issued at least one command
+    /// this session. Complementary to `recent_commands_count`:
+    /// `recent_commands_count > 0` implies `has_last_command`,
+    /// but `has_last_command` alone means "at least one command
+    /// dispatched" without committing to whether the ring
+    /// already evicted the earliest entries. `last_command_op`
+    /// and `last_command_age_secs` are only valid when this is
+    /// `true`. Per `CodeRabbit` round 6 on PR #402 — surfaces
+    /// the same `last_command` field the Rust UI uses to drive
+    /// `pick_most_recent_commander`, so FFI hosts can replicate
+    /// the "most recent commander" selection without polling /
+    /// parsing the JSON ring for every connected client.
+    pub has_last_command: bool,
+    /// Wire byte of the client's most recently dispatched
+    /// command — matches the opcode values documented in
+    /// `rtl_tcp.c:315-372` (`SetCenterFreq = 0x01`,
+    /// `SetBiasTee = 0x0e`, etc.). Valid only when
+    /// `has_last_command == true`; 0 when the client hasn't
+    /// sent a command yet. Hosts can map this back to a human
+    /// label via [`sdr_rtltcp_server_recent_commands_json`] or
+    /// their own opcode table.
+    pub last_command_op: u8,
+    /// Seconds elapsed since the client's most recent command
+    /// was dispatched. Measured at the moment this snapshot was
+    /// assembled; increases monotonically between polls.
+    /// Valid only when `has_last_command == true`.
+    pub last_command_age_secs: f64,
 }
 
 impl Default for SdrRtlTcpClientInfo {
@@ -214,6 +241,9 @@ impl Default for SdrRtlTcpClientInfo {
             has_current_gain_value: false,
             has_current_gain_mode: false,
             recent_commands_count: 0,
+            has_last_command: false,
+            last_command_op: 0,
+            last_command_age_secs: 0.0,
         }
     }
 }
@@ -792,6 +822,21 @@ fn stats_to_c(stats: &ServerStats, tuner: &TunerAdvertiseInfo) -> SdrRtlTcpServe
 }
 
 fn client_info_to_c(info: &ClientInfo) -> SdrRtlTcpClientInfo {
+    // Project `last_command` onto the flat FFI trio:
+    // `(has_last_command, last_command_op, last_command_age_secs)`.
+    // Computed against `Instant::now()` at projection time so the
+    // reported age reflects the moment the snapshot was assembled,
+    // matching how UI callers interpret the analogous fields on
+    // `ClientInfo`. Per `CodeRabbit` round 6 on PR #402.
+    let (has_last_command, last_command_op, last_command_age_secs) =
+        if let Some((op, at)) = info.last_command {
+            let age = std::time::Instant::now()
+                .saturating_duration_since(at)
+                .as_secs_f64();
+            (true, op as u8, age)
+        } else {
+            (false, 0u8, 0.0)
+        };
     let mut out = SdrRtlTcpClientInfo {
         id: info.id,
         peer_addr: [0; SDR_RTLTCP_CLIENT_PEER_LEN],
@@ -810,6 +855,9 @@ fn client_info_to_c(info: &ClientInfo) -> SdrRtlTcpClientInfo {
             reason = "recent_commands is capped at RECENT_COMMANDS_CAPACITY = 50"
         )]
         recent_commands_count: info.recent_commands.len() as u32,
+        has_last_command,
+        last_command_op,
+        last_command_age_secs,
     };
     // Write peer_addr into the inline byte array, truncating at
     // `len - 1` to leave room for a NUL. Cast via &mut raw ptr
@@ -1189,6 +1237,22 @@ mod tests {
         assert_eq!(c.id, TEST_CLIENT_ID);
         assert_eq!(c.bytes_sent, TEST_CLIENT_BYTES_SENT);
         assert_eq!(c.codec, 1); // LZ4 wire value
+        // `last_command` fixture is `None` for the whole test;
+        // the projection must surface that as `has_last_command
+        // == false` with the op / age fields defaulted to zero
+        // so FFI hosts never read an undefined opcode or age.
+        assert!(!c.has_last_command);
+        assert_eq!(c.last_command_op, 0);
+        // Exact-zero float comparison is correct here — the
+        // `None` branch of the projection assigns the literal
+        // `0.0` without any arithmetic, so a non-zero readback
+        // would mean the projection wrote the age unconditionally.
+        #[allow(
+            clippy::float_cmp,
+            reason = "projection assigns literal 0.0 in the None branch"
+        )]
+        let age_is_zero = c.last_command_age_secs == 0.0;
+        assert!(age_is_zero);
 
         // (Some(v), None) → value set, mode unknown
         info.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
@@ -1215,6 +1279,66 @@ mod tests {
         assert!(c.has_current_gain_mode);
         assert_eq!(c.current_gain_tenths_db, TEST_NONZERO_GAIN_TENTHS);
         assert!(!c.current_gain_auto);
+    }
+
+    #[test]
+    fn client_info_to_c_projects_last_command_fields() {
+        // **Regression test for `CodeRabbit` round 6 on PR #402.**
+        // `SdrRtlTcpClientInfo` now carries
+        // `(has_last_command, last_command_op, last_command_age_secs)`
+        // so FFI hosts can replicate the Rust UI's
+        // `pick_most_recent_commander` selection without parsing
+        // every client's JSON ring. Verify the projection:
+        //
+        //   `ClientInfo.last_command = None`             → flag=false, op=0, age=0.0
+        //   `ClientInfo.last_command = Some((op, at))`   → flag=true, op=op_byte, age>0
+        //
+        // The `None` case is already covered by the default path
+        // in `client_info_to_c_preserves_independent_gain_validity`;
+        // this test pins the `Some` case — opcode byte maps to
+        // the wire value, and the age is a positive number
+        // matching the injected delta.
+        use sdr_server_rtltcp::codec::Codec;
+        use sdr_server_rtltcp::protocol::CommandOp;
+        let command_age = Duration::from_secs(TEST_COMMAND_AGE_SECS);
+        let dispatched_at = std::time::Instant::now()
+            .checked_sub(command_age)
+            .expect("Instant::now - TEST_COMMAND_AGE_SECS is representable");
+        let info = ClientInfo {
+            id: TEST_CLIENT_ID,
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
+            connected_since: std::time::Instant::now(),
+            codec: Codec::None,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            // `SetBiasTee` (0x0e) chosen because it's the highest
+            // documented opcode — a projection bug that truncates
+            // to a smaller `u8` range would still surface here.
+            last_command: Some((CommandOp::SetBiasTee, dispatched_at)),
+            current_freq_hz: None,
+            current_sample_rate_hz: None,
+            current_gain_tenths_db: None,
+            current_gain_auto: None,
+            recent_commands: std::collections::VecDeque::new(),
+        };
+        let c = client_info_to_c(&info);
+        assert!(c.has_last_command);
+        assert_eq!(c.last_command_op, CommandOp::SetBiasTee as u8);
+        assert_eq!(c.last_command_op, 0x0e, "opcode wire byte");
+        // The projection computes `Instant::now().saturating_duration_since(at)`
+        // so the age is at least `TEST_COMMAND_AGE_SECS` (and a
+        // few microseconds over, but we don't pin an upper bound
+        // because CI schedulers vary).
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "seconds count fits in f64 mantissa"
+        )]
+        let min_age = TEST_COMMAND_AGE_SECS as f64;
+        assert!(
+            c.last_command_age_secs >= min_age,
+            "expected age >= {min_age}s, got {}s",
+            c.last_command_age_secs
+        );
     }
 
     #[test]

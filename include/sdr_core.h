@@ -56,8 +56,17 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 14
+#define SDR_CORE_ABI_VERSION_MINOR 15
 /*
+ * 0.15 — adds `has_last_command` / `last_command_op` /
+ * `last_command_age_secs` to the tail of `SdrRtlTcpClientInfo`
+ * so FFI hosts can replicate the "most recent commander"
+ * selection the Rust UI does via `pick_most_recent_commander`
+ * without having to poll + parse the JSON ring for every
+ * connected client. Struct layout grows; callers built against
+ * 0.14 MUST fail fast on the ABI-version check (pre-1.0
+ * exact-match rule, see "ABI versioning" block above).
+ *
  * 0.14 — breaking change to the rtl_tcp server surface.
  * `SdrRtlTcpServerStats` layout changed to aggregate-only counters
  * (per-client session state moved to the new `SdrRtlTcpClientInfo`
@@ -908,6 +917,30 @@ typedef struct SdrRtlTcpClientInfo {
      * names and float formatting and isn't a fixed per-entry
      * byte count. */
     uint32_t recent_commands_count;
+    /* true once the client has issued at least one command this
+     * session. Complementary to recent_commands_count:
+     * recent_commands_count > 0 implies has_last_command, but
+     * has_last_command alone means "at least one command
+     * dispatched" without committing to whether the ring has
+     * already evicted earlier entries. last_command_op and
+     * last_command_age_secs are only valid when this is true. */
+    bool     has_last_command;
+    /* Wire byte of the client's most recently dispatched command
+     * — matches the opcodes documented in rtl_tcp.c:315-372
+     * (SetCenterFreq = 0x01, SetSampleRate = 0x02, ...,
+     * SetBiasTee = 0x0e). Valid only when has_last_command ==
+     * true; 0 otherwise. Hosts that want a display label can map
+     * the opcode locally or call
+     * sdr_rtltcp_server_recent_commands_json for the ring. */
+    uint8_t  last_command_op;
+    /* Seconds elapsed since the client's most recent command
+     * was dispatched. Measured at the moment this snapshot was
+     * assembled; increases monotonically between polls. Valid
+     * only when has_last_command == true. Hosts that want to
+     * replicate "most recent commander" selection across the
+     * connected-client list pick the entry with the smallest
+     * last_command_age_secs. */
+    double   last_command_age_secs;
 } SdrRtlTcpClientInfo;
 
 /*
