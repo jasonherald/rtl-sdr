@@ -1727,6 +1727,20 @@ fn apply_scanner_commands(
                     if let Err(e) = state.radio.set_mode(demod_mode) {
                         tracing::warn!(?e, "scanner retune: set_mode failed");
                     } else {
+                        // Generic audio tap: same hard-boundary
+                        // treatment the `UiToDsp::SetDemodMode` path
+                        // applies. Scanner retunes deliberately
+                        // suppress `DemodModeChanged` to the UI
+                        // (per-hop chatter would be noise), which
+                        // means FFI tap consumers never see the
+                        // normal restart signal — so without this
+                        // reset, one audio stream would span mixed
+                        // demod outputs with stale 3:1 decimation
+                        // phase state. Mirrors the treatment at
+                        // L652-657 for the user-driven mode switch.
+                        state.audio_tap_tx = None;
+                        state.audio_tap_phase = 0;
+
                         // Auto-adjust decimation for the new
                         // demod's IF rate.
                         let if_rate = state.radio.demod_config().if_sample_rate;
