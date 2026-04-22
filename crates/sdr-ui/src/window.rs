@@ -3360,6 +3360,15 @@ fn connect_server_status_polling(
 /// — strong refs held only for this call's duration — so the poll
 /// closure itself doesn't contribute to the long-running `GObject`
 /// refcount.
+///
+/// Renders the FIRST connected client in the per-session rows
+/// (client peer, uptime, commanded state, activity log). Multi-
+/// client per-client UI rows land in PR B of #391; this commit
+/// just wires the new `Vec<ClientInfo>` shape into the existing
+/// single-client row layout so the server-panel keeps working.
+/// The data-rate row switches to the aggregate
+/// `total_bytes_sent` so operators see the full server throughput
+/// even before PR B's per-client rows arrive.
 fn render_status_rows(
     widgets: &ServerStatusWidgets,
     stats: &sdr_server_rtltcp::ServerStats,
@@ -3369,13 +3378,26 @@ fn render_status_rows(
         STATUS_IDLE_VALUE_SUBTITLE, STATUS_WAITING_FOR_CLIENT_SUBTITLE,
     };
 
-    // Client row + expander subtitle.
-    if let Some(peer) = stats.connected_client {
-        let peer_str = peer.to_string();
-        widgets.status_client_row.set_subtitle(&peer_str);
-        widgets
-            .status_row
-            .set_subtitle(&format!("Connected: {peer_str}"));
+    let first = stats.connected_clients.first();
+    let extra = stats.connected_clients.len().saturating_sub(1);
+
+    // Client row + expander subtitle. When there are N > 1 clients,
+    // append "(+N-1 more)" so the row makes the multi-client state
+    // visible even before PR B's per-client list exists.
+    if let Some(info) = first {
+        let peer_str = info.peer.to_string();
+        let client_subtitle = if extra > 0 {
+            format!("{peer_str} (+{extra} more)")
+        } else {
+            peer_str.clone()
+        };
+        widgets.status_client_row.set_subtitle(&client_subtitle);
+        let expander_subtitle = if stats.connected_clients.len() == 1 {
+            format!("Connected: {peer_str}")
+        } else {
+            format!("{} clients connected", stats.connected_clients.len())
+        };
+        widgets.status_row.set_subtitle(&expander_subtitle);
     } else {
         widgets
             .status_client_row
@@ -3385,31 +3407,30 @@ fn render_status_rows(
             .set_subtitle(STATUS_WAITING_FOR_CLIENT_SUBTITLE);
     }
 
-    // Uptime row.
-    widgets
-        .status_uptime_row
-        .set_subtitle(&stats.connected_since.map_or_else(
-            || STATUS_IDLE_VALUE_SUBTITLE.to_string(),
-            |since| format_uptime(since.elapsed()),
-        ));
+    // Uptime row — first client's uptime. PR B will show one row
+    // per client, each with its own uptime.
+    widgets.status_uptime_row.set_subtitle(&first.map_or_else(
+        || STATUS_IDLE_VALUE_SUBTITLE.to_string(),
+        |info| format_uptime(info.connected_since.elapsed()),
+    ));
 
-    // Data-rate row. Counter reset on disconnect produces a
-    // negative delta in the u64 arithmetic; clamp to 0 so the row
-    // doesn't read a bogus Mbps number on the transient.
-    let current_bytes = stats.bytes_sent;
+    // Data-rate row. Uses the cumulative `total_bytes_sent` counter
+    // (monotonic across the server's lifetime) so the delta here
+    // reflects aggregate traffic across ALL clients. No clamping
+    // needed — monotonic means the delta is always >= 0.
+    let current_bytes = stats.total_bytes_sent;
     let delta = current_bytes.saturating_sub(last_bytes_sent.get());
     last_bytes_sent.set(current_bytes);
     widgets
         .status_data_rate_row
         .set_subtitle(&format_data_rate(delta, SERVER_STATUS_POLL_INTERVAL));
 
-    // Commanded-state row. "Tuned to" means "what the client has
-    // most recently requested." Assembled one piece at a time; an
-    // unset field shows its upstream default stamp from
-    // `InitialDeviceState::default()` rather than blanking out.
+    // Commanded-state row — first client's state. Once #392's role
+    // gate lands this becomes "the controller's state" and the
+    // listener rows render with a "listening" badge instead.
     widgets
         .status_commanded_row
-        .set_subtitle(&format_commanded_state(stats));
+        .set_subtitle(&format_commanded_state(first));
 }
 
 /// Render a `Duration` as `Nh Nm Ns` / `Nm Ns` / `Ns` depending on
@@ -3451,19 +3472,24 @@ fn format_data_rate(bytes: u64, interval: Duration) -> String {
     }
 }
 
-/// Render the "Tuned to" row subtitle. Combines frequency, sample
-/// rate and gain into one line. Unset fields show their upstream
-/// default stamp from `InitialDeviceState::default()` — which is
-/// what the server applied on open — rather than blanking out, so
-/// the row never looks broken during the pre-first-command window.
-fn format_commanded_state(stats: &sdr_server_rtltcp::ServerStats) -> String {
-    let freq_hz = stats
+/// Render the "Tuned to" row subtitle for the first connected
+/// client. Combines frequency, sample rate and gain into one
+/// line. Unset fields show their upstream default stamp from
+/// `InitialDeviceState::default()` — which is what the server
+/// applied on open — rather than blanking out, so the row never
+/// looks broken during the pre-first-command window. `None` input
+/// (no clients connected) renders as the idle placeholder.
+fn format_commanded_state(info: Option<&sdr_server_rtltcp::ClientInfo>) -> String {
+    let Some(info) = info else {
+        return crate::sidebar::server_panel::STATUS_IDLE_VALUE_SUBTITLE.to_string();
+    };
+    let freq_hz = info
         .current_freq_hz
         .unwrap_or(sdr_server_rtltcp::DEFAULT_CENTER_FREQ_HZ);
-    let sample_rate_hz = stats
+    let sample_rate_hz = info
         .current_sample_rate_hz
         .unwrap_or(sdr_server_rtltcp::DEFAULT_SAMPLE_RATE_HZ);
-    let gain_text = match (stats.current_gain_auto, stats.current_gain_tenths_db) {
+    let gain_text = match (info.current_gain_auto, info.current_gain_tenths_db) {
         (Some(true), _) => "auto".to_string(),
         (_, Some(gain_tenths)) => {
             #[allow(clippy::cast_precision_loss, reason = "gain tenths-of-dB, cosmetic")]
@@ -3497,11 +3523,19 @@ fn format_hz(hz: u32) -> String {
     }
 }
 
-/// Rebuild the activity-log list from the `ServerStats` ring if
-/// it has actually changed since the last render. The "changed?"
-/// check uses the ring length + the timestamp of the newest entry
-/// so we skip the clear-and-rebuild on idle ticks — preserves any
-/// scroll position the user has in the `ListBox`.
+/// Rebuild the activity-log list from the first connected client's
+/// `recent_commands` ring if it has actually changed since the last
+/// render. The "changed?" check uses the ring length + the
+/// timestamp of the newest entry so we skip the clear-and-rebuild
+/// on idle ticks — preserves any scroll position the user has in
+/// the `ListBox`.
+///
+/// Renders the FIRST client's activity log in #391 (PR A). PR B
+/// replaces this with a per-client log tab so each connected
+/// client's commands show under their own row. When #392's role
+/// gate lands, only the controller can issue commands — the
+/// activity log then implicitly means "controller's commands"
+/// regardless of which client that is at any given moment.
 fn render_activity_log(
     widgets: &ServerStatusWidgets,
     stats: &sdr_server_rtltcp::ServerStats,
@@ -3509,8 +3543,29 @@ fn render_activity_log(
 ) {
     use crate::sidebar::server_panel::ACTIVITY_LOG_EMPTY_SUBTITLE;
 
-    let newest = stats.recent_commands.back().map(|(_, t)| *t);
-    let current_key = (stats.recent_commands.len(), newest);
+    let Some(first_client) = stats.connected_clients.first() else {
+        // No connected client → clear + show empty subtitle if
+        // we're not already in that state. Track the idle cache
+        // key as (0, None) so the render skips on subsequent
+        // idle ticks.
+        let current_key = (0usize, None::<Instant>);
+        if current_key == last_rendered.get() {
+            return;
+        }
+        last_rendered.set(current_key);
+        while let Some(child) = widgets.activity_log_list.first_child() {
+            widgets.activity_log_list.remove(&child);
+        }
+        widgets
+            .activity_log_row
+            .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
+        return;
+    };
+    let ring: &std::collections::VecDeque<(sdr_server_rtltcp::CommandOp, Instant)> =
+        &first_client.recent_commands;
+
+    let newest = ring.back().map(|(_, t)| *t);
+    let current_key = (ring.len(), newest);
     if current_key == last_rendered.get() {
         return;
     }
@@ -3522,7 +3577,7 @@ fn render_activity_log(
         widgets.activity_log_list.remove(&child);
     }
 
-    if stats.recent_commands.is_empty() {
+    if ring.is_empty() {
         widgets
             .activity_log_row
             .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
@@ -3531,11 +3586,11 @@ fn render_activity_log(
 
     widgets
         .activity_log_row
-        .set_subtitle(&format!("{} commands", stats.recent_commands.len()));
+        .set_subtitle(&format!("{} commands", ring.len()));
     // Newest first so the user doesn't have to scroll to see the
     // most recent activity.
     let now = Instant::now();
-    for (op, at) in stats.recent_commands.iter().rev() {
+    for (op, at) in ring.iter().rev() {
         let row = adw::ActionRow::builder()
             .title(format!("{op:?}"))
             .subtitle(format_log_age(now.saturating_duration_since(*at)))
@@ -6726,14 +6781,42 @@ mod rtl_tcp_discovery_format_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod server_panel_format_tests {
-    use std::time::Duration;
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
 
-    use sdr_server_rtltcp::ServerStats;
+    use sdr_server_rtltcp::{ClientInfo, codec::Codec};
 
     use super::{
         SERVER_STATUS_POLL_INTERVAL, format_commanded_state, format_data_rate, format_hz,
         format_uptime,
     };
+
+    /// Build a `ClientInfo` fixture for the `format_commanded_state`
+    /// tests. Defaults to unset per-session fields (`None` on
+    /// `current_freq` / `current_sample_rate` / `current_gain`) so
+    /// each test only overrides the fields it's exercising.
+    fn info(
+        current_freq_hz: Option<u32>,
+        current_sample_rate_hz: Option<u32>,
+        current_gain_tenths_db: Option<i32>,
+        current_gain_auto: Option<bool>,
+    ) -> ClientInfo {
+        ClientInfo {
+            id: 0,
+            peer: SocketAddr::from(([127, 0, 0, 1], 42_000)),
+            connected_since: Instant::now(),
+            codec: Codec::None,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            last_command: None,
+            current_freq_hz,
+            current_sample_rate_hz,
+            current_gain_tenths_db,
+            current_gain_auto,
+            recent_commands: VecDeque::new(),
+        }
+    }
 
     #[test]
     fn format_uptime_uses_compact_unit_picker() {
@@ -6783,13 +6866,26 @@ mod server_panel_format_tests {
     }
 
     #[test]
+    fn format_commanded_state_no_client_renders_idle_placeholder() {
+        // `None` means no connected client — the row should show
+        // the idle `STATUS_IDLE_VALUE_SUBTITLE` placeholder. Guards
+        // against a phantom row when the server is up but nobody's
+        // connected.
+        let subtitle = format_commanded_state(None);
+        assert_eq!(
+            subtitle,
+            crate::sidebar::server_panel::STATUS_IDLE_VALUE_SUBTITLE
+        );
+    }
+
+    #[test]
     fn format_commanded_state_uses_upstream_defaults_when_client_silent() {
-        // A brand-new session that hasn't sent any commands should
-        // still render a sensible line — we show the upstream
+        // A connected client that hasn't sent any commands yet —
+        // row should still render a sensible line via the upstream
         // rtl_tcp.c defaults (100 MHz @ 2.048 MHz, gain "initial")
-        // rather than blanking the row.
-        let stats = ServerStats::default();
-        let subtitle = format_commanded_state(&stats);
+        // rather than blanking out during the pre-first-command
+        // window.
+        let subtitle = format_commanded_state(Some(&info(None, None, None, None)));
         assert!(
             subtitle.contains("100.000 MHz"),
             "default freq should show: {subtitle}"
@@ -6808,14 +6904,8 @@ mod server_panel_format_tests {
     fn format_commanded_state_renders_client_auto_gain_preference() {
         // When the client has sent SetGainMode(auto), "auto" wins
         // regardless of any previous manual gain value.
-        let stats = ServerStats {
-            current_freq_hz: Some(145_500_000),
-            current_sample_rate_hz: Some(2_400_000),
-            current_gain_tenths_db: Some(200),
-            current_gain_auto: Some(true),
-            ..ServerStats::default()
-        };
-        let subtitle = format_commanded_state(&stats);
+        let client = info(Some(145_500_000), Some(2_400_000), Some(200), Some(true));
+        let subtitle = format_commanded_state(Some(&client));
         assert!(subtitle.contains("145.500 MHz"));
         assert!(subtitle.contains("2.400 MHz"));
         assert!(
@@ -6828,14 +6918,8 @@ mod server_panel_format_tests {
     fn format_commanded_state_renders_manual_gain_in_db() {
         // SetTunerGain records tenths-of-dB; the render converts to
         // full dB with one decimal.
-        let stats = ServerStats {
-            current_freq_hz: Some(100_000_000),
-            current_sample_rate_hz: Some(2_400_000),
-            current_gain_tenths_db: Some(496),
-            current_gain_auto: Some(false),
-            ..ServerStats::default()
-        };
-        let subtitle = format_commanded_state(&stats);
+        let client = info(Some(100_000_000), Some(2_400_000), Some(496), Some(false));
+        let subtitle = format_commanded_state(Some(&client));
         assert!(
             subtitle.contains("gain 49.6 dB"),
             "49.6 dB should render from 496 tenths: {subtitle}"

@@ -35,7 +35,6 @@
 //! semantics and the epic's "one dongle, shared state" model. Role
 //! enforcement (listeners can't tune) lands in #392.
 
-use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -205,45 +204,39 @@ impl Default for InitialDeviceState {
 
 /// Live server statistics for UI consumption.
 ///
-/// **Transitional single-client projection** (#391 commit 2a): still
-/// shaped like the pre-multi-client struct, populated from
-/// [`ClientRegistry::snapshot`] via [`project_to_legacy_stats`]. The
-/// "first connected client" fills the per-session fields; second/third
-/// clients are invisible to this view. Commit 2b replaces this with
-/// a per-client `Vec<ClientInfo>` schema and updates all in-tree
-/// consumers (Linux UI + sdr-ffi + C header) in the same change.
+/// Multi-client shape (#391). Every connected client contributes an
+/// entry to [`Self::connected_clients`]; per-session counters
+/// (bytes_sent, commanded state, etc.) live on each [`ClientInfo`].
+/// Aggregate counters at the top level are cumulative over the
+/// server's lifetime — never reset — so UI consumers can compute
+/// rolling deltas across snapshots without having to sum the
+/// per-client vec.
 ///
-/// UI callers snapshot the struct via `Server::stats()` on a timer
-/// and compute deltas (e.g. data-rate) across consecutive snapshots.
+/// UI callers snapshot the struct via `Server::stats()` on a timer.
+/// Data-rate is the delta in [`Self::total_bytes_sent`] between
+/// consecutive snapshots, divided by the poll interval.
 #[derive(Debug, Clone, Default)]
 pub struct ServerStats {
-    /// Socket address of the first connected client. `None` means no
-    /// clients are connected.
-    pub connected_client: Option<SocketAddr>,
-    /// Wall-clock moment the first client's session began. Paired
-    /// with `connected_client`: both are `Some` or both are `None`.
-    pub connected_since: Option<Instant>,
-    /// Bytes written to the first client's TCP socket for the current
-    /// session. Only reflects one client's traffic in commit 2a — the
-    /// total-across-all-clients rendering ships in 2b.
-    pub bytes_sent: u64,
-    /// Buffer-drop count for the first client. Per-client counter;
-    /// other clients' drops are invisible to this view.
-    pub buffers_dropped: u64,
-    /// Most recent command dispatched for the first client.
-    pub last_command: Option<(CommandOp, Instant)>,
-    /// First client's most recent `SetCenterFreq` request, in Hz.
-    pub current_freq_hz: Option<u32>,
-    /// First client's most recent `SetSampleRate` request, in Hz.
-    pub current_sample_rate_hz: Option<u32>,
-    /// First client's most recent `SetTunerGain` request, in tenths
-    /// of dB.
-    pub current_gain_tenths_db: Option<i32>,
-    /// First client's most recent `SetGainMode` request.
-    pub current_gain_auto: Option<bool>,
-    /// Ring buffer of the first client's recent commands. Bounded at
-    /// [`RECENT_COMMANDS_CAPACITY`].
-    pub recent_commands: VecDeque<(CommandOp, Instant)>,
+    /// Snapshot of every currently-connected client. Includes
+    /// slots that disconnected between the last broadcaster prune
+    /// tick and this snapshot — they render as "just left" for one
+    /// poll cycle before disappearing. Order is oldest-first.
+    pub connected_clients: Vec<crate::broadcaster::ClientInfo>,
+    /// Cumulative bytes fanned out across all clients over the
+    /// server's lifetime. Monotonic — never reset. UI derives the
+    /// rolling data-rate as `(stats[t].total_bytes_sent -
+    /// stats[t-1].total_bytes_sent) / poll_interval`.
+    pub total_bytes_sent: u64,
+    /// Cumulative USB chunks dropped across all clients over the
+    /// server's lifetime. A drop is counted when the broadcaster's
+    /// `try_send` into a client's channel returns `Full` (that
+    /// client's listener stalled). Monotonic — never reset.
+    pub total_buffers_dropped: u64,
+    /// Cumulative count of clients accepted over the server's
+    /// lifetime (including clients that have since disconnected).
+    /// UI renders as "N clients served" / "N sessions since start"
+    /// style load diagnostics.
+    pub lifetime_accepted: u64,
 }
 
 /// Tuner metadata captured at open time, exposed for callers that
@@ -357,14 +350,20 @@ impl Server {
         })
     }
 
-    /// Current server statistics (transitional single-client projection).
+    /// Current server statistics.
     ///
-    /// Projects the [`ClientRegistry`] to the old `ServerStats` shape
-    /// via [`project_to_legacy_stats`] so commit 2a keeps the workspace
-    /// compiling. Commit 2b swaps this for a per-client `Vec<ClientInfo>`
-    /// API and updates every consumer in the same change.
+    /// Snapshots every connected client plus the cumulative
+    /// server-lifetime counters from the registry. Cheap — acquires
+    /// the registry's slot-list lock briefly, per-slot stats mutex
+    /// once each. UI consumers call this on their poll timer (~2 Hz)
+    /// and compute data-rate deltas across consecutive snapshots.
     pub fn stats(&self) -> ServerStats {
-        project_to_legacy_stats(&self.registry)
+        ServerStats {
+            connected_clients: self.registry.snapshot(),
+            total_bytes_sent: self.registry.total_bytes_sent(),
+            total_buffers_dropped: self.registry.total_buffers_dropped(),
+            lifetime_accepted: self.registry.lifetime_accepted(),
+        }
     }
 
     /// The address the server is bound to.
@@ -566,7 +565,10 @@ fn spawn_accept_thread(
 /// The caller (accept thread) moves on to the next accept.
 #[allow(
     clippy::too_many_arguments,
-    reason = "accept-time client setup fans state"
+    clippy::too_many_lines,
+    reason = "accept-time client setup fans state across handshake + registry + \
+              two worker threads; refactoring to a context struct would churn the \
+              accept path without improving clarity"
 )]
 fn spawn_client_workers(
     stream: TcpStream,
@@ -774,40 +776,6 @@ fn set_keepalive(_stream: &TcpStream, _on: bool) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "SO_KEEPALIVE not implemented on this platform",
     ))
-}
-
-/// **Transitional**: project the multi-client registry snapshot into
-/// the legacy single-client [`ServerStats`] shape so commit 2a of
-/// #391 can land without breaking downstream consumers. Takes the
-/// oldest-still-connected client as "the client" for every
-/// per-session field, and zeroes everything else when no clients
-/// are connected.
-///
-/// Commit 2b replaces this with a direct `Vec<ClientInfo>` on
-/// `ServerStats` and updates every consumer (Linux UI + FFI).
-fn project_to_legacy_stats(registry: &Arc<ClientRegistry>) -> ServerStats {
-    // `ClientRegistry::snapshot` includes disconnected-but-not-yet-
-    // pruned slots by design (so UI rows survive one poll tick
-    // after a client drops). The legacy projection picks the
-    // first-registered slot regardless — commit 2b introduces a
-    // per-client Vec where disconnected slots render with a "just
-    // left" hint explicitly.
-    let clients = registry.snapshot();
-    let Some(first) = clients.into_iter().next() else {
-        return ServerStats::default();
-    };
-    ServerStats {
-        connected_client: Some(first.peer),
-        connected_since: Some(first.connected_since),
-        bytes_sent: first.bytes_sent,
-        buffers_dropped: first.buffers_dropped,
-        last_command: first.last_command,
-        current_freq_hz: first.current_freq_hz,
-        current_sample_rate_hz: first.current_sample_rate_hz,
-        current_gain_tenths_db: first.current_gain_tenths_db,
-        current_gain_auto: first.current_gain_auto,
-        recent_commands: first.recent_commands,
-    }
 }
 
 /// How long the server waits on a fresh TCP connection for a
@@ -1248,18 +1216,12 @@ mod tests {
     }
 
     #[test]
-    fn server_stats_default_is_not_connected() {
+    fn server_stats_default_is_empty() {
         let stats = ServerStats::default();
-        assert!(stats.connected_client.is_none());
-        assert!(stats.connected_since.is_none());
-        assert_eq!(stats.bytes_sent, 0);
-        assert_eq!(stats.buffers_dropped, 0);
-        assert!(stats.last_command.is_none());
-        assert!(stats.current_freq_hz.is_none());
-        assert!(stats.current_sample_rate_hz.is_none());
-        assert!(stats.current_gain_tenths_db.is_none());
-        assert!(stats.current_gain_auto.is_none());
-        assert!(stats.recent_commands.is_empty());
+        assert!(stats.connected_clients.is_empty());
+        assert_eq!(stats.total_bytes_sent, 0);
+        assert_eq!(stats.total_buffers_dropped, 0);
+        assert_eq!(stats.lifetime_accepted, 0);
     }
 
     #[test]
@@ -1292,27 +1254,14 @@ mod tests {
     }
 
     #[test]
-    fn project_to_legacy_stats_empty_registry_returns_default() {
-        // No clients connected → the legacy-shape projection must
-        // return the same zero-filled struct a fresh
-        // `ServerStats::default()` returns. Guards the UI's
-        // "Waiting for client" rendering: a non-None connected_client
-        // in the projection would be a phantom client.
-        let registry = Arc::new(ClientRegistry::new());
-        let stats = project_to_legacy_stats(&registry);
-        let expected = ServerStats::default();
-        assert_eq!(stats.connected_client, expected.connected_client);
-        assert_eq!(stats.bytes_sent, expected.bytes_sent);
-        assert_eq!(stats.buffers_dropped, expected.buffers_dropped);
-        assert!(stats.recent_commands.is_empty());
-    }
-
-    #[test]
-    fn project_to_legacy_stats_picks_first_registered_client() {
-        // Multiple clients → the projection returns the FIRST (oldest)
-        // registered client's session fields. Second+ clients are
-        // invisible in the legacy shape; commit 2b makes all clients
-        // visible via `Vec<ClientInfo>`.
+    fn server_stats_exposes_all_connected_clients() {
+        // Multi-client shape: `connected_clients` carries one
+        // `ClientInfo` per registered slot. Different from the
+        // pre-#391 single-client projection which only exposed the
+        // first client's session fields. This test pins the
+        // contract that every registered slot is visible to the
+        // UI / FFI — critical for the per-client rendering that
+        // follows in PR B.
         use crate::broadcaster::ClientSlot;
         let registry = Arc::new(ClientRegistry::new());
 
@@ -1340,14 +1289,28 @@ mod tests {
         }
         registry.register(slot_b);
 
-        let stats = project_to_legacy_stats(&registry);
-        // First client's peer + session fields.
+        // Snapshot via the registry directly since we don't have a
+        // real Server here — the same code path `Server::stats`
+        // uses to build its `ServerStats`.
+        let stats = ServerStats {
+            connected_clients: registry.snapshot(),
+            total_bytes_sent: registry.total_bytes_sent(),
+            total_buffers_dropped: registry.total_buffers_dropped(),
+            lifetime_accepted: registry.lifetime_accepted(),
+        };
+
+        assert_eq!(stats.connected_clients.len(), 2);
         assert_eq!(
-            stats.connected_client,
-            Some(SocketAddr::from(([127, 0, 0, 1], 42_001)))
+            stats.connected_clients[0].peer,
+            SocketAddr::from(([127, 0, 0, 1], 42_001))
         );
-        assert_eq!(stats.bytes_sent, 100);
-        assert_eq!(stats.current_freq_hz, Some(145_500_000));
+        assert_eq!(stats.connected_clients[0].bytes_sent, 100);
+        assert_eq!(
+            stats.connected_clients[1].peer,
+            SocketAddr::from(([127, 0, 0, 1], 42_002))
+        );
+        assert_eq!(stats.connected_clients[1].codec, Codec::Lz4);
+        assert_eq!(stats.lifetime_accepted, 2);
     }
 
     // ============================================================

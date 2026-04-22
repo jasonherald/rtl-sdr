@@ -780,48 +780,94 @@ typedef struct SdrRtlTcpServerConfig {
 } SdrRtlTcpServerConfig;
 
 /*
- * Scalar server statistics snapshot. String fields
- * (connected-client address, tuner name) are written to
- * caller-allocated buffers by `sdr_rtltcp_server_stats`.
+ * Aggregate server-lifetime statistics.
+ *
+ * Post-#391 the rtl_tcp server is multi-client; per-client
+ * session state (peer address, bytes_sent, commanded frequency,
+ * etc.) lives in SdrRtlTcpClientInfo and is read through
+ * sdr_rtltcp_server_client_list. This struct carries only the
+ * server-wide cumulative counters + the tuner gain count.
  */
 typedef struct SdrRtlTcpServerStats {
-    bool     has_client;
-    double   uptime_secs;              /* 0 when no client connected */
-    uint64_t bytes_sent;
-    uint64_t buffers_dropped;
-    /* Client-issued center-frequency override. 0 before the
-     * connected client has sent SetCenterFreq; resets on
-     * disconnect. Does NOT reflect the server's applied
-     * initial_freq_hz or the live device register — hosts
-     * that want "what the dongle is actually tuned to" should
-     * fall back to SdrRtlTcpServerConfig.initial_freq_hz when
-     * has_client && current_freq_hz == 0. */
-    uint32_t current_freq_hz;
-    /* Client-issued sample-rate override, same semantics as
-     * current_freq_hz above. */
-    uint32_t current_sample_rate_hz;
-    int32_t  current_gain_tenths_db;   /* valid only when has_current_gain_value */
-    bool     current_gain_auto;        /* valid only when has_current_gain_mode */
-    /* `true` once the client sent at least one SetTunerGain
-     * command this session. Tracked separately from the mode
-     * flag below because a client can set one without the
-     * other — without the separate validity bits, a genuine
-     * 0 dB manual gain would be indistinguishable from
-     * "client hasn't set gain yet." */
-    bool     has_current_gain_value;
-    /* `true` once the client sent at least one SetGainMode
-     * command this session. Valid companion to
-     * current_gain_auto — without this flag a `false` value
-     * would be indistinguishable from "client hasn't asked
-     * for a gain mode yet." */
-    bool     has_current_gain_mode;
+    /* Number of clients currently connected. Size a follow-up
+     * SdrRtlTcpClientInfo array of this length and call
+     * sdr_rtltcp_server_client_list to read per-client state. */
+    uint32_t connected_count;
+    /* Cumulative bytes fanned out across all clients over the
+     * server's lifetime. Monotonic — never reset. Consumers
+     * derive data-rate from the delta between consecutive
+     * snapshots divided by the poll interval. */
+    uint64_t total_bytes_sent;
+    /* Cumulative buffer drops across all clients. Monotonic. */
+    uint64_t total_buffers_dropped;
+    /* Cumulative count of clients accepted over the server's
+     * lifetime. Persists across disconnects. */
+    uint64_t lifetime_accepted;
     /* Tuner's advertised discrete gain count (from
      * dongle_info_t). Populated by Server::start during the
      * dongle-open phase — non-zero for the entire server
      * lifetime, including before the first client connects. */
     uint32_t gain_count;
-    uint32_t recent_commands_count;    /* size of the recent-commands ring */
 } SdrRtlTcpServerStats;
+
+/* Fixed-size buffer (bytes) for the "ip:port" peer address in
+ * SdrRtlTcpClientInfo. Sized to fit IPv6 literal forms
+ * ("[ffff:...:ffff]:65535" is 48 bytes incl NUL); 64 rounds up
+ * and leaves room for future annotation suffixes. */
+#define SDR_RTLTCP_CLIENT_PEER_LEN 64
+
+/*
+ * Per-client state snapshot. One entry per connected client,
+ * returned from sdr_rtltcp_server_client_list.
+ */
+typedef struct SdrRtlTcpClientInfo {
+    /* Stable, monotonic identifier assigned at accept time.
+     * Never reused over the server's lifetime — useful for
+     * correlating across polls when the same peer reconnects. */
+    uint64_t id;
+    /* Peer socket address as "ip:port", NUL-terminated.
+     * Always fits within SDR_RTLTCP_CLIENT_PEER_LEN incl NUL. */
+    char     peer_addr[SDR_RTLTCP_CLIENT_PEER_LEN];
+    /* Seconds since this client's handshake completed. */
+    double   uptime_secs;
+    /* Negotiated stream codec wire byte: 0 = None (legacy /
+     * vanilla rtl_tcp), 1 = LZ4. */
+    uint8_t  codec;
+    /* Bytes written to this client's TCP socket since accept.
+     * Post-compression — sum across all clients equals the
+     * server's on-wire total. */
+    uint64_t bytes_sent;
+    /* Buffer drops this client has accrued (broadcaster saw
+     * TrySendError::Full against this client's channel). */
+    uint64_t buffers_dropped;
+    /* Client-issued center-frequency override in Hz. 0 before
+     * the client has sent SetCenterFreq; does NOT reflect the
+     * server's applied initial_freq_hz or the live device
+     * register. */
+    uint32_t current_freq_hz;
+    /* Client-issued sample-rate override, same semantics as
+     * current_freq_hz. */
+    uint32_t current_sample_rate_hz;
+    /* Most recent client-issued tuner-gain request in 0.1 dB.
+     * Valid only when has_current_gain_value == true. */
+    int32_t  current_gain_tenths_db;
+    /* true when the client's last gain-mode request was auto;
+     * false when manual. Valid only when
+     * has_current_gain_mode == true. */
+    bool     current_gain_auto;
+    /* true once the client has issued at least one SetTunerGain
+     * command. Tracked separately from the mode flag because a
+     * client can send SetGainMode(auto) without a preceding
+     * SetTunerGain (and vice versa). */
+    bool     has_current_gain_value;
+    /* true once the client has issued at least one SetGainMode
+     * command. */
+    bool     has_current_gain_mode;
+    /* Number of entries in this client's recent-commands ring.
+     * Sizes a follow-up _recent_commands_json(client_id, ...)
+     * buffer. */
+    uint32_t recent_commands_count;
+} SdrRtlTcpClientInfo;
 
 /*
  * Start an rtl_tcp server. On success writes the handle to
@@ -871,13 +917,16 @@ void sdr_rtltcp_server_stop(SdrRtlTcpServer* handle);
 bool sdr_rtltcp_server_has_stopped(SdrRtlTcpServer* handle);
 
 /*
- * Snapshot the server's live stats.
+ * Snapshot the server's aggregate stats.
  *
- * `out_stats` must be non-null. `out_client_addr` and
- * `out_tuner_name` are optional NUL-terminated string buffers
- * (pass NULL with `*_len = 0` to skip). Strings longer than
- * the buffer are truncated; NOT an error. A 64-byte buffer
- * handles any realistic `"ip:port"` or tuner name.
+ * `out_stats` must be non-null. `out_tuner_name` is an optional
+ * NUL-terminated string buffer (pass NULL with
+ * `tuner_name_len = 0` to skip). Strings longer than the buffer
+ * are truncated; NOT an error. 64 bytes handles any realistic
+ * tuner name.
+ *
+ * For per-client state call `sdr_rtltcp_server_client_list` after
+ * reading `out_stats->connected_count`.
  *
  * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG`
  * on null out_stats, `SDR_CORE_ERR_INVALID_HANDLE` on null
@@ -887,28 +936,61 @@ bool sdr_rtltcp_server_has_stopped(SdrRtlTcpServer* handle);
 int32_t sdr_rtltcp_server_stats(
     SdrRtlTcpServer*      handle,
     SdrRtlTcpServerStats* out_stats,
-    char*                 out_client_addr,
-    size_t                client_addr_len,
     char*                 out_tuner_name,
     size_t                tuner_name_len
 );
 
 /*
- * Write the recent-commands ring to `out_buf` as a JSON
- * array. Each entry: `{"op": "<name>", "seconds_ago": <f64>}`.
+ * Snapshot every connected client's state into a caller-provided
+ * array.
+ *
+ * `out_count` must be non-null and receives the current
+ * connected-client count. `out_clients` may be null when
+ * `capacity == 0` — use that form to size a buffer before
+ * re-calling. When `capacity > 0` and there are more connected
+ * clients than `capacity`, the first `capacity` entries are
+ * filled and the caller should retry with a bigger buffer.
+ *
+ * Returns `SDR_CORE_OK` on success (including the query-count
+ * path), `SDR_CORE_ERR_INVALID_ARG` on null `out_count` (or null
+ * `out_clients` with non-zero `capacity`),
+ * `SDR_CORE_ERR_INVALID_HANDLE` on null handle,
+ * `SDR_CORE_ERR_NOT_RUNNING` if the server was already stopped.
+ *
+ * Client ordering is stable within a snapshot (oldest-first) but
+ * may shift across snapshots as clients disconnect. Use
+ * `SdrRtlTcpClientInfo::id` for cross-snapshot correlation.
+ */
+int32_t sdr_rtltcp_server_client_list(
+    SdrRtlTcpServer*      handle,
+    SdrRtlTcpClientInfo*  out_clients,
+    size_t                capacity,
+    size_t*               out_count
+);
+
+/*
+ * Write one client's recent-commands ring to `out_buf` as a
+ * JSON array. Each entry: `{"op": "<name>", "seconds_ago": <f64>}`.
  * The entries are ordered oldest-first.
+ *
+ * `client_id` identifies the target client — read it from an
+ * earlier `SdrRtlTcpClientInfo::id` snapshot. A stale id
+ * (client disconnected between snapshots) returns
+ * `SDR_CORE_ERR_INVALID_ARG` with `*out_required = 0`.
  *
  * Returns:
  *   SDR_CORE_OK              — buffer was big enough; filled and NUL-terminated.
- *   SDR_CORE_ERR_INVALID_ARG — buffer too small or null with nonzero len. `*out_required`
- *                              (when non-null) receives the exact size (incl. NUL) the
- *                              caller should allocate and retry. `out_buf` is untouched.
+ *   SDR_CORE_ERR_INVALID_ARG — buffer too small, null with nonzero len, or client_id
+ *                              no longer connected. `*out_required` (when non-null)
+ *                              receives the exact size (incl. NUL) the caller should
+ *                              allocate and retry (or 0 for the stale-id case).
  *   SDR_CORE_ERR_INVALID_HANDLE — null handle.
  *   SDR_CORE_ERR_NOT_RUNNING    — server already stopped.
  *   SDR_CORE_ERR_INTERNAL       — JSON encoding failure (shouldn't reach here).
  */
 int32_t sdr_rtltcp_server_recent_commands_json(
     SdrRtlTcpServer* handle,
+    uint64_t         client_id,
     char*            out_buf,
     size_t           buf_len,
     size_t*          out_required

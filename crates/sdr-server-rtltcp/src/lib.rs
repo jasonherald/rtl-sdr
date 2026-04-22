@@ -41,6 +41,7 @@ pub mod extension;
 pub mod protocol;
 pub mod server;
 
+pub use broadcaster::{ClientId, ClientInfo};
 pub use error::ServerError;
 pub use protocol::{
     COMMAND_LEN, Command, CommandOp, DEFAULT_PORT, DONGLE_INFO_LEN, DONGLE_MAGIC, DongleInfo,
