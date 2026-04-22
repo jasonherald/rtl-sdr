@@ -55,6 +55,28 @@ const CONSUMER_RECV_TIMEOUT: Duration = Duration::from_millis(50);
 /// a test timeout instead of hanging the suite indefinitely.
 const TEST_WALL_CLOCK_CEILING: Duration = Duration::from_secs(5);
 
+/// Delay between producer broadcasts. Lets consumers get a chance
+/// to drain — without this, the producer burns through its loop
+/// faster than any single-slot channel can consume, defeating the
+/// "fast drain" assertions. Per `CodeRabbit` round 1 on PR #402.
+const PRODUCER_YIELD_DELAY: Duration = Duration::from_millis(1);
+
+/// How long the disconnect-scheduler test waits before marking a
+/// slot disconnected. Short enough that at least one chunk has
+/// broadcast by then, long enough that the producer thread has
+/// actually started its loop (spawn has non-zero cost). 3 ms sits
+/// comfortably above both bounds on any real CI runner.
+const DISCONNECT_DELAY: Duration = Duration::from_millis(3);
+
+/// Test peer ports. Each test uses a disjoint pair so logs
+/// pinpoint which test generated which peer.
+const TEST_PEER_A_PORT: u16 = 10_001;
+const TEST_PEER_B_PORT: u16 = 10_002;
+const TEST_SLOW_PEER_PORT: u16 = 10_100;
+const TEST_FAST_PEER_PORT: u16 = 10_101;
+const TEST_DISCONNECT_A_PORT: u16 = 10_200;
+const TEST_DISCONNECT_B_PORT: u16 = 10_201;
+
 fn test_peer(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -77,12 +99,9 @@ fn spawn_test_producer(registry: Arc<ClientRegistry>) -> (thread::JoinHandle<()>
                 let idx_u32 = u32::try_from(i).expect("chunk count fits u32");
                 chunk[..4].copy_from_slice(&idx_u32.to_be_bytes());
                 registry.broadcast(&chunk);
-                // Yield briefly so consumers get a chance to drain
-                // between broadcasts. Without this the producer
-                // would burn through its full loop faster than any
-                // single-slot channel could drain, defeating the
-                // "fast drain" scenarios.
-                thread::sleep(Duration::from_millis(1));
+                // Yield so consumers get a drain window between
+                // broadcasts — see PRODUCER_YIELD_DELAY's docstring.
+                thread::sleep(PRODUCER_YIELD_DELAY);
             }
             done_setter.store(true, Ordering::SeqCst);
         })
@@ -132,13 +151,13 @@ fn two_clients_receive_identical_byte_streams() {
 
     let (slot_a, rx_a) = ClientSlot::new(
         registry.allocate_id(),
-        test_peer(1),
+        test_peer(TEST_PEER_A_PORT),
         Codec::None,
         TEST_FAST_CHANNEL_DEPTH,
     );
     let (slot_b, rx_b) = ClientSlot::new(
         registry.allocate_id(),
-        test_peer(2),
+        test_peer(TEST_PEER_B_PORT),
         Codec::None,
         TEST_FAST_CHANNEL_DEPTH,
     );
@@ -205,14 +224,14 @@ fn slow_client_drops_do_not_block_fast_client() {
 
     let (slow, _slow_rx) = ClientSlot::new(
         registry.allocate_id(),
-        test_peer(100),
+        test_peer(TEST_SLOW_PEER_PORT),
         Codec::None,
         TEST_SLOW_CHANNEL_DEPTH,
     );
     let slow_id = slow.id;
     let (fast, fast_rx) = ClientSlot::new(
         registry.allocate_id(),
-        test_peer(101),
+        test_peer(TEST_FAST_PEER_PORT),
         Codec::None,
         TEST_FAST_CHANNEL_DEPTH,
     );
@@ -287,13 +306,13 @@ fn disconnected_client_is_skipped_by_broadcaster_fanout() {
     let registry = Arc::new(ClientRegistry::new());
     let (slot_a, rx_a) = ClientSlot::new(
         registry.allocate_id(),
-        test_peer(200),
+        test_peer(TEST_DISCONNECT_A_PORT),
         Codec::None,
         TEST_FAST_CHANNEL_DEPTH,
     );
-    let (slot_b, _rx_b) = ClientSlot::new(
+    let (slot_b, rx_b) = ClientSlot::new(
         registry.allocate_id(),
-        test_peer(201),
+        test_peer(TEST_DISCONNECT_B_PORT),
         Codec::None,
         TEST_FAST_CHANNEL_DEPTH,
     );
@@ -305,15 +324,23 @@ fn disconnected_client_is_skipped_by_broadcaster_fanout() {
     // will have broadcast a few chunks by then; subsequent chunks
     // skip B entirely.
     let disconnector = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(3));
+        thread::sleep(DISCONNECT_DELAY);
         slot_b_handle.mark_disconnected();
     });
 
     let (producer, producer_done) = spawn_test_producer(registry.clone());
-    let done = producer_done.clone();
-    let consumer_a = thread::spawn(move || drain_until_done(&rx_a, &done));
+    let done_a = producer_done.clone();
+    let done_b = producer_done.clone();
+    let consumer_a = thread::spawn(move || drain_until_done(&rx_a, &done_a));
+    // Drain B too so we can prove it received FEWER chunks than A
+    // (the broadcaster actually skipped it post-disconnect). Per
+    // CodeRabbit round 1 on PR #402 — the original test only
+    // checked A, which passes even if B kept receiving every
+    // chunk despite being disconnected.
+    let consumer_b = thread::spawn(move || drain_until_done(&rx_b, &done_b));
 
     let received_a = consumer_a.join().expect("consumer a joined");
+    let received_b = consumer_b.join().expect("consumer b joined");
     producer.join().expect("producer joined");
     disconnector.join().expect("disconnector joined");
 
@@ -324,5 +351,13 @@ fn disconnected_client_is_skipped_by_broadcaster_fanout() {
          (got {}/{})",
         received_a.len(),
         TEST_CHUNK_COUNT
+    );
+    assert!(
+        received_b.len() < received_a.len(),
+        "client B should receive fewer chunks than A (got B={}/{}, A={}) — \
+         if they match, the broadcaster is still sending to disconnected slots",
+        received_b.len(),
+        TEST_CHUNK_COUNT,
+        received_a.len()
     );
 }

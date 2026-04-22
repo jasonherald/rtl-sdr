@@ -237,6 +237,16 @@ pub struct ServerStats {
     /// UI renders as "N clients served" / "N sessions since start"
     /// style load diagnostics.
     pub lifetime_accepted: u64,
+    /// Snapshot of the server's configured initial device state —
+    /// the values `apply_initial_state` set at `Server::start`.
+    /// UI uses these as the fallback when a client hasn't yet
+    /// issued a `SetCenterFreq` / `SetSampleRate` / `SetTunerGain`
+    /// command: `current_*` fields on a `ClientInfo` mean "what
+    /// the client asked for"; unset means "still on the server's
+    /// initial", which is a different rendering than "server's
+    /// baked-in crate defaults". Per CodeRabbit round 1 on
+    /// PR #402.
+    pub initial: InitialDeviceState,
 }
 
 /// Tuner metadata captured at open time, exposed for callers that
@@ -261,6 +271,12 @@ pub struct Server {
     bind: SocketAddr,
     tuner: TunerAdvertiseInfo,
     compression: crate::codec::CodecMask,
+    /// Snapshot of the `InitialDeviceState` that `apply_initial_state`
+    /// actually applied at start. Cloned from `ServerConfig.initial`
+    /// and stashed here so `Server::stats()` can include it without
+    /// re-reading the (mutating) live device state. UI consumers use
+    /// it as the fallback for unset per-client `current_*` fields.
+    initial: InitialDeviceState,
 }
 
 impl Server {
@@ -328,7 +344,7 @@ impl Server {
         let broadcaster_thread =
             spawn_broadcaster_thread(dev_mutex.clone(), registry.clone(), shutdown.clone())?;
 
-        let accept_thread = spawn_accept_thread(
+        let accept_thread = match spawn_accept_thread(
             listener,
             dev_mutex,
             registry.clone(),
@@ -336,7 +352,22 @@ impl Server {
             stopped.clone(),
             per_client_depth,
             config.compression,
-        )?;
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                // Accept-thread spawn failed AFTER the broadcaster
+                // was already running. Signal global shutdown so
+                // the broadcaster exits its USB read loop, join
+                // it so its `Arc<Mutex<RtlSdrDevice>>` clone
+                // drops, THEN surface the error. Without this the
+                // broadcaster would keep reading USB against a
+                // dongle the caller expects to be released. Per
+                // CodeRabbit round 1 on PR #402.
+                shutdown.store(true, Ordering::SeqCst);
+                let _ = broadcaster_thread.join();
+                return Err(ServerError::Io(e));
+            }
+        };
 
         Ok(Server {
             shutdown,
@@ -347,6 +378,7 @@ impl Server {
             bind: actual_bind,
             tuner,
             compression: config.compression,
+            initial: config.initial,
         })
     }
 
@@ -363,6 +395,7 @@ impl Server {
             total_bytes_sent: self.registry.total_bytes_sent(),
             total_buffers_dropped: self.registry.total_buffers_dropped(),
             lifetime_accepted: self.registry.lifetime_accepted(),
+            initial: self.initial.clone(),
         }
     }
 
@@ -398,36 +431,60 @@ impl Server {
         self.stopped.load(Ordering::Relaxed)
     }
 
-    /// Signal shutdown and wait for both the accept and broadcaster
-    /// threads to exit.
+    /// Signal shutdown and wait for every owned thread to exit —
+    /// accept, broadcaster, and every per-client worker
+    /// (writer + command). Equivalent to dropping the `Server`.
     ///
-    /// Equivalent to dropping the `Server`. Any panic from either
-    /// thread is silently swallowed — if you need to observe panics,
-    /// keep the `JoinHandle` yourself instead of calling `stop()`.
+    /// Joining the per-client workers is **load-bearing**: each
+    /// holds an `Arc<Mutex<RtlSdrDevice>>` clone, and dropping
+    /// `Server` without joining them would let those Arcs outlive
+    /// the reported shutdown — leaving the dongle claimed for the
+    /// next consumer. Per `CodeRabbit` round 1 on PR #402.
+    ///
+    /// Any panic from a worker thread is silently swallowed — if
+    /// you need to observe panics, keep the handle yourself
+    /// instead of routing through `Server`.
     pub fn stop(mut self) {
         self.initiate_shutdown();
+        self.join_all_threads();
+    }
+
+    fn initiate_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Drain + join every owned thread. Called by both `stop()`
+    /// and `Drop`. The order is:
+    ///   1. accept thread — stop accepting new clients first so the
+    ///      per-client worker set can't grow mid-shutdown.
+    ///   2. per-client workers — their `Arc<Mutex<RtlSdrDevice>>`
+    ///      clones must drop before the broadcaster exits so the
+    ///      last Arc hits zero and the device is released.
+    ///   3. broadcaster thread — exits once the shutdown flag is
+    ///      set; owns its own USB handle clone that's dropped
+    ///      on return.
+    ///
+    /// After this returns, no thread the Server spawned is still
+    /// running, and the device mutex's strong-ref count is
+    /// guaranteed to be zero (the inner `Device` is dropped
+    /// with `dev_mutex` when the `Server` itself is dropped).
+    fn join_all_threads(&mut self) {
         if let Some(h) = self.accept_thread.take() {
+            let _ = h.join();
+        }
+        for h in self.registry.drain_worker_handles() {
             let _ = h.join();
         }
         if let Some(h) = self.broadcaster_thread.take() {
             let _ = h.join();
         }
-    }
-
-    fn initiate_shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         self.initiate_shutdown();
-        if let Some(h) = self.accept_thread.take() {
-            let _ = h.join();
-        }
-        if let Some(h) = self.broadcaster_thread.take() {
-            let _ = h.join();
-        }
+        self.join_all_threads();
     }
 }
 
@@ -674,6 +731,7 @@ fn spawn_client_workers(
     let tracked_writer = StatsTrackingWrite {
         inner: writer,
         slot: slot.clone(),
+        registry: registry.clone(),
     };
     let encoded_writer = Encoder::new(codec, tracked_writer);
     let writer_handle = match thread::Builder::new()
@@ -689,12 +747,13 @@ fn spawn_client_workers(
     };
 
     // Spawn the command thread. If it fails, mark the slot
-    // disconnected so the writer exits too — don't leak it.
+    // disconnected so the writer exits too, and join the writer
+    // here so its handle isn't dropped on the floor.
     let command_slot = slot.clone();
     let command_shutdown = shutdown.clone();
     let command_device = device;
     let command_stream = stream;
-    let command_result = thread::Builder::new()
+    let command_handle = match thread::Builder::new()
         .name(format!("rtl_tcp-command-{id}"))
         .spawn(move || {
             command_worker(
@@ -703,13 +762,15 @@ fn spawn_client_workers(
                 command_slot,
                 command_shutdown,
             );
-        });
-    if let Err(e) = command_result {
-        tracing::error!(%peer, %e, "failed to spawn rtl_tcp command thread — tearing down client");
-        slot.mark_disconnected();
-        let _ = writer_handle.join();
-        return;
-    }
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(%peer, %e, "failed to spawn rtl_tcp command thread — tearing down client");
+            slot.mark_disconnected();
+            let _ = writer_handle.join();
+            return;
+        }
+    };
 
     // All three threads (writer, command, broadcaster-observing-this-slot)
     // are now set up. Register the slot so the broadcaster starts
@@ -717,6 +778,14 @@ fn spawn_client_workers(
     // the broadcaster can't find the slot; after register, the
     // broadcaster discovers it on its next tick.
     registry.register(slot);
+
+    // Park both worker handles on the registry so `Server::drop` can
+    // join them during shutdown — without this, the threads'
+    // `Arc<Mutex<RtlSdrDevice>>` clones could outlive
+    // `has_stopped() == true` and leave the dongle claimed for a
+    // follow-up `Server::start`. Per `CodeRabbit` round 1 on PR #402.
+    registry.register_worker_handle(writer_handle);
+    registry.register_worker_handle(command_handle);
 
     // Fire and forget — neither the writer nor the command handle is
     // joined here. Both exit independently when they observe the
@@ -886,25 +955,34 @@ fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHe
 }
 
 /// `Write` adapter sitting between the negotiated `Encoder` and the
-/// raw `TcpStream`. Updates the slot's per-client `bytes_sent` counter
-/// with the on-wire (post-compression) byte count from each
-/// successful write, so the UI's data-rate row reflects actual
-/// bandwidth rather than pre-compression payload size.
+/// raw `TcpStream`. Updates the slot's per-client `bytes_sent`
+/// counter AND the registry's aggregate `total_bytes_sent` with
+/// the on-wire (post-compression) byte count from each successful
+/// write. Counting at this layer (not inside `ClientRegistry::broadcast`)
+/// means the aggregate and per-client counters never diverge and
+/// both reflect bytes that actually reached the socket. Per
+/// CodeRabbit round 1 on PR #402.
 struct StatsTrackingWrite {
     inner: TcpStream,
     slot: Arc<ClientSlot>,
+    registry: Arc<ClientRegistry>,
 }
 
 impl Write for StatsTrackingWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
+        let delta = n as u64;
         // Poisoned mutex only happens if a stats reader panicked
         // while holding the lock — keep streaming and let the
         // stats drift; a crashed UI thread is worse than a dropped
         // counter bump.
         if let Ok(mut s) = self.slot.stats.lock() {
-            s.bytes_sent = s.bytes_sent.saturating_add(n as u64);
+            s.bytes_sent = s.bytes_sent.saturating_add(delta);
         }
+        // Aggregate tracks the sum of every successful on-wire
+        // write. Cheap atomic fetch_add; no lock contention with
+        // other writers or the UI snapshot path.
+        self.registry.record_bytes_sent(delta);
         Ok(n)
     }
 
@@ -1222,6 +1300,9 @@ mod tests {
         assert_eq!(stats.total_bytes_sent, 0);
         assert_eq!(stats.total_buffers_dropped, 0);
         assert_eq!(stats.lifetime_accepted, 0);
+        // Default initial state matches the upstream rtl_tcp defaults.
+        assert_eq!(stats.initial.center_freq_hz, DEFAULT_CENTER_FREQ_HZ);
+        assert_eq!(stats.initial.sample_rate_hz, DEFAULT_SAMPLE_RATE_HZ);
     }
 
     #[test]
@@ -1297,6 +1378,7 @@ mod tests {
             total_bytes_sent: registry.total_bytes_sent(),
             total_buffers_dropped: registry.total_buffers_dropped(),
             lifetime_accepted: registry.lifetime_accepted(),
+            initial: InitialDeviceState::default(),
         };
 
         assert_eq!(stats.connected_clients.len(), 2);

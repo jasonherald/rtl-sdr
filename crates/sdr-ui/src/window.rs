@@ -3430,7 +3430,7 @@ fn render_status_rows(
     // listener rows render with a "listening" badge instead.
     widgets
         .status_commanded_row
-        .set_subtitle(&format_commanded_state(first));
+        .set_subtitle(&format_commanded_state(first, &stats.initial));
 }
 
 /// Render a `Duration` as `Nh Nm Ns` / `Nm Ns` / `Ns` depending on
@@ -3474,21 +3474,23 @@ fn format_data_rate(bytes: u64, interval: Duration) -> String {
 
 /// Render the "Tuned to" row subtitle for the first connected
 /// client. Combines frequency, sample rate and gain into one
-/// line. Unset fields show their upstream default stamp from
-/// `InitialDeviceState::default()` — which is what the server
-/// applied on open — rather than blanking out, so the row never
-/// looks broken during the pre-first-command window. `None` input
-/// (no clients connected) renders as the idle placeholder.
-fn format_commanded_state(info: Option<&sdr_server_rtltcp::ClientInfo>) -> String {
+/// line. Unset `current_*` fields on the client fall back to the
+/// server's **configured** `initial` state (what the user set up
+/// in the server panel or CLI args), NOT the library's upstream
+/// `rtl_tcp.c` defaults. `None` input (no clients connected)
+/// renders as the idle placeholder. Per `CodeRabbit` round 1 on
+/// PR #402.
+fn format_commanded_state(
+    info: Option<&sdr_server_rtltcp::ClientInfo>,
+    initial: &sdr_server_rtltcp::InitialDeviceState,
+) -> String {
     let Some(info) = info else {
         return crate::sidebar::server_panel::STATUS_IDLE_VALUE_SUBTITLE.to_string();
     };
-    let freq_hz = info
-        .current_freq_hz
-        .unwrap_or(sdr_server_rtltcp::DEFAULT_CENTER_FREQ_HZ);
+    let freq_hz = info.current_freq_hz.unwrap_or(initial.center_freq_hz);
     let sample_rate_hz = info
         .current_sample_rate_hz
-        .unwrap_or(sdr_server_rtltcp::DEFAULT_SAMPLE_RATE_HZ);
+        .unwrap_or(initial.sample_rate_hz);
     let gain_text = match (info.current_gain_auto, info.current_gain_tenths_db) {
         (Some(true), _) => "auto".to_string(),
         (_, Some(gain_tenths)) => {
@@ -3496,7 +3498,17 @@ fn format_commanded_state(info: Option<&sdr_server_rtltcp::ClientInfo>) -> Strin
             let db = f64::from(gain_tenths) / 10.0;
             format!("{db:.1} dB")
         }
-        _ => "initial".to_string(),
+        // Client hasn't sent a gain command yet — show whatever
+        // the server started with. `initial.gain_tenths_db = None`
+        // encodes upstream's "automatic" mode (CLI `-g 0`).
+        _ => match initial.gain_tenths_db {
+            None => "auto".to_string(),
+            Some(gain_tenths) => {
+                #[allow(clippy::cast_precision_loss, reason = "gain tenths-of-dB, cosmetic")]
+                let db = f64::from(gain_tenths) / 10.0;
+                format!("{db:.1} dB")
+            }
+        },
     };
     format!(
         "{} @ {} • gain {}",
@@ -6785,12 +6797,20 @@ mod server_panel_format_tests {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
-    use sdr_server_rtltcp::{ClientInfo, codec::Codec};
+    use sdr_server_rtltcp::{ClientInfo, InitialDeviceState, codec::Codec};
 
     use super::{
         SERVER_STATUS_POLL_INTERVAL, format_commanded_state, format_data_rate, format_hz,
         format_uptime,
     };
+
+    /// Fresh `InitialDeviceState` matching what `Server::start`
+    /// stores when the user takes the upstream-default path. Most
+    /// format tests use this; the ones that want to prove
+    /// fallback-to-initial override the relevant field.
+    fn default_initial() -> InitialDeviceState {
+        InitialDeviceState::default()
+    }
 
     /// Build a `ClientInfo` fixture for the `format_commanded_state`
     /// tests. Defaults to unset per-session fields (`None` on
@@ -6871,7 +6891,7 @@ mod server_panel_format_tests {
         // the idle `STATUS_IDLE_VALUE_SUBTITLE` placeholder. Guards
         // against a phantom row when the server is up but nobody's
         // connected.
-        let subtitle = format_commanded_state(None);
+        let subtitle = format_commanded_state(None, &default_initial());
         assert_eq!(
             subtitle,
             crate::sidebar::server_panel::STATUS_IDLE_VALUE_SUBTITLE
@@ -6879,38 +6899,66 @@ mod server_panel_format_tests {
     }
 
     #[test]
-    fn format_commanded_state_uses_upstream_defaults_when_client_silent() {
+    fn format_commanded_state_falls_back_to_server_initial_when_client_silent() {
         // A connected client that hasn't sent any commands yet —
-        // row should still render a sensible line via the upstream
-        // rtl_tcp.c defaults (100 MHz @ 2.048 MHz, gain "initial")
-        // rather than blanking out during the pre-first-command
-        // window.
-        let subtitle = format_commanded_state(Some(&info(None, None, None, None)));
+        // row should render the SERVER'S configured `initial`
+        // values (what the user configured at `Server::start`),
+        // not the library's upstream `rtl_tcp.c` defaults. Here
+        // the initial is a non-default 145 MHz / 2.4 Msps / 29.6 dB,
+        // so the subtitle should read those values even though the
+        // client hasn't sent any SetX commands yet.
+        // Per `CodeRabbit` round 1 on PR #402.
+        let initial = InitialDeviceState {
+            center_freq_hz: 145_500_000,
+            sample_rate_hz: 2_400_000,
+            gain_tenths_db: Some(296),
+            ..InitialDeviceState::default()
+        };
+        let subtitle = format_commanded_state(Some(&info(None, None, None, None)), &initial);
         assert!(
-            subtitle.contains("100.000 MHz"),
-            "default freq should show: {subtitle}"
+            subtitle.contains("145.500 MHz"),
+            "server's configured initial freq should show: {subtitle}"
         );
         assert!(
-            subtitle.contains("2.048 MHz"),
-            "default sample rate should show: {subtitle}"
+            subtitle.contains("2.400 MHz"),
+            "server's configured initial sample rate should show: {subtitle}"
         );
         assert!(
-            subtitle.contains("gain initial"),
-            "default gain hint should show: {subtitle}"
+            subtitle.contains("gain 29.6 dB"),
+            "server's configured initial gain should show: {subtitle}"
+        );
+    }
+
+    #[test]
+    fn format_commanded_state_renders_auto_when_initial_gain_is_none() {
+        // `initial.gain_tenths_db = None` encodes upstream's
+        // automatic-gain mode (the CLI's `-g 0` path). With no
+        // client overrides, the gain text should read "auto", not
+        // a literal dB value. Regression for the pre-CR "initial"
+        // placeholder that was meaningless to users.
+        let initial = InitialDeviceState {
+            gain_tenths_db: None,
+            ..InitialDeviceState::default()
+        };
+        let subtitle = format_commanded_state(Some(&info(None, None, None, None)), &initial);
+        assert!(
+            subtitle.contains("gain auto"),
+            "initial gain None should render as auto: {subtitle}"
         );
     }
 
     #[test]
     fn format_commanded_state_renders_client_auto_gain_preference() {
         // When the client has sent SetGainMode(auto), "auto" wins
-        // regardless of any previous manual gain value.
+        // regardless of any previous manual gain value OR the
+        // server's configured initial gain.
         let client = info(Some(145_500_000), Some(2_400_000), Some(200), Some(true));
-        let subtitle = format_commanded_state(Some(&client));
+        let subtitle = format_commanded_state(Some(&client), &default_initial());
         assert!(subtitle.contains("145.500 MHz"));
         assert!(subtitle.contains("2.400 MHz"));
         assert!(
             subtitle.contains("gain auto"),
-            "auto should override manual gain value: {subtitle}"
+            "client auto should override manual gain value: {subtitle}"
         );
     }
 
@@ -6919,7 +6967,7 @@ mod server_panel_format_tests {
         // SetTunerGain records tenths-of-dB; the render converts to
         // full dB with one decimal.
         let client = info(Some(100_000_000), Some(2_400_000), Some(496), Some(false));
-        let subtitle = format_commanded_state(Some(&client));
+        let subtitle = format_commanded_state(Some(&client), &default_initial());
         assert!(
             subtitle.contains("gain 49.6 dB"),
             "49.6 dB should render from 496 tenths: {subtitle}"

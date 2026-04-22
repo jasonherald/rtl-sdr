@@ -62,6 +62,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::codec::Codec;
@@ -288,6 +289,19 @@ pub struct ClientRegistry {
     /// callers. Order preserved — roughly "oldest client first" —
     /// so stats snapshots render consistently across polls.
     slots: Mutex<Vec<Arc<ClientSlot>>>,
+    /// Per-client worker `JoinHandle`s parked until server shutdown.
+    /// Each `spawn_client_workers` call pushes two entries (writer +
+    /// command). `Server::drop` drains and joins them after setting
+    /// the global shutdown flag so the dongle's `Arc<Mutex<RtlSdrDevice>>`
+    /// is actually released before `has_stopped()` reports true.
+    ///
+    /// Kept on the registry rather than the slot so a panicked /
+    /// disconnected slot can be pruned without losing its handle —
+    /// the handle still blocks on the panicking thread's actual
+    /// exit during shutdown join.
+    ///
+    /// Per `CodeRabbit` round 1 on PR #402.
+    worker_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Monotonic `ClientId` allocator. Never reused. An atomic so
     /// the accept loop doesn't need to hold `slots` to issue an id.
     next_id: AtomicU64,
@@ -296,10 +310,13 @@ pub struct ClientRegistry {
     /// how many are connected right now; this tells you how many
     /// ever have been. Useful for server-uptime / load diagnostics.
     lifetime_accepted: AtomicU64,
-    /// Cumulative bytes sent across all clients (connected OR
-    /// disconnected). Updated per-client via writer-side stats and
-    /// mirrored here at fan-out time so UI doesn't need to walk the
-    /// slots vec to compute the total. Monotonic; never reset.
+    /// Cumulative bytes actually written to the wire across all
+    /// clients. Incremented by [`Self::record_bytes_sent`] from the
+    /// per-client writer path AFTER the TCP write succeeds so it
+    /// reflects post-compression on-wire bytes, not pre-encoding
+    /// payload. The per-client `ClientStats::bytes_sent` is
+    /// incremented at the same point for the same reason. Monotonic;
+    /// never reset. Per `CodeRabbit` round 1 on PR #402.
     total_bytes_sent: AtomicU64,
     /// Cumulative buffers dropped across all clients. Monotonic.
     total_buffers_dropped: AtomicU64,
@@ -330,6 +347,42 @@ impl ClientRegistry {
         if let Ok(mut guard) = self.slots.lock() {
             guard.push(slot);
         }
+    }
+
+    /// Park a per-client worker `JoinHandle` for later shutdown
+    /// join. Called twice per accepted client — once for the
+    /// writer thread, once for the command thread. Handles are
+    /// drained and joined by [`Self::drain_worker_handles`] during
+    /// `Server::drop`, guaranteeing the threads' cloned device
+    /// `Arc` references are released before shutdown completes.
+    pub fn register_worker_handle(&self, handle: JoinHandle<()>) {
+        if let Ok(mut guard) = self.worker_handles.lock() {
+            guard.push(handle);
+        }
+    }
+
+    /// Take every parked worker handle. Caller joins them. Used by
+    /// `Server::drop` so the dongle's device mutex `Arc` cannot
+    /// linger past the `has_stopped()` transition — otherwise a
+    /// follow-up `Server::start` or engine open would fight a
+    /// ghost worker for USB exclusivity. Per CodeRabbit round 1
+    /// on PR #402.
+    pub fn drain_worker_handles(&self) -> Vec<JoinHandle<()>> {
+        self.worker_handles
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+
+    /// Increment the cumulative on-wire byte counter by `n`. Called
+    /// from the per-client writer path after a successful TCP
+    /// write so the aggregate tracks post-compression bytes. Per
+    /// CodeRabbit round 1 on PR #402 — moved here from
+    /// `broadcast` (which counted pre-compression payload bytes
+    /// at `try_send` time, double-counting whatever was dropped on
+    /// a full channel).
+    pub fn record_bytes_sent(&self, n: u64) {
+        self.total_bytes_sent.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Number of slots currently in the registry (includes slots
@@ -363,11 +416,13 @@ impl ClientRegistry {
 
     /// Fan one IQ chunk out to every live slot. For each slot:
     ///
-    /// - **Live + channel has room** → `try_send` succeeds, slot's
-    ///   `bytes_sent` increments by `chunk.len()` (the broadcaster
-    ///   sees pre-compression bytes; the slot's writer-side
-    ///   `StatsTrackingWrite` counts post-compression bytes on the
-    ///   socket write — the two are the same when `codec = None`).
+    /// - **Live + channel has room** → `try_send` succeeds. No
+    ///   counter bump happens here — bytes are counted on the
+    ///   per-client writer side after the TCP write succeeds (via
+    ///   [`Self::record_bytes_sent`] + the slot's
+    ///   `bytes_sent` field), so the aggregate and per-client
+    ///   counters reflect post-compression, post-successful-write
+    ///   bytes. Per `CodeRabbit` round 1 on PR #402.
     /// - **Live + channel full** → `TrySendError::Full`; chunk is
     ///   dropped for this slot only, `buffers_dropped` increments.
     /// - **`Receiver` dropped** → `TrySendError::Disconnected`; the
@@ -399,10 +454,15 @@ impl ClientRegistry {
 
         for slot in live {
             let buf = chunk.to_vec();
-            let buf_len = buf.len() as u64;
             match slot.tx.try_send(buf) {
                 Ok(()) => {
-                    self.total_bytes_sent.fetch_add(buf_len, Ordering::Relaxed);
+                    // Bytes are counted at the writer layer after
+                    // the TCP write succeeds (both per-client
+                    // `bytes_sent` and the aggregate
+                    // `total_bytes_sent` increment there). Counting
+                    // here would inflate the aggregate with bytes
+                    // that never reach the wire when a client
+                    // disconnects mid-queue.
                 }
                 Err(TrySendError::Full(_)) => {
                     // Per-slot drop accounting.
@@ -496,7 +556,11 @@ mod tests {
         reg.broadcast(b"hello");
         let received = rx.recv().unwrap();
         assert_eq!(&received[..], b"hello");
-        assert_eq!(reg.total_bytes_sent(), 5);
+        // `total_bytes_sent` is NOT bumped by `broadcast` — it's
+        // counted at the writer layer after the TCP write succeeds
+        // (per CodeRabbit round 1 on PR #402), so this unit test
+        // without a real writer observes zero.
+        assert_eq!(reg.total_bytes_sent(), 0);
     }
 
     #[test]
@@ -511,9 +575,24 @@ mod tests {
 
         assert_eq!(rx1.recv().unwrap(), b"abcde");
         assert_eq!(rx2.recv().unwrap(), b"abcde");
-        // Both clients saw the chunk, so total_bytes_sent reflects
-        // two copies of the 5-byte payload.
-        assert_eq!(reg.total_bytes_sent(), 10);
+        // `total_bytes_sent` is counted on successful TCP write at
+        // the `StatsTrackingWrite` layer — unit tests without a
+        // real writer observe zero. Integration with the writer
+        // is covered in `server.rs`.
+        assert_eq!(reg.total_bytes_sent(), 0);
+    }
+
+    #[test]
+    fn record_bytes_sent_accumulates_in_aggregate() {
+        // The writer path calls `record_bytes_sent(n)` after each
+        // successful TCP write. Here we simulate the calls
+        // directly to pin the aggregate contract.
+        let reg = ClientRegistry::new();
+        assert_eq!(reg.total_bytes_sent(), 0);
+        reg.record_bytes_sent(128);
+        reg.record_bytes_sent(256);
+        reg.record_bytes_sent(64);
+        assert_eq!(reg.total_bytes_sent(), 448);
     }
 
     #[test]
@@ -566,8 +645,6 @@ mod tests {
         // Nothing should have been sent — `try_send` never called
         // against a disconnected slot. The Receiver sees Empty.
         assert!(rx.try_recv().is_err());
-        // And we didn't credit the "total sent" counter either.
-        assert_eq!(reg.total_bytes_sent(), 0);
     }
 
     #[test]

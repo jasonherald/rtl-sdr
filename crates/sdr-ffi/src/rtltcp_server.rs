@@ -1094,6 +1094,7 @@ mod tests {
             total_bytes_sent: 1_234_567,
             total_buffers_dropped: 3,
             lifetime_accepted: 7,
+            initial: InitialDeviceState::default(),
         };
         let c = stats_to_c(&stats, &tuner);
         assert_eq!(c.connected_count, 0);

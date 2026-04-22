@@ -951,6 +951,12 @@ int32_t sdr_rtltcp_server_stats(
  * clients than `capacity`, the first `capacity` entries are
  * filled and the caller should retry with a bigger buffer.
  *
+ * The two query-count forms are equivalent: `out_clients == NULL`
+ * with `capacity == 0`, AND `out_clients != NULL` with
+ * `capacity == 0`. Both write the connected-client count to
+ * `*out_count` and fill zero entries. Use whichever is cleanest
+ * at the call site.
+ *
  * Returns `SDR_CORE_OK` on success (including the query-count
  * path), `SDR_CORE_ERR_INVALID_ARG` on null `out_count` (or null
  * `out_clients` with non-zero `capacity`),
