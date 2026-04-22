@@ -1589,10 +1589,33 @@ mod tests {
         // either — cheap guard against a future edit making
         // rearm quietly enable auto-squelch behind the user's
         // back.
+        //
+        // We deliberately drive the floor *off* the sentinel
+        // before disabling — if we started the disabled test
+        // with the floor still at `NOISE_FLOOR_INITIAL_DB`, a
+        // buggy implementation that unconditionally resets to
+        // sentinel would false-pass (sentinel → sentinel). The
+        // pre-rearm assertion below enforces this precondition.
         let mut squelch = PowerSquelch::new(REARM_DISABLED_MANUAL_DB);
-        // Starts with auto_squelch = false, floor at sentinel.
+        squelch.set_auto_squelch(true);
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
+        let mut output = vec![Complex::default(); TEST_BLOCK_LEN];
+        for _ in 0..AUTO_SETTLE_ITERS {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+        // `set_auto_squelch(false)` only flips the flag — it does
+        // not touch the settled floor estimate, which is exactly
+        // the state we want to snapshot for the "rearm is a no-op
+        // when disabled" check.
+        squelch.set_auto_squelch(false);
         assert!(!squelch.auto_squelch_enabled());
         let floor_before = squelch.noise_floor_db();
+        assert!(
+            (floor_before - NOISE_FLOOR_INITIAL_DB).abs() > REARM_SETTLED_MARGIN_DB,
+            "precondition: floor should differ from the sentinel before the \
+             disabled rearm call (got {floor_before}) — without this, a buggy \
+             unconditional-reset would false-pass the final assertion"
+        );
 
         squelch.rearm_auto_squelch();
 
