@@ -1407,8 +1407,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             match WavWriter::new(&path, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS) {
                 Ok(writer) => {
                     // Recording committed — now apply the mutex.
-                    // Scanner and per-hit recording are mutually
-                    // exclusive in Phase 1.
+                    // Scanner, per-hit recording, and transcription
+                    // are mutually exclusive in Phase 1.
                     if state.scanner.is_enabled() {
                         let cmds = state
                             .scanner
@@ -1418,6 +1418,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                             ScannerMutexReason::ScannerStoppedForRecording,
                         ));
                     }
+                    // Recording ↔ transcription leg: stop any active
+                    // transcription tap so the two don't run concurrently.
+                    // `stop_transcription` is silent (no DspToUi event) —
+                    // the transcription lifecycle has no feedback channel
+                    // today, matching the existing DisableTranscription
+                    // path. UI-switch resync is a known follow-up.
+                    stop_transcription(state);
                     state.audio_writer = Some(writer);
                     let _ = dsp_tx.send(DspToUi::AudioRecordingStarted(path));
                 }
@@ -1452,6 +1459,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                             ScannerMutexReason::ScannerStoppedForRecording,
                         ));
                     }
+                    // Recording ↔ transcription mutex — see
+                    // StartAudioRecording for rationale.
+                    stop_transcription(state);
                     state.iq_writer = Some(writer);
                     let _ = dsp_tx.send(DspToUi::IqRecordingStarted(path));
                 }
@@ -1478,6 +1488,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     ScannerMutexReason::ScannerStoppedForTranscription,
                 ));
             }
+            // Recording ↔ transcription leg of the mutex. Both
+            // `stop_any_recording` sends cover the UI (it emits
+            // `AudioRecordingStopped` / `IqRecordingStopped`), so
+            // the recording buttons flip off automatically.
+            stop_any_recording(state, dsp_tx);
             // Reset the squelch edge tracker when a new tap is wired up.
             // Without this, a previous session that ended with squelch open
             // leaves `squelch_was_open == true`, so the first chunk of the
