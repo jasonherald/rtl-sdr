@@ -144,9 +144,15 @@ pub struct SdrRtlTcpClientInfo {
     /// `sdr_server_rtltcp::codec::Codec::to_wire`.
     pub codec: u8,
     /// Bytes written to this client's socket since its handshake.
-    /// Post-compression — `StatsTrackingWrite` counts bytes at
-    /// the TCP level, so the sum of all `bytes_sent` equals the
-    /// server's on-wire total across connected clients.
+    /// Post-compression (`StatsTrackingWrite` counts bytes at
+    /// the TCP level, below the LZ4 encoder). Covers only this
+    /// currently-connected session —
+    /// [`SdrRtlTcpServerStats::total_bytes_sent`] is a separate
+    /// server-lifetime aggregate that also carries contributions
+    /// from previously-disconnected clients, so the sum of
+    /// per-client `bytes_sent` across the live list does NOT
+    /// equal `total_bytes_sent` once at least one disconnect has
+    /// occurred. Per `CodeRabbit` round 3 on PR #402.
     pub bytes_sent: u64,
     /// Buffer drops this client has accrued (broadcaster saw
     /// `TrySendError::Full` against this client's channel).

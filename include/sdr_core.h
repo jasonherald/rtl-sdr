@@ -849,8 +849,16 @@ typedef struct SdrRtlTcpClientInfo {
      * vanilla rtl_tcp), 1 = LZ4. */
     uint8_t  codec;
     /* Bytes written to this client's TCP socket since accept.
-     * Post-compression — sum across all clients equals the
-     * server's on-wire total. */
+     * Post-compression (LZ4 sessions report the
+     * compressed-on-wire count). Covers only this currently-
+     * connected session — SdrRtlTcpServerStats.total_bytes_sent
+     * is a separate server-lifetime aggregate that also carries
+     * contributions from previously-disconnected clients, so the
+     * sum of per-client bytes_sent across the currently-
+     * connected list does NOT equal total_bytes_sent once at
+     * least one disconnect has occurred. Hosts reconciling the
+     * two counters should treat them as complementary, not
+     * overlapping. */
     uint64_t bytes_sent;
     /* Buffer drops this client has accrued (broadcaster saw
      * TrySendError::Full against this client's channel). */

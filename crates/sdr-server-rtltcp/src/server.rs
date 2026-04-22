@@ -217,10 +217,15 @@ impl Default for InitialDeviceState {
 /// consecutive snapshots, divided by the poll interval.
 #[derive(Debug, Clone, Default)]
 pub struct ServerStats {
-    /// Snapshot of every currently-connected client. Includes
-    /// slots that disconnected between the last broadcaster prune
-    /// tick and this snapshot — they render as "just left" for one
-    /// poll cycle before disappearing. Order is oldest-first.
+    /// Live-only snapshot of every currently-connected client.
+    /// Disconnected-but-not-yet-pruned slots are filtered out at
+    /// the registry layer (see `ClientRegistry::snapshot`), so
+    /// this Vec never contains dead sessions — UI and FFI
+    /// consumers can treat every entry as a peer that was
+    /// actively reachable at snapshot time. Order is oldest-first
+    /// by connect time. Per `CodeRabbit` round 2 on PR #402
+    /// (switched to live-only filtering) + round 3 (doc
+    /// alignment with the new contract).
     pub connected_clients: Vec<crate::broadcaster::ClientInfo>,
     /// Cumulative bytes fanned out across all clients over the
     /// server's lifetime. Monotonic — never reset. UI derives the

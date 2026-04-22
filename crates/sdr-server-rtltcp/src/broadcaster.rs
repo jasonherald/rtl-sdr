@@ -291,16 +291,25 @@ pub struct ClientRegistry {
     slots: Mutex<Vec<Arc<ClientSlot>>>,
     /// Per-client worker `JoinHandle`s parked until server shutdown.
     /// Each `spawn_client_workers` call pushes two entries (writer +
-    /// command). `Server::drop` drains and joins them after setting
-    /// the global shutdown flag so the dongle's `Arc<Mutex<RtlSdrDevice>>`
-    /// is actually released before `has_stopped()` reports true.
+    /// command). `Server::stop()` / `Drop` drain and join them after
+    /// setting the global shutdown flag so the dongle's
+    /// `Arc<Mutex<RtlSdrDevice>>` is actually released by the time
+    /// `drop` / `stop` returns.
+    ///
+    /// **Note on `has_stopped()`:** that flag is narrowly scoped —
+    /// it flips when the accept thread exits, which happens BEFORE
+    /// these handles are drained. Callers that need "dongle is
+    /// actually free" must wait for `stop()` / `Drop` to return,
+    /// not poll `has_stopped()`. See `Server::has_stopped` for the
+    /// full contract.
     ///
     /// Kept on the registry rather than the slot so a panicked /
     /// disconnected slot can be pruned without losing its handle —
     /// the handle still blocks on the panicking thread's actual
     /// exit during shutdown join.
     ///
-    /// Per `CodeRabbit` round 1 on PR #402.
+    /// Per `CodeRabbit` round 1 on PR #402 (initial fix) + round 3
+    /// (doc alignment with the `has_stopped` contract).
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Monotonic `ClientId` allocator. Never reused. An atomic so
     /// the accept loop doesn't need to hold `slots` to issue an id.
@@ -403,8 +412,16 @@ impl ClientRegistry {
         self.lifetime_accepted.load(Ordering::Relaxed)
     }
 
-    /// Cumulative bytes fanned out (broadcaster's view, pre-per-client
-    /// compression). Never reset.
+    /// Cumulative **on-wire** bytes written across all clients for
+    /// the server's lifetime. Counted at the writer layer
+    /// ([`Self::record_bytes_sent`] called from
+    /// `StatsTrackingWrite::write` after the TCP write succeeds)
+    /// so it reflects post-compression bytes for LZ4 sessions and
+    /// matches the sum of per-client writes exactly. Monotonic;
+    /// never reset, including across client disconnects.
+    ///
+    /// Per `CodeRabbit` round 1 on PR #402 (moved counting here
+    /// from `broadcast()`) + round 3 (doc update to match).
     pub fn total_bytes_sent(&self) -> u64 {
         self.total_bytes_sent.load(Ordering::Relaxed)
     }
@@ -525,9 +542,46 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    /// Default channel depth small enough to exercise the Full path
-    /// without needing to push 500 chunks.
-    const TEST_CHANNEL_DEPTH: usize = 2;
+    // ============================================================
+    // Test fixture constants (CodeRabbit round 3 on PR #402).
+    // Extracted so each test's intent reads at a glance — a
+    // "1234" port on its own is noise; `TEST_PORT_GENERIC_A`
+    // plus a bounds docstring is self-documenting.
+    // ============================================================
+
+    /// Generic test port A for tests that register one slot and
+    /// don't care about peer-address distinctness — any
+    /// non-privileged port works.
+    const TEST_PORT_GENERIC_A: u16 = 1_234;
+    /// Generic test port B for tests that register a SECOND slot
+    /// and want peer addresses distinct from `TEST_PORT_GENERIC_A`
+    /// so snapshot assertions can tell them apart.
+    const TEST_PORT_GENERIC_B: u16 = 1_235;
+    /// Third generic port used by tests that register slot A
+    /// and slot B with disjoint port values (1 / 2 are fine
+    /// since we're just disambiguating addresses, not binding).
+    const TEST_PORT_FIRST: u16 = 1;
+    /// Fourth generic port, disjoint from `TEST_PORT_FIRST`.
+    const TEST_PORT_SECOND: u16 = 2;
+    /// Port for the `snapshot_reflects_registered_slots_with_stats`
+    /// test — picked distinct from the others so a cross-test
+    /// regression leaks clearly in the snapshot assertion.
+    const TEST_PORT_SNAPSHOT: u16 = 4_242;
+
+    /// Small channel depth that exercises the `Full` path without
+    /// needing to broadcast 500 chunks.
+    const TEST_CHANNEL_DEPTH_SMALL: usize = 2;
+    /// Moderate channel depth used by tests where the "fast
+    /// client" must drain all broadcasts without any drops.
+    const TEST_CHANNEL_DEPTH_STANDARD: usize = 4;
+    /// Generous channel depth for the "fast neighbor" side of
+    /// the full-channel drop-isolation test — must never fill.
+    const TEST_CHANNEL_DEPTH_GENEROUS: usize = 16;
+
+    /// Kept as an alias to `TEST_CHANNEL_DEPTH_SMALL` for the one
+    /// call site (`broadcast_full_channel_counts_drop_for_that_client_only`)
+    /// that reads better with the original name.
+    const TEST_CHANNEL_DEPTH: usize = TEST_CHANNEL_DEPTH_SMALL;
 
     #[test]
     fn allocate_id_is_monotonic() {
@@ -543,12 +597,22 @@ mod tests {
         let reg = ClientRegistry::new();
         assert!(reg.is_empty());
 
-        let (slot, _rx) = ClientSlot::new(reg.allocate_id(), test_peer(1234), Codec::None, 4);
+        let (slot, _rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_GENERIC_A),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         reg.register(slot);
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.lifetime_accepted(), 1);
 
-        let (slot2, _rx2) = ClientSlot::new(reg.allocate_id(), test_peer(1235), Codec::Lz4, 4);
+        let (slot2, _rx2) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_GENERIC_B),
+            Codec::Lz4,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         reg.register(slot2);
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.lifetime_accepted(), 2);
@@ -557,7 +621,12 @@ mod tests {
     #[test]
     fn broadcast_delivers_chunk_to_live_slot() {
         let reg = ClientRegistry::new();
-        let (slot, rx) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
+        let (slot, rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_FIRST),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         reg.register(slot);
 
         reg.broadcast(b"hello");
@@ -573,8 +642,18 @@ mod tests {
     #[test]
     fn broadcast_fans_out_identical_chunks_to_every_slot() {
         let reg = ClientRegistry::new();
-        let (s1, rx1) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
-        let (s2, rx2) = ClientSlot::new(reg.allocate_id(), test_peer(2), Codec::Lz4, 4);
+        let (s1, rx1) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_FIRST),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
+        let (s2, rx2) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_SECOND),
+            Codec::Lz4,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         reg.register(s1);
         reg.register(s2);
 
@@ -609,12 +688,17 @@ mod tests {
         // capacity and verify the drop accounting.
         let (slow, _slow_rx) = ClientSlot::new(
             reg.allocate_id(),
-            test_peer(1),
+            test_peer(TEST_PORT_FIRST),
             Codec::None,
             TEST_CHANNEL_DEPTH,
         );
         // Fast client with generous room — shouldn't drop anything.
-        let (fast, fast_rx) = ClientSlot::new(reg.allocate_id(), test_peer(2), Codec::None, 16);
+        let (fast, fast_rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_SECOND),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_GENEROUS,
+        );
         let slow_id = slow.id;
         reg.register(slow);
         reg.register(fast);
@@ -643,7 +727,12 @@ mod tests {
     #[test]
     fn broadcast_skips_disconnected_slot() {
         let reg = ClientRegistry::new();
-        let (slot, rx) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
+        let (slot, rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_FIRST),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         reg.register(slot.clone());
 
         slot.mark_disconnected();
@@ -657,7 +746,12 @@ mod tests {
     #[test]
     fn broadcast_marks_slot_disconnected_when_receiver_dropped() {
         let reg = ClientRegistry::new();
-        let (slot, rx) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
+        let (slot, rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_FIRST),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         reg.register(slot.clone());
 
         // Simulate writer thread exit by dropping the receiver.
@@ -676,8 +770,18 @@ mod tests {
     #[test]
     fn prune_disconnected_removes_flagged_slots_only() {
         let reg = ClientRegistry::new();
-        let (live, _live_rx) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
-        let (dead, _dead_rx) = ClientSlot::new(reg.allocate_id(), test_peer(2), Codec::None, 4);
+        let (live, _live_rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_FIRST),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
+        let (dead, _dead_rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_SECOND),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         dead.mark_disconnected();
         reg.register(live);
         reg.register(dead);
@@ -691,7 +795,12 @@ mod tests {
     #[test]
     fn snapshot_reflects_registered_slots_with_stats() {
         let reg = ClientRegistry::new();
-        let (slot, _rx) = ClientSlot::new(reg.allocate_id(), test_peer(4242), Codec::Lz4, 4);
+        let (slot, _rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_SNAPSHOT),
+            Codec::Lz4,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         let slot_id = slot.id;
         reg.register(slot.clone());
 
@@ -707,7 +816,7 @@ mod tests {
         assert_eq!(snap.len(), 1);
         let info = &snap[0];
         assert_eq!(info.id, slot_id);
-        assert_eq!(info.peer, test_peer(4242));
+        assert_eq!(info.peer, test_peer(TEST_PORT_SNAPSHOT));
         assert_eq!(info.codec, Codec::Lz4);
         assert_eq!(info.bytes_sent, 123);
         assert_eq!(info.current_freq_hz, Some(100_000_000));
@@ -734,8 +843,18 @@ mod tests {
         // briefly see dead sessions as live (FFI clients would
         // otherwise get stale ids that are already disconnected).
         let reg = ClientRegistry::new();
-        let (live, _live_rx) = ClientSlot::new(reg.allocate_id(), test_peer(1), Codec::None, 4);
-        let (dead, _dead_rx) = ClientSlot::new(reg.allocate_id(), test_peer(2), Codec::None, 4);
+        let (live, _live_rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_FIRST),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
+        let (dead, _dead_rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(TEST_PORT_SECOND),
+            Codec::None,
+            TEST_CHANNEL_DEPTH_STANDARD,
+        );
         reg.register(live);
         reg.register(dead.clone());
 
