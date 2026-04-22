@@ -56,7 +56,7 @@ Two mutually exclusive backends, selected at build time (see the install section
 - **Runtime model swap** — change models from the dropdown without restarting the app
 - **Live captions with display mode toggle** — streaming models render an in-place italic line below the commit log; user can switch to "Final only" mode
 - **Silero VAD** — offline models use Silero voice activity detection with a user-tunable threshold slider for noisy RF audio (NFM/scanner)
-- **Auto Break segmentation** — offline models (Zipformer/Parakeet) can segment long recordings on squelch-closed edges so each transmission becomes its own transcript commit instead of a wall of text
+- **Auto Break segmentation** — with an offline transcription model on an NFM channel, Auto Break segments long recordings on squelch-closed edges so each transmission becomes its own transcript commit instead of a wall of text. The toggle appears automatically when both conditions are met.
 - Auto-downloads models and VAD on first use with a bundled progress splash
 
 **Both backends share:**
