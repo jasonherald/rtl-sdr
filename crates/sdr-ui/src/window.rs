@@ -1350,6 +1350,28 @@ fn connect_sidebar_panels(
         status_bar,
         spectrum_handle,
     );
+
+    // Mutation-triggered scanner re-projection. Fires on scan
+    // checkbox, priority star, and delete — every per-bookmark
+    // change that affects the projected channel list. Install
+    // this *after* `connect_sidebar_panels` finishes the other
+    // panel wiring so early construction-time rebuilds (which
+    // pre-date the callback) don't dispatch a spurious empty
+    // `UpdateScannerChannels`. The closure holds an `Rc` clone
+    // of `BookmarksPanel` and reads `.bookmarks` at call time —
+    // keeps the projection against the live backing store
+    // without having to capture the `Rc<RefCell<Vec<Bookmark>>>`
+    // separately.
+    let bookmarks_for_mutated = Rc::clone(&panels.bookmarks);
+    let state_for_mutated = Rc::clone(state);
+    let config_for_mutated = std::sync::Arc::clone(config);
+    panels.bookmarks.connect_mutated(move || {
+        sidebar::navigation_panel::project_and_push_scanner_channels(
+            &bookmarks_for_mutated.bookmarks.borrow(),
+            &state_for_mutated,
+            &config_for_mutated,
+        );
+    });
 }
 
 /// Connect source panel controls to DSP commands.
@@ -5033,16 +5055,12 @@ fn unlock_transcription_session_rows(
 
 /// Connect scanner panel controls to DSP commands.
 ///
-/// Wiring in this pass (Task 3.2):
+/// Wiring:
 /// - master switch → `UiToDsp::SetScannerEnabled`
 /// - default dwell / hang sliders → persist to `ConfigManager`
-///
-/// Slider changes do NOT yet dispatch `UpdateScannerChannels` —
-/// that re-projection helper lives in `navigation_panel` and is
-/// added alongside the bookmark scan-checkbox work in Task 3.4.
-/// Until then, slider edits take effect on the next channel-list
-/// mutation (bookmark add / delete / scan-toggle). Acceptable
-/// because sliders and bookmarks ship in the same PR.
+///   and re-project the bookmark list into
+///   `UiToDsp::UpdateScannerChannels` so a running scanner picks
+///   up the new per-channel dwell/hang on its next tick.
 fn connect_scanner_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -5061,24 +5079,38 @@ fn connect_scanner_panel(
         glib::Propagation::Proceed
     });
 
-    // Default dwell slider: persist on every value change. The
-    // channel-list re-projection on slider mutation is wired in
-    // Task 3.4 once the `project_and_push_scanner_channels`
-    // helper lands. Overrides on individual bookmarks win over
-    // this default at projection time.
+    // Default dwell slider: persist on every value change, then
+    // re-project the bookmark list so `ScannerChannel::dwell_ms`
+    // picks up the new default on channels without an override.
     let config_dwell = std::sync::Arc::clone(config);
+    let bookmarks_dwell = Rc::clone(&panels.bookmarks);
+    let state_dwell = Rc::clone(state);
+    let config_dwell_project = std::sync::Arc::clone(config);
     scanner.default_dwell_row.connect_value_notify(move |row| {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let ms = row.value() as u32;
         sidebar::scanner_panel::save_default_dwell_ms(&config_dwell, ms);
+        sidebar::navigation_panel::project_and_push_scanner_channels(
+            &bookmarks_dwell.bookmarks.borrow(),
+            &state_dwell,
+            &config_dwell_project,
+        );
     });
 
     // Default hang slider: same pattern as dwell.
     let config_hang = std::sync::Arc::clone(config);
+    let bookmarks_hang = Rc::clone(&panels.bookmarks);
+    let state_hang = Rc::clone(state);
+    let config_hang_project = std::sync::Arc::clone(config);
     scanner.default_hang_row.connect_value_notify(move |row| {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let ms = row.value() as u32;
         sidebar::scanner_panel::save_default_hang_ms(&config_hang, ms);
+        sidebar::navigation_panel::project_and_push_scanner_channels(
+            &bookmarks_hang.bookmarks.borrow(),
+            &state_hang,
+            &config_hang_project,
+        );
     });
 
     // Restore persisted slider values. Runs after the notify

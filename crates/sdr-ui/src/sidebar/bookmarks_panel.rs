@@ -28,8 +28,8 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 
 use super::navigation_panel::{
-    ActiveBookmark, Bookmark, NavigationCallback, SaveCallback, load_bookmarks,
-    rebuild_bookmark_list,
+    ActiveBookmark, Bookmark, BookmarksMutatedCallback, NavigationCallback, SaveCallback,
+    load_bookmarks, rebuild_bookmark_list,
 };
 
 /// Default width of the bookmarks flyout, in pixels. Wide enough for
@@ -102,6 +102,14 @@ pub struct BookmarksPanel {
     /// active (see `expanded-notify` handler in
     /// `rebuild_bookmark_list`).
     pub manual_expanded: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    /// Fires whenever a per-bookmark scanner-relevant toggle
+    /// mutates the list (scan checkbox, priority star, delete).
+    /// Window-level wiring installs a closure that re-projects
+    /// the bookmark list into scanner channels and dispatches
+    /// `UiToDsp::UpdateScannerChannels`. Stays `None` in tests
+    /// and during the construction window before
+    /// `connect_mutated` is called.
+    pub on_mutated: BookmarksMutatedCallback,
 }
 
 impl BookmarksPanel {
@@ -113,6 +121,14 @@ impl BookmarksPanel {
     /// Register a callback invoked when the user clicks save on the active bookmark.
     pub fn connect_save<F: Fn() + 'static>(&self, f: F) {
         *self.on_save.borrow_mut() = Some(Box::new(f));
+    }
+
+    /// Register a callback invoked whenever a scanner-relevant
+    /// bookmark toggle mutates the list. Window-level wiring
+    /// installs a closure that re-projects the bookmark list and
+    /// dispatches `UiToDsp::UpdateScannerChannels`.
+    pub fn connect_mutated<F: Fn() + 'static>(&self, f: F) {
+        *self.on_mutated.borrow_mut() = Some(Box::new(f));
     }
 
     /// Rebuild the flyout's bookmark list from the backing store,
@@ -132,6 +148,7 @@ impl BookmarksPanel {
             &self.on_save,
             &self.filter_text,
             &self.manual_expanded,
+            &self.on_mutated,
         );
     }
 }
@@ -201,6 +218,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     let manual_expanded = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::<
         String,
     >::new()));
+    let on_mutated: BookmarksMutatedCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
 
     // Search-changed → update needle + rebuild. We rebuild the
     // list instead of using `ListBox::set_filter_func` because
@@ -218,6 +236,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     let active_for_entry = std::rc::Rc::clone(&active_bookmark);
     let on_save_for_entry = std::rc::Rc::clone(&on_save);
     let manual_expanded_for_entry = std::rc::Rc::clone(&manual_expanded);
+    let on_mutated_for_entry = std::rc::Rc::clone(&on_mutated);
     let name_entry_for_entry = name_entry.clone();
     search_entry.connect_search_changed(move |entry| {
         *filter_for_entry.borrow_mut() = entry.text().to_lowercase();
@@ -231,6 +250,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
             &on_save_for_entry,
             &filter_for_entry,
             &manual_expanded_for_entry,
+            &on_mutated_for_entry,
         );
     });
 
@@ -245,6 +265,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         &on_save,
         &filter_text,
         &manual_expanded,
+        &on_mutated,
     );
 
     BookmarksPanel {
@@ -257,5 +278,6 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         on_save,
         filter_text,
         manual_expanded,
+        on_mutated,
     }
 }
