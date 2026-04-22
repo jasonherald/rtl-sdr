@@ -160,6 +160,13 @@ impl IfChain {
         self.squelch.set_auto_squelch(enabled);
     }
 
+    /// Re-arm auto-squelch noise-floor tracking without
+    /// flipping the enabled state. See
+    /// [`PowerSquelch::rearm_auto_squelch`] for context.
+    pub fn rearm_auto_squelch(&mut self) {
+        self.squelch.rearm_auto_squelch();
+    }
+
     /// Returns whether auto-squelch is enabled.
     pub fn auto_squelch_enabled(&self) -> bool {
         self.squelch.auto_squelch_enabled()

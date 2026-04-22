@@ -292,6 +292,23 @@ impl PowerSquelch {
         }
     }
 
+    /// Re-arm auto-squelch: reset the noise floor estimate and
+    /// settle counter without flipping the enabled state.
+    ///
+    /// Call this whenever the tuning context changes — a retune
+    /// to a new frequency, a demod-mode switch, or a bandwidth
+    /// change — so the auto-squelch tracker re-converges on the
+    /// new band's floor instead of carrying the previous
+    /// channel's settled estimate into a potentially very
+    /// different noise environment. No-op when auto-squelch is
+    /// disabled (manual threshold doesn't track floor).
+    pub fn rearm_auto_squelch(&mut self) {
+        if self.auto_squelch {
+            self.noise_floor_db = NOISE_FLOOR_INITIAL_DB;
+            self.settle_count = 0;
+        }
+    }
+
     /// Returns whether auto-squelch is enabled.
     pub fn auto_squelch_enabled(&self) -> bool {
         self.auto_squelch
@@ -1491,6 +1508,70 @@ mod tests {
         assert!(
             !squelch.is_open(),
             "with auto-squelch off, manual 100 dB threshold should close squelch"
+        );
+    }
+
+    #[test]
+    fn test_rearm_auto_squelch_resets_floor_without_toggling_enabled() {
+        // Repros the core condition of issue #374: auto-squelch
+        // settles on band A's floor, we retune to band B, and
+        // without a re-arm the stale floor drives wrong open/close
+        // decisions. `rearm_auto_squelch` should reset the floor
+        // back to the initial sentinel so the next block starts
+        // re-converging from scratch — while leaving
+        // `auto_squelch_enabled` untouched.
+        let mut squelch = PowerSquelch::new(-100.0);
+        squelch.set_auto_squelch(true);
+
+        // Settle band A's noise floor via repeated blocks.
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
+        let mut output = vec![Complex::default(); TEST_BLOCK_LEN];
+        for _ in 0..AUTO_SETTLE_ITERS {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+        let settled_floor = squelch.noise_floor_db();
+        assert!(
+            settled_floor > NOISE_FLOOR_INITIAL_DB + 1.0,
+            "sanity: noise floor should have converged above the sentinel (got {settled_floor})",
+        );
+        assert!(squelch.auto_squelch_enabled());
+
+        squelch.rearm_auto_squelch();
+
+        // Floor is back to the sentinel; auto-squelch stays on.
+        assert!(
+            (squelch.noise_floor_db() - NOISE_FLOOR_INITIAL_DB).abs() < f32::EPSILON,
+            "rearm should reset noise_floor_db to NOISE_FLOOR_INITIAL_DB (got {})",
+            squelch.noise_floor_db()
+        );
+        assert!(
+            squelch.auto_squelch_enabled(),
+            "rearm must not flip the enabled state"
+        );
+    }
+
+    #[test]
+    fn test_rearm_auto_squelch_is_no_op_when_disabled() {
+        // When auto-squelch is off, the noise_floor_db field is
+        // unused (manual threshold drives decisions). Re-arming
+        // should not touch the floor or flip any other state
+        // either — cheap guard against a future edit making
+        // rearm quietly enable auto-squelch behind the user's
+        // back.
+        let mut squelch = PowerSquelch::new(-50.0);
+        // Starts with auto_squelch = false, floor at sentinel.
+        assert!(!squelch.auto_squelch_enabled());
+        let floor_before = squelch.noise_floor_db();
+
+        squelch.rearm_auto_squelch();
+
+        assert!(
+            !squelch.auto_squelch_enabled(),
+            "rearm must not enable auto-squelch"
+        );
+        assert!(
+            (squelch.noise_floor_db() - floor_before).abs() < f32::EPSILON,
+            "rearm should leave noise_floor_db untouched when disabled"
         );
     }
 }
