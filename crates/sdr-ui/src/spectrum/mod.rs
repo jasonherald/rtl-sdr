@@ -247,14 +247,19 @@ impl SpectrumHandle {
     /// Update the tuner center frequency for frequency axis labels.
     ///
     /// Also resets the VFO overlay offset to 0 so the passband rectangle
-    /// tracks the new center. Every caller that sets the tuner center
-    /// is placing the tuner ON a specific channel (manual header tune,
-    /// click-to-tune, bookmark recall, preset, scanner retune), so the
-    /// VFO's offset-from-center should be zero afterwards. Without this
-    /// reset the rectangle would stick at the previous center-relative
-    /// offset — visually drifting across the waterfall as center moves,
-    /// even though the tuner is centered on the new frequency. Per
+    /// tracks the new center. Every caller of this method is placing the
+    /// tuner ON a specific channel — manual header tune, bookmark recall,
+    /// preset selection, scanner retune — so the VFO's
+    /// offset-from-center should be zero afterwards. Without this reset
+    /// the rectangle would stick at the previous center-relative offset,
+    /// visually drifting across the waterfall as center moves, even
+    /// though the tuner is centered on the new frequency. Per
     /// issue #376.
+    ///
+    /// Note: click-to-tune does NOT go through this path. It dispatches
+    /// `UiToDsp::SetVfoOffset(offset)` with the clicked offset,
+    /// deliberately keeping the tuner center fixed and sliding the VFO
+    /// passband to the click position instead.
     pub fn set_center_frequency(&self, freq_hz: f64) {
         self.center_freq.set(freq_hz);
         self.vfo_state.borrow_mut().offset_hz = 0.0;
