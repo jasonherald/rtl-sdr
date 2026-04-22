@@ -113,6 +113,15 @@ pub trait Source: Send {
     fn set_gain_by_index(&mut self, _index: u32) -> Result<(), SourceError> {
         Ok(())
     }
+
+    /// Toggle loop-on-EOF for the file playback source. `true`
+    /// rewinds to the start of the file at EOF and keeps
+    /// streaming; `false` stops the source at EOF. Only the
+    /// `FileSource` honors this; other sources accept silently.
+    /// Per issue #236.
+    fn set_looping(&mut self, _looping: bool) -> Result<(), SourceError> {
+        Ok(())
+    }
 }
 
 /// Manages available IQ sources and the active source lifecycle.

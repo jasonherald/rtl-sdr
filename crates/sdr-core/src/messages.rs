@@ -213,6 +213,11 @@ pub enum UiToDsp {
     },
     /// Set the file path for file source playback.
     SetFilePath(std::path::PathBuf),
+    /// Toggle loop-on-EOF for the file playback source. `true`
+    /// rewinds to the start of the file on EOF and keeps
+    /// streaming; `false` stops the source at EOF. No-op when
+    /// the active source isn't `.file`. Per issue #236.
+    SetFileLooping(bool),
     /// Set PPM frequency correction for RTL-SDR crystal offset.
     SetPpmCorrection(i32),
     // ------------------------------------------------------
@@ -615,6 +620,15 @@ mod tests {
             file_path,
             UiToDsp::SetFilePath(ref p) if p == std::path::Path::new("/tmp/test.wav")
         ));
+
+        // Loop-on-EOF toggle — both polarities, since the
+        // controller's handler branches on the value and we
+        // want a shape regression on either to fail loudly.
+        // Per `CodeRabbit` round 1 on PR #371.
+        let loop_on = UiToDsp::SetFileLooping(true);
+        assert!(matches!(loop_on, UiToDsp::SetFileLooping(true)));
+        let loop_off = UiToDsp::SetFileLooping(false);
+        assert!(matches!(loop_off, UiToDsp::SetFileLooping(false)));
 
         let ppm = UiToDsp::SetPpmCorrection(42);
         assert!(matches!(ppm, UiToDsp::SetPpmCorrection(42)));

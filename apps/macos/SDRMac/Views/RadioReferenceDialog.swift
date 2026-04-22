@@ -361,7 +361,8 @@ struct RadioReferenceDialog: View {
             gainDb: nil,
             agcEnabled: nil,
             volume: nil,
-            deemphasis: nil
+            deemphasis: nil,
+            agcType: nil
         )
     }
 

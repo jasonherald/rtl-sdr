@@ -283,6 +283,12 @@ struct DspState {
     network_port: u16,
     network_protocol: sdr_types::Protocol,
     file_path: std::path::PathBuf,
+    /// Loop-on-EOF flag for the file playback source. Default
+    /// `false` (stop at EOF). Updated by `UiToDsp::SetFileLooping`
+    /// and applied both to the currently-running source (if any)
+    /// and to the newly-opened source when the source is rebuilt
+    /// from a path or source-type change. Per issue #236.
+    file_looping: bool,
 
     // Pre-allocated buffers
     iq_buf: Vec<Complex>,
@@ -413,6 +419,7 @@ impl DspState {
             network_port: 1234,
             network_protocol: sdr_types::Protocol::TcpClient,
             file_path: std::path::PathBuf::new(),
+            file_looping: false,
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
@@ -1241,6 +1248,23 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.file_path = path;
         }
 
+        UiToDsp::SetFileLooping(looping) => {
+            // Store on the state so a source rebuild (e.g. after
+            // a file-path change) picks up the latest setting,
+            // and also apply to the live source so an already-
+            // playing file starts / stops looping at its next
+            // EOF. Non-file sources silently accept per the
+            // trait default. Per issue #236.
+            tracing::debug!(looping, "set file looping");
+            state.file_looping = looping;
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_looping(looping)
+            {
+                tracing::warn!("set file looping failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("File looping failed: {e}")));
+            }
+        }
+
         UiToDsp::SetBiasTee(enabled) => {
             tracing::debug!(enabled, "set bias tee");
             if let Some(source) = &mut state.source
@@ -1490,7 +1514,16 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
             state.network_port,
             state.network_protocol,
         )),
-        SourceType::File => Box::new(sdr_source_file::FileSource::new(&state.file_path)),
+        SourceType::File => {
+            // Apply the persisted loop flag to the freshly-
+            // constructed source so a replay after a path
+            // change honors the latest setting — without
+            // this, switching files would reset looping to
+            // the constructor default. Per issue #236.
+            let mut fs = sdr_source_file::FileSource::new(&state.file_path);
+            fs.set_looping(state.file_looping);
+            Box::new(fs)
+        }
         // rtl_tcp client: connects to a remote `rtl_tcp`-compatible
         // server, handshakes the 12-byte RTL0 header, and routes
         // future tune / gain / PPM messages through the 5-byte

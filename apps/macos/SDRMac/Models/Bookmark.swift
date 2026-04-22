@@ -38,9 +38,23 @@ struct Bookmark: Codable, Identifiable, Hashable {
     var autoSquelchEnabled: Bool?
     var squelchDb: Float?
     var gainDb: Double?
+
+    /// Legacy AGC boolean — kept for backward-compat with
+    /// pre-#357 bookmarks.json. `true` recalls to hardware
+    /// (the old default when it was Bool), `false` to off.
+    /// Modern bookmarks also carry the tristate `agcType` below
+    /// and the apply path prefers that when present. Same
+    /// dual-field pattern the Linux side uses (agc + agc_type)
+    /// so cross-frontend schemas stay aligned.
     var agcEnabled: Bool?
+
     var volume: Float?
     var deemphasis: Deemphasis?
+
+    /// Tristate AGC — Off / Hardware / Software. Takes
+    /// precedence over `agcEnabled` on recall when present.
+    /// Per issue #357.
+    var agcType: SdrCore.AgcType?
 
     // MARK: Organization
 
@@ -72,5 +86,6 @@ struct Bookmark: Codable, Identifiable, Hashable {
         case volume
         case deemphasis
         case rrCategory = "rr_category"
+        case agcType = "agc_type"
     }
 }
