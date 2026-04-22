@@ -1400,7 +1400,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::StartAudioRecording(path) => {
             // If scanner is active, stop it first — scanner and
             // per-hit recording are mutually exclusive in Phase 1.
-            if state.scanner.state() != sdr_scanner::ScannerState::Idle {
+            if state.scanner.is_enabled() {
                 let cmds = state
                     .scanner
                     .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
@@ -1432,7 +1432,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::StartIqRecording(path) => {
             // If scanner is active, stop it first — scanner and
             // per-hit recording are mutually exclusive in Phase 1.
-            if state.scanner.state() != sdr_scanner::ScannerState::Idle {
+            if state.scanner.is_enabled() {
                 let cmds = state
                     .scanner
                     .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
@@ -1463,7 +1463,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::EnableTranscription(tx) => {
-            if state.scanner.state() != sdr_scanner::ScannerState::Idle {
+            if state.scanner.is_enabled() {
                 let cmds = state
                     .scanner
                     .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
@@ -1651,27 +1651,96 @@ fn apply_scanner_commands(
                 ctcss,
                 voice_squelch,
             } => {
-                // Apply to source + radio module directly. Same
-                // path as the manual `Tune` / `SetBandwidth` /
-                // `SetDemodMode` handlers above.
-                if let Some(source) = state.source.as_mut() {
-                    #[allow(clippy::cast_precision_loss)]
-                    let freq_f64 = freq_hz as f64;
-                    let _ = source.tune(freq_f64);
+                // Mirror the manual `Tune` / `SetDemodMode` /
+                // `SetBandwidth` handlers so scanner hops end up
+                // with the same persisted state + VFO rebuild
+                // behavior. Omissions would leave `state.center_freq`
+                // / `state.bandwidth` / the RxVfo config stale —
+                // a subsequent `open_source()` restart would tune
+                // back to whatever the user manually picked before
+                // scanner started, and the IF filter width could
+                // stay locked to the previous channel's mode.
+                //
+                // Deliberately NOT emitting the corresponding
+                // `DspToUi::SampleRateChanged` / `DisplayBandwidth`
+                // / `DemodModeChanged` / `BandwidthChanged` events
+                // the manual handlers send — those are UI-sync
+                // signals for user-initiated changes. Scanner
+                // retunes carry their own `ScannerActiveChannelChanged`
+                // payload with freq/mode/bandwidth/name that the
+                // UI handler fans out to the same widgets; emitting
+                // both paths would double-drive the sync.
+
+                // 1. Center frequency (mirrors `UiToDsp::Tune`).
+                #[allow(clippy::cast_precision_loss)]
+                let freq_f64 = freq_hz as f64;
+                state.center_freq = freq_f64;
+                if let Some(source) = state.source.as_mut()
+                    && let Err(e) = source.tune(freq_f64)
+                {
+                    tracing::warn!(?e, "scanner retune: source.tune failed");
                 }
-                if let Err(e) = state.radio.set_mode(demod_mode) {
-                    tracing::warn!(?e, "scanner retune: set_mode failed");
+
+                // 2. Demod mode + VFO rebuild on change (mirrors
+                // `UiToDsp::SetDemodMode`). The scanner doesn't
+                // emit retune commands redundantly — each Retune
+                // marks a new channel — but the target mode may
+                // equal the current mode (rotation pass on same-
+                // mode channels), so guard to avoid gratuitous
+                // rebuilds.
+                let old_mode = state.radio.current_mode();
+                if old_mode != demod_mode {
+                    if let Err(e) = state.radio.set_mode(demod_mode) {
+                        tracing::warn!(?e, "scanner retune: set_mode failed");
+                    } else {
+                        // Auto-adjust decimation for the new
+                        // demod's IF rate.
+                        let if_rate = state.radio.demod_config().if_sample_rate;
+                        let auto_decim = auto_decimation_ratio(state.sample_rate, if_rate);
+                        if auto_decim != state.frontend.decim_ratio()
+                            && let Err(e) = state.frontend.set_decimation(auto_decim)
+                        {
+                            tracing::warn!(?e, "scanner retune: auto-decimation failed");
+                        }
+                        // Rebuild the VFO for the new demod's IF
+                        // rate + bandwidth. Bandwidth is set
+                        // below; rebuild picks it up via
+                        // `state.bandwidth`.
+                        state.bandwidth = bandwidth;
+                        if let Err(e) = rebuild_vfo(state) {
+                            tracing::warn!(?e, "scanner retune: VFO rebuild failed");
+                        }
+                    }
+                }
+
+                // 3. Bandwidth (mirrors `UiToDsp::SetBandwidth`).
+                // Applied to the VFO channel filter first; only
+                // persist on success. For same-mode retunes the
+                // VFO already exists; for mode-change retunes the
+                // rebuild above already used `state.bandwidth`
+                // so the two paths converge.
+                if let Some(vfo) = &mut state.vfo {
+                    match vfo.set_bandwidth(bandwidth) {
+                        Ok(()) => state.bandwidth = bandwidth,
+                        Err(e) => {
+                            tracing::warn!(?e, "scanner retune: VFO bandwidth update failed");
+                        }
+                    }
+                } else {
+                    state.bandwidth = bandwidth;
                 }
                 state.radio.set_bandwidth(bandwidth);
-                // CTCSS is per-channel: force-Off when the new
-                // channel doesn't carry a tone, otherwise stale
-                // tone gates would silence the new channel.
+
+                // 4. CTCSS is per-channel: force-Off when the new
+                // channel doesn't carry a tone, otherwise a stale
+                // tone gate would silence the new channel.
                 let ctcss_mode = ctcss.unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
                 if let Err(e) = state.radio.set_ctcss_mode(ctcss_mode) {
                     tracing::warn!(?e, "scanner retune: set_ctcss_mode failed");
                 }
-                // Voice squelch is device-level — preserve
-                // current setting when `None`.
+                // 5. Voice squelch is device-level — preserve
+                // current setting when the channel doesn't
+                // override it.
                 if let Some(m) = voice_squelch
                     && let Err(e) = state.radio.set_voice_squelch_mode(m)
                 {
@@ -2352,22 +2421,29 @@ fn process_iq_block(
 
             // Feed the sample tick into the scanner. Scanner uses this to
             // drive settle/dwell/hang countdowns — decoupled from radio
-            // output. `NonZeroU32` is enforced at the event type level;
-            // expect here is OK because any live source has a non-zero
-            // rate (source.sample_rate() always > 0 in practice).
-            // Uses `iq_count` (source-rate samples) paired with
-            // `state.sample_rate` so the ms→sample math is consistent.
+            // output. `NonZeroU32` enforces the rate invariant at the
+            // event type level; if `state.sample_rate` ever truncates
+            // to 0 we skip the tick and warn rather than panicking the
+            // DSP thread. Any live source has a non-zero rate; this is
+            // defense against future state-init bugs, not a hot-path
+            // concern.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let sample_rate_hz = std::num::NonZeroU32::new(state.sample_rate as u32)
-                .expect("source sample rate must be > 0");
-            #[allow(clippy::cast_possible_truncation)]
-            let tick_cmds = state
-                .scanner
-                .handle_event(sdr_scanner::ScannerEvent::SampleTick {
-                    samples_consumed: iq_count as u32,
-                    sample_rate_hz,
-                });
-            apply_scanner_commands(state, dsp_tx, tick_cmds);
+            let sample_rate_u32 = state.sample_rate as u32;
+            if let Some(sample_rate_hz) = std::num::NonZeroU32::new(sample_rate_u32) {
+                #[allow(clippy::cast_possible_truncation)]
+                let tick_cmds = state
+                    .scanner
+                    .handle_event(sdr_scanner::ScannerEvent::SampleTick {
+                        samples_consumed: iq_count as u32,
+                        sample_rate_hz,
+                    });
+                apply_scanner_commands(state, dsp_tx, tick_cmds);
+            } else {
+                tracing::warn!(
+                    sample_rate = state.sample_rate,
+                    "scanner sample tick skipped: source sample rate is 0 after u32 cast"
+                );
+            }
         }
         Err(e) => {
             tracing::warn!("frontend processing error: {e}");

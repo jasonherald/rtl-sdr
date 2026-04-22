@@ -209,10 +209,15 @@ pub struct Bookmark {
     /// often). Higher tiers reserved for future phases.
     #[serde(default)]
     pub priority: u8,
-    /// Per-channel dwell override in ms. None → scanner default.
+    /// Per-channel dwell override in ms. `None` → resolved to the
+    /// UI-side default at `ScannerChannel` projection time (scanner
+    /// itself doesn't own a default; timing defaults live in the
+    /// UI layer per the design).
     #[serde(default)]
     pub dwell_ms_override: Option<u32>,
-    /// Per-channel hang override in ms. None → scanner default.
+    /// Per-channel hang override in ms. `None` → resolved to the
+    /// UI-side default at `ScannerChannel` projection time (same
+    /// ownership contract as `dwell_ms_override`).
     #[serde(default)]
     pub hang_ms_override: Option<u32>,
 }

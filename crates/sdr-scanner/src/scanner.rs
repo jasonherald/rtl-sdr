@@ -154,6 +154,19 @@ impl Scanner {
         self.phase.as_state()
     }
 
+    /// Whether the scanner is user-enabled. Distinct from
+    /// `state() != Idle` because `Idle` is also the rest phase
+    /// after `EmptyRotation` (enabled scanner with every channel
+    /// locked) — callers gating "scanner is active" on phase
+    /// alone miss that case. The mutex with
+    /// recording/transcription wants `is_enabled()` so a pending
+    /// re-resume via `UnlockScannerChannel` / `UpdateScannerChannels`
+    /// counts as "scanner active."
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Feed an event, receive zero or more commands. Commands
     /// are returned in order of emission — caller applies them
     /// in sequence.
