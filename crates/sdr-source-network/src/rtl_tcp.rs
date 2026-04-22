@@ -746,7 +746,11 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
 /// compressed bytes as raw I/Q. Per CodeRabbit round 1 on PR #399.
 fn read_server_extension(stream: &TcpStream) -> std::io::Result<ServerExtension> {
     let mut buf = [0u8; SERVER_EXTENSION_LEN];
-    <&TcpStream as std::io::Read>::read_exact(&mut &*stream, &mut buf)?;
+    // `Read` is implemented for `&TcpStream`, so shadow into a
+    // local mut binding and call `read_exact` through the trait
+    // directly — cleaner than a fully-qualified turbofish and
+    // avoids the temporary-rvalue gotcha of `(&*stream).read_exact(…)`.
+    (&mut &*stream).read_exact(&mut buf)?;
     if buf[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -811,9 +815,11 @@ fn attempt_connect(
     // framing (hello is 8 bytes = 1.6 commands) and can cause
     // garbage dispatches, so we only send it when we have
     // out-of-band evidence the server speaks the extension
-    // (e.g., mDNS TXT `rtlx=1` or an explicit per-server profile
-    // setting). Default `compression = NONE_ONLY` → no hello →
-    // wire-compatible with every rtl_tcp server on earth. Per #307.
+    // (e.g., mDNS TXT `codecs=3` or an explicit per-server
+    // profile setting — see the `RtlTcpConfig.compression`
+    // doc for the full signal). Default `compression = NONE_ONLY`
+    // → no hello → wire-compatible with every rtl_tcp server on
+    // earth. Per #307.
     let extension_enabled = config.compression != CodecMask::NONE_ONLY;
     if extension_enabled {
         let hello = ClientHello {
