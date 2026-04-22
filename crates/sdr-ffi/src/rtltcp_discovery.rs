@@ -172,6 +172,11 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
                 gains: opts.gains,
                 nickname,
                 txbuf,
+                // C ABI host has no codec picker yet — advertise
+                // "unknown / legacy" so vanilla clients keep
+                // working unchanged. #307 follow-up will extend
+                // `SdrRtlTcpAdvertiseOptions` with a `codecs` byte.
+                codecs: None,
             },
         };
 
@@ -853,6 +858,7 @@ mod tests {
                     String::new()
                 },
                 txbuf,
+                codecs: None,
             },
             last_seen: Instant::now(),
         }

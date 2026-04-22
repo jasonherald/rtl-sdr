@@ -245,6 +245,7 @@ pub struct Server {
     stats: Arc<Mutex<ServerStats>>,
     bind: SocketAddr,
     tuner: TunerAdvertiseInfo,
+    compression: crate::codec::CodecMask,
 }
 
 impl Server {
@@ -326,6 +327,7 @@ impl Server {
             stats,
             bind: actual_bind,
             tuner,
+            compression: config.compression,
         })
     }
 
@@ -345,6 +347,15 @@ impl Server {
     /// to keep the server crate free of mDNS deps.
     pub fn tuner_info(&self) -> &TunerAdvertiseInfo {
         &self.tuner
+    }
+
+    /// Codec mask the server is willing to negotiate. The mDNS
+    /// advertiser calls this to stamp a `codecs=` TXT entry so
+    /// clients can decide up-front whether to send the extended
+    /// `"RTLX"` hello (a vanilla client that doesn't recognize the
+    /// key just connects the legacy way — see #307).
+    pub fn compression(&self) -> crate::codec::CodecMask {
+        self.compression
     }
 
     /// Has the accept thread exited (either via `stop()` or an

@@ -149,6 +149,7 @@ mod tests {
                 gains: R820T_GAIN_COUNT,
                 nickname: "integration-test-nick".into(),
                 txbuf: None,
+                codecs: None,
             },
         })
         .expect("announce");

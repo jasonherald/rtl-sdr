@@ -3726,6 +3726,12 @@ fn build_advertiser(
             gains: tuner_info.gain_count,
             nickname,
             txbuf: None,
+            // Advertise the codec bitmask so our own clients
+            // know up-front whether to send an extended-protocol
+            // hello (`NONE_ONLY` → no hello, vanilla path).
+            // Vanilla mDNS consumers (non-sdr-rs clients that
+            // don't know this key) just ignore it. #307.
+            codecs: Some(server.compression().to_wire()),
         },
     };
     Advertiser::announce(opts)
@@ -6613,6 +6619,7 @@ mod rtl_tcp_discovery_format_tests {
                 gains: 29,
                 nickname: "weather".into(),
                 txbuf: None,
+                codecs: None,
             },
             last_seen: Instant::now(),
         }

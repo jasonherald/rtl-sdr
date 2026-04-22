@@ -34,6 +34,19 @@ pub struct TxtRecord {
 
     /// Optional buffer-depth hint (bytes) for latency awareness.
     pub txbuf: Option<usize>,
+
+    /// Optional codec bitmask (`sdr-server-rtltcp::CodecMask`'s raw
+    /// wire byte) advertising which stream codecs the server is
+    /// willing to negotiate in the extended `"RTLX"` handshake.
+    /// `None` means "unknown" — older servers don't publish this
+    /// key; clients should treat its absence as "legacy
+    /// uncompressed only" and NOT send an extended hello (the
+    /// hello corrupts vanilla command framing). Issue #307.
+    ///
+    /// Kept as a plain `u8` here so the discovery crate stays
+    /// independent of the server crate; the caller converts to /
+    /// from `CodecMask` at the boundary.
+    pub codecs: Option<u8>,
 }
 
 impl TxtRecord {
@@ -55,6 +68,9 @@ impl TxtRecord {
         insert_checked(&mut m, "nickname", &self.nickname)?;
         if let Some(n) = self.txbuf {
             insert_checked(&mut m, "txbuf", &n.to_string())?;
+        }
+        if let Some(c) = self.codecs {
+            insert_checked(&mut m, "codecs", &c.to_string())?;
         }
         let total: usize = m.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
         if total > Self::MAX_TOTAL_BYTES {
@@ -81,6 +97,7 @@ impl TxtRecord {
         let mut gains: u32 = 0;
         let mut nickname = String::new();
         let mut txbuf: Option<usize> = None;
+        let mut codecs: Option<u8> = None;
         for (k, v) in properties {
             match k.as_ref() {
                 "tuner" => tuner = v.as_ref().to_string(),
@@ -88,6 +105,7 @@ impl TxtRecord {
                 "gains" => gains = v.as_ref().parse().unwrap_or(0),
                 "nickname" => nickname = v.as_ref().to_string(),
                 "txbuf" => txbuf = v.as_ref().parse().ok(),
+                "codecs" => codecs = v.as_ref().parse().ok(),
                 _ => {
                     tracing::trace!(
                         key = %k.as_ref(),
@@ -102,6 +120,7 @@ impl TxtRecord {
             gains,
             nickname,
             txbuf,
+            codecs,
         }
     }
 }
@@ -140,6 +159,10 @@ mod tests {
             gains: 29,
             nickname: "home-scanner".into(),
             txbuf: Some(128 * 1024),
+            // CodecMask::NONE_AND_LZ4 raw byte — stable wire value
+            // avoided referencing the server crate here to keep the
+            // discovery crate's test independent.
+            codecs: Some(0b11),
         }
     }
 
@@ -154,6 +177,7 @@ mod tests {
             Some("home-scanner")
         );
         assert_eq!(props.get("txbuf").map(String::as_str), Some("131072"));
+        assert_eq!(props.get("codecs").map(String::as_str), Some("3"));
     }
 
     #[test]
@@ -165,6 +189,17 @@ mod tests {
     }
 
     #[test]
+    fn to_properties_omits_missing_codecs() {
+        // An older server that doesn't advertise a codec mask must
+        // not emit an empty `codecs=` entry — clients interpret
+        // absence as "legacy only" per #307.
+        let mut r = sample();
+        r.codecs = None;
+        let props = r.to_properties().unwrap();
+        assert!(!props.contains_key("codecs"));
+    }
+
+    #[test]
     fn from_properties_fills_defaults_for_missing_fields() {
         let r = TxtRecord::from_properties(std::iter::empty::<(&str, &str)>());
         assert_eq!(r.tuner, "unknown");
@@ -172,6 +207,22 @@ mod tests {
         assert_eq!(r.gains, 0);
         assert_eq!(r.nickname, "");
         assert_eq!(r.txbuf, None);
+        assert_eq!(r.codecs, None);
+    }
+
+    #[test]
+    fn from_properties_parses_codecs() {
+        let r = TxtRecord::from_properties([("codecs", "3")]);
+        assert_eq!(r.codecs, Some(3));
+    }
+
+    #[test]
+    fn from_properties_tolerates_garbage_codecs() {
+        // Non-numeric `codecs` value falls back to None (unknown)
+        // rather than rejecting the whole record — same safety
+        // pattern as `gains`.
+        let r = TxtRecord::from_properties([("codecs", "not-a-number")]);
+        assert_eq!(r.codecs, None);
     }
 
     #[test]
