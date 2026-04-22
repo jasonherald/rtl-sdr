@@ -415,7 +415,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                 // the panel's individual `Rc` fields.
                 *bookmarks_for_rr.bookmarks.borrow_mut() =
                     sidebar::navigation_panel::load_bookmarks();
-                bookmarks_for_rr.rebuild(&name_entry_for_rr);
+                bookmarks_for_rr.rebuild_after_mutation(&name_entry_for_rr);
             });
         });
     }
@@ -850,6 +850,8 @@ fn handle_dsp_message(
             demod_mode,
             bandwidth,
             name,
+            ctcss,
+            voice_squelch,
         } => {
             // Cache the active channel key for the lockout button
             // click handler in `connect_scanner_panel`. Written
@@ -900,6 +902,33 @@ fn handle_dsp_message(
                 state.suppress_bandwidth_notify.set(true);
                 radio_panel.bandwidth_row.set_value(bandwidth);
                 state.suppress_bandwidth_notify.set(false);
+
+                // CTCSS + voice-squelch widget sync — keeps
+                // Add/Save Bookmark honest when the user stashes
+                // a channel the scanner landed on. The set calls
+                // bounce back through the widgets'
+                // connect_selected_notify handlers as redundant
+                // `SetCtcssMode` / `SetVoiceSquelchMode`
+                // dispatches, which are idempotent at the
+                // engine (the scanner retune has already applied
+                // the same values). Same trade-off the master-
+                // switch `connect_active_notify` migration made
+                // in round 1.
+                //
+                // `None` on the channel:
+                // - CTCSS: scanner forces engine to Off, so the
+                //   row tracks that and goes to Off.
+                // - voice-squelch: scanner leaves engine alone,
+                //   so we leave the widget alone too (what's on
+                //   the widget matches what's on the engine).
+                let ctcss_for_widget = ctcss.unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
+                let ctcss_idx =
+                    sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(ctcss_for_widget);
+                radio_panel.ctcss_row.set_selected(ctcss_idx);
+                if let Some(vs_mode) = voice_squelch {
+                    radio_panel.apply_voice_squelch_mode_ui(vs_mode);
+                }
+
                 scanner_panel.lockout_button.set_visible(true);
             } else {
                 scanner_panel.active_channel_label.set_text("Active: —");
@@ -926,9 +955,11 @@ fn handle_dsp_message(
                 ));
             }
             // Engine is already back to Idle — drop the master
-            // switch to match. `set_state` fires `state-set`; that
-            // handler re-dispatches `SetScannerEnabled(false)`
-            // which is idempotent on the engine side.
+            // switch to match. `set_state` propagates to `active`
+            // and fires `notify::active`, which the master switch's
+            // `connect_active_notify` handler dispatches as a
+            // redundant `SetScannerEnabled(false)` — idempotent on
+            // the engine side (scanner's already Idle), so no harm.
             scanner_panel.master_switch.set_state(false);
         }
         DspToUi::ScannerMutexStopped(reason) => {
@@ -4869,7 +4900,7 @@ fn connect_navigation_panel(
             sidebar::navigation_panel::Bookmark::with_profile(&name, freq_u64, mode, bw, &profile);
         bm_for_add.bookmarks.borrow_mut().push(bookmark);
         sidebar::navigation_panel::save_bookmarks(&bm_for_add.bookmarks.borrow());
-        bm_for_add.rebuild(&name_entry);
+        bm_for_add.rebuild_after_mutation(&name_entry);
         name_entry.set_text("");
     });
 
@@ -4991,8 +5022,10 @@ fn connect_navigation_panel(
         }
         sidebar::navigation_panel::save_bookmarks(&bms);
         drop(bms);
-        // Rebuild to update subtitle.
-        save_bm.rebuild(&save_name_entry);
+        // Rebuild to update subtitle. Fires `on_mutated` so the
+        // scanner re-projects — Save can change `scan_enabled` /
+        // `priority` / override fields on the bookmark.
+        save_bm.rebuild_after_mutation(&save_name_entry);
         tracing::info!("bookmark saved: {}", active.name);
     });
 }

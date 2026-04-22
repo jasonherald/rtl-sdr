@@ -131,23 +131,28 @@ impl BookmarksPanel {
         *self.on_mutated.borrow_mut() = Some(Box::new(f));
     }
 
-    /// Rebuild the flyout's bookmark list from the backing store,
-    /// honoring the current search filter. Preferred over calling
-    /// [`rebuild_bookmark_list`](super::navigation_panel::rebuild_bookmark_list)
-    /// directly — packs up all the shared `Rc` state owned by
-    /// this panel so callers only need to hand in the
-    /// `NavigationPanel`-owned `name_entry` reference.
-    ///
-    /// This is the method the external mutation paths (Add, Save,
-    /// `RadioReference` import) call after persisting changes —
-    /// they get scanner re-projection for free because `rebuild`
-    /// fires `on_mutated` after the list rebuild. Internal row
-    /// actions (delete, scan checkbox, priority star) call
-    /// [`rebuild_bookmark_list`](super::navigation_panel::rebuild_bookmark_list)
-    /// directly and dispatch `on_mutated` themselves; the
-    /// search-entry handler bypasses both and does not invoke
-    /// `on_mutated` (filter changes aren't mutations).
+    /// Redraw-only rebuild of the flyout list. Does NOT fire the
+    /// mutation callback — use [`Self::rebuild_after_mutation`]
+    /// for that. Appropriate for paths that change what's
+    /// displayed without changing the backing store's content
+    /// (e.g. highlight-active refresh after a recall click).
     pub fn rebuild(&self, name_entry: &adw::EntryRow) {
+        self.rebuild_inner(name_entry, false);
+    }
+
+    /// Rebuild the flyout list AND fire the mutation callback.
+    /// Call this from external paths that actually change the
+    /// bookmark set (Add, Save, `RadioReference` import) so the
+    /// scanner channel list gets re-projected in the same tick.
+    /// Internal row actions (delete, scan checkbox, priority
+    /// star) dispatch `on_mutated` themselves alongside their
+    /// direct [`rebuild_bookmark_list`](super::navigation_panel::rebuild_bookmark_list)
+    /// calls, so they don't go through this method.
+    pub fn rebuild_after_mutation(&self, name_entry: &adw::EntryRow) {
+        self.rebuild_inner(name_entry, true);
+    }
+
+    fn rebuild_inner(&self, name_entry: &adw::EntryRow, notify_mutated: bool) {
         super::navigation_panel::rebuild_bookmark_list(
             &self.bookmark_list,
             &self.bookmark_scroll,
@@ -160,11 +165,7 @@ impl BookmarksPanel {
             &self.manual_expanded,
             &self.on_mutated,
         );
-        // Fire the mutation callback so external callers (Add,
-        // Save, RR import) trigger scanner re-projection without
-        // needing to know the callback's wiring. Idempotent —
-        // the window-level closure just re-projects + dispatches.
-        if let Some(cb) = self.on_mutated.borrow().as_ref() {
+        if notify_mutated && let Some(cb) = self.on_mutated.borrow().as_ref() {
             cb();
         }
     }

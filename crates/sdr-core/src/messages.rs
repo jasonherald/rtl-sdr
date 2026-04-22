@@ -110,6 +110,17 @@ pub enum DspToUi {
         demod_mode: sdr_types::DemodMode,
         bandwidth: f64,
         name: String,
+        /// Per-channel CTCSS mode. `None` on the channel means
+        /// "no channel-level override"; the scanner applies Off
+        /// to the engine in that case, and the UI mirrors that
+        /// by setting the CTCSS row to Off. `Some(mode)` maps
+        /// directly.
+        ctcss: Option<CtcssMode>,
+        /// Per-channel voice-squelch mode. `None` means "don't
+        /// override" — both engine and UI keep the current value.
+        /// `Some(mode)` gets applied by the scanner retune and
+        /// reflected on the voice-squelch widget.
+        voice_squelch: Option<VoiceSquelchMode>,
     },
     /// Scanner phase transition — UI updates the state label.
     ScannerStateChanged(sdr_scanner::ScannerState),
@@ -804,6 +815,8 @@ mod tests {
             demod_mode: sdr_types::DemodMode::Nfm,
             bandwidth: TEST_BANDWIDTH_HZ,
             name: "Test".to_string(),
+            ctcss: Some(CtcssMode::Off),
+            voice_squelch: None,
         };
         assert!(matches!(
             active,
@@ -811,6 +824,8 @@ mod tests {
                 key: Some(_),
                 freq_hz: 162_550_000,
                 demod_mode: sdr_types::DemodMode::Nfm,
+                ctcss: Some(CtcssMode::Off),
+                voice_squelch: None,
                 ..
             }
         ));
@@ -821,6 +836,8 @@ mod tests {
             demod_mode: sdr_types::DemodMode::Nfm,
             bandwidth: 0.0,
             name: String::new(),
+            ctcss: None,
+            voice_squelch: None,
         };
         assert!(matches!(
             idle,
