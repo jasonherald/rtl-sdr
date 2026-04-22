@@ -494,6 +494,11 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         //     light up in the macOS UI whenever the CTCSS / voice-
         //     squelch panels get ported (no specific backlog issue
         //     yet — part of the full-parity backlog under #228).
+        //   - `BandwidthChanged` and `VfoOffsetChanged` are the
+        //     VFO-drag + "reset VFO" feedback-echo events
+        //     (#336 / #341). Linux-only for now; macOS SwiftUI
+        //     gets them when the equivalent VFO overlay +
+        //     reset affordances land on that side.
         //   - `ScannerActiveChannelChanged`, `ScannerStateChanged`,
         //     `ScannerEmptyRotation`, `ScannerMutexStopped` are the
         //     scanner Phase 1 UI events (#317). Intentionally
@@ -566,6 +571,7 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         DspToUi::FftData(_)
         | DspToUi::DemodModeChanged(_)
         | DspToUi::BandwidthChanged(_)
+        | DspToUi::VfoOffsetChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
         | DspToUi::ScannerActiveChannelChanged { .. }

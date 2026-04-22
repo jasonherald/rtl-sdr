@@ -149,6 +149,20 @@ pub fn create_demodulator(
     }
 }
 
+/// Default passband bandwidth (Hz) for a given demod mode.
+///
+/// Instantiates a demodulator and reads its `config().default_bandwidth`
+/// — keeps a single source of truth (the per-demod module constants)
+/// without re-declaring them here. Cost is one `Box::new` per call;
+/// callers should cache if they need it in a hot path, but UI
+/// comparisons on every demod-mode change are cheap enough. Falls
+/// back to 0.0 if demod construction fails (unexpected — every mode
+/// in [`sdr_types::DemodMode`] has a valid construction).
+#[must_use]
+pub fn default_bandwidth_for_mode(mode: sdr_types::DemodMode) -> f64 {
+    create_demodulator(mode).map_or(0.0, |d| d.config().default_bandwidth)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

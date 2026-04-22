@@ -267,6 +267,30 @@ impl SpectrumHandle {
         self.waterfall_area.queue_draw();
     }
 
+    /// Programmatically update the VFO overlay's offset-from-center.
+    ///
+    /// Called from the `DspToUi::VfoOffsetChanged` handler so DSP-
+    /// originated offset changes (e.g. a "reset VFO" button that
+    /// dispatches `SetVfoOffset(0)`, or a future scripting hook)
+    /// reflect on the overlay immediately. Click-to-tune and
+    /// drag paths update `vfo_state.offset_hz` directly inline
+    /// with the gesture, so they don't need to go through this
+    /// method. Per issue #341.
+    pub fn set_vfo_offset(&self, offset_hz: f64) {
+        self.vfo_state.borrow_mut().offset_hz = offset_hz;
+        self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
+    }
+
+    /// Current VFO offset (Hz from tuner center). Used by the
+    /// reset-affordance visibility logic so the floating button
+    /// can decide whether the VFO is in a non-default state
+    /// without replicating the state cache. Per issue #341.
+    #[must_use]
+    pub fn vfo_offset_hz(&self) -> f64 {
+        self.vfo_state.borrow().offset_hz
+    }
+
     /// Push a signal level sample (in dB) into the history graph.
     ///
     /// Call this from the GTK main loop when `DspToUi::SignalLevel` arrives.

@@ -913,6 +913,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if let Some(vfo) = &mut state.vfo {
                 vfo.set_offset(offset);
             }
+            // Echo so UI paths that trigger this indirectly
+            // (reset-to-defaults button, future scanner / scripting
+            // hooks) reflect the new offset in their overlay /
+            // frequency readout without optimistically guessing
+            // locally. Matches the `BandwidthChanged` echo above.
+            let _ = dsp_tx.send(DspToUi::VfoOffsetChanged(offset));
         }
 
         UiToDsp::SetNbLevel(level) => {

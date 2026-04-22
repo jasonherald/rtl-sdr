@@ -69,6 +69,14 @@ pub enum DspToUi {
     /// negligible and emitting unconditionally keeps the controller
     /// free of per-field before/after comparisons.
     BandwidthChanged(f64),
+    /// VFO offset (Hz from tuner center) changed by the DSP.
+    /// Symmetric with [`Self::BandwidthChanged`] — lets UI paths
+    /// that trigger a VFO offset change indirectly (e.g. a
+    /// "reset VFO" button that dispatches `SetVfoOffset(0)`)
+    /// receive an echo and update the spectrum overlay without
+    /// having to optimistically guess the new value locally.
+    /// Per issue #341.
+    VfoOffsetChanged(f64),
     /// CTCSS sustained-gate state changed. Emitted only on edges
     /// (closed → open / open → closed), not per-window, so the UI
     /// status indicator can subscribe without flooding the channel.
@@ -409,6 +417,17 @@ mod tests {
         let bw = DspToUi::BandwidthChanged(TEST_BANDWIDTH_HZ);
         assert!(
             matches!(bw, DspToUi::BandwidthChanged(v) if (v - TEST_BANDWIDTH_HZ).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn vfo_offset_changed_message_constructs() {
+        // Same shape regression as `bandwidth_changed_message_constructs`
+        // — future refactors that change the f64 carrier type
+        // fail here first.
+        let offset = DspToUi::VfoOffsetChanged(25_000.0);
+        assert!(
+            matches!(offset, DspToUi::VfoOffsetChanged(v) if (v - 25_000.0).abs() < f64::EPSILON)
         );
     }
 

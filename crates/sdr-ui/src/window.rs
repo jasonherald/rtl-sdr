@@ -839,6 +839,20 @@ fn handle_dsp_message(
             radio_panel.bandwidth_row.set_value(bw);
             state.suppress_bandwidth_notify.set(false);
         }
+        DspToUi::VfoOffsetChanged(offset) => {
+            // DSP-originated VFO offset change — typically a
+            // "reset VFO offset" button that dispatched
+            // `SetVfoOffset(0)`. Update the overlay + frequency
+            // display so the UI reflects the new offset without
+            // the caller having to optimistically guess locally.
+            // Per issue #341.
+            spectrum_handle.set_vfo_offset(offset);
+            let tuned = state.center_frequency.get() + offset;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let tuned_u64 = tuned.max(0.0) as u64;
+            freq_selector.set_frequency(tuned_u64);
+            status_bar.update_frequency(tuned);
+        }
         DspToUi::CtcssSustainedChanged(sustained) => {
             tracing::debug!(sustained, "CTCSS sustained-gate edge");
             radio_panel.set_ctcss_sustained(sustained);
