@@ -134,9 +134,23 @@ pub fn build_scanner_panel() -> ScannerPanel {
     switch_row.append(&master_switch);
     widget.append(&switch_row);
 
+    // Long bookmark names ("KY State Police District 7 Dispatch —
+    // 154.680 MHz") would otherwise grow the label's natural
+    // width past the sidebar width and shove the whole sidebar
+    // wider on every retune. `ellipsize(End)` + `xalign(0.0)` +
+    // `hexpand(true)` + `max_width_chars(1)` tells GTK: "grow
+    // as much as the parent allows, but stop requesting extra
+    // width past that point — truncate with `…` instead." The
+    // `max_width_chars(1)` is the idiomatic GTK incantation for
+    // "don't let the label's preferred width drive the layout";
+    // actual visible width follows `hexpand`.
     let active_channel_label = gtk4::Label::builder()
         .label("Active: —")
         .halign(gtk4::Align::Start)
+        .xalign(0.0)
+        .hexpand(true)
+        .max_width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
         .css_classes(["caption"])
         .build();
     widget.append(&active_channel_label);
@@ -144,6 +158,10 @@ pub fn build_scanner_panel() -> ScannerPanel {
     let state_label = gtk4::Label::builder()
         .label("State: Off")
         .halign(gtk4::Align::Start)
+        .xalign(0.0)
+        .hexpand(true)
+        .max_width_chars(1)
+        .ellipsize(gtk4::pango::EllipsizeMode::End)
         .css_classes(["caption", "dim-label"])
         .build();
     widget.append(&state_label);
