@@ -27,7 +27,13 @@
 //! The wire protocol lives in [`protocol`]; the server lifecycle and
 //! threading model in [`server`]; command-to-device translation in
 //! [`dispatch`]. See module docs for the upstream line-number references.
+//!
+//! The multi-client fan-out infrastructure lives in [`broadcaster`] —
+//! `ClientRegistry` + `ClientSlot` + per-client stats. Introduced by
+//! #391 as the first step of the #390 multi-client epic; the data
+//! path flip that consumes it ships in the next commit.
 
+pub mod broadcaster;
 pub mod codec;
 pub mod dispatch;
 pub mod error;
@@ -35,6 +41,7 @@ pub mod extension;
 pub mod protocol;
 pub mod server;
 
+pub use broadcaster::{ClientId, ClientInfo};
 pub use error::ServerError;
 pub use protocol::{
     COMMAND_LEN, Command, CommandOp, DEFAULT_PORT, DONGLE_INFO_LEN, DONGLE_MAGIC, DongleInfo,

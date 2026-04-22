@@ -21,7 +21,8 @@ use std::net::SocketAddr;
 use std::sync::{Mutex, MutexGuard};
 
 use sdr_server_rtltcp::{
-    InitialDeviceState, Server, ServerConfig, ServerError, ServerStats, TunerAdvertiseInfo,
+    ClientInfo, InitialDeviceState, Server, ServerConfig, ServerError, ServerStats,
+    TunerAdvertiseInfo,
     codec::CodecMask,
     protocol::{CommandOp, DEFAULT_PORT},
 };
@@ -79,69 +80,178 @@ pub struct SdrRtlTcpServerConfig {
     pub initial_direct_sampling: i32,
 }
 
-/// Live server statistics snapshot.
+/// Aggregate server-lifetime statistics snapshot.
 ///
-/// `connected_client_addr` and `tuner_name` are filled into
-/// caller-allocated buffers handed to `sdr_rtltcp_server_stats`;
-/// the struct here carries only scalar fields.
+/// Post-#391 (multi-client): carries only cumulative counters and
+/// the tuner's gain count. Per-client session state moved to
+/// [`SdrRtlTcpClientInfo`] — callers use
+/// [`sdr_rtltcp_server_client_list`] to read it.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SdrRtlTcpServerStats {
-    /// `true` while a client is connected (also implies
-    /// `uptime_secs` / `bytes_sent` are meaningful).
-    pub has_client: bool,
-    /// Seconds since the current client connected. 0 when
-    /// `has_client == false`.
-    pub uptime_secs: f64,
-    /// Bytes streamed to the client this session.
-    pub bytes_sent: u64,
-    /// Buffer-drop count this session.
-    pub buffers_dropped: u64,
-    /// **Client-issued** center frequency override in Hz —
-    /// what the connected client most recently requested via
-    /// `SetCenterFreq`. 0 before the client has issued the
-    /// command; reset on client disconnect. Does **not**
-    /// reflect the server's configured `initial_freq_hz` or
-    /// the live device register — hosts that want "what the
-    /// dongle is actually tuned to" should combine this with
-    /// `SdrRtlTcpServerConfig::initial_freq_hz` when
-    /// `has_client && current_freq_hz == 0`.
-    pub current_freq_hz: u32,
-    /// **Client-issued** sample-rate override, same semantics
-    /// as `current_freq_hz` above (0 until the client sets it;
-    /// resets on disconnect; doesn't reflect the applied
-    /// initial).
-    pub current_sample_rate_hz: u32,
-    /// Most recent client-issued tuner-gain request in 0.1 dB.
-    /// Valid only when `has_current_gain_value == true` — a
-    /// zero value here is ambiguous otherwise (could mean
-    /// "zero-dB manual gain" or "client never set gain").
-    pub current_gain_tenths_db: i32,
-    /// `true` when the client's last gain-mode request was
-    /// auto; `false` when manual. Valid only when
-    /// `has_current_gain_mode == true`.
-    pub current_gain_auto: bool,
-    /// `true` once the client has issued at least one
-    /// `SetTunerGain` command this session. The two gain
-    /// validity bits are tracked independently because a
-    /// client can send `SetGainMode(auto)` without a preceding
-    /// `SetTunerGain` (and vice versa). Per `CodeRabbit`
-    /// round 7 on PR #360.
-    pub has_current_gain_value: bool,
-    /// `true` once the client has issued at least one
-    /// `SetGainMode` command this session. Valid companion to
-    /// `current_gain_auto` — without this flag a `false`
-    /// value would be indistinguishable from "client hasn't
-    /// asked for a gain mode yet."
-    pub has_current_gain_mode: bool,
+    /// Number of clients connected at the moment this snapshot
+    /// was taken. `sdr_rtltcp_server_client_list` is a separate
+    /// live read, so membership may change between the two calls.
+    /// Use this as an initial sizing hint for the client array,
+    /// then honor `*out_count` returned by the list call and
+    /// retry with a larger buffer if the returned count exceeds
+    /// the capacity you passed.
+    pub connected_count: u32,
+    /// Cumulative bytes fanned out across all clients over the
+    /// server's lifetime. Monotonic — never reset. UI consumers
+    /// derive data-rate from the delta between consecutive
+    /// snapshots divided by the poll interval.
+    pub total_bytes_sent: u64,
+    /// Cumulative buffer drops across all clients over the
+    /// server's lifetime. Monotonic. A drop is counted when the
+    /// broadcaster's `try_send` into a client's per-client
+    /// bounded channel returns `Full` (that client's listener
+    /// stalled) — other clients drain independently.
+    pub total_buffers_dropped: u64,
+    /// Cumulative count of clients accepted over the server's
+    /// lifetime. Persists across disconnects; use to answer
+    /// "how many sessions has this server served?" without
+    /// walking a vec.
+    pub lifetime_accepted: u64,
     /// Tuner's advertised discrete gain count (from
     /// `dongle_info_t`). Populated by `Server::start` during
     /// the dongle-open phase — non-zero for the entire server
     /// lifetime, including before the first client connects.
     pub gain_count: u32,
-    /// Number of entries in the recent-commands ring — lets
-    /// hosts size a follow-up `_recent_commands_json` buffer.
+}
+
+/// Fixed-size buffer (bytes) for a client's "ip:port" peer
+/// address in [`SdrRtlTcpClientInfo`]. Sized to fit IPv6 literal
+/// forms (`[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535` is
+/// 47 bytes plus NUL); 64 is the next power-of-two round-up.
+pub const SDR_RTLTCP_CLIENT_PEER_LEN: usize = 64;
+
+/// Per-client snapshot, one entry per connected client. Returned
+/// as an array from [`sdr_rtltcp_server_client_list`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrRtlTcpClientInfo {
+    /// Stable, monotonic identifier assigned at accept time.
+    /// Never reused across the server's lifetime — useful for
+    /// correlating across stats polls ("client 7 went quiet"
+    /// reads more clearly than peer-address equality when the
+    /// same peer reconnects on a fresh port).
+    pub id: u64,
+    /// Peer socket address as "ip:port", NUL-terminated. Space
+    /// padded with zeros after the NUL. Always fits within
+    /// [`SDR_RTLTCP_CLIENT_PEER_LEN`] including the NUL.
+    pub peer_addr: [c_char; SDR_RTLTCP_CLIENT_PEER_LEN],
+    /// Seconds since this client handshake completed.
+    pub uptime_secs: f64,
+    /// Negotiated stream codec wire byte: 0 = None (legacy /
+    /// vanilla rtl_tcp), 1 = LZ4. See
+    /// `sdr_server_rtltcp::codec::Codec::to_wire`.
+    pub codec: u8,
+    /// Bytes written to this client's socket since its handshake.
+    /// Post-compression (`StatsTrackingWrite` counts bytes at
+    /// the TCP level, below the LZ4 encoder). Covers only this
+    /// currently-connected session —
+    /// [`SdrRtlTcpServerStats::total_bytes_sent`] is a separate
+    /// server-lifetime aggregate that also carries contributions
+    /// from previously-disconnected clients, so the sum of
+    /// per-client `bytes_sent` across the live list does NOT
+    /// equal `total_bytes_sent` once at least one disconnect has
+    /// occurred. Per `CodeRabbit` round 3 on PR #402.
+    pub bytes_sent: u64,
+    /// Buffer drops this client has accrued (broadcaster saw
+    /// `TrySendError::Full` against this client's channel).
+    pub buffers_dropped: u64,
+    /// Client-issued center-frequency override in Hz. 0 before
+    /// the client has issued `SetCenterFreq` — does not reflect
+    /// the server's `initial_freq_hz` or the live device
+    /// register. Hosts that want "what the dongle is actually
+    /// tuned to" should fall back to
+    /// `SdrRtlTcpServerConfig::initial_freq_hz` when
+    /// `current_freq_hz == 0`.
+    pub current_freq_hz: u32,
+    /// Client-issued sample-rate override, same semantics as
+    /// `current_freq_hz`.
+    pub current_sample_rate_hz: u32,
+    /// Most recent client-issued tuner-gain request in 0.1 dB.
+    /// Valid only when `has_current_gain_value == true`.
+    pub current_gain_tenths_db: i32,
+    /// `true` when the client's last gain-mode request was auto;
+    /// `false` when manual. Valid only when
+    /// `has_current_gain_mode == true`.
+    pub current_gain_auto: bool,
+    /// `true` once the client has issued at least one
+    /// `SetTunerGain` command. Tracked separately from the
+    /// mode flag because a client can send `SetGainMode(auto)`
+    /// without a preceding `SetTunerGain` (and vice versa).
+    pub has_current_gain_value: bool,
+    /// `true` once the client has issued at least one
+    /// `SetGainMode` command. Valid companion to
+    /// `current_gain_auto`.
+    pub has_current_gain_mode: bool,
+    /// Number of entries in this client's recent-commands ring.
+    /// An entry count, not a byte count — callers that want to
+    /// serialize the ring as JSON use
+    /// [`sdr_rtltcp_server_recent_commands_json`]'s `out_required`
+    /// size-probe path for buffer sizing (length depends on opcode
+    /// names and float formatting, not a fixed per-entry byte
+    /// count).
     pub recent_commands_count: u32,
+    /// `true` once the client has issued at least one command
+    /// this session. Complementary to `recent_commands_count`:
+    /// `recent_commands_count > 0` implies `has_last_command`,
+    /// but `has_last_command` alone means "at least one command
+    /// dispatched" without committing to whether the ring
+    /// already evicted the earliest entries. `last_command_op`
+    /// and `last_command_age_secs` are only valid when this is
+    /// `true`. Per `CodeRabbit` round 6 on PR #402 — surfaces
+    /// the same `last_command` field the Rust UI uses to drive
+    /// `pick_most_recent_commander`, so FFI hosts can replicate
+    /// the "most recent commander" selection without polling /
+    /// parsing the JSON ring for every connected client.
+    pub has_last_command: bool,
+    /// Wire byte of the client's most recently dispatched
+    /// command — matches the opcode values documented in
+    /// `rtl_tcp.c:315-372` (`SetCenterFreq = 0x01`,
+    /// `SetBiasTee = 0x0e`, etc.). Valid only when
+    /// `has_last_command == true`; 0 when the client hasn't
+    /// sent a command yet. Hosts can map this back to a human
+    /// label via [`sdr_rtltcp_server_recent_commands_json`] or
+    /// their own opcode table.
+    pub last_command_op: u8,
+    /// Seconds elapsed between the client's most recent command
+    /// and the moment this snapshot was assembled. A pure
+    /// snapshot-time age — NOT a monotonic counter: a fresh
+    /// command from the client resets it back near zero on the
+    /// next poll, so don't rely on it increasing between
+    /// consecutive samples. Intended for comparing *recency
+    /// across clients within a single snapshot* (smallest age
+    /// wins — replicates the Rust UI's
+    /// `pick_most_recent_commander`). Valid only when
+    /// `has_last_command == true`.
+    pub last_command_age_secs: f64,
+}
+
+impl Default for SdrRtlTcpClientInfo {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            peer_addr: [0; SDR_RTLTCP_CLIENT_PEER_LEN],
+            uptime_secs: 0.0,
+            codec: 0,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            current_freq_hz: 0,
+            current_sample_rate_hz: 0,
+            current_gain_tenths_db: 0,
+            current_gain_auto: false,
+            has_current_gain_value: false,
+            has_current_gain_mode: false,
+            recent_commands_count: 0,
+            has_last_command: false,
+            last_command_op: 0,
+            last_command_age_secs: 0.0,
+        }
+    }
 }
 
 // ============================================================
@@ -457,14 +567,21 @@ pub unsafe extern "C" fn sdr_rtltcp_server_has_stopped(handle: *mut SdrRtlTcpSer
     }
 }
 
-/// Snapshot the server's live stats into a caller-provided
-/// struct + string buffers.
+/// Snapshot the server's aggregate stats into a caller-provided
+/// struct + tuner-name buffer.
 ///
-/// `out_stats` must be non-null. `out_client_addr` and
-/// `out_tuner_name` are NUL-terminated on success; pass
-/// `NULL` buffers (with corresponding `*_len = 0`) to skip.
-/// Truncation is not an error — the result is NUL-terminated
-/// at `*_len - 1` when the source string is longer.
+/// `out_stats` must be non-null. `out_tuner_name` is an optional
+/// NUL-terminated string buffer (pass `NULL` with
+/// `tuner_name_len = 0` to skip). Truncation at `tuner_name_len - 1`
+/// is not an error. 64 bytes handles any realistic tuner name.
+///
+/// For per-client state (peer addresses, per-client counters,
+/// commanded frequencies, etc.) use `out_stats.connected_count`
+/// as an initial sizing hint for
+/// [`sdr_rtltcp_server_client_list`]. That call is a separate
+/// live read, so membership may change between the two — always
+/// honor the list call's returned `*out_count` and retry with a
+/// larger buffer if it exceeds the capacity you passed.
 ///
 /// # Safety
 ///
@@ -474,8 +591,6 @@ pub unsafe extern "C" fn sdr_rtltcp_server_has_stopped(handle: *mut SdrRtlTcpSer
 pub unsafe extern "C" fn sdr_rtltcp_server_stats(
     handle: *mut SdrRtlTcpServer,
     out_stats: *mut SdrRtlTcpServerStats,
-    out_client_addr: *mut c_char,
-    client_addr_len: usize,
     out_tuner_name: *mut c_char,
     tuner_name_len: usize,
 ) -> i32 {
@@ -499,13 +614,8 @@ pub unsafe extern "C" fn sdr_rtltcp_server_stats(
         // SAFETY: out_stats null-checked above.
         unsafe { *out_stats = packed };
 
-        // Copy the string fields into caller buffers (if
-        // provided). Truncate cleanly at `len - 1`.
-        let client_str = stats
-            .connected_client
-            .map_or_else(String::new, |addr| addr.to_string());
-        // SAFETY: caller contract on out_client_addr / len.
-        unsafe { write_cstr(out_client_addr, client_addr_len, &client_str) };
+        // Copy the tuner name into the caller buffer (if provided).
+        // Truncate cleanly at `len - 1`.
         // SAFETY: caller contract on out_tuner_name / len.
         unsafe { write_cstr(out_tuner_name, tuner_name_len, &tuner.name) };
 
@@ -524,26 +634,122 @@ pub unsafe extern "C" fn sdr_rtltcp_server_stats(
     }
 }
 
-/// Write the recent-commands ring to `out_buf` as a JSON array.
-/// Each entry is `{"op": "<name>", "seconds_ago": <f64>}`.
-/// The wire-level 4-byte command param is not in the upstream
-/// `ServerStats::recent_commands` payload (only the opcode +
-/// dispatch time are captured), so the param field is not
-/// surfaced here — matches the contract in `include/sdr_core.h`.
+/// Snapshot every connected client's state into a caller-provided
+/// array.
 ///
-/// On success returns `SDR_CORE_OK` and NUL-terminates the
-/// buffer. On too-small buffer returns `SDR_CORE_ERR_INVALID_ARG`
-/// and writes the required size (including NUL) to `*out_required`
-/// when non-null. On stopped server returns `NOT_RUNNING`.
+/// `out_clients` may be null when `capacity == 0` — in that case
+/// the function populates `*out_count` with the current
+/// connected-client count so the caller can size its buffer and
+/// re-call. When `capacity > 0` and there are more connected
+/// clients than `capacity`, the function fills the first
+/// `capacity` entries and still writes the full count to
+/// `*out_count` (the caller retries with a bigger buffer).
+///
+/// Returns `SDR_CORE_OK` on success (including the query-count
+/// path), `SDR_CORE_ERR_INVALID_ARG` on null `out_count`,
+/// `SDR_CORE_ERR_INVALID_HANDLE` on null handle,
+/// `SDR_CORE_ERR_NOT_RUNNING` if the server was already stopped.
+///
+/// Client ordering is stable within a snapshot (oldest-first) but
+/// may shift across snapshots as clients disconnect. Use
+/// [`SdrRtlTcpClientInfo::id`] for cross-snapshot correlation.
 ///
 /// # Safety
 ///
-/// `out_buf` must point at a writable buffer of at least
-/// `buf_len` bytes. `out_required` is optional (pass null to
-/// skip).
+/// `out_clients` must either be null (with `capacity == 0`) or
+/// point at a writable array of `capacity`
+/// `SdrRtlTcpClientInfo` entries. `out_count` must be non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_rtltcp_server_client_list(
+    handle: *mut SdrRtlTcpServer,
+    out_clients: *mut SdrRtlTcpClientInfo,
+    capacity: usize,
+    out_count: *mut usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        if out_count.is_null() {
+            set_last_error("sdr_rtltcp_server_client_list: null out_count");
+            return SdrCoreError::InvalidArg.as_int();
+        }
+        if out_clients.is_null() && capacity > 0 {
+            set_last_error(
+                "sdr_rtltcp_server_client_list: null out_clients with non-zero capacity",
+            );
+            return SdrCoreError::InvalidArg.as_int();
+        }
+        // SAFETY: caller contract.
+        let Some(h) = (unsafe { SdrRtlTcpServer::from_raw(handle) }) else {
+            set_last_error("sdr_rtltcp_server_client_list: invalid handle");
+            return SdrCoreError::InvalidHandle.as_int();
+        };
+        let Some(stats) = h.with_server(Server::stats) else {
+            set_last_error("sdr_rtltcp_server_client_list: server already stopped");
+            return SdrCoreError::NotRunning.as_int();
+        };
+
+        let total = stats.connected_clients.len();
+        // SAFETY: out_count null-checked above.
+        unsafe { *out_count = total };
+
+        // Capture the snapshot clock once for the entire array.
+        // Every projected `last_command_age_secs` / `uptime_secs`
+        // references this same `Instant`, so FFI hosts comparing
+        // ages across clients in one snapshot see a consistent
+        // ordering — per-entry `Instant::now()` calls would drift
+        // by a few microseconds across the loop and could flip
+        // the "smallest age wins" selection. Per `CodeRabbit`
+        // round 7 on PR #402.
+        let snapshot_at = std::time::Instant::now();
+        let to_write = total.min(capacity);
+        for (i, info) in stats.connected_clients.iter().take(to_write).enumerate() {
+            // SAFETY: `i < to_write <= capacity` and the caller
+            // guaranteed `out_clients` points at `capacity`
+            // entries.
+            unsafe {
+                *out_clients.add(i) = client_info_to_c(info, snapshot_at);
+            }
+        }
+
+        clear_last_error();
+        SdrCoreError::Ok.as_int()
+    });
+    match result {
+        Ok(code) => code,
+        Err(payload) => {
+            set_last_error(format!(
+                "sdr_rtltcp_server_client_list: panic: {}",
+                panic_message(&payload)
+            ));
+            SdrCoreError::Internal.as_int()
+        }
+    }
+}
+
+/// Write one client's recent-commands ring to `out_buf` as a
+/// JSON array. Each entry is
+/// `{"op": "<name>", "seconds_ago": <f64>}`.
+///
+/// `client_id` identifies the target client — read it from an
+/// earlier `SdrRtlTcpClientInfo::id` snapshot.
+///
+/// On success returns `SDR_CORE_OK` and NUL-terminates the
+/// buffer. On too-small buffer returns
+/// `SDR_CORE_ERR_INVALID_ARG` and writes the required size
+/// (including NUL) to `*out_required` when non-null. If the
+/// specified client isn't currently connected returns
+/// `SDR_CORE_ERR_INVALID_ARG` with `*out_required = 0` (client
+/// may have disconnected between snapshots). On stopped server
+/// returns `NOT_RUNNING`.
+///
+/// # Safety
+///
+/// `out_buf` must either be null (with `buf_len == 0`) or point
+/// at a writable buffer of at least `buf_len` bytes.
+/// `out_required` is optional (pass null to skip).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_rtltcp_server_recent_commands_json(
     handle: *mut SdrRtlTcpServer,
+    client_id: u64,
     out_buf: *mut c_char,
     buf_len: usize,
     out_required: *mut usize,
@@ -558,7 +764,17 @@ pub unsafe extern "C" fn sdr_rtltcp_server_recent_commands_json(
             set_last_error("sdr_rtltcp_server_recent_commands_json: server already stopped");
             return SdrCoreError::NotRunning.as_int();
         };
-        let json = match recent_commands_to_json(&stats) {
+        let Some(client) = stats.connected_clients.iter().find(|c| c.id == client_id) else {
+            set_last_error(format!(
+                "sdr_rtltcp_server_recent_commands_json: client {client_id} not connected"
+            ));
+            if !out_required.is_null() {
+                // SAFETY: caller contract.
+                unsafe { *out_required = 0 };
+            }
+            return SdrCoreError::InvalidArg.as_int();
+        };
+        let json = match recent_commands_to_json(client) {
             Ok(s) => s,
             Err(e) => {
                 set_last_error(format!(
@@ -607,33 +823,84 @@ pub unsafe extern "C" fn sdr_rtltcp_server_recent_commands_json(
 // ============================================================
 
 fn stats_to_c(stats: &ServerStats, tuner: &TunerAdvertiseInfo) -> SdrRtlTcpServerStats {
-    let uptime_secs = stats
-        .connected_since
-        .map_or(0.0, |t| t.elapsed().as_secs_f64());
     SdrRtlTcpServerStats {
-        has_client: stats.connected_client.is_some(),
-        uptime_secs,
-        bytes_sent: stats.bytes_sent,
-        buffers_dropped: stats.buffers_dropped,
-        current_freq_hz: stats.current_freq_hz.unwrap_or(0),
-        current_sample_rate_hz: stats.current_sample_rate_hz.unwrap_or(0),
-        current_gain_tenths_db: stats.current_gain_tenths_db.unwrap_or(0),
-        current_gain_auto: stats.current_gain_auto.unwrap_or(false),
-        has_current_gain_value: stats.current_gain_tenths_db.is_some(),
-        has_current_gain_mode: stats.current_gain_auto.is_some(),
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "connected_count is bounded by OS FD limits — far below u32::MAX"
+        )]
+        connected_count: stats.connected_clients.len() as u32,
+        total_bytes_sent: stats.total_bytes_sent,
+        total_buffers_dropped: stats.total_buffers_dropped,
+        lifetime_accepted: stats.lifetime_accepted,
         gain_count: tuner.gain_count,
+    }
+}
+
+fn client_info_to_c(info: &ClientInfo, snapshot_at: std::time::Instant) -> SdrRtlTcpClientInfo {
+    // Project `last_command` onto the flat FFI trio:
+    // `(has_last_command, last_command_op, last_command_age_secs)`,
+    // and compute `uptime_secs` the same way. Both ages reference
+    // `snapshot_at` — a single `Instant::now()` captured once by
+    // `sdr_rtltcp_server_client_list` — so every entry in the
+    // emitted array is measured against the same clock. Per-client
+    // `Instant::now()` calls would drift by a few microseconds
+    // across the projection loop, which is enough to flip the
+    // "smallest `last_command_age_secs` wins" ordering FFI hosts
+    // use to replicate `pick_most_recent_commander`. Per
+    // `CodeRabbit` round 7 on PR #402.
+    let (has_last_command, last_command_op, last_command_age_secs) =
+        if let Some((op, at)) = info.last_command {
+            let age = snapshot_at.saturating_duration_since(at).as_secs_f64();
+            (true, op as u8, age)
+        } else {
+            (false, 0u8, 0.0)
+        };
+    let mut out = SdrRtlTcpClientInfo {
+        id: info.id,
+        peer_addr: [0; SDR_RTLTCP_CLIENT_PEER_LEN],
+        uptime_secs: snapshot_at
+            .saturating_duration_since(info.connected_since)
+            .as_secs_f64(),
+        codec: info.codec.to_wire(),
+        bytes_sent: info.bytes_sent,
+        buffers_dropped: info.buffers_dropped,
+        current_freq_hz: info.current_freq_hz.unwrap_or(0),
+        current_sample_rate_hz: info.current_sample_rate_hz.unwrap_or(0),
+        current_gain_tenths_db: info.current_gain_tenths_db.unwrap_or(0),
+        current_gain_auto: info.current_gain_auto.unwrap_or(false),
+        has_current_gain_value: info.current_gain_tenths_db.is_some(),
+        has_current_gain_mode: info.current_gain_auto.is_some(),
         #[allow(
             clippy::cast_possible_truncation,
             reason = "recent_commands is capped at RECENT_COMMANDS_CAPACITY = 50"
         )]
-        recent_commands_count: stats.recent_commands.len() as u32,
+        recent_commands_count: info.recent_commands.len() as u32,
+        has_last_command,
+        last_command_op,
+        last_command_age_secs,
+    };
+    // Write peer_addr into the inline byte array, truncating at
+    // `len - 1` to leave room for a NUL. Cast via &mut raw ptr
+    // so `write_cstr`'s contract (null-or-writable buffer) is
+    // honored uniformly with the other callers.
+    let peer = info.peer.to_string();
+    // SAFETY: `out.peer_addr` is a stack-local array of size
+    // SDR_RTLTCP_CLIENT_PEER_LEN; taking a raw mut ptr to its
+    // first element gives write access for the full length.
+    unsafe {
+        write_cstr(
+            out.peer_addr.as_mut_ptr(),
+            SDR_RTLTCP_CLIENT_PEER_LEN,
+            &peer,
+        );
     }
+    out
 }
 
-fn recent_commands_to_json(stats: &ServerStats) -> Result<String, serde_json::Error> {
+fn recent_commands_to_json(info: &ClientInfo) -> Result<String, serde_json::Error> {
     use serde_json::json;
     let now = std::time::Instant::now();
-    let entries: Vec<_> = stats
+    let entries: Vec<_> = info
         .recent_commands
         .iter()
         .map(|(op, t)| {
@@ -740,6 +1007,44 @@ mod tests {
 
     /// Device index = 0 matches the first attached dongle.
     const TEST_DEVICE_INDEX: u32 = 0;
+
+    // ------------------------------------------------------------
+    // `ClientInfo` fixture constants (`CodeRabbit` round 4 on
+    // PR #402). Extracted so the multi-client ABI tests stay
+    // declarative and future per-client assertions inherit the
+    // same values.
+    // ------------------------------------------------------------
+
+    /// Stable test `ClientId`. Arbitrary non-zero — the registry
+    /// allocates ids starting at 0, so a mid-range value here
+    /// proves the FFI path isn't accidentally hard-coding the
+    /// first-slot assumption.
+    const TEST_CLIENT_ID: u64 = 42;
+    /// Peer port for the gain-validity test — high ephemeral
+    /// range so it doesn't collide with anything real, and
+    /// disjoint from `TEST_CLIENT_PEER_ADDR_PORT` below.
+    const TEST_CLIENT_GAIN_PEER_PORT: u16 = 50_100;
+    /// Peer port + full IP for the NUL-termination test. Uses a
+    /// private-range IP to match typical LAN-server scenarios so
+    /// the packed peer string reads like a real deployment.
+    const TEST_CLIENT_PEER_IP: [u8; 4] = [192, 168, 1, 100];
+    const TEST_CLIENT_PEER_PORT: u16 = 1234;
+    /// Synthetic per-client `bytes_sent` used by the gain test
+    /// so the `client_info_to_c` readback confirms the counter
+    /// propagated through the projection.
+    const TEST_CLIENT_BYTES_SENT: u64 = 9_999;
+    /// Synthetic per-client `buffers_dropped` — non-zero so it
+    /// can't pass from a zero-initialized struct by accident.
+    const TEST_CLIENT_BUFFERS_DROPPED: u64 = 1;
+    /// JSON serialization test: how many seconds back in time
+    /// to place the second `recent_commands` entry so the
+    /// `"seconds_ago"` field has a non-trivial value.
+    const TEST_COMMAND_AGE_SECS: u64 = 3;
+    /// Peer port for the JSON serialization tests' synthetic
+    /// `ClientInfo` — arbitrary, just needs to differ from the
+    /// other fixture ports so a cross-test regression pins to
+    /// the right test.
+    const TEST_CLIENT_JSON_PEER_PORT: u16 = 50_200;
 
     /// Build a happy-path `SdrRtlTcpServerConfig`. Tests tweak
     /// a single field to target one validation branch at a
@@ -859,11 +1164,36 @@ mod tests {
                 &raw mut stats,
                 std::ptr::null_mut(),
                 0,
-                std::ptr::null_mut(),
-                0,
             )
         };
         assert_eq!(rc, SdrCoreError::InvalidHandle.as_int());
+    }
+
+    #[test]
+    fn client_list_with_null_handle_returns_invalid_handle() {
+        let mut count: usize = 0;
+        let rc = unsafe {
+            sdr_rtltcp_server_client_list(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &raw mut count,
+            )
+        };
+        assert_eq!(rc, SdrCoreError::InvalidHandle.as_int());
+    }
+
+    #[test]
+    fn client_list_with_null_out_count_returns_invalid_arg() {
+        let rc = unsafe {
+            sdr_rtltcp_server_client_list(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
     }
 
     #[test]
@@ -873,48 +1203,213 @@ mod tests {
     }
 
     #[test]
-    fn stats_to_c_preserves_independent_gain_validity() {
-        // Four-state matrix for the two gain Options on
-        // `ServerStats`. Pins the "don't collapse into a
-        // single `has_current_gain` bit" behavior landed in
-        // round 7. Per `CodeRabbit` round 8 on PR #360.
+    fn stats_to_c_packs_aggregate_counters() {
+        // Post-#391 shape: `SdrRtlTcpServerStats` carries only
+        // aggregate cumulative counters + the tuner gain count.
+        // Per-client state belongs in `SdrRtlTcpClientInfo` and
+        // ships through `sdr_rtltcp_server_client_list`.
         let tuner = TunerAdvertiseInfo {
             name: "R820T".into(),
             gain_count: TEST_TUNER_GAIN_COUNT,
         };
-
-        // (None, None) → neither set (Default leaves both at None).
-        let mut stats = ServerStats::default();
+        let stats = ServerStats {
+            connected_clients: Vec::new(),
+            total_bytes_sent: 1_234_567,
+            total_buffers_dropped: 3,
+            lifetime_accepted: 7,
+            initial: InitialDeviceState::default(),
+        };
         let c = stats_to_c(&stats, &tuner);
+        assert_eq!(c.connected_count, 0);
+        assert_eq!(c.total_bytes_sent, 1_234_567);
+        assert_eq!(c.total_buffers_dropped, 3);
+        assert_eq!(c.lifetime_accepted, 7);
+        assert_eq!(c.gain_count, TEST_TUNER_GAIN_COUNT);
+    }
+
+    #[test]
+    fn client_info_to_c_preserves_independent_gain_validity() {
+        // Four-state matrix for the two gain Options on
+        // `ClientInfo`. Pins the "don't collapse into a single
+        // `has_current_gain` bit" behavior that shipped on the
+        // pre-#391 server-wide struct (CR round 7 on PR #360),
+        // now preserved per-client.
+        use sdr_server_rtltcp::codec::Codec;
+        let snapshot_at = std::time::Instant::now();
+        let mut info = ClientInfo {
+            id: TEST_CLIENT_ID,
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
+            connected_since: std::time::Instant::now(),
+            codec: Codec::Lz4,
+            bytes_sent: TEST_CLIENT_BYTES_SENT,
+            buffers_dropped: TEST_CLIENT_BUFFERS_DROPPED,
+            last_command: None,
+            current_freq_hz: None,
+            current_sample_rate_hz: None,
+            current_gain_tenths_db: None,
+            current_gain_auto: None,
+            recent_commands: std::collections::VecDeque::new(),
+        };
+
+        // (None, None) → neither set
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(!c.has_current_gain_value);
         assert!(!c.has_current_gain_mode);
+        assert_eq!(c.id, TEST_CLIENT_ID);
+        assert_eq!(c.bytes_sent, TEST_CLIENT_BYTES_SENT);
+        assert_eq!(c.codec, 1); // LZ4 wire value
+        // `last_command` fixture is `None` for the whole test;
+        // the projection must surface that as `has_last_command
+        // == false` with the op / age fields defaulted to zero
+        // so FFI hosts never read an undefined opcode or age.
+        assert!(!c.has_last_command);
+        assert_eq!(c.last_command_op, 0);
+        // Exact-zero float comparison is correct here — the
+        // `None` branch of the projection assigns the literal
+        // `0.0` without any arithmetic, so a non-zero readback
+        // would mean the projection wrote the age unconditionally.
+        #[allow(
+            clippy::float_cmp,
+            reason = "projection assigns literal 0.0 in the None branch"
+        )]
+        let age_is_zero = c.last_command_age_secs == 0.0;
+        assert!(age_is_zero);
 
         // (Some(v), None) → value set, mode unknown
-        stats.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
-        stats.current_gain_auto = None;
-        let c = stats_to_c(&stats, &tuner);
+        info.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
+        info.current_gain_auto = None;
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(c.has_current_gain_value);
         assert!(!c.has_current_gain_mode);
         assert_eq!(c.current_gain_tenths_db, TEST_NONZERO_GAIN_TENTHS);
         assert!(!c.current_gain_auto);
 
         // (None, Some(auto)) → mode set, value unknown
-        stats.current_gain_tenths_db = None;
-        stats.current_gain_auto = Some(true);
-        let c = stats_to_c(&stats, &tuner);
+        info.current_gain_tenths_db = None;
+        info.current_gain_auto = Some(true);
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(!c.has_current_gain_value);
         assert!(c.has_current_gain_mode);
         assert!(c.current_gain_auto);
 
         // (Some(v), Some(manual)) → both set, explicit manual
-        stats.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
-        stats.current_gain_auto = Some(false);
-        let c = stats_to_c(&stats, &tuner);
+        info.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
+        info.current_gain_auto = Some(false);
+        let c = client_info_to_c(&info, snapshot_at);
         assert!(c.has_current_gain_value);
         assert!(c.has_current_gain_mode);
         assert_eq!(c.current_gain_tenths_db, TEST_NONZERO_GAIN_TENTHS);
         assert!(!c.current_gain_auto);
-        assert_eq!(c.gain_count, TEST_TUNER_GAIN_COUNT);
+    }
+
+    #[test]
+    fn client_info_to_c_projects_last_command_fields() {
+        // **Regression test for `CodeRabbit` round 6 on PR #402**
+        // (initial projection) **+ round 7** (deterministic age
+        // via injected `snapshot_at` — the function now takes
+        // the snapshot clock as a parameter so per-entry drift
+        // can't flip the "smallest age wins" ordering).
+        //
+        // `SdrRtlTcpClientInfo` carries
+        // `(has_last_command, last_command_op, last_command_age_secs)`
+        // so FFI hosts can replicate the Rust UI's
+        // `pick_most_recent_commander` selection without parsing
+        // every client's JSON ring. Verify the projection:
+        //
+        //   `ClientInfo.last_command = None`             → flag=false, op=0, age=0.0
+        //   `ClientInfo.last_command = Some((op, at))`   → flag=true, op=op_byte, age=snapshot_at-at
+        //
+        // The `None` case is already covered by the default path
+        // in `client_info_to_c_preserves_independent_gain_validity`;
+        // this test pins the `Some` case — opcode byte maps to
+        // the wire value, and the age is exactly the delta
+        // between the injected `snapshot_at` and the dispatched
+        // timestamp (measured in `f64` seconds).
+        use sdr_server_rtltcp::codec::Codec;
+        use sdr_server_rtltcp::protocol::CommandOp;
+        let command_age = Duration::from_secs(TEST_COMMAND_AGE_SECS);
+        let base = std::time::Instant::now();
+        let dispatched_at = base
+            .checked_sub(command_age)
+            .expect("Instant::now - TEST_COMMAND_AGE_SECS is representable");
+        // `snapshot_at = dispatched_at + command_age` gives an
+        // age of *exactly* TEST_COMMAND_AGE_SECS, so the
+        // assertion doesn't depend on wall-clock jitter.
+        let snapshot_at = dispatched_at + command_age;
+        let info = ClientInfo {
+            id: TEST_CLIENT_ID,
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
+            connected_since: std::time::Instant::now(),
+            codec: Codec::None,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            // `SetBiasTee` (0x0e) chosen because it's the highest
+            // documented opcode — a projection bug that truncates
+            // to a smaller `u8` range would still surface here.
+            last_command: Some((CommandOp::SetBiasTee, dispatched_at)),
+            current_freq_hz: None,
+            current_sample_rate_hz: None,
+            current_gain_tenths_db: None,
+            current_gain_auto: None,
+            recent_commands: std::collections::VecDeque::new(),
+        };
+        let c = client_info_to_c(&info, snapshot_at);
+        assert!(c.has_last_command);
+        assert_eq!(c.last_command_op, CommandOp::SetBiasTee as u8);
+        assert_eq!(c.last_command_op, 0x0e, "opcode wire byte");
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "seconds count fits in f64 mantissa"
+        )]
+        let expected_age = TEST_COMMAND_AGE_SECS as f64;
+        // Exact-equality float comparison is correct here
+        // because `snapshot_at - dispatched_at` is a whole number
+        // of seconds converted through `Duration::as_secs_f64` —
+        // no accumulated arithmetic, no wall-clock jitter.
+        #[allow(
+            clippy::float_cmp,
+            reason = "deterministic snapshot_at + exact-seconds command_age"
+        )]
+        let age_matches = c.last_command_age_secs == expected_age;
+        assert!(
+            age_matches,
+            "expected age == {expected_age}s with injected snapshot_at, got {}s",
+            c.last_command_age_secs
+        );
+    }
+
+    #[test]
+    fn client_info_to_c_peer_addr_is_nul_terminated() {
+        // Peer address is packed into a fixed-size byte array;
+        // the slot past the written bytes must be NUL so C
+        // callers see a well-formed string.
+        use sdr_server_rtltcp::codec::Codec;
+        let info = ClientInfo {
+            id: 1,
+            peer: SocketAddr::from((TEST_CLIENT_PEER_IP, TEST_CLIENT_PEER_PORT)),
+            connected_since: std::time::Instant::now(),
+            codec: Codec::None,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            last_command: None,
+            current_freq_hz: None,
+            current_sample_rate_hz: None,
+            current_gain_tenths_db: None,
+            current_gain_auto: None,
+            recent_commands: std::collections::VecDeque::new(),
+        };
+        let c = client_info_to_c(&info, std::time::Instant::now());
+        // Find the NUL byte and decode what's before. `c_char`
+        // is `i8` on most platforms; reinterpret-cast the raw
+        // bytes as u8 for the UTF-8 decode since ASCII is
+        // layout-compatible across the signedness boundary.
+        let peer_bytes: Vec<u8> = c.peer_addr.iter().map(|&b| b.to_ne_bytes()[0]).collect();
+        let nul_pos = peer_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .expect("NUL terminator");
+        let peer_str = std::str::from_utf8(&peer_bytes[..nul_pos]).unwrap();
+        assert_eq!(peer_str, "192.168.1.100:1234");
     }
 
     #[test]
@@ -947,32 +1442,60 @@ mod tests {
         assert_eq!(buf[0], FILL_BYTE);
     }
 
+    /// Build a bare-bones `ClientInfo` fixture for the JSON
+    /// serialization tests. Callers mutate the `recent_commands`
+    /// field for their specific assertions.
+    fn empty_client_info() -> ClientInfo {
+        use sdr_server_rtltcp::codec::Codec;
+        ClientInfo {
+            id: 1,
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_JSON_PEER_PORT)),
+            connected_since: std::time::Instant::now(),
+            codec: Codec::None,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            last_command: None,
+            current_freq_hz: None,
+            current_sample_rate_hz: None,
+            current_gain_tenths_db: None,
+            current_gain_auto: None,
+            recent_commands: std::collections::VecDeque::new(),
+        }
+    }
+
     #[test]
     fn recent_commands_json_empty_when_no_commands() {
-        let stats = ServerStats::default();
-        let json = recent_commands_to_json(&stats).expect("serialize empty ring");
+        let info = empty_client_info();
+        let json = recent_commands_to_json(&info).expect("serialize empty ring");
         assert_eq!(json, "[]");
     }
 
     #[test]
     fn recent_commands_json_entries_shape() {
-        let mut stats = ServerStats::default();
-        stats
-            .recent_commands
+        let mut info = empty_client_info();
+        info.recent_commands
             .push_back((CommandOp::SetCenterFreq, std::time::Instant::now()));
-        stats.recent_commands.push_back((
+        info.recent_commands.push_back((
             CommandOp::SetBiasTee,
             std::time::Instant::now()
-                .checked_sub(Duration::from_secs(3))
+                .checked_sub(Duration::from_secs(TEST_COMMAND_AGE_SECS))
                 .expect("Instant::now - 3s is representable"),
         ));
-        let json = recent_commands_to_json(&stats).expect("serialize populated ring");
+        let json = recent_commands_to_json(&info).expect("serialize populated ring");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["op"], "SetCenterFreq");
         assert_eq!(arr[1]["op"], "SetBiasTee");
         let seconds_ago = arr[1]["seconds_ago"].as_f64().unwrap();
-        assert!(seconds_ago >= 3.0, "expected >=3s, got {seconds_ago}");
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "seconds count fits in f64 mantissa"
+        )]
+        let min_seconds_ago = TEST_COMMAND_AGE_SECS as f64;
+        assert!(
+            seconds_ago >= min_seconds_ago,
+            "expected >={min_seconds_ago}s, got {seconds_ago}"
+        );
     }
 }
