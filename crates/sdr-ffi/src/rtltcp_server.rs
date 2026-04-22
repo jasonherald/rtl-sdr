@@ -89,9 +89,13 @@ pub struct SdrRtlTcpServerConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SdrRtlTcpServerStats {
-    /// Number of clients currently connected. Callers allocate
-    /// `[SdrRtlTcpClientInfo; connected_count]` and pass it to
-    /// `sdr_rtltcp_server_client_list` for per-client state.
+    /// Number of clients connected at the moment this snapshot
+    /// was taken. `sdr_rtltcp_server_client_list` is a separate
+    /// live read, so membership may change between the two calls.
+    /// Use this as an initial sizing hint for the client array,
+    /// then honor `*out_count` returned by the list call and
+    /// retry with a larger buffer if the returned count exceeds
+    /// the capacity you passed.
     pub connected_count: u32,
     /// Cumulative bytes fanned out across all clients over the
     /// server's lifetime. Monotonic — never reset. UI consumers
@@ -536,9 +540,12 @@ pub unsafe extern "C" fn sdr_rtltcp_server_has_stopped(handle: *mut SdrRtlTcpSer
 /// is not an error. 64 bytes handles any realistic tuner name.
 ///
 /// For per-client state (peer addresses, per-client counters,
-/// commanded frequencies, etc.) call
-/// [`sdr_rtltcp_server_client_list`] after reading
-/// `out_stats.connected_count`.
+/// commanded frequencies, etc.) use `out_stats.connected_count`
+/// as an initial sizing hint for
+/// [`sdr_rtltcp_server_client_list`]. That call is a separate
+/// live read, so membership may change between the two — always
+/// honor the list call's returned `*out_count` and retry with a
+/// larger buffer if it exceeds the capacity you passed.
 ///
 /// # Safety
 ///

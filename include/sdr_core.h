@@ -58,19 +58,18 @@ extern "C" {
 #define SDR_CORE_ABI_VERSION_MAJOR 0
 #define SDR_CORE_ABI_VERSION_MINOR 14
 /*
- * 0.14 (#391 / PR #402) — breaking change to the rtl_tcp server
- * surface. `SdrRtlTcpServerStats` layout changed to aggregate-only
- * counters (per-client session state moved to the new
- * `SdrRtlTcpClientInfo` struct, fetched via
- * `sdr_rtltcp_server_client_list`), and
+ * 0.14 — breaking change to the rtl_tcp server surface.
+ * `SdrRtlTcpServerStats` layout changed to aggregate-only counters
+ * (per-client session state moved to the new `SdrRtlTcpClientInfo`
+ * struct, fetched via `sdr_rtltcp_server_client_list`), and
  * `sdr_rtltcp_server_recent_commands_json` gained a required
  * `client_id` parameter. Older hosts built against 0.13 MUST fail
  * fast on the ABI-version check — the new struct is shorter than
  * the old one, and the new `_recent_commands_json` signature
  * would silently mis-interpret the `out_buf` pointer as a
- * `client_id`. Per `CodeRabbit` round 2 on PR #402: we're pre-1.0
- * so MINOR bumps are breaking by convention on this project;
- * full semver respect starts at MAJOR >= 1.
+ * `client_id`. Pre-1.0 MINOR bumps are breaking by project
+ * convention (see "ABI versioning" block above); full SemVer
+ * applies once MAJOR >= 1.
  */
 
 /*
@@ -814,9 +813,13 @@ typedef struct SdrRtlTcpServerConfig {
  * server-wide cumulative counters + the tuner gain count.
  */
 typedef struct SdrRtlTcpServerStats {
-    /* Number of clients currently connected. Size a follow-up
-     * SdrRtlTcpClientInfo array of this length and call
-     * sdr_rtltcp_server_client_list to read per-client state. */
+    /* Number of clients connected at the moment this snapshot
+     * was taken. `sdr_rtltcp_server_client_list` is a separate
+     * live read, so membership may change between the two calls.
+     * Use this as an initial sizing hint for the client array,
+     * then honor `*out_count` returned by the list call and
+     * retry with a larger buffer if the returned count exceeds
+     * the capacity you passed. */
     uint32_t connected_count;
     /* Cumulative bytes fanned out across all clients over the
      * server's lifetime. Monotonic — never reset. Consumers
@@ -903,7 +906,7 @@ typedef struct SdrRtlTcpClientInfo {
      * worthwhile; use THAT function's `out_required` size-probe
      * path to allocate the JSON buffer — length depends on opcode
      * names and float formatting and isn't a fixed per-entry
-     * byte count. Per `CodeRabbit` round 2 on PR #402. */
+     * byte count. */
     uint32_t recent_commands_count;
 } SdrRtlTcpClientInfo;
 
@@ -963,8 +966,12 @@ bool sdr_rtltcp_server_has_stopped(SdrRtlTcpServer* handle);
  * are truncated; NOT an error. 64 bytes handles any realistic
  * tuner name.
  *
- * For per-client state call `sdr_rtltcp_server_client_list` after
- * reading `out_stats->connected_count`.
+ * For per-client state, use `out_stats->connected_count` as an
+ * initial sizing hint for `sdr_rtltcp_server_client_list`. That
+ * call is a separate live read, so membership may change between
+ * the two — always honor the list call's returned `*out_count`
+ * and retry with a larger buffer if it exceeds the capacity you
+ * passed.
  *
  * Returns `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG`
  * on null out_stats, `SDR_CORE_ERR_INVALID_HANDLE` on null

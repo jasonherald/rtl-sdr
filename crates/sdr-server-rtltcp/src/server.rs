@@ -803,11 +803,16 @@ fn spawn_client_workers(
     // broadcaster discovers it on its next tick.
     registry.register(slot);
 
-    // Park both worker handles on the registry so `Server::drop` can
-    // join them during shutdown — without this, the threads'
-    // `Arc<Mutex<RtlSdrDevice>>` clones could outlive
+    // Park both worker handles on the registry so `Server::drop`
+    // can join any still running at shutdown — without this, the
+    // threads' `Arc<Mutex<RtlSdrDevice>>` clones could outlive
     // `has_stopped() == true` and leave the dongle claimed for a
-    // follow-up `Server::start`. Per `CodeRabbit` round 1 on PR #402.
+    // follow-up `Server::start`. During normal runtime the
+    // broadcaster calls `reap_finished_worker_handles()` on its
+    // prune cadence so completed handles from disconnected
+    // clients get joined promptly and don't accumulate under
+    // connection churn. Per `CodeRabbit` round 1 on PR #402
+    // (shutdown join) + round 5 (runtime reap).
     registry.register_worker_handle(writer_handle);
     registry.register_worker_handle(command_handle);
 
@@ -885,84 +890,140 @@ const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// Return cases:
 ///
 /// - `Ok(Some(hello))` — valid 8-byte hello, fully consumed.
-/// - `Ok(None)` — legacy fallback. Reached either on a zero-byte
+/// - `Ok(None)` — legacy fallback. Reached on a zero-byte
 ///   timeout/EOF (idle client never sent anything) OR on a
-///   non-zero peek whose prefix doesn't match [`EXTENSION_MAGIC`]
-///   (legacy client sent a command; the bytes stay queued in the
-///   receive buffer so `command_worker` can parse the 5-byte
-///   frame). Nothing is consumed in either sub-case.
-/// - `Err(_)` — protocol error, raised only after the magic
-///   already matched and we committed to reading a full 8 bytes.
-///   Covers `read_exact` timeout or EOF mid-hello (partial hello,
-///   bytes already drained from the stream) and parse failure
-///   on a complete 8-byte block (unknown role, unknown protocol
-///   version, etc.). Falling back to legacy from either of these
-///   states would desync the command stream, so the caller drops
-///   the client.
+///   peek whose observed prefix definitively does NOT match
+///   [`EXTENSION_MAGIC`] (legacy client sent a command; the
+///   bytes stay queued in the receive buffer so `command_worker`
+///   can parse the frame). Nothing is consumed in either case.
+/// - `Err(_)` — protocol error. Raised when the magic already
+///   matched and we committed to reading a full 8 bytes — covers
+///   `read_exact` timeout or EOF mid-hello (partial hello, bytes
+///   already drained from the stream) and parse failure on a
+///   complete 8-byte block (unknown role, unknown protocol
+///   version, etc.). Also raised when a 1–3 byte prefix of the
+///   magic arrived but the remaining magic bytes never completed
+///   within the sniff budget: returning `Ok(None)` there would
+///   shift the command reader by the prefix bytes still queued
+///   in the receive buffer, corrupting the legacy stream.
 ///
-/// Uses `peek()` for the initial magic check so legitimate legacy
-/// traffic stays intact. Once the magic matches we commit to
-/// reading the full 8 bytes; partial reads are fatal because we
-/// can't un-consume the half we already read. Per CodeRabbit
-/// round 2 on PR #399 (initial fix) + round 3 (doc alignment).
+/// Uses `peek()` for the magic check so legitimate legacy traffic
+/// stays intact. A fragmented `RTLX` hello whose bytes arrive
+/// across two TCP segments surfaces as a short peek; the poll
+/// loop waits for more bytes as long as the observed prefix
+/// still matches `EXTENSION_MAGIC[..n]`. Once the full magic
+/// matches we commit to reading the full 8 bytes — partial reads
+/// are fatal because we can't un-consume bytes already drained.
+/// Per `CodeRabbit` round 2 on PR #399 (initial fix),
+/// round 3 (doc alignment), and round 5 on PR #402
+/// (partial-prefix handling for fragmented RTLX).
 fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHello>> {
-    stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
-    // Peek the first 4 bytes (magic-only check). `peek` maps to
-    // `recv(…, MSG_PEEK)` which respects `SO_RCVTIMEO`, so this
-    // returns WouldBlock / TimedOut after the timeout without
-    // consuming bytes.
+    // Poll cadence for the peek retry loop. Small enough that a
+    // fragmented `RTLX` hello whose trailing bytes land within a
+    // few ms gets re-checked before the sniff deadline; large
+    // enough to avoid spinning at 100 % CPU while waiting.
+    const PEEK_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+    let deadline = Instant::now() + HELLO_SNIFF_TIMEOUT;
     let mut peek_buf = [0u8; EXTENSION_MAGIC.len()];
-    let peeked = match stream.peek(&mut peek_buf) {
-        Ok(n) => n,
-        Err(e)
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
-        {
-            // Pure timeout with zero bytes observed — the client
-            // never sent anything, so this is an idle legacy peer
-            // (or a port scanner). Safe to fall back; no bytes
-            // were consumed.
+    let mut observed_any_prefix = false;
+
+    // Peek loop. `peek` maps to `recv(…, MSG_PEEK)` — returns as
+    // soon as any data is available, so a fragmented 4-byte
+    // magic (e.g. `RT` then `LX` across two TCP segments)
+    // surfaces here as a short peek. Keep waiting while the
+    // observed bytes are still a prefix of `EXTENSION_MAGIC`;
+    // only fall back to legacy when we have a definite non-magic
+    // prefix, an EOF, or a zero-byte timeout.
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             stream.set_read_timeout(None)?;
+            if observed_any_prefix {
+                // Partial magic-prefix observed but full 4 bytes
+                // never arrived. Returning `Ok(None)` (legacy
+                // fallback) would shift the command reader by
+                // the 1–3 prefix bytes still queued in the
+                // receive buffer — parsing `R` / `RT` / `RTL`
+                // as opcodes corrupts the command stream. Same
+                // reasoning as the post-magic-match failure
+                // modes below; drop the client.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "RTLX magic prefix observed but full 4-byte magic did not complete \
+                     within HELLO_SNIFF_TIMEOUT",
+                ));
+            }
+            // Zero bytes ever observed — idle legacy peer or
+            // port scanner. Nothing consumed, safe to fall back.
             return Ok(None);
         }
-        Err(e) => {
-            // Other errors (ECONNRESET, etc.) → propagate so the
-            // caller tears down cleanly.
-            stream.set_read_timeout(None)?;
-            return Err(e);
+        // Per-iteration read timeout capped by `PEEK_POLL_INTERVAL`
+        // so we wake up to re-check the deadline if the kernel
+        // blocks waiting for bytes.
+        let this_timeout = remaining.min(PEEK_POLL_INTERVAL);
+        stream.set_read_timeout(Some(this_timeout))?;
+        match stream.peek(&mut peek_buf) {
+            Ok(0) => {
+                // Peer closed cleanly. Connection is gone so
+                // there's no stream left to desync — safe
+                // fallback regardless of whether a prefix had
+                // been observed.
+                stream.set_read_timeout(None)?;
+                return Ok(None);
+            }
+            Ok(n) if n >= EXTENSION_MAGIC.len() => break,
+            Ok(n) => {
+                // 0 < n < EXTENSION_MAGIC.len() — partial peek.
+                observed_any_prefix = true;
+                if peek_buf[..n] != EXTENSION_MAGIC[..n] {
+                    // Definite non-magic prefix — legacy command
+                    // sender whose opcode byte (plus whatever
+                    // arg bytes already arrived) doesn't start
+                    // with `R`. Bytes stay queued for
+                    // `command_worker`.
+                    stream.set_read_timeout(None)?;
+                    return Ok(None);
+                }
+                // Prefix still a candidate `RTLX`. Brief yield
+                // so the kernel receive buffer can fill before
+                // the next peek.
+                thread::sleep(PEEK_POLL_INTERVAL);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // No bytes arrived this slice — loop and
+                // re-check the deadline.
+            }
+            Err(e) => {
+                // Other errors (ECONNRESET, etc.) → propagate
+                // so the caller tears down cleanly.
+                stream.set_read_timeout(None)?;
+                return Err(e);
+            }
         }
-    };
-    if peeked == 0 {
-        // Peer closed cleanly before sending anything. Same
-        // safety as a timeout-with-zero-bytes: no bytes consumed,
-        // nothing to desync.
-        stream.set_read_timeout(None)?;
-        return Ok(None);
     }
-    if peeked < EXTENSION_MAGIC.len() || peek_buf[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
-        // Legacy client — either sent fewer than 4 bytes but
-        // something (so we can't tell if they might still be
-        // sending a hello), or the first bytes aren't the
-        // sdr-rs magic. Preserving bytes for the command reader
-        // is only safe when we know they're the start of a
-        // command: a vanilla `SetCenterFreq` starts with 0x01,
-        // no documented opcode begins with 'R' (0x52), so a
-        // mismatch on a full 4-byte peek is a legitimate legacy
-        // command. A short prefix that doesn't match magic is
-        // ambiguous but benign — the command reader will parse
-        // it as a 5-byte command frame and dispatch or log
-        // unknown-opcode.
+    if peek_buf != EXTENSION_MAGIC {
+        // Full 4-byte peek and no match — legacy client. A
+        // vanilla `SetCenterFreq` starts with 0x01; no
+        // documented opcode begins with 0x52 ('R'), so four
+        // non-magic bytes at the head are a legitimate legacy
+        // command frame. Bytes stay queued for the command
+        // reader.
         stream.set_read_timeout(None)?;
         return Ok(None);
     }
     // Magic matched — commit to consuming 8 bytes. A timeout or
     // EOF here is no longer a safe fallback: we've verified the
-    // client started an extended hello and consumed `read_exact`
-    // will have eaten whatever bytes arrived before the stall.
+    // client started an extended hello and `read_exact` will
+    // have eaten whatever bytes arrived before the stall.
     // Returning `Ok(None)` would let the legacy path start
     // against a shifted command stream — exactly the desync
-    // CodeRabbit round 2 flagged. Treat every failure mode as a
-    // protocol error and drop the client.
+    // `CodeRabbit` round 2 on PR #399 flagged. Treat every
+    // failure mode as a protocol error and drop the client.
+    stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
     let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
     let read_result = stream.read_exact(&mut hello_buf);
     stream.set_read_timeout(None)?;
@@ -1199,6 +1260,19 @@ fn broadcaster_worker(
                     let removed = registry.prune_disconnected();
                     if removed > 0 {
                         tracing::debug!(removed, "rtl_tcp pruned disconnected client slots");
+                    }
+                    // Reap finished per-client worker handles on
+                    // the same cadence — otherwise a long-lived
+                    // server with connection churn would keep
+                    // every completed writer/command handle alive
+                    // until shutdown (OS thread resources + TLS
+                    // linger). Per `CodeRabbit` round 5 on PR #402.
+                    let reaped = registry.reap_finished_worker_handles();
+                    if reaped > 0 {
+                        tracing::debug!(
+                            reaped,
+                            "rtl_tcp reaped finished per-client worker threads"
+                        );
                     }
                     ticks_since_prune = 0;
                 }
@@ -1572,6 +1646,118 @@ mod tests {
             result.is_err(),
             "partial hello (magic only, body stalled) must surface as Err — \
              got {result:?} which would desync the command stream on fallback"
+        );
+    }
+
+    #[test]
+    fn sniff_client_hello_fragmented_magic_completes_successfully() {
+        // **Regression test for `CodeRabbit` round 5 on PR #402.**
+        // A well-behaved RTLX client whose `ClientHello` bytes
+        // span two TCP segments (e.g. `RT` in one, `LX` + body
+        // in the next) previously fell back to legacy on the
+        // first short peek — corrupting the command stream for
+        // the unlucky RTLX client. The fix retries the peek
+        // while the observed bytes are a prefix of
+        // `EXTENSION_MAGIC`, so a fragmented magic still reaches
+        // the full `read_exact` path.
+        use crate::codec::CodecMask;
+        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, Role};
+        let hello = ClientHello {
+            codec_mask: CodecMask::NONE_AND_LZ4,
+            role: Role::Control,
+            flags: CLIENT_HELLO_FLAGS_NONE,
+            version: PROTOCOL_VERSION,
+        };
+        let bytes = hello.to_bytes();
+        let result = run_sniff_against(move |mut client| {
+            // Send the first 2 magic bytes, flush, pause briefly
+            // to force a short peek on the server side, then
+            // send the remaining 6 bytes.
+            client.write_all(&bytes[..2]).unwrap();
+            client.flush().unwrap();
+            thread::sleep(Duration::from_millis(10));
+            client.write_all(&bytes[2..]).unwrap();
+            // Keep the client alive long enough for the server
+            // to finish `read_exact` before we drop and EOF.
+            thread::sleep(Duration::from_millis(50));
+        });
+        assert_eq!(
+            result.unwrap(),
+            Some(hello),
+            "fragmented RTLX hello must not fall back to legacy on the first short peek"
+        );
+    }
+
+    #[test]
+    fn sniff_client_hello_stalled_magic_prefix_is_protocol_error() {
+        // **Regression test for `CodeRabbit` round 5 on PR #402.**
+        // A client that starts sending the magic (e.g. `RT`)
+        // and then stalls without completing the remaining 2
+        // bytes must NOT fall back to legacy: the prefix bytes
+        // are still queued in the receive buffer, and handing
+        // them to `command_worker` would start the legacy
+        // command stream at `R` (0x52) which isn't any valid
+        // opcode — poisoning every subsequent command. Promote
+        // to `Err` so the client gets dropped.
+        let result = run_sniff_against(|mut client| {
+            client.write_all(&EXTENSION_MAGIC[..2]).unwrap();
+            thread::sleep(HELLO_SNIFF_TIMEOUT * 5);
+            drop(client);
+        });
+        assert!(
+            result.is_err(),
+            "stalled magic prefix must surface as Err (dropping the client) — got \
+             {result:?} which would desync the command stream on legacy fallback"
+        );
+    }
+
+    #[test]
+    fn sniff_client_hello_short_non_magic_prefix_is_legacy_fallback() {
+        // Legacy client whose first TCP segment carries only 1
+        // byte that already disagrees with magic (e.g. 0x01 =
+        // `SetCenterFreq` opcode). The sniff loop must recognize
+        // this as a definite non-match from the short peek and
+        // fall back to legacy immediately — no reason to wait
+        // out the full `HELLO_SNIFF_TIMEOUT` when the first byte
+        // already rules out RTLX.
+        //
+        // Times just the sniff call (not the client-thread join)
+        // to verify the short-circuit. Inlined instead of using
+        // `run_sniff_against` so the client keeps the socket
+        // open past the sniff return — otherwise we can't prove
+        // the sniff exited on the definite-non-match path vs.
+        // on an EOF from the client dropping.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let keep_alive = Arc::new(AtomicBool::new(true));
+        let keep_alive_clone = Arc::clone(&keep_alive);
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&[0x01]).unwrap();
+            client.flush().unwrap();
+            // Hold the socket open so the sniff must decide on
+            // the 1-byte prefix alone, not on EOF.
+            while keep_alive_clone.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            drop(client);
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let sniff_start = std::time::Instant::now();
+        let result = sniff_client_hello(&server_stream);
+        let elapsed = sniff_start.elapsed();
+        keep_alive.store(false, Ordering::Relaxed);
+        drop(server_stream);
+        let _ = client_thread.join();
+
+        match result {
+            Ok(None) => {}
+            other => panic!("expected Ok(None) for short non-magic prefix, got {other:?}"),
+        }
+        assert!(
+            elapsed < HELLO_SNIFF_TIMEOUT,
+            "short non-magic prefix should short-circuit within HELLO_SNIFF_TIMEOUT, \
+             but sniff took {elapsed:?} (HELLO_SNIFF_TIMEOUT = {HELLO_SNIFF_TIMEOUT:?})"
         );
     }
 

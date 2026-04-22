@@ -358,23 +358,69 @@ impl ClientRegistry {
         }
     }
 
-    /// Park a per-client worker `JoinHandle` for later shutdown
-    /// join. Called twice per accepted client — once for the
-    /// writer thread, once for the command thread. Handles are
-    /// drained and joined by [`Self::drain_worker_handles`] during
-    /// `Server::drop`, guaranteeing the threads' cloned device
-    /// `Arc` references are released before shutdown completes.
+    /// Park a per-client worker `JoinHandle` for later join.
+    /// Called twice per accepted client — once for the writer
+    /// thread, once for the command thread. During normal
+    /// runtime, finished handles are reaped on the broadcaster's
+    /// prune cadence via [`Self::reap_finished_worker_handles`];
+    /// any still-running at shutdown are drained + joined by
+    /// [`Self::drain_worker_handles`] so the threads' cloned
+    /// device `Arc` references are released before `stop()` /
+    /// `Drop` returns.
     pub fn register_worker_handle(&self, handle: JoinHandle<()>) {
         if let Ok(mut guard) = self.worker_handles.lock() {
             guard.push(handle);
         }
     }
 
+    /// Join every parked worker handle whose thread has already
+    /// exited. Runs on the broadcaster's prune cadence so a
+    /// long-lived server with heavy connection churn doesn't
+    /// accumulate completed `JoinHandle`s until shutdown — each
+    /// handle keeps the thread's OS resources + TLS around until
+    /// joined, and the list grows without bound even though the
+    /// slots themselves get pruned. Finished handles are cheap
+    /// to join (the thread has already exited), so running this
+    /// on the same ~2.5 s cadence as slot pruning keeps the
+    /// handle list bounded by the number of currently-live
+    /// clients × 2. [`Self::drain_worker_handles`] still owns
+    /// final-shutdown joining for any handles that had not
+    /// finished by the last reap. Returns the number reaped for
+    /// tracing. Per `CodeRabbit` round 5 on PR #402.
+    pub fn reap_finished_worker_handles(&self) -> usize {
+        let Ok(mut guard) = self.worker_handles.lock() else {
+            return 0;
+        };
+        let taken = std::mem::take(&mut *guard);
+        let (finished, running): (Vec<_>, Vec<_>) =
+            taken.into_iter().partition(JoinHandle::is_finished);
+        *guard = running;
+        let reaped = finished.len();
+        // Release the lock before joining; `is_finished == true`
+        // so each join returns immediately, but there's no
+        // reason to hold the mutex across the calls and block
+        // registrations of new per-client handles from the
+        // accept thread.
+        drop(guard);
+        for h in finished {
+            if let Err(payload) = h.join() {
+                // A panicked worker thread would have already
+                // flipped its slot's `disconnected` flag from
+                // inside the unwinding path (slot drop handlers
+                // do so) and a newer CR pass can tighten that
+                // guarantee. For now, log the payload so
+                // regressions surface in tests and tracing.
+                tracing::warn!(?payload, "rtl_tcp reaped panicked worker thread");
+            }
+        }
+        reaped
+    }
+
     /// Take every parked worker handle. Caller joins them. Used by
     /// `Server::drop` so the dongle's device mutex `Arc` cannot
     /// linger past the `has_stopped()` transition — otherwise a
     /// follow-up `Server::start` or engine open would fight a
-    /// ghost worker for USB exclusivity. Per CodeRabbit round 1
+    /// ghost worker for USB exclusivity. Per `CodeRabbit` round 1
     /// on PR #402.
     pub fn drain_worker_handles(&self) -> Vec<JoinHandle<()>> {
         self.worker_handles
@@ -833,6 +879,57 @@ mod tests {
             stats.record_command(CommandOp::SetCenterFreq, t);
         }
         assert_eq!(stats.recent_commands.len(), RECENT_COMMANDS_CAPACITY);
+    }
+
+    #[test]
+    fn reap_finished_worker_handles_joins_finished_keeps_running() {
+        // **Regression test for `CodeRabbit` round 5 on PR #402.**
+        // The registry used to park every worker handle until
+        // shutdown, so a long-lived server with heavy connection
+        // churn accumulated completed handles indefinitely. The
+        // fix reaps finished handles on the broadcaster's prune
+        // cadence, leaving running ones in place.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let reg = ClientRegistry::new();
+
+        // Register a handle that has already finished. Wait for
+        // `is_finished` to flip true before calling the reaper so
+        // the partition is deterministic.
+        let finished = std::thread::spawn(|| {});
+        while !finished.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        reg.register_worker_handle(finished);
+
+        // Register a handle that's still running (spins on an
+        // atomic flag the test controls).
+        let keep_running = Arc::new(AtomicBool::new(true));
+        let keep_running_clone = Arc::clone(&keep_running);
+        let running = std::thread::spawn(move || {
+            while keep_running_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        reg.register_worker_handle(running);
+
+        assert_eq!(
+            reg.reap_finished_worker_handles(),
+            1,
+            "exactly the finished handle should be reaped"
+        );
+
+        // Running handle is still in the list — verify by
+        // draining (mimics the shutdown path) and confirm we get
+        // back exactly one handle.
+        keep_running.store(false, Ordering::Relaxed);
+        let remaining = reg.drain_worker_handles();
+        assert_eq!(remaining.len(), 1, "running handle must not be reaped");
+        for h in remaining {
+            h.join()
+                .expect("running thread exits cleanly once flag clears");
+        }
     }
 
     #[test]
