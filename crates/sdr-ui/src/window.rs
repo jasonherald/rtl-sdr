@@ -1296,6 +1296,7 @@ fn connect_sidebar_panels(
     connect_radio_panel(panels, state);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
+    connect_scanner_panel(panels, state, config);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -4984,6 +4985,65 @@ fn unlock_transcription_session_rows(
     if let Some(row) = auto_break_min_segment_row.upgrade() {
         row.set_sensitive(true);
     }
+}
+
+/// Connect scanner panel controls to DSP commands.
+///
+/// Wiring in this pass (Task 3.2):
+/// - master switch → `UiToDsp::SetScannerEnabled`
+/// - default dwell / hang sliders → persist to `ConfigManager`
+///
+/// Slider changes do NOT yet dispatch `UpdateScannerChannels` —
+/// that re-projection helper lives in `navigation_panel` and is
+/// added alongside the bookmark scan-checkbox work in Task 3.4.
+/// Until then, slider edits take effect on the next channel-list
+/// mutation (bookmark add / delete / scan-toggle). Acceptable
+/// because sliders and bookmarks ship in the same PR.
+fn connect_scanner_panel(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let scanner = &panels.scanner;
+
+    // Master switch → SetScannerEnabled. `connect_state_set`
+    // fires before the internal state change commits, letting
+    // future work (Task 3.3's empty-rotation recovery) reject a
+    // toggle by returning `glib::Propagation::Stop`. Today every
+    // user toggle proceeds.
+    let state_switch = Rc::clone(state);
+    scanner.master_switch.connect_state_set(move |_, active| {
+        state_switch.send_dsp(UiToDsp::SetScannerEnabled(active));
+        glib::Propagation::Proceed
+    });
+
+    // Default dwell slider: persist on every value change. The
+    // channel-list re-projection on slider mutation is wired in
+    // Task 3.4 once the `project_and_push_scanner_channels`
+    // helper lands. Overrides on individual bookmarks win over
+    // this default at projection time.
+    let config_dwell = std::sync::Arc::clone(config);
+    scanner.default_dwell_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ms = row.value() as u32;
+        sidebar::scanner_panel::save_default_dwell_ms(&config_dwell, ms);
+    });
+
+    // Default hang slider: same pattern as dwell.
+    let config_hang = std::sync::Arc::clone(config);
+    scanner.default_hang_row.connect_value_notify(move |row| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ms = row.value() as u32;
+        sidebar::scanner_panel::save_default_hang_ms(&config_hang, ms);
+    });
+
+    // Restore persisted slider values. Runs after the notify
+    // handlers are wired, so `set_value` on a non-default
+    // persisted value re-saves the same value — idempotent.
+    let dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
+    scanner.default_dwell_row.set_value(f64::from(dwell_ms));
+    let hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
+    scanner.default_hang_row.set_value(f64::from(hang_ms));
 }
 
 /// Connect transcript panel controls to DSP commands.

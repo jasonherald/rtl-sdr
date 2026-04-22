@@ -6,9 +6,12 @@
 //! UI wiring of user actions → `UiToDsp::*` commands lives in
 //! `window.rs::connect_scanner_panel`.
 
+use std::sync::Arc;
+
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_config::ConfigManager;
 
 /// Widgets for the scanner sidebar panel. The controller layer
 /// in `window.rs` connects signal handlers that dispatch
@@ -50,6 +53,49 @@ pub const HANG_MAX_MS: f64 = 5000.0;
 pub const CONFIG_KEY_DEFAULT_DWELL_MS: &str = "scanner_default_dwell_ms";
 /// `ConfigManager` key for the default-hang slider value.
 pub const CONFIG_KEY_DEFAULT_HANG_MS: &str = "scanner_default_hang_ms";
+
+/// Default-dwell initial value (ms) when no persisted value exists.
+pub const DEFAULT_DWELL_MS: u32 = 100;
+/// Default-hang initial value (ms) when no persisted value exists.
+pub const DEFAULT_HANG_MS: u32 = 2_000;
+
+/// Load the persisted default-dwell value, or return
+/// [`DEFAULT_DWELL_MS`] if the key is missing or malformed.
+#[must_use]
+pub fn load_default_dwell_ms(config: &Arc<ConfigManager>) -> u32 {
+    config.read(|v| {
+        v.get(CONFIG_KEY_DEFAULT_DWELL_MS)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(DEFAULT_DWELL_MS)
+    })
+}
+
+/// Persist the default-dwell value.
+pub fn save_default_dwell_ms(config: &Arc<ConfigManager>, ms: u32) {
+    config.write(|v| {
+        v[CONFIG_KEY_DEFAULT_DWELL_MS] = serde_json::json!(ms);
+    });
+}
+
+/// Load the persisted default-hang value, or return
+/// [`DEFAULT_HANG_MS`] if the key is missing or malformed.
+#[must_use]
+pub fn load_default_hang_ms(config: &Arc<ConfigManager>) -> u32 {
+    config.read(|v| {
+        v.get(CONFIG_KEY_DEFAULT_HANG_MS)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(DEFAULT_HANG_MS)
+    })
+}
+
+/// Persist the default-hang value.
+pub fn save_default_hang_ms(config: &Arc<ConfigManager>, ms: u32) {
+    config.write(|v| {
+        v[CONFIG_KEY_DEFAULT_HANG_MS] = serde_json::json!(ms);
+    });
+}
 
 /// Build the scanner panel and return its owned widgets.
 ///
