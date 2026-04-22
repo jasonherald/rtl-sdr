@@ -783,6 +783,22 @@ fn spawn_client_workers(
             }
             return;
         }
+        RoleDecision::RegistryPoisoned => {
+            // Terminal server fault — the slot list mutex was
+            // poisoned by an earlier panic mid-update. Don't
+            // write anything to the peer: RTLX clients treat
+            // `ControllerBusy` as transient and retry, so
+            // sending that (or any other denial) would invite a
+            // reconnect storm against a terminally broken
+            // server. Bare TCP FIN is the cleanest signal. Per
+            // `CodeRabbit` round 1 on PR #403.
+            tracing::error!(
+                %peer,
+                ?requested_role,
+                "rtl_tcp registry slots mutex poisoned — closing client without reply"
+            );
+            return;
+        }
     }
 
     // Granted path — slot is now in the registry. The broadcaster
@@ -799,7 +815,7 @@ fn spawn_client_workers(
                 %e,
                 "failed to clone client stream for writer — tearing down client"
             );
-            slot.mark_disconnected();
+            registry.unwind_admission(&slot);
             return;
         }
     };
@@ -811,7 +827,7 @@ fn spawn_client_workers(
     let header = {
         let Ok(dev) = device.lock() else {
             tracing::error!(%peer, "device mutex poisoned, aborting client");
-            slot.mark_disconnected();
+            registry.unwind_admission(&slot);
             return;
         };
         DongleInfo {
@@ -821,7 +837,7 @@ fn spawn_client_workers(
     };
     if let Err(e) = writer.write_all(&header.to_bytes()) {
         tracing::warn!(%peer, %e, "failed to send dongle_info_t — client gone");
-        slot.mark_disconnected();
+        registry.unwind_admission(&slot);
         return;
     }
 
@@ -838,7 +854,7 @@ fn spawn_client_workers(
         };
         if let Err(e) = writer.write_all(&ext.to_bytes()) {
             tracing::warn!(%peer, %e, "failed to send RTLX server extension — client gone");
-            slot.mark_disconnected();
+            registry.unwind_admission(&slot);
             return;
         }
     }
@@ -853,14 +869,17 @@ fn spawn_client_workers(
             %e,
             "set_write_timeout on data channel failed; tearing down client"
         );
-        slot.mark_disconnected();
+        registry.unwind_admission(&slot);
         return;
     }
 
     // Spawn writer + command threads. Pre-#392 spawn-before-register
     // ordering is inverted here (register happens during the
-    // decision above) so `mark_disconnected` on any spawn failure
-    // takes the already-registered slot out of fan-out.
+    // decision above) so every failure path from this point on
+    // must call `registry.unwind_admission(&slot)` — that marks
+    // the slot disconnected AND rolls back the admission so
+    // `lifetime_accepted` stays tied to sessions that actually
+    // began serving. Per `CodeRabbit` round 1 on PR #403.
     let writer_slot = slot.clone();
     let writer_shutdown = shutdown.clone();
     let tracked_writer = StatsTrackingWrite {
@@ -881,14 +900,14 @@ fn spawn_client_workers(
                 %e,
                 "failed to spawn rtl_tcp writer thread — tearing down client"
             );
-            slot.mark_disconnected();
+            registry.unwind_admission(&slot);
             return;
         }
     };
 
-    // Spawn the command thread. If it fails, mark the slot
-    // disconnected so the writer exits too, and join the writer
-    // here so its handle isn't dropped on the floor.
+    // Spawn the command thread. If it fails, unwind the admission
+    // (also marks the slot disconnected so the writer exits) and
+    // join the writer here so its handle isn't dropped on the floor.
     let command_slot = slot.clone();
     let command_shutdown = shutdown.clone();
     let command_device = device;
@@ -910,7 +929,7 @@ fn spawn_client_workers(
                 %e,
                 "failed to spawn rtl_tcp command thread — tearing down client"
             );
-            slot.mark_disconnected();
+            registry.unwind_admission(&slot);
             let _ = writer_handle.join();
             return;
         }

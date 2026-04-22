@@ -1285,6 +1285,14 @@ mod tests {
         assert_eq!(c.id, TEST_CLIENT_ID);
         assert_eq!(c.bytes_sent, TEST_CLIENT_BYTES_SENT);
         assert_eq!(c.codec, 1); // LZ4 wire value
+        // Role projection: Control → 0 wire byte. Pins the #392
+        // FFI contract per `CodeRabbit` round 1 on PR #403 — a
+        // regression in `client_info_to_c` that drops the role
+        // field would otherwise slip through without detection.
+        assert_eq!(
+            c.role,
+            sdr_server_rtltcp::extension::Role::Control.to_wire()
+        );
         // `last_command` fixture is `None` for the whole test;
         // the projection must surface that as `has_last_command
         // == false` with the op / age fields defaulted to zero
@@ -1385,6 +1393,11 @@ mod tests {
         assert!(c.has_last_command);
         assert_eq!(c.last_command_op, CommandOp::SetBiasTee as u8);
         assert_eq!(c.last_command_op, 0x0e, "opcode wire byte");
+        // Role projection (round 1 on PR #403): Control → 0.
+        assert_eq!(
+            c.role,
+            sdr_server_rtltcp::extension::Role::Control.to_wire()
+        );
         #[allow(
             clippy::cast_precision_loss,
             reason = "seconds count fits in f64 mantissa"
@@ -1439,6 +1452,40 @@ mod tests {
             .expect("NUL terminator");
         let peer_str = std::str::from_utf8(&peer_bytes[..nul_pos]).unwrap();
         assert_eq!(peer_str, "192.168.1.100:1234");
+        // Role projection (round 1 on PR #403): Control → 0.
+        assert_eq!(
+            c.role,
+            sdr_server_rtltcp::extension::Role::Control.to_wire()
+        );
+    }
+
+    #[test]
+    fn client_info_to_c_projects_listen_role() {
+        // **Regression test for `CodeRabbit` round 1 on PR #403.**
+        // The existing projection tests all use `Role::Control`
+        // (the default for vanilla clients), so a bug that hard-
+        // coded `role: 0` in `client_info_to_c` would pass
+        // every test in this module. Flip a fixture to
+        // `Role::Listen` and verify the wire byte flips to 1.
+        use sdr_server_rtltcp::codec::Codec;
+        let info = ClientInfo {
+            id: TEST_CLIENT_ID,
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
+            connected_since: std::time::Instant::now(),
+            codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Listen,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            last_command: None,
+            current_freq_hz: None,
+            current_sample_rate_hz: None,
+            current_gain_tenths_db: None,
+            current_gain_auto: None,
+            recent_commands: std::collections::VecDeque::new(),
+        };
+        let c = client_info_to_c(&info, std::time::Instant::now());
+        assert_eq!(c.role, sdr_server_rtltcp::extension::Role::Listen.to_wire());
+        assert_eq!(c.role, 1, "Listen wire byte");
     }
 
     #[test]

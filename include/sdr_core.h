@@ -58,12 +58,18 @@ extern "C" {
 #define SDR_CORE_ABI_VERSION_MAJOR 0
 #define SDR_CORE_ABI_VERSION_MINOR 16
 /*
- * 0.16 — adds `role` (u8 wire byte: 0=Control, 1=Listen) at the
- * tail of `SdrRtlTcpClientInfo` so FFI hosts can render a
- * "Controller" / "Listener" badge per-client without parsing
- * the RTLX wire format themselves. Struct layout grows; any 0.15
- * consumer must fail fast on the exact-match ABI check (see
- * "ABI versioning" block above). Part of #392 (role gate).
+ * 0.16 — TWO struct layouts grow as part of #392 (role gate).
+ * Either change alone is ABI-breaking under the pre-1.0 exact-
+ * match rule; both land together:
+ *   - `SdrRtlTcpClientInfo.role` (uint8_t, 0=Control 1=Listen)
+ *     appended at the tail so hosts can render a "Controller" /
+ *     "Listener" badge per-client without parsing the RTLX wire
+ *     format themselves.
+ *   - `SdrRtlTcpServerConfig.listener_cap` (uint32_t, 0 = use
+ *     crate default of 10) appended at the tail so hosts can
+ *     size the Listen pool at server-start time.
+ * Any 0.15 consumer must fail fast on the exact-match ABI check
+ * (see "ABI versioning" block above).
  *
  * 0.15 — adds `has_last_command` / `last_command_op` /
  * `last_command_age_secs` to the tail of `SdrRtlTcpClientInfo`
