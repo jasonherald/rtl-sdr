@@ -17,6 +17,11 @@ use sdr_config::ConfigManager;
 /// in `window.rs` connects signal handlers that dispatch
 /// `UiToDsp::SetScannerEnabled` / `UpdateScannerChannels` /
 /// `LockoutScannerChannel` based on these widgets.
+///
+/// `Clone` is derived so the panel can be cloned into the DSP
+/// timeout callback alongside `RadioPanel` et al — each field
+/// is a `GObject` wrapper, so clone is a cheap refcount bump.
+#[derive(Clone)]
 pub struct ScannerPanel {
     /// The outer container — append to the sidebar `Box`.
     pub widget: gtk4::Box,

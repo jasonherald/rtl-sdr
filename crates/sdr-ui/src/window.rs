@@ -432,6 +432,9 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let record_audio_for_dsp = panels.audio.record_audio_row.clone();
     let record_iq_for_dsp = panels.source.record_iq_row.clone();
     let radio_panel_for_dsp = panels.radio.clone();
+    let scanner_panel_for_dsp = panels.scanner.clone();
+    let freq_selector_for_dsp = freq_selector.clone();
+    let demod_dropdown_for_dsp = demod_dropdown.clone();
     // Just the three widgets the rtl_tcp status renderer touches —
     // cloning the whole SourcePanel would be a lot of refcount
     // traffic for one signal handler. Weak refs, upgraded per
@@ -497,6 +500,9 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &record_audio_for_dsp,
                         &record_iq_for_dsp,
                         &radio_panel_for_dsp,
+                        &scanner_panel_for_dsp,
+                        &freq_selector_for_dsp,
+                        &demod_dropdown_for_dsp,
                         &rtl_tcp_status_row_weak,
                         &rtl_tcp_disconnect_button_weak,
                         &rtl_tcp_retry_button_weak,
@@ -540,6 +546,9 @@ fn handle_dsp_message(
     record_audio_row: &adw::SwitchRow,
     record_iq_row: &adw::SwitchRow,
     radio_panel: &sidebar::radio_panel::RadioPanel,
+    scanner_panel: &sidebar::scanner_panel::ScannerPanel,
+    freq_selector: &header::frequency_selector::FrequencySelector,
+    demod_dropdown: &gtk4::DropDown,
     rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
     rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
@@ -733,17 +742,6 @@ fn handle_dsp_message(
             }
         }
         // --- Scanner (#317) ---
-        //
-        // `ScannerActiveChannelChanged` and `ScannerStateChanged`
-        // are still stubs here — their fan-out to the frequency
-        // selector, spectrum, status bar, demod dropdown, and
-        // bandwidth row is PR 3 work. `ScannerEmptyRotation` and
-        // `ScannerMutexStopped` ARE promoted to real toasts +
-        // widget deactivation in this PR because they fire
-        // immediately as soon as the mutex kicks in (which
-        // happens as soon as a future caller dispatches
-        // `UiToDsp::SetScannerEnabled(true)`, which could be
-        // driven by a test harness before the PR 3 panel lands).
         DspToUi::ScannerActiveChannelChanged {
             key,
             freq_hz,
@@ -751,20 +749,51 @@ fn handle_dsp_message(
             bandwidth,
             name,
         } => {
-            tracing::debug!(
-                ?key,
-                freq_hz,
-                ?demod_mode,
-                bandwidth,
-                name,
-                "scanner active channel changed — UI fan-out lands in PR 3"
-            );
+            if key.is_some() {
+                scanner_panel.active_channel_label.set_text(&format!(
+                    "Active: {} — {}",
+                    name,
+                    sidebar::navigation_panel::format_frequency(freq_hz),
+                ));
+                // Sync every widget that mirrors the current tune.
+                // The selector's `set_frequency` does NOT fire its
+                // own callback, so no SetFrequency bounces back.
+                freq_selector.set_frequency(freq_hz);
+                #[allow(clippy::cast_precision_loss)]
+                let freq_f64 = freq_hz as f64;
+                spectrum_handle.set_center_frequency(freq_f64);
+                status_bar.update_frequency(freq_f64);
+                let label = header::demod_selector::demod_mode_label(demod_mode);
+                status_bar.update_demod(label, bandwidth);
+                // Programmatic updates of the demod dropdown +
+                // bandwidth row — suppress the notify handlers so
+                // the scanner's retune doesn't ricochet back into
+                // `SetDemodMode` / `SetBandwidth` commands.
+                state.suppress_demod_notify.set(true);
+                if let Some(idx) = header::demod_selector::demod_mode_to_index(demod_mode) {
+                    demod_dropdown.set_selected(idx);
+                }
+                state.suppress_demod_notify.set(false);
+                state.suppress_bandwidth_notify.set(true);
+                radio_panel.bandwidth_row.set_value(bandwidth);
+                state.suppress_bandwidth_notify.set(false);
+                scanner_panel.lockout_button.set_visible(true);
+            } else {
+                scanner_panel.active_channel_label.set_text("Active: —");
+                scanner_panel.lockout_button.set_visible(false);
+            }
         }
         DspToUi::ScannerStateChanged(scanner_state) => {
-            tracing::debug!(
-                ?scanner_state,
-                "scanner state changed — scanner-panel wiring lands in PR 3"
-            );
+            let label = match scanner_state {
+                sdr_scanner::ScannerState::Idle => "Off",
+                sdr_scanner::ScannerState::Retuning => "Scanning…",
+                sdr_scanner::ScannerState::Dwelling => "Listening…",
+                sdr_scanner::ScannerState::Listening => "Listening",
+                sdr_scanner::ScannerState::Hanging => "Hang…",
+            };
+            scanner_panel
+                .state_label
+                .set_text(&format!("State: {label}"));
         }
         DspToUi::ScannerEmptyRotation => {
             tracing::info!("scanner rotation empty");
@@ -773,15 +802,21 @@ fn handle_dsp_message(
                     "Scanner has no active channels (all locked or disabled)",
                 ));
             }
+            // Engine is already back to Idle — drop the master
+            // switch to match. `set_state` fires `state-set`; that
+            // handler re-dispatches `SetScannerEnabled(false)`
+            // which is idempotent on the engine side.
+            scanner_panel.master_switch.set_state(false);
         }
         DspToUi::ScannerMutexStopped(reason) => {
             tracing::info!(?reason, "scanner mutex stopped");
-            // Widget state for recording deactivates automatically
-            // via the paired `AudioRecordingStopped` /
-            // `IqRecordingStopped` events that `stop_any_recording`
-            // emits in the controller. Transcription doesn't have
-            // a matching stopped-event — deactivate the enable row
-            // explicitly here.
+            // Widget-state sync for recording comes for free via
+            // the paired `AudioRecordingStopped` / `IqRecordingStopped`
+            // events that `stop_any_recording` emits in the
+            // controller. Transcription has no matching stopped
+            // event; deactivate the switch here. Scanner sync for
+            // the `ScannerStoppedFor*` variants flips the master
+            // switch so the sidebar reflects the engine state.
             let message = match reason {
                 sdr_core::messages::ScannerMutexReason::RecordingStoppedForScanner => {
                     "Recording stopped — Scanner activated"
@@ -791,10 +826,11 @@ fn handle_dsp_message(
                     "Transcription stopped — Scanner activated"
                 }
                 sdr_core::messages::ScannerMutexReason::ScannerStoppedForRecording => {
-                    // Scanner widget state sync lands in PR 3.
+                    scanner_panel.master_switch.set_state(false);
                     "Scanner stopped — recording started"
                 }
                 sdr_core::messages::ScannerMutexReason::ScannerStoppedForTranscription => {
+                    scanner_panel.master_switch.set_state(false);
                     "Scanner stopped — transcription started"
                 }
             };
@@ -1062,6 +1098,14 @@ fn build_header_bar(
     let (demod_dropdown, _demod_mode_cell) = header::build_demod_selector();
     let state_demod = Rc::clone(state);
     demod_dropdown.connect_selected_notify(move |dd| {
+        // `suppress_demod_notify` is the DSP-origin guard — when
+        // the scanner's `ScannerActiveChannelChanged` fan-out sets
+        // the dropdown programmatically, we do NOT want to dispatch
+        // `SetDemodMode` back to the engine (it'd tear down the
+        // scanner-driven retune the UI is only trying to reflect).
+        if state_demod.suppress_demod_notify.get() {
+            return;
+        }
         if let Some(mode) = demod_selector::index_to_demod_mode(dd.selected()) {
             state_demod.demod_mode.set(mode);
             state_demod.send_dsp(UiToDsp::SetDemodMode(mode));

@@ -32,6 +32,14 @@ pub struct AppState {
     /// which would in turn re-emit `BandwidthChanged` and waste a
     /// round trip per UI reflection.
     pub suppress_bandwidth_notify: Cell<bool>,
+    /// Mirror of `suppress_bandwidth_notify` for the demod dropdown.
+    /// Set true when we're programmatically changing the selected
+    /// demod mode (e.g. the scanner `ScannerActiveChannelChanged`
+    /// fan-out) so the dropdown's `connect_selected_notify` doesn't
+    /// bounce a `UiToDsp::SetDemodMode` command back to DSP and
+    /// accidentally tear down the scanner-driven retune the UI is
+    /// only trying to reflect.
+    pub suppress_demod_notify: Cell<bool>,
 }
 
 impl AppState {
@@ -45,6 +53,7 @@ impl AppState {
             demod_mode: Cell::new(DemodMode::Wfm),
             ui_tx,
             suppress_bandwidth_notify: Cell::new(false),
+            suppress_demod_notify: Cell::new(false),
         })
     }
 

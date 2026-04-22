@@ -2198,6 +2198,7 @@ dependencies = [
  "sdr-radioreference",
  "sdr-rtlsdr",
  "sdr-rtltcp-discovery",
+ "sdr-scanner",
  "sdr-server-rtltcp",
  "sdr-sink-audio",
  "sdr-source-rtlsdr",
