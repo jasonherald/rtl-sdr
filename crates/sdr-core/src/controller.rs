@@ -1398,20 +1398,26 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::StartAudioRecording(path) => {
-            // If scanner is active, stop it first — scanner and
-            // per-hit recording are mutually exclusive in Phase 1.
-            if state.scanner.is_enabled() {
-                let cmds = state
-                    .scanner
-                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
-                apply_scanner_commands(state, dsp_tx, cmds);
-                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                    ScannerMutexReason::ScannerStoppedForRecording,
-                ));
-            }
             tracing::info!(?path, "start audio recording");
+            // Open the writer FIRST. If it fails we want to leave
+            // the scanner untouched — sending `ScannerMutexStopped`
+            // before knowing the recording actually started would
+            // visibly kill the scanner in the UI and misleadingly
+            // tell the user recording started.
             match WavWriter::new(&path, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS) {
                 Ok(writer) => {
+                    // Recording committed — now apply the mutex.
+                    // Scanner and per-hit recording are mutually
+                    // exclusive in Phase 1.
+                    if state.scanner.is_enabled() {
+                        let cmds = state
+                            .scanner
+                            .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
+                        apply_scanner_commands(state, dsp_tx, cmds);
+                        let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                            ScannerMutexReason::ScannerStoppedForRecording,
+                        ));
+                    }
                     state.audio_writer = Some(writer);
                     let _ = dsp_tx.send(DspToUi::AudioRecordingStarted(path));
                 }
@@ -1430,22 +1436,22 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::StartIqRecording(path) => {
-            // If scanner is active, stop it first — scanner and
-            // per-hit recording are mutually exclusive in Phase 1.
-            if state.scanner.is_enabled() {
-                let cmds = state
-                    .scanner
-                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
-                apply_scanner_commands(state, dsp_tx, cmds);
-                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                    ScannerMutexReason::ScannerStoppedForRecording,
-                ));
-            }
             tracing::info!(?path, "start IQ recording");
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let iq_rate = state.sample_rate as u32;
+            // Open-first, apply-mutex-on-success — same rationale
+            // as `StartAudioRecording` above.
             match WavWriter::new(&path, iq_rate, IQ_CHANNELS) {
                 Ok(writer) => {
+                    if state.scanner.is_enabled() {
+                        let cmds = state
+                            .scanner
+                            .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
+                        apply_scanner_commands(state, dsp_tx, cmds);
+                        let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                            ScannerMutexReason::ScannerStoppedForRecording,
+                        ));
+                    }
                     state.iq_writer = Some(writer);
                     let _ = dsp_tx.send(DspToUi::IqRecordingStarted(path));
                 }
@@ -1670,6 +1676,19 @@ fn apply_scanner_commands(
                 // payload with freq/mode/bandwidth/name that the
                 // UI handler fans out to the same widgets; emitting
                 // both paths would double-drive the sync.
+
+                // Re-arm the controller's squelch-edge tracker for
+                // the new channel. Without this, if the previous
+                // channel ended open and the new channel is also
+                // open during settle, the `now_open != squelch_was_open`
+                // comparison in the IQ loop would suppress the
+                // fresh `SquelchEdge::Open` — scanner's latch
+                // would stay `false`, settle expiry would go to
+                // `Dwelling` instead of directly to `Listening`,
+                // and the `persistent_open_during_settle_goes_directly_to_listening`
+                // invariant the scanner crate tests would break
+                // at integration.
+                state.squelch_was_open = false;
 
                 // 1. Center frequency (mirrors `UiToDsp::Tune`).
                 #[allow(clippy::cast_precision_loss)]

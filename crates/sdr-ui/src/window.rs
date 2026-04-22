@@ -732,7 +732,18 @@ fn handle_dsp_message(
                 apply_network_sink_status(&row, &status);
             }
         }
-        // --- Scanner (#317) — UI integration wired in Task 2.7+ ---
+        // --- Scanner (#317) ---
+        //
+        // `ScannerActiveChannelChanged` and `ScannerStateChanged`
+        // are still stubs here — their fan-out to the frequency
+        // selector, spectrum, status bar, demod dropdown, and
+        // bandwidth row is PR 3 work. `ScannerEmptyRotation` and
+        // `ScannerMutexStopped` ARE promoted to real toasts +
+        // widget deactivation in this PR because they fire
+        // immediately as soon as the mutex kicks in (which
+        // happens as soon as a future caller dispatches
+        // `UiToDsp::SetScannerEnabled(true)`, which could be
+        // driven by a test harness before the PR 3 panel lands).
         DspToUi::ScannerActiveChannelChanged {
             key,
             freq_hz,
@@ -746,17 +757,50 @@ fn handle_dsp_message(
                 ?demod_mode,
                 bandwidth,
                 name,
-                "scanner active channel changed"
+                "scanner active channel changed — UI fan-out lands in PR 3"
             );
         }
         DspToUi::ScannerStateChanged(scanner_state) => {
-            tracing::debug!(?scanner_state, "scanner state changed");
+            tracing::debug!(
+                ?scanner_state,
+                "scanner state changed — scanner-panel wiring lands in PR 3"
+            );
         }
         DspToUi::ScannerEmptyRotation => {
-            tracing::debug!("scanner rotation empty");
+            tracing::info!("scanner rotation empty");
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                overlay.add_toast(adw::Toast::new(
+                    "Scanner has no active channels (all locked or disabled)",
+                ));
+            }
         }
         DspToUi::ScannerMutexStopped(reason) => {
-            tracing::debug!(?reason, "scanner mutex stopped");
+            tracing::info!(?reason, "scanner mutex stopped");
+            // Widget state for recording deactivates automatically
+            // via the paired `AudioRecordingStopped` /
+            // `IqRecordingStopped` events that `stop_any_recording`
+            // emits in the controller. Transcription doesn't have
+            // a matching stopped-event — deactivate the enable row
+            // explicitly here.
+            let message = match reason {
+                sdr_core::messages::ScannerMutexReason::RecordingStoppedForScanner => {
+                    "Recording stopped — Scanner activated"
+                }
+                sdr_core::messages::ScannerMutexReason::TranscriptionStoppedForScanner => {
+                    transcription_enable_row.set_active(false);
+                    "Transcription stopped — Scanner activated"
+                }
+                sdr_core::messages::ScannerMutexReason::ScannerStoppedForRecording => {
+                    // Scanner widget state sync lands in PR 3.
+                    "Scanner stopped — recording started"
+                }
+                sdr_core::messages::ScannerMutexReason::ScannerStoppedForTranscription => {
+                    "Scanner stopped — transcription started"
+                }
+            };
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                overlay.add_toast(adw::Toast::new(message));
+            }
         }
     }
 }
