@@ -32,8 +32,7 @@ use crate::codec::{Codec, CodecMask, Encoder};
 use crate::dispatch::dispatch;
 use crate::error::ServerError;
 use crate::extension::{
-    CLIENT_HELLO_LEN, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension,
-    Status,
+    CLIENT_HELLO_LEN, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension, Status,
 };
 use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode};
 
@@ -868,10 +867,7 @@ fn handle_client(
     // Wrap the writer in the negotiated codec. Legacy clients
     // get a pass-through (`Codec::None`) so the write path
     // stays byte-identical to the pre-#307 behavior.
-    let encoded_writer = Encoder::new(
-        negotiated_codec.unwrap_or(Codec::None),
-        writer,
-    );
+    let encoded_writer = Encoder::new(negotiated_codec.unwrap_or(Codec::None), writer);
     let writer_shutdown = merged_shutdown.clone();
     let writer_stats = stats.clone();
     let Ok(writer_handle) = thread::Builder::new()
