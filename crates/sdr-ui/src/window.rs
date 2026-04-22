@@ -310,6 +310,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &sidebar_toggle,
         &bookmarks_toggle,
         &demod_dropdown,
+        &panels.scanner.master_switch,
     );
 
     // Ctrl+? shows keyboard shortcuts dialog.
@@ -348,6 +349,18 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         config,
         &favorites_handle,
         &scanner_force_disable,
+    );
+
+    // Seed the scanner with the persisted bookmark list on
+    // startup. Scanner starts Idle so no retune happens, but
+    // the channels are in place if the user flips F8 or the
+    // master switch. Defaults come from config via the shared
+    // projection helper — matches the on-mutation re-projection
+    // path so initial-load and post-edit semantics are identical.
+    sidebar::navigation_panel::project_and_push_scanner_channels(
+        &panels.bookmarks.bookmarks.borrow(),
+        &state,
+        config,
     );
 
     // Wire waterfall screenshot button.
