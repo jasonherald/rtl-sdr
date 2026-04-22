@@ -621,6 +621,15 @@ mod tests {
             UiToDsp::SetFilePath(ref p) if p == std::path::Path::new("/tmp/test.wav")
         ));
 
+        // Loop-on-EOF toggle — both polarities, since the
+        // controller's handler branches on the value and we
+        // want a shape regression on either to fail loudly.
+        // Per `CodeRabbit` round 1 on PR #371.
+        let loop_on = UiToDsp::SetFileLooping(true);
+        assert!(matches!(loop_on, UiToDsp::SetFileLooping(true)));
+        let loop_off = UiToDsp::SetFileLooping(false);
+        assert!(matches!(loop_off, UiToDsp::SetFileLooping(false)));
+
         let ppm = UiToDsp::SetPpmCorrection(42);
         assert!(matches!(ppm, UiToDsp::SetPpmCorrection(42)));
 

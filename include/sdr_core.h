@@ -618,13 +618,18 @@ int32_t sdr_core_set_file_path(SdrCore* handle, const char* path_utf8);
  * start of the WAV file on EOF and keeps streaming; when
  * `false` it stops at EOF.
  *
- * Applies both to the running source (effective from the next
- * EOF onward) and to future source rebuilds — the engine keeps
- * the latest value on its state so a source-type switch or
- * file-path change doesn't reset to the constructor default.
+ * The engine always persists the value on its state, regardless
+ * of the currently-active source type — a later
+ * `SDR_SOURCE_FILE` activation (or a source rebuild after a
+ * file-path change) picks up the stored value rather than
+ * resetting to the constructor default.
  *
- * No-op when the active source isn't `SDR_SOURCE_FILE` — the
- * `Source` trait's default `set_looping` impl silently accepts.
+ * When the ACTIVE source is `SDR_SOURCE_FILE`, the setting is
+ * also applied to the running source (effective from the next
+ * EOF onward). When the active source is anything else, the
+ * immediate apply is a no-op — the `Source` trait's default
+ * `set_looping` silently accepts — but the stored value still
+ * takes effect on the next switch to file playback.
  */
 int32_t sdr_core_set_file_looping(SdrCore* handle, bool looping);
 

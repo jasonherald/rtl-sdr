@@ -418,10 +418,18 @@ public final class SdrCore: @unchecked Sendable {
     /// Toggle loop-on-EOF for the file playback source.
     /// `true` rewinds to the start of the WAV file at EOF
     /// and keeps streaming; `false` stops the source at EOF.
-    /// Applies both to the running source (effective from
-    /// the next EOF onward) and to future source rebuilds.
-    /// No-op when the active source isn't `.file`. Per issue
-    /// #236 (ABI 0.13).
+    ///
+    /// The engine always persists the value on its state
+    /// regardless of the currently-active source — a later
+    /// switch to `.file` picks up the stored value rather
+    /// than resetting to the constructor default.
+    ///
+    /// When the active source is `.file`, the setting is
+    /// also applied to the running source (effective from
+    /// the next EOF onward). When the active source is
+    /// anything else the immediate apply is a no-op but
+    /// the stored value still takes effect on the next
+    /// switch to file playback. Per issue #236 (ABI 0.13).
     public func setFileLooping(_ looping: Bool) throws {
         try checkRc(sdr_core_set_file_looping(handle, looping))
     }

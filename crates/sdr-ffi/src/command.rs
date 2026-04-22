@@ -280,14 +280,27 @@ pub unsafe extern "C" fn sdr_core_set_gain(handle: *mut SdrCore, gain_db: f64) -
 /// Enable or disable tuner AGC.
 ///
 /// Legacy two-state setter preserved for backward-compat with
-/// hosts that don't need the tristate selector. Only touches the
-/// hardware (tuner) AGC; does NOT turn off software AGC. Modern
-/// hosts should use `sdr_core_set_agc_type` which dispatches both
-/// loops atomically according to the requested type. Per issue
-/// #357.
+/// hosts that don't need the tristate selector. Forwards to the
+/// `sdr_core_set_agc_type` semantics so the engine's single-
+/// loop-on policy is preserved: `true` maps to
+/// `SDR_AGC_HARDWARE` (tuner on, software off), `false` maps to
+/// `SDR_AGC_OFF` (both loops off). A pre-0.13 host dropping to
+/// `false` after software AGC had been enabled elsewhere still
+/// gets a true "manual gain, no AGC" state. Per `CodeRabbit`
+/// round 1 on PR #371 and issue #357.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_set_agc(handle: *mut SdrCore, enabled: bool) -> i32 {
-    unsafe { with_core(handle, |core| send(core, UiToDsp::SetAgc(enabled))) }
+    unsafe {
+        with_core(handle, |core| {
+            if enabled {
+                send(core, UiToDsp::SetAgc(true))
+                    .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false)))
+            } else {
+                send(core, UiToDsp::SetAgc(false))
+                    .and_then(|()| send(core, UiToDsp::SetSoftwareAgc(false)))
+            }
+        })
+    }
 }
 
 // --- AGC type selector (#357, ABI 0.13) -------------------
@@ -858,14 +871,18 @@ pub unsafe extern "C" fn sdr_core_set_file_path(
 /// WAV file on EOF and keeps streaming; when `false` the source
 /// stops at EOF.
 ///
-/// Applies both to the running source (effective from the next
-/// EOF onward) and to future source rebuilds — the engine keeps
-/// the latest value on its state so a source-type switch or
-/// file-path change doesn't reset to the constructor default.
+/// The engine always persists the value on `DspState` regardless
+/// of the currently-active source — a later `SDR_SOURCE_FILE`
+/// activation or a source rebuild after a file-path change
+/// picks up the stored value rather than resetting to the
+/// constructor default.
 ///
-/// No-op when the active source isn't `SDR_SOURCE_FILE`; the
-/// trait's default `set_looping` impl silently accepts. Per
-/// issue #236 (ABI 0.13).
+/// When the ACTIVE source is `.file`, the setting is also
+/// applied to the running source (effective from the next EOF
+/// onward). When the active source is anything else the
+/// immediate apply is a no-op (trait default), but the stored
+/// value still takes effect on the next switch to file
+/// playback. Per issue #236 (ABI 0.13).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sdr_core_set_file_looping(handle: *mut SdrCore, looping: bool) -> i32 {
     unsafe { with_core(handle, |core| send(core, UiToDsp::SetFileLooping(looping))) }
