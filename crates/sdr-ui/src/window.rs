@@ -969,7 +969,7 @@ fn handle_dsp_message(
             let label = match scanner_state {
                 sdr_scanner::ScannerState::Idle => "Off",
                 sdr_scanner::ScannerState::Retuning => "Scanning…",
-                sdr_scanner::ScannerState::Dwelling => "Listening…",
+                sdr_scanner::ScannerState::Dwelling => "Dwelling…",
                 sdr_scanner::ScannerState::Listening => "Listening",
                 sdr_scanner::ScannerState::Hanging => "Hang…",
             };
