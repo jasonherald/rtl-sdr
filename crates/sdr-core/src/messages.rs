@@ -787,4 +787,110 @@ mod tests {
         let msg = UiToDsp::SetSourceType(SourceType::RtlTcp);
         assert!(matches!(msg, UiToDsp::SetSourceType(SourceType::RtlTcp)));
     }
+
+    #[test]
+    fn test_scanner_dsp_to_ui_variants() {
+        // Shape regression for the four scanner events added in
+        // PR 2 of #317. Catches silent payload changes — if a
+        // field gets renamed or the tuple arity changes, the
+        // pattern match here fails at compile or runtime.
+        let key = sdr_scanner::ChannelKey {
+            name: "Test".to_string(),
+            frequency_hz: 162_550_000,
+        };
+        let active = DspToUi::ScannerActiveChannelChanged {
+            key: Some(key.clone()),
+            freq_hz: 162_550_000,
+            demod_mode: sdr_types::DemodMode::Nfm,
+            bandwidth: TEST_BANDWIDTH_HZ,
+            name: "Test".to_string(),
+        };
+        assert!(matches!(
+            active,
+            DspToUi::ScannerActiveChannelChanged {
+                key: Some(_),
+                freq_hz: 162_550_000,
+                demod_mode: sdr_types::DemodMode::Nfm,
+                ..
+            }
+        ));
+
+        let idle = DspToUi::ScannerActiveChannelChanged {
+            key: None,
+            freq_hz: 0,
+            demod_mode: sdr_types::DemodMode::Nfm,
+            bandwidth: 0.0,
+            name: String::new(),
+        };
+        assert!(matches!(
+            idle,
+            DspToUi::ScannerActiveChannelChanged { key: None, .. }
+        ));
+
+        let state_changed = DspToUi::ScannerStateChanged(sdr_scanner::ScannerState::Listening);
+        assert!(matches!(
+            state_changed,
+            DspToUi::ScannerStateChanged(sdr_scanner::ScannerState::Listening)
+        ));
+
+        let empty = DspToUi::ScannerEmptyRotation;
+        assert!(matches!(empty, DspToUi::ScannerEmptyRotation));
+
+        // Pin each mutex-reason variant — the UI toast text is
+        // selected by matching these, so a silent rename would
+        // misroute toasts rather than fail compilation.
+        let mutex_rec =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::RecordingStoppedForScanner);
+        assert!(matches!(
+            mutex_rec,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::RecordingStoppedForScanner)
+        ));
+        let mutex_trans =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::TranscriptionStoppedForScanner);
+        assert!(matches!(
+            mutex_trans,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::TranscriptionStoppedForScanner)
+        ));
+        let mutex_scan_rec =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForRecording);
+        assert!(matches!(
+            mutex_scan_rec,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForRecording)
+        ));
+        let mutex_scan_trans =
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForTranscription);
+        assert!(matches!(
+            mutex_scan_trans,
+            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForTranscription)
+        ));
+    }
+
+    #[test]
+    fn test_scanner_ui_to_dsp_variants() {
+        // Shape regression for the four scanner commands the UI
+        // dispatches. Same rationale as the DspToUi test above —
+        // enum-shape drift fails here first.
+        let key = sdr_scanner::ChannelKey {
+            name: "Test".to_string(),
+            frequency_hz: 146_520_000,
+        };
+
+        let enable = UiToDsp::SetScannerEnabled(true);
+        assert!(matches!(enable, UiToDsp::SetScannerEnabled(true)));
+
+        let disable = UiToDsp::SetScannerEnabled(false);
+        assert!(matches!(disable, UiToDsp::SetScannerEnabled(false)));
+
+        let update = UiToDsp::UpdateScannerChannels(Vec::new());
+        assert!(matches!(
+            update,
+            UiToDsp::UpdateScannerChannels(ref v) if v.is_empty()
+        ));
+
+        let lockout = UiToDsp::LockoutScannerChannel(key.clone());
+        assert!(matches!(lockout, UiToDsp::LockoutScannerChannel(_)));
+
+        let unlock = UiToDsp::UnlockScannerChannel(key);
+        assert!(matches!(unlock, UiToDsp::UnlockScannerChannel(_)));
+    }
 }

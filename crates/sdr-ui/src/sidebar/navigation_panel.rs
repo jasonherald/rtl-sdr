@@ -1176,16 +1176,25 @@ mod tests {
 
     #[test]
     fn bookmark_scanner_fields_roundtrip() {
+        /// Override dwell in ms; distinct from the scanner's
+        /// `DEFAULT_DWELL_MS` (100) so the roundtrip assertion
+        /// would fail if serde dropped the override field and
+        /// the default re-hydrated.
+        const TEST_SCANNER_DWELL_MS: u32 = 200;
+        /// Override hang in ms; same rationale — distinct from
+        /// the scanner default (2000).
+        const TEST_SCANNER_HANG_MS: u32 = 3_000;
+
         let mut bm = Bookmark::new("Test", 146_520_000, DemodMode::Nfm, 12_500.0);
         bm.scan_enabled = true;
         bm.priority = 1;
-        bm.dwell_ms_override = Some(200);
-        bm.hang_ms_override = Some(3000);
+        bm.dwell_ms_override = Some(TEST_SCANNER_DWELL_MS);
+        bm.hang_ms_override = Some(TEST_SCANNER_HANG_MS);
         let json = serde_json::to_string(&bm).unwrap();
         let back: Bookmark = serde_json::from_str(&json).unwrap();
         assert!(back.scan_enabled);
         assert_eq!(back.priority, 1);
-        assert_eq!(back.dwell_ms_override, Some(200));
-        assert_eq!(back.hang_ms_override, Some(3000));
+        assert_eq!(back.dwell_ms_override, Some(TEST_SCANNER_DWELL_MS));
+        assert_eq!(back.hang_ms_override, Some(TEST_SCANNER_HANG_MS));
     }
 }

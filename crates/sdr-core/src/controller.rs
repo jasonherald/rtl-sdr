@@ -1697,6 +1697,25 @@ fn apply_scanner_commands(
 /// Build the `ScannerActiveChannelChanged` payload by looking
 /// up the full channel info for the given key in the cached
 /// channel list.
+///
+/// If `key` is `Some(k)` but `k` isn't in `scanner_channels`
+/// (a race between `UpdateScannerChannels` and
+/// `ActiveChannelChanged`), we degrade to the idle-shape payload
+/// (`key = None`, zeroed fields) rather than sending a non-None
+/// key with zeroed freq/bandwidth/name — the UI can't tell
+/// those apart from a valid zero-frequency channel, and the
+/// resulting display would be incoherent (key says "active
+/// channel X" but fields say "no channel"). A warning log
+/// surfaces the cache miss so this stays diagnosable if it ever
+/// fires in practice.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owned key is passed from ScannerCommand::ActiveChannelChanged \
+              and this helper decides whether it lands in the outgoing DspToUi \
+              payload (cache hit) or gets logged + dropped (cache miss); \
+              taking a reference would force callers to clone unnecessarily \
+              on the common-case hit path"
+)]
 fn emit_scanner_active_channel(
     state: &DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,
@@ -1705,14 +1724,28 @@ fn emit_scanner_active_channel(
     let channel = key
         .as_ref()
         .and_then(|k| state.scanner_channels.iter().find(|c| c.key == *k).cloned());
-    let msg = DspToUi::ScannerActiveChannelChanged {
-        freq_hz: channel.as_ref().map_or(0, |c| c.key.frequency_hz),
-        demod_mode: channel
-            .as_ref()
-            .map_or(sdr_types::DemodMode::Nfm, |c| c.demod_mode),
-        bandwidth: channel.as_ref().map_or(0.0, |c| c.bandwidth),
-        name: channel.map_or_else(String::new, |c| c.key.name),
-        key,
+    if key.is_some() && channel.is_none() {
+        tracing::warn!(
+            ?key,
+            "scanner active-channel key not found in cached ScannerChannels — \
+             degrading to idle payload; likely an UpdateScannerChannels race"
+        );
+    }
+    let msg = match channel {
+        Some(c) => DspToUi::ScannerActiveChannelChanged {
+            freq_hz: c.key.frequency_hz,
+            demod_mode: c.demod_mode,
+            bandwidth: c.bandwidth,
+            name: c.key.name.clone(),
+            key: Some(c.key),
+        },
+        None => DspToUi::ScannerActiveChannelChanged {
+            freq_hz: 0,
+            demod_mode: sdr_types::DemodMode::Nfm,
+            bandwidth: 0.0,
+            name: String::new(),
+            key: None,
+        },
     };
     let _ = dsp_tx.send(msg);
 }

@@ -494,6 +494,13 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         //     light up in the macOS UI whenever the CTCSS / voice-
         //     squelch panels get ported (no specific backlog issue
         //     yet — part of the full-parity backlog under #228).
+        //   - `ScannerActiveChannelChanged`, `ScannerStateChanged`,
+        //     `ScannerEmptyRotation`, `ScannerMutexStopped` are the
+        //     scanner Phase 1 UI events (#317). Intentionally
+        //     withheld from ABI v1; the Mac-side scanner ticket
+        //     (tracked separately) will add them when the SwiftUI
+        //     scanner panel is designed — likely as a group at
+        //     the next minor bump.
         //
         // Adding any of these to the ABI is additive (new
         // `SDR_EVT_*` discriminant + new payload struct or reuse
