@@ -942,8 +942,15 @@ mod tests {
         // to `(true, v)`; `None` projects to `(false, 0 /
         // false)`. Pin both directions so a future parser change
         // that silently drops TXT capability bits fails here.
+        //
+        // `TEST_CODEC_MASK_NONE_AND_LZ4` names the `0x03` wire
+        // byte (None + LZ4 bits) per the project's
+        // "no-magic-numbers" rule. Per `CodeRabbit` round 2 on
+        // PR #418.
+        const TEST_CODEC_MASK_NONE_AND_LZ4: u8 = 0x03;
+
         let mut strings: Vec<CString> = Vec::new();
-        // Present: codecs = 0x03 (None+LZ4), auth_required = true.
+        // Present: None+LZ4 codecs + auth required.
         let present = DiscoveredServer {
             instance_name: format!("{TEST_INSTANCE_NAME}._rtl_tcp._tcp.local."),
             hostname: "test.local.".into(),
@@ -955,14 +962,14 @@ mod tests {
                 gains: TEST_GAIN_COUNT,
                 nickname: String::new(),
                 txbuf: None,
-                codecs: Some(0x03),
+                codecs: Some(TEST_CODEC_MASK_NONE_AND_LZ4),
                 auth_required: Some(true),
             },
             last_seen: Instant::now(),
         };
         let projected = discovered_server_to_c(&present, &mut strings);
         assert!(projected.has_codecs);
-        assert_eq!(projected.codecs, 0x03);
+        assert_eq!(projected.codecs, TEST_CODEC_MASK_NONE_AND_LZ4);
         assert!(projected.has_auth_required);
         assert!(projected.auth_required);
 

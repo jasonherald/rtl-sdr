@@ -1309,6 +1309,19 @@ mod tests {
         assert_eq!(listener_cap_from_c(7), 7);
     }
 
+    /// Wire byte for `CodecMask::NONE_ONLY` — pinned here so the
+    /// tests name the protocol value rather than lean on a raw
+    /// hex literal. Matches `CodecMask::NONE_ONLY.to_wire()` by
+    /// construction; if that ever drifts, both this constant
+    /// and the non-test `CodecMask::NONE_ONLY` bits would need
+    /// to shift in lockstep. Per `CodeRabbit` round 2 on
+    /// PR #418.
+    const TEST_CODEC_MASK_NONE_ONLY_WIRE: u8 = 0x01;
+    /// Wire byte for `CodecMask::NONE_AND_LZ4` — None bit +
+    /// LZ4 bit. Same pinning rationale as
+    /// [`TEST_CODEC_MASK_NONE_ONLY_WIRE`].
+    const TEST_CODEC_MASK_NONE_AND_LZ4_WIRE: u8 = 0x03;
+
     #[test]
     fn compression_from_c_zero_init_is_none_only() {
         // ABI 0.19 default: `has_compression = false` + any
@@ -1318,16 +1331,25 @@ mod tests {
         // to prove the `compression` field is ignored when the
         // gate is false.
         assert_eq!(compression_from_c(false, 0), CodecMask::NONE_ONLY);
-        assert_eq!(compression_from_c(false, 0x03), CodecMask::NONE_ONLY);
+        assert_eq!(
+            compression_from_c(false, TEST_CODEC_MASK_NONE_AND_LZ4_WIRE),
+            CodecMask::NONE_ONLY
+        );
     }
 
     #[test]
     fn compression_from_c_opt_in_passes_raw_wire_byte() {
         // `has_compression = true` → `CodecMask::from_wire(byte)`.
-        // Verify both a `None-only` (0x01) round-trip and a
-        // `None + LZ4` (0x03) round-trip.
-        assert_eq!(compression_from_c(true, 0x01), CodecMask::NONE_ONLY);
-        assert_eq!(compression_from_c(true, 0x03), CodecMask::NONE_AND_LZ4);
+        // Verify both a `None-only` round-trip and a
+        // `None + LZ4` round-trip.
+        assert_eq!(
+            compression_from_c(true, TEST_CODEC_MASK_NONE_ONLY_WIRE),
+            CodecMask::NONE_ONLY
+        );
+        assert_eq!(
+            compression_from_c(true, TEST_CODEC_MASK_NONE_AND_LZ4_WIRE),
+            CodecMask::NONE_AND_LZ4
+        );
     }
 
     #[test]
