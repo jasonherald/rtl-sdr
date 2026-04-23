@@ -22,10 +22,13 @@ mdns-advertise = ["dep:sdr-rtltcp-discovery"]
 sdr-rtlsdr.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# Needed for `SO_KEEPALIVE` via setsockopt — std::net::TcpStream exposes
-# `set_nodelay` and friends but not keepalive. Rather than pull in socket2
-# just for one call, we use the same libc/allow(unsafe_code) pattern used
-# elsewhere in the workspace (e.g. crates/sdr-transcription/src/util.rs).
+# On unix targets we use `libc::setsockopt` directly — lets us tune
+# `TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT` (Linux-specific)
+# without pulling in socket2 for the whole workspace. The
+# non-unix fallback below uses socket2 because std::net::TcpStream
+# has no keepalive setter and raw winsock ioctls via windows-sys
+# would be a larger dep footprint than socket2's abstraction
+# for the same result (#393 CR round 1).
 libc.workspace = true
 rusb.workspace = true
 # Binary only — enables `-s info` style env-filter logging for the CLI.
@@ -41,6 +44,15 @@ sdr-rtltcp-discovery = { workspace = true, optional = true }
 # mask at handshake time, which doesn't require the codec trait impls
 # to be absent.
 lz4_flex.workspace = true
+
+# Non-unix (Windows, WASI, etc.) keepalive enable for the #393
+# zombie-detection fallback path. `std::net::TcpStream` has no
+# keepalive setter; unix paths use `libc::setsockopt` directly, so
+# this only wires up socket2 on platforms we'd otherwise leave with
+# `Err(Unsupported)`. Scoped to `cfg(not(unix))` so the dep doesn't
+# affect the primary Linux/macOS builds.
+[target.'cfg(not(unix))'.dependencies]
+socket2 = "0.5"
 
 [lints]
 workspace = true

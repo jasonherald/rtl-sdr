@@ -1149,16 +1149,19 @@ fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_keepalive_tuned(_stream: &TcpStream) -> std::io::Result<()> {
-    // Non-unix has no implementation yet. Return Unsupported so the
-    // warn path in `configure_client_socket` fires and the log makes
-    // the missing keepalive visible — silently returning Ok would
-    // leave operators thinking dead-peer detection is active when it
-    // isn't.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "SO_KEEPALIVE not implemented on this platform",
-    ))
+fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
+    // Non-unix targets (Windows, WASI, etc.) enable keepalive with
+    // system defaults via socket2 — std::net::TcpStream exposes no
+    // keepalive setter, and our primary tunables
+    // (`TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`) are
+    // Linux-specific. Using `SockRef::from(&stream)` lets us flip
+    // `SO_KEEPALIVE` without taking ownership of the TcpStream.
+    // The kernel's default probe timings apply (~2 h first probe
+    // on Windows), so the #393 zombie-detection fallback is slower
+    // than on Linux but still runs. Per `CodeRabbit` round 1 on
+    // PR #404. #393.
+    let sock = socket2::SockRef::from(stream);
+    sock.set_keepalive(true)
 }
 
 /// Tiny `setsockopt(fd, level, name, &value)` wrapper for integer

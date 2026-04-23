@@ -233,21 +233,31 @@ pub struct RtlTcpConfig {
     /// client if the slot is occupied, and admit us instead.
     /// Defaults to `false`.
     ///
-    /// The normal UI flow that flips this to `true`: user tries
-    /// to connect as Controller, server denies with
-    /// `status=ControllerBusy`, client shows a "Take control?"
-    /// prompt, user confirms, client reconnects with
-    /// `request_takeover = true`. sdr-rs servers with role
-    /// support (#392+) honor this and displace the prior
-    /// controller; servers without (vanilla `rtl_tcp`) ignore
-    /// the whole extended hello anyway, so setting this in
-    /// combination with `compression = NONE_ONLY` still stays
-    /// wire-compatible with vanilla — the `extension_enabled`
-    /// gate below sends a hello if EITHER compression is
-    /// requested OR takeover is, so opting into takeover
-    /// against a known-vanilla server would send a hello it
-    /// doesn't understand (same mDNS `codecs=3` signal gates
-    /// both opt-ins). #393.
+    /// **RTLX-only — NOT safe against vanilla servers.** Setting
+    /// this to `true` triggers a `ClientHello` on the wire (the
+    /// `extension_enabled` gate below sends a hello if EITHER
+    /// `compression != NONE_ONLY` OR `request_takeover == true`).
+    /// Vanilla `rtl_tcp` servers misinterpret the 8-byte hello as
+    /// two 5-byte commands straddling the framing boundary, which
+    /// can cause garbage dispatches — exactly the hazard the
+    /// [`Self::compression`] doc already describes.
+    ///
+    /// Callers must gate this opt-in on the same out-of-band
+    /// evidence that gates `compression`: the server's mDNS TXT
+    /// record (`codecs=3` = RTLX-capable; absent / `codecs=1` =
+    /// legacy-only, keep this `false`). The UI / client-side
+    /// discovery layer is responsible for refusing to expose the
+    /// takeover action against legacy-only servers, just as it
+    /// already refuses to advertise compression for them.
+    ///
+    /// Normal UI flow when it IS safe: user tries to connect as
+    /// Controller, server denies with `status=ControllerBusy`,
+    /// client shows a "Take control?" prompt (only if the server
+    /// advertised RTLX via mDNS), user confirms, client
+    /// reconnects with `request_takeover = true`. sdr-rs servers
+    /// with role support (#392+) honor the flag and displace the
+    /// prior controller. Per #393 + `CodeRabbit` round 1 on
+    /// PR #404 (doc clarification).
     pub request_takeover: bool,
 }
 
