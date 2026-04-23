@@ -84,6 +84,32 @@ pub struct SdrRtlTcpServerConfig {
     /// counted — they occupy the controller slot, which is
     /// separate from the listener pool. #392.
     pub listener_cap: u32,
+    /// Pre-shared auth key bytes. `NULL` with `auth_key_len == 0`
+    /// means "auth disabled" — default, matches today's LAN-trust
+    /// model. Non-null pointer + non-zero length enables the
+    /// auth gate: every connecting client must present an
+    /// `AuthKeyMessage` whose bytes match these bytes
+    /// (constant-time compare). The server copies the bytes
+    /// into its owned `Vec<u8>` during
+    /// `sdr_rtltcp_server_start` — the caller's buffer can be
+    /// freed / reused immediately after the call returns.
+    ///
+    /// Length must be in `1..=256`
+    /// ([`sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN`]);
+    /// values outside that range cause `sdr_rtltcp_server_start`
+    /// to return [`SdrCoreError::InvalidArg`] without starting
+    /// the server.
+    ///
+    /// Keys travel as cleartext over TCP — wrap the connection in
+    /// SSH / WireGuard / Tailscale if the threat model demands
+    /// WAN-grade confidentiality. This flag enables LAN isolation
+    /// (keeping IoT devices / shared-network cohabitants from
+    /// seizing the dongle), nothing stronger. #394.
+    pub auth_key: *const u8,
+    /// Length in bytes of [`Self::auth_key`]. See that field's
+    /// doc for valid range and semantics. Must be 0 iff
+    /// `auth_key` is NULL.
+    pub auth_key_len: u32,
 }
 
 /// Aggregate server-lifetime statistics snapshot.
@@ -408,6 +434,63 @@ fn listener_cap_from_c(listener_cap: u32) -> usize {
     }
 }
 
+/// Outcome of [`auth_key_from_c`] — either the server should run
+/// without auth (`None` input, or `Some` with valid length) or
+/// the caller gave a bad pointer/length pair and
+/// `sdr_rtltcp_server_start` should reject with
+/// `SdrCoreError::InvalidArg`. Split out so the translation is
+/// unit-testable without the hardware-backed start path.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthKeyFromC {
+    /// Auth disabled (caller passed NULL pointer + zero length).
+    Disabled,
+    /// Auth enabled with the given bytes. Caller stores this in
+    /// `ServerConfig::auth_key`.
+    Enabled(Vec<u8>),
+    /// Malformed input — non-null pointer with zero length, null
+    /// pointer with non-zero length, or length exceeding
+    /// `MAX_AUTH_KEY_LEN`. `sdr_rtltcp_server_start` surfaces as
+    /// `InvalidArg`.
+    Invalid,
+}
+
+/// Translate the C-ABI `auth_key` + `auth_key_len` pair into a
+/// `ServerConfig::auth_key` value. Rules:
+///
+/// - Both `NULL` and `0`: auth disabled.
+/// - Non-null + `len` in `1..=MAX_AUTH_KEY_LEN`: copy `len`
+///   bytes, enabled.
+/// - Any other combination (null + len > 0, non-null + len = 0,
+///   len > MAX): invalid.
+///
+/// # Safety
+///
+/// `auth_key` must either be NULL or point at `auth_key_len`
+/// readable bytes. Caller's buffer can be freed/reused after
+/// this call returns — bytes are copied into the returned Vec.
+unsafe fn auth_key_from_c(auth_key: *const u8, auth_key_len: u32) -> AuthKeyFromC {
+    use sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN;
+    let len_usize = auth_key_len as usize;
+    if auth_key.is_null() && auth_key_len == 0 {
+        return AuthKeyFromC::Disabled;
+    }
+    if auth_key.is_null() || auth_key_len == 0 {
+        // Exactly one of the pair is zero/null → malformed.
+        return AuthKeyFromC::Invalid;
+    }
+    if len_usize > MAX_AUTH_KEY_LEN {
+        // Over-max length would fail at `AuthKeyMessage::to_bytes`
+        // downstream; catch here so the diagnostic surfaces
+        // cleanly as an InvalidArg rather than a handshake fail.
+        return AuthKeyFromC::Invalid;
+    }
+    // SAFETY: caller contract — pointer is non-null and points
+    // at `len_usize` readable bytes. Copy into a Vec so the
+    // caller's buffer can be freed / reused after this call.
+    let bytes = unsafe { std::slice::from_raw_parts(auth_key, len_usize) }.to_vec();
+    AuthKeyFromC::Enabled(bytes)
+}
+
 // ============================================================
 //  FFI entry points
 // ============================================================
@@ -459,6 +542,22 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             cfg.buffer_capacity as usize
         };
         let listener_cap = listener_cap_from_c(cfg.listener_cap);
+        // SAFETY: `auth_key` is NULL-or-readable-for-`auth_key_len`
+        // per the struct doc; caller contract extends to us here.
+        let auth_key = match unsafe { auth_key_from_c(cfg.auth_key, cfg.auth_key_len) } {
+            AuthKeyFromC::Disabled => None,
+            AuthKeyFromC::Enabled(bytes) => Some(bytes),
+            AuthKeyFromC::Invalid => {
+                set_last_error(format!(
+                    "sdr_rtltcp_server_start: invalid auth_key / auth_key_len pair \
+                     (auth_key null? = {}, auth_key_len = {}, max = {})",
+                    cfg.auth_key.is_null(),
+                    cfg.auth_key_len,
+                    sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN,
+                ));
+                return SdrCoreError::InvalidArg.as_int();
+            }
+        };
         let server_cfg = ServerConfig {
             bind,
             device_index: cfg.device_index,
@@ -471,6 +570,7 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             // one that currently offers LZ4.
             compression: CodecMask::NONE_ONLY,
             listener_cap,
+            auth_key,
         };
         match Server::start(server_cfg) {
             Ok(server) => {
@@ -490,6 +590,14 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
                     ServerError::Device(_)
                     | ServerError::NoDevice
                     | ServerError::BadDeviceIndex { .. } => SdrCoreError::Device.as_int(),
+                    // Config-time rejection (auth_key length out of
+                    // range). Caller supplied an out-of-bounds value
+                    // in `SdrRtlTcpServerConfig`; surface as
+                    // InvalidArg so the FFI code matches the already-
+                    // established "malformed input" error class
+                    // (same code `auth_key_from_c` returns for
+                    // NULL-pointer/length mismatches).
+                    ServerError::InvalidAuthKeyLength { .. } => SdrCoreError::InvalidArg.as_int(),
                 }
             }
         }
@@ -1100,6 +1208,11 @@ mod tests {
             initial_bias_tee: false,
             initial_direct_sampling: 0,
             listener_cap: 0, // 0 → use DEFAULT_LISTENER_CAP
+            // Auth disabled: NULL pointer + zero length = no
+            // auth gate. Matches the "LAN-trust default" from
+            // the struct docs.
+            auth_key: std::ptr::null(),
+            auth_key_len: 0,
         }
     }
 
@@ -1148,6 +1261,96 @@ mod tests {
         // off-by-one that would have passed `listener_cap_from_c(1)
         // == 1` trivially.
         assert_eq!(listener_cap_from_c(7), 7);
+    }
+
+    #[test]
+    fn auth_key_from_c_null_pointer_zero_length_is_disabled() {
+        // Default C struct (zero-initialized) has NULL + 0 here.
+        // Must map to `Disabled`, not `Invalid` — otherwise
+        // every default-constructed `SdrRtlTcpServerConfig`
+        // would fail to start.
+        // SAFETY: NULL pointer with matching zero length is
+        // valid input to `auth_key_from_c` per its contract.
+        let outcome = unsafe { auth_key_from_c(std::ptr::null(), 0) };
+        assert_eq!(outcome, AuthKeyFromC::Disabled);
+    }
+
+    #[test]
+    fn auth_key_from_c_valid_pointer_and_length_is_enabled() {
+        // Normal enable path: caller's buffer + length.
+        let buf = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "buf.len() is a const 4, fits u32 trivially"
+        )]
+        let len = buf.len() as u32;
+        // SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes.
+        let outcome = unsafe { auth_key_from_c(buf.as_ptr(), len) };
+        let AuthKeyFromC::Enabled(bytes) = outcome else {
+            unreachable!("expected Enabled variant, got {outcome:?}");
+        };
+        assert_eq!(bytes, buf.to_vec());
+    }
+
+    #[test]
+    fn auth_key_from_c_null_with_nonzero_length_is_invalid() {
+        // Malformed: caller claimed length but gave NULL. Reject
+        // cleanly rather than dereferencing a null pointer.
+        // SAFETY: Invalid input path; pointer is not
+        // dereferenced.
+        let outcome = unsafe { auth_key_from_c(std::ptr::null(), 4) };
+        assert_eq!(outcome, AuthKeyFromC::Invalid);
+    }
+
+    #[test]
+    fn auth_key_from_c_nonnull_with_zero_length_is_invalid() {
+        // Malformed: caller gave a pointer but said length is 0.
+        // Could be an uninitialized field or a bug where the
+        // operator passed a buffer but forgot the length. Reject.
+        let buf = [0xAAu8];
+        // SAFETY: Invalid input path; pointer is not
+        // dereferenced (the length-zero check short-circuits).
+        let outcome = unsafe { auth_key_from_c(buf.as_ptr(), 0) };
+        assert_eq!(outcome, AuthKeyFromC::Invalid);
+    }
+
+    #[test]
+    fn auth_key_from_c_over_max_length_is_invalid() {
+        // Length > MAX_AUTH_KEY_LEN would fail downstream at
+        // AuthKeyMessage serialization. Catch here so the FFI
+        // caller sees InvalidArg instead of a runtime handshake
+        // failure.
+        let buf = vec![0u8; sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN + 1];
+        // SAFETY: `buf.as_ptr()` is valid for `buf.len()` bytes,
+        // but we expect the length-range check to fail before
+        // any deref happens.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "MAX_AUTH_KEY_LEN + 1 = 257 fits u32 trivially"
+        )]
+        let len = buf.len() as u32;
+        let outcome = unsafe { auth_key_from_c(buf.as_ptr(), len) };
+        assert_eq!(outcome, AuthKeyFromC::Invalid);
+    }
+
+    #[test]
+    fn auth_key_from_c_max_length_at_boundary_is_enabled() {
+        // Exactly `MAX_AUTH_KEY_LEN = 256` bytes — the upper
+        // bound. Pins an off-by-one defense: a check spelled
+        // `>` vs `>=` would regress this to `Invalid`.
+        let buf = vec![0xEEu8; sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN];
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "MAX_AUTH_KEY_LEN = 256 fits u32 trivially"
+        )]
+        let len = buf.len() as u32;
+        // SAFETY: Valid buffer of matching length.
+        let outcome = unsafe { auth_key_from_c(buf.as_ptr(), len) };
+        let AuthKeyFromC::Enabled(bytes) = outcome else {
+            unreachable!("expected Enabled at max length, got {outcome:?}");
+        };
+        assert_eq!(bytes.len(), sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN);
+        assert_eq!(bytes[0], 0xEE);
     }
 
     #[test]
@@ -1203,6 +1406,8 @@ mod tests {
             initial_bias_tee: false,
             initial_direct_sampling: 0,
             listener_cap: 0,
+            auth_key: std::ptr::null(),
+            auth_key_len: 0,
         };
         let mut handle: *mut SdrRtlTcpServer = std::ptr::null_mut();
         let rc = unsafe { sdr_rtltcp_server_start(&raw const opts, &raw mut handle) };

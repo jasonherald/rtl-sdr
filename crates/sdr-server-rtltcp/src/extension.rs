@@ -73,11 +73,56 @@ pub const CLIENT_HELLO_LEN: usize = 8;
 /// Serialized size of [`ServerExtension`] on the wire.
 pub const SERVER_EXTENSION_LEN: usize = 8;
 
-/// Current protocol schema version for both hello and response.
-/// Bumped only on breaking layout changes — adding codecs or
-/// status codes is additive and doesn't require a version bump
-/// because the over-the-wire bytes keep their positions.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Protocol schema version **1** — the original (#307) shape.
+/// Callers that only opt into compression or role (#392) / takeover
+/// (#393) emit this version: the features are additive within the
+/// same 8-byte hello layout and pre-auth servers handle them
+/// without knowing about `FLAG_HAS_AUTH` or the
+/// `AuthKeyMessage` follow-up.
+pub const PROTOCOL_VERSION_V1: u8 = 1;
+
+/// Protocol schema version **2** — introduced in #394 for
+/// pre-shared-key auth. Clients that set [`FLAG_HAS_AUTH`] MUST
+/// emit this version so pre-v2 servers reject the hello cleanly
+/// at parse time rather than accepting it and then reading the
+/// queued `AuthKeyMessage` bytes as garbage legacy commands. The
+/// wire layout is byte-for-byte identical to v1; the version
+/// field is the gate, not a different shape. Per `CodeRabbit`
+/// round 1 on PR #405.
+pub const PROTOCOL_VERSION_V2: u8 = 2;
+
+/// Newest protocol schema version this crate emits. Clients that
+/// need the latest features (auth) write this. Clients that don't
+/// — compression-only, takeover-only, or plain — write
+/// [`PROTOCOL_VERSION_V1`] to stay backward-compatible with
+/// older servers. Bumping this is a breaking wire change, so it
+/// happens at well-known sub-issue boundaries.
+pub const PROTOCOL_VERSION: u8 = PROTOCOL_VERSION_V2;
+
+/// Versions this crate accepts on parse paths
+/// ([`ClientHello::from_bytes`], [`ServerExtension::from_bytes`]).
+/// Widens as new versions are introduced so old peers continue to
+/// interoperate with new peers for the feature subset they share.
+/// A v1 client talking to a v2 server sends a v1 hello, server
+/// accepts (this array includes v1), server echoes v1 on the
+/// response. Per `CodeRabbit` round 1 on PR #405.
+pub const SUPPORTED_VERSIONS: &[u8] = &[PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2];
+
+/// Pick the minimum-viable protocol version for a hello that
+/// carries the given flags. Clients use this helper so they only
+/// bump the version when a feature actually requires it —
+/// compression-only / takeover-only hellos stay v1 (backward-
+/// compat with pre-#394 servers); auth-bearing hellos go v2
+/// (pre-#394 servers reject cleanly at parse time). Per
+/// `CodeRabbit` round 1 on PR #405.
+#[must_use]
+pub fn required_protocol_version(flags: u8) -> u8 {
+    if flags & FLAG_HAS_AUTH != 0 {
+        PROTOCOL_VERSION_V2
+    } else {
+        PROTOCOL_VERSION_V1
+    }
+}
 
 /// Role a client is requesting (or that the server granted).
 /// Reserved values — #307 only ever uses [`Self::Control`]; #392
@@ -178,14 +223,23 @@ pub struct ClientHello {
 }
 
 /// Flag bit indicating the client wants to kick the current
-/// controller if the slot is occupied. Reserved for #393.
+/// controller if the slot is occupied. #393.
 pub const FLAG_REQUEST_TAKEOVER: u8 = 1 << 0;
+
+/// Flag bit indicating the client is sending an
+/// [`AuthKeyMessage`] immediately after the hello. Servers that
+/// require auth (#394) parse the key from the hello stream
+/// without waiting for an `AuthRequired` round-trip. Clients
+/// that don't have an auth key leave this clear — the server
+/// will reply with `status=AuthRequired` (for auth-enabled
+/// servers) and the client follows up with the key then.
+pub const FLAG_HAS_AUTH: u8 = 1 << 1;
 
 /// Full [`ClientHello::flags`] value for the "no flags set" case —
 /// the #307 common path, where the client isn't requesting a
-/// takeover and has no other bits to assert. Named constant so
-/// callers don't litter the codebase with bare `0` literals that
-/// silently mean "don't set any flag bit".
+/// takeover, not carrying auth, and has no other bits to assert.
+/// Named constant so callers don't litter the codebase with bare
+/// `0` literals that silently mean "don't set any flag bit".
 pub const CLIENT_HELLO_FLAGS_NONE: u8 = 0;
 
 impl ClientHello {
@@ -202,23 +256,29 @@ impl ClientHello {
     }
 
     /// Parse from its 8-byte wire representation. Returns `None`
-    /// if the magic doesn't match, the schema version doesn't
-    /// match [`PROTOCOL_VERSION`], or the role byte is unknown.
+    /// if the magic doesn't match, the schema version isn't in
+    /// [`SUPPORTED_VERSIONS`], or the role byte is unknown.
     /// Callers surface `None` as a protocol error and drop the
     /// client — letting a peer built for a future wire layout
     /// through would cause silent mis-negotiation rather than a
-    /// clean version break. Per CodeRabbit round 3 on PR #399.
+    /// clean version break.
+    ///
+    /// Version gate widened from the #399-era strict `==
+    /// PROTOCOL_VERSION` check to accept any member of
+    /// `SUPPORTED_VERSIONS`. Ensures pre-#394 clients emitting
+    /// v1 hellos interoperate with this crate's v2-era servers:
+    /// v1 is still a first-class parse result, only the wire
+    /// layout stayed identical and the flag byte's
+    /// `FLAG_HAS_AUTH` is only meaningful when `version ==
+    /// PROTOCOL_VERSION_V2`. Per `CodeRabbit` round 3 on PR #399
+    /// (initial strict gate) + round 1 on PR #405 (widen for
+    /// multi-version support).
     #[must_use]
     pub fn from_bytes(bytes: &[u8; CLIENT_HELLO_LEN]) -> Option<Self> {
         if bytes[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
             return None;
         }
-        // Version gate is strict: peers built against a newer
-        // layout must be rejected, not silently parsed as v1.
-        // If we ever bump PROTOCOL_VERSION we'll add a wider
-        // accept-set here (e.g., `matches!(bytes[7], 1 | 2)`)
-        // once both sides of the upgrade have shipped.
-        if bytes[7] != PROTOCOL_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&bytes[7]) {
             return None;
         }
         let role = Role::from_wire(bytes[5])?;
@@ -235,7 +295,159 @@ impl ClientHello {
     pub fn request_takeover(self) -> bool {
         self.flags & FLAG_REQUEST_TAKEOVER != 0
     }
+
+    /// Convenience: does the caller's flags byte announce that an
+    /// [`AuthKeyMessage`] is being sent immediately after this
+    /// hello? #394.
+    #[must_use]
+    pub fn has_auth(self) -> bool {
+        self.flags & FLAG_HAS_AUTH != 0
+    }
 }
+
+/// 4-byte magic identifying an [`AuthKeyMessage`] on the wire.
+/// Chosen to be distinct from [`EXTENSION_MAGIC`] (`RTLX`) so the
+/// server can unambiguously tell whether an incoming message is
+/// a hello follow-up or stray protocol garbage. First byte is
+/// `'R' = 0x52` (same as RTLX) — doesn't matter here since
+/// auth-key messages are only read AFTER a hello, never on a
+/// fresh connection. #394.
+pub const AUTH_KEY_MAGIC: [u8; 4] = *b"RTKA";
+
+/// Maximum length in bytes of an auth key. The issue spec caps it
+/// at 256 and the wire format uses `u16` BE for the length, so
+/// values beyond this would overflow the signaled size. 32-byte
+/// URL-safe base64 (the server-generated default) encodes to
+/// ~43 chars; 256 leaves plenty of headroom for user-chosen
+/// phrases, while staying small enough that the message fits in
+/// one TCP segment on every path MTU we care about. #394.
+pub const MAX_AUTH_KEY_LEN: usize = 256;
+
+/// Serialized size of the fixed [`AuthKeyMessage`] header prefix
+/// (magic + length field). The total on-wire size is this plus
+/// the key bytes themselves. Named so `sniff_auth_key` can
+/// `read_exact(AUTH_KEY_HEADER_LEN)` without a magic number.
+pub const AUTH_KEY_HEADER_LEN: usize = 4 + 2;
+
+/// Maximum total on-wire size of an [`AuthKeyMessage`] — header
+/// plus a [`MAX_AUTH_KEY_LEN`]-byte key. Buffer size hint for
+/// server-side reads; values beyond this are a protocol error.
+pub const MAX_AUTH_KEY_MESSAGE_LEN: usize = AUTH_KEY_HEADER_LEN + MAX_AUTH_KEY_LEN;
+
+/// Client → server auth-key follow-up. Sent immediately after a
+/// [`ClientHello`] that set the [`FLAG_HAS_AUTH`] bit, or in
+/// response to a [`Status::AuthRequired`] server message. The
+/// server validates the key using a constant-time compare and
+/// either proceeds to the normal role-admission flow (on match)
+/// or closes the connection with [`Status::AuthFailed`] (on
+/// mismatch). #394.
+///
+/// # Wire layout
+///
+/// ```text
+/// off  size    field
+/// 0    4       magic = "RTKA"
+/// 4    2       key_len (u16 BE)  — in range 1..=MAX_AUTH_KEY_LEN
+/// 6    key_len key bytes         — raw, no encoding
+/// ```
+///
+/// Length is big-endian for consistency with
+/// `sdr_server_rtltcp::protocol` (upstream `rtl_tcp.c` uses BE
+/// for the 4-byte param in its 5-byte command frames).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthKeyMessage {
+    /// Raw key bytes. Length is signaled by the on-wire `key_len`
+    /// field; the crate enforces `1..=MAX_AUTH_KEY_LEN` at parse
+    /// time. Not a `String` because auth keys aren't required to
+    /// be valid UTF-8 — the canonical server-generated form is
+    /// URL-safe base64, but user-supplied keys might be hex,
+    /// ASCII passphrases, or arbitrary bytes.
+    pub key: Vec<u8>,
+}
+
+impl AuthKeyMessage {
+    /// Serialize to its `6 + key.len()` byte wire representation.
+    /// Returns `None` when `key.is_empty()` (auth keys must carry
+    /// at least one byte; zero-length keys would be trivially
+    /// matched by the empty-string-matches-empty-string case and
+    /// defeat the auth gate) or `key.len() > MAX_AUTH_KEY_LEN`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        if self.key.is_empty() || self.key.len() > MAX_AUTH_KEY_LEN {
+            return None;
+        }
+        let mut out = Vec::with_capacity(AUTH_KEY_HEADER_LEN + self.key.len());
+        out.extend_from_slice(&AUTH_KEY_MAGIC);
+        // `self.key.len() <= MAX_AUTH_KEY_LEN (256) < u16::MAX` so
+        // the `as u16` cast is lossless. Guarded by the bounds
+        // check above.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "key length bounded by MAX_AUTH_KEY_LEN (256)"
+        )]
+        let len = self.key.len() as u16;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&self.key);
+        Some(out)
+    }
+
+    /// Parse from a byte slice. Returns `None` on:
+    /// - slice shorter than `AUTH_KEY_HEADER_LEN`
+    /// - bad magic (not `"RTKA"`)
+    /// - `key_len == 0` (empty keys rejected per `to_bytes`)
+    /// - `key_len > MAX_AUTH_KEY_LEN`
+    /// - slice length doesn't match `header + key_len`
+    ///
+    /// The caller is responsible for having read exactly the
+    /// right number of bytes — servers should first `read_exact`
+    /// the 6-byte header to decode `key_len`, then `read_exact`
+    /// that many more bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < AUTH_KEY_HEADER_LEN {
+            return None;
+        }
+        if bytes[..AUTH_KEY_MAGIC.len()] != AUTH_KEY_MAGIC {
+            return None;
+        }
+        let key_len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        if key_len == 0 || key_len > MAX_AUTH_KEY_LEN {
+            return None;
+        }
+        if bytes.len() != AUTH_KEY_HEADER_LEN + key_len {
+            return None;
+        }
+        Some(Self {
+            key: bytes[AUTH_KEY_HEADER_LEN..].to_vec(),
+        })
+    }
+
+    /// Decode just the `key_len` field from the header bytes.
+    /// Returns `None` on bad magic or out-of-range length.
+    /// Servers call this after `read_exact(6)` to know how many
+    /// more bytes to read before calling [`Self::from_bytes`] on
+    /// the full buffer.
+    #[must_use]
+    pub fn parse_header_len(header: &[u8; AUTH_KEY_HEADER_LEN]) -> Option<u16> {
+        if header[..AUTH_KEY_MAGIC.len()] != AUTH_KEY_MAGIC {
+            return None;
+        }
+        let len = u16::from_be_bytes([header[4], header[5]]);
+        let len_usize = len as usize;
+        if len_usize == 0 || len_usize > MAX_AUTH_KEY_LEN {
+            return None;
+        }
+        Some(len)
+    }
+}
+
+/// How long the server waits for an [`AuthKeyMessage`] follow-up
+/// after sending [`Status::AuthRequired`] to a client that didn't
+/// set [`FLAG_HAS_AUTH`] on its hello. 5 seconds matches the
+/// issue spec and is long enough that a UI-driven "paste the
+/// key" flow can land within the window, but short enough that a
+/// silent-client DOS can't wedge the accept thread. #394.
+pub const AUTH_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Server → client extension response — 8 bytes on the wire,
 /// fixed layout. Written immediately after the legacy
@@ -273,21 +485,20 @@ impl ServerExtension {
     }
 
     /// Parse from its 8-byte wire representation. Returns `None`
-    /// when the magic doesn't match, the schema version doesn't
-    /// match [`PROTOCOL_VERSION`], or any enum-typed byte is
-    /// unknown. Callers surface `None` as a protocol error and
-    /// drop the connection — a peer built for a future wire
-    /// layout should trigger a clean version break rather than
-    /// silent mis-negotiation as v1. Per CodeRabbit round 3 on
-    /// PR #399.
+    /// when the magic doesn't match, the schema version isn't in
+    /// [`SUPPORTED_VERSIONS`], or any enum-typed byte is unknown.
+    /// Callers surface `None` as a protocol error and drop the
+    /// connection — a peer built for a future wire layout should
+    /// trigger a clean version break rather than silent mis-
+    /// negotiation. Per `CodeRabbit` round 3 on PR #399 (initial
+    /// strict gate) + round 1 on PR #405 (widen for
+    /// multi-version support).
     #[must_use]
     pub fn from_bytes(bytes: &[u8; SERVER_EXTENSION_LEN]) -> Option<Self> {
         if bytes[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
             return None;
         }
-        // Strict version gate — see the matching comment in
-        // `ClientHello::from_bytes`.
-        if bytes[7] != PROTOCOL_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&bytes[7]) {
             return None;
         }
         let codec = Codec::from_wire(bytes[4])?;
@@ -348,18 +559,81 @@ mod tests {
 
     #[test]
     fn client_hello_rejects_unknown_version() {
-        // Regression test for CodeRabbit round 3 on PR #399: a
-        // future peer that bumps the wire layout must be rejected
-        // so we don't silently mis-negotiate it as v1. Otherwise
-        // `PROTOCOL_VERSION` is dead metadata and a clean protocol
-        // break turns into a subtle runtime bug.
+        // Regression test for `CodeRabbit` round 3 on PR #399:
+        // a future peer that bumps the wire layout must be
+        // rejected so we don't silently mis-negotiate it as v1.
+        // Updated for PR #405: supported set is now {v1, v2}, so
+        // the first rejected value is v3. Version byte zero is
+        // also rejected (guards against uninitialized struct
+        // slipping through).
         let mut bytes = [0u8; CLIENT_HELLO_LEN];
         bytes[..4].copy_from_slice(&EXTENSION_MAGIC);
         bytes[4] = CodecMask::NONE_ONLY.to_wire();
         bytes[5] = Role::Control.to_wire();
         bytes[6] = 0;
-        bytes[7] = PROTOCOL_VERSION.wrapping_add(1);
+        // v3 is not in SUPPORTED_VERSIONS → rejected.
+        bytes[7] = PROTOCOL_VERSION_V2 + 1;
         assert!(ClientHello::from_bytes(&bytes).is_none());
+        // v0 is the uninitialized-struct sentinel → rejected.
+        bytes[7] = 0;
+        assert!(ClientHello::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn client_hello_accepts_both_supported_versions() {
+        // **Regression test for `CodeRabbit` round 1 on PR #405.**
+        // The version gate widened from strict `== PROTOCOL_VERSION`
+        // to `SUPPORTED_VERSIONS.contains(..)` so pre-#394 v1
+        // clients can still hand a hello to a post-#394 v2 server
+        // without the server rejecting them. Pins both members
+        // of the supported set.
+        let base = ClientHello {
+            codec_mask: CodecMask::NONE_ONLY,
+            role: Role::Control,
+            flags: CLIENT_HELLO_FLAGS_NONE,
+            version: PROTOCOL_VERSION_V1,
+        };
+        let v1_bytes = base.to_bytes();
+        assert_eq!(
+            ClientHello::from_bytes(&v1_bytes).map(|h| h.version),
+            Some(PROTOCOL_VERSION_V1),
+            "v1 hello must be accepted for pre-#394 client back-compat"
+        );
+
+        let v2 = ClientHello {
+            version: PROTOCOL_VERSION_V2,
+            ..base
+        };
+        let v2_bytes = v2.to_bytes();
+        assert_eq!(
+            ClientHello::from_bytes(&v2_bytes).map(|h| h.version),
+            Some(PROTOCOL_VERSION_V2),
+            "v2 hello must be accepted for #394-aware clients"
+        );
+    }
+
+    #[test]
+    fn required_protocol_version_picks_minimum_viable() {
+        // Helper contract: only bump to v2 when the hello
+        // carries auth. Plain / compression / takeover hellos
+        // stay v1 so pre-#394 servers continue to accept them.
+        assert_eq!(
+            required_protocol_version(CLIENT_HELLO_FLAGS_NONE),
+            PROTOCOL_VERSION_V1
+        );
+        assert_eq!(
+            required_protocol_version(FLAG_REQUEST_TAKEOVER),
+            PROTOCOL_VERSION_V1
+        );
+        assert_eq!(
+            required_protocol_version(FLAG_HAS_AUTH),
+            PROTOCOL_VERSION_V2
+        );
+        assert_eq!(
+            required_protocol_version(FLAG_HAS_AUTH | FLAG_REQUEST_TAKEOVER),
+            PROTOCOL_VERSION_V2,
+            "takeover + auth together still needs v2 (any auth bit forces v2)"
+        );
     }
 
     #[test]
@@ -414,7 +688,8 @@ mod tests {
         bytes[4] = Codec::None.to_wire();
         bytes[5] = Role::Control.to_wire();
         bytes[6] = Status::Ok.to_wire();
-        bytes[7] = PROTOCOL_VERSION.wrapping_add(1);
+        // v3 is outside SUPPORTED_VERSIONS → rejected.
+        bytes[7] = PROTOCOL_VERSION_V2 + 1;
         assert!(ServerExtension::from_bytes(&bytes).is_none());
     }
 
@@ -479,5 +754,161 @@ mod tests {
         // Documented opcodes are 0x01..=0x0E (per rtl_tcp.c); our
         // magic's first byte sits well above that range.
         assert!(EXTENSION_MAGIC[0] > 0x0E);
+    }
+
+    // ============================================================
+    // AuthKeyMessage (#394) wire-format tests.
+    // ============================================================
+
+    #[test]
+    fn auth_key_message_round_trip() {
+        // Minimum viable auth key — a single byte. Exercises the
+        // length-field encoding + the header + key concatenation.
+        let msg = AuthKeyMessage { key: vec![0x42] };
+        let bytes = msg.to_bytes().expect("single-byte key serializes");
+        assert_eq!(bytes.len(), AUTH_KEY_HEADER_LEN + 1);
+        assert_eq!(&bytes[..4], &AUTH_KEY_MAGIC);
+        assert_eq!(&bytes[4..6], &1u16.to_be_bytes());
+        assert_eq!(bytes[6], 0x42);
+        assert_eq!(AuthKeyMessage::from_bytes(&bytes), Some(msg));
+    }
+
+    #[test]
+    fn auth_key_message_round_trip_full_length() {
+        // 256-byte key (the max) — pins that the u16 length field
+        // encodes correctly at the upper bound and `from_bytes`
+        // accepts it. Regression guard against an off-by-one that
+        // rejects exactly-MAX keys.
+        let key: Vec<u8> = (0..MAX_AUTH_KEY_LEN).map(|i| i as u8).collect();
+        let msg = AuthKeyMessage { key: key.clone() };
+        let bytes = msg.to_bytes().expect("max-length key serializes");
+        assert_eq!(bytes.len(), AUTH_KEY_HEADER_LEN + MAX_AUTH_KEY_LEN);
+        let len_field = u16::from_be_bytes([bytes[4], bytes[5]]);
+        assert_eq!(len_field as usize, MAX_AUTH_KEY_LEN);
+        assert_eq!(AuthKeyMessage::from_bytes(&bytes), Some(msg));
+    }
+
+    #[test]
+    fn auth_key_message_empty_key_rejected_on_encode() {
+        // Zero-length key would be trivially matched by an empty
+        // expected key on the server side — defeats the auth gate.
+        // Reject at serialize time.
+        let msg = AuthKeyMessage { key: vec![] };
+        assert!(msg.to_bytes().is_none());
+    }
+
+    #[test]
+    fn auth_key_message_over_max_rejected_on_encode() {
+        // Anything > MAX_AUTH_KEY_LEN can't be expressed in the
+        // u16 length field's valid range (we cap below u16::MAX so
+        // a malicious server can't allocate ~64 KiB per handshake).
+        let msg = AuthKeyMessage {
+            key: vec![0u8; MAX_AUTH_KEY_LEN + 1],
+        };
+        assert!(msg.to_bytes().is_none());
+    }
+
+    #[test]
+    fn auth_key_message_rejects_bad_magic() {
+        let mut bytes = vec![0x00, 0x01, 0x02, 0x03]; // not RTKA
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.push(0x42);
+        assert!(AuthKeyMessage::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn auth_key_message_rejects_zero_length() {
+        let mut bytes = AUTH_KEY_MAGIC.to_vec();
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        // No trailing bytes — slice length matches header but the
+        // length field is 0.
+        assert!(AuthKeyMessage::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn auth_key_message_rejects_length_mismatch() {
+        // Header says 4 bytes but only 2 follow — truncated on
+        // the wire. `from_bytes` requires the full message to
+        // have been read; servers that decode incrementally must
+        // `read_exact(header.key_len)` after parsing the header.
+        let mut bytes = AUTH_KEY_MAGIC.to_vec();
+        bytes.extend_from_slice(&4u16.to_be_bytes());
+        bytes.extend_from_slice(&[0x01, 0x02]);
+        assert!(AuthKeyMessage::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn auth_key_message_parse_header_len_decodes_valid_range() {
+        let mut header = [0u8; AUTH_KEY_HEADER_LEN];
+        header[..4].copy_from_slice(&AUTH_KEY_MAGIC);
+        header[4..6].copy_from_slice(&42u16.to_be_bytes());
+        assert_eq!(AuthKeyMessage::parse_header_len(&header), Some(42));
+    }
+
+    #[test]
+    fn auth_key_message_parse_header_len_rejects_zero_and_overlong() {
+        let mut header = [0u8; AUTH_KEY_HEADER_LEN];
+        header[..4].copy_from_slice(&AUTH_KEY_MAGIC);
+        // Zero length.
+        header[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert!(AuthKeyMessage::parse_header_len(&header).is_none());
+        // Length exceeds MAX.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test-only overflow synthesis, caller check is the point"
+        )]
+        let overlong = (MAX_AUTH_KEY_LEN + 1) as u16;
+        header[4..6].copy_from_slice(&overlong.to_be_bytes());
+        assert!(AuthKeyMessage::parse_header_len(&header).is_none());
+    }
+
+    #[test]
+    fn client_hello_has_auth_flag_helper() {
+        let with_auth = ClientHello {
+            codec_mask: CodecMask::NONE_ONLY,
+            role: Role::Control,
+            flags: FLAG_HAS_AUTH,
+            version: PROTOCOL_VERSION,
+        };
+        assert!(with_auth.has_auth());
+        assert!(!with_auth.request_takeover());
+
+        // Flags are additive — takeover + auth together.
+        let both = ClientHello {
+            flags: FLAG_HAS_AUTH | FLAG_REQUEST_TAKEOVER,
+            ..with_auth
+        };
+        assert!(both.has_auth());
+        assert!(both.request_takeover());
+
+        let without_auth = ClientHello {
+            flags: 0,
+            ..with_auth
+        };
+        assert!(!without_auth.has_auth());
+    }
+
+    #[test]
+    fn flag_bits_are_distinct() {
+        // Defense-in-depth: if someone ever adds a third flag bit
+        // and accidentally collides with an existing one, this
+        // test trips. Each bit must be uniquely assigned.
+        assert_eq!(FLAG_REQUEST_TAKEOVER & FLAG_HAS_AUTH, 0);
+        assert_ne!(FLAG_REQUEST_TAKEOVER, 0);
+        assert_ne!(FLAG_HAS_AUTH, 0);
+    }
+
+    #[test]
+    fn auth_key_magic_first_byte_distinct_from_legacy_opcodes() {
+        // `RTKA`'s first byte is 'R' (0x52), same as
+        // EXTENSION_MAGIC. That's fine here because an
+        // AuthKeyMessage is only ever read AFTER a hello, never
+        // as the first bytes on a fresh connection, so there's
+        // no legacy-opcode collision path. Documenting this as
+        // a test so a future refactor that re-reads AUTH_KEY_MAGIC
+        // at connection-start would trip the >0x0E assertion
+        // and the reviewer knows to re-examine the flow.
+        assert_eq!(AUTH_KEY_MAGIC[0], b'R');
+        assert!(AUTH_KEY_MAGIC[0] > 0x0E);
     }
 }

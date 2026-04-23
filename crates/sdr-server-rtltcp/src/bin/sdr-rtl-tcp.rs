@@ -116,6 +116,15 @@ fn usage(exit_code: i32) -> ! {
          (default: {DEFAULT_LISTENER_CAP}; the single Control client is \
          separate)"
     );
+    let _ = writeln!(
+        out,
+        "    --auth-key <HEX>  Enable pre-shared-key auth (#394). \
+         HEX is the key bytes as an even-length hex string (e.g. \
+         `openssl rand -hex 32`). Clients must present the same \
+         key at handshake; wrong / missing keys are denied. \
+         Default: disabled. LAN-grade trust model only — wrap in \
+         SSH/WG for real confidentiality."
+    );
     let _ = writeln!(out, "    -h, --help   Show this help");
     std::process::exit(exit_code);
 }
@@ -365,11 +374,69 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<(ServerConfig, DiscoveryOptio
                 config.listener_cap = v.parse().map_err(|_| ParseError)?;
                 i += 2;
             }
+            "--auth-key" => {
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
+                config.auth_key = Some(parse_auth_key_hex(v)?);
+                i += 2;
+            }
             _ => return Err(ParseError),
         }
     }
 
     Ok((config, discovery))
+}
+
+/// Decode a hex-encoded auth key from the `--auth-key` CLI arg.
+/// Accepts even-length hex (e.g. `0a1b2c...`) and produces the raw
+/// bytes. Rejects odd length, non-hex chars, empty input, or keys
+/// longer than [`sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN`].
+/// Hex chosen over base64 for CLI parsing — one fewer alphabet to
+/// remember, no URL-safety concerns, easy to generate with
+/// `openssl rand -hex 32`. #394.
+fn parse_auth_key_hex(s: &str) -> Result<Vec<u8>, ParseError> {
+    /// Number of hex chars per raw byte — two. Pulled out so the
+    /// `chunks_exact` call reads intent-first instead of bare `2`.
+    const HEX_CHARS_PER_BYTE: usize = 2;
+
+    // Reject non-ASCII BEFORE any byte-index slicing. A 4-byte
+    // emoji like "💩" passes `len().is_multiple_of(2)` but
+    // indexing `&s[i..i+2]` on a UTF-8 str would panic at the
+    // non-char-boundary offset. `is_ascii()` fast-paths on the
+    // first non-ASCII byte without a full scan. Per `CodeRabbit`
+    // round 1 on PR #405.
+    if s.is_empty() || !s.is_ascii() || !s.len().is_multiple_of(HEX_CHARS_PER_BYTE) {
+        return Err(ParseError);
+    }
+    // With ASCII confirmed, the string is also a valid byte
+    // slice — `chunks_exact(2)` walks pairs without str-slicing
+    // boundary concerns. Per-char hex-digit validation keeps
+    // the error surface narrow (same "bad input" signal for
+    // "not hex" and "not ASCII").
+    let bytes: Result<Vec<u8>, ParseError> = s
+        .as_bytes()
+        .chunks_exact(HEX_CHARS_PER_BYTE)
+        .map(|pair| {
+            let hi = char::from(pair[0]).to_digit(16).ok_or(ParseError)?;
+            let lo = char::from(pair[1]).to_digit(16).ok_or(ParseError)?;
+            // `to_digit(16)` only returns 0..=15, so `hi << 4 | lo`
+            // fits in u8. The `as u8` is lossless here.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "to_digit(16) bounds hi and lo to 0..=15"
+            )]
+            Ok(((hi << 4) | lo) as u8)
+        })
+        .collect();
+    let bytes = bytes?;
+    // Upper bound matches the wire-format `MAX_AUTH_KEY_LEN`. A
+    // CLI-supplied key beyond that would fail at
+    // `AuthKeyMessage::to_bytes` anyway; reject here so the
+    // diagnostic lands as a clean argv-parse error rather than a
+    // runtime handshake failure.
+    if bytes.len() > sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN {
+        return Err(ParseError);
+    }
+    Ok(bytes)
 }
 
 /// Register the running server in mDNS so clients can discover it
@@ -669,6 +736,94 @@ mod tests {
         let args = ["--listener-cap", "25"];
         let (cfg, _disc) = parse_args(&args).unwrap();
         assert_eq!(cfg.listener_cap, 25);
+    }
+
+    #[test]
+    fn parse_args_auth_key_defaults_to_none() {
+        let (cfg, _disc) = parse_args::<&str>(&[]).unwrap();
+        assert!(cfg.auth_key.is_none());
+    }
+
+    #[test]
+    fn parse_args_auth_key_decodes_valid_hex() {
+        // 8-byte key in hex form → 16 hex chars.
+        let args = ["--auth-key", "deadbeef01020304"];
+        let (cfg, _disc) = parse_args(&args).unwrap();
+        assert_eq!(
+            cfg.auth_key,
+            Some(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04])
+        );
+    }
+
+    #[test]
+    fn parse_args_auth_key_decodes_32_byte_default() {
+        // 32-byte key (the default `generate_random_auth_key`
+        // shape) → 64 hex chars. Pins that the CLI parser
+        // handles the canonical server-generated length, which
+        // is what operators will paste from the UI (once #395
+        // ships) or `openssl rand -hex 32`.
+        let mut hex = String::with_capacity(64);
+        {
+            use std::fmt::Write;
+            for i in 0..32u32 {
+                write!(&mut hex, "{:02x}", (i * 7) % 256).unwrap();
+            }
+        }
+        let args = ["--auth-key", hex.as_str()];
+        let (cfg, _disc) = parse_args(&args).unwrap();
+        let key = cfg.auth_key.unwrap();
+        assert_eq!(key.len(), 32);
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x07);
+        assert_eq!(key[2], 0x0E);
+    }
+
+    #[test]
+    fn parse_args_auth_key_rejects_odd_length_hex() {
+        // Odd-length hex can't round-trip to bytes — reject
+        // at argv-parse time rather than truncating silently.
+        let args = ["--auth-key", "abc"];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_auth_key_rejects_non_hex_chars() {
+        // 'z' isn't a valid hex digit.
+        let args = ["--auth-key", "zzzzzzzz"];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_auth_key_rejects_non_ascii() {
+        // **Regression test for `CodeRabbit` round 1 on PR #405.**
+        // Non-ASCII input must fail cleanly instead of panicking
+        // on UTF-8 byte-boundary slicing. 4-byte emojis like
+        // "💩" pass `len().is_multiple_of(2)` (`len() == 4`), so
+        // the early-exit length check alone wouldn't catch it;
+        // the `is_ascii()` guard in `parse_auth_key_hex` does.
+        let args = ["--auth-key", "💩"];
+        assert!(parse_args(&args).is_err());
+
+        // Mix of ASCII hex + non-ASCII also rejected.
+        let mixed_args = ["--auth-key", "ab💩cd"];
+        assert!(parse_args(&mixed_args).is_err());
+    }
+
+    #[test]
+    fn parse_args_auth_key_rejects_empty() {
+        let args = ["--auth-key", ""];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_auth_key_rejects_over_max_length() {
+        // MAX_AUTH_KEY_LEN = 256 bytes → 512 hex chars. Anything
+        // beyond that would fail at AuthKeyMessage serialization
+        // downstream; catch here so the error surfaces as a
+        // clean argv-parse fail.
+        let hex: String = "ab".repeat(sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN + 1);
+        let args = ["--auth-key", hex.as_str()];
+        assert!(parse_args(&args).is_err());
     }
 
     #[test]

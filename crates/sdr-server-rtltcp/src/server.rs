@@ -50,7 +50,8 @@ use crate::codec::{Codec, CodecMask, Encoder};
 use crate::dispatch::dispatch;
 use crate::error::ServerError;
 use crate::extension::{
-    CLIENT_HELLO_LEN, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension, Status,
+    AUTH_KEY_HEADER_LEN, AUTH_REPLY_TIMEOUT, AuthKeyMessage, CLIENT_HELLO_LEN, ClientHello,
+    EXTENSION_MAGIC, PROTOCOL_VERSION_V1, Role, ServerExtension, Status,
 };
 use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode};
 
@@ -171,6 +172,37 @@ pub struct ServerConfig {
     /// so the cap doesn't apply to them. Default:
     /// [`DEFAULT_LISTENER_CAP`]. #392.
     pub listener_cap: usize,
+
+    /// Pre-shared auth key. `None` disables the auth gate entirely
+    /// (default — matches the issue's "LAN-only trust model
+    /// continues to work as today"). When `Some(key)`, the server
+    /// validates every connecting client's [`AuthKeyMessage`]
+    /// against this value using a constant-time compare; clients
+    /// that don't produce a matching key are denied with
+    /// [`Status::AuthFailed`] and the connection is closed. Auth
+    /// runs BEFORE the role / listener-cap gate — an
+    /// unauthenticated client isn't even evaluated for role.
+    ///
+    /// Per-byte threat model: the key travels as cleartext over
+    /// the TCP connection. Fine for casual on-LAN cohabitants
+    /// and IoT-trust-zone separation; NOT suitable for WAN-grade
+    /// security. Deployments that need real confidentiality
+    /// should wrap the socket in SSH / WireGuard / Tailscale
+    /// first and use the PSK as a second layer. See #394 for the
+    /// full threat model discussion.
+    ///
+    /// Key length must be in `1..=crate::extension::MAX_AUTH_KEY_LEN`
+    /// (i.e., `1..=256`). [`Server::start`] validates the length
+    /// BEFORE binding the listener or opening the USB device and
+    /// returns [`ServerError::InvalidAuthKeyLength`] immediately
+    /// if the key is empty or oversize, so the operator sees a
+    /// single clear configuration error at startup rather than
+    /// every client failing at handshake time. Per `CodeRabbit`
+    /// round 2 on PR #405. #394.
+    ///
+    /// [`AuthKeyMessage`]: crate::extension::AuthKeyMessage
+    /// [`Status::AuthFailed`]: crate::extension::Status::AuthFailed
+    pub auth_key: Option<Vec<u8>>,
 }
 
 impl ServerConfig {
@@ -185,6 +217,7 @@ impl ServerConfig {
             buffer_capacity: DEFAULT_BUFFER_CAPACITY,
             compression: crate::codec::CodecMask::NONE_ONLY,
             listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: None,
         }
     }
 }
@@ -311,6 +344,25 @@ impl Server {
     /// thread. Dropping it signals shutdown and waits for both — plus
     /// any currently-connected clients — to exit cleanly.
     pub fn start(config: ServerConfig) -> Result<Self, ServerError> {
+        // Validate `auth_key` BEFORE bind or USB open so a bad
+        // config doesn't leave a half-initialized server + a
+        // claimed dongle. `ServerConfig` is public, so library
+        // callers can construct `Some(vec![])` or an oversize
+        // key directly (bypassing the FFI + wire-format guards).
+        // Catch that here rather than deferring to per-handshake
+        // failures — otherwise the server appears to start fine
+        // but every client gets rejected. Per `CodeRabbit`
+        // round 2 on PR #405.
+        if let Some(key) = &config.auth_key {
+            let max = crate::extension::MAX_AUTH_KEY_LEN;
+            if key.is_empty() || key.len() > max {
+                return Err(ServerError::InvalidAuthKeyLength {
+                    len: key.len(),
+                    max,
+                });
+            }
+        }
+
         // Bind first — surface port-in-use before touching the USB device
         // so we don't leave a dongle claimed after a failed bind.
         let listener = TcpListener::bind(config.bind).map_err(|e| {
@@ -377,6 +429,7 @@ impl Server {
             per_client_depth,
             config.compression,
             config.listener_cap,
+            config.auth_key.clone(),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -509,8 +562,32 @@ impl Server {
         if let Some(h) = self.accept_thread.take() {
             let _ = h.join();
         }
-        for h in self.registry.drain_worker_handles() {
-            let _ = h.join();
+        // Loop-drain: setup threads (post-PR #405 round 4) and
+        // the writer/command threads they spawn share the same
+        // registry bucket. A setup thread that's still inside
+        // `spawn_client_workers` when the FIRST drain runs will
+        // register its `writer_handle` + `command_handle` AFTER
+        // the drain returned — those late handles would never
+        // be joined under a single-pass drain, leaving the
+        // writer/command workers alive with their
+        // `Arc<Mutex<RtlSdrDevice>>` clones past the
+        // `has_stopped()` transition. Keep draining until the
+        // bucket stays empty across a full pass. Termination is
+        // guaranteed: the accept thread was joined first so no
+        // new setup threads can spawn; each live setup thread
+        // has a bounded lifetime (≤ `HELLO_SNIFF_TIMEOUT` +
+        // `AUTH_REPLY_TIMEOUT` ≈ 5.1 s) and registers its
+        // writer/command handles before exiting, so after at
+        // most one round of joins + drains the bucket converges
+        // to empty. Per `CodeRabbit` round 5 on PR #405.
+        loop {
+            let handles = self.registry.drain_worker_handles();
+            if handles.is_empty() {
+                break;
+            }
+            for h in handles {
+                let _ = h.join();
+            }
         }
         if let Some(h) = self.broadcaster_thread.take() {
             let _ = h.join();
@@ -605,6 +682,7 @@ fn spawn_accept_thread(
     per_client_buffer_depth: usize,
     compression: CodecMask,
     listener_cap: usize,
+    auth_key: Option<Vec<u8>>,
 ) -> std::io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
     thread::Builder::new()
@@ -619,16 +697,57 @@ fn spawn_accept_thread(
                             continue;
                         }
                         configure_client_socket(&stream);
-                        spawn_client_workers(
-                            stream,
-                            peer,
-                            device.clone(),
-                            registry.clone(),
-                            shutdown.clone(),
-                            per_client_buffer_depth,
-                            compression,
-                            listener_cap,
-                        );
+                        // Dispatch the blocking handshake (sniff hello +
+                        // optional auth follow-up + role admission) to a
+                        // short-lived per-connection setup thread. Holding
+                        // it inline would let one stalled RTLX client
+                        // serialize unrelated accepts for up to
+                        // `HELLO_SNIFF_TIMEOUT` (0.1 s) + `AUTH_REPLY_TIMEOUT`
+                        // (5 s) — a slow-peer DOS against the listener
+                        // backlog. Per `CodeRabbit` round 4 on PR #405.
+                        //
+                        // The setup thread runs to natural completion
+                        // regardless of shutdown: it either fails its
+                        // handshake (fast return, no registry entry) or
+                        // progresses to registering writer + command
+                        // handles and exits. We register its `JoinHandle`
+                        // on the same `register_worker_handle` bucket as
+                        // writer/command threads so `Server::drop`
+                        // joins it alongside them — bounded shutdown
+                        // latency of ≤ `HELLO_SNIFF_TIMEOUT` +
+                        // `AUTH_REPLY_TIMEOUT` per in-flight handshake.
+                        let setup_device = device.clone();
+                        let setup_registry = registry.clone();
+                        let setup_shutdown = shutdown.clone();
+                        let setup_auth_key = auth_key.clone();
+                        let setup_registry_for_register = registry.clone();
+                        match thread::Builder::new()
+                            .name(format!("rtl_tcp-setup-{}", peer.port()))
+                            .spawn(move || {
+                                spawn_client_workers(
+                                    stream,
+                                    peer,
+                                    setup_device,
+                                    setup_registry,
+                                    setup_shutdown,
+                                    per_client_buffer_depth,
+                                    compression,
+                                    listener_cap,
+                                    setup_auth_key,
+                                );
+                            }) {
+                            Ok(h) => {
+                                setup_registry_for_register.register_worker_handle(h);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    %peer,
+                                    %e,
+                                    "failed to spawn rtl_tcp setup thread — dropping client"
+                                );
+                                // `stream` drops here → bare TCP FIN.
+                            }
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -658,14 +777,25 @@ fn spawn_accept_thread(
 
 /// Do the handshake on a freshly-accepted socket, build a
 /// [`ClientSlot`], register it, and spawn this client's writer +
-/// command threads. Fire-and-forget — the accept thread doesn't wait
-/// for this client's workers; lifecycle is observed via the slot's
+/// command threads. Lifecycle is observed via the slot's
 /// disconnection flag.
+///
+/// **Runs on a per-connection setup thread**, not on the accept
+/// thread. The handshake includes two blocking reads —
+/// [`sniff_client_hello`] (bounded by `HELLO_SNIFF_TIMEOUT = 100 ms`)
+/// and, when auth is configured and the client didn't send
+/// `has_auth=true`, [`sniff_auth_key_message`] (bounded by
+/// [`AUTH_REPLY_TIMEOUT`] = 5 s). Holding these on the accept thread
+/// would let one stalled RTLX client serialize unrelated accepts for
+/// up to ~5.1 s and pressure the listener backlog. Per `CodeRabbit`
+/// round 4 on PR #405. #394.
 ///
 /// If the handshake fails at any step (sniff error, socket clone
 /// fails, header write fails, thread spawn fails), the client is
 /// silently dropped — no slot is registered, no stats are updated.
-/// The caller (accept thread) moves on to the next accept.
+/// The setup thread then exits; its `JoinHandle` is already
+/// registered with the `ClientRegistry` so `Server::drop` joins
+/// it alongside the per-client writer / command handles.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -682,6 +812,7 @@ fn spawn_client_workers(
     per_client_buffer_depth: usize,
     compression_offer: CodecMask,
     listener_cap: usize,
+    auth_key: Option<Vec<u8>>,
 ) {
     // Extended handshake (#307) — sniff the RTLX hello if the
     // client sent one. The outcome drives both codec negotiation
@@ -703,10 +834,11 @@ fn spawn_client_workers(
     //   - `negotiated_codec` is `None` for vanilla (always
     //     uncompressed); `Some(_)` for RTLX clients — the
     //     intersection of their mask and ours
-    let (hello_seen, requested_role, request_takeover, negotiated_codec) =
+    let (hello_seen, requested_role, request_takeover, has_auth, hello_version, negotiated_codec) =
         if let Some(hello) = &sniff_outcome {
             let codec = compression_offer.pick(hello.codec_mask);
             let takeover = hello.request_takeover();
+            let has_auth = hello.has_auth();
             tracing::info!(
                 %peer,
                 client_mask = hello.codec_mask.to_wire(),
@@ -714,9 +846,18 @@ fn spawn_client_workers(
                 chosen = %codec,
                 requested_role = ?hello.role,
                 request_takeover = takeover,
+                has_auth,
+                hello_version = hello.version,
                 "rtl_tcp extended-handshake negotiated"
             );
-            (true, hello.role, takeover, Some(codec))
+            (
+                true,
+                hello.role,
+                takeover,
+                has_auth,
+                hello.version,
+                Some(codec),
+            )
         } else {
             tracing::debug!(
                 %peer,
@@ -727,9 +868,185 @@ fn spawn_client_workers(
             // "request_takeover = false" — the existing Control
             // client (if any) is protected from vanilla-driven
             // displacement. Takeover is an explicit RTLX action.
-            (false, Role::Control, false, None)
+            // Same logic applies to `has_auth`: vanilla clients
+            // never carry an AuthKeyMessage follow-up, so `false`
+            // here routes the auth gate's vanilla+auth-required
+            // path to a bare TCP FIN (they can't authenticate).
+            // Vanilla clients never receive a `ServerExtension`
+            // either, so `hello_version` is nominal here — use
+            // `PROTOCOL_VERSION_V1` as a neutral default; it's
+            // never written to the wire on the vanilla path.
+            (
+                false,
+                Role::Control,
+                false,
+                false,
+                PROTOCOL_VERSION_V1,
+                None,
+            )
         };
     let codec = negotiated_codec.unwrap_or(Codec::None);
+
+    // Auth gate (#394). Runs BEFORE role admission — an
+    // unauthenticated client shouldn't even be evaluated for role
+    // because the wire response would leak server state (role
+    // grants or cap status) to an attacker probing the slot. The
+    // four outcomes:
+    //
+    //   - No auth required: skip entirely, fall through to role
+    //     admission as-is.
+    //   - Auth required + vanilla client: bare TCP FIN, no bytes.
+    //     Vanilla has no wire field to carry a key, so they can't
+    //     participate. Same signal as "server not there" from
+    //     the legacy client's POV.
+    //   - Auth required + RTLX + has_auth (eager): read the
+    //     follow-up `AuthKeyMessage` with a bounded timeout,
+    //     constant-time compare against the configured key.
+    //     - Match: continue to role admission.
+    //     - Mismatch / malformed / timeout / eof: send dongle_info_t
+    //       + `ServerExtension(status=AuthFailed)` and close.
+    //   - Auth required + RTLX + !has_auth (lazy, per #394 spec):
+    //     send dongle_info_t + `ServerExtension(status=AuthRequired)`
+    //     KEEPING THE SOCKET OPEN, then wait up to
+    //     `AUTH_REPLY_TIMEOUT` for the client to deliver an
+    //     `AuthKeyMessage` on the same connection. On match,
+    //     fall through to role admission; the granted path
+    //     then resends the ServerExtension with the actual role
+    //     status WITHOUT re-emitting dongle_info_t (the client
+    //     would misread it as a second handshake). On mismatch
+    //     / timeout / parse error, send a follow-up
+    //     `ServerExtension(status=AuthFailed)` (extension-only,
+    //     no second dongle_info_t) and close. Per `CodeRabbit`
+    //     round 3 on PR #405.
+    //
+    // If `has_auth` is set but auth isn't configured, we STILL
+    // read the AuthKeyMessage from the stream to keep the
+    // post-hello byte position in sync (the client doesn't know
+    // our config and sent the key based on its own); we just
+    // discard it without validation.
+    //
+    // `dongle_info_sent` threads through the rest of this function
+    // so the lazy path's initial dongle_info_t emission is visible
+    // to role admission (which must skip the duplicate send in
+    // both the granted and denied follow-up branches).
+    let mut dongle_info_sent = false;
+    if hello_seen && has_auth {
+        // Read the AuthKeyMessage follow-up regardless of whether
+        // auth is required — need to consume the bytes either way
+        // so the stream position stays correct.
+        let auth_result = sniff_auth_key_message(&stream);
+        match auth_result {
+            Ok(msg) => {
+                if let Some(expected) = auth_key.as_deref() {
+                    if !crate::auth::validate_auth_key(&msg.key, expected) {
+                        tracing::info!(
+                            %peer,
+                            "rtl_tcp auth key mismatch — denying client"
+                        );
+                        send_denied_response(
+                            &stream,
+                            peer,
+                            &device,
+                            Status::AuthFailed,
+                            hello_version,
+                        );
+                        return;
+                    }
+                    tracing::info!(%peer, "rtl_tcp auth key validated");
+                } else {
+                    // Client sent a key to a server that doesn't
+                    // require one — fine, just ignore it. Keeps
+                    // the wire-protocol compat flexible: clients
+                    // can always send has_auth=true without
+                    // knowing the server's config.
+                    tracing::debug!(
+                        %peer,
+                        "rtl_tcp client sent auth key but server doesn't require one — ignored"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::info!(
+                    %peer,
+                    %e,
+                    "rtl_tcp auth key follow-up unreadable — denying client"
+                );
+                if auth_key.is_some() {
+                    send_denied_response(&stream, peer, &device, Status::AuthFailed, hello_version);
+                }
+                // If auth wasn't required but the client promised
+                // a follow-up (has_auth=true) and didn't deliver,
+                // the stream position is wrong either way — drop.
+                return;
+            }
+        }
+    } else if let Some(expected) = auth_key.as_deref() {
+        // Client didn't set has_auth but the server requires auth.
+        if hello_seen {
+            // RTLX client — lazy path per #394 spec. Send
+            // dongle_info_t + `ServerExtension(AuthRequired)`
+            // and keep the socket open so a compliant client
+            // can reply with `AuthKeyMessage` on the same
+            // connection. The peer has
+            // `AUTH_REPLY_TIMEOUT` to deliver the key;
+            // `sniff_auth_key_message` enforces the bound with
+            // an absolute deadline. Per `CodeRabbit` round 3
+            // on PR #405.
+            tracing::info!(
+                %peer,
+                "rtl_tcp auth required but client didn't send key — sending AuthRequired (lazy path)"
+            );
+            send_denied_response(&stream, peer, &device, Status::AuthRequired, hello_version);
+            dongle_info_sent = true;
+
+            let auth_ok = match sniff_auth_key_message(&stream) {
+                Ok(msg) => {
+                    if crate::auth::validate_auth_key(&msg.key, expected) {
+                        tracing::info!(
+                            %peer,
+                            "rtl_tcp lazy auth key validated"
+                        );
+                        true
+                    } else {
+                        tracing::info!(
+                            %peer,
+                            "rtl_tcp lazy auth key mismatch — denying"
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    tracing::info!(
+                        %peer,
+                        %e,
+                        "rtl_tcp lazy auth follow-up unreadable — denying"
+                    );
+                    false
+                }
+            };
+            if !auth_ok {
+                // dongle_info_t already on the wire — send only
+                // the 8-byte `ServerExtension(AuthFailed)` so
+                // the client doesn't misread a duplicate header
+                // as a second handshake.
+                send_extension_only(&stream, peer, Status::AuthFailed, hello_version);
+                return;
+            }
+            // Match → fall through to role admission. The granted
+            // path below observes `dongle_info_sent = true` and
+            // skips the duplicate header write; any role-denial
+            // (ControllerBusy / ListenerCapReached) similarly
+            // switches to `send_extension_only`.
+        } else {
+            // Vanilla client: can't authenticate, so there's
+            // nothing meaningful to tell them. Bare TCP FIN.
+            tracing::info!(
+                %peer,
+                "rtl_tcp vanilla client denied — auth required"
+            );
+            return;
+        }
+    }
 
     // Allocate id + build slot with the requested role + channel.
     // The slot is not yet registered — `register_with_role` below
@@ -776,8 +1093,23 @@ fn spawn_client_workers(
             // signal for their "connection refused" UX and avoids
             // handing them a dongle_info_t they'd interpret as
             // admission.
+            //
+            // If the lazy auth path already emitted dongle_info_t
+            // (#394 round 3 on PR #405), send only the 8-byte
+            // ServerExtension follow-up — a duplicate header
+            // would desync the client's parser.
             if hello_seen {
-                send_denied_response(&stream, peer, &device, Status::ControllerBusy);
+                if dongle_info_sent {
+                    send_extension_only(&stream, peer, Status::ControllerBusy, hello_version);
+                } else {
+                    send_denied_response(
+                        &stream,
+                        peer,
+                        &device,
+                        Status::ControllerBusy,
+                        hello_version,
+                    );
+                }
             }
             return;
         }
@@ -799,7 +1131,17 @@ fn spawn_client_workers(
                 "vanilla clients should never land in ListenerCapReached"
             );
             if hello_seen {
-                send_denied_response(&stream, peer, &device, Status::ListenerCapReached);
+                if dongle_info_sent {
+                    send_extension_only(&stream, peer, Status::ListenerCapReached, hello_version);
+                } else {
+                    send_denied_response(
+                        &stream,
+                        peer,
+                        &device,
+                        Status::ListenerCapReached,
+                        hello_version,
+                    );
+                }
             }
             return;
         }
@@ -844,21 +1186,29 @@ fn spawn_client_workers(
     // Send the 12-byte dongle_info_t header (rtl_tcp.c:576-594).
     // Emitted for BOTH granted RTLX and granted vanilla — it's the
     // first thing any rtl_tcp client expects.
-    let header = {
-        let Ok(dev) = device.lock() else {
-            tracing::error!(%peer, "device mutex poisoned, aborting client");
+    //
+    // Lazy-auth (#394) skips this: the header was already emitted
+    // alongside the initial `ServerExtension(AuthRequired)`
+    // challenge, and writing it again would make the client
+    // mis-parse the second dongle_info_t as a second handshake.
+    // Per `CodeRabbit` round 3 on PR #405.
+    if !dongle_info_sent {
+        let header = {
+            let Ok(dev) = device.lock() else {
+                tracing::error!(%peer, "device mutex poisoned, aborting client");
+                registry.unwind_admission(&slot);
+                return;
+            };
+            DongleInfo {
+                tuner: TunerTypeCode::from(dev.tuner_type()),
+                gain_count: dev.tuner_gains().len() as u32,
+            }
+        };
+        if let Err(e) = writer.write_all(&header.to_bytes()) {
+            tracing::warn!(%peer, %e, "failed to send dongle_info_t — client gone");
             registry.unwind_admission(&slot);
             return;
-        };
-        DongleInfo {
-            tuner: TunerTypeCode::from(dev.tuner_type()),
-            gain_count: dev.tuner_gains().len() as u32,
         }
-    };
-    if let Err(e) = writer.write_all(&header.to_bytes()) {
-        tracing::warn!(%peer, %e, "failed to send dongle_info_t — client gone");
-        registry.unwind_admission(&slot);
-        return;
     }
 
     // RTLX clients additionally get the ServerExtension(granted)
@@ -870,7 +1220,11 @@ fn spawn_client_workers(
             codec,
             granted_role: Some(requested_role),
             status: Status::Ok,
-            version: PROTOCOL_VERSION,
+            // Echo the client's hello version on the response so
+            // v1 clients interoperate with this v2-era server
+            // without hitting the peer-side strict version gate.
+            // Per `CodeRabbit` round 1 on PR #405.
+            version: hello_version,
         };
         if let Err(e) = writer.write_all(&ext.to_bytes()) {
             tracing::warn!(%peer, %e, "failed to send RTLX server extension — client gone");
@@ -993,6 +1347,7 @@ fn send_denied_response(
     peer: SocketAddr,
     device: &Arc<Mutex<RtlSdrDevice>>,
     status: Status,
+    hello_version: u8,
 ) {
     let Ok(dev) = device.lock() else {
         tracing::warn!(%peer, "device mutex poisoned during denial response");
@@ -1029,13 +1384,67 @@ fn send_denied_response(
         codec: Codec::None,
         granted_role: None,
         status,
-        version: PROTOCOL_VERSION,
+        // Echo the client's hello version so v1 clients can
+        // parse this denial without tripping their strict
+        // version gate. Per `CodeRabbit` round 1 on PR #405.
+        version: hello_version,
     };
     if writer.write_all(&ext.to_bytes()).is_err() {
         tracing::debug!(
             %peer,
             ?status,
             "failed to send denial ServerExtension — client already gone"
+        );
+    }
+}
+
+/// Emit a follow-up `ServerExtension` (8 bytes) to an RTLX client
+/// that has already received `dongle_info_t` on this connection —
+/// i.e., the lazy #394 auth path sent `dongle_info_t +
+/// ServerExtension(AuthRequired)` as its challenge, and the
+/// outcome of the auth reply (and any downstream role-admission
+/// denial) must now be communicated WITHOUT re-emitting the
+/// header. Writing dongle_info_t twice would make the client's
+/// magic-peek misfire on the second handshake.
+///
+/// Used for `Status::AuthFailed` after a bad / missing lazy auth
+/// reply, and for role-admission denials
+/// (`Status::ControllerBusy`, `Status::ListenerCapReached`)
+/// that land AFTER the lazy path has already emitted
+/// `dongle_info_t`. Write failures downgrade to debug-level
+/// tracing because a refused-handshake peer often tears down the
+/// socket before our follow-up lands — noisy warn! would bury
+/// real signal. Per `CodeRabbit` round 3 on PR #405. #394.
+fn send_extension_only(stream: &TcpStream, peer: SocketAddr, status: Status, hello_version: u8) {
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                %peer,
+                %e,
+                "failed to clone stream for follow-up extension — closing without reply"
+            );
+            return;
+        }
+    };
+    let ext = ServerExtension {
+        // Neutral defaults — the client never proceeds to the IQ
+        // stream on a denial, and the follow-up is an
+        // informational status, not a codec negotiation.
+        codec: Codec::None,
+        granted_role: None,
+        status,
+        // Echo the client's hello version so v1 clients can
+        // parse this follow-up without tripping their strict
+        // version gate. Matches `send_denied_response`'s
+        // version-echo contract.
+        version: hello_version,
+    };
+    if writer.write_all(&ext.to_bytes()).is_err() {
+        tracing::debug!(
+            %peer,
+            ?status,
+            "failed to send follow-up ServerExtension — client already gone"
         );
     }
 }
@@ -1363,6 +1772,88 @@ fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHe
              malformed field)",
             )
         })
+}
+
+/// Read + parse an [`AuthKeyMessage`] from `stream` within an
+/// **absolute** [`AUTH_REPLY_TIMEOUT`] budget. Caller is
+/// responsible for having observed `hello.has_auth() == true`
+/// on the preceding hello — this helper assumes the auth message
+/// is the next thing on the wire. Two-phase read: 6-byte header
+/// (magic + u16 key_len) then `key_len`-byte body.
+///
+/// **Absolute deadline, not per-read timeout.** The budget caps
+/// the whole sniff call, not each `read_exact` syscall
+/// independently. Per-read timeouts reset on every successful
+/// byte, so a slow peer trickling one byte every 4.9 s could
+/// keep both reads inside their individual 5 s windows while
+/// wedging the accept thread indefinitely. The deadline-based
+/// approach bounds total elapsed time — header + body must
+/// complete within `AUTH_REPLY_TIMEOUT` of entry. Per
+/// `CodeRabbit` round 2 on PR #405. #394.
+fn sniff_auth_key_message(mut stream: &TcpStream) -> std::io::Result<AuthKeyMessage> {
+    let deadline = Instant::now() + AUTH_REPLY_TIMEOUT;
+
+    // Header read. `remaining_until` returns the interval from
+    // now to the deadline, or `Duration::ZERO` if the deadline
+    // already passed (which signals TimedOut here too — reading
+    // with a zero timeout is undefined, so we explicitly error).
+    let header_timeout = deadline.saturating_duration_since(Instant::now());
+    if header_timeout.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "auth key header read deadline expired before first read",
+        ));
+    }
+    stream.set_read_timeout(Some(header_timeout))?;
+    let mut header = [0u8; AUTH_KEY_HEADER_LEN];
+    if let Err(e) = stream.read_exact(&mut header) {
+        let _ = stream.set_read_timeout(None);
+        return Err(e);
+    }
+
+    // Header parsed OK → decode `key_len` so we know how much
+    // more to read.
+    let Some(key_len) = AuthKeyMessage::parse_header_len(&header) else {
+        let _ = stream.set_read_timeout(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth key message header: bad magic or out-of-range key_len",
+        ));
+    };
+
+    // Body read with the remaining (shrinking) budget. If the
+    // header read burned most of the window, the body read gets
+    // whatever's left. A zero-remaining budget short-circuits as
+    // TimedOut before we ever call into `read_exact`.
+    let body_timeout = deadline.saturating_duration_since(Instant::now());
+    if body_timeout.is_zero() {
+        let _ = stream.set_read_timeout(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "auth key body read deadline expired before body read",
+        ));
+    }
+    stream.set_read_timeout(Some(body_timeout))?;
+    let mut body = vec![0u8; key_len as usize];
+    let body_result = stream.read_exact(&mut body);
+    let _ = stream.set_read_timeout(None);
+    body_result?;
+
+    // Reassemble the full wire buffer for
+    // `AuthKeyMessage::from_bytes`. Passing through the decoder
+    // rather than constructing the struct directly ensures the
+    // same validation runs on BOTH the parse-header-then-body
+    // path here and the full-buffer-in-hand path the tests use
+    // — keeps round-trip invariants honest.
+    let mut full = Vec::with_capacity(AUTH_KEY_HEADER_LEN + body.len());
+    full.extend_from_slice(&header);
+    full.extend_from_slice(&body);
+    AuthKeyMessage::from_bytes(&full).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth key message body failed to round-trip through AuthKeyMessage::from_bytes",
+        )
+    })
 }
 
 /// `Write` adapter sitting between the negotiated `Encoder` and the
@@ -1812,6 +2303,220 @@ mod tests {
         let _ = client.join();
     }
 
+    // ============================================================
+    // Auth handshake tests (#394).
+    //
+    // The real `spawn_client_workers` needs a live
+    // `Arc<Mutex<RtlSdrDevice>>` which requires a USB dongle —
+    // not something CI has. These tests instead exercise
+    // `sniff_auth_key_message` directly over a loopback TCP
+    // pair, pinning the wire-read contract that the enforcement
+    // flow calls into. Full end-to-end (server + client with
+    // real dongle) lives in the manual smoke test.
+    // ============================================================
+
+    #[test]
+    fn sniff_auth_key_message_reads_and_parses_full_message() {
+        // Happy path: client sends a valid AuthKeyMessage, server
+        // reads + parses. Pins the two-phase read (header then
+        // body) + the wire-format round-trip.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Exactly 32 bytes — matches the canonical
+        // `DEFAULT_AUTH_KEY_LEN` used by `generate_random_auth_key`
+        // so the fixture shape tracks production size. The ASCII
+        // label makes test log output readable while keeping the
+        // bytes well within the `1..=MAX_AUTH_KEY_LEN` window.
+        let key_bytes = b"test-key-32-bytes-exactly-abcdef".to_vec();
+        debug_assert_eq!(key_bytes.len(), 32);
+        let msg = AuthKeyMessage {
+            key: key_bytes.clone(),
+        };
+        let wire = msg.to_bytes().unwrap();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&wire).unwrap();
+            // Hold the socket open past the server's read so the
+            // server doesn't see EOF mid-body-read.
+            thread::sleep(Duration::from_millis(50));
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let parsed = sniff_auth_key_message(&server_stream).unwrap();
+        assert_eq!(parsed.key, key_bytes);
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    #[test]
+    fn sniff_auth_key_message_rejects_bad_magic() {
+        // Client sends a 6-byte header with non-RTKA magic. The
+        // header parser catches the bad magic via
+        // `parse_header_len → None` and the helper surfaces
+        // InvalidData.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            let mut bad = vec![0x00, 0x01, 0x02, 0x03];
+            bad.extend_from_slice(&1u16.to_be_bytes());
+            bad.push(0xAA);
+            client.write_all(&bad).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let err = sniff_auth_key_message(&server_stream).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    /// Scheduling slack on top of `AUTH_REPLY_TIMEOUT` when
+    /// asserting that a timeout fired inside the budget. Must be
+    /// tight enough that a regression to per-phase timeouts
+    /// (where total elapsed could approach `2 * AUTH_REPLY_TIMEOUT`
+    /// under the header-then-body flow) trips the assertion, but
+    /// generous enough to absorb realistic OS scheduling jitter
+    /// on a loaded CI runner. 500 ms lands comfortably in that
+    /// window — one `AUTH_REPLY_TIMEOUT` (5 s) plus slack stays
+    /// well under the 2× regression threshold. Per `CodeRabbit`
+    /// round 3 on PR #405.
+    const AUTH_TIMEOUT_SLACK: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn sniff_auth_key_message_times_out_when_client_silent() {
+        // Client connects but never sends. Header read blocks
+        // up to AUTH_REPLY_TIMEOUT, then fails. Guards against a
+        // silent-client DOS that would otherwise wedge the
+        // accept thread.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
+        let client_thread = thread::spawn(move || {
+            let _client = TcpStream::connect(addr).unwrap();
+            // Hold the socket open, don't send anything. Release
+            // after the server's timeout has fired.
+            let _ = keep_rx.recv();
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let start = Instant::now();
+        let err = sniff_auth_key_message(&server_stream).unwrap_err();
+        let elapsed = start.elapsed();
+        // Error kind is WouldBlock / TimedOut depending on
+        // platform; either is an acceptable "header read timed
+        // out" signal from the OS.
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected WouldBlock/TimedOut for silent client, got {err:?}"
+        );
+        // Tight bound: total elapsed must sit inside ONE
+        // `AUTH_REPLY_TIMEOUT` plus scheduling slack, not the
+        // earlier 2× allowance. The loose 2× bound would have
+        // silently accepted a regression to per-phase timeouts
+        // where the header + body phases each reset the budget.
+        // Per `CodeRabbit` round 3 on PR #405.
+        assert!(
+            elapsed <= AUTH_REPLY_TIMEOUT + AUTH_TIMEOUT_SLACK,
+            "silent-client read took {elapsed:?}, exceeded AUTH_REPLY_TIMEOUT ({AUTH_REPLY_TIMEOUT:?}) + slack ({AUTH_TIMEOUT_SLACK:?})"
+        );
+        let _ = keep_tx.send(());
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    #[test]
+    fn sniff_auth_key_message_times_out_when_body_stalls() {
+        // Regression guard for the absolute-deadline contract.
+        // Client sends a valid header but never follows with the
+        // body bytes — this is the path that the old per-phase
+        // timeout silently accepted: the header read returns
+        // quickly (burns ~0 of the budget), then the body read
+        // gets a fresh `AUTH_REPLY_TIMEOUT` window of its own.
+        // With the absolute-deadline implementation the body
+        // read inherits the remaining budget and trips within
+        // `AUTH_REPLY_TIMEOUT` of entry.
+        //
+        // Paired with the silent-client test: together they pin
+        // the "one shared budget across both reads" contract and
+        // defeat any future revert to per-phase timeouts.
+        // Per `CodeRabbit` round 3 on PR #405.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Valid 6-byte header claiming a 32-byte key body. Server
+        // will consume it fast, then block on the absent body.
+        let key_len: u16 = 32;
+        let mut header = [0u8; AUTH_KEY_HEADER_LEN];
+        header[..4].copy_from_slice(&crate::extension::AUTH_KEY_MAGIC);
+        header[4..6].copy_from_slice(&key_len.to_be_bytes());
+
+        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&header).unwrap();
+            client.flush().unwrap();
+            // Hold the socket open WITHOUT sending the body.
+            // Server should trip its absolute deadline and
+            // return. Release after the server's timeout fires.
+            let _ = keep_rx.recv();
+        });
+
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let start = Instant::now();
+        let err = sniff_auth_key_message(&server_stream).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected WouldBlock/TimedOut for stalled body, got {err:?}"
+        );
+        // The decisive assertion: elapsed must be within the
+        // single-budget bound. A regression to per-phase
+        // timeouts would push this toward 2× AUTH_REPLY_TIMEOUT.
+        assert!(
+            elapsed <= AUTH_REPLY_TIMEOUT + AUTH_TIMEOUT_SLACK,
+            "stalled-body read took {elapsed:?}, exceeded AUTH_REPLY_TIMEOUT ({AUTH_REPLY_TIMEOUT:?}) + slack ({AUTH_TIMEOUT_SLACK:?}) — absolute-deadline contract regressed"
+        );
+        let _ = keep_tx.send(());
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    #[test]
+    fn sniff_auth_key_message_handles_fragmented_send() {
+        // Client sends the header in one write and the body in a
+        // separate write (with a short pause). The server's
+        // read_exact waits for the rest — no protocol desync.
+        // Pins the contract that the helper tolerates realistic
+        // TCP segmentation.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key_bytes: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        let msg = AuthKeyMessage {
+            key: key_bytes.clone(),
+        };
+        let wire = msg.to_bytes().unwrap();
+        let (header_part, body_part) = wire.split_at(AUTH_KEY_HEADER_LEN);
+        let header_vec = header_part.to_vec();
+        let body_vec = body_part.to_vec();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&header_vec).unwrap();
+            client.flush().unwrap();
+            thread::sleep(Duration::from_millis(20));
+            client.write_all(&body_vec).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let parsed = sniff_auth_key_message(&server_stream).unwrap();
+        assert_eq!(parsed.key, key_bytes);
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
     #[test]
     fn start_surfaces_port_conflict_as_typed_error() {
         // Hold a port before calling Server::start — the second bind must
@@ -1829,6 +2534,7 @@ mod tests {
             buffer_capacity: 0,
             compression: CodecMask::NONE_ONLY,
             listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: None,
         };
         match Server::start(config) {
             Err(ServerError::PortInUse(ref addr)) => {
@@ -1838,6 +2544,65 @@ mod tests {
             Ok(_) => panic!("bind should have failed"),
         }
         drop(holder);
+    }
+
+    #[test]
+    fn start_rejects_empty_auth_key_as_config_error() {
+        // **Regression test for `CodeRabbit` round 2 on PR #405.**
+        // `ServerConfig` is public, so a library caller can
+        // construct `Some(vec![])` and bypass every upstream
+        // guard (FFI / CLI / wire format). `Server::start` must
+        // catch this BEFORE bind / USB open so the operator sees
+        // one clear config error instead of every client
+        // failing at handshake.
+        //
+        // Uses port 0 so bind succeeds even if another test is
+        // holding a port — the config validation runs first, so
+        // the bind never actually happens. USB is never touched
+        // either (same early-exit ordering).
+        let config = ServerConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            device_index: 0,
+            initial: InitialDeviceState::default(),
+            buffer_capacity: 0,
+            compression: CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: Some(Vec::new()), // empty — invalid per `validate_auth_key`
+        };
+        match Server::start(config) {
+            Err(ServerError::InvalidAuthKeyLength { len, max }) => {
+                assert_eq!(len, 0);
+                assert_eq!(max, crate::extension::MAX_AUTH_KEY_LEN);
+            }
+            Err(e) => panic!("expected InvalidAuthKeyLength, got {e:?}"),
+            Ok(_) => panic!("empty auth_key must not start a server"),
+        }
+    }
+
+    #[test]
+    fn start_rejects_oversize_auth_key_as_config_error() {
+        // Complement to the empty-key test — keys longer than
+        // `MAX_AUTH_KEY_LEN` (256 bytes) can't be serialized by
+        // `AuthKeyMessage::to_bytes`, so the server would start
+        // but reject every client at handshake. Catch at config
+        // time.
+        let config = ServerConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            device_index: 0,
+            initial: InitialDeviceState::default(),
+            buffer_capacity: 0,
+            compression: CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: Some(vec![0u8; crate::extension::MAX_AUTH_KEY_LEN + 1]),
+        };
+        match Server::start(config) {
+            Err(ServerError::InvalidAuthKeyLength { len, max }) => {
+                assert_eq!(len, crate::extension::MAX_AUTH_KEY_LEN + 1);
+                assert_eq!(max, crate::extension::MAX_AUTH_KEY_LEN);
+            }
+            Err(e) => panic!("expected InvalidAuthKeyLength, got {e:?}"),
+            Ok(_) => panic!("oversize auth_key must not start a server"),
+        }
     }
 
     #[test]
@@ -2005,7 +2770,7 @@ mod tests {
         // returns `Ok(Some)` with the parsed struct. Regression
         // guard against a future refactor breaking the common case.
         use crate::codec::CodecMask;
-        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, Role};
+        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, PROTOCOL_VERSION, Role};
         let hello = ClientHello {
             codec_mask: CodecMask::NONE_AND_LZ4,
             role: Role::Control,
@@ -2095,7 +2860,7 @@ mod tests {
         // `EXTENSION_MAGIC`, so a fragmented magic still reaches
         // the full `read_exact` path.
         use crate::codec::CodecMask;
-        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, Role};
+        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, PROTOCOL_VERSION, Role};
         let hello = ClientHello {
             codec_mask: CodecMask::NONE_AND_LZ4,
             role: Role::Control,
@@ -2217,7 +2982,7 @@ mod tests {
         garbled[4] = 0x03; // codec mask (NONE+LZ4)
         garbled[5] = 0x99; // invalid role — from_bytes returns None
         garbled[6] = 0x00; // flags
-        garbled[7] = PROTOCOL_VERSION;
+        garbled[7] = crate::extension::PROTOCOL_VERSION;
         let result = run_sniff_against(move |mut client| {
             client.write_all(&garbled).unwrap();
             thread::sleep(Duration::from_millis(50));
