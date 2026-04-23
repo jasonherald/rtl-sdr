@@ -703,24 +703,32 @@ fn spawn_client_workers(
     //   - `negotiated_codec` is `None` for vanilla (always
     //     uncompressed); `Some(_)` for RTLX clients — the
     //     intersection of their mask and ours
-    let (hello_seen, requested_role, negotiated_codec) = if let Some(hello) = &sniff_outcome {
-        let codec = compression_offer.pick(hello.codec_mask);
-        tracing::info!(
-            %peer,
-            client_mask = hello.codec_mask.to_wire(),
-            server_mask = compression_offer.to_wire(),
-            chosen = %codec,
-            requested_role = ?hello.role,
-            "rtl_tcp extended-handshake negotiated"
-        );
-        (true, hello.role, Some(codec))
-    } else {
-        tracing::debug!(
-            %peer,
-            "rtl_tcp no extended-handshake hello — legacy client path (implicit Role::Control)"
-        );
-        (false, Role::Control, None)
-    };
+    let (hello_seen, requested_role, request_takeover, negotiated_codec) =
+        if let Some(hello) = &sniff_outcome {
+            let codec = compression_offer.pick(hello.codec_mask);
+            let takeover = hello.request_takeover();
+            tracing::info!(
+                %peer,
+                client_mask = hello.codec_mask.to_wire(),
+                server_mask = compression_offer.to_wire(),
+                chosen = %codec,
+                requested_role = ?hello.role,
+                request_takeover = takeover,
+                "rtl_tcp extended-handshake negotiated"
+            );
+            (true, hello.role, takeover, Some(codec))
+        } else {
+            tracing::debug!(
+                %peer,
+                "rtl_tcp no extended-handshake hello — legacy client path (implicit Role::Control)"
+            );
+            // Vanilla clients have no way to set the takeover
+            // flag, so the admission gate treats them as
+            // "request_takeover = false" — the existing Control
+            // client (if any) is protected from vanilla-driven
+            // displacement. Takeover is an explicit RTLX action.
+            (false, Role::Control, false, None)
+        };
     let codec = negotiated_codec.unwrap_or(Codec::None);
 
     // Allocate id + build slot with the requested role + channel.
@@ -730,10 +738,13 @@ fn spawn_client_workers(
     let id = registry.allocate_id();
     let (slot, rx) = ClientSlot::new(id, peer, codec, requested_role, per_client_buffer_depth);
 
-    // Atomic #392 admission. On `Granted` the slot is now in the
-    // registry and the broadcaster can find it on its next tick;
-    // on denial the slot is never pushed and drops on scope exit.
-    let decision = registry.register_with_role(slot.clone(), listener_cap);
+    // Atomic #392 admission + #393 takeover decision. On `Granted`
+    // or `GrantedViaTakeover` the slot is now in the registry and
+    // the broadcaster can find it on its next tick; on denial the
+    // slot is never pushed and drops on scope exit. Takeover also
+    // marks the displaced controller disconnected under the same
+    // lock so its writer / command threads exit cleanly.
+    let decision = registry.register_with_role(slot.clone(), listener_cap, request_takeover);
     match decision {
         RoleDecision::Granted => {
             tracing::info!(
@@ -742,6 +753,15 @@ fn spawn_client_workers(
                 ?requested_role,
                 ?codec,
                 "rtl_tcp client admitted"
+            );
+        }
+        RoleDecision::GrantedViaTakeover { displaced_id } => {
+            tracing::info!(
+                %peer,
+                client_id = id,
+                displaced_client_id = displaced_id,
+                ?codec,
+                "rtl_tcp client admitted via takeover — prior Control client kicked"
             );
         }
         RoleDecision::ControllerBusy => {
@@ -1020,13 +1040,34 @@ fn send_denied_response(
     }
 }
 
+/// Seconds of socket idleness before the first TCP keepalive probe
+/// goes out. `TCP_KEEPIDLE` (Linux) / `TCP_KEEPALIVE` (macOS). Kernel
+/// default is 7200 s (2 hours) on most systems — unusable for
+/// detecting a zombie controller before the user's patience runs
+/// out. 60 s is the upstream `tcp(7)` recommended minimum for
+/// interactive sessions and matches the #393 budget for zombie
+/// detection (60 + 10 × 3 = 90 s worst case). Per #393.
+const TCP_KEEPALIVE_IDLE_SECS: u32 = 60;
+/// Seconds between probes once the first one has been sent.
+/// `TCP_KEEPINTVL`. 10 s gives the zombie three chances to reply
+/// across a ~30 s window — enough to ride out a brief network
+/// hiccup without blowing the detection deadline. Per #393.
+const TCP_KEEPALIVE_INTERVAL_SECS: u32 = 10;
+/// How many unanswered probes before the kernel drops the socket.
+/// `TCP_KEEPCNT`. 3 keeps the total dead-peer detection window at
+/// roughly 90 s (idle 60 s + 3 × 10 s probes). Per #393.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
 fn configure_client_socket(stream: &TcpStream) {
-    // Keep TCP alive so dead clients (laptop lid closed, wifi dropped) stop
-    // wedging the server rather than trickling forever into the void.
-    // Per-platform keepalive tuning lives in std behind raw setsockopt; we
-    // enable the default which at least lets the kernel eventually notice.
-    if let Err(e) = set_keepalive(stream, true) {
-        tracing::warn!(%e, "SO_KEEPALIVE not applied (non-fatal)");
+    // Enable SO_KEEPALIVE and tune the probe schedule so a zombie
+    // controller (laptop-lid-closed, wifi-dropped) is detected
+    // within ~90 s instead of the kernel default (~2 h on Linux).
+    // Takeover (#393) relies on this for "stale slot eventually
+    // gets pruned without user intervention"; the takeover handshake
+    // itself is the *explicit* path, but keepalive is the fallback
+    // that prevents permanent lockout when neither side sends FIN.
+    if let Err(e) = set_keepalive_tuned(stream) {
+        tracing::warn!(%e, "SO_KEEPALIVE tuning not applied (non-fatal)");
     }
     // Disable Nagle — commands are 5 bytes and we want snappy tuning.
     if let Err(e) = stream.set_nodelay(true) {
@@ -1034,22 +1075,117 @@ fn configure_client_socket(stream: &TcpStream) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn set_keepalive(stream: &TcpStream, on: bool) -> std::io::Result<()> {
+fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
-    let value: libc::c_int = libc::c_int::from(on);
-    // SAFETY: `fd` is a valid open socket for the duration of this call
-    // (we borrow `stream` by reference). `value` is a stack-local
-    // `c_int` passed as a pointer along with the matching size — this
-    // is the documented shape of `setsockopt(_, SOL_SOCKET,
-    // SO_KEEPALIVE, ...)` on every POSIX target.
+
+    // Enable SO_KEEPALIVE first — the per-tunable options below
+    // are no-ops without it.
+    let on: libc::c_int = 1;
+    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, on)?;
+
+    // Idle time before first probe (seconds).
+    set_sockopt_int(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPIDLE,
+        TCP_KEEPALIVE_IDLE_SECS as libc::c_int,
+    )?;
+    // Interval between subsequent probes.
+    set_sockopt_int(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPINTVL,
+        TCP_KEEPALIVE_INTERVAL_SECS as libc::c_int,
+    )?;
+    // Probe count before declaring the peer dead.
+    set_sockopt_int(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPCNT,
+        TCP_KEEPALIVE_RETRIES as libc::c_int,
+    )?;
+    Ok(())
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[allow(unsafe_code)]
+fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    let on: libc::c_int = 1;
+    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, on)?;
+
+    // macOS exposes only `TCP_KEEPALIVE` (seconds-until-first-probe,
+    // analogous to Linux's `TCP_KEEPIDLE`). The per-probe interval
+    // and count use system-level defaults (`sysctl
+    // net.inet.tcp.keepintvl` / `keepcnt`), typically 75 s × 8 =
+    // ~10 minute detection. Good enough for takeover — the zombie
+    // detection path is the fallback; the explicit takeover
+    // handshake is the normal case.
+    set_sockopt_int(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPALIVE,
+        TCP_KEEPALIVE_IDLE_SECS as libc::c_int,
+    )?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[allow(unsafe_code)]
+fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    // Other unix targets (FreeBSD, etc.) — enable keepalive with
+    // system defaults. The per-target `TCP_KEEPIDLE` constant names
+    // vary; dedicated handling for those targets can be added here
+    // when we actually ship on them.
+    let on: libc::c_int = 1;
+    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, on)
+}
+
+#[cfg(not(unix))]
+fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
+    // Non-unix targets (Windows, WASI, etc.) enable keepalive with
+    // system defaults via socket2 — std::net::TcpStream exposes no
+    // keepalive setter, and our primary tunables
+    // (`TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`) are
+    // Linux-specific. Using `SockRef::from(&stream)` lets us flip
+    // `SO_KEEPALIVE` without taking ownership of the TcpStream.
+    // The kernel's default probe timings apply (~2 h first probe
+    // on Windows), so the #393 zombie-detection fallback is slower
+    // than on Linux but still runs. Per `CodeRabbit` round 1 on
+    // PR #404. #393.
+    let sock = socket2::SockRef::from(stream);
+    sock.set_keepalive(true)
+}
+
+/// Tiny `setsockopt(fd, level, name, &value)` wrapper for integer
+/// options. Extracted so each keepalive tunable is a one-liner
+/// instead of five lines of repeated FFI boilerplate. Only used
+/// on unix targets.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn set_sockopt_int(
+    fd: libc::c_int,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `fd` is a valid open socket borrowed from the
+    // caller's `&TcpStream` for the duration of this call.
+    // `value` is a stack-local `c_int`; we pass its address plus
+    // the matching size, which is the documented calling
+    // convention for `setsockopt`'s integer options.
     let ret = unsafe {
         libc::setsockopt(
             fd,
-            libc::SOL_SOCKET,
-            libc::SO_KEEPALIVE,
+            level,
+            name,
             std::ptr::addr_of!(value).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -1059,19 +1195,6 @@ fn set_keepalive(stream: &TcpStream, on: bool) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-#[cfg(not(unix))]
-fn set_keepalive(_stream: &TcpStream, _on: bool) -> std::io::Result<()> {
-    // Non-unix has no implementation yet. Return Unsupported so the
-    // warn path in `configure_client_socket` fires and the log makes
-    // the missing keepalive visible — silently returning Ok would
-    // leave operators thinking dead-peer detection is active when it
-    // isn't.
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "SO_KEEPALIVE not implemented on this platform",
-    ))
 }
 
 /// How long the server waits on a fresh TCP connection for a
@@ -1600,6 +1723,94 @@ mod tests {
     /// cross-client bugs show up as the wrong freq under
     /// `connected_clients[1]`.
     const TEST_CLIENT_B_FREQ_HZ: u32 = 100_000_000;
+
+    /// Test helper: `getsockopt(fd, level, name)` for integer
+    /// options. Panics on failure with the OS errno so test
+    /// diagnostics point at the real problem instead of a bare
+    /// "assertion failed". Linux-only because the only caller is
+    /// the keepalive readback test below and those constant
+    /// names are Linux-specific.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn get_sockopt_int(fd: libc::c_int, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut value: libc::c_int = 0;
+        let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is a valid open socket for the call's
+        // duration (test-side caller holds the accepted
+        // TcpStream). `value` and `len` live on the stack; their
+        // pointers are valid for the `getsockopt` call.
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::addr_of_mut!(value).cast(),
+                std::ptr::addr_of_mut!(len),
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "getsockopt(level={level}, name={name}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        value
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configure_client_socket_applies_tuned_keepalive_on_linux() {
+        // **Regression test for #393.** Verifies that the
+        // TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT constants
+        // actually land on the socket — not just that setsockopt
+        // returned zero. Calls getsockopt after
+        // `configure_client_socket` and asserts the kernel-side
+        // values match our per-file constants.
+        //
+        // Linux-only because the platform constants differ
+        // (macOS has only `TCP_KEEPALIVE`, FreeBSD has different
+        // names). Other targets are exercised via the Unsupported
+        // fallback path in `set_keepalive_tuned`.
+        use std::os::unix::io::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let s = TcpStream::connect(addr).unwrap();
+            // Hold the client side alive long enough for the
+            // server half to run getsockopt. Drops at thread
+            // exit, which cleans up the socket pair.
+            thread::sleep(Duration::from_millis(100));
+            drop(s);
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        configure_client_socket(&server_stream);
+
+        let fd = server_stream.as_raw_fd();
+        assert_ne!(
+            get_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "SO_KEEPALIVE should be enabled after configure_client_socket"
+        );
+        assert_eq!(
+            get_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE) as u32,
+            TCP_KEEPALIVE_IDLE_SECS,
+            "TCP_KEEPIDLE should match the tuned constant"
+        );
+        assert_eq!(
+            get_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL) as u32,
+            TCP_KEEPALIVE_INTERVAL_SECS,
+            "TCP_KEEPINTVL should match the tuned constant"
+        );
+        assert_eq!(
+            get_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT) as u32,
+            TCP_KEEPALIVE_RETRIES,
+            "TCP_KEEPCNT should match the tuned constant"
+        );
+
+        drop(server_stream);
+        let _ = client.join();
+    }
 
     #[test]
     fn start_surfaces_port_conflict_as_typed_error() {
