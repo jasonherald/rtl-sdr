@@ -590,6 +590,14 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
                     ServerError::Device(_)
                     | ServerError::NoDevice
                     | ServerError::BadDeviceIndex { .. } => SdrCoreError::Device.as_int(),
+                    // Config-time rejection (auth_key length out of
+                    // range). Caller supplied an out-of-bounds value
+                    // in `SdrRtlTcpServerConfig`; surface as
+                    // InvalidArg so the FFI code matches the already-
+                    // established "malformed input" error class
+                    // (same code `auth_key_from_c` returns for
+                    // NULL-pointer/length mismatches).
+                    ServerError::InvalidAuthKeyLength { .. } => SdrCoreError::InvalidArg.as_int(),
                 }
             }
         }

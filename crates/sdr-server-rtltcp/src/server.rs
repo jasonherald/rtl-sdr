@@ -340,6 +340,25 @@ impl Server {
     /// thread. Dropping it signals shutdown and waits for both — plus
     /// any currently-connected clients — to exit cleanly.
     pub fn start(config: ServerConfig) -> Result<Self, ServerError> {
+        // Validate `auth_key` BEFORE bind or USB open so a bad
+        // config doesn't leave a half-initialized server + a
+        // claimed dongle. `ServerConfig` is public, so library
+        // callers can construct `Some(vec![])` or an oversize
+        // key directly (bypassing the FFI + wire-format guards).
+        // Catch that here rather than deferring to per-handshake
+        // failures — otherwise the server appears to start fine
+        // but every client gets rejected. Per `CodeRabbit`
+        // round 2 on PR #405.
+        if let Some(key) = &config.auth_key {
+            let max = crate::extension::MAX_AUTH_KEY_LEN;
+            if key.is_empty() || key.len() > max {
+                return Err(ServerError::InvalidAuthKeyLength {
+                    len: key.len(),
+                    max,
+                });
+            }
+        }
+
         // Bind first — surface port-in-use before touching the USB device
         // so we don't leave a dongle claimed after a failed bind.
         let listener = TcpListener::bind(config.bind).map_err(|e| {
@@ -1419,52 +1438,6 @@ const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// Per `CodeRabbit` round 2 on PR #399 (initial fix),
 /// round 3 (doc alignment), and round 5 on PR #402
 /// (partial-prefix handling for fragmented RTLX).
-/// Read + parse an [`AuthKeyMessage`] from `stream` within
-/// [`AUTH_REPLY_TIMEOUT`]. Caller is responsible for having
-/// observed `hello.has_auth() == true` on the preceding hello
-/// — this helper assumes the auth message is the next thing on
-/// the wire. Two-phase read: header (6 bytes) then body
-/// (`key_len` bytes). Both phases gated by
-/// `AUTH_REPLY_TIMEOUT`, so a silent client can't wedge the
-/// accept thread. #394.
-fn sniff_auth_key_message(mut stream: &TcpStream) -> std::io::Result<AuthKeyMessage> {
-    stream.set_read_timeout(Some(AUTH_REPLY_TIMEOUT))?;
-    let mut header = [0u8; AUTH_KEY_HEADER_LEN];
-    if let Err(e) = stream.read_exact(&mut header) {
-        // Reset the timeout before propagating so the caller
-        // doesn't carry this temporary setting into the rest of
-        // the flow (if we even got there — but defense-in-depth).
-        let _ = stream.set_read_timeout(None);
-        return Err(e);
-    }
-    let Some(key_len) = AuthKeyMessage::parse_header_len(&header) else {
-        let _ = stream.set_read_timeout(None);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "auth key message header: bad magic or out-of-range key_len",
-        ));
-    };
-    let mut body = vec![0u8; key_len as usize];
-    let body_result = stream.read_exact(&mut body);
-    let _ = stream.set_read_timeout(None);
-    body_result?;
-    // Reassemble the full wire buffer for AuthKeyMessage::from_bytes.
-    // Passing through the decoder rather than constructing the
-    // struct directly ensures the same validation runs on BOTH
-    // the parse-header-then-body path here and the
-    // full-buffer-in-hand path the tests use — keeps
-    // round-trip invariants honest.
-    let mut full = Vec::with_capacity(AUTH_KEY_HEADER_LEN + body.len());
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&body);
-    AuthKeyMessage::from_bytes(&full).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "auth key message body failed to round-trip through AuthKeyMessage::from_bytes",
-        )
-    })
-}
-
 fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHello>> {
     // Poll cadence for the peek retry loop. Small enough that a
     // fragmented `RTLX` hello whose trailing bytes land within a
@@ -1590,6 +1563,88 @@ fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHe
              malformed field)",
             )
         })
+}
+
+/// Read + parse an [`AuthKeyMessage`] from `stream` within an
+/// **absolute** [`AUTH_REPLY_TIMEOUT`] budget. Caller is
+/// responsible for having observed `hello.has_auth() == true`
+/// on the preceding hello — this helper assumes the auth message
+/// is the next thing on the wire. Two-phase read: 6-byte header
+/// (magic + u16 key_len) then `key_len`-byte body.
+///
+/// **Absolute deadline, not per-read timeout.** The budget caps
+/// the whole sniff call, not each `read_exact` syscall
+/// independently. Per-read timeouts reset on every successful
+/// byte, so a slow peer trickling one byte every 4.9 s could
+/// keep both reads inside their individual 5 s windows while
+/// wedging the accept thread indefinitely. The deadline-based
+/// approach bounds total elapsed time — header + body must
+/// complete within `AUTH_REPLY_TIMEOUT` of entry. Per
+/// `CodeRabbit` round 2 on PR #405. #394.
+fn sniff_auth_key_message(mut stream: &TcpStream) -> std::io::Result<AuthKeyMessage> {
+    let deadline = Instant::now() + AUTH_REPLY_TIMEOUT;
+
+    // Header read. `remaining_until` returns the interval from
+    // now to the deadline, or `Duration::ZERO` if the deadline
+    // already passed (which signals TimedOut here too — reading
+    // with a zero timeout is undefined, so we explicitly error).
+    let header_timeout = deadline.saturating_duration_since(Instant::now());
+    if header_timeout.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "auth key header read deadline expired before first read",
+        ));
+    }
+    stream.set_read_timeout(Some(header_timeout))?;
+    let mut header = [0u8; AUTH_KEY_HEADER_LEN];
+    if let Err(e) = stream.read_exact(&mut header) {
+        let _ = stream.set_read_timeout(None);
+        return Err(e);
+    }
+
+    // Header parsed OK → decode `key_len` so we know how much
+    // more to read.
+    let Some(key_len) = AuthKeyMessage::parse_header_len(&header) else {
+        let _ = stream.set_read_timeout(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth key message header: bad magic or out-of-range key_len",
+        ));
+    };
+
+    // Body read with the remaining (shrinking) budget. If the
+    // header read burned most of the window, the body read gets
+    // whatever's left. A zero-remaining budget short-circuits as
+    // TimedOut before we ever call into `read_exact`.
+    let body_timeout = deadline.saturating_duration_since(Instant::now());
+    if body_timeout.is_zero() {
+        let _ = stream.set_read_timeout(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "auth key body read deadline expired before body read",
+        ));
+    }
+    stream.set_read_timeout(Some(body_timeout))?;
+    let mut body = vec![0u8; key_len as usize];
+    let body_result = stream.read_exact(&mut body);
+    let _ = stream.set_read_timeout(None);
+    body_result?;
+
+    // Reassemble the full wire buffer for
+    // `AuthKeyMessage::from_bytes`. Passing through the decoder
+    // rather than constructing the struct directly ensures the
+    // same validation runs on BOTH the parse-header-then-body
+    // path here and the full-buffer-in-hand path the tests use
+    // — keeps round-trip invariants honest.
+    let mut full = Vec::with_capacity(AUTH_KEY_HEADER_LEN + body.len());
+    full.extend_from_slice(&header);
+    full.extend_from_slice(&body);
+    AuthKeyMessage::from_bytes(&full).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth key message body failed to round-trip through AuthKeyMessage::from_bytes",
+        )
+    })
 }
 
 /// `Write` adapter sitting between the negotiated `Encoder` and the
@@ -2205,6 +2260,65 @@ mod tests {
             Ok(_) => panic!("bind should have failed"),
         }
         drop(holder);
+    }
+
+    #[test]
+    fn start_rejects_empty_auth_key_as_config_error() {
+        // **Regression test for `CodeRabbit` round 2 on PR #405.**
+        // `ServerConfig` is public, so a library caller can
+        // construct `Some(vec![])` and bypass every upstream
+        // guard (FFI / CLI / wire format). `Server::start` must
+        // catch this BEFORE bind / USB open so the operator sees
+        // one clear config error instead of every client
+        // failing at handshake.
+        //
+        // Uses port 0 so bind succeeds even if another test is
+        // holding a port — the config validation runs first, so
+        // the bind never actually happens. USB is never touched
+        // either (same early-exit ordering).
+        let config = ServerConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            device_index: 0,
+            initial: InitialDeviceState::default(),
+            buffer_capacity: 0,
+            compression: CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: Some(Vec::new()), // empty — invalid per `validate_auth_key`
+        };
+        match Server::start(config) {
+            Err(ServerError::InvalidAuthKeyLength { len, max }) => {
+                assert_eq!(len, 0);
+                assert_eq!(max, crate::extension::MAX_AUTH_KEY_LEN);
+            }
+            Err(e) => panic!("expected InvalidAuthKeyLength, got {e:?}"),
+            Ok(_) => panic!("empty auth_key must not start a server"),
+        }
+    }
+
+    #[test]
+    fn start_rejects_oversize_auth_key_as_config_error() {
+        // Complement to the empty-key test — keys longer than
+        // `MAX_AUTH_KEY_LEN` (256 bytes) can't be serialized by
+        // `AuthKeyMessage::to_bytes`, so the server would start
+        // but reject every client at handshake. Catch at config
+        // time.
+        let config = ServerConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            device_index: 0,
+            initial: InitialDeviceState::default(),
+            buffer_capacity: 0,
+            compression: CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: Some(vec![0u8; crate::extension::MAX_AUTH_KEY_LEN + 1]),
+        };
+        match Server::start(config) {
+            Err(ServerError::InvalidAuthKeyLength { len, max }) => {
+                assert_eq!(len, crate::extension::MAX_AUTH_KEY_LEN + 1);
+                assert_eq!(max, crate::extension::MAX_AUTH_KEY_LEN);
+            }
+            Err(e) => panic!("expected InvalidAuthKeyLength, got {e:?}"),
+            Ok(_) => panic!("oversize auth_key must not start a server"),
+        }
     }
 
     #[test]

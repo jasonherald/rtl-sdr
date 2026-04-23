@@ -2489,6 +2489,15 @@ mod tests {
                 .unwrap();
             let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
             sock.read_exact(&mut hello_buf).expect("read hello");
+            // Capture the client-sent version byte (offset 7)
+            // BEFORE forwarding the hello to the test driver.
+            // Compression-only opt-in should produce v1 per
+            // `required_protocol_version(flags)`; echoing this
+            // value in the response means any future regression
+            // that changes the client-side version selection
+            // surfaces here (driver asserts below). Per
+            // `CodeRabbit` round 2 on PR #405.
+            let client_hello_version = hello_buf[7];
             let _ = hello_tx.send(hello_buf);
             // Probe with a short timeout for any additional
             // bytes — expect WouldBlock / TimedOut because the
@@ -2508,7 +2517,13 @@ mod tests {
                 codec: Codec::Lz4,
                 granted_role: Some(Role::Control),
                 status: Status::Ok,
-                version: PROTOCOL_VERSION,
+                // Echo the client's hello version — this is what
+                // a real v2-era server does so v1 clients can
+                // still parse the response under their strict
+                // version gate. Hard-coding `PROTOCOL_VERSION`
+                // here would mask a regression that changes
+                // client-side version selection away from v1.
+                version: client_hello_version,
             };
             sock.write_all(&ext.to_bytes()).unwrap();
             thread::sleep(RTLX_TEST_SERVER_HOLD);
@@ -2534,6 +2549,16 @@ mod tests {
             flags_byte & sdr_server_rtltcp::extension::FLAG_HAS_AUTH,
             0,
             "auth_key = None must clear FLAG_HAS_AUTH bit in the hello"
+        );
+        // Compression-only + no auth + no takeover →
+        // `required_protocol_version(flags) == V1`. Pin the
+        // version byte so a regression that swaps the default
+        // to v2 against pre-#394 servers surfaces here. Per
+        // `CodeRabbit` round 2 on PR #405.
+        assert_eq!(
+            hello[7],
+            sdr_server_rtltcp::extension::PROTOCOL_VERSION_V1,
+            "compression-only hello must emit v1 (compat with pre-#394 servers)"
         );
 
         // Server probe for follow-up bytes. Must time out — no
