@@ -175,7 +175,6 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar,
         transcript_panel,
         bookmarks_revealer,
-        sidebar_scroll_orphan: _sidebar_scroll_orphan,
     } = build_layout(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&left_split_view);
@@ -264,6 +263,21 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         general_btn.set_active(true);
     }
     wire_activity_bar_clicks(&left_activity_bar, &left_stack, &left_split_view, "general");
+
+    // Header sidebar toggle ↔ left split view `show-sidebar` sync.
+    // Without this, clicking the currently-selected activity icon to
+    // collapse the panel leaves the header toggle stuck in `active`;
+    // the user's next header click then sets `show-sidebar=false`
+    // again (no-op) instead of reopening the panel. Mirrors the same
+    // `connect_show_sidebar_notify` pattern used on the right side.
+    let sidebar_toggle_weak = sidebar_toggle.downgrade();
+    left_split_view.connect_show_sidebar_notify(move |sv| {
+        if let Some(toggle) = sidebar_toggle_weak.upgrade()
+            && toggle.is_active() != sv.shows_sidebar()
+        {
+            toggle.set_active(sv.shows_sidebar());
+        }
+    });
 
     // Right (single-button): the transcript toggle, the header
     // transcript button, and `right_split_view.show-sidebar` form a
@@ -1759,51 +1773,6 @@ fn apply_rtl_tcp_connection_state(
     clippy::type_complexity,
     reason = "splitting into a struct would trade one named return for one named struct whose fields are used exactly once by the caller — net neutral for readability, net negative for locality of widget construction"
 )]
-/// Entries for the left activity bar — must match the order and
-/// `name` values used by the keyboard-shortcut wiring and the future
-/// config-persistence keys (`ui.sidebar.left.expanded["<name>"]`).
-const LEFT_ACTIVITY_ENTRIES: &[sidebar::ActivityBarEntry] = &[
-    sidebar::ActivityBarEntry {
-        name: "general",
-        icon_name: "go-home-symbolic",
-        display_name: "General",
-        shortcut_label: "Ctrl+1",
-    },
-    sidebar::ActivityBarEntry {
-        name: "radio",
-        icon_name: "audio-input-microphone-symbolic",
-        display_name: "Radio",
-        shortcut_label: "Ctrl+2",
-    },
-    sidebar::ActivityBarEntry {
-        name: "audio",
-        icon_name: "audio-speakers-symbolic",
-        display_name: "Audio",
-        shortcut_label: "Ctrl+3",
-    },
-    sidebar::ActivityBarEntry {
-        name: "display",
-        icon_name: "video-display-symbolic",
-        display_name: "Display",
-        shortcut_label: "Ctrl+4",
-    },
-    sidebar::ActivityBarEntry {
-        name: "scanner",
-        icon_name: "media-seek-forward-symbolic",
-        display_name: "Scanner",
-        shortcut_label: "Ctrl+5",
-    },
-];
-
-/// Entries for the right activity bar. Single entry today; the stack
-/// pattern is future-proofed for Recordings / Event log / etc.
-const RIGHT_ACTIVITY_ENTRIES: &[sidebar::ActivityBarEntry] = &[sidebar::ActivityBarEntry {
-    name: "transcript",
-    icon_name: "user-available-symbolic",
-    display_name: "Transcript",
-    shortcut_label: "Ctrl+Shift+1",
-}];
-
 /// Minimum left-panel width in pixels — narrower than this makes
 /// `AdwPreferencesGroup` content wrap awkwardly (design doc §4.4).
 const LEFT_SIDEBAR_MIN_WIDTH: f64 = 220.0;
@@ -1822,10 +1791,6 @@ const RIGHT_SIDEBAR_DEFAULT_WIDTH: f64 = 420.0;
 /// Handles returned by [`build_layout`] for downstream wiring. Bundled
 /// into a struct rather than a tuple because the return list grew past
 /// the clippy threshold during the activity-bar scaffolding migration.
-#[allow(
-    dead_code,
-    reason = "sidebar_scroll_orphan kept alive to preserve signal wiring on sidebar panel widgets (sub-tickets #422-#426 reattach them) — CodeRabbit will re-flag this once the field transitions to unused and the field can be deleted then"
-)]
 struct LayoutHandles {
     /// Root horizontal container for the whole window content area.
     root: gtk4::Box,
@@ -1854,14 +1819,6 @@ struct LayoutHandles {
     /// bookmarks list into the General activity panel and this
     /// revealer can then be dropped.
     bookmarks_revealer: gtk4::Revealer,
-    /// Orphan scrolled-window holding the legacy sidebar content.
-    /// Not attached to any widget tree; kept alive so the sidebar
-    /// panel widgets (which are transitively owned by this scroll)
-    /// stay instantiated and their signal handlers keep firing.
-    /// Sub-tickets #422-#426 migrate each panel into its own left
-    /// activity stack child; this orphan is deleted when the last
-    /// panel moves.
-    sidebar_scroll_orphan: gtk4::ScrolledWindow,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1869,14 +1826,15 @@ fn build_layout(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) -> LayoutHandles {
-    // Sidebar widgets — built but not yet visible. The `sidebar_scroll`
-    // becomes an orphan until sub-ticket #422 moves each panel into
-    // its own activity stack. Keeping `build_sidebar()` called here
-    // preserves the rich internal wiring graph (scanner signals,
-    // bookmarks backing store, server-panel persistence) that
-    // `connect_sidebar_panels` relies on — without it, every
-    // downstream handler in the crate breaks.
-    let (sidebar_scroll_orphan, panels) = sidebar::build_sidebar();
+    // Legacy sidebar — packed into the General activity slot so that
+    // Source / Radio / Audio / Display / Scanner / Navigation
+    // controls stay reachable during the scaffolding-to-real-panel
+    // migration window. Sub-tickets #422-#426 gradually pull each
+    // sub-section out into its own dedicated activity child; the last
+    // migration removes this bridge entirely and the General slot
+    // becomes a band-presets / bookmarks / source preferences page
+    // per the design doc §3.1.
+    let (legacy_sidebar_scroll, panels) = sidebar::build_sidebar();
     sidebar::server_panel::connect_server_panel_persistence(&panels.server, config);
 
     // Spectrum display (FFT + waterfall) + status bar.
@@ -1927,16 +1885,23 @@ fn build_layout(
     content_inner.append(&content_box);
     content_inner.append(&bookmarks_revealer);
 
-    // Left panel stack — 5 placeholder `Label`s per issue scope.
-    // Sub-tickets #422-#426 each swap one placeholder for the real
-    // panel widget; the `name` strings MUST remain stable because
-    // they're the config-persistence keys (§5 of the design doc).
+    // Left panel stack — General hosts the full legacy sidebar
+    // (preserves all Source / Radio / Audio / Display / Scanner
+    // control reachability during the migration), the other four
+    // activities are placeholder `Label`s until sub-tickets
+    // #422-#426 swap each one for a real panel. The `name` strings
+    // MUST remain stable because they're the config-persistence
+    // keys (§5 of the design doc).
     let left_stack = gtk4::Stack::builder()
         .transition_type(gtk4::StackTransitionType::None)
         .hexpand(true)
         .vexpand(true)
         .build();
-    for entry in LEFT_ACTIVITY_ENTRIES {
+    for entry in sidebar::LEFT_ACTIVITIES {
+        if entry.name == "general" {
+            left_stack.add_named(&legacy_sidebar_scroll, Some(entry.name));
+            continue;
+        }
         let placeholder = gtk4::Label::builder()
             .label(format!(
                 "{} — coming in a follow-up sub-ticket",
@@ -1986,9 +1951,9 @@ fn build_layout(
     left_stack.set_visible_child_name("general");
 
     let left_activity_bar =
-        sidebar::build_activity_bar(LEFT_ACTIVITY_ENTRIES, sidebar::ActivityBarSide::Left);
+        sidebar::build_activity_bar(sidebar::LEFT_ACTIVITIES, sidebar::ActivityBarSide::Left);
     let right_activity_bar =
-        sidebar::build_activity_bar(RIGHT_ACTIVITY_ENTRIES, sidebar::ActivityBarSide::Right);
+        sidebar::build_activity_bar(sidebar::RIGHT_ACTIVITIES, sidebar::ActivityBarSide::Right);
 
     let root = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
@@ -2012,7 +1977,6 @@ fn build_layout(
         status_bar,
         transcript_panel,
         bookmarks_revealer,
-        sidebar_scroll_orphan,
     }
 }
 

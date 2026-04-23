@@ -17,7 +17,10 @@ pub mod server_panel;
 pub mod source_panel;
 pub mod transcript_panel;
 
-pub use activity_bar::{ActivityBar, ActivityBarEntry, ActivityBarSide, build_activity_bar};
+pub use activity_bar::{
+    ActivityBar, ActivityBarEntry, ActivityBarSide, LEFT_ACTIVITIES, RIGHT_ACTIVITIES,
+    build_activity_bar,
+};
 pub use audio_panel::{AudioPanel, build_audio_panel};
 pub use bookmarks_panel::{BookmarksPanel, build_bookmarks_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
