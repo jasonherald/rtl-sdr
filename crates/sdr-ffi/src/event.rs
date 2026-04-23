@@ -92,6 +92,21 @@ pub const SDR_RTL_TCP_STATE_CONNECTING: i32 = 1;
 pub const SDR_RTL_TCP_STATE_CONNECTED: i32 = 2;
 pub const SDR_RTL_TCP_STATE_RETRYING: i32 = 3;
 pub const SDR_RTL_TCP_STATE_FAILED: i32 = 4;
+/// Server has an existing Control client and denied this
+/// attempt with `Status::ControllerBusy`. Host UIs should
+/// offer the user "Take control" / "Connect as Listener"
+/// actions rather than retry silently. No-auto-retry —
+/// the client does not attempt another connect while this
+/// state is active. ABI 0.18, per #396.
+pub const SDR_RTL_TCP_STATE_CONTROLLER_BUSY: i32 = 5;
+/// Server requires a pre-shared key (#394) and the client
+/// didn't send one. Host UIs should prompt the user for a
+/// key and reconnect. No-auto-retry. ABI 0.18, per #396.
+pub const SDR_RTL_TCP_STATE_AUTH_REQUIRED: i32 = 6;
+/// Server required a key and the client's attempt was
+/// rejected (`Status::AuthFailed`). Host UIs should re-
+/// prompt for a key. No-auto-retry. ABI 0.18, per #396.
+pub const SDR_RTL_TCP_STATE_AUTH_FAILED: i32 = 7;
 
 // ============================================================
 //  SdrEvent tagged union — `#[repr(C)]` layout matching the
@@ -549,6 +564,21 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
                         return None;
                     };
                     (SDR_RTL_TCP_STATE_FAILED, Some(cstr), 0, 0.0, 0)
+                }
+                // Role-denial terminal states (#396). Payload
+                // shape matches Disconnected/Connecting: no
+                // message string, zero counters. The kind
+                // discriminant is enough for the host to pick
+                // the right toast copy ("Controller busy" /
+                // "Server requires a key" / "Key rejected").
+                RtlTcpConnectionState::ControllerBusy => {
+                    (SDR_RTL_TCP_STATE_CONTROLLER_BUSY, None, 0, 0.0, 0)
+                }
+                RtlTcpConnectionState::AuthRequired => {
+                    (SDR_RTL_TCP_STATE_AUTH_REQUIRED, None, 0, 0.0, 0)
+                }
+                RtlTcpConnectionState::AuthFailed => {
+                    (SDR_RTL_TCP_STATE_AUTH_FAILED, None, 0, 0.0, 0)
                 }
             };
             let utf8 = message_cstr

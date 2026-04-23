@@ -76,6 +76,34 @@ pub enum RtlTcpConnectionState {
         /// underlying error type's `Display` should produce this.
         reason: String,
     },
+
+    /// Server has an existing Control client and the user's
+    /// connect attempt was denied with `Status::ControllerBusy`.
+    /// The UI surfaces this distinctly (not as generic
+    /// `Retrying` or `Failed`) so it can offer a "Take control"
+    /// / "Connect as Listener" choice instead of silently
+    /// retrying in the background. Pre-#396 this folded into
+    /// `TemporarilyUnavailable` with an auto-retry loop — that
+    /// hid the busy state from the user and prevented the
+    /// explicit role-choice UX the issue calls for. Per #396.
+    ControllerBusy,
+
+    /// Server requires a pre-shared key (#394) and the client
+    /// didn't send one. UI surfaces this by revealing / focusing
+    /// the Server key field so the user can enter the key and
+    /// reconnect. Distinct from `AuthFailed` (which means the
+    /// client DID send a key but the server rejected it) so the
+    /// UI can tell "never tried" vs "wrong key" apart in the
+    /// toast copy. Terminal — the connection manager does not
+    /// auto-retry while an auth prompt is pending. Per #396.
+    AuthRequired,
+
+    /// Server required a key and the client's attempt was
+    /// rejected (`Status::AuthFailed`). UI surfaces "Key
+    /// rejected. Check with the server owner." and re-focuses
+    /// the Server key field. Terminal — same no-retry treatment
+    /// as `AuthRequired`. Per #396.
+    AuthFailed,
 }
 
 impl RtlTcpConnectionState {
@@ -92,6 +120,21 @@ impl RtlTcpConnectionState {
     /// treatment.
     pub fn is_in_progress(&self) -> bool {
         matches!(self, Self::Connecting | Self::Retrying { .. })
+    }
+
+    /// True for terminal states that require explicit user
+    /// interaction before another connect attempt. `Failed` +
+    /// the three role-denial variants (`ControllerBusy`,
+    /// `AuthRequired`, `AuthFailed`) all halt the auto-retry
+    /// loop. UI uses this to distinguish "keep showing the
+    /// spinner, server will come back" (`Retrying`) from
+    /// "the user has to pick / type / click something"
+    /// (this group). Per #396.
+    pub fn needs_user_action(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed { .. } | Self::ControllerBusy | Self::AuthRequired | Self::AuthFailed
+        )
     }
 }
 

@@ -1150,9 +1150,9 @@ fn apply_rtl_tcp_connection_state(
     );
     // "Retry now" is only meaningful when there's an active source
     // to short-circuit out of its backoff wait — Retrying (most
-    // common) or Failed (the terminal protocol-error path where the
-    // source is still registered but not advancing). After an
-    // explicit Disconnect the controller drops `state.source`, and
+    // common) or any of the four terminal states (Failed +
+    // role-denials added in #396). After an explicit Disconnect
+    // the controller drops `state.source`, and
     // `UiToDsp::RetryRtlTcpNow` is a no-op (it checks
     // `state.source.as_mut()` → None → early return). Leaving the
     // button visibly enabled in that state misleads the user into
@@ -1161,7 +1161,7 @@ fn apply_rtl_tcp_connection_state(
     let can_retry_now = matches!(
         state,
         RtlTcpConnectionState::Retrying { .. } | RtlTcpConnectionState::Failed { .. }
-    );
+    ) || state.needs_user_action();
     disconnect_button.set_sensitive(is_active);
     retry_button.set_sensitive(can_retry_now);
 }

@@ -330,6 +330,14 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
             format!("Retrying in {secs} s (attempt {attempt})")
         }
         RtlTcpConnectionState::Failed { reason } => format!("Failed — {reason}"),
+        // Role-denial terminal states (#396). These show short
+        // actionable subtitles so the user knows WHY the
+        // connection didn't advance — the full toast UX with
+        // "Take control" / "Connect as Listener" buttons lives
+        // in `window.rs`.
+        RtlTcpConnectionState::ControllerBusy => "Controller slot is occupied".to_string(),
+        RtlTcpConnectionState::AuthRequired => "Server requires a key".to_string(),
+        RtlTcpConnectionState::AuthFailed => "Key rejected".to_string(),
     }
 }
 
