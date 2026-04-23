@@ -56,8 +56,19 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 16
+#define SDR_CORE_ABI_VERSION_MINOR 17
 /*
+ * 0.17 — adds `auth_key` (pointer to raw bytes) and
+ * `auth_key_len` (u32) to the tail of `SdrRtlTcpServerConfig`
+ * so FFI hosts can enable pre-shared-key auth (#394) at
+ * server-start time. NULL pointer + zero length means auth
+ * disabled (default); non-null + non-zero length enables the
+ * gate with the provided bytes. Length must be in `1..=256`
+ * (sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN); out-of-
+ * range values are rejected with SDR_CORE_ERR_INVALID_ARG.
+ * Struct layout grows; any 0.16 consumer must fail fast on
+ * the exact-match ABI check (pre-1.0 rule).
+ *
  * 0.16 — TWO struct layouts grow as part of #392 (role gate).
  * Either change alone is ABI-breaking under the pre-1.0 exact-
  * match rule; both land together:
@@ -825,6 +836,21 @@ typedef struct SdrRtlTcpServerConfig {
     bool     initial_bias_tee;
     int32_t  initial_direct_sampling;    /* 0 = off, 1 = I, 2 = Q */
     uint32_t listener_cap;               /* max concurrent Role::Listen clients; 0 = crate default (10); the single Control client is separate */
+    /* Pre-shared auth key bytes (#394). NULL pointer + zero
+     * length = auth disabled (default; LAN-trust model). Non-
+     * null + non-zero length = auth gate active: every
+     * connecting client must present these bytes verbatim in
+     * their `AuthKeyMessage`. Length must be in 1..=256; out-
+     * of-range values are rejected with
+     * SDR_CORE_ERR_INVALID_ARG. Bytes are copied into the
+     * server's owned buffer during `_start` so the caller's
+     * buffer may be freed/reused immediately after the call
+     * returns. LAN-grade trust only — wrap in SSH/WG for
+     * WAN-grade confidentiality. */
+    const uint8_t* auth_key;
+    /* Length in bytes of auth_key. Must be 0 iff auth_key is
+     * NULL. See auth_key for valid range + semantics. */
+    uint32_t auth_key_len;
 } SdrRtlTcpServerConfig;
 
 /*
