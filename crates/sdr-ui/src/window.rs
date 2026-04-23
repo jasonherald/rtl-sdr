@@ -2958,6 +2958,7 @@ struct ServerSwitchWidgetsWeak {
     bind_row: glib::WeakRef<adw::ComboRow>,
     advertise_row: glib::WeakRef<adw::SwitchRow>,
     compression_row: glib::WeakRef<adw::ComboRow>,
+    listener_cap_row: glib::WeakRef<adw::SpinRow>,
     device_defaults_row: glib::WeakRef<adw::ExpanderRow>,
     center_freq_row: glib::WeakRef<adw::SpinRow>,
     sample_rate_row: glib::WeakRef<adw::ComboRow>,
@@ -2986,6 +2987,7 @@ struct ServerSwitchWidgets {
     bind_row: adw::ComboRow,
     advertise_row: adw::SwitchRow,
     compression_row: adw::ComboRow,
+    listener_cap_row: adw::SpinRow,
     device_defaults_row: adw::ExpanderRow,
     center_freq_row: adw::SpinRow,
     sample_rate_row: adw::ComboRow,
@@ -3012,6 +3014,7 @@ impl ServerSwitchWidgetsWeak {
             bind_row: s.bind_row.downgrade(),
             advertise_row: s.advertise_row.downgrade(),
             compression_row: s.compression_row.downgrade(),
+            listener_cap_row: s.listener_cap_row.downgrade(),
             device_defaults_row: s.device_defaults_row.downgrade(),
             center_freq_row: s.center_freq_row.downgrade(),
             sample_rate_row: s.sample_rate_row.downgrade(),
@@ -3039,6 +3042,7 @@ impl ServerSwitchWidgetsWeak {
             bind_row: self.bind_row.upgrade()?,
             advertise_row: self.advertise_row.upgrade()?,
             compression_row: self.compression_row.upgrade()?,
+            listener_cap_row: self.listener_cap_row.upgrade()?,
             device_defaults_row: self.device_defaults_row.upgrade()?,
             center_freq_row: self.center_freq_row.upgrade()?,
             sample_rate_row: self.sample_rate_row.upgrade()?,
@@ -3081,6 +3085,13 @@ fn connect_share_switch(
     // self-cycle with the `connect_active_notify` subscription.
     // Upgraded per-callback so strong refs live for one tick only.
     let widgets_weak = ServerSwitchWidgetsWeak::from_panels(panels);
+
+    // Clone the `running` handle for the listener-cap live-apply
+    // closure BEFORE the `share_row` active-notify handler
+    // below consumes the outer `running` by move. Both closures
+    // share the same `RefCell`; neither holds a borrow past its
+    // own tick. Per #395.
+    let running_for_cap = Rc::clone(&running);
 
     panels.server.share_row.connect_active_notify(move |row| {
         if reentry_guard.get() {
@@ -3191,6 +3202,35 @@ fn connect_share_switch(
             reset_activity_log(&widgets);
         }
         apply_visibility();
+    });
+
+    // Listener-cap live-apply. Changes on the spin row take effect
+    // on the next client accept without restarting the server. The
+    // row also persists to sdr_config via a separate signal
+    // attached inside `server_panel.rs`; this handler only cares
+    // about the running-server case. Per issue #395.
+    panels.server.listener_cap_row.connect_value_notify(move |row| {
+        let Ok(handle) = running_for_cap.try_borrow() else {
+            // Another handler is holding the `RunningServer` borrow
+            // (e.g. the share_row active-notify flipping server
+            // start/stop). Skip this tick — the spin row's new
+            // value is already persisted via the server_panel
+            // signal, and the next accept after start will pick
+            // it up through `build_server_config_from_panel`.
+            return;
+        };
+        let Some(handle) = handle.as_ref() else {
+            // Server not running — the spin row edit is already
+            // persisted; nothing to apply live.
+            return;
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "spin row bounded to [MIN_LISTENER_CAP, MAX_LISTENER_CAP] at the widget level"
+        )]
+        let cap = row.value() as usize;
+        handle.server.set_listener_cap(cap);
     });
 }
 
@@ -3815,7 +3855,11 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
         },
         buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
         compression,
-        listener_cap: sdr_server_rtltcp::DEFAULT_LISTENER_CAP,
+        // Listener cap pulled from the panel's live widget value so
+        // the spin row's current position is the single source of
+        // truth at server-start time. Later live-update calls flow
+        // through `Server::set_listener_cap` directly. Per #395.
+        listener_cap: panel.listener_cap_row.value() as usize,
         // Auth defaults to off (None) — enabling it lives behind
         // the #395 server UI toggle. #394 ships the wire + server
         // enforcement plumbing; the UI knob + keyring storage

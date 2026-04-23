@@ -134,8 +134,10 @@ impl TxtRecord {
                 // publish it. Absence stays `None`.
                 "auth_required" => {
                     let raw = v.as_ref();
-                    auth_required =
-                        Some(matches!(raw.to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
+                    auth_required = Some(matches!(
+                        raw.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes"
+                    ));
                 }
                 _ => {
                     tracing::trace!(
@@ -253,10 +255,7 @@ mod tests {
         let mut r = sample();
         r.auth_required = Some(true);
         let props = r.to_properties().unwrap();
-        assert_eq!(
-            props.get("auth_required").map(String::as_str),
-            Some("true")
-        );
+        assert_eq!(props.get("auth_required").map(String::as_str), Some("true"));
 
         r.auth_required = Some(false);
         let props = r.to_properties().unwrap();

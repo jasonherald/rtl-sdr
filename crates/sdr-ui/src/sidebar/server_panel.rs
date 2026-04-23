@@ -47,6 +47,11 @@ const KEY_SERVER_DEFAULT_DIRECT_SAMPLING: &str = "rtl_tcp_server_default_direct_
 /// index so a future addition (e.g. Zstd) doesn't invalidate old
 /// configs — unknown indices fall back to `Off` on restore.
 const KEY_SERVER_COMPRESSION_IDX: &str = "rtl_tcp_server_compression_idx";
+/// Config key for the persisted listener cap (max `Role::Listen`
+/// clients). See [`MIN_LISTENER_CAP`] / [`MAX_LISTENER_CAP`] for
+/// the allowed range and [`sdr_server_rtltcp::DEFAULT_LISTENER_CAP`]
+/// for the default. Per issue #395.
+const KEY_SERVER_LISTENER_CAP: &str = "rtl_tcp_server_listener_cap";
 
 /// Default TCP port for `rtl_tcp`. Matches upstream `rtl_tcp.c` and
 /// every ecosystem client's default. Changing it means users have to
@@ -63,6 +68,22 @@ pub const MAX_SERVER_PORT: f64 = 65_535.0;
 const SERVER_PORT_STEP: f64 = 1.0;
 /// Spin-row page step (`PgUp` / `PgDn`) for the port field.
 const SERVER_PORT_PAGE: f64 = 100.0;
+
+/// Minimum listener-cap value. 0 is legal — it means
+/// "control-only; no listeners allowed" (the user explicitly
+/// blocks any `Role::Listen` client). Per issue #395.
+pub const MIN_LISTENER_CAP: f64 = 0.0;
+/// Maximum listener-cap value the UI lets the user pick. 32 is the
+/// soft cap from issue #395 — above that a single dongle's IQ
+/// bandwidth starts showing measurable fan-out overhead, and the
+/// `ClientSlot` / `ClientRegistry` structs aren't optimized for
+/// hundreds of live clients either. Backend accepts larger values
+/// via direct library calls; the UI just doesn't expose them.
+pub const MAX_LISTENER_CAP: f64 = 32.0;
+/// Spin-row per-click step for the listener-cap row.
+const LISTENER_CAP_STEP: f64 = 1.0;
+/// Spin-row page step (`PgUp` / `PgDn`) for the listener-cap row.
+const LISTENER_CAP_PAGE: f64 = 5.0;
 
 /// Bind-address selector index: loopback-only (127.0.0.1). The
 /// default — limits exposure to clients running on the same machine
@@ -200,6 +221,13 @@ pub struct ServerPanel {
     /// clients and our own `NONE_ONLY` clients still get uncompressed
     /// via the mutual-codec intersection. See #307.
     pub compression_row: adw::ComboRow,
+    /// Listener cap — maximum concurrent `Role::Listen` clients.
+    /// 0 = "control only — no listeners allowed". Changes take
+    /// effect on the next accept via
+    /// [`sdr_server_rtltcp::Server::set_listener_cap`]; existing
+    /// listeners are never kicked when the cap is lowered
+    /// (surprise disconnection is rude, per #395).
+    pub listener_cap_row: adw::SpinRow,
     /// Collapsible group of device-defaults (freq / sample rate /
     /// gain / PPM / bias tee / direct sampling) applied on server
     /// start. Clients override these live via the `rtl_tcp` command
@@ -535,6 +563,37 @@ pub fn build_server_panel() -> ServerPanel {
         .selected(COMPRESSION_OFF_IDX)
         .build();
 
+    // Listener cap — per #395. Default pulled from the backend's
+    // `DEFAULT_LISTENER_CAP` so a UI-backend drift would surface as
+    // a test / build failure rather than a quiet divergence. The
+    // `usize` → `f64` cast is lossless on every realistic value
+    // (cap is always < 32, and f64 is exact for integers up to
+    // `2^53`), but clippy's `cast_precision_loss` lint fires on
+    // any `usize as f64` conversion regardless — allow inline
+    // with a reason rather than adding a workspace-wide exception.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "listener cap is bounded << 2^53, f64 represents it exactly"
+    )]
+    let default_cap = sdr_server_rtltcp::DEFAULT_LISTENER_CAP as f64;
+    let listener_cap_adj = gtk4::Adjustment::new(
+        default_cap,
+        MIN_LISTENER_CAP,
+        MAX_LISTENER_CAP,
+        LISTENER_CAP_STEP,
+        LISTENER_CAP_PAGE,
+        0.0,
+    );
+    let listener_cap_row = adw::SpinRow::builder()
+        .title("Listener cap")
+        .subtitle(
+            "Max simultaneous Listen clients — 0 disables listeners, change applies on next client",
+        )
+        .adjustment(&listener_cap_adj)
+        .numeric(true)
+        .snap_to_ticks(true)
+        .build();
+
     let device_defaults_row = adw::ExpanderRow::builder()
         .title("Device defaults")
         .subtitle("Applied when the server opens the dongle — clients override live")
@@ -585,6 +644,7 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&bind_row);
     widget.add(&advertise_row);
     widget.add(&compression_row);
+    widget.add(&listener_cap_row);
     widget.add(&device_defaults_row);
     widget.add(&status_row);
     widget.add(&activity_log_row);
@@ -598,6 +658,7 @@ pub fn build_server_panel() -> ServerPanel {
         bind_row,
         advertise_row,
         compression_row,
+        listener_cap_row,
         device_defaults_row,
         center_freq_row,
         sample_rate_row,
@@ -737,6 +798,19 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             // a corrupt config can't silently enable compression.
             panel.compression_row.set_selected(idx_u32);
         }
+        if let Some(cap) = v
+            .get(KEY_SERVER_LISTENER_CAP)
+            .and_then(serde_json::Value::as_u64)
+        {
+            // Clamp to the UI's advertised range on restore. An
+            // out-of-range stored value would have been saved by
+            // some other client talking to the same config file
+            // (e.g. `sdr-rtl-tcp --listener-cap 999`); the widget
+            // still needs to be a valid spin-row value so pin it
+            // into [MIN_LISTENER_CAP, MAX_LISTENER_CAP]. Per #395.
+            let clamped = (cap as f64).clamp(MIN_LISTENER_CAP, MAX_LISTENER_CAP);
+            panel.listener_cap_row.set_value(clamped);
+        }
     });
 
     // ---- Phase 2: subscribe ----
@@ -853,5 +927,22 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
                 v[KEY_SERVER_COMPRESSION_IDX] = serde_json::json!(selected);
             });
         }
+    });
+    // Listener cap spin row. Persist on every change so the next
+    // session restores the same cap. Applying the new value to a
+    // running server (`Server::set_listener_cap`) is wired
+    // separately in `window.rs` where the live `Server` handle
+    // lives. Per #395.
+    let cfg_cap = Arc::clone(config);
+    panel.listener_cap_row.connect_value_notify(move |row| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "spin row bounded to [MIN_LISTENER_CAP, MAX_LISTENER_CAP] at the widget level"
+        )]
+        let cap = row.value() as u64;
+        cfg_cap.write(|v| {
+            v[KEY_SERVER_LISTENER_CAP] = serde_json::json!(cap);
+        });
     });
 }
