@@ -52,6 +52,23 @@ const KEY_SERVER_COMPRESSION_IDX: &str = "rtl_tcp_server_compression_idx";
 /// the allowed range and [`sdr_server_rtltcp::DEFAULT_LISTENER_CAP`]
 /// for the default. Per issue #395.
 const KEY_SERVER_LISTENER_CAP: &str = "rtl_tcp_server_listener_cap";
+/// Config key for the "Require key" switch state (bool). The key
+/// bytes themselves live in the OS keyring under
+/// [`KEYRING_KEY_AUTH_KEY`] — `sdr_config` is plaintext JSON,
+/// which is the wrong place for secret bytes. Per issue #395.
+const KEY_SERVER_REQUIRE_AUTH: &str = "rtl_tcp_server_require_auth";
+
+/// Keyring service name for all `sdr-rs` secrets. Matches the value
+/// used in `preferences::accounts_page` so both `RadioReference`
+/// and `rtl_tcp` auth-key entries show up under the same service
+/// heading in `seahorse` / `Keychain Access`.
+pub const KEYRING_SERVICE: &str = "sdr-rs";
+/// Keyring entry name holding the `rtl_tcp` pre-shared auth key.
+/// Stored as a lowercase-hex string so it round-trips through
+/// keyring's `String` API without custom base64/UTF-8 coercion
+/// — `rand::OsRng`-backed keys are arbitrary bytes, not text.
+/// Per issue #395.
+pub const KEYRING_KEY_AUTH_KEY: &str = "rtl_tcp-server-auth-key";
 
 /// Default TCP port for `rtl_tcp`. Matches upstream `rtl_tcp.c` and
 /// every ecosystem client's default. Changing it means users have to
@@ -84,6 +101,52 @@ pub const MAX_LISTENER_CAP: f64 = 32.0;
 const LISTENER_CAP_STEP: f64 = 1.0;
 /// Spin-row page step (`PgUp` / `PgDn`) for the listener-cap row.
 const LISTENER_CAP_PAGE: f64 = 5.0;
+
+/// Subtitle shown on `auth_key_row` when the key is masked
+/// (default state). Fixed-length run of bullet chars — doesn't
+/// leak key length and renders at the same width as a plausible
+/// revealed value so the row height doesn't jump when the user
+/// toggles reveal. Per issue #395.
+pub const AUTH_KEY_MASKED_PLACEHOLDER: &str = "••••••••••••••••••••••••••••••••";
+
+/// Encode an auth-key byte slice as lowercase hex for keyring
+/// storage and clipboard copy. Pre-sized allocation (two hex
+/// chars per input byte) keeps the hot "toggle reveal" UI path
+/// allocation-free after the initial key load. Per issue #395.
+pub fn auth_key_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // write! on String is infallible; _ lets us ignore the
+        // Result without burdening callers with unwrap_or_else.
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode a lowercase-hex auth-key string back into raw bytes.
+/// Strict validation: rejects odd-length, non-ASCII, and non-hex
+/// input. Returns `None` for any malformed input; callers treat
+/// that as "keyring value is corrupt, regenerate on next
+/// toggle-on". Per issue #395.
+pub fn auth_key_from_hex(s: &str) -> Option<Vec<u8>> {
+    const HEX_CHARS_PER_BYTE: usize = 2;
+    if s.is_empty() || !s.is_ascii() || !s.len().is_multiple_of(HEX_CHARS_PER_BYTE) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / HEX_CHARS_PER_BYTE);
+    for chunk in s.as_bytes().chunks_exact(HEX_CHARS_PER_BYTE) {
+        let hi = char::from(chunk[0]).to_digit(16)?;
+        let lo = char::from(chunk[1]).to_digit(16)?;
+        // `hi` and `lo` are each 0..=15 (validated by `to_digit(16)`),
+        // so `(hi << 4) | lo` fits in u8 with the top 24 bits zero —
+        // `u8::try_from` is infallible here but keeps clippy's
+        // `cast_possible_truncation` quiet.
+        let byte = u8::try_from((hi << 4) | lo).ok()?;
+        out.push(byte);
+    }
+    Some(out)
+}
 
 /// Bind-address selector index: loopback-only (127.0.0.1). The
 /// default — limits exposure to clients running on the same machine
@@ -228,6 +291,36 @@ pub struct ServerPanel {
     /// listeners are never kicked when the cap is lowered
     /// (surprise disconnection is rude, per #395).
     pub listener_cap_row: adw::SpinRow,
+    /// "Require key" master switch. When on, the server generates
+    /// (or reloads) a 32-byte pre-shared key and enforces it on
+    /// every connecting client via the #394 auth gate. When off,
+    /// the server reverts to the pre-#394 open-LAN posture. The
+    /// keyring entry persists across toggle-off/on cycles so
+    /// flipping back doesn't regenerate the key. Per issue #395.
+    pub auth_require_row: adw::SwitchRow,
+    /// Auth-key display row — hidden when `auth_require_row` is
+    /// off. When on, shows the current key in either masked
+    /// (default) or revealed form. Three suffix buttons: reveal
+    /// toggle, copy-to-clipboard, regenerate. Wiring lives in
+    /// `window.rs` where the running `Server` handle is available
+    /// for live `set_auth_key` calls. Per issue #395.
+    pub auth_key_row: adw::ActionRow,
+    /// Reveal/hide toggle. Icon flips between
+    /// `view-conceal-symbolic` (currently visible → click to hide)
+    /// and `view-reveal-symbolic` (currently masked → click to
+    /// reveal). Caller tracks the on/off state.
+    pub auth_key_reveal_button: gtk4::Button,
+    /// Copy-to-clipboard button. Always copies the FULL hex key
+    /// regardless of whether the display is revealed — users
+    /// typically click Copy without clicking Reveal first.
+    pub auth_key_copy_button: gtk4::Button,
+    /// Regenerate button. Replaces the stored key with a new
+    /// `sdr_server_rtltcp::auth::generate_random_auth_key()`
+    /// result, saves to keyring, and calls
+    /// `Server::set_auth_key` on the running server so the old
+    /// key stops working for future reconnects without kicking
+    /// already-authenticated clients.
+    pub auth_key_regenerate_button: gtk4::Button,
     /// Collapsible group of device-defaults (freq / sample rate /
     /// gain / PPM / bias tee / direct sampling) applied on server
     /// start. Clients override these live via the `rtl_tcp` command
@@ -594,6 +687,54 @@ pub fn build_server_panel() -> ServerPanel {
         .snap_to_ticks(true)
         .build();
 
+    // Auth-key controls (#394/#395). Three widgets: master
+    // "Require key" switch, a key-display row that only shows
+    // when auth is on, and three suffix buttons for
+    // reveal / copy / regenerate. State (current key bytes,
+    // currently-revealed flag) lives in `window.rs` where the
+    // running `Server` + keyring store are accessible.
+    let auth_require_row = adw::SwitchRow::builder()
+        .title("Require key")
+        .subtitle("Clients must present a pre-shared key to connect — LAN-grade only, not WAN-safe")
+        .active(false)
+        .build();
+
+    // Auth-key display row — hidden until `auth_require_row` is
+    // on. `subtitle_selectable(true)` lets users triple-click the
+    // revealed key to copy it without using the Copy button.
+    let auth_key_row = adw::ActionRow::builder()
+        .title("Key")
+        .subtitle(AUTH_KEY_MASKED_PLACEHOLDER)
+        .subtitle_selectable(true)
+        .visible(false)
+        .build();
+
+    // Reveal-toggle button. Icon starts as `view-reveal-symbolic`
+    // (masked → click to reveal); window.rs flips it to
+    // `view-conceal-symbolic` when the subtitle shows the real
+    // key. `.flat()` keeps it visually aligned with the row.
+    let auth_key_reveal_button = gtk4::Button::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text("Reveal key")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    let auth_key_copy_button = gtk4::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy key to clipboard")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    let auth_key_regenerate_button = gtk4::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Regenerate key — old key stops working for future reconnects")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    auth_key_row.add_suffix(&auth_key_reveal_button);
+    auth_key_row.add_suffix(&auth_key_copy_button);
+    auth_key_row.add_suffix(&auth_key_regenerate_button);
+
     let device_defaults_row = adw::ExpanderRow::builder()
         .title("Device defaults")
         .subtitle("Applied when the server opens the dongle — clients override live")
@@ -645,6 +786,8 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&advertise_row);
     widget.add(&compression_row);
     widget.add(&listener_cap_row);
+    widget.add(&auth_require_row);
+    widget.add(&auth_key_row);
     widget.add(&device_defaults_row);
     widget.add(&status_row);
     widget.add(&activity_log_row);
@@ -659,6 +802,11 @@ pub fn build_server_panel() -> ServerPanel {
         advertise_row,
         compression_row,
         listener_cap_row,
+        auth_require_row,
+        auth_key_row,
+        auth_key_reveal_button,
+        auth_key_copy_button,
+        auth_key_regenerate_button,
         device_defaults_row,
         center_freq_row,
         sample_rate_row,
@@ -811,6 +959,19 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             let clamped = (cap as f64).clamp(MIN_LISTENER_CAP, MAX_LISTENER_CAP);
             panel.listener_cap_row.set_value(clamped);
         }
+        if let Some(require) = v
+            .get(KEY_SERVER_REQUIRE_AUTH)
+            .and_then(serde_json::Value::as_bool)
+        {
+            // Restore the "Require key" toggle state. The key
+            // itself lives in the OS keyring; window.rs loads /
+            // creates it on toggle-on. Just restore the bool
+            // here so the widget reflects the user's last
+            // choice; window.rs's connect-active handler
+            // kicks off the keyring/server wiring if it was on.
+            // Per #395.
+            panel.auth_require_row.set_active(require);
+        }
     });
 
     // ---- Phase 2: subscribe ----
@@ -945,4 +1106,56 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             v[KEY_SERVER_LISTENER_CAP] = serde_json::json!(cap);
         });
     });
+    // "Require key" switch — persist the bool to sdr_config. The
+    // key bytes themselves live in the OS keyring, managed by
+    // window.rs. Per #395.
+    let cfg_auth = Arc::clone(config);
+    panel.auth_require_row.connect_active_notify(move |row| {
+        cfg_auth.write(|v| {
+            v[KEY_SERVER_REQUIRE_AUTH] = serde_json::json!(row.is_active());
+        });
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{auth_key_from_hex, auth_key_to_hex};
+
+    #[test]
+    fn auth_key_to_hex_round_trips_through_from_hex() {
+        // Every byte value 0..=255 must round-trip through
+        // hex encode / decode without loss. Pins the
+        // keyring-persistence contract — a key stored today
+        // comes back as the exact same bytes on the next
+        // launch.
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let hex = auth_key_to_hex(&bytes);
+        assert_eq!(hex.len(), bytes.len() * 2);
+        assert!(
+            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "encoder must emit lowercase hex only"
+        );
+        let back = auth_key_from_hex(&hex).expect("round-trip decode must succeed");
+        assert_eq!(back, bytes);
+    }
+
+    #[test]
+    fn auth_key_from_hex_rejects_malformed_input() {
+        // Empty, odd-length, and non-hex characters all
+        // surface as `None` so the keyring reader can fall
+        // back to regenerate without panicking. Non-ASCII
+        // (the PR #405 regression vector) must also fail
+        // cleanly rather than panicking on boundary slicing.
+        assert!(auth_key_from_hex("").is_none());
+        assert!(auth_key_from_hex("abc").is_none(), "odd length");
+        assert!(auth_key_from_hex("xyz0").is_none(), "non-hex chars");
+        assert!(auth_key_from_hex("💩💩").is_none(), "non-ASCII emoji");
+    }
+
+    #[test]
+    fn auth_key_to_hex_empty_input_produces_empty_string() {
+        // Edge case — empty slice is legal input (no key set);
+        // encoder must produce an empty string, not panic.
+        assert_eq!(auth_key_to_hex(&[]), "");
+    }
 }

@@ -2768,6 +2768,69 @@ struct RunningServer {
     advertiser: Option<Advertiser>,
 }
 
+/// Read the `rtl_tcp` server auth key from the OS keyring, if
+/// present. Returns `Some(bytes)` for a well-formed hex-encoded
+/// entry, `None` for a missing key, keyring unavailable, empty
+/// entry, or corrupt hex. Corrupt entries are logged at `warn`
+/// so operators can diagnose without the UI silently regenerating
+/// over their paste. Per issue #395.
+fn load_server_auth_key_from_keyring() -> Option<Vec<u8>> {
+    use sdr_config::KeyringStore;
+
+    use crate::sidebar::server_panel::{KEYRING_KEY_AUTH_KEY, KEYRING_SERVICE, auth_key_from_hex};
+
+    let store = KeyringStore::new(KEYRING_SERVICE);
+    match store.get(KEYRING_KEY_AUTH_KEY) {
+        Ok(Some(hex)) => {
+            let Some(bytes) = auth_key_from_hex(&hex) else {
+                tracing::warn!(
+                    "rtl_tcp server auth key in keyring is malformed hex; regenerating on next toggle-on"
+                );
+                return None;
+            };
+            Some(bytes)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(%e, "rtl_tcp server auth key keyring read failed");
+            None
+        }
+    }
+}
+
+/// Write the `rtl_tcp` server auth key to the OS keyring as
+/// lowercase hex. Returns the underlying keyring error so
+/// callers can surface it via toast — the caller is responsible
+/// for deciding UX fallback (e.g. revert the toggle, show a
+/// banner). Per issue #395.
+fn save_server_auth_key_to_keyring(
+    bytes: &[u8],
+) -> Result<(), sdr_config::keyring_store::KeyringError> {
+    use sdr_config::KeyringStore;
+
+    use crate::sidebar::server_panel::{KEYRING_KEY_AUTH_KEY, KEYRING_SERVICE, auth_key_to_hex};
+
+    let store = KeyringStore::new(KEYRING_SERVICE);
+    store.set(KEYRING_KEY_AUTH_KEY, &auth_key_to_hex(bytes))
+}
+
+/// Load the persisted server auth key, generating + saving a
+/// fresh one when the keyring is either empty or corrupt. The
+/// caller gets the fresh bytes regardless — a write failure
+/// leaves the key in memory so the current session works, and
+/// the next session's toggle-on retries the save path. Per
+/// issue #395.
+fn ensure_server_auth_key() -> Vec<u8> {
+    if let Some(existing) = load_server_auth_key_from_keyring() {
+        return existing;
+    }
+    let fresh = sdr_server_rtltcp::auth::generate_random_auth_key();
+    if let Err(e) = save_server_auth_key_to_keyring(&fresh) {
+        tracing::warn!(%e, "rtl_tcp server auth key keyring write failed — in-memory only");
+    }
+    fresh
+}
+
 /// Wire the server panel end-to-end: visibility gating, the master
 /// share-over-network switch, and its downstream start/stop effects.
 /// Errors surface via the `toast_overlay`, and the switch auto-
@@ -2959,6 +3022,7 @@ struct ServerSwitchWidgetsWeak {
     advertise_row: glib::WeakRef<adw::SwitchRow>,
     compression_row: glib::WeakRef<adw::ComboRow>,
     listener_cap_row: glib::WeakRef<adw::SpinRow>,
+    auth_require_row: glib::WeakRef<adw::SwitchRow>,
     device_defaults_row: glib::WeakRef<adw::ExpanderRow>,
     center_freq_row: glib::WeakRef<adw::SpinRow>,
     sample_rate_row: glib::WeakRef<adw::ComboRow>,
@@ -2988,6 +3052,7 @@ struct ServerSwitchWidgets {
     advertise_row: adw::SwitchRow,
     compression_row: adw::ComboRow,
     listener_cap_row: adw::SpinRow,
+    auth_require_row: adw::SwitchRow,
     device_defaults_row: adw::ExpanderRow,
     center_freq_row: adw::SpinRow,
     sample_rate_row: adw::ComboRow,
@@ -3015,6 +3080,7 @@ impl ServerSwitchWidgetsWeak {
             advertise_row: s.advertise_row.downgrade(),
             compression_row: s.compression_row.downgrade(),
             listener_cap_row: s.listener_cap_row.downgrade(),
+            auth_require_row: s.auth_require_row.downgrade(),
             device_defaults_row: s.device_defaults_row.downgrade(),
             center_freq_row: s.center_freq_row.downgrade(),
             sample_rate_row: s.sample_rate_row.downgrade(),
@@ -3043,6 +3109,7 @@ impl ServerSwitchWidgetsWeak {
             advertise_row: self.advertise_row.upgrade()?,
             compression_row: self.compression_row.upgrade()?,
             listener_cap_row: self.listener_cap_row.upgrade()?,
+            auth_require_row: self.auth_require_row.upgrade()?,
             device_defaults_row: self.device_defaults_row.upgrade()?,
             center_freq_row: self.center_freq_row.upgrade()?,
             sample_rate_row: self.sample_rate_row.upgrade()?,
@@ -3062,6 +3129,13 @@ impl ServerSwitchWidgetsWeak {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "share switch orchestrates server start/stop plus listener-cap + \
+              auth-key live-update signals; splitting it would scatter the \
+              `running` and `toast_overlay` Rc clones across multiple helpers \
+              without improving clarity"
+)]
 fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
@@ -3092,6 +3166,44 @@ fn connect_share_switch(
     // share the same `RefCell`; neither holds a borrow past its
     // own tick. Per #395.
     let running_for_cap = Rc::clone(&running);
+    // Additional `running` clones for the auth-related closures
+    // (toggle, reveal, copy, regenerate). Same rationale — clone
+    // before the share_row handler consumes the outer `running`.
+    let running_for_auth_toggle = Rc::clone(&running);
+    let running_for_auth_regen = Rc::clone(&running);
+
+    // Clone the toast-overlay weak ref for every auth-side
+    // closure that surfaces errors (toggle-on/off, copy,
+    // regenerate). Same move-before-share_row problem: the
+    // share_row closure below consumes the outer
+    // `toast_overlay_weak`.
+    let toast_overlay_for_auth_toggle = toast_overlay_weak.clone();
+    let toast_overlay_for_copy = toast_overlay_weak.clone();
+    let toast_overlay_for_regen = toast_overlay_weak.clone();
+
+    // Shared state for the auth-key display row. `current_key`
+    // holds the active key bytes while the server is running
+    // with auth enabled; `None` when auth is off. `key_revealed`
+    // tracks whether the subtitle currently shows the full hex
+    // or the masked placeholder — the user toggles this via the
+    // reveal button. Both are `Rc<...>` so the four closures
+    // (toggle, reveal, copy, regenerate) share the same state
+    // without borrow conflicts. Per issue #395.
+    let current_auth_key: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
+    let auth_key_revealed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+    // If auth was restored as ON from config, eagerly load the
+    // key from the keyring so the key row reflects real state
+    // before the user interacts with anything. The server isn't
+    // running yet (that requires the share_row flip), so no
+    // `set_auth_key` call here — just UI state.
+    if panels.server.auth_require_row.is_active() {
+        let key = ensure_server_auth_key();
+        *current_auth_key.borrow_mut() = Some(key);
+        panels.server.auth_key_row.set_visible(true);
+        // Leave subtitle as the masked placeholder (widget
+        // default) — user clicks Reveal to see the real value.
+    }
 
     panels.server.share_row.connect_active_notify(move |row| {
         if reentry_guard.get() {
@@ -3203,6 +3315,174 @@ fn connect_share_switch(
         }
         apply_visibility();
     });
+
+    // ====================================================
+    // Auth controls (#394/#395) — toggle + reveal + copy +
+    // regenerate. All four closures share `current_auth_key`
+    // and `auth_key_revealed` via `Rc` + the running-server
+    // handle via `running_for_auth_{toggle,regen}`.
+    // ====================================================
+
+    // Master "Require key" toggle.
+    // ON: load-or-generate key from keyring, call
+    //     Server::set_auth_key(Some(bytes)) if running, show
+    //     the key row with masked subtitle.
+    // OFF: call Server::set_auth_key(None) if running, hide
+    //      the key row, drop in-memory bytes. Keyring entry
+    //      is PRESERVED per #395 ("flipping back doesn't
+    //      regenerate").
+    let key_row_for_toggle = panels.server.auth_key_row.downgrade();
+    let reveal_button_for_toggle = panels.server.auth_key_reveal_button.downgrade();
+    let current_key_for_toggle = Rc::clone(&current_auth_key);
+    let revealed_for_toggle = Rc::clone(&auth_key_revealed);
+    panels
+        .server
+        .auth_require_row
+        .connect_active_notify(move |row| {
+            let Some(key_row) = key_row_for_toggle.upgrade() else {
+                return;
+            };
+            if row.is_active() {
+                let key = ensure_server_auth_key();
+                if let Ok(handle) = running_for_auth_toggle.try_borrow()
+                    && let Some(handle) = handle.as_ref()
+                    && let Err(e) = handle.server.set_auth_key(Some(key.clone()))
+                {
+                    tracing::warn!(%e, "Server::set_auth_key failed on toggle-on");
+                    if let Some(overlay) = toast_overlay_for_auth_toggle.upgrade() {
+                        overlay.add_toast(adw::Toast::new(&format!(
+                            "Couldn't enable auth on the running server: {e}"
+                        )));
+                    }
+                }
+                *current_key_for_toggle.borrow_mut() = Some(key);
+                key_row.set_visible(true);
+                // Reset to masked state on every toggle-on so the
+                // key row doesn't surface a previously-revealed
+                // value across sessions.
+                revealed_for_toggle.set(false);
+                key_row.set_subtitle(crate::sidebar::server_panel::AUTH_KEY_MASKED_PLACEHOLDER);
+                if let Some(rb) = reveal_button_for_toggle.upgrade() {
+                    rb.set_icon_name("view-reveal-symbolic");
+                    rb.set_tooltip_text(Some("Reveal key"));
+                }
+            } else {
+                if let Ok(handle) = running_for_auth_toggle.try_borrow()
+                    && let Some(handle) = handle.as_ref()
+                    && let Err(e) = handle.server.set_auth_key(None)
+                {
+                    tracing::warn!(%e, "Server::set_auth_key(None) failed on toggle-off");
+                }
+                *current_key_for_toggle.borrow_mut() = None;
+                key_row.set_visible(false);
+                // Zero the revealed flag too so a next toggle-on
+                // starts masked regardless of the prior reveal
+                // state.
+                revealed_for_toggle.set(false);
+            }
+        });
+
+    // Reveal / conceal button — flips the subtitle between the
+    // masked placeholder and the full hex-encoded key. Pure UI
+    // state; doesn't touch keyring or server.
+    let key_row_for_reveal = panels.server.auth_key_row.downgrade();
+    let current_key_for_reveal = Rc::clone(&current_auth_key);
+    let revealed_for_reveal = Rc::clone(&auth_key_revealed);
+    panels
+        .server
+        .auth_key_reveal_button
+        .connect_clicked(move |btn| {
+            let Some(key_row) = key_row_for_reveal.upgrade() else {
+                return;
+            };
+            let Ok(key_opt) = current_key_for_reveal.try_borrow() else {
+                return;
+            };
+            let Some(bytes) = key_opt.as_ref() else {
+                return;
+            };
+            let now_revealed = !revealed_for_reveal.get();
+            revealed_for_reveal.set(now_revealed);
+            if now_revealed {
+                key_row.set_subtitle(&crate::sidebar::server_panel::auth_key_to_hex(bytes));
+                btn.set_icon_name("view-conceal-symbolic");
+                btn.set_tooltip_text(Some("Hide key"));
+            } else {
+                key_row.set_subtitle(crate::sidebar::server_panel::AUTH_KEY_MASKED_PLACEHOLDER);
+                btn.set_icon_name("view-reveal-symbolic");
+                btn.set_tooltip_text(Some("Reveal key"));
+            }
+        });
+
+    // Copy button — always copies the FULL hex key regardless of
+    // reveal state. Users typically click Copy without clicking
+    // Reveal first.
+    let current_key_for_copy = Rc::clone(&current_auth_key);
+    panels
+        .server
+        .auth_key_copy_button
+        .connect_clicked(move |btn| {
+            let Ok(key_opt) = current_key_for_copy.try_borrow() else {
+                return;
+            };
+            let Some(bytes) = key_opt.as_ref() else {
+                return;
+            };
+            let hex = crate::sidebar::server_panel::auth_key_to_hex(bytes);
+            // Grab the display's clipboard via the button's widget
+            // ancestry. `clipboard()` on a widget returns the
+            // primary clipboard for the display it's attached to.
+            let clipboard = btn.clipboard();
+            clipboard.set_text(&hex);
+            if let Some(overlay) = toast_overlay_for_copy.upgrade() {
+                overlay.add_toast(adw::Toast::new("Key copied to clipboard"));
+            }
+        });
+
+    // Regenerate button — generates a fresh 32-byte key,
+    // overwrites the keyring entry, updates the live server
+    // (if running) via set_auth_key, and updates the display
+    // row subtitle (preserving the current revealed state so
+    // the user can verify the new value immediately).
+    let key_row_for_regen = panels.server.auth_key_row.downgrade();
+    let current_key_for_regen = Rc::clone(&current_auth_key);
+    let revealed_for_regen = Rc::clone(&auth_key_revealed);
+    panels
+        .server
+        .auth_key_regenerate_button
+        .connect_clicked(move |_btn| {
+            let Some(key_row) = key_row_for_regen.upgrade() else {
+                return;
+            };
+            let fresh = sdr_server_rtltcp::auth::generate_random_auth_key();
+            if let Err(e) = save_server_auth_key_to_keyring(&fresh) {
+                tracing::warn!(%e, "rtl_tcp auth-key regenerate keyring write failed");
+                if let Some(overlay) = toast_overlay_for_regen.upgrade() {
+                    overlay.add_toast(adw::Toast::new(&format!(
+                        "Couldn't save new key to keyring: {e}"
+                    )));
+                }
+                // Continue anyway — the in-memory key is still
+                // applied so the current session gets the new
+                // value; the next launch will find the old key
+                // until the save path succeeds.
+            }
+            if let Ok(handle) = running_for_auth_regen.try_borrow()
+                && let Some(handle) = handle.as_ref()
+                && let Err(e) = handle.server.set_auth_key(Some(fresh.clone()))
+            {
+                tracing::warn!(%e, "Server::set_auth_key failed on regenerate");
+            }
+            *current_key_for_regen.borrow_mut() = Some(fresh.clone());
+            if revealed_for_regen.get() {
+                key_row.set_subtitle(&crate::sidebar::server_panel::auth_key_to_hex(&fresh));
+            } else {
+                key_row.set_subtitle(crate::sidebar::server_panel::AUTH_KEY_MASKED_PLACEHOLDER);
+            }
+            if let Some(overlay) = toast_overlay_for_regen.upgrade() {
+                overlay.add_toast(adw::Toast::new("New key generated"));
+            }
+        });
 
     // Listener-cap live-apply. Changes on the spin row take effect
     // on the next client accept without restarting the server. The
@@ -3860,11 +4140,17 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
         // truth at server-start time. Later live-update calls flow
         // through `Server::set_listener_cap` directly. Per #395.
         listener_cap: panel.listener_cap_row.value() as usize,
-        // Auth defaults to off (None) — enabling it lives behind
-        // the #395 server UI toggle. #394 ships the wire + server
-        // enforcement plumbing; the UI knob + keyring storage
-        // hooks come in the follow-up sub-issue.
-        auth_key: None,
+        // Auth key pulled from the OS keyring when the "Require
+        // key" toggle is on; `None` otherwise. `ensure_server_auth_key`
+        // generates + saves a 32-byte CSPRNG key on first enable
+        // and reloads the same bytes on subsequent server
+        // restarts (keyring value survives toggle-off/on cycles).
+        // Per #395.
+        auth_key: if panel.auth_require_row.is_active() {
+            Some(ensure_server_auth_key())
+        } else {
+            None
+        },
     }
 }
 
