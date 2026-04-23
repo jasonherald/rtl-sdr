@@ -47,6 +47,28 @@ const KEY_SERVER_DEFAULT_DIRECT_SAMPLING: &str = "rtl_tcp_server_default_direct_
 /// index so a future addition (e.g. Zstd) doesn't invalidate old
 /// configs — unknown indices fall back to `Off` on restore.
 const KEY_SERVER_COMPRESSION_IDX: &str = "rtl_tcp_server_compression_idx";
+/// Config key for the persisted listener cap (max `Role::Listen`
+/// clients). See [`MIN_LISTENER_CAP`] / [`MAX_LISTENER_CAP`] for
+/// the allowed range and [`sdr_server_rtltcp::DEFAULT_LISTENER_CAP`]
+/// for the default. Per issue #395.
+const KEY_SERVER_LISTENER_CAP: &str = "rtl_tcp_server_listener_cap";
+/// Config key for the "Require key" switch state (bool). The key
+/// bytes themselves live in the OS keyring under
+/// [`KEYRING_KEY_AUTH_KEY`] — `sdr_config` is plaintext JSON,
+/// which is the wrong place for secret bytes. Per issue #395.
+const KEY_SERVER_REQUIRE_AUTH: &str = "rtl_tcp_server_require_auth";
+
+/// Keyring service name for all `sdr-rs` secrets. Matches the value
+/// used in `preferences::accounts_page` so both `RadioReference`
+/// and `rtl_tcp` auth-key entries show up under the same service
+/// heading in `seahorse` / `Keychain Access`.
+pub const KEYRING_SERVICE: &str = "sdr-rs";
+/// Keyring entry name holding the `rtl_tcp` pre-shared auth key.
+/// Stored as a lowercase-hex string so it round-trips through
+/// keyring's `String` API without custom base64/UTF-8 coercion
+/// — `rand::OsRng`-backed keys are arbitrary bytes, not text.
+/// Per issue #395.
+pub const KEYRING_KEY_AUTH_KEY: &str = "rtl_tcp-server-auth-key";
 
 /// Default TCP port for `rtl_tcp`. Matches upstream `rtl_tcp.c` and
 /// every ecosystem client's default. Changing it means users have to
@@ -63,6 +85,82 @@ pub const MAX_SERVER_PORT: f64 = 65_535.0;
 const SERVER_PORT_STEP: f64 = 1.0;
 /// Spin-row page step (`PgUp` / `PgDn`) for the port field.
 const SERVER_PORT_PAGE: f64 = 100.0;
+
+/// Minimum listener-cap value. 0 is legal — it means
+/// "control-only; no listeners allowed" (the user explicitly
+/// blocks any `Role::Listen` client). Per issue #395.
+pub const MIN_LISTENER_CAP: f64 = 0.0;
+/// Maximum listener-cap value the UI lets the user pick. 32 is the
+/// soft cap from issue #395 — above that a single dongle's IQ
+/// bandwidth starts showing measurable fan-out overhead, and the
+/// `ClientSlot` / `ClientRegistry` structs aren't optimized for
+/// hundreds of live clients either. Backend accepts larger values
+/// via direct library calls; the UI just doesn't expose them.
+pub const MAX_LISTENER_CAP: f64 = 32.0;
+/// Spin-row per-click step for the listener-cap row.
+const LISTENER_CAP_STEP: f64 = 1.0;
+/// Spin-row page step (`PgUp` / `PgDn`) for the listener-cap row.
+const LISTENER_CAP_PAGE: f64 = 5.0;
+
+/// Subtitle shown on `auth_key_row` when the key is masked
+/// (default state). Fixed-length run of bullet chars — doesn't
+/// leak key length and renders at the same width as a plausible
+/// revealed value so the row height doesn't jump when the user
+/// toggles reveal. Per issue #395.
+pub const AUTH_KEY_MASKED_PLACEHOLDER: &str = "••••••••••••••••••••••••••••••••";
+
+/// Encode an auth-key byte slice as lowercase hex for keyring
+/// storage and clipboard copy. Pre-sized allocation (two hex
+/// chars per input byte) keeps the hot "toggle reveal" UI path
+/// allocation-free after the initial key load. Per issue #395.
+pub fn auth_key_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // write! on String is infallible; _ lets us ignore the
+        // Result without burdening callers with unwrap_or_else.
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode a lowercase-hex auth-key string back into raw bytes.
+/// Strict validation: rejects odd-length, non-ASCII, non-hex
+/// input, AND decoded lengths outside
+/// `1..=sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN`. Returns
+/// `None` for any malformed input; callers treat that as "keyring
+/// value is corrupt, regenerate on next toggle-on" rather than
+/// letting an oversize payload reach `Server::start` and fail
+/// every client at handshake. Per issue #395 + `CodeRabbit`
+/// round 1 on PR #406.
+pub fn auth_key_from_hex(s: &str) -> Option<Vec<u8>> {
+    const HEX_CHARS_PER_BYTE: usize = 2;
+    /// Hex-encoded cap matching the backend's byte cap — two
+    /// hex chars per byte. A hex string longer than this cannot
+    /// decode to a valid auth key, so reject before we bother
+    /// allocating.
+    const MAX_HEX_CHARS: usize =
+        sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN * HEX_CHARS_PER_BYTE;
+    if s.is_empty()
+        || !s.is_ascii()
+        || !s.len().is_multiple_of(HEX_CHARS_PER_BYTE)
+        || s.len() > MAX_HEX_CHARS
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / HEX_CHARS_PER_BYTE);
+    for chunk in s.as_bytes().chunks_exact(HEX_CHARS_PER_BYTE) {
+        let hi = char::from(chunk[0]).to_digit(16)?;
+        let lo = char::from(chunk[1]).to_digit(16)?;
+        // `hi` and `lo` are each 0..=15 (validated by `to_digit(16)`),
+        // so `(hi << 4) | lo` fits in u8 with the top 24 bits zero —
+        // `u8::try_from` is infallible here but keeps clippy's
+        // `cast_possible_truncation` quiet.
+        let byte = u8::try_from((hi << 4) | lo).ok()?;
+        out.push(byte);
+    }
+    Some(out)
+}
 
 /// Bind-address selector index: loopback-only (127.0.0.1). The
 /// default — limits exposure to clients running on the same machine
@@ -200,6 +298,43 @@ pub struct ServerPanel {
     /// clients and our own `NONE_ONLY` clients still get uncompressed
     /// via the mutual-codec intersection. See #307.
     pub compression_row: adw::ComboRow,
+    /// Listener cap — maximum concurrent `Role::Listen` clients.
+    /// 0 = "control only — no listeners allowed". Changes take
+    /// effect on the next accept via
+    /// [`sdr_server_rtltcp::Server::set_listener_cap`]; existing
+    /// listeners are never kicked when the cap is lowered
+    /// (surprise disconnection is rude, per #395).
+    pub listener_cap_row: adw::SpinRow,
+    /// "Require key" master switch. When on, the server generates
+    /// (or reloads) a 32-byte pre-shared key and enforces it on
+    /// every connecting client via the #394 auth gate. When off,
+    /// the server reverts to the pre-#394 open-LAN posture. The
+    /// keyring entry persists across toggle-off/on cycles so
+    /// flipping back doesn't regenerate the key. Per issue #395.
+    pub auth_require_row: adw::SwitchRow,
+    /// Auth-key display row — hidden when `auth_require_row` is
+    /// off. When on, shows the current key in either masked
+    /// (default) or revealed form. Three suffix buttons: reveal
+    /// toggle, copy-to-clipboard, regenerate. Wiring lives in
+    /// `window.rs` where the running `Server` handle is available
+    /// for live `set_auth_key` calls. Per issue #395.
+    pub auth_key_row: adw::ActionRow,
+    /// Reveal/hide toggle. Icon flips between
+    /// `view-conceal-symbolic` (currently visible → click to hide)
+    /// and `view-reveal-symbolic` (currently masked → click to
+    /// reveal). Caller tracks the on/off state.
+    pub auth_key_reveal_button: gtk4::Button,
+    /// Copy-to-clipboard button. Always copies the FULL hex key
+    /// regardless of whether the display is revealed — users
+    /// typically click Copy without clicking Reveal first.
+    pub auth_key_copy_button: gtk4::Button,
+    /// Regenerate button. Replaces the stored key with a new
+    /// `sdr_server_rtltcp::auth::generate_random_auth_key()`
+    /// result, saves to keyring, and calls
+    /// `Server::set_auth_key` on the running server so the old
+    /// key stops working for future reconnects without kicking
+    /// already-authenticated clients.
+    pub auth_key_regenerate_button: gtk4::Button,
     /// Collapsible group of device-defaults (freq / sample rate /
     /// gain / PPM / bias tee / direct sampling) applied on server
     /// start. Clients override these live via the `rtl_tcp` command
@@ -249,6 +384,18 @@ pub struct ServerPanel {
     /// expander so the stats poller can rebuild it on updates
     /// without walking the expander's `AdwActionRow` children.
     pub activity_log_list: gtk4::ListBox,
+    /// Collapsible "Connected clients" expander listing every
+    /// connected client with role badge, duration, and drop
+    /// counter. Sibling to `status_row` (which still shows
+    /// aggregate "most-recent commander" + data rate state).
+    /// Hidden while the server isn't running. Per issue #395.
+    pub clients_row: adw::ExpanderRow,
+    /// `ListBox` child of `clients_row`, one row per connected
+    /// client. Rebuilt from scratch on each stats-poll tick when
+    /// the client-id set has changed. Held separately from the
+    /// expander so the poller doesn't have to walk the expander's
+    /// children. Per issue #395.
+    pub clients_list: gtk4::ListBox,
     /// Advisory caption shown when the device-default sample rate
     /// is at or above the "high bandwidth" threshold. Shared copy
     /// with the source panel's same-named row so the user sees a
@@ -277,6 +424,18 @@ pub const ACTIVITY_LOG_EMPTY_SUBTITLE: &str = "No commands received yet";
 /// without dominating it; the expander is collapsed by default so
 /// users opt in to seeing the log at all.
 const ACTIVITY_LOG_MAX_HEIGHT_PX: i32 = 240;
+
+/// Subtitle shown on the `clients_row` expander header when no
+/// clients are connected. Doubles as the placeholder text inside
+/// the list itself. Per issue #395.
+pub const CLIENTS_LIST_EMPTY_SUBTITLE: &str = "No clients connected";
+
+/// Max height the connected-clients `ScrolledWindow` grows
+/// before scrolling kicks in. Same tuning rationale as
+/// `ACTIVITY_LOG_MAX_HEIGHT_PX`: fits inside the sidebar without
+/// dominating it even when the listener cap is at max (32
+/// clients × ~45 px per row ≈ 1,440 px uncapped; we cap at 240).
+const CLIENTS_LIST_MAX_HEIGHT_PX: i32 = 240;
 
 /// Aggregated status rows rendered under the "Server status"
 /// expander. Grouped so the builder stays readable and the
@@ -318,6 +477,33 @@ fn build_activity_log_row() -> (adw::ExpanderRow, gtk4::ListBox) {
     // Wrap the scroll in an ActionRow so the expander's layout
     // machinery (which expects rows) renders it correctly. Empty
     // title/subtitle pushes the scroll widget into the row body.
+    let wrapper = adw::ActionRow::builder().activatable(false).build();
+    wrapper.add_prefix(&scroll);
+    row.add_row(&wrapper);
+    (row, list)
+}
+
+/// Build the "Connected clients" expander + its inner `ListBox`.
+/// Mirrors `build_activity_log_row`'s scroll-wrapping pattern
+/// so a server with a dozen listeners doesn't balloon the
+/// sidebar height. Per issue #395.
+fn build_clients_row() -> (adw::ExpanderRow, gtk4::ListBox) {
+    let row = adw::ExpanderRow::builder()
+        .title("Connected clients")
+        .subtitle(CLIENTS_LIST_EMPTY_SUBTITLE)
+        .expanded(true)
+        .visible(false)
+        .build();
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(CLIENTS_LIST_MAX_HEIGHT_PX)
+        .child(&list)
+        .build();
     let wrapper = adw::ActionRow::builder().activatable(false).build();
     wrapper.add_prefix(&scroll);
     row.add_row(&wrapper);
@@ -535,6 +721,96 @@ pub fn build_server_panel() -> ServerPanel {
         .selected(COMPRESSION_OFF_IDX)
         .build();
 
+    // Listener cap — per #395. Default pulled from the backend's
+    // `DEFAULT_LISTENER_CAP` so a UI-backend drift would surface as
+    // a test / build failure rather than a quiet divergence. The
+    // `usize` → `f64` cast is lossless on every realistic value
+    // (cap is always < 32, and f64 is exact for integers up to
+    // `2^53`), but clippy's `cast_precision_loss` lint fires on
+    // any `usize as f64` conversion regardless — allow inline
+    // with a reason rather than adding a workspace-wide exception.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "listener cap is bounded << 2^53, f64 represents it exactly"
+    )]
+    let default_cap = sdr_server_rtltcp::DEFAULT_LISTENER_CAP as f64;
+    let listener_cap_adj = gtk4::Adjustment::new(
+        default_cap,
+        MIN_LISTENER_CAP,
+        MAX_LISTENER_CAP,
+        LISTENER_CAP_STEP,
+        LISTENER_CAP_PAGE,
+        0.0,
+    );
+    let listener_cap_row = adw::SpinRow::builder()
+        .title("Listener cap")
+        .subtitle(
+            "Max simultaneous Listen clients — 0 disables listeners, change applies on next client",
+        )
+        .adjustment(&listener_cap_adj)
+        .numeric(true)
+        .snap_to_ticks(true)
+        .build();
+
+    // Auth-key controls (#394/#395). Three widgets: master
+    // "Require key" switch, a key-display row that only shows
+    // when auth is on, and three suffix buttons for
+    // reveal / copy / regenerate. State (current key bytes,
+    // currently-revealed flag) lives in `window.rs` where the
+    // running `Server` + keyring store are accessible.
+    let auth_require_row = adw::SwitchRow::builder()
+        .title("Require key")
+        .subtitle("Clients must present a pre-shared key to connect — LAN-grade only, not WAN-safe")
+        .active(false)
+        .build();
+
+    // Auth-key display row — hidden until `auth_require_row` is
+    // on. `subtitle_selectable(true)` lets users triple-click the
+    // revealed key to copy it without using the Copy button.
+    let auth_key_row = adw::ActionRow::builder()
+        .title("Key")
+        .subtitle(AUTH_KEY_MASKED_PLACEHOLDER)
+        .subtitle_selectable(true)
+        .visible(false)
+        .build();
+
+    // Reveal-toggle button. Icon starts as `view-reveal-symbolic`
+    // (masked → click to reveal); window.rs flips it to
+    // `view-conceal-symbolic` when the subtitle shows the real
+    // key. `.flat()` keeps it visually aligned with the row.
+    let auth_key_reveal_button = gtk4::Button::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text("Reveal key")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    // Icon-only buttons need an explicit accessible label —
+    // screen readers read the label, not the tooltip. The reveal
+    // button's label flips in `window.rs` alongside icon_name when
+    // toggled. Matches the established pattern in this crate
+    // (source_panel, navigation_panel, radio_panel). Per
+    // `CodeRabbit` round 1 on PR #406.
+    auth_key_reveal_button.update_property(&[gtk4::accessible::Property::Label("Reveal key")]);
+    let auth_key_copy_button = gtk4::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy key to clipboard")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    auth_key_copy_button
+        .update_property(&[gtk4::accessible::Property::Label("Copy key to clipboard")]);
+    let auth_key_regenerate_button = gtk4::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Regenerate key — old key stops working for future reconnects")
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    auth_key_regenerate_button
+        .update_property(&[gtk4::accessible::Property::Label("Regenerate key")]);
+    auth_key_row.add_suffix(&auth_key_reveal_button);
+    auth_key_row.add_suffix(&auth_key_copy_button);
+    auth_key_row.add_suffix(&auth_key_regenerate_button);
+
     let device_defaults_row = adw::ExpanderRow::builder()
         .title("Device defaults")
         .subtitle("Applied when the server opens the dongle — clients override live")
@@ -566,6 +842,7 @@ pub fn build_server_panel() -> ServerPanel {
     } = build_status_rows();
 
     let (activity_log_row, activity_log_list) = build_activity_log_row();
+    let (clients_row, clients_list) = build_clients_row();
 
     // Bandwidth advisory — hidden initially. Visibility is toggled
     // on sample-rate changes via the wiring in window.rs, mirroring
@@ -585,8 +862,12 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&bind_row);
     widget.add(&advertise_row);
     widget.add(&compression_row);
+    widget.add(&listener_cap_row);
+    widget.add(&auth_require_row);
+    widget.add(&auth_key_row);
     widget.add(&device_defaults_row);
     widget.add(&status_row);
+    widget.add(&clients_row);
     widget.add(&activity_log_row);
     widget.add(&bandwidth_advisory_row);
 
@@ -598,6 +879,12 @@ pub fn build_server_panel() -> ServerPanel {
         bind_row,
         advertise_row,
         compression_row,
+        listener_cap_row,
+        auth_require_row,
+        auth_key_row,
+        auth_key_reveal_button,
+        auth_key_copy_button,
+        auth_key_regenerate_button,
         device_defaults_row,
         center_freq_row,
         sample_rate_row,
@@ -613,6 +900,8 @@ pub fn build_server_panel() -> ServerPanel {
         status_stop_button,
         activity_log_row,
         activity_log_list,
+        clients_row,
+        clients_list,
         bandwidth_advisory_row,
     }
 }
@@ -737,6 +1026,32 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             // a corrupt config can't silently enable compression.
             panel.compression_row.set_selected(idx_u32);
         }
+        if let Some(cap) = v
+            .get(KEY_SERVER_LISTENER_CAP)
+            .and_then(serde_json::Value::as_u64)
+        {
+            // Clamp to the UI's advertised range on restore. An
+            // out-of-range stored value would have been saved by
+            // some other client talking to the same config file
+            // (e.g. `sdr-rtl-tcp --listener-cap 999`); the widget
+            // still needs to be a valid spin-row value so pin it
+            // into [MIN_LISTENER_CAP, MAX_LISTENER_CAP]. Per #395.
+            let clamped = (cap as f64).clamp(MIN_LISTENER_CAP, MAX_LISTENER_CAP);
+            panel.listener_cap_row.set_value(clamped);
+        }
+        if let Some(require) = v
+            .get(KEY_SERVER_REQUIRE_AUTH)
+            .and_then(serde_json::Value::as_bool)
+        {
+            // Restore the "Require key" toggle state. The key
+            // itself lives in the OS keyring; window.rs loads /
+            // creates it on toggle-on. Just restore the bool
+            // here so the widget reflects the user's last
+            // choice; window.rs's connect-active handler
+            // kicks off the keyring/server wiring if it was on.
+            // Per #395.
+            panel.auth_require_row.set_active(require);
+        }
     });
 
     // ---- Phase 2: subscribe ----
@@ -854,4 +1169,96 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             });
         }
     });
+    // Listener cap spin row. Persist on every change so the next
+    // session restores the same cap. Applying the new value to a
+    // running server (`Server::set_listener_cap`) is wired
+    // separately in `window.rs` where the live `Server` handle
+    // lives. Per #395.
+    let cfg_cap = Arc::clone(config);
+    panel.listener_cap_row.connect_value_notify(move |row| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "spin row bounded to [MIN_LISTENER_CAP, MAX_LISTENER_CAP] at the widget level"
+        )]
+        let cap = row.value() as u64;
+        cfg_cap.write(|v| {
+            v[KEY_SERVER_LISTENER_CAP] = serde_json::json!(cap);
+        });
+    });
+    // "Require key" switch — persist the bool to sdr_config. The
+    // key bytes themselves live in the OS keyring, managed by
+    // window.rs. Per #395.
+    let cfg_auth = Arc::clone(config);
+    panel.auth_require_row.connect_active_notify(move |row| {
+        cfg_auth.write(|v| {
+            v[KEY_SERVER_REQUIRE_AUTH] = serde_json::json!(row.is_active());
+        });
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{auth_key_from_hex, auth_key_to_hex};
+
+    #[test]
+    fn auth_key_to_hex_round_trips_through_from_hex() {
+        // Every byte value 0..=255 must round-trip through
+        // hex encode / decode without loss. Pins the
+        // keyring-persistence contract — a key stored today
+        // comes back as the exact same bytes on the next
+        // launch.
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let hex = auth_key_to_hex(&bytes);
+        assert_eq!(hex.len(), bytes.len() * 2);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "encoder must emit lowercase hex only"
+        );
+        let back = auth_key_from_hex(&hex).expect("round-trip decode must succeed");
+        assert_eq!(back, bytes);
+    }
+
+    #[test]
+    fn auth_key_from_hex_rejects_malformed_input() {
+        // Empty, odd-length, and non-hex characters all
+        // surface as `None` so the keyring reader can fall
+        // back to regenerate without panicking. Non-ASCII
+        // (the PR #405 regression vector) must also fail
+        // cleanly rather than panicking on boundary slicing.
+        assert!(auth_key_from_hex("").is_none());
+        assert!(auth_key_from_hex("abc").is_none(), "odd length");
+        assert!(auth_key_from_hex("xyz0").is_none(), "non-hex chars");
+        assert!(auth_key_from_hex("💩💩").is_none(), "non-ASCII emoji");
+    }
+
+    #[test]
+    fn auth_key_from_hex_rejects_oversize_decoded_length() {
+        // Hex string encoding more than `MAX_AUTH_KEY_LEN`
+        // bytes must be rejected up-front so a corrupt
+        // keyring entry surfaces as "regenerate" rather than
+        // reaching `Server::start` and failing every client
+        // at handshake. Per `CodeRabbit` round 1 on PR #406.
+        let max_bytes = sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN;
+        // Exactly at cap: must decode.
+        let at_cap = "a".repeat(max_bytes * 2);
+        assert!(
+            auth_key_from_hex(&at_cap).is_some(),
+            "max-length hex must decode"
+        );
+        // One byte over cap: must reject.
+        let over_cap = "a".repeat((max_bytes + 1) * 2);
+        assert!(
+            auth_key_from_hex(&over_cap).is_none(),
+            "oversize hex must be rejected"
+        );
+    }
+
+    #[test]
+    fn auth_key_to_hex_empty_input_produces_empty_string() {
+        // Edge case — empty slice is legal input (no key set);
+        // encoder must produce an empty string, not panic.
+        assert_eq!(auth_key_to_hex(&[]), "");
+    }
 }

@@ -2768,6 +2768,69 @@ struct RunningServer {
     advertiser: Option<Advertiser>,
 }
 
+/// Read the `rtl_tcp` server auth key from the OS keyring, if
+/// present. Returns `Some(bytes)` for a well-formed hex-encoded
+/// entry, `None` for a missing key, keyring unavailable, empty
+/// entry, or corrupt hex. Corrupt entries are logged at `warn`
+/// so operators can diagnose without the UI silently regenerating
+/// over their paste. Per issue #395.
+fn load_server_auth_key_from_keyring() -> Option<Vec<u8>> {
+    use sdr_config::KeyringStore;
+
+    use crate::sidebar::server_panel::{KEYRING_KEY_AUTH_KEY, KEYRING_SERVICE, auth_key_from_hex};
+
+    let store = KeyringStore::new(KEYRING_SERVICE);
+    match store.get(KEYRING_KEY_AUTH_KEY) {
+        Ok(Some(hex)) => {
+            let Some(bytes) = auth_key_from_hex(&hex) else {
+                tracing::warn!(
+                    "rtl_tcp server auth key in keyring is malformed hex; regenerating on next toggle-on"
+                );
+                return None;
+            };
+            Some(bytes)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(%e, "rtl_tcp server auth key keyring read failed");
+            None
+        }
+    }
+}
+
+/// Write the `rtl_tcp` server auth key to the OS keyring as
+/// lowercase hex. Returns the underlying keyring error so
+/// callers can surface it via toast — the caller is responsible
+/// for deciding UX fallback (e.g. revert the toggle, show a
+/// banner). Per issue #395.
+fn save_server_auth_key_to_keyring(
+    bytes: &[u8],
+) -> Result<(), sdr_config::keyring_store::KeyringError> {
+    use sdr_config::KeyringStore;
+
+    use crate::sidebar::server_panel::{KEYRING_KEY_AUTH_KEY, KEYRING_SERVICE, auth_key_to_hex};
+
+    let store = KeyringStore::new(KEYRING_SERVICE);
+    store.set(KEYRING_KEY_AUTH_KEY, &auth_key_to_hex(bytes))
+}
+
+/// Load the persisted server auth key, generating + saving a
+/// fresh one when the keyring is either empty or corrupt. The
+/// caller gets the fresh bytes regardless — a write failure
+/// leaves the key in memory so the current session works, and
+/// the next session's toggle-on retries the save path. Per
+/// issue #395.
+fn ensure_server_auth_key() -> Vec<u8> {
+    if let Some(existing) = load_server_auth_key_from_keyring() {
+        return existing;
+    }
+    let fresh = sdr_server_rtltcp::auth::generate_random_auth_key();
+    if let Err(e) = save_server_auth_key_to_keyring(&fresh) {
+        tracing::warn!(%e, "rtl_tcp server auth key keyring write failed — in-memory only");
+    }
+    fresh
+}
+
 /// Wire the server panel end-to-end: visibility gating, the master
 /// share-over-network switch, and its downstream start/stop effects.
 /// Errors surface via the `toast_overlay`, and the switch auto-
@@ -2952,12 +3015,15 @@ fn connect_server_panel(
 ///
 /// `source_device_row` is a sidebar neighbour (not in `ServerPanel`)
 /// and comes along for the exclusivity guard read.
+#[derive(Clone)]
 struct ServerSwitchWidgetsWeak {
     nickname_row: glib::WeakRef<adw::EntryRow>,
     port_row: glib::WeakRef<adw::SpinRow>,
     bind_row: glib::WeakRef<adw::ComboRow>,
     advertise_row: glib::WeakRef<adw::SwitchRow>,
     compression_row: glib::WeakRef<adw::ComboRow>,
+    listener_cap_row: glib::WeakRef<adw::SpinRow>,
+    auth_require_row: glib::WeakRef<adw::SwitchRow>,
     device_defaults_row: glib::WeakRef<adw::ExpanderRow>,
     center_freq_row: glib::WeakRef<adw::SpinRow>,
     sample_rate_row: glib::WeakRef<adw::ComboRow>,
@@ -2972,6 +3038,8 @@ struct ServerSwitchWidgetsWeak {
     status_commanded_row: glib::WeakRef<adw::ActionRow>,
     activity_log_row: glib::WeakRef<adw::ExpanderRow>,
     activity_log_list: glib::WeakRef<gtk4::ListBox>,
+    clients_row: glib::WeakRef<adw::ExpanderRow>,
+    clients_list: glib::WeakRef<gtk4::ListBox>,
     source_device_row: glib::WeakRef<adw::ComboRow>,
 }
 
@@ -2986,6 +3054,8 @@ struct ServerSwitchWidgets {
     bind_row: adw::ComboRow,
     advertise_row: adw::SwitchRow,
     compression_row: adw::ComboRow,
+    listener_cap_row: adw::SpinRow,
+    auth_require_row: adw::SwitchRow,
     device_defaults_row: adw::ExpanderRow,
     center_freq_row: adw::SpinRow,
     sample_rate_row: adw::ComboRow,
@@ -3000,6 +3070,8 @@ struct ServerSwitchWidgets {
     status_commanded_row: adw::ActionRow,
     activity_log_row: adw::ExpanderRow,
     activity_log_list: gtk4::ListBox,
+    clients_row: adw::ExpanderRow,
+    clients_list: gtk4::ListBox,
     source_device_row: adw::ComboRow,
 }
 
@@ -3012,6 +3084,8 @@ impl ServerSwitchWidgetsWeak {
             bind_row: s.bind_row.downgrade(),
             advertise_row: s.advertise_row.downgrade(),
             compression_row: s.compression_row.downgrade(),
+            listener_cap_row: s.listener_cap_row.downgrade(),
+            auth_require_row: s.auth_require_row.downgrade(),
             device_defaults_row: s.device_defaults_row.downgrade(),
             center_freq_row: s.center_freq_row.downgrade(),
             sample_rate_row: s.sample_rate_row.downgrade(),
@@ -3026,6 +3100,8 @@ impl ServerSwitchWidgetsWeak {
             status_commanded_row: s.status_commanded_row.downgrade(),
             activity_log_row: s.activity_log_row.downgrade(),
             activity_log_list: s.activity_log_list.downgrade(),
+            clients_row: s.clients_row.downgrade(),
+            clients_list: s.clients_list.downgrade(),
             source_device_row: panels.source.device_row.downgrade(),
         }
     }
@@ -3039,6 +3115,8 @@ impl ServerSwitchWidgetsWeak {
             bind_row: self.bind_row.upgrade()?,
             advertise_row: self.advertise_row.upgrade()?,
             compression_row: self.compression_row.upgrade()?,
+            listener_cap_row: self.listener_cap_row.upgrade()?,
+            auth_require_row: self.auth_require_row.upgrade()?,
             device_defaults_row: self.device_defaults_row.upgrade()?,
             center_freq_row: self.center_freq_row.upgrade()?,
             sample_rate_row: self.sample_rate_row.upgrade()?,
@@ -3053,11 +3131,20 @@ impl ServerSwitchWidgetsWeak {
             status_commanded_row: self.status_commanded_row.upgrade()?,
             activity_log_row: self.activity_log_row.upgrade()?,
             activity_log_list: self.activity_log_list.upgrade()?,
+            clients_row: self.clients_row.upgrade()?,
+            clients_list: self.clients_list.upgrade()?,
             source_device_row: self.source_device_row.upgrade()?,
         })
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "share switch orchestrates server start/stop plus listener-cap + \
+              auth-key live-update signals; splitting it would scatter the \
+              `running` and `toast_overlay` Rc clones across multiple helpers \
+              without improving clarity"
+)]
 fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
@@ -3081,6 +3168,73 @@ fn connect_share_switch(
     // self-cycle with the `connect_active_notify` subscription.
     // Upgraded per-callback so strong refs live for one tick only.
     let widgets_weak = ServerSwitchWidgetsWeak::from_panels(panels);
+
+    // Clone the `running` handle for the listener-cap live-apply
+    // closure BEFORE the `share_row` active-notify handler
+    // below consumes the outer `running` by move. Both closures
+    // share the same `RefCell`; neither holds a borrow past its
+    // own tick. Per #395.
+    let running_for_cap = Rc::clone(&running);
+    // Additional `running` clones for the auth-related closures
+    // (toggle, reveal, copy, regenerate). Same rationale — clone
+    // before the share_row handler consumes the outer `running`.
+    let running_for_auth_toggle = Rc::clone(&running);
+    let running_for_auth_regen = Rc::clone(&running);
+
+    // Clone the toast-overlay weak ref for every auth-side
+    // closure that surfaces errors (toggle-on/off, copy,
+    // regenerate). Same move-before-share_row problem: the
+    // share_row closure below consumes the outer
+    // `toast_overlay_weak`.
+    let toast_overlay_for_auth_toggle = toast_overlay_weak.clone();
+    let toast_overlay_for_copy = toast_overlay_weak.clone();
+    let toast_overlay_for_regen = toast_overlay_weak.clone();
+
+    // Shared state for the auth-key display row. `current_key`
+    // holds the active key bytes while the server is running
+    // with auth enabled; `None` when auth is off. `key_revealed`
+    // tracks whether the subtitle currently shows the full hex
+    // or the masked placeholder — the user toggles this via the
+    // reveal button. Both are `Rc<...>` so the four closures
+    // (toggle, reveal, copy, regenerate) share the same state
+    // without borrow conflicts. Per issue #395.
+    let current_auth_key: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
+    let auth_key_revealed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+    // If auth was restored as ON from config, eagerly load the
+    // key from the keyring so the key row reflects real state
+    // before the user interacts with anything. The server isn't
+    // running yet (that requires the share_row flip), so no
+    // `set_auth_key` call here — just UI state.
+    if panels.server.auth_require_row.is_active() {
+        let key = ensure_server_auth_key();
+        *current_auth_key.borrow_mut() = Some(key);
+        panels.server.auth_key_row.set_visible(true);
+        // Leave subtitle as the masked placeholder (widget
+        // default) — user clicks Reveal to see the real value.
+    }
+
+    // Clone `current_auth_key` for the share_row closure before
+    // it consumes local state. The closure reads the cell at
+    // server-start time to thread the key into
+    // `build_server_config_from_panel` without a second
+    // `ensure_server_auth_key()` call. Per `CodeRabbit` round 1
+    // on PR #406.
+    let current_key_for_share = Rc::clone(&current_auth_key);
+
+    // Widget-weak clones threaded into the auth toggle + regenerate
+    // closures so they can rebuild the mDNS advertiser when auth
+    // state changes. Without this, discovery clients keep seeing
+    // stale `auth_required` TXT until the next server restart.
+    // Per `CodeRabbit` round 1 on PR #406.
+    let widgets_weak_for_auth_toggle = widgets_weak.clone();
+
+    // Reentry guard for the auth-toggle handler. When the server
+    // reports a failed `set_auth_key`, the handler reverts the
+    // switch — but `set_active()` fires `connect_active_notify`
+    // again, which would re-run the handler and double-toast.
+    // Mirrors `reentry_guard` on the share_row.
+    let auth_toggle_reentry_guard: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
     panels.server.share_row.connect_active_notify(move |row| {
         if reentry_guard.get() {
@@ -3110,8 +3264,13 @@ fn connect_share_switch(
             }
             // Build a ServerConfig from current panel state. Widget
             // readers run on the main thread — safe to block-read
-            // the rows synchronously.
-            let config = build_server_config_from_panel(&widgets);
+            // the rows synchronously. The pending auth key is
+            // read from `current_key_for_share` so a Reveal-and-Copy
+            // operation before Play uses the same bytes
+            // `Server::start` receives. Per `CodeRabbit` round 1
+            // on PR #406.
+            let pending_auth_key = current_key_for_share.borrow().clone();
+            let config = build_server_config_from_panel(&widgets, pending_auth_key);
             match Server::start(config) {
                 Ok(server) => {
                     // If advertising is on, build the TXT record
@@ -3143,6 +3302,7 @@ fn connect_share_switch(
                     set_controls_locked(&widgets, true);
                     widgets.status_row.set_visible(true);
                     widgets.activity_log_row.set_visible(true);
+                    widgets.clients_row.set_visible(true);
                     *running.borrow_mut() = Some(RunningServer { server, advertiser });
                     // Flip the shared "server is live" flag AFTER
                     // the handle is stored so the source-panel
@@ -3187,10 +3347,288 @@ fn connect_share_switch(
             set_controls_locked(&widgets, false);
             widgets.status_row.set_visible(false);
             widgets.activity_log_row.set_visible(false);
+            widgets.clients_row.set_visible(false);
             reset_status_rows(&widgets);
             reset_activity_log(&widgets);
+            reset_clients_list(&widgets);
         }
         apply_visibility();
+    });
+
+    // ====================================================
+    // Auth controls (#394/#395) — toggle + reveal + copy +
+    // regenerate. All four closures share `current_auth_key`
+    // and `auth_key_revealed` via `Rc` + the running-server
+    // handle via `running_for_auth_{toggle,regen}`.
+    // ====================================================
+
+    // Master "Require key" toggle.
+    //
+    // Order of operations (per `CodeRabbit` round 1 on PR #406):
+    // 1. Apply the change to the running server FIRST.
+    // 2. Refresh the mDNS advertiser so discovery TXT reflects
+    //    the new `auth_required` flag.
+    // 3. Only mutate UI state (current_auth_key, row visibility,
+    //    subtitle, reveal button) after steps 1 and 2 succeeded.
+    //
+    // On any failure: revert the switch to its pre-toggle state
+    // via `auth_toggle_reentry_guard` so UI ↔ server parity is
+    // preserved. Discovery clients never see "auth advertised"
+    // while the server is unauthed, or vice versa.
+    //
+    // When the server isn't running, steps 1+2 are no-ops and UI
+    // mutation always proceeds — toggling auth with the switch
+    // off is a config-only change and the next Start path
+    // honors it via the pending-key plumbing.
+    let key_row_for_toggle = panels.server.auth_key_row.downgrade();
+    let reveal_button_for_toggle = panels.server.auth_key_reveal_button.downgrade();
+    let current_key_for_toggle = Rc::clone(&current_auth_key);
+    let revealed_for_toggle = Rc::clone(&auth_key_revealed);
+    let auth_toggle_guard_for_handler = Rc::clone(&auth_toggle_reentry_guard);
+    panels
+        .server
+        .auth_require_row
+        .connect_active_notify(move |row| {
+            if auth_toggle_guard_for_handler.get() {
+                // Re-entered from our own `set_active` revert
+                // path — let the signal settle without running
+                // the handler again.
+                return;
+            }
+            let Some(key_row) = key_row_for_toggle.upgrade() else {
+                return;
+            };
+            let widgets = widgets_weak_for_auth_toggle.upgrade();
+
+            if row.is_active() {
+                // Pending key is the single source of truth for
+                // both the server and any subsequent Reveal /
+                // Copy. Generate / load once, reuse everywhere.
+                let key = ensure_server_auth_key();
+
+                // Step 1+2: apply to live server + refresh mDNS.
+                let server_result = apply_live_auth_change(
+                    &running_for_auth_toggle,
+                    Some(key.clone()),
+                    widgets.as_ref(),
+                    &toast_overlay_for_auth_toggle,
+                );
+
+                if !server_result {
+                    // Revert the switch. UI stays on the pre-
+                    // toggle state; the user can click again
+                    // after resolving the server issue.
+                    auth_toggle_guard_for_handler.set(true);
+                    row.set_active(false);
+                    auth_toggle_guard_for_handler.set(false);
+                    return;
+                }
+
+                // Step 3: UI mutation AFTER successful server
+                // change.
+                *current_key_for_toggle.borrow_mut() = Some(key);
+                key_row.set_visible(true);
+                // Reset to masked state on every toggle-on so the
+                // key row doesn't surface a previously-revealed
+                // value across sessions.
+                revealed_for_toggle.set(false);
+                key_row.set_subtitle(crate::sidebar::server_panel::AUTH_KEY_MASKED_PLACEHOLDER);
+                if let Some(rb) = reveal_button_for_toggle.upgrade() {
+                    rb.set_icon_name("view-reveal-symbolic");
+                    rb.set_tooltip_text(Some("Reveal key"));
+                    rb.update_property(&[gtk4::accessible::Property::Label("Reveal key")]);
+                }
+            } else {
+                // Same structure for toggle-off. Server call
+                // first; on failure revert the switch so the UI
+                // stays honest about the running auth state.
+                let server_result = apply_live_auth_change(
+                    &running_for_auth_toggle,
+                    None,
+                    widgets.as_ref(),
+                    &toast_overlay_for_auth_toggle,
+                );
+
+                if !server_result {
+                    auth_toggle_guard_for_handler.set(true);
+                    row.set_active(true);
+                    auth_toggle_guard_for_handler.set(false);
+                    return;
+                }
+
+                *current_key_for_toggle.borrow_mut() = None;
+                key_row.set_visible(false);
+                // Zero the revealed flag too so a next toggle-on
+                // starts masked regardless of the prior reveal
+                // state.
+                revealed_for_toggle.set(false);
+            }
+        });
+
+    // Reveal / conceal button — flips the subtitle between the
+    // masked placeholder and the full hex-encoded key. Pure UI
+    // state; doesn't touch keyring or server.
+    let key_row_for_reveal = panels.server.auth_key_row.downgrade();
+    let current_key_for_reveal = Rc::clone(&current_auth_key);
+    let revealed_for_reveal = Rc::clone(&auth_key_revealed);
+    panels
+        .server
+        .auth_key_reveal_button
+        .connect_clicked(move |btn| {
+            let Some(key_row) = key_row_for_reveal.upgrade() else {
+                return;
+            };
+            let Ok(key_opt) = current_key_for_reveal.try_borrow() else {
+                return;
+            };
+            let Some(bytes) = key_opt.as_ref() else {
+                return;
+            };
+            let now_revealed = !revealed_for_reveal.get();
+            revealed_for_reveal.set(now_revealed);
+            if now_revealed {
+                key_row.set_subtitle(&crate::sidebar::server_panel::auth_key_to_hex(bytes));
+                btn.set_icon_name("view-conceal-symbolic");
+                btn.set_tooltip_text(Some("Hide key"));
+                // Flip the accessible label alongside the icon /
+                // tooltip so screen readers announce the current
+                // action rather than the stale build-time label.
+                // Per `CodeRabbit` round 1 on PR #406.
+                btn.update_property(&[gtk4::accessible::Property::Label("Hide key")]);
+            } else {
+                key_row.set_subtitle(crate::sidebar::server_panel::AUTH_KEY_MASKED_PLACEHOLDER);
+                btn.set_icon_name("view-reveal-symbolic");
+                btn.set_tooltip_text(Some("Reveal key"));
+                btn.update_property(&[gtk4::accessible::Property::Label("Reveal key")]);
+            }
+        });
+
+    // Copy button — always copies the FULL hex key regardless of
+    // reveal state. Users typically click Copy without clicking
+    // Reveal first.
+    let current_key_for_copy = Rc::clone(&current_auth_key);
+    panels
+        .server
+        .auth_key_copy_button
+        .connect_clicked(move |btn| {
+            let Ok(key_opt) = current_key_for_copy.try_borrow() else {
+                return;
+            };
+            let Some(bytes) = key_opt.as_ref() else {
+                return;
+            };
+            let hex = crate::sidebar::server_panel::auth_key_to_hex(bytes);
+            // Grab the display's clipboard via the button's widget
+            // ancestry. `clipboard()` on a widget returns the
+            // primary clipboard for the display it's attached to.
+            let clipboard = btn.clipboard();
+            clipboard.set_text(&hex);
+            if let Some(overlay) = toast_overlay_for_copy.upgrade() {
+                overlay.add_toast(adw::Toast::new("Key copied to clipboard"));
+            }
+        });
+
+    // Regenerate button — generates a fresh 32-byte key,
+    // applies it to the live server, persists to keyring, and
+    // updates the display row subtitle (preserving the current
+    // revealed state so the user can verify the new value
+    // immediately).
+    //
+    // Order of operations (per `CodeRabbit` round 2 on PR #406):
+    // 1. Apply to the running server via
+    //    `apply_live_auth_change` — shared with the toggle path.
+    //    On failure (mutex poisoned, borrow race), toast + return
+    //    BEFORE touching keyring or UI.
+    // 2. Persist to keyring. Failure here is non-fatal (the
+    //    in-memory key still works this session; next launch
+    //    would read the OLD keyring value, which now forces the
+    //    user to click Regenerate again — better than the old
+    //    order where a keyring success + server failure would
+    //    leave next-launch using a key the server never
+    //    accepted).
+    // 3. UI mutation (`current_auth_key`, subtitle, toast).
+    //
+    // Regenerate keeps `auth_required = true`, so the mDNS TXT
+    // doesn't change — `apply_live_auth_change` skips the
+    // advertiser rebuild when passed `widgets = None`.
+    let key_row_for_regen = panels.server.auth_key_row.downgrade();
+    let current_key_for_regen = Rc::clone(&current_auth_key);
+    let revealed_for_regen = Rc::clone(&auth_key_revealed);
+    panels
+        .server
+        .auth_key_regenerate_button
+        .connect_clicked(move |_btn| {
+            let Some(key_row) = key_row_for_regen.upgrade() else {
+                return;
+            };
+            let fresh = sdr_server_rtltcp::auth::generate_random_auth_key();
+
+            // Step 1: live server apply. `widgets = None` because
+            // regenerate doesn't flip `auth_required`, so no
+            // advertiser rebuild is needed.
+            if !apply_live_auth_change(
+                &running_for_auth_regen,
+                Some(fresh.clone()),
+                None,
+                &toast_overlay_for_regen,
+            ) {
+                return;
+            }
+
+            // Step 2: persist to keyring. Failure is tolerable —
+            // current in-memory key still works this session; the
+            // user can click Regenerate again later when the
+            // keyring recovers. Toast so they know, but don't
+            // roll back the server (it already accepted the key).
+            if let Err(e) = save_server_auth_key_to_keyring(&fresh) {
+                tracing::warn!(%e, "rtl_tcp auth-key regenerate keyring write failed");
+                if let Some(overlay) = toast_overlay_for_regen.upgrade() {
+                    overlay.add_toast(adw::Toast::new(&format!(
+                        "Couldn't save new key to keyring: {e}"
+                    )));
+                }
+            }
+
+            // Step 3: UI mutation after server + persistence
+            // settled.
+            *current_key_for_regen.borrow_mut() = Some(fresh.clone());
+            if revealed_for_regen.get() {
+                key_row.set_subtitle(&crate::sidebar::server_panel::auth_key_to_hex(&fresh));
+            } else {
+                key_row.set_subtitle(crate::sidebar::server_panel::AUTH_KEY_MASKED_PLACEHOLDER);
+            }
+            if let Some(overlay) = toast_overlay_for_regen.upgrade() {
+                overlay.add_toast(adw::Toast::new("New key generated"));
+            }
+        });
+
+    // Listener-cap live-apply. Changes on the spin row take effect
+    // on the next client accept without restarting the server. The
+    // row also persists to sdr_config via a separate signal
+    // attached inside `server_panel.rs`; this handler only cares
+    // about the running-server case. Per issue #395.
+    panels.server.listener_cap_row.connect_value_notify(move |row| {
+        let Ok(handle) = running_for_cap.try_borrow() else {
+            // Another handler is holding the `RunningServer` borrow
+            // (e.g. the share_row active-notify flipping server
+            // start/stop). Skip this tick — the spin row's new
+            // value is already persisted via the server_panel
+            // signal, and the next accept after start will pick
+            // it up through `build_server_config_from_panel`.
+            return;
+        };
+        let Some(handle) = handle.as_ref() else {
+            // Server not running — the spin row edit is already
+            // persisted; nothing to apply live.
+            return;
+        };
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "spin row bounded to [MIN_LISTENER_CAP, MAX_LISTENER_CAP] at the widget level"
+        )]
+        let cap = row.value() as usize;
+        handle.server.set_listener_cap(cap);
     });
 }
 
@@ -3229,10 +3667,12 @@ struct ServerStatusWidgetsWeak {
     status_commanded_row: glib::WeakRef<adw::ActionRow>,
     activity_log_row: glib::WeakRef<adw::ExpanderRow>,
     activity_log_list: glib::WeakRef<gtk4::ListBox>,
+    clients_row: glib::WeakRef<adw::ExpanderRow>,
+    clients_list: glib::WeakRef<gtk4::ListBox>,
 }
 
 /// Snapshot of upgraded strong references held for the duration of
-/// a single poll tick. All seven widgets upgrade together or we
+/// a single poll tick. All nine widgets upgrade together or we
 /// `Break` the timer — render functions then read these fields
 /// directly without needing their own weak-ref fallbacks.
 struct ServerStatusWidgets {
@@ -3243,6 +3683,8 @@ struct ServerStatusWidgets {
     status_commanded_row: adw::ActionRow,
     activity_log_row: adw::ExpanderRow,
     activity_log_list: gtk4::ListBox,
+    clients_row: adw::ExpanderRow,
+    clients_list: gtk4::ListBox,
 }
 
 impl ServerStatusWidgetsWeak {
@@ -3255,11 +3697,13 @@ impl ServerStatusWidgetsWeak {
             status_commanded_row: panel.status_commanded_row.downgrade(),
             activity_log_row: panel.activity_log_row.downgrade(),
             activity_log_list: panel.activity_log_list.downgrade(),
+            clients_row: panel.clients_row.downgrade(),
+            clients_list: panel.clients_list.downgrade(),
         }
     }
 
-    /// Upgrade all seven weak refs atomically. Returns `None` if
-    /// any one widget has been destroyed — the caller breaks its
+    /// Upgrade every weak ref atomically. Returns `None` if any
+    /// one widget has been destroyed — the caller breaks its
     /// timer instead of rendering against a partially-dead panel.
     fn upgrade(&self) -> Option<ServerStatusWidgets> {
         Some(ServerStatusWidgets {
@@ -3270,6 +3714,8 @@ impl ServerStatusWidgetsWeak {
             status_commanded_row: self.status_commanded_row.upgrade()?,
             activity_log_row: self.activity_log_row.upgrade()?,
             activity_log_list: self.activity_log_list.upgrade()?,
+            clients_row: self.clients_row.upgrade()?,
+            clients_list: self.clients_list.upgrade()?,
         })
     }
 }
@@ -3303,6 +3749,19 @@ fn connect_server_status_polling(
     // is cheap but clearing the ListBox resets any user scroll
     // position, so we short-circuit on unchanged ticks.
     let last_activity_key: Rc<Cell<(usize, Option<Instant>)>> = Rc::new(Cell::new((0, None)));
+    // Clients-list diff key. Hashes `(id, peer, role, drops,
+    // elapsed_secs)` per client so a stable connected set with
+    // ticking uptime / incrementing drop counters still triggers
+    // a rebuild — the previous id-set-only hash froze row
+    // subtitles once the set stabilized, so a 10-minute session
+    // would show "0s" uptime forever. `Option<u64>` so the
+    // stop/start reset path can invalidate the cache by setting
+    // `None`; without that, an "empty set → empty set" transition
+    // across stop/start would short-circuit the first post-start
+    // render and leave the expander blank (the placeholder row
+    // was removed by `reset_clients_list`). Per `CodeRabbit`
+    // round 2 on PR #406.
+    let last_clients_key: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
 
     // Separate subscription on the Stop button. Flipping the switch
     // off is the single canonical stop path — pointing the button
@@ -3350,6 +3809,7 @@ fn connect_server_status_polling(
 
         render_status_rows(&widgets, &stats, &last_bytes_sent);
         render_activity_log(&widgets, &stats, &last_activity_key);
+        render_clients_list(&widgets, &stats, &last_clients_key);
         glib::ControlFlow::Continue
     });
 }
@@ -3661,6 +4121,158 @@ fn render_activity_log(
     }
 }
 
+/// Render the "Connected clients" list — one row per client
+/// with peer, role badge, duration, and drops counter. Empty
+/// state: single "No clients connected" placeholder row plus
+/// matching expander subtitle.
+///
+/// **Rebuild trigger.** Hashes `(id, peer, role, drops,
+/// elapsed_secs)` for every connected client; rebuilds when
+/// the hash changes. That covers both accept/disconnect
+/// transitions AND per-row field churn (ticking uptime,
+/// incrementing drop counters), so the displayed subtitles
+/// stay live throughout a session. Scroll / hover state is
+/// preserved on unchanged ticks. Per issue #395 +
+/// `CodeRabbit` round 2 on PR #406.
+///
+/// **Stop/start invalidation.** On server stop
+/// `reset_clients_list` empties the `ListBox` but can't reach
+/// the cache cell across function boundaries; instead,
+/// `render_clients_list` treats `first_child().is_none()` as
+/// "reset has run, force rebuild" so an empty→empty session
+/// transition still repaints the placeholder. Per `CodeRabbit`
+/// round 2 on PR #406.
+fn render_clients_list(
+    widgets: &ServerStatusWidgets,
+    stats: &sdr_server_rtltcp::ServerStats,
+    last_rendered: &Rc<std::cell::Cell<Option<u64>>>,
+) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use crate::sidebar::server_panel::CLIENTS_LIST_EMPTY_SUBTITLE;
+
+    // Compute a diff key that bumps on *any* rendered-field
+    // change — not just accept / disconnect. Including peer,
+    // role, drops, and (rounded-seconds) uptime in the hash
+    // means a stable connected set with ticking uptime or
+    // incrementing drops still triggers rebuilds. The previous
+    // id-set-only key froze row subtitles once the client set
+    // stabilized. Per `CodeRabbit` round 2 on PR #406.
+    //
+    // Rebuild cost is ~N widget builds at 2 Hz (N ≤ 32 at the
+    // listener cap); trivial vs. the USB / DSP hot path.
+    let now = Instant::now();
+    let mut key_fields: Vec<(sdr_server_rtltcp::ClientId, String, u8, u64, u64)> = stats
+        .connected_clients
+        .iter()
+        .map(|c| {
+            let role_disc = match c.role {
+                sdr_server_rtltcp::extension::Role::Control => 0u8,
+                sdr_server_rtltcp::extension::Role::Listen => 1u8,
+            };
+            let elapsed_secs = now.saturating_duration_since(c.connected_since).as_secs();
+            (
+                c.id,
+                c.peer.to_string(),
+                role_disc,
+                c.buffers_dropped,
+                elapsed_secs,
+            )
+        })
+        .collect();
+    key_fields.sort_unstable_by_key(|(id, _, _, _, _)| *id);
+    let mut hasher = DefaultHasher::new();
+    key_fields.hash(&mut hasher);
+    let current_key = hasher.finish();
+
+    // Invalidate the cache when the ListBox has been cleared
+    // externally (by `reset_clients_list` on server stop). Without
+    // this, an "empty set → empty set" transition across stop/start
+    // would match the prior hash and short-circuit the first-tick
+    // render, leaving the expander visually blank. The empty
+    // state's placeholder row is a single child, so
+    // `first_child().is_none()` distinguishes the reset state from
+    // the rendered-empty state. Per `CodeRabbit` round 2 on PR #406.
+    let list_was_reset = widgets.clients_list.first_child().is_none();
+    if !list_was_reset && last_rendered.get() == Some(current_key) {
+        return;
+    }
+    last_rendered.set(Some(current_key));
+
+    // Clear the ListBox. GTK4 ListBox has no mass-remove.
+    while let Some(child) = widgets.clients_list.first_child() {
+        widgets.clients_list.remove(&child);
+    }
+
+    if stats.connected_clients.is_empty() {
+        widgets
+            .clients_row
+            .set_subtitle(CLIENTS_LIST_EMPTY_SUBTITLE);
+        let empty_row = adw::ActionRow::builder()
+            .title(CLIENTS_LIST_EMPTY_SUBTITLE)
+            .activatable(false)
+            .css_classes(["dim-label"])
+            .build();
+        widgets.clients_list.append(&empty_row);
+        return;
+    }
+
+    // Expander subtitle shows the count so a collapsed expander
+    // still communicates whether the server has activity.
+    let count = stats.connected_clients.len();
+    widgets.clients_row.set_subtitle(&if count == 1 {
+        "1 client".to_string()
+    } else {
+        format!("{count} clients")
+    });
+
+    // Build per-client rows. Controller first (if any) so the
+    // accent-colored row sits at the top; listeners render below
+    // in the order the registry has them (acceptance order, per
+    // `ClientRegistry`). Order isn't a hard contract — if a
+    // future registry reorders for its own reasons, this just
+    // changes visual order.
+    let mut ordered: Vec<&sdr_server_rtltcp::ClientInfo> = stats.connected_clients.iter().collect();
+    ordered.sort_by_key(|c| match c.role {
+        sdr_server_rtltcp::extension::Role::Control => 0u8,
+        sdr_server_rtltcp::extension::Role::Listen => 1u8,
+    });
+
+    // Reuse the `now` captured for the diff-key hash so the
+    // displayed duration and the hashed `elapsed_secs` are
+    // sampled from the same instant — avoids a split where
+    // the hash matches but the render shows a one-tick-newer
+    // duration (or vice-versa).
+    for info in ordered {
+        let (role_label, role_css) = match info.role {
+            sdr_server_rtltcp::extension::Role::Control => ("Controller", "accent"),
+            sdr_server_rtltcp::extension::Role::Listen => ("Listener", "dim-label"),
+        };
+        let duration = format_uptime(now.saturating_duration_since(info.connected_since));
+        let subtitle = if info.buffers_dropped > 0 {
+            format!(
+                "{role_label} · {duration} · {drops} drops",
+                drops = info.buffers_dropped
+            )
+        } else {
+            format!("{role_label} · {duration}")
+        };
+        let row = adw::ActionRow::builder()
+            .title(info.peer.to_string())
+            .subtitle(&subtitle)
+            .activatable(false)
+            .build();
+        // Prefix badge: a colored dot (accent for Control, dim
+        // for Listen). Small and unobtrusive but enough to
+        // distinguish the controller at a glance in a dense list.
+        let badge = gtk4::Image::from_icon_name("media-record-symbolic");
+        badge.add_css_class(role_css);
+        row.add_prefix(&badge);
+        widgets.clients_list.append(&row);
+    }
+}
+
 /// Reset activity-log list + subtitle on stop. Without this the
 /// list would persist after the server stopped — misleading users
 /// into thinking the log reflects a currently-running session.
@@ -3672,6 +4284,17 @@ fn reset_activity_log(panel: &ServerSwitchWidgets) {
     panel
         .activity_log_row
         .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
+}
+
+/// Reset the connected-clients list to its empty state. Called on
+/// server stop so the next start doesn't surface stale client rows
+/// before the first poll tick repopulates. Per issue #395.
+fn reset_clients_list(panel: &ServerSwitchWidgets) {
+    use crate::sidebar::server_panel::CLIENTS_LIST_EMPTY_SUBTITLE;
+    while let Some(child) = panel.clients_list.first_child() {
+        panel.clients_list.remove(&child);
+    }
+    panel.clients_row.set_subtitle(CLIENTS_LIST_EMPTY_SUBTITLE);
 }
 
 /// Render an elapsed duration as a compact "age" string for the
@@ -3739,7 +4362,21 @@ const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
     clippy::cast_sign_loss,
     reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
 )]
-fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
+/// Build a `ServerConfig` from the panel's current widget state.
+///
+/// **`auth_key` parameter policy**: caller passes the pending
+/// key already loaded into the panel's `current_auth_key` cell.
+/// This is NOT re-derived inside the function via
+/// `ensure_server_auth_key()` — doing so would risk a second
+/// generate-and-save call with a different random value if the
+/// keyring is unavailable between the UI-seed moment and the
+/// server-start moment. Single source of truth: the key shown
+/// by the Reveal button is exactly what `Server::start`
+/// receives. Per `CodeRabbit` round 1 on PR #406.
+fn build_server_config_from_panel(
+    panel: &ServerSwitchWidgets,
+    pending_auth_key: Option<Vec<u8>>,
+) -> ServerConfig {
     use std::net::SocketAddr;
 
     use crate::sidebar::server_panel::{BIND_ALL_INTERFACES_IDX, BIND_LOOPBACK_IDX};
@@ -3815,12 +4452,23 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
         },
         buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
         compression,
-        listener_cap: sdr_server_rtltcp::DEFAULT_LISTENER_CAP,
-        // Auth defaults to off (None) — enabling it lives behind
-        // the #395 server UI toggle. #394 ships the wire + server
-        // enforcement plumbing; the UI knob + keyring storage
-        // hooks come in the follow-up sub-issue.
-        auth_key: None,
+        // Listener cap pulled from the panel's live widget value so
+        // the spin row's current position is the single source of
+        // truth at server-start time. Later live-update calls flow
+        // through `Server::set_listener_cap` directly. Per #395.
+        listener_cap: panel.listener_cap_row.value() as usize,
+        // Auth key plumbed from the caller. The panel's
+        // `auth_require_row.is_active()` still dictates whether
+        // auth is on — caller passes `Some(key)` only when the
+        // toggle is active. Caller has already validated the
+        // key length via `ensure_server_auth_key()`; `Server::start`
+        // re-validates defensively before bind. Per `CodeRabbit`
+        // round 1 on PR #406.
+        auth_key: if panel.auth_require_row.is_active() {
+            pending_auth_key
+        } else {
+            None
+        },
     }
 }
 
@@ -3865,9 +4513,121 @@ fn build_advertiser(
             // Vanilla mDNS consumers (non-sdr-rs clients that
             // don't know this key) just ignore it. #307.
             codecs: Some(server.compression().to_wire()),
+            // Advertise `auth_required=true` when the running
+            // server has a key configured so clients can prompt
+            // for a key BEFORE dispatching connect. Read from
+            // `Server::auth_required()` (not the UI's auth-toggle
+            // state) because a future live-update via
+            // `Server::set_auth_key` is the single source of truth.
+            // #394 + #395.
+            auth_required: server.auth_required().then_some(true),
         },
     };
     Advertiser::announce(opts)
+}
+
+/// Apply an auth-key change to the running server and refresh
+/// the mDNS advertiser atomically. Returns `true` iff the
+/// server actually holds the new state; `false` means the
+/// caller must revert the UI so it stays in sync.
+///
+/// **Success cases:**
+/// - No server is running (`running` cell contains `None`): no
+///   server-side change to apply; caller can proceed with UI.
+/// - Server is running and `set_auth_key(new)` returns `Ok`.
+///   The advertiser is then rebuilt via
+///   `refresh_advertiser_for_auth_change` so the TXT record
+///   reflects the new `auth_required` state.
+///
+/// **Failure cases:**
+/// - `try_borrow_mut` on the running-server cell fails (another
+///   handler holds a mutable borrow — rare, mid-click race).
+///   Caller reverts the switch; next click usually wins.
+/// - `set_auth_key` returns `Err` (e.g., mutex poisoned). The
+///   toast surfaces the error and the caller reverts UI state.
+///
+/// Does NOT touch UI state — caller owns the UI mutation gate.
+/// Per `CodeRabbit` round 1 on PR #406.
+fn apply_live_auth_change(
+    running: &Rc<RefCell<Option<RunningServer>>>,
+    new_key: Option<Vec<u8>>,
+    widgets: Option<&ServerSwitchWidgets>,
+    toast_overlay: &glib::WeakRef<adw::ToastOverlay>,
+) -> bool {
+    let Ok(mut handle_cell) = running.try_borrow_mut() else {
+        tracing::warn!("auth change skipped — running-server cell busy");
+        return false;
+    };
+    let Some(handle) = handle_cell.as_mut() else {
+        // Server not running — UI-only change is always fine.
+        return true;
+    };
+    if let Err(e) = handle.server.set_auth_key(new_key) {
+        tracing::warn!(%e, "Server::set_auth_key failed on live auth change");
+        if let Some(overlay) = toast_overlay.upgrade() {
+            overlay.add_toast(adw::Toast::new(&format!(
+                "Couldn't update auth on the running server: {e}"
+            )));
+        }
+        return false;
+    }
+    // mDNS TXT refresh. Only meaningful when we have widget refs
+    // (caller upgraded `widgets_weak` before the call).
+    if let Some(widgets) = widgets {
+        refresh_advertiser_for_auth_change(handle, widgets, toast_overlay);
+    }
+    true
+}
+
+/// Tear down and rebuild the running server's mDNS advertiser so
+/// its TXT record reflects the current `Server::auth_required()`
+/// state. Called after every successful live auth toggle so
+/// discovery clients see the new `auth_required=true|absent`
+/// flag without waiting for a server restart.
+///
+/// **No-op when:**
+/// - No server is running (`handle` is `None`).
+/// - The user has advertising turned off (`advertise_row`
+///   inactive). Honors the user's choice — we don't bring
+///   advertising back online just because auth flipped.
+///
+/// **Error path:** `build_advertiser` failures log + toast
+/// (same pattern as the initial server-start advertise failure).
+/// The server itself keeps running without a fresh TXT; worst
+/// case, clients see stale auth metadata until the server is
+/// restarted. Never panics, never leaves a half-registered
+/// advertiser in place. Per `CodeRabbit` round 1 on PR #406.
+fn refresh_advertiser_for_auth_change(
+    handle: &mut RunningServer,
+    widgets: &ServerSwitchWidgets,
+    toast_overlay: &glib::WeakRef<adw::ToastOverlay>,
+) {
+    if !widgets.advertise_row.is_active() {
+        // User turned advertising off — don't sneak it back on.
+        return;
+    }
+    // Drop the old advertiser FIRST so its Drop-based unregister
+    // fires before we re-announce under the same instance name.
+    // mdns-sd allows back-to-back registers with the same name
+    // but cleanly bracketed unregister/register avoids a window
+    // where duplicate records briefly coexist on the LAN.
+    drop(handle.advertiser.take());
+    match build_advertiser(&handle.server, &widgets.nickname_row.text()) {
+        Ok(adv) => {
+            handle.advertiser = Some(adv);
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "mDNS advertiser rebuild after auth toggle failed; TXT auth_required will be stale until next start"
+            );
+            if let Some(overlay) = toast_overlay.upgrade() {
+                overlay.add_toast(adw::Toast::new(&format!(
+                    "Couldn't refresh mDNS advertisement after auth toggle: {e}"
+                )));
+            }
+        }
+    }
 }
 
 /// Lock or unlock the server-config rows. Called with `true` on
@@ -6754,6 +7514,7 @@ mod rtl_tcp_discovery_format_tests {
                 nickname: "weather".into(),
                 txbuf: None,
                 codecs: None,
+                auth_required: None,
             },
             last_seen: Instant::now(),
         }

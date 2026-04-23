@@ -37,7 +37,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -328,6 +328,30 @@ pub struct Server {
     bind: SocketAddr,
     tuner: TunerAdvertiseInfo,
     compression: crate::codec::CodecMask,
+    /// Listener cap shared with the accept thread via [`AtomicUsize`]
+    /// so the UI can live-update it via [`Server::set_listener_cap`]
+    /// without restarting the server. Accept path does a
+    /// `Relaxed` load on each admission decision; the atomic's cost
+    /// is negligible relative to the `TcpListener::accept` syscall.
+    /// Per #395.
+    listener_cap: Arc<AtomicUsize>,
+    /// Auth key shared with the accept thread via `Mutex` so the UI
+    /// can live-update it via [`Server::set_auth_key`] without
+    /// restarting the server. The handshake path snapshots the value
+    /// once per connection (cloning the `Option<Vec<u8>>`) so a
+    /// mid-handshake `set_auth_key` never splits a single client's
+    /// eager-vs-lazy gate across two keys. Per #395.
+    auth_key: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Cached "auth is required" flag used by [`Server::auth_required`]
+    /// when the `auth_key` mutex is poisoned. Without this, a poisoned
+    /// mutex would silently advertise "no auth" via mDNS (discovery
+    /// clients would stop prompting for a key) while the handshake
+    /// path and [`Server::set_auth_key`] still treat the poison as
+    /// fatal. The atomic is updated inside [`Server::set_auth_key`]
+    /// on every successful mutation (AFTER the mutex write succeeds)
+    /// and initialized from `ServerConfig.auth_key.is_some()` at
+    /// construction. Per `CodeRabbit` round 1 on PR #406.
+    auth_required_cache: Arc<AtomicBool>,
     /// Snapshot of the `InitialDeviceState` that `apply_initial_state`
     /// actually applied at start. Cloned from `ServerConfig.initial`
     /// and stashed here so `Server::stats()` can include it without
@@ -353,15 +377,7 @@ impl Server {
         // failures — otherwise the server appears to start fine
         // but every client gets rejected. Per `CodeRabbit`
         // round 2 on PR #405.
-        if let Some(key) = &config.auth_key {
-            let max = crate::extension::MAX_AUTH_KEY_LEN;
-            if key.is_empty() || key.len() > max {
-                return Err(ServerError::InvalidAuthKeyLength {
-                    len: key.len(),
-                    max,
-                });
-            }
-        }
+        validate_auth_key_length(config.auth_key.as_deref())?;
 
         // Bind first — surface port-in-use before touching the USB device
         // so we don't leave a dongle claimed after a failed bind.
@@ -413,6 +429,19 @@ impl Server {
             config.buffer_capacity
         };
 
+        // Wrap `listener_cap` and `auth_key` in shared atomics so the
+        // UI can live-update them via `Server::set_listener_cap` /
+        // `Server::set_auth_key` without restarting the server. The
+        // accept thread holds `Arc` clones and re-reads on every
+        // admission so the next-accept-after-change sees the new
+        // value. Per issue #395: "change takes effect on next accept".
+        let listener_cap = Arc::new(AtomicUsize::new(config.listener_cap));
+        let auth_key = Arc::new(Mutex::new(config.auth_key.clone()));
+        // Seed the auth-required cache from the starting config.
+        // Kept in lockstep with `auth_key` updates by `set_auth_key`.
+        // Per `CodeRabbit` round 1 on PR #406.
+        let auth_required_cache = Arc::new(AtomicBool::new(config.auth_key.is_some()));
+
         // Broadcaster runs for the server's lifetime regardless of
         // connected-client count. Starting it BEFORE the accept thread
         // means the first client that connects already has a live
@@ -428,8 +457,8 @@ impl Server {
             stopped.clone(),
             per_client_depth,
             config.compression,
-            config.listener_cap,
-            config.auth_key.clone(),
+            listener_cap.clone(),
+            auth_key.clone(),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -456,8 +485,98 @@ impl Server {
             bind: actual_bind,
             tuner,
             compression: config.compression,
+            listener_cap,
+            auth_key,
+            auth_required_cache,
             initial: config.initial,
         })
+    }
+
+    /// Replace the listener cap while the server is running. Takes
+    /// effect on the **next accept** — already-connected listeners
+    /// are never kicked, even when the new cap is lower than the
+    /// currently-connected count (surprise disconnection is rude;
+    /// per issue #395). Cheap — single `Relaxed` atomic store. The
+    /// accept thread reads via `Relaxed` load on each admission.
+    pub fn set_listener_cap(&self, cap: usize) {
+        self.listener_cap.store(cap, Ordering::Relaxed);
+    }
+
+    /// Replace the auth key while the server is running. Takes
+    /// effect on the **next accept** — already-authenticated clients
+    /// keep their sessions (auth runs once per handshake, not
+    /// per-message). Useful for the #395 "Regenerate" button: the
+    /// old key stops working for future reconnects without
+    /// disturbing anyone currently streaming.
+    ///
+    /// Validates length up-front (same rule as [`Server::start`]):
+    /// `Some(key)` must have `1..=MAX_AUTH_KEY_LEN` bytes. Rejects
+    /// empty / oversize inputs with [`ServerError::InvalidAuthKeyLength`]
+    /// — the live-update surface cannot silently accept a config
+    /// value that `Server::start` itself would have refused.
+    ///
+    /// `None` disables the auth gate entirely (matches the
+    /// "Require key" switch flipping off in the #395 UI).
+    ///
+    /// Poisoned mutex surfaces as
+    /// [`ServerError::Io(ErrorKind::Other)`] — the only way the
+    /// mutex gets poisoned is if a prior auth-gate panic left it
+    /// locked, which should be unreachable in practice; the server
+    /// is effectively broken at that point and the UI should
+    /// surface the error so the operator can restart it.
+    pub fn set_auth_key(&self, key: Option<Vec<u8>>) -> Result<(), ServerError> {
+        validate_auth_key_length(key.as_deref())?;
+        let mut guard = self.auth_key.lock().map_err(|_| {
+            ServerError::Io(std::io::Error::other(
+                "auth_key mutex poisoned — server is in a broken state",
+            ))
+        })?;
+        let will_be_required = key.is_some();
+        *guard = key;
+        // Drop the lock BEFORE the cache store so the cache write
+        // is never ordered-after a still-held mutex observer.
+        drop(guard);
+        // Update the poison-survival cache. Readers of
+        // `auth_required()` fall back to this value when the mutex
+        // is poisoned, so the cache must reflect the latest
+        // successful state change. Per `CodeRabbit` round 1 on
+        // PR #406.
+        self.auth_required_cache
+            .store(will_be_required, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Current listener cap. Reflects the most recent
+    /// [`Server::set_listener_cap`] call, or the starting
+    /// `ServerConfig.listener_cap` if never changed.
+    pub fn listener_cap(&self) -> usize {
+        self.listener_cap.load(Ordering::Relaxed)
+    }
+
+    /// Whether the server currently requires auth. Returns `true`
+    /// iff [`Server::set_auth_key`] has been called with `Some(_)`
+    /// (or the starting `ServerConfig.auth_key` was `Some`). Does
+    /// not leak the key itself — useful for stamping the mDNS TXT
+    /// `auth_required=true` field without handing the caller the
+    /// raw key bytes.
+    ///
+    /// Falls back to `auth_required_cache` on a poisoned mutex.
+    /// The handshake path and `set_auth_key` treat poisoning as
+    /// fatal; downgrading the mDNS advertisement to "no auth" in
+    /// the same scenario would make discovery clients stop
+    /// prompting for a key exactly when the server is broken. The
+    /// cache holds the last-known good value so the TXT stays
+    /// honest even after the mutex is unusable. Per `CodeRabbit`
+    /// round 1 on PR #406.
+    pub fn auth_required(&self) -> bool {
+        if let Ok(g) = self.auth_key.lock() {
+            g.is_some()
+        } else {
+            tracing::warn!(
+                "auth_key mutex poisoned — auth_required() falling back to cached value"
+            );
+            self.auth_required_cache.load(Ordering::Relaxed)
+        }
     }
 
     /// Current server statistics.
@@ -602,6 +721,27 @@ impl Drop for Server {
     }
 }
 
+/// Shared validation for `ServerConfig.auth_key` /
+/// `Server::set_auth_key` inputs: `None` is always fine; `Some(key)`
+/// must have `1..=MAX_AUTH_KEY_LEN` bytes. Empty or oversize Vecs
+/// return [`ServerError::InvalidAuthKeyLength`] with the out-of-range
+/// len so the caller's error message can name the exact failure.
+/// Centralized here so `Server::start` and `Server::set_auth_key`
+/// enforce the same contract — the live-update path cannot silently
+/// accept inputs that the construction path would refuse. Per #395.
+fn validate_auth_key_length(key: Option<&[u8]>) -> Result<(), ServerError> {
+    if let Some(bytes) = key {
+        let max = crate::extension::MAX_AUTH_KEY_LEN;
+        if bytes.is_empty() || bytes.len() > max {
+            return Err(ServerError::InvalidAuthKeyLength {
+                len: bytes.len(),
+                max,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Apply the user's initial settings to the freshly-opened device.
 ///
 /// Mirrors the setup block in rtl_tcp.c:490-520. Called once at
@@ -681,8 +821,8 @@ fn spawn_accept_thread(
     stopped: Arc<AtomicBool>,
     per_client_buffer_depth: usize,
     compression: CodecMask,
-    listener_cap: usize,
-    auth_key: Option<Vec<u8>>,
+    listener_cap: Arc<AtomicUsize>,
+    auth_key: Arc<Mutex<Option<Vec<u8>>>>,
 ) -> std::io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
     thread::Builder::new()
@@ -719,6 +859,17 @@ fn spawn_accept_thread(
                         let setup_device = device.clone();
                         let setup_registry = registry.clone();
                         let setup_shutdown = shutdown.clone();
+                        // Snapshot the live listener cap + auth key
+                        // Arcs into this accept's setup thread. Both
+                        // are `Arc` clones (cheap), so a mid-handshake
+                        // `set_*` call is visible to future accepts
+                        // but does not split the current client's
+                        // gate across two values (the setup thread
+                        // reads the cap once at role-admission, and
+                        // snapshots the auth key once at the top of
+                        // `spawn_client_workers`). Per issue #395
+                        // live-update design.
+                        let setup_listener_cap = listener_cap.clone();
                         let setup_auth_key = auth_key.clone();
                         let setup_registry_for_register = registry.clone();
                         match thread::Builder::new()
@@ -732,7 +883,7 @@ fn spawn_accept_thread(
                                     setup_shutdown,
                                     per_client_buffer_depth,
                                     compression,
-                                    listener_cap,
+                                    setup_listener_cap,
                                     setup_auth_key,
                                 );
                             }) {
@@ -811,9 +962,27 @@ fn spawn_client_workers(
     shutdown: Arc<AtomicBool>,
     per_client_buffer_depth: usize,
     compression_offer: CodecMask,
-    listener_cap: usize,
-    auth_key: Option<Vec<u8>>,
+    listener_cap: Arc<AtomicUsize>,
+    auth_key: Arc<Mutex<Option<Vec<u8>>>>,
 ) {
+    // Snapshot the live-update auth key once at the top of the
+    // handshake. Reading the `Arc<Mutex>` on every gate branch
+    // would risk a mid-handshake `Server::set_auth_key` call
+    // splitting the client's eager path (key bytes already on
+    // the wire against the old expected value) vs the lazy-gate
+    // follow-up (validated against the new value). Snapshot
+    // semantics keep each connection bound to a single key view.
+    // Per issue #395 live-update design.
+    let auth_key: Option<Vec<u8>> = if let Ok(guard) = auth_key.lock() {
+        guard.clone()
+    } else {
+        tracing::error!(
+            %peer,
+            "auth_key mutex poisoned during handshake — dropping client"
+        );
+        return;
+    };
+
     // Extended handshake (#307) — sniff the RTLX hello if the
     // client sent one. The outcome drives both codec negotiation
     // and the role request that feeds the #392 admission gate.
@@ -1061,7 +1230,12 @@ fn spawn_client_workers(
     // slot is never pushed and drops on scope exit. Takeover also
     // marks the displaced controller disconnected under the same
     // lock so its writer / command threads exit cleanly.
-    let decision = registry.register_with_role(slot.clone(), listener_cap, request_takeover);
+    //
+    // Read the listener cap from the live-update Arc ONCE here so
+    // a mid-decision `Server::set_listener_cap` call doesn't split
+    // the "is there room?" check across two values. Per issue #395.
+    let cap = listener_cap.load(Ordering::Relaxed);
+    let decision = registry.register_with_role(slot.clone(), cap, request_takeover);
     match decision {
         RoleDecision::Granted => {
             tracing::info!(
@@ -1117,7 +1291,7 @@ fn spawn_client_workers(
             tracing::info!(
                 %peer,
                 ?requested_role,
-                cap = listener_cap,
+                cap = cap,
                 "rtl_tcp listener cap reached — denying client"
             );
             // Vanilla clients never land here — they always request
@@ -2602,6 +2776,57 @@ mod tests {
             }
             Err(e) => panic!("expected InvalidAuthKeyLength, got {e:?}"),
             Ok(_) => panic!("oversize auth_key must not start a server"),
+        }
+    }
+
+    #[test]
+    fn validate_auth_key_length_accepts_none() {
+        // None disables the auth gate entirely — always valid.
+        // Per the #395 live-update shared-validation contract.
+        validate_auth_key_length(None).unwrap();
+    }
+
+    #[test]
+    fn validate_auth_key_length_accepts_boundary_sizes() {
+        // 1 byte = minimum non-empty key, `MAX_AUTH_KEY_LEN` = 256 =
+        // maximum that the wire format (`AuthKeyMessage::to_bytes`)
+        // can serialize. Both boundaries must pass — the `1..=max`
+        // range is inclusive on both ends.
+        validate_auth_key_length(Some(&[0u8; 1])).unwrap();
+        validate_auth_key_length(Some(&[0u8; crate::extension::MAX_AUTH_KEY_LEN])).unwrap();
+    }
+
+    #[test]
+    fn validate_auth_key_length_rejects_empty() {
+        // `Some(vec![])` bypasses every upstream guard (FFI, CLI,
+        // wire-format) but would silently match an `expected` of
+        // the same length at handshake time. `validate_auth_key`
+        // already guards the match, but defense-in-depth: catch
+        // at construction / set time too. Pinned separately from
+        // `Server::start` + `Server::set_auth_key` so the helper's
+        // contract is a first-class regression surface independent
+        // of the callers.
+        match validate_auth_key_length(Some(&[])) {
+            Err(ServerError::InvalidAuthKeyLength { len, max }) => {
+                assert_eq!(len, 0);
+                assert_eq!(max, crate::extension::MAX_AUTH_KEY_LEN);
+            }
+            other => panic!("expected InvalidAuthKeyLength, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_auth_key_length_rejects_oversize() {
+        // `MAX_AUTH_KEY_LEN + 1` = smallest oversize. Serialization
+        // via `AuthKeyMessage::to_bytes` would fail every handshake;
+        // catch at config time.
+        let oversize = vec![0u8; crate::extension::MAX_AUTH_KEY_LEN + 1];
+        match validate_auth_key_length(Some(&oversize)) {
+            Err(ServerError::InvalidAuthKeyLength { len, max }) => {
+                assert_eq!(len, crate::extension::MAX_AUTH_KEY_LEN + 1);
+                assert_eq!(max, crate::extension::MAX_AUTH_KEY_LEN);
+            }
+            other => panic!("expected InvalidAuthKeyLength, got {other:?}"),
         }
     }
 

@@ -179,6 +179,16 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
                 // `codecs` fields so the Swift macOS app can
                 // advertise compression capability.
                 codecs: None,
+                // `auth_required` publishes via the same FFI
+                // extension as `codecs` when the Swift host wires
+                // up its own advertiser config. Today the FFI
+                // advertiser is decoupled from the FFI server
+                // (Swift publishes advertise options separately),
+                // so default to `None` — downstream mDNS browsers
+                // treat absence as "no auth required" per #395's
+                // omit-on-false contract. Issue #400 covers
+                // extending this struct.
+                auth_required: None,
             },
         };
 
@@ -861,6 +871,7 @@ mod tests {
                 },
                 txbuf,
                 codecs: None,
+                auth_required: None,
             },
             last_seen: Instant::now(),
         }

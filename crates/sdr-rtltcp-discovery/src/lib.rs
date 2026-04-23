@@ -150,6 +150,7 @@ mod tests {
                 nickname: "integration-test-nick".into(),
                 txbuf: None,
                 codecs: None,
+                auth_required: None,
             },
         })
         .expect("announce");
