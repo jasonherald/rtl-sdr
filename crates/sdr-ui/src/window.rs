@@ -1436,6 +1436,58 @@ fn record_active_rtl_tcp_server(
     }
 }
 
+/// Invalidate the cached active `rtl_tcp` server identity when
+/// the hostname / port widgets no longer match it. Called from
+/// the `hostname_row.connect_changed` + `port_row.connect_value_
+/// notify` handlers so a manual edit retargets per-server state
+/// (keyring lookups, favorite matches, `rtl_tcp_active_server`)
+/// to the newly-typed endpoint.
+///
+/// Without this, after the startup `LastConnectedServer` restore
+/// or an `apply_rtl_tcp_connect` seeded the cache, typing a
+/// different host or port in the source row would leave the
+/// cache pointing at the old server — the first subsequent
+/// `AuthFailed` / `Connected` arm would then
+/// clear/save the key under the WRONG server. Per
+/// `CodeRabbit` round 4 on PR #408.
+///
+/// **Comparison guard:** the cache is cleared only when its
+/// current value differs from the widget-derived key. That
+/// keeps `apply_rtl_tcp_connect`'s own `hostname_row.set_text` /
+/// `port_row.set_value` writes (which fire these same handlers)
+/// from spuriously clobbering the stable id the caller just
+/// wrote. During a caller-driven server switch the cache IS
+/// stale at the widget-write moment (old server id, new widget
+/// text), so this invalidation fires correctly there too —
+/// `apply_rtl_tcp_connect` overwrites the empty cache right
+/// afterwards with the new stable id.
+///
+/// Also clears the auth-key row (visibility + text) so the
+/// old server's key bytes can't leak onto a different endpoint.
+/// The row's `connect_changed` handler re-dispatches
+/// `SetRtlTcpClientConfig { auth_key: None, .. }` so DSP state
+/// tracks the invalidation in lockstep with the UI.
+fn invalidate_rtl_tcp_active_server_on_edit(
+    app_state: &Rc<AppState>,
+    hostname_row: &adw::EntryRow,
+    port_row: &adw::SpinRow,
+    auth_key_row: &adw::PasswordEntryRow,
+) {
+    let hostname = hostname_row.text().to_string();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let port = port_row.value() as u16;
+    let current_key = format!("{hostname}:{port}");
+    let should_clear = {
+        let cached = app_state.rtl_tcp_active_server.borrow();
+        !cached.is_empty() && *cached != current_key
+    };
+    if should_clear {
+        app_state.rtl_tcp_active_server.borrow_mut().clear();
+        auth_key_row.set_visible(false);
+        auth_key_row.set_text("");
+    }
+}
+
 /// Save the current Server-key-row text to the keyring under
 /// the active `rtl_tcp` server's `host:port`. Called on a
 /// successful Connected following AuthRequired / AuthFailed.
@@ -5936,7 +5988,21 @@ fn connect_source_panel(
     let state_host = Rc::clone(state);
     let port_for_host = panels.source.port_row.clone();
     let proto_for_host = panels.source.protocol_row.clone();
+    let hostname_for_host = panels.source.hostname_row.clone();
+    let auth_key_for_host = panels.source.rtl_tcp_auth_key_row.clone();
     panels.source.hostname_row.connect_changed(move |row| {
+        // Invalidate the cached `rtl_tcp_active_server` when
+        // the widget no longer matches the cached stable id
+        // (typically a manual edit; harmless no-op for
+        // `apply_rtl_tcp_connect`'s programmatic writes when
+        // those match the cache). Per CodeRabbit round 4 on
+        // PR #408.
+        invalidate_rtl_tcp_active_server_on_edit(
+            &state_host,
+            &hostname_for_host,
+            &port_for_host,
+            &auth_key_for_host,
+        );
         let hostname = row.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = port_for_host.value() as u16;
@@ -5956,7 +6022,15 @@ fn connect_source_panel(
     let state_port = Rc::clone(state);
     let host_for_port = panels.source.hostname_row.clone();
     let proto_for_port = panels.source.protocol_row.clone();
+    let port_row_for_port = panels.source.port_row.clone();
+    let auth_key_for_port = panels.source.rtl_tcp_auth_key_row.clone();
     panels.source.port_row.connect_value_notify(move |row| {
+        invalidate_rtl_tcp_active_server_on_edit(
+            &state_port,
+            &host_for_port,
+            &port_row_for_port,
+            &auth_key_for_port,
+        );
         let hostname = host_for_port.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = row.value() as u16;
