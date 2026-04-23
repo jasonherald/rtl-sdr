@@ -2943,13 +2943,24 @@ fn apply_rtl_tcp_connect(
                     .and_then(|rv| serde_json::from_value::<FavoriteRole>(rv.clone()).ok())
             })
         });
-    if let Some(fav_role) = favorite_role {
-        let idx = match fav_role {
-            FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
-            FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
-        };
-        role_row.set_selected(idx);
-    }
+    // Always set the role explicitly — never leave the combo
+    // showing whatever a prior favorite-restore put there. Pre-
+    // `CodeRabbit` round 9 on PR #408 this was `if let Some(
+    // fav_role) = favorite_role { ... }`, so a fresh server
+    // with no per-favorite role and no global
+    // `KEY_RTL_TCP_CLIENT_LAST_ROLE` would silently inherit
+    // whatever `Listen` a previous favorite had set — meaning
+    // the first connect against a never-seen server could
+    // accidentally request Listener instead of the legacy-safe
+    // Control default. `unwrap_or(Control)` forces the picker
+    // to the right default every time `apply_rtl_tcp_connect`
+    // runs.
+    let resolved_role = favorite_role.unwrap_or(FavoriteRole::Control);
+    let idx = match resolved_role {
+        FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
+        FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
+    };
+    role_row.set_selected(idx);
     // Auth-row state is driven by two inputs:
     // - `auth_required = Some(true)` on the favorite → the
     //   server advertises a required key, so reveal the row so
@@ -6183,12 +6194,37 @@ fn connect_source_panel(
     //   save_favorites so the next connect from this favorite
     //   restores the right picker state without touching other
     //   servers.
+    // Shared "last-good auth bytes" cache between the auth-key
+    // handler (primary writer) and the role-picker handler
+    // (reader). Populated whenever the auth row parses as empty
+    // (`None`, intentional clear) or valid hex (`Some(bytes)`);
+    // NOT updated on malformed hex. The role handler uses this
+    // snapshot when the live auth text is unparseable so it can
+    // still propagate the new role to DSP with a coherent
+    // auth_key value — without this, flipping role while the
+    // key field held a bad paste would skip the whole
+    // `SetRtlTcpClientConfig` dispatch and leave DSP on the
+    // previous role. Per `CodeRabbit` round 9 on PR #408.
+    //
+    // `Rc<RefCell<Option<Vec<u8>>>>` on GTK's single-threaded
+    // main loop — no lock contention. The outer `Option`
+    // differentiates "never parsed" (fresh session, never had a
+    // valid auth value) from "intentionally cleared" (user typed
+    // empty): both dispatch `auth_key: None` so the distinction
+    // only affects the role-handler's fallback path, where
+    // "never parsed" means "just forward the current text's
+    // parse result (which will itself be None for empty and
+    // therefore match)" — see the role-handler below for the
+    // exact semantics.
+    let last_good_auth_key: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
+
     let state_role = Rc::clone(state);
     let auth_key_for_role = panels.source.rtl_tcp_auth_key_row.clone();
     let config_for_role = std::sync::Arc::clone(config);
     let hostname_for_role = panels.source.hostname_row.clone();
     let port_for_role = panels.source.port_row.clone();
     let favorites_for_role = Rc::clone(favorites);
+    let last_good_for_role = Rc::clone(&last_good_auth_key);
     panels
         .source
         .rtl_tcp_role_row
@@ -6203,35 +6239,32 @@ fn connect_source_panel(
                 _ => return, // transient out-of-range indices
             };
             let requested_role = fav_role.as_wire_role();
-            // Re-parsing the auth-key row here has the same
-            // malformed-vs-empty distinction as
-            // `rtl_tcp_auth_key_row.connect_changed` (round 7):
-            // an `auth_key_from_hex(..) -> None` on NON-empty
-            // text means "invalid hex, preserve last-good DSP
-            // auth" — NOT "clear". Pre-`CodeRabbit` round 8 on
-            // PR #408 this handler collapsed both cases to
-            // `auth_key: None`, so flipping the role while the
-            // key field held a bad paste silently clobbered
-            // DSP's saved auth. `Option<Option<..>>` gates the
-            // dispatch: outer `Some` means "push to DSP",
-            // outer `None` means "skip dispatch, keep last-good"
-            // — role persistence below still runs either way so
-            // the picker's user intent is recorded, and the
-            // `auth_key_row`'s own handler will catch up DSP
-            // with the current role + fixed/cleared text on
-            // the next edit.
+            // Resolve the auth_key for this dispatch:
+            // - Empty text → `None` (intentional clear).
+            // - Valid hex → `Some(bytes)`.
+            // - Malformed non-empty text → the cached last-good
+            //   bytes (which the auth handler maintains). This
+            //   means a role flip with bad hex in the auth field
+            //   still pushes the new role to DSP — pre-
+            //   `CodeRabbit` round 9 on PR #408 we'd skip the
+            //   dispatch entirely, so a user could switch to
+            //   Listener, hit Retry / ControllerBusy-toast-
+            //   Takeover, and still end up as Controller because
+            //   DSP never saw the new role. The auth_key-row
+            //   handler still drives the `error` CSS class on
+            //   the row so the user sees the malformed input.
             let key_text = auth_key_for_role.text().to_string();
-            let dispatch_auth: Option<Option<Vec<u8>>> = if key_text.is_empty() {
-                Some(None)
+            let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
+                None
+            } else if let Some(bytes) = crate::sidebar::server_panel::auth_key_from_hex(&key_text) {
+                Some(bytes)
             } else {
-                crate::sidebar::server_panel::auth_key_from_hex(&key_text).map(Some)
+                last_good_for_role.borrow().clone()
             };
-            if let Some(auth_key) = dispatch_auth {
-                state_role.send_dsp(UiToDsp::SetRtlTcpClientConfig {
-                    requested_role,
-                    auth_key,
-                });
-            }
+            state_role.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+                requested_role,
+                auth_key,
+            });
             // Tier 1: global default — always written so a fresh
             // server ("never favorited, never configured") picks
             // this up as the picker seed.
@@ -6291,6 +6324,7 @@ fn connect_source_panel(
     // DSP.
     let state_auth = Rc::clone(state);
     let role_for_auth = panels.source.rtl_tcp_role_row.clone();
+    let last_good_for_auth = Rc::clone(&last_good_auth_key);
     panels
         .source
         .rtl_tcp_auth_key_row
@@ -6325,13 +6359,15 @@ fn connect_source_panel(
             // had been clobbered. Three cases now:
             //
             // - Empty text: intentional clear. Drop the error
-            //   class, dispatch `auth_key: None`.
+            //   class, dispatch `auth_key: None`, cache `None`.
             // - Valid hex: parsed bytes. Drop the error class,
-            //   dispatch `Some(bytes)`.
+            //   dispatch `Some(bytes)`, cache `Some(bytes)`.
             // - Malformed non-empty text: add the libadwaita
             //   `error` CSS class so the row reads as invalid,
-            //   and RETURN without dispatching — keeping the
-            //   last-good DSP auth state intact until the user
+            //   and RETURN without dispatching or updating the
+            //   cache — keeping DSP's last-good auth state
+            //   (and the `last_good_auth_key` cache the role
+            //   handler reads from) intact until the user
             //   either fixes the text or clears the field.
             //
             // `auth_key_from_hex` treats empty as `None` too, but
@@ -6347,6 +6383,12 @@ fn connect_source_panel(
                 row.add_css_class("error");
                 return;
             };
+            // Update the last-good cache alongside the dispatch
+            // so the role handler's fallback path (malformed
+            // hex at role-flip time) has a coherent value to
+            // dispatch. See `last_good_auth_key` declaration
+            // above. Per `CodeRabbit` round 9 on PR #408.
+            last_good_for_auth.borrow_mut().clone_from(&auth_key);
             state_auth.send_dsp(UiToDsp::SetRtlTcpClientConfig {
                 requested_role: fav_role.as_wire_role(),
                 auth_key,
