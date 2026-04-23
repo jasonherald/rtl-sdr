@@ -62,34 +62,40 @@ const APP_CSS: &str = r#"
     background: transparent;
 }
 
-/* Activity bar — narrow strip of icon toggle buttons against window edge */
+/* Activity bar — narrow strip of icon toggle buttons against window
+ * edge. Visually a natural extension of the header bar: no chrome
+ * on buttons, icons sit on transparent background, subtle hover tint,
+ * and a thin accent strip + tint on the currently-selected icon.
+ */
 .activity-bar {
-    background-color: alpha(@theme_bg_color, 0.95);
-    border-right: 1px solid alpha(@borders, 0.4);
-    padding: 6px 2px;
+    background-color: transparent;
+    padding: 4px 0;
 }
 
-.activity-bar button {
-    min-width: 40px;
-    min-height: 40px;
-    padding: 8px;
-    border-radius: 4px;
-    margin: 2px 0;
+.activity-bar button.activity-bar-button {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 4px;
+    margin: 2px 4px;
+    border-radius: 6px;
+    background: none;
+    border: none;
+    box-shadow: none;
+    color: alpha(@window_fg_color, 0.7);
 }
 
-.activity-bar button.accent {
-    border-left: 2px solid @accent_color;
+.activity-bar button.activity-bar-button:hover {
+    background-color: alpha(@window_fg_color, 0.08);
+    color: @window_fg_color;
 }
 
-/* Right activity bar — mirror the border to the left edge */
-.activity-bar-right {
-    border-left: 1px solid alpha(@borders, 0.4);
-    border-right: none;
+.activity-bar button.activity-bar-button:checked {
+    background-color: alpha(@accent_color, 0.15);
+    color: @accent_color;
 }
 
-.activity-bar-right button.accent {
-    border-left: none;
-    border-right: 2px solid @accent_color;
+.activity-bar button.activity-bar-button:checked:hover {
+    background-color: alpha(@accent_color, 0.2);
 }
 "#;
 

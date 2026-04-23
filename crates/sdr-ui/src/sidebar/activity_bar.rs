@@ -67,9 +67,13 @@ pub struct ActivityBar {
 
 /// Build an activity bar for one window edge.
 ///
-/// Entries are packed top-down in the given order; the first entry
-/// starts `active` so a panel is always selected on launch. Callers
-/// persist and restore `active` state themselves (sub-ticket #428).
+/// Every button is flat (no chrome), sized to match libadwaita
+/// header-bar buttons so the activity bar reads as a natural window-
+/// edge extension rather than an inset toolbar. Initial `active` and
+/// `.accent` state are the caller's responsibility — left bars
+/// typically start with the first entry selected (a panel is always
+/// visible); the right bar starts with no entry selected (panel
+/// closed by default).
 pub fn build_activity_bar(entries: &[ActivityBarEntry], side: ActivityBarSide) -> ActivityBar {
     let widget = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -84,23 +88,16 @@ pub fn build_activity_bar(entries: &[ActivityBarEntry], side: ActivityBarSide) -
 
     let mut buttons = HashMap::with_capacity(entries.len());
 
-    for (index, entry) in entries.iter().enumerate() {
+    for entry in entries {
         let btn = gtk4::ToggleButton::builder()
             .icon_name(entry.icon_name)
             .tooltip_text(format!("{} ({})", entry.display_name, entry.shortcut_label))
-            .active(index == 0)
+            .css_classes(["flat", "activity-bar-button"])
             .build();
 
         // Explicit accessibility label — tooltip text is not reliably
         // announced by screen readers (see module docs §Accessibility).
         btn.update_property(&[gtk4::accessible::Property::Label(entry.display_name)]);
-
-        // The first entry starts as the selected activity; give it
-        // the `.accent` class so its selected-strip matches the
-        // click-handler's later toggling.
-        if index == 0 {
-            btn.add_css_class("accent");
-        }
 
         widget.append(&btn);
         buttons.insert(entry.name, btn);

@@ -169,7 +169,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         left_activity_bar,
         right_activity_bar,
         left_stack,
-        right_stack,
+        right_stack: _right_stack,
         panels,
         spectrum_handle: spectrum_handle_raw,
         status_bar,
@@ -256,53 +256,59 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 
     // --- Activity-bar wiring ---
     //
-    // Click on a NEW left icon → deselect other buttons, switch
-    // stack, ensure left panel is open.
-    // Click on the CURRENTLY-selected left icon → keep icon
-    // selected (design doc §4.2) and toggle panel open/closed.
-    // Accent CSS class tracks the `active` state via a `toggled`
-    // handler per button so screen-reader and visual states stay
-    // in lockstep.
+    // Left (multi-button): click on a NEW icon → deselect siblings,
+    // switch stack, open panel. Click on the CURRENTLY-selected
+    // icon → icon stays selected (design doc §4.2), panel toggles.
+    // `:checked` CSS renders the accent tint automatically.
+    if let Some(general_btn) = left_activity_bar.buttons.get("general") {
+        general_btn.set_active(true);
+    }
     wire_activity_bar_clicks(&left_activity_bar, &left_stack, &left_split_view, "general");
-    wire_activity_bar_clicks(
-        &right_activity_bar,
-        &right_stack,
-        &right_split_view,
-        "transcript",
-    );
 
-    // Header transcript button ↔ right activity bar transcript
-    // toggle — two-way sync so clicking either one drives the
-    // same panel. `set_active(x)` on an already-in-state-`x` toggle
-    // is a no-op (GTK suppresses `toggled`), so the mutual calls
-    // don't infinite-loop.
+    // Right (single-button): the transcript toggle, the header
+    // transcript button, and `right_split_view.show-sidebar` form a
+    // tri-state that must stay in sync. Approach: each toggle button
+    // writes its `active` state through to `show-sidebar`; the split
+    // view's `notify::show-sidebar` reflects back into both buttons.
+    // `set_active(x)` on an already-in-state-`x` button is a GTK
+    // no-op (no `toggled` signal), so the two-way propagation is
+    // naturally idempotent.
     if let Some(right_transcript_btn) = right_activity_bar.buttons.get("transcript") {
-        let right_btn_weak = right_transcript_btn.downgrade();
-        transcript_button.connect_toggled(move |btn| {
-            if let Some(right) = right_btn_weak.upgrade()
-                && right.is_active() != btn.is_active()
-            {
-                right.set_active(btn.is_active());
-                right.emit_clicked();
-            }
-        });
-        // Initial state: right panel starts closed, so the header
-        // toggle starts inactive. Restore-from-config happens in
-        // sub-ticket #428.
-        transcript_button.set_active(right_transcript_btn.is_active());
-
-        let header_btn_weak = transcript_button.downgrade();
         let right_split_weak = right_split_view.downgrade();
         right_transcript_btn.connect_toggled(move |btn| {
-            if let Some(hdr) = header_btn_weak.upgrade()
-                && hdr.is_active() != btn.is_active()
-            {
-                hdr.set_active(btn.is_active());
-            }
             if let Some(sv) = right_split_weak.upgrade() {
                 sv.set_show_sidebar(btn.is_active());
             }
         });
+
+        let right_split_weak = right_split_view.downgrade();
+        transcript_button.connect_toggled(move |btn| {
+            if let Some(sv) = right_split_weak.upgrade() {
+                sv.set_show_sidebar(btn.is_active());
+            }
+        });
+
+        let right_btn_weak = right_transcript_btn.downgrade();
+        let header_btn_weak = transcript_button.downgrade();
+        right_split_view.connect_show_sidebar_notify(move |sv| {
+            let visible = sv.shows_sidebar();
+            if let Some(rb) = right_btn_weak.upgrade()
+                && rb.is_active() != visible
+            {
+                rb.set_active(visible);
+            }
+            if let Some(hdr) = header_btn_weak.upgrade()
+                && hdr.is_active() != visible
+            {
+                hdr.set_active(visible);
+            }
+        });
+
+        // Initial alignment — panel is closed at launch, so both
+        // buttons start inactive. Config-driven restoration comes
+        // in sub-ticket #428.
+        right_transcript_btn.set_active(false);
+        transcript_button.set_active(false);
     }
 
     let toolbar_view = build_toolbar_view(&header, &layout_root);
@@ -1798,13 +1804,20 @@ const RIGHT_ACTIVITY_ENTRIES: &[sidebar::ActivityBarEntry] = &[sidebar::Activity
     shortcut_label: "Ctrl+Shift+1",
 }];
 
-/// Minimum side-panel width in pixels — narrower than this makes
+/// Minimum left-panel width in pixels — narrower than this makes
 /// `AdwPreferencesGroup` content wrap awkwardly (design doc §4.4).
-const SIDEBAR_MIN_WIDTH: f64 = 220.0;
+const LEFT_SIDEBAR_MIN_WIDTH: f64 = 220.0;
+/// Minimum right-panel width. The transcript panel's controls
+/// (model combo, VAD slider, auto-break sliders) need more breathing
+/// room than a preferences row — below this they stack awkwardly
+/// and the transcript text view loses usable line width.
+const RIGHT_SIDEBAR_MIN_WIDTH: f64 = 360.0;
 /// Default left-panel width — matches today's sidebar width.
 const LEFT_SIDEBAR_DEFAULT_WIDTH: f64 = 320.0;
-/// Default right-panel width — matches today's transcript flyout width.
-const RIGHT_SIDEBAR_DEFAULT_WIDTH: f64 = 360.0;
+/// Default right-panel width — gives the transcript panel room for
+/// its wider controls without the user having to resize on every
+/// launch.
+const RIGHT_SIDEBAR_DEFAULT_WIDTH: f64 = 420.0;
 
 /// Handles returned by [`build_layout`] for downstream wiring. Bundled
 /// into a struct rather than a tuple because the return list grew past
@@ -1954,7 +1967,7 @@ fn build_layout(
         .sidebar(&right_stack)
         .content(&content_inner)
         .show_sidebar(false)
-        .min_sidebar_width(SIDEBAR_MIN_WIDTH)
+        .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * 2.0)
         .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
@@ -1966,7 +1979,7 @@ fn build_layout(
         .sidebar(&left_stack)
         .content(&right_split_view)
         .show_sidebar(true)
-        .min_sidebar_width(SIDEBAR_MIN_WIDTH)
+        .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0)
         .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
@@ -2265,23 +2278,28 @@ fn build_toolbar_view(header: &adw::HeaderBar, content: &gtk4::Box) -> adw::Tool
     toolbar_view
 }
 
-/// Wire click handlers on every button of an activity bar so that:
+/// Wire click handlers on every button of a multi-activity bar so:
 ///
-/// - Clicking a *different* button swaps the stack's visible child,
-///   moves the `.accent` CSS class to the new button, and forces the
-///   split view's sidebar open.
+/// - Clicking a *different* button swaps the stack's visible child
+///   and forces the split view's sidebar open.
 /// - Clicking the *currently-selected* button keeps that button
 ///   visually selected (design doc §4.2 — the user's mental model is
 ///   "I'm still in Radio, I just closed the panel for a second") and
 ///   toggles the split view's sidebar show/hide.
 ///
-/// `initial_selected` is the `name` that starts selected on launch.
-/// It must match the stack's initial visible child and the button
-/// that `build_activity_bar` initialised with the `.accent` class
-/// (the first entry in the list passed to that function).
+/// `initial_selected` must match the stack's initial visible child
+/// and the button the caller pre-activated via `set_active(true)`.
+///
+/// The `:checked` CSS pseudo-class (driven by `ToggleButton::active`)
+/// renders the accent tint — no manual CSS class juggling needed.
 ///
 /// Mutual exclusion is enforced manually rather than via
 /// `ToggleButton::set_group`; see `sidebar::activity_bar` module docs.
+///
+/// Only suitable for bars with more than one entry. Single-button
+/// bars (like the right transcript bar today) wire `active` directly
+/// to `show_sidebar` — there's no "select vs. toggle panel"
+/// distinction to preserve.
 fn wire_activity_bar_clicks(
     bar: &sidebar::ActivityBar,
     stack: &gtk4::Stack,
@@ -2289,21 +2307,6 @@ fn wire_activity_bar_clicks(
     initial_selected: &'static str,
 ) {
     let selected: Rc<RefCell<&'static str>> = Rc::new(RefCell::new(initial_selected));
-
-    // `.accent` tracks `active` per button — a `toggled` handler on
-    // each button syncs the class so screen readers and eyeballs
-    // agree on which activity is selected. Separate from the click
-    // handler because `set_active` from the click handler fires
-    // `toggled`, and that's the one place we want the class swap.
-    for btn in bar.buttons.values() {
-        btn.connect_toggled(|b| {
-            if b.is_active() {
-                b.add_css_class("accent");
-            } else {
-                b.remove_css_class("accent");
-            }
-        });
-    }
 
     for (&name, btn) in &bar.buttons {
         let selected = Rc::clone(&selected);
