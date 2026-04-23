@@ -206,6 +206,36 @@ ui.sidebar.right.width_px       = 360
 ui.sidebar.right.expanded[<panel>][<section>] = true | false
 ```
 
+Concrete identifiers (canonical names — sub-tickets 2–7 must use these strings when wiring their expander rows so persistence survives a panel refactor):
+
+```text
+ui.sidebar.left.expanded["general"]["band-presets"]    = true
+ui.sidebar.left.expanded["general"]["bookmarks"]       = true
+ui.sidebar.left.expanded["general"]["source"]          = true
+ui.sidebar.left.expanded["general"]["rtl-tcp-discovery"] = true
+ui.sidebar.left.expanded["radio"]["demod"]             = true
+ui.sidebar.left.expanded["radio"]["squelch"]           = true
+ui.sidebar.left.expanded["radio"]["filters"]           = true
+ui.sidebar.left.expanded["radio"]["deemphasis"]        = true
+ui.sidebar.left.expanded["radio"]["agc-gain"]          = true
+ui.sidebar.left.expanded["radio"]["ctcss-dcs"]         = true
+ui.sidebar.left.expanded["audio"]["output"]            = true
+ui.sidebar.left.expanded["audio"]["volume"]            = true
+ui.sidebar.left.expanded["audio"]["network-sink"]      = true
+ui.sidebar.left.expanded["audio"]["recording"]         = true
+ui.sidebar.left.expanded["display"]["fft"]             = true
+ui.sidebar.left.expanded["display"]["waterfall"]       = true
+ui.sidebar.left.expanded["display"]["levels"]          = true
+ui.sidebar.left.expanded["display"]["overlay"]         = true
+ui.sidebar.left.expanded["scanner"]["scanner"]         = true
+ui.sidebar.left.expanded["scanner"]["channels"]        = true
+ui.sidebar.left.expanded["scanner"]["timing"]          = true
+ui.sidebar.left.expanded["scanner"]["active"]          = true
+ui.sidebar.right.expanded["transcript"]["controls"]    = true
+ui.sidebar.right.expanded["transcript"]["vad"]         = true
+ui.sidebar.right.expanded["transcript"]["auto-break"]  = true
+```
+
 - **Default selected:** left = `"general"`, right = `"transcript"` (even though closed by default on fresh installs).
 - **Default open:** left = `true` (user lands on General panel), right = `false` (Transcript opt-in).
 - **Default widths:** left = 320 px (current sidebar width), right = 360 px (current transcript width).
@@ -273,7 +303,8 @@ This is a big refactor — touching `window.rs` is unavoidable but the *panel co
 3. **Right side** (sub-ticket 7): transcript moves from the existing slide-out to the right-activity-bar stack. Single-icon strip; single panel.
 4. **Persistence** (sub-ticket 8): config keys, migration from legacy key, restore on launch, write on change.
 5. **Resize handles** (sub-ticket 9): the split-view's own dividers handle this if we use them; otherwise custom `GtkGestureDrag`. Decide during sub-ticket 1 (scaffolding) — if `AdwOverlaySplitView` dividers look right, skip the custom code.
-6. **Narrow-screen single-panel constraint** (sub-ticket 10, follow-up epic): not v1.
+6. **Documentation + CLAUDE.md** (sub-ticket 10): architecture docs refresh; runs parallel with the panel migrations.
+7. **Narrow-screen single-panel constraint** (follow-up epic, filed separately): not v1.
 
 Rolling the migration in panel-sized PRs instead of one giant refactor lets CodeRabbit review each chunk cleanly and gives smoke-test checkpoints along the way.
 
