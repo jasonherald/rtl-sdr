@@ -3744,11 +3744,19 @@ fn connect_server_status_polling(
     // is cheap but clearing the ListBox resets any user scroll
     // position, so we short-circuit on unchanged ticks.
     let last_activity_key: Rc<Cell<(usize, Option<Instant>)>> = Rc::new(Cell::new((0, None)));
-    // Clients-list diff key: hash of the connected `ClientId` set.
-    // Same rationale as `last_activity_key` — rebuilding the
-    // ListBox every tick would wipe user scroll position + flash
-    // the hover highlight off each 500 ms tick. Per issue #395.
-    let last_clients_key: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    // Clients-list diff key. Hashes `(id, peer, role, drops,
+    // elapsed_secs)` per client so a stable connected set with
+    // ticking uptime / incrementing drop counters still triggers
+    // a rebuild — the previous id-set-only hash froze row
+    // subtitles once the set stabilized, so a 10-minute session
+    // would show "0s" uptime forever. `Option<u64>` so the
+    // stop/start reset path can invalidate the cache by setting
+    // `None`; without that, an "empty set → empty set" transition
+    // across stop/start would short-circuit the first post-start
+    // render and leave the expander blank (the placeholder row
+    // was removed by `reset_clients_list`). Per `CodeRabbit`
+    // round 2 on PR #406.
+    let last_clients_key: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
 
     // Separate subscription on the Stop button. Flipping the switch
     // off is the single canonical stop path — pointing the button
@@ -4123,27 +4131,60 @@ fn render_activity_log(
 fn render_clients_list(
     widgets: &ServerStatusWidgets,
     stats: &sdr_server_rtltcp::ServerStats,
-    last_rendered: &Rc<std::cell::Cell<u64>>,
+    last_rendered: &Rc<std::cell::Cell<Option<u64>>>,
 ) {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     use crate::sidebar::server_panel::CLIENTS_LIST_EMPTY_SUBTITLE;
 
-    // Compute a diff key that only changes on accept / disconnect.
-    // `ClientId` is monotonic and never reused, so the sorted-id
-    // tuple uniquely identifies the connected set. Tracking just
-    // a hash keeps the cell small (u64 vs. Vec<ClientId>).
-    let mut ids: Vec<sdr_server_rtltcp::ClientId> =
-        stats.connected_clients.iter().map(|c| c.id).collect();
-    ids.sort_unstable();
+    // Compute a diff key that bumps on *any* rendered-field
+    // change — not just accept / disconnect. Including peer,
+    // role, drops, and (rounded-seconds) uptime in the hash
+    // means a stable connected set with ticking uptime or
+    // incrementing drops still triggers rebuilds. The previous
+    // id-set-only key froze row subtitles once the client set
+    // stabilized. Per `CodeRabbit` round 2 on PR #406.
+    //
+    // Rebuild cost is ~N widget builds at 2 Hz (N ≤ 32 at the
+    // listener cap); trivial vs. the USB / DSP hot path.
+    let now = Instant::now();
+    let mut key_fields: Vec<(sdr_server_rtltcp::ClientId, String, u8, u64, u64)> = stats
+        .connected_clients
+        .iter()
+        .map(|c| {
+            let role_disc = match c.role {
+                sdr_server_rtltcp::extension::Role::Control => 0u8,
+                sdr_server_rtltcp::extension::Role::Listen => 1u8,
+            };
+            let elapsed_secs = now.saturating_duration_since(c.connected_since).as_secs();
+            (
+                c.id,
+                c.peer.to_string(),
+                role_disc,
+                c.buffers_dropped,
+                elapsed_secs,
+            )
+        })
+        .collect();
+    key_fields.sort_unstable_by_key(|(id, _, _, _, _)| *id);
     let mut hasher = DefaultHasher::new();
-    ids.hash(&mut hasher);
+    key_fields.hash(&mut hasher);
     let current_key = hasher.finish();
-    if current_key == last_rendered.get() {
+
+    // Invalidate the cache when the ListBox has been cleared
+    // externally (by `reset_clients_list` on server stop). Without
+    // this, an "empty set → empty set" transition across stop/start
+    // would match the prior hash and short-circuit the first-tick
+    // render, leaving the expander visually blank. The empty
+    // state's placeholder row is a single child, so
+    // `first_child().is_none()` distinguishes the reset state from
+    // the rendered-empty state. Per `CodeRabbit` round 2 on PR #406.
+    let list_was_reset = widgets.clients_list.first_child().is_none();
+    if !list_was_reset && last_rendered.get() == Some(current_key) {
         return;
     }
-    last_rendered.set(current_key);
+    last_rendered.set(Some(current_key));
 
     // Clear the ListBox. GTK4 ListBox has no mass-remove.
     while let Some(child) = widgets.clients_list.first_child() {
@@ -4184,7 +4225,11 @@ fn render_clients_list(
         sdr_server_rtltcp::extension::Role::Listen => 1u8,
     });
 
-    let now = Instant::now();
+    // Reuse the `now` captured for the diff-key hash so the
+    // displayed duration and the hashed `elapsed_secs` are
+    // sampled from the same instant — avoids a split where
+    // the hash matches but the render shows a one-tick-newer
+    // duration (or vice-versa).
     for info in ordered {
         let (role_label, role_css) = match info.role {
             sdr_server_rtltcp::extension::Role::Control => ("Controller", "accent"),
