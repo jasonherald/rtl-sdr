@@ -192,9 +192,13 @@ pub struct ServerConfig {
     /// full threat model discussion.
     ///
     /// Key length must be in `1..=crate::extension::MAX_AUTH_KEY_LEN`
-    /// — enforced at [`AuthKeyMessage`] serialization/parse time,
-    /// so a zero-length or oversize value here would fail-fast at
-    /// handshake rather than silently accepting anyone. #394.
+    /// (i.e., `1..=256`). [`Server::start`] validates the length
+    /// BEFORE binding the listener or opening the USB device and
+    /// returns [`ServerError::InvalidAuthKeyLength`] immediately
+    /// if the key is empty or oversize, so the operator sees a
+    /// single clear configuration error at startup rather than
+    /// every client failing at handshake time. Per `CodeRabbit`
+    /// round 2 on PR #405. #394.
     ///
     /// [`AuthKeyMessage`]: crate::extension::AuthKeyMessage
     /// [`Status::AuthFailed`]: crate::extension::Status::AuthFailed
@@ -669,17 +673,57 @@ fn spawn_accept_thread(
                             continue;
                         }
                         configure_client_socket(&stream);
-                        spawn_client_workers(
-                            stream,
-                            peer,
-                            device.clone(),
-                            registry.clone(),
-                            shutdown.clone(),
-                            per_client_buffer_depth,
-                            compression,
-                            listener_cap,
-                            auth_key.clone(),
-                        );
+                        // Dispatch the blocking handshake (sniff hello +
+                        // optional auth follow-up + role admission) to a
+                        // short-lived per-connection setup thread. Holding
+                        // it inline would let one stalled RTLX client
+                        // serialize unrelated accepts for up to
+                        // `HELLO_SNIFF_TIMEOUT` (0.1 s) + `AUTH_REPLY_TIMEOUT`
+                        // (5 s) — a slow-peer DOS against the listener
+                        // backlog. Per `CodeRabbit` round 4 on PR #405.
+                        //
+                        // The setup thread runs to natural completion
+                        // regardless of shutdown: it either fails its
+                        // handshake (fast return, no registry entry) or
+                        // progresses to registering writer + command
+                        // handles and exits. We register its `JoinHandle`
+                        // on the same `register_worker_handle` bucket as
+                        // writer/command threads so `Server::drop`
+                        // joins it alongside them — bounded shutdown
+                        // latency of ≤ `HELLO_SNIFF_TIMEOUT` +
+                        // `AUTH_REPLY_TIMEOUT` per in-flight handshake.
+                        let setup_device = device.clone();
+                        let setup_registry = registry.clone();
+                        let setup_shutdown = shutdown.clone();
+                        let setup_auth_key = auth_key.clone();
+                        let setup_registry_for_register = registry.clone();
+                        match thread::Builder::new()
+                            .name(format!("rtl_tcp-setup-{}", peer.port()))
+                            .spawn(move || {
+                                spawn_client_workers(
+                                    stream,
+                                    peer,
+                                    setup_device,
+                                    setup_registry,
+                                    setup_shutdown,
+                                    per_client_buffer_depth,
+                                    compression,
+                                    listener_cap,
+                                    setup_auth_key,
+                                );
+                            }) {
+                            Ok(h) => {
+                                setup_registry_for_register.register_worker_handle(h);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    %peer,
+                                    %e,
+                                    "failed to spawn rtl_tcp setup thread — dropping client"
+                                );
+                                // `stream` drops here → bare TCP FIN.
+                            }
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -709,14 +753,25 @@ fn spawn_accept_thread(
 
 /// Do the handshake on a freshly-accepted socket, build a
 /// [`ClientSlot`], register it, and spawn this client's writer +
-/// command threads. Fire-and-forget — the accept thread doesn't wait
-/// for this client's workers; lifecycle is observed via the slot's
+/// command threads. Lifecycle is observed via the slot's
 /// disconnection flag.
+///
+/// **Runs on a per-connection setup thread**, not on the accept
+/// thread. The handshake includes two blocking reads —
+/// [`sniff_client_hello`] (bounded by `HELLO_SNIFF_TIMEOUT = 100 ms`)
+/// and, when auth is configured and the client didn't send
+/// `has_auth=true`, [`sniff_auth_key_message`] (bounded by
+/// [`AUTH_REPLY_TIMEOUT`] = 5 s). Holding these on the accept thread
+/// would let one stalled RTLX client serialize unrelated accepts for
+/// up to ~5.1 s and pressure the listener backlog. Per `CodeRabbit`
+/// round 4 on PR #405. #394.
 ///
 /// If the handshake fails at any step (sniff error, socket clone
 /// fails, header write fails, thread spawn fails), the client is
 /// silently dropped — no slot is registered, no stats are updated.
-/// The caller (accept thread) moves on to the next accept.
+/// The setup thread then exits; its `JoinHandle` is already
+/// registered with the `ClientRegistry` so `Server::drop` joins
+/// it alongside the per-client writer / command handles.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
