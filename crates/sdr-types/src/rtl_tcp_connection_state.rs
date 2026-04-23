@@ -57,7 +57,7 @@ pub enum RtlTcpConnectionState {
         /// Listener, `None` = unknown (we never sent a hello, or
         /// the server is a pre-#392 RTLX build that doesn't yet
         /// write the field). UIs render the role badge only when
-        /// this is `Some` — per CodeRabbit round 1 on PR #408,
+        /// this is `Some` — per `CodeRabbit` round 1 on PR #408,
         /// a legacy / pre-#392 server's actual slot is unknowable
         /// from the client side, and guessing "Controller" there
         /// could mis-label the session. Issue #396.

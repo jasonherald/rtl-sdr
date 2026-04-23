@@ -148,7 +148,7 @@ pub enum ConnectionState {
     /// territory, and guessing "Controller" there would mis-label
     /// the connection on pre-#392 RTLX servers that still hand
     /// every accepted client a Control-equivalent slot without
-    /// saying so on the wire. Per #396 / CodeRabbit round 1 on
+    /// saying so on the wire. Per #396 / `CodeRabbit` round 1 on
     /// PR #408.
     Connected {
         tuner: TunerInfo,
@@ -975,7 +975,7 @@ fn read_server_extension(stream: &TcpStream) -> std::io::Result<ServerExtension>
 /// outcome struct too would require the manager's data-pump
 /// branch to also read and forward it, which it has no use for
 /// (no mid-stream role changes exist in the wire protocol).
-/// Per CodeRabbit round 1 on PR #408.
+/// Per `CodeRabbit` round 1 on PR #408.
 struct HandshakeOutcome {
     stream: TcpStream,
     codec: Codec,
@@ -2885,8 +2885,7 @@ mod tests {
                 client_hello_version,
                 sdr_server_rtltcp::extension::PROTOCOL_VERSION_V1,
                 "role-only hello must stay on v1 for backward compatibility \
-                 (got 0x{:02x})",
-                client_hello_version,
+                 (got 0x{client_hello_version:02x})",
             );
             let _ = hello_tx.send(hello_buf);
             // Accept the handshake with Listen granted so the
@@ -2944,6 +2943,40 @@ mod tests {
         // Flags byte (offset 6) must be zero — we didn't opt
         // into takeover or auth, just role.
         assert_eq!(hello[6], 0);
+
+        // Lock in the state-side contract: after the handshake
+        // completes, `ConnectionState::Connected.granted_role`
+        // must carry `Some(Role::Listen)` — the value the server
+        // wrote into `ServerExtension.granted_role` above. A
+        // regression in `attempt_connect` that drops the
+        // extension's `granted_role` on the floor would still
+        // pass the wire-byte assertions but would break the
+        // status-bar badge provenance (it would read `None` and
+        // hide the badge even when the server explicitly
+        // admitted us as a Listener). Poll with a bounded
+        // deadline since the state transition is driven by the
+        // manager thread. Per `CodeRabbit` round 2 on PR #408.
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut reached_connected_with_listen = false;
+        while Instant::now() < deadline {
+            if matches!(
+                src.connection_state(),
+                ConnectionState::Connected {
+                    granted_role: Some(Role::Listen),
+                    ..
+                }
+            ) {
+                reached_connected_with_listen = true;
+                break;
+            }
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(
+            reached_connected_with_listen,
+            "Connected state should retain the server-granted Listen role \
+             (final observed state: {:?})",
+            src.connection_state()
+        );
 
         src.stop_manager();
         let _ = server_thread.join();

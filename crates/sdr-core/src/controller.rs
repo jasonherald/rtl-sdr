@@ -2048,12 +2048,32 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
         // config fields for address, but also threads the #396
         // `requested_role` + `auth_key` fields from state into an
         // `RtlTcpConfig` so the hello carries the user's choices.
-        // Non-default role / auth opt-ins are RTLX-only — safe
-        // against any server advertising `codecs=3`; unsafe against
-        // vanilla rtl_tcp servers (which mis-parse the 8-byte hello
-        // as two 5-byte commands). The source panel's discovery
-        // gating is responsible for refusing those opt-ins against
-        // legacy-only servers. Per #396.
+        //
+        // **Capability signals, in narrow scope:**
+        // - `codecs=3` in the mDNS TXT record says "this server
+        //   parses `ClientHello`, so a hello won't be mis-framed as
+        //   two 5-byte commands." That makes `compression`,
+        //   `request_takeover`, and `requested_role` opt-ins wire-
+        //   safe on this server. It does **NOT** prove the server
+        //   supports auth — auth uses the v2 protocol path, which
+        //   `codecs=3` doesn't speak to.
+        // - Auth capability is a separate signal: the #394 servers
+        //   advertise `auth_required` (present in the mDNS TXT
+        //   record and persisted on `FavoriteEntry`) AND accept
+        //   hellos with `PROTOCOL_VERSION_V2`. Eager-auth hellos
+        //   therefore require v2 — `required_protocol_version(flags)`
+        //   in `sdr-source-network` picks the minimum viable version
+        //   from the flag set, returning v2 when `FLAG_HAS_AUTH` is
+        //   set. Sending an auth-bearing hello to a `codecs=3`-only
+        //   server that doesn't understand v2 will bounce at the
+        //   server's version gate.
+        //
+        // The source panel's discovery gating is responsible for
+        // refusing role / compression / takeover opt-ins against
+        // legacy-only (non-`codecs=3`) servers, and for only
+        // offering the auth field on servers that advertise
+        // `auth_required`. Per #396 / `CodeRabbit` round 2 on
+        // PR #408.
         SourceType::RtlTcp => {
             let rtl_tcp_config = sdr_source_network::rtl_tcp::RtlTcpConfig {
                 requested_role: state.rtl_tcp_requested_role,

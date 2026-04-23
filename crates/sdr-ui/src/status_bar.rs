@@ -37,7 +37,7 @@ const DEFAULT_CURSOR_TEXT: &str = "Cursor: --";
 /// caller whether the bool came from the user's requested role
 /// or the server's admission decision, so a UI that passed a
 /// requested role here would mis-label sessions where the server
-/// admitted a different role than asked. Per CodeRabbit round 1
+/// admitted a different role than asked. Per `CodeRabbit` round 1
 /// on PR #408, callers must now name the slot explicitly. Per
 /// issue #396.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +105,7 @@ impl StatusBar {
     /// CSS; `None` hides the badge + its separator entirely.
     /// Callers must pass the server's admitted role (not the
     /// user's requested role) — see [`RtlTcpRoleBadge`]. Per
-    /// issue #396 / CodeRabbit round 1 on PR #408.
+    /// issue #396 / `CodeRabbit` round 1 on PR #408.
     pub fn update_role(&self, role: Option<RtlTcpRoleBadge>) {
         match role {
             Some(RtlTcpRoleBadge::Controller) => {
