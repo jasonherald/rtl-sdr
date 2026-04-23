@@ -5913,6 +5913,28 @@ fn connect_source_panel(
         );
     }
 
+    // Shared "last-good auth bytes" cache between the auth-key
+    // handler (primary writer) and the role-picker handler
+    // (reader). Populated whenever the auth row parses as empty
+    // (`None`, intentional clear) or valid hex (`Some(bytes)`);
+    // NOT updated on malformed hex. The role handler uses this
+    // snapshot when the live auth text is unparseable so it can
+    // still propagate the new role to DSP with a coherent
+    // auth_key value — without this, flipping role while the
+    // key field held a bad paste would skip the whole
+    // `SetRtlTcpClientConfig` dispatch and leave DSP on the
+    // previous role. Per `CodeRabbit` round 9 on PR #408.
+    //
+    // `Rc<RefCell<Option<Vec<u8>>>>` on GTK's single-threaded
+    // main loop — no lock contention. Declared BEFORE the
+    // startup last-connected restore below so that block can
+    // seed the cache with the keyring-loaded bytes — per
+    // `CodeRabbit` round 10 on PR #408, leaving the cache
+    // empty after startup would let a subsequent malformed-hex
+    // role flip clear DSP's working auth instead of preserving
+    // the startup-restored bytes.
+    let last_good_auth_key: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
+
     // Restore the rtl_tcp client's last-used role + auth key
     // (#396). Role resolution uses the standard two-tier
     // lookup: per-favorite `requested_role` first (if the
@@ -5976,6 +5998,16 @@ fn connect_source_panel(
         if let Some(srv) = last_connected.as_ref() {
             *state.rtl_tcp_active_server.borrow_mut() = format!("{}:{}", srv.host, srv.port);
             auth_key = load_client_auth_key_from_keyring(&srv.host, srv.port);
+            // Seed the round-9 last-good cache with the
+            // startup-restored bytes so a subsequent malformed-
+            // hex role flip (round 9's fallback path) preserves
+            // the auth DSP just received. Without this the
+            // cache would stay `None` until the user first
+            // edited the auth field, opening a window where a
+            // role flip with malformed text in the row silently
+            // clears DSP auth. Per `CodeRabbit` round 10 on
+            // PR #408.
+            last_good_auth_key.borrow_mut().clone_from(&auth_key);
             let has_auth_required = matches!(
                 favorite_entry.as_ref().and_then(|f| f.auth_required),
                 Some(true)
@@ -6194,30 +6226,6 @@ fn connect_source_panel(
     //   save_favorites so the next connect from this favorite
     //   restores the right picker state without touching other
     //   servers.
-    // Shared "last-good auth bytes" cache between the auth-key
-    // handler (primary writer) and the role-picker handler
-    // (reader). Populated whenever the auth row parses as empty
-    // (`None`, intentional clear) or valid hex (`Some(bytes)`);
-    // NOT updated on malformed hex. The role handler uses this
-    // snapshot when the live auth text is unparseable so it can
-    // still propagate the new role to DSP with a coherent
-    // auth_key value — without this, flipping role while the
-    // key field held a bad paste would skip the whole
-    // `SetRtlTcpClientConfig` dispatch and leave DSP on the
-    // previous role. Per `CodeRabbit` round 9 on PR #408.
-    //
-    // `Rc<RefCell<Option<Vec<u8>>>>` on GTK's single-threaded
-    // main loop — no lock contention. The outer `Option`
-    // differentiates "never parsed" (fresh session, never had a
-    // valid auth value) from "intentionally cleared" (user typed
-    // empty): both dispatch `auth_key: None` so the distinction
-    // only affects the role-handler's fallback path, where
-    // "never parsed" means "just forward the current text's
-    // parse result (which will itself be None for empty and
-    // therefore match)" — see the role-handler below for the
-    // exact semantics.
-    let last_good_auth_key: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
-
     let state_role = Rc::clone(state);
     let auth_key_for_role = panels.source.rtl_tcp_auth_key_row.clone();
     let config_for_role = std::sync::Arc::clone(config);
@@ -6272,27 +6280,48 @@ fn connect_source_panel(
                 v[KEY_RTL_TCP_CLIENT_LAST_ROLE] =
                     serde_json::to_value(fav_role).unwrap_or(serde_json::Value::Null);
             });
-            // Tier 2: per-favorite override. Compute the current
-            // `host:port` key; if it matches a favorite in the
-            // SHARED in-memory map (the one
-            // `connect_rtl_tcp_discovery`'s re-announce path
-            // also reads + mutates), update that entry's
-            // `requested_role` and persist. Pre-`CodeRabbit`
-            // round 8 on PR #408 this handler called
+            // Tier 2: per-favorite override. Resolve the
+            // server key from the cached stable identity first
+            // (`state.rtl_tcp_active_server`, written by
+            // `apply_rtl_tcp_connect` / the startup restore at
+            // connect-setup time) and only fall back to reading
+            // the `hostname_row` / `port_row` widgets when the
+            // cache is empty (manually-typed Play path, no
+            // apply_rtl_tcp_connect). Pre-`CodeRabbit` round 10
+            // on PR #408 this handler always rebuilt the key
+            // from the widgets, so a discovery connect that
+            // persisted `shack-pi.local.:1234` as the favorite
+            // identity could silently diverge from whatever
+            // resolved-IP value the dial path had pushed into
+            // `hostname_row` — the lookup below would miss the
+            // favorite, and `requested_role` wouldn't round-
+            // trip between discovery, favorites, and reconnects.
+            //
+            // Then update the matching entry's `requested_role`
+            // in the SHARED in-memory map
+            // (`connect_rtl_tcp_discovery`'s re-announce path
+            // also reads + mutates this map), and persist the
+            // full snapshot. Pre-round-8 this handler called
             // `load_favorites` on every fire and saved a fresh
-            // `Vec`, which diverged from the discovery path's
-            // in-memory map — a subsequent `ServerAnnounced`
-            // would preserve the stale in-memory role and
-            // clobber the just-saved selection on its own
-            // `save_favorites` call. Mutating the shared map
+            // `Vec`, diverging from the discovery path's in-
+            // memory map — a subsequent `ServerAnnounced` would
+            // preserve the stale in-memory role and clobber the
+            // just-saved selection. Mutating the shared map
             // keeps both paths honest.
-            let host = hostname_for_role.text().to_string();
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let port = port_for_role.value() as u16;
-            if host.is_empty() || port == 0 {
-                return;
-            }
-            let server_key = format!("{host}:{port}");
+            let server_key = {
+                let cached = state_role.rtl_tcp_active_server.borrow().clone();
+                if cached.is_empty() {
+                    let host = hostname_for_role.text().to_string();
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let port = port_for_role.value() as u16;
+                    if host.is_empty() || port == 0 {
+                        return;
+                    }
+                    format!("{host}:{port}")
+                } else {
+                    cached
+                }
+            };
             let dirty = {
                 let mut favorites = favorites_for_role.borrow_mut();
                 if let Some(fav) = favorites.get_mut(&server_key)
