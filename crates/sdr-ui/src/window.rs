@@ -5875,20 +5875,39 @@ fn connect_source_panel(
         // already has it and the keyring save / clear paths
         // target the right entry without waiting on the first
         // `apply_rtl_tcp_connect` call.
+        //
+        // Auth-row visibility + text is resolved deterministically
+        // using the same two-input rule as `apply_rtl_tcp_connect`
+        // (per `CodeRabbit` round 5 on PR #408): reveal the row
+        // when EITHER the favorite advertises `auth_required ==
+        // Some(true)` (server requires a key; user should see the
+        // field up-front even on a fresh session with no saved
+        // key) OR a saved key exists in the keyring (we want to
+        // show the pre-loaded value so the user knows the
+        // session will auto-auth). Set text from the saved key,
+        // or clear when none — so a prior-session auth-required
+        // server whose key the user later cleared doesn't leak
+        // stale text into the field on the next launch.
         let mut auth_key: Option<Vec<u8>> = None;
         if let Some(srv) = last_connected.as_ref() {
             *state.rtl_tcp_active_server.borrow_mut() = format!("{}:{}", srv.host, srv.port);
             auth_key = load_client_auth_key_from_keyring(&srv.host, srv.port);
-            // Also reveal + prefill the auth-key row when we
-            // have a saved key, mirroring `apply_rtl_tcp_connect`
-            // so the user can see the pre-loaded value
-            // immediately.
+            let has_auth_required = matches!(
+                favorite_entry.as_ref().and_then(|f| f.auth_required),
+                Some(true)
+            );
+            let should_reveal = has_auth_required || auth_key.is_some();
+            panels
+                .source
+                .rtl_tcp_auth_key_row
+                .set_visible(should_reveal);
             if let Some(bytes) = auth_key.as_ref() {
-                panels.source.rtl_tcp_auth_key_row.set_visible(true);
                 panels
                     .source
                     .rtl_tcp_auth_key_row
                     .set_text(&crate::sidebar::server_panel::auth_key_to_hex(bytes));
+            } else {
+                panels.source.rtl_tcp_auth_key_row.set_text("");
             }
         }
         state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
