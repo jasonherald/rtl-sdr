@@ -820,25 +820,37 @@ fn spawn_client_workers(
     //     Vanilla has no wire field to carry a key, so they can't
     //     participate. Same signal as "server not there" from
     //     the legacy client's POV.
-    //   - Auth required + RTLX + has_auth: read the follow-up
-    //     `AuthKeyMessage` with a bounded timeout, constant-time
-    //     compare against the configured key.
+    //   - Auth required + RTLX + has_auth (eager): read the
+    //     follow-up `AuthKeyMessage` with a bounded timeout,
+    //     constant-time compare against the configured key.
     //     - Match: continue to role admission.
     //     - Mismatch / malformed / timeout / eof: send dongle_info_t
     //       + `ServerExtension(status=AuthFailed)` and close.
-    //   - Auth required + RTLX + !has_auth: send dongle_info_t +
-    //     `ServerExtension(status=AuthRequired)` and close. Client
-    //     must reconnect with `has_auth=true` and the key to
-    //     succeed. (Simpler than an in-connection retry state
-    //     machine; costs one extra TCP handshake per never-
-    //     authed-before client, which is a one-time UX cost per
-    //     saved-profile.)
+    //   - Auth required + RTLX + !has_auth (lazy, per #394 spec):
+    //     send dongle_info_t + `ServerExtension(status=AuthRequired)`
+    //     KEEPING THE SOCKET OPEN, then wait up to
+    //     `AUTH_REPLY_TIMEOUT` for the client to deliver an
+    //     `AuthKeyMessage` on the same connection. On match,
+    //     fall through to role admission; the granted path
+    //     then resends the ServerExtension with the actual role
+    //     status WITHOUT re-emitting dongle_info_t (the client
+    //     would misread it as a second handshake). On mismatch
+    //     / timeout / parse error, send a follow-up
+    //     `ServerExtension(status=AuthFailed)` (extension-only,
+    //     no second dongle_info_t) and close. Per `CodeRabbit`
+    //     round 3 on PR #405.
     //
     // If `has_auth` is set but auth isn't configured, we STILL
     // read the AuthKeyMessage from the stream to keep the
     // post-hello byte position in sync (the client doesn't know
     // our config and sent the key based on its own); we just
     // discard it without validation.
+    //
+    // `dongle_info_sent` threads through the rest of this function
+    // so the lazy path's initial dongle_info_t emission is visible
+    // to role admission (which must skip the duplicate send in
+    // both the granted and denied follow-up branches).
+    let mut dongle_info_sent = false;
     if hello_seen && has_auth {
         // Read the AuthKeyMessage follow-up regardless of whether
         // auth is required — need to consume the bytes either way
@@ -889,17 +901,63 @@ fn spawn_client_workers(
                 return;
             }
         }
-    } else if auth_key.is_some() {
+    } else if let Some(expected) = auth_key.as_deref() {
         // Client didn't set has_auth but the server requires auth.
         if hello_seen {
-            // RTLX client: send the AuthRequired denial so the
-            // client's UI can surface "server requires key" and
-            // prompt for one.
+            // RTLX client — lazy path per #394 spec. Send
+            // dongle_info_t + `ServerExtension(AuthRequired)`
+            // and keep the socket open so a compliant client
+            // can reply with `AuthKeyMessage` on the same
+            // connection. The peer has
+            // `AUTH_REPLY_TIMEOUT` to deliver the key;
+            // `sniff_auth_key_message` enforces the bound with
+            // an absolute deadline. Per `CodeRabbit` round 3
+            // on PR #405.
             tracing::info!(
                 %peer,
-                "rtl_tcp auth required but client didn't send key — denying with AuthRequired"
+                "rtl_tcp auth required but client didn't send key — sending AuthRequired (lazy path)"
             );
             send_denied_response(&stream, peer, &device, Status::AuthRequired, hello_version);
+            dongle_info_sent = true;
+
+            let auth_ok = match sniff_auth_key_message(&stream) {
+                Ok(msg) => {
+                    if crate::auth::validate_auth_key(&msg.key, expected) {
+                        tracing::info!(
+                            %peer,
+                            "rtl_tcp lazy auth key validated"
+                        );
+                        true
+                    } else {
+                        tracing::info!(
+                            %peer,
+                            "rtl_tcp lazy auth key mismatch — denying"
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    tracing::info!(
+                        %peer,
+                        %e,
+                        "rtl_tcp lazy auth follow-up unreadable — denying"
+                    );
+                    false
+                }
+            };
+            if !auth_ok {
+                // dongle_info_t already on the wire — send only
+                // the 8-byte `ServerExtension(AuthFailed)` so
+                // the client doesn't misread a duplicate header
+                // as a second handshake.
+                send_extension_only(&stream, peer, Status::AuthFailed, hello_version);
+                return;
+            }
+            // Match → fall through to role admission. The granted
+            // path below observes `dongle_info_sent = true` and
+            // skips the duplicate header write; any role-denial
+            // (ControllerBusy / ListenerCapReached) similarly
+            // switches to `send_extension_only`.
         } else {
             // Vanilla client: can't authenticate, so there's
             // nothing meaningful to tell them. Bare TCP FIN.
@@ -907,8 +965,8 @@ fn spawn_client_workers(
                 %peer,
                 "rtl_tcp vanilla client denied — auth required"
             );
+            return;
         }
-        return;
     }
 
     // Allocate id + build slot with the requested role + channel.
@@ -956,14 +1014,23 @@ fn spawn_client_workers(
             // signal for their "connection refused" UX and avoids
             // handing them a dongle_info_t they'd interpret as
             // admission.
+            //
+            // If the lazy auth path already emitted dongle_info_t
+            // (#394 round 3 on PR #405), send only the 8-byte
+            // ServerExtension follow-up — a duplicate header
+            // would desync the client's parser.
             if hello_seen {
-                send_denied_response(
-                    &stream,
-                    peer,
-                    &device,
-                    Status::ControllerBusy,
-                    hello_version,
-                );
+                if dongle_info_sent {
+                    send_extension_only(&stream, peer, Status::ControllerBusy, hello_version);
+                } else {
+                    send_denied_response(
+                        &stream,
+                        peer,
+                        &device,
+                        Status::ControllerBusy,
+                        hello_version,
+                    );
+                }
             }
             return;
         }
@@ -985,13 +1052,17 @@ fn spawn_client_workers(
                 "vanilla clients should never land in ListenerCapReached"
             );
             if hello_seen {
-                send_denied_response(
-                    &stream,
-                    peer,
-                    &device,
-                    Status::ListenerCapReached,
-                    hello_version,
-                );
+                if dongle_info_sent {
+                    send_extension_only(&stream, peer, Status::ListenerCapReached, hello_version);
+                } else {
+                    send_denied_response(
+                        &stream,
+                        peer,
+                        &device,
+                        Status::ListenerCapReached,
+                        hello_version,
+                    );
+                }
             }
             return;
         }
@@ -1036,21 +1107,29 @@ fn spawn_client_workers(
     // Send the 12-byte dongle_info_t header (rtl_tcp.c:576-594).
     // Emitted for BOTH granted RTLX and granted vanilla — it's the
     // first thing any rtl_tcp client expects.
-    let header = {
-        let Ok(dev) = device.lock() else {
-            tracing::error!(%peer, "device mutex poisoned, aborting client");
+    //
+    // Lazy-auth (#394) skips this: the header was already emitted
+    // alongside the initial `ServerExtension(AuthRequired)`
+    // challenge, and writing it again would make the client
+    // mis-parse the second dongle_info_t as a second handshake.
+    // Per `CodeRabbit` round 3 on PR #405.
+    if !dongle_info_sent {
+        let header = {
+            let Ok(dev) = device.lock() else {
+                tracing::error!(%peer, "device mutex poisoned, aborting client");
+                registry.unwind_admission(&slot);
+                return;
+            };
+            DongleInfo {
+                tuner: TunerTypeCode::from(dev.tuner_type()),
+                gain_count: dev.tuner_gains().len() as u32,
+            }
+        };
+        if let Err(e) = writer.write_all(&header.to_bytes()) {
+            tracing::warn!(%peer, %e, "failed to send dongle_info_t — client gone");
             registry.unwind_admission(&slot);
             return;
-        };
-        DongleInfo {
-            tuner: TunerTypeCode::from(dev.tuner_type()),
-            gain_count: dev.tuner_gains().len() as u32,
         }
-    };
-    if let Err(e) = writer.write_all(&header.to_bytes()) {
-        tracing::warn!(%peer, %e, "failed to send dongle_info_t — client gone");
-        registry.unwind_admission(&slot);
-        return;
     }
 
     // RTLX clients additionally get the ServerExtension(granted)
@@ -1236,6 +1315,57 @@ fn send_denied_response(
             %peer,
             ?status,
             "failed to send denial ServerExtension — client already gone"
+        );
+    }
+}
+
+/// Emit a follow-up `ServerExtension` (8 bytes) to an RTLX client
+/// that has already received `dongle_info_t` on this connection —
+/// i.e., the lazy #394 auth path sent `dongle_info_t +
+/// ServerExtension(AuthRequired)` as its challenge, and the
+/// outcome of the auth reply (and any downstream role-admission
+/// denial) must now be communicated WITHOUT re-emitting the
+/// header. Writing dongle_info_t twice would make the client's
+/// magic-peek misfire on the second handshake.
+///
+/// Used for `Status::AuthFailed` after a bad / missing lazy auth
+/// reply, and for role-admission denials
+/// (`Status::ControllerBusy`, `Status::ListenerCapReached`)
+/// that land AFTER the lazy path has already emitted
+/// `dongle_info_t`. Write failures downgrade to debug-level
+/// tracing because a refused-handshake peer often tears down the
+/// socket before our follow-up lands — noisy warn! would bury
+/// real signal. Per `CodeRabbit` round 3 on PR #405. #394.
+fn send_extension_only(stream: &TcpStream, peer: SocketAddr, status: Status, hello_version: u8) {
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                %peer,
+                %e,
+                "failed to clone stream for follow-up extension — closing without reply"
+            );
+            return;
+        }
+    };
+    let ext = ServerExtension {
+        // Neutral defaults — the client never proceeds to the IQ
+        // stream on a denial, and the follow-up is an
+        // informational status, not a codec negotiation.
+        codec: Codec::None,
+        granted_role: None,
+        status,
+        // Echo the client's hello version so v1 clients can
+        // parse this follow-up without tripping their strict
+        // version gate. Matches `send_denied_response`'s
+        // version-echo contract.
+        version: hello_version,
+    };
+    if writer.write_all(&ext.to_bytes()).is_err() {
+        tracing::debug!(
+            %peer,
+            ?status,
+            "failed to send follow-up ServerExtension — client already gone"
         );
     }
 }
@@ -2161,6 +2291,18 @@ mod tests {
         let _ = client_thread.join();
     }
 
+    /// Scheduling slack on top of `AUTH_REPLY_TIMEOUT` when
+    /// asserting that a timeout fired inside the budget. Must be
+    /// tight enough that a regression to per-phase timeouts
+    /// (where total elapsed could approach `2 * AUTH_REPLY_TIMEOUT`
+    /// under the header-then-body flow) trips the assertion, but
+    /// generous enough to absorb realistic OS scheduling jitter
+    /// on a loaded CI runner. 500 ms lands comfortably in that
+    /// window — one `AUTH_REPLY_TIMEOUT` (5 s) plus slack stays
+    /// well under the 2× regression threshold. Per `CodeRabbit`
+    /// round 3 on PR #405.
+    const AUTH_TIMEOUT_SLACK: Duration = Duration::from_millis(500);
+
     #[test]
     fn sniff_auth_key_message_times_out_when_client_silent() {
         // Client connects but never sends. Header read blocks
@@ -2190,11 +2332,74 @@ mod tests {
             ),
             "expected WouldBlock/TimedOut for silent client, got {err:?}"
         );
-        // And it actually respected the timeout budget (within
-        // a generous 2x margin for scheduling jitter).
+        // Tight bound: total elapsed must sit inside ONE
+        // `AUTH_REPLY_TIMEOUT` plus scheduling slack, not the
+        // earlier 2× allowance. The loose 2× bound would have
+        // silently accepted a regression to per-phase timeouts
+        // where the header + body phases each reset the budget.
+        // Per `CodeRabbit` round 3 on PR #405.
         assert!(
-            elapsed <= AUTH_REPLY_TIMEOUT * 2,
-            "silent-client read took {elapsed:?}, exceeded 2× AUTH_REPLY_TIMEOUT ({AUTH_REPLY_TIMEOUT:?})"
+            elapsed <= AUTH_REPLY_TIMEOUT + AUTH_TIMEOUT_SLACK,
+            "silent-client read took {elapsed:?}, exceeded AUTH_REPLY_TIMEOUT ({AUTH_REPLY_TIMEOUT:?}) + slack ({AUTH_TIMEOUT_SLACK:?})"
+        );
+        let _ = keep_tx.send(());
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    #[test]
+    fn sniff_auth_key_message_times_out_when_body_stalls() {
+        // Regression guard for the absolute-deadline contract.
+        // Client sends a valid header but never follows with the
+        // body bytes — this is the path that the old per-phase
+        // timeout silently accepted: the header read returns
+        // quickly (burns ~0 of the budget), then the body read
+        // gets a fresh `AUTH_REPLY_TIMEOUT` window of its own.
+        // With the absolute-deadline implementation the body
+        // read inherits the remaining budget and trips within
+        // `AUTH_REPLY_TIMEOUT` of entry.
+        //
+        // Paired with the silent-client test: together they pin
+        // the "one shared budget across both reads" contract and
+        // defeat any future revert to per-phase timeouts.
+        // Per `CodeRabbit` round 3 on PR #405.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Valid 6-byte header claiming a 32-byte key body. Server
+        // will consume it fast, then block on the absent body.
+        let key_len: u16 = 32;
+        let mut header = [0u8; AUTH_KEY_HEADER_LEN];
+        header[..4].copy_from_slice(&crate::extension::AUTH_KEY_MAGIC);
+        header[4..6].copy_from_slice(&key_len.to_be_bytes());
+
+        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&header).unwrap();
+            client.flush().unwrap();
+            // Hold the socket open WITHOUT sending the body.
+            // Server should trip its absolute deadline and
+            // return. Release after the server's timeout fires.
+            let _ = keep_rx.recv();
+        });
+
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let start = Instant::now();
+        let err = sniff_auth_key_message(&server_stream).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected WouldBlock/TimedOut for stalled body, got {err:?}"
+        );
+        // The decisive assertion: elapsed must be within the
+        // single-budget bound. A regression to per-phase
+        // timeouts would push this toward 2× AUTH_REPLY_TIMEOUT.
+        assert!(
+            elapsed <= AUTH_REPLY_TIMEOUT + AUTH_TIMEOUT_SLACK,
+            "stalled-body read took {elapsed:?}, exceeded AUTH_REPLY_TIMEOUT ({AUTH_REPLY_TIMEOUT:?}) + slack ({AUTH_TIMEOUT_SLACK:?}) — absolute-deadline contract regressed"
         );
         let _ = keep_tx.send(());
         drop(server_stream);
