@@ -6252,10 +6252,37 @@ fn connect_source_panel(
                 _ => FavoriteRole::Control,
             };
             let text = row.text().to_string();
+            // Malformed hex must NOT collapse to `auth_key: None`.
+            // Pre-`CodeRabbit` round 7 on PR #408 a bad paste fell
+            // into the `auth_key_from_hex(..) -> None` branch and
+            // silently cleared DSP auth state — the next Retry /
+            // Play would then dispatch an unauthenticated connect,
+            // bounce through `AuthRequired`, and the user had to
+            // fix the text before realizing the previous saved key
+            // had been clobbered. Three cases now:
+            //
+            // - Empty text: intentional clear. Drop the error
+            //   class, dispatch `auth_key: None`.
+            // - Valid hex: parsed bytes. Drop the error class,
+            //   dispatch `Some(bytes)`.
+            // - Malformed non-empty text: add the libadwaita
+            //   `error` CSS class so the row reads as invalid,
+            //   and RETURN without dispatching — keeping the
+            //   last-good DSP auth state intact until the user
+            //   either fixes the text or clears the field.
+            //
+            // `auth_key_from_hex` treats empty as `None` too, but
+            // we handle the empty branch explicitly above so the
+            // malformed case is cleanly separable.
             let auth_key: Option<Vec<u8>> = if text.is_empty() {
+                row.remove_css_class("error");
                 None
+            } else if let Some(bytes) = crate::sidebar::server_panel::auth_key_from_hex(&text) {
+                row.remove_css_class("error");
+                Some(bytes)
             } else {
-                crate::sidebar::server_panel::auth_key_from_hex(&text)
+                row.add_css_class("error");
+                return;
             };
             state_auth.send_dsp(UiToDsp::SetRtlTcpClientConfig {
                 requested_role: fav_role.as_wire_role(),
