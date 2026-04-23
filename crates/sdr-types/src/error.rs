@@ -47,19 +47,68 @@ pub enum SourceError {
     /// Treated as **terminal** by the `rtl_tcp` client's connection manager:
     /// the backoff loop exits and the state transitions to
     /// `ConnectionState::Failed`. Use this for errors that won't be fixed
-    /// by retrying (bad server, wrong protocol version, auth rejection).
+    /// by retrying and that don't have a dedicated variant below (bad
+    /// server, wrong protocol version, unexpected handshake status codes
+    /// like `Status::ListenerCapReached`, LZ4 mid-stream decode failure).
+    ///
+    /// **Not** for role-denial errors (pre-#396 those folded in here with
+    /// a `"not an rtl_tcp server: ..."` or similar reason string — now
+    /// routed to [`Self::ControllerBusy`] / [`Self::AuthRequired`] /
+    /// [`Self::AuthFailed`] so the connection manager can publish a
+    /// distinct [`crate::RtlTcpConnectionState`] variant and the UI
+    /// can offer a specific recovery action instead of a generic
+    /// "Failed — \<reason\>" toast).
     #[error("protocol error: {0}")]
     Protocol(String),
-    /// Transient, retryable failure from a network source — e.g. the
-    /// `rtl_tcp` server's extended handshake returned `ControllerBusy`
-    /// because another client is currently controlling the dongle.
-    /// The condition is expected to resolve without user action once
-    /// the other client disconnects, so the connection manager keeps
-    /// retrying on the normal backoff schedule rather than
-    /// transitioning to `Failed`. Distinct from `Protocol` so callers
-    /// can route terminal vs. retry-worthy rejections correctly.
+    /// Transient, retryable failure from a network source. Used for
+    /// conditions the connection manager expects to resolve without
+    /// user action — currently none of the `rtl_tcp` extended
+    /// handshake status codes. The backoff loop keeps retrying on
+    /// the normal schedule rather than transitioning to a terminal
+    /// state.
+    ///
+    /// **Not** for `Status::ControllerBusy`: pre-#396 this variant
+    /// wrapped busy rejections with silent auto-retry, which hid the
+    /// decision point (Take control? / Connect as Listener? / give
+    /// up?) from the user. Per #396, `ControllerBusy` now routes to
+    /// the dedicated [`Self::ControllerBusy`] variant (terminal,
+    /// no auto-retry) so the UI can surface the choice explicitly
+    /// via a toast.
     #[error("temporarily unavailable: {0}")]
     TemporarilyUnavailable(String),
+
+    /// Server denied the connect with `Status::ControllerBusy`
+    /// (#392) and the user needs to explicitly decide what to
+    /// do next — either connect as Listener, force a takeover,
+    /// or give up. Treated as terminal by the connection
+    /// manager (no auto-retry) per #396; the UI surfaces
+    /// the choice via a toast with "Take control" / "Connect
+    /// as Listener" action buttons. Distinct from
+    /// [`Self::TemporarilyUnavailable`] (which auto-retries)
+    /// because a user-facing decision is needed. Per #396.
+    #[error("controller slot is occupied")]
+    ControllerBusy,
+
+    /// Server requires a pre-shared key (#394) and the client
+    /// didn't send one. Terminal from the connection manager's
+    /// perspective (no auto-retry); the UI re-prompts for a
+    /// key and triggers a fresh connect. Distinct from
+    /// [`Self::Protocol`] (which is where this folded pre-#396,
+    /// as `"protocol error: server requires auth"`) so the UI
+    /// can reveal / focus the Server-key entry row instead of
+    /// showing a generic failure toast. Per #396.
+    #[error("server requires an authentication key")]
+    AuthRequired,
+
+    /// Server required a key and the client's attempt was
+    /// rejected (`Status::AuthFailed`). Terminal from the
+    /// connection manager's perspective; the UI re-prompts
+    /// with "Key rejected" copy. Distinct from
+    /// [`Self::AuthRequired`] (which means the client never
+    /// sent a key) so the toast can tell "never tried" vs
+    /// "wrong key" apart. Per #396.
+    #[error("authentication key rejected")]
+    AuthFailed,
 }
 
 /// Errors from sink modules.

@@ -56,8 +56,24 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 17
+#define SDR_CORE_ABI_VERSION_MINOR 18
 /*
+ * 0.18 — adds three new discriminants to
+ * `SdrRtlTcpConnectionStateKind`:
+ *   - SDR_RTL_TCP_STATE_CONTROLLER_BUSY  = 5
+ *   - SDR_RTL_TCP_STATE_AUTH_REQUIRED    = 6
+ *   - SDR_RTL_TCP_STATE_AUTH_FAILED      = 7
+ * These are terminal role-denial states surfaced by the
+ * client after #396's connection-manager rework: the
+ * manager no longer auto-retries on these conditions (user
+ * must pick a role / enter a key / click reconnect). Host
+ * UIs should branch on the new discriminants to show the
+ * appropriate toast + action buttons instead of the generic
+ * FAILED handler. Discriminant additions are
+ * ABI-incompatible for hosts that switch on the enum
+ * without a default arm, so the minor bump forces the
+ * exact-match pre-1.0 ABI check to fail on 0.17 consumers.
+ *
  * 0.17 — adds `auth_key` (pointer to raw bytes) and
  * `auth_key_len` (u32) to the tail of `SdrRtlTcpServerConfig`
  * so FFI hosts can enable pre-shared-key auth (#394) at
@@ -1563,11 +1579,20 @@ typedef enum SdrEventKind {
  * `SdrEventRtlTcpConnectionState` below. Stable — never reorder.
  */
 typedef enum SdrRtlTcpConnectionStateKind {
-    SDR_RTL_TCP_STATE_DISCONNECTED = 0,
-    SDR_RTL_TCP_STATE_CONNECTING   = 1,
-    SDR_RTL_TCP_STATE_CONNECTED    = 2,
-    SDR_RTL_TCP_STATE_RETRYING     = 3,
-    SDR_RTL_TCP_STATE_FAILED       = 4,
+    SDR_RTL_TCP_STATE_DISCONNECTED     = 0,
+    SDR_RTL_TCP_STATE_CONNECTING       = 1,
+    SDR_RTL_TCP_STATE_CONNECTED        = 2,
+    SDR_RTL_TCP_STATE_RETRYING         = 3,
+    SDR_RTL_TCP_STATE_FAILED           = 4,
+    /* Role-denial terminal states (ABI 0.18, per #396). Hosts
+     * should surface these distinctly from the generic FAILED
+     * path — the client does not auto-retry while any of these
+     * states is active; the user must pick a role / enter a key
+     * / click a reconnect button.
+     */
+    SDR_RTL_TCP_STATE_CONTROLLER_BUSY  = 5,
+    SDR_RTL_TCP_STATE_AUTH_REQUIRED    = 6,
+    SDR_RTL_TCP_STATE_AUTH_FAILED      = 7,
 } SdrRtlTcpConnectionStateKind;
 
 /* Discriminants for the `kind` field of `SdrEventNetworkSinkStatus`
@@ -1662,9 +1687,12 @@ typedef struct SdrEventNetworkSinkStatus {
  * | SDR_RTL_TCP_STATE_CONNECTED       | tuner name     | 0       | 0.0           | gain steps |
  * | SDR_RTL_TCP_STATE_RETRYING        | NULL           | attempt | seconds       | 0          |
  * | SDR_RTL_TCP_STATE_FAILED          | reason         | 0       | 0.0           | 0          |
+ * | SDR_RTL_TCP_STATE_CONTROLLER_BUSY | NULL           | 0       | 0.0           | 0          |
+ * | SDR_RTL_TCP_STATE_AUTH_REQUIRED   | NULL           | 0       | 0.0           | 0          |
+ * | SDR_RTL_TCP_STATE_AUTH_FAILED     | NULL           | 0       | 0.0           | 0          |
  *
  * `utf8` is borrowed from dispatcher-owned storage; valid only
- * for the duration of the callback. Per issue #325.
+ * for the duration of the callback. Per issue #325 + #396.
  */
 typedef struct SdrEventRtlTcpConnectionState {
     int32_t     kind;

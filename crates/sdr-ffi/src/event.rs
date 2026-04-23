@@ -92,6 +92,21 @@ pub const SDR_RTL_TCP_STATE_CONNECTING: i32 = 1;
 pub const SDR_RTL_TCP_STATE_CONNECTED: i32 = 2;
 pub const SDR_RTL_TCP_STATE_RETRYING: i32 = 3;
 pub const SDR_RTL_TCP_STATE_FAILED: i32 = 4;
+/// Server has an existing Control client and denied this
+/// attempt with `Status::ControllerBusy`. Host UIs should
+/// offer the user "Take control" / "Connect as Listener"
+/// actions rather than retry silently. No-auto-retry —
+/// the client does not attempt another connect while this
+/// state is active. ABI 0.18, per #396.
+pub const SDR_RTL_TCP_STATE_CONTROLLER_BUSY: i32 = 5;
+/// Server requires a pre-shared key (#394) and the client
+/// didn't send one. Host UIs should prompt the user for a
+/// key and reconnect. No-auto-retry. ABI 0.18, per #396.
+pub const SDR_RTL_TCP_STATE_AUTH_REQUIRED: i32 = 6;
+/// Server required a key and the client's attempt was
+/// rejected (`Status::AuthFailed`). Host UIs should re-
+/// prompt for a key. No-auto-retry. ABI 0.18, per #396.
+pub const SDR_RTL_TCP_STATE_AUTH_FAILED: i32 = 7;
 
 // ============================================================
 //  SdrEvent tagged union — `#[repr(C)]` layout matching the
@@ -550,6 +565,21 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
                     };
                     (SDR_RTL_TCP_STATE_FAILED, Some(cstr), 0, 0.0, 0)
                 }
+                // Role-denial terminal states (#396). Payload
+                // shape matches Disconnected/Connecting: no
+                // message string, zero counters. The kind
+                // discriminant is enough for the host to pick
+                // the right toast copy ("Controller busy" /
+                // "Server requires a key" / "Key rejected").
+                RtlTcpConnectionState::ControllerBusy => {
+                    (SDR_RTL_TCP_STATE_CONTROLLER_BUSY, None, 0, 0.0, 0)
+                }
+                RtlTcpConnectionState::AuthRequired => {
+                    (SDR_RTL_TCP_STATE_AUTH_REQUIRED, None, 0, 0.0, 0)
+                }
+                RtlTcpConnectionState::AuthFailed => {
+                    (SDR_RTL_TCP_STATE_AUTH_FAILED, None, 0, 0.0, 0)
+                }
             };
             let utf8 = message_cstr
                 .as_ref()
@@ -862,6 +892,64 @@ mod tests {
         assert_eq!(SDR_RTL_TCP_STATE_CONNECTED, 2);
         assert_eq!(SDR_RTL_TCP_STATE_RETRYING, 3);
         assert_eq!(SDR_RTL_TCP_STATE_FAILED, 4);
+        // ABI 0.18 role-denial states (#396) — the host-side
+        // toast routing reads these wire integers directly,
+        // so any accidental renumber breaks every client of
+        // the C ABI without failing any Rust-level type check.
+        assert_eq!(SDR_RTL_TCP_STATE_CONTROLLER_BUSY, 5);
+        assert_eq!(SDR_RTL_TCP_STATE_AUTH_REQUIRED, 6);
+        assert_eq!(SDR_RTL_TCP_STATE_AUTH_FAILED, 7);
+    }
+
+    #[test]
+    fn translate_rtl_tcp_connection_state_controller_busy() {
+        use sdr_types::RtlTcpConnectionState;
+        let (event, owned_cstring, _) = translate_event(&DspToUi::RtlTcpConnectionState(
+            RtlTcpConnectionState::ControllerBusy,
+        ))
+        .expect("ControllerBusy event should translate");
+        let payload = unsafe { event.payload.rtl_tcp_connection_state };
+        assert_eq!(payload.kind, SDR_RTL_TCP_STATE_CONTROLLER_BUSY);
+        // Role-denial states are payload-less — no tuner
+        // string, no counters. Host UIs dispatch on `kind`
+        // alone and look up localized copy on their side.
+        assert!(payload.utf8.is_null());
+        assert_eq!(payload.attempt, 0);
+        assert!(payload.retry_in_secs.abs() < f64::EPSILON);
+        assert_eq!(payload.gain_count, 0);
+        assert!(owned_cstring.is_none());
+    }
+
+    #[test]
+    fn translate_rtl_tcp_connection_state_auth_required() {
+        use sdr_types::RtlTcpConnectionState;
+        let (event, owned_cstring, _) = translate_event(&DspToUi::RtlTcpConnectionState(
+            RtlTcpConnectionState::AuthRequired,
+        ))
+        .expect("AuthRequired event should translate");
+        let payload = unsafe { event.payload.rtl_tcp_connection_state };
+        assert_eq!(payload.kind, SDR_RTL_TCP_STATE_AUTH_REQUIRED);
+        assert!(payload.utf8.is_null());
+        assert_eq!(payload.attempt, 0);
+        assert!(payload.retry_in_secs.abs() < f64::EPSILON);
+        assert_eq!(payload.gain_count, 0);
+        assert!(owned_cstring.is_none());
+    }
+
+    #[test]
+    fn translate_rtl_tcp_connection_state_auth_failed() {
+        use sdr_types::RtlTcpConnectionState;
+        let (event, owned_cstring, _) = translate_event(&DspToUi::RtlTcpConnectionState(
+            RtlTcpConnectionState::AuthFailed,
+        ))
+        .expect("AuthFailed event should translate");
+        let payload = unsafe { event.payload.rtl_tcp_connection_state };
+        assert_eq!(payload.kind, SDR_RTL_TCP_STATE_AUTH_FAILED);
+        assert!(payload.utf8.is_null());
+        assert_eq!(payload.attempt, 0);
+        assert!(payload.retry_in_secs.abs() < f64::EPSILON);
+        assert_eq!(payload.gain_count, 0);
+        assert!(owned_cstring.is_none());
     }
 
     #[test]
@@ -893,6 +981,7 @@ mod tests {
                 tuner_name: "R820T".to_string(),
                 gain_count: 29,
                 codec: "None".to_string(),
+                granted_role: Some(true),
             },
         ))
         .expect("Connected event should translate");

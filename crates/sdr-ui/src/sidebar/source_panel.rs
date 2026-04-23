@@ -156,6 +156,18 @@ pub fn probe_rtlsdr_device_label() -> String {
 /// empty-after-disconnect paths render identical text.
 pub const RTL_TCP_STATUS_DISCONNECTED_SUBTITLE: &str = "Disconnected";
 
+/// Combo-row index for `Role::Control` on `rtl_tcp_role_row`.
+/// Load-bearing — must match the `StringList` order built in
+/// `build_source_panel`. Per issue #396.
+pub const RTL_TCP_ROLE_CONTROL_IDX: u32 = 0;
+/// Combo-row index for `Role::Listen` on `rtl_tcp_role_row`.
+pub const RTL_TCP_ROLE_LISTEN_IDX: u32 = 1;
+
+/// Config key for the persisted last-used connection role.
+/// Stored as a `"control"` / `"listen"` string via
+/// `FavoriteRole`'s serde representation. Per issue #396.
+pub const KEY_RTL_TCP_CLIENT_LAST_ROLE: &str = "rtl_tcp_client_last_role";
+
 /// Sample-rate selector index at which we start showing the
 /// "high bandwidth" advisory caption. Index 7 = 2.4 MHz, which
 /// at 8-bit I/Q pairs wire-format works out to ~38 Mbps — over
@@ -285,6 +297,20 @@ pub struct SourcePanel {
     /// indicates we're between attempts (Retrying / Failed /
     /// Disconnected).
     pub rtl_tcp_retry_button: gtk4::Button,
+    /// "Connection role" picker (Control / Listen) shown only
+    /// when the RTL-TCP source type is selected. Wire-level
+    /// default is Control (#392 back-compat); Listen opts into
+    /// concurrent read-only access to a server that already has
+    /// a controller. Per issue #396.
+    pub rtl_tcp_role_row: adw::ComboRow,
+    /// "Server key" password entry shown when the RTL-TCP source
+    /// is selected AND the active server either advertises
+    /// `auth_required=true` via mDNS TXT or has a saved key in
+    /// the keyring. Per issue #396. The key bytes themselves
+    /// are persisted to the OS keyring (not this widget's
+    /// value), so the `EntryRow` is cleared on source-type change
+    /// to avoid leaking the value into widget-tree dumps.
+    pub rtl_tcp_auth_key_row: adw::PasswordEntryRow,
 
     /// Advisory caption shown when the selected sample rate is at
     /// or above `HIGH_BANDWIDTH_SAMPLE_RATE_IDX` AND the source
@@ -305,6 +331,10 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
             tuner_name,
             gain_count,
             codec,
+            // The subtitle copy intentionally omits the role —
+            // the status-bar badge carries it. Per CodeRabbit
+            // round 1 on PR #408.
+            granted_role: _,
         } => {
             // Only surface the codec when it's actually compressing —
             // the common "None" case (every legacy server, plus our
@@ -330,6 +360,14 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
             format!("Retrying in {secs} s (attempt {attempt})")
         }
         RtlTcpConnectionState::Failed { reason } => format!("Failed — {reason}"),
+        // Role-denial terminal states (#396). These show short
+        // actionable subtitles so the user knows WHY the
+        // connection didn't advance — the full toast UX with
+        // "Take control" / "Connect as Listener" buttons lives
+        // in `window.rs`.
+        RtlTcpConnectionState::ControllerBusy => "Controller slot is occupied".to_string(),
+        RtlTcpConnectionState::AuthRequired => "Server requires a key".to_string(),
+        RtlTcpConnectionState::AuthFailed => "Key rejected".to_string(),
     }
 }
 
@@ -601,6 +639,30 @@ pub fn build_source_panel() -> SourcePanel {
     rtl_tcp_status_row.add_suffix(&rtl_tcp_disconnect_button);
     rtl_tcp_status_row.add_suffix(&rtl_tcp_retry_button);
 
+    // Connection-role picker (#396). AdwComboRow with two
+    // entries: "Control" (index 0) and "Listen" (index 1).
+    // Default Control matches the pre-#392 single-client flow
+    // every legacy rtl_tcp client / server assumes.
+    let rtl_tcp_role_model = gtk4::StringList::new(&["Control", "Listen"]);
+    let rtl_tcp_role_row = adw::ComboRow::builder()
+        .title("Connection role")
+        .subtitle("Control drives tuning; Listen receives IQ read-only")
+        .model(&rtl_tcp_role_model)
+        .selected(RTL_TCP_ROLE_CONTROL_IDX)
+        .visible(false)
+        .build();
+
+    // Server key entry (#394 + #396). Password-purpose entry
+    // row — masked by default, revealable via AdwPasswordEntryRow's
+    // built-in "peek" button. Kept separate from the main hostname
+    // / port block so the user sees it only when a key is
+    // actually needed (server advertises auth_required=true OR
+    // there's a saved key for the active host:port).
+    let rtl_tcp_auth_key_row = adw::PasswordEntryRow::builder()
+        .title("Server key")
+        .visible(false)
+        .build();
+
     // Bandwidth advisory row — hidden by default. Visibility is
     // toggled by the sample-rate and device-type notify handlers
     // in window.rs. Title + subtitle copy come from shared consts
@@ -629,6 +691,8 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&record_iq_row);
     group.add(&rtl_tcp_discovered_row);
     group.add(&rtl_tcp_status_row);
+    group.add(&rtl_tcp_role_row);
+    group.add(&rtl_tcp_auth_key_row);
     group.add(&bandwidth_advisory_row);
 
     // Derive initial visibility from the selected device.
@@ -648,6 +712,13 @@ pub fn build_source_panel() -> SourcePanel {
     file_path_row.set_visible(is_file);
     rtl_tcp_discovered_row.set_visible(is_rtltcp);
     rtl_tcp_status_row.set_visible(is_rtltcp);
+    rtl_tcp_role_row.set_visible(is_rtltcp);
+    // Auth key row stays hidden until a specific signal
+    // (mDNS TXT auth_required=true OR saved key exists for the
+    // active host:port). Starting hidden avoids prompting users
+    // on servers that don't require auth. The wiring in
+    // window.rs flips visibility via the discovery / last-
+    // connected load paths.
 
     connect_device_visibility(
         &device_row,
@@ -660,7 +731,13 @@ pub fn build_source_panel() -> SourcePanel {
         &protocol_row,
         &file_path_row,
     );
-    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row, &rtl_tcp_status_row);
+    connect_rtl_tcp_visibility(
+        &device_row,
+        &rtl_tcp_discovered_row,
+        &rtl_tcp_status_row,
+        &rtl_tcp_role_row,
+        &rtl_tcp_auth_key_row,
+    );
 
     // Controls connected to DSP pipeline via window.rs
 
@@ -686,6 +763,8 @@ pub fn build_source_panel() -> SourcePanel {
         rtl_tcp_status_row,
         rtl_tcp_disconnect_button,
         rtl_tcp_retry_button,
+        rtl_tcp_role_row,
+        rtl_tcp_auth_key_row,
         bandwidth_advisory_row,
     }
 }
@@ -697,16 +776,34 @@ fn connect_rtl_tcp_visibility(
     device_row: &adw::ComboRow,
     rtl_tcp_discovered_row: &adw::ExpanderRow,
     rtl_tcp_status_row: &adw::ActionRow,
+    rtl_tcp_role_row: &adw::ComboRow,
+    rtl_tcp_auth_key_row: &adw::PasswordEntryRow,
 ) {
     device_row.connect_selected_notify(glib::clone!(
         #[weak]
         rtl_tcp_discovered_row,
         #[weak]
         rtl_tcp_status_row,
+        #[weak]
+        rtl_tcp_role_row,
+        #[weak]
+        rtl_tcp_auth_key_row,
         move |row| {
             let is_rtltcp = row.selected() == DEVICE_RTLTCP;
             rtl_tcp_discovered_row.set_visible(is_rtltcp);
             rtl_tcp_status_row.set_visible(is_rtltcp);
+            rtl_tcp_role_row.set_visible(is_rtltcp);
+            // Auth key row stays hidden until the discovery /
+            // last-connected layer in window.rs flips it on via
+            // the `auth_required` hint or a saved-key lookup.
+            // Flipping to a non-RTLX source type always hides
+            // it AND clears the entry so the value doesn't
+            // linger in the widget tree for other source types
+            // that don't use it. Per #396.
+            if !is_rtltcp {
+                rtl_tcp_auth_key_row.set_visible(false);
+                rtl_tcp_auth_key_row.set_text("");
+            }
         }
     ));
 }
@@ -765,6 +862,61 @@ pub struct FavoriteEntry {
     /// `ServerAnnounced` event for this `key`. `None` when we
     /// haven't seen the server this session.
     pub last_seen_unix: Option<u64>,
+    /// Last-used role against this server: `"control"` or
+    /// `"listen"`. Stored as a string (via
+    /// `serde(rename_all = "snake_case")` on the enum) rather
+    /// than the raw enum so the JSON is human-readable and a
+    /// future enum-variant rename doesn't silently break
+    /// deserialization. `None` until the user explicitly picks
+    /// a role for this server; the connect path defaults to
+    /// Control when `None`. Per issue #396.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_role: Option<FavoriteRole>,
+    /// Whether the most recent mDNS TXT for this server
+    /// advertised `auth_required=true`. Pre-populated from
+    /// discovery events so the UI can reveal the Server key
+    /// field BEFORE the user clicks Connect (saves a round
+    /// trip through the `AuthRequired` error path). `None`
+    /// means "unknown" — either we've never seen a TXT, or the
+    /// record didn't carry the field (older server, non-sdr-rs
+    /// server). Per issue #396.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_required: Option<bool>,
+}
+
+/// Favorite-entry serialized form of a client's preferred role
+/// for a given server. `snake_case` so the JSON surface reads
+/// as `"control"` / `"listen"` — easier to hand-edit and
+/// more forgiving across future enum changes. Per #396.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FavoriteRole {
+    Control,
+    Listen,
+}
+
+impl FavoriteRole {
+    /// Translate to the wire-level `sdr_server_rtltcp::extension::Role`
+    /// the client hello will carry. Kept as a separate crate
+    /// boundary so `FavoriteEntry` doesn't force a dep on
+    /// `sdr-server-rtltcp` at every call site that reads a
+    /// serialized favorite.
+    pub fn as_wire_role(self) -> sdr_server_rtltcp::extension::Role {
+        match self {
+            Self::Control => sdr_server_rtltcp::extension::Role::Control,
+            Self::Listen => sdr_server_rtltcp::extension::Role::Listen,
+        }
+    }
+
+    /// Inverse: build a `FavoriteRole` from a wire-level
+    /// `Role`. Used when persisting a newly-chosen role back to
+    /// the favorite entry after a successful connect.
+    pub fn from_wire_role(role: sdr_server_rtltcp::extension::Role) -> Self {
+        match role {
+            sdr_server_rtltcp::extension::Role::Control => Self::Control,
+            sdr_server_rtltcp::extension::Role::Listen => Self::Listen,
+        }
+    }
 }
 
 /// Load the persisted favorites list. Returns an empty `Vec` on
@@ -801,13 +953,20 @@ pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<FavoriteEntry> {
                     // Legacy bare-string entry. Build a stub
                     // FavoriteEntry so the slide-out still has
                     // something to render while the user waits
-                    // for the server to re-announce.
+                    // for the server to re-announce. Role and
+                    // auth-required default to `None` — the
+                    // connect path treats both as "unknown"
+                    // (role defaults to Control, auth_required
+                    // is decided by the server on first
+                    // connect).
                     Some(FavoriteEntry {
                         key: s.to_string(),
                         nickname: s.to_string(),
                         tuner_name: None,
                         gain_count: None,
                         last_seen_unix: None,
+                        requested_role: None,
+                        auth_required: None,
                     })
                 } else {
                     // Corrupt object entry — hand-edited JSON or a
@@ -988,6 +1147,7 @@ mod tests {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
                 codec: "None".into(),
+                granted_role: Some(true),
             }),
             "Connected — R820T (29 gains)"
         );
@@ -1000,6 +1160,7 @@ mod tests {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
                 codec: "LZ4".into(),
+                granted_role: Some(true),
             }),
             "Connected — R820T (29 gains, LZ4)"
         );
@@ -1038,6 +1199,23 @@ mod tests {
             }),
             "Failed — bad handshake"
         );
+        // Role-denial states (#396) get their own short
+        // subtitles — no reason string needed because the
+        // variant itself IS the reason. Lock in each copy
+        // against accidental drift; a typo here would ship
+        // to users without CI catching it otherwise.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::ControllerBusy),
+            "Controller slot is occupied",
+        );
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::AuthRequired),
+            "Server requires a key",
+        );
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::AuthFailed),
+            "Key rejected",
+        );
     }
 
     // ---- Client-persistence helpers (favorites + last-connected) ----
@@ -1058,6 +1236,8 @@ mod tests {
                 tuner_name: Some("R820T".into()),
                 gain_count: Some(29),
                 last_seen_unix: Some(TEST_LAST_SEEN_UNIX),
+                requested_role: Some(FavoriteRole::Listen),
+                auth_required: Some(true),
             },
             FavoriteEntry {
                 key: "attic-pi.local.:1234".into(),
@@ -1065,6 +1245,8 @@ mod tests {
                 tuner_name: None,
                 gain_count: None,
                 last_seen_unix: None,
+                requested_role: None,
+                auth_required: None,
             },
         ];
         save_favorites(&config, &favs);
@@ -1075,11 +1257,18 @@ mod tests {
         assert_eq!(loaded[0].tuner_name.as_deref(), Some("R820T"));
         assert_eq!(loaded[0].gain_count, Some(29));
         assert_eq!(loaded[0].last_seen_unix, Some(TEST_LAST_SEEN_UNIX));
+        // Role + auth_required round-trip on the opt-in side.
+        // Per #396: the JSON surface carries these through the
+        // serde `snake_case` rename and skip-if-none attributes.
+        assert_eq!(loaded[0].requested_role, Some(FavoriteRole::Listen));
+        assert_eq!(loaded[0].auth_required, Some(true));
         // Second entry has every optional field None → must
         // round-trip as None, NOT as missing / default values.
         assert!(loaded[1].tuner_name.is_none());
         assert!(loaded[1].gain_count.is_none());
         assert!(loaded[1].last_seen_unix.is_none());
+        assert!(loaded[1].requested_role.is_none());
+        assert!(loaded[1].auth_required.is_none());
     }
 
     #[test]
@@ -1105,6 +1294,15 @@ mod tests {
         assert!(loaded[0].tuner_name.is_none());
         assert!(loaded[0].gain_count.is_none());
         assert!(loaded[0].last_seen_unix.is_none());
+        // Role + auth-required fields are #396 additions and
+        // must also default to `None` for legacy bare-string
+        // entries — the connect path treats `None` as
+        // "unknown, default to Control / don't pre-reveal the
+        // auth row." A regression that silently wrote `Some`
+        // defaults here would change the UX for every
+        // pre-#396 favorite on the first launch after upgrade.
+        assert!(loaded[0].requested_role.is_none());
+        assert!(loaded[0].auth_required.is_none());
     }
 
     #[test]

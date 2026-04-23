@@ -16,6 +16,11 @@ const SPS_PER_KSPS: f64 = 1_000.0;
 
 /// Default signal level display text when no data has arrived.
 const DEFAULT_LEVEL_TEXT: &str = "Level: -- dBFS";
+/// Default role badge text when no `rtl_tcp` session is active.
+/// The label itself stays invisible in this state so it doesn't
+/// clutter the bar for users on local RTL-SDR / File / Network
+/// sources. Per issue #396.
+const DEFAULT_ROLE_TEXT: &str = "";
 /// Default sample rate display text when no data has arrived.
 const DEFAULT_SAMPLE_RATE_TEXT: &str = "SR: --";
 /// Default demod display text when no data has arrived.
@@ -24,6 +29,25 @@ const DEFAULT_DEMOD_TEXT: &str = "-- --";
 const DEFAULT_FREQUENCY_TEXT: &str = "-- Hz";
 /// Default cursor readout text when the cursor is not over the spectrum.
 const DEFAULT_CURSOR_TEXT: &str = "Cursor: --";
+
+/// Role badge state rendered by the status bar when connected
+/// to an `rtl_tcp` server. Variants carry role provenance
+/// explicitly — the API that previously took an `Option<bool>`
+/// (`true` = Controller, `false` = Listener) couldn't tell the
+/// caller whether the bool came from the user's requested role
+/// or the server's admission decision, so a UI that passed a
+/// requested role here would mis-label sessions where the server
+/// admitted a different role than asked. Per `CodeRabbit` round 1
+/// on PR #408, callers must now name the slot explicitly. Per
+/// issue #396.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtlTcpRoleBadge {
+    /// Server admitted us as the Controller client — accent
+    /// styling in the status bar.
+    Controller,
+    /// Server admitted us as a Listener — dim styling.
+    Listener,
+}
 
 /// Bottom status bar showing live metrics.
 pub struct StatusBar {
@@ -39,6 +63,16 @@ pub struct StatusBar {
     pub frequency_label: gtk4::Label,
     /// Label showing cursor frequency and power readout.
     pub cursor_label: gtk4::Label,
+    /// `rtl_tcp` role badge — "Controller" (accent color) or
+    /// "Listener" (dim) when connected to an `rtl_tcp` server.
+    /// Hidden when the source isn't `rtl_tcp` or when the
+    /// connection isn't in `Connected` state. Per issue #396.
+    pub role_label: gtk4::Label,
+    /// Separator widget packed immediately before `role_label`.
+    /// Kept as a field so visibility can be toggled in lockstep
+    /// with the label (hiding the label alone leaves a stray
+    /// separator on the right edge).
+    pub role_separator: gtk4::Separator,
 }
 
 impl StatusBar {
@@ -65,6 +99,36 @@ impl StatusBar {
         self.frequency_label.set_label(&format_frequency(hz));
     }
 
+    /// Update the `rtl_tcp` role badge. `Some(RtlTcpRoleBadge::
+    /// Controller)` shows "Controller" with accent CSS; `Some(
+    /// RtlTcpRoleBadge::Listener)` shows "Listener" with dim
+    /// CSS; `None` hides the badge + its separator entirely.
+    /// Callers must pass the server's admitted role (not the
+    /// user's requested role) — see [`RtlTcpRoleBadge`]. Per
+    /// issue #396 / `CodeRabbit` round 1 on PR #408.
+    pub fn update_role(&self, role: Option<RtlTcpRoleBadge>) {
+        match role {
+            Some(RtlTcpRoleBadge::Controller) => {
+                self.role_label.set_label("Controller");
+                self.role_label.remove_css_class("dim-label");
+                self.role_label.add_css_class("accent");
+                self.role_label.set_visible(true);
+                self.role_separator.set_visible(true);
+            }
+            Some(RtlTcpRoleBadge::Listener) => {
+                self.role_label.set_label("Listener");
+                self.role_label.remove_css_class("accent");
+                self.role_label.add_css_class("dim-label");
+                self.role_label.set_visible(true);
+                self.role_separator.set_visible(true);
+            }
+            None => {
+                self.role_label.set_visible(false);
+                self.role_separator.set_visible(false);
+            }
+        }
+    }
+
     /// Update the cursor readout with frequency and power at the mouse position.
     ///
     /// When `power_db` is `f32::NEG_INFINITY`, the cursor has left the area
@@ -88,6 +152,10 @@ pub fn build_status_bar() -> StatusBar {
     let demod_label = gtk4::Label::new(Some(DEFAULT_DEMOD_TEXT));
     let frequency_label = gtk4::Label::new(Some(DEFAULT_FREQUENCY_TEXT));
     let cursor_label = gtk4::Label::new(Some(DEFAULT_CURSOR_TEXT));
+    let role_label = gtk4::Label::new(Some(DEFAULT_ROLE_TEXT));
+    role_label.set_visible(false);
+    let role_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
+    role_separator.set_visible(false);
 
     let widget = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
@@ -104,6 +172,8 @@ pub fn build_status_bar() -> StatusBar {
     widget.append(&frequency_label);
     widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     widget.append(&cursor_label);
+    widget.append(&role_separator);
+    widget.append(&role_label);
 
     StatusBar {
         widget,
@@ -112,6 +182,8 @@ pub fn build_status_bar() -> StatusBar {
         demod_label,
         frequency_label,
         cursor_label,
+        role_label,
+        role_separator,
     }
 }
 

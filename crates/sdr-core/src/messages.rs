@@ -267,6 +267,25 @@ pub enum UiToDsp {
         port: u16,
         protocol: sdr_types::Protocol,
     },
+    /// Configure `rtl_tcp` client role + auth key. Takes effect
+    /// on the NEXT connect (already-open sessions keep their
+    /// admitted role until they disconnect). `requested_role`
+    /// drives the `ClientHello.role` byte; `auth_key` activates
+    /// the eager-auth path (#394) when `Some`. Both fields are
+    /// independent — a caller can change just the role
+    /// (Control ↔ Listen) or just rotate the key. Per issue
+    /// #396.
+    SetRtlTcpClientConfig {
+        /// Role to request in the next connect. `Role::Control`
+        /// is the default / back-compat path; `Role::Listen`
+        /// opts into the #392 concurrent-listener flow.
+        requested_role: sdr_server_rtltcp::extension::Role,
+        /// Pre-shared key (#394) to send eagerly with the hello.
+        /// `None` disables the auth gate (no key on the wire);
+        /// `Some(bytes)` sets `FLAG_HAS_AUTH` and emits an
+        /// `AuthKeyMessage` follow-up.
+        auth_key: Option<Vec<u8>>,
+    },
     /// Set the file path for file source playback.
     SetFilePath(std::path::PathBuf),
     /// Toggle loop-on-EOF for the file playback source. `true`
@@ -339,6 +358,15 @@ pub enum UiToDsp {
     /// wait for the current exponential-backoff delay to expire.
     /// No-op when the active source is not `RtlTcp`.
     RetryRtlTcpNow,
+    /// One-shot "Take control" reconnect (#393 takeover handshake).
+    /// Sets `FLAG_REQUEST_TAKEOVER` on the NEXT `ClientHello`
+    /// and triggers an immediate reconnect; the bit auto-clears
+    /// after that single attempt so subsequent reconnects (e.g.,
+    /// transport-level retries) don't keep displacing whoever
+    /// just got admitted. Surfaced by the UI when the user
+    /// clicks "Take control" on the `ControllerBusy` toast. No-op
+    /// when the active source is not `RtlTcp`. Per issue #396.
+    RetryRtlTcpWithTakeover,
     // --- Scanner (#317) ---
     /// Master scanner on/off toggle.
     SetScannerEnabled(bool),
@@ -479,6 +507,7 @@ mod tests {
             tuner_name: "R820T".into(),
             gain_count: 29,
             codec: "None".into(),
+            granted_role: Some(true),
         });
         assert!(matches!(
             connected,
@@ -798,6 +827,30 @@ mod tests {
         assert!(matches!(disc, UiToDsp::DisconnectRtlTcp));
         let retry = UiToDsp::RetryRtlTcpNow;
         assert!(matches!(retry, UiToDsp::RetryRtlTcpNow));
+
+        // RTL-TCP role + auth-key config (issue #396). Constructed
+        // with a non-default Listen role and a plausible 32-byte
+        // key so the shape regression fires on either a field
+        // rename / retyping OR the re-export path going stale. The
+        // matching `SetRtlTcpClientConfig` handler is load-bearing
+        // for the role picker and per-server keyring flows.
+        let cfg = UiToDsp::SetRtlTcpClientConfig {
+            requested_role: sdr_server_rtltcp::extension::Role::Listen,
+            auth_key: Some(vec![0xAB; 32]),
+        };
+        assert!(matches!(
+            cfg,
+            UiToDsp::SetRtlTcpClientConfig {
+                requested_role: sdr_server_rtltcp::extension::Role::Listen,
+                auth_key: Some(ref bytes),
+            } if bytes.len() == 32 && bytes.iter().all(|&b| b == 0xAB)
+        ));
+
+        // `RetryRtlTcpWithTakeover` is a unit variant today, but
+        // the pattern match fails loudly if that changes (e.g.
+        // a future refactor adds a scoped-reason payload).
+        let takeover = UiToDsp::RetryRtlTcpWithTakeover;
+        assert!(matches!(takeover, UiToDsp::RetryRtlTcpWithTakeover));
     }
 
     #[test]

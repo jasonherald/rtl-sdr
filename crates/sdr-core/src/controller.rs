@@ -282,6 +282,16 @@ struct DspState {
     network_host: String,
     network_port: u16,
     network_protocol: sdr_types::Protocol,
+    /// Role the `rtl_tcp` client requests in its `ClientHello`.
+    /// Default `Role::Control` matches the pre-#392 single-
+    /// client flow every legacy client assumes; UI flips this
+    /// to `Role::Listen` when the user picks the Listen option
+    /// in the connection-role combo row. Per #396.
+    rtl_tcp_requested_role: sdr_server_rtltcp::extension::Role,
+    /// Pre-shared key (#394) to send eagerly on `rtl_tcp`
+    /// connect. `None` disables the auth gate; `Some(bytes)`
+    /// activates the eager-auth path. Per #396.
+    rtl_tcp_auth_key: Option<Vec<u8>>,
     file_path: std::path::PathBuf,
     /// Loop-on-EOF flag for the file playback source. Default
     /// `false` (stop at EOF). Updated by `UiToDsp::SetFileLooping`
@@ -439,6 +449,8 @@ impl DspState {
             network_host: "127.0.0.1".to_string(),
             network_port: 1234,
             network_protocol: sdr_types::Protocol::TcpClient,
+            rtl_tcp_requested_role: sdr_server_rtltcp::extension::Role::Control,
+            rtl_tcp_auth_key: None,
             file_path: std::path::PathBuf::new(),
             file_looping: false,
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
@@ -1276,6 +1288,27 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.network_protocol = protocol;
         }
 
+        UiToDsp::SetRtlTcpClientConfig {
+            requested_role,
+            auth_key,
+        } => {
+            // Role-only updates log the role; auth-key updates
+            // log the has/not-has state, not the bytes.
+            tracing::debug!(
+                ?requested_role,
+                auth_key_set = auth_key.is_some(),
+                "set rtl_tcp client config"
+            );
+            state.rtl_tcp_requested_role = requested_role;
+            state.rtl_tcp_auth_key = auth_key;
+            // Takes effect on the NEXT connect. An already-
+            // running rtl_tcp session keeps its admitted role
+            // until it disconnects — changing role mid-stream
+            // would require the server to re-admit the client,
+            // which the wire protocol doesn't support (the
+            // role byte is part of the hello). Per issue #396.
+        }
+
         UiToDsp::SetFilePath(path) => {
             tracing::debug!(?path, "set file path");
             state.file_path = path;
@@ -1566,10 +1599,26 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             let _ = dsp_tx.send(DspToUi::SourceStopped);
         }
         UiToDsp::RetryRtlTcpNow => {
-            // Same source-type gate as Disconnect. "Retry now"
-            // implements as stop+start so the current backoff
-            // sleep is short-circuited; the existing start_manager
-            // path tears up a fresh connection from Connecting.
+            // "Retry now" REBUILDS the `RtlTcpSource` from the
+            // latest `DspState` (role + auth_key) instead of just
+            // stopping + starting the existing instance. Rebuild
+            // is required because the role / auth-key config is
+            // baked into `RtlTcpSource` at construction via
+            // `with_config(...)`; a subsequent `start()` on the
+            // same instance replays its original `ClientHello`,
+            // which means a newly-entered key or flipped role
+            // from the UI would never land on the wire until the
+            // user forced a full source tear-down (Stop + Play,
+            // source-type switch). After an `AuthRequired` /
+            // `AuthFailed` / `ControllerBusy` denial those retry
+            // semantics are explicitly user-driven, so the
+            // rebuild is the correct behavior.
+            //
+            // The sticky-command replay cache (gain, AGC, PPM,
+            // bias tee, direct sampling, etc.) is carried across
+            // the rebuild via the Source-trait snapshot hooks so
+            // the reconnect lands with the pre-retry device state.
+            // Per `CodeRabbit` round 3 on PR #408.
             if state.source_type != SourceType::RtlTcp {
                 tracing::debug!(
                     active = ?state.source_type,
@@ -1577,15 +1626,45 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 );
                 return;
             }
-            if let Some(source) = state.source.as_mut() {
-                if let Err(e) = source.stop() {
-                    tracing::warn!(error = %e, "rtl_tcp stop before retry failed");
-                }
-                if let Err(e) = source.start() {
-                    tracing::warn!(error = %e, "rtl_tcp restart failed");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Retry failed: {e}")));
-                }
+            if state.source.is_none() {
+                tracing::debug!("RetryRtlTcpNow ignored — no live source (was disconnected)");
+                return;
             }
+            rebuild_rtl_tcp_source(state, dsp_tx, /* request_takeover */ false);
+        }
+        UiToDsp::RetryRtlTcpWithTakeover => {
+            // One-shot Take-control reconnect per #396. Same
+            // rebuild machinery as `RetryRtlTcpNow`, but with
+            // `request_takeover = true` set on the rebuilt
+            // config's `ClientHello`. The flag doesn't persist on
+            // `DspState` — the next non-takeover retry or a
+            // fresh `open_source` (Play after Stop, source-type
+            // switch) rebuilds without it. Keeping takeover
+            // "one-shot per action" matches the #393 spec:
+            // takeover is an explicit user decision, not a
+            // persistent preference.
+            if state.source_type != SourceType::RtlTcp {
+                tracing::debug!(
+                    active = ?state.source_type,
+                    "RetryRtlTcpWithTakeover ignored — active source is not RtlTcp"
+                );
+                return;
+            }
+            // Gate on a live source. After `DisconnectRtlTcp`
+            // the source is gone (`state.source = None`) but
+            // `state.source_type` remains `RtlTcp`, so a stale
+            // "Take control" toast action could otherwise
+            // recreate + start a fresh source here — breaking
+            // the disconnect contract (reopen path after an
+            // explicit disconnect is Play/Start, not a retry
+            // command). Mirrors the `RetryRtlTcpNow` gate above.
+            if state.source.is_none() {
+                tracing::debug!(
+                    "RetryRtlTcpWithTakeover ignored — no live source (was disconnected)"
+                );
+                return;
+            }
+            rebuild_rtl_tcp_source(state, dsp_tx, /* request_takeover */ true);
         }
         // --- Scanner (#317) ---
         UiToDsp::SetScannerEnabled(enabled) => {
@@ -1913,6 +1992,120 @@ fn emit_scanner_active_channel(
     let _ = dsp_tx.send(msg);
 }
 
+/// Destroy the current `RtlTcpSource` and construct a fresh one
+/// with the latest role / `auth_key` config from `DspState`, then
+/// start it. Used by both `RetryRtlTcpNow` (ordinary manual
+/// retry after an `AuthRequired` / `AuthFailed` / `ControllerBusy`
+/// denial) and `RetryRtlTcpWithTakeover` (the #393 "Take
+/// control" one-shot).
+///
+/// **Why rebuild instead of stop+start the existing source:** the
+/// `ClientHello` is built at `with_config(...)` time from the
+/// `RtlTcpConfig` passed to the constructor. Calling `start()` on
+/// the same instance replays its original hello — a newly entered
+/// auth key or a flipped role would never land on the wire until
+/// a full source tear-down (Stop + Play, source-type switch).
+/// Rebuilding picks up the current `state.rtl_tcp_requested_role`
+/// and `state.rtl_tcp_auth_key` for the next hello, which is the
+/// behavior the UI expects after any denial arm.
+///
+/// **Sticky-command cache:** the previous source's replay
+/// snapshot (gain, AGC, PPM, bias tee, direct sampling, etc.) is
+/// captured via `Source::rtl_tcp_sticky_snapshot()` and restored
+/// onto the new instance BEFORE `start()` so the reconnect's
+/// `replay_sticky_commands` emits the same setters the old
+/// session had. Without this, a takeover / auth-retry rebuild
+/// would reset device state to defaults (gain = 0, AGC off, PPM
+/// = 0, ...) and the user would lose their tuning setup.
+///
+/// `request_takeover` is the one bit of per-call config not read
+/// from `DspState` — we keep takeover as an explicit one-shot
+/// parameter so the next non-takeover retry or `open_source` call
+/// cleanly starts without the flag.
+///
+/// Caller must have already ensured `state.source_type ==
+/// RtlTcp` and `state.source.is_some()`. Per `CodeRabbit` round
+/// 3 on PR #408.
+fn rebuild_rtl_tcp_source(
+    state: &mut DspState,
+    dsp_tx: &std::sync::mpsc::Sender<DspToUi>,
+    request_takeover: bool,
+) {
+    let error_prefix = if request_takeover {
+        "Take control failed"
+    } else {
+        "Retry failed"
+    };
+    // Snapshot the replay cache + drop the old source. The
+    // Source-trait hook returns `None` for non-RtlTcp sources —
+    // can't happen here given the caller's `source_type` gate,
+    // but `unwrap_or_default()` keeps this defensive.
+    let sticky_snapshot = state
+        .source
+        .as_ref()
+        .and_then(|s| s.rtl_tcp_sticky_snapshot())
+        .unwrap_or_default();
+    if let Some(mut source) = state.source.take()
+        && let Err(e) = source.stop()
+    {
+        tracing::warn!(
+            error = %e,
+            request_takeover,
+            "rtl_tcp stop before rebuild failed"
+        );
+    }
+    // Build the fresh config from the latest DspState.
+    // `Default` covers timeouts + compression; role and auth
+    // come from state, and `request_takeover` is the caller's
+    // one-shot choice.
+    let rtl_tcp_config = sdr_source_network::rtl_tcp::RtlTcpConfig {
+        requested_role: state.rtl_tcp_requested_role,
+        auth_key: state.rtl_tcp_auth_key.clone(),
+        request_takeover,
+        ..Default::default()
+    };
+    let mut source: Box<dyn Source> = Box::new(sdr_source_network::RtlTcpSource::with_config(
+        &state.network_host,
+        state.network_port,
+        rtl_tcp_config,
+    ));
+    // Restore sticky cache BEFORE `start()` so the manager
+    // thread's `replay_sticky_commands` call on the freshly-
+    // opened stream already sees the pre-rebuild values.
+    source.rtl_tcp_restore_sticky_snapshot(&sticky_snapshot);
+    // Reapply sample rate + tune on the new instance — these
+    // are derived from `DspState`, not the snapshot, because
+    // they can change between the snapshot and the restart
+    // (e.g., a user sample-rate switch while the old source
+    // was in `AuthRequired`). Both calls also update the
+    // sticky cache on the new source, which is fine — any
+    // subsequent reconnect replays the fresher value.
+    if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {
+        tracing::warn!(
+            error = %e,
+            request_takeover,
+            "rtl_tcp rebuild set_sample_rate failed"
+        );
+    }
+    if let Err(e) = source.tune(state.center_freq) {
+        tracing::warn!(
+            error = %e,
+            request_takeover,
+            "rtl_tcp rebuild tune failed"
+        );
+    }
+    if let Err(e) = source.start() {
+        tracing::warn!(
+            error = %e,
+            request_takeover,
+            "rtl_tcp rebuild start failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("{error_prefix}: {e}")));
+        return;
+    }
+    state.source = Some(source);
+}
+
 /// Open the active IQ source and configure it for streaming.
 fn open_source(state: &mut DspState) -> Result<(), String> {
     let mut source: Box<dyn Source> = match state.source_type {
@@ -1936,12 +2129,47 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
         // server, handshakes the 12-byte RTL0 header, and routes
         // future tune / gain / PPM messages through the 5-byte
         // command channel. Reuses the `network_host` + `network_port`
-        // config fields since the connection shape is the same (no
-        // separate RtlTcpConfig state field needed).
-        SourceType::RtlTcp => Box::new(sdr_source_network::RtlTcpSource::new(
-            &state.network_host,
-            state.network_port,
-        )),
+        // config fields for address, but also threads the #396
+        // `requested_role` + `auth_key` fields from state into an
+        // `RtlTcpConfig` so the hello carries the user's choices.
+        //
+        // **Capability signals, in narrow scope:**
+        // - `codecs=3` in the mDNS TXT record says "this server
+        //   parses `ClientHello`, so a hello won't be mis-framed as
+        //   two 5-byte commands." That makes `compression`,
+        //   `request_takeover`, and `requested_role` opt-ins wire-
+        //   safe on this server. It does **NOT** prove the server
+        //   supports auth — auth uses the v2 protocol path, which
+        //   `codecs=3` doesn't speak to.
+        // - Auth capability is a separate signal: the #394 servers
+        //   advertise `auth_required` (present in the mDNS TXT
+        //   record and persisted on `FavoriteEntry`) AND accept
+        //   hellos with `PROTOCOL_VERSION_V2`. Eager-auth hellos
+        //   therefore require v2 — `required_protocol_version(flags)`
+        //   in `sdr-source-network` picks the minimum viable version
+        //   from the flag set, returning v2 when `FLAG_HAS_AUTH` is
+        //   set. Sending an auth-bearing hello to a `codecs=3`-only
+        //   server that doesn't understand v2 will bounce at the
+        //   server's version gate.
+        //
+        // The source panel's discovery gating is responsible for
+        // refusing role / compression / takeover opt-ins against
+        // legacy-only (non-`codecs=3`) servers, and for only
+        // offering the auth field on servers that advertise
+        // `auth_required`. Per #396 / `CodeRabbit` round 2 on
+        // PR #408.
+        SourceType::RtlTcp => {
+            let rtl_tcp_config = sdr_source_network::rtl_tcp::RtlTcpConfig {
+                requested_role: state.rtl_tcp_requested_role,
+                auth_key: state.rtl_tcp_auth_key.clone(),
+                ..Default::default()
+            };
+            Box::new(sdr_source_network::RtlTcpSource::with_config(
+                &state.network_host,
+                state.network_port,
+                rtl_tcp_config,
+            ))
+        }
     };
 
     if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {

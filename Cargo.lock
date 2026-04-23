@@ -1996,6 +1996,7 @@ dependencies = [
  "sdr-radio",
  "sdr-rtlsdr",
  "sdr-scanner",
+ "sdr-server-rtltcp",
  "sdr-sink-audio",
  "sdr-sink-network",
  "sdr-source-file",

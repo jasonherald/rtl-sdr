@@ -46,9 +46,11 @@ use std::time::{Duration, Instant};
 
 use sdr_pipeline::source_manager::Source;
 use sdr_server_rtltcp::codec::{Codec, CodecMask, Decoder};
+#[cfg(test)]
+use sdr_server_rtltcp::extension::Role;
 use sdr_server_rtltcp::extension::{
-    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, Role, SERVER_EXTENSION_LEN,
-    ServerExtension, Status,
+    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, SERVER_EXTENSION_LEN, ServerExtension,
+    Status,
 };
 use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
 use sdr_types::{Complex, SourceError};
@@ -136,17 +138,45 @@ pub enum ConnectionState {
     /// Handshake complete, handler streaming I/Q. `codec` reflects
     /// the negotiated stream codec from the extended `"RTLX"`
     /// handshake (#307); legacy / uncompressed paths land on
-    /// `Codec::None`.
-    Connected { tuner: TunerInfo, codec: Codec },
+    /// `Codec::None`. `granted_role` carries the server's
+    /// `ServerExtension.granted_role` decision (#392): `Some(Role)`
+    /// when the server is RTLX-capable and admitted us into a
+    /// specific slot, `None` when we didn't send a hello (legacy
+    /// path) or the server is a pre-#392 RTLX server that doesn't
+    /// yet advertise the field. The UI shows the role badge only
+    /// when this is `Some` — a legacy server's role is unknown
+    /// territory, and guessing "Controller" there would mis-label
+    /// the connection on pre-#392 RTLX servers that still hand
+    /// every accepted client a Control-equivalent slot without
+    /// saying so on the wire. Per #396 / `CodeRabbit` round 1 on
+    /// PR #408.
+    Connected {
+        tuner: TunerInfo,
+        codec: Codec,
+        granted_role: Option<sdr_server_rtltcp::extension::Role>,
+    },
     /// Connection dropped, backoff pending. Transport-level errors
     /// (TCP connect refused, EOF, stall) stay in this state — the
     /// manager retries forever with exponential backoff up to the
     /// 30 s cap.
-    Retrying { attempt: u32, next_at: Instant },
+    Retrying {
+        attempt: u32,
+        next_at: Instant,
+    },
     /// Terminal failure — only entered for a protocol-level error
     /// (e.g., server sent a non-RTL0 header). Transport failures
     /// never reach this state; they remain in `Retrying`.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
+    /// Terminal role-denial states surfaced by the #392/#394
+    /// extended handshake. Per #396, the connection manager
+    /// stops retrying and waits for the UI to offer the user an
+    /// explicit recovery action (take-control, re-enter key, or
+    /// give up).
+    ControllerBusy,
+    AuthRequired,
+    AuthFailed,
 }
 
 impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
@@ -154,13 +184,30 @@ impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
         match value {
             ConnectionState::Disconnected => Self::Disconnected,
             ConnectionState::Connecting => Self::Connecting,
-            ConnectionState::Connected { tuner, codec } => Self::Connected {
+            ConnectionState::Connected {
+                tuner,
+                codec,
+                granted_role,
+            } => Self::Connected {
                 // `TunerTypeCode`'s `Debug` renders the upstream
                 // tuner name ("R820T", "E4000", etc.) directly —
                 // what the UI wants for the status row subtitle.
                 tuner_name: format!("{:?}", tuner.tuner),
                 gain_count: tuner.gain_count,
                 codec: codec.label().to_string(),
+                // Project the server-granted role to `Option<bool>`
+                // at the crate boundary so `sdr_types` doesn't have
+                // to depend on `sdr-server-rtltcp`'s wire `Role`
+                // enum: `true` = Controller, `false` = Listener,
+                // `None` = unknown (legacy handshake or pre-#392
+                // RTLX server). The UI uses this to decide whether
+                // to show the role badge at all — per CodeRabbit
+                // round 1 on PR #408, the previous `Option<bool>`
+                // derived from the user's requested role could
+                // mis-label a session the server actually admitted
+                // differently.
+                granted_role: granted_role
+                    .map(|r| r == sdr_server_rtltcp::extension::Role::Control),
             },
             ConnectionState::Retrying { attempt, next_at } => Self::Retrying {
                 attempt: *attempt,
@@ -175,6 +222,9 @@ impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
             ConnectionState::Failed { reason } => Self::Failed {
                 reason: reason.clone(),
             },
+            ConnectionState::ControllerBusy => Self::ControllerBusy,
+            ConnectionState::AuthRequired => Self::AuthRequired,
+            ConnectionState::AuthFailed => Self::AuthFailed,
         }
     }
 }
@@ -290,6 +340,27 @@ pub struct RtlTcpConfig {
     /// casual LAN isolation, not WAN-grade security. See #394
     /// for the full threat model discussion. #394.
     pub auth_key: Option<Vec<u8>>,
+
+    /// Role the client requests in its `ClientHello`. Default
+    /// [`Role::Control`] matches the pre-#392 single-client
+    /// behavior every legacy `rtl_tcp` client assumes. The UI
+    /// lets users opt into [`Role::Listen`] for concurrent
+    /// read-only access to a server that already has a
+    /// controller. Per issue #396.
+    ///
+    /// **RTLX-only when non-default.** `Role::Listen` implies
+    /// the server is #392-aware (has the role gate); vanilla
+    /// `rtl_tcp` servers ignore the role byte entirely and
+    /// every client is implicitly Control. The
+    /// `extension_enabled` gate below already trips when the
+    /// hello needs to carry any non-default flag, and the same
+    /// mDNS TXT `codecs=3` out-of-band evidence that gates
+    /// compression / takeover / auth also gates this field.
+    /// `Role::Control` is the back-compat default for vanilla
+    /// servers; setting `Role::Listen` against a vanilla
+    /// server corrupts the 5-byte command framing (same hazard
+    /// as `compression` / `request_takeover` / `auth_key`).
+    pub requested_role: sdr_server_rtltcp::extension::Role,
 }
 
 impl Default for RtlTcpConfig {
@@ -301,6 +372,10 @@ impl Default for RtlTcpConfig {
             compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
             request_takeover: false,
             auth_key: None,
+            // `Role::Control` matches the pre-#392 single-client
+            // behavior every legacy `rtl_tcp` client assumes — no
+            // wire change from the default path.
+            requested_role: sdr_server_rtltcp::extension::Role::Control,
         }
     }
 }
@@ -772,26 +847,51 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
             }
             Err(e) => {
                 tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
-                if let SourceError::Protocol(_) = e {
-                    // Non-recoverable: server isn't speaking
-                    // rtl_tcp, or the extended handshake was
-                    // rejected for a reason that won't clear on
-                    // retry (auth required/failed, parse error).
-                    set_state(
-                        &shared,
-                        ConnectionState::Failed {
-                            reason: format!("{e}"),
-                        },
-                    );
-                    return;
+                // Route each terminal error-kind to its
+                // dedicated `ConnectionState` variant so the UI
+                // can offer specific recovery actions (take-
+                // control, enter key, re-prompt) instead of a
+                // generic "Failed" with opaque reason string.
+                // Pre-#396 AuthRequired/AuthFailed folded into
+                // `Failed { reason: "protocol error: ..." }` and
+                // `ControllerBusy` auto-retried via
+                // `TemporarilyUnavailable`. Per #396, each gets
+                // its own terminal state.
+                match e {
+                    SourceError::ControllerBusy => {
+                        set_state(&shared, ConnectionState::ControllerBusy);
+                        return;
+                    }
+                    SourceError::AuthRequired => {
+                        set_state(&shared, ConnectionState::AuthRequired);
+                        return;
+                    }
+                    SourceError::AuthFailed => {
+                        set_state(&shared, ConnectionState::AuthFailed);
+                        return;
+                    }
+                    SourceError::Protocol(_) => {
+                        // Non-recoverable: server isn't speaking
+                        // rtl_tcp, or the extended handshake was
+                        // rejected for a reason we don't have a
+                        // dedicated state for (ListenerCapReached,
+                        // parse errors, future status codes).
+                        set_state(
+                            &shared,
+                            ConnectionState::Failed {
+                                reason: format!("{e}"),
+                            },
+                        );
+                        return;
+                    }
+                    // `TemporarilyUnavailable` (transient network
+                    // conditions the caller wants us to back off
+                    // and retry on — NOT role denials, which are
+                    // now their own variants above) and every
+                    // other `SourceError` variant fall through to
+                    // the backoff loop below.
+                    _ => {}
                 }
-                // `TemporarilyUnavailable` (e.g. server responded
-                // with `ControllerBusy`) and every other
-                // `SourceError` variant fall through to the
-                // backoff loop below. The condition is expected
-                // to clear on its own — retrying with the normal
-                // schedule is the right behavior. Per CodeRabbit
-                // round 7 on PR #399.
             }
         }
 
@@ -867,6 +967,15 @@ fn read_server_extension(stream: &TcpStream) -> std::io::Result<ServerExtension>
 /// TCP socket (still plain `TcpStream`; the caller wraps it in a
 /// [`Decoder`] for reads). `codec` tells the caller which
 /// decoder to use for the IQ stream.
+///
+/// `ServerExtension.granted_role` isn't carried here — it's
+/// already published inside `attempt_connect` on the
+/// `ConnectionState::Connected` state transition, which is the
+/// single consumer the UI needs. Threading it through the
+/// outcome struct too would require the manager's data-pump
+/// branch to also read and forward it, which it has no use for
+/// (no mid-stream role changes exist in the wire protocol).
+/// Per `CodeRabbit` round 1 on PR #408.
 struct HandshakeOutcome {
     stream: TcpStream,
     codec: Codec,
@@ -928,9 +1037,16 @@ fn attempt_connect(
     // Default `compression = NONE_ONLY && request_takeover =
     // false` → no hello → wire-compatible with every rtl_tcp
     // server on earth. Per #307 / #393.
+    // Hello needed when ANY field carries non-default state:
+    // compression opt-in, takeover opt-in, auth, or role
+    // (Listen != Control default). Per #396, a `Role::Listen`
+    // request also has to surface on the wire, so widen the
+    // gate here — same RTLX-only hazard as the other fields,
+    // same mDNS `codecs=3` out-of-band evidence requirement.
     let extension_enabled = config.compression != CodecMask::NONE_ONLY
         || config.request_takeover
-        || config.auth_key.is_some();
+        || config.auth_key.is_some()
+        || config.requested_role != sdr_server_rtltcp::extension::Role::Control;
     if extension_enabled {
         // Compose the flags byte. Each bit is independently set
         // based on config — takeover and auth can co-exist on
@@ -984,11 +1100,15 @@ fn attempt_connect(
 
         let hello = ClientHello {
             codec_mask: config.compression,
-            // sdr-rs clients always request Control on connect;
-            // Listen clients don't emerge from this codepath —
-            // they'd flow through a future client-side Listen
-            // opt-in that isn't part of #393's scope.
-            role: Role::Control,
+            // Threaded from `RtlTcpConfig.requested_role` — the
+            // UI's Connection-role picker (#396) feeds this
+            // directly. Default `Role::Control` matches the
+            // pre-#392 single-client behavior every legacy
+            // `rtl_tcp` client assumes; opting into
+            // `Role::Listen` needs the out-of-band evidence
+            // that the server is #392-aware (mDNS TXT
+            // `codecs=3` or saved-profile knowledge).
+            role: config.requested_role,
             flags,
             // Pick the MINIMUM viable protocol version for this
             // hello's feature set. Compression-only / takeover-
@@ -1047,44 +1167,66 @@ fn attempt_connect(
     // silently falling back would let a server that picked LZ4
     // stream compressed bytes into our IQ decoder. Per CodeRabbit
     // round 1 on PR #399.
+    // Track the server's `granted_role` so it can flow through
+    // to `ConnectionState::Connected`. `None` on the legacy path
+    // (we never read the extension block) OR on an extended
+    // server that predates #392 and leaves the field unset —
+    // the UI treats both as "unknown" and hides the role badge.
+    // Per CodeRabbit round 1 on PR #408.
+    let mut granted_role: Option<sdr_server_rtltcp::extension::Role> = None;
     let codec = if extension_enabled {
         match read_server_extension(&stream) {
             Ok(ext) => {
                 // A non-OK status means the server parsed our hello
-                // but rejected the session. Two flavors:
+                // but rejected the session. Each flavor needs a
+                // distinct error variant so the connection manager
+                // can route to the right `RtlTcpConnectionState`
+                // without string-parsing the reason:
                 //
-                // - `ControllerBusy` (#392): another client owns the
-                //   control slot right now. This is **transient** —
-                //   that client will eventually disconnect, so we
-                //   return `SourceError::TemporarilyUnavailable` and
-                //   let the connection manager retry on the normal
-                //   backoff schedule. Per CodeRabbit round 7 on
-                //   PR #399.
-                // - `AuthRequired` / `AuthFailed` (#394) and any
-                //   future non-OK status: terminal. The user must
-                //   take action (set the right auth key) before
-                //   retries have any chance of succeeding, so we
-                //   surface `SourceError::Protocol` and the manager
-                //   transitions to `Failed`.
-                if ext.status == Status::ControllerBusy {
-                    return Err(SourceError::TemporarilyUnavailable(format!(
-                        "rtl_tcp server controller busy: status={:?} (wire={})",
-                        ext.status,
-                        ext.status.to_wire()
-                    )));
-                }
-                if ext.status != Status::Ok {
-                    return Err(SourceError::Protocol(format!(
-                        "rtl_tcp extension rejected by server: status={:?} (wire={})",
-                        ext.status,
-                        ext.status.to_wire()
-                    )));
+                // - `ControllerBusy` (#392) → `SourceError::ControllerBusy`.
+                //   User must decide: retry with `request_takeover`
+                //   or switch to `Role::Listen`. No auto-retry; the
+                //   UI surfaces a toast with action buttons.
+                //   Pre-#396 this folded into `TemporarilyUnavailable`
+                //   with silent auto-retry, which hid the decision
+                //   point. Per #396.
+                // - `AuthRequired` (#394) → `SourceError::AuthRequired`.
+                //   User must enter a key. No auto-retry.
+                // - `AuthFailed` (#394) → `SourceError::AuthFailed`.
+                //   User must enter the RIGHT key. No auto-retry.
+                // - Anything else → `SourceError::Protocol` (generic
+                //   terminal). Covers future status codes we haven't
+                //   seen yet, plus `ListenerCapReached` (which the
+                //   UI can treat similarly to ControllerBusy at the
+                //   toast level, but surfacing as generic Protocol
+                //   is acceptable until a dedicated #396 follow-up
+                //   fleshes out listener-cap UX).
+                match ext.status {
+                    Status::Ok => {}
+                    Status::ControllerBusy => {
+                        return Err(SourceError::ControllerBusy);
+                    }
+                    Status::AuthRequired => {
+                        return Err(SourceError::AuthRequired);
+                    }
+                    Status::AuthFailed => {
+                        return Err(SourceError::AuthFailed);
+                    }
+                    other @ Status::ListenerCapReached => {
+                        return Err(SourceError::Protocol(format!(
+                            "rtl_tcp extension rejected by server: status={:?} (wire={})",
+                            other,
+                            other.to_wire()
+                        )));
+                    }
                 }
                 tracing::info!(
                     codec = %ext.codec,
                     status = ext.status.to_wire(),
+                    granted_role = ?ext.granted_role,
                     "rtl_tcp extended-handshake accepted by server"
                 );
+                granted_role = ext.granted_role;
                 ext.codec
             }
             Err(e) => {
@@ -1106,7 +1248,14 @@ fn attempt_connect(
     if let Ok(mut slot) = shared.tuner.lock() {
         *slot = Some(tuner);
     }
-    set_state(shared, ConnectionState::Connected { tuner, codec });
+    set_state(
+        shared,
+        ConnectionState::Connected {
+            tuner,
+            codec,
+            granted_role,
+        },
+    );
 
     // Publish a clone of the stream for the command sender. Install a
     // write timeout on the clone so `send_command`'s blocking
@@ -1570,6 +1719,100 @@ impl Source for RtlTcpSource {
     fn set_gain_by_index(&mut self, index: u32) -> Result<(), SourceError> {
         RtlTcpSource::set_gain_by_index(self, index)
     }
+
+    // ----------------------------------------------------------
+    //  Sticky-command replay snapshot (#396 round 3)
+    //
+    //  Controller-driven rebuilds (manual retry after an auth
+    //  flow, takeover retry) destroy the old `RtlTcpSource` and
+    //  construct a fresh one. Without these two hooks, the new
+    //  source starts with zeroed replay atomics — gain / AGC /
+    //  PPM / bias tee / direct sampling / etc. would default
+    //  back to zero on the first reconnect, stripping the user's
+    //  session state. Snapshot + restore copies the `u32` values
+    //  across the boundary so the fresh manager thread's
+    //  `replay_sticky_commands` call emits the same `SetX`
+    //  commands the old one would have.
+    // ----------------------------------------------------------
+    fn rtl_tcp_sticky_snapshot(
+        &self,
+    ) -> Option<sdr_pipeline::source_manager::RtlTcpStickySnapshot> {
+        Some(sdr_pipeline::source_manager::RtlTcpStickySnapshot {
+            replay_mask: self.shared.replay_mask.load(Ordering::Relaxed),
+            last_center_freq_hz: self.shared.last_center_freq_hz.load(Ordering::Relaxed),
+            last_sample_rate_hz: self.shared.last_sample_rate_hz.load(Ordering::Relaxed),
+            last_gain_mode: self.shared.last_gain_mode.load(Ordering::Relaxed),
+            last_tuner_gain: self.shared.last_tuner_gain.load(Ordering::Relaxed),
+            last_ppm: self.shared.last_ppm.load(Ordering::Relaxed),
+            last_agc_mode: self.shared.last_agc_mode.load(Ordering::Relaxed),
+            last_direct_sampling: self.shared.last_direct_sampling.load(Ordering::Relaxed),
+            last_offset_tuning: self.shared.last_offset_tuning.load(Ordering::Relaxed),
+            last_bias_tee: self.shared.last_bias_tee.load(Ordering::Relaxed),
+            last_gain_by_index: self.shared.last_gain_by_index.load(Ordering::Relaxed),
+            last_testmode: self.shared.last_testmode.load(Ordering::Relaxed),
+            last_if_gain: self.shared.last_if_gain.load(Ordering::Relaxed),
+            last_rtl_xtal: self.shared.last_rtl_xtal.load(Ordering::Relaxed),
+            last_tuner_xtal: self.shared.last_tuner_xtal.load(Ordering::Relaxed),
+        })
+    }
+
+    fn rtl_tcp_restore_sticky_snapshot(
+        &mut self,
+        snapshot: &sdr_pipeline::source_manager::RtlTcpStickySnapshot,
+    ) {
+        // Order mirrors `SharedState::new`'s initialization so a
+        // future field addition here is forced through the same
+        // review as the atomics themselves.
+        self.shared
+            .last_center_freq_hz
+            .store(snapshot.last_center_freq_hz, Ordering::Relaxed);
+        self.shared
+            .last_sample_rate_hz
+            .store(snapshot.last_sample_rate_hz, Ordering::Relaxed);
+        self.shared
+            .last_gain_mode
+            .store(snapshot.last_gain_mode, Ordering::Relaxed);
+        self.shared
+            .last_tuner_gain
+            .store(snapshot.last_tuner_gain, Ordering::Relaxed);
+        self.shared
+            .last_ppm
+            .store(snapshot.last_ppm, Ordering::Relaxed);
+        self.shared
+            .last_agc_mode
+            .store(snapshot.last_agc_mode, Ordering::Relaxed);
+        self.shared
+            .last_direct_sampling
+            .store(snapshot.last_direct_sampling, Ordering::Relaxed);
+        self.shared
+            .last_offset_tuning
+            .store(snapshot.last_offset_tuning, Ordering::Relaxed);
+        self.shared
+            .last_bias_tee
+            .store(snapshot.last_bias_tee, Ordering::Relaxed);
+        self.shared
+            .last_gain_by_index
+            .store(snapshot.last_gain_by_index, Ordering::Relaxed);
+        self.shared
+            .last_testmode
+            .store(snapshot.last_testmode, Ordering::Relaxed);
+        self.shared
+            .last_if_gain
+            .store(snapshot.last_if_gain, Ordering::Relaxed);
+        self.shared
+            .last_rtl_xtal
+            .store(snapshot.last_rtl_xtal, Ordering::Relaxed);
+        self.shared
+            .last_tuner_xtal
+            .store(snapshot.last_tuner_xtal, Ordering::Relaxed);
+        // `replay_mask` last so a partially-restored snapshot
+        // (e.g. a panic mid-write — shouldn't happen with simple
+        // atomics but belt-and-braces) doesn't leave the
+        // reconnect path replaying fresh zeros.
+        self.shared
+            .replay_mask
+            .store(snapshot.replay_mask, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -1763,6 +2006,7 @@ mod tests {
             compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2030,6 +2274,7 @@ mod tests {
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         (listener, config)
     }
@@ -2123,8 +2368,16 @@ mod tests {
         // transient — the other controller will eventually
         // disconnect and we should retry. `AuthFailed` is the
         // right terminal substitute: a wrong key will not start
-        // working on retry, so the manager must transition to
-        // `Failed` and stop looping.
+        // working on retry, so the manager must transition to a
+        // terminal state and stop looping.
+        //
+        // **Updated for #396:** `AuthFailed` now routes to the
+        // dedicated `ConnectionState::AuthFailed` variant (not
+        // generic `Failed`) so the UI can surface a specific
+        // "Key rejected" toast + re-prompt path instead of an
+        // opaque error string. The terminal-ness contract is
+        // unchanged — the manager still stops the retry loop on
+        // `AuthFailed`.
         //
         // The test also guards the delayed-tuner-publish ordering:
         // `tuner_info()` must stay `None` because the handshake
@@ -2149,17 +2402,17 @@ mod tests {
         src.start_manager().unwrap();
 
         let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
-        let mut reached_failed = false;
+        let mut reached_terminal = false;
         while Instant::now() < deadline {
-            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
-                reached_failed = true;
+            if matches!(src.connection_state(), ConnectionState::AuthFailed) {
+                reached_terminal = true;
                 break;
             }
             thread::sleep(RTLX_TEST_POLL_INTERVAL);
         }
         assert!(
-            reached_failed,
-            "client should transition to Failed on `AuthFailed` ServerExtension status"
+            reached_terminal,
+            "client should transition to AuthFailed on `AuthFailed` ServerExtension status (per #396)"
         );
         assert!(
             src.tuner_info().is_none(),
@@ -2171,26 +2424,39 @@ mod tests {
     }
 
     #[test]
-    fn rtlx_handshake_controller_busy_is_transient_not_terminal() {
-        // Regression test for CodeRabbit round 7 on PR #399.
-        // `ControllerBusy` means another client currently owns the
-        // control slot (#392). That condition resolves on its own
-        // when the other client disconnects, so the rtl_tcp source
-        // must NOT transition to `Failed` — the connection manager
-        // should keep cycling through the backoff + reconnect path.
+    fn rtlx_handshake_controller_busy_routes_to_dedicated_state() {
+        // Regression test for #396. `ControllerBusy` means
+        // another client currently owns the control slot (#392).
+        // Pre-#396 this routed to `TemporarilyUnavailable` and
+        // the connection manager auto-retried silently via
+        // backoff. Per #396 the connection manager now routes
+        // it to the dedicated `ConnectionState::ControllerBusy`
+        // variant and STOPS the retry loop — the UI needs to
+        // surface the busy state to the user so they can pick
+        // Take-control or Connect-as-Listener instead of
+        // waiting for the other controller to drop.
         //
-        // We assert two things:
-        //   1. State never reaches `Failed` within the observation
-        //      window (CR #17 regression guard).
-        //   2. `tuner_info()` stays `None` (the delayed-publish
-        //      ordering holds regardless of status).
+        // Historical rename: the CR-round-7-on-PR-#399 rule
+        // ("ControllerBusy must not route to Failed") still
+        // holds — `ControllerBusy` is its OWN terminal state,
+        // not `Failed`. The UX contract changed; the naming
+        // discipline for generic-error terminal = `Failed` did
+        // not.
+        //
+        // We assert:
+        //   1. State reaches `ConnectionState::ControllerBusy`
+        //      within the observation window (the new #396
+        //      routing).
+        //   2. `tuner_info()` stays `None` — the handshake
+        //      never reached `Connected`.
         let (listener, config) = rtlx_test_listener_and_config();
         let addr = listener.local_addr().unwrap();
 
         let server_thread = thread::spawn(move || {
-            // Accept a single connection and reject it. The client
-            // will then loop; subsequent accepts would require an
-            // accept loop we don't need for this assertion.
+            // Accept a single connection and reject it. Because
+            // ControllerBusy is now terminal, the client will
+            // NOT retry and we don't need a multi-accept loop
+            // here.
             let ext = ServerExtension {
                 codec: Codec::None,
                 granted_role: None,
@@ -2205,23 +2471,94 @@ mod tests {
 
         src.start_manager().unwrap();
 
-        // Poll for the entire window. If `Failed` shows up at any
-        // point, that's the round-7 regression (ControllerBusy
-        // being treated as terminal).
         let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut reached_controller_busy = false;
         while Instant::now() < deadline {
-            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
-                panic!(
-                    "ControllerBusy must not route to Failed — the server condition \
-                     is transient and the manager should keep retrying. \
-                     Observed state: Failed."
-                );
+            if matches!(src.connection_state(), ConnectionState::ControllerBusy) {
+                reached_controller_busy = true;
+                break;
             }
+            // The `Failed` path would be a regression — Failed
+            // is for generic protocol errors only, not role
+            // denials.
+            assert!(
+                !matches!(src.connection_state(), ConnectionState::Failed { .. }),
+                "ControllerBusy must route to its dedicated state, not generic Failed"
+            );
             thread::sleep(RTLX_TEST_POLL_INTERVAL);
         }
         assert!(
+            reached_controller_busy,
+            "client should transition to ControllerBusy on `ControllerBusy` \
+             ServerExtension status (per #396)"
+        );
+        assert!(
             src.tuner_info().is_none(),
-            "tuner_info must stay None across transient busy retries"
+            "tuner_info must stay None when the handshake is rejected"
+        );
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_auth_required_routes_to_dedicated_state() {
+        // Regression test for #396. `AuthRequired` means the
+        // server demands a pre-shared key (#394) and the client
+        // didn't include one in the hello. Pre-#396 the
+        // connection manager folded this into `Protocol` and
+        // landed in `Failed` with a generic reason; per #396 it
+        // now routes to the dedicated `ConnectionState::
+        // AuthRequired` variant so the UI can reveal + focus
+        // the Server key entry row instead of showing an opaque
+        // error toast. Terminal — no auto-retry while the UI
+        // waits for the user to enter a key.
+        //
+        // Complements the existing `AuthFailed` /
+        // `ControllerBusy` regression tests, which pin the same
+        // contract for the other two role-denial statuses. Per
+        // `CodeRabbit` round 3 on PR #408.
+        let (listener, config) = rtlx_test_listener_and_config();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: None,
+                status: Status::AuthRequired,
+                version: PROTOCOL_VERSION,
+            };
+            rtlx_test_serve_one(&listener, ext);
+        });
+
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        assert!(src.tuner_info().is_none());
+
+        src.start_manager().unwrap();
+
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut reached_auth_required = false;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::AuthRequired) {
+                reached_auth_required = true;
+                break;
+            }
+            // `Failed` would be a regression back to the pre-#396
+            // routing — the dedicated variant is the whole point.
+            assert!(
+                !matches!(src.connection_state(), ConnectionState::Failed { .. }),
+                "AuthRequired must route to its dedicated state, not generic Failed"
+            );
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(
+            reached_auth_required,
+            "client should transition to AuthRequired on `AuthRequired` \
+             ServerExtension status (per #396)"
+        );
+        assert!(
+            src.tuner_info().is_none(),
+            "tuner_info must stay None when the handshake is rejected"
         );
 
         src.stop_manager();
@@ -2278,6 +2615,7 @@ mod tests {
             compression: CodecMask::NONE_ONLY,
             request_takeover: true,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2359,6 +2697,7 @@ mod tests {
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2443,6 +2782,7 @@ mod tests {
             compression: CodecMask::NONE_ONLY,
             request_takeover: false,
             auth_key: Some(expected_key.clone()),
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2537,6 +2877,7 @@ mod tests {
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2666,6 +3007,159 @@ mod tests {
 
         src.stop_manager();
         let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_sends_listen_role_when_config_opts_in() {
+        // **Regression test for #396.** When
+        // `RtlTcpConfig::requested_role = Role::Listen`, the
+        // `extension_enabled` gate must widen to emit a hello
+        // (even with compression=NONE_ONLY + takeover=false +
+        // auth_key=None) AND the role byte in the hello must be
+        // `Role::Listen`. Server-side admission logic for the
+        // Listen path is pinned by the role-matrix tests in
+        // `broadcaster::tests::register_with_role_*`; this test
+        // locks in the client's end of the same wire contract.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (hello_tx, hello_rx) = std::sync::mpsc::channel::<[u8; CLIENT_HELLO_LEN]>();
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(RTLX_TEST_STATE_DEADLINE))
+                .unwrap();
+            let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+            sock.read_exact(&mut hello_buf).expect("read hello");
+            // Pin the role-only hello to protocol v1 — this
+            // gate path has non-default role but zero flags, so
+            // `required_protocol_version(flags)` (used by the
+            // client hello-builder) returns v1. A regression
+            // that silently promoted this hello to v2 would
+            // lock out pre-#394 servers without surfacing a
+            // test failure unless the version byte is checked
+            // explicitly. Per CodeRabbit round 1 on PR #408.
+            let client_hello_version = hello_buf[7];
+            assert_eq!(
+                client_hello_version,
+                sdr_server_rtltcp::extension::PROTOCOL_VERSION_V1,
+                "role-only hello must stay on v1 for backward compatibility \
+                 (got 0x{client_hello_version:02x})",
+            );
+            let _ = hello_tx.send(hello_buf);
+            // Accept the handshake with Listen granted so the
+            // client reaches Connected. Echo the client-chosen
+            // protocol version back rather than the compile-time
+            // `PROTOCOL_VERSION` so a future bump of `PROTOCOL_
+            // VERSION` doesn't mask a regression where the role-
+            // only hello regresses to a newer version.
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: RTLX_TEST_GAIN_COUNT,
+            }
+            .to_bytes();
+            sock.write_all(&header).unwrap();
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: Some(Role::Listen),
+                status: Status::Ok,
+                version: client_hello_version,
+            };
+            sock.write_all(&ext.to_bytes()).unwrap();
+            thread::sleep(RTLX_TEST_SERVER_HOLD);
+        });
+
+        let config = RtlTcpConfig {
+            data_read_timeout: RTLX_TEST_DATA_READ_TIMEOUT,
+            max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            // Only role is non-default; every other gate field
+            // stays at the vanilla-safe default. This pins the
+            // "role opt-in alone trips the hello" contract so a
+            // future refactor of `extension_enabled` can't
+            // silently drop the role from the gate list.
+            compression: CodecMask::NONE_ONLY,
+            request_takeover: false,
+            auth_key: None,
+            requested_role: Role::Listen,
+        };
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        src.start_manager().unwrap();
+
+        let hello = hello_rx
+            .recv_timeout(RTLX_TEST_STATE_DEADLINE)
+            .expect("server should receive hello within deadline");
+        // Magic bytes first — sanity-check we read a hello, not
+        // command framing.
+        assert_eq!(&hello[..EXTENSION_MAGIC.len()], &EXTENSION_MAGIC);
+        // Role byte (offset 5) must be `Role::Listen`.
+        assert_eq!(
+            hello[5],
+            Role::Listen as u8,
+            "Listen opt-in must encode Role::Listen at byte offset 5 (got 0x{:02x})",
+            hello[5],
+        );
+        // Flags byte (offset 6) must be zero — we didn't opt
+        // into takeover or auth, just role.
+        assert_eq!(hello[6], 0);
+
+        // Lock in the state-side contract: after the handshake
+        // completes, `ConnectionState::Connected.granted_role`
+        // must carry `Some(Role::Listen)` — the value the server
+        // wrote into `ServerExtension.granted_role` above. A
+        // regression in `attempt_connect` that drops the
+        // extension's `granted_role` on the floor would still
+        // pass the wire-byte assertions but would break the
+        // status-bar badge provenance (it would read `None` and
+        // hide the badge even when the server explicitly
+        // admitted us as a Listener). Poll with a bounded
+        // deadline since the state transition is driven by the
+        // manager thread. Per `CodeRabbit` round 2 on PR #408.
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut reached_connected_with_listen = false;
+        while Instant::now() < deadline {
+            if matches!(
+                src.connection_state(),
+                ConnectionState::Connected {
+                    granted_role: Some(Role::Listen),
+                    ..
+                }
+            ) {
+                reached_connected_with_listen = true;
+                break;
+            }
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(
+            reached_connected_with_listen,
+            "Connected state should retain the server-granted Listen role \
+             (final observed state: {:?})",
+            src.connection_state()
+        );
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_emits_control_role_by_default() {
+        // Complement to the Listen test above: the TRUE default
+        // path (fields all at `Default`) sends no hello at all,
+        // matching `rtl_tcp_default_config_sends_no_hello_to_vanilla_server`.
+        // The DEFAULT *role* is `Role::Control`, but the default
+        // config gate (`extension_enabled = false` because
+        // compression / takeover / auth / role are all default)
+        // means no hello is emitted on the wire.
+        //
+        // This test pins the "role defaults to Control" struct
+        // contract via `Default::default()` so a future typo or
+        // accidental swap (e.g. flipping the default to Listen)
+        // would trip here immediately.
+        let config = RtlTcpConfig::default();
+        assert_eq!(
+            config.requested_role,
+            Role::Control,
+            "Default for `requested_role` must be `Control` — legacy-safe behavior"
+        );
     }
 
     #[test]

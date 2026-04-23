@@ -122,6 +122,66 @@ pub trait Source: Send {
     fn set_looping(&mut self, _looping: bool) -> Result<(), SourceError> {
         Ok(())
     }
+
+    // ----------------------------------------------------------
+    //  RTL-TCP sticky-command replay snapshot (#396 round 3)
+    //
+    //  `RtlTcpSource` accumulates the latest value for each wire
+    //  command (gain, AGC, PPM, bias tee, direct sampling, etc.)
+    //  in its `SharedState` so reconnects replay those settings
+    //  onto the fresh stream and the server's view matches the
+    //  UI's. A controller-driven source REBUILD (manual retry
+    //  after an auth or takeover flow) destroys the old source
+    //  and constructs a new one — without these two hooks, the
+    //  new source starts with a blank replay cache and the user
+    //  loses gain / AGC / PPM / etc. until they touch each
+    //  control. These methods let the controller shuttle the
+    //  cache across the rebuild boundary without downcasting to
+    //  the concrete RtlTcpSource type. Default no-op so other
+    //  source impls ignore them entirely.
+    // ----------------------------------------------------------
+
+    /// Snapshot the RTL-TCP sticky-command replay cache. `None`
+    /// for every source except `RtlTcpSource`.
+    fn rtl_tcp_sticky_snapshot(&self) -> Option<RtlTcpStickySnapshot> {
+        None
+    }
+
+    /// Restore a previously-captured sticky-command replay cache
+    /// before `start()`. No-op for every source except
+    /// `RtlTcpSource`; the RTL-TCP impl seeds its internal
+    /// atomics so the next reconnect replays the saved values.
+    fn rtl_tcp_restore_sticky_snapshot(&mut self, _snapshot: &RtlTcpStickySnapshot) {}
+}
+
+/// Snapshot of `RtlTcpSource`'s sticky-command replay cache,
+/// plain `u32` fields so it can live in `sdr-pipeline` without
+/// forcing a dep on `sdr-source-network`. The atomics inside
+/// `SharedState` use `u32` bit representations throughout, so
+/// passing raw values through is semantically identical to
+/// copying the atomics themselves. Order + set must mirror
+/// `SharedState`'s sticky fields — dropping one here silently
+/// drops it across a rebuild.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RtlTcpStickySnapshot {
+    /// `replay_mask` bit-per-op sentinel — bit `i` set means op
+    /// `0x01 + i` has had at least one value recorded, and the
+    /// reconnect path should resend it.
+    pub replay_mask: u32,
+    pub last_center_freq_hz: u32,
+    pub last_sample_rate_hz: u32,
+    pub last_gain_mode: u32,
+    pub last_tuner_gain: u32,
+    pub last_ppm: u32,
+    pub last_agc_mode: u32,
+    pub last_direct_sampling: u32,
+    pub last_offset_tuning: u32,
+    pub last_bias_tee: u32,
+    pub last_gain_by_index: u32,
+    pub last_testmode: u32,
+    pub last_if_gain: u32,
+    pub last_rtl_xtal: u32,
+    pub last_tuner_xtal: u32,
 }
 
 /// Manages available IQ sources and the active source lifecycle.
