@@ -52,6 +52,14 @@ const VFO_RESET_BUTTON_MARGIN_PX: i32 = 8;
 /// Exponential moving average smoothing factor for `RunningAvg` mode.
 const AVERAGING_ALPHA: f32 = 0.3;
 
+/// Fraction of `max_span_hz` below which the click-to-tune diagnostic
+/// classifies the view as "zoomed in". Set slightly below 1.0 so tiny
+/// floating-point drift in the span arithmetic doesn't flip the
+/// classification on an unzoomed view. Per `CodeRabbit` round 1 on
+/// PR #418 — the threshold was previously a bare `0.99` literal inside
+/// the tracing call.
+const ZOOMED_IN_SPAN_RATIO_THRESHOLD: f64 = 0.99;
+
 /// Spectrum averaging mode for the FFT display.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AveragingMode {
@@ -675,7 +683,8 @@ fn attach_click_gesture(
             display_start_hz,
             display_end_hz,
             max_span_hz,
-            zoomed_in = (display_end_hz - display_start_hz) < max_span_hz * 0.99,
+            zoomed_in =
+                (display_end_hz - display_start_hz) < max_span_hz * ZOOMED_IN_SPAN_RATIO_THRESHOLD,
             offset_hz = offset,
             "click-to-tune: computed offset from pixel"
         );

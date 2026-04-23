@@ -1255,6 +1255,17 @@ typedef struct SdrRtlTcpDiscoveredServer {
     bool        has_txbuf;
     uint64_t    txbuf;
     double      last_seen_secs_ago;
+    /* ABI 0.19 (#400) — read-side TXT capability fields mirroring
+     * `SdrRtlTcpAdvertiseOptions.{has_codecs, codecs, has_auth_required,
+     * auth_required}` so FFI hosts can gate compression / takeover /
+     * role / auth-field reveal decisions against the same capability
+     * signals the server publishes. Zero-init defaults (has_* = false)
+     * map to "server didn't advertise this TXT key" — identical to
+     * how the parser already treats an absent key. */
+    bool        has_codecs;
+    uint8_t     codecs;
+    bool        has_auth_required;
+    bool        auth_required;
 } SdrRtlTcpDiscoveredServer;
 
 /*

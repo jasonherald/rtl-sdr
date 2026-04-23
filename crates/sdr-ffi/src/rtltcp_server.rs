@@ -451,6 +451,28 @@ fn listener_cap_from_c(listener_cap: u32) -> usize {
     }
 }
 
+/// Translate the C-ABI `has_compression` / `compression` pair
+/// into the Rust `ServerConfig::compression` `CodecMask`. The
+/// `has_*` gate is the zero-init-safe opt-in pattern (same as
+/// `has_txbuf` / `has_codecs` on [`SdrRtlTcpAdvertiseOptions`]):
+///
+/// - `has_compression = false` → `CodecMask::NONE_ONLY`, matching
+///   the pre-ABI-0.19 hardcoded behaviour.
+/// - `has_compression = true` → `CodecMask::from_wire(compression)`.
+///
+/// Extracted into its own helper (rather than inlined in
+/// `sdr_rtltcp_server_start`) so the ABI translation path is
+/// unit-testable without the hardware-backed start call.
+/// Matches the [`listener_cap_from_c`] / [`auth_key_from_c`]
+/// shape. Per `CodeRabbit` round 1 on PR #418, issue #400.
+fn compression_from_c(has_compression: bool, compression: u8) -> CodecMask {
+    if has_compression {
+        CodecMask::from_wire(compression)
+    } else {
+        CodecMask::NONE_ONLY
+    }
+}
+
 /// Outcome of [`auth_key_from_c`] — either the server should run
 /// without auth (`None` input, or `Some` with valid length) or
 /// the caller gave a bad pointer/length pair and
@@ -576,18 +598,11 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             }
         };
         // `compression` projects from the `has_compression` gate
-        // per #400 / ABI 0.19. Zero-init callers
-        // (`has_compression = false`) stay on `CodecMask::NONE_
-        // ONLY`, matching pre-#400 behaviour. A host that wants
-        // LZ4 sets `has_compression = true; compression = 0x03`
-        // and MUST also flip the matching bits on
-        // `SdrRtlTcpAdvertiseOptions.codecs` via mDNS so clients
-        // know the server accepts compression hellos.
-        let compression = if cfg.has_compression {
-            CodecMask::from_wire(cfg.compression)
-        } else {
-            CodecMask::NONE_ONLY
-        };
+        // per #400 / ABI 0.19. See [`compression_from_c`] for the
+        // full contract (zero-init default = `NONE_ONLY`,
+        // opt-in = `from_wire`). Extracted into the helper so
+        // the ABI promise has unit-test coverage.
+        let compression = compression_from_c(cfg.has_compression, cfg.compression);
         let server_cfg = ServerConfig {
             bind,
             device_index: cfg.device_index,
@@ -1292,6 +1307,27 @@ mod tests {
         // off-by-one that would have passed `listener_cap_from_c(1)
         // == 1` trivially.
         assert_eq!(listener_cap_from_c(7), 7);
+    }
+
+    #[test]
+    fn compression_from_c_zero_init_is_none_only() {
+        // ABI 0.19 default: `has_compression = false` + any
+        // `compression` byte → `NONE_ONLY`. This is the "pre-0.19
+        // caller with a zero-init struct stays on the legacy
+        // path" contract. Check both 0 and a non-zero raw byte
+        // to prove the `compression` field is ignored when the
+        // gate is false.
+        assert_eq!(compression_from_c(false, 0), CodecMask::NONE_ONLY);
+        assert_eq!(compression_from_c(false, 0x03), CodecMask::NONE_ONLY);
+    }
+
+    #[test]
+    fn compression_from_c_opt_in_passes_raw_wire_byte() {
+        // `has_compression = true` → `CodecMask::from_wire(byte)`.
+        // Verify both a `None-only` (0x01) round-trip and a
+        // `None + LZ4` (0x03) round-trip.
+        assert_eq!(compression_from_c(true, 0x01), CodecMask::NONE_ONLY);
+        assert_eq!(compression_from_c(true, 0x03), CodecMask::NONE_AND_LZ4);
     }
 
     #[test]

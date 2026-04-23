@@ -124,9 +124,17 @@ impl StatusBar {
     /// discoverable.
     pub fn update_frequency(&self, hz: f64) {
         self.frequency_label.set_label(&format_frequency(hz));
-        let antenna_text = crate::antenna::format_antenna_line(hz)
-            .unwrap_or_else(|| DEFAULT_ANTENNA_TEXT.to_string());
-        self.antenna_label.set_label(&antenna_text);
+        // Matched rather than `.unwrap_or_else(|| .to_string())`
+        // so the no-render branch passes the `&'static str`
+        // `DEFAULT_ANTENNA_TEXT` directly — no `String`
+        // allocation per update. Matters on VFO-drag retune
+        // storms where this fires at GTK mouse-event cadence.
+        // Per `CodeRabbit` round 1 on PR #418.
+        if let Some(antenna_text) = crate::antenna::format_antenna_line(hz) {
+            self.antenna_label.set_label(&antenna_text);
+        } else {
+            self.antenna_label.set_label(DEFAULT_ANTENNA_TEXT);
+        }
     }
 
     /// Update the `rtl_tcp` role badge. `Some(RtlTcpRoleBadge::
