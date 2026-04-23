@@ -394,14 +394,40 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<(ServerConfig, DiscoveryOptio
 /// remember, no URL-safety concerns, easy to generate with
 /// `openssl rand -hex 32`. #394.
 fn parse_auth_key_hex(s: &str) -> Result<Vec<u8>, ParseError> {
-    if s.is_empty() || !s.len().is_multiple_of(2) {
+    /// Number of hex chars per raw byte — two. Pulled out so the
+    /// `chunks_exact` call reads intent-first instead of bare `2`.
+    const HEX_CHARS_PER_BYTE: usize = 2;
+
+    // Reject non-ASCII BEFORE any byte-index slicing. A 4-byte
+    // emoji like "💩" passes `len().is_multiple_of(2)` but
+    // indexing `&s[i..i+2]` on a UTF-8 str would panic at the
+    // non-char-boundary offset. `is_ascii()` fast-paths on the
+    // first non-ASCII byte without a full scan. Per `CodeRabbit`
+    // round 1 on PR #405.
+    if s.is_empty() || !s.is_ascii() || !s.len().is_multiple_of(HEX_CHARS_PER_BYTE) {
         return Err(ParseError);
     }
-    let bytes: Result<Vec<u8>, _> = (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+    // With ASCII confirmed, the string is also a valid byte
+    // slice — `chunks_exact(2)` walks pairs without str-slicing
+    // boundary concerns. Per-char hex-digit validation keeps
+    // the error surface narrow (same "bad input" signal for
+    // "not hex" and "not ASCII").
+    let bytes: Result<Vec<u8>, ParseError> = s
+        .as_bytes()
+        .chunks_exact(HEX_CHARS_PER_BYTE)
+        .map(|pair| {
+            let hi = char::from(pair[0]).to_digit(16).ok_or(ParseError)?;
+            let lo = char::from(pair[1]).to_digit(16).ok_or(ParseError)?;
+            // `to_digit(16)` only returns 0..=15, so `hi << 4 | lo`
+            // fits in u8. The `as u8` is lossless here.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "to_digit(16) bounds hi and lo to 0..=15"
+            )]
+            Ok(((hi << 4) | lo) as u8)
+        })
         .collect();
-    let bytes = bytes.map_err(|_| ParseError)?;
+    let bytes = bytes?;
     // Upper bound matches the wire-format `MAX_AUTH_KEY_LEN`. A
     // CLI-supplied key beyond that would fail at
     // `AuthKeyMessage::to_bytes` anyway; reject here so the
@@ -765,6 +791,22 @@ mod tests {
         // 'z' isn't a valid hex digit.
         let args = ["--auth-key", "zzzzzzzz"];
         assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn parse_args_auth_key_rejects_non_ascii() {
+        // **Regression test for `CodeRabbit` round 1 on PR #405.**
+        // Non-ASCII input must fail cleanly instead of panicking
+        // on UTF-8 byte-boundary slicing. 4-byte emojis like
+        // "💩" pass `len().is_multiple_of(2)` (`len() == 4`), so
+        // the early-exit length check alone wouldn't catch it;
+        // the `is_ascii()` guard in `parse_auth_key_hex` does.
+        let args = ["--auth-key", "💩"];
+        assert!(parse_args(&args).is_err());
+
+        // Mix of ASCII hex + non-ASCII also rejected.
+        let mixed_args = ["--auth-key", "ab💩cd"];
+        assert!(parse_args(&mixed_args).is_err());
     }
 
     #[test]

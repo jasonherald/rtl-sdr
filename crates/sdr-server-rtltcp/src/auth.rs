@@ -75,6 +75,18 @@ pub fn generate_random_auth_key() -> Vec<u8> {
 /// the return duration is a function of `min(lenA, lenB)` only.
 #[must_use]
 pub fn validate_auth_key(provided: &[u8], expected: &[u8]) -> bool {
+    // Empty keys are rejected at every layer of the auth gate
+    // — wire format, FFI translator, and here. Defense in depth:
+    // if an upstream layer ever regresses and hands us an empty
+    // `expected` (misconfigured `ServerConfig { auth_key:
+    // Some(vec![]) }` constructed by hand, say), this check
+    // makes sure the validator doesn't silently accept every
+    // peer with a matching-empty provided. `ct_eq(empty, empty)`
+    // would otherwise return `true` and defeat the gate. Per
+    // `CodeRabbit` round 1 on PR #405.
+    if provided.is_empty() || expected.is_empty() {
+        return false;
+    }
     // `ConstantTimeEq::ct_eq` returns a `Choice` (wire byte 1 or
     // 0) that we convert to `bool` via `Into::into`. The length-
     // mismatch check is intentionally NOT constant-time — a
@@ -155,29 +167,44 @@ mod tests {
 
     #[test]
     fn validate_auth_key_rejects_empty_vs_empty() {
-        // Empty keys should never be accepted by the server even
-        // if both sides are empty — the wire format rejects
-        // zero-length `AuthKeyMessage`s at parse time, so this
-        // state shouldn't be reachable in practice, but
-        // defense-in-depth: if it is reached, reject.
-        //
-        // Actually — `ct_eq` of two empty slices returns `true`,
-        // which is mathematically consistent but NOT what we
-        // want for an auth gate (empty provided = empty expected
-        // would bypass). We rely on upstream (`AuthKeyMessage`
-        // parse + server config loader) to never pass empty
-        // slices to this function. Documenting the assumption
-        // here so the assumption chain stays explicit.
-        //
-        // If the upstream guard ever breaks, this test would
-        // PASS (because ct_eq of empties is true), not fail —
-        // which is why the real defense is at the wire-format
-        // layer, not here. Leaving the test as documentation.
+        // Defense-in-depth: empty keys are rejected at every
+        // layer of the auth gate. The wire format rejects
+        // zero-length `AuthKeyMessage`s at parse time and the
+        // FFI translator rejects `auth_key_len == 0` with
+        // non-null pointer — but a direct `ServerConfig {
+        // auth_key: Some(vec![]) }` construction could slip a
+        // naked empty Vec through. The validator's own empty
+        // guard means that even in that pathological case, no
+        // peer authenticates. Per `CodeRabbit` round 1 on
+        // PR #405 — the previous test documented the
+        // `ct_eq(empty, empty) == true` invariant as an
+        // assumption-chain note; that's now a real guard.
         let empty_a: Vec<u8> = Vec::new();
         let empty_b: Vec<u8> = Vec::new();
-        // This IS true; the test documents the invariant, not
-        // the surface behavior callers should rely on.
-        assert!(validate_auth_key(&empty_a, &empty_b));
+        assert!(
+            !validate_auth_key(&empty_a, &empty_b),
+            "validator must reject empty-vs-empty (defense in depth)"
+        );
+    }
+
+    #[test]
+    fn validate_auth_key_rejects_empty_provided() {
+        // Client sends zero-length key against a non-empty
+        // expected — should be rejected. Covers the wire-path
+        // regression where a bad parser hands us Vec::new() as
+        // the provided key.
+        let provided: Vec<u8> = Vec::new();
+        let expected = vec![0xAA, 0xBB];
+        assert!(!validate_auth_key(&provided, &expected));
+    }
+
+    #[test]
+    fn validate_auth_key_rejects_empty_expected() {
+        // Server config mistakenly carries an empty key (should
+        // have been caught upstream, but defense in depth).
+        let provided = vec![0xAA, 0xBB];
+        let expected: Vec<u8> = Vec::new();
+        assert!(!validate_auth_key(&provided, &expected));
     }
 
     #[test]

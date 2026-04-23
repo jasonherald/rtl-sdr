@@ -51,7 +51,7 @@ use crate::dispatch::dispatch;
 use crate::error::ServerError;
 use crate::extension::{
     AUTH_KEY_HEADER_LEN, AUTH_REPLY_TIMEOUT, AuthKeyMessage, CLIENT_HELLO_LEN, ClientHello,
-    EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension, Status,
+    EXTENSION_MAGIC, PROTOCOL_VERSION_V1, Role, ServerExtension, Status,
 };
 use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode};
 
@@ -736,7 +736,7 @@ fn spawn_client_workers(
     //   - `negotiated_codec` is `None` for vanilla (always
     //     uncompressed); `Some(_)` for RTLX clients — the
     //     intersection of their mask and ours
-    let (hello_seen, requested_role, request_takeover, has_auth, negotiated_codec) =
+    let (hello_seen, requested_role, request_takeover, has_auth, hello_version, negotiated_codec) =
         if let Some(hello) = &sniff_outcome {
             let codec = compression_offer.pick(hello.codec_mask);
             let takeover = hello.request_takeover();
@@ -749,9 +749,17 @@ fn spawn_client_workers(
                 requested_role = ?hello.role,
                 request_takeover = takeover,
                 has_auth,
+                hello_version = hello.version,
                 "rtl_tcp extended-handshake negotiated"
             );
-            (true, hello.role, takeover, has_auth, Some(codec))
+            (
+                true,
+                hello.role,
+                takeover,
+                has_auth,
+                hello.version,
+                Some(codec),
+            )
         } else {
             tracing::debug!(
                 %peer,
@@ -766,7 +774,18 @@ fn spawn_client_workers(
             // never carry an AuthKeyMessage follow-up, so `false`
             // here routes the auth gate's vanilla+auth-required
             // path to a bare TCP FIN (they can't authenticate).
-            (false, Role::Control, false, false, None)
+            // Vanilla clients never receive a `ServerExtension`
+            // either, so `hello_version` is nominal here — use
+            // `PROTOCOL_VERSION_V1` as a neutral default; it's
+            // never written to the wire on the vanilla path.
+            (
+                false,
+                Role::Control,
+                false,
+                false,
+                PROTOCOL_VERSION_V1,
+                None,
+            )
         };
     let codec = negotiated_codec.unwrap_or(Codec::None);
 
@@ -814,7 +833,13 @@ fn spawn_client_workers(
                             %peer,
                             "rtl_tcp auth key mismatch — denying client"
                         );
-                        send_denied_response(&stream, peer, &device, Status::AuthFailed);
+                        send_denied_response(
+                            &stream,
+                            peer,
+                            &device,
+                            Status::AuthFailed,
+                            hello_version,
+                        );
                         return;
                     }
                     tracing::info!(%peer, "rtl_tcp auth key validated");
@@ -837,7 +862,7 @@ fn spawn_client_workers(
                     "rtl_tcp auth key follow-up unreadable — denying client"
                 );
                 if auth_key.is_some() {
-                    send_denied_response(&stream, peer, &device, Status::AuthFailed);
+                    send_denied_response(&stream, peer, &device, Status::AuthFailed, hello_version);
                 }
                 // If auth wasn't required but the client promised
                 // a follow-up (has_auth=true) and didn't deliver,
@@ -855,7 +880,7 @@ fn spawn_client_workers(
                 %peer,
                 "rtl_tcp auth required but client didn't send key — denying with AuthRequired"
             );
-            send_denied_response(&stream, peer, &device, Status::AuthRequired);
+            send_denied_response(&stream, peer, &device, Status::AuthRequired, hello_version);
         } else {
             // Vanilla client: can't authenticate, so there's
             // nothing meaningful to tell them. Bare TCP FIN.
@@ -913,7 +938,13 @@ fn spawn_client_workers(
             // handing them a dongle_info_t they'd interpret as
             // admission.
             if hello_seen {
-                send_denied_response(&stream, peer, &device, Status::ControllerBusy);
+                send_denied_response(
+                    &stream,
+                    peer,
+                    &device,
+                    Status::ControllerBusy,
+                    hello_version,
+                );
             }
             return;
         }
@@ -935,7 +966,13 @@ fn spawn_client_workers(
                 "vanilla clients should never land in ListenerCapReached"
             );
             if hello_seen {
-                send_denied_response(&stream, peer, &device, Status::ListenerCapReached);
+                send_denied_response(
+                    &stream,
+                    peer,
+                    &device,
+                    Status::ListenerCapReached,
+                    hello_version,
+                );
             }
             return;
         }
@@ -1006,7 +1043,11 @@ fn spawn_client_workers(
             codec,
             granted_role: Some(requested_role),
             status: Status::Ok,
-            version: PROTOCOL_VERSION,
+            // Echo the client's hello version on the response so
+            // v1 clients interoperate with this v2-era server
+            // without hitting the peer-side strict version gate.
+            // Per `CodeRabbit` round 1 on PR #405.
+            version: hello_version,
         };
         if let Err(e) = writer.write_all(&ext.to_bytes()) {
             tracing::warn!(%peer, %e, "failed to send RTLX server extension — client gone");
@@ -1129,6 +1170,7 @@ fn send_denied_response(
     peer: SocketAddr,
     device: &Arc<Mutex<RtlSdrDevice>>,
     status: Status,
+    hello_version: u8,
 ) {
     let Ok(dev) = device.lock() else {
         tracing::warn!(%peer, "device mutex poisoned during denial response");
@@ -1165,7 +1207,10 @@ fn send_denied_response(
         codec: Codec::None,
         granted_role: None,
         status,
-        version: PROTOCOL_VERSION,
+        // Echo the client's hello version so v1 clients can
+        // parse this denial without tripping their strict
+        // version gate. Per `CodeRabbit` round 1 on PR #405.
+        version: hello_version,
     };
     if writer.write_all(&ext.to_bytes()).is_err() {
         tracing::debug!(
@@ -2013,7 +2058,13 @@ mod tests {
         // body) + the wire-format round-trip.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let key_bytes = b"test-key-32-bytes-exactly--abcdef".to_vec();
+        // Exactly 32 bytes — matches the canonical
+        // `DEFAULT_AUTH_KEY_LEN` used by `generate_random_auth_key`
+        // so the fixture shape tracks production size. The ASCII
+        // label makes test log output readable while keeping the
+        // bytes well within the `1..=MAX_AUTH_KEY_LEN` window.
+        let key_bytes = b"test-key-32-bytes-exactly-abcdef".to_vec();
+        debug_assert_eq!(key_bytes.len(), 32);
         let msg = AuthKeyMessage {
             key: key_bytes.clone(),
         };
@@ -2321,7 +2372,7 @@ mod tests {
         // returns `Ok(Some)` with the parsed struct. Regression
         // guard against a future refactor breaking the common case.
         use crate::codec::CodecMask;
-        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, Role};
+        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, PROTOCOL_VERSION, Role};
         let hello = ClientHello {
             codec_mask: CodecMask::NONE_AND_LZ4,
             role: Role::Control,
@@ -2411,7 +2462,7 @@ mod tests {
         // `EXTENSION_MAGIC`, so a fragmented magic still reaches
         // the full `read_exact` path.
         use crate::codec::CodecMask;
-        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, Role};
+        use crate::extension::{CLIENT_HELLO_FLAGS_NONE, PROTOCOL_VERSION, Role};
         let hello = ClientHello {
             codec_mask: CodecMask::NONE_AND_LZ4,
             role: Role::Control,
@@ -2533,7 +2584,7 @@ mod tests {
         garbled[4] = 0x03; // codec mask (NONE+LZ4)
         garbled[5] = 0x99; // invalid role — from_bytes returns None
         garbled[6] = 0x00; // flags
-        garbled[7] = PROTOCOL_VERSION;
+        garbled[7] = crate::extension::PROTOCOL_VERSION;
         let result = run_sniff_against(move |mut client| {
             client.write_all(&garbled).unwrap();
             thread::sleep(Duration::from_millis(50));

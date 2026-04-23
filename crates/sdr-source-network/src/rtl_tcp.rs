@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 use sdr_pipeline::source_manager::Source;
 use sdr_server_rtltcp::codec::{Codec, CodecMask, Decoder};
 use sdr_server_rtltcp::extension::{
-    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role,
-    SERVER_EXTENSION_LEN, ServerExtension, Status,
+    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, Role, SERVER_EXTENSION_LEN,
+    ServerExtension, Status,
 };
 use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
 use sdr_types::{Complex, SourceError};
@@ -872,6 +872,13 @@ struct HandshakeOutcome {
     codec: Codec,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "connect flow is linear — TCP connect + RTLX handshake + \
+              auth pre-build + dongle_info_t + ServerExtension + state \
+              publish. Splitting would scatter the error-mapping glue \
+              that's the whole point of this function."
+)]
 fn attempt_connect(
     host: &str,
     port: u16,
@@ -946,6 +953,35 @@ fn attempt_connect(
             // to request it. #394.
             flags |= sdr_server_rtltcp::extension::FLAG_HAS_AUTH;
         }
+        // Pre-build AND validate the auth payload BEFORE any
+        // writes hit the socket. Two reasons (`CodeRabbit` round 1
+        // on PR #405):
+        //
+        // 1. An invalid `auth_key` (empty or > `MAX_AUTH_KEY_LEN`)
+        //    caught at `AuthKeyMessage::to_bytes` must surface
+        //    as a config error BEFORE the hello lands on the
+        //    wire. Otherwise we'd send the hello, discover the
+        //    key is bad, and abort — leaving a pre-#394 server
+        //    stuck reading bytes we never sent (or mis-parsing
+        //    the hello as a legacy command prefix).
+        // 2. All-or-nothing semantics — the server either sees
+        //    the full extended handshake (hello + auth) or
+        //    nothing at all. No partial-write state.
+        let auth_payload: Option<Vec<u8>> = if let Some(key) = &config.auth_key {
+            let msg = sdr_server_rtltcp::extension::AuthKeyMessage { key: key.clone() };
+            Some(msg.to_bytes().ok_or_else(|| {
+                SourceError::Protocol(format!(
+                    "RtlTcpConfig.auth_key length {} invalid for AuthKeyMessage (must be \
+                     1..={MAX}; 32-byte URL-safe base64 is the canonical server-\
+                     generated shape)",
+                    key.len(),
+                    MAX = sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN,
+                ))
+            })?)
+        } else {
+            None
+        };
+
         let hello = ClientHello {
             codec_mask: config.compression,
             // sdr-rs clients always request Control on connect;
@@ -954,33 +990,25 @@ fn attempt_connect(
             // opt-in that isn't part of #393's scope.
             role: Role::Control,
             flags,
-            version: PROTOCOL_VERSION,
+            // Pick the MINIMUM viable protocol version for this
+            // hello's feature set. Compression-only / takeover-
+            // only / plain hellos emit v1 (back-compat with
+            // pre-#394 servers that haven't widened their version
+            // gate). Auth-bearing hellos emit v2 so pre-#394
+            // servers reject at parse time instead of accepting
+            // the hello and then mis-reading the queued
+            // `AuthKeyMessage` bytes as legacy commands. Per
+            // `CodeRabbit` round 1 on PR #405.
+            version: sdr_server_rtltcp::extension::required_protocol_version(flags),
         };
         if let Err(e) = (&stream).write_all(&hello.to_bytes()) {
             return Err(SourceError::Io(e));
         }
-
-        // Auth-key follow-up (#394 eager path). When configured,
-        // the AuthKeyMessage lands immediately after the hello
-        // — the server has already seen `FLAG_HAS_AUTH` set and
-        // is in the "read auth follow-up" state. Message format:
-        // 4-byte `RTKA` magic + 2-byte u16 BE length + key bytes.
-        // `AuthKeyMessage::to_bytes` returns `None` on empty or
-        // over-max keys; we surface that as a clear protocol
-        // error since the caller's config is busted — rather
-        // than write nothing and have the server stall on
-        // `read_exact`.
-        if let Some(key) = &config.auth_key {
-            let msg = sdr_server_rtltcp::extension::AuthKeyMessage { key: key.clone() };
-            let wire = msg.to_bytes().ok_or_else(|| {
-                SourceError::Protocol(format!(
-                    "RtlTcpConfig.auth_key length {} invalid for AuthKeyMessage (must be \
-                     1..={MAX}; 32-byte URL-safe base64 is the canonical server-\
-                     generated shape)",
-                    key.len(),
-                    MAX = sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN,
-                ))
-            })?;
+        // Auth follow-up (#394 eager path). Pre-built above so
+        // local validation precedes any socket write; server
+        // reads these bytes in the same receive-buffer position
+        // without a round-trip to request them.
+        if let Some(wire) = auth_payload {
             if let Err(e) = (&stream).write_all(&wire) {
                 return Err(SourceError::Io(e));
             }
@@ -1548,6 +1576,13 @@ impl Source for RtlTcpSource {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    // Tests build `ServerExtension` / `ClientHello` values with
+    // explicit `version: PROTOCOL_VERSION`. Lib code itself
+    // picks versions via `required_protocol_version` and no
+    // longer needs the constant at the top of the file; the
+    // test-scope import keeps clippy's `unused_imports` lint
+    // happy on the lib target.
+    use sdr_server_rtltcp::extension::PROTOCOL_VERSION;
     use std::net::TcpListener;
     // `CLIENT_HELLO_LEN` is only consumed by the loopback fixtures
     // in the RTLX handshake tests below — keep it in test scope

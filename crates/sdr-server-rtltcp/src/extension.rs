@@ -73,11 +73,56 @@ pub const CLIENT_HELLO_LEN: usize = 8;
 /// Serialized size of [`ServerExtension`] on the wire.
 pub const SERVER_EXTENSION_LEN: usize = 8;
 
-/// Current protocol schema version for both hello and response.
-/// Bumped only on breaking layout changes — adding codecs or
-/// status codes is additive and doesn't require a version bump
-/// because the over-the-wire bytes keep their positions.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Protocol schema version **1** — the original (#307) shape.
+/// Callers that only opt into compression or role (#392) / takeover
+/// (#393) emit this version: the features are additive within the
+/// same 8-byte hello layout and pre-auth servers handle them
+/// without knowing about `FLAG_HAS_AUTH` or the
+/// `AuthKeyMessage` follow-up.
+pub const PROTOCOL_VERSION_V1: u8 = 1;
+
+/// Protocol schema version **2** — introduced in #394 for
+/// pre-shared-key auth. Clients that set [`FLAG_HAS_AUTH`] MUST
+/// emit this version so pre-v2 servers reject the hello cleanly
+/// at parse time rather than accepting it and then reading the
+/// queued `AuthKeyMessage` bytes as garbage legacy commands. The
+/// wire layout is byte-for-byte identical to v1; the version
+/// field is the gate, not a different shape. Per `CodeRabbit`
+/// round 1 on PR #405.
+pub const PROTOCOL_VERSION_V2: u8 = 2;
+
+/// Newest protocol schema version this crate emits. Clients that
+/// need the latest features (auth) write this. Clients that don't
+/// — compression-only, takeover-only, or plain — write
+/// [`PROTOCOL_VERSION_V1`] to stay backward-compatible with
+/// older servers. Bumping this is a breaking wire change, so it
+/// happens at well-known sub-issue boundaries.
+pub const PROTOCOL_VERSION: u8 = PROTOCOL_VERSION_V2;
+
+/// Versions this crate accepts on parse paths
+/// ([`ClientHello::from_bytes`], [`ServerExtension::from_bytes`]).
+/// Widens as new versions are introduced so old peers continue to
+/// interoperate with new peers for the feature subset they share.
+/// A v1 client talking to a v2 server sends a v1 hello, server
+/// accepts (this array includes v1), server echoes v1 on the
+/// response. Per `CodeRabbit` round 1 on PR #405.
+pub const SUPPORTED_VERSIONS: &[u8] = &[PROTOCOL_VERSION_V1, PROTOCOL_VERSION_V2];
+
+/// Pick the minimum-viable protocol version for a hello that
+/// carries the given flags. Clients use this helper so they only
+/// bump the version when a feature actually requires it —
+/// compression-only / takeover-only hellos stay v1 (backward-
+/// compat with pre-#394 servers); auth-bearing hellos go v2
+/// (pre-#394 servers reject cleanly at parse time). Per
+/// `CodeRabbit` round 1 on PR #405.
+#[must_use]
+pub fn required_protocol_version(flags: u8) -> u8 {
+    if flags & FLAG_HAS_AUTH != 0 {
+        PROTOCOL_VERSION_V2
+    } else {
+        PROTOCOL_VERSION_V1
+    }
+}
 
 /// Role a client is requesting (or that the server granted).
 /// Reserved values — #307 only ever uses [`Self::Control`]; #392
@@ -211,23 +256,29 @@ impl ClientHello {
     }
 
     /// Parse from its 8-byte wire representation. Returns `None`
-    /// if the magic doesn't match, the schema version doesn't
-    /// match [`PROTOCOL_VERSION`], or the role byte is unknown.
+    /// if the magic doesn't match, the schema version isn't in
+    /// [`SUPPORTED_VERSIONS`], or the role byte is unknown.
     /// Callers surface `None` as a protocol error and drop the
     /// client — letting a peer built for a future wire layout
     /// through would cause silent mis-negotiation rather than a
-    /// clean version break. Per CodeRabbit round 3 on PR #399.
+    /// clean version break.
+    ///
+    /// Version gate widened from the #399-era strict `==
+    /// PROTOCOL_VERSION` check to accept any member of
+    /// `SUPPORTED_VERSIONS`. Ensures pre-#394 clients emitting
+    /// v1 hellos interoperate with this crate's v2-era servers:
+    /// v1 is still a first-class parse result, only the wire
+    /// layout stayed identical and the flag byte's
+    /// `FLAG_HAS_AUTH` is only meaningful when `version ==
+    /// PROTOCOL_VERSION_V2`. Per `CodeRabbit` round 3 on PR #399
+    /// (initial strict gate) + round 1 on PR #405 (widen for
+    /// multi-version support).
     #[must_use]
     pub fn from_bytes(bytes: &[u8; CLIENT_HELLO_LEN]) -> Option<Self> {
         if bytes[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
             return None;
         }
-        // Version gate is strict: peers built against a newer
-        // layout must be rejected, not silently parsed as v1.
-        // If we ever bump PROTOCOL_VERSION we'll add a wider
-        // accept-set here (e.g., `matches!(bytes[7], 1 | 2)`)
-        // once both sides of the upgrade have shipped.
-        if bytes[7] != PROTOCOL_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&bytes[7]) {
             return None;
         }
         let role = Role::from_wire(bytes[5])?;
@@ -434,21 +485,20 @@ impl ServerExtension {
     }
 
     /// Parse from its 8-byte wire representation. Returns `None`
-    /// when the magic doesn't match, the schema version doesn't
-    /// match [`PROTOCOL_VERSION`], or any enum-typed byte is
-    /// unknown. Callers surface `None` as a protocol error and
-    /// drop the connection — a peer built for a future wire
-    /// layout should trigger a clean version break rather than
-    /// silent mis-negotiation as v1. Per CodeRabbit round 3 on
-    /// PR #399.
+    /// when the magic doesn't match, the schema version isn't in
+    /// [`SUPPORTED_VERSIONS`], or any enum-typed byte is unknown.
+    /// Callers surface `None` as a protocol error and drop the
+    /// connection — a peer built for a future wire layout should
+    /// trigger a clean version break rather than silent mis-
+    /// negotiation. Per `CodeRabbit` round 3 on PR #399 (initial
+    /// strict gate) + round 1 on PR #405 (widen for
+    /// multi-version support).
     #[must_use]
     pub fn from_bytes(bytes: &[u8; SERVER_EXTENSION_LEN]) -> Option<Self> {
         if bytes[..EXTENSION_MAGIC.len()] != EXTENSION_MAGIC {
             return None;
         }
-        // Strict version gate — see the matching comment in
-        // `ClientHello::from_bytes`.
-        if bytes[7] != PROTOCOL_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&bytes[7]) {
             return None;
         }
         let codec = Codec::from_wire(bytes[4])?;
@@ -509,18 +559,81 @@ mod tests {
 
     #[test]
     fn client_hello_rejects_unknown_version() {
-        // Regression test for CodeRabbit round 3 on PR #399: a
-        // future peer that bumps the wire layout must be rejected
-        // so we don't silently mis-negotiate it as v1. Otherwise
-        // `PROTOCOL_VERSION` is dead metadata and a clean protocol
-        // break turns into a subtle runtime bug.
+        // Regression test for `CodeRabbit` round 3 on PR #399:
+        // a future peer that bumps the wire layout must be
+        // rejected so we don't silently mis-negotiate it as v1.
+        // Updated for PR #405: supported set is now {v1, v2}, so
+        // the first rejected value is v3. Version byte zero is
+        // also rejected (guards against uninitialized struct
+        // slipping through).
         let mut bytes = [0u8; CLIENT_HELLO_LEN];
         bytes[..4].copy_from_slice(&EXTENSION_MAGIC);
         bytes[4] = CodecMask::NONE_ONLY.to_wire();
         bytes[5] = Role::Control.to_wire();
         bytes[6] = 0;
-        bytes[7] = PROTOCOL_VERSION.wrapping_add(1);
+        // v3 is not in SUPPORTED_VERSIONS → rejected.
+        bytes[7] = PROTOCOL_VERSION_V2 + 1;
         assert!(ClientHello::from_bytes(&bytes).is_none());
+        // v0 is the uninitialized-struct sentinel → rejected.
+        bytes[7] = 0;
+        assert!(ClientHello::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn client_hello_accepts_both_supported_versions() {
+        // **Regression test for `CodeRabbit` round 1 on PR #405.**
+        // The version gate widened from strict `== PROTOCOL_VERSION`
+        // to `SUPPORTED_VERSIONS.contains(..)` so pre-#394 v1
+        // clients can still hand a hello to a post-#394 v2 server
+        // without the server rejecting them. Pins both members
+        // of the supported set.
+        let base = ClientHello {
+            codec_mask: CodecMask::NONE_ONLY,
+            role: Role::Control,
+            flags: CLIENT_HELLO_FLAGS_NONE,
+            version: PROTOCOL_VERSION_V1,
+        };
+        let v1_bytes = base.to_bytes();
+        assert_eq!(
+            ClientHello::from_bytes(&v1_bytes).map(|h| h.version),
+            Some(PROTOCOL_VERSION_V1),
+            "v1 hello must be accepted for pre-#394 client back-compat"
+        );
+
+        let v2 = ClientHello {
+            version: PROTOCOL_VERSION_V2,
+            ..base
+        };
+        let v2_bytes = v2.to_bytes();
+        assert_eq!(
+            ClientHello::from_bytes(&v2_bytes).map(|h| h.version),
+            Some(PROTOCOL_VERSION_V2),
+            "v2 hello must be accepted for #394-aware clients"
+        );
+    }
+
+    #[test]
+    fn required_protocol_version_picks_minimum_viable() {
+        // Helper contract: only bump to v2 when the hello
+        // carries auth. Plain / compression / takeover hellos
+        // stay v1 so pre-#394 servers continue to accept them.
+        assert_eq!(
+            required_protocol_version(CLIENT_HELLO_FLAGS_NONE),
+            PROTOCOL_VERSION_V1
+        );
+        assert_eq!(
+            required_protocol_version(FLAG_REQUEST_TAKEOVER),
+            PROTOCOL_VERSION_V1
+        );
+        assert_eq!(
+            required_protocol_version(FLAG_HAS_AUTH),
+            PROTOCOL_VERSION_V2
+        );
+        assert_eq!(
+            required_protocol_version(FLAG_HAS_AUTH | FLAG_REQUEST_TAKEOVER),
+            PROTOCOL_VERSION_V2,
+            "takeover + auth together still needs v2 (any auth bit forces v2)"
+        );
     }
 
     #[test]
@@ -575,7 +688,8 @@ mod tests {
         bytes[4] = Codec::None.to_wire();
         bytes[5] = Role::Control.to_wire();
         bytes[6] = Status::Ok.to_wire();
-        bytes[7] = PROTOCOL_VERSION.wrapping_add(1);
+        // v3 is outside SUPPORTED_VERSIONS → rejected.
+        bytes[7] = PROTOCOL_VERSION_V2 + 1;
         assert!(ServerExtension::from_bytes(&bytes).is_none());
     }
 
