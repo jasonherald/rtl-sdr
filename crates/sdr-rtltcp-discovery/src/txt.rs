@@ -47,6 +47,19 @@ pub struct TxtRecord {
     /// independent of the server crate; the caller converts to /
     /// from `CodecMask` at the boundary.
     pub codecs: Option<u8>,
+
+    /// Whether the server requires pre-shared-key auth (#394).
+    /// `Some(true)` → serialized as `auth_required=true` so clients
+    /// can prompt for a key BEFORE dispatching connect. `None` or
+    /// `Some(false)` → key omitted entirely; clients treat absence
+    /// as "auth not required" (matches the #394 "LAN-only trust
+    /// model continues to work as today" default). Kept as an
+    /// `Option<bool>` rather than `bool` so "unknown" (older
+    /// advertiser didn't publish the field) is distinguishable
+    /// from "explicitly off" at the parser level — both are safe
+    /// to treat as no-auth, but logging can note the difference
+    /// for troubleshooting. Per #395.
+    pub auth_required: Option<bool>,
 }
 
 impl TxtRecord {
@@ -71,6 +84,13 @@ impl TxtRecord {
         }
         if let Some(c) = self.codecs {
             insert_checked(&mut m, "codecs", &c.to_string())?;
+        }
+        // Only emit `auth_required` when explicitly true. `None` and
+        // `Some(false)` both leave the key off the wire — clients
+        // default to "no auth required" on absence, which matches
+        // the pre-#394 deployment behavior. Per #395.
+        if self.auth_required == Some(true) {
+            insert_checked(&mut m, "auth_required", "true")?;
         }
         let total: usize = m.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
         if total > Self::MAX_TOTAL_BYTES {
@@ -98,6 +118,7 @@ impl TxtRecord {
         let mut nickname = String::new();
         let mut txbuf: Option<usize> = None;
         let mut codecs: Option<u8> = None;
+        let mut auth_required: Option<bool> = None;
         for (k, v) in properties {
             match k.as_ref() {
                 "tuner" => tuner = v.as_ref().to_string(),
@@ -106,6 +127,16 @@ impl TxtRecord {
                 "nickname" => nickname = v.as_ref().to_string(),
                 "txbuf" => txbuf = v.as_ref().parse().ok(),
                 "codecs" => codecs = v.as_ref().parse().ok(),
+                // Parse any of the common truthy spellings as `true`.
+                // Anything else (including the literal string "false")
+                // becomes `Some(false)` so the parser round-trips
+                // explicit-false in case a future server wants to
+                // publish it. Absence stays `None`.
+                "auth_required" => {
+                    let raw = v.as_ref();
+                    auth_required =
+                        Some(matches!(raw.to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
+                }
                 _ => {
                     tracing::trace!(
                         key = %k.as_ref(),
@@ -121,6 +152,7 @@ impl TxtRecord {
             nickname,
             txbuf,
             codecs,
+            auth_required,
         }
     }
 }
@@ -163,6 +195,7 @@ mod tests {
             // avoided referencing the server crate here to keep the
             // discovery crate's test independent.
             codecs: Some(0b11),
+            auth_required: None,
         }
     }
 
@@ -208,6 +241,76 @@ mod tests {
         assert_eq!(r.nickname, "");
         assert_eq!(r.txbuf, None);
         assert_eq!(r.codecs, None);
+        assert_eq!(r.auth_required, None);
+    }
+
+    #[test]
+    fn to_properties_emits_auth_required_only_when_true() {
+        // Matches the #395 contract: only `Some(true)` lands on the
+        // wire. `None` and `Some(false)` both omit the key so clients
+        // default to "no auth" on absence (the pre-#394 deployment
+        // behavior).
+        let mut r = sample();
+        r.auth_required = Some(true);
+        let props = r.to_properties().unwrap();
+        assert_eq!(
+            props.get("auth_required").map(String::as_str),
+            Some("true")
+        );
+
+        r.auth_required = Some(false);
+        let props = r.to_properties().unwrap();
+        assert!(!props.contains_key("auth_required"));
+
+        r.auth_required = None;
+        let props = r.to_properties().unwrap();
+        assert!(!props.contains_key("auth_required"));
+    }
+
+    #[test]
+    fn from_properties_parses_auth_required_truthy_spellings() {
+        // Server implementations in other languages may pick
+        // slightly different truthy spellings. Accept "true", "1",
+        // and "yes" (case-insensitive) as `Some(true)`; anything
+        // else becomes `Some(false)` (explicit-false surface for
+        // round-trip of a future `Some(false)` publisher).
+        for raw in ["true", "True", "TRUE", "1", "yes", "YES"] {
+            let r = TxtRecord::from_properties([("auth_required", raw)]);
+            assert_eq!(r.auth_required, Some(true), "failed to parse {raw:?}");
+        }
+        for raw in ["false", "0", "no", "off", "garbage"] {
+            let r = TxtRecord::from_properties([("auth_required", raw)]);
+            assert_eq!(r.auth_required, Some(false), "failed to parse {raw:?}");
+        }
+    }
+
+    #[test]
+    fn auth_required_round_trips_through_wire() {
+        // Pin the emit + parse contract together: a `Some(true)`
+        // record round-trips through `to_properties` →
+        // `from_properties` with value preserved. `None` round-trips
+        // as `None`. `Some(false)` intentionally DOES NOT round-trip
+        // — it serializes as absence, which parses back as `None`.
+        // Document this explicitly so a future refactor that adds
+        // `auth_required=false` emission doesn't silently break the
+        // "absence == unknown, no auth" contract clients rely on.
+        let mut r = sample();
+        r.auth_required = Some(true);
+        let props = r.to_properties().unwrap();
+        let back = TxtRecord::from_properties(props.iter().map(|(k, v)| (k.clone(), v.clone())));
+        assert_eq!(back.auth_required, Some(true));
+
+        r.auth_required = None;
+        let props = r.to_properties().unwrap();
+        let back = TxtRecord::from_properties(props.iter().map(|(k, v)| (k.clone(), v.clone())));
+        assert_eq!(back.auth_required, None);
+
+        r.auth_required = Some(false);
+        let props = r.to_properties().unwrap();
+        let back = TxtRecord::from_properties(props.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // Some(false) → omitted → None on the way back. Intentional;
+        // asserted here so the asymmetry stays documented.
+        assert_eq!(back.auth_required, None);
     }
 
     #[test]

@@ -465,6 +465,15 @@ fn announce_over_mdns(
         // so compression-capable clients can decide up-front
         // whether to send an extended hello. #307.
         codecs: Some(server.compression().to_wire()),
+        // CLI surfaces auth via `--auth-key HEX`; advertise
+        // `auth_required=true` iff the server has a key configured
+        // so mDNS browsers can prompt for a key before connecting.
+        // Read from the server (not the raw args) because
+        // `Server::set_auth_key` could in principle flip the state
+        // between the construction here and a future live-update
+        // call; `Server::auth_required()` is the single source of
+        // truth. #394 + #395.
+        auth_required: server.auth_required().then_some(true),
     };
     Advertiser::announce(AdvertiseOptions {
         port: server.bind_address().port(),

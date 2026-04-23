@@ -3865,6 +3865,14 @@ fn build_advertiser(
             // Vanilla mDNS consumers (non-sdr-rs clients that
             // don't know this key) just ignore it. #307.
             codecs: Some(server.compression().to_wire()),
+            // Advertise `auth_required=true` when the running
+            // server has a key configured so clients can prompt
+            // for a key BEFORE dispatching connect. Read from
+            // `Server::auth_required()` (not the UI's auth-toggle
+            // state) because a future live-update via
+            // `Server::set_auth_key` is the single source of truth.
+            // #394 + #395.
+            auth_required: server.auth_required().then_some(true),
         },
     };
     Advertiser::announce(opts)
@@ -6754,6 +6762,7 @@ mod rtl_tcp_discovery_format_tests {
                 nickname: "weather".into(),
                 txbuf: None,
                 codecs: None,
+                auth_required: None,
             },
             last_seen: Instant::now(),
         }

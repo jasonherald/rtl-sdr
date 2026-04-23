@@ -527,6 +527,18 @@ impl Server {
         self.listener_cap.load(Ordering::Relaxed)
     }
 
+    /// Whether the server currently requires auth. Returns `true`
+    /// iff [`Server::set_auth_key`] has been called with `Some(_)`
+    /// (or the starting `ServerConfig.auth_key` was `Some`). Does
+    /// not leak the key itself — useful for stamping the mDNS TXT
+    /// `auth_required=true` field without handing the caller the
+    /// raw key bytes. Returns `false` on a poisoned mutex because
+    /// an unknown auth state should default to the safer "advertise
+    /// no auth" so clients don't falsely prompt for a key. Per #395.
+    pub fn auth_required(&self) -> bool {
+        self.auth_key.lock().is_ok_and(|g| g.is_some())
+    }
+
     /// Current server statistics.
     ///
     /// Snapshots every connected client plus the cumulative
