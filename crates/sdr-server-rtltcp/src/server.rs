@@ -50,7 +50,8 @@ use crate::codec::{Codec, CodecMask, Encoder};
 use crate::dispatch::dispatch;
 use crate::error::ServerError;
 use crate::extension::{
-    CLIENT_HELLO_LEN, ClientHello, EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension, Status,
+    AUTH_KEY_HEADER_LEN, AUTH_REPLY_TIMEOUT, AuthKeyMessage, CLIENT_HELLO_LEN, ClientHello,
+    EXTENSION_MAGIC, PROTOCOL_VERSION, Role, ServerExtension, Status,
 };
 use crate::protocol::{COMMAND_LEN, Command, CommandOp, DongleInfo, TunerTypeCode};
 
@@ -405,6 +406,7 @@ impl Server {
             per_client_depth,
             config.compression,
             config.listener_cap,
+            config.auth_key.clone(),
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -633,6 +635,7 @@ fn spawn_accept_thread(
     per_client_buffer_depth: usize,
     compression: CodecMask,
     listener_cap: usize,
+    auth_key: Option<Vec<u8>>,
 ) -> std::io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
     thread::Builder::new()
@@ -656,6 +659,7 @@ fn spawn_accept_thread(
                             per_client_buffer_depth,
                             compression,
                             listener_cap,
+                            auth_key.clone(),
                         );
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -710,6 +714,7 @@ fn spawn_client_workers(
     per_client_buffer_depth: usize,
     compression_offer: CodecMask,
     listener_cap: usize,
+    auth_key: Option<Vec<u8>>,
 ) {
     // Extended handshake (#307) — sniff the RTLX hello if the
     // client sent one. The outcome drives both codec negotiation
@@ -731,10 +736,11 @@ fn spawn_client_workers(
     //   - `negotiated_codec` is `None` for vanilla (always
     //     uncompressed); `Some(_)` for RTLX clients — the
     //     intersection of their mask and ours
-    let (hello_seen, requested_role, request_takeover, negotiated_codec) =
+    let (hello_seen, requested_role, request_takeover, has_auth, negotiated_codec) =
         if let Some(hello) = &sniff_outcome {
             let codec = compression_offer.pick(hello.codec_mask);
             let takeover = hello.request_takeover();
+            let has_auth = hello.has_auth();
             tracing::info!(
                 %peer,
                 client_mask = hello.codec_mask.to_wire(),
@@ -742,9 +748,10 @@ fn spawn_client_workers(
                 chosen = %codec,
                 requested_role = ?hello.role,
                 request_takeover = takeover,
+                has_auth,
                 "rtl_tcp extended-handshake negotiated"
             );
-            (true, hello.role, takeover, Some(codec))
+            (true, hello.role, takeover, has_auth, Some(codec))
         } else {
             tracing::debug!(
                 %peer,
@@ -755,9 +762,110 @@ fn spawn_client_workers(
             // "request_takeover = false" — the existing Control
             // client (if any) is protected from vanilla-driven
             // displacement. Takeover is an explicit RTLX action.
-            (false, Role::Control, false, None)
+            // Same logic applies to `has_auth`: vanilla clients
+            // never carry an AuthKeyMessage follow-up, so `false`
+            // here routes the auth gate's vanilla+auth-required
+            // path to a bare TCP FIN (they can't authenticate).
+            (false, Role::Control, false, false, None)
         };
     let codec = negotiated_codec.unwrap_or(Codec::None);
+
+    // Auth gate (#394). Runs BEFORE role admission — an
+    // unauthenticated client shouldn't even be evaluated for role
+    // because the wire response would leak server state (role
+    // grants or cap status) to an attacker probing the slot. The
+    // four outcomes:
+    //
+    //   - No auth required: skip entirely, fall through to role
+    //     admission as-is.
+    //   - Auth required + vanilla client: bare TCP FIN, no bytes.
+    //     Vanilla has no wire field to carry a key, so they can't
+    //     participate. Same signal as "server not there" from
+    //     the legacy client's POV.
+    //   - Auth required + RTLX + has_auth: read the follow-up
+    //     `AuthKeyMessage` with a bounded timeout, constant-time
+    //     compare against the configured key.
+    //     - Match: continue to role admission.
+    //     - Mismatch / malformed / timeout / eof: send dongle_info_t
+    //       + `ServerExtension(status=AuthFailed)` and close.
+    //   - Auth required + RTLX + !has_auth: send dongle_info_t +
+    //     `ServerExtension(status=AuthRequired)` and close. Client
+    //     must reconnect with `has_auth=true` and the key to
+    //     succeed. (Simpler than an in-connection retry state
+    //     machine; costs one extra TCP handshake per never-
+    //     authed-before client, which is a one-time UX cost per
+    //     saved-profile.)
+    //
+    // If `has_auth` is set but auth isn't configured, we STILL
+    // read the AuthKeyMessage from the stream to keep the
+    // post-hello byte position in sync (the client doesn't know
+    // our config and sent the key based on its own); we just
+    // discard it without validation.
+    if hello_seen && has_auth {
+        // Read the AuthKeyMessage follow-up regardless of whether
+        // auth is required — need to consume the bytes either way
+        // so the stream position stays correct.
+        let auth_result = sniff_auth_key_message(&stream);
+        match auth_result {
+            Ok(msg) => {
+                if let Some(expected) = auth_key.as_deref() {
+                    if !crate::auth::validate_auth_key(&msg.key, expected) {
+                        tracing::info!(
+                            %peer,
+                            "rtl_tcp auth key mismatch — denying client"
+                        );
+                        send_denied_response(&stream, peer, &device, Status::AuthFailed);
+                        return;
+                    }
+                    tracing::info!(%peer, "rtl_tcp auth key validated");
+                } else {
+                    // Client sent a key to a server that doesn't
+                    // require one — fine, just ignore it. Keeps
+                    // the wire-protocol compat flexible: clients
+                    // can always send has_auth=true without
+                    // knowing the server's config.
+                    tracing::debug!(
+                        %peer,
+                        "rtl_tcp client sent auth key but server doesn't require one — ignored"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::info!(
+                    %peer,
+                    %e,
+                    "rtl_tcp auth key follow-up unreadable — denying client"
+                );
+                if auth_key.is_some() {
+                    send_denied_response(&stream, peer, &device, Status::AuthFailed);
+                }
+                // If auth wasn't required but the client promised
+                // a follow-up (has_auth=true) and didn't deliver,
+                // the stream position is wrong either way — drop.
+                return;
+            }
+        }
+    } else if auth_key.is_some() {
+        // Client didn't set has_auth but the server requires auth.
+        if hello_seen {
+            // RTLX client: send the AuthRequired denial so the
+            // client's UI can surface "server requires key" and
+            // prompt for one.
+            tracing::info!(
+                %peer,
+                "rtl_tcp auth required but client didn't send key — denying with AuthRequired"
+            );
+            send_denied_response(&stream, peer, &device, Status::AuthRequired);
+        } else {
+            // Vanilla client: can't authenticate, so there's
+            // nothing meaningful to tell them. Bare TCP FIN.
+            tracing::info!(
+                %peer,
+                "rtl_tcp vanilla client denied — auth required"
+            );
+        }
+        return;
+    }
 
     // Allocate id + build slot with the requested role + channel.
     // The slot is not yet registered — `register_with_role` below
@@ -1266,6 +1374,52 @@ const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// Per `CodeRabbit` round 2 on PR #399 (initial fix),
 /// round 3 (doc alignment), and round 5 on PR #402
 /// (partial-prefix handling for fragmented RTLX).
+/// Read + parse an [`AuthKeyMessage`] from `stream` within
+/// [`AUTH_REPLY_TIMEOUT`]. Caller is responsible for having
+/// observed `hello.has_auth() == true` on the preceding hello
+/// — this helper assumes the auth message is the next thing on
+/// the wire. Two-phase read: header (6 bytes) then body
+/// (`key_len` bytes). Both phases gated by
+/// `AUTH_REPLY_TIMEOUT`, so a silent client can't wedge the
+/// accept thread. #394.
+fn sniff_auth_key_message(mut stream: &TcpStream) -> std::io::Result<AuthKeyMessage> {
+    stream.set_read_timeout(Some(AUTH_REPLY_TIMEOUT))?;
+    let mut header = [0u8; AUTH_KEY_HEADER_LEN];
+    if let Err(e) = stream.read_exact(&mut header) {
+        // Reset the timeout before propagating so the caller
+        // doesn't carry this temporary setting into the rest of
+        // the flow (if we even got there — but defense-in-depth).
+        let _ = stream.set_read_timeout(None);
+        return Err(e);
+    }
+    let Some(key_len) = AuthKeyMessage::parse_header_len(&header) else {
+        let _ = stream.set_read_timeout(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth key message header: bad magic or out-of-range key_len",
+        ));
+    };
+    let mut body = vec![0u8; key_len as usize];
+    let body_result = stream.read_exact(&mut body);
+    let _ = stream.set_read_timeout(None);
+    body_result?;
+    // Reassemble the full wire buffer for AuthKeyMessage::from_bytes.
+    // Passing through the decoder rather than constructing the
+    // struct directly ensures the same validation runs on BOTH
+    // the parse-header-then-body path here and the
+    // full-buffer-in-hand path the tests use — keeps
+    // round-trip invariants honest.
+    let mut full = Vec::with_capacity(AUTH_KEY_HEADER_LEN + body.len());
+    full.extend_from_slice(&header);
+    full.extend_from_slice(&body);
+    AuthKeyMessage::from_bytes(&full).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth key message body failed to round-trip through AuthKeyMessage::from_bytes",
+        )
+    })
+}
+
 fn sniff_client_hello(mut stream: &TcpStream) -> std::io::Result<Option<ClientHello>> {
     // Poll cadence for the peek retry loop. Small enough that a
     // fragmented `RTLX` hello whose trailing bytes land within a
@@ -1838,6 +1992,139 @@ mod tests {
 
         drop(server_stream);
         let _ = client.join();
+    }
+
+    // ============================================================
+    // Auth handshake tests (#394).
+    //
+    // The real `spawn_client_workers` needs a live
+    // `Arc<Mutex<RtlSdrDevice>>` which requires a USB dongle —
+    // not something CI has. These tests instead exercise
+    // `sniff_auth_key_message` directly over a loopback TCP
+    // pair, pinning the wire-read contract that the enforcement
+    // flow calls into. Full end-to-end (server + client with
+    // real dongle) lives in the manual smoke test.
+    // ============================================================
+
+    #[test]
+    fn sniff_auth_key_message_reads_and_parses_full_message() {
+        // Happy path: client sends a valid AuthKeyMessage, server
+        // reads + parses. Pins the two-phase read (header then
+        // body) + the wire-format round-trip.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key_bytes = b"test-key-32-bytes-exactly--abcdef".to_vec();
+        let msg = AuthKeyMessage {
+            key: key_bytes.clone(),
+        };
+        let wire = msg.to_bytes().unwrap();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&wire).unwrap();
+            // Hold the socket open past the server's read so the
+            // server doesn't see EOF mid-body-read.
+            thread::sleep(Duration::from_millis(50));
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let parsed = sniff_auth_key_message(&server_stream).unwrap();
+        assert_eq!(parsed.key, key_bytes);
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    #[test]
+    fn sniff_auth_key_message_rejects_bad_magic() {
+        // Client sends a 6-byte header with non-RTKA magic. The
+        // header parser catches the bad magic via
+        // `parse_header_len → None` and the helper surfaces
+        // InvalidData.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            let mut bad = vec![0x00, 0x01, 0x02, 0x03];
+            bad.extend_from_slice(&1u16.to_be_bytes());
+            bad.push(0xAA);
+            client.write_all(&bad).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let err = sniff_auth_key_message(&server_stream).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    #[test]
+    fn sniff_auth_key_message_times_out_when_client_silent() {
+        // Client connects but never sends. Header read blocks
+        // up to AUTH_REPLY_TIMEOUT, then fails. Guards against a
+        // silent-client DOS that would otherwise wedge the
+        // accept thread.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
+        let client_thread = thread::spawn(move || {
+            let _client = TcpStream::connect(addr).unwrap();
+            // Hold the socket open, don't send anything. Release
+            // after the server's timeout has fired.
+            let _ = keep_rx.recv();
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let start = Instant::now();
+        let err = sniff_auth_key_message(&server_stream).unwrap_err();
+        let elapsed = start.elapsed();
+        // Error kind is WouldBlock / TimedOut depending on
+        // platform; either is an acceptable "header read timed
+        // out" signal from the OS.
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected WouldBlock/TimedOut for silent client, got {err:?}"
+        );
+        // And it actually respected the timeout budget (within
+        // a generous 2x margin for scheduling jitter).
+        assert!(
+            elapsed <= AUTH_REPLY_TIMEOUT * 2,
+            "silent-client read took {elapsed:?}, exceeded 2× AUTH_REPLY_TIMEOUT ({AUTH_REPLY_TIMEOUT:?})"
+        );
+        let _ = keep_tx.send(());
+        drop(server_stream);
+        let _ = client_thread.join();
+    }
+
+    #[test]
+    fn sniff_auth_key_message_handles_fragmented_send() {
+        // Client sends the header in one write and the body in a
+        // separate write (with a short pause). The server's
+        // read_exact waits for the rest — no protocol desync.
+        // Pins the contract that the helper tolerates realistic
+        // TCP segmentation.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key_bytes: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        let msg = AuthKeyMessage {
+            key: key_bytes.clone(),
+        };
+        let wire = msg.to_bytes().unwrap();
+        let (header_part, body_part) = wire.split_at(AUTH_KEY_HEADER_LEN);
+        let header_vec = header_part.to_vec();
+        let body_vec = body_part.to_vec();
+        let client_thread = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            client.write_all(&header_vec).unwrap();
+            client.flush().unwrap();
+            thread::sleep(Duration::from_millis(20));
+            client.write_all(&body_vec).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+        let (server_stream, _peer) = listener.accept().unwrap();
+        let parsed = sniff_auth_key_message(&server_stream).unwrap();
+        assert_eq!(parsed.key, key_bytes);
+        drop(server_stream);
+        let _ = client_thread.join();
     }
 
     #[test]
