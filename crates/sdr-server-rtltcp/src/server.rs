@@ -703,24 +703,32 @@ fn spawn_client_workers(
     //   - `negotiated_codec` is `None` for vanilla (always
     //     uncompressed); `Some(_)` for RTLX clients — the
     //     intersection of their mask and ours
-    let (hello_seen, requested_role, negotiated_codec) = if let Some(hello) = &sniff_outcome {
-        let codec = compression_offer.pick(hello.codec_mask);
-        tracing::info!(
-            %peer,
-            client_mask = hello.codec_mask.to_wire(),
-            server_mask = compression_offer.to_wire(),
-            chosen = %codec,
-            requested_role = ?hello.role,
-            "rtl_tcp extended-handshake negotiated"
-        );
-        (true, hello.role, Some(codec))
-    } else {
-        tracing::debug!(
-            %peer,
-            "rtl_tcp no extended-handshake hello — legacy client path (implicit Role::Control)"
-        );
-        (false, Role::Control, None)
-    };
+    let (hello_seen, requested_role, request_takeover, negotiated_codec) =
+        if let Some(hello) = &sniff_outcome {
+            let codec = compression_offer.pick(hello.codec_mask);
+            let takeover = hello.request_takeover();
+            tracing::info!(
+                %peer,
+                client_mask = hello.codec_mask.to_wire(),
+                server_mask = compression_offer.to_wire(),
+                chosen = %codec,
+                requested_role = ?hello.role,
+                request_takeover = takeover,
+                "rtl_tcp extended-handshake negotiated"
+            );
+            (true, hello.role, takeover, Some(codec))
+        } else {
+            tracing::debug!(
+                %peer,
+                "rtl_tcp no extended-handshake hello — legacy client path (implicit Role::Control)"
+            );
+            // Vanilla clients have no way to set the takeover
+            // flag, so the admission gate treats them as
+            // "request_takeover = false" — the existing Control
+            // client (if any) is protected from vanilla-driven
+            // displacement. Takeover is an explicit RTLX action.
+            (false, Role::Control, false, None)
+        };
     let codec = negotiated_codec.unwrap_or(Codec::None);
 
     // Allocate id + build slot with the requested role + channel.
@@ -730,10 +738,13 @@ fn spawn_client_workers(
     let id = registry.allocate_id();
     let (slot, rx) = ClientSlot::new(id, peer, codec, requested_role, per_client_buffer_depth);
 
-    // Atomic #392 admission. On `Granted` the slot is now in the
-    // registry and the broadcaster can find it on its next tick;
-    // on denial the slot is never pushed and drops on scope exit.
-    let decision = registry.register_with_role(slot.clone(), listener_cap);
+    // Atomic #392 admission + #393 takeover decision. On `Granted`
+    // or `GrantedViaTakeover` the slot is now in the registry and
+    // the broadcaster can find it on its next tick; on denial the
+    // slot is never pushed and drops on scope exit. Takeover also
+    // marks the displaced controller disconnected under the same
+    // lock so its writer / command threads exit cleanly.
+    let decision = registry.register_with_role(slot.clone(), listener_cap, request_takeover);
     match decision {
         RoleDecision::Granted => {
             tracing::info!(
@@ -742,6 +753,15 @@ fn spawn_client_workers(
                 ?requested_role,
                 ?codec,
                 "rtl_tcp client admitted"
+            );
+        }
+        RoleDecision::GrantedViaTakeover { displaced_id } => {
+            tracing::info!(
+                %peer,
+                client_id = id,
+                displaced_client_id = displaced_id,
+                ?codec,
+                "rtl_tcp client admitted via takeover — prior Control client kicked"
             );
         }
         RoleDecision::ControllerBusy => {

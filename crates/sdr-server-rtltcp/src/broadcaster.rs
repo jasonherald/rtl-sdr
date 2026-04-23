@@ -267,21 +267,40 @@ impl ClientSlot {
 
 /// Outcome of [`ClientRegistry::register_with_role`] — whether the
 /// slot was admitted, and if not, why. The caller maps these onto
-/// the wire-level `ServerExtension` response: `Granted` →
-/// `status=Ok, granted_role=Some(requested)`; denial variants →
-/// `status=<matching>, granted_role=None` (0xFF sentinel). #392.
+/// the wire-level `ServerExtension` response: `Granted` /
+/// `GrantedViaTakeover` → `status=Ok, granted_role=Some(requested)`;
+/// denial variants → `status=<matching>, granted_role=None`
+/// (0xFF sentinel). #392 / #393.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleDecision {
     /// Slot registered. Caller proceeds with the handshake response
     /// and spawns the per-client writer + command workers.
     Granted,
+    /// Slot registered AFTER displacing the prior Control client —
+    /// i.e., the takeover path (#393). The prior controller's
+    /// slot is marked disconnected by `register_with_role` under
+    /// the same lock, so its writer / command threads observe the
+    /// flag on their next tick and exit with a clean TCP FIN. The
+    /// caller treats this identically to [`Self::Granted`] on the
+    /// wire (both send `ServerExtension { status: Ok, granted_role:
+    /// Some(Control) }`) — the `displaced_id` is carried only for
+    /// server-side logging and UI activity-log correlation.
+    GrantedViaTakeover {
+        /// `ClientId` of the Control slot that was displaced.
+        /// Captured from the slot snapshot taken under the admission
+        /// lock so log output points at the exact predecessor.
+        displaced_id: ClientId,
+    },
     /// Client requested `Role::Control` but another live slot is
-    /// already holding it. Caller emits
+    /// already holding it **and** the client did not set the
+    /// takeover flag. Caller emits
     /// `ServerExtension { granted_role: None, status: ControllerBusy }`
     /// to RTLX clients (vanilla clients get TCP FIN without a
     /// header so they see "connection refused"-equivalent), then
     /// closes. **Transient** — clients treat this as retryable via
-    /// their connect/backoff loop.
+    /// their connect/backoff loop, or prompt the user to click
+    /// "Take control" which re-sends the hello with the takeover
+    /// flag set.
     ControllerBusy,
     /// Client requested `Role::Listen` but `listener_cap` live
     /// listeners are already registered. Caller emits
@@ -426,18 +445,26 @@ impl ClientRegistry {
 
     /// Admit a slot if the server's role gate and listener cap
     /// permit it. Returns the outcome so the caller can respond to
-    /// the client appropriately (Granted → continue the handshake,
-    /// denied → send a denial `ServerExtension` + close). The
-    /// slot's role (decided at construction time from the client's
-    /// hello, or defaulted to `Control` for vanilla clients) drives
-    /// the decision:
+    /// the client appropriately (Granted / GrantedViaTakeover →
+    /// continue the handshake, denied → send a denial
+    /// `ServerExtension` + close). The slot's role (decided at
+    /// construction time from the client's hello, or defaulted to
+    /// `Control` for vanilla clients) drives the decision:
     ///
     /// - `Role::Control` — granted iff no other live slot currently
-    ///   has role Control. Denying with `ControllerBusy` because
-    ///   the Control slot is exclusive (one commander at a time).
+    ///   has role Control. When the slot IS taken:
+    ///   - `request_takeover == false` → [`RoleDecision::ControllerBusy`].
+    ///   - `request_takeover == true` → the prior controller's slot
+    ///     is marked disconnected (its writer + command threads
+    ///     observe the flag on their next tick and exit with a
+    ///     clean TCP FIN) and the new slot is admitted; returns
+    ///     [`RoleDecision::GrantedViaTakeover`] carrying the
+    ///     displaced client's id for server-side logging. #393.
     /// - `Role::Listen` — granted iff the count of live `Listen`
     ///   slots is strictly less than `listener_cap`. Denying with
-    ///   `ListenerCapReached`.
+    ///   `ListenerCapReached`. `request_takeover` is ignored for
+    ///   Listen requests: takeover only makes sense against the
+    ///   single exclusive Control slot.
     ///
     /// "Live" means not flagged disconnected — the broadcaster's
     /// periodic `prune_disconnected` sweep evicts dead slots, but
@@ -446,14 +473,25 @@ impl ClientRegistry {
     /// client frees the slot immediately on their worker
     /// disconnecting, without waiting for the next prune tick.
     ///
-    /// `lifetime_accepted` is bumped only on `Granted` — the
-    /// counter tracks real admissions, not denied-handshake
-    /// attempts. #392.
-    pub fn register_with_role(&self, slot: Arc<ClientSlot>, listener_cap: usize) -> RoleDecision {
-        // Lock the slot list first so the decision + push land
-        // atomically — two concurrent Control requests can't both
-        // observe "slot free" and both push. Same lock discipline
-        // as `prune_disconnected` and `snapshot`, so the decision
+    /// `lifetime_accepted` is bumped only on admission (Granted or
+    /// GrantedViaTakeover) — the counter tracks real admissions,
+    /// not denied-handshake attempts. The takeover's displaced
+    /// controller is NOT subtracted from `lifetime_accepted`: it
+    /// was a real admission that happened to end via kick instead
+    /// of clean disconnect. #392 / #393.
+    pub fn register_with_role(
+        &self,
+        slot: Arc<ClientSlot>,
+        listener_cap: usize,
+        request_takeover: bool,
+    ) -> RoleDecision {
+        // Lock the slot list first so the decision + push (and
+        // the takeover-path mark_disconnected) land atomically —
+        // two concurrent Control requests can't both observe
+        // "slot free" and both push, and a takeover request
+        // can't race with another admission that would displace
+        // someone else's slot. Same lock discipline as
+        // `prune_disconnected` and `snapshot`, so the decision
         // sees a consistent live-set view.
         let Ok(mut guard) = self.slots.lock() else {
             // Poisoned — a prior operation panicked mid-update
@@ -464,13 +502,30 @@ impl ClientRegistry {
             // round 1 on PR #403.
             return RoleDecision::RegistryPoisoned;
         };
+        let mut displaced_id: Option<ClientId> = None;
         match slot.role {
             Role::Control => {
-                let has_live_controller = guard
+                // Find the live controller (if any) so we can
+                // either deny or displace.
+                let existing_controller = guard
                     .iter()
-                    .any(|s| s.role == Role::Control && !s.is_disconnected());
-                if has_live_controller {
-                    return RoleDecision::ControllerBusy;
+                    .find(|s| s.role == Role::Control && !s.is_disconnected())
+                    .cloned();
+                if let Some(prev) = existing_controller {
+                    if !request_takeover {
+                        return RoleDecision::ControllerBusy;
+                    }
+                    // Takeover path: mark the prior controller
+                    // disconnected so its workers exit on their
+                    // next tick. The slot stays in the registry
+                    // until the next `prune_disconnected` sweep or
+                    // an explicit `unwind_admission` — keeping it
+                    // around keeps its per-client stats visible in
+                    // the next UI poll so operators can see
+                    // "client 7 was kicked by client 12" in the
+                    // activity log. #393.
+                    prev.mark_disconnected();
+                    displaced_id = Some(prev.id);
                 }
             }
             Role::Listen => {
@@ -485,7 +540,10 @@ impl ClientRegistry {
         }
         self.lifetime_accepted.fetch_add(1, Ordering::Relaxed);
         guard.push(slot);
-        RoleDecision::Granted
+        match displaced_id {
+            Some(displaced_id) => RoleDecision::GrantedViaTakeover { displaced_id },
+            None => RoleDecision::Granted,
+        }
     }
 
     /// Undo a prior [`Self::register_with_role`] `Granted` outcome
@@ -1239,7 +1297,7 @@ mod tests {
         let reg = ClientRegistry::new();
         let slot = role_test_slot(&reg, ROLE_TEST_SINGLE_CTRL_PORT, Role::Control);
         assert_eq!(
-            reg.register_with_role(slot, TEST_LISTENER_CAP),
+            reg.register_with_role(slot, TEST_LISTENER_CAP, false),
             RoleDecision::Granted
         );
         assert_eq!(reg.len(), 1);
@@ -1254,12 +1312,12 @@ mod tests {
         let reg = ClientRegistry::new();
         let first = role_test_slot(&reg, ROLE_TEST_BUSY_FIRST_CTRL_PORT, Role::Control);
         assert_eq!(
-            reg.register_with_role(first, TEST_LISTENER_CAP),
+            reg.register_with_role(first, TEST_LISTENER_CAP, false),
             RoleDecision::Granted
         );
         let second = role_test_slot(&reg, ROLE_TEST_BUSY_SECOND_CTRL_PORT, Role::Control);
         assert_eq!(
-            reg.register_with_role(second, TEST_LISTENER_CAP),
+            reg.register_with_role(second, TEST_LISTENER_CAP, false),
             RoleDecision::ControllerBusy
         );
         // Registry still only has the first — denial must not
@@ -1279,13 +1337,13 @@ mod tests {
         let reg = ClientRegistry::new();
         let first = role_test_slot(&reg, ROLE_TEST_DISCONNECT_FIRST_CTRL_PORT, Role::Control);
         assert_eq!(
-            reg.register_with_role(first.clone(), TEST_LISTENER_CAP),
+            reg.register_with_role(first.clone(), TEST_LISTENER_CAP, false),
             RoleDecision::Granted
         );
         first.mark_disconnected();
         let second = role_test_slot(&reg, ROLE_TEST_DISCONNECT_SECOND_CTRL_PORT, Role::Control);
         assert_eq!(
-            reg.register_with_role(second, TEST_LISTENER_CAP),
+            reg.register_with_role(second, TEST_LISTENER_CAP, false),
             RoleDecision::Granted
         );
         assert_eq!(reg.lifetime_accepted(), 2);
@@ -1299,7 +1357,7 @@ mod tests {
         let reg = ClientRegistry::new();
         let ctrl = role_test_slot(&reg, ROLE_TEST_ADMIT_CTRL_PORT, Role::Control);
         assert_eq!(
-            reg.register_with_role(ctrl, TEST_LISTENER_CAP),
+            reg.register_with_role(ctrl, TEST_LISTENER_CAP, false),
             RoleDecision::Granted
         );
         for i in 0..TEST_LISTENER_CAP {
@@ -1309,7 +1367,7 @@ mod tests {
                 Role::Listen,
             );
             assert_eq!(
-                reg.register_with_role(listener, TEST_LISTENER_CAP),
+                reg.register_with_role(listener, TEST_LISTENER_CAP, false),
                 RoleDecision::Granted,
                 "listener {i} should fit under cap {TEST_LISTENER_CAP}"
             );
@@ -1328,13 +1386,13 @@ mod tests {
                 Role::Listen,
             );
             assert_eq!(
-                reg.register_with_role(listener, TEST_LISTENER_CAP),
+                reg.register_with_role(listener, TEST_LISTENER_CAP, false),
                 RoleDecision::Granted
             );
         }
         let overflow = role_test_slot(&reg, ROLE_TEST_CAP_OVERFLOW_PORT, Role::Listen);
         assert_eq!(
-            reg.register_with_role(overflow, TEST_LISTENER_CAP),
+            reg.register_with_role(overflow, TEST_LISTENER_CAP, false),
             RoleDecision::ListenerCapReached
         );
         // Denial must not push into slots.
@@ -1361,7 +1419,7 @@ mod tests {
         let reg = ClientRegistry::new();
         let slot = role_test_slot(&reg, ROLE_TEST_SINGLE_CTRL_PORT, Role::Control);
         assert_eq!(
-            reg.register_with_role(slot.clone(), TEST_LISTENER_CAP),
+            reg.register_with_role(slot.clone(), TEST_LISTENER_CAP, false),
             RoleDecision::Granted
         );
         assert_eq!(reg.len(), 1);
@@ -1395,6 +1453,163 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------
+    // Takeover handshake tests (#393).
+    //
+    // Shape: `register_with_role(slot, cap, request_takeover)`.
+    // When the Control slot is busy and the new client sets
+    // `request_takeover = true`, the existing controller is
+    // marked disconnected + the new client is admitted as Control.
+    // Vanilla clients never exercise the takeover path (they
+    // can't set the flag); RTLX clients request it explicitly via
+    // `ClientHello::flags` bit 0.
+    // ------------------------------------------------------------
+
+    /// `takeover` peer ports — each test uses a disjoint block so
+    /// log output points at the specific test that stamped the
+    /// peer.
+    const TAKEOVER_TEST_ORIG_CTRL_PORT: u16 = 20_100;
+    const TAKEOVER_TEST_NEW_CTRL_PORT: u16 = 20_101;
+    const TAKEOVER_TEST_NO_CONFLICT_PORT: u16 = 20_110;
+    const TAKEOVER_TEST_DENIED_ORIG_PORT: u16 = 20_120;
+    const TAKEOVER_TEST_DENIED_NEW_PORT: u16 = 20_121;
+    const TAKEOVER_TEST_LISTENER_PORT: u16 = 20_130;
+    const TAKEOVER_TEST_LISTENER_TAKEOVER_CTRL_PORT: u16 = 20_131;
+
+    #[test]
+    fn register_with_role_takeover_displaces_existing_controller() {
+        // **Regression test for #393.** Core takeover contract:
+        // Control client A is live, client B requests Control
+        // with `request_takeover = true`. Expected:
+        //   - B is admitted (GrantedViaTakeover carries A's id)
+        //   - A is marked disconnected (the broadcaster stops
+        //     fanning to it, writer/command workers exit on their
+        //     next tick with a clean TCP FIN)
+        //   - `lifetime_accepted` reflects both admissions (A's
+        //     kick doesn't decrement; it was a real session)
+        let reg = ClientRegistry::new();
+        let slot_a = role_test_slot(&reg, TAKEOVER_TEST_ORIG_CTRL_PORT, Role::Control);
+        let a_id = slot_a.id;
+        assert_eq!(
+            reg.register_with_role(slot_a.clone(), TEST_LISTENER_CAP, false),
+            RoleDecision::Granted
+        );
+
+        let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
+        let b_id = slot_b.id;
+        assert_eq!(
+            reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover { displaced_id: a_id }
+        );
+
+        // A is still in the registry (stats visible to UI) but
+        // flagged disconnected.
+        assert!(
+            slot_a.is_disconnected(),
+            "displaced controller should be marked disconnected"
+        );
+        // B is live and holds the Control slot from the registry's
+        // point of view.
+        assert!(
+            !slot_b.is_disconnected(),
+            "new controller should be alive after takeover"
+        );
+        // Two admissions in lifetime_accepted — A's kick doesn't
+        // subtract, it was a real session.
+        assert_eq!(reg.lifetime_accepted(), 2);
+        // The live-snapshot reflects only the new controller.
+        let snapshot = reg.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, b_id);
+        assert_eq!(snapshot[0].role, Role::Control);
+    }
+
+    #[test]
+    fn register_with_role_takeover_is_noop_when_slot_is_free() {
+        // Pure takeover flag with no existing controller → just
+        // `Granted` (no displacement metadata). The flag is
+        // harmless in the no-conflict case; it's the "please kick
+        // whoever's there" hint, not a hard requirement that
+        // someone BE there.
+        let reg = ClientRegistry::new();
+        let slot = role_test_slot(&reg, TAKEOVER_TEST_NO_CONFLICT_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot, TEST_LISTENER_CAP, true),
+            RoleDecision::Granted,
+            "takeover flag with no conflict must resolve to plain Granted"
+        );
+        assert_eq!(reg.lifetime_accepted(), 1);
+    }
+
+    #[test]
+    fn register_with_role_takeover_false_still_denies_busy_controller() {
+        // Regression guard: the #392 ControllerBusy semantics
+        // must stay intact when `request_takeover = false`. A
+        // Control client whose hello has the takeover flag
+        // clear gets denied exactly as before — the #393 branch
+        // only activates on an explicit `true` request.
+        let reg = ClientRegistry::new();
+        let slot_a = role_test_slot(&reg, TAKEOVER_TEST_DENIED_ORIG_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_a.clone(), TEST_LISTENER_CAP, false),
+            RoleDecision::Granted
+        );
+        let slot_b = role_test_slot(&reg, TAKEOVER_TEST_DENIED_NEW_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_b, TEST_LISTENER_CAP, false),
+            RoleDecision::ControllerBusy
+        );
+        // A stays alive — no unintended displacement when the
+        // takeover flag is clear.
+        assert!(!slot_a.is_disconnected());
+        // Denial doesn't bump lifetime_accepted.
+        assert_eq!(reg.lifetime_accepted(), 1);
+    }
+
+    #[test]
+    fn register_with_role_takeover_leaves_listeners_alone() {
+        // Integration: listener + Control(A), then B takes over
+        // from A. Listener must stay connected through the
+        // takeover — the fan-out contract says listeners are
+        // isolated from controller churn. Without this, a
+        // takeover event would drop listeners too, turning every
+        // "kick the zombie controller" action into a reconnect
+        // storm across every passive viewer.
+        let reg = ClientRegistry::new();
+        let listener = role_test_slot(&reg, TAKEOVER_TEST_LISTENER_PORT, Role::Listen);
+        assert_eq!(
+            reg.register_with_role(listener.clone(), TEST_LISTENER_CAP, false),
+            RoleDecision::Granted
+        );
+        let ctrl_a = role_test_slot(&reg, TAKEOVER_TEST_ORIG_CTRL_PORT, Role::Control);
+        let a_id = ctrl_a.id;
+        assert_eq!(
+            reg.register_with_role(ctrl_a.clone(), TEST_LISTENER_CAP, false),
+            RoleDecision::Granted
+        );
+        let ctrl_b = role_test_slot(
+            &reg,
+            TAKEOVER_TEST_LISTENER_TAKEOVER_CTRL_PORT,
+            Role::Control,
+        );
+        assert_eq!(
+            reg.register_with_role(ctrl_b, TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover { displaced_id: a_id }
+        );
+        // Listener survived unscathed.
+        assert!(
+            !listener.is_disconnected(),
+            "takeover must not mark listeners disconnected"
+        );
+        // Old Control was displaced.
+        assert!(ctrl_a.is_disconnected());
+        // Live snapshot has the listener + the new controller
+        // (two live slots; A is pruned out of the live view by
+        // the is_disconnected filter).
+        let snapshot = reg.snapshot();
+        assert_eq!(snapshot.len(), 2);
+    }
+
     #[test]
     fn register_with_role_counts_only_live_listeners_for_cap() {
         // A disconnected Listener frees a listener slot
@@ -1410,7 +1625,7 @@ mod tests {
                 Role::Listen,
             );
             assert_eq!(
-                reg.register_with_role(listener.clone(), TEST_LISTENER_CAP),
+                reg.register_with_role(listener.clone(), TEST_LISTENER_CAP, false),
                 RoleDecision::Granted
             );
             listeners.push(listener);
@@ -1418,14 +1633,14 @@ mod tests {
         // Cap is full — verify.
         let denied = role_test_slot(&reg, ROLE_TEST_LIVE_DENIED_PORT, Role::Listen);
         assert_eq!(
-            reg.register_with_role(denied, TEST_LISTENER_CAP),
+            reg.register_with_role(denied, TEST_LISTENER_CAP, false),
             RoleDecision::ListenerCapReached
         );
         // Flip one listener to disconnected and retry.
         listeners[0].mark_disconnected();
         let replacement = role_test_slot(&reg, ROLE_TEST_LIVE_REPLACEMENT_PORT, Role::Listen);
         assert_eq!(
-            reg.register_with_role(replacement, TEST_LISTENER_CAP),
+            reg.register_with_role(replacement, TEST_LISTENER_CAP, false),
             RoleDecision::Granted
         );
     }
