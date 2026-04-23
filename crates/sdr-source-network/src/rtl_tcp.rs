@@ -1898,6 +1898,19 @@ mod tests {
     /// enough to catch brief state visits without pegging a core.
     const RTLX_TEST_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+    /// Slice large enough to catch any stray prefix the default
+    /// client might emit against a vanilla-shape server — 4 bytes
+    /// would be the EXTENSION_MAGIC prefix, 8 would be a full
+    /// `ClientHello`. 16 bytes comfortably covers either
+    /// regression. Used by
+    /// `rtl_tcp_default_config_sends_no_hello_to_vanilla_server`.
+    const NO_HELLO_PROBE_LEN: usize = 16;
+    /// Read timeout for the "did the client send anything?" probe.
+    /// Short enough to keep the test fast, long enough that a
+    /// real client-side hello emission would fall well within
+    /// this window.
+    const NO_HELLO_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+
     /// Shared fixture setup: listener on loopback + config that
     /// opts into the extended handshake. Keeps the three RTLX
     /// handshake tests aligned on compression mask + timeouts.
@@ -2184,12 +2197,21 @@ mod tests {
     }
 
     #[test]
-    fn rtlx_handshake_omits_takeover_flag_by_default() {
-        // Complement to the takeover-flag test: when
-        // `request_takeover` is left at its default (`false`),
-        // the hello flags byte must NOT have the bit set.
-        // Protects against a bug where `FLAG_REQUEST_TAKEOVER`
-        // gets hard-coded anywhere in the client emission path.
+    fn rtlx_handshake_clears_takeover_flag_when_only_compression_opts_in() {
+        // **Regression test for #393 + CodeRabbit round 2 on PR #404.**
+        // Pins the RTLX-hello-path contract: when compression
+        // triggers the hello (the `extension_enabled` gate) but
+        // `request_takeover` stays at its default `false`, the
+        // flags byte on the wire must NOT have
+        // `FLAG_REQUEST_TAKEOVER` set. Protects against a bug
+        // where the bit gets hard-coded anywhere in the client
+        // emission path.
+        //
+        // The complementary "true default path sends no hello at
+        // all" case is covered by
+        // `rtl_tcp_default_config_sends_no_hello_to_vanilla_server`
+        // below — that test pins NONE_ONLY + request_takeover =
+        // false → no hello, which is the legacy-safe default.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -2217,9 +2239,10 @@ mod tests {
             thread::sleep(RTLX_TEST_SERVER_HOLD);
         });
 
-        // Compression opts into the extended handshake (it must,
-        // otherwise no hello is sent and this test is vacuous).
-        // `request_takeover` stays at its default `false`.
+        // Compression opts into the extended handshake (required
+        // for this path — without it, `extension_enabled = false`
+        // and no hello is sent). `request_takeover` at its
+        // default `false`.
         let config = RtlTcpConfig {
             data_read_timeout: RTLX_TEST_DATA_READ_TIMEOUT,
             max_consecutive_timeouts: 2,
@@ -2241,6 +2264,91 @@ mod tests {
             "request_takeover = false must clear FLAG_REQUEST_TAKEOVER \
              in the hello (got flags byte 0x{flags_byte:02x})"
         );
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtl_tcp_default_config_sends_no_hello_to_vanilla_server() {
+        // **Regression test for `CodeRabbit` round 2 on PR #404.**
+        // The true default path (no compression opt-in, no
+        // takeover opt-in) MUST NOT send a `ClientHello` — that's
+        // the legacy-safe contract that keeps the client
+        // wire-compatible with every vanilla rtl_tcp server
+        // (GQRX, SDR++, CubicSDR, upstream rtl_tcp, etc.). An
+        // unexpected 8-byte hello would straddle their 5-byte
+        // command framing and cause garbage dispatches.
+        //
+        // Test server: accept, briefly try to read from the
+        // client with a short timeout, assert the read times out
+        // (no bytes received) — proves the client sent nothing
+        // before expecting the server's `dongle_info_t`. Then
+        // send the legacy `dongle_info_t` to let the client's
+        // manager settle into Connected cleanly.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<std::io::Result<usize>>();
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(NO_HELLO_PROBE_TIMEOUT))
+                .expect("set_read_timeout");
+            // Try to read. If the client sent nothing (the
+            // correct behavior), this returns WouldBlock /
+            // TimedOut after the probe window. Any bytes
+            // received mean the client incorrectly emitted
+            // something before waiting for dongle_info_t.
+            let mut probe_buf = [0u8; NO_HELLO_PROBE_LEN];
+            let read_result = sock.read(&mut probe_buf);
+            let _ = probe_tx.send(read_result);
+            // Clear the probe timeout before the legacy send so
+            // the client's `set_read_timeout` on its side
+            // doesn't interact with ours.
+            sock.set_read_timeout(None).expect("clear timeout");
+            // Complete the legacy handshake so the client
+            // settles into Connected.
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: RTLX_TEST_GAIN_COUNT,
+            }
+            .to_bytes();
+            let _ = sock.write_all(&header);
+            thread::sleep(RTLX_TEST_SERVER_HOLD);
+        });
+
+        // True default: NONE_ONLY compression + request_takeover
+        // default (false) → `extension_enabled = false` → no
+        // hello on the wire.
+        let config = RtlTcpConfig::default();
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        src.start_manager().unwrap();
+
+        let probe_result = probe_rx
+            .recv_timeout(RTLX_TEST_STATE_DEADLINE)
+            .expect("server probe should resolve within deadline");
+        match probe_result {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Expected outcome: the client sent nothing, so
+                // the server's short-timeout read times out.
+                // Legacy-safe contract holds.
+            }
+            Ok(0) => {
+                // Also acceptable: clean EOF before any bytes
+                // (e.g., the manager tore down before proceeding
+                // to the legacy read). Still proves no hello was
+                // emitted.
+            }
+            Ok(n) => panic!(
+                "default config must not send a hello before dongle_info_t, \
+                 but the server observed {n} byte(s) from the client before \
+                 writing its own response"
+            ),
+            Err(e) => panic!("unexpected server probe error (not the benign timeout/EOF): {e:?}"),
+        }
 
         src.stop_manager();
         let _ = server_thread.join();
