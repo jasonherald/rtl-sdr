@@ -965,6 +965,23 @@ fn handle_dsp_message(
                     rtl_tcp_port_row_weak,
                 );
             }
+            // Status-bar role badge (#396) — flip on Connected
+            // based on the user's most recently-requested role;
+            // hide on every non-Connected state. Server
+            // admission is always "grant as requested" (#392
+            // has no downgrade path), so the requested role
+            // the UI holds mirrors what the server admitted.
+            let role_badge = match &conn_state {
+                sdr_types::RtlTcpConnectionState::Connected { .. } => {
+                    let selected = rtl_tcp_role_row_weak.upgrade().map_or(
+                        crate::sidebar::source_panel::RTL_TCP_ROLE_CONTROL_IDX,
+                        |row| row.selected(),
+                    );
+                    Some(selected == crate::sidebar::source_panel::RTL_TCP_ROLE_CONTROL_IDX)
+                }
+                _ => None,
+            };
+            status_bar.update_role(role_badge);
         }
         DspToUi::NetworkSinkStatus(status) => {
             tracing::debug!(?status, "network sink status");
