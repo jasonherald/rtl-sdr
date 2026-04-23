@@ -60,6 +60,32 @@ pub enum SourceError {
     /// can route terminal vs. retry-worthy rejections correctly.
     #[error("temporarily unavailable: {0}")]
     TemporarilyUnavailable(String),
+
+    /// Server denied the connect with `Status::ControllerBusy`
+    /// (#392) and the user needs to explicitly decide what to
+    /// do next — either connect as Listener, force a takeover,
+    /// or give up. Treated as terminal by the connection
+    /// manager (no auto-retry) per #396; the UI surfaces
+    /// the choice via a toast with "Take control" / "Connect
+    /// as Listener" action buttons. Distinct from
+    /// `TemporarilyUnavailable` (which auto-retries) because
+    /// a user-facing decision is needed. Per #396.
+    #[error("controller slot is occupied")]
+    ControllerBusy,
+
+    /// Server requires a pre-shared key (#394) and the client
+    /// didn't send one. Terminal from the connection manager's
+    /// perspective (no auto-retry); the UI re-prompts for a
+    /// key and triggers a fresh connect. Per #396.
+    #[error("server requires an authentication key")]
+    AuthRequired,
+
+    /// Server required a key and the client's attempt was
+    /// rejected (`Status::AuthFailed`). Terminal from the
+    /// connection manager's perspective; the UI re-prompts
+    /// with "Key rejected" copy. Per #396.
+    #[error("authentication key rejected")]
+    AuthFailed,
 }
 
 /// Errors from sink modules.

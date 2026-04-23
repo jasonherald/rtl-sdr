@@ -149,6 +149,14 @@ pub enum ConnectionState {
     /// (e.g., server sent a non-RTL0 header). Transport failures
     /// never reach this state; they remain in `Retrying`.
     Failed { reason: String },
+    /// Terminal role-denial states surfaced by the #392/#394
+    /// extended handshake. Per #396, the connection manager
+    /// stops retrying and waits for the UI to offer the user an
+    /// explicit recovery action (take-control, re-enter key, or
+    /// give up).
+    ControllerBusy,
+    AuthRequired,
+    AuthFailed,
 }
 
 impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
@@ -177,6 +185,9 @@ impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
             ConnectionState::Failed { reason } => Self::Failed {
                 reason: reason.clone(),
             },
+            ConnectionState::ControllerBusy => Self::ControllerBusy,
+            ConnectionState::AuthRequired => Self::AuthRequired,
+            ConnectionState::AuthFailed => Self::AuthFailed,
         }
     }
 }
@@ -799,26 +810,51 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
             }
             Err(e) => {
                 tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
-                if let SourceError::Protocol(_) = e {
-                    // Non-recoverable: server isn't speaking
-                    // rtl_tcp, or the extended handshake was
-                    // rejected for a reason that won't clear on
-                    // retry (auth required/failed, parse error).
-                    set_state(
-                        &shared,
-                        ConnectionState::Failed {
-                            reason: format!("{e}"),
-                        },
-                    );
-                    return;
+                // Route each terminal error-kind to its
+                // dedicated `ConnectionState` variant so the UI
+                // can offer specific recovery actions (take-
+                // control, enter key, re-prompt) instead of a
+                // generic "Failed" with opaque reason string.
+                // Pre-#396 AuthRequired/AuthFailed folded into
+                // `Failed { reason: "protocol error: ..." }` and
+                // `ControllerBusy` auto-retried via
+                // `TemporarilyUnavailable`. Per #396, each gets
+                // its own terminal state.
+                match e {
+                    SourceError::ControllerBusy => {
+                        set_state(&shared, ConnectionState::ControllerBusy);
+                        return;
+                    }
+                    SourceError::AuthRequired => {
+                        set_state(&shared, ConnectionState::AuthRequired);
+                        return;
+                    }
+                    SourceError::AuthFailed => {
+                        set_state(&shared, ConnectionState::AuthFailed);
+                        return;
+                    }
+                    SourceError::Protocol(_) => {
+                        // Non-recoverable: server isn't speaking
+                        // rtl_tcp, or the extended handshake was
+                        // rejected for a reason we don't have a
+                        // dedicated state for (ListenerCapReached,
+                        // parse errors, future status codes).
+                        set_state(
+                            &shared,
+                            ConnectionState::Failed {
+                                reason: format!("{e}"),
+                            },
+                        );
+                        return;
+                    }
+                    // `TemporarilyUnavailable` (transient network
+                    // conditions the caller wants us to back off
+                    // and retry on — NOT role denials, which are
+                    // now their own variants above) and every
+                    // other `SourceError` variant fall through to
+                    // the backoff loop below.
+                    _ => {}
                 }
-                // `TemporarilyUnavailable` (e.g. server responded
-                // with `ControllerBusy`) and every other
-                // `SourceError` variant fall through to the
-                // backoff loop below. The condition is expected
-                // to clear on its own — retrying with the normal
-                // schedule is the right behavior. Per CodeRabbit
-                // round 7 on PR #399.
             }
         }
 
@@ -1089,34 +1125,47 @@ fn attempt_connect(
         match read_server_extension(&stream) {
             Ok(ext) => {
                 // A non-OK status means the server parsed our hello
-                // but rejected the session. Two flavors:
+                // but rejected the session. Each flavor needs a
+                // distinct error variant so the connection manager
+                // can route to the right `RtlTcpConnectionState`
+                // without string-parsing the reason:
                 //
-                // - `ControllerBusy` (#392): another client owns the
-                //   control slot right now. This is **transient** —
-                //   that client will eventually disconnect, so we
-                //   return `SourceError::TemporarilyUnavailable` and
-                //   let the connection manager retry on the normal
-                //   backoff schedule. Per CodeRabbit round 7 on
-                //   PR #399.
-                // - `AuthRequired` / `AuthFailed` (#394) and any
-                //   future non-OK status: terminal. The user must
-                //   take action (set the right auth key) before
-                //   retries have any chance of succeeding, so we
-                //   surface `SourceError::Protocol` and the manager
-                //   transitions to `Failed`.
-                if ext.status == Status::ControllerBusy {
-                    return Err(SourceError::TemporarilyUnavailable(format!(
-                        "rtl_tcp server controller busy: status={:?} (wire={})",
-                        ext.status,
-                        ext.status.to_wire()
-                    )));
-                }
-                if ext.status != Status::Ok {
-                    return Err(SourceError::Protocol(format!(
-                        "rtl_tcp extension rejected by server: status={:?} (wire={})",
-                        ext.status,
-                        ext.status.to_wire()
-                    )));
+                // - `ControllerBusy` (#392) → `SourceError::ControllerBusy`.
+                //   User must decide: retry with `request_takeover`
+                //   or switch to `Role::Listen`. No auto-retry; the
+                //   UI surfaces a toast with action buttons.
+                //   Pre-#396 this folded into `TemporarilyUnavailable`
+                //   with silent auto-retry, which hid the decision
+                //   point. Per #396.
+                // - `AuthRequired` (#394) → `SourceError::AuthRequired`.
+                //   User must enter a key. No auto-retry.
+                // - `AuthFailed` (#394) → `SourceError::AuthFailed`.
+                //   User must enter the RIGHT key. No auto-retry.
+                // - Anything else → `SourceError::Protocol` (generic
+                //   terminal). Covers future status codes we haven't
+                //   seen yet, plus `ListenerCapReached` (which the
+                //   UI can treat similarly to ControllerBusy at the
+                //   toast level, but surfacing as generic Protocol
+                //   is acceptable until a dedicated #396 follow-up
+                //   fleshes out listener-cap UX).
+                match ext.status {
+                    Status::Ok => {}
+                    Status::ControllerBusy => {
+                        return Err(SourceError::ControllerBusy);
+                    }
+                    Status::AuthRequired => {
+                        return Err(SourceError::AuthRequired);
+                    }
+                    Status::AuthFailed => {
+                        return Err(SourceError::AuthFailed);
+                    }
+                    other @ Status::ListenerCapReached => {
+                        return Err(SourceError::Protocol(format!(
+                            "rtl_tcp extension rejected by server: status={:?} (wire={})",
+                            other,
+                            other.to_wire()
+                        )));
+                    }
                 }
                 tracing::info!(
                     codec = %ext.codec,
@@ -2163,8 +2212,16 @@ mod tests {
         // transient — the other controller will eventually
         // disconnect and we should retry. `AuthFailed` is the
         // right terminal substitute: a wrong key will not start
-        // working on retry, so the manager must transition to
-        // `Failed` and stop looping.
+        // working on retry, so the manager must transition to a
+        // terminal state and stop looping.
+        //
+        // **Updated for #396:** `AuthFailed` now routes to the
+        // dedicated `ConnectionState::AuthFailed` variant (not
+        // generic `Failed`) so the UI can surface a specific
+        // "Key rejected" toast + re-prompt path instead of an
+        // opaque error string. The terminal-ness contract is
+        // unchanged — the manager still stops the retry loop on
+        // `AuthFailed`.
         //
         // The test also guards the delayed-tuner-publish ordering:
         // `tuner_info()` must stay `None` because the handshake
@@ -2189,17 +2246,17 @@ mod tests {
         src.start_manager().unwrap();
 
         let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
-        let mut reached_failed = false;
+        let mut reached_terminal = false;
         while Instant::now() < deadline {
-            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
-                reached_failed = true;
+            if matches!(src.connection_state(), ConnectionState::AuthFailed) {
+                reached_terminal = true;
                 break;
             }
             thread::sleep(RTLX_TEST_POLL_INTERVAL);
         }
         assert!(
-            reached_failed,
-            "client should transition to Failed on `AuthFailed` ServerExtension status"
+            reached_terminal,
+            "client should transition to AuthFailed on `AuthFailed` ServerExtension status (per #396)"
         );
         assert!(
             src.tuner_info().is_none(),
@@ -2211,26 +2268,39 @@ mod tests {
     }
 
     #[test]
-    fn rtlx_handshake_controller_busy_is_transient_not_terminal() {
-        // Regression test for CodeRabbit round 7 on PR #399.
-        // `ControllerBusy` means another client currently owns the
-        // control slot (#392). That condition resolves on its own
-        // when the other client disconnects, so the rtl_tcp source
-        // must NOT transition to `Failed` — the connection manager
-        // should keep cycling through the backoff + reconnect path.
+    fn rtlx_handshake_controller_busy_routes_to_dedicated_state() {
+        // Regression test for #396. `ControllerBusy` means
+        // another client currently owns the control slot (#392).
+        // Pre-#396 this routed to `TemporarilyUnavailable` and
+        // the connection manager auto-retried silently via
+        // backoff. Per #396 the connection manager now routes
+        // it to the dedicated `ConnectionState::ControllerBusy`
+        // variant and STOPS the retry loop — the UI needs to
+        // surface the busy state to the user so they can pick
+        // Take-control or Connect-as-Listener instead of
+        // waiting for the other controller to drop.
         //
-        // We assert two things:
-        //   1. State never reaches `Failed` within the observation
-        //      window (CR #17 regression guard).
-        //   2. `tuner_info()` stays `None` (the delayed-publish
-        //      ordering holds regardless of status).
+        // Historical rename: the CR-round-7-on-PR-#399 rule
+        // ("ControllerBusy must not route to Failed") still
+        // holds — `ControllerBusy` is its OWN terminal state,
+        // not `Failed`. The UX contract changed; the naming
+        // discipline for generic-error terminal = `Failed` did
+        // not.
+        //
+        // We assert:
+        //   1. State reaches `ConnectionState::ControllerBusy`
+        //      within the observation window (the new #396
+        //      routing).
+        //   2. `tuner_info()` stays `None` — the handshake
+        //      never reached `Connected`.
         let (listener, config) = rtlx_test_listener_and_config();
         let addr = listener.local_addr().unwrap();
 
         let server_thread = thread::spawn(move || {
-            // Accept a single connection and reject it. The client
-            // will then loop; subsequent accepts would require an
-            // accept loop we don't need for this assertion.
+            // Accept a single connection and reject it. Because
+            // ControllerBusy is now terminal, the client will
+            // NOT retry and we don't need a multi-accept loop
+            // here.
             let ext = ServerExtension {
                 codec: Codec::None,
                 granted_role: None,
@@ -2245,23 +2315,30 @@ mod tests {
 
         src.start_manager().unwrap();
 
-        // Poll for the entire window. If `Failed` shows up at any
-        // point, that's the round-7 regression (ControllerBusy
-        // being treated as terminal).
         let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut reached_controller_busy = false;
         while Instant::now() < deadline {
-            if matches!(src.connection_state(), ConnectionState::Failed { .. }) {
-                panic!(
-                    "ControllerBusy must not route to Failed — the server condition \
-                     is transient and the manager should keep retrying. \
-                     Observed state: Failed."
-                );
+            if matches!(src.connection_state(), ConnectionState::ControllerBusy) {
+                reached_controller_busy = true;
+                break;
             }
+            // The `Failed` path would be a regression — Failed
+            // is for generic protocol errors only, not role
+            // denials.
+            assert!(
+                !matches!(src.connection_state(), ConnectionState::Failed { .. }),
+                "ControllerBusy must route to its dedicated state, not generic Failed"
+            );
             thread::sleep(RTLX_TEST_POLL_INTERVAL);
         }
         assert!(
+            reached_controller_busy,
+            "client should transition to ControllerBusy on `ControllerBusy` \
+             ServerExtension status (per #396)"
+        );
+        assert!(
             src.tuner_info().is_none(),
-            "tuner_info must stay None across transient busy retries"
+            "tuner_info must stay None when the handshake is rejected"
         );
 
         src.stop_manager();
