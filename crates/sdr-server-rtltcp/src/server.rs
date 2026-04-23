@@ -562,8 +562,32 @@ impl Server {
         if let Some(h) = self.accept_thread.take() {
             let _ = h.join();
         }
-        for h in self.registry.drain_worker_handles() {
-            let _ = h.join();
+        // Loop-drain: setup threads (post-PR #405 round 4) and
+        // the writer/command threads they spawn share the same
+        // registry bucket. A setup thread that's still inside
+        // `spawn_client_workers` when the FIRST drain runs will
+        // register its `writer_handle` + `command_handle` AFTER
+        // the drain returned — those late handles would never
+        // be joined under a single-pass drain, leaving the
+        // writer/command workers alive with their
+        // `Arc<Mutex<RtlSdrDevice>>` clones past the
+        // `has_stopped()` transition. Keep draining until the
+        // bucket stays empty across a full pass. Termination is
+        // guaranteed: the accept thread was joined first so no
+        // new setup threads can spawn; each live setup thread
+        // has a bounded lifetime (≤ `HELLO_SNIFF_TIMEOUT` +
+        // `AUTH_REPLY_TIMEOUT` ≈ 5.1 s) and registers its
+        // writer/command handles before exiting, so after at
+        // most one round of joins + drains the bucket converges
+        // to empty. Per `CodeRabbit` round 5 on PR #405.
+        loop {
+            let handles = self.registry.drain_worker_handles();
+            if handles.is_empty() {
+                break;
+            }
+            for h in handles {
+                let _ = h.join();
+            }
         }
         if let Some(h) = self.broadcaster_thread.take() {
             let _ = h.join();
