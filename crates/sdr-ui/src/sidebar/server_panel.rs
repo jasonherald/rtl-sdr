@@ -125,13 +125,27 @@ pub fn auth_key_to_hex(bytes: &[u8]) -> String {
 }
 
 /// Decode a lowercase-hex auth-key string back into raw bytes.
-/// Strict validation: rejects odd-length, non-ASCII, and non-hex
-/// input. Returns `None` for any malformed input; callers treat
-/// that as "keyring value is corrupt, regenerate on next
-/// toggle-on". Per issue #395.
+/// Strict validation: rejects odd-length, non-ASCII, non-hex
+/// input, AND decoded lengths outside
+/// `1..=sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN`. Returns
+/// `None` for any malformed input; callers treat that as "keyring
+/// value is corrupt, regenerate on next toggle-on" rather than
+/// letting an oversize payload reach `Server::start` and fail
+/// every client at handshake. Per issue #395 + `CodeRabbit`
+/// round 1 on PR #406.
 pub fn auth_key_from_hex(s: &str) -> Option<Vec<u8>> {
     const HEX_CHARS_PER_BYTE: usize = 2;
-    if s.is_empty() || !s.is_ascii() || !s.len().is_multiple_of(HEX_CHARS_PER_BYTE) {
+    /// Hex-encoded cap matching the backend's byte cap — two
+    /// hex chars per byte. A hex string longer than this cannot
+    /// decode to a valid auth key, so reject before we bother
+    /// allocating.
+    const MAX_HEX_CHARS: usize =
+        sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN * HEX_CHARS_PER_BYTE;
+    if s.is_empty()
+        || !s.is_ascii()
+        || !s.len().is_multiple_of(HEX_CHARS_PER_BYTE)
+        || s.len() > MAX_HEX_CHARS
+    {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / HEX_CHARS_PER_BYTE);
@@ -770,18 +784,29 @@ pub fn build_server_panel() -> ServerPanel {
         .valign(gtk4::Align::Center)
         .css_classes(["flat"])
         .build();
+    // Icon-only buttons need an explicit accessible label —
+    // screen readers read the label, not the tooltip. The reveal
+    // button's label flips in `window.rs` alongside icon_name when
+    // toggled. Matches the established pattern in this crate
+    // (source_panel, navigation_panel, radio_panel). Per
+    // `CodeRabbit` round 1 on PR #406.
+    auth_key_reveal_button.update_property(&[gtk4::accessible::Property::Label("Reveal key")]);
     let auth_key_copy_button = gtk4::Button::builder()
         .icon_name("edit-copy-symbolic")
         .tooltip_text("Copy key to clipboard")
         .valign(gtk4::Align::Center)
         .css_classes(["flat"])
         .build();
+    auth_key_copy_button
+        .update_property(&[gtk4::accessible::Property::Label("Copy key to clipboard")]);
     let auth_key_regenerate_button = gtk4::Button::builder()
         .icon_name("view-refresh-symbolic")
         .tooltip_text("Regenerate key — old key stops working for future reconnects")
         .valign(gtk4::Align::Center)
         .css_classes(["flat"])
         .build();
+    auth_key_regenerate_button
+        .update_property(&[gtk4::accessible::Property::Label("Regenerate key")]);
     auth_key_row.add_suffix(&auth_key_reveal_button);
     auth_key_row.add_suffix(&auth_key_copy_button);
     auth_key_row.add_suffix(&auth_key_regenerate_button);
@@ -1206,6 +1231,28 @@ mod tests {
         assert!(auth_key_from_hex("abc").is_none(), "odd length");
         assert!(auth_key_from_hex("xyz0").is_none(), "non-hex chars");
         assert!(auth_key_from_hex("💩💩").is_none(), "non-ASCII emoji");
+    }
+
+    #[test]
+    fn auth_key_from_hex_rejects_oversize_decoded_length() {
+        // Hex string encoding more than `MAX_AUTH_KEY_LEN`
+        // bytes must be rejected up-front so a corrupt
+        // keyring entry surfaces as "regenerate" rather than
+        // reaching `Server::start` and failing every client
+        // at handshake. Per `CodeRabbit` round 1 on PR #406.
+        let max_bytes = sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN;
+        // Exactly at cap: must decode.
+        let at_cap = "a".repeat(max_bytes * 2);
+        assert!(
+            auth_key_from_hex(&at_cap).is_some(),
+            "max-length hex must decode"
+        );
+        // One byte over cap: must reject.
+        let over_cap = "a".repeat((max_bytes + 1) * 2);
+        assert!(
+            auth_key_from_hex(&over_cap).is_none(),
+            "oversize hex must be rejected"
+        );
     }
 
     #[test]

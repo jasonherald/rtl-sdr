@@ -342,6 +342,16 @@ pub struct Server {
     /// mid-handshake `set_auth_key` never splits a single client's
     /// eager-vs-lazy gate across two keys. Per #395.
     auth_key: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Cached "auth is required" flag used by [`Server::auth_required`]
+    /// when the `auth_key` mutex is poisoned. Without this, a poisoned
+    /// mutex would silently advertise "no auth" via mDNS (discovery
+    /// clients would stop prompting for a key) while the handshake
+    /// path and [`Server::set_auth_key`] still treat the poison as
+    /// fatal. The atomic is updated inside [`Server::set_auth_key`]
+    /// on every successful mutation (AFTER the mutex write succeeds)
+    /// and initialized from `ServerConfig.auth_key.is_some()` at
+    /// construction. Per `CodeRabbit` round 1 on PR #406.
+    auth_required_cache: Arc<AtomicBool>,
     /// Snapshot of the `InitialDeviceState` that `apply_initial_state`
     /// actually applied at start. Cloned from `ServerConfig.initial`
     /// and stashed here so `Server::stats()` can include it without
@@ -427,6 +437,10 @@ impl Server {
         // value. Per issue #395: "change takes effect on next accept".
         let listener_cap = Arc::new(AtomicUsize::new(config.listener_cap));
         let auth_key = Arc::new(Mutex::new(config.auth_key.clone()));
+        // Seed the auth-required cache from the starting config.
+        // Kept in lockstep with `auth_key` updates by `set_auth_key`.
+        // Per `CodeRabbit` round 1 on PR #406.
+        let auth_required_cache = Arc::new(AtomicBool::new(config.auth_key.is_some()));
 
         // Broadcaster runs for the server's lifetime regardless of
         // connected-client count. Starting it BEFORE the accept thread
@@ -473,6 +487,7 @@ impl Server {
             compression: config.compression,
             listener_cap,
             auth_key,
+            auth_required_cache,
             initial: config.initial,
         })
     }
@@ -516,7 +531,18 @@ impl Server {
                 "auth_key mutex poisoned — server is in a broken state",
             ))
         })?;
+        let will_be_required = key.is_some();
         *guard = key;
+        // Drop the lock BEFORE the cache store so the cache write
+        // is never ordered-after a still-held mutex observer.
+        drop(guard);
+        // Update the poison-survival cache. Readers of
+        // `auth_required()` fall back to this value when the mutex
+        // is poisoned, so the cache must reflect the latest
+        // successful state change. Per `CodeRabbit` round 1 on
+        // PR #406.
+        self.auth_required_cache
+            .store(will_be_required, Ordering::Relaxed);
         Ok(())
     }
 
@@ -532,11 +558,25 @@ impl Server {
     /// (or the starting `ServerConfig.auth_key` was `Some`). Does
     /// not leak the key itself — useful for stamping the mDNS TXT
     /// `auth_required=true` field without handing the caller the
-    /// raw key bytes. Returns `false` on a poisoned mutex because
-    /// an unknown auth state should default to the safer "advertise
-    /// no auth" so clients don't falsely prompt for a key. Per #395.
+    /// raw key bytes.
+    ///
+    /// Falls back to `auth_required_cache` on a poisoned mutex.
+    /// The handshake path and `set_auth_key` treat poisoning as
+    /// fatal; downgrading the mDNS advertisement to "no auth" in
+    /// the same scenario would make discovery clients stop
+    /// prompting for a key exactly when the server is broken. The
+    /// cache holds the last-known good value so the TXT stays
+    /// honest even after the mutex is unusable. Per `CodeRabbit`
+    /// round 1 on PR #406.
     pub fn auth_required(&self) -> bool {
-        self.auth_key.lock().is_ok_and(|g| g.is_some())
+        if let Ok(g) = self.auth_key.lock() {
+            g.is_some()
+        } else {
+            tracing::warn!(
+                "auth_key mutex poisoned — auth_required() falling back to cached value"
+            );
+            self.auth_required_cache.load(Ordering::Relaxed)
+        }
     }
 
     /// Current server statistics.
