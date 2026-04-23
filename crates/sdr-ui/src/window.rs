@@ -2395,10 +2395,31 @@ fn connect_rtl_tcp_discovery(
                     } else {
                         server.txt.nickname.clone()
                     };
-                    let host = server
-                        .addresses
-                        .first()
-                        .map_or_else(|| server.hostname.clone(), ToString::to_string);
+                    // Identity host — the advertised mDNS
+                    // hostname, matching `favorite_key(&server)`.
+                    // `apply_rtl_tcp_connect` uses its `host`
+                    // argument as the stable id for
+                    // `rtl_tcp_active_server`, keyring lookups,
+                    // favorite matches, and
+                    // `LastConnectedServer`. Pre-`CodeRabbit`
+                    // round 6 on PR #408 this preferred
+                    // `server.addresses.first()` (a resolved
+                    // IPv4/IPv6 literal when mDNS had resolved
+                    // one), which split per-server state
+                    // between `shack-pi.local.:1234` (what
+                    // favorites store) and `192.168.1.17:1234`
+                    // (what the discovery connect path
+                    // persisted) — role / auth round-tripping
+                    // through discovery + favorites + startup
+                    // restore broke silently. The DSP's actual
+                    // dial path (`RtlTcpSource::with_config` →
+                    // `(host, port).to_socket_addrs()`) resolves
+                    // the hostname at connect time, so keeping
+                    // identity on the advertised name is
+                    // strictly better: stable across IP
+                    // changes AND correct by the
+                    // favorite-key contract.
+                    let host = server.hostname.clone();
                     // Age is effectively 0 here — `server.last_seen` was
                     // stamped by the browser thread a few ms ago —
                     // `format_age` will render "just now". Subsequent
@@ -2474,6 +2495,22 @@ fn connect_rtl_tcp_discovery(
                     };
                     let star_tuner_name = Some(server.txt.tuner.clone());
                     let star_gain_count = Some(server.txt.gains);
+                    // Capture the announce-derived auth flag so
+                    // a fresh star persists it alongside the
+                    // rest of the metadata. Pre-`CodeRabbit`
+                    // round 6 on PR #408 this was hard-set to
+                    // `None` at star time, which meant a newly-
+                    // starred auth-required server looked
+                    // "unknown" until the next mDNS refresh —
+                    // `apply_rtl_tcp_connect` + the startup
+                    // restore wouldn't reveal the key row
+                    // ahead of the first `AuthRequired` bounce.
+                    // The discovery-refresh path below already
+                    // writes `server.txt.auth_required` on re-
+                    // announce; this keeps the two entry points
+                    // consistent so freshly-starred favorites
+                    // carry the same hint as refreshed ones.
+                    let star_auth_required = server.txt.auth_required;
                     let star_favorites = Rc::clone(&favorites);
                     let star_config = std::sync::Arc::clone(&config_for_discovery);
                     let star_expander_weak = expander_weak.clone();
@@ -2513,12 +2550,18 @@ fn connect_rtl_tcp_discovery(
                                         last_seen_unix: Some(
                                             sidebar::source_panel::now_unix_seconds(),
                                         ),
-                                        // Fresh star — no role preference yet;
-                                        // auth_required hint comes from the
-                                        // discovery-refresh path below on a
-                                        // future mDNS announce. Per #396.
+                                        // Fresh star — no role preference
+                                        // yet; `auth_required` is captured
+                                        // from the current mDNS announce's
+                                        // TXT record above so
+                                        // `apply_rtl_tcp_connect` + the
+                                        // startup restore can pre-reveal
+                                        // the key row immediately, without
+                                        // waiting on a mDNS re-announce.
+                                        // Per `CodeRabbit` round 6 on
+                                        // PR #408 and issue #396.
                                         requested_role: None,
-                                        auth_required: None,
+                                        auth_required: star_auth_required,
                                     },
                                 );
                             } else {
