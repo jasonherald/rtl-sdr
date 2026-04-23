@@ -27,11 +27,15 @@ const DEFAULT_SAMPLE_RATE_TEXT: &str = "SR: --";
 const DEFAULT_DEMOD_TEXT: &str = "-- --";
 /// Default frequency display text when no data has arrived.
 const DEFAULT_FREQUENCY_TEXT: &str = "-- Hz";
-/// Default antenna-dimension text when no frequency is set yet. The
-/// label itself stays invisible in this state so the status bar
-/// reads cleanly at app launch; `update_frequency` reveals it once
-/// a valid tuned frequency lands. Per issue #157.
-const DEFAULT_ANTENNA_TEXT: &str = "";
+/// Default antenna-dimension text when no frequency is set yet or
+/// the tuned frequency is below the renderable floor. Mirrors the
+/// other `-- unit` placeholders (`Level: -- dBFS`, `SR: --`) so the
+/// feature is discoverable in the status bar from app launch, not
+/// hidden until the first tune. Per issue #157 — post-smoke-test
+/// tweak to drop the start-hidden behaviour (the user couldn't
+/// find "a way to activate" the calculator because there was no
+/// indication it existed until the freq fell in range).
+const DEFAULT_ANTENNA_TEXT: &str = "λ/2 -- · λ/4 --";
 /// Default cursor readout text when the cursor is not over the spectrum.
 const DEFAULT_CURSOR_TEXT: &str = "Cursor: --";
 
@@ -67,14 +71,14 @@ pub struct StatusBar {
     /// Label showing center frequency.
     pub frequency_label: gtk4::Label,
     /// Label showing half-wave + quarter-wave antenna dimensions for
-    /// the current frequency. Paired with [`antenna_separator`] so
-    /// both toggle together when the label has nothing to render
-    /// (e.g. sub-3-kHz inputs, which would balloon into kilometre
-    /// wavelengths). Per issue #157.
+    /// the current frequency. Always visible (falls back to the
+    /// `DEFAULT_ANTENNA_TEXT` placeholder for frequencies below
+    /// [`crate::antenna::MIN_RENDERABLE_FREQUENCY_HZ`]) so the
+    /// feature is always discoverable in the status bar. Per
+    /// issue #157.
     pub antenna_label: gtk4::Label,
-    /// Separator packed immediately before `antenna_label`. Hidden
-    /// in lockstep with the label so a no-render state doesn't
-    /// leave a floating separator.
+    /// Separator packed immediately before [`antenna_label`]. Always
+    /// visible alongside the label.
     pub antenna_separator: gtk4::Separator,
     /// Label showing cursor frequency and power readout.
     pub cursor_label: gtk4::Label,
@@ -112,19 +116,17 @@ impl StatusBar {
     /// Update the center frequency display. Also refreshes the
     /// companion antenna-dimension label (half-wave + quarter-wave
     /// arm length) for the same frequency so the builder value
-    /// stays in sync with the tuned band. Hidden when the
-    /// frequency is below the renderable floor (see
-    /// [`crate::antenna::MIN_RENDERABLE_FREQUENCY_HZ`]).
+    /// stays in sync with the tuned band. Falls back to the
+    /// `DEFAULT_ANTENNA_TEXT` placeholder when the frequency is
+    /// below the renderable floor (see
+    /// [`crate::antenna::MIN_RENDERABLE_FREQUENCY_HZ`]); the label
+    /// itself stays visible either way so the feature is always
+    /// discoverable.
     pub fn update_frequency(&self, hz: f64) {
         self.frequency_label.set_label(&format_frequency(hz));
-        if let Some(text) = crate::antenna::format_antenna_line(hz) {
-            self.antenna_label.set_label(&text);
-            self.antenna_label.set_visible(true);
-            self.antenna_separator.set_visible(true);
-        } else {
-            self.antenna_label.set_visible(false);
-            self.antenna_separator.set_visible(false);
-        }
+        let antenna_text = crate::antenna::format_antenna_line(hz)
+            .unwrap_or_else(|| DEFAULT_ANTENNA_TEXT.to_string());
+        self.antenna_label.set_label(&antenna_text);
     }
 
     /// Update the `rtl_tcp` role badge. `Some(RtlTcpRoleBadge::
@@ -180,10 +182,7 @@ pub fn build_status_bar() -> StatusBar {
     let demod_label = gtk4::Label::new(Some(DEFAULT_DEMOD_TEXT));
     let frequency_label = gtk4::Label::new(Some(DEFAULT_FREQUENCY_TEXT));
     let antenna_label = gtk4::Label::new(Some(DEFAULT_ANTENNA_TEXT));
-    antenna_label.add_css_class("dim-label");
-    antenna_label.set_visible(false);
     let antenna_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
-    antenna_separator.set_visible(false);
     let cursor_label = gtk4::Label::new(Some(DEFAULT_CURSOR_TEXT));
     let role_label = gtk4::Label::new(Some(DEFAULT_ROLE_TEXT));
     role_label.set_visible(false);
