@@ -2086,6 +2086,12 @@ fn connect_rtl_tcp_discovery(
                                         last_seen_unix: Some(
                                             sidebar::source_panel::now_unix_seconds(),
                                         ),
+                                        // Fresh star — no role preference yet;
+                                        // auth_required hint comes from the
+                                        // discovery-refresh path below on a
+                                        // future mDNS announce. Per #396.
+                                        requested_role: None,
+                                        auth_required: None,
                                     },
                                 );
                             } else {
@@ -2183,6 +2189,14 @@ fn connect_rtl_tcp_discovery(
                             } else {
                                 server.txt.nickname.clone()
                             };
+                            // Preserve any saved `requested_role`
+                            // from the previous favorites entry (the
+                            // user's last pick sticks across
+                            // re-announces); refresh the
+                            // `auth_required` hint from the incoming
+                            // TXT so the UI reveals the key field
+                            // BEFORE the user clicks Connect. Per #396.
+                            let preserved_role = favs.get(&fav_key).and_then(|f| f.requested_role);
                             favs.insert(
                                 fav_key.clone(),
                                 sidebar::source_panel::FavoriteEntry {
@@ -2191,6 +2205,8 @@ fn connect_rtl_tcp_discovery(
                                     tuner_name: Some(server.txt.tuner.clone()),
                                     gain_count: Some(server.txt.gains),
                                     last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+                                    requested_role: preserved_role,
+                                    auth_required: server.txt.auth_required,
                                 },
                             );
                             let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
@@ -7417,6 +7433,8 @@ mod favorite_sort_tests {
             tuner_name: None,
             gain_count: None,
             last_seen_unix: None,
+            requested_role: None,
+            auth_required: None,
         }
     }
 
@@ -7492,6 +7510,8 @@ mod favorite_subtitle_format_tests {
             tuner_name: tuner.map(str::to_string),
             gain_count: gains,
             last_seen_unix: last_seen,
+            requested_role: None,
+            auth_required: None,
         }
     }
 

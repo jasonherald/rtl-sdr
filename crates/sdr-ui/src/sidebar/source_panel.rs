@@ -773,6 +773,61 @@ pub struct FavoriteEntry {
     /// `ServerAnnounced` event for this `key`. `None` when we
     /// haven't seen the server this session.
     pub last_seen_unix: Option<u64>,
+    /// Last-used role against this server: `"control"` or
+    /// `"listen"`. Stored as a string (via
+    /// `serde(rename_all = "snake_case")` on the enum) rather
+    /// than the raw enum so the JSON is human-readable and a
+    /// future enum-variant rename doesn't silently break
+    /// deserialization. `None` until the user explicitly picks
+    /// a role for this server; the connect path defaults to
+    /// Control when `None`. Per issue #396.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_role: Option<FavoriteRole>,
+    /// Whether the most recent mDNS TXT for this server
+    /// advertised `auth_required=true`. Pre-populated from
+    /// discovery events so the UI can reveal the Server key
+    /// field BEFORE the user clicks Connect (saves a round
+    /// trip through the `AuthRequired` error path). `None`
+    /// means "unknown" — either we've never seen a TXT, or the
+    /// record didn't carry the field (older server, non-sdr-rs
+    /// server). Per issue #396.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_required: Option<bool>,
+}
+
+/// Favorite-entry serialized form of a client's preferred role
+/// for a given server. `snake_case` so the JSON surface reads
+/// as `"control"` / `"listen"` — easier to hand-edit and
+/// more forgiving across future enum changes. Per #396.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FavoriteRole {
+    Control,
+    Listen,
+}
+
+impl FavoriteRole {
+    /// Translate to the wire-level `sdr_server_rtltcp::extension::Role`
+    /// the client hello will carry. Kept as a separate crate
+    /// boundary so `FavoriteEntry` doesn't force a dep on
+    /// `sdr-server-rtltcp` at every call site that reads a
+    /// serialized favorite.
+    pub fn as_wire_role(self) -> sdr_server_rtltcp::extension::Role {
+        match self {
+            Self::Control => sdr_server_rtltcp::extension::Role::Control,
+            Self::Listen => sdr_server_rtltcp::extension::Role::Listen,
+        }
+    }
+
+    /// Inverse: build a `FavoriteRole` from a wire-level
+    /// `Role`. Used when persisting a newly-chosen role back to
+    /// the favorite entry after a successful connect.
+    pub fn from_wire_role(role: sdr_server_rtltcp::extension::Role) -> Self {
+        match role {
+            sdr_server_rtltcp::extension::Role::Control => Self::Control,
+            sdr_server_rtltcp::extension::Role::Listen => Self::Listen,
+        }
+    }
 }
 
 /// Load the persisted favorites list. Returns an empty `Vec` on
@@ -809,13 +864,20 @@ pub fn load_favorites(config: &Arc<ConfigManager>) -> Vec<FavoriteEntry> {
                     // Legacy bare-string entry. Build a stub
                     // FavoriteEntry so the slide-out still has
                     // something to render while the user waits
-                    // for the server to re-announce.
+                    // for the server to re-announce. Role and
+                    // auth-required default to `None` — the
+                    // connect path treats both as "unknown"
+                    // (role defaults to Control, auth_required
+                    // is decided by the server on first
+                    // connect).
                     Some(FavoriteEntry {
                         key: s.to_string(),
                         nickname: s.to_string(),
                         tuner_name: None,
                         gain_count: None,
                         last_seen_unix: None,
+                        requested_role: None,
+                        auth_required: None,
                     })
                 } else {
                     // Corrupt object entry — hand-edited JSON or a
@@ -1066,6 +1128,8 @@ mod tests {
                 tuner_name: Some("R820T".into()),
                 gain_count: Some(29),
                 last_seen_unix: Some(TEST_LAST_SEEN_UNIX),
+                requested_role: Some(FavoriteRole::Listen),
+                auth_required: Some(true),
             },
             FavoriteEntry {
                 key: "attic-pi.local.:1234".into(),
@@ -1073,6 +1137,8 @@ mod tests {
                 tuner_name: None,
                 gain_count: None,
                 last_seen_unix: None,
+                requested_role: None,
+                auth_required: None,
             },
         ];
         save_favorites(&config, &favs);
@@ -1083,11 +1149,18 @@ mod tests {
         assert_eq!(loaded[0].tuner_name.as_deref(), Some("R820T"));
         assert_eq!(loaded[0].gain_count, Some(29));
         assert_eq!(loaded[0].last_seen_unix, Some(TEST_LAST_SEEN_UNIX));
+        // Role + auth_required round-trip on the opt-in side.
+        // Per #396: the JSON surface carries these through the
+        // serde `snake_case` rename and skip-if-none attributes.
+        assert_eq!(loaded[0].requested_role, Some(FavoriteRole::Listen));
+        assert_eq!(loaded[0].auth_required, Some(true));
         // Second entry has every optional field None → must
         // round-trip as None, NOT as missing / default values.
         assert!(loaded[1].tuner_name.is_none());
         assert!(loaded[1].gain_count.is_none());
         assert!(loaded[1].last_seen_unix.is_none());
+        assert!(loaded[1].requested_role.is_none());
+        assert!(loaded[1].auth_required.is_none());
     }
 
     #[test]

@@ -139,16 +139,24 @@ pub enum ConnectionState {
     /// the negotiated stream codec from the extended `"RTLX"`
     /// handshake (#307); legacy / uncompressed paths land on
     /// `Codec::None`.
-    Connected { tuner: TunerInfo, codec: Codec },
+    Connected {
+        tuner: TunerInfo,
+        codec: Codec,
+    },
     /// Connection dropped, backoff pending. Transport-level errors
     /// (TCP connect refused, EOF, stall) stay in this state — the
     /// manager retries forever with exponential backoff up to the
     /// 30 s cap.
-    Retrying { attempt: u32, next_at: Instant },
+    Retrying {
+        attempt: u32,
+        next_at: Instant,
+    },
     /// Terminal failure — only entered for a protocol-level error
     /// (e.g., server sent a non-RTL0 header). Transport failures
     /// never reach this state; they remain in `Retrying`.
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     /// Terminal role-denial states surfaced by the #392/#394
     /// extended handshake. Per #396, the connection manager
     /// stops retrying and waits for the UI to offer the user an
