@@ -61,6 +61,36 @@ const APP_CSS: &str = r#"
     border: none;
     background: transparent;
 }
+
+/* Activity bar — narrow strip of icon toggle buttons against window edge */
+.activity-bar {
+    background-color: alpha(@theme_bg_color, 0.95);
+    border-right: 1px solid alpha(@borders, 0.4);
+    padding: 6px 2px;
+}
+
+.activity-bar button {
+    min-width: 40px;
+    min-height: 40px;
+    padding: 8px;
+    border-radius: 4px;
+    margin: 2px 0;
+}
+
+.activity-bar button.accent {
+    border-left: 2px solid @accent_color;
+}
+
+/* Right activity bar — mirror the border to the left edge */
+.activity-bar-right {
+    border-left: 1px solid alpha(@borders, 0.4);
+    border-right: none;
+}
+
+.activity-bar-right button.accent {
+    border-left: none;
+    border-right: 2px solid @accent_color;
+}
 "#;
 
 /// Load the application CSS into the default display's style context.

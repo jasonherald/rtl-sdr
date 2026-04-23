@@ -6,11 +6,21 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::header::demod_selector::DEMOD_MODE_COUNT;
+use crate::sidebar::ActivityBar;
+
+/// Ordered list of left-activity stable names used by `Ctrl+1`..`Ctrl+5`.
+/// Must match the `ActivityBarEntry::name` values in `window.rs`.
+const LEFT_ACTIVITY_SHORTCUT_NAMES: &[&str] = &["general", "radio", "audio", "display", "scanner"];
 
 /// Set up keyboard shortcuts on the application window.
 ///
 /// Registers shortcuts for play/stop toggle, demod cycling, sidebar toggle,
 /// and attaches a help overlay for `Ctrl+?`.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "single window-wide shortcut setup — callers already bundle their widgets; the registrations are parallel not chainable"
+)]
 pub fn setup_shortcuts(
     window: &adw::ApplicationWindow,
     play_button: &gtk4::ToggleButton,
@@ -18,6 +28,8 @@ pub fn setup_shortcuts(
     bookmarks_toggle: &gtk4::ToggleButton,
     demod_dropdown: &gtk4::DropDown,
     scanner_switch: &gtk4::Switch,
+    left_activity_bar: &ActivityBar,
+    right_activity_bar: &ActivityBar,
 ) {
     let controller = gtk4::ShortcutController::new();
     controller.set_scope(gtk4::ShortcutScope::Managed);
@@ -116,6 +128,52 @@ pub fn setup_shortcuts(
         controller.add_shortcut(shortcut);
     }
 
+    // Ctrl+1..Ctrl+5: Select left activity by index. `emit_clicked`
+    // runs the activity bar's click handler, which handles the
+    // different-button-vs-same-button logic (swap stack or toggle
+    // panel). Going through the button keeps the visual `.accent`
+    // state and the logical selection in lockstep — same indirection
+    // pattern as the F9 sidebar toggle above.
+    for (index, name) in LEFT_ACTIVITY_SHORTCUT_NAMES.iter().enumerate() {
+        let Some(btn) = left_activity_bar.buttons.get(*name) else {
+            tracing::warn!(
+                "Ctrl+{} shortcut has no matching activity button ({})",
+                index + 1,
+                name
+            );
+            continue;
+        };
+        let btn_weak = btn.downgrade();
+        let trigger_str = format!("<Ctrl>{}", index + 1);
+        let Some(trigger) = gtk4::ShortcutTrigger::parse_string(&trigger_str) else {
+            continue;
+        };
+        let action = gtk4::CallbackAction::new(move |_widget, _args| {
+            if let Some(btn) = btn_weak.upgrade() {
+                btn.emit_clicked();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        controller.add_shortcut(gtk4::Shortcut::new(Some(trigger), Some(action)));
+    }
+
+    // Ctrl+Shift+1: Toggle right transcript panel. Single icon today;
+    // future additions extend this block with `<Ctrl><Shift>2` etc.
+    if let Some(transcript_btn) = right_activity_bar.buttons.get("transcript") {
+        let btn_weak = transcript_btn.downgrade();
+        if let Some(trigger) = gtk4::ShortcutTrigger::parse_string("<Ctrl><Shift>1") {
+            let action = gtk4::CallbackAction::new(move |_widget, _args| {
+                if let Some(btn) = btn_weak.upgrade() {
+                    btn.emit_clicked();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+            controller.add_shortcut(gtk4::Shortcut::new(Some(trigger), Some(action)));
+        }
+    }
+
     window.add_controller(controller);
 }
 
@@ -128,7 +186,13 @@ const SHORTCUT_CATALOG: &[(&str, &[(&str, &str)])] = &[
     (
         "Navigation",
         &[
-            ("F9", "Toggle sidebar"),
+            ("F9", "Toggle left panel"),
+            ("Ctrl+1", "General panel"),
+            ("Ctrl+2", "Radio panel"),
+            ("Ctrl+3", "Audio panel"),
+            ("Ctrl+4", "Display panel"),
+            ("Ctrl+5", "Scanner panel"),
+            ("Ctrl+Shift+1", "Toggle transcript panel"),
             ("Ctrl+B", "Toggle bookmarks panel"),
             ("F8", "Toggle scanner"),
         ],
