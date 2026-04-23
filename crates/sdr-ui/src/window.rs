@@ -596,6 +596,20 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let rtl_tcp_auth_key_row_weak = panels.source.rtl_tcp_auth_key_row.downgrade();
     let rtl_tcp_hostname_row_weak = panels.source.hostname_row.downgrade();
     let rtl_tcp_port_row_weak = panels.source.port_row.downgrade();
+    // Weak refs to the two persistent ControllerBusy toasts, so
+    // clicking either action dismisses BOTH (pre-`CodeRabbit`
+    // round 11 on PR #408 only the clicked toast dismissed and
+    // the sibling stale-action could later rebuild the source
+    // against a healthy session), and so a transition away from
+    // ControllerBusy (e.g. the controller slot freed up and we
+    // reached `Connected` directly) sweeps the live pair. `Rc<
+    // RefCell<Vec<..>>>` lives at the DSP-poll closure scope so
+    // it persists across ticks but drops with the timeout
+    // source. `glib::WeakRef` inside the Vec so a dropped toast
+    // doesn't keep a strong reference — the vec is just a
+    // "remember to dismiss these on state change" ledger.
+    let pending_controller_busy_toasts: Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>> =
+        Rc::new(RefCell::new(Vec::new()));
     // Network audio sink status row — same weak-ref pattern as
     // the rtl_tcp status row above so a window close can't keep
     // the row alive past its useful life. Per issue #247.
@@ -663,6 +677,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &rtl_tcp_auth_key_row_weak,
                         &rtl_tcp_hostname_row_weak,
                         &rtl_tcp_port_row_weak,
+                        &pending_controller_busy_toasts,
                         &network_sink_status_row_weak,
                         &transcription_enable_for_dsp,
                         #[cfg(feature = "sherpa")]
@@ -736,6 +751,7 @@ fn handle_dsp_message(
     rtl_tcp_auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
     rtl_tcp_hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
     rtl_tcp_port_row_weak: &glib::WeakRef<adw::SpinRow>,
+    pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
     network_sink_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     transcription_enable_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
@@ -963,6 +979,7 @@ fn handle_dsp_message(
                     rtl_tcp_auth_key_row_weak,
                     rtl_tcp_hostname_row_weak,
                     rtl_tcp_port_row_weak,
+                    pending_controller_busy_toasts,
                 );
             }
             // Status-bar role badge (#396) — show the role the
@@ -1200,6 +1217,22 @@ fn apply_network_sink_status(row: &adw::ActionRow, status: &sdr_core::NetworkSin
 /// immediately following an auth-required transition (to save
 /// the user-entered key to the per-server keyring).
 ///
+/// `adw::Toast::set_timeout(0)` keeps a toast on screen until
+/// the user dismisses it or an explicit `dismiss()` fires. Used
+/// for the two `ControllerBusy` action toasts — the stakes are
+/// high enough (the user has to actively choose between Take-
+/// control, Listener, or abandoning the connect) that a
+/// time-limited toast would feel like silent retry behavior.
+/// Per `CodeRabbit` round 12 on PR #408.
+const TOAST_TIMEOUT_PERSISTENT: u32 = 0;
+
+/// Short toast timeout in seconds for transient-acknowledgement
+/// notices — the `AuthRequired` / `AuthFailed` copy that
+/// complements a revealed key-entry row. Long enough to read, short
+/// enough to clear without user interaction once the user has
+/// moved on to typing. Per `CodeRabbit` round 12 on PR #408.
+const TOAST_TIMEOUT_SHORT_SECS: u32 = 5;
+
 /// Called only from the edge-detection path in
 /// `handle_dsp_message`; the caller already verified
 /// `prev_disc != now_disc` and stored the new discriminant.
@@ -1216,6 +1249,10 @@ fn apply_network_sink_status(row: &adw::ActionRow, status: &sdr_core::NetworkSin
               AuthFailed are type variants — enum paths would make the prose \
               unreadable; backticks on each would overwhelm the paragraph"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear arm-by-arm toast + row + state handling for all 8 rtl_tcp connection-state variants; splitting would scatter the shared setup (pending-toasts sweep, edge-log) and obscure the 1:1 mapping from variant to UX gesture"
+)]
 fn handle_rtl_tcp_state_toast(
     state_val: &sdr_types::RtlTcpConnectionState,
     prev_disc: u8,
@@ -1225,13 +1262,35 @@ fn handle_rtl_tcp_state_toast(
     auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
     hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
     port_row_weak: &glib::WeakRef<adw::SpinRow>,
+    pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
 ) {
     use sdr_types::RtlTcpConnectionState;
 
     use crate::state::{
         RTL_TCP_STATE_DISC_AUTH_FAILED, RTL_TCP_STATE_DISC_AUTH_REQUIRED,
-        RTL_TCP_STATE_DISC_CONNECTING,
+        RTL_TCP_STATE_DISC_CONNECTING, RTL_TCP_STATE_DISC_CONTROLLER_BUSY,
     };
+
+    // Sweep any still-live ControllerBusy toasts on any
+    // transition that isn't re-entering ControllerBusy. Pre-
+    // `CodeRabbit` round 11 on PR #408 each ControllerBusy
+    // toast's button handler only dismissed itself, so a stale
+    // "Take control" / "Connect as Listener" action sat visible
+    // after the server went away (Connected directly, Disconnect,
+    // Failed, etc.) and could later rebuild the source
+    // unexpectedly against a healthy session. The
+    // `timeout(0)` persistence is intentional — we WANT these to
+    // stick around until the user interacts OR the state
+    // resolves itself — but "the state resolved itself" needs
+    // its own cleanup pass.
+    if !matches!(state_val, RtlTcpConnectionState::ControllerBusy) {
+        let mut pending = pending_controller_busy_toasts.borrow_mut();
+        for weak in pending.drain(..) {
+            if let Some(toast) = weak.upgrade() {
+                toast.dismiss();
+            }
+        }
+    }
 
     match state_val {
         RtlTcpConnectionState::ControllerBusy => {
@@ -1245,21 +1304,57 @@ fn handle_rtl_tcp_state_toast(
             let Some(overlay) = toast_overlay_weak.upgrade() else {
                 return;
             };
+            // Before creating the new pair, sweep any still-
+            // live toasts from a prior `ControllerBusy` entry
+            // (e.g. the user hit `Retry` without clicking either
+            // action, and the server is still busy on the
+            // rebound). Otherwise the overlay would stack two
+            // pairs, and dismissing one pair via the cross-
+            // dismiss helpers below would leave the other pair
+            // orphaned. Per `CodeRabbit` round 11 on PR #408.
+            {
+                let mut pending = pending_controller_busy_toasts.borrow_mut();
+                for weak in pending.drain(..) {
+                    if let Some(toast) = weak.upgrade() {
+                        toast.dismiss();
+                    }
+                }
+            }
+
             let toast = adw::Toast::builder()
                 .title("Controller slot is occupied on this server.")
-                .timeout(0)
+                .timeout(TOAST_TIMEOUT_PERSISTENT)
                 .build();
+            let listen_toast = adw::Toast::builder()
+                .title("Or connect as Listener (read-only).")
+                .timeout(TOAST_TIMEOUT_PERSISTENT)
+                .build();
+            // Cross-dismiss: clicking either action dismisses
+            // BOTH toasts, so a stale sibling action can't fire
+            // later against a session that's already resolved.
+            // `WeakRef` rather than strong clones — the toasts
+            // hand out their own strong refs to the overlay
+            // internally, and we only need to reach the sibling
+            // when it's still live.
+            let toast_weak = toast.downgrade();
+            let listen_toast_weak = listen_toast.downgrade();
+
             // Track the two action buttons as separate signals.
             // AdwToast supports a single primary action via
             // `set_button_label` + `connect_button_clicked`; the
             // "Take control" action lands there, and the
-            // "Connect as Listener" option lives in the toast
-            // body copy so users still see both choices.
+            // "Connect as Listener" option lives in the
+            // sibling toast below so users still see both
+            // choices.
             toast.set_button_label(Some("Take control"));
             let state_for_takeover = Rc::clone(app_state);
+            let listen_weak_for_takeover = listen_toast_weak.clone();
             toast.connect_button_clicked(move |t| {
                 state_for_takeover.send_dsp(UiToDsp::RetryRtlTcpWithTakeover);
                 t.dismiss();
+                if let Some(sibling) = listen_weak_for_takeover.upgrade() {
+                    sibling.dismiss();
+                }
             });
             overlay.add_toast(toast);
 
@@ -1267,13 +1362,10 @@ fn handle_rtl_tcp_state_toast(
             // separate toasts beats a single one because AdwToast
             // exposes only one action button — splitting the two
             // paths keeps both discoverable.
-            let listen_toast = adw::Toast::builder()
-                .title("Or connect as Listener (read-only).")
-                .timeout(0)
-                .build();
             listen_toast.set_button_label(Some("Connect as Listener"));
             let state_for_listen = Rc::clone(app_state);
             let role_row_for_listen = role_row_weak.clone();
+            let toast_weak_for_listen = toast_weak.clone();
             listen_toast.connect_button_clicked(move |t| {
                 if let Some(role_row) = role_row_for_listen.upgrade() {
                     // Flipping the combo to Listen fires its
@@ -1285,8 +1377,21 @@ fn handle_rtl_tcp_state_toast(
                 }
                 state_for_listen.send_dsp(UiToDsp::RetryRtlTcpNow);
                 t.dismiss();
+                if let Some(sibling) = toast_weak_for_listen.upgrade() {
+                    sibling.dismiss();
+                }
             });
             overlay.add_toast(listen_toast);
+
+            // Record the pair so the non-ControllerBusy state
+            // transition at the top of this function can sweep
+            // them if the server resolves itself without user
+            // interaction.
+            {
+                let mut pending = pending_controller_busy_toasts.borrow_mut();
+                pending.push(toast_weak);
+                pending.push(listen_toast_weak);
+            }
         }
 
         RtlTcpConnectionState::AuthRequired => {
@@ -1303,7 +1408,7 @@ fn handle_rtl_tcp_state_toast(
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let toast = adw::Toast::builder()
                     .title("Server requires an authentication key.")
-                    .timeout(5)
+                    .timeout(TOAST_TIMEOUT_SHORT_SECS)
                     .build();
                 overlay.add_toast(toast);
             }
@@ -1346,7 +1451,7 @@ fn handle_rtl_tcp_state_toast(
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let toast = adw::Toast::builder()
                     .title("Key rejected. Check with the server owner.")
-                    .timeout(5)
+                    .timeout(TOAST_TIMEOUT_SHORT_SECS)
                     .build();
                 overlay.add_toast(toast);
             }
@@ -1355,26 +1460,39 @@ fn handle_rtl_tcp_state_toast(
         RtlTcpConnectionState::Connected { .. } => {
             // Save the user-entered key to the per-server
             // keyring so subsequent reconnects auto-use it.
-            // Fires on the edge from either `AuthRequired` /
-            // `AuthFailed` (user typed a key in response to a
-            // denial) OR `Connecting` (user had auth configured
-            // up front — server advertised `auth_required` via
-            // mDNS, key was entered before the first connect,
-            // and the handshake succeeded in a single
-            // `Connecting → Connected` hop without ever
-            // surfacing an auth-denial state). Pre-CodeRabbit
-            // round 1 on PR #408 the Connecting case was
-            // missed, so up-front keys never hit the keyring
-            // and the user had to re-type them on every
+            // Fires on the edge from any of:
+            //
+            // - `AuthRequired` / `AuthFailed` — user typed a
+            //   key in response to a denial toast;
+            // - `Connecting` — user had auth configured up
+            //   front (server advertised `auth_required` via
+            //   mDNS, key was entered before the first
+            //   connect, and the handshake succeeded in a
+            //   single `Connecting → Connected` hop);
+            // - `ControllerBusy` — user entered a key before
+            //   the first connect, server denied with
+            //   `ControllerBusy`, and the user's subsequent
+            //   Take-control / Listener retry (via
+            //   `RetryRtlTcpWithTakeover` or `RetryRtlTcpNow`)
+            //   succeeded. Added per `CodeRabbit` round 12 on
+            //   PR #408 — without this branch an auth-required
+            //   server that's also busy on the first attempt
+            //   would accept the key on the takeover reconnect
+            //   but never persist it to the keyring.
+            //
+            // Pre-round-1 on PR #408 only the auth-denial arms
+            // triggered the save, so up-front keys never hit the
+            // keyring and the user had to re-type them on every
             // reconnect. `save_current_auth_key_for_active_
             // server` is a no-op when the key row is empty, so
-            // this is safe to trigger on every Connecting→
-            // Connected edge even if the server doesn't require
-            // auth. Call `record_active_rtl_tcp_server` first
-            // so the save-path sees the right `host:port` even
-            // when the user never hit an auth-denial arm
-            // (which is what previously set the cache).
+            // this is safe to trigger on every qualifying edge
+            // even if the server doesn't require auth. Call
+            // `record_active_rtl_tcp_server` first so the save-
+            // path sees the right `host:port` even when the
+            // user never hit an auth-denial arm (which is what
+            // previously set the cache).
             if prev_disc == RTL_TCP_STATE_DISC_CONNECTING
+                || prev_disc == RTL_TCP_STATE_DISC_CONTROLLER_BUSY
                 || prev_disc == RTL_TCP_STATE_DISC_AUTH_REQUIRED
                 || prev_disc == RTL_TCP_STATE_DISC_AUTH_FAILED
             {
