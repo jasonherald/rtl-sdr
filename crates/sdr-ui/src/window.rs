@@ -3037,6 +3037,8 @@ struct ServerSwitchWidgetsWeak {
     status_commanded_row: glib::WeakRef<adw::ActionRow>,
     activity_log_row: glib::WeakRef<adw::ExpanderRow>,
     activity_log_list: glib::WeakRef<gtk4::ListBox>,
+    clients_row: glib::WeakRef<adw::ExpanderRow>,
+    clients_list: glib::WeakRef<gtk4::ListBox>,
     source_device_row: glib::WeakRef<adw::ComboRow>,
 }
 
@@ -3067,6 +3069,8 @@ struct ServerSwitchWidgets {
     status_commanded_row: adw::ActionRow,
     activity_log_row: adw::ExpanderRow,
     activity_log_list: gtk4::ListBox,
+    clients_row: adw::ExpanderRow,
+    clients_list: gtk4::ListBox,
     source_device_row: adw::ComboRow,
 }
 
@@ -3095,6 +3099,8 @@ impl ServerSwitchWidgetsWeak {
             status_commanded_row: s.status_commanded_row.downgrade(),
             activity_log_row: s.activity_log_row.downgrade(),
             activity_log_list: s.activity_log_list.downgrade(),
+            clients_row: s.clients_row.downgrade(),
+            clients_list: s.clients_list.downgrade(),
             source_device_row: panels.source.device_row.downgrade(),
         }
     }
@@ -3124,6 +3130,8 @@ impl ServerSwitchWidgetsWeak {
             status_commanded_row: self.status_commanded_row.upgrade()?,
             activity_log_row: self.activity_log_row.upgrade()?,
             activity_log_list: self.activity_log_list.upgrade()?,
+            clients_row: self.clients_row.upgrade()?,
+            clients_list: self.clients_list.upgrade()?,
             source_device_row: self.source_device_row.upgrade()?,
         })
     }
@@ -3266,6 +3274,7 @@ fn connect_share_switch(
                     set_controls_locked(&widgets, true);
                     widgets.status_row.set_visible(true);
                     widgets.activity_log_row.set_visible(true);
+                    widgets.clients_row.set_visible(true);
                     *running.borrow_mut() = Some(RunningServer { server, advertiser });
                     // Flip the shared "server is live" flag AFTER
                     // the handle is stored so the source-panel
@@ -3310,8 +3319,10 @@ fn connect_share_switch(
             set_controls_locked(&widgets, false);
             widgets.status_row.set_visible(false);
             widgets.activity_log_row.set_visible(false);
+            widgets.clients_row.set_visible(false);
             reset_status_rows(&widgets);
             reset_activity_log(&widgets);
+            reset_clients_list(&widgets);
         }
         apply_visibility();
     });
@@ -3549,10 +3560,12 @@ struct ServerStatusWidgetsWeak {
     status_commanded_row: glib::WeakRef<adw::ActionRow>,
     activity_log_row: glib::WeakRef<adw::ExpanderRow>,
     activity_log_list: glib::WeakRef<gtk4::ListBox>,
+    clients_row: glib::WeakRef<adw::ExpanderRow>,
+    clients_list: glib::WeakRef<gtk4::ListBox>,
 }
 
 /// Snapshot of upgraded strong references held for the duration of
-/// a single poll tick. All seven widgets upgrade together or we
+/// a single poll tick. All nine widgets upgrade together or we
 /// `Break` the timer — render functions then read these fields
 /// directly without needing their own weak-ref fallbacks.
 struct ServerStatusWidgets {
@@ -3563,6 +3576,8 @@ struct ServerStatusWidgets {
     status_commanded_row: adw::ActionRow,
     activity_log_row: adw::ExpanderRow,
     activity_log_list: gtk4::ListBox,
+    clients_row: adw::ExpanderRow,
+    clients_list: gtk4::ListBox,
 }
 
 impl ServerStatusWidgetsWeak {
@@ -3575,11 +3590,13 @@ impl ServerStatusWidgetsWeak {
             status_commanded_row: panel.status_commanded_row.downgrade(),
             activity_log_row: panel.activity_log_row.downgrade(),
             activity_log_list: panel.activity_log_list.downgrade(),
+            clients_row: panel.clients_row.downgrade(),
+            clients_list: panel.clients_list.downgrade(),
         }
     }
 
-    /// Upgrade all seven weak refs atomically. Returns `None` if
-    /// any one widget has been destroyed — the caller breaks its
+    /// Upgrade every weak ref atomically. Returns `None` if any
+    /// one widget has been destroyed — the caller breaks its
     /// timer instead of rendering against a partially-dead panel.
     fn upgrade(&self) -> Option<ServerStatusWidgets> {
         Some(ServerStatusWidgets {
@@ -3590,6 +3607,8 @@ impl ServerStatusWidgetsWeak {
             status_commanded_row: self.status_commanded_row.upgrade()?,
             activity_log_row: self.activity_log_row.upgrade()?,
             activity_log_list: self.activity_log_list.upgrade()?,
+            clients_row: self.clients_row.upgrade()?,
+            clients_list: self.clients_list.upgrade()?,
         })
     }
 }
@@ -3623,6 +3642,11 @@ fn connect_server_status_polling(
     // is cheap but clearing the ListBox resets any user scroll
     // position, so we short-circuit on unchanged ticks.
     let last_activity_key: Rc<Cell<(usize, Option<Instant>)>> = Rc::new(Cell::new((0, None)));
+    // Clients-list diff key: hash of the connected `ClientId` set.
+    // Same rationale as `last_activity_key` — rebuilding the
+    // ListBox every tick would wipe user scroll position + flash
+    // the hover highlight off each 500 ms tick. Per issue #395.
+    let last_clients_key: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
     // Separate subscription on the Stop button. Flipping the switch
     // off is the single canonical stop path — pointing the button
@@ -3670,6 +3694,7 @@ fn connect_server_status_polling(
 
         render_status_rows(&widgets, &stats, &last_bytes_sent);
         render_activity_log(&widgets, &stats, &last_activity_key);
+        render_clients_list(&widgets, &stats, &last_clients_key);
         glib::ControlFlow::Continue
     });
 }
@@ -3981,6 +4006,112 @@ fn render_activity_log(
     }
 }
 
+/// Render the "Connected clients" list — one row per client
+/// with peer, role badge, duration, and drops counter. Empty
+/// state: single "No clients connected" placeholder row plus
+/// matching expander subtitle. Rebuilds only when the
+/// `ClientId` set changes (i.e. a client joined or left) so
+/// user scroll position + hover highlight survive the 500 ms
+/// poll cadence. The per-client field churn (duration bumps,
+/// drop-count increments) IS NOT diffed here — we'd have to
+/// index rows by id to patch them in place, which is more
+/// complexity than the row-per-client design needs. Callers
+/// who want a running clock on each row should watch
+/// individual slots via a dedicated widget. Per issue #395.
+fn render_clients_list(
+    widgets: &ServerStatusWidgets,
+    stats: &sdr_server_rtltcp::ServerStats,
+    last_rendered: &Rc<std::cell::Cell<u64>>,
+) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use crate::sidebar::server_panel::CLIENTS_LIST_EMPTY_SUBTITLE;
+
+    // Compute a diff key that only changes on accept / disconnect.
+    // `ClientId` is monotonic and never reused, so the sorted-id
+    // tuple uniquely identifies the connected set. Tracking just
+    // a hash keeps the cell small (u64 vs. Vec<ClientId>).
+    let mut ids: Vec<sdr_server_rtltcp::ClientId> =
+        stats.connected_clients.iter().map(|c| c.id).collect();
+    ids.sort_unstable();
+    let mut hasher = DefaultHasher::new();
+    ids.hash(&mut hasher);
+    let current_key = hasher.finish();
+    if current_key == last_rendered.get() {
+        return;
+    }
+    last_rendered.set(current_key);
+
+    // Clear the ListBox. GTK4 ListBox has no mass-remove.
+    while let Some(child) = widgets.clients_list.first_child() {
+        widgets.clients_list.remove(&child);
+    }
+
+    if stats.connected_clients.is_empty() {
+        widgets
+            .clients_row
+            .set_subtitle(CLIENTS_LIST_EMPTY_SUBTITLE);
+        let empty_row = adw::ActionRow::builder()
+            .title(CLIENTS_LIST_EMPTY_SUBTITLE)
+            .activatable(false)
+            .css_classes(["dim-label"])
+            .build();
+        widgets.clients_list.append(&empty_row);
+        return;
+    }
+
+    // Expander subtitle shows the count so a collapsed expander
+    // still communicates whether the server has activity.
+    let count = stats.connected_clients.len();
+    widgets.clients_row.set_subtitle(&if count == 1 {
+        "1 client".to_string()
+    } else {
+        format!("{count} clients")
+    });
+
+    // Build per-client rows. Controller first (if any) so the
+    // accent-colored row sits at the top; listeners render below
+    // in the order the registry has them (acceptance order, per
+    // `ClientRegistry`). Order isn't a hard contract — if a
+    // future registry reorders for its own reasons, this just
+    // changes visual order.
+    let mut ordered: Vec<&sdr_server_rtltcp::ClientInfo> = stats.connected_clients.iter().collect();
+    ordered.sort_by_key(|c| match c.role {
+        sdr_server_rtltcp::extension::Role::Control => 0u8,
+        sdr_server_rtltcp::extension::Role::Listen => 1u8,
+    });
+
+    let now = Instant::now();
+    for info in ordered {
+        let (role_label, role_css) = match info.role {
+            sdr_server_rtltcp::extension::Role::Control => ("Controller", "accent"),
+            sdr_server_rtltcp::extension::Role::Listen => ("Listener", "dim-label"),
+        };
+        let duration = format_uptime(now.saturating_duration_since(info.connected_since));
+        let subtitle = if info.buffers_dropped > 0 {
+            format!(
+                "{role_label} · {duration} · {drops} drops",
+                drops = info.buffers_dropped
+            )
+        } else {
+            format!("{role_label} · {duration}")
+        };
+        let row = adw::ActionRow::builder()
+            .title(info.peer.to_string())
+            .subtitle(&subtitle)
+            .activatable(false)
+            .build();
+        // Prefix badge: a colored dot (accent for Control, dim
+        // for Listen). Small and unobtrusive but enough to
+        // distinguish the controller at a glance in a dense list.
+        let badge = gtk4::Image::from_icon_name("media-record-symbolic");
+        badge.add_css_class(role_css);
+        row.add_prefix(&badge);
+        widgets.clients_list.append(&row);
+    }
+}
+
 /// Reset activity-log list + subtitle on stop. Without this the
 /// list would persist after the server stopped — misleading users
 /// into thinking the log reflects a currently-running session.
@@ -3992,6 +4123,17 @@ fn reset_activity_log(panel: &ServerSwitchWidgets) {
     panel
         .activity_log_row
         .set_subtitle(ACTIVITY_LOG_EMPTY_SUBTITLE);
+}
+
+/// Reset the connected-clients list to its empty state. Called on
+/// server stop so the next start doesn't surface stale client rows
+/// before the first poll tick repopulates. Per issue #395.
+fn reset_clients_list(panel: &ServerSwitchWidgets) {
+    use crate::sidebar::server_panel::CLIENTS_LIST_EMPTY_SUBTITLE;
+    while let Some(child) = panel.clients_list.first_child() {
+        panel.clients_list.remove(&child);
+    }
+    panel.clients_row.set_subtitle(CLIENTS_LIST_EMPTY_SUBTITLE);
 }
 
 /// Render an elapsed duration as a compact "age" string for the

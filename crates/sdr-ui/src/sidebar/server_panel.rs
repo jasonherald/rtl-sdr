@@ -370,6 +370,18 @@ pub struct ServerPanel {
     /// expander so the stats poller can rebuild it on updates
     /// without walking the expander's `AdwActionRow` children.
     pub activity_log_list: gtk4::ListBox,
+    /// Collapsible "Connected clients" expander listing every
+    /// connected client with role badge, duration, and drop
+    /// counter. Sibling to `status_row` (which still shows
+    /// aggregate "most-recent commander" + data rate state).
+    /// Hidden while the server isn't running. Per issue #395.
+    pub clients_row: adw::ExpanderRow,
+    /// `ListBox` child of `clients_row`, one row per connected
+    /// client. Rebuilt from scratch on each stats-poll tick when
+    /// the client-id set has changed. Held separately from the
+    /// expander so the poller doesn't have to walk the expander's
+    /// children. Per issue #395.
+    pub clients_list: gtk4::ListBox,
     /// Advisory caption shown when the device-default sample rate
     /// is at or above the "high bandwidth" threshold. Shared copy
     /// with the source panel's same-named row so the user sees a
@@ -398,6 +410,18 @@ pub const ACTIVITY_LOG_EMPTY_SUBTITLE: &str = "No commands received yet";
 /// without dominating it; the expander is collapsed by default so
 /// users opt in to seeing the log at all.
 const ACTIVITY_LOG_MAX_HEIGHT_PX: i32 = 240;
+
+/// Subtitle shown on the `clients_row` expander header when no
+/// clients are connected. Doubles as the placeholder text inside
+/// the list itself. Per issue #395.
+pub const CLIENTS_LIST_EMPTY_SUBTITLE: &str = "No clients connected";
+
+/// Max height the connected-clients `ScrolledWindow` grows
+/// before scrolling kicks in. Same tuning rationale as
+/// `ACTIVITY_LOG_MAX_HEIGHT_PX`: fits inside the sidebar without
+/// dominating it even when the listener cap is at max (32
+/// clients × ~45 px per row ≈ 1,440 px uncapped; we cap at 240).
+const CLIENTS_LIST_MAX_HEIGHT_PX: i32 = 240;
 
 /// Aggregated status rows rendered under the "Server status"
 /// expander. Grouped so the builder stays readable and the
@@ -439,6 +463,33 @@ fn build_activity_log_row() -> (adw::ExpanderRow, gtk4::ListBox) {
     // Wrap the scroll in an ActionRow so the expander's layout
     // machinery (which expects rows) renders it correctly. Empty
     // title/subtitle pushes the scroll widget into the row body.
+    let wrapper = adw::ActionRow::builder().activatable(false).build();
+    wrapper.add_prefix(&scroll);
+    row.add_row(&wrapper);
+    (row, list)
+}
+
+/// Build the "Connected clients" expander + its inner `ListBox`.
+/// Mirrors `build_activity_log_row`'s scroll-wrapping pattern
+/// so a server with a dozen listeners doesn't balloon the
+/// sidebar height. Per issue #395.
+fn build_clients_row() -> (adw::ExpanderRow, gtk4::ListBox) {
+    let row = adw::ExpanderRow::builder()
+        .title("Connected clients")
+        .subtitle(CLIENTS_LIST_EMPTY_SUBTITLE)
+        .expanded(true)
+        .visible(false)
+        .build();
+    let list = gtk4::ListBox::builder()
+        .selection_mode(gtk4::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_height(true)
+        .max_content_height(CLIENTS_LIST_MAX_HEIGHT_PX)
+        .child(&list)
+        .build();
     let wrapper = adw::ActionRow::builder().activatable(false).build();
     wrapper.add_prefix(&scroll);
     row.add_row(&wrapper);
@@ -766,6 +817,7 @@ pub fn build_server_panel() -> ServerPanel {
     } = build_status_rows();
 
     let (activity_log_row, activity_log_list) = build_activity_log_row();
+    let (clients_row, clients_list) = build_clients_row();
 
     // Bandwidth advisory — hidden initially. Visibility is toggled
     // on sample-rate changes via the wiring in window.rs, mirroring
@@ -790,6 +842,7 @@ pub fn build_server_panel() -> ServerPanel {
     widget.add(&auth_key_row);
     widget.add(&device_defaults_row);
     widget.add(&status_row);
+    widget.add(&clients_row);
     widget.add(&activity_log_row);
     widget.add(&bandwidth_advisory_row);
 
@@ -822,6 +875,8 @@ pub fn build_server_panel() -> ServerPanel {
         status_stop_button,
         activity_log_row,
         activity_log_list,
+        clients_row,
+        clients_list,
         bandwidth_advisory_row,
     }
 }
@@ -1132,7 +1187,8 @@ mod tests {
         let hex = auth_key_to_hex(&bytes);
         assert_eq!(hex.len(), bytes.len() * 2);
         assert!(
-            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "encoder must emit lowercase hex only"
         );
         let back = auth_key_from_hex(&hex).expect("round-trip decode must succeed");
