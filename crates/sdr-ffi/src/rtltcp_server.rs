@@ -110,6 +110,23 @@ pub struct SdrRtlTcpServerConfig {
     /// doc for valid range and semantics. Must be 0 iff
     /// `auth_key` is NULL.
     pub auth_key_len: u32,
+    /// Whether [`Self::compression`] below is meaningful. `false`
+    /// (the zero-init default) runs the server with
+    /// [`CodecMask::NONE_ONLY`] — legacy clients negotiate with
+    /// no compression, identical to pre-#400 behaviour. Added in
+    /// ABI 0.19 per issue #400.
+    pub has_compression: bool,
+    /// Compression-mask wire byte. Only used when
+    /// [`Self::has_compression`] is `true`. Value is a
+    /// [`CodecMask::to_wire`] byte. Typical values: `0x01` =
+    /// `None`-only, `0x03` = `None + LZ4` (accept LZ4
+    /// compression hellos + fall back to `None` for vanilla
+    /// clients). Must match the codecs the host is willing to
+    /// advertise via [`SdrRtlTcpAdvertiseOptions::codecs`] on
+    /// mDNS — those two have to stay in sync or clients see
+    /// "server advertises LZ4" but hit a `None`-only negotiation
+    /// at handshake time.
+    pub compression: u8,
 }
 
 /// Aggregate server-lifetime statistics snapshot.
@@ -558,17 +575,25 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
                 return SdrCoreError::InvalidArg.as_int();
             }
         };
+        // `compression` projects from the `has_compression` gate
+        // per #400 / ABI 0.19. Zero-init callers
+        // (`has_compression = false`) stay on `CodecMask::NONE_
+        // ONLY`, matching pre-#400 behaviour. A host that wants
+        // LZ4 sets `has_compression = true; compression = 0x03`
+        // and MUST also flip the matching bits on
+        // `SdrRtlTcpAdvertiseOptions.codecs` via mDNS so clients
+        // know the server accepts compression hellos.
+        let compression = if cfg.has_compression {
+            CodecMask::from_wire(cfg.compression)
+        } else {
+            CodecMask::NONE_ONLY
+        };
         let server_cfg = ServerConfig {
             bind,
             device_index: cfg.device_index,
             initial,
             buffer_capacity,
-            // Compression stays off for the C ABI until the host
-            // adds a codec-mask field to `SdrRtlTcpServerConfig`
-            // (issue #400 tracks extending the C struct). Vanilla
-            // clients keep working; the Linux GTK path is the only
-            // one that currently offers LZ4.
-            compression: CodecMask::NONE_ONLY,
+            compression,
             listener_cap,
             auth_key,
         };
@@ -1213,6 +1238,12 @@ mod tests {
             // the struct docs.
             auth_key: std::ptr::null(),
             auth_key_len: 0,
+            // ABI 0.19 defaults — zero-init equivalent so the base
+            // fixture matches pre-#400 behaviour. Tests that
+            // exercise the new compression mask mutate these after
+            // `base_test_config()` returns.
+            has_compression: false,
+            compression: 0,
         }
     }
 
@@ -1408,6 +1439,8 @@ mod tests {
             listener_cap: 0,
             auth_key: std::ptr::null(),
             auth_key_len: 0,
+            has_compression: false,
+            compression: 0,
         };
         let mut handle: *mut SdrRtlTcpServer = std::ptr::null_mut();
         let rc = unsafe { sdr_rtltcp_server_start(&raw const opts, &raw mut handle) };

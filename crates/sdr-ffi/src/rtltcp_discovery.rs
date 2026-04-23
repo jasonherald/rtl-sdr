@@ -66,6 +66,32 @@ pub struct SdrRtlTcpAdvertiseOptions {
     pub has_txbuf: bool,
     /// TXT: optional buffer-depth hint in bytes.
     pub txbuf: u64,
+    /// Whether [`Self::codecs`] below is meaningful. `false` (the
+    /// zero-init default) publishes the TXT record with NO
+    /// `codecs=` key, which every browser then treats as
+    /// "legacy-only" — identical to pre-#400 behaviour. Added in
+    /// ABI 0.19 per issue #400.
+    pub has_codecs: bool,
+    /// TXT: compression-mask wire byte. Only used when
+    /// [`Self::has_codecs`] is `true`. Value is a [`CodecMask::
+    /// to_wire`] byte — bit 0 = `None` codec, bit 1 = `LZ4`, etc.
+    /// Typical values: `0x01` = `None`-only (legacy-safe),
+    /// `0x03` = `None + LZ4` (signals the server speaks the
+    /// extended handshake and accepts compression hellos).
+    pub codecs: u8,
+    /// Whether [`Self::auth_required`] below is meaningful.
+    /// `false` (zero-init default) publishes no `auth_required=`
+    /// key — per #395's "omit on false" contract, mDNS browsers
+    /// treat absence as "no auth required." Added in ABI 0.19
+    /// per issue #400.
+    pub has_auth_required: bool,
+    /// TXT: whether the server requires a pre-shared key (#394).
+    /// Only used when [`Self::has_auth_required`] is `true`. The
+    /// FFI advertiser is decoupled from the FFI server (hosts
+    /// publish this independently of [`sdr_rtltcp_server_start`]),
+    /// so it's the caller's responsibility to keep the flag in
+    /// sync with its `ServerConfig.auth_key` state.
+    pub auth_required: bool,
 }
 
 pub struct SdrRtlTcpAdvertiser {
@@ -162,6 +188,22 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
             None
         };
 
+        // `codecs` + `auth_required` project from the
+        // `has_*` gates per #400. Zero-init defaults
+        // (`has_codecs = has_auth_required = false`) yield the
+        // same "omit from TXT" behaviour as pre-ABI-0.19, so
+        // hosts that haven't updated their init still publish
+        // legacy-compatible records.
+        let codecs = if opts.has_codecs {
+            Some(opts.codecs)
+        } else {
+            None
+        };
+        let auth_required = if opts.has_auth_required {
+            Some(opts.auth_required)
+        } else {
+            None
+        };
         let options = AdvertiseOptions {
             port: opts.port,
             instance_name,
@@ -172,23 +214,8 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
                 gains: opts.gains,
                 nickname,
                 txbuf,
-                // C ABI host has no codec picker yet — advertise
-                // "unknown / legacy" so vanilla clients keep
-                // working unchanged. Issue #400 tracks extending
-                // `SdrRtlTcpAdvertiseOptions` with `has_codecs` +
-                // `codecs` fields so the Swift macOS app can
-                // advertise compression capability.
-                codecs: None,
-                // `auth_required` publishes via the same FFI
-                // extension as `codecs` when the Swift host wires
-                // up its own advertiser config. Today the FFI
-                // advertiser is decoupled from the FFI server
-                // (Swift publishes advertise options separately),
-                // so default to `None` — downstream mDNS browsers
-                // treat absence as "no auth required" per #395's
-                // omit-on-false contract. Issue #400 covers
-                // extending this struct.
-                auth_required: None,
+                codecs,
+                auth_required,
             },
         };
 
@@ -706,6 +733,14 @@ mod tests {
                 nickname: std::ptr::null(),
                 has_txbuf: false,
                 txbuf: 0,
+                // ABI 0.19 defaults — zero-init equivalent so the
+                // base fixture matches pre-#400 behaviour. Tests
+                // that exercise the new fields mutate these after
+                // `happy_path()` returns.
+                has_codecs: false,
+                codecs: 0,
+                has_auth_required: false,
+                auth_required: false,
             };
             Self {
                 _instance: instance,
