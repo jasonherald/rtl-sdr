@@ -201,8 +201,14 @@ pub fn format_length_m(length_m: f64) -> String {
 /// so the caller can hide the label entirely rather than showing `"λ/2 —"`.
 #[must_use]
 pub fn format_antenna_line(freq_hz: f64) -> Option<String> {
-    let half = half_wave_m(freq_hz)?;
-    let quarter = quarter_wave_m(freq_hz)?;
+    // Compute wavelength once and derive both halves from it.
+    // `half_wave_m` / `quarter_wave_m` each re-invoke
+    // `wavelength_m` — fine when callers want just one value,
+    // wasteful on the status-bar refresh path which wants
+    // both. Per `CodeRabbit` round 4 on PR #418.
+    let wavelength = wavelength_m(freq_hz)?;
+    let half = wavelength / 2.0;
+    let quarter = wavelength / 4.0;
     let (angle, hint) = suggested_v_angle(freq_hz);
     Some(format!(
         "λ/2 {} · λ/4 {} · V {angle}° {hint}",
