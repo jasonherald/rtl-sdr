@@ -156,6 +156,18 @@ pub fn probe_rtlsdr_device_label() -> String {
 /// empty-after-disconnect paths render identical text.
 pub const RTL_TCP_STATUS_DISCONNECTED_SUBTITLE: &str = "Disconnected";
 
+/// Combo-row index for `Role::Control` on `rtl_tcp_role_row`.
+/// Load-bearing — must match the `StringList` order built in
+/// `build_source_panel`. Per issue #396.
+pub const RTL_TCP_ROLE_CONTROL_IDX: u32 = 0;
+/// Combo-row index for `Role::Listen` on `rtl_tcp_role_row`.
+pub const RTL_TCP_ROLE_LISTEN_IDX: u32 = 1;
+
+/// Config key for the persisted last-used connection role.
+/// Stored as a `"control"` / `"listen"` string via
+/// `FavoriteRole`'s serde representation. Per issue #396.
+pub const KEY_RTL_TCP_CLIENT_LAST_ROLE: &str = "rtl_tcp_client_last_role";
+
 /// Sample-rate selector index at which we start showing the
 /// "high bandwidth" advisory caption. Index 7 = 2.4 MHz, which
 /// at 8-bit I/Q pairs wire-format works out to ~38 Mbps — over
@@ -285,6 +297,20 @@ pub struct SourcePanel {
     /// indicates we're between attempts (Retrying / Failed /
     /// Disconnected).
     pub rtl_tcp_retry_button: gtk4::Button,
+    /// "Connection role" picker (Control / Listen) shown only
+    /// when the RTL-TCP source type is selected. Wire-level
+    /// default is Control (#392 back-compat); Listen opts into
+    /// concurrent read-only access to a server that already has
+    /// a controller. Per issue #396.
+    pub rtl_tcp_role_row: adw::ComboRow,
+    /// "Server key" password entry shown when the RTL-TCP source
+    /// is selected AND the active server either advertises
+    /// `auth_required=true` via mDNS TXT or has a saved key in
+    /// the keyring. Per issue #396. The key bytes themselves
+    /// are persisted to the OS keyring (not this widget's
+    /// value), so the `EntryRow` is cleared on source-type change
+    /// to avoid leaking the value into widget-tree dumps.
+    pub rtl_tcp_auth_key_row: adw::PasswordEntryRow,
 
     /// Advisory caption shown when the selected sample rate is at
     /// or above `HIGH_BANDWIDTH_SAMPLE_RATE_IDX` AND the source
@@ -609,6 +635,30 @@ pub fn build_source_panel() -> SourcePanel {
     rtl_tcp_status_row.add_suffix(&rtl_tcp_disconnect_button);
     rtl_tcp_status_row.add_suffix(&rtl_tcp_retry_button);
 
+    // Connection-role picker (#396). AdwComboRow with two
+    // entries: "Control" (index 0) and "Listen" (index 1).
+    // Default Control matches the pre-#392 single-client flow
+    // every legacy rtl_tcp client / server assumes.
+    let rtl_tcp_role_model = gtk4::StringList::new(&["Control", "Listen"]);
+    let rtl_tcp_role_row = adw::ComboRow::builder()
+        .title("Connection role")
+        .subtitle("Control drives tuning; Listen receives IQ read-only")
+        .model(&rtl_tcp_role_model)
+        .selected(RTL_TCP_ROLE_CONTROL_IDX)
+        .visible(false)
+        .build();
+
+    // Server key entry (#394 + #396). Password-purpose entry
+    // row — masked by default, revealable via AdwPasswordEntryRow's
+    // built-in "peek" button. Kept separate from the main hostname
+    // / port block so the user sees it only when a key is
+    // actually needed (server advertises auth_required=true OR
+    // there's a saved key for the active host:port).
+    let rtl_tcp_auth_key_row = adw::PasswordEntryRow::builder()
+        .title("Server key")
+        .visible(false)
+        .build();
+
     // Bandwidth advisory row — hidden by default. Visibility is
     // toggled by the sample-rate and device-type notify handlers
     // in window.rs. Title + subtitle copy come from shared consts
@@ -637,6 +687,8 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&record_iq_row);
     group.add(&rtl_tcp_discovered_row);
     group.add(&rtl_tcp_status_row);
+    group.add(&rtl_tcp_role_row);
+    group.add(&rtl_tcp_auth_key_row);
     group.add(&bandwidth_advisory_row);
 
     // Derive initial visibility from the selected device.
@@ -656,6 +708,13 @@ pub fn build_source_panel() -> SourcePanel {
     file_path_row.set_visible(is_file);
     rtl_tcp_discovered_row.set_visible(is_rtltcp);
     rtl_tcp_status_row.set_visible(is_rtltcp);
+    rtl_tcp_role_row.set_visible(is_rtltcp);
+    // Auth key row stays hidden until a specific signal
+    // (mDNS TXT auth_required=true OR saved key exists for the
+    // active host:port). Starting hidden avoids prompting users
+    // on servers that don't require auth. The wiring in
+    // window.rs flips visibility via the discovery / last-
+    // connected load paths.
 
     connect_device_visibility(
         &device_row,
@@ -668,7 +727,13 @@ pub fn build_source_panel() -> SourcePanel {
         &protocol_row,
         &file_path_row,
     );
-    connect_rtl_tcp_visibility(&device_row, &rtl_tcp_discovered_row, &rtl_tcp_status_row);
+    connect_rtl_tcp_visibility(
+        &device_row,
+        &rtl_tcp_discovered_row,
+        &rtl_tcp_status_row,
+        &rtl_tcp_role_row,
+        &rtl_tcp_auth_key_row,
+    );
 
     // Controls connected to DSP pipeline via window.rs
 
@@ -694,6 +759,8 @@ pub fn build_source_panel() -> SourcePanel {
         rtl_tcp_status_row,
         rtl_tcp_disconnect_button,
         rtl_tcp_retry_button,
+        rtl_tcp_role_row,
+        rtl_tcp_auth_key_row,
         bandwidth_advisory_row,
     }
 }
@@ -705,16 +772,34 @@ fn connect_rtl_tcp_visibility(
     device_row: &adw::ComboRow,
     rtl_tcp_discovered_row: &adw::ExpanderRow,
     rtl_tcp_status_row: &adw::ActionRow,
+    rtl_tcp_role_row: &adw::ComboRow,
+    rtl_tcp_auth_key_row: &adw::PasswordEntryRow,
 ) {
     device_row.connect_selected_notify(glib::clone!(
         #[weak]
         rtl_tcp_discovered_row,
         #[weak]
         rtl_tcp_status_row,
+        #[weak]
+        rtl_tcp_role_row,
+        #[weak]
+        rtl_tcp_auth_key_row,
         move |row| {
             let is_rtltcp = row.selected() == DEVICE_RTLTCP;
             rtl_tcp_discovered_row.set_visible(is_rtltcp);
             rtl_tcp_status_row.set_visible(is_rtltcp);
+            rtl_tcp_role_row.set_visible(is_rtltcp);
+            // Auth key row stays hidden until the discovery /
+            // last-connected layer in window.rs flips it on via
+            // the `auth_required` hint or a saved-key lookup.
+            // Flipping to a non-RTLX source type always hides
+            // it AND clears the entry so the value doesn't
+            // linger in the widget tree for other source types
+            // that don't use it. Per #396.
+            if !is_rtltcp {
+                rtl_tcp_auth_key_row.set_visible(false);
+                rtl_tcp_auth_key_row.set_text("");
+            }
         }
     ));
 }

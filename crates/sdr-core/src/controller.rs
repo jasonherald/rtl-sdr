@@ -282,6 +282,16 @@ struct DspState {
     network_host: String,
     network_port: u16,
     network_protocol: sdr_types::Protocol,
+    /// Role the `rtl_tcp` client requests in its `ClientHello`.
+    /// Default `Role::Control` matches the pre-#392 single-
+    /// client flow every legacy client assumes; UI flips this
+    /// to `Role::Listen` when the user picks the Listen option
+    /// in the connection-role combo row. Per #396.
+    rtl_tcp_requested_role: sdr_server_rtltcp::extension::Role,
+    /// Pre-shared key (#394) to send eagerly on `rtl_tcp`
+    /// connect. `None` disables the auth gate; `Some(bytes)`
+    /// activates the eager-auth path. Per #396.
+    rtl_tcp_auth_key: Option<Vec<u8>>,
     file_path: std::path::PathBuf,
     /// Loop-on-EOF flag for the file playback source. Default
     /// `false` (stop at EOF). Updated by `UiToDsp::SetFileLooping`
@@ -439,6 +449,8 @@ impl DspState {
             network_host: "127.0.0.1".to_string(),
             network_port: 1234,
             network_protocol: sdr_types::Protocol::TcpClient,
+            rtl_tcp_requested_role: sdr_server_rtltcp::extension::Role::Control,
+            rtl_tcp_auth_key: None,
             file_path: std::path::PathBuf::new(),
             file_looping: false,
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
@@ -1276,6 +1288,27 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.network_protocol = protocol;
         }
 
+        UiToDsp::SetRtlTcpClientConfig {
+            requested_role,
+            auth_key,
+        } => {
+            // Role-only updates log the role; auth-key updates
+            // log the has/not-has state, not the bytes.
+            tracing::debug!(
+                ?requested_role,
+                auth_key_set = auth_key.is_some(),
+                "set rtl_tcp client config"
+            );
+            state.rtl_tcp_requested_role = requested_role;
+            state.rtl_tcp_auth_key = auth_key;
+            // Takes effect on the NEXT connect. An already-
+            // running rtl_tcp session keeps its admitted role
+            // until it disconnects — changing role mid-stream
+            // would require the server to re-admit the client,
+            // which the wire protocol doesn't support (the
+            // role byte is part of the hello). Per issue #396.
+        }
+
         UiToDsp::SetFilePath(path) => {
             tracing::debug!(?path, "set file path");
             state.file_path = path;
@@ -1936,12 +1969,27 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
         // server, handshakes the 12-byte RTL0 header, and routes
         // future tune / gain / PPM messages through the 5-byte
         // command channel. Reuses the `network_host` + `network_port`
-        // config fields since the connection shape is the same (no
-        // separate RtlTcpConfig state field needed).
-        SourceType::RtlTcp => Box::new(sdr_source_network::RtlTcpSource::new(
-            &state.network_host,
-            state.network_port,
-        )),
+        // config fields for address, but also threads the #396
+        // `requested_role` + `auth_key` fields from state into an
+        // `RtlTcpConfig` so the hello carries the user's choices.
+        // Non-default role / auth opt-ins are RTLX-only — safe
+        // against any server advertising `codecs=3`; unsafe against
+        // vanilla rtl_tcp servers (which mis-parse the 8-byte hello
+        // as two 5-byte commands). The source panel's discovery
+        // gating is responsible for refusing those opt-ins against
+        // legacy-only servers. Per #396.
+        SourceType::RtlTcp => {
+            let rtl_tcp_config = sdr_source_network::rtl_tcp::RtlTcpConfig {
+                requested_role: state.rtl_tcp_requested_role,
+                auth_key: state.rtl_tcp_auth_key.clone(),
+                ..Default::default()
+            };
+            Box::new(sdr_source_network::RtlTcpSource::with_config(
+                &state.network_host,
+                state.network_port,
+                rtl_tcp_config,
+            ))
+        }
     };
 
     if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {

@@ -30,6 +30,14 @@ sdr-scanner.workspace = true
 sdr-rtlsdr.workspace = true
 sdr-source-rtlsdr.workspace = true
 sdr-source-network.workspace = true
+# `sdr-server-rtltcp` is pulled in for its
+# `extension::Role` enum, used by the `UiToDsp::SetRtlTcpClientConfig`
+# message added in #396. The role is already in the dependency
+# graph transitively (via `sdr-source-network`), but naming it
+# directly here lets us reference the type without going through
+# the source-client's re-export chain and keeps the controller's
+# type imports flat. Per #396.
+sdr-server-rtltcp.workspace = true
 sdr-source-file.workspace = true
 sdr-sink-network.workspace = true
 thiserror.workspace = true

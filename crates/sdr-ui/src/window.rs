@@ -5237,6 +5237,41 @@ fn connect_source_panel(
         );
     }
 
+    // Restore the rtl_tcp client's last-used role (#396). Stored
+    // as a `FavoriteRole` serde-tagged string under
+    // `KEY_RTL_TCP_CLIENT_LAST_ROLE`. Missing / corrupt config
+    // → default Control (legacy-safe). We also seed the DSP
+    // state with the persisted role so the next Play against an
+    // rtl_tcp source picks it up even if the user never touched
+    // the combo this session.
+    {
+        use crate::sidebar::source_panel::{
+            FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
+            RTL_TCP_ROLE_LISTEN_IDX,
+        };
+        let persisted_role: FavoriteRole = config.read(|v| {
+            v.get(KEY_RTL_TCP_CLIENT_LAST_ROLE)
+                .and_then(|val| serde_json::from_value(val.clone()).ok())
+                .unwrap_or(FavoriteRole::Control)
+        });
+        let idx = match persisted_role {
+            FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
+            FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
+        };
+        panels.source.rtl_tcp_role_row.set_selected(idx);
+        // Seed the DSP with the restored role so a Play before
+        // the user touches the combo picks up the right value.
+        // The auth-key restore lives in the per-server flow
+        // (wired in the follow-up discovery / last-connected
+        // handlers) — here we pass `None` as a safe default;
+        // the per-server load will overlay real bytes before
+        // Connect time when applicable.
+        state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+            requested_role: persisted_role.as_wire_role(),
+            auth_key: None,
+        });
+    }
+
     // IQ correction toggle
     let state_iq_corr = Rc::clone(state);
     panels
@@ -5384,6 +5419,96 @@ fn connect_source_panel(
                 hostname,
                 port,
                 protocol,
+            });
+        });
+
+    // Connection-role picker (#396). The selector flips between
+    // `Role::Control` (index 0) and `Role::Listen` (index 1); we
+    // dispatch a fresh `SetRtlTcpClientConfig` with the new role
+    // plus the current auth key (unchanged by a role flip). The
+    // role takes effect on the NEXT connect — already-running
+    // sessions keep their admitted role because the wire
+    // protocol ties role to the hello and doesn't support
+    // mid-stream role changes. Also persist the chosen role so a
+    // restart restores the user's preference.
+    let state_role = Rc::clone(state);
+    let auth_key_for_role = panels.source.rtl_tcp_auth_key_row.clone();
+    let config_for_role = std::sync::Arc::clone(config);
+    panels
+        .source
+        .rtl_tcp_role_row
+        .connect_selected_notify(move |row| {
+            use crate::sidebar::source_panel::{
+                FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
+                RTL_TCP_ROLE_LISTEN_IDX,
+            };
+            let fav_role = match row.selected() {
+                RTL_TCP_ROLE_CONTROL_IDX => FavoriteRole::Control,
+                RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
+                _ => return, // transient out-of-range indices
+            };
+            let requested_role = fav_role.as_wire_role();
+            let key_text = auth_key_for_role.text().to_string();
+            let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
+                None
+            } else {
+                crate::sidebar::server_panel::auth_key_from_hex(&key_text)
+            };
+            state_role.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+                requested_role,
+                auth_key,
+            });
+            config_for_role.write(|v| {
+                v[KEY_RTL_TCP_CLIENT_LAST_ROLE] =
+                    serde_json::to_value(fav_role).unwrap_or(serde_json::Value::Null);
+            });
+        });
+
+    // Server key entry (#394 + #396). On every edit we rebuild
+    // the `SetRtlTcpClientConfig` message with the current role
+    // + the new key bytes, so the NEXT connect carries the
+    // latest value. The entry accepts hex input (matching what
+    // `openssl rand -hex 32` produces and what the server UI's
+    // Copy button writes to the clipboard); an empty field
+    // clears the key (`auth_key: None`). The key is also saved
+    // to the per-server keyring on a successful auth-required
+    // connect (wired in the toast-flow commit) — this handler
+    // only threads the current-session value through to the
+    // DSP.
+    let state_auth = Rc::clone(state);
+    let role_for_auth = panels.source.rtl_tcp_role_row.clone();
+    panels
+        .source
+        .rtl_tcp_auth_key_row
+        .connect_changed(move |row| {
+            use crate::sidebar::source_panel::{
+                FavoriteRole, RTL_TCP_ROLE_CONTROL_IDX, RTL_TCP_ROLE_LISTEN_IDX,
+            };
+            // Transient out-of-range indices on `ComboRow` can
+            // occur during widget teardown; fall back to the
+            // legacy-safe `Control` default in that case (same
+            // treatment the role_row handler gives with an
+            // `early return`, but auth_key edits happen often
+            // enough that swallowing one rare transient is
+            // fine).
+            #[allow(
+                clippy::match_same_arms,
+                reason = "explicit catch-all matches the Control default"
+            )]
+            let fav_role = match role_for_auth.selected() {
+                RTL_TCP_ROLE_CONTROL_IDX => FavoriteRole::Control,
+                RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
+                _ => FavoriteRole::Control,
+            };
+            let text = row.text().to_string();
+            let auth_key: Option<Vec<u8>> = if text.is_empty() {
+                None
+            } else {
+                crate::sidebar::server_panel::auth_key_from_hex(&text)
+            };
+            state_auth.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+                requested_role: fav_role.as_wire_role(),
+                auth_key,
             });
         });
 

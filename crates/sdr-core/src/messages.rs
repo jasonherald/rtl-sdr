@@ -267,6 +267,25 @@ pub enum UiToDsp {
         port: u16,
         protocol: sdr_types::Protocol,
     },
+    /// Configure `rtl_tcp` client role + auth key. Takes effect
+    /// on the NEXT connect (already-open sessions keep their
+    /// admitted role until they disconnect). `requested_role`
+    /// drives the `ClientHello.role` byte; `auth_key` activates
+    /// the eager-auth path (#394) when `Some`. Both fields are
+    /// independent — a caller can change just the role
+    /// (Control ↔ Listen) or just rotate the key. Per issue
+    /// #396.
+    SetRtlTcpClientConfig {
+        /// Role to request in the next connect. `Role::Control`
+        /// is the default / back-compat path; `Role::Listen`
+        /// opts into the #392 concurrent-listener flow.
+        requested_role: sdr_server_rtltcp::extension::Role,
+        /// Pre-shared key (#394) to send eagerly with the hello.
+        /// `None` disables the auth gate (no key on the wire);
+        /// `Some(bytes)` sets `FLAG_HAS_AUTH` and emits an
+        /// `AuthKeyMessage` follow-up.
+        auth_key: Option<Vec<u8>>,
+    },
     /// Set the file path for file source playback.
     SetFilePath(std::path::PathBuf),
     /// Toggle loop-on-EOF for the file playback source. `true`
