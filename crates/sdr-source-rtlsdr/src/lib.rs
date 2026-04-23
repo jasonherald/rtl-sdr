@@ -190,6 +190,27 @@ impl Source for RtlSdrSource {
             .reset_buffer()
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
 
+        // Belt-and-suspenders: force auto gain mode so the tuner
+        // produces signal regardless of whatever state a prior
+        // session's deinit left it in. Matches upstream
+        // `rtl_test.c` / `rtl_tcp.c` reference programs, which
+        // always call `rtlsdr_set_tuner_gain_mode(dev, 0)`
+        // immediately after open. Without this, a dongle that
+        // was left in an edge-case state (e.g. an app crash mid-
+        // session that didn't run the R820T deinit sequence) can
+        // come back with the LNA at a manual zero-gain index and
+        // stream nothing until the user physically reseats the
+        // USB. The UI's `SetAgc` / `SetGain` message flow
+        // re-applies the user's actual preferences immediately
+        // after the source becomes visible to the controller;
+        // this call just guarantees the first few seconds of the
+        // session produce data. Per issue #407 (hit during PR
+        // #406 smoke test — reseating the dongle was the only
+        // workaround at the time).
+        device
+            .set_tuner_gain_mode(false)
+            .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+
         // Set running BEFORE spawning so the reader thread sees it immediately.
         self.running.store(true, Ordering::Release);
 
