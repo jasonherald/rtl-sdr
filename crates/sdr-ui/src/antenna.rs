@@ -170,8 +170,8 @@ pub fn quarter_wave_m(freq_hz: f64) -> Option<f64> {
 /// displayed value in the 0.1..=999 range so the status bar reads cleanly
 /// across HF-to-UHF:
 ///
-/// - `>= 1 m`  → "X.XX m" (e.g. "58.8 cm on VHF air, 1.17 m on HF 40m")
-/// - `>= 1 cm` → "X.X cm"
+/// - `>= 1 m`  → "X.XX m" (e.g. "1.17 m on HF 40m")
+/// - `>= 1 cm` → "X.X cm" (e.g. "58.8 cm on VHF air")
 /// - `< 1 cm`  → "X.X mm"
 ///
 /// Returns an empty string for non-finite / non-positive inputs so the
@@ -193,7 +193,10 @@ pub fn format_length_m(length_m: f64) -> String {
 }
 
 /// Build the status-bar line that pairs the half-wave total-dipole length
-/// with the quarter-wave element length. Format: `"λ/2 58.8 cm · λ/4 29.4 cm"`.
+/// with the quarter-wave element length and the suggested V-angle hint.
+/// Format: `"λ/2 58.8 cm · λ/4 29.4 cm · V 180° horizon"` (at 255 MHz ATIS)
+/// or `"λ/2 109.4 cm · λ/4 54.7 cm · V 120° sat"` (at 137.62 MHz NOAA).
+///
 /// Returns `None` when the frequency is below [`MIN_RENDERABLE_FREQUENCY_HZ`]
 /// so the caller can hide the label entirely rather than showing `"λ/2 —"`.
 #[must_use]
