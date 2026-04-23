@@ -3529,23 +3529,28 @@ fn connect_share_switch(
         });
 
     // Regenerate button — generates a fresh 32-byte key,
-    // overwrites the keyring entry, updates the live server
-    // (if running) via set_auth_key, and updates the display
-    // row subtitle (preserving the current revealed state so
-    // the user can verify the new value immediately).
+    // applies it to the live server, persists to keyring, and
+    // updates the display row subtitle (preserving the current
+    // revealed state so the user can verify the new value
+    // immediately).
     //
-    // UI ↔ server parity (per `CodeRabbit` round 1 on PR #406):
-    // if `Server::set_auth_key` returns `Err`, DO NOT advance
-    // the UI to the new key — the server is still holding the
-    // old key, and showing the user a "new key generated"
-    // message that clients can't actually use with the server
-    // would be a lie. Toast the error, log it, leave
-    // `current_auth_key` + the displayed subtitle on the old
-    // value. The keyring write failure is tolerable (in-memory
-    // recovery next launch); the server write failure is not.
+    // Order of operations (per `CodeRabbit` round 2 on PR #406):
+    // 1. Apply to the running server via
+    //    `apply_live_auth_change` — shared with the toggle path.
+    //    On failure (mutex poisoned, borrow race), toast + return
+    //    BEFORE touching keyring or UI.
+    // 2. Persist to keyring. Failure here is non-fatal (the
+    //    in-memory key still works this session; next launch
+    //    would read the OLD keyring value, which now forces the
+    //    user to click Regenerate again — better than the old
+    //    order where a keyring success + server failure would
+    //    leave next-launch using a key the server never
+    //    accepted).
+    // 3. UI mutation (`current_auth_key`, subtitle, toast).
     //
-    // Regenerate keeps `auth_required = true` so the mDNS TXT
-    // doesn't change — no advertiser refresh needed.
+    // Regenerate keeps `auth_required = true`, so the mDNS TXT
+    // doesn't change — `apply_live_auth_change` skips the
+    // advertiser rebuild when passed `widgets = None`.
     let key_row_for_regen = panels.server.auth_key_row.downgrade();
     let current_key_for_regen = Rc::clone(&current_auth_key);
     let revealed_for_regen = Rc::clone(&auth_key_revealed);
@@ -3557,6 +3562,24 @@ fn connect_share_switch(
                 return;
             };
             let fresh = sdr_server_rtltcp::auth::generate_random_auth_key();
+
+            // Step 1: live server apply. `widgets = None` because
+            // regenerate doesn't flip `auth_required`, so no
+            // advertiser rebuild is needed.
+            if !apply_live_auth_change(
+                &running_for_auth_regen,
+                Some(fresh.clone()),
+                None,
+                &toast_overlay_for_regen,
+            ) {
+                return;
+            }
+
+            // Step 2: persist to keyring. Failure is tolerable —
+            // current in-memory key still works this session; the
+            // user can click Regenerate again later when the
+            // keyring recovers. Toast so they know, but don't
+            // roll back the server (it already accepted the key).
             if let Err(e) = save_server_auth_key_to_keyring(&fresh) {
                 tracing::warn!(%e, "rtl_tcp auth-key regenerate keyring write failed");
                 if let Some(overlay) = toast_overlay_for_regen.upgrade() {
@@ -3564,28 +3587,10 @@ fn connect_share_switch(
                         "Couldn't save new key to keyring: {e}"
                     )));
                 }
-                // Continue anyway — the in-memory key is still
-                // applied below so the current session gets the
-                // new value; the next launch will find the old
-                // key until the save path succeeds.
             }
-            // Server-side apply. On error, don't advance the UI
-            // state — toast and return so the displayed key
-            // still matches what the server accepts.
-            if let Ok(handle) = running_for_auth_regen.try_borrow()
-                && let Some(handle) = handle.as_ref()
-                && let Err(e) = handle.server.set_auth_key(Some(fresh.clone()))
-            {
-                tracing::warn!(%e, "Server::set_auth_key failed on regenerate");
-                if let Some(overlay) = toast_overlay_for_regen.upgrade() {
-                    overlay.add_toast(adw::Toast::new(&format!(
-                        "Couldn't apply new key to the running server: {e}"
-                    )));
-                }
-                return;
-            }
-            // All server-side gates passed (or server wasn't
-            // running) — commit the UI update.
+
+            // Step 3: UI mutation after server + persistence
+            // settled.
             *current_key_for_regen.borrow_mut() = Some(fresh.clone());
             if revealed_for_regen.get() {
                 key_row.set_subtitle(&crate::sidebar::server_panel::auth_key_to_hex(&fresh));
@@ -4119,15 +4124,24 @@ fn render_activity_log(
 /// Render the "Connected clients" list — one row per client
 /// with peer, role badge, duration, and drops counter. Empty
 /// state: single "No clients connected" placeholder row plus
-/// matching expander subtitle. Rebuilds only when the
-/// `ClientId` set changes (i.e. a client joined or left) so
-/// user scroll position + hover highlight survive the 500 ms
-/// poll cadence. The per-client field churn (duration bumps,
-/// drop-count increments) IS NOT diffed here — we'd have to
-/// index rows by id to patch them in place, which is more
-/// complexity than the row-per-client design needs. Callers
-/// who want a running clock on each row should watch
-/// individual slots via a dedicated widget. Per issue #395.
+/// matching expander subtitle.
+///
+/// **Rebuild trigger.** Hashes `(id, peer, role, drops,
+/// elapsed_secs)` for every connected client; rebuilds when
+/// the hash changes. That covers both accept/disconnect
+/// transitions AND per-row field churn (ticking uptime,
+/// incrementing drop counters), so the displayed subtitles
+/// stay live throughout a session. Scroll / hover state is
+/// preserved on unchanged ticks. Per issue #395 +
+/// `CodeRabbit` round 2 on PR #406.
+///
+/// **Stop/start invalidation.** On server stop
+/// `reset_clients_list` empties the `ListBox` but can't reach
+/// the cache cell across function boundaries; instead,
+/// `render_clients_list` treats `first_child().is_none()` as
+/// "reset has run, force rebuild" so an empty→empty session
+/// transition still repaints the placeholder. Per `CodeRabbit`
+/// round 2 on PR #406.
 fn render_clients_list(
     widgets: &ServerStatusWidgets,
     stats: &sdr_server_rtltcp::ServerStats,
