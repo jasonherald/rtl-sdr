@@ -657,9 +657,28 @@ fn attach_click_gesture(
         let width = f64::from(area.width());
         let mut vfo = vfo_state.borrow_mut();
         let hz = vfo.pixel_to_hz(x, width);
+        // Snapshot display span + max span BEFORE mutating offset so
+        // a post-investigation diff of the trace can tell (a) whether
+        // the click landed inside the AA-filter-safe subset of the
+        // display, and (b) whether the user was zoomed in — zoom
+        // modifies `display_start_hz` / `display_end_hz` at runtime
+        // so a fixed ±bandwidth/2 assumption doesn't hold. Per #337
+        // investigation in PR batch with #407 / #157 / #400.
+        let display_start_hz = vfo.display_start_hz;
+        let display_end_hz = vfo.display_end_hz;
+        let max_span_hz = vfo.max_span_hz;
         vfo.offset_hz = hz;
         let offset = vfo.offset_hz;
-        tracing::debug!(offset_hz = offset, "click-to-tune");
+        tracing::debug!(
+            click_x = x,
+            width,
+            display_start_hz,
+            display_end_hz,
+            max_span_hz,
+            zoomed_in = (display_end_hz - display_start_hz) < max_span_hz * 0.99,
+            offset_hz = offset,
+            "click-to-tune: computed offset from pixel"
+        );
         drop(vfo);
 
         // Send VFO offset to DSP thread for actual tuning

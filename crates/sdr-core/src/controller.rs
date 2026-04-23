@@ -920,7 +920,25 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetVfoOffset(offset) => {
-            tracing::debug!(offset_hz = offset, "set VFO offset");
+            // Expanded tracing for the #337 click-to-tune-no-audio
+            // investigation: the #337 hypotheses point at a
+            // display-span vs. VFO-input-sample-rate mismatch
+            // (decim > 1) and/or clicks landing outside the AA-
+            // filter-safe subset, so surface BOTH rates + whether
+            // the VFO chain exists so the next smoke-test trace
+            // shows the offset's relationship to the filterable
+            // range at a glance.
+            let raw_rate = state.frontend.sample_rate();
+            let effective_rate = state.frontend.effective_sample_rate();
+            let vfo_exists = state.vfo.is_some();
+            tracing::debug!(
+                offset_hz = offset,
+                raw_sample_rate_hz = raw_rate,
+                effective_sample_rate_hz = effective_rate,
+                offset_within_effective = offset.abs() < effective_rate / 2.0,
+                vfo_exists,
+                "set VFO offset"
+            );
             state.vfo_offset = offset;
             if let Some(vfo) = &mut state.vfo {
                 vfo.set_offset(offset);
