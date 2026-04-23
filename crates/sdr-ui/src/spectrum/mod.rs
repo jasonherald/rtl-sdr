@@ -52,6 +52,14 @@ const VFO_RESET_BUTTON_MARGIN_PX: i32 = 8;
 /// Exponential moving average smoothing factor for `RunningAvg` mode.
 const AVERAGING_ALPHA: f32 = 0.3;
 
+/// Fraction of `max_span_hz` below which the click-to-tune diagnostic
+/// classifies the view as "zoomed in". Set slightly below 1.0 so tiny
+/// floating-point drift in the span arithmetic doesn't flip the
+/// classification on an unzoomed view. Per `CodeRabbit` round 1 on
+/// PR #418 — the threshold was previously a bare `0.99` literal inside
+/// the tracing call.
+const ZOOMED_IN_SPAN_RATIO_THRESHOLD: f64 = 0.99;
+
 /// Spectrum averaging mode for the FFT display.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AveragingMode {
@@ -657,9 +665,29 @@ fn attach_click_gesture(
         let width = f64::from(area.width());
         let mut vfo = vfo_state.borrow_mut();
         let hz = vfo.pixel_to_hz(x, width);
+        // Snapshot display span + max span BEFORE mutating offset so
+        // a post-investigation diff of the trace can tell (a) whether
+        // the click landed inside the AA-filter-safe subset of the
+        // display, and (b) whether the user was zoomed in — zoom
+        // modifies `display_start_hz` / `display_end_hz` at runtime
+        // so a fixed ±bandwidth/2 assumption doesn't hold. Per #337
+        // investigation in PR batch with #407 / #157 / #400.
+        let display_start_hz = vfo.display_start_hz;
+        let display_end_hz = vfo.display_end_hz;
+        let max_span_hz = vfo.max_span_hz;
         vfo.offset_hz = hz;
         let offset = vfo.offset_hz;
-        tracing::debug!(offset_hz = offset, "click-to-tune");
+        tracing::debug!(
+            click_x = x,
+            width,
+            display_start_hz,
+            display_end_hz,
+            max_span_hz,
+            zoomed_in =
+                (display_end_hz - display_start_hz) < max_span_hz * ZOOMED_IN_SPAN_RATIO_THRESHOLD,
+            offset_hz = offset,
+            "click-to-tune: computed offset from pixel"
+        );
         drop(vfo);
 
         // Send VFO offset to DSP thread for actual tuning

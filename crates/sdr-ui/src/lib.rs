@@ -11,6 +11,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod antenna;
 pub mod app;
 pub mod css;
 pub mod header;

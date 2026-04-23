@@ -175,6 +175,16 @@ impl Source for RtlSdrSource {
     }
 
     fn start(&mut self) -> Result<(), SourceError> {
+        // R820T supports 29.7 dB exactly (gain-table index 17).
+        // See the supported-gains list in
+        // `crates/sdr-rtlsdr/src/tuner/r82xx/mod.rs` if porting
+        // to a different tuner family (E4000 / FC0012 / FC0013
+        // / FC2580 have different step tables; the post-open
+        // default-gain call below would need to be tuner-
+        // adaptive then. Per issue #407 + PR #418 smoke test
+        // feedback ("AGC off by default").
+        const DEFAULT_TUNER_GAIN_TENTHS_DB: i32 = 297;
+
         let mut device = RtlSdrDevice::open(self.device_index)
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
 
@@ -189,6 +199,53 @@ impl Source for RtlSdrSource {
         device
             .reset_buffer()
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+
+        // Belt-and-suspenders: explicitly put the tuner into a
+        // known manual-gain state so the first Play produces
+        // signal regardless of whatever state a prior session
+        // left the device in. Pre-#407 no post-open gain setup
+        // ran at all, which let a USB-reseat-needing edge case
+        // slip through (dongle left in a bad state streamed
+        // zero bytes until physically reseated — seen during
+        // the PR #406 smoke test).
+        //
+        // **Gain mode: manual (AGC off) by default.** User
+        // preference is AGC off — mirrors SDR++ / GQRX's
+        // default for scanner / FM reception where a fixed gain
+        // is easier to reason about than an auto-ranging loop.
+        // The UI's `SetAgc(true)` dispatch re-enables auto mode
+        // immediately after the source is visible to the
+        // controller, so users who save "AGC on" still get
+        // their saved preference within one controller tick.
+        //
+        // **Gain value: mid-range default.** `set_gain_mode(true)`
+        // writes LNA-auto-off + mixer-auto-off + VGA 16.3 dB to
+        // the R820T regs, leaving the LNA and mixer at whatever
+        // index the `R82XX_INIT_ARRAY` post-init sequence left
+        // behind (LNA index 3 is common — low but non-zero).
+        // Explicitly set a mid-range tuner gain (29.7 dB, index
+        // 17 of 29 for R820T) on top of that so fresh-install
+        // users hear signal on the first Play without having to
+        // touch the gain slider. UI `SetGain` dispatch overrides
+        // this with the saved preference a moment later.
+        //
+        // Per issue #407 + user feedback on PR #418 smoke test
+        // ("AGC should default to off").
+        device
+            .set_tuner_gain_mode(true)
+            .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+        if let Err(e) = device.set_tuner_gain(DEFAULT_TUNER_GAIN_TENTHS_DB) {
+            // Non-fatal: the gain-mode write above already put
+            // the tuner in a valid manual state. If the
+            // mid-range default fails (unexpected tuner
+            // variant / I2C flake), log and carry on — the UI's
+            // `SetGain` dispatch takes over on the next
+            // controller tick.
+            tracing::warn!(
+                error = %e,
+                "RtlSdrSource::start: post-open set_tuner_gain default failed (non-fatal)"
+            );
+        }
 
         // Set running BEFORE spawning so the reader thread sees it immediately.
         self.running.store(true, Ordering::Release);

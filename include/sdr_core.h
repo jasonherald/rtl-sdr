@@ -56,8 +56,30 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 18
+#define SDR_CORE_ABI_VERSION_MINOR 19
 /*
+ * 0.19 — extends the rtl_tcp FFI surface with codec-mask and
+ * auth-required fields that were previously hardcoded (#307
+ * / #395 follow-ups, issue #400):
+ *   - `SdrRtlTcpAdvertiseOptions` gains `has_codecs` (bool) +
+ *     `codecs` (uint8_t) + `has_auth_required` (bool) +
+ *     `auth_required` (bool) at the tail. Zero-init defaults
+ *     (`has_*` = false) publish the mDNS TXT without the
+ *     `codecs=` / `auth_required=` keys — identical to pre-0.19
+ *     behaviour. Hosts that want to advertise compression or
+ *     auth capability set the `has_*` gate and populate the
+ *     matching value.
+ *   - `SdrRtlTcpServerConfig` gains `has_compression` (bool) +
+ *     `compression` (uint8_t) at the tail. Zero-init default
+ *     (`has_compression = false`) keeps the server on
+ *     `CodecMask::NONE_ONLY`, matching pre-0.19 behaviour.
+ *     Hosts that want LZ4 stream compression flip `has_
+ *     compression = true; compression = 0x03` AND keep the
+ *     matching mDNS `codecs` field in sync.
+ * Both structs grow at the tail so 0.18 consumers must fail
+ * fast on the exact-match ABI check (pre-1.0 rule). No existing
+ * field offsets change.
+ *
  * 0.18 — adds three new discriminants to
  * `SdrRtlTcpConnectionStateKind`:
  *   - SDR_RTL_TCP_STATE_CONTROLLER_BUSY  = 5
@@ -867,6 +889,18 @@ typedef struct SdrRtlTcpServerConfig {
     /* Length in bytes of auth_key. Must be 0 iff auth_key is
      * NULL. See auth_key for valid range + semantics. */
     uint32_t auth_key_len;
+    /* Whether `compression` below is meaningful. `false` (zero-
+     * init) runs the server with `CodecMask::NONE_ONLY` — legacy
+     * clients only, identical to pre-ABI-0.19 behaviour. Added
+     * per #400. */
+    bool     has_compression;
+    /* Compression-mask wire byte. Only used when
+     * has_compression == true. Value is a `CodecMask::to_wire`
+     * byte: 0x01 = None-only (legacy), 0x03 = None + LZ4.
+     * Must match the codecs advertised on mDNS via
+     * `SdrRtlTcpAdvertiseOptions.codecs` or clients see a
+     * false advertisement at discovery time. Added per #400. */
+    uint8_t  compression;
 } SdrRtlTcpServerConfig;
 
 /*
@@ -1193,6 +1227,13 @@ typedef struct SdrRtlTcpAdvertiseOptions {
     const char*  nickname;       /* TXT: user-editable nickname; optional (NULL / "" = no nickname) */
     bool         has_txbuf;      /* TXT: whether `txbuf` below is meaningful */
     uint64_t     txbuf;          /* TXT: optional buffer-depth hint (bytes) */
+    /* ABI 0.19 (#400) — opt-in TXT fields. Zero-init defaults
+     * (has_* = false) omit the key from the TXT record,
+     * matching pre-0.19 behaviour. */
+    bool         has_codecs;         /* whether `codecs` below is meaningful */
+    uint8_t      codecs;             /* TXT: CodecMask wire byte (0x01 = None-only, 0x03 = None+LZ4) */
+    bool         has_auth_required;  /* whether `auth_required` below is meaningful */
+    bool         auth_required;      /* TXT: whether the server requires pre-shared-key auth (#394) */
 } SdrRtlTcpAdvertiseOptions;
 
 /*
@@ -1214,6 +1255,17 @@ typedef struct SdrRtlTcpDiscoveredServer {
     bool        has_txbuf;
     uint64_t    txbuf;
     double      last_seen_secs_ago;
+    /* ABI 0.19 (#400) — read-side TXT capability fields mirroring
+     * `SdrRtlTcpAdvertiseOptions.{has_codecs, codecs, has_auth_required,
+     * auth_required}` so FFI hosts can gate compression / takeover /
+     * role / auth-field reveal decisions against the same capability
+     * signals the server publishes. Zero-init defaults (has_* = false)
+     * map to "server didn't advertise this TXT key" — identical to
+     * how the parser already treats an absent key. */
+    bool        has_codecs;
+    uint8_t     codecs;
+    bool        has_auth_required;
+    bool        auth_required;
 } SdrRtlTcpDiscoveredServer;
 
 /*
