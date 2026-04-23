@@ -507,6 +507,7 @@ mod tests {
             tuner_name: "R820T".into(),
             gain_count: 29,
             codec: "None".into(),
+            granted_role: Some(true),
         });
         assert!(matches!(
             connected,
@@ -826,6 +827,30 @@ mod tests {
         assert!(matches!(disc, UiToDsp::DisconnectRtlTcp));
         let retry = UiToDsp::RetryRtlTcpNow;
         assert!(matches!(retry, UiToDsp::RetryRtlTcpNow));
+
+        // RTL-TCP role + auth-key config (issue #396). Constructed
+        // with a non-default Listen role and a plausible 32-byte
+        // key so the shape regression fires on either a field
+        // rename / retyping OR the re-export path going stale. The
+        // matching `SetRtlTcpClientConfig` handler is load-bearing
+        // for the role picker and per-server keyring flows.
+        let cfg = UiToDsp::SetRtlTcpClientConfig {
+            requested_role: sdr_server_rtltcp::extension::Role::Listen,
+            auth_key: Some(vec![0xAB; 32]),
+        };
+        assert!(matches!(
+            cfg,
+            UiToDsp::SetRtlTcpClientConfig {
+                requested_role: sdr_server_rtltcp::extension::Role::Listen,
+                auth_key: Some(ref bytes),
+            } if bytes.len() == 32 && bytes.iter().all(|&b| b == 0xAB)
+        ));
+
+        // `RetryRtlTcpWithTakeover` is a unit variant today, but
+        // the pattern match fails loudly if that changes (e.g.
+        // a future refactor adds a scoped-reason payload).
+        let takeover = UiToDsp::RetryRtlTcpWithTakeover;
+        assert!(matches!(takeover, UiToDsp::RetryRtlTcpWithTakeover));
     }
 
     #[test]

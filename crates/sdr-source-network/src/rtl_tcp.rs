@@ -138,10 +138,22 @@ pub enum ConnectionState {
     /// Handshake complete, handler streaming I/Q. `codec` reflects
     /// the negotiated stream codec from the extended `"RTLX"`
     /// handshake (#307); legacy / uncompressed paths land on
-    /// `Codec::None`.
+    /// `Codec::None`. `granted_role` carries the server's
+    /// `ServerExtension.granted_role` decision (#392): `Some(Role)`
+    /// when the server is RTLX-capable and admitted us into a
+    /// specific slot, `None` when we didn't send a hello (legacy
+    /// path) or the server is a pre-#392 RTLX server that doesn't
+    /// yet advertise the field. The UI shows the role badge only
+    /// when this is `Some` — a legacy server's role is unknown
+    /// territory, and guessing "Controller" there would mis-label
+    /// the connection on pre-#392 RTLX servers that still hand
+    /// every accepted client a Control-equivalent slot without
+    /// saying so on the wire. Per #396 / CodeRabbit round 1 on
+    /// PR #408.
     Connected {
         tuner: TunerInfo,
         codec: Codec,
+        granted_role: Option<sdr_server_rtltcp::extension::Role>,
     },
     /// Connection dropped, backoff pending. Transport-level errors
     /// (TCP connect refused, EOF, stall) stay in this state — the
@@ -172,13 +184,30 @@ impl From<&ConnectionState> for sdr_types::RtlTcpConnectionState {
         match value {
             ConnectionState::Disconnected => Self::Disconnected,
             ConnectionState::Connecting => Self::Connecting,
-            ConnectionState::Connected { tuner, codec } => Self::Connected {
+            ConnectionState::Connected {
+                tuner,
+                codec,
+                granted_role,
+            } => Self::Connected {
                 // `TunerTypeCode`'s `Debug` renders the upstream
                 // tuner name ("R820T", "E4000", etc.) directly —
                 // what the UI wants for the status row subtitle.
                 tuner_name: format!("{:?}", tuner.tuner),
                 gain_count: tuner.gain_count,
                 codec: codec.label().to_string(),
+                // Project the server-granted role to `Option<bool>`
+                // at the crate boundary so `sdr_types` doesn't have
+                // to depend on `sdr-server-rtltcp`'s wire `Role`
+                // enum: `true` = Controller, `false` = Listener,
+                // `None` = unknown (legacy handshake or pre-#392
+                // RTLX server). The UI uses this to decide whether
+                // to show the role badge at all — per CodeRabbit
+                // round 1 on PR #408, the previous `Option<bool>`
+                // derived from the user's requested role could
+                // mis-label a session the server actually admitted
+                // differently.
+                granted_role: granted_role
+                    .map(|r| r == sdr_server_rtltcp::extension::Role::Control),
             },
             ConnectionState::Retrying { attempt, next_at } => Self::Retrying {
                 attempt: *attempt,
@@ -938,6 +967,15 @@ fn read_server_extension(stream: &TcpStream) -> std::io::Result<ServerExtension>
 /// TCP socket (still plain `TcpStream`; the caller wraps it in a
 /// [`Decoder`] for reads). `codec` tells the caller which
 /// decoder to use for the IQ stream.
+///
+/// `ServerExtension.granted_role` isn't carried here — it's
+/// already published inside `attempt_connect` on the
+/// `ConnectionState::Connected` state transition, which is the
+/// single consumer the UI needs. Threading it through the
+/// outcome struct too would require the manager's data-pump
+/// branch to also read and forward it, which it has no use for
+/// (no mid-stream role changes exist in the wire protocol).
+/// Per CodeRabbit round 1 on PR #408.
 struct HandshakeOutcome {
     stream: TcpStream,
     codec: Codec,
@@ -1129,6 +1167,13 @@ fn attempt_connect(
     // silently falling back would let a server that picked LZ4
     // stream compressed bytes into our IQ decoder. Per CodeRabbit
     // round 1 on PR #399.
+    // Track the server's `granted_role` so it can flow through
+    // to `ConnectionState::Connected`. `None` on the legacy path
+    // (we never read the extension block) OR on an extended
+    // server that predates #392 and leaves the field unset —
+    // the UI treats both as "unknown" and hides the role badge.
+    // Per CodeRabbit round 1 on PR #408.
+    let mut granted_role: Option<sdr_server_rtltcp::extension::Role> = None;
     let codec = if extension_enabled {
         match read_server_extension(&stream) {
             Ok(ext) => {
@@ -1178,8 +1223,10 @@ fn attempt_connect(
                 tracing::info!(
                     codec = %ext.codec,
                     status = ext.status.to_wire(),
+                    granted_role = ?ext.granted_role,
                     "rtl_tcp extended-handshake accepted by server"
                 );
+                granted_role = ext.granted_role;
                 ext.codec
             }
             Err(e) => {
@@ -1201,7 +1248,14 @@ fn attempt_connect(
     if let Ok(mut slot) = shared.tuner.lock() {
         *slot = Some(tuner);
     }
-    set_state(shared, ConnectionState::Connected { tuner, codec });
+    set_state(
+        shared,
+        ConnectionState::Connected {
+            tuner,
+            codec,
+            granted_role,
+        },
+    );
 
     // Publish a clone of the stream for the command sender. Install a
     // write timeout on the clone so `send_command`'s blocking
@@ -2818,9 +2872,29 @@ mod tests {
                 .unwrap();
             let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
             sock.read_exact(&mut hello_buf).expect("read hello");
+            // Pin the role-only hello to protocol v1 — this
+            // gate path has non-default role but zero flags, so
+            // `required_protocol_version(flags)` (used by the
+            // client hello-builder) returns v1. A regression
+            // that silently promoted this hello to v2 would
+            // lock out pre-#394 servers without surfacing a
+            // test failure unless the version byte is checked
+            // explicitly. Per CodeRabbit round 1 on PR #408.
+            let client_hello_version = hello_buf[7];
+            assert_eq!(
+                client_hello_version,
+                sdr_server_rtltcp::extension::PROTOCOL_VERSION_V1,
+                "role-only hello must stay on v1 for backward compatibility \
+                 (got 0x{:02x})",
+                client_hello_version,
+            );
             let _ = hello_tx.send(hello_buf);
             // Accept the handshake with Listen granted so the
-            // client reaches Connected.
+            // client reaches Connected. Echo the client-chosen
+            // protocol version back rather than the compile-time
+            // `PROTOCOL_VERSION` so a future bump of `PROTOCOL_
+            // VERSION` doesn't mask a regression where the role-
+            // only hello regresses to a newer version.
             let header = DongleInfo {
                 tuner: TunerTypeCode::R820t,
                 gain_count: RTLX_TEST_GAIN_COUNT,
@@ -2831,7 +2905,7 @@ mod tests {
                 codec: Codec::None,
                 granted_role: Some(Role::Listen),
                 status: Status::Ok,
-                version: PROTOCOL_VERSION,
+                version: client_hello_version,
             };
             sock.write_all(&ext.to_bytes()).unwrap();
             thread::sleep(RTLX_TEST_SERVER_HOLD);

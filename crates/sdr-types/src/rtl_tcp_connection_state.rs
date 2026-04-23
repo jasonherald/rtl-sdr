@@ -50,6 +50,18 @@ pub enum RtlTcpConnectionState {
         /// uncompressed-by-choice paths both land on `"None"`.
         /// Issue #307.
         codec: String,
+        /// Server's `ServerExtension.granted_role` decision from
+        /// the #392 extended handshake, projected to `Option<bool>`
+        /// so this type doesn't pull in `sdr-server-rtltcp`'s wire
+        /// `Role` enum: `Some(true)` = Controller, `Some(false)` =
+        /// Listener, `None` = unknown (we never sent a hello, or
+        /// the server is a pre-#392 RTLX build that doesn't yet
+        /// write the field). UIs render the role badge only when
+        /// this is `Some` — per CodeRabbit round 1 on PR #408,
+        /// a legacy / pre-#392 server's actual slot is unknowable
+        /// from the client side, and guessing "Controller" there
+        /// could mis-label the session. Issue #396.
+        granted_role: Option<bool>,
     },
 
     /// Transport-level error (connect refused, EOF, stall). The
@@ -151,6 +163,7 @@ mod tests {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
                 codec: "None".into(),
+                granted_role: Some(true),
             }
             .is_connected()
         );
@@ -178,6 +191,7 @@ mod tests {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
                 codec: "None".into(),
+                granted_role: Some(true),
             }
             .is_in_progress()
         );
@@ -189,5 +203,45 @@ mod tests {
             .is_in_progress()
         );
         assert!(!RtlTcpConnectionState::Failed { reason: "x".into() }.is_in_progress());
+    }
+
+    #[test]
+    fn needs_user_action_matches_terminal_user_action_states() {
+        // Terminal states that gate the auto-retry loop and
+        // demand an explicit click / type / pick from the user.
+        // Added alongside the #396 client UI so the helper
+        // cleanly replaces an ad-hoc pattern match at every
+        // call site. Pre-#396 only `Failed` needed this
+        // treatment; `ControllerBusy` / `AuthRequired` /
+        // `AuthFailed` are new terminal variants that must
+        // also return `true`.
+        assert!(RtlTcpConnectionState::Failed { reason: "x".into() }.needs_user_action());
+        assert!(RtlTcpConnectionState::ControllerBusy.needs_user_action());
+        assert!(RtlTcpConnectionState::AuthRequired.needs_user_action());
+        assert!(RtlTcpConnectionState::AuthFailed.needs_user_action());
+
+        // Non-terminal states — the connection manager is
+        // either waiting to start, already streaming, or
+        // auto-retrying on its own backoff schedule. The UI
+        // should show a spinner / status icon, not a recovery
+        // affordance.
+        assert!(!RtlTcpConnectionState::Disconnected.needs_user_action());
+        assert!(!RtlTcpConnectionState::Connecting.needs_user_action());
+        assert!(
+            !RtlTcpConnectionState::Connected {
+                tuner_name: "R820T".into(),
+                gain_count: 29,
+                codec: "None".into(),
+                granted_role: Some(true),
+            }
+            .needs_user_action()
+        );
+        assert!(
+            !RtlTcpConnectionState::Retrying {
+                attempt: 1,
+                retry_in: Duration::from_secs(1),
+            }
+            .needs_user_action()
+        );
     }
 }

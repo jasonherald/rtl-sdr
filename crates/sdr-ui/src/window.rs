@@ -965,20 +965,30 @@ fn handle_dsp_message(
                     rtl_tcp_port_row_weak,
                 );
             }
-            // Status-bar role badge (#396) — flip on Connected
-            // based on the user's most recently-requested role;
-            // hide on every non-Connected state. Server
-            // admission is always "grant as requested" (#392
-            // has no downgrade path), so the requested role
-            // the UI holds mirrors what the server admitted.
+            // Status-bar role badge (#396) — show the role the
+            // SERVER admitted us into, never the role the user
+            // requested. Pre-CodeRabbit round 1 on PR #408 the
+            // badge was derived from the role-picker selection,
+            // which could silently mis-label sessions where the
+            // server admitted a different role (e.g. a pre-#392
+            // RTLX server that hands every client a Control-
+            // equivalent slot without honoring role requests,
+            // or a hypothetical future server with
+            // role-downgrade semantics). `granted_role` is
+            // populated by the extended handshake: `Some(true)`
+            // → Controller, `Some(false)` → Listener, `None` →
+            // unknown (legacy server, or pre-#392 RTLX build
+            // that doesn't write the field). Hide the badge
+            // when unknown AND in every non-Connected state.
             let role_badge = match &conn_state {
-                sdr_types::RtlTcpConnectionState::Connected { .. } => {
-                    let selected = rtl_tcp_role_row_weak.upgrade().map_or(
-                        crate::sidebar::source_panel::RTL_TCP_ROLE_CONTROL_IDX,
-                        |row| row.selected(),
-                    );
-                    Some(selected == crate::sidebar::source_panel::RTL_TCP_ROLE_CONTROL_IDX)
-                }
+                sdr_types::RtlTcpConnectionState::Connected {
+                    granted_role: Some(true),
+                    ..
+                } => Some(crate::status_bar::RtlTcpRoleBadge::Controller),
+                sdr_types::RtlTcpConnectionState::Connected {
+                    granted_role: Some(false),
+                    ..
+                } => Some(crate::status_bar::RtlTcpRoleBadge::Listener),
                 _ => None,
             };
             status_bar.update_role(role_badge);
@@ -1218,7 +1228,10 @@ fn handle_rtl_tcp_state_toast(
 ) {
     use sdr_types::RtlTcpConnectionState;
 
-    use crate::state::{RTL_TCP_STATE_DISC_AUTH_FAILED, RTL_TCP_STATE_DISC_AUTH_REQUIRED};
+    use crate::state::{
+        RTL_TCP_STATE_DISC_AUTH_FAILED, RTL_TCP_STATE_DISC_AUTH_REQUIRED,
+        RTL_TCP_STATE_DISC_CONNECTING,
+    };
 
     match state_val {
         RtlTcpConnectionState::ControllerBusy => {
@@ -1318,16 +1331,32 @@ fn handle_rtl_tcp_state_toast(
         }
 
         RtlTcpConnectionState::Connected { .. } => {
-            // Successful connect after an auth-required attempt:
-            // save the user-entered key to the per-server
+            // Save the user-entered key to the per-server
             // keyring so subsequent reconnects auto-use it.
-            // Only fires on the edge FROM AuthRequired /
-            // AuthFailed — a regular Connected-from-Connecting
-            // doesn't touch the keyring (user didn't type
-            // anything worth saving).
-            if prev_disc == RTL_TCP_STATE_DISC_AUTH_REQUIRED
+            // Fires on the edge from either `AuthRequired` /
+            // `AuthFailed` (user typed a key in response to a
+            // denial) OR `Connecting` (user had auth configured
+            // up front — server advertised `auth_required` via
+            // mDNS, key was entered before the first connect,
+            // and the handshake succeeded in a single
+            // `Connecting → Connected` hop without ever
+            // surfacing an auth-denial state). Pre-CodeRabbit
+            // round 1 on PR #408 the Connecting case was
+            // missed, so up-front keys never hit the keyring
+            // and the user had to re-type them on every
+            // reconnect. `save_current_auth_key_for_active_
+            // server` is a no-op when the key row is empty, so
+            // this is safe to trigger on every Connecting→
+            // Connected edge even if the server doesn't require
+            // auth. Call `record_active_rtl_tcp_server` first
+            // so the save-path sees the right `host:port` even
+            // when the user never hit an auth-denial arm
+            // (which is what previously set the cache).
+            if prev_disc == RTL_TCP_STATE_DISC_CONNECTING
+                || prev_disc == RTL_TCP_STATE_DISC_AUTH_REQUIRED
                 || prev_disc == RTL_TCP_STATE_DISC_AUTH_FAILED
             {
+                record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
                 save_current_auth_key_for_active_server(app_state, auth_key_row_weak);
             }
         }
@@ -2059,6 +2088,8 @@ fn connect_rtl_tcp_discovery(
     let port_row = panels.source.port_row.clone();
     let protocol_row = panels.source.protocol_row.clone();
     let device_row = panels.source.device_row.clone();
+    let role_row = panels.source.rtl_tcp_role_row.clone();
+    let auth_key_row = panels.source.rtl_tcp_auth_key_row.clone();
     let state = Rc::clone(state);
     // Shared config handle — the Connect button on each discovered
     // row clones it once more inside the closure so it can persist
@@ -2105,6 +2136,8 @@ fn connect_rtl_tcp_discovery(
         port_row: port_row.downgrade(),
         protocol_row: protocol_row.downgrade(),
         device_row: device_row.downgrade(),
+        role_row: role_row.downgrade(),
+        auth_key_row: auth_key_row.downgrade(),
         expander_weak: expander_weak.clone(),
         // Weak refs — see `FavoriteRowContext.displayed_rows`
         // docstring for the retain-cycle reasoning.
@@ -2433,6 +2466,8 @@ fn connect_rtl_tcp_discovery(
                     let pr = port_row.clone();
                     let protor = protocol_row.clone();
                     let dr = device_row.clone();
+                    let rr = role_row.clone();
+                    let akr = auth_key_row.clone();
                     let st = Rc::clone(&state);
                     let cfg = std::sync::Arc::clone(&config_for_discovery);
                     // Friendly nickname for the persisted snapshot.
@@ -2457,6 +2492,8 @@ fn connect_rtl_tcp_discovery(
                             &pr,
                             &protor,
                             &dr,
+                            &rr,
+                            &akr,
                             &st,
                             &cfg,
                         );
@@ -2652,6 +2689,8 @@ fn apply_rtl_tcp_connect(
     port_row: &adw::SpinRow,
     protocol_row: &adw::ComboRow,
     device_row: &adw::ComboRow,
+    role_row: &adw::ComboRow,
+    auth_key_row: &adw::PasswordEntryRow,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
@@ -2659,6 +2698,104 @@ fn apply_rtl_tcp_connect(
     protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
     hostname_row.set_text(host);
     port_row.set_value(f64::from(port));
+    // Restore saved per-server state (#396) BEFORE the
+    // `SetNetworkConfig` / `SetSourceType` dispatch so the DSP
+    // thread's first use of the new endpoint already carries the
+    // right `requested_role` + `auth_key`. Pre-CodeRabbit round 1
+    // on PR #408 this helper only pushed host / port / source,
+    // which meant the new favorite metadata (`requested_role`,
+    // `auth_required`) and per-server client-key keyring helpers
+    // were inert from the discovery + favorites entry points —
+    // role always reverted to the global default and keys never
+    // auto-filled.
+    //
+    // Resolution order for role:
+    // - If the server is a favorite and that favorite carries a
+    //   `requested_role`, use it.
+    // - Otherwise fall back to the global
+    //   `KEY_RTL_TCP_CLIENT_LAST_ROLE` default (if any).
+    // - Otherwise leave the picker alone (Control is the
+    //   picker's built-in default for fresh servers).
+    //
+    // For the auth-key row:
+    // - Reveal the row if the favorite's `auth_required` is
+    //   `Some(true)` — user doesn't have to hit an
+    //   `AuthRequired` denial before seeing the field.
+    // - Load any saved keyring hex for this `host:port` and
+    //   pre-fill the row so the subsequent connect succeeds in
+    //   a single `Connecting → Connected` hop.
+    //
+    // Both operations are no-ops for servers we've never
+    // favorited AND never connected to; the picker stays on
+    // Control and the row stays hidden, matching pre-#408
+    // behavior.
+    use crate::sidebar::source_panel::{
+        FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
+        RTL_TCP_ROLE_LISTEN_IDX, load_favorites,
+    };
+    let server_key = format!("{host}:{port}");
+    let favorite_entry = load_favorites(config)
+        .into_iter()
+        .find(|f| f.key == server_key);
+    let favorite_role = favorite_entry
+        .as_ref()
+        .and_then(|f| f.requested_role)
+        .or_else(|| {
+            config.read(|v| {
+                v.get(KEY_RTL_TCP_CLIENT_LAST_ROLE)
+                    .and_then(|rv| serde_json::from_value::<FavoriteRole>(rv.clone()).ok())
+            })
+        });
+    if let Some(fav_role) = favorite_role {
+        let idx = match fav_role {
+            FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
+            FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
+        };
+        role_row.set_selected(idx);
+    }
+    // Reveal Server-key row if the favorite advertised
+    // `auth_required = true`. We leave it alone when `None` —
+    // an unknown auth stance means "don't nag the user now,
+    // the AuthRequired handshake arm will reveal it if
+    // needed." `Some(false)` also leaves it alone (row stays
+    // hidden for explicitly-no-auth servers).
+    if matches!(
+        favorite_entry.as_ref().and_then(|f| f.auth_required),
+        Some(true)
+    ) {
+        auth_key_row.set_visible(true);
+    }
+    // Pre-fill the saved client key (hex) if we have one for
+    // this server. `load_client_auth_key_from_keyring` returns
+    // raw bytes; re-hex them for the row (the row always
+    // displays hex, matching what `openssl rand -hex 32`
+    // produces and what the server UI's Copy button writes).
+    if let Some(bytes) = load_client_auth_key_from_keyring(host, port) {
+        auth_key_row.set_text(&crate::sidebar::server_panel::auth_key_to_hex(&bytes));
+    }
+    // Dispatch a fresh `SetRtlTcpClientConfig` so the DSP
+    // thread has the restored role + key in place before the
+    // `SetNetworkConfig` + `SetSourceType` below trigger the
+    // actual handshake. Without this the DSP would use its
+    // last-known values (possibly stale from a prior server)
+    // and the first connect could land with the wrong role or
+    // a dead auth key from another session.
+    let requested_role = match role_row.selected() {
+        RTL_TCP_ROLE_CONTROL_IDX => FavoriteRole::Control,
+        RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
+        _ => FavoriteRole::Control,
+    }
+    .as_wire_role();
+    let key_text = auth_key_row.text().to_string();
+    let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
+        None
+    } else {
+        crate::sidebar::server_panel::auth_key_from_hex(&key_text)
+    };
+    state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+        requested_role,
+        auth_key,
+    });
     device_row.set_selected(DEVICE_RTLTCP);
     state.send_dsp(UiToDsp::SetNetworkConfig {
         hostname: host.to_string(),
@@ -2776,6 +2913,18 @@ struct FavoriteRowContext {
     port_row: glib::WeakRef<adw::SpinRow>,
     protocol_row: glib::WeakRef<adw::ComboRow>,
     device_row: glib::WeakRef<adw::ComboRow>,
+    /// Role picker — `apply_rtl_tcp_connect` needs it so the
+    /// per-server `requested_role` can be restored before
+    /// the new endpoint's first connect dispatch. Per
+    /// CodeRabbit round 1 on PR #408.
+    role_row: glib::WeakRef<adw::ComboRow>,
+    /// Auth-key row — `apply_rtl_tcp_connect` reveals it
+    /// when the favorite advertises `auth_required` and
+    /// pre-fills any saved key from the keyring so a
+    /// pre-configured auth connect lands in a single
+    /// `Connecting → Connected` hop. Per CodeRabbit round 1
+    /// on PR #408.
+    auth_key_row: glib::WeakRef<adw::PasswordEntryRow>,
     expander_weak: glib::WeakRef<adw::ExpanderRow>,
     displayed_rows: std::rc::Weak<
         RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
@@ -2873,12 +3022,22 @@ fn attach_favorite_row_actions(
             );
             return;
         };
-        let (Some(hostname_row), Some(port_row), Some(protocol_row), Some(device_row)) = (
+        let (
+            Some(hostname_row),
+            Some(port_row),
+            Some(protocol_row),
+            Some(device_row),
+            Some(role_row),
+            Some(auth_key_row),
+        ) = (
             connect_ctx.hostname_row.upgrade(),
             connect_ctx.port_row.upgrade(),
             connect_ctx.protocol_row.upgrade(),
             connect_ctx.device_row.upgrade(),
-        ) else {
+            connect_ctx.role_row.upgrade(),
+            connect_ctx.auth_key_row.upgrade(),
+        )
+        else {
             return;
         };
         // Shared ordering-sensitive flow lives in
@@ -2892,6 +3051,8 @@ fn attach_favorite_row_actions(
             &port_row,
             &protocol_row,
             &device_row,
+            &role_row,
+            &auth_key_row,
             &connect_ctx.state,
             &connect_ctx.config,
         );
@@ -5719,18 +5880,33 @@ fn connect_source_panel(
     // role takes effect on the NEXT connect — already-running
     // sessions keep their admitted role because the wire
     // protocol ties role to the hello and doesn't support
-    // mid-stream role changes. Also persist the chosen role so a
-    // restart restores the user's preference.
+    // mid-stream role changes. Persistence has two tiers:
+    //
+    // - Global `KEY_RTL_TCP_CLIENT_LAST_ROLE` — fallback default
+    //   for NEW servers that haven't been favorited yet. The
+    //   Connect-from-discovery path reads this to seed the
+    //   picker before the user has expressed a per-server
+    //   preference. Pre-CodeRabbit round 1 on PR #408 this was
+    //   the ONLY persistence tier, which meant changing
+    //   Server B's role clobbered Server A's preference.
+    // - Per-favorite `FavoriteEntry.requested_role` — wins for
+    //   favorited servers. When the current server identity
+    //   matches a favorite key, update that entry's role and
+    //   save_favorites so the next connect from this favorite
+    //   restores the right picker state without touching other
+    //   servers.
     let state_role = Rc::clone(state);
     let auth_key_for_role = panels.source.rtl_tcp_auth_key_row.clone();
     let config_for_role = std::sync::Arc::clone(config);
+    let hostname_for_role = panels.source.hostname_row.clone();
+    let port_for_role = panels.source.port_row.clone();
     panels
         .source
         .rtl_tcp_role_row
         .connect_selected_notify(move |row| {
             use crate::sidebar::source_panel::{
                 FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
-                RTL_TCP_ROLE_LISTEN_IDX,
+                RTL_TCP_ROLE_LISTEN_IDX, load_favorites, save_favorites,
             };
             let fav_role = match row.selected() {
                 RTL_TCP_ROLE_CONTROL_IDX => FavoriteRole::Control,
@@ -5748,10 +5924,37 @@ fn connect_source_panel(
                 requested_role,
                 auth_key,
             });
+            // Tier 1: global default — always written so a fresh
+            // server ("never favorited, never configured") picks
+            // this up as the picker seed.
             config_for_role.write(|v| {
                 v[KEY_RTL_TCP_CLIENT_LAST_ROLE] =
                     serde_json::to_value(fav_role).unwrap_or(serde_json::Value::Null);
             });
+            // Tier 2: per-favorite override. Compute the current
+            // `host:port` key; if it matches a favorite, update
+            // that favorite's `requested_role` and persist. No-op
+            // when the server isn't favorited (the global default
+            // above covers it).
+            let host = hostname_for_role.text().to_string();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let port = port_for_role.value() as u16;
+            if host.is_empty() || port == 0 {
+                return;
+            }
+            let server_key = format!("{host}:{port}");
+            let mut favorites = load_favorites(&config_for_role);
+            let mut dirty = false;
+            for fav in &mut favorites {
+                if fav.key == server_key && fav.requested_role != Some(fav_role) {
+                    fav.requested_role = Some(fav_role);
+                    dirty = true;
+                    break;
+                }
+            }
+            if dirty {
+                save_favorites(&config_for_role, &favorites);
+            }
         });
 
     // Server key entry (#394 + #396). On every edit we rebuild

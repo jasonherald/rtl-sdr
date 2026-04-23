@@ -167,4 +167,58 @@ mod tests {
         // Should not panic — just logs a warning.
         state.send_dsp(UiToDsp::Stop);
     }
+
+    #[test]
+    fn rtl_tcp_state_discriminant_covers_all_variants() {
+        // Lock-in test so a future `RtlTcpConnectionState`
+        // variant reorder doesn't silently desync the
+        // `RTL_TCP_STATE_DISC_*` u8 constants used by the
+        // toast edge-detection path. The constants are
+        // `Cell<u8>`-friendly projections of the enum's
+        // variant ordering and must match 1:1. Per
+        // CodeRabbit round 1 on PR #408.
+        use std::time::Duration;
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::Disconnected),
+            RTL_TCP_STATE_DISC_DISCONNECTED
+        );
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::Connecting),
+            RTL_TCP_STATE_DISC_CONNECTING
+        );
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::Connected {
+                tuner_name: "R820T".into(),
+                gain_count: 29,
+                codec: "None".into(),
+                granted_role: Some(true),
+            }),
+            RTL_TCP_STATE_DISC_CONNECTED
+        );
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::Retrying {
+                attempt: 1,
+                retry_in: Duration::from_secs(1),
+            }),
+            RTL_TCP_STATE_DISC_RETRYING
+        );
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::Failed {
+                reason: "x".into(),
+            }),
+            RTL_TCP_STATE_DISC_FAILED
+        );
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::ControllerBusy),
+            RTL_TCP_STATE_DISC_CONTROLLER_BUSY
+        );
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::AuthRequired),
+            RTL_TCP_STATE_DISC_AUTH_REQUIRED
+        );
+        assert_eq!(
+            rtl_tcp_state_discriminant(&sdr_types::RtlTcpConnectionState::AuthFailed),
+            RTL_TCP_STATE_DISC_AUTH_FAILED
+        );
+    }
 }

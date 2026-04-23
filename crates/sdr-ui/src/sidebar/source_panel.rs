@@ -331,6 +331,10 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
             tuner_name,
             gain_count,
             codec,
+            // The subtitle copy intentionally omits the role —
+            // the status-bar badge carries it. Per CodeRabbit
+            // round 1 on PR #408.
+            granted_role: _,
         } => {
             // Only surface the codec when it's actually compressing —
             // the common "None" case (every legacy server, plus our
@@ -1143,6 +1147,7 @@ mod tests {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
                 codec: "None".into(),
+                granted_role: Some(true),
             }),
             "Connected — R820T (29 gains)"
         );
@@ -1155,6 +1160,7 @@ mod tests {
                 tuner_name: "R820T".into(),
                 gain_count: 29,
                 codec: "LZ4".into(),
+                granted_role: Some(true),
             }),
             "Connected — R820T (29 gains, LZ4)"
         );
@@ -1192,6 +1198,23 @@ mod tests {
                 reason: "bad handshake".into(),
             }),
             "Failed — bad handshake"
+        );
+        // Role-denial states (#396) get their own short
+        // subtitles — no reason string needed because the
+        // variant itself IS the reason. Lock in each copy
+        // against accidental drift; a typo here would ship
+        // to users without CI catching it otherwise.
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::ControllerBusy),
+            "Controller slot is occupied",
+        );
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::AuthRequired),
+            "Server requires a key",
+        );
+        assert_eq!(
+            format_rtl_tcp_state(&RtlTcpConnectionState::AuthFailed),
+            "Key rejected",
         );
     }
 
@@ -1271,6 +1294,15 @@ mod tests {
         assert!(loaded[0].tuner_name.is_none());
         assert!(loaded[0].gain_count.is_none());
         assert!(loaded[0].last_seen_unix.is_none());
+        // Role + auth-required fields are #396 additions and
+        // must also default to `None` for legacy bare-string
+        // entries — the connect path treats `None` as
+        // "unknown, default to Control / don't pre-reveal the
+        // auth row." A regression that silently wrote `Some`
+        // defaults here would change the UX for every
+        // pre-#396 favorite on the first launch after upgrade.
+        assert!(loaded[0].requested_role.is_none());
+        assert!(loaded[0].auth_required.is_none());
     }
 
     #[test]

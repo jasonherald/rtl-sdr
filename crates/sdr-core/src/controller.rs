@@ -1639,12 +1639,26 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 );
                 return;
             }
-            // Stop the current source first (if any) so its
-            // connection manager thread exits cleanly before we
-            // open a fresh source with the takeover flag.
-            // `source` drops at the end of the if-let — the
-            // manager thread joins on Drop, so the next
-            // open_source sees a quiescent slot.
+            // Also gate on a live source. After DisconnectRtlTcp
+            // the source is gone (`state.source = None`) but
+            // `state.source_type` remains `RtlTcp`, so a stale
+            // "Take control" toast action could otherwise
+            // recreate + start a fresh source here — breaking
+            // the disconnect contract (reopen path after an
+            // explicit disconnect is Play/Start, not a retry
+            // command). Mirrors the `RetryRtlTcpNow` gate above.
+            if state.source.is_none() {
+                tracing::debug!(
+                    "RetryRtlTcpWithTakeover ignored — no live source (was disconnected)"
+                );
+                return;
+            }
+            // Stop the current source first so its connection
+            // manager thread exits cleanly before we open a
+            // fresh source with the takeover flag. `source`
+            // drops at the end of the if-let — the manager
+            // thread joins on Drop, so the next open_source
+            // sees a quiescent slot.
             if let Some(mut source) = state.source.take()
                 && let Err(e) = source.stop()
             {

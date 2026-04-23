@@ -30,6 +30,25 @@ const DEFAULT_FREQUENCY_TEXT: &str = "-- Hz";
 /// Default cursor readout text when the cursor is not over the spectrum.
 const DEFAULT_CURSOR_TEXT: &str = "Cursor: --";
 
+/// Role badge state rendered by the status bar when connected
+/// to an `rtl_tcp` server. Variants carry role provenance
+/// explicitly — the API that previously took an `Option<bool>`
+/// (`true` = Controller, `false` = Listener) couldn't tell the
+/// caller whether the bool came from the user's requested role
+/// or the server's admission decision, so a UI that passed a
+/// requested role here would mis-label sessions where the server
+/// admitted a different role than asked. Per CodeRabbit round 1
+/// on PR #408, callers must now name the slot explicitly. Per
+/// issue #396.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtlTcpRoleBadge {
+    /// Server admitted us as the Controller client — accent
+    /// styling in the status bar.
+    Controller,
+    /// Server admitted us as a Listener — dim styling.
+    Listener,
+}
+
 /// Bottom status bar showing live metrics.
 pub struct StatusBar {
     /// The container widget to pack into the window.
@@ -80,20 +99,23 @@ impl StatusBar {
         self.frequency_label.set_label(&format_frequency(hz));
     }
 
-    /// Update the `rtl_tcp` role badge. `Some(is_control)`
-    /// shows "Controller" (accent CSS) when `true` or
-    /// "Listener" (dim CSS) when `false`; `None` hides the
-    /// badge + its separator entirely. Per issue #396.
-    pub fn update_role(&self, role: Option<bool>) {
+    /// Update the `rtl_tcp` role badge. `Some(RtlTcpRoleBadge::
+    /// Controller)` shows "Controller" with accent CSS; `Some(
+    /// RtlTcpRoleBadge::Listener)` shows "Listener" with dim
+    /// CSS; `None` hides the badge + its separator entirely.
+    /// Callers must pass the server's admitted role (not the
+    /// user's requested role) — see [`RtlTcpRoleBadge`]. Per
+    /// issue #396 / CodeRabbit round 1 on PR #408.
+    pub fn update_role(&self, role: Option<RtlTcpRoleBadge>) {
         match role {
-            Some(true) => {
+            Some(RtlTcpRoleBadge::Controller) => {
                 self.role_label.set_label("Controller");
                 self.role_label.remove_css_class("dim-label");
                 self.role_label.add_css_class("accent");
                 self.role_label.set_visible(true);
                 self.role_separator.set_visible(true);
             }
-            Some(false) => {
+            Some(RtlTcpRoleBadge::Listener) => {
                 self.role_label.set_label("Listener");
                 self.role_label.remove_css_class("accent");
                 self.role_label.add_css_class("dim-label");
