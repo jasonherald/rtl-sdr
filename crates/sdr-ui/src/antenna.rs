@@ -47,6 +47,99 @@ const CM_PER_M: f64 = 100.0;
 /// rationale as [`CM_PER_M`].
 const MM_PER_M: f64 = 1_000.0;
 
+// ------------------------------------------------------------
+//  V-dipole angle suggestion
+//
+//  The V-angle between the two dipole arms tilts the radiation
+//  pattern upward as it narrows from 180° (straight dipole,
+//  peaks at horizon) toward 90° (peaks near zenith). The
+//  [`suggested_v_angle`] helper picks an angle based on what
+//  kind of signal typically lives at the current tuned
+//  frequency: sky-dominated signals (weather sats, amateur
+//  LEO birds) get a narrower V; horizon-dominated signals (FM
+//  broadcast, airband, repeaters, HF skip) get the straight
+//  dipole.
+//
+//  The V-angle tilts the pattern peak upward; a V of 120°
+//  puts the peak around 30° elevation — a reasonable middle-
+//  of-sky target for a typical polar-orbit satellite pass,
+//  which sweeps from horizon to zenith through roughly that
+//  elevation over half its track.
+//
+//  Companion to the 3D-printed V-dipole angle gauge at
+//  https://github.com/jasonherald/aentenna-measure which sets
+//  the angle in 5° detents.
+// ------------------------------------------------------------
+
+/// Suggested V-angle for a sky-dominated signal (sat pass). 120°
+/// peaks the V-dipole's elevation pattern around 30° above the
+/// horizon — approximately where a typical polar-orbit satellite
+/// pass spends most of its track.
+const V_ANGLE_SAT_DEGREES: u16 = 120;
+/// Suggested V-angle for a horizon-dominated signal. 180° is a
+/// straight dipole, peak gain at 0° elevation — optimal for FM
+/// broadcast, airband, terrestrial repeaters, and HF skip
+/// arrival angles.
+const V_ANGLE_HORIZON_DEGREES: u16 = 180;
+
+/// Short hint string displayed alongside a sky-band V-angle.
+/// Three-char so the status-bar line stays compact.
+const V_HINT_SAT: &str = "sat";
+/// Short hint string for horizon-band.
+const V_HINT_HORIZON: &str = "horizon";
+
+/// NOAA APT weather-satellite band (polar-orbit birds). Active
+/// discrete frequencies are 137.1 MHz (NOAA-18), 137.62 MHz
+/// (NOAA-19), and 137.9125 MHz (NOAA-15 / historical). The
+/// ±0.95 MHz window wraps all three plus the nearby sat-
+/// telemetry bumpers so a user tuned slightly off-centre
+/// still gets the satellite suggestion.
+const NOAA_APT_MIN_HZ: f64 = 137_000_000.0;
+const NOAA_APT_MAX_HZ: f64 = 137_950_000.0;
+
+/// 2 m amateur band (144–148 MHz). ISS voice + APRS + a stack
+/// of LEO amateur sats use this window.
+const BAND_2M_MIN_HZ: f64 = 144_000_000.0;
+const BAND_2M_MAX_HZ: f64 = 148_000_000.0;
+
+/// 70 cm amateur satellite sub-band (435–438 MHz). Most LEO
+/// amateur-radio satellites downlink here. The full ham 70cm
+/// allocation is wider (420–450 MHz in ITU Region 2) but the
+/// sat-specific segment is what we optimise for.
+const BAND_70CM_SAT_MIN_HZ: f64 = 435_000_000.0;
+const BAND_70CM_SAT_MAX_HZ: f64 = 438_000_000.0;
+
+/// 13 cm amateur band (2300–2450 MHz). Higher-frequency
+/// amateur satellites + some ISM co-habitate this range.
+/// We pick the sat-friendly subset.
+const BAND_13CM_MIN_HZ: f64 = 2_320_000_000.0;
+const BAND_13CM_MAX_HZ: f64 = 2_450_000_000.0;
+
+/// Suggested V-dipole angle for the current tuned frequency,
+/// paired with a short hint word describing WHERE the angle
+/// peaks the radiation pattern. Always returns a value for any
+/// frequency at or above [`MIN_RENDERABLE_FREQUENCY_HZ`] —
+/// callers gate on the enclosing line builder
+/// ([`format_antenna_line`]) which already handles the below-
+/// floor case.
+///
+/// **Band mapping is intentionally opinionated** — the exact
+/// boundaries will shift as the companion aentenna-measure
+/// gauge sees real-world use. Horizon (180°) is the legacy-safe
+/// default for anything outside the recognised sat bands.
+#[must_use]
+pub fn suggested_v_angle(freq_hz: f64) -> (u16, &'static str) {
+    let is_sat_band = (NOAA_APT_MIN_HZ..=NOAA_APT_MAX_HZ).contains(&freq_hz)
+        || (BAND_2M_MIN_HZ..=BAND_2M_MAX_HZ).contains(&freq_hz)
+        || (BAND_70CM_SAT_MIN_HZ..=BAND_70CM_SAT_MAX_HZ).contains(&freq_hz)
+        || (BAND_13CM_MIN_HZ..=BAND_13CM_MAX_HZ).contains(&freq_hz);
+    if is_sat_band {
+        (V_ANGLE_SAT_DEGREES, V_HINT_SAT)
+    } else {
+        (V_ANGLE_HORIZON_DEGREES, V_HINT_HORIZON)
+    }
+}
+
 /// Wavelength (metres) for a given frequency (Hz). Returns `None` when
 /// the input isn't a finite positive number or is below
 /// [`MIN_RENDERABLE_FREQUENCY_HZ`] — callers treat that as "don't render".
@@ -107,8 +200,9 @@ pub fn format_length_m(length_m: f64) -> String {
 pub fn format_antenna_line(freq_hz: f64) -> Option<String> {
     let half = half_wave_m(freq_hz)?;
     let quarter = quarter_wave_m(freq_hz)?;
+    let (angle, hint) = suggested_v_angle(freq_hz);
     Some(format!(
-        "λ/2 {} · λ/4 {}",
+        "λ/2 {} · λ/4 {} · V {angle}° {hint}",
         format_length_m(half),
         format_length_m(quarter)
     ))
@@ -158,10 +252,26 @@ mod tests {
     /// [`wavelength_m`] must reject this even though it's
     /// finite and positive.
     const FREQ_JUST_BELOW_FLOOR_HZ: f64 = 2_999.0;
-    /// Frequency inside the renderable range but below the ATIS
-    /// example, used as the floor-plus-epsilon guard on
-    /// `format_antenna_line`.
+    /// Frequency below the renderable floor (1 kHz < 3 kHz),
+    /// used to verify `format_antenna_line` rejects sub-floor
+    /// input in the same way it rejects zero / negative /
+    /// non-finite. Per `CodeRabbit` round 2 on PR #418.
     const FREQ_1_KHZ: f64 = 1_000.0;
+
+    /// NOAA APT centre band exemplar (NOAA-19 downlink frequency).
+    /// Used to pin the sat-band V-angle recommendation.
+    const FREQ_NOAA_19_MHZ: f64 = 137_620_000.0;
+    /// 2 m ham band — ISS voice downlink frequency.
+    const FREQ_ISS_VOICE_MHZ: f64 = 145_800_000.0;
+    /// 70 cm ham satellite centre — typical LEO-sat downlink.
+    const FREQ_70CM_SAT_MHZ: f64 = 436_500_000.0;
+    /// 13 cm ham band example.
+    const FREQ_13CM_SAT_MHZ: f64 = 2_400_000_000.0;
+    /// FM broadcast band exemplar — `WXPN` Philadelphia,
+    /// classic horizon-dominated reception target.
+    const FREQ_FM_BROADCAST_MHZ: f64 = 88_500_000.0;
+    /// Airband exemplar — standard ATIS frequency.
+    const FREQ_AIRBAND_MHZ: f64 = 124_050_000.0;
 
     // Length fixtures for [`format_length_m`] branch coverage.
     /// Metre-range exemplar — the `.xx m` output branch.
@@ -225,9 +335,63 @@ mod tests {
 
     #[test]
     fn format_antenna_line_combines_both_values() {
-        // ATIS 255 MHz → λ/2 58.8 cm, λ/4 29.4 cm.
+        // ATIS 255 MHz → λ/2 58.8 cm, λ/4 29.4 cm, V 180° horizon
+        // (255 MHz is outside every known sat band, so the default
+        // horizon-dipole suggestion lands).
         let line = format_antenna_line(FREQ_ATIS_255_MHZ).expect("valid");
-        assert_eq!(line, "λ/2 58.8 cm · λ/4 29.4 cm");
+        assert_eq!(line, "λ/2 58.8 cm · λ/4 29.4 cm · V 180° horizon");
+    }
+
+    #[test]
+    fn suggested_v_angle_noaa_apt_is_sat_120() {
+        let (angle, hint) = suggested_v_angle(FREQ_NOAA_19_MHZ);
+        assert_eq!(angle, 120);
+        assert_eq!(hint, "sat");
+    }
+
+    #[test]
+    fn suggested_v_angle_2m_ham_is_sat_120() {
+        let (angle, hint) = suggested_v_angle(FREQ_ISS_VOICE_MHZ);
+        assert_eq!(angle, 120);
+        assert_eq!(hint, "sat");
+    }
+
+    #[test]
+    fn suggested_v_angle_70cm_sat_is_sat_120() {
+        let (angle, hint) = suggested_v_angle(FREQ_70CM_SAT_MHZ);
+        assert_eq!(angle, 120);
+        assert_eq!(hint, "sat");
+    }
+
+    #[test]
+    fn suggested_v_angle_13cm_sat_is_sat_120() {
+        let (angle, hint) = suggested_v_angle(FREQ_13CM_SAT_MHZ);
+        assert_eq!(angle, 120);
+        assert_eq!(hint, "sat");
+    }
+
+    #[test]
+    fn suggested_v_angle_fm_broadcast_is_horizon_180() {
+        let (angle, hint) = suggested_v_angle(FREQ_FM_BROADCAST_MHZ);
+        assert_eq!(angle, 180);
+        assert_eq!(hint, "horizon");
+    }
+
+    #[test]
+    fn suggested_v_angle_airband_is_horizon_180() {
+        let (angle, hint) = suggested_v_angle(FREQ_AIRBAND_MHZ);
+        assert_eq!(angle, 180);
+        assert_eq!(hint, "horizon");
+    }
+
+    #[test]
+    fn suggested_v_angle_just_outside_2m_band_is_horizon() {
+        // Boundary check — 2 m band is 144..=148 MHz per the
+        // `BAND_2M_*` consts. 149 MHz should fall to the horizon
+        // default. Pins the "inclusive upper edge" contract so
+        // `..=` vs `..` can't drift silently.
+        let (angle, _) = suggested_v_angle(149_000_000.0);
+        assert_eq!(angle, 180);
     }
 
     #[test]
