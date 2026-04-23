@@ -2005,15 +2005,41 @@ fn connect_sidebar_panels(
     // closures.
     let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
+    // Shared favorites map — key (stable hostname:port) → rich
+    // `FavoriteEntry` record. Loaded once here and handed to
+    // both `connect_source_panel` (role picker mutates
+    // `requested_role` per-server) and `connect_rtl_tcp_discovery`
+    // (re-announce path refreshes metadata). Pre-`CodeRabbit`
+    // round 8 on PR #408 each function built its own view: the
+    // role picker read + wrote the on-disk JSON via
+    // `load_favorites`/`save_favorites` while discovery held a
+    // separate in-memory HashMap. A subsequent `ServerAnnounced`
+    // would preserve the stale in-memory role from the map and
+    // clobber the user's just-saved selection on next re-
+    // announce. Hoisting the map here makes both paths mutate
+    // the SAME `Rc<RefCell<..>>` so persistence stays
+    // consistent. `Rc<RefCell<HashMap>>` mirrors the
+    // `displayed_rows` pattern — single-threaded GTK main loop,
+    // no lock contention.
+    let favorites: Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    > = Rc::new(RefCell::new(
+        crate::sidebar::source_panel::load_favorites(config)
+            .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
+            .collect(),
+    ));
+
     connect_source_panel(
         panels,
         state,
         toast_overlay,
         Rc::clone(&server_running),
         config,
+        &favorites,
     );
     connect_source_rtlsdr_probe(panels);
-    connect_rtl_tcp_discovery(panels, state, config, favorites_header);
+    connect_rtl_tcp_discovery(panels, state, config, favorites_header, &favorites);
     connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state, scanner_force_disable);
     connect_display_panel(panels, state, spectrum_handle);
@@ -2079,6 +2105,9 @@ fn connect_rtl_tcp_discovery(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     favorites_header: &FavoritesHeaderHandle,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
 ) {
     use std::collections::HashMap;
     use std::time::Instant;
@@ -2201,21 +2230,19 @@ fn connect_rtl_tcp_discovery(
     let config_for_discovery = std::sync::Arc::clone(config);
 
     // Favorites map — key (stable hostname:port) → rich
-    // `FavoriteEntry` record. Loaded once on startup, mutated by
-    // star-toggle handlers and re-announce metadata refresh,
-    // persisted after each change via `save_favorites`.
-    // `Rc<RefCell<HashMap>>` mirrors the `displayed_rows` pattern
-    // — single-threaded GTK main loop, no lock contention. Keyed
-    // by the same `favorite_key(server)` that the reorder / pin-
-    // to-top path uses so lookups stay consistent.
-    let favorites: Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    > = Rc::new(RefCell::new(
-        crate::sidebar::source_panel::load_favorites(&config_for_discovery)
-            .into_iter()
-            .map(|entry| (entry.key.clone(), entry))
-            .collect(),
-    ));
+    // `FavoriteEntry` record. Created by the parent
+    // `connect_sidebar_panels` so the role-picker handler in
+    // `connect_source_panel` can mutate the SAME map this
+    // function's re-announce path reads. Per CodeRabbit round 8
+    // on PR #408: pre-fix the role-picker reloaded favorites
+    // from disk, mutated a local `Vec`, and saved — a
+    // later `ServerAnnounced` would preserve the stale
+    // in-memory role from this map and clobber the just-saved
+    // selection on next disk flush. Sharing keeps both paths
+    // honest. The clone we hold here is a cheap `Rc::clone`; the
+    // parent retains the original so the Arc-count stays > 0
+    // for the lifetime of both handlers.
+    let favorites = Rc::clone(favorites);
 
     // Weak refs to the favorites popover's contents. The star-
     // toggle closure (attached to each row's `ToggleButton`) and
@@ -5625,6 +5652,9 @@ fn connect_source_panel(
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
 ) {
     // Sample rate selector + bandwidth advisory re-render.
     // The advisory visibility depends on BOTH the sample-rate
@@ -6158,13 +6188,14 @@ fn connect_source_panel(
     let config_for_role = std::sync::Arc::clone(config);
     let hostname_for_role = panels.source.hostname_row.clone();
     let port_for_role = panels.source.port_row.clone();
+    let favorites_for_role = Rc::clone(favorites);
     panels
         .source
         .rtl_tcp_role_row
         .connect_selected_notify(move |row| {
             use crate::sidebar::source_panel::{
                 FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
-                RTL_TCP_ROLE_LISTEN_IDX, load_favorites, save_favorites,
+                RTL_TCP_ROLE_LISTEN_IDX, save_favorites,
             };
             let fav_role = match row.selected() {
                 RTL_TCP_ROLE_CONTROL_IDX => FavoriteRole::Control,
@@ -6172,16 +6203,35 @@ fn connect_source_panel(
                 _ => return, // transient out-of-range indices
             };
             let requested_role = fav_role.as_wire_role();
+            // Re-parsing the auth-key row here has the same
+            // malformed-vs-empty distinction as
+            // `rtl_tcp_auth_key_row.connect_changed` (round 7):
+            // an `auth_key_from_hex(..) -> None` on NON-empty
+            // text means "invalid hex, preserve last-good DSP
+            // auth" — NOT "clear". Pre-`CodeRabbit` round 8 on
+            // PR #408 this handler collapsed both cases to
+            // `auth_key: None`, so flipping the role while the
+            // key field held a bad paste silently clobbered
+            // DSP's saved auth. `Option<Option<..>>` gates the
+            // dispatch: outer `Some` means "push to DSP",
+            // outer `None` means "skip dispatch, keep last-good"
+            // — role persistence below still runs either way so
+            // the picker's user intent is recorded, and the
+            // `auth_key_row`'s own handler will catch up DSP
+            // with the current role + fixed/cleared text on
+            // the next edit.
             let key_text = auth_key_for_role.text().to_string();
-            let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
-                None
+            let dispatch_auth: Option<Option<Vec<u8>>> = if key_text.is_empty() {
+                Some(None)
             } else {
-                crate::sidebar::server_panel::auth_key_from_hex(&key_text)
+                crate::sidebar::server_panel::auth_key_from_hex(&key_text).map(Some)
             };
-            state_role.send_dsp(UiToDsp::SetRtlTcpClientConfig {
-                requested_role,
-                auth_key,
-            });
+            if let Some(auth_key) = dispatch_auth {
+                state_role.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+                    requested_role,
+                    auth_key,
+                });
+            }
             // Tier 1: global default — always written so a fresh
             // server ("never favorited, never configured") picks
             // this up as the picker seed.
@@ -6190,10 +6240,19 @@ fn connect_source_panel(
                     serde_json::to_value(fav_role).unwrap_or(serde_json::Value::Null);
             });
             // Tier 2: per-favorite override. Compute the current
-            // `host:port` key; if it matches a favorite, update
-            // that favorite's `requested_role` and persist. No-op
-            // when the server isn't favorited (the global default
-            // above covers it).
+            // `host:port` key; if it matches a favorite in the
+            // SHARED in-memory map (the one
+            // `connect_rtl_tcp_discovery`'s re-announce path
+            // also reads + mutates), update that entry's
+            // `requested_role` and persist. Pre-`CodeRabbit`
+            // round 8 on PR #408 this handler called
+            // `load_favorites` on every fire and saved a fresh
+            // `Vec`, which diverged from the discovery path's
+            // in-memory map — a subsequent `ServerAnnounced`
+            // would preserve the stale in-memory role and
+            // clobber the just-saved selection on its own
+            // `save_favorites` call. Mutating the shared map
+            // keeps both paths honest.
             let host = hostname_for_role.text().to_string();
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let port = port_for_role.value() as u16;
@@ -6201,17 +6260,21 @@ fn connect_source_panel(
                 return;
             }
             let server_key = format!("{host}:{port}");
-            let mut favorites = load_favorites(&config_for_role);
-            let mut dirty = false;
-            for fav in &mut favorites {
-                if fav.key == server_key && fav.requested_role != Some(fav_role) {
+            let dirty = {
+                let mut favorites = favorites_for_role.borrow_mut();
+                if let Some(fav) = favorites.get_mut(&server_key)
+                    && fav.requested_role != Some(fav_role)
+                {
                     fav.requested_role = Some(fav_role);
-                    dirty = true;
-                    break;
+                    true
+                } else {
+                    false
                 }
-            }
+            };
             if dirty {
-                save_favorites(&config_for_role, &favorites);
+                let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                    favorites_for_role.borrow().values().cloned().collect();
+                save_favorites(&config_for_role, &snapshot);
             }
         });
 
