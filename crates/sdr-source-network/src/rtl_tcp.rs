@@ -46,9 +46,11 @@ use std::time::{Duration, Instant};
 
 use sdr_pipeline::source_manager::Source;
 use sdr_server_rtltcp::codec::{Codec, CodecMask, Decoder};
+#[cfg(test)]
+use sdr_server_rtltcp::extension::Role;
 use sdr_server_rtltcp::extension::{
-    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, Role, SERVER_EXTENSION_LEN,
-    ServerExtension, Status,
+    CLIENT_HELLO_FLAGS_NONE, ClientHello, EXTENSION_MAGIC, SERVER_EXTENSION_LEN, ServerExtension,
+    Status,
 };
 use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN, DongleInfo, TunerTypeCode};
 use sdr_types::{Complex, SourceError};
@@ -290,6 +292,27 @@ pub struct RtlTcpConfig {
     /// casual LAN isolation, not WAN-grade security. See #394
     /// for the full threat model discussion. #394.
     pub auth_key: Option<Vec<u8>>,
+
+    /// Role the client requests in its `ClientHello`. Default
+    /// [`Role::Control`] matches the pre-#392 single-client
+    /// behavior every legacy `rtl_tcp` client assumes. The UI
+    /// lets users opt into [`Role::Listen`] for concurrent
+    /// read-only access to a server that already has a
+    /// controller. Per issue #396.
+    ///
+    /// **RTLX-only when non-default.** `Role::Listen` implies
+    /// the server is #392-aware (has the role gate); vanilla
+    /// `rtl_tcp` servers ignore the role byte entirely and
+    /// every client is implicitly Control. The
+    /// `extension_enabled` gate below already trips when the
+    /// hello needs to carry any non-default flag, and the same
+    /// mDNS TXT `codecs=3` out-of-band evidence that gates
+    /// compression / takeover / auth also gates this field.
+    /// `Role::Control` is the back-compat default for vanilla
+    /// servers; setting `Role::Listen` against a vanilla
+    /// server corrupts the 5-byte command framing (same hazard
+    /// as `compression` / `request_takeover` / `auth_key`).
+    pub requested_role: sdr_server_rtltcp::extension::Role,
 }
 
 impl Default for RtlTcpConfig {
@@ -301,6 +324,10 @@ impl Default for RtlTcpConfig {
             compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
             request_takeover: false,
             auth_key: None,
+            // `Role::Control` matches the pre-#392 single-client
+            // behavior every legacy `rtl_tcp` client assumes — no
+            // wire change from the default path.
+            requested_role: sdr_server_rtltcp::extension::Role::Control,
         }
     }
 }
@@ -928,9 +955,16 @@ fn attempt_connect(
     // Default `compression = NONE_ONLY && request_takeover =
     // false` → no hello → wire-compatible with every rtl_tcp
     // server on earth. Per #307 / #393.
+    // Hello needed when ANY field carries non-default state:
+    // compression opt-in, takeover opt-in, auth, or role
+    // (Listen != Control default). Per #396, a `Role::Listen`
+    // request also has to surface on the wire, so widen the
+    // gate here — same RTLX-only hazard as the other fields,
+    // same mDNS `codecs=3` out-of-band evidence requirement.
     let extension_enabled = config.compression != CodecMask::NONE_ONLY
         || config.request_takeover
-        || config.auth_key.is_some();
+        || config.auth_key.is_some()
+        || config.requested_role != sdr_server_rtltcp::extension::Role::Control;
     if extension_enabled {
         // Compose the flags byte. Each bit is independently set
         // based on config — takeover and auth can co-exist on
@@ -984,11 +1018,15 @@ fn attempt_connect(
 
         let hello = ClientHello {
             codec_mask: config.compression,
-            // sdr-rs clients always request Control on connect;
-            // Listen clients don't emerge from this codepath —
-            // they'd flow through a future client-side Listen
-            // opt-in that isn't part of #393's scope.
-            role: Role::Control,
+            // Threaded from `RtlTcpConfig.requested_role` — the
+            // UI's Connection-role picker (#396) feeds this
+            // directly. Default `Role::Control` matches the
+            // pre-#392 single-client behavior every legacy
+            // `rtl_tcp` client assumes; opting into
+            // `Role::Listen` needs the out-of-band evidence
+            // that the server is #392-aware (mDNS TXT
+            // `codecs=3` or saved-profile knowledge).
+            role: config.requested_role,
             flags,
             // Pick the MINIMUM viable protocol version for this
             // hello's feature set. Compression-only / takeover-
@@ -1763,6 +1801,7 @@ mod tests {
             compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2030,6 +2069,7 @@ mod tests {
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         (listener, config)
     }
@@ -2278,6 +2318,7 @@ mod tests {
             compression: CodecMask::NONE_ONLY,
             request_takeover: true,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2359,6 +2400,7 @@ mod tests {
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2443,6 +2485,7 @@ mod tests {
             compression: CodecMask::NONE_ONLY,
             request_takeover: false,
             auth_key: Some(expected_key.clone()),
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2537,6 +2580,7 @@ mod tests {
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
             auth_key: None,
+            requested_role: Role::Control,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2666,6 +2710,106 @@ mod tests {
 
         src.stop_manager();
         let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_sends_listen_role_when_config_opts_in() {
+        // **Regression test for #396.** When
+        // `RtlTcpConfig::requested_role = Role::Listen`, the
+        // `extension_enabled` gate must widen to emit a hello
+        // (even with compression=NONE_ONLY + takeover=false +
+        // auth_key=None) AND the role byte in the hello must be
+        // `Role::Listen`. Server-side admission logic for the
+        // Listen path is pinned by the role-matrix tests in
+        // `broadcaster::tests::register_with_role_*`; this test
+        // locks in the client's end of the same wire contract.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (hello_tx, hello_rx) = std::sync::mpsc::channel::<[u8; CLIENT_HELLO_LEN]>();
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(RTLX_TEST_STATE_DEADLINE))
+                .unwrap();
+            let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+            sock.read_exact(&mut hello_buf).expect("read hello");
+            let _ = hello_tx.send(hello_buf);
+            // Accept the handshake with Listen granted so the
+            // client reaches Connected.
+            let header = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: RTLX_TEST_GAIN_COUNT,
+            }
+            .to_bytes();
+            sock.write_all(&header).unwrap();
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: Some(Role::Listen),
+                status: Status::Ok,
+                version: PROTOCOL_VERSION,
+            };
+            sock.write_all(&ext.to_bytes()).unwrap();
+            thread::sleep(RTLX_TEST_SERVER_HOLD);
+        });
+
+        let config = RtlTcpConfig {
+            data_read_timeout: RTLX_TEST_DATA_READ_TIMEOUT,
+            max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            // Only role is non-default; every other gate field
+            // stays at the vanilla-safe default. This pins the
+            // "role opt-in alone trips the hello" contract so a
+            // future refactor of `extension_enabled` can't
+            // silently drop the role from the gate list.
+            compression: CodecMask::NONE_ONLY,
+            request_takeover: false,
+            auth_key: None,
+            requested_role: Role::Listen,
+        };
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        src.start_manager().unwrap();
+
+        let hello = hello_rx
+            .recv_timeout(RTLX_TEST_STATE_DEADLINE)
+            .expect("server should receive hello within deadline");
+        // Magic bytes first — sanity-check we read a hello, not
+        // command framing.
+        assert_eq!(&hello[..EXTENSION_MAGIC.len()], &EXTENSION_MAGIC);
+        // Role byte (offset 5) must be `Role::Listen`.
+        assert_eq!(
+            hello[5],
+            Role::Listen as u8,
+            "Listen opt-in must encode Role::Listen at byte offset 5 (got 0x{:02x})",
+            hello[5],
+        );
+        // Flags byte (offset 6) must be zero — we didn't opt
+        // into takeover or auth, just role.
+        assert_eq!(hello[6], 0);
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_emits_control_role_by_default() {
+        // Complement to the Listen test above: the TRUE default
+        // path (fields all at `Default`) sends no hello at all,
+        // matching `rtl_tcp_default_config_sends_no_hello_to_vanilla_server`.
+        // The DEFAULT *role* is `Role::Control`, but the default
+        // config gate (`extension_enabled = false` because
+        // compression / takeover / auth / role are all default)
+        // means no hello is emitted on the wire.
+        //
+        // This test pins the "role defaults to Control" struct
+        // contract via `Default::default()` so a future typo or
+        // accidental swap (e.g. flipping the default to Listen)
+        // would trip here immediately.
+        let config = RtlTcpConfig::default();
+        assert_eq!(
+            config.requested_role,
+            Role::Control,
+            "Default for `requested_role` must be `Control` — legacy-safe behavior"
+        );
     }
 
     #[test]
