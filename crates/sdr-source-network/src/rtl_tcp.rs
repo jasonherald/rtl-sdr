@@ -1719,6 +1719,100 @@ impl Source for RtlTcpSource {
     fn set_gain_by_index(&mut self, index: u32) -> Result<(), SourceError> {
         RtlTcpSource::set_gain_by_index(self, index)
     }
+
+    // ----------------------------------------------------------
+    //  Sticky-command replay snapshot (#396 round 3)
+    //
+    //  Controller-driven rebuilds (manual retry after an auth
+    //  flow, takeover retry) destroy the old `RtlTcpSource` and
+    //  construct a fresh one. Without these two hooks, the new
+    //  source starts with zeroed replay atomics — gain / AGC /
+    //  PPM / bias tee / direct sampling / etc. would default
+    //  back to zero on the first reconnect, stripping the user's
+    //  session state. Snapshot + restore copies the `u32` values
+    //  across the boundary so the fresh manager thread's
+    //  `replay_sticky_commands` call emits the same `SetX`
+    //  commands the old one would have.
+    // ----------------------------------------------------------
+    fn rtl_tcp_sticky_snapshot(
+        &self,
+    ) -> Option<sdr_pipeline::source_manager::RtlTcpStickySnapshot> {
+        Some(sdr_pipeline::source_manager::RtlTcpStickySnapshot {
+            replay_mask: self.shared.replay_mask.load(Ordering::Relaxed),
+            last_center_freq_hz: self.shared.last_center_freq_hz.load(Ordering::Relaxed),
+            last_sample_rate_hz: self.shared.last_sample_rate_hz.load(Ordering::Relaxed),
+            last_gain_mode: self.shared.last_gain_mode.load(Ordering::Relaxed),
+            last_tuner_gain: self.shared.last_tuner_gain.load(Ordering::Relaxed),
+            last_ppm: self.shared.last_ppm.load(Ordering::Relaxed),
+            last_agc_mode: self.shared.last_agc_mode.load(Ordering::Relaxed),
+            last_direct_sampling: self.shared.last_direct_sampling.load(Ordering::Relaxed),
+            last_offset_tuning: self.shared.last_offset_tuning.load(Ordering::Relaxed),
+            last_bias_tee: self.shared.last_bias_tee.load(Ordering::Relaxed),
+            last_gain_by_index: self.shared.last_gain_by_index.load(Ordering::Relaxed),
+            last_testmode: self.shared.last_testmode.load(Ordering::Relaxed),
+            last_if_gain: self.shared.last_if_gain.load(Ordering::Relaxed),
+            last_rtl_xtal: self.shared.last_rtl_xtal.load(Ordering::Relaxed),
+            last_tuner_xtal: self.shared.last_tuner_xtal.load(Ordering::Relaxed),
+        })
+    }
+
+    fn rtl_tcp_restore_sticky_snapshot(
+        &mut self,
+        snapshot: &sdr_pipeline::source_manager::RtlTcpStickySnapshot,
+    ) {
+        // Order mirrors `SharedState::new`'s initialization so a
+        // future field addition here is forced through the same
+        // review as the atomics themselves.
+        self.shared
+            .last_center_freq_hz
+            .store(snapshot.last_center_freq_hz, Ordering::Relaxed);
+        self.shared
+            .last_sample_rate_hz
+            .store(snapshot.last_sample_rate_hz, Ordering::Relaxed);
+        self.shared
+            .last_gain_mode
+            .store(snapshot.last_gain_mode, Ordering::Relaxed);
+        self.shared
+            .last_tuner_gain
+            .store(snapshot.last_tuner_gain, Ordering::Relaxed);
+        self.shared
+            .last_ppm
+            .store(snapshot.last_ppm, Ordering::Relaxed);
+        self.shared
+            .last_agc_mode
+            .store(snapshot.last_agc_mode, Ordering::Relaxed);
+        self.shared
+            .last_direct_sampling
+            .store(snapshot.last_direct_sampling, Ordering::Relaxed);
+        self.shared
+            .last_offset_tuning
+            .store(snapshot.last_offset_tuning, Ordering::Relaxed);
+        self.shared
+            .last_bias_tee
+            .store(snapshot.last_bias_tee, Ordering::Relaxed);
+        self.shared
+            .last_gain_by_index
+            .store(snapshot.last_gain_by_index, Ordering::Relaxed);
+        self.shared
+            .last_testmode
+            .store(snapshot.last_testmode, Ordering::Relaxed);
+        self.shared
+            .last_if_gain
+            .store(snapshot.last_if_gain, Ordering::Relaxed);
+        self.shared
+            .last_rtl_xtal
+            .store(snapshot.last_rtl_xtal, Ordering::Relaxed);
+        self.shared
+            .last_tuner_xtal
+            .store(snapshot.last_tuner_xtal, Ordering::Relaxed);
+        // `replay_mask` last so a partially-restored snapshot
+        // (e.g. a panic mid-write — shouldn't happen with simple
+        // atomics but belt-and-braces) doesn't leave the
+        // reconnect path replaying fresh zeros.
+        self.shared
+            .replay_mask
+            .store(snapshot.replay_mask, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -2396,6 +2490,70 @@ mod tests {
         assert!(
             reached_controller_busy,
             "client should transition to ControllerBusy on `ControllerBusy` \
+             ServerExtension status (per #396)"
+        );
+        assert!(
+            src.tuner_info().is_none(),
+            "tuner_info must stay None when the handshake is rejected"
+        );
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_auth_required_routes_to_dedicated_state() {
+        // Regression test for #396. `AuthRequired` means the
+        // server demands a pre-shared key (#394) and the client
+        // didn't include one in the hello. Pre-#396 the
+        // connection manager folded this into `Protocol` and
+        // landed in `Failed` with a generic reason; per #396 it
+        // now routes to the dedicated `ConnectionState::
+        // AuthRequired` variant so the UI can reveal + focus
+        // the Server key entry row instead of showing an opaque
+        // error toast. Terminal — no auto-retry while the UI
+        // waits for the user to enter a key.
+        //
+        // Complements the existing `AuthFailed` /
+        // `ControllerBusy` regression tests, which pin the same
+        // contract for the other two role-denial statuses. Per
+        // `CodeRabbit` round 3 on PR #408.
+        let (listener, config) = rtlx_test_listener_and_config();
+        let addr = listener.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: None,
+                status: Status::AuthRequired,
+                version: PROTOCOL_VERSION,
+            };
+            rtlx_test_serve_one(&listener, ext);
+        });
+
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        assert!(src.tuner_info().is_none());
+
+        src.start_manager().unwrap();
+
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        let mut reached_auth_required = false;
+        while Instant::now() < deadline {
+            if matches!(src.connection_state(), ConnectionState::AuthRequired) {
+                reached_auth_required = true;
+                break;
+            }
+            // `Failed` would be a regression back to the pre-#396
+            // routing — the dedicated variant is the whole point.
+            assert!(
+                !matches!(src.connection_state(), ConnectionState::Failed { .. }),
+                "AuthRequired must route to its dedicated state, not generic Failed"
+            );
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(
+            reached_auth_required,
+            "client should transition to AuthRequired on `AuthRequired` \
              ServerExtension status (per #396)"
         );
         assert!(

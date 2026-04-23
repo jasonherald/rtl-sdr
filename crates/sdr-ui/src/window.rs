@@ -1466,10 +1466,22 @@ fn save_current_auth_key_for_active_server(
     };
     let text = row.text().to_string();
     if text.is_empty() {
-        // Nothing to save — e.g., the user connected with a
-        // previously-saved key that was auto-loaded and never
-        // edited the field. The keyring already has the right
-        // value.
+        // User explicitly cleared the field BEFORE this connect
+        // succeeded — mirror that intent in the keyring by
+        // deleting the saved entry. Pre-CodeRabbit round 3 on
+        // PR #408 this branch returned early with a stale
+        // "nothing to save" comment, so clearing the row and
+        // reconnecting left the old bytes in the keyring and
+        // `apply_rtl_tcp_connect` would preload them on the
+        // next discovery / favorites / last-connected path,
+        // silently undoing the user's clear.
+        if let Err(e) = clear_client_auth_key_from_keyring(host, port) {
+            tracing::warn!(
+                server = %active,
+                %e,
+                "rtl_tcp: client auth key keyring clear failed (empty row)"
+            );
+        }
         return;
     }
     let Some(bytes) = crate::sidebar::server_panel::auth_key_from_hex(&text) else {
