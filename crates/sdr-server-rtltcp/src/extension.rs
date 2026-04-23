@@ -43,7 +43,8 @@
 //! 4    1     codec             chosen codec scalar (#307)
 //! 5    1     granted_role      0=control, 1=listen, 255=denied (reserved for #392)
 //! 6    1     status            0=ok, 1=controller_busy, 2=auth_required,
-//!                               3=auth_failed (reserved for #392/#394)
+//!                               3=auth_failed, 4=listener_cap_reached
+//!                               (0/1/4 used by #392, 2/3 reserved for #394)
 //! 7    1     version           response schema version, currently 1
 //! ```
 //!
@@ -110,22 +111,30 @@ impl Role {
     }
 }
 
-/// Status code in the server's response block. Reserved —
-/// #307 only ever emits [`Self::Ok`]; #392 and #394 use the other
-/// variants when roles / auth are active.
+/// Status code in the server's response block. Variants 0, 1, 4
+/// are live with #392 (role gate + listener cap); 2 and 3 are
+/// reserved for #394 (auth) and will be emitted by a future
+/// handshake layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Status {
     /// Negotiation succeeded. Client proceeds to the IQ stream.
     Ok = 0,
     /// Controller slot is busy and the client didn't request
-    /// takeover. Reserved for #392.
+    /// takeover. #392.
     ControllerBusy = 1,
     /// Server requires an auth key and the client didn't provide
     /// one. Reserved for #394.
     AuthRequired = 2,
     /// Client-provided auth key didn't match. Reserved for #394.
     AuthFailed = 3,
+    /// Server's listener slot count (`ServerConfig::listener_cap`)
+    /// is already fully allocated; the client asked for
+    /// `Role::Listen` and there's no room. #392. Additive wire
+    /// code — new variants don't version-bump as long as the
+    /// `PROTOCOL_VERSION` gate catches peers reading layouts
+    /// they don't understand.
+    ListenerCapReached = 4,
 }
 
 impl Status {
@@ -139,6 +148,7 @@ impl Status {
             1 => Some(Self::ControllerBusy),
             2 => Some(Self::AuthRequired),
             3 => Some(Self::AuthFailed),
+            4 => Some(Self::ListenerCapReached),
             _ => None,
         }
     }
@@ -406,6 +416,41 @@ mod tests {
         bytes[6] = Status::Ok.to_wire();
         bytes[7] = PROTOCOL_VERSION.wrapping_add(1);
         assert!(ServerExtension::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn server_extension_listener_cap_reached_round_trips() {
+        // #392 path: server denies a Listen request because the
+        // cap is already filled. Encoded with `granted_role =
+        // denied (0xFF)` + `status = ListenerCapReached (4)`.
+        // Additive status code — no PROTOCOL_VERSION bump needed
+        // because the schema gate already catches peers that
+        // read a value they don't know.
+        let ext = ServerExtension {
+            codec: Codec::None,
+            granted_role: None,
+            status: Status::ListenerCapReached,
+            version: PROTOCOL_VERSION,
+        };
+        let bytes = ext.to_bytes();
+        assert_eq!(bytes[5], GRANTED_ROLE_DENIED);
+        assert_eq!(bytes[6], 4);
+        assert_eq!(ServerExtension::from_bytes(&bytes), Some(ext));
+    }
+
+    #[test]
+    fn status_from_wire_covers_all_documented_variants() {
+        // Pin the 0/1/2/3/4 → enum mapping. A future addition
+        // that reshuffles the discriminants would break over-the-
+        // wire compat with already-shipped clients; this test is
+        // the trip-wire.
+        assert_eq!(Status::from_wire(0), Some(Status::Ok));
+        assert_eq!(Status::from_wire(1), Some(Status::ControllerBusy));
+        assert_eq!(Status::from_wire(2), Some(Status::AuthRequired));
+        assert_eq!(Status::from_wire(3), Some(Status::AuthFailed));
+        assert_eq!(Status::from_wire(4), Some(Status::ListenerCapReached));
+        assert_eq!(Status::from_wire(5), None);
+        assert_eq!(Status::from_wire(255), None);
     }
 
     #[test]

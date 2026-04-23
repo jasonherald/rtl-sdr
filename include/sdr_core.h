@@ -56,8 +56,21 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 15
+#define SDR_CORE_ABI_VERSION_MINOR 16
 /*
+ * 0.16 — TWO struct layouts grow as part of #392 (role gate).
+ * Either change alone is ABI-breaking under the pre-1.0 exact-
+ * match rule; both land together:
+ *   - `SdrRtlTcpClientInfo.role` (uint8_t, 0=Control 1=Listen)
+ *     appended at the tail so hosts can render a "Controller" /
+ *     "Listener" badge per-client without parsing the RTLX wire
+ *     format themselves.
+ *   - `SdrRtlTcpServerConfig.listener_cap` (uint32_t, 0 = use
+ *     crate default of 10) appended at the tail so hosts can
+ *     size the Listen pool at server-start time.
+ * Any 0.15 consumer must fail fast on the exact-match ABI check
+ * (see "ABI versioning" block above).
+ *
  * 0.15 — adds `has_last_command` / `last_command_op` /
  * `last_command_age_secs` to the tail of `SdrRtlTcpClientInfo`
  * so FFI hosts can replicate the "most recent commander"
@@ -798,6 +811,7 @@ typedef enum SdrBindAddress {
  * `initial_gain_tenths_db == 0` means "auto" (no manual gain).
  * `initial_direct_sampling` must be one of 0 / 1 / 2.
  * `port == 0` falls back to the crate default port (1234).
+ * `listener_cap == 0` uses the crate default (10).
  */
 typedef struct SdrRtlTcpServerConfig {
     int32_t  bind_address;               /* SdrBindAddress */
@@ -810,6 +824,7 @@ typedef struct SdrRtlTcpServerConfig {
     int32_t  initial_ppm;                /* frequency correction (ppm) */
     bool     initial_bias_tee;
     int32_t  initial_direct_sampling;    /* 0 = off, 1 = I, 2 = Q */
+    uint32_t listener_cap;               /* max concurrent Role::Listen clients; 0 = crate default (10); the single Control client is separate */
 } SdrRtlTcpServerConfig;
 
 /*
@@ -947,6 +962,15 @@ typedef struct SdrRtlTcpClientInfo {
      * sdr_rtltcp_server_client_list call reference a single
      * snapshot clock, so the ordering is consistent. */
     double   last_command_age_secs;
+    /* Role the server granted to this client: 0 = Control (can
+     * tune / change gain / etc.), 1 = Listen (receives the IQ
+     * stream; server drops any commands they send). Matches the
+     * Role enum wire byte in sdr_server_rtltcp::extension.
+     * Hosts render this as "Controller" / "Listener" in the
+     * client list. Vanilla rtl_tcp clients that don't speak the
+     * RTLX extension always land here as Control — the server
+     * only admits them when the Control slot is free. #392. */
+    uint8_t  role;
 } SdrRtlTcpClientInfo;
 
 /*

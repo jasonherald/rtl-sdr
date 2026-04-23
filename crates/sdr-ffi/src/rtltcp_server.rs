@@ -78,6 +78,12 @@ pub struct SdrRtlTcpServerConfig {
     /// Direct-sampling mode: 0 = off, 1 = I, 2 = Q. Rejected
     /// outside this range by `sdr_rtltcp_server_start`.
     pub initial_direct_sampling: i32,
+    /// Maximum concurrent `Role::Listen` clients. 0 = use
+    /// [`sdr_server_rtltcp::DEFAULT_LISTENER_CAP`] (10). Vanilla
+    /// `rtl_tcp` clients and the single Control client are NOT
+    /// counted — they occupy the controller slot, which is
+    /// separate from the listener pool. #392.
+    pub listener_cap: u32,
 }
 
 /// Aggregate server-lifetime statistics snapshot.
@@ -229,6 +235,16 @@ pub struct SdrRtlTcpClientInfo {
     /// `pick_most_recent_commander`). Valid only when
     /// `has_last_command == true`.
     pub last_command_age_secs: f64,
+    /// Role the server granted to this client: `0 = Control` (can
+    /// tune / change gain / etc.), `1 = Listen` (receives the IQ
+    /// stream; server drops any commands they send). Matches
+    /// `sdr_server_rtltcp::extension::Role::to_wire`. Hosts that
+    /// want to render a "Controller" / "Listener" badge in the
+    /// client list read this byte directly; the `Role::Control`
+    /// value is the default for vanilla `rtl_tcp` clients that
+    /// don't speak the RTLX extension (they always land in the
+    /// Control slot when it's free, never as listeners). #392.
+    pub role: u8,
 }
 
 impl Default for SdrRtlTcpClientInfo {
@@ -250,6 +266,7 @@ impl Default for SdrRtlTcpClientInfo {
             has_last_command: false,
             last_command_op: 0,
             last_command_age_secs: 0.0,
+            role: sdr_server_rtltcp::extension::Role::Control.to_wire(),
         }
     }
 }
@@ -374,6 +391,23 @@ fn bind_socket_addr(bind: i32, port: u16) -> Result<SocketAddr, SdrCoreError> {
     }
 }
 
+/// Translate the C-ABI `listener_cap` field into the Rust
+/// `ServerConfig::listener_cap`. Zero means "use the crate
+/// default" per the header docs — the `0 → DEFAULT_LISTENER_CAP`
+/// rule is the public contract, so pulling it out of
+/// `sdr_rtltcp_server_start` makes it unit-testable without the
+/// hardware-backed start path. Non-zero values passthrough as
+/// `u32 → usize` (widening cast, always lossless on 32- and
+/// 64-bit targets we build for). Per `CodeRabbit` round 2 on
+/// PR #403.
+fn listener_cap_from_c(listener_cap: u32) -> usize {
+    if listener_cap == 0 {
+        sdr_server_rtltcp::DEFAULT_LISTENER_CAP
+    } else {
+        listener_cap as usize
+    }
+}
+
 // ============================================================
 //  FFI entry points
 // ============================================================
@@ -424,6 +458,7 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
         } else {
             cfg.buffer_capacity as usize
         };
+        let listener_cap = listener_cap_from_c(cfg.listener_cap);
         let server_cfg = ServerConfig {
             bind,
             device_index: cfg.device_index,
@@ -435,6 +470,7 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             // clients keep working; the Linux GTK path is the only
             // one that currently offers LZ4.
             compression: CodecMask::NONE_ONLY,
+            listener_cap,
         };
         match Server::start(server_cfg) {
             Ok(server) => {
@@ -878,6 +914,7 @@ fn client_info_to_c(info: &ClientInfo, snapshot_at: std::time::Instant) -> SdrRt
         has_last_command,
         last_command_op,
         last_command_age_secs,
+        role: info.role.to_wire(),
     };
     // Write peer_addr into the inline byte array, truncating at
     // `len - 1` to leave room for a NUL. Cast via &mut raw ptr
@@ -1062,6 +1099,7 @@ mod tests {
             initial_ppm: 0,
             initial_bias_tee: false,
             initial_direct_sampling: 0,
+            listener_cap: 0, // 0 → use DEFAULT_LISTENER_CAP
         }
     }
 
@@ -1088,6 +1126,28 @@ mod tests {
     fn bind_socket_addr_zero_port_uses_default() {
         let addr = bind_socket_addr(SDR_BIND_LOOPBACK, 0).unwrap();
         assert_eq!(addr.port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn listener_cap_from_c_zero_uses_default() {
+        // Contract: `SdrRtlTcpServerConfig::listener_cap == 0` is
+        // the "use the crate default" sentinel. Extracted helper
+        // lets this rule be verified without the hardware-backed
+        // `sdr_rtltcp_server_start` path. Per `CodeRabbit` round 2
+        // on PR #403.
+        assert_eq!(
+            listener_cap_from_c(0),
+            sdr_server_rtltcp::DEFAULT_LISTENER_CAP
+        );
+    }
+
+    #[test]
+    fn listener_cap_from_c_nonzero_is_preserved() {
+        // Non-zero values widen from u32 to usize without
+        // modification. Picking a mid-range value rules out an
+        // off-by-one that would have passed `listener_cap_from_c(1)
+        // == 1` trivially.
+        assert_eq!(listener_cap_from_c(7), 7);
     }
 
     #[test]
@@ -1142,6 +1202,7 @@ mod tests {
             initial_ppm: 0,
             initial_bias_tee: false,
             initial_direct_sampling: 0,
+            listener_cap: 0,
         };
         let mut handle: *mut SdrRtlTcpServer = std::ptr::null_mut();
         let rc = unsafe { sdr_rtltcp_server_start(&raw const opts, &raw mut handle) };
@@ -1241,6 +1302,7 @@ mod tests {
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::Lz4,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: TEST_CLIENT_BYTES_SENT,
             buffers_dropped: TEST_CLIENT_BUFFERS_DROPPED,
             last_command: None,
@@ -1258,6 +1320,14 @@ mod tests {
         assert_eq!(c.id, TEST_CLIENT_ID);
         assert_eq!(c.bytes_sent, TEST_CLIENT_BYTES_SENT);
         assert_eq!(c.codec, 1); // LZ4 wire value
+        // Role projection: Control → 0 wire byte. Pins the #392
+        // FFI contract per `CodeRabbit` round 1 on PR #403 — a
+        // regression in `client_info_to_c` that drops the role
+        // field would otherwise slip through without detection.
+        assert_eq!(
+            c.role,
+            sdr_server_rtltcp::extension::Role::Control.to_wire()
+        );
         // `last_command` fixture is `None` for the whole test;
         // the projection must surface that as `has_last_command
         // == false` with the op / age fields defaulted to zero
@@ -1341,6 +1411,7 @@ mod tests {
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: 0,
             buffers_dropped: 0,
             // `SetBiasTee` (0x0e) chosen because it's the highest
@@ -1357,6 +1428,11 @@ mod tests {
         assert!(c.has_last_command);
         assert_eq!(c.last_command_op, CommandOp::SetBiasTee as u8);
         assert_eq!(c.last_command_op, 0x0e, "opcode wire byte");
+        // Role projection (round 1 on PR #403): Control → 0.
+        assert_eq!(
+            c.role,
+            sdr_server_rtltcp::extension::Role::Control.to_wire()
+        );
         #[allow(
             clippy::cast_precision_loss,
             reason = "seconds count fits in f64 mantissa"
@@ -1389,6 +1465,7 @@ mod tests {
             peer: SocketAddr::from((TEST_CLIENT_PEER_IP, TEST_CLIENT_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: 0,
             buffers_dropped: 0,
             last_command: None,
@@ -1410,6 +1487,40 @@ mod tests {
             .expect("NUL terminator");
         let peer_str = std::str::from_utf8(&peer_bytes[..nul_pos]).unwrap();
         assert_eq!(peer_str, "192.168.1.100:1234");
+        // Role projection (round 1 on PR #403): Control → 0.
+        assert_eq!(
+            c.role,
+            sdr_server_rtltcp::extension::Role::Control.to_wire()
+        );
+    }
+
+    #[test]
+    fn client_info_to_c_projects_listen_role() {
+        // **Regression test for `CodeRabbit` round 1 on PR #403.**
+        // The existing projection tests all use `Role::Control`
+        // (the default for vanilla clients), so a bug that hard-
+        // coded `role: 0` in `client_info_to_c` would pass
+        // every test in this module. Flip a fixture to
+        // `Role::Listen` and verify the wire byte flips to 1.
+        use sdr_server_rtltcp::codec::Codec;
+        let info = ClientInfo {
+            id: TEST_CLIENT_ID,
+            peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
+            connected_since: std::time::Instant::now(),
+            codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Listen,
+            bytes_sent: 0,
+            buffers_dropped: 0,
+            last_command: None,
+            current_freq_hz: None,
+            current_sample_rate_hz: None,
+            current_gain_tenths_db: None,
+            current_gain_auto: None,
+            recent_commands: std::collections::VecDeque::new(),
+        };
+        let c = client_info_to_c(&info, std::time::Instant::now());
+        assert_eq!(c.role, sdr_server_rtltcp::extension::Role::Listen.to_wire());
+        assert_eq!(c.role, 1, "Listen wire byte");
     }
 
     #[test]
@@ -1452,6 +1563,7 @@ mod tests {
             peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_JSON_PEER_PORT)),
             connected_since: std::time::Instant::now(),
             codec: Codec::None,
+            role: sdr_server_rtltcp::extension::Role::Control,
             bytes_sent: 0,
             buffers_dropped: 0,
             last_command: None,

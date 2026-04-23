@@ -66,6 +66,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crate::codec::Codec;
+use crate::extension::Role;
 use crate::protocol::CommandOp;
 
 /// Default per-client bounded-channel capacity measured in 256 KiB USB
@@ -168,6 +169,16 @@ pub struct ClientSlot {
     /// lifetime — if the client wants to change codec they must
     /// reconnect.
     pub codec: Codec,
+    /// Role granted by the server during handshake. `Control` =
+    /// commands dispatched to the device; `Listen` = commands
+    /// dropped server-side (the command worker observes this and
+    /// logs + skips the dispatch). Immutable for the slot's
+    /// lifetime — if the client wants to change role they must
+    /// reconnect (or, once #393 lands, send a takeover request).
+    /// Vanilla `rtl_tcp` clients (no RTLX hello) always land here
+    /// as `Control`; they have no way to request `Listen` and the
+    /// server only admits them when the Control slot is free. #392.
+    pub role: Role,
     /// Write half of this client's bounded channel. The broadcaster
     /// calls [`SyncSender::try_send`] to push USB chunks; the
     /// client's writer thread owns the matching `Receiver` and
@@ -188,11 +199,14 @@ pub struct ClientSlot {
 impl ClientSlot {
     /// Construct a slot with a freshly-created bounded channel.
     /// Returns both the slot (ready to register) and the `Receiver`
-    /// that the writer thread consumes.
+    /// that the writer thread consumes. `role` is the server's
+    /// grant (not the client's request — the server may deny the
+    /// request, in which case no slot is built at all). #392.
     pub fn new(
         id: ClientId,
         peer: SocketAddr,
         codec: Codec,
+        role: Role,
         channel_depth: usize,
     ) -> (Arc<Self>, Receiver<Vec<u8>>) {
         let (tx, rx) = sync_channel::<Vec<u8>>(channel_depth);
@@ -201,6 +215,7 @@ impl ClientSlot {
             peer,
             connected_since: Instant::now(),
             codec,
+            role,
             tx,
             stats: Mutex::new(ClientStats::default()),
             disconnected: AtomicBool::new(false),
@@ -237,6 +252,7 @@ impl ClientSlot {
             peer: self.peer,
             connected_since: self.connected_since,
             codec: self.codec,
+            role: self.role,
             bytes_sent: stats_clone.bytes_sent,
             buffers_dropped: stats_clone.buffers_dropped,
             last_command: stats_clone.last_command,
@@ -249,6 +265,42 @@ impl ClientSlot {
     }
 }
 
+/// Outcome of [`ClientRegistry::register_with_role`] — whether the
+/// slot was admitted, and if not, why. The caller maps these onto
+/// the wire-level `ServerExtension` response: `Granted` →
+/// `status=Ok, granted_role=Some(requested)`; denial variants →
+/// `status=<matching>, granted_role=None` (0xFF sentinel). #392.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleDecision {
+    /// Slot registered. Caller proceeds with the handshake response
+    /// and spawns the per-client writer + command workers.
+    Granted,
+    /// Client requested `Role::Control` but another live slot is
+    /// already holding it. Caller emits
+    /// `ServerExtension { granted_role: None, status: ControllerBusy }`
+    /// to RTLX clients (vanilla clients get TCP FIN without a
+    /// header so they see "connection refused"-equivalent), then
+    /// closes. **Transient** — clients treat this as retryable via
+    /// their connect/backoff loop.
+    ControllerBusy,
+    /// Client requested `Role::Listen` but `listener_cap` live
+    /// listeners are already registered. Caller emits
+    /// `ServerExtension { granted_role: None, status: ListenerCapReached }`
+    /// and closes. Vanilla clients never land here — they're
+    /// always Control-or-denied.
+    ListenerCapReached,
+    /// Registry's slots mutex is poisoned — a prior operation
+    /// panicked mid-update and the server is in a broken state.
+    /// Distinct from [`Self::ControllerBusy`] because the client
+    /// retry loop treats ControllerBusy as a transient "try again
+    /// in a second" hint; poison is a terminal server fault that
+    /// deserves a clean close + server-side log. Callers drop the
+    /// client with no wire response (no admission state to
+    /// narrate, and the server-side log captures the diagnostic).
+    /// Per `CodeRabbit` round 1 on PR #403. #392.
+    RegistryPoisoned,
+}
+
 /// Public snapshot of a client's state, returned by
 /// [`ClientRegistry::snapshot`] and embedded in `ServerStats`. Flat
 /// (not an `Arc`) so stats consumers can clone it freely without
@@ -259,6 +311,11 @@ pub struct ClientInfo {
     pub peer: SocketAddr,
     pub connected_since: Instant,
     pub codec: Codec,
+    /// Role the server granted to this client (`Control` dispatches
+    /// commands to the device; `Listen` drops them at the command
+    /// worker). Stats consumers render this as "Controller" /
+    /// "Listener" in the client list. #392.
+    pub role: Role,
     pub bytes_sent: u64,
     pub buffers_dropped: u64,
     pub last_command: Option<(CommandOp, Instant)>,
@@ -351,11 +408,133 @@ impl ClientRegistry {
     /// have been allocated via [`Self::allocate_id`]; the registry
     /// doesn't enforce this but stats consumers expect ids to be
     /// monotonic and unique.
+    ///
+    /// **No role/cap check** — admits unconditionally. Production
+    /// callers (`spawn_client_workers`) use
+    /// [`Self::register_with_role`] instead so the role gate and
+    /// listener cap enforcement happen atomically under the same
+    /// lock that would otherwise let two concurrent accepts both
+    /// claim Control. `register()` stays as the test-facing
+    /// convenience for fixtures that don't exercise the role
+    /// path.
     pub fn register(&self, slot: Arc<ClientSlot>) {
         self.lifetime_accepted.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut guard) = self.slots.lock() {
             guard.push(slot);
         }
+    }
+
+    /// Admit a slot if the server's role gate and listener cap
+    /// permit it. Returns the outcome so the caller can respond to
+    /// the client appropriately (Granted → continue the handshake,
+    /// denied → send a denial `ServerExtension` + close). The
+    /// slot's role (decided at construction time from the client's
+    /// hello, or defaulted to `Control` for vanilla clients) drives
+    /// the decision:
+    ///
+    /// - `Role::Control` — granted iff no other live slot currently
+    ///   has role Control. Denying with `ControllerBusy` because
+    ///   the Control slot is exclusive (one commander at a time).
+    /// - `Role::Listen` — granted iff the count of live `Listen`
+    ///   slots is strictly less than `listener_cap`. Denying with
+    ///   `ListenerCapReached`.
+    ///
+    /// "Live" means not flagged disconnected — the broadcaster's
+    /// periodic `prune_disconnected` sweep evicts dead slots, but
+    /// between sweeps a slot can already be marked disconnected.
+    /// Using the flag for the check means a dropping-Control
+    /// client frees the slot immediately on their worker
+    /// disconnecting, without waiting for the next prune tick.
+    ///
+    /// `lifetime_accepted` is bumped only on `Granted` — the
+    /// counter tracks real admissions, not denied-handshake
+    /// attempts. #392.
+    pub fn register_with_role(&self, slot: Arc<ClientSlot>, listener_cap: usize) -> RoleDecision {
+        // Lock the slot list first so the decision + push land
+        // atomically — two concurrent Control requests can't both
+        // observe "slot free" and both push. Same lock discipline
+        // as `prune_disconnected` and `snapshot`, so the decision
+        // sees a consistent live-set view.
+        let Ok(mut guard) = self.slots.lock() else {
+            // Poisoned — a prior operation panicked mid-update
+            // and the slot list is in a broken state. Surface as
+            // `RegistryPoisoned` rather than `ControllerBusy` so
+            // clients that retry transient denials don't thrash
+            // against a terminally-broken server. Per `CodeRabbit`
+            // round 1 on PR #403.
+            return RoleDecision::RegistryPoisoned;
+        };
+        match slot.role {
+            Role::Control => {
+                let has_live_controller = guard
+                    .iter()
+                    .any(|s| s.role == Role::Control && !s.is_disconnected());
+                if has_live_controller {
+                    return RoleDecision::ControllerBusy;
+                }
+            }
+            Role::Listen => {
+                let live_listeners = guard
+                    .iter()
+                    .filter(|s| s.role == Role::Listen && !s.is_disconnected())
+                    .count();
+                if live_listeners >= listener_cap {
+                    return RoleDecision::ListenerCapReached;
+                }
+            }
+        }
+        self.lifetime_accepted.fetch_add(1, Ordering::Relaxed);
+        guard.push(slot);
+        RoleDecision::Granted
+    }
+
+    /// Undo a prior [`Self::register_with_role`] `Granted` outcome
+    /// after post-admission setup fails (header write fails, worker
+    /// spawn fails, etc.). Marks the slot disconnected so the
+    /// broadcaster stops fanning to it immediately, removes it
+    /// from the slot list, and decrements
+    /// [`Self::lifetime_accepted`] so sessions that never served a
+    /// byte don't inflate the "accepted clients" counter. Returns
+    /// `true` iff the slot was found and removed.
+    ///
+    /// Idempotent — safe to call even if the slot was already
+    /// pruned by [`Self::prune_disconnected`] or removed by a
+    /// concurrent rollback. The slot-list mutex serializes the
+    /// remove, and the decrement is tied 1:1 to the original
+    /// `register_with_role` increment via the `removed` guard, so
+    /// double-calls can't underflow the counter.
+    ///
+    /// Per `CodeRabbit` round 1 on PR #403.
+    pub fn unwind_admission(&self, slot: &Arc<ClientSlot>) -> bool {
+        // Flag the slot first so any in-flight broadcaster tick
+        // skips it before we even take the slots lock. This
+        // shrinks the fan-out window between the setup failure
+        // and the slot-list remove below to at most one
+        // broadcaster tick.
+        slot.mark_disconnected();
+        let Ok(mut guard) = self.slots.lock() else {
+            // Poisoned — the rollback target is inaccessible, but
+            // the server is in a terminal state anyway (see
+            // `RoleDecision::RegistryPoisoned`). Log + return
+            // `false` so callers can't double-count the failure.
+            tracing::warn!(
+                slot_id = slot.id,
+                "unwind_admission: registry slots mutex poisoned"
+            );
+            return false;
+        };
+        let before = guard.len();
+        guard.retain(|s| s.id != slot.id);
+        let removed = guard.len() < before;
+        if removed {
+            // `lifetime_accepted` was `fetch_add(1)`-bumped during
+            // `register_with_role`, so the corresponding
+            // `fetch_sub(1)` cancels it out exactly. No underflow
+            // risk because the `removed` guard ties the decrement
+            // to the prior increment 1:1.
+            self.lifetime_accepted.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Park a per-client worker `JoinHandle` for later join.
@@ -647,6 +826,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_GENERIC_A),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot);
@@ -657,6 +837,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_GENERIC_B),
             Codec::Lz4,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot2);
@@ -671,6 +852,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot);
@@ -692,12 +874,14 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let (s2, rx2) = ClientSlot::new(
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::Lz4,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(s1);
@@ -736,6 +920,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH,
         );
         // Fast client with generous room — shouldn't drop anything.
@@ -743,6 +928,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_GENEROUS,
         );
         let slow_id = slow.id;
@@ -777,6 +963,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot.clone());
@@ -796,6 +983,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(slot.clone());
@@ -820,12 +1008,14 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let (dead, _dead_rx) = ClientSlot::new(
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         dead.mark_disconnected();
@@ -845,6 +1035,7 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_SNAPSHOT),
             Codec::Lz4,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let slot_id = slot.id;
@@ -944,12 +1135,14 @@ mod tests {
             reg.allocate_id(),
             test_peer(TEST_PORT_FIRST),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         let (dead, _dead_rx) = ClientSlot::new(
             reg.allocate_id(),
             test_peer(TEST_PORT_SECOND),
             Codec::None,
+            Role::Control,
             TEST_CHANNEL_DEPTH_STANDARD,
         );
         reg.register(live);
@@ -964,5 +1157,276 @@ mod tests {
         reg.prune_disconnected();
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.snapshot().len(), 1);
+    }
+
+    // ============================================================
+    // register_with_role decision matrix (#392)
+    //
+    // These cover the atomic role-gate contract at the registry
+    // level — `spawn_client_workers` is the sole production caller
+    // and threads the decision directly into the `ServerExtension`
+    // response block, so pinning the decision semantics here is
+    // the durable guard against future regressions in either the
+    // role gate or the listener cap.
+    // ============================================================
+
+    /// Test listener cap shared across the role-gate tests. Small
+    /// enough to hit the cap quickly without inflating the fixture.
+    const TEST_LISTENER_CAP: usize = 2;
+
+    // ------------------------------------------------------------
+    // Named peer ports for the role-gate tests. Each test uses a
+    // disjoint 20_0XX / 20_1XX etc. block so log output points
+    // directly at the test that emitted the peer. Extracted per
+    // `CodeRabbit` round 1 on PR #403 — raw `20_001` / `20_010`
+    // literals aren't grep-friendly and drift naming conventions
+    // away from the rest of this module's `TEST_*_PORT` pattern.
+    // ------------------------------------------------------------
+
+    /// Single-Control happy path: port for the first (and only)
+    /// admitted client.
+    const ROLE_TEST_SINGLE_CTRL_PORT: u16 = 20_001;
+    /// `denies_second_control_as_controller_busy`: first Control
+    /// client (admitted) and second (denied).
+    const ROLE_TEST_BUSY_FIRST_CTRL_PORT: u16 = 20_010;
+    const ROLE_TEST_BUSY_SECOND_CTRL_PORT: u16 = 20_011;
+    /// `grants_second_control_after_first_disconnects`: original
+    /// Control then the takeover-via-disconnect successor.
+    const ROLE_TEST_DISCONNECT_FIRST_CTRL_PORT: u16 = 20_020;
+    const ROLE_TEST_DISCONNECT_SECOND_CTRL_PORT: u16 = 20_021;
+    /// `admits_listeners_up_to_cap`: Control base port + offset
+    /// per listener. The listener loop adds `i` to the base, so
+    /// the reserved block is `20_031..20_031 + TEST_LISTENER_CAP`.
+    const ROLE_TEST_ADMIT_CTRL_PORT: u16 = 20_030;
+    const ROLE_TEST_ADMIT_LISTENER_BASE_PORT: u16 = 20_031;
+    /// `denies_listen_past_cap`: listener-fill block + the
+    /// overflow peer that gets denied.
+    const ROLE_TEST_CAP_LISTENER_BASE_PORT: u16 = 20_040;
+    const ROLE_TEST_CAP_OVERFLOW_PORT: u16 = 20_049;
+    /// `counts_only_live_listeners_for_cap`: listener-fill block,
+    /// first overflow attempt that should be denied, and the
+    /// replacement that succeeds after a slot is freed.
+    const ROLE_TEST_LIVE_LISTENER_BASE_PORT: u16 = 20_050;
+    const ROLE_TEST_LIVE_DENIED_PORT: u16 = 20_058;
+    const ROLE_TEST_LIVE_REPLACEMENT_PORT: u16 = 20_059;
+
+    /// Convenience: compute the Nth listener port in a test that
+    /// stamps a contiguous block starting at `base`.
+    fn listener_port(base: u16, offset: usize) -> u16 {
+        base.checked_add(u16::try_from(offset).expect("offset fits u16"))
+            .expect("listener port fits u16")
+    }
+
+    /// Build a slot with the requested role for the decision
+    /// tests. Channel depth doesn't matter (nothing broadcasts
+    /// here); `TEST_CHANNEL_DEPTH_SMALL` keeps allocation cheap.
+    fn role_test_slot(reg: &ClientRegistry, port: u16, role: Role) -> Arc<ClientSlot> {
+        let (slot, _rx) = ClientSlot::new(
+            reg.allocate_id(),
+            test_peer(port),
+            Codec::None,
+            role,
+            TEST_CHANNEL_DEPTH_SMALL,
+        );
+        slot
+    }
+
+    #[test]
+    fn register_with_role_grants_first_control_client() {
+        // No prior clients → a Control request fits. Verify the
+        // slot lands in the registry and `lifetime_accepted`
+        // bumps.
+        let reg = ClientRegistry::new();
+        let slot = role_test_slot(&reg, ROLE_TEST_SINGLE_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot, TEST_LISTENER_CAP),
+            RoleDecision::Granted
+        );
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.lifetime_accepted(), 1);
+    }
+
+    #[test]
+    fn register_with_role_denies_second_control_as_controller_busy() {
+        // First Control grants; second Control sees the first
+        // live and gets ControllerBusy without consuming a
+        // lifetime_accepted slot (denials don't count).
+        let reg = ClientRegistry::new();
+        let first = role_test_slot(&reg, ROLE_TEST_BUSY_FIRST_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(first, TEST_LISTENER_CAP),
+            RoleDecision::Granted
+        );
+        let second = role_test_slot(&reg, ROLE_TEST_BUSY_SECOND_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(second, TEST_LISTENER_CAP),
+            RoleDecision::ControllerBusy
+        );
+        // Registry still only has the first — denial must not
+        // push.
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.lifetime_accepted(), 1);
+    }
+
+    #[test]
+    fn register_with_role_grants_second_control_after_first_disconnects() {
+        // Contract: the "live" check treats disconnected slots as
+        // absent (so a freshly-dropping Control client opens the
+        // slot before the next prune tick lands). This matters
+        // for the natural "user 1 disconnects, user 2 reconnects"
+        // flow — we shouldn't require them to wait ~2.5s for
+        // prune_disconnected to run.
+        let reg = ClientRegistry::new();
+        let first = role_test_slot(&reg, ROLE_TEST_DISCONNECT_FIRST_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(first.clone(), TEST_LISTENER_CAP),
+            RoleDecision::Granted
+        );
+        first.mark_disconnected();
+        let second = role_test_slot(&reg, ROLE_TEST_DISCONNECT_SECOND_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(second, TEST_LISTENER_CAP),
+            RoleDecision::Granted
+        );
+        assert_eq!(reg.lifetime_accepted(), 2);
+    }
+
+    #[test]
+    fn register_with_role_admits_listeners_up_to_cap() {
+        // Coexistence test: one Control + up-to-cap Listeners all
+        // live simultaneously. Shape: Control doesn't contribute
+        // to the listener count.
+        let reg = ClientRegistry::new();
+        let ctrl = role_test_slot(&reg, ROLE_TEST_ADMIT_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(ctrl, TEST_LISTENER_CAP),
+            RoleDecision::Granted
+        );
+        for i in 0..TEST_LISTENER_CAP {
+            let listener = role_test_slot(
+                &reg,
+                listener_port(ROLE_TEST_ADMIT_LISTENER_BASE_PORT, i),
+                Role::Listen,
+            );
+            assert_eq!(
+                reg.register_with_role(listener, TEST_LISTENER_CAP),
+                RoleDecision::Granted,
+                "listener {i} should fit under cap {TEST_LISTENER_CAP}"
+            );
+        }
+        assert_eq!(reg.len(), 1 + TEST_LISTENER_CAP);
+    }
+
+    #[test]
+    fn register_with_role_denies_listen_past_cap() {
+        // Fill the cap, then attempt one more → ListenerCapReached.
+        let reg = ClientRegistry::new();
+        for i in 0..TEST_LISTENER_CAP {
+            let listener = role_test_slot(
+                &reg,
+                listener_port(ROLE_TEST_CAP_LISTENER_BASE_PORT, i),
+                Role::Listen,
+            );
+            assert_eq!(
+                reg.register_with_role(listener, TEST_LISTENER_CAP),
+                RoleDecision::Granted
+            );
+        }
+        let overflow = role_test_slot(&reg, ROLE_TEST_CAP_OVERFLOW_PORT, Role::Listen);
+        assert_eq!(
+            reg.register_with_role(overflow, TEST_LISTENER_CAP),
+            RoleDecision::ListenerCapReached
+        );
+        // Denial must not push into slots.
+        assert_eq!(reg.len(), TEST_LISTENER_CAP);
+        // Denials don't count toward lifetime_accepted.
+        assert_eq!(reg.lifetime_accepted() as usize, TEST_LISTENER_CAP);
+    }
+
+    #[test]
+    fn unwind_admission_removes_slot_and_decrements_counter() {
+        // **Regression guard for `CodeRabbit` round 1 on PR #403.**
+        // Post-register setup failures (try_clone, header write,
+        // worker spawn) must roll back the admission so
+        // `lifetime_accepted` doesn't inflate with sessions that
+        // never served a byte. Contract:
+        //   - slot is removed from the registry
+        //   - `lifetime_accepted` decrements 1:1 with the prior
+        //     register_with_role bump
+        //   - slot's `disconnected` flag is set (broadcaster
+        //     stops fanning immediately, before the slot-list
+        //     remove takes effect)
+        //   - double-call is idempotent (returns false the
+        //     second time; counter doesn't underflow)
+        let reg = ClientRegistry::new();
+        let slot = role_test_slot(&reg, ROLE_TEST_SINGLE_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot.clone(), TEST_LISTENER_CAP),
+            RoleDecision::Granted
+        );
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.lifetime_accepted(), 1);
+
+        assert!(
+            reg.unwind_admission(&slot),
+            "first unwind should find the slot"
+        );
+        assert_eq!(reg.len(), 0, "unwound slot must not remain in the registry");
+        assert_eq!(
+            reg.lifetime_accepted(),
+            0,
+            "unwind should cancel the register_with_role bump"
+        );
+        assert!(
+            slot.is_disconnected(),
+            "unwind marks the slot dead so the broadcaster stops fanning"
+        );
+
+        // Second call: slot is gone → returns false, counter
+        // stays at zero (no underflow).
+        assert!(
+            !reg.unwind_admission(&slot),
+            "second unwind returns false because the slot is already gone"
+        );
+        assert_eq!(
+            reg.lifetime_accepted(),
+            0,
+            "double-unwind must not underflow lifetime_accepted"
+        );
+    }
+
+    #[test]
+    fn register_with_role_counts_only_live_listeners_for_cap() {
+        // A disconnected Listener frees a listener slot
+        // immediately (same reasoning as the Control disconnect
+        // test above). Fills cap, flips one to disconnected,
+        // verifies the next Listen fits.
+        let reg = ClientRegistry::new();
+        let mut listeners = Vec::new();
+        for i in 0..TEST_LISTENER_CAP {
+            let listener = role_test_slot(
+                &reg,
+                listener_port(ROLE_TEST_LIVE_LISTENER_BASE_PORT, i),
+                Role::Listen,
+            );
+            assert_eq!(
+                reg.register_with_role(listener.clone(), TEST_LISTENER_CAP),
+                RoleDecision::Granted
+            );
+            listeners.push(listener);
+        }
+        // Cap is full — verify.
+        let denied = role_test_slot(&reg, ROLE_TEST_LIVE_DENIED_PORT, Role::Listen);
+        assert_eq!(
+            reg.register_with_role(denied, TEST_LISTENER_CAP),
+            RoleDecision::ListenerCapReached
+        );
+        // Flip one listener to disconnected and retry.
+        listeners[0].mark_disconnected();
+        let replacement = role_test_slot(&reg, ROLE_TEST_LIVE_REPLACEMENT_PORT, Role::Listen);
+        assert_eq!(
+            reg.register_with_role(replacement, TEST_LISTENER_CAP),
+            RoleDecision::Granted
+        );
     }
 }

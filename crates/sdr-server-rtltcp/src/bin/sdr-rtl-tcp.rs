@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use sdr_rtltcp_discovery::{AdvertiseOptions, Advertiser, TxtRecord, local_hostname};
 use sdr_server_rtltcp::server::{DEFAULT_SAMPLE_RATE_HZ, Server, ServerConfig};
-use sdr_server_rtltcp::{DEFAULT_BUFFER_CAPACITY, DEFAULT_PORT};
+use sdr_server_rtltcp::{DEFAULT_BUFFER_CAPACITY, DEFAULT_LISTENER_CAP, DEFAULT_PORT};
 
 /// How often `main` polls the shutdown / server-stopped flags. Below
 /// any user-perceptible latency; costs a few syscalls per second while
@@ -109,6 +109,12 @@ fn usage(exit_code: i32) -> ! {
     let _ = writeln!(
         out,
         "    --no-announce  Skip mDNS advertisement (default: advertise)"
+    );
+    let _ = writeln!(
+        out,
+        "    --listener-cap <N>  Max concurrent Role::Listen clients \
+         (default: {DEFAULT_LISTENER_CAP}; the single Control client is \
+         separate)"
     );
     let _ = writeln!(out, "    -h, --help   Show this help");
     std::process::exit(exit_code);
@@ -353,6 +359,11 @@ fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<(ServerConfig, DiscoveryOptio
             "--no-announce" => {
                 discovery.announce = false;
                 i += 1;
+            }
+            "--listener-cap" => {
+                let v = args.get(i + 1).ok_or(ParseError)?.as_ref();
+                config.listener_cap = v.parse().map_err(|_| ParseError)?;
+                i += 2;
             }
             _ => return Err(ParseError),
         }
@@ -641,6 +652,32 @@ mod tests {
         assert_eq!(cfg.buffer_capacity, 250);
         assert!(cfg.initial.bias_tee);
         assert_eq!(cfg.initial.direct_sampling, 2);
+    }
+
+    #[test]
+    fn parse_args_listener_cap_defaults_to_crate_default() {
+        // No `--listener-cap` flag → `ServerConfig::default_loopback`
+        // value, which is [`DEFAULT_LISTENER_CAP`]. Pins the contract
+        // that omitting the flag doesn't silently zero the cap.
+        let (cfg, _disc) = parse_args::<&str>(&[]).unwrap();
+        assert_eq!(cfg.listener_cap, DEFAULT_LISTENER_CAP);
+    }
+
+    #[test]
+    fn parse_args_listener_cap_override() {
+        // Explicit `--listener-cap N` overrides the default.
+        let args = ["--listener-cap", "25"];
+        let (cfg, _disc) = parse_args(&args).unwrap();
+        assert_eq!(cfg.listener_cap, 25);
+    }
+
+    #[test]
+    fn parse_args_listener_cap_rejects_non_numeric() {
+        // Non-u32 argument surfaces as `ParseError` — users get a
+        // clean "bad args" exit code instead of a silent fallback
+        // that would confuse "why is my cap still 10?"
+        let args = ["--listener-cap", "lots"];
+        assert!(parse_args(&args).is_err());
     }
 
     #[test]

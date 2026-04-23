@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use sdr_rtlsdr::device::RtlSdrDevice;
 
-use crate::broadcaster::{ClientRegistry, ClientSlot};
+use crate::broadcaster::{ClientRegistry, ClientSlot, RoleDecision};
 use crate::codec::{Codec, CodecMask, Encoder};
 use crate::dispatch::dispatch;
 use crate::error::ServerError;
@@ -106,6 +106,13 @@ const USB_READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// lock + retain work happen per chunk.
 const BROADCASTER_PRUNE_EVERY_N_TICKS: u32 = 256;
 
+/// Default cap on concurrent `Role::Listen` clients. Vanilla / Control
+/// clients are counted separately (they allocate the single controller
+/// slot). 10 is a generous default — real deployments pushing past this
+/// are either relay/broadcast scenarios where the UI gives the user an
+/// explicit "max listeners" knob, or a test setup. Per #390 decisions.
+pub const DEFAULT_LISTENER_CAP: usize = 10;
+
 /// Default sample rate in Hz. Matches upstream `rtl_tcp.c:DEFAULT_SAMPLE_RATE_HZ`.
 ///
 /// Exposed so the CLI can share the same constant instead of hard-coding
@@ -153,6 +160,17 @@ pub struct ServerConfig {
     /// [`CodecMask::NONE_ONLY`] — compression is opt-in per-
     /// server so existing deployments behave identically.
     pub compression: crate::codec::CodecMask,
+
+    /// Maximum concurrent `Role::Listen` clients. The Control client
+    /// is separate (always exactly one when occupied), so the total
+    /// live-client ceiling is `listener_cap + 1`. When the cap is
+    /// already filled, an RTLX client requesting `Role::Listen`
+    /// receives `granted_role=denied, status=ListenerCapReached` and
+    /// the connection is closed. Vanilla `rtl_tcp` clients never
+    /// enter the listener path — they're always Control-or-denied —
+    /// so the cap doesn't apply to them. Default:
+    /// [`DEFAULT_LISTENER_CAP`]. #392.
+    pub listener_cap: usize,
 }
 
 impl ServerConfig {
@@ -166,6 +184,7 @@ impl ServerConfig {
             initial: InitialDeviceState::default(),
             buffer_capacity: DEFAULT_BUFFER_CAPACITY,
             compression: crate::codec::CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
         }
     }
 }
@@ -357,6 +376,7 @@ impl Server {
             stopped.clone(),
             per_client_depth,
             config.compression,
+            config.listener_cap,
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -584,6 +604,7 @@ fn spawn_accept_thread(
     stopped: Arc<AtomicBool>,
     per_client_buffer_depth: usize,
     compression: CodecMask,
+    listener_cap: usize,
 ) -> std::io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
     thread::Builder::new()
@@ -606,6 +627,7 @@ fn spawn_accept_thread(
                             shutdown.clone(),
                             per_client_buffer_depth,
                             compression,
+                            listener_cap,
                         );
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -659,39 +681,153 @@ fn spawn_client_workers(
     shutdown: Arc<AtomicBool>,
     per_client_buffer_depth: usize,
     compression_offer: CodecMask,
+    listener_cap: usize,
 ) {
-    // Extended handshake (#307). Must run BEFORE we write the legacy
-    // `dongle_info_t` — if the client sent an `"RTLX"` hello, the
-    // server response block must be emitted immediately after the
-    // legacy header, all in one atomic stretch, so the client's peek
-    // for the `"RTLX"` magic lands on our bytes and not on IQ samples
-    // a racing broadcaster may have queued.
-    let negotiated_codec = match sniff_client_hello(&stream) {
-        Ok(Some(hello)) => {
-            let codec = compression_offer.pick(hello.codec_mask);
-            tracing::info!(
-                %peer,
-                client_mask = hello.codec_mask.to_wire(),
-                server_mask = compression_offer.to_wire(),
-                chosen = %codec,
-                "rtl_tcp extended-handshake negotiated"
-            );
-            Some(codec)
-        }
-        Ok(None) => {
-            tracing::debug!(%peer, "rtl_tcp no extended-handshake hello — legacy client path");
-            None
-        }
+    // Extended handshake (#307) — sniff the RTLX hello if the
+    // client sent one. The outcome drives both codec negotiation
+    // and the role request that feeds the #392 admission gate.
+    let sniff_outcome = match sniff_client_hello(&stream) {
+        Ok(h) => h,
         Err(e) => {
             tracing::warn!(%peer, %e, "rtl_tcp handshake sniff failed — dropping client");
             return;
         }
     };
+    // Split the sniff result into the fields we actually act on:
+    //   - `hello_seen` gates ServerExtension emission (vanilla
+    //     clients don't expect it; writing one would corrupt their
+    //     stream)
+    //   - `requested_role` is what the client asked for; vanilla
+    //     clients implicitly request `Control` since they have no
+    //     way to ask for Listen (no hello = no role byte)
+    //   - `negotiated_codec` is `None` for vanilla (always
+    //     uncompressed); `Some(_)` for RTLX clients — the
+    //     intersection of their mask and ours
+    let (hello_seen, requested_role, negotiated_codec) = if let Some(hello) = &sniff_outcome {
+        let codec = compression_offer.pick(hello.codec_mask);
+        tracing::info!(
+            %peer,
+            client_mask = hello.codec_mask.to_wire(),
+            server_mask = compression_offer.to_wire(),
+            chosen = %codec,
+            requested_role = ?hello.role,
+            "rtl_tcp extended-handshake negotiated"
+        );
+        (true, hello.role, Some(codec))
+    } else {
+        tracing::debug!(
+            %peer,
+            "rtl_tcp no extended-handshake hello — legacy client path (implicit Role::Control)"
+        );
+        (false, Role::Control, None)
+    };
+    let codec = negotiated_codec.unwrap_or(Codec::None);
+
+    // Allocate id + build slot with the requested role + channel.
+    // The slot is not yet registered — `register_with_role` below
+    // takes the slots mutex and checks the role/cap atomically
+    // before admitting.
+    let id = registry.allocate_id();
+    let (slot, rx) = ClientSlot::new(id, peer, codec, requested_role, per_client_buffer_depth);
+
+    // Atomic #392 admission. On `Granted` the slot is now in the
+    // registry and the broadcaster can find it on its next tick;
+    // on denial the slot is never pushed and drops on scope exit.
+    let decision = registry.register_with_role(slot.clone(), listener_cap);
+    match decision {
+        RoleDecision::Granted => {
+            tracing::info!(
+                %peer,
+                client_id = id,
+                ?requested_role,
+                ?codec,
+                "rtl_tcp client admitted"
+            );
+        }
+        RoleDecision::ControllerBusy => {
+            tracing::info!(
+                %peer,
+                ?requested_role,
+                "rtl_tcp Control slot busy — denying client"
+            );
+            // RTLX clients get the full denial response so their UI
+            // can show "controller busy" rather than a bare EOF.
+            // Vanilla clients get TCP FIN with no bytes — cleanest
+            // signal for their "connection refused" UX and avoids
+            // handing them a dongle_info_t they'd interpret as
+            // admission.
+            if hello_seen {
+                send_denied_response(&stream, peer, &device, Status::ControllerBusy);
+            }
+            return;
+        }
+        RoleDecision::ListenerCapReached => {
+            tracing::info!(
+                %peer,
+                ?requested_role,
+                cap = listener_cap,
+                "rtl_tcp listener cap reached — denying client"
+            );
+            // Vanilla clients never land here — they always request
+            // (implicit) Control, which routes through the
+            // ControllerBusy path above. Defensive debug_assert
+            // catches any future regression that breaks that
+            // invariant; runtime behavior stays safe (TCP FIN
+            // only) even if the assert fires.
+            debug_assert!(
+                hello_seen,
+                "vanilla clients should never land in ListenerCapReached"
+            );
+            if hello_seen {
+                send_denied_response(&stream, peer, &device, Status::ListenerCapReached);
+            }
+            return;
+        }
+        RoleDecision::RegistryPoisoned => {
+            // Terminal server fault — the slot list mutex was
+            // poisoned by an earlier panic mid-update. Don't
+            // write anything to the peer: RTLX clients treat
+            // `ControllerBusy` as transient and retry, so
+            // sending that (or any other denial) would invite a
+            // reconnect storm against a terminally broken
+            // server. Bare TCP FIN is the cleanest signal. Per
+            // `CodeRabbit` round 1 on PR #403.
+            tracing::error!(
+                %peer,
+                ?requested_role,
+                "rtl_tcp registry slots mutex poisoned — closing client without reply"
+            );
+            return;
+        }
+    }
+
+    // Granted path — slot is now in the registry. The broadcaster
+    // can begin fan-out as soon as its next tick runs; any chunks
+    // that arrive before the writer thread spawns queue in the
+    // bounded channel and get recorded as per-client `buffers_dropped`
+    // if the channel fills first. Worker spawn is microseconds
+    // away so the drop risk is negligible in practice.
+    let writer_stream = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(
+                %peer,
+                %e,
+                "failed to clone client stream for writer — tearing down client"
+            );
+            registry.unwind_admission(&slot);
+            return;
+        }
+    };
+    let mut writer = writer_stream;
 
     // Send the 12-byte dongle_info_t header (rtl_tcp.c:576-594).
+    // Emitted for BOTH granted RTLX and granted vanilla — it's the
+    // first thing any rtl_tcp client expects.
     let header = {
         let Ok(dev) = device.lock() else {
             tracing::error!(%peer, "device mutex poisoned, aborting client");
+            registry.unwind_admission(&slot);
             return;
         };
         DongleInfo {
@@ -699,35 +835,26 @@ fn spawn_client_workers(
             gain_count: dev.tuner_gains().len() as u32,
         }
     };
-    let header_bytes = header.to_bytes();
-    let writer_stream = match stream.try_clone() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::error!(%peer, %e, "failed to clone client stream for writer — dropping client");
-            return;
-        }
-    };
-    let mut writer = writer_stream;
-    if let Err(e) = writer.write_all(&header_bytes) {
+    if let Err(e) = writer.write_all(&header.to_bytes()) {
         tracing::warn!(%peer, %e, "failed to send dongle_info_t — client gone");
+        registry.unwind_admission(&slot);
         return;
     }
 
-    // Emit the `ServerExtension` block immediately after
-    // `dongle_info_t` when we negotiated the extended protocol. Must
-    // land before any IQ data or the client's magic-peek will read
-    // random samples instead.
-    if let Some(codec) = negotiated_codec {
+    // RTLX clients additionally get the ServerExtension(granted)
+    // block. Must land immediately after dongle_info_t so the
+    // client's magic-peek lands on our bytes and not on IQ samples
+    // a racing broadcaster may have queued.
+    if hello_seen {
         let ext = ServerExtension {
             codec,
-            // #391 is still single-controller; role always reports
-            // Control until #392 plugs in the actual role gate.
-            granted_role: Some(Role::Control),
+            granted_role: Some(requested_role),
             status: Status::Ok,
             version: PROTOCOL_VERSION,
         };
         if let Err(e) = writer.write_all(&ext.to_bytes()) {
             tracing::warn!(%peer, %e, "failed to send RTLX server extension — client gone");
+            registry.unwind_admission(&slot);
             return;
         }
     }
@@ -737,19 +864,22 @@ fn spawn_client_workers(
     // stream's `write()`, which in turn enforces `SO_SNDTIMEO`.
     // Setting after-wrap would lose visibility into the inner stream.
     if let Err(e) = writer.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
-        tracing::warn!(%peer, %e, "set_write_timeout on data channel failed; dropping client");
+        tracing::warn!(
+            %peer,
+            %e,
+            "set_write_timeout on data channel failed; tearing down client"
+        );
+        registry.unwind_admission(&slot);
         return;
     }
 
-    // Build the slot, allocating a fresh id + per-client channel.
-    let id = registry.allocate_id();
-    let codec = negotiated_codec.unwrap_or(Codec::None);
-    let (slot, rx) = ClientSlot::new(id, peer, codec, per_client_buffer_depth);
-
-    // Spawn the writer first so that by the time we register, the
-    // receiver end of the slot's channel is already being drained.
-    // If spawn fails, bail without registering — no half-registered
-    // clients to clean up.
+    // Spawn writer + command threads. Pre-#392 spawn-before-register
+    // ordering is inverted here (register happens during the
+    // decision above) so every failure path from this point on
+    // must call `registry.unwind_admission(&slot)` — that marks
+    // the slot disconnected AND rolls back the admission so
+    // `lifetime_accepted` stays tied to sessions that actually
+    // began serving. Per `CodeRabbit` round 1 on PR #403.
     let writer_slot = slot.clone();
     let writer_shutdown = shutdown.clone();
     let tracked_writer = StatsTrackingWrite {
@@ -765,14 +895,19 @@ fn spawn_client_workers(
         }) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(%peer, %e, "failed to spawn rtl_tcp writer thread — dropping client");
+            tracing::error!(
+                %peer,
+                %e,
+                "failed to spawn rtl_tcp writer thread — tearing down client"
+            );
+            registry.unwind_admission(&slot);
             return;
         }
     };
 
-    // Spawn the command thread. If it fails, mark the slot
-    // disconnected so the writer exits too, and join the writer
-    // here so its handle isn't dropped on the floor.
+    // Spawn the command thread. If it fails, unwind the admission
+    // (also marks the slot disconnected so the writer exits) and
+    // join the writer here so its handle isn't dropped on the floor.
     let command_slot = slot.clone();
     let command_shutdown = shutdown.clone();
     let command_device = device;
@@ -789,19 +924,16 @@ fn spawn_client_workers(
         }) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(%peer, %e, "failed to spawn rtl_tcp command thread — tearing down client");
-            slot.mark_disconnected();
+            tracing::error!(
+                %peer,
+                %e,
+                "failed to spawn rtl_tcp command thread — tearing down client"
+            );
+            registry.unwind_admission(&slot);
             let _ = writer_handle.join();
             return;
         }
     };
-
-    // All three threads (writer, command, broadcaster-observing-this-slot)
-    // are now set up. Register the slot so the broadcaster starts
-    // fanning out to it. Registration order matters: before register,
-    // the broadcaster can't find the slot; after register, the
-    // broadcaster discovers it on its next tick.
-    registry.register(slot);
 
     // Park both worker handles on the registry so `Server::drop`
     // can join any still running at shutdown — without this, the
@@ -820,6 +952,72 @@ fn spawn_client_workers(
     // joined here. Both exit independently when they observe the
     // shutdown flag or the slot's disconnection flag. The slot itself
     // is retained by the registry until it's pruned.
+}
+
+/// Emit a dongle_info_t + denial `ServerExtension` to an RTLX
+/// client whose admission the role gate refused, then let the
+/// stream drop out of scope so the TCP FIN reaches the peer. Only
+/// called for RTLX clients — vanilla peers get a bare TCP close
+/// (no bytes) because they'd mis-parse any response we wrote. The
+/// dongle_info_t block comes first because the RTLX client
+/// protocol expects it at the head of the stream regardless of
+/// whether the handshake was accepted; the ServerExtension
+/// follows with `granted_role = None` (0xFF wire sentinel) and
+/// the caller-supplied `status` (ControllerBusy or
+/// ListenerCapReached). Write failures downgrade to debug-level
+/// tracing because a refused-handshake peer often tears down the
+/// socket before our response lands — noisy warn! would bury
+/// real signal. #392.
+fn send_denied_response(
+    stream: &TcpStream,
+    peer: SocketAddr,
+    device: &Arc<Mutex<RtlSdrDevice>>,
+    status: Status,
+) {
+    let Ok(dev) = device.lock() else {
+        tracing::warn!(%peer, "device mutex poisoned during denial response");
+        return;
+    };
+    let header = DongleInfo {
+        tuner: TunerTypeCode::from(dev.tuner_type()),
+        gain_count: dev.tuner_gains().len() as u32,
+    };
+    drop(dev);
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                %peer,
+                %e,
+                "failed to clone stream for denial response — closing without reply"
+            );
+            return;
+        }
+    };
+    if writer.write_all(&header.to_bytes()).is_err() {
+        tracing::debug!(
+            %peer,
+            ?status,
+            "failed to send dongle_info_t during denial — client already gone"
+        );
+        return;
+    }
+    let ext = ServerExtension {
+        // Codec choice is moot on denial — the client never
+        // proceeds to the IQ stream. `Codec::None` is the neutral
+        // choice: no allocation, always valid on the wire.
+        codec: Codec::None,
+        granted_role: None,
+        status,
+        version: PROTOCOL_VERSION,
+    };
+    if writer.write_all(&ext.to_bytes()).is_err() {
+        tracing::debug!(
+            %peer,
+            ?status,
+            "failed to send denial ServerExtension — client already gone"
+        );
+    }
 }
 
 fn configure_client_socket(stream: &TcpStream) {
@@ -1179,6 +1377,23 @@ fn command_worker(
             );
             continue;
         };
+        // Role gate (#392). Listener clients may send commands —
+        // the protocol doesn't stop them — but the server drops
+        // them server-side without touching the device. No reply
+        // is sent (keeps the wire protocol identical for Control
+        // and Listen); the listener's UI simply observes that its
+        // tune / gain commands have no effect, which matches the
+        // "passive observer" contract they signed up for by
+        // requesting Role::Listen.
+        if slot.role == Role::Listen {
+            tracing::debug!(
+                client_id = slot.id,
+                op = ?cmd.op,
+                param = cmd.param,
+                "rtl_tcp listener client attempted command — dropped"
+            );
+            continue;
+        }
         let Ok(mut dev) = device.lock() else {
             // Same rationale as the broadcaster: a poisoned device
             // mutex is unrecoverable, and silently dropping commands
@@ -1402,6 +1617,7 @@ mod tests {
             initial: InitialDeviceState::default(),
             buffer_capacity: 0,
             compression: CodecMask::NONE_ONLY,
+            listener_cap: DEFAULT_LISTENER_CAP,
         };
         match Server::start(config) {
             Err(ServerError::PortInUse(ref addr)) => {
@@ -1490,6 +1706,7 @@ mod tests {
             registry.allocate_id(),
             SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_A_PORT)),
             Codec::None,
+            Role::Control,
             TEST_CLIENT_CHANNEL_DEPTH,
         );
         if let Ok(mut s) = slot_a.stats.lock() {
@@ -1502,6 +1719,7 @@ mod tests {
             registry.allocate_id(),
             SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_B_PORT)),
             Codec::Lz4,
+            Role::Control,
             TEST_CLIENT_CHANNEL_DEPTH,
         );
         if let Ok(mut s) = slot_b.stats.lock() {

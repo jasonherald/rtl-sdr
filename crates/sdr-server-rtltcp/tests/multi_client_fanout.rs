@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use sdr_server_rtltcp::broadcaster::{ClientRegistry, ClientSlot};
 use sdr_server_rtltcp::codec::Codec;
+use sdr_server_rtltcp::extension::Role;
 
 /// How many distinct chunks the producer thread fans out in each
 /// test. 32 is small enough for tests to finish quickly, large
@@ -153,12 +154,20 @@ fn two_clients_receive_identical_byte_streams() {
         registry.allocate_id(),
         test_peer(TEST_PEER_A_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
+    // Client B is a listener — pins the post-#392 contract that
+    // fan-out reaches Role::Listen slots identically to Control.
+    // If broadcast ever starts skipping listeners (e.g., a
+    // misplaced `slot.role == Role::Control` filter in the fanout
+    // path), this test flips to failure. Per `CodeRabbit` round 1
+    // on PR #403.
     let (slot_b, rx_b) = ClientSlot::new(
         registry.allocate_id(),
         test_peer(TEST_PEER_B_PORT),
         Codec::None,
+        Role::Listen,
         TEST_FAST_CHANNEL_DEPTH,
     );
     registry.register(slot_a);
@@ -222,10 +231,16 @@ fn slow_client_drops_do_not_block_fast_client() {
     //     sees all 32 chunks in order.
     let registry = Arc::new(ClientRegistry::new());
 
+    // Slow client is the listener — proves a stalled listener
+    // doesn't block the controller's fan-out. This is the
+    // realistic production shape: the Control client is an
+    // active host and the slow neighbor is a passive listener
+    // with a full channel.
     let (slow, _slow_rx) = ClientSlot::new(
         registry.allocate_id(),
         test_peer(TEST_SLOW_PEER_PORT),
         Codec::None,
+        Role::Listen,
         TEST_SLOW_CHANNEL_DEPTH,
     );
     let slow_id = slow.id;
@@ -233,6 +248,7 @@ fn slow_client_drops_do_not_block_fast_client() {
         registry.allocate_id(),
         test_peer(TEST_FAST_PEER_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
     registry.register(slow);
@@ -308,12 +324,17 @@ fn disconnected_client_is_skipped_by_broadcaster_fanout() {
         registry.allocate_id(),
         test_peer(TEST_DISCONNECT_A_PORT),
         Codec::None,
+        Role::Control,
         TEST_FAST_CHANNEL_DEPTH,
     );
+    // Slot B is a listener — pins the post-#392 contract that
+    // mid-stream disconnect skip-on-fanout applies identically
+    // regardless of role.
     let (slot_b, rx_b) = ClientSlot::new(
         registry.allocate_id(),
         test_peer(TEST_DISCONNECT_B_PORT),
         Codec::None,
+        Role::Listen,
         TEST_FAST_CHANNEL_DEPTH,
     );
     let slot_b_handle = slot_b.clone();
