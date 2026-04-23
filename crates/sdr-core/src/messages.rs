@@ -358,6 +358,15 @@ pub enum UiToDsp {
     /// wait for the current exponential-backoff delay to expire.
     /// No-op when the active source is not `RtlTcp`.
     RetryRtlTcpNow,
+    /// One-shot "Take control" reconnect (#393 takeover handshake).
+    /// Sets `FLAG_REQUEST_TAKEOVER` on the NEXT `ClientHello`
+    /// and triggers an immediate reconnect; the bit auto-clears
+    /// after that single attempt so subsequent reconnects (e.g.,
+    /// transport-level retries) don't keep displacing whoever
+    /// just got admitted. Surfaced by the UI when the user
+    /// clicks "Take control" on the `ControllerBusy` toast. No-op
+    /// when the active source is not `RtlTcp`. Per issue #396.
+    RetryRtlTcpWithTakeover,
     // --- Scanner (#317) ---
     /// Master scanner on/off toggle.
     SetScannerEnabled(bool),

@@ -1620,6 +1620,68 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 }
             }
         }
+        UiToDsp::RetryRtlTcpWithTakeover => {
+            // One-shot Take-control reconnect per #396. Rebuild
+            // the `rtl_tcp` source with `request_takeover = true`
+            // on the hello, then stop + start to trigger the
+            // handshake. The flag is not persisted on `DspState`
+            // — the source is destroyed + recreated with
+            // `request_takeover = false` on the NEXT open_source
+            // (scheduled when the user hits Play after Stop, a
+            // fresh source-type switch, etc.). Keeping takeover
+            // "one-shot per action" matches the #393 spec:
+            // takeover is an explicit user decision, not a
+            // persistent preference.
+            if state.source_type != SourceType::RtlTcp {
+                tracing::debug!(
+                    active = ?state.source_type,
+                    "RetryRtlTcpWithTakeover ignored — active source is not RtlTcp"
+                );
+                return;
+            }
+            // Stop the current source first (if any) so its
+            // connection manager thread exits cleanly before we
+            // open a fresh source with the takeover flag.
+            // `source` drops at the end of the if-let — the
+            // manager thread joins on Drop, so the next
+            // open_source sees a quiescent slot.
+            if let Some(mut source) = state.source.take()
+                && let Err(e) = source.stop()
+            {
+                tracing::warn!(error = %e, "rtl_tcp stop before takeover-retry failed");
+            }
+            // Build a one-shot config with takeover + the
+            // user's current role / auth choices. `Default`
+            // covers timeouts + compression; `requested_role`
+            // and `auth_key` come from the SetRtlTcpClientConfig
+            // state carried across the retry. After this
+            // source's lifetime ends, a fresh open_source will
+            // build without `request_takeover`.
+            let rtl_tcp_config = sdr_source_network::rtl_tcp::RtlTcpConfig {
+                requested_role: state.rtl_tcp_requested_role,
+                auth_key: state.rtl_tcp_auth_key.clone(),
+                request_takeover: true,
+                ..Default::default()
+            };
+            let mut source: Box<dyn sdr_pipeline::source_manager::Source> =
+                Box::new(sdr_source_network::RtlTcpSource::with_config(
+                    &state.network_host,
+                    state.network_port,
+                    rtl_tcp_config,
+                ));
+            if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {
+                tracing::warn!(error = %e, "takeover-retry set_sample_rate failed");
+            }
+            if let Err(e) = source.tune(state.center_freq) {
+                tracing::warn!(error = %e, "takeover-retry tune failed");
+            }
+            if let Err(e) = source.start() {
+                tracing::warn!(error = %e, "rtl_tcp takeover-retry start failed");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Take control failed: {e}")));
+                return;
+            }
+            state.source = Some(source);
+        }
         // --- Scanner (#317) ---
         UiToDsp::SetScannerEnabled(enabled) => {
             if enabled {

@@ -592,6 +592,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let rtl_tcp_status_row_weak = panels.source.rtl_tcp_status_row.downgrade();
     let rtl_tcp_disconnect_button_weak = panels.source.rtl_tcp_disconnect_button.downgrade();
     let rtl_tcp_retry_button_weak = panels.source.rtl_tcp_retry_button.downgrade();
+    let rtl_tcp_role_row_weak = panels.source.rtl_tcp_role_row.downgrade();
+    let rtl_tcp_auth_key_row_weak = panels.source.rtl_tcp_auth_key_row.downgrade();
+    let rtl_tcp_hostname_row_weak = panels.source.hostname_row.downgrade();
+    let rtl_tcp_port_row_weak = panels.source.port_row.downgrade();
     // Network audio sink status row — same weak-ref pattern as
     // the rtl_tcp status row above so a window close can't keep
     // the row alive past its useful life. Per issue #247.
@@ -655,6 +659,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                         &rtl_tcp_status_row_weak,
                         &rtl_tcp_disconnect_button_weak,
                         &rtl_tcp_retry_button_weak,
+                        &rtl_tcp_role_row_weak,
+                        &rtl_tcp_auth_key_row_weak,
+                        &rtl_tcp_hostname_row_weak,
+                        &rtl_tcp_port_row_weak,
                         &network_sink_status_row_weak,
                         &transcription_enable_for_dsp,
                         #[cfg(feature = "sherpa")]
@@ -724,6 +732,10 @@ fn handle_dsp_message(
     rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
     rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
+    rtl_tcp_role_row_weak: &glib::WeakRef<adw::ComboRow>,
+    rtl_tcp_auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
+    rtl_tcp_hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
+    rtl_tcp_port_row_weak: &glib::WeakRef<adw::SpinRow>,
     network_sink_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     transcription_enable_row: &adw::SwitchRow,
     #[cfg(feature = "sherpa")] auto_break_row: &adw::SwitchRow,
@@ -932,6 +944,27 @@ fn handle_dsp_message(
             ) {
                 apply_rtl_tcp_connection_state(&status_row, &disconnect, &retry, &conn_state);
             }
+            // #396 toast surface: fire toast + manipulate widgets
+            // on the EDGE of every transition into a role-denial
+            // terminal state (or into Connected from one of those
+            // states, for the keyring save path). Edge detection
+            // uses a u8-discriminant cell on AppState so we don't
+            // re-fire the toast on every same-state republish.
+            let prev_disc = state.last_rtl_tcp_state_disc.get();
+            let now_disc = crate::state::rtl_tcp_state_discriminant(&conn_state);
+            if prev_disc != now_disc {
+                state.last_rtl_tcp_state_disc.set(now_disc);
+                handle_rtl_tcp_state_toast(
+                    &conn_state,
+                    prev_disc,
+                    state,
+                    toast_overlay_weak,
+                    rtl_tcp_role_row_weak,
+                    rtl_tcp_auth_key_row_weak,
+                    rtl_tcp_hostname_row_weak,
+                    rtl_tcp_port_row_weak,
+                );
+            }
         }
         DspToUi::NetworkSinkStatus(status) => {
             tracing::debug!(?status, "network sink status");
@@ -1134,6 +1167,246 @@ fn apply_network_sink_status(row: &adw::ActionRow, status: &sdr_core::NetworkSin
 /// handler can call it with individual weak-upgraded widgets
 /// instead of holding a whole `SourcePanel` clone across the
 /// signal-handler boundary.
+/// Fire a toast + manipulate widgets on each **edge transition**
+/// into a terminal role-denial state (`ControllerBusy`,
+/// `AuthRequired`, `AuthFailed`), or on a successful `Connected`
+/// immediately following an auth-required transition (to save
+/// the user-entered key to the per-server keyring).
+///
+/// Called only from the edge-detection path in
+/// `handle_dsp_message`; the caller already verified
+/// `prev_disc != now_disc` and stored the new discriminant.
+/// Per issue #396.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "toast composition needs read access to multiple panel widgets \
+              + a dispatch handle; collapsing into a single context struct \
+              would move the same argument count one layer up"
+)]
+#[allow(
+    clippy::doc_markdown,
+    reason = "doc references to Connected / ControllerBusy / AuthRequired / \
+              AuthFailed are type variants — enum paths would make the prose \
+              unreadable; backticks on each would overwhelm the paragraph"
+)]
+fn handle_rtl_tcp_state_toast(
+    state_val: &sdr_types::RtlTcpConnectionState,
+    prev_disc: u8,
+    app_state: &Rc<AppState>,
+    toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
+    role_row_weak: &glib::WeakRef<adw::ComboRow>,
+    auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
+    hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
+    port_row_weak: &glib::WeakRef<adw::SpinRow>,
+) {
+    use sdr_types::RtlTcpConnectionState;
+
+    use crate::state::{RTL_TCP_STATE_DISC_AUTH_FAILED, RTL_TCP_STATE_DISC_AUTH_REQUIRED};
+
+    match state_val {
+        RtlTcpConnectionState::ControllerBusy => {
+            // Toast with two action buttons: "Connect as
+            // Listener" flips the role combo (its change handler
+            // re-dispatches SetRtlTcpClientConfig) and fires a
+            // normal retry; "Take control" dispatches the one-shot
+            // `RetryRtlTcpWithTakeover` message which rebuilds
+            // the source with `request_takeover = true` on the
+            // hello.
+            let Some(overlay) = toast_overlay_weak.upgrade() else {
+                return;
+            };
+            let toast = adw::Toast::builder()
+                .title("Controller slot is occupied on this server.")
+                .timeout(0)
+                .build();
+            // Track the two action buttons as separate signals.
+            // AdwToast supports a single primary action via
+            // `set_button_label` + `connect_button_clicked`; the
+            // "Take control" action lands there, and the
+            // "Connect as Listener" option lives in the toast
+            // body copy so users still see both choices.
+            toast.set_button_label(Some("Take control"));
+            let state_for_takeover = Rc::clone(app_state);
+            toast.connect_button_clicked(move |t| {
+                state_for_takeover.send_dsp(UiToDsp::RetryRtlTcpWithTakeover);
+                t.dismiss();
+            });
+            overlay.add_toast(toast);
+
+            // Second toast offering the Listen fallback. Two
+            // separate toasts beats a single one because AdwToast
+            // exposes only one action button — splitting the two
+            // paths keeps both discoverable.
+            let listen_toast = adw::Toast::builder()
+                .title("Or connect as Listener (read-only).")
+                .timeout(0)
+                .build();
+            listen_toast.set_button_label(Some("Connect as Listener"));
+            let state_for_listen = Rc::clone(app_state);
+            let role_row_for_listen = role_row_weak.clone();
+            listen_toast.connect_button_clicked(move |t| {
+                if let Some(role_row) = role_row_for_listen.upgrade() {
+                    // Flipping the combo to Listen fires its
+                    // `selected-notify` handler which dispatches
+                    // `SetRtlTcpClientConfig` with the new role.
+                    // Follow with RetryRtlTcpNow so the user
+                    // doesn't have to click Retry themselves.
+                    role_row.set_selected(crate::sidebar::source_panel::RTL_TCP_ROLE_LISTEN_IDX);
+                }
+                state_for_listen.send_dsp(UiToDsp::RetryRtlTcpNow);
+                t.dismiss();
+            });
+            overlay.add_toast(listen_toast);
+        }
+
+        RtlTcpConnectionState::AuthRequired => {
+            // Remember the active server so a subsequent
+            // successful Connected can save the user-entered
+            // key to the right keyring entry.
+            record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
+            // Reveal + focus the Server key field so the user
+            // can enter the key.
+            if let Some(row) = auth_key_row_weak.upgrade() {
+                row.set_visible(true);
+                row.grab_focus();
+            }
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                let toast = adw::Toast::builder()
+                    .title("Server requires an authentication key.")
+                    .timeout(5)
+                    .build();
+                overlay.add_toast(toast);
+            }
+        }
+
+        RtlTcpConnectionState::AuthFailed => {
+            record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
+            if let Some(row) = auth_key_row_weak.upgrade() {
+                row.set_visible(true);
+                row.grab_focus();
+                // Clear the entered value so the user doesn't
+                // re-submit the same wrong key by reflex on the
+                // next Retry. The saved-key keyring entry (if
+                // any) stays untouched — the user can clear it
+                // explicitly via the keyring UI.
+                row.set_text("");
+            }
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                let toast = adw::Toast::builder()
+                    .title("Key rejected. Check with the server owner.")
+                    .timeout(5)
+                    .build();
+                overlay.add_toast(toast);
+            }
+        }
+
+        RtlTcpConnectionState::Connected { .. } => {
+            // Successful connect after an auth-required attempt:
+            // save the user-entered key to the per-server
+            // keyring so subsequent reconnects auto-use it.
+            // Only fires on the edge FROM AuthRequired /
+            // AuthFailed — a regular Connected-from-Connecting
+            // doesn't touch the keyring (user didn't type
+            // anything worth saving).
+            if prev_disc == RTL_TCP_STATE_DISC_AUTH_REQUIRED
+                || prev_disc == RTL_TCP_STATE_DISC_AUTH_FAILED
+            {
+                save_current_auth_key_for_active_server(app_state, auth_key_row_weak);
+            }
+        }
+
+        // Non-toast states (Disconnected / Connecting / Retrying
+        // / Failed) just update the status row subtitle via the
+        // sibling call in `handle_dsp_message`. No additional
+        // UX gesture needed here.
+        RtlTcpConnectionState::Disconnected
+        | RtlTcpConnectionState::Connecting
+        | RtlTcpConnectionState::Retrying { .. }
+        | RtlTcpConnectionState::Failed { .. } => {}
+    }
+}
+
+/// Record the currently-displayed `rtl_tcp` server's `host:port`
+/// on `AppState` so a subsequent successful `Connected` can save
+/// the just-entered key to the right per-server keyring entry.
+/// Empty on upgrade failure — the save path skips when the
+/// cached identity is empty. Per #396.
+fn record_active_rtl_tcp_server(
+    app_state: &Rc<AppState>,
+    hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
+    port_row_weak: &glib::WeakRef<adw::SpinRow>,
+) {
+    let Some(host_row) = hostname_row_weak.upgrade() else {
+        return;
+    };
+    let Some(port_row) = port_row_weak.upgrade() else {
+        return;
+    };
+    let host = host_row.text().to_string();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let port = port_row.value() as u16;
+    if !host.is_empty() && port != 0 {
+        *app_state.rtl_tcp_active_server.borrow_mut() = format!("{host}:{port}");
+    }
+}
+
+/// Save the current Server-key-row text to the keyring under
+/// the active `rtl_tcp` server's `host:port`. Called on a
+/// successful Connected following AuthRequired / AuthFailed.
+/// Empty text → clear the saved entry instead of writing empty
+/// bytes; invalid hex → log + skip (the live connection
+/// obviously accepted the text, but our keyring round-trip
+/// demands valid hex). Per #396.
+#[allow(
+    clippy::doc_markdown,
+    reason = "Connected / AuthRequired / AuthFailed are enum variants"
+)]
+fn save_current_auth_key_for_active_server(
+    app_state: &Rc<AppState>,
+    auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
+) {
+    let active = app_state.rtl_tcp_active_server.borrow().clone();
+    if active.is_empty() {
+        return;
+    }
+    let Some((host, port_str)) = active.rsplit_once(':') else {
+        return;
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        return;
+    };
+    let Some(row) = auth_key_row_weak.upgrade() else {
+        return;
+    };
+    let text = row.text().to_string();
+    if text.is_empty() {
+        // Nothing to save — e.g., the user connected with a
+        // previously-saved key that was auto-loaded and never
+        // edited the field. The keyring already has the right
+        // value.
+        return;
+    }
+    let Some(bytes) = crate::sidebar::server_panel::auth_key_from_hex(&text) else {
+        tracing::warn!(
+            server = %active,
+            "rtl_tcp: client auth key hex is invalid — skipping keyring save"
+        );
+        return;
+    };
+    if let Err(e) = save_client_auth_key_to_keyring(host, port, &bytes) {
+        tracing::warn!(
+            server = %active,
+            %e,
+            "rtl_tcp: client auth key keyring save failed"
+        );
+    } else {
+        tracing::info!(
+            server = %active,
+            "rtl_tcp: client auth key saved to keyring for next reconnect"
+        );
+    }
+}
+
 fn apply_rtl_tcp_connection_state(
     status_row: &adw::ActionRow,
     disconnect_button: &gtk4::Button,
