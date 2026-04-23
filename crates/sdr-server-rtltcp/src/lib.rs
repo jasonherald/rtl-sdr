@@ -33,6 +33,7 @@
 //! #391 as the first step of the #390 multi-client epic; the data
 //! path flip that consumes it ships in the next commit.
 
+pub mod auth;
 pub mod broadcaster;
 pub mod codec;
 pub mod dispatch;

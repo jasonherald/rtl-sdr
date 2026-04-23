@@ -471,6 +471,9 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
             // one that currently offers LZ4.
             compression: CodecMask::NONE_ONLY,
             listener_cap,
+            // Auth (#394) is off for this commit — wiring the
+            // FFI auth_key field lands later on this branch.
+            auth_key: None,
         };
         match Server::start(server_cfg) {
             Ok(server) => {

@@ -44,6 +44,12 @@ sdr-rtltcp-discovery = { workspace = true, optional = true }
 # mask at handshake time, which doesn't require the codec trait impls
 # to be absent.
 lz4_flex.workspace = true
+# Optional pre-shared-key auth (#394). `rand::rngs::OsRng` generates
+# the 32-byte server key; `subtle::ConstantTimeEq` compares a
+# client-provided key against the expected value without leaking
+# timing info about where a mismatch occurred.
+rand.workspace = true
+subtle.workspace = true
 
 # Non-unix (Windows, WASI, etc.) keepalive enable for the #393
 # zombie-detection fallback path. `std::net::TcpStream` has no

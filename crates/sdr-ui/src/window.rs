@@ -3816,6 +3816,11 @@ fn build_server_config_from_panel(panel: &ServerSwitchWidgets) -> ServerConfig {
         buffer_capacity: SERVER_BUFFER_CAPACITY_DEFAULT,
         compression,
         listener_cap: sdr_server_rtltcp::DEFAULT_LISTENER_CAP,
+        // Auth defaults to off (None) — enabling it lives behind
+        // the #395 server UI toggle. #394 ships the wire + server
+        // enforcement plumbing; the UI knob + keyring storage
+        // hooks come in the follow-up sub-issue.
+        auth_key: None,
     }
 }
 

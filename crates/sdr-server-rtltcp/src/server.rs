@@ -171,6 +171,33 @@ pub struct ServerConfig {
     /// so the cap doesn't apply to them. Default:
     /// [`DEFAULT_LISTENER_CAP`]. #392.
     pub listener_cap: usize,
+
+    /// Pre-shared auth key. `None` disables the auth gate entirely
+    /// (default — matches the issue's "LAN-only trust model
+    /// continues to work as today"). When `Some(key)`, the server
+    /// validates every connecting client's [`AuthKeyMessage`]
+    /// against this value using a constant-time compare; clients
+    /// that don't produce a matching key are denied with
+    /// [`Status::AuthFailed`] and the connection is closed. Auth
+    /// runs BEFORE the role / listener-cap gate — an
+    /// unauthenticated client isn't even evaluated for role.
+    ///
+    /// Per-byte threat model: the key travels as cleartext over
+    /// the TCP connection. Fine for casual on-LAN cohabitants
+    /// and IoT-trust-zone separation; NOT suitable for WAN-grade
+    /// security. Deployments that need real confidentiality
+    /// should wrap the socket in SSH / WireGuard / Tailscale
+    /// first and use the PSK as a second layer. See #394 for the
+    /// full threat model discussion.
+    ///
+    /// Key length must be in `1..=crate::extension::MAX_AUTH_KEY_LEN`
+    /// — enforced at [`AuthKeyMessage`] serialization/parse time,
+    /// so a zero-length or oversize value here would fail-fast at
+    /// handshake rather than silently accepting anyone. #394.
+    ///
+    /// [`AuthKeyMessage`]: crate::extension::AuthKeyMessage
+    /// [`Status::AuthFailed`]: crate::extension::Status::AuthFailed
+    pub auth_key: Option<Vec<u8>>,
 }
 
 impl ServerConfig {
@@ -185,6 +212,7 @@ impl ServerConfig {
             buffer_capacity: DEFAULT_BUFFER_CAPACITY,
             compression: crate::codec::CodecMask::NONE_ONLY,
             listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: None,
         }
     }
 }
@@ -1829,6 +1857,7 @@ mod tests {
             buffer_capacity: 0,
             compression: CodecMask::NONE_ONLY,
             listener_cap: DEFAULT_LISTENER_CAP,
+            auth_key: None,
         };
         match Server::start(config) {
             Err(ServerError::PortInUse(ref addr)) => {

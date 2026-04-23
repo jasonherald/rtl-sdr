@@ -185,6 +185,21 @@ sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "6
 dirs-next = "2"
 libc = "0.2"
 
+# Random number generation. Pulled in for the rtl_tcp optional-auth
+# server (#394) key generator — `OsRng` wraps `/dev/urandom` on
+# unix and `BCryptGenRandom` on Windows, which is what we want for
+# a 32-byte pre-shared key (CSPRNG quality, no seed management).
+# Pinned to 0.8.x until we need the 0.9 API rework; 0.8 is still
+# the ecosystem-majority version as of the workspace's 1.95 pin.
+rand = "0.8"
+
+# Constant-time primitives. Used by the rtl_tcp optional-auth
+# server (#394) for the `ConstantTimeEq` compare between the
+# client-provided key and the configured expected key. Rolling
+# a constant-time `memcmp` by hand is easy to get wrong; this
+# crate is the standard Rust answer and has zero runtime deps.
+subtle = "2.5"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
