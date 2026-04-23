@@ -18,7 +18,7 @@ Replace the single scrollable sidebar with a **VS Code-style activity-bar + slid
 
 ## 2. Layout
 
-```
+```text
 ┌──┬──────────────────────────────────────────────┬──┐
 │  │ Header bar: [▶] 146.520.000 Hz [NFM▾] [🔊]  │  │
 │  ├─────────────────────────────────────────────┬┤  │
@@ -68,6 +68,7 @@ One icon today. The strip exists as a single-icon strip so (a) the layout is sym
 - **Icon size:** 16 px symbolic (GNOME convention).
 - **Selected indicator:** libadwaita `accent` CSS class on the toggle button — same visual treatment as other selected-state controls in the app (Play button when running, role badge accent, etc.). Optionally add a 2 px vertical accent-colored bar on the inside edge of the button matching VS Code's "selected strip" idiom, which reinforces the "this is where you are" signal.
 - **Tooltip on hover:** full activity name + keyboard shortcut (e.g., `"Radio (Ctrl+2)"`).
+- **Accessibility label (required):** every icon-only activity button (both left and right bars) MUST set an explicit `GtkAccessible` label via `gtk4::accessible::Property::Label(...)` at construction time (e.g., `"Radio panel"`, `"Toggle transcript panel"`). Screen readers and keyboard users MUST NOT rely on tooltip text for an accessible name — tooltips are hover-only and invisible to assistive tech. This is a codebase-wide rule for icon-only buttons; the activity bar follows it.
 - **Hover effect:** standard GTK button hover — subtle background lightening.
 - **Packing:** `GtkBox` orientation=vertical, spacing=0. Icons flush against the top of the bar, leaving bottom empty for future utility icons (settings gear? about? — not v1).
 
@@ -193,7 +194,7 @@ Activity bars always visible on both sides — they're only 44 px each so the 88
 
 New keys under a fresh `ui.sidebar` namespace:
 
-```
+```text
 ui.sidebar.left.selected        = "general" | "radio" | "audio" | "display" | "scanner"
 ui.sidebar.left.open            = true | false
 ui.sidebar.left.width_px        = 320
