@@ -27,6 +27,11 @@ const DEFAULT_SAMPLE_RATE_TEXT: &str = "SR: --";
 const DEFAULT_DEMOD_TEXT: &str = "-- --";
 /// Default frequency display text when no data has arrived.
 const DEFAULT_FREQUENCY_TEXT: &str = "-- Hz";
+/// Default antenna-dimension text when no frequency is set yet. The
+/// label itself stays invisible in this state so the status bar
+/// reads cleanly at app launch; `update_frequency` reveals it once
+/// a valid tuned frequency lands. Per issue #157.
+const DEFAULT_ANTENNA_TEXT: &str = "";
 /// Default cursor readout text when the cursor is not over the spectrum.
 const DEFAULT_CURSOR_TEXT: &str = "Cursor: --";
 
@@ -61,6 +66,16 @@ pub struct StatusBar {
     pub demod_label: gtk4::Label,
     /// Label showing center frequency.
     pub frequency_label: gtk4::Label,
+    /// Label showing half-wave + quarter-wave antenna dimensions for
+    /// the current frequency. Paired with [`antenna_separator`] so
+    /// both toggle together when the label has nothing to render
+    /// (e.g. sub-3-kHz inputs, which would balloon into kilometre
+    /// wavelengths). Per issue #157.
+    pub antenna_label: gtk4::Label,
+    /// Separator packed immediately before `antenna_label`. Hidden
+    /// in lockstep with the label so a no-render state doesn't
+    /// leave a floating separator.
+    pub antenna_separator: gtk4::Separator,
     /// Label showing cursor frequency and power readout.
     pub cursor_label: gtk4::Label,
     /// `rtl_tcp` role badge — "Controller" (accent color) or
@@ -94,9 +109,22 @@ impl StatusBar {
             .set_label(&format!("{mode} {}", format_bandwidth(bw)));
     }
 
-    /// Update the center frequency display.
+    /// Update the center frequency display. Also refreshes the
+    /// companion antenna-dimension label (half-wave + quarter-wave
+    /// arm length) for the same frequency so the builder value
+    /// stays in sync with the tuned band. Hidden when the
+    /// frequency is below the renderable floor (see
+    /// [`crate::antenna::MIN_RENDERABLE_FREQUENCY_HZ`]).
     pub fn update_frequency(&self, hz: f64) {
         self.frequency_label.set_label(&format_frequency(hz));
+        if let Some(text) = crate::antenna::format_antenna_line(hz) {
+            self.antenna_label.set_label(&text);
+            self.antenna_label.set_visible(true);
+            self.antenna_separator.set_visible(true);
+        } else {
+            self.antenna_label.set_visible(false);
+            self.antenna_separator.set_visible(false);
+        }
     }
 
     /// Update the `rtl_tcp` role badge. `Some(RtlTcpRoleBadge::
@@ -151,6 +179,11 @@ pub fn build_status_bar() -> StatusBar {
     let sample_rate_label = gtk4::Label::new(Some(DEFAULT_SAMPLE_RATE_TEXT));
     let demod_label = gtk4::Label::new(Some(DEFAULT_DEMOD_TEXT));
     let frequency_label = gtk4::Label::new(Some(DEFAULT_FREQUENCY_TEXT));
+    let antenna_label = gtk4::Label::new(Some(DEFAULT_ANTENNA_TEXT));
+    antenna_label.add_css_class("dim-label");
+    antenna_label.set_visible(false);
+    let antenna_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
+    antenna_separator.set_visible(false);
     let cursor_label = gtk4::Label::new(Some(DEFAULT_CURSOR_TEXT));
     let role_label = gtk4::Label::new(Some(DEFAULT_ROLE_TEXT));
     role_label.set_visible(false);
@@ -170,6 +203,12 @@ pub fn build_status_bar() -> StatusBar {
     widget.append(&demod_label);
     widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     widget.append(&frequency_label);
+    // Antenna-dimension label packs immediately after the
+    // frequency label so builders reading the screen can scan
+    // right across the pair: "146.52 MHz · λ/2 1.02 m · λ/4 51.2 cm"
+    // Per issue #157.
+    widget.append(&antenna_separator);
+    widget.append(&antenna_label);
     widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     widget.append(&cursor_label);
     widget.append(&role_separator);
@@ -181,6 +220,8 @@ pub fn build_status_bar() -> StatusBar {
         sample_rate_label,
         demod_label,
         frequency_label,
+        antenna_label,
+        antenna_separator,
         cursor_label,
         role_label,
         role_separator,
