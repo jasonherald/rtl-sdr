@@ -259,6 +259,37 @@ pub struct RtlTcpConfig {
     /// prior controller. Per #393 + `CodeRabbit` round 1 on
     /// PR #404 (doc clarification).
     pub request_takeover: bool,
+
+    /// Pre-shared auth key to send in the extended handshake
+    /// (#394). `None` means "no key" (default); `Some(bytes)`
+    /// activates the eager-auth path: hello's `FLAG_HAS_AUTH`
+    /// bit is set AND the client immediately follows with an
+    /// `AuthKeyMessage` carrying these bytes. Server-side
+    /// behavior:
+    /// - If the server doesn't require auth, the key is
+    ///   discarded server-side (stream-sync only) and the
+    ///   handshake proceeds normally.
+    /// - If the server requires auth and the key matches
+    ///   (constant-time compare), the handshake proceeds.
+    /// - If the server requires auth and the key doesn't match,
+    ///   the server responds with `status=AuthFailed` and
+    ///   closes; the client's manager transitions to `Failed`
+    ///   with a Protocol-kind error so the UI can surface
+    ///   "wrong key" guidance.
+    ///
+    /// **RTLX-only — NOT safe against vanilla servers.** Same
+    /// hazard as [`Self::request_takeover`] — setting this
+    /// triggers a `ClientHello` emission via the
+    /// `extension_enabled` gate below, and vanilla rtl_tcp
+    /// servers misinterpret the 8-byte hello as two 5-byte
+    /// commands. Gate this on the same out-of-band evidence
+    /// that gates `compression` / `request_takeover` (mDNS
+    /// TXT `codecs=3`, or cached server-profile knowledge).
+    ///
+    /// Keys are cleartext over TCP — the threat model is
+    /// casual LAN isolation, not WAN-grade security. See #394
+    /// for the full threat model discussion. #394.
+    pub auth_key: Option<Vec<u8>>,
 }
 
 impl Default for RtlTcpConfig {
@@ -269,6 +300,7 @@ impl Default for RtlTcpConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
             request_takeover: false,
+            auth_key: None,
         }
     }
 }
@@ -889,18 +921,31 @@ fn attempt_connect(
     // Default `compression = NONE_ONLY && request_takeover =
     // false` → no hello → wire-compatible with every rtl_tcp
     // server on earth. Per #307 / #393.
-    let extension_enabled = config.compression != CodecMask::NONE_ONLY || config.request_takeover;
+    let extension_enabled = config.compression != CodecMask::NONE_ONLY
+        || config.request_takeover
+        || config.auth_key.is_some();
     if extension_enabled {
-        let flags = if config.request_takeover {
-            // Bit 0 of the reserved flags byte is
-            // `FLAG_REQUEST_TAKEOVER`. Setting it tells #392+
-            // servers to kick the existing Control client and
-            // admit us instead (when the slot is busy); servers
-            // without role support ignore the whole hello. #393.
-            sdr_server_rtltcp::extension::FLAG_REQUEST_TAKEOVER
-        } else {
-            CLIENT_HELLO_FLAGS_NONE
-        };
+        // Compose the flags byte. Each bit is independently set
+        // based on config — takeover and auth can co-exist on
+        // the same hello. Servers without role / auth support
+        // ignore the whole hello, but the RTLX-only hazard still
+        // applies (see the field docs for the mDNS `codecs=`
+        // gate).
+        let mut flags = CLIENT_HELLO_FLAGS_NONE;
+        if config.request_takeover {
+            // Bit 0: `FLAG_REQUEST_TAKEOVER`. Tells #392+ servers
+            // to kick the existing Control client (when the slot
+            // is busy) and admit us instead. #393.
+            flags |= sdr_server_rtltcp::extension::FLAG_REQUEST_TAKEOVER;
+        }
+        if config.auth_key.is_some() {
+            // Bit 1: `FLAG_HAS_AUTH`. Announces that an
+            // `AuthKeyMessage` follow-up lands immediately after
+            // this hello. Server reads the follow-up in the
+            // same receive-buffer position without a round-trip
+            // to request it. #394.
+            flags |= sdr_server_rtltcp::extension::FLAG_HAS_AUTH;
+        }
         let hello = ClientHello {
             codec_mask: config.compression,
             // sdr-rs clients always request Control on connect;
@@ -913,6 +958,32 @@ fn attempt_connect(
         };
         if let Err(e) = (&stream).write_all(&hello.to_bytes()) {
             return Err(SourceError::Io(e));
+        }
+
+        // Auth-key follow-up (#394 eager path). When configured,
+        // the AuthKeyMessage lands immediately after the hello
+        // — the server has already seen `FLAG_HAS_AUTH` set and
+        // is in the "read auth follow-up" state. Message format:
+        // 4-byte `RTKA` magic + 2-byte u16 BE length + key bytes.
+        // `AuthKeyMessage::to_bytes` returns `None` on empty or
+        // over-max keys; we surface that as a clear protocol
+        // error since the caller's config is busted — rather
+        // than write nothing and have the server stall on
+        // `read_exact`.
+        if let Some(key) = &config.auth_key {
+            let msg = sdr_server_rtltcp::extension::AuthKeyMessage { key: key.clone() };
+            let wire = msg.to_bytes().ok_or_else(|| {
+                SourceError::Protocol(format!(
+                    "RtlTcpConfig.auth_key length {} invalid for AuthKeyMessage (must be \
+                     1..={MAX}; 32-byte URL-safe base64 is the canonical server-\
+                     generated shape)",
+                    key.len(),
+                    MAX = sdr_server_rtltcp::extension::MAX_AUTH_KEY_LEN,
+                ))
+            })?;
+            if let Err(e) = (&stream).write_all(&wire) {
+                return Err(SourceError::Io(e));
+            }
         }
     }
 
@@ -1656,6 +1727,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             compression: sdr_server_rtltcp::codec::CodecMask::NONE_ONLY,
             request_takeover: false,
+            auth_key: None,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -1922,6 +1994,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
+            auth_key: None,
         };
         (listener, config)
     }
@@ -2169,6 +2242,7 @@ mod tests {
             // "compression != NONE_ONLY OR request_takeover".
             compression: CodecMask::NONE_ONLY,
             request_takeover: true,
+            auth_key: None,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2249,6 +2323,7 @@ mod tests {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             compression: CodecMask::NONE_AND_LZ4,
             request_takeover: false,
+            auth_key: None,
         };
         let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
         src.start_manager().unwrap();
@@ -2264,6 +2339,185 @@ mod tests {
             "request_takeover = false must clear FLAG_REQUEST_TAKEOVER \
              in the hello (got flags byte 0x{flags_byte:02x})"
         );
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_sends_auth_key_when_config_opts_in() {
+        // **Regression test for #394.** When
+        // `RtlTcpConfig::auth_key = Some(key)`, the client must
+        // emit `FLAG_HAS_AUTH` on the hello AND follow with an
+        // `AuthKeyMessage` carrying the configured bytes. Pairs
+        // with the server-side `sniff_auth_key_message` tests in
+        // `sdr_server_rtltcp::server::tests` — this test locks
+        // in the client's end of the same wire contract.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected_key = b"the-shared-secret-32-bytes-!!".to_vec();
+        let expected_key_for_server = expected_key.clone();
+
+        let (hello_tx, hello_rx) = std::sync::mpsc::channel::<[u8; CLIENT_HELLO_LEN]>();
+        let (auth_tx, auth_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(RTLX_TEST_STATE_DEADLINE))
+                .unwrap();
+            let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+            sock.read_exact(&mut hello_buf).expect("read hello");
+            let _ = hello_tx.send(hello_buf);
+            // Read the AuthKeyMessage follow-up: 6-byte header
+            // (RTKA + u16 key_len) then key_len bytes.
+            let mut header = [0u8; sdr_server_rtltcp::extension::AUTH_KEY_HEADER_LEN];
+            sock.read_exact(&mut header).expect("read auth header");
+            let key_len = sdr_server_rtltcp::extension::AuthKeyMessage::parse_header_len(&header)
+                .expect("valid header");
+            let mut body = vec![0u8; key_len as usize];
+            sock.read_exact(&mut body).expect("read auth body");
+            let _ = auth_tx.send(body);
+            // Accept the handshake so the client reaches
+            // Connected.
+            let header_out = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: RTLX_TEST_GAIN_COUNT,
+            }
+            .to_bytes();
+            sock.write_all(&header_out).unwrap();
+            let ext = ServerExtension {
+                codec: Codec::None,
+                granted_role: Some(Role::Control),
+                status: Status::Ok,
+                version: PROTOCOL_VERSION,
+            };
+            sock.write_all(&ext.to_bytes()).unwrap();
+            thread::sleep(RTLX_TEST_SERVER_HOLD);
+            // Consume the server's copy so the test data stays
+            // alive until the thread runs.
+            let _ = expected_key_for_server;
+        });
+
+        let config = RtlTcpConfig {
+            data_read_timeout: RTLX_TEST_DATA_READ_TIMEOUT,
+            max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            // Auth opt-in triggers the hello even without
+            // compression — the `extension_enabled` gate is
+            // `compression != NONE_ONLY OR request_takeover OR
+            // auth_key.is_some()`.
+            compression: CodecMask::NONE_ONLY,
+            request_takeover: false,
+            auth_key: Some(expected_key.clone()),
+        };
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        src.start_manager().unwrap();
+
+        let hello = hello_rx
+            .recv_timeout(RTLX_TEST_STATE_DEADLINE)
+            .expect("server should receive hello within deadline");
+        assert_eq!(&hello[..EXTENSION_MAGIC.len()], &EXTENSION_MAGIC);
+        let flags_byte = hello[6];
+        assert_ne!(
+            flags_byte & sdr_server_rtltcp::extension::FLAG_HAS_AUTH,
+            0,
+            "auth_key = Some(..) must set FLAG_HAS_AUTH bit in the \
+             hello (got flags byte 0x{flags_byte:02x})"
+        );
+        let observed_key = auth_rx
+            .recv_timeout(RTLX_TEST_STATE_DEADLINE)
+            .expect("server should receive auth key within deadline");
+        assert_eq!(
+            observed_key, expected_key,
+            "client must emit the configured key bytes verbatim"
+        );
+
+        src.stop_manager();
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn rtlx_handshake_omits_auth_flag_when_no_auth_key_configured() {
+        // Complement to the auth opt-in test: when `auth_key =
+        // None`, the hello's `FLAG_HAS_AUTH` bit must be clear
+        // AND the server must not observe any bytes after the
+        // 8-byte hello (the client sends no AuthKeyMessage).
+        // Protects against a bug that hard-codes the flag or
+        // always emits a key.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (hello_tx, hello_rx) = std::sync::mpsc::channel::<[u8; CLIENT_HELLO_LEN]>();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<std::io::Result<usize>>();
+        let server_thread = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(RTLX_TEST_STATE_DEADLINE))
+                .unwrap();
+            let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+            sock.read_exact(&mut hello_buf).expect("read hello");
+            let _ = hello_tx.send(hello_buf);
+            // Probe with a short timeout for any additional
+            // bytes — expect WouldBlock / TimedOut because the
+            // client shouldn't have sent an AuthKeyMessage.
+            sock.set_read_timeout(Some(NO_HELLO_PROBE_TIMEOUT)).unwrap();
+            let mut probe_buf = [0u8; 8];
+            let read_result = sock.read(&mut probe_buf);
+            let _ = probe_tx.send(read_result);
+            sock.set_read_timeout(None).unwrap();
+            let header_out = DongleInfo {
+                tuner: TunerTypeCode::R820t,
+                gain_count: RTLX_TEST_GAIN_COUNT,
+            }
+            .to_bytes();
+            sock.write_all(&header_out).unwrap();
+            let ext = ServerExtension {
+                codec: Codec::Lz4,
+                granted_role: Some(Role::Control),
+                status: Status::Ok,
+                version: PROTOCOL_VERSION,
+            };
+            sock.write_all(&ext.to_bytes()).unwrap();
+            thread::sleep(RTLX_TEST_SERVER_HOLD);
+        });
+
+        // Compression-only opt-in, no auth.
+        let config = RtlTcpConfig {
+            data_read_timeout: RTLX_TEST_DATA_READ_TIMEOUT,
+            max_consecutive_timeouts: 2,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            compression: CodecMask::NONE_AND_LZ4,
+            request_takeover: false,
+            auth_key: None,
+        };
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        src.start_manager().unwrap();
+
+        let hello = hello_rx
+            .recv_timeout(RTLX_TEST_STATE_DEADLINE)
+            .expect("server should receive hello within deadline");
+        let flags_byte = hello[6];
+        assert_eq!(
+            flags_byte & sdr_server_rtltcp::extension::FLAG_HAS_AUTH,
+            0,
+            "auth_key = None must clear FLAG_HAS_AUTH bit in the hello"
+        );
+
+        // Server probe for follow-up bytes. Must time out — no
+        // AuthKeyMessage means nothing more on the wire before
+        // the server's response.
+        let probe_result = probe_rx
+            .recv_timeout(RTLX_TEST_STATE_DEADLINE)
+            .expect("server probe should resolve within deadline");
+        match probe_result {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Ok(0) => {}
+            Ok(n) => panic!(
+                "client with auth_key = None must NOT emit any follow-up bytes, \
+                 but server observed {n} byte(s) after the hello"
+            ),
+            Err(e) => panic!("unexpected server probe error: {e:?}"),
+        }
 
         src.stop_manager();
         let _ = server_thread.join();
