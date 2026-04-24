@@ -1755,9 +1755,11 @@ struct LayoutHandles {
     spectrum_handle: spectrum::SpectrumHandle,
     status_bar: StatusBar,
     transcript_panel: sidebar::transcript_panel::TranscriptPanel,
-    /// General activity panel — landing view. Exposes its expander
-    /// rows so the header bookmarks toggle can open the Bookmarks
-    /// section on focus.
+    /// General activity panel — landing view. Hosts band presets
+    /// and source as flat `AdwPreferencesGroup`s on an
+    /// `AdwPreferencesPage`. Bookmarks live in the right activity
+    /// stack (not here); `rtl_tcp` share controls live in the Share
+    /// left activity (not here).
     general_panel: sidebar::GeneralPanel,
 }
 
@@ -1767,12 +1769,12 @@ fn build_layout(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) -> LayoutHandles {
     // Sidebar panels — constructed flat; each lives in its own
-    // activity stack child (no shared scroll wrapper anymore).
-    // Sub-ticket #422 lands the General activity's composed panel
-    // (band presets + bookmarks + source + rtl_tcp share); the
-    // remaining four activities host their source panel widget
-    // directly until sub-tickets #423-#426 refactor each into
-    // the expander-row layout.
+    // activity stack child (no shared scroll wrapper). The
+    // General activity composes band presets + source into an
+    // `AdwPreferencesPage`; Radio / Audio / Display / Scanner /
+    // Share host their respective panel widgets directly until
+    // sub-tickets #423-#426 refactor each into the expander-row
+    // layout. Bookmarks lives in the right activity stack.
     let panels = sidebar::build_panels();
     sidebar::server_panel::connect_server_panel_persistence(&panels.server, config);
 
@@ -3911,32 +3913,21 @@ fn clear_client_auth_key_from_keyring(
     store.delete(&entry)
 }
 
-/// Wire the server panel end-to-end: visibility gating, the master
-/// share-over-network switch, and its downstream start/stop effects.
-/// Errors surface via the `toast_overlay`, and the switch auto-
-/// reverts to its off state so the UI never lies about whether a
-/// server is actually running.
+/// Wire the server panel end-to-end: the master share-over-network
+/// switch (start/stop + control locking), periodic `Server::stats()`
+/// polling (rendered status rows + auto-stop on `has_stopped()`), and
+/// the bandwidth advisory that toggles on the device-default sample
+/// rate. Errors surface via the `toast_overlay`, and the switch
+/// auto-reverts to its off state on start failure so the UI never
+/// lies about whether a server is actually running.
 ///
-/// Visibility rule:
-/// 1. at least one RTL-SDR dongle is visible on the local USB bus
-///    (`sdr_rtlsdr::get_device_count() > 0`), and
-/// 2. the active source type is **not** RTL-SDR — re-exposing the
-///    same dongle over `rtl_tcp` while a local `RtlSdrSource` is
-///    holding it would cause a USB-device double-open, and
-/// 3. OR the server is already running (keep the panel visible so
-///    the user can reach the Stop switch no matter what).
-///
-/// Visibility is recomputed on three triggers so the panel feels
-/// responsive without polling the world: a low-frequency timer that
-/// handles the USB side (hotplug has no GTK signal we can subscribe
-/// to), a `device_row.connect_selected_notify` handler that fires
-/// on every source-type change, and the share-row start/stop path
-/// itself. A `Cell<u32>` tracks the last-seen device count so we
-/// only pay the widget-state-update cost on an actual edge.
-#[allow(
-    clippy::too_many_lines,
-    reason = "GTK signal-wiring: visibility + start-stop + control-locking all share state via nested closures — splitting scatters the captures"
-)]
+/// The panel itself is always visible — Share is its own activity on
+/// the left activity bar (📡), so the legacy hotplug-gated
+/// hide/show timer, the device-count cache, and the
+/// `device_row.connect_selected_notify` handler that fed it are gone.
+/// The start path still rejects a "local RTL-SDR is the active
+/// source" conflict via an exclusivity toast inside the share-switch
+/// handler — that guard is independent of the removed machinery.
 fn connect_server_panel(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
