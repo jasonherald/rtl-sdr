@@ -26,6 +26,13 @@ struct ContentView: View {
     @Environment(CoreModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
 
+    /// Appearance override applied via `.preferredColorScheme(_:)`
+    /// at the root. Read directly from `UserDefaults` (same key
+    /// the Display panel writes) — `@AppStorage` here would set
+    /// up two write paths and diverge if the Display picker and
+    /// this binding ever fired in the same tick. Per #446.
+    @AppStorage("SDRMac.appearance") private var rawAppearance: String = "system"
+
     // ----------------------------------------------------------
     //  Pre-redesign toolbar-driven surfaces — preserved as-is
     //  during scaffolding. #448 may relocate the right flyouts
@@ -169,6 +176,10 @@ struct ContentView: View {
                 shortcutModifiers: [.command, .shift]
             )
         }
+        // Display panel's Appearance picker writes the same
+        // UserDefaults key; this read drives the actual
+        // window-wide override. Per #446.
+        .preferredColorScheme((Appearance(rawValue: rawAppearance) ?? .system).colorScheme)
         .toolbar {
             HeaderToolbar(
                 showingRadioReference: $showingRadioReference,

@@ -34,20 +34,26 @@ struct LeftPanelHost: View {
         // proper multi-section `<X>PanelView` without changing
         // what the user sees on first click.
         case .radio:
-            LegacySectionPanel { RadioSection() }
+            // #444 — five flat sections (Bandwidth / Squelch /
+            // Filters / De-emphasis / CTCSS placeholder).
+            RadioPanelView()
         case .audio:
-            // Audio activity owns recording UI for now;
-            // #445 expands to volume + output device picker
-            // + network sink rows as additional sections.
-            LegacySectionPanel { RecordingSection() }
+            // #445 — Output / Volume / Network sink / Recording.
+            AudioPanelView()
         case .display:
-            LegacySectionPanel { DisplaySection() }
+            // #446 — FFT / Waterfall placeholder / Levels /
+            // Appearance.
+            DisplayPanelView()
         case .scanner:
-            // Scanner has no pre-redesign Mac section to host
-            // — its UI is brand-new in #447.
+            // #447 deferred: the Mac CoreModel doesn't expose
+            // any scanner state yet (the engine's `sdr-scanner`
+            // crate has no FFI surface — the C ABI still
+            // needs the matching commands + events). Until
+            // that lands, clicking Scanner shows a clear
+            // placeholder.
             ComingSoonPanel(
                 activity: activity,
-                followUpTicket: "#447 — Scanner panel"
+                followUpTicket: "#447 — Scanner panel (blocked on FFI surface)"
             )
         case .share:
             // Share = rtl_tcp server (and eventually client +
