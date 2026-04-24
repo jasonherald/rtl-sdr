@@ -1,9 +1,16 @@
 //! Waterfall display renderer using Cairo.
 //!
-//! Renders a scrolling spectrogram: each FFT frame becomes one horizontal line
-//! in a display buffer, mapped through a colormap for visualization. Uses a
-//! simple shift-down approach — each new line is inserted at the top and all
-//! existing rows shift down by one.
+//! Renders a scrolling spectrogram: each FFT frame becomes one horizontal
+//! line in a display buffer, mapped through a colormap for visualization.
+//! The buffer is laid out in Cairo ARGB32 format as a **logical ring**
+//! — new lines are written at a rotating `top_row` offset and
+//! [`WaterfallRenderer::render`] paints the source surface in two clipped
+//! regions to stitch the wrap back into visual order (newest on top).
+//!
+//! This avoids the per-frame memmove that would otherwise cost
+//! `display_width · (HISTORY_LINES-1) · 4` bytes of ring-buffer
+//! shift-down every frame — ~1 GB/sec at 4K under naive shift-down,
+//! per the epic #452 investigation (PR #458).
 
 use gtk4::cairo;
 
@@ -393,16 +400,9 @@ impl WaterfallRenderer {
         .map_err(|e| format!("surface: {e}"))
     }
 
-    /// Export the waterfall display to a PNG file.
-    ///
-    /// The PNG expects rows in visual order (newest on top), but the
-    /// internal `pixel_buf` is in ring-buffer order keyed off
-    /// `top_row`. We walk the ring once to materialize a linear copy
-    /// here — one allocation per export, which is negligible for a
-    /// user-triggered "save to PNG" operation.
     /// Walk the ring buffer once to produce a linearly-ordered copy
     /// of `pixel_buf` — display row 0 on top, row `HISTORY_LINES-1`
-    /// on the bottom. Used by `export_png` and covered by a
+    /// on the bottom. Used by [`Self::export_png`] and covered by a
     /// dedicated test so the ordering is verifiable without
     /// round-tripping through PNG I/O.
     fn linearized_pixel_buf(&self) -> Vec<u8> {
@@ -417,6 +417,14 @@ impl WaterfallRenderer {
         linear
     }
 
+    /// Export the waterfall display to a PNG file.
+    ///
+    /// The PNG expects rows in visual order (newest on top), but the
+    /// internal `pixel_buf` is in ring-buffer order keyed off
+    /// `top_row` — so this uses [`Self::linearized_pixel_buf`] to
+    /// materialize one allocation of correctly-ordered pixels before
+    /// handing it to Cairo. The allocation cost is negligible for a
+    /// user-triggered "save to PNG" operation.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
         if self.display_width == 0 {
