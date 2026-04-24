@@ -99,20 +99,34 @@ pub const LEFT_ACTIVITIES: &[ActivityBarEntry] = &[
         shortcut_label: "Ctrl+5",
         accelerator: "<Ctrl>5",
     },
+    ActivityBarEntry {
+        name: "share",
+        icon_name: "network-transmit-receive-symbolic",
+        display_name: "Share",
+        shortcut_label: "Ctrl+6",
+        accelerator: "<Ctrl>6",
+    },
 ];
 
-/// Canonical right-activity-bar entries. Single entry today; the
-/// slice-based API future-proofs the pattern for Recordings /
-/// Event log / etc. Consumers derive shortcut registration and help
-/// rows from this — same single-source-of-truth contract as
-/// [`LEFT_ACTIVITIES`].
-pub const RIGHT_ACTIVITIES: &[ActivityBarEntry] = &[ActivityBarEntry {
-    name: "transcript",
-    icon_name: "user-available-symbolic",
-    display_name: "Transcript",
-    shortcut_label: "Ctrl+Shift+1",
-    accelerator: "<Ctrl><Shift>1",
-}];
+/// Canonical right-activity-bar entries — Transcript + Bookmarks.
+/// Consumers derive shortcut registration and help rows from this
+/// single source of truth. Same contract as [`LEFT_ACTIVITIES`].
+pub const RIGHT_ACTIVITIES: &[ActivityBarEntry] = &[
+    ActivityBarEntry {
+        name: "transcript",
+        icon_name: "user-available-symbolic",
+        display_name: "Transcript",
+        shortcut_label: "Ctrl+Shift+1",
+        accelerator: "<Ctrl><Shift>1",
+    },
+    ActivityBarEntry {
+        name: "bookmarks",
+        icon_name: "user-bookmarks-symbolic",
+        display_name: "Bookmarks",
+        shortcut_label: "Ctrl+Shift+2",
+        accelerator: "<Ctrl><Shift>2",
+    },
+];
 
 /// Which edge of the window the activity bar sits against. Controls
 /// the CSS class list and the border side.

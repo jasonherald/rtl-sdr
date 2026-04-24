@@ -26,24 +26,12 @@
 
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 
 use super::navigation_panel::{
     ActiveBookmark, Bookmark, BookmarksMutatedCallback, NavigationCallback, SaveCallback,
     load_bookmarks, rebuild_bookmark_list,
 };
-
-/// Default width of the bookmarks flyout, in pixels. Wide enough for
-/// a long bookmark nickname + a recall button + a delete affordance
-/// without wrapping. Slightly wider than the transcript revealer
-/// (320 px) because bookmark rows carry more suffix widgets (active
-/// indicator, save button, delete button) than transcript items.
-pub const BOOKMARKS_PANEL_WIDTH_PX: i32 = 360;
-
-/// Config key for whether the bookmarks flyout was open at last
-/// shutdown. Read once on startup to restore the reveal state +
-/// the header toggle button's visual pressed state; written on
-/// every toggle change.
-pub const CONFIG_KEY_FLYOUT_OPEN: &str = "bookmarks_flyout_open";
 
 /// Widget handles + shared state exposed from the bookmarks flyout.
 ///
@@ -59,8 +47,10 @@ pub const CONFIG_KEY_FLYOUT_OPEN: &str = "bookmarks_flyout_open";
 ///   selected. The `connect_navigate` / `connect_save` methods
 ///   register the callbacks the list rows invoke on click.
 pub struct BookmarksPanel {
-    /// Root container for the flyout — packed into the revealer.
-    pub widget: gtk4::Box,
+    /// Root container — an `AdwPreferencesGroup` so the Bookmarks
+    /// activity panel picks up the same title + margin rhythm as
+    /// the other preferences-style panels on the left side.
+    pub widget: adw::PreferencesGroup,
     /// Bookmark list widget. Rebuilt in place on every add /
     /// delete / import via [`rebuild_bookmark_list`].
     pub bookmark_list: gtk4::ListBox,
@@ -185,22 +175,10 @@ impl BookmarksPanel {
 /// with it; this panel just holds a reference.
 #[must_use]
 pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
-    let widget = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .width_request(BOOKMARKS_PANEL_WIDTH_PX)
+    let widget = adw::PreferencesGroup::builder()
+        .title("Bookmarks")
+        .description("Saved stations")
         .build();
-
-    let heading = gtk4::Label::builder()
-        .label("Bookmarks")
-        .css_classes(["title-2"])
-        .halign(gtk4::Align::Start)
-        .build();
-    widget.append(&heading);
 
     // Search entry — live-filters the list by updating
     // `filter_text` and rebuilding on every `search-changed`
@@ -212,7 +190,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     let search_entry = gtk4::SearchEntry::builder()
         .placeholder_text("Search bookmarks")
         .build();
-    widget.append(&search_entry);
+    widget.add(&search_entry);
 
     let bookmark_list = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::None)
@@ -224,8 +202,13 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vscrollbar_policy(gtk4::PolicyType::Automatic)
         .vexpand(true)
+        // Breathing room between the search entry and the list —
+        // `AdwPreferencesGroup` packs its children flush, and a
+        // search row + list row stacked flush look crowded. Same
+        // ~12 px rhythm the other preferences sections have.
+        .margin_top(12)
         .build();
-    widget.append(&bookmark_scroll);
+    widget.add(&bookmark_scroll);
 
     let bookmarks = std::rc::Rc::new(std::cell::RefCell::new(load_bookmarks()));
     let on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>> =
