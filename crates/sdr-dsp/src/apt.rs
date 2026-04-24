@@ -539,18 +539,22 @@ impl AptDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`DspError::InvalidParameter`] if `input_rate_hz` is below
-    /// the Nyquist floor for the APT subcarrier. Propagates other
+    /// Returns [`DspError::InvalidParameter`] if `input_rate_hz` is at or
+    /// below the strict Nyquist floor for the APT subcarrier
+    /// (`> 2·SUBCARRIER_HZ`, i.e. above 4800 Hz). Propagates other
     /// [`DspError`] values from the underlying resampler, envelope
     /// detector, or tap designer.
     pub fn new(input_rate_hz: u32) -> Result<Self, DspError> {
         // 2 · 2400 = 4800 Hz exactly — no rounding, just hard-code so the
         // const-context-friendly comparison below stays trivially correct.
+        // Note `<=`: at exactly 2·f_c the subcarrier sits at Nyquist where
+        // each sample lands at a phase-ambiguous point on the cosine, so
+        // the boundary itself has to be rejected — not just rates below.
         const NYQUIST_FLOOR_HZ: u32 = 4_800;
-        if input_rate_hz < NYQUIST_FLOOR_HZ {
+        if input_rate_hz <= NYQUIST_FLOOR_HZ {
             return Err(DspError::InvalidParameter(format!(
-                "input_rate_hz ({input_rate_hz}) must be ≥ 2·SUBCARRIER_HZ \
-                 ({NYQUIST_FLOOR_HZ}) to avoid aliasing the 2400 Hz APT subcarrier",
+                "input_rate_hz ({input_rate_hz}) must be > 2·SUBCARRIER_HZ \
+                 ({NYQUIST_FLOOR_HZ}) to sample the 2400 Hz APT subcarrier safely",
             )));
         }
         Ok(Self {
@@ -563,7 +567,12 @@ impl AptDecoder {
             sync_detector: SyncDetector::new(),
             resample_scratch: Vec::new(),
             envelope_scratch: Vec::new(),
-            accumulator: Vec::with_capacity(DECODER_BUFFER_CAP),
+            // Reserve room for the *intentional* overshoot in chunked
+            // ingestion: each chunk can take SAMPLES_PER_LINE more than
+            // the cap before the post-chunk trim brings it back down.
+            // Sizing for the peak avoids reallocating on the first
+            // backpressure event in a hot path.
+            accumulator: Vec::with_capacity(DECODER_BUFFER_CAP + SAMPLES_PER_LINE),
             ready_lines: VecDeque::with_capacity(READY_QUEUE_CAP),
             accumulator_start_intermediate_sample: 0,
         })
@@ -1253,13 +1262,14 @@ mod tests {
 
     #[test]
     fn apt_decoder_rejects_sub_nyquist_input_rate() {
-        // Below 2·SUBCARRIER_HZ (4800 Hz) the 2400 Hz APT subcarrier is
-        // already aliased — refuse the rate up-front.
+        // At or below 2·SUBCARRIER_HZ (4800 Hz) the 2400 Hz APT subcarrier
+        // is at-or-past Nyquist — at exactly 4800 Hz the cosine samples
+        // hit phase-ambiguous points and collapse, so the boundary itself
+        // must be rejected, not just rates strictly below.
         assert!(AptDecoder::new(0).is_err());
         assert!(AptDecoder::new(4_799).is_err());
-        // 4800 Hz exactly is the floor; the resampler may still reject it
-        // for unrelated reasons, but the Nyquist check itself must accept.
-        // 8000 Hz (telephony) is the smallest realistic accept.
+        assert!(AptDecoder::new(4_800).is_err());
+        // 8000 Hz (telephony) is the smallest realistic rate we accept.
         assert!(AptDecoder::new(8_000).is_ok());
     }
 
@@ -1416,6 +1426,40 @@ mod tests {
             tight_total, n_reference,
             "tight-output run produced {tight_total} lines, generous run produced \
              {n_reference} — surplus was silently dropped",
+        );
+    }
+
+    #[test]
+    fn apt_decoder_accumulator_capacity_absorbs_intentional_overshoot() {
+        // The chunked-ingestion path intentionally lets `accumulator` peak
+        // at DECODER_BUFFER_CAP + SAMPLES_PER_LINE before being trimmed.
+        // Reserving exactly DECODER_BUFFER_CAP would force a realloc on
+        // first backpressure (and Vec keeps the larger capacity afterward,
+        // defeating bounded memory). Pre-reserving for the peak avoids
+        // it. Verify by snapshotting capacity after construction and
+        // again after a multi-line process call — they must match.
+        let rate = TEST_INPUT_RATE_HZ;
+        let mut d = AptDecoder::new(rate).unwrap();
+        let initial_capacity = d.accumulator.capacity();
+        assert!(
+            initial_capacity >= DECODER_BUFFER_CAP + SAMPLES_PER_LINE,
+            "initial accumulator capacity {initial_capacity} too small to \
+             absorb the chunked-ingestion overshoot",
+        );
+
+        // Push 8 lines through a 1-slot output to force backpressure.
+        let mut audio = Vec::new();
+        for _ in 0..8 {
+            audio.extend_from_slice(&synth_line_audio(rate, TEST_GREY_LEVEL));
+        }
+        let mut tight_out = vec![AptLine::default(); 1];
+        d.process(&audio, &mut tight_out).unwrap();
+
+        assert_eq!(
+            d.accumulator.capacity(),
+            initial_capacity,
+            "accumulator capacity grew under backpressure — Vec reallocated, \
+             defeating bounded-memory intent",
         );
     }
 
