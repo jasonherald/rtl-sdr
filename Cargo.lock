@@ -2805,6 +2805,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cairo-rs",
+ "criterion",
  "gtk4",
  "libadwaita",
  "sdr-config",
