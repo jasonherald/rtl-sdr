@@ -2,6 +2,7 @@
 //!
 //! All functions are pure: no side effects, no thread spawning, no I/O.
 
+pub mod apt;
 pub mod channel;
 pub mod convert;
 pub mod correction;
