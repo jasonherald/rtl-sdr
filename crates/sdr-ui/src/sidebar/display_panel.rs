@@ -148,6 +148,27 @@ pub fn build_display_panel() -> DisplayPanel {
         .digits(0)
         .build();
 
+    // Cross-couple the min/max adjustments so the UI can't produce
+    // an inverted range (min_db >= max_db). When min moves, we
+    // raise max's lower bound to `new_min + DB_STEP`; if max is
+    // below that, GTK auto-clamps max up — a single-dB "range drag"
+    // that keeps the pair valid. Symmetric for max → min's upper.
+    // Separate from the DSP-dispatch handlers in `window.rs`, which
+    // kept a defensive `min >= max` early-return; that branch is
+    // now unreachable via UI but cheap to leave as belt-and-braces.
+    let max_adj_weak = max_db_adj.downgrade();
+    min_db_row.connect_value_notify(move |row| {
+        if let Some(adj) = max_adj_weak.upgrade() {
+            adj.set_lower(row.value() + DB_STEP);
+        }
+    });
+    let min_adj_weak = min_db_adj.downgrade();
+    max_db_row.connect_value_notify(move |row| {
+        if let Some(adj) = min_adj_weak.upgrade() {
+            adj.set_upper(row.value() - DB_STEP);
+        }
+    });
+
     // --- Fill Mode ---
     let fill_mode_row = adw::SwitchRow::builder()
         .title("Spectrum Fill")
