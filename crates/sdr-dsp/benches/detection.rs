@@ -28,6 +28,8 @@
 //! allocated once outside the closure; the hot path is purely
 //! compute + one bool-ish write per bin.
 
+use std::hint::black_box;
+
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 const BINS: usize = 65_536;
@@ -115,10 +117,15 @@ fn bench_energy_detect(c: &mut Criterion) {
     group.throughput(Throughput::Elements(BINS as u64));
     group.bench_function(format!("bins={BINS}"), |b| {
         b.iter_batched(
-            || db_line.clone(),
+            // `black_box` on the input + on the returned hit count
+            // prevents LLVM from constant-folding the sort or
+            // eliding the threshold scan once it sees the result
+            // is dropped.
+            || black_box(db_line.clone()),
             |line| {
                 let floor = estimate_noise_floor(&line, &mut sort_scratch);
-                let _hits = count_detections(&line, floor);
+                let hits = count_detections(&line, floor);
+                black_box(hits);
             },
             BatchSize::SmallInput,
         );

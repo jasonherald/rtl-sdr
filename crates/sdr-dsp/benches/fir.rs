@@ -23,6 +23,8 @@
 //!   shape where small-buffer GPU almost certainly loses —
 //!   #181 calls this out.
 
+use std::hint::black_box;
+
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use sdr_dsp::filter::{ComplexFirFilter, FirFilter};
 use sdr_dsp::taps::low_pass;
@@ -98,11 +100,15 @@ fn bench_channel_filter(c: &mut Criterion) {
         |b| {
             let mut output = vec![Complex::default(); CHANNEL_IQ_BUFFER_SAMPLES];
             b.iter_batched(
-                || input.clone(),
+                // `black_box` on setup + after `process` keeps LLVM
+                // from hoisting constants through the taps or
+                // eliding the filtered write-back.
+                || black_box(input.clone()),
                 |buf| {
                     filter
                         .process(&buf, &mut output)
                         .expect("output sized to input");
+                    black_box(&output);
                 },
                 BatchSize::SmallInput,
             );
@@ -133,11 +139,12 @@ fn bench_audio_lpf(c: &mut Criterion) {
         |b| {
             let mut output = vec![0.0_f32; AUDIO_BUFFER_SAMPLES];
             b.iter_batched(
-                || input.clone(),
+                || black_box(input.clone()),
                 |buf| {
                     filter
                         .process_f32(&buf, &mut output)
                         .expect("output sized to input");
+                    black_box(&output);
                 },
                 BatchSize::SmallInput,
             );

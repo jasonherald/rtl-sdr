@@ -16,6 +16,8 @@
 //! allocated once outside the closure; only the normalize +
 //! lookup + write loop runs inside.
 
+use std::hint::black_box;
+
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 
 /// Typical waterfall width at high FFT resolution — matches
@@ -115,9 +117,13 @@ fn bench_colormap(c: &mut Criterion) {
     group.bench_function(format!("bins={BINS}"), |b| {
         let mut output = vec![[0_u8; 4]; BINS];
         b.iter_batched(
-            || db_line.clone(),
+            // `black_box` on setup + after the lookup forces LLVM
+            // to treat the RGBA write-back as observable, so the
+            // clamp-normalize-index-write chain can't be elided.
+            || black_box(db_line.clone()),
             |line| {
                 apply_colormap(&line, &palette, &mut output);
+                black_box(&output);
             },
             BatchSize::SmallInput,
         );

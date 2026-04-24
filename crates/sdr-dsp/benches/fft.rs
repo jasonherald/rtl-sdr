@@ -18,6 +18,8 @@
 //! designed for exactly this pattern: the setup closure clones
 //! the input, the routine closure consumes it.
 
+use std::hint::black_box;
+
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use sdr_dsp::fft::{FftEngine, RustFftEngine};
 use sdr_types::Complex;
@@ -64,9 +66,16 @@ fn bench_forward(c: &mut Criterion) {
         let mut engine = RustFftEngine::new(size).expect("valid FFT size");
         group.bench_function(format!("size={size}"), |b| {
             b.iter_batched(
-                || input.clone(),
+                // `black_box` on the setup return value forces LLVM
+                // to treat the cloned buffer as "could be anything",
+                // so it can't hoist constants out of the FFT call.
+                || black_box(input.clone()),
                 |mut buf| {
                     engine.forward(&mut buf).expect("forward FFT in-place");
+                    // And `black_box(&buf)` after the call forces
+                    // the frequency-domain result to be observed,
+                    // so the write-back can't be elided.
+                    black_box(&buf);
                 },
                 BatchSize::SmallInput,
             );
