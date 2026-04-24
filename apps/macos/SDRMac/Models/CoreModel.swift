@@ -750,6 +750,17 @@ final class CoreModel {
             let raw = Int32(UserDefaults.standard.integer(forKey: Self.sourceTypeDefaultsKey))
             sourceType = SourceType(rawValue: raw) ?? .rtlSdr
         }
+        // Last band preset the user picked from the General
+        // panel — restored as just the ID; resolution against
+        // the canonical `bandPresets` slice happens via the
+        // `lastSelectedBandPreset` computed accessor. Doesn't
+        // re-apply the tuning state (the engine's persisted
+        // center/demod/bandwidth are authoritative on launch).
+        if let id = UserDefaults.standard.string(
+            forKey: Self.lastSelectedBandPresetDefaultsKey
+        ) {
+            lastSelectedBandPresetID = id
+        }
         if UserDefaults.standard.object(forKey: Self.agcTypeDefaultsKey) != nil {
             let raw = Int32(UserDefaults.standard.integer(forKey: Self.agcTypeDefaultsKey))
             agcType = SdrCore.AgcType(rawValue: raw) ?? .software
@@ -2355,6 +2366,65 @@ final class CoreModel {
         UserDefaults.standard.set(Int(type.rawValue), forKey: Self.sourceTypeDefaultsKey)
         capture { try core?.setSourceType(type) }
     }
+
+    // ----------------------------------------------------------
+    //  Band presets — persisted last selection
+    //
+    //  Owned by the model rather than by `BandPresetsSection`'s
+    //  local `@State` so the picker's chosen value survives
+    //  panel close + activity swap (the General activity panel
+    //  is rebuilt every time the user reopens it). Persisted
+    //  to UserDefaults too, so the dropdown reflects the user's
+    //  last pick across launches. Per `CodeRabbit` round 1 on
+    //  PR #493.
+    // ----------------------------------------------------------
+
+    /// ID of the last band preset the user picked from the
+    /// General panel's dropdown. Defaults to `"FM Broadcast"`
+    /// on a fresh install — the model's default tuner state
+    /// (100 MHz / WFM) lives in the FM band so this is the
+    /// most natural pick for first launch. The `BandPreset.id`
+    /// is the preset's name string (`"FM Broadcast"`, `"NOAA
+    /// Weather"`, …) — see `apps/macos/SDRMac/Models/BandPreset.swift`.
+    var lastSelectedBandPresetID: String? = "FM Broadcast"
+
+    /// Resolved view of `lastSelectedBandPresetID`. Returns
+    /// `nil` when no preset has been picked yet, or when the
+    /// persisted ID no longer matches any entry in the
+    /// canonical `bandPresets` slice (slice rename or removal).
+    var lastSelectedBandPreset: BandPreset? {
+        guard let id = lastSelectedBandPresetID else { return nil }
+        return bandPresets.first { $0.id == id }
+    }
+
+    /// Apply a preset by routing through the standard tuner
+    /// setters (so squelch / auto-squelch / VFO echoes behave
+    /// identically to a manual tune), then remember the
+    /// selection so the picker reflects it next time the
+    /// General panel opens. Passing `nil` clears the remembered
+    /// pick without retuning. Per `CodeRabbit` round 1 on PR
+    /// #493 (split selection from tune action so the picker can
+    /// also be cleared programmatically).
+    func setLastSelectedBandPreset(_ preset: BandPreset?) {
+        lastSelectedBandPresetID = preset?.id
+        if let id = preset?.id {
+            UserDefaults.standard.set(id, forKey: Self.lastSelectedBandPresetDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.lastSelectedBandPresetDefaultsKey)
+        }
+        if let preset {
+            setCenter(preset.centerFrequencyHz)
+            setDemodMode(preset.demodMode)
+            setBandwidth(preset.bandwidthHz)
+        }
+    }
+
+    /// UserDefaults key for the persisted last-selected preset
+    /// ID. The Mac app persists locally; the Rust config layer
+    /// doesn't round-trip this value (no Linux equivalent —
+    /// the GTK panel uses an in-memory `ComboRow` and resets on
+    /// app restart).
+    static let lastSelectedBandPresetDefaultsKey = "SDRMac.lastSelectedBandPreset"
 
     /// Apply the current network-source host/port/protocol to
     /// the engine. Called on explicit Apply in the Source pane

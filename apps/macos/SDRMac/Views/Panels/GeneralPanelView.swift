@@ -46,24 +46,23 @@ struct GeneralPanelView: View {
 
 /// Single Picker row for quick-tuning to a common band.
 /// Matches the GTK `ComboRow`-based preset row in
-/// `navigation_panel.rs` — keeps the vertical footprint
-/// small (one row) regardless of how many presets the slice
-/// grows to. Selection persists locally on the view so the
-/// dropdown reflects the user's last preset pick; manual
-/// tunes don't auto-clear it (same behavior as Linux).
+/// `navigation_panel.rs`. The picked preset lives on
+/// `CoreModel.lastSelectedBandPresetID` (not `@State` here)
+/// so the selection survives panel close + activity swap +
+/// app relaunch — the Mac panel host rebuilds this view on
+/// every reopen, which would clear local view state. Manual
+/// tunes don't auto-clear the dropdown (same behavior as
+/// Linux). Per `CodeRabbit` round 1 on PR #493.
 private struct BandPresetsSection: View {
     @Environment(CoreModel.self) private var model
-
-    /// Last preset the user selected from the dropdown. Local
-    /// to this view — manual tunes via the spectrum or header
-    /// frequency entry don't touch it. `nil` on fresh launch
-    /// (no preset chosen yet).
-    @State private var selected: BandPreset? = nil
 
     var body: some View {
         Section {
             LabeledContent("Preset") {
-                Picker("", selection: $selected) {
+                Picker(selection: Binding<BandPreset?>(
+                    get: { model.lastSelectedBandPreset },
+                    set: { model.setLastSelectedBandPreset($0) }
+                )) {
                     // Placeholder slot for the "no preset
                     // selected" state — the dropdown opens
                     // displaying this until the user makes a
@@ -72,12 +71,10 @@ private struct BandPresetsSection: View {
                     ForEach(bandPresets) { preset in
                         Text(preset.name).tag(BandPreset?.some(preset))
                     }
+                } label: {
+                    EmptyView()
                 }
                 .labelsHidden()
-            }
-            .onChange(of: selected) { _, new in
-                guard let new else { return }
-                apply(new)
             }
         } header: {
             Text("Band")
@@ -85,17 +82,5 @@ private struct BandPresetsSection: View {
             Text("Quick-tune to a common band. Picking sets frequency, demod mode, and channel bandwidth.")
                 .font(.caption)
         }
-    }
-
-    /// Apply a preset by routing through the engine: tune,
-    /// switch demod, set bandwidth. Each call goes through
-    /// the existing setters so squelch / auto-squelch / VFO
-    /// echoes behave identically to a manual tune. Per the
-    /// "every reset routes through the DSP" convention from
-    /// PR #380.
-    private func apply(_ preset: BandPreset) {
-        model.setCenter(preset.centerFrequencyHz)
-        model.setDemodMode(preset.demodMode)
-        model.setBandwidth(preset.bandwidthHz)
     }
 }

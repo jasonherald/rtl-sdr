@@ -196,7 +196,7 @@ private struct NetworkSinkSection: View {
     }
 
     private func parsePort() -> UInt16? {
-        guard let raw = Int(portEdit.trimmingCharacters(in: .whitespaces)),
+        guard let raw = Int(portEdit.trimmingCharacters(in: .whitespacesAndNewlines)),
               (1...Int(UInt16.max)).contains(raw) else {
             return nil
         }
