@@ -1838,17 +1838,16 @@ fn build_layout(
     // Inner (right) split view — sidebar sits on the trailing edge
     // so the right activity bar is the rightmost element on-screen.
     //
-    // `sidebar_width_fraction` is in `[0, 1]` regardless of
-    // `sidebar-width-unit`; that unit only controls how the
-    // `min`/`max-sidebar-width` pixel values are interpreted. So the
-    // exact 420 px / 320 px default is approximate under nested
-    // splits — the fraction resolves against each split view's
-    // *own* allocated width, not the full window. We accept the
-    // approximation and let `min-sidebar-width` clamp the transcript
-    // panel up to its 360 px floor when the fractional math would
-    // otherwise leave it narrower; hitting the exact pixel target
-    // would require a post-realize callback (sub-ticket #428
-    // session-persistence territory).
+    // `sidebar_width_fraction` is `[0, 1]` regardless of the
+    // `sidebar-width-unit` we set; the unit only changes how
+    // `min`/`max-sidebar-width` are interpreted. Passing a pixel
+    // value as the fraction panics at property-set even with
+    // `unit = Px` (verified on libadwaita 1.9). So the default
+    // here is a fraction; under nested splits its pixel result
+    // is approximate, and `min-sidebar-width` clamps the transcript
+    // panel up to its 360 px floor when the math would otherwise
+    // leave it narrower. Hitting the exact pixel target would
+    // require a post-realize callback (sub-ticket #428 territory).
     let right_split_view = adw::OverlaySplitView::builder()
         .sidebar_position(gtk4::PackType::End)
         .sidebar(&right_stack)
@@ -3048,14 +3047,6 @@ fn connect_rtl_tcp_discovery(
     });
 }
 
-/// Cadence for the USB hotplug poll that drives server-panel
-/// visibility. 3 s is the sweet spot: fast enough that a user
-/// plugging in a dongle sees the panel within the time it takes them
-/// to reach the sidebar with the mouse, slow enough that the
-/// per-tick `rusb::devices()` USB-bus enumerate is invisible in
-/// profile traces.
-const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
-
 /// Icon name for the un-filled ("not pinned") star on discovery
 /// rows. GNOME Symbolic icon set — `non-starred-symbolic` renders
 /// the outline glyph, which is visually distinct from the filled
@@ -3950,85 +3941,26 @@ fn connect_server_panel(
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
-    use std::cell::Cell;
-
-    let server_widget_weak = panels.server.widget.downgrade();
-    let last_seen_count = Rc::new(Cell::new(u32::MAX));
     let running: Rc<RefCell<Option<RunningServer>>> = Rc::new(RefCell::new(None));
 
-    // Visibility hook kept as a no-op callable so the existing
-    // call sites (`connect_share_switch`, `connect_server_status_polling`,
-    // device-row / poll-tick re-apply) stay wired with minimum churn.
-    // The legacy hotplug-driven hide/show behaviour no longer
-    // applies: the Share activity is an opt-in icon on the left
-    // activity bar, so users explicitly request the panel; leaving
-    // it empty when no dongle is plugged in was the old scrolling-
-    // sidebar concern, not a concern here. The `last_seen_count`
-    // tracking remains because it's used by the start-server path
-    // (exclusivity guard vs. the local-RTL-SDR source).
-    let apply_visibility = || {};
-
-    // Reapply on source-type change. Cloned because
-    // `connect_selected_notify` takes an `Fn(&ComboRow)` and we want
-    // the same logic as the poll tick.
-    let apply_on_device_change = apply_visibility;
-    panels
-        .source
-        .device_row
-        .connect_selected_notify(move |_| apply_on_device_change());
-
-    // Seed `last_seen_count` on the first tick. Using a glib timer
-    // (rather than running the USB probe synchronously during
-    // wiring) keeps the window-build path fast and avoids a libusb
-    // session init on a thread that may not have one ready.
-    let apply_on_tick = apply_visibility;
-    let poll_widget_weak = server_widget_weak.clone();
-    let poll_last_seen_count = Rc::clone(&last_seen_count);
-    let _ = glib::timeout_add_local(SERVER_PANEL_HOTPLUG_POLL_INTERVAL, move || {
-        // If the widget is gone, tear the poller down — nothing to
-        // show, and we don't want to leak `rusb::devices()` calls
-        // past window close.
-        if poll_widget_weak.upgrade().is_none() {
-            return glib::ControlFlow::Break;
-        }
-        // `sdr_rtlsdr::get_device_count()` is a libusb enumerate
-        // (vendor/product-ID filter over `rusb::devices()`). Fast
-        // enough for the UI thread at a 3 s cadence; no syscall
-        // churn worth moving to a worker.
-        let count = sdr_rtlsdr::get_device_count();
-        // First tick ALWAYS flips the cache off `u32::MAX`, so this
-        // branch fires at least once even if the real count is 0 —
-        // that's the "resolve the panel out of its pre-first-tick
-        // hidden state" moment. Subsequent ticks only apply on a
-        // real edge so we don't churn widget state every 3 s.
-        if count != poll_last_seen_count.get() {
-            tracing::debug!(
-                previous = poll_last_seen_count.get(),
-                current = count,
-                "rtl_tcp server panel: local dongle count changed"
-            );
-            poll_last_seen_count.set(count);
-            apply_on_tick();
-        }
-        glib::ControlFlow::Continue
-    });
+    // Share is now an activity on the left activity bar — always
+    // reachable via the 📡 icon. The legacy hotplug-driven
+    // hide/show timer + device-count cache + device-row notify
+    // were removed with that migration; `sdr_rtlsdr::get_device_count`
+    // is no longer polled on the GTK main loop for visibility,
+    // and the start-server path still rejects the "local dongle is
+    // the active source" conflict via its own exclusivity guard.
 
     // Wire the master share-over-network switch. The handler is the
     // authority on server lifecycle — on toggle we either start a
     // new `Server` (+ optional `Advertiser`) and store the handle,
     // or drop the handle so the accept thread tears down.
-    connect_share_switch(
-        panels,
-        toast_overlay,
-        Rc::clone(&running),
-        apply_visibility,
-        server_running,
-    );
+    connect_share_switch(panels, toast_overlay, Rc::clone(&running), server_running);
 
     // Poll `Server::stats()` on a timer, render the status rows,
     // and auto-stop the server if `has_stopped()` becomes true
     // (e.g. USB unplug or accept-thread failure).
-    connect_server_status_polling(panels, Rc::clone(&running), apply_visibility);
+    connect_server_status_polling(panels, Rc::clone(&running));
 
     // Bandwidth advisory — toggled on the device-default sample
     // rate. Unlike the source panel's advisory (which also gates
@@ -4213,7 +4145,6 @@ fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
     running: Rc<RefCell<Option<RunningServer>>>,
-    apply_visibility: impl Fn() + Clone + 'static,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
     use std::cell::Cell;
@@ -4416,7 +4347,6 @@ fn connect_share_switch(
             reset_activity_log(&widgets);
             reset_clients_list(&widgets);
         }
-        apply_visibility();
     });
 
     // ====================================================
@@ -4802,7 +4732,6 @@ impl ServerStatusWidgetsWeak {
 fn connect_server_status_polling(
     panels: &SidebarPanels,
     running: Rc<RefCell<Option<RunningServer>>>,
-    apply_visibility: impl Fn() + 'static,
 ) {
     use std::cell::Cell;
 
@@ -4867,7 +4796,6 @@ fn connect_server_status_polling(
             if let Some(share) = share_row_weak.upgrade() {
                 share.set_active(false);
             }
-            apply_visibility();
             return glib::ControlFlow::Continue;
         }
 
@@ -5851,12 +5779,12 @@ fn apply_agc_squelch_mutex(
 /// dongle after app launch sees the slot update to the real
 /// device name within a few seconds without having to restart.
 ///
-/// Shares cadence with `SERVER_PANEL_HOTPLUG_POLL_INTERVAL` as a
-/// deliberate choice — both pollers watch the same libusb bus for
-/// the same vendor/product-filtered device set, so users see
-/// both the source combo and the server panel update on the same
-/// tick. Kept as a separate constant so each poller's sizing can
-/// evolve independently.
+/// Previously shared cadence with a server-panel hotplug poll that
+/// drove panel visibility — that poll was removed when Share became
+/// its own activity icon, but this source-combo poller's 3 s cadence
+/// was tuned for the same reason (user plugs in a dongle, sees the
+/// slot update by the time they reach for the sidebar) so the value
+/// remains a good fit on its own.
 const SOURCE_RTLSDR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Install a hotplug poller on the source panel that keeps the

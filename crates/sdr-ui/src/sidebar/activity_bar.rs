@@ -1,6 +1,7 @@
 //! VS Code-style activity bar — narrow vertical strip of icon toggle
 //! buttons used to switch between panel "activities" (General, Radio,
-//! Audio, Display, Scanner on the left; Transcript on the right).
+//! Audio, Display, Scanner, Share on the left; Transcript, Bookmarks
+//! on the right).
 //!
 //! See `docs/design/sidebar-activity-bar-redesign.md` §2.3 for the
 //! design rationale. This module produces the widget; wiring (stack

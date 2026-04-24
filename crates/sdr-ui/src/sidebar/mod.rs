@@ -56,9 +56,10 @@ pub struct SidebarPanels {
     /// to break the otherwise-cyclic `on_save → stored closure`
     /// reference chain.
     pub bookmarks: Rc<BookmarksPanel>,
-    /// Share-over-network (`rtl_tcp` server) controls. Hidden by
-    /// default; `window.rs` reveals it when a local RTL-SDR dongle
-    /// is plugged in and not currently the active source.
+    /// Share-over-network (`rtl_tcp` server) controls. Packed as
+    /// the `"share"` child of the left activity stack, so the panel
+    /// is always reachable via the 📡 Share icon; the Start switch
+    /// errors gracefully when no dongle is plugged in.
     pub server: ServerPanel,
     /// Scanner control panel at bottom of left sidebar (Phase 1,
     /// issue #317). Master switch, active-channel / state

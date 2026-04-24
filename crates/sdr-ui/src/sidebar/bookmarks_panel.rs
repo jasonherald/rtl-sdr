@@ -1,32 +1,34 @@
-//! Right-side bookmarks slide-out panel (#339).
+//! Bookmarks activity panel (#339).
 //!
-//! Complementary to the left sidebar's `NavigationPanel`: the sidebar
-//! keeps the quick-add controls (name entry + Add button) so the user
-//! can stash a bookmark without opening the flyout, while this panel
-//! is the browse / search / manage surface for the full bookmark
-//! list. Toggled from the header bar bookmark icon or `Ctrl+B`.
+//! Complementary to the left sidebar's `NavigationPanel`: the left
+//! side keeps the quick-add controls (name entry + Add button) so
+//! the user can stash a bookmark without leaving the General panel,
+//! while this panel is the browse / search / manage surface for the
+//! full bookmark list. Opened by clicking the 📑 icon in the right
+//! activity bar, via the header bookmark button, or `Ctrl+B`.
 //!
-//! The widget built here is packed into a `gtk4::Revealer` alongside
-//! the transcript revealer in `window.rs::build_split_view`. Slide
-//! transition matches the transcript pattern (200 ms slide from the
-//! right edge of the content area).
+//! The widget built here is an `adw::PreferencesGroup` slotted into
+//! the right activity-bar stack as the `"bookmarks"` child (see
+//! `window.rs::build_layout`). Switching to this activity makes the
+//! right split view's sidebar visible and renders this panel — there
+//! is no separate revealer or slide animation; the activity-bar
+//! wiring owns open/close/switch semantics.
 //!
 //! Owns the bookmark list state: the `Rc<RefCell<Vec<Bookmark>>>`
 //! backing store, active-bookmark highlight, navigate / save
 //! callbacks. `NavigationPanel`'s Add button wires into this state
 //! via shared `Rc` clones — both panels render views of the same
 //! underlying list.
-//!
-//! Commits that land on this file:
-//! - Layout scaffolding (prior commit).
-//! - List + row actions relocated from `NavigationPanel` (prior commit).
-//! - Filter / search row (prior commit).
-//! - Category grouping via `AdwExpanderRow` (prior commit).
-//! - Persist flyout open/closed state across restarts (THIS commit).
 
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+
+/// Vertical gap between the search entry and the bookmark list in
+/// pixels. `AdwPreferencesGroup` packs its children flush; without
+/// this the two rows sit crowded together. Matches the 12 px rhythm
+/// the other preferences sections use.
+const SEARCH_LIST_GAP_PX: i32 = 12;
 
 use super::navigation_panel::{
     ActiveBookmark, Bookmark, BookmarksMutatedCallback, NavigationCallback, SaveCallback,
@@ -202,11 +204,7 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vscrollbar_policy(gtk4::PolicyType::Automatic)
         .vexpand(true)
-        // Breathing room between the search entry and the list —
-        // `AdwPreferencesGroup` packs its children flush, and a
-        // search row + list row stacked flush look crowded. Same
-        // ~12 px rhythm the other preferences sections have.
-        .margin_top(12)
+        .margin_top(SEARCH_LIST_GAP_PX)
         .build();
     widget.add(&bookmark_scroll);
 
