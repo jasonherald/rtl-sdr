@@ -78,7 +78,7 @@
 //! thread inside wgpu-core's own event loop.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 use sdr_types::{Complex, DspError};
@@ -161,6 +161,18 @@ struct ShaderParams {
     apply_twiddle: u32,
     twiddle_p_mult: u32,
 }
+
+/// Shared completion slot for the async readback callback.
+///
+/// `forward()` clones this `Arc` into a `map_async` closure and
+/// then blocks on `device.poll(Wait)`. The callback fires inside
+/// `poll` on the calling thread, so the `Mutex` is never
+/// contended — we use it only to satisfy `map_async`'s
+/// `WasmNotSend + 'static` closure bound (the slot has to be
+/// `Send`) and to cleanly handle the "callback didn't fire"
+/// error case. Allocated once in `new()`; reused by every
+/// `forward()` call.
+type MapComplete = Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>;
 
 /// Adapter / backend summary for a constructed GPU engine, exposed
 /// so the bench harness can print which GPU a given run measured
@@ -269,6 +281,12 @@ pub struct GpuFftEngine {
 
     // MAP_READ | COPY_DST staging buffer for device→host readback.
     staging: wgpu::Buffer,
+    // Reusable completion slot for the `map_async` readback
+    // callback, written while `device.poll(Wait)` is executing
+    // and drained by `forward()` afterwards. Held as an `Arc<…>`
+    // so the closure can capture a clone without allocating a
+    // fresh channel on every transform.
+    map_complete: MapComplete,
 
     size: usize,
 
@@ -681,6 +699,7 @@ impl GpuFftEngine {
             bind_group_stage2,
             params_stride,
             staging,
+            map_complete: Arc::new(Mutex::new(None)),
             size,
             stage1_sub_n,
             stage2_sub_n,
@@ -781,11 +800,18 @@ impl FftEngine for GpuFftEngine {
                 timestamp_writes: None,
             });
 
-            // Stage 1 dispatch. Uniform at offset 0.
-            let stage1_pipeline = self
-                .pipelines
-                .get(&self.stage1_sub_n)
-                .expect("stage1 pipeline pre-built in new()");
+            // Stage 1 dispatch. Uniform at offset 0. Missing
+            // pipeline here means `build_async` returned Ok with a
+            // pipelines map that doesn't cover the stage we need —
+            // an internal regression, but surface it as a typed
+            // `GpuUnavailable` rather than panicking from library
+            // code.
+            let stage1_pipeline = self.pipelines.get(&self.stage1_sub_n).ok_or_else(|| {
+                DspError::GpuUnavailable(format!(
+                    "missing stage-1 GPU FFT pipeline for sub_n={}",
+                    self.stage1_sub_n,
+                ))
+            })?;
             pass.set_pipeline(stage1_pipeline);
             pass.set_bind_group(0, &self.bind_group_stage1, &[0]);
             pass.dispatch_workgroups(self.stage1_workgroups, 1, 1);
@@ -793,10 +819,12 @@ impl FftEngine for GpuFftEngine {
             // Stage 2 dispatch (only for tiered). Uniform at
             // offset `params_stride`.
             if let Some(bg2) = &self.bind_group_stage2 {
-                let stage2_pipeline = self
-                    .pipelines
-                    .get(&self.stage2_sub_n)
-                    .expect("stage2 pipeline pre-built in new()");
+                let stage2_pipeline = self.pipelines.get(&self.stage2_sub_n).ok_or_else(|| {
+                    DspError::GpuUnavailable(format!(
+                        "missing stage-2 GPU FFT pipeline for sub_n={}",
+                        self.stage2_sub_n,
+                    ))
+                })?;
                 pass.set_pipeline(stage2_pipeline);
                 pass.set_bind_group(0, bg2, &[self.params_stride]);
                 pass.dispatch_workgroups(self.stage2_workgroups, 1, 1);
@@ -815,21 +843,44 @@ impl FftEngine for GpuFftEngine {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // 4. Map staging synchronously (blocks the calling thread
-        //    via device.poll(Wait) inside wgpu-core).
+        //    via device.poll(Wait) inside wgpu-core). We reuse the
+        //    pre-allocated `map_complete` slot across calls — no
+        //    channel/vector allocation on the hot path. The
+        //    `map_async` callback fires *during* `device.poll`
+        //    on our thread, so ordering is:
+        //      - clear slot
+        //      - schedule callback (captures an Arc clone)
+        //      - poll(Wait) runs the callback synchronously
+        //      - poll returns; slot is populated
+        //    The `Mutex` is only here to satisfy `map_async`'s
+        //    `Send + 'static` closure bound; it's never contended.
         let slice = self.staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut slot = self
+                .map_complete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = None;
+        }
+        let completion = Arc::clone(&self.map_complete);
         slice.map_async(wgpu::MapMode::Read, move |res| {
-            // Ignore send errors — the receiver always drains
-            // exactly once on the same thread, so the channel
-            // can't be closed before we post.
-            let _ = tx.send(res);
+            let mut slot = completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(res);
         });
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| DspError::GpuUnavailable(format!("device poll failed: {e}")))?;
-        rx.recv()
-            .map_err(|e| DspError::GpuUnavailable(format!("staging map channel: {e}")))?
-            .map_err(|e| DspError::GpuUnavailable(format!("staging map failed: {e}")))?;
+        let map_result = self
+            .map_complete
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                DspError::GpuUnavailable("map_async callback did not fire during poll".into())
+            })?;
+        map_result.map_err(|e| DspError::GpuUnavailable(format!("staging map failed: {e}")))?;
 
         // 5. Copy mapped bytes into the caller's buffer.
         let data = slice.get_mapped_range();
@@ -956,6 +1007,27 @@ mod tests {
     #[test]
     fn parity_single_stage_256() {
         assert_parity(256);
+    }
+
+    /// N = 512 decomposes to P = 16, Q = 32. Stage 2's size-16
+    /// sub-FFT exercises the smallest pipeline specialisation the
+    /// engine can generate (`WORKGROUP_SIZE` = 8, below a single
+    /// NVIDIA warp) — a useful correctness check that the
+    /// `POINTS_PER_THREAD = 2` invariant holds even when the
+    /// workgroup is sub-warp sized.
+    #[test]
+    fn parity_512() {
+        assert_parity(512);
+    }
+
+    /// N = 1024 decomposes to P = Q = 32 — the equal-factor path
+    /// where `build_pipelines_and_bgs` reuses the same pipeline
+    /// for both stages rather than building a second one. This
+    /// test confirms the stage-2 bind group and the reused
+    /// pipeline cooperate correctly.
+    #[test]
+    fn parity_1024() {
+        assert_parity(1024);
     }
 
     #[test]
