@@ -492,6 +492,15 @@ const MIN_ACCUMULATOR_FOR_DECODE: usize = SAMPLES_PER_LINE * 2;
 /// has its own cap); only after both fill does anything get dropped.
 const READY_QUEUE_CAP: usize = 8;
 
+/// Maximum input audio samples processed through the resample → envelope
+/// stages in one pass. Keeps `resample_scratch`, `envelope_scratch`, and
+/// the resampler's internal complex scratch all strictly bounded
+/// regardless of how big a single `process` input chunk is. At the
+/// typical 48 kHz input rate, 8192 input samples yields ~3550 envelope
+/// samples, well under one APT line — small enough that the scratch
+/// vectors never need to grow past their first allocation in practice.
+const INPUT_SUBCHUNK_SAMPLES: usize = 8_192;
+
 /// End-to-end APT line decoder.
 ///
 /// Owns the resampler, envelope detector, and sync correlator, and carries
@@ -544,6 +553,7 @@ impl AptDecoder {
     /// (`> 2·SUBCARRIER_HZ`, i.e. above 4800 Hz). Propagates other
     /// [`DspError`] values from the underlying resampler, envelope
     /// detector, or tap designer.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(input_rate_hz: u32) -> Result<Self, DspError> {
         // 2 · 2400 = 4800 Hz exactly — no rounding, just hard-code so the
         // const-context-friendly comparison below stays trivially correct.
@@ -557,6 +567,17 @@ impl AptDecoder {
                  ({NYQUIST_FLOOR_HZ}) to sample the 2400 Hz APT subcarrier safely",
             )));
         }
+        // Pre-size the resample / envelope scratch vectors for the
+        // worst-case per-subchunk output: an INPUT_SUBCHUNK_SAMPLES
+        // input always produces at most this many envelope samples at
+        // the configured input rate. Pre-reserving means subsequent
+        // `Vec::resize` calls inside the hot path are bookkeeping-only
+        // (no realloc, no allocator traffic).
+        let max_subchunk_envelope = ((INPUT_SUBCHUNK_SAMPLES as u64
+            * u64::from(INTERMEDIATE_RATE_HZ)
+            / u64::from(input_rate_hz))
+            + 4) as usize;
+
         Ok(Self {
             input_rate_hz,
             resampler: RealResampler::new(
@@ -565,8 +586,8 @@ impl AptDecoder {
             )?,
             envelope: EnvelopeDetector::new(INTERMEDIATE_RATE_HZ)?,
             sync_detector: SyncDetector::new(),
-            resample_scratch: Vec::new(),
-            envelope_scratch: Vec::new(),
+            resample_scratch: Vec::with_capacity(max_subchunk_envelope),
+            envelope_scratch: Vec::with_capacity(max_subchunk_envelope),
             // Reserve room for the *intentional* overshoot in chunked
             // ingestion: each chunk can take SAMPLES_PER_LINE more than
             // the cap before the post-chunk trim brings it back down.
@@ -599,41 +620,83 @@ impl AptDecoder {
     /// **Streaming semantics.** If more lines are ready than `output` can
     /// hold, the surplus is preserved as fully-decoded `AptLine`s in a
     /// small internal queue (`READY_QUEUE_CAP` lines) and surfaces on
-    /// subsequent calls. The raw envelope buffer is processed in chunks
-    /// bounded by the accumulator cap, so even a multi-megabyte input
-    /// chunk can never grow internal memory past
-    /// `DECODER_BUFFER_CAP + (one chunk)` at any moment. Sample-level
-    /// dropping only happens when both the ready queue *and* the raw
-    /// accumulator are full, which only occurs when the caller has
-    /// stopped draining `output` for several seconds.
+    /// subsequent calls. The full pipeline runs in two nested bounded
+    /// loops:
+    ///
+    /// 1. **Outer (input subchunk)**: `input` is fed through the
+    ///    resampler and envelope detector in pieces of at most
+    ///    `INPUT_SUBCHUNK_SAMPLES`, so `resample_scratch`,
+    ///    `envelope_scratch`, and the resampler's internal complex
+    ///    scratch never grow with caller chunk size.
+    /// 2. **Inner (envelope subchunk)**: each subchunk's envelope output
+    ///    is appended to the accumulator in slices bounded by
+    ///    `DECODER_BUFFER_CAP`, with the decode + cap cycle running
+    ///    between each slice.
+    ///
+    /// Together this makes total hot-path memory bounded by a small
+    /// constant (~few hundred KB) regardless of how big a chunk the
+    /// caller hands us. Sample-level dropping only happens when both
+    /// the ready queue *and* the raw accumulator are full — which only
+    /// occurs when the caller has stopped draining `output` for several
+    /// seconds.
     ///
     /// # Errors
     ///
     /// Propagates [`DspError`] from the resampler or envelope detector.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn process(&mut self, input: &[f32], output: &mut [AptLine]) -> Result<usize, DspError> {
-        // 0. Drain previously-queued ready lines into `output` first so
+        // Drain previously-queued ready lines into `output` first so
         // the queue has room to absorb new emissions before any decode.
         let mut produced = self.drain_ready_into_output(output, 0);
 
-        // 1. Resample to the internal 20800 Hz grid.
-        let est_out = (input.len() as u64 * u64::from(INTERMEDIATE_RATE_HZ)
+        // Outer loop: process input in bounded subchunks so the
+        // resampler / envelope scratch never scales with caller chunk
+        // size. Empty input still needs one decode pass below in case
+        // earlier calls buffered enough samples for a fresh emission.
+        for in_chunk in input.chunks(INPUT_SUBCHUNK_SAMPLES) {
+            produced = self.process_subchunk(in_chunk, output, produced)?;
+        }
+
+        // Edge case: empty input. The for loop above didn't run, but
+        // earlier `process` calls may have buffered enough samples for
+        // another line, and the caller is asking for them now.
+        if input.is_empty() {
+            produced = self.decode_into_output_or_queue(output, produced);
+        }
+
+        Ok(produced)
+    }
+
+    /// Resample → envelope → accumulator-ingest one bounded subchunk of
+    /// input. Factored out of `process` so the outer subchunking loop
+    /// stays readable. All scratch buffers used here are sized to at
+    /// most `INPUT_SUBCHUNK_SAMPLES` worth of work.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn process_subchunk(
+        &mut self,
+        in_chunk: &[f32],
+        output: &mut [AptLine],
+        mut produced: usize,
+    ) -> Result<usize, DspError> {
+        // 1. Resample this subchunk to the internal 20800 Hz grid.
+        let est_out = (in_chunk.len() as u64 * u64::from(INTERMEDIATE_RATE_HZ)
             / u64::from(self.input_rate_hz)) as usize
             + 4;
         self.resample_scratch.resize(est_out, 0.0);
-        let resampled = self.resampler.process(input, &mut self.resample_scratch)?;
+        let resampled = self
+            .resampler
+            .process(in_chunk, &mut self.resample_scratch)?;
 
-        // 2. Envelope-detect in place into an equally-sized scratch buffer.
+        // 2. Envelope-detect into a same-sized scratch.
         self.envelope_scratch.resize(resampled, 0.0);
         self.envelope.process(
             &self.resample_scratch[..resampled],
             &mut self.envelope_scratch,
         )?;
 
-        // 3. Feed the envelope into the accumulator in *chunks bounded by
-        // DECODER_BUFFER_CAP*. After each chunk, run the decode + cap
-        // cycle. This is what keeps memory bounded even for huge inputs:
-        // accumulator grows by at most one chunk before the cap re-trims.
+        // 3. Feed the envelope into the accumulator in *chunks bounded
+        // by DECODER_BUFFER_CAP*. After each, run the decode + cap
+        // cycle so accumulator growth stays bounded.
         let mut env_offset = 0_usize;
         while env_offset < resampled {
             // Take a chunk that fits in the remaining cap space, with a
@@ -659,14 +722,6 @@ impl AptDecoder {
                 self.accumulator.drain(..drop_n);
                 self.accumulator_start_intermediate_sample += drop_n as u64;
             }
-        }
-
-        // 4. Edge case: empty input. The `while env_offset < resampled`
-        // loop never ran, but the caller might still be waiting for
-        // queued data, and earlier process() calls may have buffered
-        // enough for another decode. Run one final pass.
-        if resampled == 0 {
-            produced = self.decode_into_output_or_queue(output, produced);
         }
 
         Ok(produced)
@@ -1460,6 +1515,44 @@ mod tests {
             initial_capacity,
             "accumulator capacity grew under backpressure — Vec reallocated, \
              defeating bounded-memory intent",
+        );
+    }
+
+    #[test]
+    fn apt_decoder_huge_chunk_keeps_resample_scratch_bounded() {
+        // Outer-loop subchunking guarantees that resample_scratch and
+        // envelope_scratch never need to grow with caller chunk size.
+        // Snapshot capacities, push a multi-megabyte input chunk, and
+        // assert the scratch vectors haven't reallocated to fit the
+        // input's full size.
+        let rate = TEST_INPUT_RATE_HZ;
+        let mut d = AptDecoder::new(rate).unwrap();
+        let resample_cap_before = d.resample_scratch.capacity();
+        let envelope_cap_before = d.envelope_scratch.capacity();
+
+        // 100 audio lines = 2.4 M samples = ~9.6 MB. Pre-bounded design,
+        // resample_scratch must stay sized for one INPUT_SUBCHUNK_SAMPLES
+        // worth of output, not the whole 9.6 MB input.
+        let mut huge = Vec::new();
+        for _ in 0..100 {
+            huge.extend_from_slice(&synth_line_audio(rate, TEST_GREY_LEVEL));
+        }
+        let mut roomy_out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        d.process(&huge, &mut roomy_out).unwrap();
+
+        assert_eq!(
+            d.resample_scratch.capacity(),
+            resample_cap_before,
+            "resample_scratch reallocated under huge input — outer subchunk \
+             bound is broken (cap was {resample_cap_before}, now {})",
+            d.resample_scratch.capacity(),
+        );
+        assert_eq!(
+            d.envelope_scratch.capacity(),
+            envelope_cap_before,
+            "envelope_scratch reallocated under huge input — outer subchunk \
+             bound is broken (cap was {envelope_cap_before}, now {})",
+            d.envelope_scratch.capacity(),
         );
     }
 
