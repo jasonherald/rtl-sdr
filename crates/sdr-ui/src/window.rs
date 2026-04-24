@@ -1837,6 +1837,12 @@ fn build_layout(
         &page_from_group(&panels.bookmarks.widget),
         Some("bookmarks"),
     );
+    // Explicitly pin the initial visible child so a future
+    // additional right-activity inserted before transcript doesn't
+    // silently shift what the first `Ctrl+Shift+1` press (or the
+    // header transcript button's click) shows. Matches the contract
+    // `wire_activity_bar_clicks(..., "transcript")` relies on below.
+    right_stack.set_visible_child_name("transcript");
 
     // Inner (right) split view — sidebar sits on the trailing edge
     // so the right activity bar is the rightmost element on-screen.
