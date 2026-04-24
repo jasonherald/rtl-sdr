@@ -83,18 +83,28 @@ struct LegacySectionPanel<Content: View>: View {
     }
 }
 
-/// Right panel host — one activity during scaffolding
-/// (`#442`); Bookmarks lands in `#448`.
+/// Right panel host — landed both transcript and bookmarks
+/// in `#448`. Takes an `isOpen` binding so the bookmarks
+/// panel's close button can drive the activity-bar's
+/// open/closed state without the panel needing to know
+/// about the activity bar.
 struct RightPanelHost: View {
     let activity: RightActivity
+    @Binding var isOpen: Bool
 
     var body: some View {
         switch activity {
         case .transcript:
-            ComingSoonPanel(
-                activity: activity,
-                followUpTicket: "#448 — Transcript + right activity bar"
-            )
+            // Transcription panel doesn't have an in-panel
+            // close button — the right activity bar's
+            // Transcript icon is the close affordance.
+            TranscriptionPanel()
+        case .bookmarks:
+            // BookmarksPanel ships its own X close button
+            // bound to `isPresented`; routing that binding
+            // to `isOpen` makes the close button toggle the
+            // activity bar's state directly.
+            BookmarksPanel(isPresented: $isOpen)
         }
     }
 }

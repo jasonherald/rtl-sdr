@@ -104,10 +104,12 @@ enum LeftActivity: String, CaseIterable, Identifiable, ActivityEntry {
     }
 }
 
-/// Right activity bar — transcript slot only in scaffolding;
-/// bookmarks lands in `#448` (Right activity bar + Transcript)
-/// when the existing toolbar-toggled `BookmarksPanel` flyout
-/// migrates to the activity-bar pattern.
+/// Right activity bar — transcript + bookmarks. Both panels
+/// migrated off their pre-redesign toolbar-toggled flyouts in
+/// `#448`; clicking each icon (or pressing `⌘⇧1` / `⌘⇧2`)
+/// drives the right-side panel directly, replacing the
+/// previous `showingTranscription` / `showingBookmarks` Bool
+/// pair on `ContentView`.
 ///
 /// Kept as a separate enum from `LeftActivity` so the compiler
 /// enforces that a left selection can't accidentally be used
@@ -115,22 +117,26 @@ enum LeftActivity: String, CaseIterable, Identifiable, ActivityEntry {
 /// shortcut-modifier sets and different default widths).
 enum RightActivity: String, CaseIterable, Identifiable, ActivityEntry {
     case transcript
+    case bookmarks
 
     var label: String {
         switch self {
         case .transcript: return "Transcript"
+        case .bookmarks:  return "Bookmarks"
         }
     }
 
     var systemImage: String {
         switch self {
         case .transcript: return "text.bubble"
+        case .bookmarks:  return "bookmark"
         }
     }
 
     var shortcutIndex: Int {
         switch self {
         case .transcript: return 1
+        case .bookmarks:  return 2
         }
     }
 }

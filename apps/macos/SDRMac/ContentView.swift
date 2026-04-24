@@ -47,34 +47,6 @@ struct ContentView: View {
     /// attach to a plain View that renders the dialog.
     @State private var showingRadioReference: Bool = false
 
-    /// Right-side transcription panel visibility. Same pattern
-    /// as the RadioReference sheet: view-layer state, toggled
-    /// from the header toolbar. The driver runs independent of
-    /// panel visibility so the user can show/hide without
-    /// stopping transcription.
-    @State private var showingTranscription: Bool = false
-
-    /// Right-side bookmarks flyout visibility. Mirrors the GTK
-    /// bookmarks_panel.rs flyout (issue #339). Toggled from the
-    /// header toolbar / `⌘B`, persisted across launches in
-    /// UserDefaults so the user's last-chosen layout sticks.
-    /// Mutually exclusive with `showingTranscription` — the
-    /// content area only has room for one right-side flyout;
-    /// the `.onChange` handlers below enforce that.
-    @State private var showingBookmarks: Bool =
-        UserDefaults.standard.bool(forKey: ContentView.bookmarksFlyoutOpenKey)
-
-    /// UserDefaults key for persisting the bookmarks flyout's
-    /// open/closed state. Matches the Linux `bookmarks_flyout_open`
-    /// config key so both frontends share wording.
-    static let bookmarksFlyoutOpenKey = "SDRMac.bookmarks.flyoutOpen"
-
-    /// Right-side flyout slide transition duration, in seconds.
-    /// Shared between the transcription and bookmarks revealers
-    /// so they stay in lockstep if one is tweaked. Matches GTK's
-    /// 200 ms `Revealer.transition_duration`.
-    static let rightFlyoutTransitionSeconds: Double = 0.2
-
     // ----------------------------------------------------------
     //  Activity-bar selections — new in #442
     //
@@ -126,45 +98,29 @@ struct ContentView: View {
                 Divider()
             }
 
-            // Detail column — unchanged from the pre-redesign
-            // app. Spectrum + status bar live here, and the
-            // existing right flyouts (Transcription, Bookmarks)
-            // still slide in from the right edge of this
-            // column. #448 will reconcile that with the new
-            // right activity bar.
-            HStack(spacing: 0) {
-                VStack(spacing: 0) {
-                    CenterView()
-                    StatusBar()
-                }
-                if showingTranscription {
-                    Divider()
-                    TranscriptionPanel()
-                        .transition(.move(edge: .trailing))
-                }
-                if showingBookmarks {
-                    Divider()
-                    BookmarksPanel(isPresented: $showingBookmarks)
-                        .transition(.move(edge: .trailing))
-                }
+            // Detail column — spectrum + status bar. The
+            // pre-redesign right-side flyouts (Transcription,
+            // Bookmarks) moved to the right activity-bar
+            // panels in #448, so the detail column is now
+            // just the visualization stack.
+            VStack(spacing: 0) {
+                CenterView()
+                StatusBar()
             }
             .frame(maxWidth: .infinity)
-            .animation(
-                .easeInOut(duration: Self.rightFlyoutTransitionSeconds),
-                value: showingTranscription
-            )
-            .animation(
-                .easeInOut(duration: Self.rightFlyoutTransitionSeconds),
-                value: showingBookmarks
-            )
 
-            // Right panel — placeholder during scaffolding.
-            // The existing flyouts above still live inside the
-            // detail column; #448 unifies these surfaces.
+            // Right panel — driven by the right activity bar.
+            // Hosts TranscriptionPanel or BookmarksPanel
+            // depending on `rightSelection`; bookmarks gets
+            // the `isOpen` binding so its X close button
+            // toggles the activity bar's state directly.
             if rightPanelOpen {
                 Divider()
-                RightPanelHost(activity: rightSelection)
-                    .frame(width: Self.rightPanelWidth)
+                RightPanelHost(
+                    activity: rightSelection,
+                    isOpen: $rightPanelOpen
+                )
+                .frame(width: Self.rightPanelWidth)
             }
             Divider()
 
@@ -181,31 +137,16 @@ struct ContentView: View {
         // window-wide override. Per #446.
         .preferredColorScheme((Appearance(rawValue: rawAppearance) ?? .system).colorScheme)
         .toolbar {
-            HeaderToolbar(
-                showingRadioReference: $showingRadioReference,
-                showingTranscription: $showingTranscription,
-                showingBookmarks: $showingBookmarks
-            )
+            HeaderToolbar(showingRadioReference: $showingRadioReference)
         }
-        // Mutual exclusivity between the two right-side flyouts.
-        // Opening one closes the other rather than stacking,
-        // matching the Linux treatment (a793cdc) and fitting
-        // the content area's single-flyout width budget. Also
-        // persists the bookmarks flyout's open/closed state —
-        // the transcription panel is ephemeral, but bookmarks
-        // is a durable browse surface the user wants back where
-        // they left it.
-        .onChange(of: showingBookmarks) { _, newValue in
-            if newValue && showingTranscription {
-                showingTranscription = false
-            }
-            UserDefaults.standard.set(newValue, forKey: ContentView.bookmarksFlyoutOpenKey)
-        }
-        .onChange(of: showingTranscription) { _, newValue in
-            if newValue && showingBookmarks {
-                showingBookmarks = false
-            }
-        }
+        // Pre-redesign mutual exclusivity between the
+        // Transcription and Bookmarks toolbar buttons, plus
+        // the bookmarks UserDefaults persistence, both went
+        // away in #448. The right activity bar's selection
+        // is inherently single-valued (one panel open at a
+        // time), and #449 will handle session persistence
+        // for `rightSelection` + `rightPanelOpen` via the
+        // shared sdr-config keys.
         .sheet(isPresented: $showingRadioReference) {
             RadioReferenceDialog()
         }
