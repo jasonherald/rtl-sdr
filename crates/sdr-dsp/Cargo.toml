@@ -11,6 +11,16 @@ sdr-types.workspace = true
 rustfft.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# GPU FFT backend (epic #452 phase 2 / #179). Behind the same
+# `FftEngine` trait as `RustFftEngine`. `pollster` drives the async
+# wgpu readback to completion on the sync trait surface.
+wgpu.workspace = true
+pollster.workspace = true
+# bytemuck gets us zero-copy `Complex` ↔ `f32` slice casts for the
+# GPU upload / readback path — the same layout-identity we rely on
+# in the rustfft path, expressed safely.
+bytemuck.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -31,6 +41,14 @@ workspace = true
 
 [[bench]]
 name = "fft"
+harness = false
+
+# GPU companion to the CPU FFT bench (epic #452 phase 2 / #179).
+# Uses the same `FftEngine::forward` surface, same sizes, same
+# `iter_batched` + `black_box` discipline so the numbers are
+# directly comparable against `fft`.
+[[bench]]
+name = "fft_gpu"
 harness = false
 
 [[bench]]
