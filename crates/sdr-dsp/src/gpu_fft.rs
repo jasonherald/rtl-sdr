@@ -1,51 +1,83 @@
-//! wgpu-backed FFT engine — Stockham autosort radix-2 forward DFT,
-//! one pass per compute dispatch (epic #452 phase 2 / #179).
+//! wgpu-backed FFT engine — tiered 2D Cooley-Tukey decomposition
+//! with single-dispatch shared-memory sub-FFTs per tier (epic
+//! #452 phase 2b / #179).
 //!
 //! Lives behind the same [`FftEngine`] trait as [`RustFftEngine`]
 //! so callers can hot-swap CPU↔GPU without touching the signal
-//! path. The host-side scaffolding here owns the device / queue /
-//! pipeline / ping-pong buffers for the engine's lifetime; the
-//! hot path (`forward`) only issues `log2(N)` compute dispatches
-//! plus one readback copy, zero allocations.
+//! path. The host side owns every wgpu object (device, queue,
+//! pipelines, ping-pong buffers, uniform buffer, bind groups,
+//! staging) for the engine's lifetime; the hot path (`forward`)
+//! only issues **two** compute dispatches plus one readback copy,
+//! zero allocations.
 //!
-//! # Algorithm
+//! # Why tiered
 //!
-//! Stockham out-of-place radix-2 FFT. Pass `s` (0 ≤ s < log2(N))
-//! combines two size-`2^s` subFFTs into one size-`2^(s+1)` subFFT,
-//! reading from one ping-pong buffer and writing to the other.
-//! No bit-reversal permutation pass — Stockham's "contiguous
-//! output" layout already produces the final natural order after
-//! the last pass. See `gpu_fft.wgsl` for the per-butterfly
-//! arithmetic.
+//! Phase 2 (see `git log` for the replaced code) issued
+//! `log2(N)` sequential dispatches — one per Stockham pass —
+//! and paid ~15 µs of driver scheduling overhead on each. At
+//! N = 65536 that was ~200 µs of pure dispatch overhead, which
+//! exceeded the CPU's entire compute budget (~126 µs) before any
+//! GPU work happened.
 //!
-//! # Pre-allocation
+//! Phase 2b collapses the sequential passes into a single
+//! shared-memory sub-FFT per workgroup, then composes larger
+//! transforms via a 2D decomposition `N = P·Q`:
 //!
-//! Everything is created once in [`GpuFftEngine::with_options`]:
+//! - Stage 1: P workgroups, each computing a size-Q sub-FFT
+//!   over stride-P reads of the input, applying the cross-tier
+//!   twiddle `ω_N^(p·k_Q)`, and writing to a column-major
+//!   scratch buffer.
+//! - Stage 2: Q workgroups, each computing a size-P sub-FFT over
+//!   contiguous reads of a scratch column and writing to the
+//!   output in natural order.
 //!
-//! - `wgpu::Instance`, `wgpu::Adapter`, `wgpu::Device`, `wgpu::Queue`
-//! - Compute pipeline + bind group layout
-//! - Two ping-pong storage buffers (sized `N * 8 bytes`)
-//! - One uniform buffer holding all `log2(N)` `Params` entries at
-//!   `min_uniform_buffer_offset_alignment` stride; written once,
-//!   bound with dynamic offsets per pass
-//! - Two bind groups (ping and pong) with the uniform in both
-//! - One staging download buffer (`MAP_READ | COPY_DST`)
+//! Two dispatches per transform, regardless of N (up to the max
+//! supported size of 256·256 = 65536 — a third stage for larger
+//! N is a phase-2c extension). Each dispatch pays its own
+//! driver-scheduling cost once, not `log2(N)` times.
 //!
-//! GPU pipeline state caching is paramount — wgpu device+pipeline
-//! construction is the expensive part (~ms), dispatches are cheap
-//! (~µs). Anything that skips this cache defeats the point of GPU
-//! compute for this workload, which is why the trait is
-//! `&mut self` and every per-FFT allocation is denied.
+//! # Decomposition
+//!
+//! | N     | P   | Q   | stage-1 sub-FFT | stage-2 sub-FFT |
+//! |-------|-----|-----|-----------------|-----------------|
+//! | 2048  | 32  | 64  | 32              | 64              |
+//! | 4096  | 64  | 64  | 64              | 64              |
+//! | 8192  | 64  | 128 | 64              | 128             |
+//! | 16384 | 128 | 128 | 128             | 128             |
+//! | 32768 | 128 | 256 | 128             | 256             |
+//! | 65536 | 256 | 256 | 256             | 256             |
+//!
+//! Sizes below `MAX_SUB_N` (≤ 256) use the degenerate P = 1
+//! case — single stage, no cross-tier twiddle.
+//!
+//! # Shared memory per workgroup
+//!
+//! Two `var<workgroup>` arrays of `vec2<f32>` each sized `SUB_N`
+//! via the shader's override constants. Max usage is
+//! 2 · 256 · 8 B = 4 KB — well under the 32 KB limit every GPU
+//! we target publishes (NVIDIA discrete, AMD RDNA iGPU), leaving
+//! room for 8+ concurrent workgroups per compute unit.
+//!
+//! # Pre-allocation discipline (unchanged from phase 2)
+//!
+//! Everything is built once in [`GpuFftEngine::with_options`]:
+//! device, queue, both pipelines (one per distinct sub-FFT size),
+//! both storage buffers, uniform buffer, both stage bind groups,
+//! and the staging download buffer. `forward()` issues only queue
+//! operations: `write_buffer` for the input, two compute
+//! dispatches, a `copy_buffer_to_buffer` for readback, and a
+//! blocking `poll(Wait)`. No heap activity on the hot path.
 //!
 //! # Sync surface over async wgpu
 //!
 //! wgpu 29's `request_adapter` / `request_device` / `map_async`
-//! are all futures. The [`FftEngine`] trait is sync, so we block
-//! via [`pollster`] on the `new`/`with_options` path and poll the
-//! device on the `forward` readback path. The forward path does
-//! *not* spawn an async runtime — `device.poll(PollType::Wait)`
-//! blocks on the calling thread inside wgpu-core's own event loop.
+//! are futures. The [`FftEngine`] trait is sync, so we block via
+//! [`pollster`] on the construction path and poll the device on
+//! the readback path. The forward path does *not* spawn an async
+//! runtime — `device.poll(PollType::Wait)` blocks on the calling
+//! thread inside wgpu-core's own event loop.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
@@ -54,21 +86,27 @@ use tracing::{debug, info};
 
 use crate::fft::FftEngine;
 
-/// WGSL source for the Stockham FFT compute kernel. Compiled into
-/// a single pipeline reused across all passes.
+/// WGSL source for the tiered FFT compute kernel. Specialized at
+/// pipeline creation time via override constants.
 const SHADER_SRC: &str = include_str!("gpu_fft.wgsl");
 
-/// Workgroup size declared in the shader. Must match
-/// `@workgroup_size(N)` in `gpu_fft.wgsl` — the CPU dispatch math
-/// divides butterfly count by this.
-const SHADER_WORKGROUP_SIZE: u32 = 64;
+/// Largest sub-FFT size (per stage) this phase supports. Each
+/// workgroup allocates `2 · SUB_N · 8 B` of shared memory; keeping
+/// `MAX_SUB_N = 256` holds the footprint at 4 KB, which every
+/// GPU in our matrix runs comfortably with multiple concurrent
+/// workgroups per compute unit.
+const MAX_SUB_N: usize = 256;
 
-/// `Params` struct size in WGSL is two `u32`s = 8 bytes, but we
-/// stride entries by the device's
-/// `min_uniform_buffer_offset_alignment` so each dispatch can use
-/// a dynamic offset. 256 covers every GPU we care about (NVIDIA /
-/// AMD discrete and integrated); we query the actual limit at
-/// construction time rather than hard-coding it.
+/// Fixed number of complex points each shader thread owns across
+/// one sub-FFT. With `POINTS_PER_THREAD = 2` and
+/// `WORKGROUP_SIZE = SUB_N / 2`, each thread does exactly one
+/// butterfly per pass — no bounds-checking, no wasted lanes.
+const POINTS_PER_THREAD: u32 = 2;
+
+/// Size of [`ShaderParams`] in bytes — small enough that we just
+/// stride by `min_uniform_buffer_offset_alignment` (256 on every
+/// real GPU) between stage 1 and stage 2 entries in the uniform
+/// buffer.
 const PARAMS_SIZE_BYTES: u64 = std::mem::size_of::<ShaderParams>() as u64;
 
 /// Adapter-selection knobs for [`GpuFftEngine::with_options`].
@@ -104,11 +142,24 @@ impl Default for GpuFftOptions {
     }
 }
 
+/// Layout must match `struct Params` in `gpu_fft.wgsl`. All
+/// fields `u32` so the struct has scalar alignment 4 and total
+/// size 36 bytes. We stride by
+/// `min_uniform_buffer_offset_alignment` (≥256 on all supported
+/// GPUs) between entries, so the 36-byte natural size just fits
+/// within the first entry and the rest of the stride is padding.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
 struct ShaderParams {
-    pass_s: u32,
-    size: u32,
+    total_n: u32,
+    input_sub_offset_base: u32,
+    input_sub_offset_mult: u32,
+    input_stride: u32,
+    output_sub_offset_base: u32,
+    output_sub_offset_mult: u32,
+    output_stride: u32,
+    apply_twiddle: u32,
+    twiddle_p_mult: u32,
 }
 
 /// Adapter / backend summary for a constructed GPU engine, exposed
@@ -124,6 +175,67 @@ pub struct AdapterSummary {
     pub driver: String,
 }
 
+/// 2D decomposition `N = P · Q` used internally by
+/// [`GpuFftEngine`]. `P == 1` encodes the degenerate "single
+/// stage" case (for `N ≤ MAX_SUB_N`).
+#[derive(Debug, Clone, Copy)]
+struct Decomposition {
+    p: u32,
+    q: u32,
+}
+
+impl Decomposition {
+    fn for_size(n: usize) -> Result<Self, DspError> {
+        if n < 2 || !n.is_power_of_two() {
+            return Err(DspError::InvalidParameter(format!(
+                "GPU FFT size must be a power of two ≥ 2, got {n}"
+            )));
+        }
+        if n <= MAX_SUB_N {
+            // Single-stage path: P = 1, Q = N. Stage 1 dispatches
+            // one workgroup, no cross-tier twiddle, natural-order
+            // output.
+            let q = u32::try_from(n)
+                .map_err(|_| DspError::InvalidParameter(format!("FFT size {n} exceeds u32")))?;
+            return Ok(Self { p: 1, q });
+        }
+
+        // Two-stage path: pick P as the largest power of two
+        // ≤ √N that still keeps Q ≤ MAX_SUB_N. `trailing_zeros`
+        // on a power of two gives log2 directly; dividing log2(N)
+        // by 2 (rounding down) gives log2(floor(√N)).
+        let log2_n = n.trailing_zeros();
+        let max_log2 = MAX_SUB_N.trailing_zeros();
+        let p_log2 = (log2_n / 2).clamp(1, max_log2);
+        let mut p = 1_u32 << p_log2;
+        #[allow(clippy::cast_possible_truncation)]
+        let mut q = (n / (p as usize)) as u32;
+
+        // If `Q` exceeds MAX_SUB_N the decomposition is
+        // unbalanced — this happens for sizes like N > 65536
+        // where we'd need three tiers.
+        if q as usize > MAX_SUB_N {
+            return Err(DspError::InvalidParameter(format!(
+                "GPU FFT size {n} requires a 3-stage decomposition (Q = {q} > MAX_SUB_N = {MAX_SUB_N}); not implemented in phase 2b"
+            )));
+        }
+
+        // Canonicalize so the smaller factor is P — stage 1 sub-FFTs
+        // are often smaller than stage 2, and having the smaller
+        // one run first keeps per-workgroup pressure lower on the
+        // first wave of workgroups.
+        if p > q {
+            std::mem::swap(&mut p, &mut q);
+        }
+
+        Ok(Self { p, q })
+    }
+
+    fn is_single_stage(self) -> bool {
+        self.p == 1
+    }
+}
+
 /// wgpu-backed FFT engine. Implements [`FftEngine`] with identical
 /// semantics to [`RustFftEngine`]: in-place forward complex DFT.
 ///
@@ -136,32 +248,40 @@ pub struct GpuFftEngine {
     adapter_summary: AdapterSummary,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    pipeline: wgpu::ComputePipeline,
 
-    // Ping-pong storage buffers. Both sized `size * 8 bytes` (size
-    // complex × 2 × f32). `buf_a` also carries `COPY_DST` so we
-    // can upload the input via `queue.write_buffer`.
+    // Pipelines keyed by sub-FFT size. Either one (single-stage,
+    // or P == Q) or two entries.
+    pipelines: HashMap<u32, wgpu::ComputePipeline>,
+
+    // Ping-pong storage buffers. Both sized `size · 8 bytes`.
+    // `buf_a` carries `COPY_DST` so `queue.write_buffer` uploads
+    // the input here.
     buf_a: wgpu::Buffer,
     buf_b: wgpu::Buffer,
 
-    // Uniform buffer holding `log2(size)` `ShaderParams` entries at
+    // Uniform buffer holding at most two `ShaderParams` entries at
     // `params_stride` bytes each. Pre-filled once in `new()` and
     // addressed via dynamic offsets at dispatch time — so the host
     // never writes to it on the forward path.
-    params_bg_a: wgpu::BindGroup,
-    params_bg_b: wgpu::BindGroup,
+    bind_group_stage1: wgpu::BindGroup,
+    bind_group_stage2: Option<wgpu::BindGroup>,
     params_stride: u32,
 
     // MAP_READ | COPY_DST staging buffer for device→host readback.
     staging: wgpu::Buffer,
 
     size: usize,
-    log2_size: u32,
-    workgroup_count: u32,
 
-    // After `log2_size` ping-pong passes, the final result lives in
-    // `buf_a` iff `log2_size` is even (last pass reads from the
-    // buffer flipped-to-pong-side, writes back to A).
+    // Sub-FFT size of each stage. Used to dispatch the right
+    // pipeline and compute the workgroup count.
+    stage1_sub_n: u32,
+    stage2_sub_n: u32,
+    stage1_workgroups: u32,
+    stage2_workgroups: u32,
+
+    // Which physical buffer holds the final result after stage 2
+    // (or stage 1 if single-stage). Determines which buffer we
+    // copy to staging.
     output_in_buf_a: bool,
 }
 
@@ -172,7 +292,8 @@ impl GpuFftEngine {
     /// # Errors
     ///
     /// - [`DspError::InvalidParameter`] if `size` is not a power
-    ///   of two ≥ 2.
+    ///   of two ≥ 2, or if `size > MAX_SUB_N² = 65536` (which
+    ///   would require a 3-stage decomposition).
     /// - [`DspError::GpuUnavailable`] if no compatible adapter /
     ///   device can be acquired. Callers that want the CPU
     ///   engine as a fallback should catch this and construct
@@ -189,12 +310,8 @@ impl GpuFftEngine {
     ///
     /// Same as [`GpuFftEngine::new`].
     pub fn with_options(size: usize, opts: &GpuFftOptions) -> Result<Self, DspError> {
-        if size < 2 || !size.is_power_of_two() {
-            return Err(DspError::InvalidParameter(format!(
-                "GPU FFT size must be a power of two ≥ 2, got {size}"
-            )));
-        }
-        pollster::block_on(Self::build_async(size, opts))
+        let decomp = Decomposition::for_size(size)?;
+        pollster::block_on(Self::build_async(size, decomp, opts))
     }
 
     /// Adapter / backend / driver string for the underlying wgpu
@@ -253,63 +370,12 @@ impl GpuFftEngine {
         Ok((Arc::new(device), Arc::new(queue), summary))
     }
 
-    /// Pre-fill the per-pass uniforms. Stride is the device's
-    /// reported `min_uniform_buffer_offset_alignment`, which is
-    /// 256 on almost every GPU. Each entry is only 8 bytes so we
-    /// zero-pad the remainder of each stride.
-    ///
-    /// The `try_from` cascades can't actually fail for any shape
-    /// the caller could construct — FFT sizes are validated at
-    /// power-of-two above and `min_uniform_buffer_offset_alignment`
-    /// is always a small u32 — but going through fallible casts
-    /// keeps clippy's pedantic cast lint happy and documents the
-    /// narrowing explicitly.
-    fn build_params_buffer(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        size: usize,
-        log2_size: u32,
-    ) -> Result<(wgpu::Buffer, u32), DspError> {
-        let params_size_u32 = u32::try_from(PARAMS_SIZE_BYTES)
-            .map_err(|_| DspError::InvalidParameter("ShaderParams size exceeds u32".into()))?;
-        let params_stride = device
-            .limits()
-            .min_uniform_buffer_offset_alignment
-            .max(params_size_u32);
-        let size_u32 = u32::try_from(size)
-            .map_err(|_| DspError::InvalidParameter(format!("FFT size {size} exceeds u32")))?;
-        let params_buf_bytes = u64::from(params_stride) * u64::from(log2_size);
-        let params_buf_bytes_usize = usize::try_from(params_buf_bytes).map_err(|_| {
-            DspError::InvalidParameter(format!(
-                "uniform buffer size {params_buf_bytes} exceeds usize"
-            ))
-        })?;
-
-        let mut params_bytes = vec![0_u8; params_buf_bytes_usize];
-        for s in 0..log2_size {
-            let params = ShaderParams {
-                pass_s: s,
-                size: size_u32,
-            };
-            let start = (s * params_stride) as usize;
-            let end = start + std::mem::size_of::<ShaderParams>();
-            params_bytes[start..end].copy_from_slice(bytemuck::bytes_of(&params));
-        }
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sdr-dsp GPU FFT params"),
-            size: params_buf_bytes,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&params_buf, 0, &params_bytes);
-
-        Ok((params_buf, params_stride))
-    }
-
-    /// Build the single compute pipeline + its bind group layout.
-    /// The pipeline is reused across every pass.
-    fn build_pipeline(device: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    /// Build the bind group layout used by every pipeline this
+    /// engine creates. The three bindings are (0) a uniform buffer
+    /// with dynamic offset, (1) a read-only storage buffer, and
+    /// (2) a read-write storage buffer.
+    fn build_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sdr-dsp GPU FFT bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -343,35 +409,96 @@ impl GpuFftEngine {
                     count: None,
                 },
             ],
-        });
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sdr-dsp GPU FFT shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sdr-dsp GPU FFT pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("sdr-dsp GPU FFT pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        (pipeline, bind_group_layout)
+        })
     }
 
-    async fn build_async(size: usize, opts: &GpuFftOptions) -> Result<Self, DspError> {
-        let (device, queue, adapter_summary) = Self::acquire_device(opts).await?;
+    /// Build one specialized compute pipeline for the given
+    /// `sub_n`. The shader's override constants are bound to
+    /// match the sub-FFT size — `WORKGROUP_SIZE = sub_n / 2`,
+    /// `LOG2_SUB_N`, and the hardcoded `POINTS_PER_THREAD`
+    /// contract — so each pipeline runs exactly one butterfly per
+    /// thread per pass, no wasted lanes.
+    fn build_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        sub_n: u32,
+    ) -> wgpu::ComputePipeline {
+        let workgroup_size = sub_n / POINTS_PER_THREAD;
+        let log2_sub_n = sub_n.trailing_zeros();
 
-        // Buffer sizing. Each complex point is two f32s = 8 bytes.
+        // wgpu 29 takes override constants as `&[(&str, f64)]`.
+        let constants: [(&str, f64); 4] = [
+            ("WORKGROUP_SIZE", f64::from(workgroup_size)),
+            ("SUB_N", f64::from(sub_n)),
+            ("LOG2_SUB_N", f64::from(log2_sub_n)),
+            ("POINTS_PER_THREAD", f64::from(POINTS_PER_THREAD)),
+        ];
+
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("sdr-dsp GPU FFT pipeline"),
+            layout: Some(layout),
+            module: shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                zero_initialize_workgroup_memory: false,
+            },
+            cache: None,
+        })
+    }
+
+    /// Fill the uniform buffer with at most two `ShaderParams`
+    /// entries (stage 1 + stage 2), each at an aligned offset.
+    /// Returns the buffer plus the per-entry stride.
+    fn build_params_buffer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        stage1: &ShaderParams,
+        stage2: Option<&ShaderParams>,
+    ) -> Result<(wgpu::Buffer, u32), DspError> {
+        let params_size_u32 = u32::try_from(PARAMS_SIZE_BYTES)
+            .map_err(|_| DspError::InvalidParameter("ShaderParams size exceeds u32".into()))?;
+        let params_stride = device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(params_size_u32);
+
+        let entry_count: u64 = if stage2.is_some() { 2 } else { 1 };
+        let params_buf_bytes = u64::from(params_stride) * entry_count;
+        let params_buf_bytes_usize = usize::try_from(params_buf_bytes).map_err(|_| {
+            DspError::InvalidParameter(format!(
+                "uniform buffer size {params_buf_bytes} exceeds usize"
+            ))
+        })?;
+
+        let mut params_bytes = vec![0_u8; params_buf_bytes_usize];
+        let end1 = std::mem::size_of::<ShaderParams>();
+        params_bytes[..end1].copy_from_slice(bytemuck::bytes_of(stage1));
+        if let Some(s2) = stage2 {
+            let start2 = params_stride as usize;
+            let end2 = start2 + std::mem::size_of::<ShaderParams>();
+            params_bytes[start2..end2].copy_from_slice(bytemuck::bytes_of(s2));
+        }
+
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sdr-dsp GPU FFT params"),
+            size: params_buf_bytes,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buf, 0, &params_bytes);
+
+        Ok((params_buf, params_stride))
+    }
+
+    /// Create the three device-side buffers the engine uses for
+    /// the lifetime of the FFT: two storage buffers (ping-pong)
+    /// and a `MAP_READ`-capable staging buffer for readback.
+    fn build_storage_buffers(
+        device: &wgpu::Device,
+        size: usize,
+    ) -> Result<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer), DspError> {
         let buffer_bytes = (size as u64)
             .checked_mul(std::mem::size_of::<Complex>() as u64)
             .ok_or_else(|| {
@@ -392,91 +519,240 @@ impl GpuFftEngine {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sdr-dsp GPU FFT staging"),
             size: buffer_bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        Ok((buf_a, buf_b, staging))
+    }
 
-        let log2_size = size.trailing_zeros();
-        let (params_buf, params_stride) =
-            Self::build_params_buffer(&device, &queue, size, log2_size)?;
-        let (pipeline, bind_group_layout) = Self::build_pipeline(&device);
+    /// Compile the shader, build all required pipelines (one per
+    /// distinct sub-FFT size), and materialize stage-1 / stage-2
+    /// bind groups that swap ping-pong buffer roles. Returns
+    /// `None` for stage 2 when `decomp` is single-stage.
+    fn build_pipelines_and_bgs(
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        params_buf: &wgpu::Buffer,
+        buf_a: &wgpu::Buffer,
+        buf_b: &wgpu::Buffer,
+        decomp: Decomposition,
+    ) -> (
+        HashMap<u32, wgpu::ComputePipeline>,
+        wgpu::BindGroup,
+        Option<wgpu::BindGroup>,
+    ) {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sdr-dsp GPU FFT shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sdr-dsp GPU FFT pipeline layout"),
+            bind_group_layouts: &[Some(bind_group_layout)],
+            immediate_size: 0,
+        });
 
-        // Two bind groups — alternating which ping-pong buffer is
-        // read-only (src) vs read-write (dst). Both share the same
-        // dynamic-offset uniform binding.
-        let make_bg = |label: &str, src: &wgpu::Buffer, dst: &wgpu::Buffer| -> wgpu::BindGroup {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &bind_group_layout,
+        // stage 1 runs size-Q sub-FFTs, stage 2 runs size-P.
+        let stage1_sub_n = decomp.q;
+        let stage2_sub_n = decomp.p;
+        let mut pipelines: HashMap<u32, wgpu::ComputePipeline> = HashMap::new();
+        pipelines.insert(
+            stage1_sub_n,
+            Self::build_pipeline(device, &shader, &pipeline_layout, stage1_sub_n),
+        );
+        if !decomp.is_single_stage() && stage2_sub_n != stage1_sub_n {
+            pipelines.insert(
+                stage2_sub_n,
+                Self::build_pipeline(device, &shader, &pipeline_layout, stage2_sub_n),
+            );
+        }
+
+        let uniform_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: params_buf,
+            offset: 0,
+            size: wgpu::BufferSize::new(PARAMS_SIZE_BYTES),
+        });
+
+        // Stage 1: A→B. Uniform at dynamic offset 0.
+        let bind_group_stage1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sdr-dsp GPU FFT bg stage1 (A→B)"),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_binding.clone(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buf_b.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Stage 2: B→A. Storage buffer roles swap; ping-pong
+        // preserved. Uniform at dynamic offset = `params_stride`
+        // (supplied at dispatch time in `forward`).
+        let bind_group_stage2 = if decomp.is_single_stage() {
+            None
+        } else {
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sdr-dsp GPU FFT bg stage2 (B→A)"),
+                layout: bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &params_buf,
-                            offset: 0,
-                            size: wgpu::BufferSize::new(PARAMS_SIZE_BYTES),
-                        }),
+                        resource: uniform_binding,
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: src.as_entire_binding(),
+                        resource: buf_b.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: dst.as_entire_binding(),
+                        resource: buf_a.as_entire_binding(),
                     },
                 ],
-            })
+            }))
         };
-        let params_bg_a = make_bg("sdr-dsp GPU FFT bg (read A, write B)", &buf_a, &buf_b);
-        let params_bg_b = make_bg("sdr-dsp GPU FFT bg (read B, write A)", &buf_b, &buf_a);
 
-        let butterflies_per_pass = size / 2;
-        let workgroup_count = u32::try_from(
-            butterflies_per_pass.div_ceil(SHADER_WORKGROUP_SIZE as usize),
-        )
-        .map_err(|_| {
-            DspError::InvalidParameter(format!(
-                "FFT size {size} produces too many workgroups for u32 dispatch"
-            ))
-        })?;
+        (pipelines, bind_group_stage1, bind_group_stage2)
+    }
 
-        // Last pass is `log2_size - 1` (0-indexed). After an even
-        // number of total passes, result is back in `buf_a`
-        // (pass 0 A→B, pass 1 B→A, pass 2 A→B, ...).
-        let output_in_buf_a = log2_size.is_multiple_of(2);
+    async fn build_async(
+        size: usize,
+        decomp: Decomposition,
+        opts: &GpuFftOptions,
+    ) -> Result<Self, DspError> {
+        let (device, queue, adapter_summary) = Self::acquire_device(opts).await?;
+
+        let (buf_a, buf_b, staging) = Self::build_storage_buffers(&device, size)?;
+
+        let total_n = u32::try_from(size)
+            .map_err(|_| DspError::InvalidParameter(format!("FFT size {size} exceeds u32")))?;
+        let (stage1_params, stage2_params_opt, output_in_buf_a) =
+            Self::build_stage_params(total_n, decomp);
+
+        let bind_group_layout = Self::build_bind_group_layout(&device);
+        let (params_buf, params_stride) =
+            Self::build_params_buffer(&device, &queue, &stage1_params, stage2_params_opt.as_ref())?;
+
+        let (pipelines, bind_group_stage1, bind_group_stage2) = Self::build_pipelines_and_bgs(
+            &device,
+            &bind_group_layout,
+            &params_buf,
+            &buf_a,
+            &buf_b,
+            decomp,
+        );
+
+        let stage1_sub_n = decomp.q;
+        let stage2_sub_n = decomp.p;
+        let stage1_workgroups = decomp.p;
+        let stage2_workgroups = decomp.q;
 
         debug!(
             target: "sdr_dsp::gpu_fft",
             size = size,
-            log2_size = log2_size,
-            buffer_bytes = buffer_bytes,
+            p = decomp.p,
+            q = decomp.q,
+            stage1_sub_n = stage1_sub_n,
+            stage2_sub_n = stage2_sub_n,
+            stage1_workgroups = stage1_workgroups,
+            stage2_workgroups = stage2_workgroups,
             params_stride = params_stride,
-            workgroup_count = workgroup_count,
-            output_in_buf_a = output_in_buf_a,
-            "GPU FFT engine ready"
+            pipeline_count = pipelines.len(),
+            "GPU FFT engine ready (tiered)"
         );
 
         Ok(Self {
             adapter_summary,
             device,
             queue,
-            pipeline,
+            pipelines,
             buf_a,
             buf_b,
-            params_bg_a,
-            params_bg_b,
+            bind_group_stage1,
+            bind_group_stage2,
             params_stride,
             staging,
             size,
-            log2_size,
-            workgroup_count,
+            stage1_sub_n,
+            stage2_sub_n,
+            stage1_workgroups,
+            stage2_workgroups,
             output_in_buf_a,
         })
+    }
+
+    /// Compute the per-stage `ShaderParams` given the full
+    /// decomposition. The returned `output_in_buf_a` flag names
+    /// which physical buffer holds the final result after the
+    /// last dispatch.
+    fn build_stage_params(
+        total_n: u32,
+        decomp: Decomposition,
+    ) -> (ShaderParams, Option<ShaderParams>, bool) {
+        if decomp.is_single_stage() {
+            // Single stage: one workgroup doing a size-N FFT over
+            // contiguous reads of the input. Output is natural-
+            // order in buf_b (stage 1 writes A→B).
+            let params = ShaderParams {
+                total_n,
+                input_sub_offset_base: 0,
+                input_sub_offset_mult: 0,
+                input_stride: 1,
+                output_sub_offset_base: 0,
+                output_sub_offset_mult: 0,
+                output_stride: 1,
+                apply_twiddle: 0,
+                twiddle_p_mult: 0,
+            };
+            return (params, None, /* output_in_buf_a */ false);
+        }
+
+        let p = decomp.p;
+
+        // Stage 1: P workgroups. Workgroup `p ∈ [0, P)` reads
+        // x[p + k·P] for k ∈ [0, Q), applies the cross-tier
+        // twiddle ω_N^(p·k_Q), writes Z[p, k_Q] at column-major
+        // address `k_Q · P + p`.
+        let stage1 = ShaderParams {
+            total_n,
+            input_sub_offset_base: 0,
+            input_sub_offset_mult: 1, // wg_id * 1 = p
+            input_stride: p,          // stride-P reads
+            output_sub_offset_base: 0,
+            output_sub_offset_mult: 1, // wg_id * 1 = p (column-major base)
+            output_stride: p,          // stride-P writes (k_Q * P + p)
+            apply_twiddle: 1,
+            twiddle_p_mult: 1, // p = wg_id * 1
+        };
+
+        // Stage 2: Q workgroups. Workgroup `k_Q ∈ [0, Q)` reads
+        // Z[p, k_Q] at addresses `k_Q · P + p` for p ∈ [0, P) —
+        // contiguous reads since Z is column-major. Writes to
+        // y[k_P · Q + k_Q] — stride-Q writes.
+        let q = decomp.q;
+        let stage2 = ShaderParams {
+            total_n,
+            input_sub_offset_base: 0,
+            input_sub_offset_mult: p, // wg_id * P = k_Q * P (column base)
+            input_stride: 1,          // contiguous reads within column
+            output_sub_offset_base: 0,
+            output_sub_offset_mult: 1, // wg_id * 1 = k_Q
+            output_stride: q,          // stride-Q writes (k_P * Q + k_Q)
+            apply_twiddle: 0,
+            twiddle_p_mult: 0,
+        };
+
+        // Stage 2 writes A→B→A, so the result is back in buf_a.
+        (stage1, Some(stage2), /* output_in_buf_a */ true)
     }
 }
 
@@ -493,8 +769,7 @@ impl FftEngine for GpuFftEngine {
         self.queue
             .write_buffer(&self.buf_a, 0, bytemuck::cast_slice(buf));
 
-        // 2. Encode log2(N) compute dispatches, alternating bind
-        //    groups so the ping-pong reads/writes flow correctly.
+        // 2. Encode one or two compute dispatches.
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -505,16 +780,26 @@ impl FftEngine for GpuFftEngine {
                 label: Some("sdr-dsp GPU FFT compute pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            for s in 0..self.log2_size {
-                let bg = if s % 2 == 0 {
-                    &self.params_bg_a
-                } else {
-                    &self.params_bg_b
-                };
-                let dynamic_offset = s * self.params_stride;
-                pass.set_bind_group(0, bg, &[dynamic_offset]);
-                pass.dispatch_workgroups(self.workgroup_count, 1, 1);
+
+            // Stage 1 dispatch. Uniform at offset 0.
+            let stage1_pipeline = self
+                .pipelines
+                .get(&self.stage1_sub_n)
+                .expect("stage1 pipeline pre-built in new()");
+            pass.set_pipeline(stage1_pipeline);
+            pass.set_bind_group(0, &self.bind_group_stage1, &[0]);
+            pass.dispatch_workgroups(self.stage1_workgroups, 1, 1);
+
+            // Stage 2 dispatch (only for tiered). Uniform at
+            // offset `params_stride`.
+            if let Some(bg2) = &self.bind_group_stage2 {
+                let stage2_pipeline = self
+                    .pipelines
+                    .get(&self.stage2_sub_n)
+                    .expect("stage2 pipeline pre-built in new()");
+                pass.set_pipeline(stage2_pipeline);
+                pass.set_bind_group(0, bg2, &[self.params_stride]);
+                pass.dispatch_workgroups(self.stage2_workgroups, 1, 1);
             }
         }
 
@@ -534,7 +819,7 @@ impl FftEngine for GpuFftEngine {
         let slice = self.staging.slice(..);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |res| {
-            // Ignore send errors — the receiver side always drains
+            // Ignore send errors — the receiver always drains
             // exactly once on the same thread, so the channel
             // can't be closed before we post.
             let _ = tx.send(res);
@@ -663,6 +948,16 @@ mod tests {
         assert_parity(65_536);
     }
 
+    /// Extra coverage for a size that hits the single-stage
+    /// (P = 1) path — important because the tiered code is the
+    /// exciting part, but the degenerate path shares all the
+    /// uniform-buffer / bind-group plumbing and deserves its
+    /// own correctness check.
+    #[test]
+    fn parity_single_stage_256() {
+        assert_parity(256);
+    }
+
     #[test]
     fn rejects_non_power_of_two() {
         // 1000 isn't a power of two, should fail param validation
@@ -681,6 +976,26 @@ mod tests {
         assert!(
             matches!(err, DspError::InvalidParameter(_)),
             "expected InvalidParameter, got {err:?}"
+        );
+    }
+
+    /// Sizes above `MAX_SUB_N² = 65536` need a 3-stage
+    /// decomposition that isn't in phase 2b. The error path
+    /// should be an `InvalidParameter` with a clear message —
+    /// not a `GpuUnavailable` (which would mislead a caller that
+    /// has a working GPU but asked for an unsupported size).
+    #[test]
+    fn rejects_too_large() {
+        let err = GpuFftEngine::new(131_072).expect_err("must reject");
+        // `unreachable!` rather than `panic!` to satisfy clippy's
+        // production-code panic lint — the guard value can only
+        // be reached on a real regression in `Decomposition::for_size`.
+        let DspError::InvalidParameter(msg) = err else {
+            unreachable!("expected InvalidParameter");
+        };
+        assert!(
+            msg.contains("3-stage") || msg.contains("131072"),
+            "expected informative error, got: {msg}"
         );
     }
 }
