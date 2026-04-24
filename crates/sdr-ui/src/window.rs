@@ -2040,6 +2040,11 @@ fn build_header_bar(
     // `build_window` after `connect_audio_panel` runs, so the
     // persistence + audio-panel mirror rely on the full handle set.
     volume_button.set_tooltip_text(Some("Volume"));
+    // Explicit accessibility label — tooltip text alone isn't
+    // announced reliably by screen readers for icon-only header
+    // controls (same idiom as the bookmarks / transcript / pinned-
+    // servers buttons).
+    volume_button.update_property(&[gtk4::accessible::Property::Label("Volume")]);
 
     // App menu
     let menu_button = build_menu_button();
@@ -2365,6 +2370,7 @@ fn connect_sidebar_panels(
         status_bar,
         spectrum_handle,
         scanner_force_disable,
+        volume_button,
     );
 
     // Mutation-triggered scanner re-projection. Fires on scan
@@ -7109,6 +7115,7 @@ fn restore_bookmark_profile(
     radio: &sidebar::RadioPanel,
     gain_row: &adw::SpinRow,
     agc_row: &adw::ComboRow,
+    volume_button: &gtk4::ScaleButton,
 ) {
     if let Some(sq_en) = bookmark.squelch_enabled {
         state.send_dsp(UiToDsp::SetSquelchEnabled(sq_en));
@@ -7161,7 +7168,19 @@ fn restore_bookmark_profile(
         gain_row.set_value(gain);
     }
     if let Some(vol) = bookmark.volume {
-        state.send_dsp(UiToDsp::SetVolume(vol));
+        // Route through the header `ScaleButton` so the restored
+        // level flows through the single source of truth
+        // `connect_volume_persistence` established: the button's
+        // `value_changed` handler dispatches `SetVolume`, writes
+        // `KEY_AUDIO_VOLUME`, and mirrors into the audio panel's
+        // `volume_row`. Calling `send_dsp(SetVolume(vol))` directly
+        // here would leave the button + audio row + persisted key
+        // showing stale state until the next user edit flicked
+        // them back. `set_value` fires the handler only if the new
+        // value differs from the current one — same idempotency
+        // story as the gain row above.
+        #[allow(clippy::cast_lossless)]
+        volume_button.set_value(vol as f64);
     }
     if let Some(de_idx) = bookmark.deemphasis {
         let deemp = match de_idx {
@@ -7242,6 +7261,7 @@ fn connect_navigation_panel(
     status_bar: &Rc<StatusBar>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     scanner_force_disable: &Rc<ScannerForceDisable>,
+    volume_button: &gtk4::ScaleButton,
 ) {
     // Navigation callback: restore full tuning profile from bookmark.
     let state_nav = Rc::clone(state);
@@ -7253,6 +7273,7 @@ fn connect_navigation_panel(
     let source_nav_gain = panels.source.gain_row.clone();
     let source_nav_agc = panels.source.agc_row.clone();
     let force_disable_nav = Rc::clone(scanner_force_disable);
+    let volume_button_nav = volume_button.clone();
 
     panels.bookmarks.connect_navigate(move |bookmark| {
         // Both bookmark recall AND band-preset selection come in
@@ -7297,6 +7318,7 @@ fn connect_navigation_panel(
             &radio_nav,
             &source_nav_gain,
             &source_nav_agc,
+            &volume_button_nav,
         );
 
         // Update mode-specific control visibility for the restored mode.

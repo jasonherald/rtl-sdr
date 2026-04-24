@@ -26,6 +26,14 @@ pub const VOLUME_PERCENT_MAX: f64 = 100.0;
 pub const VOLUME_PERCENT_STEP: f64 = 1.0;
 pub const VOLUME_PERCENT_PAGE: f64 = 10.0;
 
+/// Valid TCP / UDP port range for the network sink port spin row.
+pub const PORT_MIN: f64 = 1.0;
+pub const PORT_MAX: f64 = 65535.0;
+/// Keyboard increment / scroll-wheel step for the port spin row.
+pub const PORT_STEP: f64 = 1.0;
+/// Page-up / page-down step for the port spin row.
+pub const PORT_PAGE: f64 = 100.0;
+
 /// Config key for persisted volume. Stored as a `f64` in
 /// `[0.0, 1.0]` (header `GtkScaleButton` domain) so the on-disk
 /// value is the same shape the DSP sees via `UiToDsp::SetVolume`.
@@ -150,10 +158,10 @@ pub fn build_audio_panel() -> AudioPanel {
 
     let port_adjustment = gtk4::Adjustment::new(
         f64::from(NETWORK_SINK_DEFAULT_PORT),
-        1.0,
-        65535.0,
-        1.0,
-        100.0,
+        PORT_MIN,
+        PORT_MAX,
+        PORT_STEP,
+        PORT_PAGE,
         0.0,
     );
     let network_port_row = adw::SpinRow::builder()
