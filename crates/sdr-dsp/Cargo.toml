@@ -14,6 +14,33 @@ thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# Benchmark harness for the GPU-acceleration epic (#452).
+# Phase-1 baseline suite measures the CPU implementations of FFT,
+# FIR filtering, waterfall colormap lookup, and energy detection so
+# every subsequent GPU sub-ticket has a fixed comparison surface.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [lints]
 workspace = true
+
+# ─── Benchmarks (epic #452 phase 1) ──────────────────────────
+# `harness = false` tells cargo to skip the default libtest harness
+# so Criterion's own entrypoint (`criterion_group!` + `criterion_main!`)
+# takes over. Missing this is the usual "why does `cargo bench` do
+# nothing useful" trap.
+
+[[bench]]
+name = "fft"
+harness = false
+
+[[bench]]
+name = "fir"
+harness = false
+
+[[bench]]
+name = "colormap"
+harness = false
+
+[[bench]]
+name = "detection"
+harness = false
