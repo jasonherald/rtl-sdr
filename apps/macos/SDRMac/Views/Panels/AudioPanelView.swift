@@ -87,6 +87,14 @@ private struct OutputSection: View {
             Text("Where demodulated audio goes — local CoreAudio device or a network stream.")
                 .font(.caption)
         }
+        .onAppear {
+            // Re-enumerate CoreAudio outputs whenever the
+            // panel opens so a hot-plugged headset / DAC
+            // shows up in the picker without an app
+            // relaunch. Cheap call; runs on main actor. Per
+            // `CodeRabbit` round 2 on PR #493.
+            model.refreshAudioDevices()
+        }
     }
 }
 
@@ -133,6 +141,13 @@ private struct NetworkSinkSection: View {
     @Environment(CoreModel.self) private var model
     @State private var hostEdit: String = ""
     @State private var portEdit: String = ""
+    /// Draft-local protocol value — only flushes to the model
+    /// on Apply, matching how `hostEdit` / `portEdit` work.
+    /// Per `CodeRabbit` round 2 on PR #493: the previous
+    /// direct-write to `model.networkSinkProtocol` violated
+    /// the explicit-commit contract, leaving an un-applied
+    /// edit live for `syncToEngine()` to pick up.
+    @State private var protocolEdit: NetworkProtocol = .tcpServer
     @State private var didPrefill: Bool = false
 
     var body: some View {
@@ -149,10 +164,7 @@ private struct NetworkSinkSection: View {
             }
 
             LabeledContent("Protocol") {
-                Picker("", selection: Binding(
-                    get: { model.networkSinkProtocol },
-                    set: { model.networkSinkProtocol = $0 }
-                )) {
+                Picker("", selection: $protocolEdit) {
                     ForEach(NetworkProtocol.allCases, id: \.self) { p in
                         Text(p.label).tag(p)
                     }
@@ -167,7 +179,7 @@ private struct NetworkSinkSection: View {
                 model.applyNetworkSinkConfig(
                     host: host,
                     port: port,
-                    protocol: model.networkSinkProtocol
+                    protocol: protocolEdit
                 )
             } label: {
                 Label("Apply", systemImage: "checkmark.circle")
@@ -192,6 +204,7 @@ private struct NetworkSinkSection: View {
             didPrefill = true
             hostEdit = model.networkSinkHost
             portEdit = String(model.networkSinkPort)
+            protocolEdit = model.networkSinkProtocol
         }
     }
 
