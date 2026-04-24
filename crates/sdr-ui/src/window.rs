@@ -178,6 +178,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         freq_selector,
         screenshot_button,
         rr_button,
+        volume_button,
         favorites_handle,
     ) = build_header_bar(&sidebar_toggle, &state);
 
@@ -359,6 +360,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         config,
         &favorites_handle,
         &scanner_force_disable,
+        &volume_button,
     );
 
     // Seed the scanner with the persisted bookmark list on
@@ -1816,7 +1818,7 @@ fn build_layout(
         .build();
     left_stack.add_named(&general_panel.widget, Some("general"));
     left_stack.add_named(&panels.radio.widget, Some("radio"));
-    left_stack.add_named(&page_from_group(&panels.audio.widget), Some("audio"));
+    left_stack.add_named(&panels.audio.widget, Some("audio"));
     left_stack.add_named(&page_from_group(&panels.display.widget), Some("display"));
     left_stack.add_named(&page_from_widget(&panels.scanner.widget), Some("scanner"));
     left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
@@ -1985,6 +1987,7 @@ fn build_header_bar(
     header::frequency_selector::FrequencySelector,
     gtk4::Button,
     gtk4::Button,
+    gtk4::ScaleButton,
     FavoritesHeaderHandle,
 ) {
     // Play/stop button
@@ -2033,13 +2036,15 @@ fn build_header_bar(
             "audio-volume-high-symbolic",
         ],
     );
-    volume_button.set_value(1.0);
+    // Initial value + `connect_value_changed` handler are wired in
+    // `build_window` after `connect_audio_panel` runs, so the
+    // persistence + audio-panel mirror rely on the full handle set.
     volume_button.set_tooltip_text(Some("Volume"));
-    let state_vol = Rc::clone(state);
-    volume_button.connect_value_changed(move |_btn, value| {
-        #[allow(clippy::cast_possible_truncation)]
-        state_vol.send_dsp(UiToDsp::SetVolume(value as f32));
-    });
+    // Explicit accessibility label — tooltip text alone isn't
+    // announced reliably by screen readers for icon-only header
+    // controls (same idiom as the bookmarks / transcript / pinned-
+    // servers buttons).
+    volume_button.update_property(&[gtk4::accessible::Property::Label("Volume")]);
 
     // App menu
     let menu_button = build_menu_button();
@@ -2083,6 +2088,7 @@ fn build_header_bar(
         freq_selector,
         screenshot_button,
         rr_button,
+        volume_button,
         favorites_handle,
     )
 }
@@ -2302,6 +2308,7 @@ fn connect_sidebar_panels(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     favorites_header: &FavoritesHeaderHandle,
     scanner_force_disable: &Rc<ScannerForceDisable>,
+    volume_button: &gtk4::ScaleButton,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -2352,6 +2359,7 @@ fn connect_sidebar_panels(
     connect_radio_panel(panels, state, scanner_force_disable);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
+    connect_volume_persistence(panels, state, config, volume_button);
     connect_scanner_panel(panels, state, config);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
@@ -2362,6 +2370,7 @@ fn connect_sidebar_panels(
         status_bar,
         spectrum_handle,
         scanner_force_disable,
+        volume_button,
     );
 
     // Mutation-triggered scanner re-projection. Fires on scan
@@ -7106,6 +7115,7 @@ fn restore_bookmark_profile(
     radio: &sidebar::RadioPanel,
     gain_row: &adw::SpinRow,
     agc_row: &adw::ComboRow,
+    volume_button: &gtk4::ScaleButton,
 ) {
     if let Some(sq_en) = bookmark.squelch_enabled {
         state.send_dsp(UiToDsp::SetSquelchEnabled(sq_en));
@@ -7158,7 +7168,19 @@ fn restore_bookmark_profile(
         gain_row.set_value(gain);
     }
     if let Some(vol) = bookmark.volume {
-        state.send_dsp(UiToDsp::SetVolume(vol));
+        // Route through the header `ScaleButton` so the restored
+        // level flows through the single source of truth
+        // `connect_volume_persistence` established: the button's
+        // `value_changed` handler dispatches `SetVolume`, writes
+        // `KEY_AUDIO_VOLUME`, and mirrors into the audio panel's
+        // `volume_row`. Calling `send_dsp(SetVolume(vol))` directly
+        // here would leave the button + audio row + persisted key
+        // showing stale state until the next user edit flicked
+        // them back. `set_value` fires the handler only if the new
+        // value differs from the current one — same idempotency
+        // story as the gain row above.
+        #[allow(clippy::cast_lossless)]
+        volume_button.set_value(vol as f64);
     }
     if let Some(de_idx) = bookmark.deemphasis {
         let deemp = match de_idx {
@@ -7239,6 +7261,7 @@ fn connect_navigation_panel(
     status_bar: &Rc<StatusBar>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     scanner_force_disable: &Rc<ScannerForceDisable>,
+    volume_button: &gtk4::ScaleButton,
 ) {
     // Navigation callback: restore full tuning profile from bookmark.
     let state_nav = Rc::clone(state);
@@ -7250,6 +7273,7 @@ fn connect_navigation_panel(
     let source_nav_gain = panels.source.gain_row.clone();
     let source_nav_agc = panels.source.agc_row.clone();
     let force_disable_nav = Rc::clone(scanner_force_disable);
+    let volume_button_nav = volume_button.clone();
 
     panels.bookmarks.connect_navigate(move |bookmark| {
         // Both bookmark recall AND band-preset selection come in
@@ -7294,6 +7318,7 @@ fn connect_navigation_panel(
             &radio_nav,
             &source_nav_gain,
             &source_nav_agc,
+            &volume_button_nav,
         );
 
         // Update mode-specific control visibility for the restored mode.
@@ -7502,6 +7527,108 @@ fn connect_navigation_panel(
     });
 }
 
+/// Epsilon (in fractional volume units, i.e. `[0.0, 1.0]`) below
+/// which the mirrored volume widgets are considered "already at the
+/// target" and the sync side skips its `set_value` call. Prevents
+/// floating-point round-trip artefacts from causing a trivial
+/// mirror loop between the header `GtkScaleButton` (0.0..=1.0 step
+/// 0.05) and the audio panel `AdwSpinRow` (0..=100 step 1 →
+/// 0.01-per-step when scaled). A half-step worth of slack sits
+/// comfortably below the smallest user-perceptible change.
+const VOLUME_SYNC_EPSILON: f64 = 0.005;
+
+/// Wire volume persistence (closes #419) and two-way sync between
+/// the header `GtkScaleButton` and the audio panel's
+/// `volume_row` `AdwSpinRow`.
+///
+/// The header button is the single source of truth: its
+/// `connect_value_changed` handler is the ONLY path that dispatches
+/// `UiToDsp::SetVolume` and writes to the config. The audio-panel
+/// row drives the button via `set_value` — its own
+/// `connect_value_notify` just mirrors into the button and lets the
+/// button's handler do the real work. That keeps one handler owning
+/// dispatch + persist, and the mirror path stays idempotent.
+///
+/// Startup ordering (load-bearing):
+///   1. Seed both widgets with the saved volume (no handlers yet,
+///      so no dispatch or cascade).
+///   2. Explicit `state.send_dsp(UiToDsp::SetVolume(saved))` —
+///      guarantees the DSP starts at the restored level regardless
+///      of `ScaleButton::set_value` being a no-op on same-value
+///      (closes #424's "no 1-frame blast while config loads"
+///      requirement).
+///   3. Wire the handlers.
+///
+/// Any other code path that mutates volume (bookmark recall,
+/// preferences restore, etc.) must go through
+/// `volume_button.set_value(vol)` so this handler runs — direct
+/// `send_dsp(SetVolume(..))` would leave the button / row / config
+/// showing stale state until the user's next edit.
+fn connect_volume_persistence(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    volume_button: &gtk4::ScaleButton,
+) {
+    let saved_volume = config.read(|v| {
+        v.get(sidebar::audio_panel::KEY_AUDIO_VOLUME)
+            .and_then(serde_json::Value::as_f64)
+            .map_or(1.0, |f| f.clamp(0.0, 1.0))
+    });
+
+    // Seed both widgets BEFORE wiring handlers. Setting values
+    // first means the initial state isn't observed as a
+    // "user change" — no handlers fire, no duplicate dispatch,
+    // no mirror-path cascade. Dispatch is done explicitly below.
+    volume_button.set_value(saved_volume);
+    panels
+        .audio
+        .volume_row
+        .set_value(saved_volume * sidebar::audio_panel::VOLUME_PERCENT_MAX);
+
+    // Guaranteed initial dispatch to the DSP so audio starts at
+    // the restored level regardless of how `ScaleButton::set_value`
+    // interacts with its default (closes #424's "no 1-frame blast
+    // while config loads" requirement).
+    #[allow(clippy::cast_possible_truncation)]
+    state.send_dsp(UiToDsp::SetVolume(saved_volume as f32));
+
+    // Button is the single source of truth: its handler owns
+    // dispatch + persist + mirror-to-row.
+    let state_vol = Rc::clone(state);
+    let config_vol = std::sync::Arc::clone(config);
+    let volume_row_weak = panels.audio.volume_row.downgrade();
+    volume_button.connect_value_changed(move |_btn, value| {
+        #[allow(clippy::cast_possible_truncation)]
+        state_vol.send_dsp(UiToDsp::SetVolume(value as f32));
+        config_vol.write(|v| {
+            v[sidebar::audio_panel::KEY_AUDIO_VOLUME] = serde_json::json!(value);
+        });
+        if let Some(row) = volume_row_weak.upgrade() {
+            let target_pct = value * sidebar::audio_panel::VOLUME_PERCENT_MAX;
+            if (row.value() - target_pct).abs()
+                > VOLUME_SYNC_EPSILON * sidebar::audio_panel::VOLUME_PERCENT_MAX
+            {
+                row.set_value(target_pct);
+            }
+        }
+    });
+
+    // Audio panel row is mirror-only. Drives the button, which
+    // runs the dispatch + config write. The idempotency check
+    // breaks the `btn.set_value → row.set_value → btn.set_value`
+    // loop when the two widgets are already in sync.
+    let volume_button_weak = volume_button.downgrade();
+    panels.audio.volume_row.connect_value_notify(move |row| {
+        let value = (row.value() / sidebar::audio_panel::VOLUME_PERCENT_MAX).clamp(0.0, 1.0);
+        if let Some(btn) = volume_button_weak.upgrade()
+            && (btn.value() - value).abs() > VOLUME_SYNC_EPSILON
+        {
+            btn.set_value(value);
+        }
+    });
+}
+
 /// Connect audio panel controls to DSP commands.
 fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Audio device selector — routes PipeWire output to the selected sink
@@ -7519,10 +7646,7 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // network config rows so the sidebar layout reflects the
     // active mode. Per issue #247.
     let state_sink_type = Rc::clone(state);
-    let host_row = panels.audio.network_host_row.clone();
-    let port_row = panels.audio.network_port_row.clone();
-    let proto_row = panels.audio.network_protocol_row.clone();
-    let status_row = panels.audio.network_status_row.clone();
+    let network_group = panels.audio.network_sink_group.clone();
     panels
         .audio
         .sink_type_row
@@ -7545,10 +7669,10 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
                 }
             };
             let network_visible = matches!(new_type, sdr_core::AudioSinkType::Network);
-            host_row.set_visible(network_visible);
-            port_row.set_visible(network_visible);
-            proto_row.set_visible(network_visible);
-            status_row.set_visible(network_visible);
+            // Toggle the whole Network-sink section instead of its
+            // four rows individually — same pattern as the Radio
+            // panel's De-emphasis / CTCSS group-level hides.
+            network_group.set_visible(network_visible);
             state_sink_type.send_dsp(UiToDsp::SetAudioSinkType(new_type));
         });
 
