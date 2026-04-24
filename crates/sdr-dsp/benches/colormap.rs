@@ -33,6 +33,21 @@ const PALETTE_ENTRIES: usize = 256;
 const DB_FLOOR: f32 = -70.0;
 const DB_CEILING: f32 = 0.0;
 
+/// Max channel byte value (fully-lit red / fully-opaque alpha).
+const PALETTE_CHANNEL_MAX: u8 = 255;
+/// Divisor applied to the blue channel so the synthetic ramp
+/// produces three non-identical colour curves (otherwise the
+/// compiler could theoretically fold the `[u8; 4]` build down).
+const PALETTE_BLUE_DIVISOR: u8 = 2;
+
+/// Low end of the synthetic dB sweep — below `DB_FLOOR` so the
+/// clamp's saturate-low branch actually fires on some bins.
+const SWEEP_DB_FLOOR: f32 = -90.0;
+/// Span of the sweep. Paired with `SWEEP_DB_FLOOR = -90.0` this
+/// takes the ramp up to +5 dB, above `DB_CEILING = 0.0`, so the
+/// saturate-high branch also fires.
+const SWEEP_DB_RANGE: f32 = 95.0;
+
 /// Build a synthetic 256-entry palette. The real picker uses
 /// Turbo / Viridis / Plasma / Inferno; the lookup cost is
 /// identical regardless of the palette's colour ramp, so a
@@ -43,7 +58,12 @@ fn synthetic_palette() -> Vec<[u8; 4]> {
         .map(|i| {
             #[allow(clippy::cast_possible_truncation)]
             let byte = i as u8;
-            [byte, 255 - byte, byte / 2, 255]
+            [
+                byte,
+                PALETTE_CHANNEL_MAX - byte,
+                byte / PALETTE_BLUE_DIVISOR,
+                PALETTE_CHANNEL_MAX,
+            ]
         })
         .collect()
 }
@@ -57,10 +77,11 @@ fn synthetic_db_line(bins: usize) -> Vec<f32> {
         .map(|i| {
             #[allow(clippy::cast_precision_loss)]
             let x = i as f32 / bins as f32;
-            // Sweep from -90 to +5 dB linearly — covers the
-            // saturate-low and saturate-high branches of the
+            // Sweep from `SWEEP_DB_FLOOR` to
+            // `SWEEP_DB_FLOOR + SWEEP_DB_RANGE` linearly — covers
+            // the saturate-low and saturate-high branches of the
             // clamp plus the linear-interior hot path.
-            -90.0 + x * 95.0
+            SWEEP_DB_FLOOR + x * SWEEP_DB_RANGE
         })
         .collect()
 }

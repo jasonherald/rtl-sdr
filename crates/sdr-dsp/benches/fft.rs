@@ -28,6 +28,12 @@ use sdr_types::Complex;
 /// SIMD.
 const SIZES: &[usize] = &[2048, 8192, 65536];
 
+/// Radians-per-sample advance for the synthetic input sinusoid.
+/// `rustfft`'s butterfly cost is independent of sample values, so
+/// the exact step doesn't matter — it's here only so the bench
+/// fixture is documented and reproducible across machines.
+const INPUT_PHASE_STEP_RAD: f32 = 0.01;
+
 fn make_input(size: usize) -> Vec<Complex> {
     // Deterministic, non-zero samples — a real FFT would see
     // bursty energy from a live IQ stream, but the cost of
@@ -39,8 +45,8 @@ fn make_input(size: usize) -> Vec<Complex> {
             #[allow(clippy::cast_precision_loss)]
             let t = i as f32;
             Complex {
-                re: (t * 0.01).sin(),
-                im: (t * 0.01).cos(),
+                re: (t * INPUT_PHASE_STEP_RAD).sin(),
+                im: (t * INPUT_PHASE_STEP_RAD).cos(),
             }
         })
         .collect()

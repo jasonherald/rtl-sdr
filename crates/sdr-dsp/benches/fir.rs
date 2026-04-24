@@ -42,14 +42,25 @@ const AUDIO_SAMPLE_RATE_HZ: f64 = 48_000.0;
 const AUDIO_CUTOFF_HZ: f64 = 5_000.0;
 const AUDIO_TRANSITION_HZ: f64 = 500.0;
 
+/// Radians-per-sample advance for the synthetic IQ fixture. The
+/// FIR hot path is data-independent (multiply-add over a fixed
+/// tap set), so the exact step only has to be small enough that
+/// the generated samples stay in-range — the bench cost is
+/// identical either way.
+const COMPLEX_INPUT_PHASE_STEP_RAD: f32 = 0.001;
+/// Same idea for the real-valued audio fixture, at an order of
+/// magnitude faster because 4800 samples is a much shorter span
+/// than the 16384-sample IQ buffer.
+const REAL_INPUT_PHASE_STEP_RAD: f32 = 0.01;
+
 fn make_complex_input(n: usize) -> Vec<Complex> {
     (0..n)
         .map(|i| {
             #[allow(clippy::cast_precision_loss)]
             let t = i as f32;
             Complex {
-                re: (t * 0.001).sin(),
-                im: (t * 0.001).cos(),
+                re: (t * COMPLEX_INPUT_PHASE_STEP_RAD).sin(),
+                im: (t * COMPLEX_INPUT_PHASE_STEP_RAD).cos(),
             }
         })
         .collect()
@@ -60,7 +71,7 @@ fn make_real_input(n: usize) -> Vec<f32> {
         .map(|i| {
             #[allow(clippy::cast_precision_loss)]
             let t = i as f32;
-            (t * 0.01).sin()
+            (t * REAL_INPUT_PHASE_STEP_RAD).sin()
         })
         .collect()
 }

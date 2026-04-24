@@ -44,20 +44,42 @@ const THRESHOLD_DB: f32 = 10.0;
 /// single-bin glitches.
 const NOISE_FLOOR_QUANTILE_BINS: usize = BINS / 4;
 
+/// Base noise floor of the synthetic fixture, in dB. Sets where
+/// the estimator should land so the detection threshold has a
+/// sensible reference point.
+const SYNTH_BASE_NOISE_DB: f32 = -80.0;
+/// Radians-per-bin phase advance of the synthetic noise wobble.
+/// Bench cost is data-independent so the exact value only has to
+/// produce a varying (not constant) offset so the compiler can't
+/// fold the add.
+const SYNTH_WOBBLE_STEP_RAD: f32 = 0.05;
+/// Peak dB amplitude of the synthetic noise wobble on top of
+/// `SYNTH_BASE_NOISE_DB`.
+const SYNTH_WOBBLE_AMPLITUDE_DB: f32 = 3.0;
+/// Spacing between the synthetic "signals" punched into the
+/// noise line. 100-bin spacing on a 65 536-bin line gives ~1 %
+/// detection hit rate — matches a moderately busy spectrum and
+/// keeps the branch predictor honest.
+const SYNTH_SIGNAL_EVERY_BINS: usize = 100;
+/// dB level of the synthetic "signals". Picked well above
+/// `SYNTH_BASE_NOISE_DB + THRESHOLD_DB` so every planted signal
+/// counts as a detection hit.
+const SYNTH_SIGNAL_LEVEL_DB: f32 = -40.0;
+
 fn synthetic_db_line(bins: usize) -> Vec<f32> {
     // Noise floor around -80 dB + a few narrow-band "signals"
     // punched in at known offsets. Gives the bench a
     // realistic mix of detection hits + non-hits so branch
     // predictors see a realistic hit-rate (~1 %).
-    let mut v = vec![-80.0_f32; bins];
+    let mut v = vec![SYNTH_BASE_NOISE_DB; bins];
     for (i, x) in v.iter_mut().enumerate() {
         #[allow(clippy::cast_precision_loss)]
         let t = i as f32;
         // Broadband noise variance.
-        *x += (t * 0.05).sin() * 3.0;
-        // Sparse "signals" every ~100 bins.
-        if i % 100 == 0 {
-            *x = -40.0;
+        *x += (t * SYNTH_WOBBLE_STEP_RAD).sin() * SYNTH_WOBBLE_AMPLITUDE_DB;
+        // Sparse "signals" every ~SYNTH_SIGNAL_EVERY_BINS bins.
+        if i % SYNTH_SIGNAL_EVERY_BINS == 0 {
+            *x = SYNTH_SIGNAL_LEVEL_DB;
         }
     }
     v

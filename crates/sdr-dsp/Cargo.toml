@@ -18,7 +18,7 @@ serde_json.workspace = true
 # Phase-1 baseline suite measures the CPU implementations of FFT,
 # FIR filtering, waterfall colormap lookup, and energy detection so
 # every subsequent GPU sub-ticket has a fixed comparison surface.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion.workspace = true
 
 [lints]
 workspace = true
