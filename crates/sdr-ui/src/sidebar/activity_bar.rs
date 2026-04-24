@@ -275,18 +275,21 @@ pub fn save_left_selected(config: &std::sync::Arc<sdr_config::ConfigManager>, na
     });
 }
 
+/// Shared writer used by both sidebar width persistors.
+fn save_width_px(config: &std::sync::Arc<sdr_config::ConfigManager>, key: &str, px: u32) {
+    config.write(|v| {
+        v[key] = serde_json::json!(px);
+    });
+}
+
 /// Persist the left panel's pixel width.
 pub fn save_left_width_px(config: &std::sync::Arc<sdr_config::ConfigManager>, px: u32) {
-    config.write(|v| {
-        v[KEY_LEFT_WIDTH_PX] = serde_json::json!(px);
-    });
+    save_width_px(config, KEY_LEFT_WIDTH_PX, px);
 }
 
 /// Persist the right panel's pixel width.
 pub fn save_right_width_px(config: &std::sync::Arc<sdr_config::ConfigManager>, px: u32) {
-    config.write(|v| {
-        v[KEY_RIGHT_WIDTH_PX] = serde_json::json!(px);
-    });
+    save_width_px(config, KEY_RIGHT_WIDTH_PX, px);
 }
 
 /// Persist the left panel open/closed state.
@@ -522,20 +525,27 @@ mod tests {
 
     #[test]
     fn session_round_trips_full_state() {
+        // Arbitrary in-range widths picked for the test — named
+        // so the save/assert pairs stay in lockstep and the
+        // intent reads as "a round-trip preserves the literal",
+        // not "420 magic bytes somewhere".
+        const TEST_LEFT_WIDTH_PX: u32 = 400;
+        const TEST_RIGHT_WIDTH_PX: u32 = 500;
+
         let config = make_config();
         save_left_selected(&config, "radio");
         save_left_open(&config, false);
-        save_left_width_px(&config, 400);
+        save_left_width_px(&config, TEST_LEFT_WIDTH_PX);
         save_right_selected(&config, "bookmarks");
         save_right_open(&config, true);
-        save_right_width_px(&config, 500);
+        save_right_width_px(&config, TEST_RIGHT_WIDTH_PX);
         let loaded = load_session(&config);
         assert_eq!(loaded.left_selected, "radio");
         assert!(!loaded.left_open);
-        assert_eq!(loaded.left_width_px, Some(400));
+        assert_eq!(loaded.left_width_px, Some(TEST_LEFT_WIDTH_PX));
         assert_eq!(loaded.right_selected, "bookmarks");
         assert!(loaded.right_open);
-        assert_eq!(loaded.right_width_px, Some(500));
+        assert_eq!(loaded.right_width_px, Some(TEST_RIGHT_WIDTH_PX));
     }
 
     #[test]

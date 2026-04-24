@@ -271,8 +271,28 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // `applied` cell flips after the first non-zero width is seen
     // so subsequent width changes (window resize) leave the
     // sidebar's fraction alone.
-    apply_saved_sidebar_width(&left_split_view, session.left_width_px);
-    apply_saved_sidebar_width(&right_split_view, session.right_width_px);
+    //
+    // Fresh sessions (`width_px == None`) route the builder-time
+    // default through the same post-allocation conversion so the
+    // advertised default actually lands: the builder fraction was
+    // derived from `DEFAULT_WIDTH = 1200`, but the right split
+    // view's parent is the left split view's content area (already
+    // narrower by the left sidebar's slice), so the fraction
+    // evaluates against a smaller width and the resulting pixel
+    // value undershoots the target. Routing defaults through
+    // `apply_sidebar_width` with the allocated width fixes that.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    apply_sidebar_width(
+        &left_split_view,
+        session.left_width_px,
+        LEFT_SIDEBAR_DEFAULT_WIDTH as u32,
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    apply_sidebar_width(
+        &right_split_view,
+        session.right_width_px,
+        RIGHT_SIDEBAR_DEFAULT_WIDTH as u32,
+    );
 
     wire_activity_bar_clicks(
         &left_activity_bar,
@@ -1797,6 +1817,19 @@ const LEFT_SIDEBAR_DEFAULT_WIDTH: f64 = 320.0;
 /// launch.
 const RIGHT_SIDEBAR_DEFAULT_WIDTH: f64 = 420.0;
 
+/// How much wider than its default a sidebar may be dragged. 2× the
+/// default feels natural — "a little bigger" and "a lot bigger"
+/// without letting the panel overrun the spectrum.
+const SIDEBAR_MAX_WIDTH_MULTIPLIER: f64 = 2.0;
+/// Minimum `sidebar-width-fraction` we write. Guards against the
+/// `AdwOverlaySplitView` pspec's rejection of exactly 0 and the
+/// animator's visual collapse at very small values.
+const SIDEBAR_FRACTION_MIN: f64 = 0.01;
+/// Maximum `sidebar-width-fraction` — symmetric sibling of
+/// [`SIDEBAR_FRACTION_MIN`]. Prevents the content area from being
+/// squeezed to zero even if a pixel clamp miscomputes.
+const SIDEBAR_FRACTION_MAX: f64 = 0.99;
+
 /// Handles returned by [`build_layout`] for downstream wiring. Bundled
 /// into a struct rather than a tuple because the return list grew past
 /// the clippy threshold during the activity-bar scaffolding migration.
@@ -1929,7 +1962,7 @@ fn build_layout(
         .content(&content_box)
         .show_sidebar(false)
         .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
-        .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * 2.0)
+        .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER)
         .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
 
@@ -1945,7 +1978,7 @@ fn build_layout(
         &right_split_view,
         ResizeDirection::LeftGrowsSidebar,
         RIGHT_SIDEBAR_MIN_WIDTH,
-        RIGHT_SIDEBAR_DEFAULT_WIDTH * 2.0,
+        RIGHT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER,
         RIGHT_SIDEBAR_DEFAULT_WIDTH,
         &save_right_width,
     );
@@ -1965,7 +1998,7 @@ fn build_layout(
         .content(&right_split_view)
         .show_sidebar(true)
         .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
-        .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0)
+        .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER)
         .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
 
@@ -1979,7 +2012,7 @@ fn build_layout(
         &left_split_view,
         ResizeDirection::RightGrowsSidebar,
         LEFT_SIDEBAR_MIN_WIDTH,
-        LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0,
+        LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER,
         LEFT_SIDEBAR_DEFAULT_WIDTH,
         &save_left_width,
     );
@@ -2034,18 +2067,23 @@ fn page_from_group(group: &adw::PreferencesGroup) -> adw::PreferencesPage {
     page
 }
 
-/// Apply a saved pixel width to an `AdwOverlaySplitView` sidebar
-/// after the split view has a real allocation. A single
-/// `notify::width` handler fires once the first non-zero width
-/// lands, converts the saved pixels into the `[0, 1]` fraction
-/// the widget accepts, applies it, and then the handler is
-/// effectively inert for the rest of the window's lifetime
-/// (`applied` flag). `None` skips everything — the builder-time
-/// fractional default stands.
-fn apply_saved_sidebar_width(split_view: &adw::OverlaySplitView, saved_px: Option<u32>) {
-    let Some(px) = saved_px else {
-        return;
-    };
+/// Apply a pixel width to an `AdwOverlaySplitView` sidebar after
+/// the split view has a real allocation. A single `notify::width`
+/// handler fires once the first non-zero width lands, converts
+/// the target pixels into the `[0, 1]` fraction the widget
+/// accepts, applies it, and then disarms (`applied` flag) so
+/// subsequent width notifications (window resize) leave the
+/// sidebar's fractional preference alone.
+///
+/// `saved_px == Some(px)` uses the persisted value; `None` falls
+/// back to `default_px`. Both cases go through the same
+/// post-allocation conversion so the advertised pixel default
+/// actually lands — builder-time fractions are derived from
+/// `DEFAULT_WIDTH` and evaluate against the split view's
+/// narrower-than-window allocation, so without this the fresh-
+/// session defaults under-shoot their targets.
+fn apply_sidebar_width(split_view: &adw::OverlaySplitView, saved_px: Option<u32>, default_px: u32) {
+    let target_px = saved_px.unwrap_or(default_px);
     let applied: std::rc::Rc<std::cell::Cell<bool>> = std::rc::Rc::new(std::cell::Cell::new(false));
     split_view.connect_notify_local(Some("width"), move |sv, _| {
         if applied.get() {
@@ -2055,7 +2093,8 @@ fn apply_saved_sidebar_width(split_view: &adw::OverlaySplitView, saved_px: Optio
         if sv_w <= 0.0 {
             return;
         }
-        let fraction = (f64::from(px) / sv_w).clamp(0.01, 0.99);
+        let fraction =
+            (f64::from(target_px) / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
         sv.set_sidebar_width_fraction(fraction);
         applied.set(true);
     });
@@ -2117,18 +2156,31 @@ fn build_resize_handle(
     let start_fraction: std::rc::Rc<std::cell::Cell<f64>> =
         std::rc::Rc::new(std::cell::Cell::new(0.0));
 
+    // Gesture closures capture `split_view` via `WeakRef` to
+    // break an otherwise-real retain cycle: `split_view` owns
+    // `sidebar`, `sidebar` owns `handle`, `handle` owns the
+    // gesture controllers, the controllers own their closures,
+    // and a strong `split_view.clone()` inside the closures would
+    // close the loop and leak the whole sidebar subtree on window
+    // teardown. Matches the `glib::WeakRef` idiom used elsewhere
+    // in this file (scanner force-disable, RTL-TCP handlers).
     let drag_gesture = gtk4::GestureDrag::new();
 
-    let split_view_begin = split_view.clone();
+    let split_view_weak = split_view.downgrade();
     let start_fraction_begin = std::rc::Rc::clone(&start_fraction);
     drag_gesture.connect_drag_begin(move |_, _, _| {
-        start_fraction_begin.set(split_view_begin.sidebar_width_fraction());
+        if let Some(sv) = split_view_weak.upgrade() {
+            start_fraction_begin.set(sv.sidebar_width_fraction());
+        }
     });
 
-    let split_view_update = split_view.clone();
+    let split_view_weak = split_view.downgrade();
     let start_fraction_update = std::rc::Rc::clone(&start_fraction);
     drag_gesture.connect_drag_update(move |_, offset_x, _| {
-        let sv_w = f64::from(split_view_update.width());
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
         if sv_w <= 0.0 {
             return;
         }
@@ -2140,18 +2192,21 @@ fn build_resize_handle(
         let new_px = (start_px + signed_offset).clamp(min_px, max_px);
         // Fraction pspec is `[0, 1]`; guard against 0 which the
         // widget treats as "collapsed" at the animator level.
-        let new_fraction = (new_px / sv_w).clamp(0.01, 0.99);
-        split_view_update.set_sidebar_width_fraction(new_fraction);
+        let new_fraction = (new_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
+        sv.set_sidebar_width_fraction(new_fraction);
     });
 
-    let split_view_end = split_view.clone();
+    let split_view_weak = split_view.downgrade();
     let save_end = std::rc::Rc::clone(save_width_px);
     drag_gesture.connect_drag_end(move |_, _, _| {
-        let sv_w = f64::from(split_view_end.width());
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
         if sv_w <= 0.0 {
             return;
         }
-        let final_px = split_view_end.sidebar_width_fraction() * sv_w;
+        let final_px = sv.sidebar_width_fraction() * sv_w;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let px = final_px.round().max(0.0) as u32;
         save_end(px);
@@ -2164,18 +2219,21 @@ fn build_resize_handle(
     // already handles press/release.
     let click_gesture = gtk4::GestureClick::new();
     click_gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
-    let split_view_click = split_view.clone();
+    let split_view_weak = split_view.downgrade();
     let save_click = std::rc::Rc::clone(save_width_px);
     click_gesture.connect_released(move |_, n_press, _, _| {
         if n_press != 2 {
             return;
         }
-        let sv_w = f64::from(split_view_click.width());
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
         if sv_w <= 0.0 {
             return;
         }
-        let fraction = (default_px / sv_w).clamp(0.01, 0.99);
-        split_view_click.set_sidebar_width_fraction(fraction);
+        let fraction = (default_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
+        sv.set_sidebar_width_fraction(fraction);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let px = default_px.round().max(0.0) as u32;
         save_click(px);
