@@ -46,10 +46,14 @@ struct ActivityBarView<Activity: ActivityEntry>: View {
     /// for the right — matches the Linux accelerator scheme.
     let shortcutModifiers: EventModifiers
 
-    /// Static column width. Matches the GTK 48 px icon strip —
-    /// wide enough for a 24 pt SF Symbol + comfortable padding,
-    /// narrow enough that it doesn't steal space from the
-    /// panels it flanks.
+    /// Static column width — 44 pt. Wide enough for an 18 pt
+    /// SF Symbol in a 36×32 hit-target plus comfortable
+    /// padding, narrow enough that it doesn't steal space
+    /// from the panels it flanks. (The GTK side sizes its
+    /// activity-bar via Adwaita CSS rather than an explicit
+    /// constant, so there's no Linux number to mirror — the
+    /// 44 pt value is tuned for the macOS look directly.)
+    /// Per `CodeRabbit` round 4 on PR #491.
     static var columnWidth: CGFloat { 44 }
 
     var body: some View {
