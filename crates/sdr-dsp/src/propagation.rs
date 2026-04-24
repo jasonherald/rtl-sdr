@@ -34,14 +34,15 @@ const C_M_PER_S: f64 = 299_792_458.0;
 
 /// The FSPL additive constant, `20·log10(c / 4π)`.
 ///
-/// Computing this once at module-const time rather than every call.
 /// The value is approximately 147.55 dB — what you'll see in RF
 /// engineering tables. We evaluate it analytically here so the
 /// formulas match any textbook derivation precisely.
 ///
-/// `const fn`-free because `log10` isn't a const-fn; we compute it
-/// lazily via `Lazy` in a helper accessor instead of forcing the
-/// computation inline every call.
+/// Not a `const` because `f64::log10` isn't `const fn`. The
+/// arithmetic is cheap (one division + one `log10`) and nothing
+/// here is a hot path — FSPL is called at most once per FFT
+/// display frame (~60 Hz), so skipping a `OnceCell` dep and just
+/// recomputing inline keeps the code simpler at negligible cost.
 #[inline]
 fn fspl_constant_db() -> f64 {
     // 20 · log10(c / (4π))

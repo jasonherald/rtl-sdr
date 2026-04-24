@@ -637,6 +637,26 @@ const MAX_MEANINGFUL_DISTANCE_M: f64 = 20_000_000.0;
 /// into sci-fi territory.
 const NO_ACTIVE_SIGNAL_DBM: f64 = -130.0;
 
+/// At or above this distance (metres) the distance display
+/// switches from "N m" to "N.N km". Mirrors the naming pattern
+/// in `antenna.rs` for unit-scaling thresholds.
+const KM_THRESHOLD_M: f64 = 1_000.0;
+
+/// At or above this distance (metres) single-km precision is
+/// meaningless — FSPL idealisation swamps any third-significant-
+/// digit stability — so the display rounds to the nearest 10 km.
+const MEGAMETRE_THRESHOLD_M: f64 = 1_000_000.0;
+
+/// Rounding granularity (in km) for distances at or above
+/// `MEGAMETRE_THRESHOLD_M`. Kept as a named constant so the
+/// "why round to 10 km" rationale lives next to the value.
+const MEGAMETRE_ROUND_KM: f64 = 10.0;
+
+/// Kilometres per metre, factored out so the formatter's intent
+/// reads cleanly without magic literals sharing the numeric
+/// literal `1_000.0` with `KM_THRESHOLD_M`.
+const METRES_PER_KM: f64 = 1_000.0;
+
 /// Distinct visual states the distance display can be in.
 /// Split out so the logic is explicit and test-covered rather
 /// than buried in a single formatter function that had to
@@ -709,13 +729,14 @@ impl DistanceDisplay {
             Self::CheckCalibration => "Check calibration".to_string(),
             Self::TooWeak => "Too weak to measure".to_string(),
             Self::Value(d) => {
-                if d < 1_000.0 {
+                if d < KM_THRESHOLD_M {
                     format!("{} m", d.round() as u64)
-                } else if d < 1_000_000.0 {
-                    format!("{:.1} km", d / 1_000.0)
+                } else if d < MEGAMETRE_THRESHOLD_M {
+                    format!("{:.1} km", d / METRES_PER_KM)
                 } else {
-                    let km_rounded_10 = ((d / 1_000.0) / 10.0).round() * 10.0;
-                    format!("{km_rounded_10:.0} km")
+                    let km_rounded =
+                        (d / METRES_PER_KM / MEGAMETRE_ROUND_KM).round() * MEGAMETRE_ROUND_KM;
+                    format!("{km_rounded:.0} km")
                 }
             }
         }
