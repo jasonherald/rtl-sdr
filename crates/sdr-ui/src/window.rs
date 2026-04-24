@@ -44,13 +44,6 @@ const DEFAULT_HEIGHT: i32 = 800;
 /// Sidebar collapse breakpoint width in pixels.
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
-/// Slide-in/out duration for right-side flyouts (transcript,
-/// bookmarks) in milliseconds. Centralized so the two
-/// revealers stay in lockstep — drifting values would make
-/// one panel feel snappier than the other when the user
-/// toggles between them.
-const RIGHT_FLYOUT_TRANSITION_MS: u32 = 200;
-
 /// FFT sizes — re-exported from display panel (single source of truth).
 use crate::sidebar::display_panel::FFT_SIZES;
 #[cfg(feature = "sherpa")]
@@ -169,12 +162,12 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         left_activity_bar,
         right_activity_bar,
         left_stack,
-        right_stack: _right_stack,
+        right_stack,
         panels,
         spectrum_handle: spectrum_handle_raw,
         status_bar,
         transcript_panel,
-        bookmarks_revealer,
+        general_panel: _general_panel,
     } = build_layout(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&left_split_view);
@@ -188,57 +181,35 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         favorites_handle,
     ) = build_header_bar(&sidebar_toggle, &state);
 
-    // Bookmarks flyout toggle — packed `pack_end` first so it
-    // ends up LEFT of the transcript toggle in the header's
-    // right cluster. `pack_end` stacks right-to-left, so the
-    // last `pack_end` call sits furthest from the right edge.
-    // Keeping bookmarks near the far edge matches the visual
-    // mapping "click the icon → panel slides in from directly
-    // under it on the right."
-    let bookmarks_toggle = gtk4::ToggleButton::builder()
+    // Header bookmarks shortcut — a plain click-to-navigate button
+    // (not a state toggle). Clicking it routes through the right
+    // activity bar's Bookmarks button, which owns the
+    // show/hide-and-stack-swap logic. Same pattern as `Ctrl+B` —
+    // both go through the activity-bar handler for consistency.
+    let bookmarks_toggle = gtk4::Button::builder()
         .icon_name("user-bookmarks-symbolic")
         .tooltip_text("Toggle bookmarks panel (Ctrl+B)")
         .build();
-    // `tooltip_text` alone isn't reliably announced by screen
-    // readers — set the accessible label explicitly, matching
-    // the pattern used for the other icon-only controls in this
-    // file (pinned servers menu, copy server address, etc.).
     bookmarks_toggle
         .update_property(&[gtk4::accessible::Property::Label("Toggle bookmarks panel")]);
     header.pack_end(&bookmarks_toggle);
 
-    // Restore the flyout open/closed state saved at last shutdown.
-    // Set the toggle's `active` property before wiring the handler
-    // so the initial `set_active` doesn't feed a no-op write back
-    // through `connect_toggled` — `connect_toggled` fires only on
-    // changes, but explicitly wiring the handler after the initial
-    // state is set keeps the "saved state → initial reveal" path
-    // free of config round-trips.
-    let bookmarks_initial_open = config.read(|v| {
-        v.get(sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN)
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    });
-    bookmarks_toggle.set_active(bookmarks_initial_open);
-    bookmarks_revealer.set_reveal_child(bookmarks_initial_open);
-
-    let bookmarks_revealer_clone = bookmarks_revealer.clone();
-    let bookmarks_config = std::sync::Arc::clone(config);
-    bookmarks_toggle.connect_toggled(move |btn| {
-        let open = btn.is_active();
-        bookmarks_revealer_clone.set_reveal_child(open);
-        bookmarks_config.write(|v| {
-            v[sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN] = serde_json::json!(open);
-        });
+    let right_bookmarks_btn_weak = right_activity_bar
+        .buttons
+        .get("bookmarks")
+        .map(glib::object::ObjectExt::downgrade);
+    bookmarks_toggle.connect_clicked(move |_| {
+        if let Some(Some(btn)) = right_bookmarks_btn_weak
+            .as_ref()
+            .map(glib::WeakRef::upgrade)
+        {
+            btn.emit_clicked();
+        }
     });
 
-    // Transcript toggle button in header bar — now drives the right
-    // activity bar's transcript button (which in turn toggles the
-    // right split view's show-sidebar). Keeping the header toggle
-    // preserves muscle memory from the pre-activity-bar layout;
-    // future sub-tickets may remove it as activity-bar-first UX
-    // beds in.
-    let transcript_button = gtk4::ToggleButton::builder()
+    // Header transcript shortcut — same click-to-navigate pattern.
+    // Drives the right activity bar's Transcript button.
+    let transcript_button = gtk4::Button::builder()
         .icon_name("document-page-setup-symbolic")
         .tooltip_text("Toggle transcript panel (Ctrl+Shift+1)")
         .build();
@@ -246,30 +217,47 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         .update_property(&[gtk4::accessible::Property::Label("Toggle transcript panel")]);
     header.pack_end(&transcript_button);
 
-    // The right-side transcript is no longer an opaque revealer
-    // that could stack over the bookmarks flyout — it lives in the
-    // right split view's sidebar. Bookmarks still hang off the
-    // content HBox in that split view, so the two right-side panels
-    // no longer compete for the same space and the old mutual-
-    // exclusion handler can be dropped.
+    let right_transcript_btn_weak = right_activity_bar
+        .buttons
+        .get("transcript")
+        .map(glib::object::ObjectExt::downgrade);
+    transcript_button.connect_clicked(move |_| {
+        if let Some(Some(btn)) = right_transcript_btn_weak
+            .as_ref()
+            .map(glib::WeakRef::upgrade)
+        {
+            btn.emit_clicked();
+        }
+    });
 
     // --- Activity-bar wiring ---
     //
-    // Left (multi-button): click on a NEW icon → deselect siblings,
-    // switch stack, open panel. Click on the CURRENTLY-selected
-    // icon → icon stays selected (design doc §4.2), panel toggles.
-    // `:checked` CSS renders the accent tint automatically.
+    // Both bars use `wire_activity_bar_clicks`: click on a NEW icon
+    // swaps the stack child and opens the panel; click on the
+    // CURRENTLY-selected icon toggles the panel while keeping the
+    // icon selected (design doc §4.2). `:checked` CSS renders the
+    // accent tint via `ToggleButton::active`.
     if let Some(general_btn) = left_activity_bar.buttons.get("general") {
         general_btn.set_active(true);
     }
     wire_activity_bar_clicks(&left_activity_bar, &left_stack, &left_split_view, "general");
 
+    // Right bar pre-selection: Transcript is the landing activity
+    // when the right panel first opens. No button starts visually
+    // active because the panel itself starts closed — first click
+    // opens it and flips the matching icon's `active` on.
+    wire_activity_bar_clicks(
+        &right_activity_bar,
+        &right_stack,
+        &right_split_view,
+        "transcript",
+    );
+
     // Header sidebar toggle ↔ left split view `show-sidebar` sync.
     // Without this, clicking the currently-selected activity icon to
     // collapse the panel leaves the header toggle stuck in `active`;
     // the user's next header click then sets `show-sidebar=false`
-    // again (no-op) instead of reopening the panel. Mirrors the same
-    // `connect_show_sidebar_notify` pattern used on the right side.
+    // again (no-op) instead of reopening the panel.
     let sidebar_toggle_weak = sidebar_toggle.downgrade();
     left_split_view.connect_show_sidebar_notify(move |sv| {
         if let Some(toggle) = sidebar_toggle_weak.upgrade()
@@ -278,52 +266,6 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
             toggle.set_active(sv.shows_sidebar());
         }
     });
-
-    // Right (single-button): the transcript toggle, the header
-    // transcript button, and `right_split_view.show-sidebar` form a
-    // tri-state that must stay in sync. Approach: each toggle button
-    // writes its `active` state through to `show-sidebar`; the split
-    // view's `notify::show-sidebar` reflects back into both buttons.
-    // `set_active(x)` on an already-in-state-`x` button is a GTK
-    // no-op (no `toggled` signal), so the two-way propagation is
-    // naturally idempotent.
-    if let Some(right_transcript_btn) = right_activity_bar.buttons.get("transcript") {
-        let right_split_weak = right_split_view.downgrade();
-        right_transcript_btn.connect_toggled(move |btn| {
-            if let Some(sv) = right_split_weak.upgrade() {
-                sv.set_show_sidebar(btn.is_active());
-            }
-        });
-
-        let right_split_weak = right_split_view.downgrade();
-        transcript_button.connect_toggled(move |btn| {
-            if let Some(sv) = right_split_weak.upgrade() {
-                sv.set_show_sidebar(btn.is_active());
-            }
-        });
-
-        let right_btn_weak = right_transcript_btn.downgrade();
-        let header_btn_weak = transcript_button.downgrade();
-        right_split_view.connect_show_sidebar_notify(move |sv| {
-            let visible = sv.shows_sidebar();
-            if let Some(rb) = right_btn_weak.upgrade()
-                && rb.is_active() != visible
-            {
-                rb.set_active(visible);
-            }
-            if let Some(hdr) = header_btn_weak.upgrade()
-                && hdr.is_active() != visible
-            {
-                hdr.set_active(visible);
-            }
-        });
-
-        // Initial alignment — panel is closed at launch, so both
-        // buttons start inactive. Config-driven restoration comes
-        // in sub-ticket #428.
-        right_transcript_btn.set_active(false);
-        transcript_button.set_active(false);
-    }
 
     let toolbar_view = build_toolbar_view(&header, &layout_root);
     let breakpoint = build_breakpoint(&left_split_view, &right_split_view);
@@ -1813,12 +1755,12 @@ struct LayoutHandles {
     spectrum_handle: spectrum::SpectrumHandle,
     status_bar: StatusBar,
     transcript_panel: sidebar::transcript_panel::TranscriptPanel,
-    /// Legacy bookmarks flyout — hangs off the right-split-view
-    /// content box. Retained for this scaffolding PR so the header
-    /// `Ctrl+B` path keeps working; sub-ticket #422 will migrate the
-    /// bookmarks list into the General activity panel and this
-    /// revealer can then be dropped.
-    bookmarks_revealer: gtk4::Revealer,
+    /// General activity panel — landing view. Hosts band presets
+    /// and source as flat `AdwPreferencesGroup`s on an
+    /// `AdwPreferencesPage`. Bookmarks live in the right activity
+    /// stack (not here); `rtl_tcp` share controls live in the Share
+    /// left activity (not here).
+    general_panel: sidebar::GeneralPanel,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1826,16 +1768,17 @@ fn build_layout(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) -> LayoutHandles {
-    // Legacy sidebar — packed into the General activity slot so that
-    // Source / Radio / Audio / Display / Scanner / Navigation
-    // controls stay reachable during the scaffolding-to-real-panel
-    // migration window. Sub-tickets #422-#426 gradually pull each
-    // sub-section out into its own dedicated activity child; the last
-    // migration removes this bridge entirely and the General slot
-    // becomes a band-presets / bookmarks / source preferences page
-    // per the design doc §3.1.
-    let (legacy_sidebar_scroll, panels) = sidebar::build_sidebar();
+    // Sidebar panels — constructed flat; each lives in its own
+    // activity stack child (no shared scroll wrapper). The
+    // General activity composes band presets + source into an
+    // `AdwPreferencesPage`; Radio / Audio / Display / Scanner /
+    // Share host their respective panel widgets directly until
+    // sub-tickets #423-#426 refactor each into the expander-row
+    // layout. Bookmarks lives in the right activity stack.
+    let panels = sidebar::build_panels();
     sidebar::server_panel::connect_server_panel_persistence(&panels.server, config);
+
+    let general_panel = sidebar::build_general_panel(&panels.navigation, &panels.source);
 
     // Spectrum display (FFT + waterfall) + status bar.
     let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view(state.ui_tx.clone());
@@ -1850,70 +1793,33 @@ fn build_layout(
     content_box.append(&spectrum_view);
     content_box.append(&status_bar.widget);
 
-    // Transcript panel — becomes the only child of the right stack
-    // (the real widget, not a placeholder) because this sub-ticket's
-    // design is that transcription keeps working through the
-    // scaffolding. See PR description for the one-real-panel
-    // rationale (design doc §3.6 end-state).
+    // Transcript panel — the real widget, not a placeholder. Its
+    // root is already an `AdwPreferencesGroup` so it slots straight
+    // into the page wrapper in the right stack, inheriting the same
+    // chrome as every other activity panel.
     let transcript_panel = sidebar::transcript_panel::build_transcript_panel(config);
-    let transcript_scroll = gtk4::ScrolledWindow::builder()
-        .child(&transcript_panel.widget)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vexpand(true)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
 
-    // Legacy bookmarks flyout — still hosted as a right-side revealer
-    // in the inner split view's content area. Header `bookmarks_toggle`
-    // + `Ctrl+B` still drive this revealer unchanged. Sub-ticket #422
-    // migrates the list into the General activity panel and this
-    // revealer is deleted at that time.
-    let bookmarks_revealer = gtk4::Revealer::builder()
-        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
-        .reveal_child(false)
-        .child(&panels.bookmarks.widget)
-        .hexpand(false)
-        .build();
-
-    let content_inner = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .build();
-    content_inner.append(&content_box);
-    content_inner.append(&bookmarks_revealer);
-
-    // Left panel stack — General hosts the full legacy sidebar
-    // (preserves all Source / Radio / Audio / Display / Scanner
-    // control reachability during the migration), the other four
-    // activities are placeholder `Label`s until sub-tickets
-    // #422-#426 swap each one for a real panel. The `name` strings
-    // MUST remain stable because they're the config-persistence
-    // keys (§5 of the design doc).
+    // Left panel stack — one real panel widget per activity. General
+    // hosts the composed `GeneralPanel` (band presets + bookmarks +
+    // source + rtl_tcp share as expander rows); Radio / Audio /
+    // Display / Scanner host their existing panel widget wrapped in
+    // a scroll so long pages can scroll internally without resizing
+    // the panel's width (design doc §2.4). Sub-tickets #423-#426
+    // later refactor each of those widgets into the expander-row
+    // layout the General panel demonstrates; the `name` strings MUST
+    // remain stable because they're the config-persistence keys
+    // (§5 of the design doc).
     let left_stack = gtk4::Stack::builder()
         .transition_type(gtk4::StackTransitionType::None)
         .hexpand(true)
         .vexpand(true)
         .build();
-    for entry in sidebar::LEFT_ACTIVITIES {
-        if entry.name == "general" {
-            left_stack.add_named(&legacy_sidebar_scroll, Some(entry.name));
-            continue;
-        }
-        let placeholder = gtk4::Label::builder()
-            .label(format!(
-                "{} — coming in a follow-up sub-ticket",
-                entry.display_name
-            ))
-            .wrap(true)
-            .justify(gtk4::Justification::Center)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        left_stack.add_named(&placeholder, Some(entry.name));
-    }
+    left_stack.add_named(&general_panel.widget, Some("general"));
+    left_stack.add_named(&page_from_group(&panels.radio.widget), Some("radio"));
+    left_stack.add_named(&page_from_group(&panels.audio.widget), Some("audio"));
+    left_stack.add_named(&page_from_group(&panels.display.widget), Some("display"));
+    left_stack.add_named(&page_from_widget(&panels.scanner.widget), Some("scanner"));
+    left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
 
     // Right panel stack — single child today, hosts the real
     // transcript widget (not a placeholder) so transcription keeps
@@ -1923,44 +1829,54 @@ fn build_layout(
         .hexpand(true)
         .vexpand(true)
         .build();
-    right_stack.add_named(&transcript_scroll, Some("transcript"));
+    right_stack.add_named(
+        &page_from_group(&transcript_panel.widget),
+        Some("transcript"),
+    );
+    right_stack.add_named(
+        &page_from_group(&panels.bookmarks.widget),
+        Some("bookmarks"),
+    );
+    // Explicitly pin the initial visible child so a future
+    // additional right-activity inserted before transcript doesn't
+    // silently shift what the first `Ctrl+Shift+1` press (or the
+    // header transcript button's click) shows. Matches the contract
+    // `wire_activity_bar_clicks(..., "transcript")` relies on below.
+    right_stack.set_visible_child_name("transcript");
 
     // Inner (right) split view — sidebar sits on the trailing edge
     // so the right activity bar is the rightmost element on-screen.
-    // `sidebar-width-unit = Px` makes `sidebar_width_fraction`
-    // interpret its argument as literal pixels instead of a fraction
-    // of the split view's allocated width. Without this, the
-    // default-width math lies under nesting: the left split view is
-    // already narrower than the window (activity bars are outside
-    // it), and the right split view is narrower again (it lives in
-    // the left split's content area), so a naive
-    // `LEFT_SIDEBAR_DEFAULT_WIDTH / DEFAULT_WIDTH` fraction resolves
-    // to something smaller than the desired pixel width on every
-    // child. Pixels-first avoids the post-realize callback path and
-    // matches the `min_sidebar_width` / `max_sidebar_width` pixel
-    // units already in use.
+    //
+    // `sidebar_width_fraction` is `[0, 1]` regardless of the
+    // `sidebar-width-unit` we set; the unit only changes how
+    // `min`/`max-sidebar-width` are interpreted. Passing a pixel
+    // value as the fraction panics at property-set even with
+    // `unit = Px` (verified on libadwaita 1.9). So the default
+    // here is a fraction; under nested splits its pixel result
+    // is approximate, and `min-sidebar-width` clamps the transcript
+    // panel up to its 360 px floor when the math would otherwise
+    // leave it narrower. Hitting the exact pixel target would
+    // require a post-realize callback (sub-ticket #428 territory).
     let right_split_view = adw::OverlaySplitView::builder()
         .sidebar_position(gtk4::PackType::End)
         .sidebar(&right_stack)
-        .content(&content_inner)
+        .content(&content_box)
         .show_sidebar(false)
         .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * 2.0)
-        .sidebar_width_unit(adw::LengthUnit::Px)
-        .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH)
+        .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
 
     // Outer (left) split view — sidebar hosts the left activity
     // stack. Starts open with "general" visible so a fresh launch
-    // lands on the General placeholder instead of an empty frame.
+    // lands on the General panel instead of an empty frame.
     let left_split_view = adw::OverlaySplitView::builder()
         .sidebar(&left_stack)
         .content(&right_split_view)
         .show_sidebar(true)
         .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0)
-        .sidebar_width_unit(adw::LengthUnit::Px)
-        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH)
+        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
     left_stack.set_visible_child_name("general");
 
@@ -1990,8 +1906,31 @@ fn build_layout(
         spectrum_handle,
         status_bar,
         transcript_panel,
-        bookmarks_revealer,
+        general_panel,
     }
+}
+
+/// Wrap an `AdwPreferencesGroup` in its own `AdwPreferencesPage`
+/// so every activity stack child inherits the same margin/spacing
+/// rhythm as the General panel (Apple-style header padding + group
+/// titles). `AdwPreferencesPage` is itself scrollable internally,
+/// so no extra `GtkScrolledWindow` wrapper is needed.
+fn page_from_group(group: &adw::PreferencesGroup) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    page.add(group);
+    page
+}
+
+/// Wrap a non-`PreferencesGroup` widget (scanner's custom `GtkBox`,
+/// transcript's scrolled text view) in an untitled
+/// `AdwPreferencesGroup` hosted on a page — keeps outer chrome
+/// identical to the other stack children.
+fn page_from_widget(child: &impl gtk4::prelude::IsA<gtk4::Widget>) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    let group = adw::PreferencesGroup::new();
+    group.add(child);
+    page.add(&group);
+    page
 }
 
 /// Build the sidebar toggle button bound to the split view.
@@ -3117,14 +3056,6 @@ fn connect_rtl_tcp_discovery(
     });
 }
 
-/// Cadence for the USB hotplug poll that drives server-panel
-/// visibility. 3 s is the sweet spot: fast enough that a user
-/// plugging in a dongle sees the panel within the time it takes them
-/// to reach the sidebar with the mouse, slow enough that the
-/// per-tick `rusb::devices()` USB-bus enumerate is invisible in
-/// profile traces.
-const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
-
 /// Icon name for the un-filled ("not pinned") star on discovery
 /// rows. GNOME Symbolic icon set — `non-starred-symbolic` renders
 /// the outline glyph, which is visually distinct from the filled
@@ -3988,140 +3919,46 @@ fn clear_client_auth_key_from_keyring(
     store.delete(&entry)
 }
 
-/// Wire the server panel end-to-end: visibility gating, the master
-/// share-over-network switch, and its downstream start/stop effects.
-/// Errors surface via the `toast_overlay`, and the switch auto-
-/// reverts to its off state so the UI never lies about whether a
-/// server is actually running.
+/// Wire the server panel end-to-end: the master share-over-network
+/// switch (start/stop + control locking), periodic `Server::stats()`
+/// polling (rendered status rows + auto-stop on `has_stopped()`), and
+/// the bandwidth advisory that toggles on the device-default sample
+/// rate. Errors surface via the `toast_overlay`, and the switch
+/// auto-reverts to its off state on start failure so the UI never
+/// lies about whether a server is actually running.
 ///
-/// Visibility rule:
-/// 1. at least one RTL-SDR dongle is visible on the local USB bus
-///    (`sdr_rtlsdr::get_device_count() > 0`), and
-/// 2. the active source type is **not** RTL-SDR — re-exposing the
-///    same dongle over `rtl_tcp` while a local `RtlSdrSource` is
-///    holding it would cause a USB-device double-open, and
-/// 3. OR the server is already running (keep the panel visible so
-///    the user can reach the Stop switch no matter what).
-///
-/// Visibility is recomputed on three triggers so the panel feels
-/// responsive without polling the world: a low-frequency timer that
-/// handles the USB side (hotplug has no GTK signal we can subscribe
-/// to), a `device_row.connect_selected_notify` handler that fires
-/// on every source-type change, and the share-row start/stop path
-/// itself. A `Cell<u32>` tracks the last-seen device count so we
-/// only pay the widget-state-update cost on an actual edge.
-#[allow(
-    clippy::too_many_lines,
-    reason = "GTK signal-wiring: visibility + start-stop + control-locking all share state via nested closures — splitting scatters the captures"
-)]
+/// The panel itself is always visible — Share is its own activity on
+/// the left activity bar (📡), so the legacy hotplug-gated
+/// hide/show timer, the device-count cache, and the
+/// `device_row.connect_selected_notify` handler that fed it are gone.
+/// The start path still rejects a "local RTL-SDR is the active
+/// source" conflict via an exclusivity toast inside the share-switch
+/// handler — that guard is independent of the removed machinery.
 fn connect_server_panel(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
-    use std::cell::Cell;
-
-    let server_widget_weak = panels.server.widget.downgrade();
-    let device_row = panels.source.device_row.clone();
-    let last_seen_count = Rc::new(Cell::new(u32::MAX));
     let running: Rc<RefCell<Option<RunningServer>>> = Rc::new(RefCell::new(None));
 
-    // Pure function: does the combined rule say "show"? A running
-    // server always wins — the user must be able to reach the Stop
-    // switch regardless of hotplug / source-type state.
-    let should_be_visible = |dongle_count: u32, selected: u32, is_running: bool| -> bool {
-        is_running || (dongle_count > 0 && selected != DEVICE_RTLSDR)
-    };
-
-    // Apply visibility, using the cached dongle count. Shared
-    // between the poll tick, the device-row notify handler, and the
-    // start/stop path so all three callers stay in lockstep.
-    let apply_visibility = {
-        let server_widget_weak = server_widget_weak.clone();
-        let device_row = device_row.clone();
-        let last_seen_count = Rc::clone(&last_seen_count);
-        let running = Rc::clone(&running);
-        move || {
-            let Some(widget) = server_widget_weak.upgrade() else {
-                return;
-            };
-            let count = last_seen_count.get();
-            // First invocation before any poll: count is u32::MAX,
-            // which would evaluate true for `> 0`. Treat the
-            // pre-first-tick state as "no dongle yet" so the panel
-            // stays hidden until we actually know — prevents a
-            // flash-of-unwanted-panel during startup.
-            let effective_count = if count == u32::MAX { 0 } else { count };
-            let is_running = running.borrow().is_some();
-            widget.set_visible(should_be_visible(
-                effective_count,
-                device_row.selected(),
-                is_running,
-            ));
-        }
-    };
-
-    // Reapply on source-type change. Cloned because
-    // `connect_selected_notify` takes an `Fn(&ComboRow)` and we want
-    // the same logic as the poll tick.
-    let apply_on_device_change = apply_visibility.clone();
-    panels
-        .source
-        .device_row
-        .connect_selected_notify(move |_| apply_on_device_change());
-
-    // Seed `last_seen_count` on the first tick. Using a glib timer
-    // (rather than running the USB probe synchronously during
-    // wiring) keeps the window-build path fast and avoids a libusb
-    // session init on a thread that may not have one ready.
-    let apply_on_tick = apply_visibility.clone();
-    let poll_widget_weak = server_widget_weak.clone();
-    let poll_last_seen_count = Rc::clone(&last_seen_count);
-    let _ = glib::timeout_add_local(SERVER_PANEL_HOTPLUG_POLL_INTERVAL, move || {
-        // If the widget is gone, tear the poller down — nothing to
-        // show, and we don't want to leak `rusb::devices()` calls
-        // past window close.
-        if poll_widget_weak.upgrade().is_none() {
-            return glib::ControlFlow::Break;
-        }
-        // `sdr_rtlsdr::get_device_count()` is a libusb enumerate
-        // (vendor/product-ID filter over `rusb::devices()`). Fast
-        // enough for the UI thread at a 3 s cadence; no syscall
-        // churn worth moving to a worker.
-        let count = sdr_rtlsdr::get_device_count();
-        // First tick ALWAYS flips the cache off `u32::MAX`, so this
-        // branch fires at least once even if the real count is 0 —
-        // that's the "resolve the panel out of its pre-first-tick
-        // hidden state" moment. Subsequent ticks only apply on a
-        // real edge so we don't churn widget state every 3 s.
-        if count != poll_last_seen_count.get() {
-            tracing::debug!(
-                previous = poll_last_seen_count.get(),
-                current = count,
-                "rtl_tcp server panel: local dongle count changed"
-            );
-            poll_last_seen_count.set(count);
-            apply_on_tick();
-        }
-        glib::ControlFlow::Continue
-    });
+    // Share is now an activity on the left activity bar — always
+    // reachable via the 📡 icon. The legacy hotplug-driven
+    // hide/show timer + device-count cache + device-row notify
+    // were removed with that migration; `sdr_rtlsdr::get_device_count`
+    // is no longer polled on the GTK main loop for visibility,
+    // and the start-server path still rejects the "local dongle is
+    // the active source" conflict via its own exclusivity guard.
 
     // Wire the master share-over-network switch. The handler is the
     // authority on server lifecycle — on toggle we either start a
     // new `Server` (+ optional `Advertiser`) and store the handle,
     // or drop the handle so the accept thread tears down.
-    connect_share_switch(
-        panels,
-        toast_overlay,
-        Rc::clone(&running),
-        apply_visibility.clone(),
-        server_running,
-    );
+    connect_share_switch(panels, toast_overlay, Rc::clone(&running), server_running);
 
     // Poll `Server::stats()` on a timer, render the status rows,
     // and auto-stop the server if `has_stopped()` becomes true
     // (e.g. USB unplug or accept-thread failure).
-    connect_server_status_polling(panels, Rc::clone(&running), apply_visibility);
+    connect_server_status_polling(panels, Rc::clone(&running));
 
     // Bandwidth advisory — toggled on the device-default sample
     // rate. Unlike the source panel's advisory (which also gates
@@ -4306,7 +4143,6 @@ fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
     running: Rc<RefCell<Option<RunningServer>>>,
-    apply_visibility: impl Fn() + Clone + 'static,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
     use std::cell::Cell;
@@ -4509,7 +4345,6 @@ fn connect_share_switch(
             reset_activity_log(&widgets);
             reset_clients_list(&widgets);
         }
-        apply_visibility();
     });
 
     // ====================================================
@@ -4895,7 +4730,6 @@ impl ServerStatusWidgetsWeak {
 fn connect_server_status_polling(
     panels: &SidebarPanels,
     running: Rc<RefCell<Option<RunningServer>>>,
-    apply_visibility: impl Fn() + 'static,
 ) {
     use std::cell::Cell;
 
@@ -4960,7 +4794,6 @@ fn connect_server_status_polling(
             if let Some(share) = share_row_weak.upgrade() {
                 share.set_active(false);
             }
-            apply_visibility();
             return glib::ControlFlow::Continue;
         }
 
@@ -5944,12 +5777,12 @@ fn apply_agc_squelch_mutex(
 /// dongle after app launch sees the slot update to the real
 /// device name within a few seconds without having to restart.
 ///
-/// Shares cadence with `SERVER_PANEL_HOTPLUG_POLL_INTERVAL` as a
-/// deliberate choice — both pollers watch the same libusb bus for
-/// the same vendor/product-filtered device set, so users see
-/// both the source combo and the server panel update on the same
-/// tick. Kept as a separate constant so each poller's sizing can
-/// evolve independently.
+/// Previously shared cadence with a server-panel hotplug poll that
+/// drove panel visibility — that poll was removed when Share became
+/// its own activity icon, but this source-combo poller's 3 s cadence
+/// was tuned for the same reason (user plugs in a dongle, sees the
+/// slot update by the time they reach for the sidebar) so the value
+/// remains a good fit on its own.
 const SOURCE_RTLSDR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Install a hotplug poller on the source panel that keeps the

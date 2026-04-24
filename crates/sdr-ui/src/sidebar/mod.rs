@@ -4,12 +4,11 @@
 
 use std::rc::Rc;
 
-use gtk4::prelude::*;
-
 pub mod activity_bar;
 pub mod audio_panel;
 pub mod bookmarks_panel;
 pub mod display_panel;
+pub mod general_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
 pub mod scanner_panel;
@@ -24,17 +23,13 @@ pub use activity_bar::{
 pub use audio_panel::{AudioPanel, build_audio_panel};
 pub use bookmarks_panel::{BookmarksPanel, build_bookmarks_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
+pub use general_panel::{GeneralPanel, build_general_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
 pub use scanner_panel::{ScannerPanel, build_scanner_panel};
 pub use server_panel::{ServerPanel, build_server_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
 pub use transcript_panel::{TranscriptPanel, build_transcript_panel};
-
-/// Spacing between sidebar preference groups in pixels.
-const SIDEBAR_SPACING: i32 = 12;
-/// Margin around the sidebar content in pixels.
-const SIDEBAR_MARGIN: i32 = 12;
 
 /// All sidebar panels, for DSP bridge wiring.
 pub struct SidebarPanels {
@@ -61,9 +56,10 @@ pub struct SidebarPanels {
     /// to break the otherwise-cyclic `on_save → stored closure`
     /// reference chain.
     pub bookmarks: Rc<BookmarksPanel>,
-    /// Share-over-network (`rtl_tcp` server) controls. Hidden by
-    /// default; `window.rs` reveals it when a local RTL-SDR dongle
-    /// is plugged in and not currently the active source.
+    /// Share-over-network (`rtl_tcp` server) controls. Packed as
+    /// the `"share"` child of the left activity stack, so the panel
+    /// is always reachable via the 📡 Share icon; the Start switch
+    /// errors gracefully when no dongle is plugged in.
     pub server: ServerPanel,
     /// Scanner control panel at bottom of left sidebar (Phase 1,
     /// issue #317). Master switch, active-channel / state
@@ -71,13 +67,13 @@ pub struct SidebarPanels {
     pub scanner: ScannerPanel,
 }
 
-/// Build the complete sidebar `ScrolledWindow` containing all configuration panels.
-///
-/// Returns both the scroll widget (for embedding in the split view) and the
-/// `SidebarPanels` struct (for DSP bridge signal wiring — see issue #92).
-/// The returned `SidebarPanels::bookmarks` is the right-side flyout widget;
-/// `window.rs` packs it into the bookmarks revealer.
-pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
+/// Build every sidebar panel. Activity-bar migration: each panel
+/// widget is packed individually into its matching `GtkStack` child
+/// by `window.rs::build_layout`, so this builder no longer wraps
+/// them in a shared `ScrolledWindow`. The returned `SidebarPanels`
+/// carries the full panel set for both widget placement and DSP
+/// bridge signal wiring (see issue #92).
+pub fn build_panels() -> SidebarPanels {
     let source = build_source_panel();
     let server = build_server_panel();
     let audio = build_audio_panel();
@@ -99,33 +95,7 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
     navigation_panel::connect_preset_to_bookmarks(&navigation, &bookmarks);
     let bookmarks = Rc::new(bookmarks);
 
-    let sidebar_box = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(SIDEBAR_SPACING)
-        .margin_top(SIDEBAR_MARGIN)
-        .margin_bottom(SIDEBAR_MARGIN)
-        .margin_start(SIDEBAR_MARGIN)
-        .margin_end(SIDEBAR_MARGIN)
-        .build();
-
-    sidebar_box.append(&navigation.presets_widget);
-    sidebar_box.append(&navigation.bookmarks_widget);
-    sidebar_box.append(&source.widget);
-    // Server panel sits directly under Source so the "consume local
-    // dongle" vs "share local dongle" decision is one visual group.
-    // Hidden by default; revealed dynamically by the wiring layer.
-    sidebar_box.append(&server.widget);
-    sidebar_box.append(&audio.widget);
-    sidebar_box.append(&radio.widget);
-    sidebar_box.append(&display.widget);
-    sidebar_box.append(&scanner.widget);
-
-    let scroll = gtk4::ScrolledWindow::builder()
-        .child(&sidebar_box)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .build();
-
-    let panels = SidebarPanels {
+    SidebarPanels {
         source,
         audio,
         radio,
@@ -134,7 +104,5 @@ pub fn build_sidebar() -> (gtk4::ScrolledWindow, SidebarPanels) {
         bookmarks,
         server,
         scanner,
-    };
-
-    (scroll, panels)
+    }
 }
