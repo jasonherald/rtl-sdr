@@ -726,8 +726,10 @@ fn clear_scanner_active_channel_ui(
     state: &AppState,
 ) {
     *state.scanner_active_key.borrow_mut() = None;
-    scanner_panel.active_channel_label.set_text("Active: —");
-    scanner_panel.lockout_button.set_visible(false);
+    scanner_panel
+        .active_channel_row
+        .set_subtitle(sidebar::scanner_panel::ACTIVE_CHANNEL_PLACEHOLDER);
+    scanner_panel.lockout_row.set_visible(false);
 }
 
 /// Handle a single message from the DSP thread.
@@ -1045,8 +1047,8 @@ fn handle_dsp_message(
                 state.center_frequency.set(freq_f64);
                 state.demod_mode.set(demod_mode);
 
-                scanner_panel.active_channel_label.set_text(&format!(
-                    "Active: {} — {}",
+                scanner_panel.active_channel_row.set_subtitle(&format!(
+                    "{} — {}",
                     name,
                     sidebar::navigation_panel::format_frequency(freq_hz),
                 ));
@@ -1112,7 +1114,7 @@ fn handle_dsp_message(
                     radio_panel.set_voice_squelch_open(false);
                 }
 
-                scanner_panel.lockout_button.set_visible(true);
+                scanner_panel.lockout_row.set_visible(true);
             } else {
                 clear_scanner_active_channel_ui(scanner_panel, state);
             }
@@ -1125,9 +1127,7 @@ fn handle_dsp_message(
                 sdr_scanner::ScannerState::Listening => "Listening",
                 sdr_scanner::ScannerState::Hanging => "Hang…",
             };
-            scanner_panel
-                .state_label
-                .set_text(&format!("State: {label}"));
+            scanner_panel.state_row.set_subtitle(label);
         }
         DspToUi::ScannerEmptyRotation => {
             tracing::info!("scanner rotation empty");
@@ -1820,7 +1820,7 @@ fn build_layout(
     left_stack.add_named(&panels.radio.widget, Some("radio"));
     left_stack.add_named(&panels.audio.widget, Some("audio"));
     left_stack.add_named(&panels.display.widget, Some("display"));
-    left_stack.add_named(&page_from_widget(&panels.scanner.widget), Some("scanner"));
+    left_stack.add_named(&panels.scanner.widget, Some("scanner"));
     left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
 
     // Right panel stack — single child today, hosts the real
@@ -1920,18 +1920,6 @@ fn build_layout(
 fn page_from_group(group: &adw::PreferencesGroup) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(group);
-    page
-}
-
-/// Wrap a non-`PreferencesGroup` widget (scanner's custom `GtkBox`,
-/// transcript's scrolled text view) in an untitled
-/// `AdwPreferencesGroup` hosted on a page — keeps outer chrome
-/// identical to the other stack children.
-fn page_from_widget(child: &impl gtk4::prelude::IsA<gtk4::Widget>) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::new();
-    let group = adw::PreferencesGroup::new();
-    group.add(child);
-    page.add(&group);
     page
 }
 

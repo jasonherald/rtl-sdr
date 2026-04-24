@@ -1,14 +1,13 @@
-//! Scanner control panel at the bottom of the left sidebar.
+//! Scanner control panel — master switch, live state readout,
+//! default dwell/hang timing, and session lockout button.
 //!
-//! Master switch, active-channel / state display, default
-//! dwell/hang sliders (collapsed expander), and session lockout
-//! button (visible only when scanner is on an active channel).
-//! UI wiring of user actions → `UiToDsp::*` commands lives in
-//! `window.rs::connect_scanner_panel`.
+//! Lays out as an `AdwPreferencesPage` with three titled sections
+//! (Scanner / Active / Timing) matching the activity-bar redesign's
+//! Apple-style rhythm. UI wiring of user actions →
+//! `UiToDsp::*` commands lives in `window.rs::connect_scanner_panel`.
 
 use std::sync::Arc;
 
-use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
@@ -23,16 +22,26 @@ use sdr_config::ConfigManager;
 /// is a `GObject` wrapper, so clone is a cheap refcount bump.
 #[derive(Clone)]
 pub struct ScannerPanel {
-    /// The outer container — append to the sidebar `Box`.
-    pub widget: gtk4::Box,
-    /// Master on/off toggle.
+    /// The `AdwPreferencesPage` widget packed into the Scanner
+    /// activity stack slot.
+    pub widget: adw::PreferencesPage,
+    /// Master on/off toggle. Still a bare `gtk4::Switch` (wrapped
+    /// as the suffix of an `AdwActionRow` in the page) so
+    /// `window.rs` + `shortcuts.rs` keep using the same
+    /// `set_state` / `set_active` / `connect_active_notify` API.
     pub master_switch: gtk4::Switch,
-    /// "Active: {name} — {freq}" while scanner is Listening /
-    /// Hanging; shows "Active: —" otherwise.
-    pub active_channel_label: gtk4::Label,
-    /// Human-readable phase label — "Off", "Scanning…",
-    /// "Listening…", "Listening", "Hang…".
-    pub state_label: gtk4::Label,
+    /// Action row displaying the active channel. Title is fixed
+    /// ("Channel"); subtitle carries the dynamic value
+    /// (`"{name} — {freq}"` while listening / hanging, `"—"`
+    /// otherwise). Subtitle is multi-line — long bookmark names
+    /// wrap in place instead of truncating with "…". Call
+    /// `set_subtitle` to update.
+    pub active_channel_row: adw::ActionRow,
+    /// Action row displaying the scanner's live state. Title is
+    /// fixed ("State"); subtitle carries the phase label ("Off",
+    /// "Scanning…", "Listening…", "Listening", "Hang…"). Call
+    /// `set_subtitle` to update.
+    pub state_row: adw::ActionRow,
     /// Default dwell (settle after retune) in ms. Value is
     /// folded into `ScannerChannel::dwell_ms` at projection time
     /// when the per-bookmark override is `None`.
@@ -40,8 +49,14 @@ pub struct ScannerPanel {
     /// Default hang (linger after squelch closes) in ms. Same
     /// projection-time fallback model as `default_dwell_row`.
     pub default_hang_row: adw::SpinRow,
-    /// "Lockout current channel" — only visible while the
-    /// scanner has an active channel latched.
+    /// Lockout action row — visible only while the scanner has
+    /// an active channel latched. Hide / show via `lockout_row`
+    /// (the button alone inside an always-visible row would
+    /// leave an empty titled strip).
+    pub lockout_row: adw::ActionRow,
+    /// "Lockout" button, packed as a suffix on `lockout_row`.
+    /// Exposed as a field so `window.rs` can wire its click
+    /// handler without walking the row's child tree.
     pub lockout_button: gtk4::Button,
 }
 
@@ -75,6 +90,23 @@ pub const DWELL_PAGE_MS: f64 = 50.0;
 pub const HANG_STEP_MS: f64 = 100.0;
 /// Hang `SpinRow` page increment (ms).
 pub const HANG_PAGE_MS: f64 = 500.0;
+
+/// Placeholder subtitle shown on `active_channel_row` when the
+/// scanner isn't latched on a channel. Kept as a constant so
+/// every reset path in `window.rs` hits the same string.
+pub const ACTIVE_CHANNEL_PLACEHOLDER: &str = "—";
+/// Placeholder subtitle for `state_row` before the first
+/// `ScannerStateChanged` event arrives.
+pub const STATE_PLACEHOLDER: &str = "Off";
+
+/// `AdwActionRow::set_subtitle_lines(0)` disables the one-line
+/// cap and lets long text wrap to as many lines as needed. The
+/// active channel's subtitle can be a long bookmark nickname +
+/// formatted frequency ("KY State Police District 7 Dispatch
+/// — 154.680 MHz") and single-line ellipsize made the row
+/// unreadable in sidebar widths; wrap-in-place is the better
+/// affordance.
+const SUBTITLE_UNLIMITED_LINES: i32 = 0;
 
 /// Shared parse-fallback-clamp pipeline used by the
 /// default-dwell and default-hang loaders. Pulls a `u64` out of
@@ -153,78 +185,71 @@ pub fn save_default_hang_ms(config: &Arc<ConfigManager>, ms: u32) {
 
 /// Build the scanner panel and return its owned widgets.
 ///
-/// The outer `widget` is appended to the sidebar `Box`; the rest
-/// are captured by the controller layer for signal wiring.
+/// Lays out as an `AdwPreferencesPage` with three titled sections
+/// matching the activity-bar redesign's Apple-style rhythm (design
+/// doc §3.5). Flat groups, no `AdwExpanderRow` wrappers — same
+/// call as the General / Radio / Audio / Display panels.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_scanner_panel() -> ScannerPanel {
-    let widget = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Vertical)
-        .spacing(8)
+    // --- Scanner master switch ---
+    //
+    // Kept as a bare `gtk4::Switch` so `window.rs` and
+    // `shortcuts.rs` callers don't change signature. Wrapped in
+    // an `AdwActionRow` as the row suffix so the preferences-page
+    // chrome matches the rest of the activity panels.
+    let master_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
+    let master_switch_row = adw::ActionRow::builder()
+        .title("Scanner")
+        .subtitle("Enable rotation through active channels")
+        .build();
+    master_switch_row.add_suffix(&master_switch);
+    master_switch_row.set_activatable_widget(Some(&master_switch));
+
+    // --- Active state readouts ---
+    //
+    // Two `AdwActionRow`s with static titles + dynamic subtitles.
+    // `set_subtitle_lines(0)` disables the default one-line cap
+    // so long bookmark names wrap in place instead of
+    // truncating — makes long names like "KY State Police
+    // District 7 Dispatch — 154.680 MHz" fully readable in the
+    // sidebar without the user having to hover for a tooltip.
+    let active_channel_row = adw::ActionRow::builder()
+        .title("Channel")
+        .subtitle(ACTIVE_CHANNEL_PLACEHOLDER)
+        .subtitle_lines(SUBTITLE_UNLIMITED_LINES)
+        .build();
+    let state_row = adw::ActionRow::builder()
+        .title("State")
+        .subtitle(STATE_PLACEHOLDER)
+        .subtitle_lines(SUBTITLE_UNLIMITED_LINES)
         .build();
 
-    let heading = gtk4::Label::builder()
-        .label("Scanner")
-        .css_classes(["heading"])
-        .halign(gtk4::Align::Start)
-        .build();
-    widget.append(&heading);
-
-    let switch_row = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let switch_label = gtk4::Label::builder()
-        .label("Scanner")
-        .hexpand(true)
-        .halign(gtk4::Align::Start)
-        .build();
-    let master_switch = gtk4::Switch::builder().halign(gtk4::Align::End).build();
-    switch_row.append(&switch_label);
-    switch_row.append(&master_switch);
-    widget.append(&switch_row);
-
-    // Long bookmark names ("KY State Police District 7 Dispatch —
-    // 154.680 MHz") would otherwise grow the label's natural
-    // width past the sidebar width and shove the whole sidebar
-    // wider on every retune. `ellipsize(End)` + `xalign(0.0)` +
-    // `hexpand(true)` + `max_width_chars(1)` tells GTK: "grow
-    // as much as the parent allows, but stop requesting extra
-    // width past that point — truncate with `…` instead." The
-    // `max_width_chars(1)` is the idiomatic GTK incantation for
-    // "don't let the label's preferred width drive the layout";
-    // actual visible width follows `hexpand`.
-    let active_channel_label = gtk4::Label::builder()
-        .label("Active: —")
-        .halign(gtk4::Align::Start)
-        .xalign(0.0)
-        .hexpand(true)
-        .max_width_chars(1)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .css_classes(["caption"])
-        .build();
-    widget.append(&active_channel_label);
-
-    let state_label = gtk4::Label::builder()
-        .label("State: Off")
-        .halign(gtk4::Align::Start)
-        .xalign(0.0)
-        .hexpand(true)
-        .max_width_chars(1)
-        .ellipsize(gtk4::pango::EllipsizeMode::End)
-        .css_classes(["caption", "dim-label"])
-        .build();
-    widget.append(&state_label);
-
+    // --- Lockout action row ---
+    //
+    // Button packed as a suffix on an action row so the hide /
+    // show control toggles the whole row (title + button
+    // together). Hiding just the button would leave an empty
+    // "Current channel" title strip when the scanner isn't
+    // latched.
     let lockout_button = gtk4::Button::builder()
-        .label("Lockout current channel")
+        .label("Lockout")
         .css_classes(["destructive-action", "flat"])
+        .valign(gtk4::Align::Center)
+        .build();
+    let lockout_row = adw::ActionRow::builder()
+        .title("Current channel")
+        .subtitle("Skip for the rest of this session")
+        .subtitle_lines(SUBTITLE_UNLIMITED_LINES)
         .visible(false)
         .build();
-    widget.append(&lockout_button);
+    lockout_row.add_suffix(&lockout_button);
+    lockout_row.set_activatable_widget(Some(&lockout_button));
 
-    let expander = adw::ExpanderRow::builder().title("Settings").build();
+    // --- Timing spin rows ---
     let default_dwell_row = adw::SpinRow::builder()
-        .title("Default dwell (ms)")
+        .title("Default dwell")
+        .subtitle("ms — settle after retune")
         .adjustment(&gtk4::Adjustment::new(
             f64::from(DEFAULT_DWELL_MS),
             DWELL_MIN_MS,
@@ -236,7 +261,8 @@ pub fn build_scanner_panel() -> ScannerPanel {
         .digits(0)
         .build();
     let default_hang_row = adw::SpinRow::builder()
-        .title("Default hang (ms)")
+        .title("Default hang")
+        .subtitle("ms — linger after squelch closes")
         .adjustment(&gtk4::Adjustment::new(
             f64::from(DEFAULT_HANG_MS),
             HANG_MIN_MS,
@@ -247,23 +273,46 @@ pub fn build_scanner_panel() -> ScannerPanel {
         ))
         .digits(0)
         .build();
-    expander.add_row(&default_dwell_row);
-    expander.add_row(&default_hang_row);
 
-    let settings_group = gtk4::ListBox::builder()
-        .selection_mode(gtk4::SelectionMode::None)
-        .css_classes(["boxed-list"])
+    // --- Sectioned preferences page ---
+    //
+    // `title` + `description` pattern mirrors the other panels
+    // (Audio / Radio / Display) so the header rhythm stays
+    // consistent across activities.
+    let scanner_group = adw::PreferencesGroup::builder()
+        .title("Scanner")
+        .description("Sweep through bookmarked frequencies")
         .build();
-    settings_group.append(&expander);
-    widget.append(&settings_group);
+    scanner_group.add(&master_switch_row);
+
+    let active_group = adw::PreferencesGroup::builder()
+        .title("Active")
+        .description("Current channel and detector state")
+        .build();
+    active_group.add(&active_channel_row);
+    active_group.add(&state_row);
+    active_group.add(&lockout_row);
+
+    let timing_group = adw::PreferencesGroup::builder()
+        .title("Timing")
+        .description("How long to linger on each channel")
+        .build();
+    timing_group.add(&default_dwell_row);
+    timing_group.add(&default_hang_row);
+
+    let widget = adw::PreferencesPage::new();
+    widget.add(&scanner_group);
+    widget.add(&active_group);
+    widget.add(&timing_group);
 
     ScannerPanel {
         widget,
         master_switch,
-        active_channel_label,
-        state_label,
+        active_channel_row,
+        state_row,
         default_dwell_row,
         default_hang_row,
+        lockout_row,
         lockout_button,
     }
 }
