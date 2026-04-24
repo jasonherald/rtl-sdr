@@ -241,5 +241,11 @@ mod tests {
         assert!(super::DEFAULT_MIN_DB <= super::MIN_DB_CEILING);
         assert!(super::DEFAULT_MAX_DB >= super::MAX_DB_FLOOR);
         assert!(super::DEFAULT_MAX_DB <= super::MAX_DB_CEILING);
+        // Default pair ordering — a future constant tweak that
+        // crosses the defaults would produce a spectrum view with
+        // min above max, which the trace renderer treats as an
+        // empty range (no pixels lit). Assert directly so the
+        // regression fails the build, not the first frame.
+        assert!(super::DEFAULT_MIN_DB <= super::DEFAULT_MAX_DB);
     };
 }
