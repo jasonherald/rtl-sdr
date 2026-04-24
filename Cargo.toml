@@ -249,6 +249,13 @@ gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
 cairo-rs = { version = "0.22", features = ["png"] }
 
+# Benchmarking. `default-features = false` drops the `rayon`-backed
+# HTML reporting; we only need the `cargo bench` harness support, which
+# `cargo_bench_support` turns on. Keeping the pin workspace-wide so the
+# GPU-acceleration sub-tickets (#179-#182) pick up the same version as
+# the CPU baseline harness in sdr-dsp.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
