@@ -146,9 +146,12 @@ impl WaterfallRenderer {
             fft_data
         };
 
+        // Normalize dB values to 0..255. Positions past the FFT's
+        // actual bin count stay at `0` from the `fill(0)` — those
+        // render as `colormap[0]` (the "no signal" floor color),
+        // which is the semantically correct treatment for frequency
+        // regions with no real data.
         let bin_count = display_data.len().min(self.display_width);
-
-        // Normalize dB values to 0..255.
         self.row_buffer.fill(0);
         for (i, &db) in display_data.iter().take(bin_count).enumerate() {
             let normalized = ((db - self.min_db) / db_range).clamp(0.0, 1.0);
@@ -163,9 +166,14 @@ impl WaterfallRenderer {
         self.top_row = (self.top_row + HISTORY_LINES - 1) % HISTORY_LINES;
 
         // Write the new row into the physical slot for `top_row`.
+        // Iterate the FULL `display_width`, not just `bin_count` —
+        // this matters specifically because the ring-buffer path
+        // recycles old slots. Skipping the tail would leak the
+        // oldest row's right-edge pixels into the newest row, visible
+        // on narrow-FFT frames (or during FFT size changes).
         let row_bytes = self.display_width * 4;
         let row_start = self.top_row * row_bytes;
-        for (i, &val) in self.row_buffer.iter().take(bin_count).enumerate() {
+        for (i, &val) in self.row_buffer.iter().enumerate() {
             let color = self.colormap_bgra[val as usize];
             let idx = row_start + i * 4;
             self.pixel_buf[idx] = color[0]; // B
@@ -311,36 +319,69 @@ impl WaterfallRenderer {
         }
     }
 
-    /// Build a Cairo `ImageSurface` from the pixel buffer, handling stride
-    /// alignment. Cairo may require row strides wider than our tightly-packed
-    /// data; when they differ, rows are padded to match.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
+    /// Query Cairo's required stride for our ARGB32 row width.
+    /// Returns `(stride_bytes, packed_stride_bytes)` so callers can
+    /// decide whether to use a zero-copy packed buffer or a padded
+    /// copy.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn argb32_strides(display_width: usize) -> Result<(i32, i32), String> {
+        let stride = cairo::Format::ARgb32
+            .stride_for_width(display_width as u32)
+            .map_err(|e| format!("stride: {e}"))?;
+        let packed_stride = (display_width * 4) as i32;
+        Ok((stride, packed_stride))
+    }
+
+    /// Re-pack `linear` (tightly-packed `display_width * 4` bytes
+    /// per row) into whatever stride Cairo demands for the given
+    /// width. Returns either the input `Vec` unchanged (when
+    /// Cairo's stride matches the packed stride — the common case
+    /// on typical widths) or a fresh padded copy.
+    ///
+    /// Used by both `to_cairo_surface` and `export_png` to keep
+    /// the ARGB32 packing logic in one place.
+    #[allow(clippy::cast_sign_loss)]
+    fn pack_argb32_for_cairo(
+        mut linear: Vec<u8>,
+        display_width: usize,
+        stride: i32,
+        packed_stride: i32,
+    ) -> Vec<u8> {
+        if stride == packed_stride {
+            return linear;
+        }
+        let row_bytes = display_width * 4;
+        // `stride` comes from `cairo::Format::stride_for_width`, which
+        // returns `Err` on negative values — safe to treat as unsigned.
+        let stride_usize = stride as usize;
+        let mut padded = vec![0u8; stride_usize * HISTORY_LINES];
+        for row in 0..HISTORY_LINES {
+            let src = row * row_bytes;
+            let dst = row * stride_usize;
+            padded[dst..dst + row_bytes].copy_from_slice(&linear[src..src + row_bytes]);
+        }
+        // Drop the unpadded copy explicitly rather than relying on
+        // it falling out of scope — makes the "we're abandoning
+        // this buffer" intent obvious.
+        linear.clear();
+        padded
+    }
+
+    /// Build a Cairo `ImageSurface` over the ring-ordered pixel
+    /// buffer. `render()` handles the ring wrap via two clipped
+    /// paints, so no re-ordering happens here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn to_cairo_surface(&self) -> Result<cairo::ImageSurface, String> {
         if self.display_width == 0 {
             return Err("no waterfall data".to_string());
         }
-
-        let stride = cairo::Format::ARgb32
-            .stride_for_width(self.display_width as u32)
-            .map_err(|e| format!("stride: {e}"))?;
-
-        let packed_stride = (self.display_width * 4) as i32;
-        let buf = if stride == packed_stride {
-            self.pixel_buf.clone()
-        } else {
-            let mut padded = vec![0u8; stride as usize * HISTORY_LINES];
-            let row_bytes = self.display_width * 4;
-            for row in 0..HISTORY_LINES {
-                let src = row * row_bytes;
-                let dst = row * stride as usize;
-                padded[dst..dst + row_bytes].copy_from_slice(&self.pixel_buf[src..src + row_bytes]);
-            }
-            padded
-        };
+        let (stride, packed_stride) = Self::argb32_strides(self.display_width)?;
+        let buf = Self::pack_argb32_for_cairo(
+            self.pixel_buf.clone(),
+            self.display_width,
+            stride,
+            packed_stride,
+        );
 
         cairo::ImageSurface::create_for_data(
             buf,
@@ -359,11 +400,7 @@ impl WaterfallRenderer {
     /// `top_row`. We walk the ring once to materialize a linear copy
     /// here — one allocation per export, which is negligible for a
     /// user-triggered "save to PNG" operation.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
         if self.display_width == 0 {
             return Err("no waterfall data".to_string());
@@ -377,21 +414,8 @@ impl WaterfallRenderer {
             linear[dst..dst + row_bytes].copy_from_slice(&self.pixel_buf[src..src + row_bytes]);
         }
 
-        let stride = cairo::Format::ARgb32
-            .stride_for_width(self.display_width as u32)
-            .map_err(|e| format!("stride: {e}"))?;
-        let packed_stride = (self.display_width * 4) as i32;
-        let buf = if stride == packed_stride {
-            linear
-        } else {
-            let mut padded = vec![0u8; stride as usize * HISTORY_LINES];
-            for row in 0..HISTORY_LINES {
-                let src = row * row_bytes;
-                let dst = row * stride as usize;
-                padded[dst..dst + row_bytes].copy_from_slice(&linear[src..src + row_bytes]);
-            }
-            padded
-        };
+        let (stride, packed_stride) = Self::argb32_strides(self.display_width)?;
+        let buf = Self::pack_argb32_for_cairo(linear, self.display_width, stride, packed_stride);
 
         let surface = cairo::ImageSurface::create_for_data(
             buf,
@@ -581,6 +605,49 @@ mod tests {
         assert_eq!(
             p, p_prev,
             "previous row pixel must not be touched by next push"
+        );
+    }
+
+    #[test]
+    fn narrow_fft_does_not_leak_stale_tail() {
+        // Simulates the ring-buffer hazard: after many rows of a
+        // 4-wide FFT, switch to a 2-wide FFT. The recycled physical
+        // slot previously held a fully-populated row with non-zero
+        // tail pixels — if `push_line` only writes `bin_count`
+        // pixels, those stale tail pixels bleed into the new row.
+        let mut r = WaterfallRenderer::new(4);
+        r.set_db_range(0.0, 100.0);
+
+        // Fill every slot with a fully-saturated 4-wide row so the
+        // tail positions are non-zero across the whole ring.
+        for _ in 0..HISTORY_LINES {
+            r.push_line(&[100.0, 100.0, 100.0, 100.0]);
+        }
+
+        // Now push a 2-bin frame — the other two positions are
+        // "past the FFT width" and MUST render as `colormap[0]`,
+        // not the previous row's saturated tail.
+        r.push_line(&[100.0, 100.0]);
+        let top = r.top_row;
+
+        // Positions 0-1: high-level color (normalized byte = 255).
+        let high = physical_pixel(&r, top, 0);
+        // Positions 2-3: "no data" color (normalized byte = 0).
+        let no_data = physical_pixel(&r, top, 2);
+
+        assert_ne!(
+            high, no_data,
+            "narrow-FFT tail should differ from the data region"
+        );
+        // And no-data must match the colormap's zero entry (the
+        // "floor" color), not the saturated color the old row had.
+        let floor = {
+            let c = r.colormap_bgra[0];
+            [c[0], c[1], c[2], c[3]]
+        };
+        assert_eq!(
+            no_data, floor,
+            "tail pixels must be colormap[0], not stale ring-buffer content"
         );
     }
 
