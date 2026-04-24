@@ -97,6 +97,22 @@ const APP_CSS: &str = r#"
 .activity-bar button.activity-bar-button:checked:hover {
     background-color: alpha(@accent_color, 0.2);
 }
+
+/* Sidebar resize handle — a thin strip at the sidebar's inner
+ * edge that carries the drag gesture + col-resize cursor. The
+ * strip is transparent by default (invisible to eye) and tints
+ * subtly on hover so the user discovers the affordance when
+ * their cursor enters the region. Matches the restrained visual
+ * treatment of the activity bar — no chrome unless the user
+ * reaches for it.
+ */
+.sidebar-resize-handle {
+    background: transparent;
+}
+
+.sidebar-resize-handle:hover {
+    background-color: alpha(@accent_color, 0.2);
+}
 "#;
 
 /// Load the application CSS into the default display's style context.

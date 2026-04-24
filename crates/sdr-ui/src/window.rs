@@ -264,6 +264,16 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     }
     right_split_view.set_show_sidebar(session.right_open);
 
+    // Restore saved pixel widths via a one-shot `notify::width`
+    // handler — `sidebar_width_fraction` needs the split view's
+    // live allocation to convert pixels → fraction, and the
+    // allocation isn't settled until the widget has mapped. The
+    // `applied` cell flips after the first non-zero width is seen
+    // so subsequent width changes (window resize) leave the
+    // sidebar's fraction alone.
+    apply_saved_sidebar_width(&left_split_view, session.left_width_px);
+    apply_saved_sidebar_width(&right_split_view, session.right_width_px);
+
     wire_activity_bar_clicks(
         &left_activity_bar,
         &left_stack,
@@ -1912,11 +1922,10 @@ fn build_layout(
     // here is a fraction; under nested splits its pixel result
     // is approximate, and `min-sidebar-width` clamps the transcript
     // panel up to its 360 px floor when the math would otherwise
-    // leave it narrower. Hitting the exact pixel target would
-    // require a post-realize callback (sub-ticket #428 territory).
+    // leave it narrower. User-driven resize + persistence come from
+    // the drag handle wired below (#429).
     let right_split_view = adw::OverlaySplitView::builder()
         .sidebar_position(gtk4::PackType::End)
-        .sidebar(&right_stack)
         .content(&content_box)
         .show_sidebar(false)
         .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
@@ -1924,17 +1933,64 @@ fn build_layout(
         .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
 
+    // Compose the right sidebar with its resize handle on the
+    // leading edge (the boundary with the content area). Dragging
+    // the handle LEFT widens the sidebar; drag-end persists the
+    // new pixel width; double-click resets to the default.
+    let config_right_resize = std::sync::Arc::clone(config);
+    let save_right_width: std::rc::Rc<dyn Fn(u32)> = std::rc::Rc::new(move |px| {
+        sidebar::activity_bar::save_right_width_px(&config_right_resize, px);
+    });
+    let right_handle = build_resize_handle(
+        &right_split_view,
+        ResizeDirection::LeftGrowsSidebar,
+        RIGHT_SIDEBAR_MIN_WIDTH,
+        RIGHT_SIDEBAR_DEFAULT_WIDTH * 2.0,
+        RIGHT_SIDEBAR_DEFAULT_WIDTH,
+        &save_right_width,
+    );
+    let right_sidebar_wrap = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    right_sidebar_wrap.append(&right_handle);
+    right_sidebar_wrap.append(&right_stack);
+    right_split_view.set_sidebar(Some(&right_sidebar_wrap));
+
     // Outer (left) split view — sidebar hosts the left activity
     // stack. Starts open with "general" visible so a fresh launch
     // lands on the General panel instead of an empty frame.
     let left_split_view = adw::OverlaySplitView::builder()
-        .sidebar(&left_stack)
         .content(&right_split_view)
         .show_sidebar(true)
         .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0)
         .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
+
+    // Compose the left sidebar with its resize handle on the
+    // trailing edge. Dragging the handle RIGHT widens the sidebar.
+    let config_left_resize = std::sync::Arc::clone(config);
+    let save_left_width: std::rc::Rc<dyn Fn(u32)> = std::rc::Rc::new(move |px| {
+        sidebar::activity_bar::save_left_width_px(&config_left_resize, px);
+    });
+    let left_handle = build_resize_handle(
+        &left_split_view,
+        ResizeDirection::RightGrowsSidebar,
+        LEFT_SIDEBAR_MIN_WIDTH,
+        LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0,
+        LEFT_SIDEBAR_DEFAULT_WIDTH,
+        &save_left_width,
+    );
+    let left_sidebar_wrap = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    left_sidebar_wrap.append(&left_stack);
+    left_sidebar_wrap.append(&left_handle);
+    left_split_view.set_sidebar(Some(&left_sidebar_wrap));
     left_stack.set_visible_child_name("general");
 
     let left_activity_bar =
@@ -1976,6 +2032,157 @@ fn page_from_group(group: &adw::PreferencesGroup) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(group);
     page
+}
+
+/// Apply a saved pixel width to an `AdwOverlaySplitView` sidebar
+/// after the split view has a real allocation. A single
+/// `notify::width` handler fires once the first non-zero width
+/// lands, converts the saved pixels into the `[0, 1]` fraction
+/// the widget accepts, applies it, and then the handler is
+/// effectively inert for the rest of the window's lifetime
+/// (`applied` flag). `None` skips everything — the builder-time
+/// fractional default stands.
+fn apply_saved_sidebar_width(split_view: &adw::OverlaySplitView, saved_px: Option<u32>) {
+    let Some(px) = saved_px else {
+        return;
+    };
+    let applied: std::rc::Rc<std::cell::Cell<bool>> = std::rc::Rc::new(std::cell::Cell::new(false));
+    split_view.connect_notify_local(Some("width"), move |sv, _| {
+        if applied.get() {
+            return;
+        }
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let fraction = (f64::from(px) / sv_w).clamp(0.01, 0.99);
+        sv.set_sidebar_width_fraction(fraction);
+        applied.set(true);
+    });
+}
+
+/// Width of the invisible drag strip at a sidebar's inner edge
+/// (design doc §4.4 calls for "thin (4–6 px)"). 6 px gives the
+/// user a forgiving hit target without stealing pixels from the
+/// panel content.
+const RESIZE_HANDLE_WIDTH_PX: i32 = 6;
+
+/// Which direction of drag grows the sidebar. The LEFT split
+/// view's sidebar sits on the leading edge — dragging the handle
+/// right pushes the sidebar-content boundary right and widens the
+/// sidebar. The RIGHT split view's sidebar sits on the trailing
+/// edge (`sidebar_position=End`) — the handle is on its leading
+/// edge, and dragging LEFT widens the sidebar.
+#[derive(Clone, Copy, Debug)]
+enum ResizeDirection {
+    /// Positive `offset_x` widens the sidebar (left split view).
+    RightGrowsSidebar,
+    /// Negative `offset_x` widens the sidebar (right split view).
+    LeftGrowsSidebar,
+}
+
+/// Build an invisible drag-handle widget sized to
+/// [`RESIZE_HANDLE_WIDTH_PX`] and wire it to resize an
+/// `AdwOverlaySplitView` sidebar. Live-resizes during drag,
+/// persists the final width on drag-end via `save_width_px`,
+/// and resets to `default_px` on a left-button double-click
+/// (standard GTK paned-divider pattern).
+///
+/// `AdwOverlaySplitView` only exposes `sidebar-width-fraction`
+/// (range `[0, 1]`); pixel min/max/default are converted to the
+/// fraction against the split view's live allocation every time
+/// the gesture fires, so the clamp reacts correctly to window
+/// resizes.
+fn build_resize_handle(
+    split_view: &adw::OverlaySplitView,
+    direction: ResizeDirection,
+    min_px: f64,
+    max_px: f64,
+    default_px: f64,
+    save_width_px: &std::rc::Rc<dyn Fn(u32)>,
+) -> gtk4::Box {
+    let handle = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .width_request(RESIZE_HANDLE_WIDTH_PX)
+        .css_classes(["sidebar-resize-handle"])
+        .build();
+    if let Some(cursor) = gtk4::gdk::Cursor::from_name("col-resize", None) {
+        handle.set_cursor(Some(&cursor));
+    }
+
+    // Captured at drag-begin so every `drag-update` computes the
+    // new width from the stable starting fraction rather than
+    // integrating floating-point deltas. Without this the gesture
+    // would drift 1–2 px per drag cycle.
+    let start_fraction: std::rc::Rc<std::cell::Cell<f64>> =
+        std::rc::Rc::new(std::cell::Cell::new(0.0));
+
+    let drag_gesture = gtk4::GestureDrag::new();
+
+    let split_view_begin = split_view.clone();
+    let start_fraction_begin = std::rc::Rc::clone(&start_fraction);
+    drag_gesture.connect_drag_begin(move |_, _, _| {
+        start_fraction_begin.set(split_view_begin.sidebar_width_fraction());
+    });
+
+    let split_view_update = split_view.clone();
+    let start_fraction_update = std::rc::Rc::clone(&start_fraction);
+    drag_gesture.connect_drag_update(move |_, offset_x, _| {
+        let sv_w = f64::from(split_view_update.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let start_px = start_fraction_update.get() * sv_w;
+        let signed_offset = match direction {
+            ResizeDirection::RightGrowsSidebar => offset_x,
+            ResizeDirection::LeftGrowsSidebar => -offset_x,
+        };
+        let new_px = (start_px + signed_offset).clamp(min_px, max_px);
+        // Fraction pspec is `[0, 1]`; guard against 0 which the
+        // widget treats as "collapsed" at the animator level.
+        let new_fraction = (new_px / sv_w).clamp(0.01, 0.99);
+        split_view_update.set_sidebar_width_fraction(new_fraction);
+    });
+
+    let split_view_end = split_view.clone();
+    let save_end = std::rc::Rc::clone(save_width_px);
+    drag_gesture.connect_drag_end(move |_, _, _| {
+        let sv_w = f64::from(split_view_end.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let final_px = split_view_end.sidebar_width_fraction() * sv_w;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = final_px.round().max(0.0) as u32;
+        save_end(px);
+    });
+    handle.add_controller(drag_gesture);
+
+    // Double-click = reset to default width. Matches the GTK paned-
+    // divider convention users expect ("I messed up my drag, take
+    // me back"). A single click does nothing — the drag gesture
+    // already handles press/release.
+    let click_gesture = gtk4::GestureClick::new();
+    click_gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    let split_view_click = split_view.clone();
+    let save_click = std::rc::Rc::clone(save_width_px);
+    click_gesture.connect_released(move |_, n_press, _, _| {
+        if n_press != 2 {
+            return;
+        }
+        let sv_w = f64::from(split_view_click.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let fraction = (default_px / sv_w).clamp(0.01, 0.99);
+        split_view_click.set_sidebar_width_fraction(fraction);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = default_px.round().max(0.0) as u32;
+        save_click(px);
+    });
+    handle.add_controller(click_gesture);
+
+    handle
 }
 
 /// Build the sidebar toggle button bound to the split view.
