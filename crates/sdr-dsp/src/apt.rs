@@ -173,22 +173,29 @@ const ENVELOPE_LPF_TRANSITION_HZ: f64 = 1_000.0;
 impl EnvelopeDetector {
     /// Build an envelope detector for audio sampled at `sample_rate_hz`.
     ///
-    /// The only constraint is that Nyquist sits above `2 · SUBCARRIER_HZ`
-    /// so the rectification harmonic is resolvable; otherwise the filter
-    /// design would alias and you'd get phantom ripple back into the video
-    /// band.
+    /// The Nyquist constraint is on the *rectified* signal: full-wave
+    /// rectification of the cosine subcarrier creates a tone at
+    /// `2 · SUBCARRIER_HZ = 4800 Hz`, so the input sample rate must
+    /// satisfy `sample_rate_hz > 2 · 4800 = 9600 Hz` to resolve that
+    /// harmonic at all (otherwise it aliases back into the video band
+    /// and the LPF can't get rid of it).
     ///
     /// # Errors
     ///
-    /// Returns [`DspError::InvalidParameter`] if `sample_rate_hz` is too low
-    /// to cleanly place the 4800 Hz harmonic below Nyquist, or if the
+    /// Returns [`DspError::InvalidParameter`] if `sample_rate_hz` is at
+    /// or below the Nyquist floor for the rectified harmonic, or if the
     /// underlying FIR / tap generation rejects the design parameters.
     pub fn new(sample_rate_hz: u32) -> Result<Self, DspError> {
-        if f64::from(sample_rate_hz) < 2.0 * SUBCARRIER_HZ + ENVELOPE_LPF_TRANSITION_HZ {
+        // Nyquist floor for the post-rectification 2·f_c = 4800 Hz tone.
+        // Strictly: Nyquist (rate / 2) must exceed 2·SUBCARRIER_HZ, i.e.
+        // rate must exceed 4·SUBCARRIER_HZ.
+        const NYQUIST_FLOOR_HZ: f64 = 4.0 * SUBCARRIER_HZ;
+        if f64::from(sample_rate_hz) <= NYQUIST_FLOOR_HZ {
             return Err(DspError::InvalidParameter(format!(
                 "sample_rate_hz ({sample_rate_hz}) too low for APT envelope detection — \
-                 must be well above 2·{SUBCARRIER_HZ} Hz = {} Hz",
-                2.0 * SUBCARRIER_HZ
+                 the 2·SUBCARRIER_HZ ({} Hz) rectification harmonic requires Nyquist \
+                 above that, i.e. sample rate > 4·SUBCARRIER_HZ = {NYQUIST_FLOOR_HZ} Hz",
+                2.0 * SUBCARRIER_HZ,
             )));
         }
         let lpf_taps = taps::low_pass(
@@ -561,11 +568,17 @@ impl AptDecoder {
     /// A return value of `0` is normal until the buffer has accumulated
     /// enough data for the first line (~0.5 s into a capture).
     ///
+    /// **Streaming semantics:** if more lines are ready than `output` can
+    /// hold, the function emits as many as fit and returns the count; the
+    /// remaining ready lines stay buffered and become available on the
+    /// next `process` call. This keeps the error path clean (no streaming
+    /// state mutated then unwound) and lets a small fixed-size output
+    /// buffer drive the decoder safely. The buffer cap of three lines
+    /// internally bounds how far behind the caller can get.
+    ///
     /// # Errors
     ///
-    /// Returns [`DspError::BufferTooSmall`] if `output` cannot hold every
-    /// line that became ready in this call. Propagates [`DspError`] from
-    /// the resampler or envelope detector otherwise.
+    /// Propagates [`DspError`] from the resampler or envelope detector.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn process(&mut self, input: &[f32], output: &mut [AptLine]) -> Result<usize, DspError> {
         // 1. Resample to the internal 20800 Hz grid.
@@ -586,9 +599,13 @@ impl AptDecoder {
         self.accumulator
             .extend_from_slice(&self.envelope_scratch[..resampled]);
 
-        // 4. While there's enough data for a search + full line, emit.
+        // 4. Emit as many lines as `output` can hold. Stopping at the
+        // caller's capacity (rather than erroring) keeps the streaming
+        // contract: any line we *don't* emit this call stays buffered
+        // and surfaces on the next call. State mutates only for lines
+        // that successfully landed in `output` — no half-applied drains.
         let mut produced = 0_usize;
-        while self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
+        while produced < output.len() && self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
             // Search the first SAMPLES_PER_LINE tau positions — any match
             // in there leaves a full SAMPLES_PER_LINE window for the line
             // body without running past the end.
@@ -607,11 +624,9 @@ impl AptDecoder {
             let line_start = m.offset;
             let line_end = line_start + SAMPLES_PER_LINE;
 
-            let output_capacity = output.len();
-            let slot = output.get_mut(produced).ok_or(DspError::BufferTooSmall {
-                need: produced + 1,
-                got: output_capacity,
-            })?;
+            // The `produced < output.len()` loop guard guarantees this
+            // index is in bounds.
+            let slot = &mut output[produced];
             decimate_into_pixels(&self.accumulator[line_start..line_end], &mut slot.pixels);
             slot.sync_quality = m.quality;
             slot.sync_channel = SyncChannel::A;
@@ -1279,23 +1294,50 @@ mod tests {
     }
 
     #[test]
-    fn apt_decoder_buffer_too_small_returns_error() {
-        // Slice-based contract: if the caller's output can't hold every
-        // line that becomes ready, surface BufferTooSmall instead of
-        // dropping data on the floor.
+    fn apt_decoder_undersized_output_buffers_remainder() {
+        // Streaming contract: if more lines are ready than `output` can
+        // hold, emit as many as fit and leave the rest buffered for the
+        // next call. State must NOT advance for lines that didn't land
+        // in `output` — verified by feeding the same audio across two
+        // calls and checking the decoder still emits the buffered lines.
         let rate = TEST_INPUT_RATE_HZ;
         let mut d = AptDecoder::new(rate).unwrap();
-        // Feed 6 lines so multiple emissions are queued.
         let mut audio = Vec::new();
         for _ in 0..6 {
             audio.extend_from_slice(&synth_line_audio(rate, TEST_GREY_LEVEL));
         }
-        // Output buffer too small to hold them all.
+
+        // First call with a single-slot output should fill that slot and
+        // return Ok(1) with more lines still queued internally.
         let mut tiny_out = vec![AptLine::default(); 1];
-        let result = d.process(&audio, &mut tiny_out);
-        // The first line emits successfully and overwrites tiny_out[0],
-        // but the second emission has no slot to land in — error.
-        assert!(matches!(result, Err(DspError::BufferTooSmall { .. })));
+        let n_first = d.process(&audio, &mut tiny_out).unwrap();
+        assert_eq!(
+            n_first, 1,
+            "single-slot output should emit exactly one line, got {n_first}"
+        );
+
+        // Second call (empty input) should still drain previously-queued
+        // lines from the accumulator into a roomier output. If state had
+        // advanced incorrectly on the first call we'd see fewer here.
+        let mut roomy_out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        let n_second = d.process(&[], &mut roomy_out).unwrap();
+        assert!(
+            n_second >= 1,
+            "expected buffered lines to surface on a follow-up call, got {n_second}",
+        );
+    }
+
+    #[test]
+    fn envelope_detector_rejects_below_rectified_nyquist() {
+        // The rectified subcarrier harmonic sits at 2·f_c = 4800 Hz, so
+        // any sample rate at or below 2·4800 = 9600 Hz aliases that tone
+        // back into the video band. The detector must refuse those rates.
+        // Earlier values like 8 kHz "look" plausible (above 2·f_c) but
+        // the rectified harmonic Nyquist still isn't met — make sure 8 kHz
+        // is rejected, and 16 kHz (well above the floor) is accepted.
+        assert!(EnvelopeDetector::new(8_000).is_err());
+        assert!(EnvelopeDetector::new(9_600).is_err()); // exactly at floor
+        assert!(EnvelopeDetector::new(16_000).is_ok());
     }
 
     /// Synthesize a realistic APT line with a sync A burst followed by a
