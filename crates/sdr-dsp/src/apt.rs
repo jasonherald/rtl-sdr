@@ -115,10 +115,16 @@ pub enum SyncChannel {
 }
 
 /// One decoded APT scan line.
+///
+/// `pixels` is stored inline (~2 KB) so an `AptLine` is `Clone`-able and
+/// reusable as an output slot without per-line heap allocation — the
+/// `AptDecoder::process` contract takes `&mut [AptLine]` and writes new
+/// values into existing entries. Construct empty slots with
+/// `AptLine::default()`.
 #[derive(Debug, Clone)]
 pub struct AptLine {
     /// The 2080 greyscale pixels of this line, in transmission order.
-    pub pixels: Box<[u8; LINE_PIXELS]>,
+    pub pixels: [u8; LINE_PIXELS],
     /// Normalized cross-correlation peak against the matched sync template
     /// (range `[0.0, 1.0]`, higher = stronger lock).
     pub sync_quality: f32,
@@ -128,6 +134,17 @@ pub struct AptLine {
     /// this line. Useful for timing correlation with telemetry or pass
     /// ephemerides.
     pub input_sample_index: u64,
+}
+
+impl Default for AptLine {
+    fn default() -> Self {
+        Self {
+            pixels: [0; LINE_PIXELS],
+            sync_quality: 0.0,
+            sync_channel: SyncChannel::A,
+            input_sample_index: 0,
+        }
+    }
 }
 
 /// AM envelope detector — full-wave rectification followed by a lowpass
@@ -478,25 +495,40 @@ pub struct AptDecoder {
     envelope_scratch: Vec<f32>,
     accumulator: Vec<f32>,
 
-    // Which input-audio sample is currently at accumulator[0]. Carried
-    // forward on every drain so we can stamp each emitted line with a
-    // source-timestamp-ish index for correlation with satellite pass
-    // ephemerides or telemetry ticks.
-    accumulator_start_input_sample: u64,
+    // Cumulative count of *intermediate-rate* samples (envelope samples)
+    // that have been streamed through the accumulator and dropped on a
+    // drain. Stored at the internal-rate so drain bookkeeping is exact —
+    // converting on every drain (e.g. ⌊acc · input/20800⌋) leaks a
+    // fractional remainder when the ratio isn't a clean integer (at 48 kHz
+    // it's 30/13), which would walk `input_sample_index` earlier over
+    // long captures. We only convert to input-sample units at stamp time.
+    accumulator_start_intermediate_sample: u64,
 }
 
 impl AptDecoder {
     /// Build a decoder for audio sampled at `input_rate_hz`.
     ///
-    /// Typical value is 48000 (the output rate of the FM demodulator), but
-    /// any rate above `2 · SUBCARRIER_HZ` that the resampler can reach is
-    /// accepted.
+    /// Typical value is 48000 (the output rate of the FM demodulator).
+    /// Must be at least `2 · SUBCARRIER_HZ` (4800 Hz) — below that the
+    /// 2400 Hz APT subcarrier is already aliased before this pipeline
+    /// gets a chance to look at it, which would produce silent garbage.
     ///
     /// # Errors
     ///
-    /// Propagates [`DspError`] from the underlying resampler, envelope
+    /// Returns [`DspError::InvalidParameter`] if `input_rate_hz` is below
+    /// the Nyquist floor for the APT subcarrier. Propagates other
+    /// [`DspError`] values from the underlying resampler, envelope
     /// detector, or tap designer.
     pub fn new(input_rate_hz: u32) -> Result<Self, DspError> {
+        // 2 · 2400 = 4800 Hz exactly — no rounding, just hard-code so the
+        // const-context-friendly comparison below stays trivially correct.
+        const NYQUIST_FLOOR_HZ: u32 = 4_800;
+        if input_rate_hz < NYQUIST_FLOOR_HZ {
+            return Err(DspError::InvalidParameter(format!(
+                "input_rate_hz ({input_rate_hz}) must be ≥ 2·SUBCARRIER_HZ \
+                 ({NYQUIST_FLOOR_HZ}) to avoid aliasing the 2400 Hz APT subcarrier",
+            )));
+        }
         Ok(Self {
             input_rate_hz,
             resampler: RealResampler::new(
@@ -508,7 +540,7 @@ impl AptDecoder {
             resample_scratch: Vec::new(),
             envelope_scratch: Vec::new(),
             accumulator: Vec::with_capacity(DECODER_BUFFER_CAP),
-            accumulator_start_input_sample: 0,
+            accumulator_start_intermediate_sample: 0,
         })
     }
 
@@ -517,21 +549,25 @@ impl AptDecoder {
         self.resampler.reset();
         self.envelope.reset();
         self.accumulator.clear();
-        self.accumulator_start_input_sample = 0;
+        self.accumulator_start_intermediate_sample = 0;
     }
 
-    /// Feed `input` audio samples into the decoder and return any lines
-    /// that became available as a result.
+    /// Feed `input` audio samples into the decoder, writing any newly-decoded
+    /// lines into `output`, and return the number written.
     ///
-    /// Returns an empty `Vec` if the internal buffer hasn't yet
-    /// accumulated a full line — which is normal for the first ~0.5 s of
-    /// any capture.
+    /// Each emitted line overwrites an existing entry in `output` in place
+    /// (so the caller pre-allocates `output` once with `AptLine::default()`
+    /// slots and reuses it across calls — no heap allocation per emission).
+    /// A return value of `0` is normal until the buffer has accumulated
+    /// enough data for the first line (~0.5 s into a capture).
     ///
     /// # Errors
     ///
-    /// Propagates [`DspError`] from the resampler or envelope detector.
+    /// Returns [`DspError::BufferTooSmall`] if `output` cannot hold every
+    /// line that became ready in this call. Propagates [`DspError`] from
+    /// the resampler or envelope detector otherwise.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub fn process(&mut self, input: &[f32]) -> Result<Vec<AptLine>, DspError> {
+    pub fn process(&mut self, input: &[f32], output: &mut [AptLine]) -> Result<usize, DspError> {
         // 1. Resample to the internal 20800 Hz grid.
         let est_out = (input.len() as u64 * u64::from(INTERMEDIATE_RATE_HZ)
             / u64::from(self.input_rate_hz)) as usize
@@ -551,31 +587,40 @@ impl AptDecoder {
             .extend_from_slice(&self.envelope_scratch[..resampled]);
 
         // 4. While there's enough data for a search + full line, emit.
-        let mut lines = Vec::new();
+        let mut produced = 0_usize;
         while self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
             // Search the first SAMPLES_PER_LINE tau positions — any match
             // in there leaves a full SAMPLES_PER_LINE window for the line
             // body without running past the end.
             let search_len = SAMPLES_PER_LINE + SYNC_A_TEMPLATE_LEN;
-            let m = self
+            // `find_best` only returns `None` when the search slice is
+            // shorter than the template; the loop guard guarantees that
+            // can't happen here, but stay defensive: a future constants
+            // change shouldn't be allowed to abort the whole DSP path.
+            let Some(m) = self
                 .sync_detector
                 .find_best(&self.accumulator[..search_len], SyncChannel::A)
-                .expect("search slice always longer than sync template");
+            else {
+                break;
+            };
 
             let line_start = m.offset;
             let line_end = line_start + SAMPLES_PER_LINE;
-            let pixels = decimate_to_pixels(&self.accumulator[line_start..line_end]);
 
-            lines.push(AptLine {
-                pixels,
-                sync_quality: m.quality,
-                sync_channel: SyncChannel::A,
-                input_sample_index: self.accumulator_to_input_index(line_start),
-            });
+            let output_capacity = output.len();
+            let slot = output.get_mut(produced).ok_or(DspError::BufferTooSmall {
+                need: produced + 1,
+                got: output_capacity,
+            })?;
+            decimate_into_pixels(&self.accumulator[line_start..line_end], &mut slot.pixels);
+            slot.sync_quality = m.quality;
+            slot.sync_channel = SyncChannel::A;
+            slot.input_sample_index = self.accumulator_to_input_index(line_start);
+            produced += 1;
 
             // Drain the accumulator through the end of the emitted line.
             self.accumulator.drain(..line_end);
-            self.accumulator_start_input_sample += self.ratio_intermediate_to_input(line_end);
+            self.accumulator_start_intermediate_sample += line_end as u64;
         }
 
         // 5. Cap buffered memory. If a stretch of noise keeps `find_best`
@@ -585,28 +630,24 @@ impl AptDecoder {
         if self.accumulator.len() > DECODER_BUFFER_CAP {
             let drop_n = self.accumulator.len() - DECODER_BUFFER_CAP;
             self.accumulator.drain(..drop_n);
-            self.accumulator_start_input_sample += self.ratio_intermediate_to_input(drop_n);
+            self.accumulator_start_intermediate_sample += drop_n as u64;
         }
 
-        Ok(lines)
+        Ok(produced)
     }
 
     /// Convert an offset within the envelope accumulator (intermediate-rate
-    /// samples) to an input-rate sample index.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    /// samples) to an input-rate sample index. Computed in one shot from
+    /// the running intermediate-rate origin so there's no fractional
+    /// rounding drift across drains.
     fn accumulator_to_input_index(&self, acc_offset: usize) -> u64 {
-        self.accumulator_start_input_sample + self.ratio_intermediate_to_input(acc_offset)
-    }
-
-    /// `acc_samples · input_rate / intermediate_rate`, expressed in u64 to
-    /// keep the bookkeeping loss-free for multi-hour captures.
-    fn ratio_intermediate_to_input(&self, acc_samples: usize) -> u64 {
-        (acc_samples as u64 * u64::from(self.input_rate_hz)) / u64::from(INTERMEDIATE_RATE_HZ)
+        let total_intermediate = self.accumulator_start_intermediate_sample + acc_offset as u64;
+        (total_intermediate * u64::from(self.input_rate_hz)) / u64::from(INTERMEDIATE_RATE_HZ)
     }
 }
 
 /// Decimate one line's worth of envelope samples (`SAMPLES_PER_LINE`) into
-/// `LINE_PIXELS` 8-bit greyscale values.
+/// `LINE_PIXELS` 8-bit greyscale values, writing in place into `pixels`.
 ///
 /// Uses a simple boxcar average of `SAMPLES_PER_PIXEL` adjacent samples
 /// followed by per-line min/max normalization. Per-line normalization is a
@@ -619,7 +660,7 @@ impl AptDecoder {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn decimate_to_pixels(samples: &[f32]) -> Box<[u8; LINE_PIXELS]> {
+fn decimate_into_pixels(samples: &[f32], pixels: &mut [u8; LINE_PIXELS]) {
     debug_assert_eq!(samples.len(), SAMPLES_PER_LINE);
 
     let mut pixel_vals = [0.0_f32; LINE_PIXELS];
@@ -635,12 +676,10 @@ fn decimate_to_pixels(samples: &[f32]) -> Box<[u8; LINE_PIXELS]> {
         });
     let range = (hi - lo).max(1e-9);
 
-    let mut pixels = Box::new([0_u8; LINE_PIXELS]);
     for (dst, &v) in pixels.iter_mut().zip(pixel_vals.iter()) {
         let norm = ((v - lo) / range).clamp(0.0, 1.0);
         *dst = (norm * 255.0).round() as u8;
     }
-    pixels
 }
 
 #[cfg(test)]
@@ -654,6 +693,53 @@ fn decimate_to_pixels(samples: &[f32]) -> Box<[u8; LINE_PIXELS]> {
 mod tests {
     use super::*;
     use core::f32::consts::TAU;
+
+    // ─── Fixture constants ────────────────────────────────────────────
+    //
+    // Hoisted so the same load-bearing rates / chunk sizes / thresholds
+    // can be retuned in one place if upstream design parameters change,
+    // and so future readers don't have to re-derive what e.g. "0.7"
+    // means in context.
+
+    /// Standard FM-demod output rate the decoder is built around.
+    const TEST_INPUT_RATE_HZ: u32 = 48_000;
+    /// "Realistic" chunk size — ~21 ms at 48 kHz, similar to what the
+    /// audio pipeline actually delivers.
+    const TEST_REALISTIC_CHUNK: usize = 1_024;
+    /// Odd-prime chunk size for the chunked-vs-one-shot equivalence test;
+    /// picked specifically so chunk boundaries don't align with line
+    /// boundaries — exposes any state-leak bugs in the decoder pipeline.
+    const TEST_ODD_PRIME_CHUNK: usize = 513;
+    /// Generous buffer for `process` output so the slice-based contract
+    /// never returns `BufferTooSmall` in tests. Way above the 6 lines
+    /// the longest synthetic input could plausibly emit at once.
+    const TEST_OUTPUT_CAPACITY: usize = 16;
+    /// Mid-grey envelope level used in single-line-shape tests.
+    const TEST_GREY_LEVEL: f32 = 0.7;
+    /// End-to-end gradient probes — sample at 1/4 and 3/4 of the line.
+    const TEST_GRADIENT_START: f32 = 0.2;
+    const TEST_GRADIENT_END: f32 = 0.9;
+    /// Minimum sync-quality score we expect from clean synthetic input.
+    const TEST_SYNC_QUALITY_THRESHOLD: f32 = 0.5;
+    /// Minimum sync-quality score for the more carefully-shaped single
+    /// line test (which has a fully square Sync A burst).
+    const TEST_SYNC_QUALITY_THRESHOLD_TIGHT: f32 = 0.6;
+    /// Below this NCC score the input is effectively noise.
+    const TEST_SYNC_NOISE_CEILING: f32 = 0.5;
+    /// Threshold for "good lock" sync quality (above-noise band).
+    const TEST_SYNC_GOOD_LOCK: f32 = 0.95;
+    /// Length of the synthetic noise stream in seconds (used by
+    /// accumulator-bound test).
+    const TEST_NOISE_DURATION_SEC: usize = 5;
+
+    /// Tiny LCG used by the noise tests to generate deterministic
+    /// pseudo-random samples without pulling in a `rand` dep. Numbers
+    /// from BSD libc — well-known and known-poor, but plenty random
+    /// for a "no-pattern" input.
+    fn lcg_step(state: &mut u32) -> f32 {
+        *state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        ((*state >> 16) & 0x7fff) as f32 / 32_767.0 - 0.5
+    }
 
     #[test]
     fn pixel_and_line_invariants_hold() {
@@ -951,7 +1037,11 @@ mod tests {
             .expect("should match");
         assert_eq!(m.channel, SyncChannel::A);
         assert_eq!(m.offset, offset);
-        assert!(m.quality > 0.95, "quality too low: {:.3}", m.quality);
+        assert!(
+            m.quality > TEST_SYNC_GOOD_LOCK,
+            "quality too low: {:.3}",
+            m.quality,
+        );
     }
 
     #[test]
@@ -970,7 +1060,11 @@ mod tests {
             .expect("should match");
         assert_eq!(m.channel, SyncChannel::B);
         assert_eq!(m.offset, offset);
-        assert!(m.quality > 0.95, "quality too low: {:.3}", m.quality);
+        assert!(
+            m.quality > TEST_SYNC_GOOD_LOCK,
+            "quality too low: {:.3}",
+            m.quality,
+        );
     }
 
     #[test]
@@ -999,15 +1093,10 @@ mod tests {
         // Pseudo-random noise (deterministic LCG) — no embedded sync at all.
         // Any accidental peak must score well below a real match.
         let mut state: u32 = 1;
-        let buf: Vec<f32> = (0..2_000)
-            .map(|_| {
-                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                ((state >> 16) & 0x7fff) as f32 / 32_767.0 - 0.5
-            })
-            .collect();
+        let buf: Vec<f32> = (0..2_000).map(|_| lcg_step(&mut state)).collect();
         let m = SyncDetector::new().find_best(&buf, SyncChannel::A).unwrap();
         assert!(
-            m.quality < 0.5,
+            m.quality < TEST_SYNC_NOISE_CEILING,
             "noise quality too high: {:.3} at offset {}",
             m.quality,
             m.offset,
@@ -1067,45 +1156,50 @@ mod tests {
     }
 
     #[test]
-    fn apt_decoder_rejects_sub_hz_input_rate() {
-        // Below RationalResampler's 1 Hz integer-GCD floor — the underlying
-        // RealResampler::new must refuse.
+    fn apt_decoder_rejects_sub_nyquist_input_rate() {
+        // Below 2·SUBCARRIER_HZ (4800 Hz) the 2400 Hz APT subcarrier is
+        // already aliased — refuse the rate up-front.
         assert!(AptDecoder::new(0).is_err());
+        assert!(AptDecoder::new(4_799).is_err());
+        // 4800 Hz exactly is the floor; the resampler may still reject it
+        // for unrelated reasons, but the Nyquist check itself must accept.
+        // 8000 Hz (telephony) is the smallest realistic accept.
+        assert!(AptDecoder::new(8_000).is_ok());
     }
 
     #[test]
     fn apt_decoder_emits_nothing_with_short_input() {
-        let mut d = AptDecoder::new(48_000).unwrap();
+        let mut d = AptDecoder::new(TEST_INPUT_RATE_HZ).unwrap();
         let input = vec![0.0_f32; 128];
-        let lines = d.process(&input).unwrap();
-        assert!(lines.is_empty());
+        let mut out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        let n = d.process(&input, &mut out).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
     fn apt_decoder_recovers_line_from_synthetic_audio() {
         // Feed three lines of synthetic audio so the decoder has enough
         // post-warmup buffer to emit at least one.
-        let rate = 48_000_u32;
-        let grey = 0.7_f32;
+        let rate = TEST_INPUT_RATE_HZ;
         let mut d = AptDecoder::new(rate).unwrap();
-        let one_line = synth_line_audio(rate, grey);
+        let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
         let mut three_lines = Vec::with_capacity(one_line.len() * 3);
         for _ in 0..3 {
             three_lines.extend_from_slice(&one_line);
         }
-        let lines = d.process(&three_lines).unwrap();
+        let mut out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        let produced = d.process(&three_lines, &mut out).unwrap();
         assert!(
-            !lines.is_empty(),
+            produced > 0,
             "expected at least one decoded line from 3-line synthetic input",
         );
-        for (i, line) in lines.iter().enumerate() {
+        for (i, line) in out[..produced].iter().enumerate() {
             assert_eq!(line.sync_channel, SyncChannel::A);
             assert!(
-                line.sync_quality > 0.6,
+                line.sync_quality > TEST_SYNC_QUALITY_THRESHOLD_TIGHT,
                 "line {i} quality too low: {:.3}",
                 line.sync_quality,
             );
-            assert_eq!(line.pixels.len(), LINE_PIXELS);
         }
     }
 
@@ -1114,19 +1208,25 @@ mod tests {
         // Any reasonable chunking must produce bit-identical pixel output
         // compared to a single giant call — the decoder's state carries
         // everything the resampler / envelope / accumulator need.
-        let rate = 48_000_u32;
+        let rate = TEST_INPUT_RATE_HZ;
         let mut audio = Vec::new();
         for _ in 0..4 {
             audio.extend_from_slice(&synth_line_audio(rate, 0.6));
         }
 
-        let mut one_shot = AptDecoder::new(rate).unwrap();
-        let lines_whole = one_shot.process(&audio).unwrap();
+        let mut one_shot_dec = AptDecoder::new(rate).unwrap();
+        let mut lines_whole = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        let n_whole = one_shot_dec.process(&audio, &mut lines_whole).unwrap();
+        lines_whole.truncate(n_whole);
 
         let mut chunked_dec = AptDecoder::new(rate).unwrap();
-        let mut lines_chunked = Vec::new();
-        for chunk in audio.chunks(513) {
-            lines_chunked.extend(chunked_dec.process(chunk).unwrap());
+        let mut lines_chunked: Vec<AptLine> = Vec::new();
+        let mut chunk_out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        for chunk in audio.chunks(TEST_ODD_PRIME_CHUNK) {
+            let n = chunked_dec.process(chunk, &mut chunk_out).unwrap();
+            for line in &chunk_out[..n] {
+                lines_chunked.push(line.clone());
+            }
         }
 
         assert_eq!(
@@ -1135,49 +1235,67 @@ mod tests {
             "chunked and one-shot produced different line counts",
         );
         for (w, c) in lines_whole.iter().zip(lines_chunked.iter()) {
-            assert_eq!(*w.pixels, *c.pixels, "chunked pixels diverge from one-shot");
+            assert_eq!(w.pixels, c.pixels, "chunked pixels diverge from one-shot");
         }
     }
 
     #[test]
     fn apt_decoder_reset_clears_pending_state() {
-        let rate = 48_000_u32;
+        let rate = TEST_INPUT_RATE_HZ;
         let mut d = AptDecoder::new(rate).unwrap();
-        let partial = synth_line_audio(rate, 0.7);
+        let partial = synth_line_audio(rate, TEST_GREY_LEVEL);
+        let mut out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
         // Push part of a line — not enough to emit.
-        d.process(&partial[..partial.len() / 4]).unwrap();
+        d.process(&partial[..partial.len() / 4], &mut out).unwrap();
 
         d.reset();
 
         // After reset, pushing silence should not emit a line on account
-        // of leftover state, and the decoder should still work for a real
-        // subsequent multi-line input.
+        // of leftover state.
         let silence = vec![0.0_f32; 2_048];
-        assert!(d.process(&silence).unwrap().is_empty());
+        let n = d.process(&silence, &mut out).unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
     fn apt_decoder_bounds_accumulator_on_pure_noise() {
-        // Pure Gaussian-ish noise will still emit lines (normalized cross
-        // correlation always picks a peak) — what we care about is that
-        // the internal buffer never grows unbounded.
-        let rate = 48_000_u32;
+        // Pure pseudo-random noise still trips `find_best` to a peak —
+        // what matters is that the internal buffer never grows unbounded.
+        let rate = TEST_INPUT_RATE_HZ;
         let mut d = AptDecoder::new(rate).unwrap();
         let mut state: u32 = 7;
-        let noise: Vec<f32> = (0..(rate as usize * 5)) // 5 seconds
-            .map(|_| {
-                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                ((state >> 16) & 0x7fff) as f32 / 16_384.0 - 1.0
-            })
+        let noise: Vec<f32> = (0..(rate as usize * TEST_NOISE_DURATION_SEC))
+            .map(|_| lcg_step(&mut state))
             .collect();
-        for chunk in noise.chunks(2_000) {
-            let _ = d.process(chunk).unwrap();
+        let mut out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        for chunk in noise.chunks(TEST_REALISTIC_CHUNK) {
+            let _ = d.process(chunk, &mut out).unwrap();
             assert!(
                 d.accumulator.len() <= DECODER_BUFFER_CAP,
                 "accumulator grew past cap: {}",
                 d.accumulator.len(),
             );
         }
+    }
+
+    #[test]
+    fn apt_decoder_buffer_too_small_returns_error() {
+        // Slice-based contract: if the caller's output can't hold every
+        // line that becomes ready, surface BufferTooSmall instead of
+        // dropping data on the floor.
+        let rate = TEST_INPUT_RATE_HZ;
+        let mut d = AptDecoder::new(rate).unwrap();
+        // Feed 6 lines so multiple emissions are queued.
+        let mut audio = Vec::new();
+        for _ in 0..6 {
+            audio.extend_from_slice(&synth_line_audio(rate, TEST_GREY_LEVEL));
+        }
+        // Output buffer too small to hold them all.
+        let mut tiny_out = vec![AptLine::default(); 1];
+        let result = d.process(&audio, &mut tiny_out);
+        // The first line emits successfully and overwrites tiny_out[0],
+        // but the second emission has no slot to land in — error.
+        assert!(matches!(result, Err(DspError::BufferTooSmall { .. })));
     }
 
     /// Synthesize a realistic APT line with a sync A burst followed by a
@@ -1212,24 +1330,29 @@ mod tests {
         // gradient. Verify the decoder:
         //   (1) emits at least three lines (early ones eaten by resampler /
         //       envelope filter warmup)
-        //   (2) stays locked (sync_quality > 0.5) on every emitted line
+        //   (2) stays locked on every emitted line
         //   (3) produces a roughly monotonic pixel gradient inside each
         //       line's video area
         //   (4) reports strictly-increasing input_sample_index values
-        let rate = 48_000_u32;
-        let start_grey = 0.2_f32;
-        let end_grey = 0.9_f32;
+        let rate = TEST_INPUT_RATE_HZ;
 
         let mut audio = Vec::new();
         for _ in 0..6 {
-            audio.extend_from_slice(&synth_line_with_gradient(rate, start_grey, end_grey));
+            audio.extend_from_slice(&synth_line_with_gradient(
+                rate,
+                TEST_GRADIENT_START,
+                TEST_GRADIENT_END,
+            ));
         }
 
         let mut decoder = AptDecoder::new(rate).unwrap();
-        // Feed in realistic-sized chunks (~21 ms each at 48 kHz).
         let mut lines: Vec<AptLine> = Vec::new();
-        for chunk in audio.chunks(1_024) {
-            lines.extend(decoder.process(chunk).unwrap());
+        let mut chunk_out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        for chunk in audio.chunks(TEST_REALISTIC_CHUNK) {
+            let n = decoder.process(chunk, &mut chunk_out).unwrap();
+            for line in &chunk_out[..n] {
+                lines.push(line.clone());
+            }
         }
         assert!(
             lines.len() >= 3,
@@ -1240,7 +1363,7 @@ mod tests {
         // Sync lock held on every emitted line.
         for (i, line) in lines.iter().enumerate() {
             assert!(
-                line.sync_quality > 0.5,
+                line.sync_quality > TEST_SYNC_QUALITY_THRESHOLD,
                 "line {i}: quality {:.3} below lock threshold",
                 line.sync_quality,
             );
