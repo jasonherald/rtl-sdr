@@ -188,9 +188,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // both go through the activity-bar handler for consistency.
     let bookmarks_toggle = gtk4::Button::builder()
         .icon_name("user-bookmarks-symbolic")
-        .tooltip_text("Show bookmarks (Ctrl+B)")
+        .tooltip_text("Toggle bookmarks panel (Ctrl+B)")
         .build();
-    bookmarks_toggle.update_property(&[gtk4::accessible::Property::Label("Show bookmarks")]);
+    bookmarks_toggle
+        .update_property(&[gtk4::accessible::Property::Label("Toggle bookmarks panel")]);
     header.pack_end(&bookmarks_toggle);
 
     let right_bookmarks_btn_weak = right_activity_bar
