@@ -1,5 +1,5 @@
-//! Audio output configuration panel — device, sink type, network
-//! sink config, and recording toggle.
+//! Audio output configuration panel — device, volume, network sink
+//! config, and recording toggle.
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -16,6 +16,22 @@ pub const SINK_TYPE_NETWORK_IDX: u32 = 1;
 /// must match the model strings in `build_audio_panel`.
 pub const NETWORK_SINK_PROTOCOL_TCP_IDX: u32 = 0;
 pub const NETWORK_SINK_PROTOCOL_UDP_IDX: u32 = 1;
+
+/// Volume slider range — the header `GtkScaleButton` is 0.0..=1.0
+/// with a 0.05 step; the panel's spin row is the percentage
+/// equivalent (0..=100 step 1) so both feel natural to users.
+/// `window.rs` converts between the two via simple ×100 / ÷100.
+pub const VOLUME_PERCENT_MIN: f64 = 0.0;
+pub const VOLUME_PERCENT_MAX: f64 = 100.0;
+pub const VOLUME_PERCENT_STEP: f64 = 1.0;
+pub const VOLUME_PERCENT_PAGE: f64 = 10.0;
+
+/// Config key for persisted volume. Stored as a `f64` in
+/// `[0.0, 1.0]` (header `GtkScaleButton` domain) so the on-disk
+/// value is the same shape the DSP sees via `UiToDsp::SetVolume`.
+/// Restored at startup by `window::connect_volume_persistence`
+/// (closes #419).
+pub const KEY_AUDIO_VOLUME: &str = "audio_volume";
 
 // Defaults are owned by `sdr_core::sink_slot` so the engine
 // initializer and the panel always agree. Re-exported here as
@@ -43,18 +59,32 @@ pub fn protocol_from_combo_idx(idx: u32) -> Protocol {
 
 /// Audio output configuration panel with references to interactive rows.
 pub struct AudioPanel {
-    /// The `AdwPreferencesGroup` widget to pack into the sidebar.
-    pub widget: adw::PreferencesGroup,
+    /// The `AdwPreferencesPage` widget packed into the Audio
+    /// activity stack slot. Hosts four titled `AdwPreferencesGroup`s
+    /// (Output / Volume / Network sink / Recording) — see
+    /// [`build_audio_panel`].
+    pub widget: adw::PreferencesPage,
+    /// Network-sink section group. Stored as a handle so
+    /// `window::connect_audio_panel` can toggle the entire
+    /// section's visibility when the user flips between the local
+    /// and network sink types, rather than hiding four rows
+    /// individually.
+    pub network_sink_group: adw::PreferencesGroup,
     /// Audio device selector.
     pub device_row: adw::ComboRow,
     /// Sink type selector (Audio, Network).
     pub sink_type_row: adw::ComboRow,
     /// Node names corresponding to device dropdown indices (for routing).
     pub device_node_names: Vec<String>,
+    /// Volume slider — 0..=100 percent. Kept in two-way sync with
+    /// the header `GtkScaleButton` (which uses 0.0..=1.0); both
+    /// dispatch `UiToDsp::SetVolume` and persist to config on
+    /// change. Closes #419.
+    pub volume_row: adw::SpinRow,
     /// Toggle to start/stop audio recording.
     pub record_audio_row: adw::SwitchRow,
-    /// Hostname / IP for the network audio sink. Hidden unless
-    /// `Network` is the active sink type.
+    /// Hostname / IP for the network audio sink. Visible only
+    /// when the Network sink type is selected.
     pub network_host_row: adw::EntryRow,
     /// Port for the network audio sink (1..=65535).
     pub network_port_row: adw::SpinRow,
@@ -70,15 +100,16 @@ pub struct AudioPanel {
 ///
 /// Queries `PipeWire` for available audio output sinks and populates
 /// the device selector dropdown. The network config rows are built
-/// up front (so the sidebar layout doesn't shift when the user
-/// toggles between sink types) but `set_visible(false)` until
-/// `Network` is the active sink type.
+/// up front and packed into their own titled section group so the
+/// outer layout doesn't shift when the user toggles between sink
+/// types — `window::connect_audio_panel` hides the whole group via
+/// [`AudioPanel::network_sink_group`] when the Local sink is active.
+///
+/// Lays out as an `AdwPreferencesPage` with four titled sections
+/// matching the activity-bar redesign's Apple-style rhythm (design
+/// doc §3.3). Flat groups, no `AdwExpanderRow` wrappers — same call
+/// as the General / Radio panels.
 pub fn build_audio_panel() -> AudioPanel {
-    let group = adw::PreferencesGroup::builder()
-        .title("Audio")
-        .description("Output configuration")
-        .build();
-
     // Query PipeWire for available audio sinks
     let sinks = sdr_sink_audio::list_audio_sinks();
     let display_names: Vec<&str> = sinks.iter().map(|s| s.display_name.as_str()).collect();
@@ -95,13 +126,26 @@ pub fn build_audio_panel() -> AudioPanel {
         .model(&sink_model)
         .build();
 
-    // Network config rows — built unconditionally so the
-    // visibility toggle in `connect_audio_panel` is a cheap
-    // `set_visible` rather than a structural insert/remove.
+    // --- Volume (new, closes #419) ---
+    let volume_adj = gtk4::Adjustment::new(
+        VOLUME_PERCENT_MAX,
+        VOLUME_PERCENT_MIN,
+        VOLUME_PERCENT_MAX,
+        VOLUME_PERCENT_STEP,
+        VOLUME_PERCENT_PAGE,
+        0.0,
+    );
+    let volume_row = adw::SpinRow::builder()
+        .title("Volume")
+        .subtitle("%")
+        .adjustment(&volume_adj)
+        .digits(0)
+        .build();
+
+    // --- Network sink config ---
     let network_host_row = adw::EntryRow::builder()
         .title("Network host")
         .text(NETWORK_SINK_DEFAULT_HOST)
-        .visible(false)
         .build();
 
     let port_adjustment = gtk4::Adjustment::new(
@@ -115,20 +159,17 @@ pub fn build_audio_panel() -> AudioPanel {
     let network_port_row = adw::SpinRow::builder()
         .title("Port")
         .adjustment(&port_adjustment)
-        .visible(false)
         .build();
 
     let protocol_model = gtk4::StringList::new(&["TCP (server)", "UDP"]);
     let network_protocol_row = adw::ComboRow::builder()
         .title("Protocol")
         .model(&protocol_model)
-        .visible(false)
         .build();
 
     let network_status_row = adw::ActionRow::builder()
         .title("Network sink")
         .subtitle("Inactive")
-        .visible(false)
         .build();
 
     let record_audio_row = adw::SwitchRow::builder()
@@ -136,19 +177,49 @@ pub fn build_audio_panel() -> AudioPanel {
         .subtitle("48 kHz stereo WAV")
         .build();
 
-    group.add(&device_row);
-    group.add(&sink_type_row);
-    group.add(&network_host_row);
-    group.add(&network_port_row);
-    group.add(&network_protocol_row);
-    group.add(&network_status_row);
-    group.add(&record_audio_row);
+    // --- Sectioned preferences page ---
+    let output_group = adw::PreferencesGroup::builder()
+        .title("Output")
+        .description("Where audio plays")
+        .build();
+    output_group.add(&device_row);
+    output_group.add(&sink_type_row);
+
+    let volume_group = adw::PreferencesGroup::builder()
+        .title("Volume")
+        .description("Playback level — mirrors the header slider")
+        .build();
+    volume_group.add(&volume_row);
+
+    let network_sink_group = adw::PreferencesGroup::builder()
+        .title("Network sink")
+        .description("Stream audio to another host over TCP or UDP")
+        .visible(false)
+        .build();
+    network_sink_group.add(&network_host_row);
+    network_sink_group.add(&network_port_row);
+    network_sink_group.add(&network_protocol_row);
+    network_sink_group.add(&network_status_row);
+
+    let recording_group = adw::PreferencesGroup::builder()
+        .title("Recording")
+        .description("Save demodulated audio to disk")
+        .build();
+    recording_group.add(&record_audio_row);
+
+    let page = adw::PreferencesPage::new();
+    page.add(&output_group);
+    page.add(&volume_group);
+    page.add(&network_sink_group);
+    page.add(&recording_group);
 
     AudioPanel {
-        widget: group,
+        widget: page,
+        network_sink_group,
         device_row,
         sink_type_row,
         device_node_names: node_names,
+        volume_row,
         record_audio_row,
         network_host_row,
         network_port_row,
