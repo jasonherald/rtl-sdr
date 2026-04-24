@@ -7549,11 +7549,21 @@ const VOLUME_SYNC_EPSILON: f64 = 0.005;
 /// button's handler do the real work. That keeps one handler owning
 /// dispatch + persist, and the mirror path stays idempotent.
 ///
-/// Startup ordering: wire the handlers first, THEN seed
-/// `volume_button.set_value(saved)`. That ensures the initial
-/// `value_changed` fires with the saved level so the DSP starts at
-/// the restored volume and the user doesn't hear a 1-frame blast at
-/// the build-time default (spec req for #424).
+/// Startup ordering (load-bearing):
+///   1. Seed both widgets with the saved volume (no handlers yet,
+///      so no dispatch or cascade).
+///   2. Explicit `state.send_dsp(UiToDsp::SetVolume(saved))` —
+///      guarantees the DSP starts at the restored level regardless
+///      of `ScaleButton::set_value` being a no-op on same-value
+///      (closes #424's "no 1-frame blast while config loads"
+///      requirement).
+///   3. Wire the handlers.
+///
+/// Any other code path that mutates volume (bookmark recall,
+/// preferences restore, etc.) must go through
+/// `volume_button.set_value(vol)` so this handler runs — direct
+/// `send_dsp(SetVolume(..))` would leave the button / row / config
+/// showing stale state until the user's next edit.
 fn connect_volume_persistence(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -7571,7 +7581,10 @@ fn connect_volume_persistence(
     // "user change" — no handlers fire, no duplicate dispatch,
     // no mirror-path cascade. Dispatch is done explicitly below.
     volume_button.set_value(saved_volume);
-    panels.audio.volume_row.set_value(saved_volume * 100.0);
+    panels
+        .audio
+        .volume_row
+        .set_value(saved_volume * sidebar::audio_panel::VOLUME_PERCENT_MAX);
 
     // Guaranteed initial dispatch to the DSP so audio starts at
     // the restored level regardless of how `ScaleButton::set_value`
@@ -7592,8 +7605,10 @@ fn connect_volume_persistence(
             v[sidebar::audio_panel::KEY_AUDIO_VOLUME] = serde_json::json!(value);
         });
         if let Some(row) = volume_row_weak.upgrade() {
-            let target_pct = value * 100.0;
-            if (row.value() - target_pct).abs() > VOLUME_SYNC_EPSILON * 100.0 {
+            let target_pct = value * sidebar::audio_panel::VOLUME_PERCENT_MAX;
+            if (row.value() - target_pct).abs()
+                > VOLUME_SYNC_EPSILON * sidebar::audio_panel::VOLUME_PERCENT_MAX
+            {
                 row.set_value(target_pct);
             }
         }
@@ -7605,7 +7620,7 @@ fn connect_volume_persistence(
     // loop when the two widgets are already in sync.
     let volume_button_weak = volume_button.downgrade();
     panels.audio.volume_row.connect_value_notify(move |row| {
-        let value = (row.value() / 100.0).clamp(0.0, 1.0);
+        let value = (row.value() / sidebar::audio_panel::VOLUME_PERCENT_MAX).clamp(0.0, 1.0);
         if let Some(btn) = volume_button_weak.upgrade()
             && (btn.value() - value).abs() > VOLUME_SYNC_EPSILON
         {

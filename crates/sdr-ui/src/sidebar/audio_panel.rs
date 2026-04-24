@@ -85,9 +85,16 @@ pub struct AudioPanel {
     /// Node names corresponding to device dropdown indices (for routing).
     pub device_node_names: Vec<String>,
     /// Volume slider — 0..=100 percent. Kept in two-way sync with
-    /// the header `GtkScaleButton` (which uses 0.0..=1.0); both
-    /// dispatch `UiToDsp::SetVolume` and persist to config on
-    /// change. Closes #419.
+    /// the header `GtkScaleButton` (which uses 0.0..=1.0). The
+    /// header button is the **single source of truth** — only its
+    /// `value_changed` handler dispatches `UiToDsp::SetVolume` and
+    /// writes `KEY_AUDIO_VOLUME`. This row is mirror-only: its
+    /// `value_notify` handler forwards edits into the button via
+    /// `set_value`, and the button's handler does the real work.
+    /// Programmatic restores (e.g. bookmark recall) must also go
+    /// through the button, never call `send_dsp(SetVolume(..))`
+    /// directly — see `connect_volume_persistence` in `window.rs`.
+    /// Closes #419.
     pub volume_row: adw::SpinRow,
     /// Toggle to start/stop audio recording.
     pub record_audio_row: adw::SwitchRow,
