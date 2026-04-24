@@ -1,11 +1,23 @@
 //
-// ContentView.swift — top-level layout.
+// ContentView.swift — top-level layout with activity-bar
+// sidebar redesign (epic #441, sub-ticket #442).
 //
-// `NavigationSplitView` gives us the macOS-native sidebar pattern
-// (collapsible via the toolbar button for free). Sidebar holds
-// the Source/Radio/Display accordion; the detail column holds the
-// spectrum/waterfall + status bar, with the header toolbar
-// attached via `.toolbar`.
+// Layout mirrors the GTK VS Code-style activity-bar pattern:
+//
+//   ┌─────────────────────────────────────────────────────────┐
+//   │ [L] │ [L panel] │ spectrum + status + [old flyouts] │ [R panel] │ [R] │
+//   └─────────────────────────────────────────────────────────┘
+//      ↑       ↑                 ↑                      ↑        ↑
+//    left   optional          detail column          optional  right
+//   activity left panel       (existing content)     right     activity
+//    bar      (per-selection)                        panel      bar
+//
+// Scaffolding phase (this ticket): all left/right panels are
+// `ComingSoonPanel` placeholders pointing at the follow-up
+// sub-tickets that port their real content (#443–#447, #448).
+// The old flyouts (Transcription, Bookmarks) and the RR sheet
+// stay toolbar-driven — #448 consolidates the right side,
+// which may remove or relocate the existing flyouts.
 
 import AppKit
 import SwiftUI
@@ -13,6 +25,13 @@ import SwiftUI
 struct ContentView: View {
     @Environment(CoreModel.self) private var model
     @Environment(\.scenePhase) private var scenePhase
+
+    // ----------------------------------------------------------
+    //  Pre-redesign toolbar-driven surfaces — preserved as-is
+    //  during scaffolding. #448 may relocate the right flyouts
+    //  into the activity-bar-driven `rightSelection` panel.
+    // ----------------------------------------------------------
+
     /// Sheet state lives up here (not inside the toolbar)
     /// because the subview-wrapped version of the RR button
     /// didn't render in the toolbar — inlining the button in
@@ -49,11 +68,63 @@ struct ContentView: View {
     /// 200 ms `Revealer.transition_duration`.
     static let rightFlyoutTransitionSeconds: Double = 0.2
 
+    // ----------------------------------------------------------
+    //  Activity-bar selections — new in #442
+    //
+    //  Ephemeral for scaffolding; session persistence wires
+    //  these bindings into `sdr-config` via #449.
+    // ----------------------------------------------------------
+
+    /// Currently-selected left activity. Stays stable across
+    /// panel open/close so the icon highlight persists when
+    /// the user collapses the panel via a second click.
+    /// `leftPanelOpen` controls visibility independently.
+    /// This split mirrors the Linux
+    /// `ui_sidebar_left_{selected,open}` config-key pair, so
+    /// #449's session-persistence wires both bindings into
+    /// the shared sdr-config JSON. Per `CodeRabbit` round 1
+    /// on PR #491.
+    @State private var leftSelection: LeftActivity = .general
+    @State private var leftPanelOpen: Bool = true
+
+    /// Same split for the right bar. Defaults: Transcript
+    /// remembered as the active activity, panel starts closed
+    /// — matches Linux startup.
+    @State private var rightSelection: RightActivity = .transcript
+    @State private var rightPanelOpen: Bool = false
+
+    /// Ideal width of a left / right panel. `HSplitView` in
+    /// #450 will let the user drag these; today they're fixed.
+    private static let leftPanelWidth: CGFloat = 280
+    private static let rightPanelWidth: CGFloat = 360
+
     var body: some View {
-        NavigationSplitView {
-            SidebarView()
-                .navigationSplitViewColumnWidth(min: 240, ideal: 280)
-        } detail: {
+        HStack(spacing: 0) {
+            // Left activity bar — always visible.
+            ActivityBarView(
+                selection: $leftSelection,
+                isOpen: $leftPanelOpen,
+                shortcutModifiers: .command
+            )
+            Divider()
+
+            // Left panel — visible only when `leftPanelOpen`.
+            // The remembered `leftSelection` stays put when
+            // closed so a re-open snaps back to the same panel.
+            // Placeholder bodies during scaffolding; real
+            // panels land in #443–#447.
+            if leftPanelOpen {
+                LeftPanelHost(activity: leftSelection)
+                    .frame(width: Self.leftPanelWidth)
+                Divider()
+            }
+
+            // Detail column — unchanged from the pre-redesign
+            // app. Spectrum + status bar live here, and the
+            // existing right flyouts (Transcription, Bookmarks)
+            // still slide in from the right edge of this
+            // column. #448 will reconcile that with the new
+            // right activity bar.
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     CenterView()
@@ -70,15 +141,32 @@ struct ContentView: View {
                         .transition(.move(edge: .trailing))
                 }
             }
-            // Match GTK's Revealer SlideLeft animation. Shared
-            // duration constant so both flyouts stay in lockstep.
+            .frame(maxWidth: .infinity)
             .animation(
-                .easeInOut(duration: ContentView.rightFlyoutTransitionSeconds),
+                .easeInOut(duration: Self.rightFlyoutTransitionSeconds),
                 value: showingTranscription
             )
             .animation(
-                .easeInOut(duration: ContentView.rightFlyoutTransitionSeconds),
+                .easeInOut(duration: Self.rightFlyoutTransitionSeconds),
                 value: showingBookmarks
+            )
+
+            // Right panel — placeholder during scaffolding.
+            // The existing flyouts above still live inside the
+            // detail column; #448 unifies these surfaces.
+            if rightPanelOpen {
+                Divider()
+                RightPanelHost(activity: rightSelection)
+                    .frame(width: Self.rightPanelWidth)
+            }
+            Divider()
+
+            // Right activity bar — always visible. One icon
+            // in scaffolding; #448 adds the second.
+            ActivityBarView(
+                selection: $rightSelection,
+                isOpen: $rightPanelOpen,
+                shortcutModifiers: [.command, .shift]
             )
         }
         .toolbar {
@@ -165,29 +253,6 @@ struct ContentView: View {
                 bad output. Reinstall a matching build.
                 """)
         }
-    }
-}
-
-/// Accordion sidebar: three sections, each collapsible. SwiftUI's
-/// `Form` + `Section` inside a `List` gives the native "sidebar
-/// panels" look without custom drawing.
-struct SidebarView: View {
-    var body: some View {
-        Form {
-            SourceSection()
-            RadioSection()
-            DisplaySection()
-            RecordingSection()
-            BookmarksSection()
-            // `RtlTcpServerSection` is visible only when a
-            // local RTL-SDR dongle is detected — the section
-            // itself is always included in the form, but the
-            // body collapses to a single "no dongle" caption
-            // otherwise so it doesn't clutter the sidebar on a
-            // network/file source setup.
-            RtlTcpServerSection()
-        }
-        .formStyle(.grouped)
     }
 }
 
