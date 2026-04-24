@@ -531,6 +531,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let state_freq = Rc::clone(&state);
     let spectrum_for_freq = Rc::clone(&spectrum_handle);
     let force_disable_freq = Rc::clone(&scanner_force_disable);
+    let radio_for_freq = panels.radio.clone();
     freq_selector.connect_frequency_changed(move |freq| {
         tracing::debug!(frequency_hz = freq, "frequency changed");
         // Flip scanner off before dispatching the tune so the
@@ -544,6 +545,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         state_freq.send_dsp(UiToDsp::Tune(freq_f64));
         status_bar_for_freq.update_frequency(freq_f64);
         spectrum_for_freq.set_center_frequency(freq_f64);
+        // Feed the FSPL distance estimator in the Radio panel
+        // with the new frequency so the cached distance estimate
+        // uses the right carrier (ticket #164).
+        radio_for_freq.update_distance_frequency(freq_f64);
     });
     // Single demod-change handler: gate → force-disable → dispatch
     // → cosmetic UI updates. Order matters: force-disable must
@@ -858,6 +863,11 @@ fn handle_dsp_message(
         DspToUi::SignalLevel(level) => {
             status_bar.update_signal_level(level);
             spectrum_handle.push_signal_level(level);
+            // Feed the FSPL distance estimator in the Radio panel
+            // (ticket #164). The panel caches the level + current
+            // frequency so the display refreshes if the user later
+            // tweaks ERP / calibration.
+            radio_panel.update_distance_from_signal(level, state.center_frequency.get());
         }
         DspToUi::Error(err_msg) => {
             tracing::warn!(error = %err_msg, "DSP error");
@@ -2668,6 +2678,7 @@ fn connect_sidebar_panels(
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
     connect_volume_persistence(panels, state, config, volume_button);
+    connect_distance_estimator_persistence(panels, config);
     connect_scanner_panel(panels, state, config);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
@@ -8130,6 +8141,59 @@ fn unlock_transcription_session_rows(
     if let Some(row) = auto_break_min_segment_row.upgrade() {
         row.set_sensitive(true);
     }
+}
+
+/// Load saved transmitter ERP and receiver calibration offset
+/// into the Radio panel's FSPL distance estimator rows, and wire
+/// value-change handlers to persist any edits back to the config
+/// (ticket #164). The distance display refresh wiring lives
+/// inside `build_radio_panel` — this function is only about
+/// config ↔ row synchronisation.
+fn connect_distance_estimator_persistence(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use sidebar::radio_panel::{KEY_RADIO_DISTANCE_CALIBRATION_DB, KEY_RADIO_DISTANCE_ERP_WATTS};
+
+    // Seed the rows with the saved values (clamped to the spin
+    // rows' own adjustment bounds via their `set_value`). The
+    // default spin row values were already applied at
+    // `build_radio_panel` time, so `config.read` here only
+    // overrides when a saved value exists.
+    let saved_erp = config.read(|v| {
+        v.get(KEY_RADIO_DISTANCE_ERP_WATTS)
+            .and_then(serde_json::Value::as_f64)
+    });
+    let saved_cal = config.read(|v| {
+        v.get(KEY_RADIO_DISTANCE_CALIBRATION_DB)
+            .and_then(serde_json::Value::as_f64)
+    });
+    if let Some(erp) = saved_erp {
+        panels.radio.erp_row.set_value(erp);
+    }
+    if let Some(cal) = saved_cal {
+        panels.radio.calibration_row.set_value(cal);
+    }
+
+    // Persist-on-change. Uses `value_notify` (not the adjustment's
+    // `value_changed`) to match the signal the in-panel distance
+    // refresh handler is already listening to — both fire on the
+    // same user edit.
+    let config_erp = std::sync::Arc::clone(config);
+    panels.radio.erp_row.connect_value_notify(move |row| {
+        config_erp.write(|v| {
+            v[KEY_RADIO_DISTANCE_ERP_WATTS] = serde_json::json!(row.value());
+        });
+    });
+    let config_cal = std::sync::Arc::clone(config);
+    panels
+        .radio
+        .calibration_row
+        .connect_value_notify(move |row| {
+            config_cal.write(|v| {
+                v[KEY_RADIO_DISTANCE_CALIBRATION_DB] = serde_json::json!(row.value());
+            });
+        });
 }
 
 /// Connect scanner panel controls to DSP commands.

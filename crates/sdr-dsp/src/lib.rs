@@ -19,6 +19,7 @@ pub mod loops;
 pub mod math;
 pub mod multirate;
 pub mod noise;
+pub mod propagation;
 pub mod stereo;
 pub mod taps;
 pub mod tone_detect;
