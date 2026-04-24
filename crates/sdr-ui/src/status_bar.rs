@@ -185,14 +185,32 @@ impl StatusBar {
 
 /// Build the status bar widget with initial placeholder labels.
 pub fn build_status_bar() -> StatusBar {
-    let signal_level_label = gtk4::Label::new(Some(DEFAULT_LEVEL_TEXT));
-    let sample_rate_label = gtk4::Label::new(Some(DEFAULT_SAMPLE_RATE_TEXT));
-    let demod_label = gtk4::Label::new(Some(DEFAULT_DEMOD_TEXT));
-    let frequency_label = gtk4::Label::new(Some(DEFAULT_FREQUENCY_TEXT));
-    let antenna_label = gtk4::Label::new(Some(DEFAULT_ANTENNA_TEXT));
+    // Ellipsize every label so a crowded status bar (long frequency
+    // + long antenna readout + live cursor readout + role badge)
+    // can shrink gracefully below its natural width when the
+    // sidebars pinch content-area room. Without this, the status
+    // bar demands its full natural width from its parent, which
+    // with both sidebars open leaves the content area in a
+    // renegotiation loop with the split view — the visible symptom
+    // is a few-pixel layout "bounce" every time a label updates.
+    // `EllipsizeMode::End` puts "…" at the end of the trimmed text;
+    // combined with not setting `max_width_chars`, GTK picks the
+    // widest fit per frame and shrinks only when needed.
+    let make_label = |text: &str| -> gtk4::Label {
+        let label = gtk4::Label::new(Some(text));
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        label.set_xalign(0.0);
+        label
+    };
+
+    let signal_level_label = make_label(DEFAULT_LEVEL_TEXT);
+    let sample_rate_label = make_label(DEFAULT_SAMPLE_RATE_TEXT);
+    let demod_label = make_label(DEFAULT_DEMOD_TEXT);
+    let frequency_label = make_label(DEFAULT_FREQUENCY_TEXT);
+    let antenna_label = make_label(DEFAULT_ANTENNA_TEXT);
     let antenna_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
-    let cursor_label = gtk4::Label::new(Some(DEFAULT_CURSOR_TEXT));
-    let role_label = gtk4::Label::new(Some(DEFAULT_ROLE_TEXT));
+    let cursor_label = make_label(DEFAULT_CURSOR_TEXT);
+    let role_label = make_label(DEFAULT_ROLE_TEXT);
     role_label.set_visible(false);
     let role_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
     role_separator.set_visible(false);

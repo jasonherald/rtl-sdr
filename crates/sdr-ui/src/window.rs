@@ -162,17 +162,22 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let state = AppState::new_shared(ui_tx);
 
     // --- Build UI ---
-    let (
-        split_view,
+    let LayoutHandles {
+        root: layout_root,
+        left_split_view,
+        right_split_view,
+        left_activity_bar,
+        right_activity_bar,
+        left_stack,
+        right_stack: _right_stack,
         panels,
-        spectrum_handle_raw,
+        spectrum_handle: spectrum_handle_raw,
         status_bar,
         transcript_panel,
-        transcript_revealer,
         bookmarks_revealer,
-    ) = build_split_view(&state, config);
+    } = build_layout(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
-    let sidebar_toggle = build_sidebar_toggle(&split_view);
+    let sidebar_toggle = build_sidebar_toggle(&left_split_view);
     let (
         header,
         play_button,
@@ -227,50 +232,101 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         });
     });
 
-    // Transcript toggle button in header bar.
+    // Transcript toggle button in header bar — now drives the right
+    // activity bar's transcript button (which in turn toggles the
+    // right split view's show-sidebar). Keeping the header toggle
+    // preserves muscle memory from the pre-activity-bar layout;
+    // future sub-tickets may remove it as activity-bar-first UX
+    // beds in.
     let transcript_button = gtk4::ToggleButton::builder()
         .icon_name("document-page-setup-symbolic")
-        .tooltip_text("Toggle transcript panel")
+        .tooltip_text("Toggle transcript panel (Ctrl+Shift+1)")
         .build();
+    transcript_button
+        .update_property(&[gtk4::accessible::Property::Label("Toggle transcript panel")]);
     header.pack_end(&transcript_button);
 
-    let revealer_clone = transcript_revealer.clone();
-    transcript_button.connect_toggled(move |btn| {
-        revealer_clone.set_reveal_child(btn.is_active());
-    });
+    // The right-side transcript is no longer an opaque revealer
+    // that could stack over the bookmarks flyout — it lives in the
+    // right split view's sidebar. Bookmarks still hang off the
+    // content HBox in that split view, so the two right-side panels
+    // no longer compete for the same space and the old mutual-
+    // exclusion handler can be dropped.
 
-    // Mutual exclusion between the two right-side flyouts —
-    // opening one closes the other so the content area doesn't
-    // end up with both panels stacked. Each toggle's mutex
-    // handler is added AFTER its primary handler (which does the
-    // reveal + config write), so on activation the primary fires
-    // first and the mutex then deactivates the sibling toggle;
-    // the sibling's primary handler in turn hides its revealer.
-    // `set_active(false)` on an already-inactive toggle is a
-    // no-op (GTK suppresses the `toggled` signal when the state
-    // doesn't change), so closing either panel manually doesn't
-    // cascade.
-    let transcript_btn_weak = transcript_button.downgrade();
-    bookmarks_toggle.connect_toggled(move |btn| {
-        if btn.is_active()
-            && let Some(other) = transcript_btn_weak.upgrade()
-            && other.is_active()
+    // --- Activity-bar wiring ---
+    //
+    // Left (multi-button): click on a NEW icon → deselect siblings,
+    // switch stack, open panel. Click on the CURRENTLY-selected
+    // icon → icon stays selected (design doc §4.2), panel toggles.
+    // `:checked` CSS renders the accent tint automatically.
+    if let Some(general_btn) = left_activity_bar.buttons.get("general") {
+        general_btn.set_active(true);
+    }
+    wire_activity_bar_clicks(&left_activity_bar, &left_stack, &left_split_view, "general");
+
+    // Header sidebar toggle ↔ left split view `show-sidebar` sync.
+    // Without this, clicking the currently-selected activity icon to
+    // collapse the panel leaves the header toggle stuck in `active`;
+    // the user's next header click then sets `show-sidebar=false`
+    // again (no-op) instead of reopening the panel. Mirrors the same
+    // `connect_show_sidebar_notify` pattern used on the right side.
+    let sidebar_toggle_weak = sidebar_toggle.downgrade();
+    left_split_view.connect_show_sidebar_notify(move |sv| {
+        if let Some(toggle) = sidebar_toggle_weak.upgrade()
+            && toggle.is_active() != sv.shows_sidebar()
         {
-            other.set_active(false);
-        }
-    });
-    let bookmarks_toggle_weak = bookmarks_toggle.downgrade();
-    transcript_button.connect_toggled(move |btn| {
-        if btn.is_active()
-            && let Some(other) = bookmarks_toggle_weak.upgrade()
-            && other.is_active()
-        {
-            other.set_active(false);
+            toggle.set_active(sv.shows_sidebar());
         }
     });
 
-    let toolbar_view = build_toolbar_view(&header, &split_view);
-    let breakpoint = build_breakpoint(&split_view);
+    // Right (single-button): the transcript toggle, the header
+    // transcript button, and `right_split_view.show-sidebar` form a
+    // tri-state that must stay in sync. Approach: each toggle button
+    // writes its `active` state through to `show-sidebar`; the split
+    // view's `notify::show-sidebar` reflects back into both buttons.
+    // `set_active(x)` on an already-in-state-`x` button is a GTK
+    // no-op (no `toggled` signal), so the two-way propagation is
+    // naturally idempotent.
+    if let Some(right_transcript_btn) = right_activity_bar.buttons.get("transcript") {
+        let right_split_weak = right_split_view.downgrade();
+        right_transcript_btn.connect_toggled(move |btn| {
+            if let Some(sv) = right_split_weak.upgrade() {
+                sv.set_show_sidebar(btn.is_active());
+            }
+        });
+
+        let right_split_weak = right_split_view.downgrade();
+        transcript_button.connect_toggled(move |btn| {
+            if let Some(sv) = right_split_weak.upgrade() {
+                sv.set_show_sidebar(btn.is_active());
+            }
+        });
+
+        let right_btn_weak = right_transcript_btn.downgrade();
+        let header_btn_weak = transcript_button.downgrade();
+        right_split_view.connect_show_sidebar_notify(move |sv| {
+            let visible = sv.shows_sidebar();
+            if let Some(rb) = right_btn_weak.upgrade()
+                && rb.is_active() != visible
+            {
+                rb.set_active(visible);
+            }
+            if let Some(hdr) = header_btn_weak.upgrade()
+                && hdr.is_active() != visible
+            {
+                hdr.set_active(visible);
+            }
+        });
+
+        // Initial alignment — panel is closed at launch, so both
+        // buttons start inactive. Config-driven restoration comes
+        // in sub-ticket #428.
+        right_transcript_btn.set_active(false);
+        transcript_button.set_active(false);
+    }
+
+    let toolbar_view = build_toolbar_view(&header, &layout_root);
+    let breakpoint = build_breakpoint(&left_split_view, &right_split_view);
 
     // Toast overlay wraps the toolbar view for error notifications.
     let toast_overlay = adw::ToastOverlay::new();
@@ -322,6 +378,8 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &bookmarks_toggle,
         &demod_dropdown,
         &panels.scanner.master_switch,
+        &left_activity_bar,
+        &right_activity_bar,
     );
 
     // Ctrl+? shows keyboard shortcuts dialog.
@@ -1715,31 +1773,73 @@ fn apply_rtl_tcp_connection_state(
     clippy::type_complexity,
     reason = "splitting into a struct would trade one named return for one named struct whose fields are used exactly once by the caller — net neutral for readability, net negative for locality of widget construction"
 )]
-fn build_split_view(
+/// Minimum left-panel width in pixels — narrower than this makes
+/// `AdwPreferencesGroup` content wrap awkwardly (design doc §4.4).
+const LEFT_SIDEBAR_MIN_WIDTH: f64 = 220.0;
+/// Minimum right-panel width. The transcript panel's controls
+/// (model combo, VAD slider, auto-break sliders) need more breathing
+/// room than a preferences row — below this they stack awkwardly
+/// and the transcript text view loses usable line width.
+const RIGHT_SIDEBAR_MIN_WIDTH: f64 = 360.0;
+/// Default left-panel width — matches today's sidebar width.
+const LEFT_SIDEBAR_DEFAULT_WIDTH: f64 = 320.0;
+/// Default right-panel width — gives the transcript panel room for
+/// its wider controls without the user having to resize on every
+/// launch.
+const RIGHT_SIDEBAR_DEFAULT_WIDTH: f64 = 420.0;
+
+/// Handles returned by [`build_layout`] for downstream wiring. Bundled
+/// into a struct rather than a tuple because the return list grew past
+/// the clippy threshold during the activity-bar scaffolding migration.
+struct LayoutHandles {
+    /// Root horizontal container for the whole window content area.
+    root: gtk4::Box,
+    /// Outer split view — sidebar hosts the left activity stack,
+    /// content hosts the nested right split view.
+    left_split_view: adw::OverlaySplitView,
+    /// Inner split view — sidebar hosts the right activity stack
+    /// (`sidebar_position=End`), content hosts spectrum + status
+    /// + the legacy bookmarks revealer.
+    right_split_view: adw::OverlaySplitView,
+    /// Left activity bar widget + per-entry toggle buttons.
+    left_activity_bar: sidebar::ActivityBar,
+    /// Right activity bar widget + per-entry toggle buttons.
+    right_activity_bar: sidebar::ActivityBar,
+    /// Left panel content switcher — 5 children keyed by entry name.
+    left_stack: gtk4::Stack,
+    /// Right panel content switcher — 1 child keyed `"transcript"`.
+    right_stack: gtk4::Stack,
+    panels: SidebarPanels,
+    spectrum_handle: spectrum::SpectrumHandle,
+    status_bar: StatusBar,
+    transcript_panel: sidebar::transcript_panel::TranscriptPanel,
+    /// Legacy bookmarks flyout — hangs off the right-split-view
+    /// content box. Retained for this scaffolding PR so the header
+    /// `Ctrl+B` path keeps working; sub-ticket #422 will migrate the
+    /// bookmarks list into the General activity panel and this
+    /// revealer can then be dropped.
+    bookmarks_revealer: gtk4::Revealer,
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_layout(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-) -> (
-    adw::OverlaySplitView,
-    SidebarPanels,
-    spectrum::SpectrumHandle,
-    StatusBar,
-    sidebar::transcript_panel::TranscriptPanel,
-    gtk4::Revealer,
-    gtk4::Revealer,
-) {
-    // Sidebar — configuration panels.
-    let (sidebar_scroll, panels) = sidebar::build_sidebar();
-    // Restore saved server-panel settings + subscribe to persist
-    // future changes. Runs as soon as panels are built so the
-    // saved values are visible before any user interaction could
-    // otherwise overwrite them.
+) -> LayoutHandles {
+    // Legacy sidebar — packed into the General activity slot so that
+    // Source / Radio / Audio / Display / Scanner / Navigation
+    // controls stay reachable during the scaffolding-to-real-panel
+    // migration window. Sub-tickets #422-#426 gradually pull each
+    // sub-section out into its own dedicated activity child; the last
+    // migration removes this bridge entirely and the General slot
+    // becomes a band-presets / bookmarks / source preferences page
+    // per the design doc §3.1.
+    let (legacy_sidebar_scroll, panels) = sidebar::build_sidebar();
     sidebar::server_panel::connect_server_panel_persistence(&panels.server, config);
 
-    // Main content area — spectrum display (FFT plot + waterfall) + status bar.
+    // Spectrum display (FFT + waterfall) + status bar.
     let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view(state.ui_tx.clone());
     spectrum_view.add_css_class("spectrum-area");
-
-    // Status bar at the bottom.
     let status_bar = status_bar::build_status_bar();
 
     let content_box = gtk4::Box::builder()
@@ -1750,40 +1850,27 @@ fn build_split_view(
     content_box.append(&spectrum_view);
     content_box.append(&status_bar.widget);
 
-    // Transcript panel — slides out from the right.
+    // Transcript panel — becomes the only child of the right stack
+    // (the real widget, not a placeholder) because this sub-ticket's
+    // design is that transcription keeps working through the
+    // scaffolding. See PR description for the one-real-panel
+    // rationale (design doc §3.6 end-state).
     let transcript_panel = sidebar::transcript_panel::build_transcript_panel(config);
     let transcript_scroll = gtk4::ScrolledWindow::builder()
         .child(&transcript_panel.widget)
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vexpand(true)
-        .width_request(320)
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
         .build();
 
-    let transcript_revealer = gtk4::Revealer::builder()
-        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
-        .reveal_child(false)
-        .child(&transcript_scroll)
-        .hexpand(false)
-        .build();
-
-    // Bookmarks flyout — slides out from the right, outermost of
-    // the two right-side panels so the header `Ctrl+B` toggle
-    // reveals an unambiguously right-edge element. Shares the
-    // `SlideLeft` + `RIGHT_FLYOUT_TRANSITION_MS` transition with
-    // the transcript revealer for visual consistency when either
-    // panel opens.
-    //
-    // The flyout widget is built by `build_sidebar` (so it can
-    // share state with the left-sidebar `NavigationPanel`) and
-    // returned on `panels.bookmarks`; here we just pack it into
-    // the revealer. The panel widget already contains its own
-    // vertical scroll for the bookmark list, so no outer scroll
-    // wrap is needed.
+    // Legacy bookmarks flyout — still hosted as a right-side revealer
+    // in the inner split view's content area. Header `bookmarks_toggle`
+    // + `Ctrl+B` still drive this revealer unchanged. Sub-ticket #422
+    // migrates the list into the General activity panel and this
+    // revealer is deleted at that time.
     let bookmarks_revealer = gtk4::Revealer::builder()
         .transition_type(gtk4::RevealerTransitionType::SlideLeft)
         .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
@@ -1792,32 +1879,119 @@ fn build_split_view(
         .hexpand(false)
         .build();
 
-    // Wrap content + both side revealers in an HBox. Bookmarks
-    // sits rightmost so the header-bar bookmark icon (which is
-    // itself at the far right of the header via `pack_end`) maps
-    // visually to the panel that appears when the user clicks it.
-    let content_with_transcript = gtk4::Box::builder()
+    let content_inner = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
         .build();
-    content_with_transcript.append(&content_box);
-    content_with_transcript.append(&transcript_revealer);
-    content_with_transcript.append(&bookmarks_revealer);
+    content_inner.append(&content_box);
+    content_inner.append(&bookmarks_revealer);
 
-    let split_view = adw::OverlaySplitView::builder()
-        .sidebar(&sidebar_scroll)
-        .content(&content_with_transcript)
-        .show_sidebar(true)
+    // Left panel stack — General hosts the full legacy sidebar
+    // (preserves all Source / Radio / Audio / Display / Scanner
+    // control reachability during the migration), the other four
+    // activities are placeholder `Label`s until sub-tickets
+    // #422-#426 swap each one for a real panel. The `name` strings
+    // MUST remain stable because they're the config-persistence
+    // keys (§5 of the design doc).
+    let left_stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::None)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    for entry in sidebar::LEFT_ACTIVITIES {
+        if entry.name == "general" {
+            left_stack.add_named(&legacy_sidebar_scroll, Some(entry.name));
+            continue;
+        }
+        let placeholder = gtk4::Label::builder()
+            .label(format!(
+                "{} — coming in a follow-up sub-ticket",
+                entry.display_name
+            ))
+            .wrap(true)
+            .justify(gtk4::Justification::Center)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        left_stack.add_named(&placeholder, Some(entry.name));
+    }
+
+    // Right panel stack — single child today, hosts the real
+    // transcript widget (not a placeholder) so transcription keeps
+    // working during the migration window.
+    let right_stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::None)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    right_stack.add_named(&transcript_scroll, Some("transcript"));
+
+    // Inner (right) split view — sidebar sits on the trailing edge
+    // so the right activity bar is the rightmost element on-screen.
+    // `sidebar-width-unit = Px` makes `sidebar_width_fraction`
+    // interpret its argument as literal pixels instead of a fraction
+    // of the split view's allocated width. Without this, the
+    // default-width math lies under nesting: the left split view is
+    // already narrower than the window (activity bars are outside
+    // it), and the right split view is narrower again (it lives in
+    // the left split's content area), so a naive
+    // `LEFT_SIDEBAR_DEFAULT_WIDTH / DEFAULT_WIDTH` fraction resolves
+    // to something smaller than the desired pixel width on every
+    // child. Pixels-first avoids the post-realize callback path and
+    // matches the `min_sidebar_width` / `max_sidebar_width` pixel
+    // units already in use.
+    let right_split_view = adw::OverlaySplitView::builder()
+        .sidebar_position(gtk4::PackType::End)
+        .sidebar(&right_stack)
+        .content(&content_inner)
+        .show_sidebar(false)
+        .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
+        .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * 2.0)
+        .sidebar_width_unit(adw::LengthUnit::Px)
+        .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH)
         .build();
 
-    (
-        split_view,
+    // Outer (left) split view — sidebar hosts the left activity
+    // stack. Starts open with "general" visible so a fresh launch
+    // lands on the General placeholder instead of an empty frame.
+    let left_split_view = adw::OverlaySplitView::builder()
+        .sidebar(&left_stack)
+        .content(&right_split_view)
+        .show_sidebar(true)
+        .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
+        .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0)
+        .sidebar_width_unit(adw::LengthUnit::Px)
+        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH)
+        .build();
+    left_stack.set_visible_child_name("general");
+
+    let left_activity_bar =
+        sidebar::build_activity_bar(sidebar::LEFT_ACTIVITIES, sidebar::ActivityBarSide::Left);
+    let right_activity_bar =
+        sidebar::build_activity_bar(sidebar::RIGHT_ACTIVITIES, sidebar::ActivityBarSide::Right);
+
+    let root = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    root.append(&left_activity_bar.widget);
+    root.append(&left_split_view);
+    root.append(&right_activity_bar.widget);
+
+    LayoutHandles {
+        root,
+        left_split_view,
+        right_split_view,
+        left_activity_bar,
+        right_activity_bar,
+        left_stack,
+        right_stack,
         panels,
         spectrum_handle,
         status_bar,
         transcript_panel,
-        transcript_revealer,
         bookmarks_revealer,
-    )
+    }
 }
 
 /// Build the sidebar toggle button bound to the split view.
@@ -2075,18 +2249,94 @@ fn build_menu_button() -> gtk4::MenuButton {
 }
 
 /// Wrap header and content in an `AdwToolbarView`.
-fn build_toolbar_view(
-    header: &adw::HeaderBar,
-    content: &adw::OverlaySplitView,
-) -> adw::ToolbarView {
+fn build_toolbar_view(header: &adw::HeaderBar, content: &gtk4::Box) -> adw::ToolbarView {
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(header);
     toolbar_view.set_content(Some(content));
     toolbar_view
 }
 
-/// Create a breakpoint that collapses the sidebar below `SIDEBAR_BREAKPOINT_PX`.
-fn build_breakpoint(split_view: &adw::OverlaySplitView) -> adw::Breakpoint {
+/// Wire click handlers on every button of a multi-activity bar so:
+///
+/// - Clicking a *different* button swaps the stack's visible child
+///   and forces the split view's sidebar open.
+/// - Clicking the *currently-selected* button keeps that button
+///   visually selected (design doc §4.2 — the user's mental model is
+///   "I'm still in Radio, I just closed the panel for a second") and
+///   toggles the split view's sidebar show/hide.
+///
+/// `initial_selected` must match the stack's initial visible child
+/// and the button the caller pre-activated via `set_active(true)`.
+///
+/// The `:checked` CSS pseudo-class (driven by `ToggleButton::active`)
+/// renders the accent tint — no manual CSS class juggling needed.
+///
+/// Mutual exclusion is enforced manually rather than via
+/// `ToggleButton::set_group`; see `sidebar::activity_bar` module docs.
+///
+/// Only suitable for bars with more than one entry. Single-button
+/// bars (like the right transcript bar today) wire `active` directly
+/// to `show_sidebar` — there's no "select vs. toggle panel"
+/// distinction to preserve.
+fn wire_activity_bar_clicks(
+    bar: &sidebar::ActivityBar,
+    stack: &gtk4::Stack,
+    split_view: &adw::OverlaySplitView,
+    initial_selected: &'static str,
+) {
+    let selected: Rc<RefCell<&'static str>> = Rc::new(RefCell::new(initial_selected));
+
+    for (&name, btn) in &bar.buttons {
+        let selected = Rc::clone(&selected);
+        let bar_buttons: Vec<(&'static str, glib::WeakRef<gtk4::ToggleButton>)> = bar
+            .buttons
+            .iter()
+            .map(|(n, b)| (*n, b.downgrade()))
+            .collect();
+        let stack_weak = stack.downgrade();
+        let split_view_weak = split_view.downgrade();
+        btn.connect_clicked(move |clicked_btn| {
+            let prev = *selected.borrow();
+            if prev == name {
+                // Clicking the already-selected icon keeps it
+                // selected visually (force-restore the `active`
+                // property after GTK's default click-flip) and
+                // toggles the panel open/closed.
+                clicked_btn.set_active(true);
+                if let Some(sv) = split_view_weak.upgrade() {
+                    sv.set_show_sidebar(!sv.shows_sidebar());
+                }
+            } else {
+                // Click on a different activity — deselect siblings,
+                // swap stack child, open panel.
+                for (other_name, weak) in &bar_buttons {
+                    if let Some(other) = weak.upgrade()
+                        && *other_name != name
+                        && other.is_active()
+                    {
+                        other.set_active(false);
+                    }
+                }
+                clicked_btn.set_active(true);
+                if let Some(stk) = stack_weak.upgrade() {
+                    stk.set_visible_child_name(name);
+                }
+                if let Some(sv) = split_view_weak.upgrade() {
+                    sv.set_show_sidebar(true);
+                }
+                *selected.borrow_mut() = name;
+            }
+        });
+    }
+}
+
+/// Create a breakpoint that collapses both sidebars below
+/// `SIDEBAR_BREAKPOINT_PX`. Both split views flip to overlay mode at
+/// narrow widths so the spectrum keeps its minimum real estate.
+fn build_breakpoint(
+    left_split_view: &adw::OverlaySplitView,
+    right_split_view: &adw::OverlaySplitView,
+) -> adw::Breakpoint {
     let condition = adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
         SIDEBAR_BREAKPOINT_PX,
@@ -2094,7 +2344,8 @@ fn build_breakpoint(split_view: &adw::OverlaySplitView) -> adw::Breakpoint {
     );
 
     let breakpoint = adw::Breakpoint::new(condition);
-    breakpoint.add_setter(split_view, "collapsed", Some(&true.into()));
+    breakpoint.add_setter(left_split_view, "collapsed", Some(&true.into()));
+    breakpoint.add_setter(right_split_view, "collapsed", Some(&true.into()));
 
     breakpoint
 }
@@ -5814,7 +6065,12 @@ fn connect_source_panel(
             ) else {
                 return;
             };
-            let is_network_path = device_row.selected() == DEVICE_RTLTCP;
+            // Raw Network (TCP/UDP IQ) has the same wire-bandwidth
+            // cost profile as rtl_tcp — a high-sample-rate pull
+            // across the network will saturate a 100 Mbit link
+            // either way. The advisory applies equally to both
+            // network-backed source types.
+            let is_network_path = matches!(device_row.selected(), DEVICE_NETWORK | DEVICE_RTLTCP);
             // Bounds-check the sample-rate index: transient
             // out-of-range values from widget-model churn would
             // otherwise satisfy the `>= threshold` compare and

@@ -824,6 +824,46 @@ mod tests {
     }
 
     #[test]
+    fn parakeet_v3_filename_and_label_match_upstream() {
+        // Upstream k2-fsa release filename + display label pin —
+        // deliberate literal test rather than deriving from the enum,
+        // so a future edit that accidentally changes either one fails
+        // here rather than silently breaking every user's download or
+        // their persisted UI selection. Mirrors the Whisper-side
+        // `large_v3_turbo_filename_matches_upstream` pattern.
+        assert_eq!(
+            SherpaModel::ParakeetTdt06bV3En.archive_filename(),
+            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
+        );
+        assert_eq!(
+            SherpaModel::ParakeetTdt06bV3En.label(),
+            "Parakeet TDT 0.6b v3 (English)"
+        );
+        assert!(
+            SherpaModel::ParakeetTdt06bV3En
+                .archive_url()
+                .ends_with("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"),
+            "archive_url must resolve to the canonical upstream filename"
+        );
+    }
+
+    #[test]
+    fn all_models_preserves_legacy_indices() {
+        // Persistence contract: `ALL` is append-only. The UI stores
+        // the user's model choice as an index into this slice, so
+        // reordering or inserting mid-list would silently change
+        // existing users' selections on next launch. Pinning the
+        // leading indices here catches any accidental reordering.
+        // Mirrors the Whisper-side `all_models_preserves_legacy_indices`
+        // pattern.
+        let models = SherpaModel::ALL;
+        assert_eq!(models[0], SherpaModel::StreamingZipformerEn);
+        assert_eq!(models[1], SherpaModel::MoonshineTinyEn);
+        assert_eq!(models[2], SherpaModel::MoonshineBaseEn);
+        assert_eq!(models[3], SherpaModel::ParakeetTdt06bV3En);
+    }
+
+    #[test]
     fn silero_vad_path_is_under_sherpa_models_dir() {
         let path = silero_vad_path();
         assert!(path.ends_with("silero-vad/silero_vad.onnx"));

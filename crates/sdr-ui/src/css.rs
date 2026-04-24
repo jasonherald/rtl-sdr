@@ -61,6 +61,42 @@ const APP_CSS: &str = r#"
     border: none;
     background: transparent;
 }
+
+/* Activity bar — narrow strip of icon toggle buttons against window
+ * edge. Visually a natural extension of the header bar: no chrome
+ * on buttons, icons sit on transparent background, subtle hover tint,
+ * and a thin accent strip + tint on the currently-selected icon.
+ */
+.activity-bar {
+    background-color: transparent;
+    padding: 4px 0;
+}
+
+.activity-bar button.activity-bar-button {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 4px;
+    margin: 2px 4px;
+    border-radius: 6px;
+    background: none;
+    border: none;
+    box-shadow: none;
+    color: alpha(@window_fg_color, 0.7);
+}
+
+.activity-bar button.activity-bar-button:hover {
+    background-color: alpha(@window_fg_color, 0.08);
+    color: @window_fg_color;
+}
+
+.activity-bar button.activity-bar-button:checked {
+    background-color: alpha(@accent_color, 0.15);
+    color: @accent_color;
+}
+
+.activity-bar button.activity-bar-button:checked:hover {
+    background-color: alpha(@accent_color, 0.2);
+}
 "#;
 
 /// Load the application CSS into the default display's style context.
