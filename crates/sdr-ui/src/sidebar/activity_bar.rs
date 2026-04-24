@@ -23,6 +23,56 @@
 //! screen readers, so it cannot substitute. This mirrors the idiom
 //! used by other icon-only controls in this crate (bookmarks toggle,
 //! pinned-servers menu, etc.).
+//!
+//! # Example — adding a new activity
+//!
+//! The canonical `LEFT_ACTIVITIES` / `RIGHT_ACTIVITIES` slices drive
+//! the entire activity-bar surface: the widget itself, keyboard
+//! shortcut registration, help-dialog Navigation rows, and config
+//! persistence. Adding an activity is almost entirely a data edit.
+//!
+//! To add (say) a "Recordings" activity on the right side:
+//!
+//! ```ignore
+//! // 1. In this file, append to RIGHT_ACTIVITIES:
+//! pub const RIGHT_ACTIVITIES: &[ActivityBarEntry] = &[
+//!     ActivityBarEntry {
+//!         name: "transcript", // existing
+//!         // ...
+//!     },
+//!     ActivityBarEntry {
+//!         name: "bookmarks", // existing
+//!         // ...
+//!     },
+//!     ActivityBarEntry {
+//!         name: "recordings",
+//!         icon_name: "media-record-symbolic",
+//!         display_name: "Recordings",
+//!         shortcut_label: "Ctrl+Shift+3",
+//!         accelerator: "<Ctrl><Shift>3",
+//!     },
+//! ];
+//!
+//! // 2. In window.rs::build_layout, add the stack child under the
+//! //    new `name`. The panel widget should be an
+//! //    `AdwPreferencesPage` for chrome consistency; use flat
+//! //    `AdwPreferencesGroup`s with title + description for each
+//! //    section (no `AdwExpanderRow`).
+//! right_stack.add_named(&recordings_panel.widget, Some("recordings"));
+//! ```
+//!
+//! That's it for the bar. `Ctrl+Shift+3` registration, the
+//! help-dialog row, activity-bar click-handler state machine, and
+//! session persistence (`ui_sidebar_right_selected`) all derive from
+//! the entry automatically. Keep existing entries' `name` strings
+//! stable — they're config keys.
+//!
+//! If the new activity hosts DSP-connected controls, add a
+//! `connect_recordings_panel(panels, state)` call in
+//! `connect_sidebar_panels` following the existing panel patterns.
+//! See `CLAUDE.md` → "Sidebar architecture" for the broader
+//! contributor guide and `docs/design/sidebar-activity-bar-redesign.md`
+//! for the design rationale.
 
 use std::collections::HashMap;
 
