@@ -400,11 +400,12 @@ impl WaterfallRenderer {
     /// `top_row`. We walk the ring once to materialize a linear copy
     /// here — one allocation per export, which is negligible for a
     /// user-triggered "save to PNG" operation.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
-        if self.display_width == 0 {
-            return Err("no waterfall data".to_string());
-        }
+    /// Walk the ring buffer once to produce a linearly-ordered copy
+    /// of `pixel_buf` — display row 0 on top, row `HISTORY_LINES-1`
+    /// on the bottom. Used by `export_png` and covered by a
+    /// dedicated test so the ordering is verifiable without
+    /// round-tripping through PNG I/O.
+    fn linearized_pixel_buf(&self) -> Vec<u8> {
         let row_bytes = self.display_width * 4;
         let mut linear = vec![0u8; row_bytes * HISTORY_LINES];
         for display_row in 0..HISTORY_LINES {
@@ -413,7 +414,16 @@ impl WaterfallRenderer {
             let dst = display_row * row_bytes;
             linear[dst..dst + row_bytes].copy_from_slice(&self.pixel_buf[src..src + row_bytes]);
         }
+        linear
+    }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.display_width == 0 {
+            return Err("no waterfall data".to_string());
+        }
+
+        let linear = self.linearized_pixel_buf();
         let (stride, packed_stride) = Self::argb32_strides(self.display_width)?;
         let buf = Self::pack_argb32_for_cairo(linear, self.display_width, stride, packed_stride);
 
@@ -525,6 +535,27 @@ mod tests {
         assert_eq!(supported_texture_width(1024), 1024);
     }
 
+    /// Ring-buffer test fixtures — named so the ring-invariant
+    /// tests read at the level of intent, not at the level of
+    /// specific byte values.
+    const WIDTH_SMALL: usize = 4;
+    const WIDTH_LARGE: usize = 8;
+    const DB_MIN: f32 = 0.0;
+    const DB_MAX: f32 = 100.0;
+    /// Normalizes to `(50 - 0) / 100 = 0.5 → byte 128` — a
+    /// mid-range value that's cleanly distinguishable from both
+    /// the floor (byte 0) and the saturation (byte 255) in the
+    /// ring-buffer placement tests.
+    const DB_MID: f32 = 50.0;
+    /// Normalizes to `1.0 → byte 255` — the saturation end. Used
+    /// by the narrow-FFT test to make the "stale tail" regression
+    /// visually obvious if it recurs.
+    const DB_HIGH: f32 = 100.0;
+    /// Low dB anchor for the linearization ordering test. Paired
+    /// with `DB_HIGH` to make newest-row vs oldest-row easy to
+    /// identify in the linearized output.
+    const DB_LOW: f32 = 0.0;
+
     /// Helper: read the BGRA pixel at the physical row / column out
     /// of the renderer's internal buffer. Tests use this to verify
     /// that the ring-buffer `top_row` advances correctly.
@@ -538,57 +569,61 @@ mod tests {
         ]
     }
 
+    /// Helper: read one BGRA pixel from a linearized buffer.
+    fn linear_pixel(buf: &[u8], width: usize, row: usize, col: usize) -> [u8; 4] {
+        let idx = (row * width + col) * 4;
+        [buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]]
+    }
+
     #[test]
     fn ring_buffer_starts_at_zero() {
-        let r = WaterfallRenderer::new(8);
+        let r = WaterfallRenderer::new(WIDTH_LARGE);
         assert_eq!(r.top_row, 0);
         assert!(r.pixel_buf.iter().all(|&b| b == 0));
     }
 
     #[test]
     fn ring_buffer_advances_backwards_on_push() {
-        // Use a small width so the bench isn't slow, and a known dB
-        // range so the normalization produces a deterministic byte.
-        let mut r = WaterfallRenderer::new(4);
-        r.set_db_range(0.0, 100.0);
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
         // One push advances `top_row` from 0 to HISTORY_LINES - 1.
-        r.push_line(&[50.0, 50.0, 50.0, 50.0]);
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
         assert_eq!(r.top_row, HISTORY_LINES - 1);
         // Second push advances to HISTORY_LINES - 2.
-        r.push_line(&[50.0, 50.0, 50.0, 50.0]);
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
         assert_eq!(r.top_row, HISTORY_LINES - 2);
     }
 
     #[test]
     fn ring_buffer_wraps_after_full_cycle() {
-        let mut r = WaterfallRenderer::new(4);
-        r.set_db_range(0.0, 100.0);
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
         for _ in 0..HISTORY_LINES {
-            r.push_line(&[50.0, 50.0, 50.0, 50.0]);
+            r.push_line(&[DB_MID; WIDTH_SMALL]);
         }
         // After exactly HISTORY_LINES pushes we wrap back to 0.
         assert_eq!(r.top_row, 0);
         // One more push: back to HISTORY_LINES - 1.
-        r.push_line(&[50.0, 50.0, 50.0, 50.0]);
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
         assert_eq!(r.top_row, HISTORY_LINES - 1);
     }
 
     #[test]
     fn pushed_row_lands_at_top_row_offset() {
-        let mut r = WaterfallRenderer::new(4);
-        r.set_db_range(0.0, 100.0);
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
 
-        // Push a distinctive line: normalized values are 0 / 64 / 128 /
-        // 255 across the four pixels. With the default Turbo colormap
-        // we don't care about exact RGB — we care that the row was
-        // written at the current `top_row`, and the row BEFORE it
-        // (physical row `top_row + 1`, still zeroed) is untouched.
-        r.push_line(&[0.0, 25.0, 50.0, 100.0]);
+        // Push a distinctive line: four distinct magnitudes so the
+        // colormap lookup produces distinct per-column outputs.
+        // With the default Turbo colormap we don't care about exact
+        // RGB — we care that the row was written at the current
+        // `top_row`, and the row BEFORE it (physical row `top_row
+        // + 1`, still zeroed) is untouched.
+        r.push_line(&[0.0, 25.0, DB_MID, DB_HIGH]);
         let first_top = r.top_row;
         assert_eq!(first_top, HISTORY_LINES - 1);
-        // The new row is non-zero (first pixel uses colormap[0], which
-        // may happen to be zero — so instead check the fourth, which
-        // uses colormap[255] and is definitely non-zero for Turbo).
+        // The new row is non-zero — check the fourth pixel, which
+        // uses colormap[255] and is definitely non-zero for Turbo.
         let p = physical_pixel(&r, first_top, 3);
         assert!(p != [0, 0, 0, 0], "new row pixel should be non-zero");
         // And the row ADJACENT to top_row going the other way
@@ -598,7 +633,7 @@ mod tests {
 
         // Push a second line and confirm it lands one physical row
         // up, not on top of the previous row.
-        r.push_line(&[0.0, 25.0, 50.0, 100.0]);
+        r.push_line(&[0.0, 25.0, DB_MID, DB_HIGH]);
         assert_eq!(r.top_row, HISTORY_LINES - 2);
         // Previous row unchanged.
         let p_prev = physical_pixel(&r, first_top, 3);
@@ -611,29 +646,30 @@ mod tests {
     #[test]
     fn narrow_fft_does_not_leak_stale_tail() {
         // Simulates the ring-buffer hazard: after many rows of a
-        // 4-wide FFT, switch to a 2-wide FFT. The recycled physical
-        // slot previously held a fully-populated row with non-zero
-        // tail pixels — if `push_line` only writes `bin_count`
-        // pixels, those stale tail pixels bleed into the new row.
-        let mut r = WaterfallRenderer::new(4);
-        r.set_db_range(0.0, 100.0);
+        // full-width FFT, switch to a narrow FFT. The recycled
+        // physical slot previously held a fully-populated row with
+        // non-zero tail pixels — if `push_line` only writes
+        // `bin_count` pixels, those stale tail pixels bleed into
+        // the new row.
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
 
-        // Fill every slot with a fully-saturated 4-wide row so the
-        // tail positions are non-zero across the whole ring.
+        // Fill every slot with a fully-saturated full-width row so
+        // the tail positions are non-zero across the whole ring.
         for _ in 0..HISTORY_LINES {
-            r.push_line(&[100.0, 100.0, 100.0, 100.0]);
+            r.push_line(&[DB_HIGH; WIDTH_SMALL]);
         }
 
-        // Now push a 2-bin frame — the other two positions are
-        // "past the FFT width" and MUST render as `colormap[0]`,
+        // Now push a half-width frame — the other two positions
+        // are "past the FFT width" and MUST render as `colormap[0]`,
         // not the previous row's saturated tail.
-        r.push_line(&[100.0, 100.0]);
+        r.push_line(&[DB_HIGH; WIDTH_SMALL / 2]);
         let top = r.top_row;
 
-        // Positions 0-1: high-level color (normalized byte = 255).
+        // Positions 0..WIDTH_SMALL/2: high-level color.
         let high = physical_pixel(&r, top, 0);
-        // Positions 2-3: "no data" color (normalized byte = 0).
-        let no_data = physical_pixel(&r, top, 2);
+        // Positions past the FFT width: "no data" color.
+        let no_data = physical_pixel(&r, top, WIDTH_SMALL / 2);
 
         assert_ne!(
             high, no_data,
@@ -641,10 +677,7 @@ mod tests {
         );
         // And no-data must match the colormap's zero entry (the
         // "floor" color), not the saturated color the old row had.
-        let floor = {
-            let c = r.colormap_bgra[0];
-            [c[0], c[1], c[2], c[3]]
-        };
+        let floor = r.colormap_bgra[0];
         assert_eq!(
             no_data, floor,
             "tail pixels must be colormap[0], not stale ring-buffer content"
@@ -653,12 +686,60 @@ mod tests {
 
     #[test]
     fn resize_resets_ring_index() {
-        let mut r = WaterfallRenderer::new(4);
-        r.set_db_range(0.0, 100.0);
-        r.push_line(&[50.0, 50.0, 50.0, 50.0]);
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
         assert_eq!(r.top_row, HISTORY_LINES - 1);
-        r.resize(8);
+        r.resize(WIDTH_LARGE);
         assert_eq!(r.top_row, 0);
         assert!(r.pixel_buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn linearize_places_newest_row_on_top() {
+        // Exercises `linearized_pixel_buf` — the function used by
+        // `export_png` to turn a ring-ordered pixel_buf into
+        // newest-on-top visual order. This is the test CR asked for:
+        // it verifies correct ordering WITHOUT the PNG round-trip,
+        // and works past the ring wrap where ordering is most
+        // likely to break.
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+
+        // Push HISTORY_LINES+5 frames so we've wrapped once. The
+        // final five frames alternate LOW / HIGH so the newest row
+        // is identifiable by color.
+        for _ in 0..HISTORY_LINES {
+            r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        }
+        // Four low rows then one high row. After these pushes, the
+        // most recent row (which should end up at display row 0) is
+        // the high one.
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_HIGH; WIDTH_SMALL]);
+
+        let floor = r.colormap_bgra[0];
+        let saturation = r.colormap_bgra[255];
+
+        let linear = r.linearized_pixel_buf();
+
+        // Display row 0: the newest push — the saturated row.
+        assert_eq!(
+            linear_pixel(&linear, WIDTH_SMALL, 0, 0),
+            saturation,
+            "display row 0 must be the newest (saturated) line"
+        );
+        // Display rows 1..5: the four `DB_LOW` pushes immediately
+        // before the saturated one.
+        for visual_row in 1..5 {
+            assert_eq!(
+                linear_pixel(&linear, WIDTH_SMALL, visual_row, 0),
+                floor,
+                "display row {visual_row} must be the DB_LOW line"
+            );
+        }
     }
 }
