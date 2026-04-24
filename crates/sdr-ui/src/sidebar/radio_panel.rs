@@ -108,8 +108,24 @@ const SQUELCH_PAGE_DB: f64 = 10.0;
 /// Radio / demodulator configuration panel with references to interactive rows.
 #[derive(Clone)]
 pub struct RadioPanel {
-    /// The `AdwPreferencesGroup` widget to pack into the sidebar.
-    pub widget: adw::PreferencesGroup,
+    /// The `AdwPreferencesPage` widget packed into the Radio
+    /// activity stack slot. The page hosts five titled
+    /// `AdwPreferencesGroup`s (Bandwidth / Squelch / Filters /
+    /// De-emphasis / CTCSS) — see [`build_radio_panel`].
+    pub widget: adw::PreferencesPage,
+    /// De-emphasis section group. Stored as a handle so
+    /// [`apply_demod_visibility`] can show/hide the whole section
+    /// instead of the single row inside it; cleaner visual rhythm
+    /// than a titled group with one hidden child taking up a row
+    /// of whitespace on AM / SSB / CW.
+    ///
+    /// [`apply_demod_visibility`]: Self::apply_demod_visibility
+    pub deemphasis_group: adw::PreferencesGroup,
+    /// CTCSS section group — NFM-only. Hidden as a group for the
+    /// same reason as [`deemphasis_group`].
+    ///
+    /// [`deemphasis_group`]: Self::deemphasis_group
+    pub ctcss_group: adw::PreferencesGroup,
     /// Bandwidth control.
     pub bandwidth_row: adw::SpinRow,
     /// "Reset bandwidth to default for current demod mode" button,
@@ -173,14 +189,23 @@ impl RadioPanel {
     /// handlers stay in sync.
     pub fn apply_demod_visibility(&self, mode: sdr_types::DemodMode) {
         let is_fm = matches!(mode, sdr_types::DemodMode::Wfm | sdr_types::DemodMode::Nfm);
+        // De-emphasis group: hide the whole section on AM / SSB /
+        // CW. The per-row `deemphasis_row.set_visible(...)` is
+        // retained as a belt for screen readers (the row stays
+        // hidden even if a future refactor moves the group
+        // around).
+        self.deemphasis_group.set_visible(is_fm);
         self.deemphasis_row.set_visible(is_fm);
         self.fm_if_nr_row.set_visible(is_fm);
         self.stereo_row
             .set_visible(mode == sdr_types::DemodMode::Wfm);
         // CTCSS is an NFM-only feature — WFM / AM / SSB / CW
         // either don't carry sub-audible tones or don't use them
-        // as a squelch keying mechanism in practice.
+        // as a squelch keying mechanism in practice. Hide the
+        // whole group; individual `set_visible` kept for the
+        // same defensive reason as de-emphasis.
         let ctcss_allowed = mode == sdr_types::DemodMode::Nfm;
+        self.ctcss_group.set_visible(ctcss_allowed);
         self.ctcss_row.set_visible(ctcss_allowed);
         self.ctcss_threshold_row.set_visible(ctcss_allowed);
         self.ctcss_status_row.set_visible(ctcss_allowed);
@@ -464,13 +489,18 @@ impl RadioPanel {
 }
 
 /// Build the radio / demodulator configuration panel.
+///
+/// Lays out as an `AdwPreferencesPage` with five titled sections —
+/// Bandwidth / Squelch / Filters / De-emphasis / CTCSS — matching
+/// the activity-bar redesign's Apple-style section rhythm (design
+/// doc §3.2). Section groups are flat rather than `AdwExpanderRow`
+/// — same call as the General panel: the expander-row inset +
+/// group-title inset stacked to a double-indent that read cluttered
+/// once sections were populated, so we pin "expanded by default"
+/// into "always visible" and give the user scroll instead of
+/// collapse as the focus affordance.
 #[allow(clippy::too_many_lines)]
 pub fn build_radio_panel() -> RadioPanel {
-    let group = adw::PreferencesGroup::builder()
-        .title("Radio")
-        .description("Demodulator settings")
-        .build();
-
     // --- Bandwidth ---
     let bandwidth_adj = gtk4::Adjustment::new(
         DEFAULT_BANDWIDTH_HZ,
@@ -697,28 +727,74 @@ pub fn build_radio_panel() -> RadioPanel {
         "SNR default threshold outside UI range"
     );
 
-    group.add(&bandwidth_row);
-    group.add(&squelch_enabled_row);
-    group.add(&squelch_level_row);
-    group.add(&auto_squelch_row);
-    group.add(&deemphasis_row);
-    group.add(&noise_blanker_row);
-    group.add(&nb_level_row);
-    group.add(&fm_if_nr_row);
-    group.add(&stereo_row);
-    group.add(&notch_enabled_row);
-    group.add(&notch_freq_row);
-    group.add(&ctcss_row);
-    group.add(&ctcss_threshold_row);
-    group.add(&ctcss_status_row);
-    group.add(&voice_squelch_row);
-    group.add(&voice_squelch_threshold_row);
-    group.add(&voice_squelch_status_row);
+    // --- Sectioned preferences page ---
+    //
+    // Individual row-level `.visible(false)` flags set at
+    // construction above (stereo, CTCSS rows, voice-squelch rows)
+    // are preserved — they keep the startup state correct before
+    // `apply_demod_visibility` runs, and the group-level hide in
+    // `apply_demod_visibility` is a second line of defence for
+    // screen-reader users.
+    // Section groups — `title` + `description` pattern mirrors the
+    // other panels (Audio / Display / Source / etc.) so header
+    // spacing + typography stays consistent across activities.
+    // Descriptions double as plain-English hints for users new to
+    // SDR jargon.
+    let bandwidth_group = adw::PreferencesGroup::builder()
+        .title("Bandwidth")
+        .description("Filter width around the tuned frequency")
+        .build();
+    bandwidth_group.add(&bandwidth_row);
+
+    let squelch_group = adw::PreferencesGroup::builder()
+        .title("Squelch")
+        .description("Mute audio when the signal is too weak")
+        .build();
+    squelch_group.add(&squelch_enabled_row);
+    squelch_group.add(&squelch_level_row);
+    squelch_group.add(&auto_squelch_row);
+    squelch_group.add(&voice_squelch_row);
+    squelch_group.add(&voice_squelch_threshold_row);
+    squelch_group.add(&voice_squelch_status_row);
+
+    let filters_group = adw::PreferencesGroup::builder()
+        .title("Filters")
+        .description("Clean up interference and noise")
+        .build();
+    filters_group.add(&noise_blanker_row);
+    filters_group.add(&nb_level_row);
+    filters_group.add(&fm_if_nr_row);
+    filters_group.add(&stereo_row);
+    filters_group.add(&notch_enabled_row);
+    filters_group.add(&notch_freq_row);
+
+    let deemphasis_group = adw::PreferencesGroup::builder()
+        .title("De-emphasis")
+        .description("Restore high-frequency audio on FM")
+        .build();
+    deemphasis_group.add(&deemphasis_row);
+
+    let ctcss_group = adw::PreferencesGroup::builder()
+        .title("CTCSS")
+        .description("Open audio only when a matching tone is present")
+        .build();
+    ctcss_group.add(&ctcss_row);
+    ctcss_group.add(&ctcss_threshold_row);
+    ctcss_group.add(&ctcss_status_row);
+
+    let page = adw::PreferencesPage::new();
+    page.add(&bandwidth_group);
+    page.add(&squelch_group);
+    page.add(&filters_group);
+    page.add(&deemphasis_group);
+    page.add(&ctcss_group);
 
     // All rows connected to DSP pipeline via window.rs
 
     RadioPanel {
-        widget: group,
+        widget: page,
+        deemphasis_group,
+        ctcss_group,
         bandwidth_row,
         bandwidth_reset_button,
         squelch_enabled_row,
