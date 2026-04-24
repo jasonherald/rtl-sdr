@@ -143,11 +143,20 @@ pub const RIGHT_ACTIVITIES: &[ActivityBarEntry] = &[
 pub const KEY_LEFT_SELECTED: &str = "ui_sidebar_left_selected";
 /// Config key for the left split-view's open/closed state.
 pub const KEY_LEFT_OPEN: &str = "ui_sidebar_left_open";
+/// Config key for the left panel's pixel width (persisted on
+/// resize drag-end). The saved value is stored as pixels per the
+/// user-facing contract in #429; `window.rs` converts back to an
+/// `AdwOverlaySplitView` fraction once the split view has a real
+/// allocation.
+pub const KEY_LEFT_WIDTH_PX: &str = "ui_sidebar_left_width_px";
 /// Config key for the `name` of the currently selected right
 /// activity. Values must be one of [`RIGHT_ACTIVITIES`]`.name`.
 pub const KEY_RIGHT_SELECTED: &str = "ui_sidebar_right_selected";
 /// Config key for the right split-view's open/closed state.
 pub const KEY_RIGHT_OPEN: &str = "ui_sidebar_right_open";
+/// Config key for the right panel's pixel width. Same conversion
+/// contract as [`KEY_LEFT_WIDTH_PX`].
+pub const KEY_RIGHT_WIDTH_PX: &str = "ui_sidebar_right_width_px";
 
 /// Default left selection on a fresh install. Must match an entry
 /// in [`LEFT_ACTIVITIES`].
@@ -163,8 +172,12 @@ pub const DEFAULT_RIGHT_OPEN: bool = false;
 
 /// Persisted activity-bar state, loaded once at launch by
 /// [`load_session`] and applied before the window is presented.
-/// Every field resolves to a concrete value even on a fresh
-/// install; callers don't see `Option`s.
+/// Selection + open state resolve to concrete values even on a
+/// fresh install; width fields stay `Option`-wrapped because the
+/// builder-time default (a fraction of the split view's allocated
+/// width) is a good answer in the absence of a user preference,
+/// and forcing a pixel value at build time would require knowing
+/// the split view's allocation before it exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SidebarSession {
     /// Stable `name` from [`LEFT_ACTIVITIES`]. Guaranteed valid
@@ -172,10 +185,19 @@ pub struct SidebarSession {
     /// [`DEFAULT_LEFT_SELECTED`]).
     pub left_selected: &'static str,
     pub left_open: bool,
+    /// Persisted left panel width in pixels. `None` on fresh
+    /// install; `window.rs` applies the value after the left
+    /// split view's first allocation (fractions are the only
+    /// knob `AdwOverlaySplitView` exposes, and those need
+    /// allocation width to convert from pixels).
+    pub left_width_px: Option<u32>,
     /// Stable `name` from [`RIGHT_ACTIVITIES`]. Same validity
     /// guarantee as [`left_selected`](Self::left_selected).
     pub right_selected: &'static str,
     pub right_open: bool,
+    /// Persisted right panel width in pixels. Same semantics as
+    /// [`left_width_px`](Self::left_width_px).
+    pub right_width_px: Option<u32>,
 }
 
 impl Default for SidebarSession {
@@ -183,8 +205,10 @@ impl Default for SidebarSession {
         Self {
             left_selected: DEFAULT_LEFT_SELECTED,
             left_open: DEFAULT_LEFT_OPEN,
+            left_width_px: None,
             right_selected: DEFAULT_RIGHT_SELECTED,
             right_open: DEFAULT_RIGHT_OPEN,
+            right_width_px: None,
         }
     }
 }
@@ -205,6 +229,16 @@ fn pick_entry_name(
         .unwrap_or(default)
 }
 
+/// Load a persisted pixel width, narrowing JSON `u64` → `u32`
+/// and silently falling back to `None` if the value is missing,
+/// malformed, or overflows.
+fn read_optional_width_px(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
 /// Load the persisted activity-bar session from config, filling
 /// missing or malformed fields with the fresh-install defaults.
 #[must_use]
@@ -219,6 +253,7 @@ pub fn load_session(config: &std::sync::Arc<sdr_config::ConfigManager>) -> Sideb
             .get(KEY_LEFT_OPEN)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(DEFAULT_LEFT_OPEN),
+        left_width_px: read_optional_width_px(v, KEY_LEFT_WIDTH_PX),
         right_selected: pick_entry_name(
             v.get(KEY_RIGHT_SELECTED)
                 .and_then(serde_json::Value::as_str),
@@ -229,6 +264,7 @@ pub fn load_session(config: &std::sync::Arc<sdr_config::ConfigManager>) -> Sideb
             .get(KEY_RIGHT_OPEN)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(DEFAULT_RIGHT_OPEN),
+        right_width_px: read_optional_width_px(v, KEY_RIGHT_WIDTH_PX),
     })
 }
 
@@ -237,6 +273,23 @@ pub fn save_left_selected(config: &std::sync::Arc<sdr_config::ConfigManager>, na
     config.write(|v| {
         v[KEY_LEFT_SELECTED] = serde_json::json!(name);
     });
+}
+
+/// Shared writer used by both sidebar width persistors.
+fn save_width_px(config: &std::sync::Arc<sdr_config::ConfigManager>, key: &str, px: u32) {
+    config.write(|v| {
+        v[key] = serde_json::json!(px);
+    });
+}
+
+/// Persist the left panel's pixel width.
+pub fn save_left_width_px(config: &std::sync::Arc<sdr_config::ConfigManager>, px: u32) {
+    save_width_px(config, KEY_LEFT_WIDTH_PX, px);
+}
+
+/// Persist the right panel's pixel width.
+pub fn save_right_width_px(config: &std::sync::Arc<sdr_config::ConfigManager>, px: u32) {
+    save_width_px(config, KEY_RIGHT_WIDTH_PX, px);
 }
 
 /// Persist the left panel open/closed state.
@@ -472,16 +525,53 @@ mod tests {
 
     #[test]
     fn session_round_trips_full_state() {
+        // Arbitrary in-range widths picked for the test — named
+        // so the save/assert pairs stay in lockstep and the
+        // intent reads as "a round-trip preserves the literal",
+        // not "420 magic bytes somewhere".
+        const TEST_LEFT_WIDTH_PX: u32 = 400;
+        const TEST_RIGHT_WIDTH_PX: u32 = 500;
+
         let config = make_config();
         save_left_selected(&config, "radio");
         save_left_open(&config, false);
+        save_left_width_px(&config, TEST_LEFT_WIDTH_PX);
         save_right_selected(&config, "bookmarks");
         save_right_open(&config, true);
+        save_right_width_px(&config, TEST_RIGHT_WIDTH_PX);
         let loaded = load_session(&config);
         assert_eq!(loaded.left_selected, "radio");
         assert!(!loaded.left_open);
+        assert_eq!(loaded.left_width_px, Some(TEST_LEFT_WIDTH_PX));
         assert_eq!(loaded.right_selected, "bookmarks");
         assert!(loaded.right_open);
+        assert_eq!(loaded.right_width_px, Some(TEST_RIGHT_WIDTH_PX));
+    }
+
+    #[test]
+    fn session_missing_widths_resolve_to_none() {
+        // Fresh install (or a pre-#429 config with no width keys)
+        // loads with `None` so the builder-time fractional default
+        // stands and no post-realize callback runs.
+        let config = make_config();
+        save_left_selected(&config, "general");
+        let loaded = load_session(&config);
+        assert_eq!(loaded.left_width_px, None);
+        assert_eq!(loaded.right_width_px, None);
+    }
+
+    #[test]
+    fn session_malformed_widths_resolve_to_none() {
+        // A hand-edited or upgrade-corrupted config shouldn't
+        // crash — `u64` that can't narrow to `u32`, wrong JSON
+        // types all become `None`.
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            KEY_LEFT_WIDTH_PX: "not-a-number",
+            KEY_RIGHT_WIDTH_PX: u64::from(u32::MAX) + 1,
+        })));
+        let loaded = load_session(&config);
+        assert_eq!(loaded.left_width_px, None);
+        assert_eq!(loaded.right_width_px, None);
     }
 
     #[test]
