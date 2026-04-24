@@ -211,6 +211,25 @@ mod tests {
     /// Quality value comfortably under the threshold (gap-fill territory).
     const TEST_BAD_QUALITY: f32 = 0.30;
 
+    /// Modulus for the synthetic pixel pattern. A prime under 256 gives
+    /// a long, non-repeating ramp inside the 2080-sample line so any
+    /// "preserved verbatim" assertion fails loudly if pixel order, width,
+    /// or content gets corrupted.
+    const TEST_PIXEL_PATTERN_MODULUS: usize = 251;
+
+    /// Number of lines pushed by the ordering test. Big enough to span
+    /// several buffer entries, small enough that the monotonic-timestamp
+    /// assertion runs in microseconds.
+    const TEST_ORDERED_INSERT_COUNT: u32 = 5;
+    /// Spacing (ms) between successive synthetic lines in the ordering
+    /// test. Half a second mirrors the real APT line cadence.
+    const TEST_ORDERED_STEP_MS: u64 = 500;
+
+    /// Authoritative APT scan width in pixels. Pinned independently of
+    /// `LINE_PIXELS` so any future protocol-width drift in `sdr-dsp` is
+    /// caught loudly here instead of silently propagating.
+    const EXPECTED_APT_WIDTH_PIXELS: usize = 2_080;
+
     /// Build an `AptLine` with the given quality and a deterministic
     /// non-zero pixel pattern so we can verify pixel preservation.
     fn synth_line(quality: f32) -> AptLine {
@@ -219,7 +238,7 @@ mod tests {
             ..AptLine::default()
         };
         for (i, p) in line.pixels.iter_mut().enumerate() {
-            *p = (i % 251) as u8; // any non-trivial pattern
+            *p = (i % TEST_PIXEL_PATTERN_MODULUS) as u8;
         }
         line
     }
@@ -301,12 +320,15 @@ mod tests {
     fn lines_are_ordered_by_insertion() {
         let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
         let t0 = Instant::now();
-        for i in 0..5_u32 {
+        for i in 0..TEST_ORDERED_INSERT_COUNT {
             let mut line = synth_line(TEST_GOOD_QUALITY);
             // Tag each line by writing its index into pixel 0 so we can
             // verify ordering is preserved by a renderer-style scan.
             line.pixels[0] = i as u8;
-            img.push_line(&line, t0 + Duration::from_millis(u64::from(i) * 500));
+            img.push_line(
+                &line,
+                t0 + Duration::from_millis(u64::from(i) * TEST_ORDERED_STEP_MS),
+            );
         }
         for (i, stored) in img.lines().iter().enumerate() {
             assert_eq!(stored.pixels[0], i as u8, "line at index {i} out of order");
@@ -336,6 +358,6 @@ mod tests {
     #[test]
     fn width_constant_matches_apt_line_pixels() {
         assert_eq!(AptImage::WIDTH, LINE_PIXELS);
-        assert_eq!(AptImage::WIDTH, 2080);
+        assert_eq!(AptImage::WIDTH, EXPECTED_APT_WIDTH_PIXELS);
     }
 }
