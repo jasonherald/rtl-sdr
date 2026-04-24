@@ -1927,6 +1927,18 @@ fn build_layout(
 
     // Inner (right) split view — sidebar sits on the trailing edge
     // so the right activity bar is the rightmost element on-screen.
+    // `sidebar-width-unit = Px` makes `sidebar_width_fraction`
+    // interpret its argument as literal pixels instead of a fraction
+    // of the split view's allocated width. Without this, the
+    // default-width math lies under nesting: the left split view is
+    // already narrower than the window (activity bars are outside
+    // it), and the right split view is narrower again (it lives in
+    // the left split's content area), so a naive
+    // `LEFT_SIDEBAR_DEFAULT_WIDTH / DEFAULT_WIDTH` fraction resolves
+    // to something smaller than the desired pixel width on every
+    // child. Pixels-first avoids the post-realize callback path and
+    // matches the `min_sidebar_width` / `max_sidebar_width` pixel
+    // units already in use.
     let right_split_view = adw::OverlaySplitView::builder()
         .sidebar_position(gtk4::PackType::End)
         .sidebar(&right_stack)
@@ -1934,7 +1946,8 @@ fn build_layout(
         .show_sidebar(false)
         .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * 2.0)
-        .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
+        .sidebar_width_unit(adw::LengthUnit::Px)
+        .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH)
         .build();
 
     // Outer (left) split view — sidebar hosts the left activity
@@ -1946,7 +1959,8 @@ fn build_layout(
         .show_sidebar(true)
         .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * 2.0)
-        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
+        .sidebar_width_unit(adw::LengthUnit::Px)
+        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH)
         .build();
     left_stack.set_visible_child_name("general");
 
@@ -6051,7 +6065,12 @@ fn connect_source_panel(
             ) else {
                 return;
             };
-            let is_network_path = device_row.selected() == DEVICE_RTLTCP;
+            // Raw Network (TCP/UDP IQ) has the same wire-bandwidth
+            // cost profile as rtl_tcp — a high-sample-rate pull
+            // across the network will saturate a 100 Mbit link
+            // either way. The advisory applies equally to both
+            // network-backed source types.
+            let is_network_path = matches!(device_row.selected(), DEVICE_NETWORK | DEVICE_RTLTCP);
             // Bounds-check the sample-rate index: transient
             // out-of-range values from widget-model churn would
             // otherwise satisfy the `>= threshold` compare and
