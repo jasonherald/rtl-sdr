@@ -14,6 +14,7 @@ pub mod decim_taps;
 pub mod demod;
 pub mod fft;
 pub mod filter;
+pub mod gpu_fft;
 pub mod loops;
 pub mod math;
 pub mod multirate;

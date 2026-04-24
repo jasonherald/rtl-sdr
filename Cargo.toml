@@ -244,6 +244,15 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # Zero-copy type casting
 bytemuck = { version = "1", features = ["derive"] }
 
+# GPU compute (epic #452 phase 2+). Used by sdr-dsp for the wgpu-backed
+# FFT engine behind the `FftEngine` trait. We target the default wgpu
+# backend set — Vulkan on Linux, Metal on macOS, DX12 on Windows —
+# which is what the `RTL-SDR` project supports anyway. `pollster`
+# drives wgpu's async surface to completion on the sync `FftEngine::
+# forward` path without pulling in a full async runtime.
+wgpu = "29"
+pollster = "0.4"
+
 # GTK4 / UI
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }

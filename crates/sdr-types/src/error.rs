@@ -5,6 +5,13 @@ pub enum DspError {
     InvalidParameter(String),
     #[error("buffer too small: need {need}, got {got}")]
     BufferTooSmall { need: usize, got: usize },
+    /// GPU-backed DSP path failed to initialise or run. Covers "no
+    /// compatible adapter", "device request failed", "shader
+    /// compile rejected by driver", and mid-transform mapping
+    /// failures. Carries a human-readable message so the caller
+    /// can log it or fall back to a CPU engine.
+    #[error("gpu unavailable: {0}")]
+    GpuUnavailable(String),
 }
 
 /// Errors from pipeline/streaming operations.
