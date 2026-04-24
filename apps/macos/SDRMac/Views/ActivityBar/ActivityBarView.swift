@@ -8,12 +8,14 @@
 // the left column (6 entries, `⌘1..6`) and the right column
 // (1 entry in scaffolding — `⌘⇧1` — grows to 2 after #448).
 //
-// Click semantics:
-// - Click an unselected icon → selects that activity, opens
-//   its panel.
-// - Click the currently-selected icon → clears selection,
-//   closes the panel. (Icon stays visible; just the panel
-//   slides away.)
+// Click semantics (mirrors the GTK
+// `wire_activity_bar_clicks` doc in `sdr-ui/src/window.rs`):
+//
+// - Click an unselected icon → selects that activity AND
+//   opens its panel.
+// - Click the currently-selected icon → toggles the panel
+//   open / closed; selection stays put so the icon keeps
+//   its highlight even when the panel is collapsed.
 //
 // Keyboard shortcut semantics match the Linux accelerators:
 // the index (1..N) binds to a `KeyEquivalent` of "1".."N" with
@@ -121,7 +123,11 @@ private struct ActivityBarButton<Activity: ActivityEntry>: View {
                 .foregroundStyle(isSelected ? Color.accentColor : .primary)
         }
         .buttonStyle(.plain)
-        .keyboardShortcut(shortcutKey, modifiers: shortcutModifiers)
+        // Pass the shortcut as an optional `KeyboardShortcut?`
+        // so an out-of-range `shortcutIndex` (>9) registers no
+        // shortcut at all rather than silently binding the Tab
+        // key. Per `CodeRabbit` round 2 on PR #491.
+        .keyboardShortcut(keyboardShortcut)
         .help(helpText)
         .accessibilityLabel(helpText)
         // Surface the active state to VoiceOver. The visual
@@ -132,23 +138,32 @@ private struct ActivityBarButton<Activity: ActivityEntry>: View {
         .accessibilityAddTraits(isPanelOpen ? .isSelected : [])
     }
 
-    /// Key equivalent for the 1..9 shortcut mapping. Out-of-range
-    /// indices degrade to no shortcut rather than crash — the
-    /// enums above all stay within 1..9, but belt-and-suspenders
-    /// in case a future activity is added past 9.
-    private var shortcutKey: KeyEquivalent {
+    /// `KeyboardShortcut?` for this button. Returns `nil` when
+    /// `shortcutIndex` falls outside `1...9`, which causes
+    /// `.keyboardShortcut(_:)` to register no shortcut at all
+    /// (the optional API form is the documented "no shortcut"
+    /// path; passing a real `KeyEquivalent` like `.tab` as a
+    /// fallback would actually bind the Tab key, which is the
+    /// trap CodeRabbit caught).
+    ///
+    /// All current activity enums stay within 1...9, so this
+    /// branch is a defensive guard for a future enum that adds
+    /// a 10th entry without expanding the digit table.
+    private var keyboardShortcut: KeyboardShortcut? {
+        let key: KeyEquivalent
         switch activity.shortcutIndex {
-        case 1: return "1"
-        case 2: return "2"
-        case 3: return "3"
-        case 4: return "4"
-        case 5: return "5"
-        case 6: return "6"
-        case 7: return "7"
-        case 8: return "8"
-        case 9: return "9"
-        default: return .tab  // unreachable under current enums
+        case 1: key = "1"
+        case 2: key = "2"
+        case 3: key = "3"
+        case 4: key = "4"
+        case 5: key = "5"
+        case 6: key = "6"
+        case 7: key = "7"
+        case 8: key = "8"
+        case 9: key = "9"
+        default: return nil
         }
+        return KeyboardShortcut(key, modifiers: shortcutModifiers)
     }
 
     private var helpText: String {

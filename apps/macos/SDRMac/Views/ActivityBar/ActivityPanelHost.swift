@@ -20,10 +20,26 @@ struct LeftPanelHost: View {
     var body: some View {
         switch activity {
         case .general:
-            ComingSoonPanel(
-                activity: activity,
-                followUpTicket: "#443 — General panel (band + source)"
-            )
+            // Scaffolding compromise per `CodeRabbit` round 2
+            // on PR #491: the legacy sidebar Form (Source +
+            // Radio + Display + Recording + Bookmarks +
+            // RtlTcpServer sections) hangs off the General
+            // slot during scaffolding so the user retains
+            // access to every existing control. Subsequent
+            // sub-tickets carve sections OUT of this Form
+            // and into their dedicated activity panels:
+            //
+            //  #443 → Source moves out (General panel proper)
+            //  #444 → Radio moves out
+            //  #445 → Audio (Recording) moves out
+            //  #446 → Display moves out
+            //  #447 → Scanner panel
+            //
+            // After all five land, this case will only carry
+            // the band presets + the trimmed Source content.
+            // Mirrors the Linux scaffolding decision in
+            // `crates/sdr-ui/src/window.rs`.
+            LegacySidebarPanel()
         case .radio:
             ComingSoonPanel(
                 activity: activity,
@@ -70,6 +86,37 @@ struct RightPanelHost: View {
                 followUpTicket: "#448 — Transcript + right activity bar"
             )
         }
+    }
+}
+
+/// Scaffolding-only stand-in for the General slot — keeps the
+/// pre-redesign sidebar Form (with every existing section)
+/// reachable while subsequent sub-tickets carve sections out
+/// into dedicated activity panels. Verbatim copy of the
+/// pre-#442 `SidebarView` body so the user loses nothing
+/// during the redesign transition.
+///
+/// Each carve-out sub-ticket (#443–#447) deletes the
+/// corresponding `*Section()` line from this body and stands
+/// up the matching panel in `LeftPanelHost`. When all five
+/// have landed, this struct can be deleted entirely.
+struct LegacySidebarPanel: View {
+    var body: some View {
+        Form {
+            SourceSection()
+            RadioSection()
+            DisplaySection()
+            RecordingSection()
+            BookmarksSection()
+            // `RtlTcpServerSection` is visible only when a
+            // local RTL-SDR dongle is detected — the section
+            // itself is always included in the form, but the
+            // body collapses to a single "no dongle" caption
+            // otherwise so it doesn't clutter the sidebar on
+            // a network/file source setup.
+            RtlTcpServerSection()
+        }
+        .formStyle(.grouped)
     }
 }
 
