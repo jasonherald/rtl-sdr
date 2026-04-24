@@ -1,7 +1,11 @@
 //! Radio / demodulator configuration panel — bandwidth, squelch, de-emphasis.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_dsp::propagation::{fspl_distance_m, watts_to_dbm};
 use sdr_dsp::tone_detect::{CTCSS_DEFAULT_THRESHOLD, CTCSS_TONES_HZ};
 use sdr_dsp::voice_squelch::{
     VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB, VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
@@ -94,6 +98,59 @@ const CTCSS_THRESHOLD_STEP: f64 = 0.01;
 /// Page step (scroll / page-down).
 const CTCSS_THRESHOLD_PAGE: f64 = 0.05;
 
+// ─── Distance estimator (FSPL) tuning ────────────────────────
+//
+// Config keys for the two user-settable inputs (ticket #164).
+// Persisted as top-level entries in the main JSON config rather
+// than inside a bookmark's `TuningProfile` because ERP and
+// receiver calibration are properties of the station + receiver
+// setup, not per-channel: a user's antenna/receiver chain has one
+// calibration offset, and typical usage is to dial in a known
+// transmitter's power once and estimate distances for whatever
+// channel they're on.
+
+/// Config key for the FSPL distance estimator's transmitter ERP,
+/// stored as watts. Public so `window.rs` can persist the row's
+/// value without re-typing the literal.
+pub const KEY_RADIO_DISTANCE_ERP_WATTS: &str = "radio_distance_erp_watts";
+
+/// Config key for the FSPL distance estimator's receiver
+/// calibration offset, stored as dB.
+pub const KEY_RADIO_DISTANCE_CALIBRATION_DB: &str = "radio_distance_calibration_db";
+
+// Transmitter effective radiated power (ERP) bounds. 25 W is a
+// reasonable default — most mobile public-safety radios (police,
+// fire, EMS) ship at 25-50 W, handhelds at 1-5 W, broadcast
+// transmitters up to ~100 kW. The spin row covers the useful
+// range without restricting experimentation.
+
+/// Default transmitter ERP in watts.
+const DEFAULT_ERP_WATTS: f64 = 25.0;
+/// Minimum ERP. Below this a user is probably mis-typing.
+const MIN_ERP_WATTS: f64 = 0.001;
+/// Maximum ERP — covers high-power FM broadcast.
+const MAX_ERP_WATTS: f64 = 100_000.0;
+/// Step size for small-knob tuning.
+const ERP_STEP_WATTS: f64 = 1.0;
+/// Page step for the scroll / page-down keys.
+const ERP_PAGE_WATTS: f64 = 10.0;
+
+/// Default receiver-chain calibration offset in dB. The FSPL
+/// formula assumes the received level in dBm is calibrated — most
+/// RTL-SDRs report relative dBFS with an arbitrary reference, so
+/// this slider lets the user dial in an offset until a known
+/// reference signal's distance reads correctly.
+const DEFAULT_CALIBRATION_DB: f64 = 0.0;
+/// Minimum calibration offset. ±30 dB covers every reasonable
+/// RTL-SDR reference-level scenario we've seen.
+const MIN_CALIBRATION_DB: f64 = -30.0;
+/// Maximum calibration offset.
+const MAX_CALIBRATION_DB: f64 = 30.0;
+/// Calibration offset step.
+const CALIBRATION_STEP_DB: f64 = 0.5;
+/// Calibration offset page step.
+const CALIBRATION_PAGE_DB: f64 = 5.0;
+
 /// Default squelch level in dB.
 const DEFAULT_SQUELCH_DB: f64 = -100.0;
 /// Minimum squelch level in dB.
@@ -180,6 +237,27 @@ pub struct RadioPanel {
     /// from `DspToUi::VoiceSquelchOpenChanged` via
     /// [`Self::set_voice_squelch_open`].
     pub voice_squelch_status_row: adw::ActionRow,
+    /// Transmitter effective radiated power (watts) — input to the
+    /// FSPL distance estimator. Persisted to config.
+    pub erp_row: adw::SpinRow,
+    /// Receiver calibration offset (dB). Shifts the raw signal
+    /// level before computing path loss. Persisted to config.
+    pub calibration_row: adw::SpinRow,
+    /// Read-only display row whose subtitle shows the current
+    /// distance estimate. Value set by [`Self::update_distance_display`].
+    pub distance_row: adw::ActionRow,
+    /// Cached most-recent signal level (dB). Used by the ERP /
+    /// calibration value-changed handlers so the distance display
+    /// refreshes immediately when the user tweaks a knob, even if
+    /// no new `SignalLevel` message arrives in between.
+    ///
+    /// `Rc<Cell<_>>` (not plain `Cell<_>`) so that cloning
+    /// `RadioPanel` shares the cache across clones — the derive
+    /// on plain `Cell` would produce disconnected caches.
+    pub distance_last_signal_db: Rc<Cell<Option<f32>>>,
+    /// Cached most-recent tuner centre frequency (Hz). Same
+    /// rationale as `distance_last_signal_db`.
+    pub distance_last_frequency_hz: Rc<Cell<Option<f64>>>,
 }
 
 impl RadioPanel {
@@ -486,6 +564,306 @@ impl RadioPanel {
             }
         });
     }
+
+    /// Cache a fresh signal level and recompute the distance
+    /// estimate. Called from the `DspToUi::SignalLevel` handler
+    /// in `window.rs` on every level update (~10 Hz).
+    pub fn update_distance_from_signal(&self, signal_db: f32, frequency_hz: f64) {
+        self.distance_last_signal_db.set(Some(signal_db));
+        self.distance_last_frequency_hz.set(Some(frequency_hz));
+        self.refresh_distance_display();
+    }
+
+    /// Cache a new tuner frequency and recompute the distance
+    /// estimate. Called from the tuner-change handler in
+    /// `window.rs`.
+    pub fn update_distance_frequency(&self, frequency_hz: f64) {
+        self.distance_last_frequency_hz.set(Some(frequency_hz));
+        self.refresh_distance_display();
+    }
+
+    /// Recompute and render the distance display from the cached
+    /// signal/frequency and the current ERP / calibration row
+    /// values. Called by the setters above and by the ERP /
+    /// calibration spin-row value-notify handlers.
+    pub fn refresh_distance_display(&self) {
+        let state = DistanceDisplay::compute(
+            self.distance_last_signal_db.get(),
+            self.distance_last_frequency_hz.get(),
+            self.erp_row.value(),
+            self.calibration_row.value(),
+        );
+        self.distance_row.set_subtitle(&state.format());
+    }
+}
+
+/// Standalone version of [`RadioPanel::refresh_distance_display`]
+/// usable from inside `build_radio_panel` before the `RadioPanel`
+/// struct has been materialised — wired to the ERP / calibration
+/// value-notify signals so a knob twiddle refreshes the display
+/// immediately. Both variants route through [`DistanceDisplay`]
+/// so the state machine stays in one place.
+fn refresh_distance_display_standalone(
+    erp_row: &adw::SpinRow,
+    calibration_row: &adw::SpinRow,
+    distance_row: &adw::ActionRow,
+    last_signal_db: Option<f32>,
+    last_frequency_hz: Option<f64>,
+) {
+    let state = DistanceDisplay::compute(
+        last_signal_db,
+        last_frequency_hz,
+        erp_row.value(),
+        calibration_row.value(),
+    );
+    distance_row.set_subtitle(&state.format());
+}
+
+/// Maximum distance in metres the formatter will print as a
+/// number. The longest great-circle path on Earth is ~20,015 km;
+/// above this the FSPL math is producing a physically
+/// meaningless result (almost always because path loss is
+/// implying a distance bigger than any RF can meaningfully
+/// travel from a terrestrial source).
+const MAX_MEANINGFUL_DISTANCE_M: f64 = 20_000_000.0;
+
+/// Calibrated received-power threshold (dBm) below which we
+/// assume there is no active signal to estimate a distance from.
+/// Slightly above the theoretical MDS of a sensitive narrowband
+/// receiver (~-130 dBm for a commercial VHF/UHF set, a bit
+/// better for lab gear). Anything below this is dominated by
+/// noise or is the pipeline reporting a squelch-gated floor —
+/// we label it "no active signal" rather than stretching FSPL
+/// into sci-fi territory.
+const NO_ACTIVE_SIGNAL_DBM: f64 = -130.0;
+
+/// Distinct visual states the distance display can be in.
+/// Split out so the logic is explicit and test-covered rather
+/// than buried in a single formatter function that had to
+/// overload "—" for several semantically different cases.
+#[derive(Debug, PartialEq)]
+enum DistanceDisplay {
+    /// No signal level has ever flowed yet — source not running
+    /// or panel freshly constructed.
+    NoData,
+    /// Calibrated received level is below receiver sensitivity,
+    /// so there is nothing real to measure. Typical cause:
+    /// squelch gated, source pointed at an empty channel, or
+    /// hardware disconnected.
+    NoActiveSignal,
+    /// Received level ≥ transmitted ERP — physically impossible
+    /// under FSPL. The user has a calibration problem (receiver
+    /// cal offset too large, or ERP set too low for the actual
+    /// transmitter).
+    CheckCalibration,
+    /// A signal is present above the sensitivity threshold but
+    /// path loss implies a distance greater than Earth's great-
+    /// circle maximum — the estimator has saturated.
+    TooWeak,
+    /// Meaningful distance in metres, safe to print as a number.
+    Value(f64),
+}
+
+impl DistanceDisplay {
+    /// Decide the display state from the live inputs. All four
+    /// fields-that-matter (last signal, last frequency, ERP,
+    /// calibration offset) get threaded through explicitly so
+    /// tests can pin every transition without constructing a
+    /// full `RadioPanel`.
+    fn compute(
+        signal_db: Option<f32>,
+        frequency_hz: Option<f64>,
+        erp_watts: f64,
+        cal_db: f64,
+    ) -> Self {
+        let (Some(raw_signal_db), Some(freq)) = (signal_db, frequency_hz) else {
+            return Self::NoData;
+        };
+        let received_dbm = f64::from(raw_signal_db) + cal_db;
+        if !received_dbm.is_finite() || received_dbm < NO_ACTIVE_SIGNAL_DBM {
+            return Self::NoActiveSignal;
+        }
+        let erp_dbm = watts_to_dbm(erp_watts);
+        let d = fspl_distance_m(erp_dbm, received_dbm, freq);
+        if !d.is_finite() || d < f64::EPSILON {
+            // `fspl_distance_m` returns 0.0 when received ≥ ERP
+            // (i.e., the user is receiving stronger than the
+            // transmitter putatively radiates — only reachable
+            // by miscalibrated inputs).
+            return Self::CheckCalibration;
+        }
+        if d > MAX_MEANINGFUL_DISTANCE_M {
+            return Self::TooWeak;
+        }
+        Self::Value(d)
+    }
+
+    /// Render the state as the subtitle text for the
+    /// `distance_row`. Keeps wording in one place so changes
+    /// don't drift between the panel helpers and test assertions.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn format(&self) -> String {
+        match *self {
+            Self::NoData => "—".to_string(),
+            Self::NoActiveSignal => "No active signal".to_string(),
+            Self::CheckCalibration => "Check calibration".to_string(),
+            Self::TooWeak => "Too weak to measure".to_string(),
+            Self::Value(d) => {
+                if d < 1_000.0 {
+                    format!("{} m", d.round() as u64)
+                } else if d < 1_000_000.0 {
+                    format!("{:.1} km", d / 1_000.0)
+                } else {
+                    let km_rounded_10 = ((d / 1_000.0) / 10.0).round() * 10.0;
+                    format!("{km_rounded_10:.0} km")
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod distance_display_tests {
+    use super::{DistanceDisplay, MAX_MEANINGFUL_DISTANCE_M};
+
+    // ERP for the scenarios below: a 25 W public-safety mobile,
+    // which is one of the defaults we suggest in the UI. Doesn't
+    // affect any of the state-transition boundaries this module
+    // tests — just needs to be a realistic value.
+    const TEST_ERP_WATTS: f64 = 25.0;
+    const TEST_FREQ_HZ: f64 = 155e6;
+
+    #[test]
+    fn no_data_when_signal_cache_empty() {
+        let s = DistanceDisplay::compute(None, Some(TEST_FREQ_HZ), TEST_ERP_WATTS, 0.0);
+        assert_eq!(s, DistanceDisplay::NoData);
+        assert_eq!(s.format(), "—");
+    }
+
+    #[test]
+    fn no_data_when_frequency_missing() {
+        let s = DistanceDisplay::compute(Some(-80.0), None, TEST_ERP_WATTS, 0.0);
+        assert_eq!(s, DistanceDisplay::NoData);
+    }
+
+    #[test]
+    fn no_active_signal_below_receiver_sensitivity() {
+        // -120 dB raw + -20 dB calibration → -140 dBm received,
+        // below our -130 dBm "active signal" threshold. This
+        // matches the exact user report of "squelch on, no audio,
+        // showing millions of km" (ticket #164 user feedback).
+        let s = DistanceDisplay::compute(Some(-120.0), Some(TEST_FREQ_HZ), TEST_ERP_WATTS, -20.0);
+        assert_eq!(s, DistanceDisplay::NoActiveSignal);
+        assert_eq!(s.format(), "No active signal");
+    }
+
+    #[test]
+    fn check_calibration_when_received_exceeds_transmitted() {
+        // 25 W ERP ≈ 44 dBm. Received at +50 dBm is louder than
+        // the transmitter — impossible under FSPL; user needs to
+        // check their calibration offset or ERP value.
+        let s = DistanceDisplay::compute(Some(50.0), Some(TEST_FREQ_HZ), TEST_ERP_WATTS, 0.0);
+        assert_eq!(s, DistanceDisplay::CheckCalibration);
+        assert_eq!(s.format(), "Check calibration");
+    }
+
+    #[test]
+    fn too_weak_when_signal_present_but_fspl_saturates() {
+        // Received level above the sensitivity threshold but
+        // implying a distance past Earth's great-circle max.
+        // -50 dB raw + -75 dB cal → -125 dBm received, just above
+        // the -130 dBm threshold; 25W at 155 MHz says distance is
+        // about 35,000 km — past the 20,000 km cap.
+        let s = DistanceDisplay::compute(Some(-50.0), Some(TEST_FREQ_HZ), TEST_ERP_WATTS, -75.0);
+        assert_eq!(s, DistanceDisplay::TooWeak);
+        assert_eq!(s.format(), "Too weak to measure");
+    }
+
+    #[test]
+    fn value_for_plausible_signal() {
+        // 25W ERP, -80 dBm received at 155 MHz → 44 dBm path loss
+        // of 124 dB → ~244 km FSPL. Hand-computed:
+        //   d = 10 ^ ((124 - 163.8 + 147.55) / 20)
+        //     = 10 ^ (107.75 / 20)  ≈  243 km
+        // Bounds generous (100–1000 km) so micro-drift in the
+        // 147.55 constant doesn't fail the test.
+        let s = DistanceDisplay::compute(Some(-80.0), Some(TEST_FREQ_HZ), TEST_ERP_WATTS, 0.0);
+        let DistanceDisplay::Value(d) = s else {
+            unreachable!("expected Value, got {s:?}");
+        };
+        assert!(
+            (100_000.0..1_000_000.0).contains(&d),
+            "expected 100-1000 km for -80 dBm received from 25W at 155 MHz, got {d} m"
+        );
+    }
+
+    #[test]
+    fn value_for_strong_signal() {
+        // Anchors the user-reported "9 km" scenario. For 25W at
+        // 155 MHz to produce a ~9 km estimate the received level
+        // has to be roughly -51 dBm — a very strong nearby
+        // station. The test just checks the same
+        // state-machine path returns `Value` and a modest
+        // (single-to-tens-of-km) distance.
+        let s = DistanceDisplay::compute(Some(-51.0), Some(TEST_FREQ_HZ), TEST_ERP_WATTS, 0.0);
+        let DistanceDisplay::Value(d) = s else {
+            unreachable!("expected Value, got {s:?}");
+        };
+        assert!(
+            (1_000.0..50_000.0).contains(&d),
+            "expected 1-50 km for -51 dBm received from 25W at 155 MHz, got {d} m"
+        );
+    }
+
+    #[test]
+    fn exactly_at_sensitivity_threshold_still_evaluates() {
+        // Boundary: exactly at the threshold should NOT trip
+        // `NoActiveSignal` — we use `<` not `<=` so legitimate
+        // edge-of-sensitivity receptions still get measured.
+        // The threshold is -130 dBm; explicit literal rather than
+        // casting `NO_ACTIVE_SIGNAL_DBM` because `as f32` would
+        // trip clippy's `cast_possible_truncation` even though
+        // -130.0 is exactly representable.
+        let signal_at_threshold_db: f32 = -130.0;
+        let s = DistanceDisplay::compute(
+            Some(signal_at_threshold_db),
+            Some(TEST_FREQ_HZ),
+            TEST_ERP_WATTS,
+            0.0,
+        );
+        assert_ne!(s, DistanceDisplay::NoActiveSignal);
+    }
+
+    // ─── format() rendering tests ─────────────────────────────
+
+    #[test]
+    fn format_sub_kilometre_shows_metres() {
+        assert_eq!(DistanceDisplay::Value(1.4).format(), "1 m");
+        assert_eq!(DistanceDisplay::Value(837.5).format(), "838 m");
+        assert_eq!(DistanceDisplay::Value(999.0).format(), "999 m");
+    }
+
+    #[test]
+    fn format_kilometre_range_has_one_decimal() {
+        assert_eq!(DistanceDisplay::Value(1_000.0).format(), "1.0 km");
+        assert_eq!(DistanceDisplay::Value(12_345.0).format(), "12.3 km");
+        assert_eq!(DistanceDisplay::Value(999_000.0).format(), "999.0 km");
+    }
+
+    #[test]
+    fn format_large_distances_round_to_10_km() {
+        assert_eq!(DistanceDisplay::Value(1_234_000.0).format(), "1230 km");
+        assert_eq!(DistanceDisplay::Value(1_500_000.0).format(), "1500 km");
+    }
+
+    #[test]
+    fn format_exactly_at_cap_still_shown_as_number() {
+        // Boundary case: the cap value itself is still a real
+        // distance (half of Earth's circumference). Only values
+        // STRICTLY above it transition to `TooWeak`.
+        let formatted = DistanceDisplay::Value(MAX_MEANINGFUL_DISTANCE_M).format();
+        assert!(formatted.ends_with(" km"));
+    }
 }
 
 /// Build the radio / demodulator configuration panel.
@@ -782,12 +1160,92 @@ pub fn build_radio_panel() -> RadioPanel {
     ctcss_group.add(&ctcss_threshold_row);
     ctcss_group.add(&ctcss_status_row);
 
+    // --- Distance Estimator (FSPL, ticket #164) ---
+    let erp_adj = gtk4::Adjustment::new(
+        DEFAULT_ERP_WATTS,
+        MIN_ERP_WATTS,
+        MAX_ERP_WATTS,
+        ERP_STEP_WATTS,
+        ERP_PAGE_WATTS,
+        0.0,
+    );
+    let erp_row = adw::SpinRow::builder()
+        .title("Transmitter Power")
+        .subtitle("Effective radiated power, in watts (handheld ~5, mobile ~25-50)")
+        .adjustment(&erp_adj)
+        .digits(3)
+        .build();
+
+    let cal_adj = gtk4::Adjustment::new(
+        DEFAULT_CALIBRATION_DB,
+        MIN_CALIBRATION_DB,
+        MAX_CALIBRATION_DB,
+        CALIBRATION_STEP_DB,
+        CALIBRATION_PAGE_DB,
+        0.0,
+    );
+    let calibration_row = adw::SpinRow::builder()
+        .title("Receiver Calibration")
+        .subtitle("dB offset applied to raw level before computing path loss")
+        .adjustment(&cal_adj)
+        .digits(1)
+        .build();
+
+    let distance_row = adw::ActionRow::builder()
+        .title("Estimated Distance")
+        .subtitle("—")
+        .selectable(false)
+        .activatable(false)
+        .build();
+
+    let distance_group = adw::PreferencesGroup::builder()
+        .title("Distance Estimator")
+        .description(
+            "Rough line-of-sight (FSPL) estimate — read as an upper bound, not precision ranging",
+        )
+        .build();
+    distance_group.add(&erp_row);
+    distance_group.add(&calibration_row);
+    distance_group.add(&distance_row);
+
+    // Internal state shared across the panel clone surface — see
+    // the field docs on `RadioPanel` for why this is `Rc<Cell>`
+    // rather than plain `Cell`.
+    let distance_last_signal_db: Rc<Cell<Option<f32>>> = Rc::new(Cell::new(None));
+    let distance_last_frequency_hz: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
+
+    // Wire ERP and calibration spin-row changes to trigger a
+    // distance refresh using the cached signal/frequency. Config
+    // persistence and any DSP plumbing that cares about these
+    // values is wired separately in `window.rs` on the same
+    // signal — both handlers run on value change.
+    {
+        let last_signal = Rc::clone(&distance_last_signal_db);
+        let last_freq = Rc::clone(&distance_last_frequency_hz);
+        let erp_row_for_signal = erp_row.clone();
+        let cal_row_for_signal = calibration_row.clone();
+        let distance_row_for_signal = distance_row.clone();
+        let refresh = move || {
+            refresh_distance_display_standalone(
+                &erp_row_for_signal,
+                &cal_row_for_signal,
+                &distance_row_for_signal,
+                last_signal.get(),
+                last_freq.get(),
+            );
+        };
+        let refresh_for_erp = refresh.clone();
+        erp_row.connect_value_notify(move |_| refresh_for_erp());
+        calibration_row.connect_value_notify(move |_| refresh());
+    }
+
     let page = adw::PreferencesPage::new();
     page.add(&bandwidth_group);
     page.add(&squelch_group);
     page.add(&filters_group);
     page.add(&deemphasis_group);
     page.add(&ctcss_group);
+    page.add(&distance_group);
 
     // All rows connected to DSP pipeline via window.rs
 
@@ -813,6 +1271,11 @@ pub fn build_radio_panel() -> RadioPanel {
         voice_squelch_row,
         voice_squelch_threshold_row,
         voice_squelch_status_row,
+        erp_row,
+        calibration_row,
+        distance_row,
+        distance_last_signal_db,
+        distance_last_frequency_hz,
     }
 }
 
