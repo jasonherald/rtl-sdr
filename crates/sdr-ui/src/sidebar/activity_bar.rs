@@ -129,6 +129,137 @@ pub const RIGHT_ACTIVITIES: &[ActivityBarEntry] = &[
     },
 ];
 
+// ─── Session persistence (#428) ───────────────────────────────
+//
+// Four config keys carry the across-restart activity-bar state.
+// `width_px` is a separate concern that lands with sub-ticket
+// #429 (resize handles). The `expanded.<panel>.<section>` keys
+// the design doc envisaged are moot — the panels shipped with
+// flat `AdwPreferencesGroup`s instead of `AdwExpanderRow`s, so
+// there is no per-section collapse state to remember.
+
+/// Config key for the `name` of the currently selected left
+/// activity. Values must be one of [`LEFT_ACTIVITIES`]`.name`.
+pub const KEY_LEFT_SELECTED: &str = "ui_sidebar_left_selected";
+/// Config key for the left split-view's open/closed state.
+pub const KEY_LEFT_OPEN: &str = "ui_sidebar_left_open";
+/// Config key for the `name` of the currently selected right
+/// activity. Values must be one of [`RIGHT_ACTIVITIES`]`.name`.
+pub const KEY_RIGHT_SELECTED: &str = "ui_sidebar_right_selected";
+/// Config key for the right split-view's open/closed state.
+pub const KEY_RIGHT_OPEN: &str = "ui_sidebar_right_open";
+
+/// Default left selection on a fresh install. Must match an entry
+/// in [`LEFT_ACTIVITIES`].
+pub const DEFAULT_LEFT_SELECTED: &str = "general";
+/// Default left-panel open state on a fresh install.
+pub const DEFAULT_LEFT_OPEN: bool = true;
+/// Default right selection on a fresh install. Must match an
+/// entry in [`RIGHT_ACTIVITIES`].
+pub const DEFAULT_RIGHT_SELECTED: &str = "transcript";
+/// Default right-panel open state on a fresh install — closed,
+/// per the design doc's "Transcript opt-in" note.
+pub const DEFAULT_RIGHT_OPEN: bool = false;
+
+/// Persisted activity-bar state, loaded once at launch by
+/// [`load_session`] and applied before the window is presented.
+/// Every field resolves to a concrete value even on a fresh
+/// install; callers don't see `Option`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarSession {
+    /// Stable `name` from [`LEFT_ACTIVITIES`]. Guaranteed valid
+    /// (a stale config naming a removed activity falls back to
+    /// [`DEFAULT_LEFT_SELECTED`]).
+    pub left_selected: &'static str,
+    pub left_open: bool,
+    /// Stable `name` from [`RIGHT_ACTIVITIES`]. Same validity
+    /// guarantee as [`left_selected`](Self::left_selected).
+    pub right_selected: &'static str,
+    pub right_open: bool,
+}
+
+impl Default for SidebarSession {
+    fn default() -> Self {
+        Self {
+            left_selected: DEFAULT_LEFT_SELECTED,
+            left_open: DEFAULT_LEFT_OPEN,
+            right_selected: DEFAULT_RIGHT_SELECTED,
+            right_open: DEFAULT_RIGHT_OPEN,
+        }
+    }
+}
+
+/// Resolve a persisted activity name against the canonical entry
+/// list. Returns the entry's `&'static str` (not the caller's
+/// borrowed config value) so downstream code — notably
+/// `wire_activity_bar_clicks` — can hold it in a
+/// `RefCell<&'static str>` without lifetime headaches. Any stale
+/// or typo'd name falls back to `default`.
+fn pick_entry_name(
+    candidate: Option<&str>,
+    entries: &'static [ActivityBarEntry],
+    default: &'static str,
+) -> &'static str {
+    candidate
+        .and_then(|c| entries.iter().find(|e| e.name == c).map(|e| e.name))
+        .unwrap_or(default)
+}
+
+/// Load the persisted activity-bar session from config, filling
+/// missing or malformed fields with the fresh-install defaults.
+#[must_use]
+pub fn load_session(config: &std::sync::Arc<sdr_config::ConfigManager>) -> SidebarSession {
+    config.read(|v| SidebarSession {
+        left_selected: pick_entry_name(
+            v.get(KEY_LEFT_SELECTED).and_then(serde_json::Value::as_str),
+            LEFT_ACTIVITIES,
+            DEFAULT_LEFT_SELECTED,
+        ),
+        left_open: v
+            .get(KEY_LEFT_OPEN)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(DEFAULT_LEFT_OPEN),
+        right_selected: pick_entry_name(
+            v.get(KEY_RIGHT_SELECTED)
+                .and_then(serde_json::Value::as_str),
+            RIGHT_ACTIVITIES,
+            DEFAULT_RIGHT_SELECTED,
+        ),
+        right_open: v
+            .get(KEY_RIGHT_OPEN)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(DEFAULT_RIGHT_OPEN),
+    })
+}
+
+/// Persist the left-activity selection.
+pub fn save_left_selected(config: &std::sync::Arc<sdr_config::ConfigManager>, name: &str) {
+    config.write(|v| {
+        v[KEY_LEFT_SELECTED] = serde_json::json!(name);
+    });
+}
+
+/// Persist the left panel open/closed state.
+pub fn save_left_open(config: &std::sync::Arc<sdr_config::ConfigManager>, open: bool) {
+    config.write(|v| {
+        v[KEY_LEFT_OPEN] = serde_json::json!(open);
+    });
+}
+
+/// Persist the right-activity selection.
+pub fn save_right_selected(config: &std::sync::Arc<sdr_config::ConfigManager>, name: &str) {
+    config.write(|v| {
+        v[KEY_RIGHT_SELECTED] = serde_json::json!(name);
+    });
+}
+
+/// Persist the right panel open/closed state.
+pub fn save_right_open(config: &std::sync::Arc<sdr_config::ConfigManager>, open: bool) {
+    config.write(|v| {
+        v[KEY_RIGHT_OPEN] = serde_json::json!(open);
+    });
+}
+
 /// Which edge of the window the activity bar sits against. Controls
 /// the CSS class list and the border side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,5 +429,84 @@ mod tests {
                 entry.name
             );
         }
+    }
+
+    // ─── Session persistence ────────────────────────────────
+
+    use std::sync::Arc;
+
+    use sdr_config::ConfigManager;
+
+    fn make_config() -> Arc<ConfigManager> {
+        Arc::new(ConfigManager::in_memory(&serde_json::json!({})))
+    }
+
+    #[test]
+    fn session_defaults_on_fresh_config() {
+        let config = make_config();
+        let loaded = load_session(&config);
+        assert_eq!(loaded, SidebarSession::default());
+    }
+
+    #[test]
+    fn session_default_agrees_with_canonical_activity_list() {
+        // `DEFAULT_LEFT_SELECTED` / `DEFAULT_RIGHT_SELECTED` must
+        // resolve against their respective entry lists — a typo
+        // would silently fall back to the entry's own default
+        // string but then `pick_entry_name` with the stale key
+        // would still work because it matches by name. Pin the
+        // direct presence here to catch the misspelling earlier.
+        assert!(
+            LEFT_ACTIVITIES
+                .iter()
+                .any(|e| e.name == DEFAULT_LEFT_SELECTED),
+            "DEFAULT_LEFT_SELECTED not in LEFT_ACTIVITIES"
+        );
+        assert!(
+            RIGHT_ACTIVITIES
+                .iter()
+                .any(|e| e.name == DEFAULT_RIGHT_SELECTED),
+            "DEFAULT_RIGHT_SELECTED not in RIGHT_ACTIVITIES"
+        );
+    }
+
+    #[test]
+    fn session_round_trips_full_state() {
+        let config = make_config();
+        save_left_selected(&config, "radio");
+        save_left_open(&config, false);
+        save_right_selected(&config, "bookmarks");
+        save_right_open(&config, true);
+        let loaded = load_session(&config);
+        assert_eq!(loaded.left_selected, "radio");
+        assert!(!loaded.left_open);
+        assert_eq!(loaded.right_selected, "bookmarks");
+        assert!(loaded.right_open);
+    }
+
+    #[test]
+    fn session_stale_selection_falls_back_to_default() {
+        // A config left behind by an older build (pre-Share)
+        // might name an activity we removed. Fall back to the
+        // default rather than crash or show a blank stack.
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            KEY_LEFT_SELECTED: "removed-activity",
+            KEY_RIGHT_SELECTED: "also-removed",
+        })));
+        let loaded = load_session(&config);
+        assert_eq!(loaded.left_selected, DEFAULT_LEFT_SELECTED);
+        assert_eq!(loaded.right_selected, DEFAULT_RIGHT_SELECTED);
+    }
+
+    #[test]
+    fn session_malformed_values_fall_back_to_defaults() {
+        let config = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            KEY_LEFT_SELECTED: 42,
+            KEY_LEFT_OPEN: "not-a-bool",
+            KEY_RIGHT_SELECTED: [1, 2, 3],
+            KEY_RIGHT_OPEN: "nope",
+        })));
+        let loaded = load_session(&config);
+        assert_eq!(loaded, SidebarSession::default());
     }
 }

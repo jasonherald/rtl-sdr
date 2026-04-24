@@ -238,21 +238,68 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // CURRENTLY-selected icon toggles the panel while keeping the
     // icon selected (design doc §4.2). `:checked` CSS renders the
     // accent tint via `ToggleButton::active`.
-    if let Some(general_btn) = left_activity_bar.buttons.get("general") {
-        general_btn.set_active(true);
+    //
+    // Seed ordering (closes #428): load the persisted session,
+    // apply to widgets BEFORE wiring the persistence notify
+    // handlers, so the initial `set_active` / `set_visible_child` /
+    // `set_show_sidebar` calls don't write the same value back
+    // through the save path. Matches the "seed-then-wire" pattern
+    // `connect_volume_persistence` uses.
+    let session = sidebar::activity_bar::load_session(config);
+    left_stack.set_visible_child_name(session.left_selected);
+    if let Some(btn) = left_activity_bar.buttons.get(session.left_selected) {
+        btn.set_active(true);
     }
-    wire_activity_bar_clicks(&left_activity_bar, &left_stack, &left_split_view, "general");
+    left_split_view.set_show_sidebar(session.left_open);
+    right_stack.set_visible_child_name(session.right_selected);
+    if session.right_open
+        && let Some(btn) = right_activity_bar.buttons.get(session.right_selected)
+    {
+        btn.set_active(true);
+    }
+    right_split_view.set_show_sidebar(session.right_open);
 
-    // Right bar pre-selection: Transcript is the landing activity
-    // when the right panel first opens. No button starts visually
-    // active because the panel itself starts closed — first click
-    // opens it and flips the matching icon's `active` on.
+    wire_activity_bar_clicks(
+        &left_activity_bar,
+        &left_stack,
+        &left_split_view,
+        session.left_selected,
+    );
     wire_activity_bar_clicks(
         &right_activity_bar,
         &right_stack,
         &right_split_view,
-        "transcript",
+        session.right_selected,
     );
+
+    // Persistence — wire AFTER the seed so the initial sets don't
+    // round-trip back through config. `save_*` writes are cheap
+    // (`ConfigManager` batches); every activity click / panel
+    // open-close writes.
+    for (&name, btn) in &left_activity_bar.buttons {
+        let config_weak = std::sync::Arc::clone(config);
+        btn.connect_toggled(move |b| {
+            if b.is_active() {
+                sidebar::activity_bar::save_left_selected(&config_weak, name);
+            }
+        });
+    }
+    for (&name, btn) in &right_activity_bar.buttons {
+        let config_weak = std::sync::Arc::clone(config);
+        btn.connect_toggled(move |b| {
+            if b.is_active() {
+                sidebar::activity_bar::save_right_selected(&config_weak, name);
+            }
+        });
+    }
+    let config_left_open = std::sync::Arc::clone(config);
+    left_split_view.connect_show_sidebar_notify(move |sv| {
+        sidebar::activity_bar::save_left_open(&config_left_open, sv.shows_sidebar());
+    });
+    let config_right_open = std::sync::Arc::clone(config);
+    right_split_view.connect_show_sidebar_notify(move |sv| {
+        sidebar::activity_bar::save_right_open(&config_right_open, sv.shows_sidebar());
+    });
 
     // Header sidebar toggle ↔ left split view `show-sidebar` sync.
     // Without this, clicking the currently-selected activity icon to
@@ -267,6 +314,9 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
             toggle.set_active(sv.shows_sidebar());
         }
     });
+    // Seed the header sidebar toggle to match the restored left
+    // panel state so F9's "is it open?" check starts accurate.
+    sidebar_toggle.set_active(session.left_open);
 
     let toolbar_view = build_toolbar_view(&header, &layout_root);
     let breakpoint = build_breakpoint(&left_split_view, &right_split_view);
