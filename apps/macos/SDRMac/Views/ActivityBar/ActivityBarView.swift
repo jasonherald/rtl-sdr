@@ -166,8 +166,15 @@ private struct ActivityBarButton<Activity: ActivityEntry>: View {
         return KeyboardShortcut(key, modifiers: shortcutModifiers)
     }
 
+    /// Tooltip + accessibility label. Falls back to just the
+    /// activity label when `keyboardShortcut` is `nil`, so an
+    /// out-of-range `shortcutIndex` doesn't show a phantom
+    /// `⌘10` glyph that wouldn't actually fire. Per
+    /// `CodeRabbit` round 3 on PR #491.
     private var helpText: String {
-        // Build the shortcut string Mac-style: ⌘1 / ⌘⇧1.
+        guard keyboardShortcut != nil else {
+            return activity.label
+        }
         let shortcut = formatShortcut(
             index: activity.shortcutIndex,
             modifiers: shortcutModifiers
