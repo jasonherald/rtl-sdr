@@ -112,7 +112,8 @@ impl AptImage {
     }
 
     /// Start a fresh pass, pre-reserving room for `max_lines` scan lines.
-    /// Pushing past `max_lines` still works but pays one Vec reallocation.
+    /// Pushing past `max_lines` still works, but additional growth may
+    /// trigger one or more Vec reallocations as it doubles to fit.
     #[must_use]
     pub fn with_capacity(pass_start: Instant, max_lines: usize) -> Self {
         Self {
