@@ -252,9 +252,14 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     }
     left_split_view.set_show_sidebar(session.left_open);
     right_stack.set_visible_child_name(session.right_selected);
-    if session.right_open
-        && let Some(btn) = right_activity_bar.buttons.get(session.right_selected)
-    {
+    // Seed the right selection as active even when the panel
+    // restores closed. The activity-bar contract (design doc §4.2)
+    // is that an icon stays visually selected through open/close
+    // cycles — the icon is a preview of "which slot opens next".
+    // Without this, `right_stack` + `wire_activity_bar_clicks`
+    // would both treat `session.right_selected` as selected while
+    // the bar shows no active button until the user's first click.
+    if let Some(btn) = right_activity_bar.buttons.get(session.right_selected) {
         btn.set_active(true);
     }
     right_split_view.set_show_sidebar(session.right_open);
