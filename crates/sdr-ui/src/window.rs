@@ -1815,7 +1815,7 @@ fn build_layout(
         .vexpand(true)
         .build();
     left_stack.add_named(&general_panel.widget, Some("general"));
-    left_stack.add_named(&page_from_group(&panels.radio.widget), Some("radio"));
+    left_stack.add_named(&panels.radio.widget, Some("radio"));
     left_stack.add_named(&page_from_group(&panels.audio.widget), Some("audio"));
     left_stack.add_named(&page_from_group(&panels.display.widget), Some("display"));
     left_stack.add_named(&page_from_widget(&panels.scanner.widget), Some("scanner"));
