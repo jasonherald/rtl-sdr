@@ -1,5 +1,5 @@
 //! Display settings panel — FFT size, window function, frame rate, color map,
-//! dB range, fill mode, and averaging mode.
+//! dB range, fill mode, averaging mode, and theme.
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -30,10 +30,30 @@ const DEFAULT_MIN_DB: f64 = -70.0;
 /// Default maximum dB level for the display range.
 const DEFAULT_MAX_DB: f64 = 0.0;
 
+/// Minimum dB level the `Min Level` spin row will accept.
+const MIN_DB_FLOOR: f64 = -200.0;
+/// Maximum value the `Min Level` spin row will accept.
+const MIN_DB_CEILING: f64 = 0.0;
+/// Minimum value the `Max Level` spin row will accept.
+const MAX_DB_FLOOR: f64 = -120.0;
+/// Maximum value the `Max Level` spin row will accept.
+const MAX_DB_CEILING: f64 = 20.0;
+/// Step for the dB spin rows (keyboard / scroll).
+const DB_STEP: f64 = 1.0;
+/// Page step for the dB spin rows.
+const DB_PAGE: f64 = 10.0;
+/// Step for the frame-rate spin row.
+const FPS_STEP: f64 = 1.0;
+/// Page step for the frame-rate spin row.
+const FPS_PAGE: f64 = 5.0;
+
 /// Display settings panel with references to interactive rows.
 pub struct DisplayPanel {
-    /// The `AdwPreferencesGroup` widget to pack into the sidebar.
-    pub widget: adw::PreferencesGroup,
+    /// The `AdwPreferencesPage` widget packed into the Display
+    /// activity stack slot. Hosts four titled
+    /// `AdwPreferencesGroup`s (FFT / Waterfall / Levels /
+    /// Appearance) — see [`build_display_panel`].
+    pub widget: adw::PreferencesPage,
     /// FFT size selector.
     pub fft_size_row: adw::ComboRow,
     /// Window function selector.
@@ -55,12 +75,13 @@ pub struct DisplayPanel {
 }
 
 /// Build the display settings panel.
+///
+/// Lays out as an `AdwPreferencesPage` with four titled sections
+/// matching the activity-bar redesign's Apple-style rhythm (design
+/// doc §3.4). Flat groups, no `AdwExpanderRow` wrappers — same call
+/// as the General / Radio / Audio panels.
+#[allow(clippy::too_many_lines)]
 pub fn build_display_panel() -> DisplayPanel {
-    let group = adw::PreferencesGroup::builder()
-        .title("Display")
-        .description("Spectrum and waterfall settings")
-        .build();
-
     // --- FFT Size ---
     let fft_labels: Vec<String> = FFT_SIZES.iter().map(usize::to_string).collect();
     let fft_label_refs: Vec<&str> = fft_labels.iter().map(String::as_str).collect();
@@ -80,7 +101,7 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- Frame Rate ---
-    let fps_adj = gtk4::Adjustment::new(DEFAULT_FPS, MIN_FPS, MAX_FPS, 1.0, 5.0, 0.0);
+    let fps_adj = gtk4::Adjustment::new(DEFAULT_FPS, MIN_FPS, MAX_FPS, FPS_STEP, FPS_PAGE, 0.0);
     let frame_rate_row = adw::SpinRow::builder()
         .title("Frame Rate")
         .subtitle("FPS")
@@ -96,7 +117,14 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- Min dB ---
-    let min_db_adj = gtk4::Adjustment::new(DEFAULT_MIN_DB, -200.0, 0.0, 1.0, 10.0, 0.0);
+    let min_db_adj = gtk4::Adjustment::new(
+        DEFAULT_MIN_DB,
+        MIN_DB_FLOOR,
+        MIN_DB_CEILING,
+        DB_STEP,
+        DB_PAGE,
+        0.0,
+    );
     let min_db_row = adw::SpinRow::builder()
         .title("Min Level")
         .subtitle("dB")
@@ -105,7 +133,14 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
 
     // --- Max dB ---
-    let max_db_adj = gtk4::Adjustment::new(DEFAULT_MAX_DB, -120.0, 20.0, 1.0, 10.0, 0.0);
+    let max_db_adj = gtk4::Adjustment::new(
+        DEFAULT_MAX_DB,
+        MAX_DB_FLOOR,
+        MAX_DB_CEILING,
+        DB_STEP,
+        DB_PAGE,
+        0.0,
+    );
     let max_db_row = adw::SpinRow::builder()
         .title("Max Level")
         .subtitle("dB")
@@ -133,20 +168,50 @@ pub fn build_display_panel() -> DisplayPanel {
         .model(&theme_model)
         .build();
 
-    group.add(&fft_size_row);
-    group.add(&window_fn_row);
-    group.add(&frame_rate_row);
-    group.add(&color_map_row);
-    group.add(&min_db_row);
-    group.add(&max_db_row);
-    group.add(&fill_mode_row);
-    group.add(&averaging_row);
-    group.add(&theme_row);
+    // --- Sectioned preferences page ---
+    // Section `title` + `description` pattern mirrors the other
+    // panels (Audio / Radio / Source) so the header rhythm is
+    // consistent across activities. Descriptions are plain English
+    // — hints for users new to FFT / dB terminology.
+    let fft_group = adw::PreferencesGroup::builder()
+        .title("FFT")
+        .description("Frequency transform resolution and update rate")
+        .build();
+    fft_group.add(&fft_size_row);
+    fft_group.add(&window_fn_row);
+    fft_group.add(&frame_rate_row);
+
+    let waterfall_group = adw::PreferencesGroup::builder()
+        .title("Waterfall")
+        .description("Color mapping for the scrolling history")
+        .build();
+    waterfall_group.add(&color_map_row);
+
+    let levels_group = adw::PreferencesGroup::builder()
+        .title("Levels")
+        .description("Signal range and averaging on the spectrum trace")
+        .build();
+    levels_group.add(&min_db_row);
+    levels_group.add(&max_db_row);
+    levels_group.add(&averaging_row);
+    levels_group.add(&fill_mode_row);
+
+    let appearance_group = adw::PreferencesGroup::builder()
+        .title("Appearance")
+        .description("Application theme")
+        .build();
+    appearance_group.add(&theme_row);
+
+    let page = adw::PreferencesPage::new();
+    page.add(&fft_group);
+    page.add(&waterfall_group);
+    page.add(&levels_group);
+    page.add(&appearance_group);
 
     // FFT size and window function connected via window.rs
 
     DisplayPanel {
-        widget: group,
+        widget: page,
         fft_size_row,
         window_fn_row,
         frame_rate_row,
@@ -166,5 +231,15 @@ mod tests {
         assert!(super::MIN_FPS <= super::MAX_FPS);
         assert!(super::DEFAULT_FPS >= super::MIN_FPS);
         assert!(super::DEFAULT_FPS <= super::MAX_FPS);
+    };
+
+    /// Compile-time validation that dB range constants are consistent.
+    const _: () = {
+        assert!(super::MIN_DB_FLOOR <= super::MIN_DB_CEILING);
+        assert!(super::MAX_DB_FLOOR <= super::MAX_DB_CEILING);
+        assert!(super::DEFAULT_MIN_DB >= super::MIN_DB_FLOOR);
+        assert!(super::DEFAULT_MIN_DB <= super::MIN_DB_CEILING);
+        assert!(super::DEFAULT_MAX_DB >= super::MAX_DB_FLOOR);
+        assert!(super::DEFAULT_MAX_DB <= super::MAX_DB_CEILING);
     };
 }
