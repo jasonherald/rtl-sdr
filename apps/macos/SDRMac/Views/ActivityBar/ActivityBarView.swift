@@ -23,10 +23,21 @@
 import SwiftUI
 
 struct ActivityBarView<Activity: ActivityEntry>: View {
-    /// Selected activity for this column, or `nil` when the
-    /// panel is closed. Binding so parent view owns the state;
-    /// session persistence wires into this same binding in #449.
-    @Binding var selection: Activity?
+    /// Which activity is currently "selected" in this column.
+    /// Stays stable across open/close — tapping the same icon
+    /// twice flips `isOpen` but leaves `selection` alone, so
+    /// the icon keeps its active highlight even when the panel
+    /// is hidden. This split maps 1:1 onto the Linux
+    /// `ui_sidebar_{left,right}_selected` config key for
+    /// session persistence in #449. Per `CodeRabbit` round 1
+    /// on PR #491.
+    @Binding var selection: Activity
+
+    /// Whether the panel next to this bar is currently
+    /// visible. Independent of `selection` — closing the
+    /// panel doesn't clear which activity was selected.
+    /// Maps onto Linux `ui_sidebar_{left,right}_open`.
+    @Binding var isOpen: Bool
 
     /// Modifier set applied to each activity's shortcut.
     /// `.command` for the left column, `[.command, .shift]`
@@ -45,8 +56,9 @@ struct ActivityBarView<Activity: ActivityEntry>: View {
                 ActivityBarButton(
                     activity: activity,
                     isSelected: selection == activity,
+                    isPanelOpen: selection == activity && isOpen,
                     shortcutModifiers: shortcutModifiers,
-                    onTap: { toggle(activity) }
+                    onTap: { tap(activity) }
                 )
             }
             Spacer(minLength: 0)
@@ -56,17 +68,22 @@ struct ActivityBarView<Activity: ActivityEntry>: View {
         .background(Color(nsColor: .underPageBackgroundColor))
     }
 
-    /// Select `activity`, or clear the selection if `activity`
-    /// was already selected. Mirrors the Linux "same-button
-    /// toggles panel while keeping the icon selected" intent
-    /// — on Mac the icon visual selection simply falls out of
-    /// the `selection == activity` read below, so no separate
-    /// "icon pressed but panel closed" state is needed.
-    private func toggle(_ activity: Activity) {
+    /// Click-handler semantics — matches the GTK
+    /// `wire_activity_bar_clicks` comment in
+    /// `sdr-ui/src/window.rs`:
+    ///
+    /// - Tapping the **currently-selected** icon toggles the
+    ///   panel open/closed. Selection stays put so the icon
+    ///   remains visually active.
+    /// - Tapping a **different** icon switches selection AND
+    ///   opens the panel (matching Linux "different-button
+    ///   swaps stack + opens panel").
+    private func tap(_ activity: Activity) {
         if selection == activity {
-            selection = nil
+            isOpen.toggle()
         } else {
             selection = activity
+            isOpen = true
         }
     }
 }
@@ -76,7 +93,17 @@ struct ActivityBarView<Activity: ActivityEntry>: View {
 /// visual treatment live in one place.
 private struct ActivityBarButton<Activity: ActivityEntry>: View {
     let activity: Activity
+    /// `true` when this is the column's currently-selected
+    /// activity. Persists across open/close so the icon stays
+    /// visually highlighted even when the panel is closed —
+    /// matches the Linux activity-bar contract.
     let isSelected: Bool
+    /// `true` only when this activity is selected AND its
+    /// panel is open. Drives the `.isSelected` accessibility
+    /// trait so VoiceOver announces "selected" only for the
+    /// active panel, not for a remembered-but-collapsed
+    /// selection.
+    let isPanelOpen: Bool
     let shortcutModifiers: EventModifiers
     let onTap: () -> Void
 
@@ -97,6 +124,12 @@ private struct ActivityBarButton<Activity: ActivityEntry>: View {
         .keyboardShortcut(shortcutKey, modifiers: shortcutModifiers)
         .help(helpText)
         .accessibilityLabel(helpText)
+        // Surface the active state to VoiceOver. The visual
+        // highlight (tint + background) tells sighted users
+        // which panel is active; the `.isSelected` trait
+        // tells screen readers the same thing. Per `CodeRabbit`
+        // round 1 on PR #491.
+        .accessibilityAddTraits(isPanelOpen ? .isSelected : [])
     }
 
     /// Key equivalent for the 1..9 shortcut mapping. Out-of-range

@@ -75,15 +75,23 @@ struct ContentView: View {
     //  these bindings into `sdr-config` via #449.
     // ----------------------------------------------------------
 
-    /// Which left panel is currently open, or `nil` when
-    /// collapsed. Defaults to `.general` matching the Linux
-    /// startup behavior.
-    @State private var leftSelection: LeftActivity? = .general
+    /// Currently-selected left activity. Stays stable across
+    /// panel open/close so the icon highlight persists when
+    /// the user collapses the panel via a second click.
+    /// `leftPanelOpen` controls visibility independently.
+    /// This split mirrors the Linux
+    /// `ui_sidebar_left_{selected,open}` config-key pair, so
+    /// #449's session-persistence wires both bindings into
+    /// the shared sdr-config JSON. Per `CodeRabbit` round 1
+    /// on PR #491.
+    @State private var leftSelection: LeftActivity = .general
+    @State private var leftPanelOpen: Bool = true
 
-    /// Which right panel is currently open, or `nil` when
-    /// collapsed. Defaults to `nil` — the right bar is there
-    /// but starts closed, matching Linux.
-    @State private var rightSelection: RightActivity? = nil
+    /// Same split for the right bar. Defaults: Transcript
+    /// remembered as the active activity, panel starts closed
+    /// — matches Linux startup.
+    @State private var rightSelection: RightActivity = .transcript
+    @State private var rightPanelOpen: Bool = false
 
     /// Ideal width of a left / right panel. `HSplitView` in
     /// #450 will let the user drag these; today they're fixed.
@@ -95,14 +103,17 @@ struct ContentView: View {
             // Left activity bar — always visible.
             ActivityBarView(
                 selection: $leftSelection,
+                isOpen: $leftPanelOpen,
                 shortcutModifiers: .command
             )
             Divider()
 
-            // Left panel — only when an activity is selected.
+            // Left panel — visible only when `leftPanelOpen`.
+            // The remembered `leftSelection` stays put when
+            // closed so a re-open snaps back to the same panel.
             // Placeholder bodies during scaffolding; real
             // panels land in #443–#447.
-            if let leftSelection {
+            if leftPanelOpen {
                 LeftPanelHost(activity: leftSelection)
                     .frame(width: Self.leftPanelWidth)
                 Divider()
@@ -143,7 +154,7 @@ struct ContentView: View {
             // Right panel — placeholder during scaffolding.
             // The existing flyouts above still live inside the
             // detail column; #448 unifies these surfaces.
-            if let rightSelection {
+            if rightPanelOpen {
                 Divider()
                 RightPanelHost(activity: rightSelection)
                     .frame(width: Self.rightPanelWidth)
@@ -154,6 +165,7 @@ struct ContentView: View {
             // in scaffolding; #448 adds the second.
             ActivityBarView(
                 selection: $rightSelection,
+                isOpen: $rightPanelOpen,
                 shortcutModifiers: [.command, .shift]
             )
         }
