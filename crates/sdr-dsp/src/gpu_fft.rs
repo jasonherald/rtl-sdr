@@ -40,12 +40,19 @@
 //!
 //! | N     | P   | Q   | stage-1 sub-FFT | stage-2 sub-FFT |
 //! |-------|-----|-----|-----------------|-----------------|
-//! | 2048  | 32  | 64  | 32              | 64              |
+//! | 2048  | 32  | 64  | 64              | 32              |
 //! | 4096  | 64  | 64  | 64              | 64              |
-//! | 8192  | 64  | 128 | 64              | 128             |
+//! | 8192  | 64  | 128 | 128             | 64              |
 //! | 16384 | 128 | 128 | 128             | 128             |
-//! | 32768 | 128 | 256 | 128             | 256             |
+//! | 32768 | 128 | 256 | 256             | 128             |
 //! | 65536 | 256 | 256 | 256             | 256             |
+//!
+//! Stage-1 sub-FFT size is Q (not P) because the 2D Cooley-Tukey
+//! decomposition runs the "inner" DFT over the Q-length sub-
+//! sequences first — one workgroup per `p ∈ [0, P)`, each
+//! computing a size-Q transform — then the "outer" size-P DFT
+//! across the results. `build_pipelines_and_bgs` mirrors this:
+//! `stage1_sub_n = decomp.q`, `stage2_sub_n = decomp.p`.
 //!
 //! Sizes below `MAX_SUB_N` (≤ 256) use the degenerate P = 1
 //! case — single stage, no cross-tier twiddle.
