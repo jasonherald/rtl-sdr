@@ -1,6 +1,14 @@
 //! wgpu-backed FFT engine — tiered 2D Cooley-Tukey decomposition
 //! with single-dispatch shared-memory sub-FFTs per tier (epic
-//! #452 phase 2b / #179).
+//! #452 phase 2b / #179). Phase 2c extends this with:
+//!
+//! - [`GpuFftEngine::forward_no_readback`]: experimental method
+//!   that runs the compute but skips the GPU→CPU readback, for
+//!   measuring the readback cost and validating the future
+//!   "GPU FFT → GPU colormap → render" chain architecture.
+//! - [`GpuFftOptions::adapter_name_substring`]: explicit adapter
+//!   selection by name, used by the bench harness to
+//!   disambiguate between multiple same-class GPUs on one host.
 //!
 //! Lives behind the same [`FftEngine`] trait as [`RustFftEngine`]
 //! so callers can hot-swap CPU↔GPU without touching the signal
@@ -137,6 +145,19 @@ pub struct GpuFftOptions {
     /// as a sanity check — the shader should produce identical
     /// output on any compliant backend.
     pub force_fallback_adapter: bool,
+    /// Optional substring to match against the adapter's reported
+    /// name. When set, the engine enumerates all adapters on the
+    /// requested `backends` and picks the first whose `name`
+    /// contains this substring (case-insensitive). Falls back to
+    /// [`DspError::GpuUnavailable`] if no adapter matches.
+    ///
+    /// Primary use case: the dev machine in epic #452 has two
+    /// discrete NVIDIA cards (4080 Super, 3090) which are both
+    /// reported as `HighPerformance` by `request_adapter`, so the
+    /// default pick is deterministic but not selectable. This
+    /// field lets the bench harness pin one specifically, e.g.
+    /// `adapter_name_substring: Some("3090".into())`.
+    pub adapter_name_substring: Option<String>,
 }
 
 impl Default for GpuFftOptions {
@@ -145,6 +166,7 @@ impl Default for GpuFftOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             backends: wgpu::Backends::all(),
             force_fallback_adapter: false,
+            adapter_name_substring: None,
         }
     }
 }
@@ -350,6 +372,14 @@ impl GpuFftEngine {
     /// Create the wgpu instance, pick an adapter per `opts`, and
     /// request a device + queue. Split out of `build_async` to
     /// keep that function under the `too_many_lines` clippy bar.
+    ///
+    /// When `opts.adapter_name_substring` is `None`, this falls
+    /// through to wgpu's `request_adapter` (respecting power
+    /// preference and fallback flags). When set, it instead
+    /// enumerates every adapter on the requested backends and
+    /// picks the first whose `name` contains the substring
+    /// (case-insensitive) — used to disambiguate between
+    /// multiple discrete GPUs that share the same power class.
     async fn acquire_device(
         opts: &GpuFftOptions,
     ) -> Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>, AdapterSummary), DspError> {
@@ -357,14 +387,28 @@ impl GpuFftEngine {
         instance_desc.backends = opts.backends;
         let instance = wgpu::Instance::new(instance_desc);
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: opts.power_preference,
-                force_fallback_adapter: opts.force_fallback_adapter,
-                compatible_surface: None,
-            })
-            .await
-            .map_err(|e| DspError::GpuUnavailable(format!("request_adapter failed: {e}")))?;
+        let adapter = if let Some(needle) = opts.adapter_name_substring.as_deref() {
+            let needle_lc = needle.to_ascii_lowercase();
+            let adapters = instance.enumerate_adapters(opts.backends).await;
+            adapters
+                .into_iter()
+                .find(|a| a.get_info().name.to_ascii_lowercase().contains(&needle_lc))
+                .ok_or_else(|| {
+                    DspError::GpuUnavailable(format!(
+                        "no adapter name contains {needle:?} (backends = {:?})",
+                        opts.backends,
+                    ))
+                })?
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: opts.power_preference,
+                    force_fallback_adapter: opts.force_fallback_adapter,
+                    compatible_surface: None,
+                })
+                .await
+                .map_err(|e| DspError::GpuUnavailable(format!("request_adapter failed: {e}")))?
+        };
 
         let info = adapter.get_info();
         let summary = AdapterSummary {
@@ -452,7 +496,6 @@ impl GpuFftEngine {
         let workgroup_size = sub_n / POINTS_PER_THREAD;
         let log2_sub_n = sub_n.trailing_zeros();
 
-        // wgpu 29 takes override constants as `&[(&str, f64)]`.
         let constants: [(&str, f64); 4] = [
             ("WORKGROUP_SIZE", f64::from(workgroup_size)),
             ("SUB_N", f64::from(sub_n)),
@@ -782,6 +825,137 @@ impl GpuFftEngine {
     }
 }
 
+impl GpuFftEngine {
+    /// Encode the one-or-two compute dispatches for a tiered FFT
+    /// into `encoder`. Shared by the full [`FftEngine::forward`]
+    /// path (which tacks on a readback) and the experimental
+    /// [`Self::forward_no_readback`] path (which doesn't).
+    fn encode_dispatches(&self, encoder: &mut wgpu::CommandEncoder) -> Result<(), DspError> {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("sdr-dsp GPU FFT compute pass"),
+            timestamp_writes: None,
+        });
+
+        // Stage 1 dispatch. Uniform at offset 0. Missing pipeline
+        // here means `build_async` returned Ok with a pipelines
+        // map that doesn't cover the stage we need — an internal
+        // regression, but surface it as a typed `GpuUnavailable`
+        // rather than panicking from library code.
+        let stage1_pipeline = self.pipelines.get(&self.stage1_sub_n).ok_or_else(|| {
+            DspError::GpuUnavailable(format!(
+                "missing stage-1 GPU FFT pipeline for sub_n={}",
+                self.stage1_sub_n,
+            ))
+        })?;
+        pass.set_pipeline(stage1_pipeline);
+        pass.set_bind_group(0, &self.bind_group_stage1, &[0]);
+        pass.dispatch_workgroups(self.stage1_workgroups, 1, 1);
+
+        // Stage 2 dispatch (only for tiered). Uniform at offset
+        // `params_stride`.
+        if let Some(bg2) = &self.bind_group_stage2 {
+            let stage2_pipeline = self.pipelines.get(&self.stage2_sub_n).ok_or_else(|| {
+                DspError::GpuUnavailable(format!(
+                    "missing stage-2 GPU FFT pipeline for sub_n={}",
+                    self.stage2_sub_n,
+                ))
+            })?;
+            pass.set_pipeline(stage2_pipeline);
+            pass.set_bind_group(0, bg2, &[self.params_stride]);
+            pass.dispatch_workgroups(self.stage2_workgroups, 1, 1);
+        }
+
+        Ok(())
+    }
+
+    /// Which ping-pong buffer holds the final FFT result after
+    /// the last dispatch. Exposed so the future chain API can
+    /// point the next pipeline stage at the right source without
+    /// re-computing the decomposition.
+    fn final_buffer(&self) -> &wgpu::Buffer {
+        if self.output_in_buf_a {
+            &self.buf_a
+        } else {
+            &self.buf_b
+        }
+    }
+
+    /// **Experimental (phase 2c).** Run the FFT compute but leave
+    /// the result on the GPU — no copy to staging, no
+    /// `map_async`, no host-side memcpy. `input` is uploaded to
+    /// the engine's internal buffer and the forward DFT is
+    /// dispatched; this call blocks until the GPU signals the
+    /// dispatches are complete, but the spectrum never leaves
+    /// the device.
+    ///
+    /// Purpose: validate the "GPU FFT → GPU colormap → render"
+    /// chain architecture for epic #452 phase 3a. Measuring this
+    /// path against the full [`FftEngine::forward`] lets us put
+    /// a real number on the readback cost at each FFT size —
+    /// which is our main lever for making the GPU path actually
+    /// faster than CPU at small N.
+    ///
+    /// Not part of the `FftEngine` trait because there's nothing
+    /// useful to hand the caller: by definition the result is
+    /// not on CPU. A future chain API will return a handle to
+    /// the on-device buffer instead.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`FftEngine::forward`].
+    pub fn forward_no_readback(&mut self, input: &[Complex]) -> Result<(), DspError> {
+        if input.len() != self.size {
+            return Err(DspError::BufferTooSmall {
+                need: self.size,
+                got: input.len(),
+            });
+        }
+
+        // 1. Upload input.
+        self.queue
+            .write_buffer(&self.buf_a, 0, bytemuck::cast_slice(input));
+
+        // 2. Encode the dispatches (no readback copy).
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sdr-dsp GPU FFT encoder (no-readback)"),
+            });
+        self.encode_dispatches(&mut encoder)?;
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // 3. Register an on-submitted-work-done callback so
+        //    `poll(Wait)` has the same driver path as the
+        //    map_async-based readback wait. Empirically, a bare
+        //    `poll(Wait)` with no callbacks registered can
+        //    follow a different (slower) code path in the
+        //    NVIDIA Vulkan driver — using the same completion
+        //    mechanism as the readback path keeps the comparison
+        //    apples-to-apples. We reuse the pre-allocated
+        //    `map_complete` slot as the signal since it already
+        //    has the right shape.
+        {
+            let mut slot = self
+                .map_complete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = None;
+        }
+        let completion = Arc::clone(&self.map_complete);
+        self.queue.on_submitted_work_done(move || {
+            let mut slot = completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(Ok(()));
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| DspError::GpuUnavailable(format!("device poll failed: {e}")))?;
+
+        Ok(())
+    }
+}
+
 impl FftEngine for GpuFftEngine {
     fn forward(&mut self, buf: &mut [Complex]) -> Result<(), DspError> {
         if buf.len() != self.size {
@@ -795,57 +969,18 @@ impl FftEngine for GpuFftEngine {
         self.queue
             .write_buffer(&self.buf_a, 0, bytemuck::cast_slice(buf));
 
-        // 2. Encode one or two compute dispatches.
+        // 2. Encode the compute dispatches and the staging copy
+        //    into a single encoder / single submit.
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("sdr-dsp GPU FFT encoder"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sdr-dsp GPU FFT compute pass"),
-                timestamp_writes: None,
-            });
-
-            // Stage 1 dispatch. Uniform at offset 0. Missing
-            // pipeline here means `build_async` returned Ok with a
-            // pipelines map that doesn't cover the stage we need —
-            // an internal regression, but surface it as a typed
-            // `GpuUnavailable` rather than panicking from library
-            // code.
-            let stage1_pipeline = self.pipelines.get(&self.stage1_sub_n).ok_or_else(|| {
-                DspError::GpuUnavailable(format!(
-                    "missing stage-1 GPU FFT pipeline for sub_n={}",
-                    self.stage1_sub_n,
-                ))
-            })?;
-            pass.set_pipeline(stage1_pipeline);
-            pass.set_bind_group(0, &self.bind_group_stage1, &[0]);
-            pass.dispatch_workgroups(self.stage1_workgroups, 1, 1);
-
-            // Stage 2 dispatch (only for tiered). Uniform at
-            // offset `params_stride`.
-            if let Some(bg2) = &self.bind_group_stage2 {
-                let stage2_pipeline = self.pipelines.get(&self.stage2_sub_n).ok_or_else(|| {
-                    DspError::GpuUnavailable(format!(
-                        "missing stage-2 GPU FFT pipeline for sub_n={}",
-                        self.stage2_sub_n,
-                    ))
-                })?;
-                pass.set_pipeline(stage2_pipeline);
-                pass.set_bind_group(0, bg2, &[self.params_stride]);
-                pass.dispatch_workgroups(self.stage2_workgroups, 1, 1);
-            }
-        }
+        self.encode_dispatches(&mut encoder)?;
 
         // 3. Copy final buffer to staging for readback.
-        let final_buf = if self.output_in_buf_a {
-            &self.buf_a
-        } else {
-            &self.buf_b
-        };
         let buffer_bytes = (self.size * std::mem::size_of::<Complex>()) as u64;
-        encoder.copy_buffer_to_buffer(final_buf, 0, &self.staging, 0, buffer_bytes);
+        encoder.copy_buffer_to_buffer(self.final_buffer(), 0, &self.staging, 0, buffer_bytes);
 
         self.queue.submit(std::iter::once(encoder.finish()));
 

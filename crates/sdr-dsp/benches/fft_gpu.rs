@@ -77,6 +77,15 @@ fn gpu_options_from_env() -> GpuFftOptions {
             other => eprintln!("unknown SDR_GPU_BACKEND={other:?}, using default"),
         }
     }
+    // Adapter name substring — primary reason is the dev machine
+    // has both a 4080 Super and a 3090 reporting as
+    // `HighPerformance`, so `SDR_GPU_NAME=3090` is the only way
+    // to pin the bench to the specific card.
+    if let Ok(name) = std::env::var("SDR_GPU_NAME")
+        && !name.is_empty()
+    {
+        opts.adapter_name_substring = Some(name);
+    }
     opts
 }
 
@@ -125,5 +134,51 @@ fn bench_forward(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_forward);
+/// Companion bench measuring [`GpuFftEngine::forward_no_readback`]
+/// — identical shape to `bench_forward` but skips the
+/// map/poll/unmap/memcpy-out steps. The delta against
+/// `bench_forward` is the readback cost, which we expect to be
+/// the dominant remaining overhead after phase 2b.
+///
+/// This is an experimental measurement only — the production
+/// `FftEngine::forward` path always reads back, and nothing
+/// consumes the GPU-resident result yet. But the numbers directly
+/// inform whether building a "GPU FFT → GPU colormap → render"
+/// chain (epic #452 phase 3a) is worth the architecture.
+fn bench_forward_no_readback(c: &mut Criterion) {
+    let opts = gpu_options_from_env();
+
+    let mut group = c.benchmark_group("fft_forward_gpu_no_readback");
+    for &size in SIZES {
+        group.throughput(Throughput::Elements(size as u64));
+        let input = make_input(size);
+
+        let Ok(mut engine) = GpuFftEngine::with_options(size, &opts) else {
+            eprintln!("GPU FFT engine unavailable at size={size}, skipping");
+            continue;
+        };
+
+        let summary = engine.adapter_summary();
+        eprintln!(
+            "fft_forward_gpu_no_readback/size={size}: adapter = {} ({:?} / {:?}) driver = {}",
+            summary.name, summary.device_type, summary.backend, summary.driver,
+        );
+
+        group.bench_function(format!("size={size}"), |b| {
+            b.iter_batched(
+                || black_box(input.clone()),
+                |buf| {
+                    engine
+                        .forward_no_readback(&buf)
+                        .expect("GPU forward (no readback)");
+                    black_box(&buf);
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_forward, bench_forward_no_readback);
 criterion_main!(benches);
