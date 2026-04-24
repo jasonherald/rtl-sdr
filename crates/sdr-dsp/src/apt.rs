@@ -542,9 +542,12 @@ impl AptDecoder {
     /// Build a decoder for audio sampled at `input_rate_hz`.
     ///
     /// Typical value is 48000 (the output rate of the FM demodulator).
-    /// Must be at least `2 · SUBCARRIER_HZ` (4800 Hz) — below that the
-    /// 2400 Hz APT subcarrier is already aliased before this pipeline
-    /// gets a chance to look at it, which would produce silent garbage.
+    /// Must be **strictly greater than** `2 · SUBCARRIER_HZ` (4800 Hz)
+    /// — at exactly 4800 Hz the 2400 Hz APT subcarrier sits on Nyquist
+    /// where each sample lands at a phase-ambiguous point on the cosine,
+    /// and below that it's already aliased before this pipeline gets a
+    /// chance to look at it. Either case produces silent garbage, so
+    /// the boundary itself is rejected.
     ///
     /// # Errors
     ///
