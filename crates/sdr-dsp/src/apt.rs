@@ -32,6 +32,8 @@
 //! sample counter for tracking the start-of-line offset as successive audio
 //! buffers stream in.
 
+use std::collections::VecDeque;
+
 use sdr_types::{Complex, DspError};
 
 use crate::filter::FirFilter;
@@ -481,6 +483,15 @@ const DECODER_BUFFER_CAP: usize = SAMPLES_PER_LINE * 3;
 /// the line after the matched sync.
 const MIN_ACCUMULATOR_FOR_DECODE: usize = SAMPLES_PER_LINE * 2;
 
+/// Maximum number of decoded-but-undelivered `AptLine`s the decoder will
+/// queue internally when the caller's `output` slice is too small to hold
+/// every line that became ready. Bounded so the queue itself can't grow
+/// unboundedly, but large enough to absorb a few seconds of latency
+/// between calls — at 2 lines/sec, 8 lines = 4 s of slack. Lines past
+/// the cap stay buffered as raw envelope samples in `accumulator` (which
+/// has its own cap); only after both fill does anything get dropped.
+const READY_QUEUE_CAP: usize = 8;
+
 /// End-to-end APT line decoder.
 ///
 /// Owns the resampler, envelope detector, and sync correlator, and carries
@@ -501,6 +512,12 @@ pub struct AptDecoder {
     resample_scratch: Vec<f32>,
     envelope_scratch: Vec<f32>,
     accumulator: Vec<f32>,
+
+    // Decoded-but-undelivered scan lines. Lives separately from
+    // `accumulator` so that lines we couldn't fit into the caller's
+    // `output` are preserved as fully-decoded data (not as raw samples
+    // in the cap-trimmed accumulator that could be silently dropped).
+    ready_lines: VecDeque<AptLine>,
 
     // Cumulative count of *intermediate-rate* samples (envelope samples)
     // that have been streamed through the accumulator and dropped on a
@@ -547,6 +564,7 @@ impl AptDecoder {
             resample_scratch: Vec::new(),
             envelope_scratch: Vec::new(),
             accumulator: Vec::with_capacity(DECODER_BUFFER_CAP),
+            ready_lines: VecDeque::with_capacity(READY_QUEUE_CAP),
             accumulator_start_intermediate_sample: 0,
         })
     }
@@ -556,6 +574,7 @@ impl AptDecoder {
         self.resampler.reset();
         self.envelope.reset();
         self.accumulator.clear();
+        self.ready_lines.clear();
         self.accumulator_start_intermediate_sample = 0;
     }
 
@@ -568,19 +587,26 @@ impl AptDecoder {
     /// A return value of `0` is normal until the buffer has accumulated
     /// enough data for the first line (~0.5 s into a capture).
     ///
-    /// **Streaming semantics:** if more lines are ready than `output` can
-    /// hold, the function emits as many as fit and returns the count; the
-    /// remaining ready lines stay buffered and become available on the
-    /// next `process` call. This keeps the error path clean (no streaming
-    /// state mutated then unwound) and lets a small fixed-size output
-    /// buffer drive the decoder safely. The buffer cap of three lines
-    /// internally bounds how far behind the caller can get.
+    /// **Streaming semantics.** If more lines are ready than `output` can
+    /// hold, the surplus is preserved as fully-decoded `AptLine`s in a
+    /// small internal queue (`READY_QUEUE_CAP` lines) and surfaces on
+    /// subsequent calls. The raw envelope buffer is processed in chunks
+    /// bounded by the accumulator cap, so even a multi-megabyte input
+    /// chunk can never grow internal memory past
+    /// `DECODER_BUFFER_CAP + (one chunk)` at any moment. Sample-level
+    /// dropping only happens when both the ready queue *and* the raw
+    /// accumulator are full, which only occurs when the caller has
+    /// stopped draining `output` for several seconds.
     ///
     /// # Errors
     ///
     /// Propagates [`DspError`] from the resampler or envelope detector.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn process(&mut self, input: &[f32], output: &mut [AptLine]) -> Result<usize, DspError> {
+        // 0. Drain previously-queued ready lines into `output` first so
+        // the queue has room to absorb new emissions before any decode.
+        let mut produced = self.drain_ready_into_output(output, 0);
+
         // 1. Resample to the internal 20800 Hz grid.
         let est_out = (input.len() as u64 * u64::from(INTERMEDIATE_RATE_HZ)
             / u64::from(self.input_rate_hz)) as usize
@@ -595,25 +621,84 @@ impl AptDecoder {
             &mut self.envelope_scratch,
         )?;
 
-        // 3. Append to the accumulator.
-        self.accumulator
-            .extend_from_slice(&self.envelope_scratch[..resampled]);
+        // 3. Feed the envelope into the accumulator in *chunks bounded by
+        // DECODER_BUFFER_CAP*. After each chunk, run the decode + cap
+        // cycle. This is what keeps memory bounded even for huge inputs:
+        // accumulator grows by at most one chunk before the cap re-trims.
+        let mut env_offset = 0_usize;
+        while env_offset < resampled {
+            // Take a chunk that fits in the remaining cap space, with a
+            // hard floor of one line so we always make forward progress
+            // (e.g. when the accumulator is already at cap).
+            let space_until_cap = DECODER_BUFFER_CAP.saturating_sub(self.accumulator.len());
+            let max_take = space_until_cap.max(SAMPLES_PER_LINE);
+            let take = (resampled - env_offset).min(max_take);
+            self.accumulator
+                .extend_from_slice(&self.envelope_scratch[env_offset..env_offset + take]);
+            env_offset += take;
 
-        // 4. Emit as many lines as `output` can hold. Stopping at the
-        // caller's capacity (rather than erroring) keeps the streaming
-        // contract: any line we *don't* emit this call stays buffered
-        // and surfaces on the next call. State mutates only for lines
-        // that successfully landed in `output` — no half-applied drains.
-        let mut produced = 0_usize;
-        while produced < output.len() && self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
-            // Search the first SAMPLES_PER_LINE tau positions — any match
-            // in there leaves a full SAMPLES_PER_LINE window for the line
-            // body without running past the end.
+            // Decode whatever lines are now sliceable, routing each one
+            // either into the caller's output or into the ready queue.
+            produced = self.decode_into_output_or_queue(output, produced);
+
+            // Cap the raw accumulator. By construction we're at most
+            // DECODER_BUFFER_CAP + SAMPLES_PER_LINE here, so we drop at
+            // most one line of raw samples per chunk — and only when
+            // *both* the ready queue and the live `output` were full.
+            if self.accumulator.len() > DECODER_BUFFER_CAP {
+                let drop_n = self.accumulator.len() - DECODER_BUFFER_CAP;
+                self.accumulator.drain(..drop_n);
+                self.accumulator_start_intermediate_sample += drop_n as u64;
+            }
+        }
+
+        // 4. Edge case: empty input. The `while env_offset < resampled`
+        // loop never ran, but the caller might still be waiting for
+        // queued data, and earlier process() calls may have buffered
+        // enough for another decode. Run one final pass.
+        if resampled == 0 {
+            produced = self.decode_into_output_or_queue(output, produced);
+        }
+
+        Ok(produced)
+    }
+
+    /// Pop already-decoded lines off the ready queue into `output`,
+    /// starting at index `produced`, until either the queue empties or
+    /// `output` fills. Returns the new `produced` count.
+    fn drain_ready_into_output(&mut self, output: &mut [AptLine], mut produced: usize) -> usize {
+        while produced < output.len() {
+            let Some(line) = self.ready_lines.pop_front() else {
+                break;
+            };
+            output[produced] = line;
+            produced += 1;
+        }
+        produced
+    }
+
+    /// Inner decode loop. While the accumulator holds enough samples for
+    /// a sync search + full line, find the next sync, slice the line,
+    /// and route it to `output[produced]` if there's room there, else
+    /// to the ready queue if it has room, else stop. Returns the new
+    /// `produced` count.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn decode_into_output_or_queue(
+        &mut self,
+        output: &mut [AptLine],
+        mut produced: usize,
+    ) -> usize {
+        while self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
+            // Nowhere to put the next line — leave the accumulator alone
+            // so the next `process` call can pick up from here.
+            if produced >= output.len() && self.ready_lines.len() >= READY_QUEUE_CAP {
+                break;
+            }
+
+            // Search the first SAMPLES_PER_LINE tau positions — any
+            // match in there leaves a full SAMPLES_PER_LINE window
+            // for the line body without running past the end.
             let search_len = SAMPLES_PER_LINE + SYNC_A_TEMPLATE_LEN;
-            // `find_best` only returns `None` when the search slice is
-            // shorter than the template; the loop guard guarantees that
-            // can't happen here, but stay defensive: a future constants
-            // change shouldn't be allowed to abort the whole DSP path.
             let Some(m) = self
                 .sync_detector
                 .find_best(&self.accumulator[..search_len], SyncChannel::A)
@@ -624,31 +709,27 @@ impl AptDecoder {
             let line_start = m.offset;
             let line_end = line_start + SAMPLES_PER_LINE;
 
-            // The `produced < output.len()` loop guard guarantees this
-            // index is in bounds.
-            let slot = &mut output[produced];
-            decimate_into_pixels(&self.accumulator[line_start..line_end], &mut slot.pixels);
-            slot.sync_quality = m.quality;
-            slot.sync_channel = SyncChannel::A;
-            slot.input_sample_index = self.accumulator_to_input_index(line_start);
-            produced += 1;
+            // Build the line on the stack (a 2 KB struct), then move it
+            // into the right destination. Stack alloc + memcpy avoids
+            // heap traffic on the hot path.
+            let mut line = AptLine::default();
+            decimate_into_pixels(&self.accumulator[line_start..line_end], &mut line.pixels);
+            line.sync_quality = m.quality;
+            line.sync_channel = SyncChannel::A;
+            line.input_sample_index = self.accumulator_to_input_index(line_start);
 
-            // Drain the accumulator through the end of the emitted line.
+            if produced < output.len() {
+                output[produced] = line;
+                produced += 1;
+            } else {
+                // Queue room is guaranteed by the loop guard above.
+                self.ready_lines.push_back(line);
+            }
+
             self.accumulator.drain(..line_end);
             self.accumulator_start_intermediate_sample += line_end as u64;
         }
-
-        // 5. Cap buffered memory. If a stretch of noise keeps `find_best`
-        // from producing a high-quality match we still eat a line's worth
-        // of samples every loop iteration, but belt-and-braces: bound the
-        // worst case.
-        if self.accumulator.len() > DECODER_BUFFER_CAP {
-            let drop_n = self.accumulator.len() - DECODER_BUFFER_CAP;
-            self.accumulator.drain(..drop_n);
-            self.accumulator_start_intermediate_sample += drop_n as u64;
-        }
-
-        Ok(produced)
+        produced
     }
 
     /// Convert an offset within the envelope accumulator (intermediate-rate
@@ -1294,36 +1375,78 @@ mod tests {
     }
 
     #[test]
-    fn apt_decoder_undersized_output_buffers_remainder() {
-        // Streaming contract: if more lines are ready than `output` can
-        // hold, emit as many as fit and leave the rest buffered for the
-        // next call. State must NOT advance for lines that didn't land
-        // in `output` — verified by feeding the same audio across two
-        // calls and checking the decoder still emits the buffered lines.
+    fn apt_decoder_undersized_output_preserves_all_decoded_lines() {
+        // Streaming contract: if more lines are decoded than `output` can
+        // hold, the surplus lives in the internal ready queue and must
+        // surface on subsequent calls — *no* decoded line should ever
+        // be silently dropped just because the caller's output was tight.
         let rate = TEST_INPUT_RATE_HZ;
-        let mut d = AptDecoder::new(rate).unwrap();
+
+        // Reference run: same audio, generous output, count lines emitted.
         let mut audio = Vec::new();
         for _ in 0..6 {
             audio.extend_from_slice(&synth_line_audio(rate, TEST_GREY_LEVEL));
         }
-
-        // First call with a single-slot output should fill that slot and
-        // return Ok(1) with more lines still queued internally.
-        let mut tiny_out = vec![AptLine::default(); 1];
-        let n_first = d.process(&audio, &mut tiny_out).unwrap();
-        assert_eq!(
-            n_first, 1,
-            "single-slot output should emit exactly one line, got {n_first}"
+        let mut reference = AptDecoder::new(rate).unwrap();
+        let mut ref_out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        let n_reference = reference.process(&audio, &mut ref_out).unwrap();
+        assert!(
+            n_reference > 1,
+            "test setup needs to emit multiple lines; got {n_reference}",
         );
 
-        // Second call (empty input) should still drain previously-queued
-        // lines from the accumulator into a roomier output. If state had
-        // advanced incorrectly on the first call we'd see fewer here.
-        let mut roomy_out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
-        let n_second = d.process(&[], &mut roomy_out).unwrap();
+        // Tight run: one-slot output, drained line-by-line across calls.
+        let mut tight = AptDecoder::new(rate).unwrap();
+        let mut tight_out = vec![AptLine::default(); 1];
+        let n_first = tight.process(&audio, &mut tight_out).unwrap();
+        assert_eq!(n_first, 1);
+        let mut tight_total = 1_usize;
+
+        // Drain the ready queue with empty inputs — every queued line
+        // must come through.
+        loop {
+            let n = tight.process(&[], &mut tight_out).unwrap();
+            if n == 0 {
+                break;
+            }
+            tight_total += n;
+        }
+
+        assert_eq!(
+            tight_total, n_reference,
+            "tight-output run produced {tight_total} lines, generous run produced \
+             {n_reference} — surplus was silently dropped",
+        );
+    }
+
+    #[test]
+    fn apt_decoder_huge_chunk_keeps_accumulator_bounded() {
+        // CR concern: a single oversized input must not let the raw
+        // accumulator transiently balloon past its cap. With chunk-bounded
+        // ingestion the accumulator should never exceed
+        // DECODER_BUFFER_CAP + SAMPLES_PER_LINE at any instant.
+        let rate = TEST_INPUT_RATE_HZ;
+        let mut d = AptDecoder::new(rate).unwrap();
+        let mut huge = Vec::new();
+        for _ in 0..100 {
+            huge.extend_from_slice(&synth_line_audio(rate, TEST_GREY_LEVEL));
+        }
+        // One-slot output and a one-slot ready queue effective limit
+        // (lines still queue internally up to READY_QUEUE_CAP).
+        let mut tight_out = vec![AptLine::default(); 1];
+        d.process(&huge, &mut tight_out).unwrap();
+        // After the call the accumulator must be at-or-below cap — the
+        // chunked-ingestion design re-trims after each chunk.
         assert!(
-            n_second >= 1,
-            "expected buffered lines to surface on a follow-up call, got {n_second}",
+            d.accumulator.len() <= DECODER_BUFFER_CAP,
+            "accumulator past cap after huge input: {}",
+            d.accumulator.len(),
+        );
+        // And the ready queue is bounded by its own cap.
+        assert!(
+            d.ready_lines.len() <= READY_QUEUE_CAP,
+            "ready queue past cap: {}",
+            d.ready_lines.len(),
         );
     }
 
