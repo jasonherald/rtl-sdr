@@ -20,56 +20,60 @@ struct LeftPanelHost: View {
     var body: some View {
         switch activity {
         case .general:
-            // Scaffolding compromise per `CodeRabbit` round 2
-            // on PR #491: the legacy sidebar Form (Source +
-            // Radio + Display + Recording + Bookmarks +
-            // RtlTcpServer sections) hangs off the General
-            // slot during scaffolding so the user retains
-            // access to every existing control. Subsequent
-            // sub-tickets carve sections OUT of this Form
-            // and into their dedicated activity panels:
-            //
-            //  #443 → Source moves out (General panel proper)
-            //  #444 → Radio moves out
-            //  #445 → Audio (Recording) moves out
-            //  #446 → Display moves out
-            //  #447 → Scanner panel
-            //
-            // After all five land, this case will only carry
-            // the band presets + the trimmed Source content.
-            // Mirrors the Linux scaffolding decision in
-            // `crates/sdr-ui/src/window.rs`.
-            LegacySidebarPanel()
+            // First panel ported under the redesign (#443).
+            // Hosts band presets + the existing Source section.
+            GeneralPanelView()
+
+        // Activities below: each routes directly to its
+        // matching legacy section wrapped in a Form during the
+        // intermediate state. Clicking the icon does what the
+        // icon's label says — Radio shows radio controls,
+        // Display shows display controls, etc. — instead of a
+        // generic placeholder. Subsequent sub-tickets upgrade
+        // each arm in place from a single-section host to a
+        // proper multi-section `<X>PanelView` without changing
+        // what the user sees on first click.
         case .radio:
-            ComingSoonPanel(
-                activity: activity,
-                followUpTicket: "#444 — Radio panel"
-            )
+            LegacySectionPanel { RadioSection() }
         case .audio:
-            ComingSoonPanel(
-                activity: activity,
-                followUpTicket: "#445 — Audio panel + volume persistence"
-            )
+            // Audio activity owns recording UI for now;
+            // #445 expands to volume + output device picker
+            // + network sink rows as additional sections.
+            LegacySectionPanel { RecordingSection() }
         case .display:
-            ComingSoonPanel(
-                activity: activity,
-                followUpTicket: "#446 — Display panel"
-            )
+            LegacySectionPanel { DisplaySection() }
         case .scanner:
+            // Scanner has no pre-redesign Mac section to host
+            // — its UI is brand-new in #447.
             ComingSoonPanel(
                 activity: activity,
                 followUpTicket: "#447 — Scanner panel"
             )
         case .share:
-            // Share = rtl_tcp server + client + discovery. The
-            // existing RtlTcpServerSection / SourceSection
-            // rtl_tcp arm fills this slot once #447/#443 port
-            // their content.
-            ComingSoonPanel(
-                activity: activity,
-                followUpTicket: "#443/#447 — rtl_tcp share (server + client)"
-            )
+            // Share = rtl_tcp server (and eventually client +
+            // discovery). The existing server panel slots in
+            // here cleanly; client UI follows in a separate
+            // ticket.
+            LegacySectionPanel { RtlTcpServerSection() }
         }
+    }
+}
+
+/// One-section host that wraps an existing pre-redesign
+/// `*Section` view inside a grouped Form. Used by
+/// `LeftPanelHost` to give every activity a panel that looks
+/// like the eventual rich `<X>PanelView` even when only one
+/// section is wired up. Each carve-out sub-ticket replaces
+/// the single-section call with a proper panel view that
+/// composes multiple sections.
+struct LegacySectionPanel<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        Form {
+            content()
+        }
+        .formStyle(.grouped)
     }
 }
 
@@ -86,37 +90,6 @@ struct RightPanelHost: View {
                 followUpTicket: "#448 — Transcript + right activity bar"
             )
         }
-    }
-}
-
-/// Scaffolding-only stand-in for the General slot — keeps the
-/// pre-redesign sidebar Form (with every existing section)
-/// reachable while subsequent sub-tickets carve sections out
-/// into dedicated activity panels. Verbatim copy of the
-/// pre-#442 `SidebarView` body so the user loses nothing
-/// during the redesign transition.
-///
-/// Each carve-out sub-ticket (#443–#447) deletes the
-/// corresponding `*Section()` line from this body and stands
-/// up the matching panel in `LeftPanelHost`. When all five
-/// have landed, this struct can be deleted entirely.
-struct LegacySidebarPanel: View {
-    var body: some View {
-        Form {
-            SourceSection()
-            RadioSection()
-            DisplaySection()
-            RecordingSection()
-            BookmarksSection()
-            // `RtlTcpServerSection` is visible only when a
-            // local RTL-SDR dongle is detected — the section
-            // itself is always included in the form, but the
-            // body collapses to a single "no dongle" caption
-            // otherwise so it doesn't clutter the sidebar on
-            // a network/file source setup.
-            RtlTcpServerSection()
-        }
-        .formStyle(.grouped)
     }
 }
 
