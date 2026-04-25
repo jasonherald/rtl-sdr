@@ -15,6 +15,7 @@
 //! scheduler UI's "refresh TLEs" button, for example).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration as StdDuration, SystemTime};
 
 /// Default cache freshness window. TLEs from Celestrak are updated
@@ -101,6 +102,13 @@ pub struct TleCache {
     cache_dir: PathBuf,
     refresh_max_age: StdDuration,
     fetch_timeout: StdDuration,
+    /// HTTP client built lazily on first fetch so builder methods like
+    /// [`TleCache::with_fetch_timeout`] still get a chance to apply
+    /// before we lock in the configuration. Reused across fetches for
+    /// connection / TLS-session pooling — small win for a once-a-day
+    /// caller, free improvement if a future flow asks for several
+    /// sources in a row.
+    client: OnceLock<reqwest::blocking::Client>,
 }
 
 impl TleCache {
@@ -125,6 +133,7 @@ impl TleCache {
             cache_dir,
             refresh_max_age: DEFAULT_REFRESH_MAX_AGE,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
+            client: OnceLock::new(),
         }
     }
 
@@ -214,13 +223,10 @@ impl TleCache {
         })
     }
 
-    /// Blocking HTTP fetch of one source file.
+    /// Blocking HTTP fetch of one source file. Reuses the cached
+    /// reqwest client across calls for connection + TLS-session pooling.
     fn fetch(&self, source: TleSource) -> Result<String, TleCacheError> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(self.fetch_timeout)
-            .user_agent(concat!("sdr-rs/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| TleCacheError::Fetch(format!("client build: {e}")))?;
+        let client = self.client()?;
         let url = source.url();
         let response = client
             .get(&url)
@@ -232,6 +238,29 @@ impl TleCache {
         response
             .text()
             .map_err(|e| TleCacheError::Fetch(format!("response body: {e}")))
+    }
+
+    /// Get-or-build the cached HTTP client. First call builds it from
+    /// the current `fetch_timeout`; subsequent calls reuse the same
+    /// instance. Builder methods that change the timeout *after* the
+    /// first fetch don't take effect — by design, since reqwest's
+    /// timeout is baked into the client at build time.
+    fn client(&self) -> Result<&reqwest::blocking::Client, TleCacheError> {
+        if let Some(c) = self.client.get() {
+            return Ok(c);
+        }
+        let new_client = reqwest::blocking::Client::builder()
+            .timeout(self.fetch_timeout)
+            .user_agent(concat!("sdr-rs/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| TleCacheError::Fetch(format!("client build: {e}")))?;
+        // If another thread won the race we just drop our local copy;
+        // either way, `get` after `set` returns the canonical client.
+        let _ = self.client.set(new_client);
+        Ok(self
+            .client
+            .get()
+            .expect("client::set succeeded or another thread won the race"))
     }
 
     #[allow(clippy::unused_self)] // kept on impl for symmetry with other cache methods
