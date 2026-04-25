@@ -45,6 +45,13 @@ pub const GARDNER_OMEGA_GAIN: f32 = 1e-6;
 /// caller in `meteor_demodulator/src/main.cpp`.
 pub const GARDNER_MU_GAIN: f32 = 0.01;
 
+/// LRPT demod chain samples-per-symbol setting. The chain runs at
+/// 2 sps post-RRC (the standard QPSK convention); pinning it as a
+/// constant lets the RRC filter and Gardner timing recovery agree
+/// without drift, and matches the project convention of naming
+/// every magic numeric configuration value.
+pub const SAMPLES_PER_SYMBOL: usize = 2;
+
 /// Top-level LRPT demodulator chain.
 pub struct LrptDemod {
     rrc: RrcFilter,
@@ -54,19 +61,28 @@ pub struct LrptDemod {
 
 impl LrptDemod {
     /// Build a demod chain at the standard Meteor parameters
-    /// (2 sps, [`COSTAS_LOOP_BW`], [`GARDNER_OMEGA_GAIN`],
-    /// [`GARDNER_MU_GAIN`]).
+    /// ([`SAMPLES_PER_SYMBOL`], [`COSTAS_LOOP_BW`],
+    /// [`GARDNER_OMEGA_GAIN`], [`GARDNER_MU_GAIN`]).
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` only if the Costas
-    /// loop's internal `PhaseControlLoop` rejects the synthesized
-    /// alpha/beta — practically unreachable for valid constants.
+    /// Returns `DspError::InvalidParameter` if either inner
+    /// constructor rejects its synthesized parameters: `Costas::new`
+    /// (loop-bandwidth validation), or `Gardner::new`
+    /// (samples-per-symbol + gain finiteness validation).
+    /// Practically unreachable for the project's pinned constants —
+    /// the propagation is here for defensive consistency with the
+    /// rest of the DSP module.
     pub fn new() -> Result<Self, DspError> {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "SAMPLES_PER_SYMBOL is a tiny constant (= 2); the f32 conversion is exact"
+        )]
+        let sps_f = SAMPLES_PER_SYMBOL as f32;
         Ok(Self {
-            rrc: RrcFilter::new(2),
+            rrc: RrcFilter::new(SAMPLES_PER_SYMBOL),
             costas: Costas::new(COSTAS_LOOP_BW)?,
-            gardner: Gardner::new(2.0, GARDNER_OMEGA_GAIN, GARDNER_MU_GAIN)?,
+            gardner: Gardner::new(sps_f, GARDNER_OMEGA_GAIN, GARDNER_MU_GAIN)?,
         })
     }
 

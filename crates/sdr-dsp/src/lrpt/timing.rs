@@ -20,6 +20,12 @@ use sdr_types::Complex;
 /// before the symbol period is hard-locked. Matches `meteor_demod`.
 const OMEGA_LIM: f32 = 0.005;
 
+/// Pre-allocated capacity for the `pending` buffer. The buffer
+/// holds at most 3 samples (early/mid/late triplet Gardner needs);
+/// a small headroom over the steady-state size keeps the first few
+/// pushes from triggering a Vec re-grow during loop warmup.
+const PENDING_CAPACITY: usize = 8;
+
 /// Gardner timing recovery. Single-channel, takes
 /// `samples_per_symbol` samples per symbol in (typically 2.0) and
 /// emits one symbol per recovered timing tick.
@@ -74,7 +80,7 @@ impl Gardner {
             gain_mu: mu_gain,
             gain_omega: omega_gain,
             mid: Complex::new(0.0, 0.0),
-            pending: Vec::with_capacity(8),
+            pending: Vec::with_capacity(PENDING_CAPACITY),
         })
     }
 
