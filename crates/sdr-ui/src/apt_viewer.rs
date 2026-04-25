@@ -347,6 +347,12 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         .icon_name("media-playback-pause-symbolic")
         .tooltip_text("Pause / resume the live image update")
         .build();
+    // Tooltips are hover-only — set the accessible label too so screen
+    // readers actually announce the icon-only buttons. Project rule
+    // for any header / popover icon-only control.
+    pause_btn.update_property(&[gtk4::accessible::Property::Label(
+        "Pause or resume live image update",
+    )]);
     let pause_view = view.clone();
     pause_btn.connect_toggled(move |btn| {
         pause_view.set_paused(btn.is_active());
@@ -357,6 +363,7 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         .icon_name("document-save-symbolic")
         .tooltip_text("Export the current APT image to PNG")
         .build();
+    export_btn.update_property(&[gtk4::accessible::Property::Label("Export APT image to PNG")]);
     let export_view = view.clone();
     let window_for_export = window.clone();
     export_btn.connect_clicked(move |_| {
@@ -448,28 +455,61 @@ pub fn connect_demo_action(
 /// row-dependent vertical fade — easy to eyeball as "yep, lines are
 /// arriving in order, the renderer is fitting correctly, the image
 /// is building downward".
+///
+/// The timer holds a `WeakRef` to the underlying `DrawingArea` and
+/// `Weak` references to the renderer / pause state. If the user
+/// closes the viewer window before the demo completes, the next
+/// tick fails to upgrade the weak refs and breaks out cleanly —
+/// no work pumped into a destroyed widget, no lingering ~17 MB
+/// pixel buffer kept alive by the closure for the rest of the
+/// 2-minute schedule.
 fn spawn_demo_pass<W: gtk4::prelude::IsA<gtk4::Window>>(parent: &W) {
     let view = open_apt_viewer_window(parent, "NOAA APT — Demo Pass (synthetic)");
+
+    // Weak refs to widget + state. Drop the strong `view` immediately
+    // so the timer doesn't keep the window's DrawingArea alive past
+    // the user closing the window.
+    let drawing_area_weak = view.drawing_area.downgrade();
+    let renderer_weak = Rc::downgrade(&view.renderer);
+    let paused_weak = Rc::downgrade(&view.paused);
+    drop(view);
+
     let row = Rc::new(Cell::new(0_u32));
     glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-        let mut pixels = [0_u8; LINE_PIXELS];
-        let r = row.get();
-        // Left-to-right horizontal gradient + a vertical fade so each
-        // row is visibly different from the last — enough variation
-        // that any rendering bug (off-by-one, wrong stride, scale
-        // direction wrong) shows up obviously.
-        #[allow(clippy::cast_possible_truncation)]
-        for (i, p) in pixels.iter_mut().enumerate() {
-            let h = (i * 255 / LINE_PIXELS) as u32;
-            let v = (r.wrapping_mul(7)) % 200; // slow-cycling brightness offset
-            *p = (((h + v) % 256) & 0xff) as u8;
+        // Window gone → nothing left to draw into, exit the timer.
+        let Some(drawing_area) = drawing_area_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let Some(renderer) = renderer_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let Some(paused) = paused_weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+
+        if !paused.get() {
+            let mut pixels = [0_u8; LINE_PIXELS];
+            let r = row.get();
+            // Left-to-right horizontal gradient + a vertical fade so
+            // each row is visibly different from the last — enough
+            // variation that any rendering bug (off-by-one, wrong
+            // stride, scale direction wrong) shows up obviously.
+            #[allow(clippy::cast_possible_truncation)]
+            for (i, p) in pixels.iter_mut().enumerate() {
+                let h = (i * 255 / LINE_PIXELS) as u32;
+                let v = (r.wrapping_mul(7)) % 200; // slow-cycling brightness offset
+                *p = (((h + v) % 256) & 0xff) as u8;
+            }
+            renderer.borrow_mut().push_line(&pixels);
+            drawing_area.queue_draw();
+            row.set(r.wrapping_add(1));
         }
-        view.push_line(&pixels);
-        row.set(r.wrapping_add(1));
-        // Stop after 2 minutes worth of synthetic pass (240 lines) —
+
+        // Stop after 2 minutes of synthetic pass (240 lines) —
         // long enough to verify auto-fit kicks in, short enough that
-        // the demo doesn't run forever.
-        if r >= 240 {
+        // the demo doesn't run forever even if the user leaves the
+        // window open.
+        if row.get() >= 240 {
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
