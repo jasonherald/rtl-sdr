@@ -531,18 +531,24 @@ pub fn pass_quality_label(peak_elev_deg: f64) -> &'static str {
     }
 }
 
+/// Find the [`KnownSatellite`] entry whose display name matches the
+/// pass's satellite. `None` for off-catalog satellites — shouldn't
+/// happen in practice because the pass list is enumerated against
+/// `KNOWN_SATELLITES`, but the name is the only key carried on
+/// [`Pass`] so the lookup indirection is the natural shape. Shared
+/// by every `*_for_pass` accessor in this module so the predicate
+/// stays in exactly one place.
+#[must_use]
+fn known_satellite_for_pass(pass: &Pass) -> Option<&'static sdr_sat::KnownSatellite> {
+    KNOWN_SATELLITES.iter().find(|s| s.name == pass.satellite)
+}
+
 /// Look up the downlink frequency for a satellite by its display
 /// name. Returns `None` for satellites that aren't in
-/// [`KNOWN_SATELLITES`] (shouldn't happen in practice — the
-/// pass list is enumerated against that catalog — but the name is
-/// the only key carried on the [`Pass`] type, so a lookup
-/// indirection is the natural shape).
+/// [`KNOWN_SATELLITES`].
 #[must_use]
 pub fn downlink_hz_for_pass(pass: &Pass) -> Option<u64> {
-    KNOWN_SATELLITES
-        .iter()
-        .find(|s| s.name == pass.satellite)
-        .map(|s| s.downlink_hz)
+    known_satellite_for_pass(pass).map(|s| s.downlink_hz)
 }
 
 /// The full tuning triple — frequency, demod mode, channel
@@ -553,10 +559,7 @@ pub fn downlink_hz_for_pass(pass: &Pass) -> Option<u64> {
 /// [`downlink_hz_for_pass`].
 #[must_use]
 pub fn tune_target_for_pass(pass: &Pass) -> Option<(u64, sdr_types::DemodMode, u32)> {
-    KNOWN_SATELLITES
-        .iter()
-        .find(|s| s.name == pass.satellite)
-        .map(|s| (s.downlink_hz, s.demod_mode, s.bandwidth_hz))
+    known_satellite_for_pass(pass).map(|s| (s.downlink_hz, s.demod_mode, s.bandwidth_hz))
 }
 
 /// Format a Hz frequency as a fixed-precision MHz string with

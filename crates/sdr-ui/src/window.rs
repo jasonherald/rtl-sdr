@@ -2712,14 +2712,17 @@ fn connect_sidebar_panels(
     connect_scanner_panel(panels, state, config);
     // "Tune to satellite" closure used by the Satellites panel's
     // per-row play buttons. Mirrors the bookmark-recall dance in
-    // `connect_navigation_panel`: forces the scanner off, updates
-    // local `AppState`, sends `Tune` + `SetBandwidth` to the DSP,
-    // and pokes every UI widget that mirrors the radio's tuning
-    // state (spectrum centre line, demod dropdown, bandwidth
-    // SpinRow). The dropdown's `selected-notify` and the spin
-    // row's `value-notify` callbacks then fire `SetDemodMode` /
-    // `SetBandwidth` themselves — that's why we only `send_dsp`
-    // the freq + initial bandwidth here.
+    // `connect_navigation_panel` end-to-end: forces the scanner
+    // off, updates local `AppState`, sends `Tune` + `SetBandwidth`
+    // to the DSP, and pokes every UI widget / status indicator
+    // that mirrors the radio's tuning state — spectrum centre
+    // line, demod dropdown, bandwidth SpinRow, status bar
+    // frequency / demod-mode label, and the radio panel's mode-
+    // specific control visibility. The dropdown's
+    // `selected-notify` and the spin row's `value-notify`
+    // callbacks fire `SetDemodMode` / a redundant `SetBandwidth`
+    // themselves — idempotent at the DSP, cheaper than threading
+    // a suppress flag through here.
     let tune_to_satellite: Rc<dyn Fn(u64, sdr_types::DemodMode, u32)> = {
         let state_t = Rc::clone(state);
         let freq_selector_t = freq_selector.clone();
@@ -2727,6 +2730,8 @@ fn connect_sidebar_panels(
         let spectrum_t = Rc::clone(spectrum_handle);
         let force_disable_t = Rc::clone(scanner_force_disable);
         let bandwidth_row_t = panels.radio.bandwidth_row.clone();
+        let radio_panel_t = panels.radio.clone();
+        let status_bar_t = Rc::clone(status_bar);
         Rc::new(move |freq_hz, mode, bw_hz| {
             force_disable_t.trigger("satellite tune");
             #[allow(
@@ -2746,6 +2751,16 @@ fn connect_sidebar_panels(
                 demod_dropdown_t.set_selected(idx);
             }
             bandwidth_row_t.set_value(bw_f64);
+            // Mode-specific control visibility (e.g. squelch /
+            // deemph rows shown only in NFM/WFM) — must be poked
+            // explicitly because the demod-dropdown notify only
+            // covers the dropdown's own state.
+            radio_panel_t.apply_demod_visibility(mode);
+            // Status bar mirrors. Done last so a panic anywhere
+            // upstream doesn't leave the indicator showing an
+            // optimistic value that the DSP never received.
+            status_bar_t.update_frequency(freq_f64);
+            status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
         })
     };
     connect_satellites_panel(panels, config, &tune_to_satellite);
