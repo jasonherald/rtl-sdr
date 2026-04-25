@@ -2672,10 +2672,13 @@ final class CoreModel {
     //  the Linux activity-bar entry names — same source of
     //  truth).
     //
-    //  Default values match the Linux `SidebarSession::default`:
-    //  left = General open at 320 px, right = Transcript closed
-    //  at 320 px. The 320 px width matches the GTK
-    //  `DEFAULT_SIDEBAR_WIDTH_PX` constant.
+    //  Default values per the spec for #450 and the Linux
+    //  `SidebarSession::default`: left = General, open, 320 px;
+    //  right = Transcript, closed, 420 px. The right default is
+    //  wider than the left because the right side hosts content-
+    //  heavy panels (Transcript / Bookmarks) that read better
+    //  with extra room — same rationale captured on the per-side
+    //  range constants below.
     //
     //  These fields are observable @Observable storage so
     //  ContentView can bind through them (and the activity bar /
