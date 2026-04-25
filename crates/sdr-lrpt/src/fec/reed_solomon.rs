@@ -32,6 +32,53 @@ pub const PARITY: usize = N - K; // 32
 /// Maximum correctable byte errors per codeword.
 pub const T: usize = PARITY / 2; // 16
 
+// --- CCSDS / GF(256) characteristic constants ---
+//
+// These embed the CCSDS-RS spec choices that distinguish this
+// decoder from a textbook RS(255, 223). Lifted to named constants
+// so the algorithm reads as a series of named primitives instead
+// of bare numerals.
+
+/// Number of nonzero elements in GF(256). All exponent arithmetic
+/// is done modulo this value.
+const GF_NONZERO: u32 = 255;
+/// Length of the error-locator polynomial register (`λ` and `B`).
+/// `PARITY + 1` because λ has degree at most `PARITY` (= 2T),
+/// hence `PARITY + 1` coefficients.
+const LAMBDA_LEN: usize = PARITY + 1;
+/// CCSDS-RS first consecutive root of the code generator. Per
+/// CCSDS 101.0-B-3 the first root is α^112 (rather than the
+/// textbook α^1).
+const FIRST_ROOT_INDEX: u32 = 112;
+/// CCSDS-RS code generator power. The code generator polynomial
+/// has roots at α^(`FIRST_ROOT_INDEX` + i · `CODE_GENERATOR_POWER`),
+/// i = 0..2T-1. For CCSDS that's α^(112 + 11·i).
+const CODE_GENERATOR_POWER: u32 = 11;
+/// Per-step increment for the dual-basis location index in
+/// Chien search. `LOCATION_STEP` and `LOCATION_INIT` together
+/// implement medet's location-walk: `k = (k + LOCATION_STEP) mod
+/// GF_NONZERO` advances the search through dual-basis positions.
+const LOCATION_STEP: u32 = 116;
+/// Initial dual-basis location index for Chien search (one less
+/// than `LOCATION_STEP` so the first iteration lands on the
+/// correct first position).
+const LOCATION_INIT: u32 = 115;
+/// CCSDS-RS Forney-evaluation pre-factor power. The Forney error
+/// magnitude for root r includes a factor α^(r · `FORNEY_NUM2_POWER`)
+/// — characteristic of the dual-basis representation.
+const FORNEY_NUM2_POWER: u32 = 111;
+/// Maximum index when computing the Forney denominator. Loop
+/// walks `λ` indices in steps of 2 starting from
+/// `min(deg_lambda, FORNEY_DEN_MAX_IDX)`; the cap exists because
+/// `λ` has only [`LAMBDA_LEN`] = `PARITY + 1` coefficients and we
+/// index `λ[i+1]`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "PARITY = 32, well within i32 range"
+)]
+const FORNEY_DEN_MAX_IDX: i32 = (PARITY - 1) as i32;
+
 /// GF(256) antilog table — `ALPHA[i] = α^i mod field-poly` under
 /// the CCSDS dual-basis primitive polynomial. Verbatim from
 /// `medet/alib/ecc.pas`.
@@ -131,13 +178,13 @@ impl ReedSolomon {
             let feedback = IDX[(m ^ bb[0]) as usize];
             if feedback != LOG_ZERO {
                 for j in 1..PARITY {
-                    let exponent = (u32::from(feedback) + u32::from(POLY[PARITY - j])) % 255;
+                    let exponent = (u32::from(feedback) + u32::from(POLY[PARITY - j])) % GF_NONZERO;
                     bb[j] ^= ALPHA[exponent as usize];
                 }
             }
             bb.copy_within(1..PARITY, 0);
             bb[PARITY - 1] = if feedback != LOG_ZERO {
-                ALPHA[((u32::from(feedback) + u32::from(POLY[0])) % 255) as usize]
+                ALPHA[((u32::from(feedback) + u32::from(POLY[0])) % GF_NONZERO) as usize]
             } else {
                 0
             };
@@ -185,7 +232,9 @@ impl ReedSolomon {
                 if *slot == 0 {
                     *slot = data[j];
                 } else {
-                    let exponent = (u32::from(IDX[*slot as usize]) + (112 + i as u32) * 11) % 255;
+                    let exponent = (u32::from(IDX[*slot as usize])
+                        + (FIRST_ROOT_INDEX + i as u32) * CODE_GENERATOR_POWER)
+                        % GF_NONZERO;
                     *slot = data[j] ^ ALPHA[exponent as usize];
                 }
             }
@@ -208,13 +257,13 @@ impl ReedSolomon {
         // Berlekamp-Massey to find the error-locator polynomial
         // λ(x). Both `lambda` and `b` are 33-element registers
         // (degree-32 polynomials).
-        let mut lambda = [0_u8; 33];
+        let mut lambda = [0_u8; LAMBDA_LEN];
         lambda[0] = 1;
-        let mut b = [0_u8; 33];
-        for i in 0..33 {
+        let mut b = [0_u8; LAMBDA_LEN];
+        for i in 0..LAMBDA_LEN {
             b[i] = IDX[lambda[i] as usize];
         }
-        let mut t = [0_u8; 33];
+        let mut t = [0_u8; LAMBDA_LEN];
         let mut el: i32 = 0;
         for r in 1..=PARITY as i32 {
             // Discrepancy: Δ = Σ λ_i · S_{r-i-1}
@@ -223,7 +272,7 @@ impl ReedSolomon {
                 if lambda[i] != 0 && s_log[r as usize - i - 1] != LOG_ZERO {
                     let exponent = (u32::from(IDX[lambda[i] as usize])
                         + u32::from(s_log[r as usize - i - 1]))
-                        % 255;
+                        % GF_NONZERO;
                     discr_r ^= ALPHA[exponent as usize];
                 }
             }
@@ -231,14 +280,14 @@ impl ReedSolomon {
             if discr_r_log == LOG_ZERO {
                 // Δ = 0: shift b right by one, prepend the log-
                 // zero sentinel.
-                b.copy_within(0..32, 1);
+                b.copy_within(0..PARITY, 1);
                 b[0] = LOG_ZERO;
             } else {
                 // T(x) = λ(x) − (Δ/b) · x · B(x)
                 t[0] = lambda[0];
                 for i in 0..PARITY {
                     if b[i] != LOG_ZERO {
-                        let exponent = (u32::from(discr_r_log) + u32::from(b[i])) % 255;
+                        let exponent = (u32::from(discr_r_log) + u32::from(b[i])) % GF_NONZERO;
                         t[i + 1] = lambda[i + 1] ^ ALPHA[exponent as usize];
                     } else {
                         t[i + 1] = lambda[i + 1];
@@ -250,19 +299,14 @@ impl ReedSolomon {
                         b[i] = if lambda[i] == 0 {
                             LOG_ZERO
                         } else {
-                            let v: i32 =
-                                i32::from(IDX[lambda[i] as usize]) - i32::from(discr_r_log) + 255;
-                            #[allow(
-                                clippy::cast_possible_truncation,
-                                clippy::cast_sign_loss,
-                                reason = "expression range fits in u8 after the mod 255"
-                            )]
-                            let folded = (v % 255) as u8;
-                            folded
+                            let v: i32 = i32::from(IDX[lambda[i] as usize])
+                                - i32::from(discr_r_log)
+                                + GF_NONZERO as i32;
+                            (v % GF_NONZERO as i32) as u8
                         };
                     }
                 } else {
-                    b.copy_within(0..32, 1);
+                    b.copy_within(0..PARITY, 1);
                     b[0] = LOG_ZERO;
                 }
                 lambda.copy_from_slice(&t);
@@ -271,38 +315,52 @@ impl ReedSolomon {
 
         // Determine deg(λ) and convert lambda to log-domain.
         let mut deg_lambda: usize = 0;
-        for i in 0..33 {
+        for i in 0..LAMBDA_LEN {
             lambda[i] = IDX[lambda[i] as usize];
             if lambda[i] != LOG_ZERO {
                 deg_lambda = i;
             }
         }
 
-        // Chien search — try every i in 1..=255 as a candidate
-        // root, walking the location index k = (k + 116) mod 255
-        // (CCSDS dual-basis indexing per medet).
-        let mut reg = [0_u8; 33];
+        // Bound check: a non-positive degree means BM didn't
+        // find a valid locator (degenerate trellis), and a degree
+        // above T means more errors than we can correct (Chien
+        // would otherwise push past `roots[T]` and panic). Both
+        // fail closed.
+        if deg_lambda == 0 || deg_lambda > T {
+            return Err(RsError::Uncorrectable);
+        }
+
+        // Chien search — try every i in 1..=GF_NONZERO as a
+        // candidate root, walking the location index by
+        // LOCATION_STEP per iteration (dual-basis indexing).
+        let mut reg = [0_u8; LAMBDA_LEN];
         reg[1..].copy_from_slice(&lambda[1..]);
         let mut roots = [0_u8; T];
         let mut locs = [0_u8; T];
         let mut found: usize = 0;
         let mut i: u32 = 1;
-        let mut k: u32 = 115;
-        while i <= 255 {
+        let mut k: u32 = LOCATION_INIT;
+        while i <= GF_NONZERO {
             let mut q: u8 = 1;
             for j in (1..=deg_lambda).rev() {
                 if reg[j] != LOG_ZERO {
-                    let new_reg = (u32::from(reg[j]) + j as u32) % 255;
-                    #[allow(clippy::cast_possible_truncation, reason = "value mod 255 fits in u8")]
+                    let new_reg = (u32::from(reg[j]) + j as u32) % GF_NONZERO;
                     let new_reg_u8 = new_reg as u8;
                     reg[j] = new_reg_u8;
                     q ^= ALPHA[new_reg as usize];
                 }
             }
             if q == 0 {
-                #[allow(clippy::cast_possible_truncation, reason = "i ≤ 255 fits in u8")]
+                // Belt-and-braces guard against the array overrun
+                // that the deg_lambda > T check above also
+                // prevents — if either bound check is ever
+                // weakened we still fail closed instead of
+                // panicking.
+                if found >= T {
+                    return Err(RsError::Uncorrectable);
+                }
                 let i_u8 = i as u8;
-                #[allow(clippy::cast_possible_truncation, reason = "k mod 255 fits in u8")]
                 let k_u8 = k as u8;
                 roots[found] = i_u8;
                 locs[found] = k_u8;
@@ -312,7 +370,7 @@ impl ReedSolomon {
                 }
             }
             i += 1;
-            k = (k + 116) % 255;
+            k = (k + LOCATION_STEP) % GF_NONZERO;
         }
 
         if deg_lambda != found {
@@ -320,13 +378,15 @@ impl ReedSolomon {
         }
 
         // Compute Ω(x) = λ(x) · S(x) mod x^(2T) for Forney.
+        // deg_omega = deg_lambda - 1 is well-defined here
+        // because the bound check above guaranteed deg_lambda > 0.
         let deg_omega = deg_lambda - 1;
-        let mut omega = [0_u8; 33];
+        let mut omega = [0_u8; LAMBDA_LEN];
         for i in 0..=deg_omega {
             let mut tmp = 0_u8;
             for j in (0..=i).rev() {
                 if s_log[i - j] != LOG_ZERO && lambda[j] != LOG_ZERO {
-                    let exponent = (u32::from(s_log[i - j]) + u32::from(lambda[j])) % 255;
+                    let exponent = (u32::from(s_log[i - j]) + u32::from(lambda[j])) % GF_NONZERO;
                     tmp ^= ALPHA[exponent as usize];
                 }
             }
@@ -343,21 +403,22 @@ impl ReedSolomon {
             let root_j = u32::from(roots[j]);
             for ii in (0..=deg_omega).rev() {
                 if omega[ii] != LOG_ZERO {
-                    let exponent = (u32::from(omega[ii]) + ii as u32 * root_j) % 255;
+                    let exponent = (u32::from(omega[ii]) + ii as u32 * root_j) % GF_NONZERO;
                     num1 ^= ALPHA[exponent as usize];
                 }
             }
-            let num2 = ALPHA[((root_j * 111 + 255) % 255) as usize];
+            let num2 = ALPHA[((root_j * FORNEY_NUM2_POWER + GF_NONZERO) % GF_NONZERO) as usize];
             let mut den: u8 = 0;
-            let mut ii: i32 = if deg_lambda < 31 {
+            let mut ii: i32 = if (deg_lambda as i32) < FORNEY_DEN_MAX_IDX {
                 deg_lambda as i32
             } else {
-                31
+                FORNEY_DEN_MAX_IDX
             };
             ii &= !1;
             while ii >= 0 {
                 if lambda[ii as usize + 1] != LOG_ZERO {
-                    let exponent = (u32::from(lambda[ii as usize + 1]) + ii as u32 * root_j) % 255;
+                    let exponent =
+                        (u32::from(lambda[ii as usize + 1]) + ii as u32 * root_j) % GF_NONZERO;
                     den ^= ALPHA[exponent as usize];
                 }
                 ii -= 2;
@@ -365,9 +426,9 @@ impl ReedSolomon {
             if num1 != 0 && (locs[j] as usize) >= pad {
                 let target = locs[j] as usize - pad;
                 let exponent =
-                    (u32::from(IDX[num1 as usize]) + u32::from(IDX[num2 as usize]) + 255
+                    (u32::from(IDX[num1 as usize]) + u32::from(IDX[num2 as usize]) + GF_NONZERO
                         - u32::from(IDX[den as usize]))
-                        % 255;
+                        % GF_NONZERO;
                 data[target] ^= ALPHA[exponent as usize];
             }
         }
@@ -399,7 +460,7 @@ mod tests {
 
     #[test]
     fn idx_zero_is_log_zero_sentinel() {
-        assert_eq!(IDX[0], LOG_ZERO, "IDX[0] must be the log(0) sentinel = 255",);
+        assert_eq!(IDX[0], LOG_ZERO, "IDX[0] must be the log(0) sentinel = 255");
     }
 
     #[test]
@@ -470,18 +531,16 @@ mod tests {
         let result = rs.decode(&codeword);
         assert!(matches!(result, Err(RsError::Uncorrectable)));
     }
-}
 
-#[cfg(test)]
-mod proptests {
-    use super::*;
-    use proptest::prelude::*;
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
 
-    proptest! {
-        /// Random message + random ≤T-error pattern. Decoder
-        /// must recover the original message bytes exactly.
-        #[test]
-        fn rs_corrects_random_error_pattern_within_capacity(
+        proptest! {
+            /// Random message + random ≤T-error pattern. Decoder
+            /// must recover the original message bytes exactly.
+            #[test]
+            fn rs_corrects_random_error_pattern_within_capacity(
             seed in any::<u64>(),
             error_count in 0_usize..=T,
             error_positions in proptest::collection::vec(0_usize..N, T),
@@ -511,6 +570,7 @@ mod proptests {
                 .expect("≤T errors must be correctable");
             prop_assert_eq!(usize::from(n_corrected), applied);
             prop_assert_eq!(&decoded[..K], &message);
+            }
         }
     }
 }

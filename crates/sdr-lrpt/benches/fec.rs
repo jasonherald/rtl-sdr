@@ -5,7 +5,7 @@
 //! perf floor for regression detection.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use sdr_lrpt::fec::{Derandomizer, ReedSolomon, SyncCorrelator, ViterbiDecoder};
+use sdr_lrpt::fec::{Derandomizer, RS_N, ReedSolomon, SyncCorrelator, ViterbiDecoder};
 
 /// Number of encoded bit pairs to drive through Viterbi per
 /// iteration. Slightly above one CADU's worth of soft input.
@@ -89,7 +89,7 @@ fn bench_rs_decode_no_errors(c: &mut Criterion) {
     // syndrome-zero fast path with no Berlekamp-Massey work.
     // Measures the lower-bound RS decode cost — the cost the
     // pipeline pays for every clean CADU in a noise-free stretch.
-    let codeword = [0_u8; 255];
+    let codeword = [0_u8; RS_N];
     c.bench_function("rs_decode_no_errors", |b| {
         b.iter(|| {
             let result = rs.decode(black_box(&codeword));
