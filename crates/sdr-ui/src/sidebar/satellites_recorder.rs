@@ -84,9 +84,16 @@ pub enum State {
 /// Snapshot of the radio's tune state at the moment the recorder
 /// took over. Stored on the in-flight state so a `Finalizing`
 /// transition can restore it without the caller having to re-snap.
+///
+/// Carries `vfo_offset_hz` separately from `freq_hz` so a user-
+/// dragged VFO position survives the auto-record round trip:
+/// snapshot captures both, restore replays both. Without this,
+/// LOS would re-tune to bare centre frequency and the user would
+/// lose whatever signal they had pinned with a VFO drag pre-AOS.
 #[derive(Debug, Clone, Copy)]
 pub struct SavedTune {
     pub freq_hz: f64,
+    pub vfo_offset_hz: f64,
     pub mode: DemodMode,
     pub bandwidth_hz: f64,
 }
@@ -251,16 +258,20 @@ impl AutoRecorder {
         tuned_at: DateTime<Utc>,
         saved_tune: SavedTune,
     ) -> Vec<Action> {
-        // Defensive: if the pass somehow ended while we were
-        // settling (e.g. a low-elevation pass shorter than the
-        // settle window), skip straight to finalizing.
+        // LOS already arrived (e.g. the 1 Hz driver stalled on a
+        // sleep / suspend cycle, or a very short pass elapsed
+        // entirely inside the settle window). Skip straight to
+        // finalizing AND emit the SavePng — otherwise we'd jump
+        // to Idle on the next tick without ever exporting the
+        // image.
         if pass.end <= now {
+            let png_path = png_path_for(&pass, now);
             self.state = State::Finalizing {
                 pass: pass.clone(),
                 saved_tune,
-                png_path: png_path_for(&pass, now),
+                png_path: png_path.clone(),
             };
-            return Vec::new();
+            return vec![Action::SavePng(png_path)];
         }
         if (now - tuned_at).num_seconds() >= SETTLE_SECS {
             self.state = State::Recording { pass, saved_tune };
@@ -275,24 +286,19 @@ impl AutoRecorder {
         saved_tune: SavedTune,
     ) -> Vec<Action> {
         if pass.end <= now {
+            // Emit `SavePng` only — the success / failure toast
+            // is the wiring layer's responsibility (it knows the
+            // export's actual outcome). Announcing "image saved"
+            // here would lie if the user closed the viewer
+            // mid-pass or `export_png` errored on disk-full /
+            // permissions.
             let png_path = png_path_for(&pass, now);
-            let actions = vec![
-                Action::SavePng(png_path.clone()),
-                Action::Toast {
-                    message: format!(
-                        "{} pass complete — image saved to {}",
-                        pass.satellite,
-                        png_path.display()
-                    ),
-                    kind: ToastKind::Info,
-                },
-            ];
             self.state = State::Finalizing {
                 pass,
                 saved_tune,
-                png_path,
+                png_path: png_path.clone(),
             };
-            return actions;
+            return vec![Action::SavePng(png_path)];
         }
         Vec::new()
     }
@@ -387,6 +393,7 @@ mod tests {
     fn default_tune() -> SavedTune {
         SavedTune {
             freq_hz: 100_000_000.0,
+            vfo_offset_hz: 0.0,
             mode: DemodMode::Wfm,
             bandwidth_hz: 200_000.0,
         }
@@ -486,8 +493,15 @@ mod tests {
         let los_plus_one = pass.end + ChronoDuration::seconds(1);
         let actions = r.tick(los_plus_one, &[pass], true, default_tune());
         assert!(matches!(r.state(), State::Finalizing { .. }));
+        // Only `SavePng` — the success / failure toast is the
+        // wiring layer's responsibility now (it knows the export
+        // outcome). Asserting absence of any Toast keeps the
+        // recorder honest about what it claims.
         assert!(matches!(actions[0], Action::SavePng(_)));
-        assert!(matches!(actions[1], Action::Toast { .. }));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Toast { .. })),
+            "recorder must not announce save success before export — actions: {actions:?}"
+        );
     }
 
     #[test]
@@ -497,6 +511,7 @@ mod tests {
         let pass = synthetic_noaa19(now, 3, 60, 50.0);
         let saved = SavedTune {
             freq_hz: 89_700_000.0,
+            vfo_offset_hz: 25_000.0, // pin a non-zero offset for the round trip
             mode: DemodMode::Wfm,
             bandwidth_hz: 200_000.0,
         };
@@ -514,15 +529,41 @@ mod tests {
         assert!(matches!(r.state(), State::Finalizing { .. }));
         let actions = r.tick(los_plus, &[pass], true, default_tune());
         assert!(matches!(r.state(), State::Idle));
-        // Restore action carries the original saved tune.
+        // Restore action carries the original saved tune,
+        // including the VFO offset (so a user's drag position
+        // survives the auto-record round trip).
         match &actions[0] {
             Action::RestoreTune(t) => {
                 assert_eq!(t.freq_hz, 89_700_000.0);
+                assert_eq!(t.vfo_offset_hz, 25_000.0);
                 assert_eq!(t.mode, DemodMode::Wfm);
                 assert_eq!(t.bandwidth_hz, 200_000.0);
             }
             other => panic!("expected RestoreTune, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn los_during_before_pass_still_emits_save_png() {
+        // Regression: a 1 Hz driver stall (sleep / suspend) can
+        // jump the recorder from BeforePass to Finalizing without
+        // ever entering Recording. The PNG must still be saved —
+        // otherwise the pass completes silently and the user
+        // loses whatever decoder lines did arrive during the
+        // stall window.
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 60, 50.0); // 1 min pass, 3 s lead-in
+        r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        assert!(matches!(r.state(), State::BeforePass { .. }));
+        // Jump to a moment past LOS (simulate stalled driver).
+        let post_los = pass.end + ChronoDuration::seconds(5);
+        let actions = r.tick(post_los, std::slice::from_ref(&pass), true, default_tune());
+        assert!(matches!(r.state(), State::Finalizing { .. }));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::SavePng(_))),
+            "BeforePass→Finalizing must emit SavePng even when stalled past LOS"
+        );
     }
 
     #[test]

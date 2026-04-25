@@ -2763,7 +2763,14 @@ fn connect_sidebar_panels(
             status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
         })
     };
-    connect_satellites_panel(panels, config, state, toast_overlay, &tune_to_satellite);
+    connect_satellites_panel(
+        panels,
+        config,
+        state,
+        toast_overlay,
+        spectrum_handle,
+        &tune_to_satellite,
+    );
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -8401,6 +8408,7 @@ fn connect_satellites_panel(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     state: &Rc<AppState>,
     toast_overlay: &adw::ToastOverlay,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
 ) {
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
@@ -8860,13 +8868,16 @@ fn connect_satellites_panel(
     // Parent-window resolver for the auto-open-viewer side effect.
     // Walks up the widget tree from the satellites page; falls
     // back to `None` if the widget has been detached, in which
-    // case the open is silently skipped — matches the
-    // already-open no-op semantics.
+    // case the open is silently skipped. Holds a `WeakRef` so the
+    // 1 Hz timer's `panel_weak.upgrade() == None` exit gate can
+    // actually fire — a strong clone here would keep the panel
+    // widget alive and the timer would never break.
     let parent_provider_for_recorder: Rc<dyn Fn() -> Option<gtk4::Window>> = {
-        let widget = panel.widget.clone();
+        let widget_weak = panel.widget.downgrade();
         Rc::new(move || {
-            widget
-                .root()
+            widget_weak
+                .upgrade()
+                .and_then(|w| w.root())
                 .and_then(|r| r.downcast::<gtk4::Window>().ok())
         })
     };
@@ -8874,8 +8885,16 @@ fn connect_satellites_panel(
     let interpret_action: Rc<dyn Fn(RecorderAction)> = {
         let state_a = Rc::clone(state);
         let tune_a = Rc::clone(tune_to_satellite);
-        let toast_overlay_a = toast_overlay.clone();
+        // Weak ref for the same lifecycle reason as
+        // `parent_provider_for_recorder` — strong clone would pin
+        // the toast overlay alive past window close.
+        let toast_overlay_weak = toast_overlay.downgrade();
         let parent_provider_a = Rc::clone(&parent_provider_for_recorder);
+        let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
+            if let Some(overlay) = overlay_weak.upgrade() {
+                overlay.add_toast(adw::Toast::new(msg));
+            }
+        };
         Rc::new(move |action: RecorderAction| match action {
             RecorderAction::StartAutoRecord {
                 satellite,
@@ -8890,22 +8909,35 @@ fn connect_satellites_panel(
                 crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
             }
             RecorderAction::SavePng(path) => {
-                if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
-                    if let Err(e) = view.export_png(&path) {
-                        tracing::warn!("auto-record PNG export to {path:?} failed: {e}");
-                    } else {
-                        tracing::info!("auto-record PNG saved to {path:?}");
+                // Toast based on the *actual* export outcome
+                // rather than announcing success up front — the
+                // recorder doesn't know whether the user closed
+                // the viewer mid-pass or whether disk write will
+                // succeed.
+                let result_msg = if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                    match view.export_png(&path) {
+                        Ok(()) => {
+                            tracing::info!("auto-record PNG saved to {path:?}");
+                            format!("Pass complete — image saved to {}", path.display())
+                        }
+                        Err(e) => {
+                            tracing::warn!("auto-record PNG export to {path:?} failed: {e}");
+                            format!("Pass complete but PNG save failed: {e}")
+                        }
                     }
                 } else {
                     tracing::warn!(
                         "auto-record SavePng but no APT viewer is open (user closed mid-pass)",
                     );
-                }
+                    "Pass complete, but the APT viewer was closed — no image saved".to_string()
+                };
+                post_toast(&toast_overlay_weak, &result_msg);
             }
             RecorderAction::RestoreTune(saved) => {
                 tracing::info!(
-                    "auto-record LOS: restoring tune to {} Hz, BW {} Hz",
+                    "auto-record LOS: restoring tune to {} Hz (offset {} Hz), BW {} Hz",
                     saved.freq_hz,
+                    saved.vfo_offset_hz,
                     saved.bandwidth_hz,
                 );
                 #[allow(
@@ -8922,16 +8954,22 @@ fn connect_satellites_panel(
                 )]
                 let bandwidth_hz = saved.bandwidth_hz.round() as u32;
                 tune_a(freq_hz, saved.mode, bandwidth_hz);
+                // Replay the user's pre-AOS VFO offset so a
+                // dragged-from-centre carrier comes back. The
+                // existing `DspToUi::VfoOffsetChanged` handler
+                // updates the spectrum + freq selector + status
+                // bar when the DSP echoes the change, so we
+                // don't have to mirror those widgets manually.
+                state_a.send_dsp(UiToDsp::SetVfoOffset(saved.vfo_offset_hz));
             }
             RecorderAction::Toast { message, kind } => {
-                let toast = adw::Toast::new(&message);
                 if matches!(kind, ToastKind::Warn) {
                     // No dedicated warn styling on AdwToast; the
                     // message itself carries the severity. Tracing
                     // captures it for the log either way.
                     tracing::warn!("auto-record: {message}");
                 }
-                toast_overlay_a.add_toast(toast);
+                post_toast(&toast_overlay_weak, &message);
             }
         })
     };
@@ -8944,6 +8982,7 @@ fn connect_satellites_panel(
         let interpret_tick = Rc::clone(&interpret_action);
         let state_tick = Rc::clone(state);
         let bandwidth_row_tick = panels.radio.bandwidth_row.clone();
+        let spectrum_tick = Rc::clone(spectrum_handle);
         let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
             let Some(panel) = panel_weak_tick.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -8960,7 +8999,10 @@ fn connect_satellites_panel(
             // Drive the auto-record state machine. Snapshot the
             // pass list (cloned out of the displayed vec to keep
             // the borrow short) and the current tune so the
-            // recorder gets a consistent view.
+            // recorder gets a consistent view. Capture the VFO
+            // offset alongside centre frequency — a user-dragged
+            // carrier position needs to survive the AOS→LOS round
+            // trip.
             let passes_snapshot: Vec<Pass> = displayed_tick
                 .borrow()
                 .iter()
@@ -8969,6 +9011,7 @@ fn connect_satellites_panel(
             let auto_record_on = panel.auto_record_switch.is_active();
             let now_tune = SavedTune {
                 freq_hz: state_tick.center_frequency.get(),
+                vfo_offset_hz: spectrum_tick.vfo_offset_hz(),
                 mode: state_tick.demod_mode.get(),
                 bandwidth_hz: bandwidth_row_tick.value(),
             };
