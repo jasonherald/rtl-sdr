@@ -157,6 +157,19 @@ pub const LEFT_ACTIVITIES: &[ActivityBarEntry] = &[
         shortcut_label: "Ctrl+6",
         accelerator: "<Ctrl>6",
     },
+    ActivityBarEntry {
+        name: "satellites",
+        // `find-location-symbolic` reads as "where things are" —
+        // a fit for pass prediction (we predict *where* a satellite
+        // will be when). GNOME doesn't ship a dedicated satellite
+        // icon, and `network-wireless-symbolic` (the ticket's
+        // alternative) overlaps too closely with our existing
+        // wireless/signal icons elsewhere in the bar.
+        icon_name: "find-location-symbolic",
+        display_name: "Satellites",
+        shortcut_label: "Ctrl+7",
+        accelerator: "<Ctrl>7",
+    },
 ];
 
 /// Canonical right-activity-bar entries — Transcript + Bookmarks.

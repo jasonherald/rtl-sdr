@@ -1,18 +1,35 @@
 //! Celestrak TLE fetch + on-disk cache.
 //!
-//! Pulls satellite TLE files from
-//! `https://celestrak.org/NORAD/elements/{slug}.txt` and stores them
-//! under `~/.cache/sdr-rs/tle/`. Daily refresh: callers ask for a TLE
-//! by NORAD id, the cache returns it from disk if the file is fresher
-//! than [`DEFAULT_REFRESH_MAX_AGE`] (24 hours); otherwise it tries to
-//! re-download. If re-download fails (offline, Celestrak down, etc.)
-//! it falls back to whatever stale copy the cache already has so the
-//! UI degrades gracefully rather than going dark.
+//! Pulls satellite TLEs from Celestrak's stable per-catalog endpoint
+//!
+//! ```text
+//! https://celestrak.org/NORAD/elements/gp.php?CATNR={id}&FORMAT=tle
+//! ```
+//!
+//! and stores them under `~/.cache/sdr-rs/tle/{id}.tle`. Daily refresh:
+//! callers ask for a TLE by NORAD id, the cache returns it from disk if
+//! the file is fresher than [`DEFAULT_REFRESH_MAX_AGE`] (24 hours);
+//! otherwise it tries to re-download. If re-download fails (offline,
+//! Celestrak down, etc.) it falls back to whatever stale copy the cache
+//! already has so the UI degrades gracefully rather than going dark.
 //!
 //! The HTTP fetch is **blocking** by design — the rest of the
 //! workspace is blocking-only, and TLE fetches are once-a-day so the
 //! caller is expected to invoke this from a worker thread (the
 //! scheduler UI's "refresh TLEs" button, for example).
+//!
+//! ## Why per-NORAD instead of group files
+//!
+//! Earlier versions of this cache fetched whole group files
+//! (`noaa.txt`, `weather.txt`, `stations.txt`) keyed by a `TleSource`
+//! enum. Celestrak deprecated those URLs in 2024-2025: `noaa.txt`
+//! returns 404 outright, the `noaa` group is gone from the GP API,
+//! and the surviving `.txt` paths only redirect to the new `gp.php`
+//! form. NOAA 15/18/19 (the APT-capable POES) aren't grouped under
+//! any current GROUP slug — only `gp.php?CATNR=…` reliably returns
+//! them. Per-NORAD fetches dodge the group-churn problem entirely
+//! and let the catalog in [`crate::KNOWN_SATELLITES`] grow without
+//! someone having to figure out which group each satellite lives in.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -36,34 +53,12 @@ pub const DEFAULT_REFRESH_MAX_AGE: StdDuration = StdDuration::from_hours(24);
 /// thread doesn't lock up if Celestrak is hung.
 pub const DEFAULT_FETCH_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 
-/// Which Celestrak source file a TLE belongs to. Each maps directly to
-/// a `https://celestrak.org/NORAD/elements/{slug}.txt` URL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TleSource {
-    /// `noaa.txt` — NOAA POES satellites (15/18/19) for APT.
-    Noaa,
-    /// `weather.txt` — Meteor-M and other weather sats for LRPT.
-    Weather,
-    /// `stations.txt` — ISS and crewed-vehicle TLEs for SSTV.
-    Stations,
-}
-
-impl TleSource {
-    /// Celestrak filename slug — the bit between `/elements/` and `.txt`.
-    #[must_use]
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::Noaa => "noaa",
-            Self::Weather => "weather",
-            Self::Stations => "stations",
-        }
-    }
-
-    /// Full Celestrak URL for the file backing this source.
-    #[must_use]
-    pub fn url(self) -> String {
-        format!("https://celestrak.org/NORAD/elements/{}.txt", self.slug())
-    }
+/// Build the Celestrak GP URL for a single NORAD catalog number. Public
+/// so [`TleCache::with_fetcher`] callers (custom HTTP stacks) can mirror
+/// the production URL shape without re-deriving it.
+#[must_use]
+pub fn celestrak_gp_url(norad_id: u32) -> String {
+    format!("https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle")
 }
 
 /// Errors from cache lookup or HTTP fetch.
@@ -89,27 +84,25 @@ pub enum TleCacheError {
         #[source]
         source: std::io::Error,
     },
-    /// Looked up a NORAD id that wasn't present in the source's text.
-    /// Usually means the satellite was decommissioned and dropped from
-    /// the upstream file.
-    #[error("NORAD id {norad_id} not found in {tle_source:?} TLE source")]
+    /// Cache file existed and parsed but didn't contain a TLE pair
+    /// matching `norad_id`. Almost always the cached body got truncated
+    /// or corrupted — the canonical path on a successful fetch is for
+    /// the per-NORAD response to contain exactly the requested entry,
+    /// so a `NotFound` after a clean fetch means upstream returned
+    /// something other than the asked-for satellite.
+    #[error("NORAD id {norad_id} not found in cached TLE response")]
     NotFound {
         /// NORAD id requested.
         norad_id: u32,
-        /// Source the lookup ran against. Renamed from `source` because
-        /// thiserror auto-treats a field literally called `source` as
-        /// an `Error::source()` shim and demands the type implement
-        /// `std::error::Error`.
-        tle_source: TleSource,
     },
 }
 
 /// Custom fetcher used by [`TleCache::with_fetcher`]. Receives the
-/// requested source and returns the raw TLE text or a fetch-style
+/// requested NORAD id and returns the raw TLE text or a fetch-style
 /// error. Useful for unit tests that need hermetic refetch-path
 /// behaviour, and for users who want to plug in a non-reqwest HTTP
 /// stack (proxy-aware client, custom auth, etc.).
-pub type Fetcher = dyn Fn(TleSource) -> Result<String, TleCacheError> + Send + Sync;
+pub type Fetcher = dyn Fn(u32) -> Result<String, TleCacheError> + Send + Sync;
 
 /// Filesystem-backed cache of Celestrak TLE files.
 pub struct TleCache {
@@ -176,7 +169,7 @@ impl TleCache {
     #[must_use]
     pub fn with_fetcher<F>(mut self, fetcher: F) -> Self
     where
-        F: Fn(TleSource) -> Result<String, TleCacheError> + Send + Sync + 'static,
+        F: Fn(u32) -> Result<String, TleCacheError> + Send + Sync + 'static,
     {
         self.fetcher = Some(Box::new(fetcher));
         self
@@ -198,14 +191,16 @@ impl TleCache {
         self
     }
 
-    /// Path on disk where this source's TLE file is cached.
+    /// Path on disk where this NORAD id's TLE is cached. Filename uses
+    /// a `.tle` extension so a glance at `~/.cache/sdr-rs/tle/` makes
+    /// it obvious what's there even if the satellite catalog grows.
     #[must_use]
-    pub fn cache_path(&self, source: TleSource) -> PathBuf {
-        self.cache_dir.join(format!("{}.txt", source.slug()))
+    pub fn cache_path(&self, norad_id: u32) -> PathBuf {
+        self.cache_dir.join(format!("{norad_id}.tle"))
     }
 
-    /// Look up the TLE pair for `norad_id` in the given source,
-    /// refreshing the cache file from Celestrak if it's stale.
+    /// Look up the TLE pair for `norad_id`, refreshing from Celestrak
+    /// if the cache file is stale (or missing).
     ///
     /// On a fetch failure with a stale-but-present cache, returns the
     /// cached entry — the user gets *something* rather than a blank
@@ -214,31 +209,24 @@ impl TleCache {
     /// # Errors
     ///
     /// Surfaces [`TleCacheError`] for network, I/O, or lookup failures.
-    pub fn tle_for(
-        &self,
-        norad_id: u32,
-        source: TleSource,
-    ) -> Result<(String, String), TleCacheError> {
-        let text = self.tle_text(source)?;
-        parse_tle_text(&text, norad_id).ok_or(TleCacheError::NotFound {
-            norad_id,
-            tle_source: source,
-        })
+    pub fn tle_for(&self, norad_id: u32) -> Result<(String, String), TleCacheError> {
+        let text = self.tle_text(norad_id)?;
+        parse_tle_text(&text, norad_id).ok_or(TleCacheError::NotFound { norad_id })
     }
 
-    /// Get the raw TLE-file text for a source, refreshing on disk if
+    /// Get the raw TLE text for one satellite, refreshing on disk if
     /// the cached copy is stale (or missing).
     ///
     /// # Errors
     ///
     /// See [`TleCache::tle_for`].
-    pub fn tle_text(&self, source: TleSource) -> Result<String, TleCacheError> {
-        let path = self.cache_path(source);
+    pub fn tle_text(&self, norad_id: u32) -> Result<String, TleCacheError> {
+        let path = self.cache_path(norad_id);
 
         // Fast path: cache file is fresh, readable, AND structurally
         // a TLE file. Mtime + read alone aren't enough — older builds
-        // or a manual `echo > cache.txt` could have left HTML or
-        // garbage at this path, and we'd otherwise keep serving it
+        // or a manual `echo $whatever > cache.txt` could have left HTML
+        // or garbage at this path, and we'd otherwise keep serving it
         // until the file ages out (and `tle_for` would surface a
         // misleading `NotFound` even when upstream is healthy). If a
         // TOCTOU race steals the file between mtime check and read,
@@ -250,17 +238,14 @@ impl TleCache {
             if has_any_tle_pair(&cached) {
                 return Ok(cached);
             }
-            tracing::warn!(
-                "ignoring corrupted fresh TLE cache for {:?}; refetching",
-                source,
-            );
+            tracing::warn!("ignoring corrupted fresh TLE cache for NORAD {norad_id}; refetching");
         }
 
         // Slow path: fetch from upstream, validate, write to disk.
         // If the fetch (or validation) fails, fall back to whatever
         // stale copy still happens to exist *and validates*. If even
         // that's gone or corrupted, surface the original fetch error.
-        let fetch_result = self.fetch(source).and_then(|text| {
+        let fetch_result = self.fetch(norad_id).and_then(|text| {
             if has_any_tle_pair(&text) {
                 Ok(text)
             } else {
@@ -277,8 +262,7 @@ impl TleCache {
                 // network-fresh TLE data. Log and move on.
                 if let Err(e) = self.write_cache(&path, &text) {
                     tracing::warn!(
-                        "TLE cache write for {:?} failed ({e}); returning fresh in-memory copy",
-                        source,
+                        "TLE cache write for NORAD {norad_id} failed ({e}); returning fresh in-memory copy",
                     );
                 }
                 Ok(text)
@@ -288,8 +272,7 @@ impl TleCache {
                     && has_any_tle_pair(&cached)
                 {
                     tracing::warn!(
-                        "TLE fetch for {:?} failed ({fetch_err}); using stale cache",
-                        source,
+                        "TLE fetch for NORAD {norad_id} failed ({fetch_err}); using stale cache",
                     );
                     return Ok(cached);
                 }
@@ -298,17 +281,17 @@ impl TleCache {
         }
     }
 
-    /// Blocking HTTP fetch of one source file. Reuses the cached
+    /// Blocking HTTP fetch of one satellite's TLE. Reuses the cached
     /// reqwest client across calls for connection + TLS-session pooling.
     /// If [`TleCache::with_fetcher`] supplied an override, that closure
     /// runs instead — letting tests stay hermetic and users plug in
     /// custom HTTP stacks.
-    fn fetch(&self, source: TleSource) -> Result<String, TleCacheError> {
+    fn fetch(&self, norad_id: u32) -> Result<String, TleCacheError> {
         if let Some(override_fetcher) = &self.fetcher {
-            return override_fetcher(source);
+            return override_fetcher(norad_id);
         }
         let client = self.client()?;
-        let url = source.url();
+        let url = celestrak_gp_url(norad_id);
         let response = client
             .get(&url)
             .send()
@@ -568,17 +551,16 @@ NOAA 19
 ";
 
     #[test]
-    fn slug_for_each_source_matches_celestrak_filename() {
-        assert_eq!(TleSource::Noaa.slug(), "noaa");
-        assert_eq!(TleSource::Weather.slug(), "weather");
-        assert_eq!(TleSource::Stations.slug(), "stations");
-    }
-
-    #[test]
-    fn url_points_to_celestrak_https() {
-        let url = TleSource::Noaa.url();
-        assert!(url.starts_with("https://celestrak.org/NORAD/elements/"));
-        assert!(url.ends_with("noaa.txt"));
+    fn celestrak_gp_url_uses_stable_per_catnr_endpoint() {
+        // Pin the URL shape — we deliberately do NOT use the legacy
+        // `noaa.txt` / `weather.txt` group files (Celestrak deprecated
+        // them in 2024-2025) or the redirector at `redirect.php`.
+        // Per-CATNR is the documented stable interface.
+        let url = celestrak_gp_url(25_338);
+        assert_eq!(
+            url,
+            "https://celestrak.org/NORAD/elements/gp.php?CATNR=25338&FORMAT=tle"
+        );
     }
 
     #[test]
@@ -707,9 +689,15 @@ SOMETHING
     /// Canned fetcher for hermetic refetch-path tests: always returns
     /// a `Fetch` error so we exercise the "fetch failed, fall back to
     /// stale" branch without touching the network.
-    fn always_fail_fetcher() -> impl Fn(TleSource) -> Result<String, TleCacheError> + Send + Sync {
+    fn always_fail_fetcher() -> impl Fn(u32) -> Result<String, TleCacheError> + Send + Sync {
         |_| Err(TleCacheError::Fetch("test: fetcher disabled".to_string()))
     }
+
+    /// NORAD id used as the fixture key across the cache tests below.
+    /// Matches NOAA 19 — meaningful in case a test file actually leaks
+    /// to disk during debugging, but every test injects a custom
+    /// fetcher / cache dir so no real network call is ever made.
+    const TEST_NORAD: u32 = 33_591;
 
     #[test]
     fn cache_does_not_trust_html_blob_in_fresh_cache_file() {
@@ -726,11 +714,11 @@ SOMETHING
         let dir = unique_temp_dir("html-blob");
         std::fs::create_dir_all(&dir).unwrap();
         let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
-        let path = cache.cache_path(TleSource::Noaa);
+        let path = cache.cache_path(TEST_NORAD);
         let html = "<html><head><title>503</title></head><body>oops</body></html>\n";
         std::fs::write(&path, html).unwrap();
 
-        match cache.tle_text(TleSource::Noaa) {
+        match cache.tle_text(TEST_NORAD) {
             Err(TleCacheError::Fetch(_)) => {}
             Ok(text) => {
                 panic!("cache returned the HTML blob verbatim — corruption was trusted: {text:?}")
@@ -749,11 +737,11 @@ SOMETHING
         let dir = unique_temp_dir("non-utf8");
         std::fs::create_dir_all(&dir).unwrap();
         let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
-        let path = cache.cache_path(TleSource::Noaa);
+        let path = cache.cache_path(TEST_NORAD);
         // 0xFF 0xFE 0x80 0x81 0x82 are invalid as UTF-8 lead bytes.
         std::fs::write(&path, [0xFF_u8, 0xFE, 0x80, 0x81, 0x82]).unwrap();
 
-        match cache.tle_text(TleSource::Noaa) {
+        match cache.tle_text(TEST_NORAD) {
             Err(TleCacheError::Fetch(_)) => {}
             Err(TleCacheError::Io { ref source, .. })
                 if source.kind() == std::io::ErrorKind::InvalidData =>
@@ -777,13 +765,13 @@ SOMETHING
         let dir = unique_temp_dir("toctou");
         std::fs::create_dir_all(&dir).unwrap();
         let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
-        let path = cache.cache_path(TleSource::Noaa);
+        let path = cache.cache_path(TEST_NORAD);
         std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
         // Sanity: fresh-cache fast path works (doesn't go through fetch).
-        assert!(cache.tle_text(TleSource::Noaa).is_ok());
+        assert!(cache.tle_text(TEST_NORAD).is_ok());
         // Race: delete the file before the next call.
         std::fs::remove_file(&path).unwrap();
-        match cache.tle_text(TleSource::Noaa) {
+        match cache.tle_text(TEST_NORAD) {
             Err(TleCacheError::Fetch(_)) => {} // expected: fell through to (failing) fetch
             Err(other @ TleCacheError::Io { .. }) => {
                 panic!("TOCTOU race should fall through to fetch, got Io error: {other:?}")
@@ -802,18 +790,39 @@ SOMETHING
         std::fs::create_dir_all(&dir).unwrap();
         let cache = TleCache::with_dir(dir).with_fetcher(|_| Ok(SAMPLE_TLE_3LINE.to_string()));
         // No file present → goes through the fetch path.
-        let text = cache.tle_text(TleSource::Noaa).unwrap();
+        let text = cache.tle_text(TEST_NORAD).unwrap();
         assert!(text.contains("VANGUARD 1"));
+    }
+
+    #[test]
+    fn cache_fetcher_receives_requested_norad_id() {
+        // The fetcher closure must see the actual NORAD id the caller
+        // asked for — otherwise a custom HTTP stack couldn't build the
+        // right `gp.php?CATNR=…` query. Round-trip an `AtomicU32` so
+        // the test pins the contract regardless of how many times
+        // the fetcher is called.
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = unique_temp_dir("fetcher-id");
+        std::fs::create_dir_all(&dir).unwrap();
+        let last_seen = StdArc::new(AtomicU32::new(0));
+        let last_seen_clone = StdArc::clone(&last_seen);
+        let cache = TleCache::with_dir(dir).with_fetcher(move |id| {
+            last_seen_clone.store(id, Ordering::Relaxed);
+            Ok(SAMPLE_TLE_3LINE.to_string())
+        });
+        let _ = cache.tle_text(33_591).unwrap();
+        assert_eq!(last_seen.load(Ordering::Relaxed), 33_591);
     }
 
     #[test]
     fn cache_returns_text_when_file_is_fresh() {
         let dir = unique_temp_dir("fresh");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("noaa.txt");
+        let path = dir.join(format!("{TEST_NORAD}.tle"));
         std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
         let cache = TleCache::with_dir(dir.clone());
-        let text = cache.tle_text(TleSource::Noaa).unwrap();
+        let text = cache.tle_text(TEST_NORAD).unwrap();
         assert!(text.contains("VANGUARD 1"));
     }
 
@@ -821,29 +830,28 @@ SOMETHING
     fn cache_returns_tle_pair_when_file_is_fresh() {
         let dir = unique_temp_dir("pair");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("noaa.txt");
+        // Per-NORAD cache: the fixture body needs to contain NORAD 5
+        // and the cache file must be at the path keyed by 5.
+        let path = dir.join("5.tle");
         std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
         let cache = TleCache::with_dir(dir);
-        let (l1, l2) = cache.tle_for(5, TleSource::Noaa).unwrap();
+        let (l1, l2) = cache.tle_for(5).unwrap();
         assert!(l1.starts_with("1 00005"));
         assert!(l2.starts_with("2 00005"));
     }
 
     #[test]
     fn cache_returns_not_found_when_norad_id_missing_from_fresh_file() {
+        // Per-NORAD cache file at id 99999 that contains a different
+        // satellite's entries — should surface as NotFound, not as
+        // a successful match.
         let dir = unique_temp_dir("missing-id");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("noaa.txt");
+        let path = dir.join("99999.tle");
         std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
         let cache = TleCache::with_dir(dir);
-        let err = cache.tle_for(99_999, TleSource::Noaa).unwrap_err();
-        assert!(matches!(
-            err,
-            TleCacheError::NotFound {
-                norad_id: 99_999,
-                tle_source: TleSource::Noaa,
-            }
-        ));
+        let err = cache.tle_for(99_999).unwrap_err();
+        assert!(matches!(err, TleCacheError::NotFound { norad_id: 99_999 }));
     }
 
     #[test]
@@ -888,12 +896,12 @@ SOMETHING
         let dir = unique_temp_dir("atomic-write");
         std::fs::create_dir_all(&dir).unwrap();
         let cache = TleCache::with_dir(dir.clone());
-        let path = cache.cache_path(TleSource::Noaa);
+        let path = cache.cache_path(TEST_NORAD);
         cache.write_cache(&path, "hello cache").unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "hello cache");
         // No leftover tempfiles in the cache directory.
-        // Tempfiles look like `noaa.tmp.12345.0` — `Path::extension()`
+        // Tempfiles look like `33591.tmp.12345.0` — `Path::extension()`
         // returns the *last* segment (`"0"`), not `"tmp"`, so we have
         // to scan the filename string for the `.tmp.` infix instead.
         let leftover_tmp_count = std::fs::read_dir(&dir)

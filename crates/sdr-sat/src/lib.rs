@@ -23,12 +23,17 @@
 //! Hard-coded NORAD IDs for the satellites we ship with are in
 //! [`KNOWN_SATELLITES`] so callers don't need to look them up.
 
+pub mod elevation;
 pub mod passes;
+pub mod postal_lookup;
 pub mod sgp4_core;
 pub mod tle_cache;
 
+pub use elevation::{ElevationLookupError, lookup_elevation_m};
+pub use passes::{GroundStation, Pass, Track, track, upcoming_passes};
+pub use postal_lookup::{PostalLocation, PostalLookupError, lookup_us_zip};
 pub use sgp4_core::{Satellite, SatelliteError};
-pub use tle_cache::TleSource;
+pub use tle_cache::{TleCache, TleCacheError, celestrak_gp_url};
 
 /// A satellite the user-facing scheduler ships with by default. The list
 /// is intentionally tight — we want passes to "just work" for the most
@@ -36,14 +41,11 @@ pub use tle_cache::TleSource;
 /// TLEs by hand.
 #[derive(Debug, Clone, Copy)]
 pub struct KnownSatellite {
-    /// Display name, matches the Celestrak TLE name field exactly. Used
-    /// for the `Browse...` filter that pulls the TLE pair out of the
-    /// downloaded text file.
+    /// Display name, matches the Celestrak TLE name field exactly.
     pub name: &'static str,
     /// NORAD catalog number — the canonical satellite identifier.
+    /// [`TleCache`] looks up TLEs by this id directly.
     pub norad_id: u32,
-    /// Which Celestrak source file the TLE lives in.
-    pub source: TleSource,
 }
 
 /// Built-in catalog. Order is the order the scheduler UI displays.
@@ -52,39 +54,32 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     KnownSatellite {
         name: "NOAA 15",
         norad_id: 25_338,
-        source: TleSource::Noaa,
     },
     KnownSatellite {
         name: "NOAA 18",
         norad_id: 28_654,
-        source: TleSource::Noaa,
     },
     KnownSatellite {
         name: "NOAA 19",
         norad_id: 33_591,
-        source: TleSource::Noaa,
     },
     // Meteor-M LRPT — epic #469
     KnownSatellite {
         name: "METEOR-M 2",
         norad_id: 40_069,
-        source: TleSource::Weather,
     },
     KnownSatellite {
         name: "METEOR-M2 3",
         norad_id: 57_166,
-        source: TleSource::Weather,
     },
     KnownSatellite {
         name: "METEOR-M2 4",
         norad_id: 61_024,
-        source: TleSource::Weather,
     },
     // ISS SSTV — epic #472
     KnownSatellite {
         name: "ISS (ZARYA)",
         norad_id: 25_544,
-        source: TleSource::Stations,
     },
 ];
 
