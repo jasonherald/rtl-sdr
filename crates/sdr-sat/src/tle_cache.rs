@@ -927,10 +927,20 @@ SOMETHING
 
     /// Per-test scratch dir under the system temp prefix. Avoids
     /// pulling in `tempfile` for one-off unit tests.
+    /// Process-wide test-only counter so two parallel tests with the
+    /// same `tag` can't land on the same scratch path. `SystemTime`
+    /// alone isn't enough — `cargo test` defaults to running tests
+    /// concurrently within a single process, and on coarse-resolution
+    /// clocks (e.g. CI runners with a 1 ms tick) two threads can read
+    /// the same `nanos` value.
+    static NEXT_TEST_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn unique_temp_dir(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        std::env::temp_dir().join(format!("sdr-sat-test-{tag}-{nanos}"))
+        let counter = NEXT_TEST_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("sdr-sat-test-{tag}-{pid}-{nanos}-{counter}"))
     }
 }
