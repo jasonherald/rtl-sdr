@@ -2721,25 +2721,43 @@ final class CoreModel {
     static let sidebarRightOpenKey = "ui_sidebar_right_open"
     static let sidebarRightWidthKey = "ui_sidebar_right_width_px"
 
-    /// Per-side clamp ranges + defaults, matching the spec for
-    /// #450. Different floors and ceilings on each side reflect
-    /// what the panels need to render usefully — left holds a
-    /// `Form` with grouped sections (220 px is the minimum that
-    /// keeps the labels readable), right holds Transcript /
-    /// Bookmarks list views (360 px is the minimum that keeps
-    /// timestamps + content side-by-side without truncation).
-    /// Upper ceilings prevent a single panel from monopolising
-    /// the window.
+    /// Allowed clamp range for the left sidebar's width (px).
+    /// 220 px is the minimum that keeps the panel's `Form`
+    /// section labels readable; 640 px stops a single panel
+    /// from monopolising the window. Matches the Linux
+    /// `LEFT_PANEL_MIN_PX` / `_MAX_PX` constants in
+    /// `crates/sdr-ui/src/sidebar/activity_bar.rs`. Used by
+    /// `setSidebarLeftWidth(_:)` for runtime clamps and by
+    /// the `loadSidebarSession()` restore for validating
+    /// persisted values.
     ///
-    /// Ranges live as `Int` rather than `UInt32` because both
+    /// Stored as `Int` rather than `UInt32` because both
     /// AppKit (`NSSplitView` constraints) and SwiftUI's
     /// `.frame(minWidth:maxWidth:)` modifier take `CGFloat`,
     /// and the conversion path is simpler from `Int`. The
-    /// model still stores width as `UInt32` because the
+    /// model still persists width as `UInt32` because the
     /// shared `sdr-config` file uses unsigned ints there.
     static let sidebarLeftWidthRange: ClosedRange<Int> = 220...640
+
+    /// Allowed clamp range for the right sidebar's width (px).
+    /// 360 px is the minimum that keeps Transcript /
+    /// Bookmarks list rows from truncating timestamps+content;
+    /// 840 px is the upper ceiling. Same Linux-parity
+    /// rationale as `sidebarLeftWidthRange`.
     static let sidebarRightWidthRange: ClosedRange<Int> = 360...840
+
+    /// Default width applied on a fresh install, on a
+    /// double-click reset of the left handle, and as the seed
+    /// value for the `sidebarLeftWidth` observable property.
+    /// Matches the Linux `DEFAULT_SIDEBAR_WIDTH_PX` constant.
     static let sidebarLeftDefaultWidth: UInt32 = 320
+
+    /// Default width applied on a fresh install, on a
+    /// double-click reset of the right handle, and as the seed
+    /// value for the `sidebarRightWidth` observable property.
+    /// Wider than the left default because the right side
+    /// hosts content-heavy panels (Transcript / Bookmarks)
+    /// that read better with extra room.
     static let sidebarRightDefaultWidth: UInt32 = 420
 
     /// Restore all six sidebar fields from the shared config.
