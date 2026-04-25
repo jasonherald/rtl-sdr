@@ -9,7 +9,7 @@
 //! the synthetic CADU fixtures alone exercise framing logic but
 //! can't verify the FEC math against a live recording. The full
 //! real-pass integration test runs on demand:
-//!   `cargo test -p sdr-lrpt -- --ignored real_pass`
+//!   `cargo test -p sdr-lrpt -- --ignored frames_match_golden`
 //!
 //! Regeneration procedure: see
 //! `crates/sdr-lrpt/tests/fixtures/REGENERATE_GOLDENS.md`.

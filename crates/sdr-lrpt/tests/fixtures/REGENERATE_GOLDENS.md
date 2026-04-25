@@ -89,5 +89,5 @@ runs, but early-returns when the goldens directory is empty.
 Run on demand once goldens land:
 
 ```bash
-cargo test -p sdr-lrpt -- --ignored real_pass
+cargo test -p sdr-lrpt -- --ignored frames_match_golden
 ```
