@@ -246,6 +246,13 @@ struct ContentView: View {
         let baseWidth: CGFloat = side == .left
             ? CGFloat(model.sidebarLeftWidth)
             : CGFloat(model.sidebarRightWidth)
+        // Per-side clamp range — left 220..=640, right 360..=840
+        // per the spec for #450. The model's setters clamp to
+        // these too; doing it during the drag also keeps the
+        // live preview inside the visible bounds.
+        let range: ClosedRange<Int> = side == .left
+            ? CoreModel.sidebarLeftWidthRange
+            : CoreModel.sidebarRightWidthRange
         // 8 px of draggable strip centered on the 1 px divider.
         // Wider than the divider so the hit target is forgiving
         // — matches macOS's own HSplitView separator feel.
@@ -273,8 +280,22 @@ struct ContentView: View {
                     NSCursor.pop()
                 }
             }
+            // Double-click → reset to the side's default width.
+            // Per the spec for #450. The tap gesture has higher
+            // priority than the drag so a fast double-click
+            // doesn't get interpreted as a zero-distance drag.
+            .onTapGesture(count: 2) {
+                switch side {
+                case .left:
+                    liveLeftWidth = nil
+                    model.setSidebarLeftWidth(CoreModel.sidebarLeftDefaultWidth)
+                case .right:
+                    liveRightWidth = nil
+                    model.setSidebarRightWidth(CoreModel.sidebarRightDefaultWidth)
+                }
+            }
             .gesture(
-                DragGesture(minimumDistance: 0)
+                DragGesture(minimumDistance: 1)
                     .onChanged { value in
                         let delta = value.translation.width
                         let next: CGFloat
@@ -284,11 +305,8 @@ struct ContentView: View {
                         case .right:
                             next = baseWidth - delta
                         }
-                        // Clamp to the model's configured range
-                        // so the live preview stays inside the
-                        // visible bounds (setter clamps too).
-                        let lo = CGFloat(CoreModel.sidebarWidthRange.lowerBound)
-                        let hi = CGFloat(CoreModel.sidebarWidthRange.upperBound)
+                        let lo = CGFloat(range.lowerBound)
+                        let hi = CGFloat(range.upperBound)
                         let clamped = min(max(next, lo), hi)
                         switch side {
                         case .left: liveLeftWidth = clamped

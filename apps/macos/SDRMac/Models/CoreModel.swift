@@ -2692,16 +2692,21 @@ final class CoreModel {
     var sidebarLeftSelected: String = "general"
     /// Whether the left panel is currently visible.
     var sidebarLeftOpen: Bool = true
-    /// Width of the left panel in pixels.
-    var sidebarLeftWidth: UInt32 = 320
+    /// Width of the left panel in pixels. Default matches the
+    /// Linux `DEFAULT_SIDEBAR_WIDTH_PX` constant; the per-side
+    /// clamp range below is the spec's floor/ceiling pair.
+    var sidebarLeftWidth: UInt32 = sidebarLeftDefaultWidth
 
     /// Activity selected in the right sidebar — one of the
     /// `RightActivity` raw values.
     var sidebarRightSelected: String = "transcript"
     /// Whether the right panel is currently visible.
     var sidebarRightOpen: Bool = false
-    /// Width of the right panel in pixels.
-    var sidebarRightWidth: UInt32 = 320
+    /// Width of the right panel in pixels. Default is wider than
+    /// the left because the right side hosts content-heavy
+    /// panels (Transcript / Bookmarks) that read better with
+    /// extra room.
+    var sidebarRightWidth: UInt32 = sidebarRightDefaultWidth
 
     /// Config keys — match the Linux constants in
     /// `crates/sdr-ui/src/sidebar/activity_bar.rs` exactly so a
@@ -2713,13 +2718,26 @@ final class CoreModel {
     static let sidebarRightOpenKey = "ui_sidebar_right_open"
     static let sidebarRightWidthKey = "ui_sidebar_right_width_px"
 
-    /// Hard floor / ceiling for sidebar widths (pixels). The
-    /// GTK side tolerates anything but applies a sane minimum
-    /// in its split-view handler; we mirror that here so a
-    /// hand-edited config can't hand the SwiftUI HSplitView a
-    /// degenerate width that collapses the panel beyond the
-    /// drag-back-out threshold.
-    static let sidebarWidthRange: ClosedRange<UInt32> = 200...800
+    /// Per-side clamp ranges + defaults, matching the spec for
+    /// #450. Different floors and ceilings on each side reflect
+    /// what the panels need to render usefully — left holds a
+    /// `Form` with grouped sections (220 px is the minimum that
+    /// keeps the labels readable), right holds Transcript /
+    /// Bookmarks list views (360 px is the minimum that keeps
+    /// timestamps + content side-by-side without truncation).
+    /// Upper ceilings prevent a single panel from monopolising
+    /// the window.
+    ///
+    /// Ranges live as `Int` rather than `UInt32` because both
+    /// AppKit (`NSSplitView` constraints) and SwiftUI's
+    /// `.frame(minWidth:maxWidth:)` modifier take `CGFloat`,
+    /// and the conversion path is simpler from `Int`. The
+    /// model still stores width as `UInt32` because the
+    /// shared `sdr-config` file uses unsigned ints there.
+    static let sidebarLeftWidthRange: ClosedRange<Int> = 220...640
+    static let sidebarRightWidthRange: ClosedRange<Int> = 360...840
+    static let sidebarLeftDefaultWidth: UInt32 = 320
+    static let sidebarRightDefaultWidth: UInt32 = 420
 
     /// Restore all six sidebar fields from the shared config.
     /// Called once during `bootstrap()` AFTER the engine is
@@ -2737,7 +2755,7 @@ final class CoreModel {
             sidebarLeftOpen = b
         }
         if let w = core.configUInt32(key: Self.sidebarLeftWidthKey),
-           Self.sidebarWidthRange.contains(w) {
+           Self.sidebarLeftWidthRange.contains(Int(w)) {
             sidebarLeftWidth = w
         }
         if let s = core.configString(key: Self.sidebarRightSelectedKey),
@@ -2748,7 +2766,7 @@ final class CoreModel {
             sidebarRightOpen = b
         }
         if let w = core.configUInt32(key: Self.sidebarRightWidthKey),
-           Self.sidebarWidthRange.contains(w) {
+           Self.sidebarRightWidthRange.contains(Int(w)) {
             sidebarRightWidth = w
         }
     }
@@ -2773,10 +2791,9 @@ final class CoreModel {
     }
 
     func setSidebarLeftWidth(_ width: UInt32) {
-        let clamped = min(
-            max(width, Self.sidebarWidthRange.lowerBound),
-            Self.sidebarWidthRange.upperBound
-        )
+        let lo = UInt32(Self.sidebarLeftWidthRange.lowerBound)
+        let hi = UInt32(Self.sidebarLeftWidthRange.upperBound)
+        let clamped = min(max(width, lo), hi)
         sidebarLeftWidth = clamped
         capture {
             try core?.setConfigUInt32(key: Self.sidebarLeftWidthKey, value: clamped)
@@ -2797,10 +2814,9 @@ final class CoreModel {
     }
 
     func setSidebarRightWidth(_ width: UInt32) {
-        let clamped = min(
-            max(width, Self.sidebarWidthRange.lowerBound),
-            Self.sidebarWidthRange.upperBound
-        )
+        let lo = UInt32(Self.sidebarRightWidthRange.lowerBound)
+        let hi = UInt32(Self.sidebarRightWidthRange.upperBound)
+        let clamped = min(max(width, lo), hi)
         sidebarRightWidth = clamped
         capture {
             try core?.setConfigUInt32(key: Self.sidebarRightWidthKey, value: clamped)
