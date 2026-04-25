@@ -1210,27 +1210,6 @@ pub unsafe extern "C" fn sdr_core_set_fft_rate(handle: *mut SdrCore, fps: f64) -
 // without observable effect; the SwiftUI panel documents this
 // in its footer.
 
-/// Helper: read a borrowed `*const c_char` channel name into a
-/// validated `String` for `LockoutScannerChannel` /
-/// `UnlockScannerChannel` dispatch. Rejects null pointers and
-/// non-UTF-8 input with `SdrCoreError::InvalidArg`. Empty
-/// strings are accepted — the engine treats them as a real
-/// (if unusual) channel name.
-fn read_channel_name(name_utf8: *const c_char, fn_label: &str) -> Result<String, SdrCoreError> {
-    if name_utf8.is_null() {
-        set_last_error(format!("{fn_label}: name pointer is null"));
-        return Err(SdrCoreError::InvalidArg);
-    }
-    // SAFETY: caller contract — name_utf8 is a NUL-terminated
-    // C string for the duration of this call.
-    let cstr = unsafe { CStr::from_ptr(name_utf8) };
-    let Ok(s) = cstr.to_str() else {
-        set_last_error(format!("{fn_label}: name is not valid UTF-8"));
-        return Err(SdrCoreError::InvalidArg);
-    };
-    Ok(s.to_owned())
-}
-
 /// Master scanner enable / disable. Routes to
 /// `UiToDsp::SetScannerEnabled`. Tripping this on with no
 /// projected channels leaves the engine in `Idle` (visible
@@ -1267,7 +1246,9 @@ pub unsafe extern "C" fn sdr_core_lockout_scanner_channel(
 ) -> i32 {
     unsafe {
         with_core(handle, |core| {
-            let name = read_channel_name(name_utf8, "sdr_core_lockout_scanner_channel")?;
+            // Reuse the shared string-in helper so null / non-UTF-8
+            // error semantics match every other command path.
+            let name = cstr_to_string("sdr_core_lockout_scanner_channel", name_utf8)?;
             send(
                 core,
                 UiToDsp::LockoutScannerChannel(sdr_scanner::ChannelKey { name, frequency_hz }),
@@ -1291,7 +1272,7 @@ pub unsafe extern "C" fn sdr_core_unlock_scanner_channel(
 ) -> i32 {
     unsafe {
         with_core(handle, |core| {
-            let name = read_channel_name(name_utf8, "sdr_core_unlock_scanner_channel")?;
+            let name = cstr_to_string("sdr_core_unlock_scanner_channel", name_utf8)?;
             send(
                 core,
                 UiToDsp::UnlockScannerChannel(sdr_scanner::ChannelKey { name, frequency_hz }),
@@ -2483,6 +2464,14 @@ mod tests {
     //  Scanner — ABI 0.20, issue #447
     // ------------------------------------------------------
 
+    /// Fixture frequency reused across all four scanner
+    /// command tests. 162.550 MHz is the NOAA Weather Radio
+    /// canonical frequency — a realistic NFM channel rather
+    /// than a round number, so a naive default-0 in either
+    /// side of the lockout path would be obvious in logs.
+    /// Per `CodeRabbit` round 2 on PR #497.
+    const TEST_SCANNER_FREQ_HZ: u64 = 162_550_000;
+
     #[test]
     fn scanner_commands_reject_null_handle() {
         // Matches the `all_commands_reject_null_handle` pattern
@@ -2497,13 +2486,21 @@ mod tests {
         let name = CString::new("Test").unwrap();
         assert_eq!(
             unsafe {
-                sdr_core_lockout_scanner_channel(std::ptr::null_mut(), name.as_ptr(), 162_550_000)
+                sdr_core_lockout_scanner_channel(
+                    std::ptr::null_mut(),
+                    name.as_ptr(),
+                    TEST_SCANNER_FREQ_HZ,
+                )
             },
             SdrCoreError::InvalidHandle.as_int()
         );
         assert_eq!(
             unsafe {
-                sdr_core_unlock_scanner_channel(std::ptr::null_mut(), name.as_ptr(), 162_550_000)
+                sdr_core_unlock_scanner_channel(
+                    std::ptr::null_mut(),
+                    name.as_ptr(),
+                    TEST_SCANNER_FREQ_HZ,
+                )
             },
             SdrCoreError::InvalidHandle.as_int()
         );
@@ -2517,11 +2514,11 @@ mod tests {
         // of dereferencing.
         let h = make_handle();
         assert_eq!(
-            unsafe { sdr_core_lockout_scanner_channel(h, std::ptr::null(), 162_550_000) },
+            unsafe { sdr_core_lockout_scanner_channel(h, std::ptr::null(), TEST_SCANNER_FREQ_HZ) },
             SdrCoreError::InvalidArg.as_int()
         );
         assert_eq!(
-            unsafe { sdr_core_unlock_scanner_channel(h, std::ptr::null(), 162_550_000) },
+            unsafe { sdr_core_unlock_scanner_channel(h, std::ptr::null(), TEST_SCANNER_FREQ_HZ) },
             SdrCoreError::InvalidArg.as_int()
         );
         destroy(h);
@@ -2541,11 +2538,11 @@ mod tests {
         let bad: [u8; 2] = [0xFF, 0x00];
         let bad_ptr = bad.as_ptr().cast::<c_char>();
         assert_eq!(
-            unsafe { sdr_core_lockout_scanner_channel(h, bad_ptr, 162_550_000) },
+            unsafe { sdr_core_lockout_scanner_channel(h, bad_ptr, TEST_SCANNER_FREQ_HZ) },
             SdrCoreError::InvalidArg.as_int()
         );
         assert_eq!(
-            unsafe { sdr_core_unlock_scanner_channel(h, bad_ptr, 162_550_000) },
+            unsafe { sdr_core_unlock_scanner_channel(h, bad_ptr, TEST_SCANNER_FREQ_HZ) },
             SdrCoreError::InvalidArg.as_int()
         );
         destroy(h);
@@ -2565,11 +2562,11 @@ mod tests {
         );
         let name = CString::new("NOAA Weather").unwrap();
         assert_eq!(
-            unsafe { sdr_core_lockout_scanner_channel(h, name.as_ptr(), 162_550_000) },
+            unsafe { sdr_core_lockout_scanner_channel(h, name.as_ptr(), TEST_SCANNER_FREQ_HZ) },
             SdrCoreError::Ok.as_int()
         );
         assert_eq!(
-            unsafe { sdr_core_unlock_scanner_channel(h, name.as_ptr(), 162_550_000) },
+            unsafe { sdr_core_unlock_scanner_channel(h, name.as_ptr(), TEST_SCANNER_FREQ_HZ) },
             SdrCoreError::Ok.as_int()
         );
         assert_eq!(

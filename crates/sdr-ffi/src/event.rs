@@ -284,6 +284,12 @@ pub struct SdrEventScannerMutexStopped {
 /// | `SDR_EVT_AUDIO_RECORDING_STOPPED` | none                         |
 /// | `SDR_EVT_IQ_RECORDING_STARTED`    | `iq_recording.path_utf8`     |
 /// | `SDR_EVT_IQ_RECORDING_STOPPED`    | none                         |
+/// | `SDR_EVT_NETWORK_SINK_STATUS`     | `network_sink_status.{kind,utf8,protocol}` |
+/// | `SDR_EVT_RTL_TCP_CONNECTION_STATE`| `rtl_tcp_connection_state.{kind,utf8,attempt,retry_in_secs,gain_count}` |
+/// | `SDR_EVT_SCANNER_STATE_CHANGED`   | `scanner_state.state`        |
+/// | `SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED` | `scanner_active_channel.{name_utf8,frequency_hz}` |
+/// | `SDR_EVT_SCANNER_EMPTY_ROTATION`  | none                         |
+/// | `SDR_EVT_SCANNER_MUTEX_STOPPED`   | `scanner_mutex_stopped.reason` |
 ///
 /// `_placeholder` exists so `SOURCE_STOPPED` events (which carry
 /// no payload) can still construct the struct with a meaningful
@@ -1061,6 +1067,30 @@ mod tests {
         assert!(owned_cstring.is_none());
     }
 
+    /// Fixture name for the latched-channel scanner tests. NOAA
+    /// Weather Radio is a canonical NFM channel with a recognisable
+    /// string, making debug output easy to read. Per `CodeRabbit`
+    /// round 2 on PR #497.
+    const TEST_SCANNER_NAME: &str = "NOAA Weather";
+    /// Fixture frequency paired with `TEST_SCANNER_NAME` — 162.550
+    /// MHz is the NOAA Weather Radio canonical channel. Same
+    /// constant appears in the command-side tests under the same
+    /// name, but keep them crate-private-per-test-module so a
+    /// future refactor that splits the modules doesn't collide.
+    const TEST_SCANNER_FREQ_HZ: u64 = 162_550_000;
+    /// Fixture bandwidth the active-channel event carries in the
+    /// flattened `bandwidth` field. NFM default — the FFI layer
+    /// doesn't read this field, so the exact value is only
+    /// meaningful as a recognisable placeholder in debug dumps.
+    const TEST_SCANNER_BANDWIDTH_HZ: f64 = 12_500.0;
+    /// Interior-NUL fixture for the sanitization test. The
+    /// dispatcher's `replace('\0', '?')` call should turn this
+    /// into "Weather?Channel" before it reaches the callback.
+    const TEST_SCANNER_NAME_WITH_INTERIOR_NUL: &str = "Weather\0Channel";
+    /// Expected output after the dispatcher sanitizes the
+    /// interior NUL in `TEST_SCANNER_NAME_WITH_INTERIOR_NUL`.
+    const TEST_SCANNER_NAME_SANITIZED: &str = "Weather?Channel";
+
     /// Build a synthetic `DspToUi::ScannerActiveChannelChanged`
     /// for the FFI translation tests. The flattened `freq_hz` /
     /// `name` fields are populated by the controller-side helper
@@ -1076,7 +1106,7 @@ mod tests {
             key,
             freq_hz,
             demod_mode: sdr_types::DemodMode::Nfm,
-            bandwidth: 12_500.0,
+            bandwidth: TEST_SCANNER_BANDWIDTH_HZ,
             name: latched_name.unwrap_or("").to_string(),
             ctcss: None,
             voice_squelch: None,
@@ -1086,19 +1116,19 @@ mod tests {
     #[test]
     fn translate_scanner_active_channel_latched_carries_name_and_frequency() {
         let (event, owned_cstring, _) = translate_event(&scanner_active_channel_event(
-            Some("NOAA Weather"),
-            162_550_000,
+            Some(TEST_SCANNER_NAME),
+            TEST_SCANNER_FREQ_HZ,
         ))
         .expect("ScannerActiveChannelChanged should translate");
         assert_eq!(event.kind, SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED);
         let payload = unsafe { event.payload.scanner_active_channel };
         assert!(!payload.name_utf8.is_null());
-        assert_eq!(payload.frequency_hz, 162_550_000);
+        assert_eq!(payload.frequency_hz, TEST_SCANNER_FREQ_HZ);
         // Name lives in the owned CString — pointer must still
         // resolve to the original bytes via the standard
         // round-trip through CStr.
         let as_cstr = unsafe { std::ffi::CStr::from_ptr(payload.name_utf8) };
-        assert_eq!(as_cstr.to_str().unwrap(), "NOAA Weather");
+        assert_eq!(as_cstr.to_str().unwrap(), TEST_SCANNER_NAME);
         assert!(owned_cstring.is_some());
     }
 
@@ -1132,13 +1162,13 @@ mod tests {
         // `name_utf8` dangling. Same lifetime contract as the
         // other translate_*-pattern tests.
         let (event, _owned_cstring, _) = translate_event(&scanner_active_channel_event(
-            Some("Weather\0Channel"),
-            162_550_000,
+            Some(TEST_SCANNER_NAME_WITH_INTERIOR_NUL),
+            TEST_SCANNER_FREQ_HZ,
         ))
         .expect("sanitized ScannerActiveChannelChanged should translate");
         let payload = unsafe { event.payload.scanner_active_channel };
         let as_cstr = unsafe { std::ffi::CStr::from_ptr(payload.name_utf8) };
-        assert_eq!(as_cstr.to_str().unwrap(), "Weather?Channel");
+        assert_eq!(as_cstr.to_str().unwrap(), TEST_SCANNER_NAME_SANITIZED);
     }
 
     #[test]
