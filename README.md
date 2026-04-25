@@ -40,6 +40,12 @@ Software-defined radio application in Rust -- a port of [SDR++](https://github.c
 - IQ WAV recording (raw pre-decimation samples)
 - Waterfall PNG export with desktop notification and click-to-open
 
+### Weather satellites
+
+- **NOAA APT** reception on 137 MHz — pass prediction (SGP4 + Celestrak TLEs), live image viewer, PNG export, auto-record-on-pass that tunes the radio at AOS, opens the viewer, saves the image at LOS, and restores your previous tune
+- Walkthrough: [`docs/guides/apt-reception.md`](docs/guides/apt-reception.md) — antenna setup, FM-broadcast notch advice, your first pass, troubleshooting
+- Built-in catalog covers NOAA 15 / 18 / 19 (APT), Meteor-M 2 / Meteor-M2 3 (LRPT placeholder — decoder pending #469), and ISS (SSTV placeholder — pending #472)
+
 ### Transcription
 
 Two mutually exclusive backends, selected at build time (see the install section below):
@@ -82,7 +88,7 @@ Two mutually exclusive backends, selected at build time (see the install section
 
 ### Under the Hood
 
-- 22-member workspace (root binary + 21 library crates) with clear dependency boundaries
+- 23-member workspace (root binary + 22 library crates) with clear dependency boundaries
 - Pure DSP functions (no threading, no I/O, no side effects)
 - Zero per-frame heap allocations on hot paths
 - Lock-based SPSC audio ring buffer between DSP and audio threads
@@ -257,7 +263,7 @@ sdr-rs
 
 ## Architecture
 
-22-member Rust workspace (root binary + 21 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
+23-member Rust workspace (root binary + 22 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
 
 ```text
 sdr (binary)              Linux entry point
@@ -282,6 +288,7 @@ sdr-sink-network          TCP/UDP audio output
 sdr-server-rtltcp         rtl_tcp server — stream local dongle over TCP + CLI binary
 sdr-rtltcp-discovery      mDNS _rtl_tcp._tcp.local. announce + browse
 sdr-scanner               Classic sequential scanner state machine (pure, no I/O)
+sdr-sat                   Satellite pass prediction (SGP4) + TLE cache + ground-station catalog
 
 apps/macos/
 ├── SDRMac                   Native SwiftUI app (macOS 26+)

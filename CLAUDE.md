@@ -4,27 +4,32 @@ Rust port of SDR++ — software-defined radio application with GTK4 UI.
 
 ## Architecture
 
-18-member workspace (root binary + 17 library crates) with clear dependency boundaries:
+23-member workspace (root binary + 22 library crates) with clear dependency boundaries:
 
 ```text
-sdr-types           → Foundation types, errors, constants (no internal deps)
-sdr-dsp             → Pure DSP: math, filters, FFT, demod, resampling (depends on: types)
-sdr-config          → JSON configuration persistence + OS keyring (depends on: types)
-sdr-pipeline        → Threading, streaming, signal path (depends on: types, dsp, config)
-sdr-rtlsdr          → Rust port of librtlsdr over rusb — 5 tuner families (no internal deps)
-sdr-source-rtlsdr   → RTL-SDR source module (depends on: types, pipeline, rtlsdr, config)
-sdr-source-network  → TCP/UDP IQ source (depends on: types, pipeline, config)
-sdr-source-file     → WAV file playback source (depends on: types, pipeline, config)
-sdr-sink-audio      → PipeWire/CoreAudio output (depends on: types, pipeline, config)
-sdr-sink-network    → TCP/UDP audio output (depends on: types, pipeline, config)
-sdr-radio           → Radio decoder, demod, IF/AF chains (depends on: types, dsp, pipeline)
-sdr-radioreference  → RadioReference.com SOAP client (depends on: types, config)
-sdr-transcription   → Whisper OR Sherpa-onnx backend, Silero VAD, spectral denoiser
-sdr-core            → Headless cross-platform engine facade (macOS port path)
-sdr-splash          → Cross-platform splash subprocess controller (stdin wire protocol)
-sdr-splash-gtk      → Linux GTK4 splash window implementation
-sdr-ui              → GTK4/libadwaita UI — Linux-only (depends on: all above)
-sdr (binary)        → Entry point (depends on: ui, core, splash, transcription, …)
+sdr-types             → Foundation types, errors, constants (no internal deps)
+sdr-dsp               → Pure DSP: math, filters, FFT, demod, resampling, APT decoder (depends on: types)
+sdr-config            → JSON configuration persistence + OS keyring (depends on: types)
+sdr-pipeline          → Threading, streaming, signal path (depends on: types, dsp, config)
+sdr-rtlsdr            → Rust port of librtlsdr over rusb — 5 tuner families (no internal deps)
+sdr-rtltcp-discovery  → mDNS browser/responder for `_rtl_tcp._tcp.local.` services
+sdr-server-rtltcp     → `rtl_tcp` server — share a local dongle over TCP
+sdr-source-rtlsdr     → RTL-SDR source module (depends on: types, pipeline, rtlsdr, config)
+sdr-source-network    → TCP/UDP IQ source (depends on: types, pipeline, config)
+sdr-source-file       → WAV file playback source (depends on: types, pipeline, config)
+sdr-sink-audio        → PipeWire/CoreAudio output (depends on: types, pipeline, config)
+sdr-sink-network      → TCP/UDP audio output (depends on: types, pipeline, config)
+sdr-radio             → Radio decoder, demod, IF/AF chains, APT image buffer (depends on: types, dsp, pipeline)
+sdr-radioreference    → RadioReference.com SOAP client (depends on: types, config)
+sdr-sat               → Satellite pass prediction (SGP4) + TLE cache + ground-station catalog
+sdr-scanner           → Multi-channel scanner engine — projection, dwell/hang, lockout
+sdr-transcription     → Whisper OR Sherpa-onnx backend, Silero VAD, spectral denoiser
+sdr-ffi               → C-ABI surface for the future macOS native-app bridge
+sdr-core              → Headless cross-platform engine facade (macOS port path)
+sdr-splash            → Cross-platform splash subprocess controller (stdin wire protocol)
+sdr-splash-gtk        → Linux GTK4 splash window implementation
+sdr-ui                → GTK4/libadwaita UI — Linux-only (depends on: all above)
+sdr (binary)          → Entry point (depends on: ui, core, splash, transcription, …)
 ```
 
 ## Transcription backend feature mutex
@@ -99,7 +104,7 @@ make lint                        # All of the above + cargo deny + cargo audit
 
 ### Sidebar architecture
 
-The GTK4 UI uses a VS Code-style activity-bar pattern (epic #420): a narrow icon strip on each window edge switches a `GtkStack` of panels between "activities". Left bar hosts General / Radio / Audio / Display / Scanner / Share; right bar hosts Transcript / Bookmarks. See `docs/design/sidebar-activity-bar-redesign.md` for the full rationale.
+The GTK4 UI uses a VS Code-style activity-bar pattern (epic #420): a narrow icon strip on each window edge switches a `GtkStack` of panels between "activities". Left bar hosts General / Radio / Audio / Display / Scanner / Share / Satellites; right bar hosts Transcript / Bookmarks. See `docs/design/sidebar-activity-bar-redesign.md` for the full rationale.
 
 **Key files:**
 
@@ -122,6 +127,25 @@ Every activity panel is an `AdwPreferencesPage` of flat `AdwPreferencesGroup`s w
 **Session persistence:**
 
 Four config keys per side live in `activity_bar.rs`: `ui_sidebar_{left,right}_{selected,open,width_px}`. Load at launch via `load_session(config)`, apply before wiring handlers (seed-then-wire prevents the initial `set_active` / `set_show_sidebar` calls from writing back). On change, persist via `save_*` helpers. Pixel widths are converted to `AdwOverlaySplitView`'s `[0, 1]` fraction via `apply_sidebar_width`'s one-shot `notify::width` handler once the split view has its first real allocation.
+
+### Satellite reception
+
+NOAA APT (epic #468) is shipped end-to-end. Future weather-sat work (Meteor-M LRPT #469, ISS SSTV #472) will reuse the same scaffolding.
+
+**Key files:**
+
+- `crates/sdr-sat/src/lib.rs` — `KNOWN_SATELLITES` is the canonical catalog (NOAA / Meteor-M / ISS) with downlink frequency, demod mode, and channel bandwidth per entry. New satellites get added here, not at call sites.
+- `crates/sdr-sat/src/passes.rs` — `upcoming_passes(...)` enumerates SGP4-propagated passes for a `GroundStation`. Pure function over time + TLEs; no I/O.
+- `crates/sdr-sat/src/tle_cache.rs` — Celestrak `gp.php?CATNR=…` per-NORAD fetcher with 24 h cache under `~/.cache/sdr-rs/tle/`. Background `gio::spawn_blocking`; never call from the GTK main loop.
+- `crates/sdr-dsp/src/apt.rs` — APT decoder (FM demod → 11025 Hz resample → 2400 Hz AM envelope → sync detect → scan-line assembly). Pure DSP, no GTK awareness.
+- `crates/sdr-radio/src/apt_image.rs` + `apt_telemetry.rs` — 2D image buffer + telemetry-wedge decode for AVHRR channel ID and brightness calibration; consumed by the live viewer.
+- `crates/sdr-ui/src/sidebar/satellites_panel.rs` — Satellites activity panel: ground-station entry, TLE refresh, upcoming passes list, auto-record toggle.
+- `crates/sdr-ui/src/sidebar/satellites_recorder.rs` — Auto-record state machine (Idle → BeforePass → Recording → Finalizing). **Pure** — `tick()` returns `Vec<Action>`, the wiring layer in `window.rs::connect_satellites_panel` interprets each. Keep state-machine logic in this module so it stays unit-testable without a GTK harness.
+- `crates/sdr-ui/src/apt_viewer.rs` — Live image viewer window with Pause/Resume + Export PNG header buttons.
+
+**User-facing walkthrough:** `docs/guides/apt-reception.md`.
+
+**PNG output path:** `~/sdr-recordings/apt-{satellite-slug}-{local-timestamp}.png` — `png_path_for` in `satellites_recorder.rs` is the single source of truth.
 
 ## C++ Reference
 
