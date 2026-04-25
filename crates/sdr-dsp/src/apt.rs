@@ -490,7 +490,12 @@ const MIN_ACCUMULATOR_FOR_DECODE: usize = SAMPLES_PER_LINE * 2;
 /// between calls — at 2 lines/sec, 8 lines = 4 s of slack. Lines past
 /// the cap stay buffered as raw envelope samples in `accumulator` (which
 /// has its own cap); only after both fill does anything get dropped.
-const READY_QUEUE_CAP: usize = 8;
+///
+/// Public so callers that pre-allocate an output slice for
+/// [`AptDecoder::process`] can size it to the decoder's internal
+/// emission cap without duplicating the literal — see the controller
+/// crate's `apt_decode_tap` for an example.
+pub const READY_QUEUE_CAP: usize = 8;
 
 /// Maximum input audio samples processed through the resample → envelope
 /// stages in one pass. Keeps `resample_scratch`, `envelope_scratch`, and

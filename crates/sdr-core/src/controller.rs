@@ -18,6 +18,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use sdr_dsp::apt::{AptDecoder, AptLine, READY_QUEUE_CAP};
 use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
@@ -401,6 +402,36 @@ struct DspState {
     /// runs (squelch edges still fire → scanner state machine
     /// stays live).
     scanner_muted: bool,
+
+    /// NOAA APT decoder, lazily constructed on first use. Fed
+    /// from the post-`radio.process` audio path when the active
+    /// demod mode is NFM (the only mode the APT 2400 Hz subcarrier
+    /// rides through cleanly). Audio output rate is 48 kHz which
+    /// is well above the decoder's 4800 Hz Nyquist floor.
+    ///
+    /// `None` means "not yet built" — built once, kept across
+    /// demod-mode toggles so re-entering NFM during a pass picks
+    /// up where it left off rather than restarting decoder state.
+    /// Per epic #468 / ticket #482.
+    apt_decoder: Option<AptDecoder>,
+    /// Pre-allocated mono downmix buffer for the APT decoder
+    /// input. Reused across DSP blocks; resized in place each
+    /// call so we don't alloc inside the hot loop.
+    apt_mono_buf: Vec<f32>,
+    /// Pre-allocated output buffer for `AptDecoder::process`. Sized
+    /// to match the decoder's internal queue cap (8 lines per the
+    /// `AptDecoder` docs); the decoder won't emit more than this in
+    /// a single call.
+    apt_lines_buf: Vec<AptLine>,
+    /// Most recent audio sample rate that `AptDecoder::new` rejected
+    /// (or `None` if every prior init succeeded / hasn't been tried).
+    /// Guards against the audio-block hot loop retrying — and
+    /// log-spamming — on a rate the decoder will never accept (e.g.
+    /// a future audio-rate change to something below the 4800 Hz
+    /// Nyquist floor). Cleared in `cleanup` alongside the decoder
+    /// reset so a fresh source restart always gets one fresh
+    /// init attempt.
+    apt_init_failed_at_rate: Option<u32>,
 }
 
 impl DspState {
@@ -473,7 +504,86 @@ impl DspState {
             scanner: sdr_scanner::Scanner::new(),
             scanner_channels: Vec::new(),
             scanner_muted: false,
+            apt_decoder: None,
+            apt_mono_buf: Vec::new(),
+            apt_lines_buf: Vec::new(),
+            apt_init_failed_at_rate: None,
         })
+    }
+}
+
+/// NOAA APT decode tap. Lazy-initialises the decoder at the
+/// `RadioModule`'s current audio sample rate, downmixes the post-
+/// `radio.process` stereo audio block to mono, runs the decoder,
+/// and emits any newly-produced lines through the DSP→UI channel
+/// as `DspToUi::AptLine`.
+///
+/// Per epic #468 / ticket #482. Caller must ensure
+/// `audio_count > 0` and the active demod is NFM.
+fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_count: usize) {
+    // Lazy-init. Audio rate comes from `RadioModule::audio_sample_rate`
+    // (typically 48 kHz, well above the decoder's 4800 Hz floor).
+    if state.apt_decoder.is_none() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rate_hz = state.radio.audio_sample_rate() as u32;
+        // Guard against retry-spamming the warn log on a rate the
+        // decoder will reject. If we've already tried this exact
+        // rate and it failed, silently bail until either the rate
+        // changes (next-block check) or `cleanup` clears the cache.
+        if state.apt_init_failed_at_rate == Some(rate_hz) {
+            return;
+        }
+        match AptDecoder::new(rate_hz) {
+            Ok(decoder) => {
+                tracing::info!("APT decoder initialised at {rate_hz} Hz");
+                state.apt_decoder = Some(decoder);
+                state.apt_init_failed_at_rate = None;
+                // Size the output slice to the decoder's documented
+                // per-call emission cap so a single `process` call
+                // can never need to flush.
+                state
+                    .apt_lines_buf
+                    .resize(READY_QUEUE_CAP, AptLine::default());
+            }
+            Err(e) => {
+                tracing::warn!("APT decoder init failed at {rate_hz} Hz: {e}");
+                state.apt_init_failed_at_rate = Some(rate_hz);
+                return;
+            }
+        }
+    }
+    let Some(decoder) = state.apt_decoder.as_mut() else {
+        return;
+    };
+
+    // Mono downmix. APT is mono by spec — averaging L+R is
+    // equivalent to taking either channel for FM-demodulated
+    // audio (both channels carry the same baseband signal once
+    // any stereo pilot is filtered out by the channel filter).
+    // `extend` over a `map` iterator is exact-size, so `Vec`'s
+    // internal reserve is precise — no manual `reserve` needed.
+    state.apt_mono_buf.clear();
+    state.apt_mono_buf.extend(
+        state.audio_buf[..audio_count]
+            .iter()
+            .map(|s| (s.l + s.r) * 0.5),
+    );
+
+    match decoder.process(&state.apt_mono_buf, &mut state.apt_lines_buf) {
+        Ok(produced) => {
+            // `mem::take` lifts each emitted line out by swapping in
+            // `AptLine::default()` — moves ownership without the
+            // ~2 KB clone. The next `process` call overwrites the
+            // (now-default) slot regardless, so leaving an empty
+            // line behind is harmless.
+            for slot in state.apt_lines_buf.iter_mut().take(produced) {
+                let line = std::mem::take(slot);
+                let _ = dsp_tx.send(DspToUi::AptLine(Box::new(line)));
+            }
+        }
+        Err(e) => {
+            tracing::warn!("APT decode failed: {e}");
+        }
     }
 }
 
@@ -2267,6 +2377,26 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     }
 
     state.source = None;
+
+    // Hard stream discontinuity — flush APT decoder state so a
+    // subsequent Start can't bleed pre-stop accumulator/ready
+    // lines into the new session and emit a stale first line.
+    // The decoder itself stays allocated so the next Start
+    // doesn't pay re-init cost (filter taps, resampler tables);
+    // we only clear its in-flight buffers via `AptDecoder::reset`.
+    // Cross-mode preservation (NFM → WFM → NFM mid-pass) is a
+    // *soft* discontinuity and intentionally stays untouched —
+    // the user keeps decoding the same pass.
+    if let Some(decoder) = state.apt_decoder.as_mut() {
+        decoder.reset();
+    }
+    state.apt_mono_buf.clear();
+    // Clear the failed-init guard so a fresh Start gets a fresh
+    // init attempt — the user may have tweaked the radio audio
+    // rate between sessions, and we don't want a stale failure
+    // memo to silently suppress a now-valid rate.
+    state.apt_init_failed_at_rate = None;
+
     tracing::info!("source closed");
 }
 
@@ -2483,6 +2613,23 @@ fn process_iq_block(
                             let rms = (sum_sq / (2.0 * audio_count as f32)).sqrt();
                             let level_db = 20.0 * rms.max(f32::MIN_POSITIVE).log10();
                             let _ = dsp_tx.send(DspToUi::SignalLevel(level_db));
+                        }
+
+                        // NOAA APT decode tap (#482). Only runs in
+                        // NFM mode — the APT 2400 Hz subcarrier rides
+                        // on a Wide-FM-style demod with a narrow
+                        // (~38 kHz) channel filter, which the user's
+                        // NFM mode is set up for. WFM's deemphasis
+                        // would smear the subcarrier; AM/SSB don't
+                        // demodulate it at all. Pre-volume audio
+                        // (this point) so the volume knob doesn't
+                        // affect decode quality. Worker is the DSP
+                        // thread — `AptDecoder` is internally
+                        // single-threaded which fits perfectly.
+                        if audio_count > 0
+                            && state.radio.current_mode() == sdr_types::DemodMode::Nfm
+                        {
+                            apt_decode_tap(state, dsp_tx, audio_count);
                         }
 
                         // Emit CTCSS sustained-gate edges for the UI

@@ -754,7 +754,12 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::BandwidthChanged(_)
         | DspToUi::VfoOffsetChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
-        | DspToUi::VoiceSquelchOpenChanged(_) => return None,
+        | DspToUi::VoiceSquelchOpenChanged(_)
+        // APT lines (#482) aren't surfaced through the FFI layer
+        // yet — the macOS frontend will gain a native APT viewer
+        // through its own ticket. Drop them here so the Linux UI
+        // side can keep emitting without a Mac-side build break.
+        | DspToUi::AptLine(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))
@@ -1214,6 +1219,25 @@ mod tests {
             assert_eq!(payload.reason, expected_int);
             assert!(owned_cstring.is_none());
         }
+    }
+
+    #[test]
+    fn translate_apt_line_is_dropped_at_ffi_boundary() {
+        // `DspToUi::AptLine` is intentionally dropped by the FFI
+        // translation layer — the macOS frontend's APT viewer is a
+        // separate ticket, and forwarding 2 KB-per-line image data
+        // through a C ABI without a host consumer would be wasted
+        // work. Pin that policy with a regression test: a future
+        // change that exposes APT lines through the FFI (or
+        // accidentally lets the variant fall through to the
+        // catch-all panic arm) trips this assert before it can
+        // reach the Mac side. Per CodeRabbit on PR #503.
+        let line = sdr_core::messages::AptLine::default();
+        let msg = DspToUi::AptLine(Box::new(line));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AptLine must not translate to a wire event yet",
+        );
     }
 
     #[test]
