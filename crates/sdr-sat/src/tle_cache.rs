@@ -197,7 +197,16 @@ impl TleCache {
             // that; otherwise propagate the fetch error.
             match self.fetch(source) {
                 Ok(text) => {
-                    self.write_cache(&path, &text)?;
+                    // Best-effort cache write — a failed write
+                    // (read-only fs, disk full, permissions) shouldn't
+                    // throw away network-fresh TLE data. Log and move
+                    // on; the next call will just refetch.
+                    if let Err(e) = self.write_cache(&path, &text) {
+                        tracing::warn!(
+                            "TLE cache write for {:?} failed ({e}); returning fresh in-memory copy",
+                            source,
+                        );
+                    }
                     return Ok(text);
                 }
                 Err(fetch_err) => {
@@ -314,41 +323,53 @@ fn is_stale(path: &Path, max_age: StdDuration) -> bool {
 /// formatted text file. Accepts both 2-line entries (TLE-only) and
 /// 3-line entries (name + TLE), as Celestrak emits the 3-line variant
 /// for the named-satellite endpoints we use.
+///
+/// Uses a sliding-window scan rather than a "consume in groups of 3"
+/// loop so that a malformed entry can't accidentally swallow the next
+/// satellite's `1 ...` line as its `line2` and lose that satellite.
+/// Each window position checks "is this a valid TLE pair?" and slides
+/// by exactly one line otherwise — worst-case `O(n)` and resyncs
+/// cleanly across any cache corruption.
 #[must_use]
+#[allow(clippy::similar_names)] // line1/line2 names match TLE-spec terminology
 pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
-    let mut iter = text
+    let lines: Vec<&str> = text
         .lines()
         .map(str::trim_end)
         .filter(|l| !l.is_empty())
-        .peekable();
+        .collect();
 
-    while iter.peek().is_some() {
-        // A TLE entry is either:
-        //   3 lines: NAME / "1 ..." / "2 ..."
-        //   2 lines: "1 ..." / "2 ..."
-        let first = iter.next()?;
-        let (line1, line2) = if first.starts_with("1 ") {
-            (first.to_string(), iter.next()?.to_string())
+    let mut i = 0_usize;
+    while i < lines.len() {
+        // At each window position, decide where line1/line2 would be:
+        //   * starts with "1 "  → 2-line entry: (lines[i], lines[i+1])
+        //   * otherwise (name)  → 3-line entry: (lines[i+1], lines[i+2])
+        let (line1, line2) = if lines[i].starts_with("1 ") {
+            match lines.get(i + 1) {
+                Some(l2) => (lines[i], *l2),
+                None => break,
+            }
         } else {
-            // First was a name; next two are the TLE.
-            let l1 = iter.next()?;
-            let l2 = iter.next()?;
-            (l1.to_string(), l2.to_string())
+            match (lines.get(i + 1), lines.get(i + 2)) {
+                (Some(l1), Some(l2)) => (*l1, *l2),
+                _ => break,
+            }
         };
-        // Validate the TLE shape before checking the NORAD id —
-        // garbage input (truncated download, HTML error page in the
-        // cache) can produce a "line1" that looks like one but a
-        // "line2" that's actually the next satellite's name. Skip and
-        // resync on the next iteration rather than handing a bogus
-        // pair to SGP4.
-        if !line1.starts_with("1 ") || !line2.starts_with("2 ") {
-            continue;
-        }
-        if let Some(parsed) = norad_id_from_line1(&line1)
+
+        if line1.starts_with("1 ")
+            && line2.starts_with("2 ")
+            && let Some(parsed) = norad_id_from_line1(line1)
             && parsed == norad_id
         {
-            return Some((line1, line2));
+            return Some((line1.to_string(), line2.to_string()));
         }
+
+        // Slide by exactly one line. Even if this window saw a
+        // malformed pair that ate "the next entry's line 1" as its
+        // line2, the next window starts at lines[i+1] which is that
+        // very line 1 — so we re-evaluate it as a fresh entry start
+        // rather than skipping it.
+        i += 1;
     }
     None
 }
@@ -483,6 +504,28 @@ NEXT NAME LINE NOT A TLE
         // The resync test: after skipping the bad pair, the parser
         // must still find the well-formed entry that follows.
         let (l1, l2) = parse_tle_text(bad_pair_then_good, 5).unwrap();
+        assert!(l1.starts_with("1 00005"));
+        assert!(l2.starts_with("2 00005"));
+    }
+
+    #[test]
+    fn parse_resyncs_when_malformed_entry_swallows_next_line1() {
+        // Adversarial corruption: a "name" line followed by *two*
+        // valid line-1s back to back, then a valid line 2 for the
+        // second of them. The first entry is malformed (`1 11111…`
+        // pretends to be a line 1 but its partner is the *next*
+        // satellite's line 1 instead of a "2 ..." line). The
+        // sliding-window parser must NOT lose the good `(1 00005…,
+        // 2 00005…)` pair, even though my earlier consume-in-3s
+        // implementation would have eaten line 1 of NORAD 5 as
+        // line 2 of NORAD 11111 and then run off the end.
+        let bad_swallows_next = "\
+SOMETHING
+1 11111U 99001A   24000.00000000  .00000000  00000-0  10000-3 0  9990
+1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
+2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667
+";
+        let (l1, l2) = parse_tle_text(bad_swallows_next, 5).unwrap();
         assert!(l1.starts_with("1 00005"));
         assert!(l2.starts_with("2 00005"));
     }
