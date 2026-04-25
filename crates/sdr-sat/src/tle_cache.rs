@@ -367,59 +367,24 @@ fn is_stale(path: &Path, max_age: StdDuration) -> bool {
 /// 3-line entries (name + TLE), as Celestrak emits the 3-line variant
 /// for the named-satellite endpoints we use.
 ///
-/// Uses a sliding-window scan rather than a "consume in groups of 3"
-/// loop so that a malformed entry can't accidentally swallow the next
-/// satellite's `1 ...` line as its `line2` and lose that satellite.
-/// Each window position checks "is this a valid TLE pair?" and slides
-/// by exactly one line otherwise — worst-case `O(n)` and resyncs
-/// cleanly across any cache corruption.
+/// Uses a sliding-window scan over consecutive non-empty line pairs.
+/// 3-line entries are handled implicitly: when the window sits on a
+/// name + `1 …` pair, [`pair_matches`] rejects it (line 1 doesn't
+/// start with `"1 "`); next iteration the window sits on `1 …` /
+/// `2 …`, which matches. Worst-case `O(n)` and resyncs cleanly across
+/// any cache corruption — even an entry whose "line 2" is actually
+/// the next satellite's "line 1" (the previous consume-in-3s
+/// implementation was vulnerable to that case).
 #[must_use]
 #[allow(clippy::similar_names)] // line1/line2 names match TLE-spec terminology
 pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    let mut i = 0_usize;
-    while i < lines.len() {
-        // At each window position, decide where line1/line2 would be:
-        //   * starts with "1 "  → 2-line entry: (lines[i], lines[i+1])
-        //   * otherwise (name)  → 3-line entry: (lines[i+1], lines[i+2])
-        let (line1, line2) = if lines[i].starts_with("1 ") {
-            match lines.get(i + 1) {
-                Some(l2) => (lines[i], *l2),
-                None => break,
-            }
-        } else {
-            match (lines.get(i + 1), lines.get(i + 2)) {
-                (Some(l1), Some(l2)) => (*l1, *l2),
-                _ => break,
-            }
-        };
-
-        // Cross-check: both TLE lines have the NORAD catalog number at
-        // the same column, and a sane file always pairs them. A
-        // corrupted cache could splice line 1 of one satellite with
-        // line 2 of another (both look "valid" individually) — refuse
-        // to return such a Frankenstein pair.
-        if line1.starts_with("1 ")
-            && line2.starts_with("2 ")
-            && let (Some(line1_id), Some(line2_id)) =
-                (norad_id_from_tle_line(line1), norad_id_from_tle_line(line2))
-            && line1_id == norad_id
-            && line2_id == norad_id
-        {
+    let lines = tle_lines(text);
+    let last = lines.len().saturating_sub(1);
+    for i in 0..last {
+        let (line1, line2) = (lines[i], lines[i + 1]);
+        if pair_matches(line1, line2, Some(norad_id)) {
             return Some((line1.to_string(), line2.to_string()));
         }
-
-        // Slide by exactly one line. Even if this window saw a
-        // malformed pair that ate "the next entry's line 1" as its
-        // line2, the next window starts at lines[i+1] which is that
-        // very line 1 — so we re-evaluate it as a fresh entry start
-        // rather than skipping it.
-        i += 1;
     }
     None
 }
@@ -430,36 +395,58 @@ pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
 /// response from upstream would otherwise poison the on-disk cache
 /// and break the offline fallback.
 ///
-/// "Structurally consistent" means: a `1 NNNNN ...` line followed
-/// (with any number of intervening blank lines stripped) by a
-/// `2 NNNNN ...` line where both lines parse a NORAD id and the ids
-/// match. Doesn't validate checksums or any orbital fields — those
-/// would catch more, but the cheap structural check is enough to
-/// reject HTML responses (no `1 ` prefix at the right offset).
+/// "Structurally consistent" means [`pair_matches`] accepts at least
+/// one pair of consecutive non-empty lines without an id constraint.
+/// Doesn't validate checksums or orbital fields — the cheap structural
+/// check is enough to reject HTML responses (no `1 ` prefix at the
+/// right offset, no NORAD id at the right column, mismatched ids).
 #[must_use]
-#[allow(clippy::similar_names)] // line1/line2 names match TLE-spec terminology
 pub fn has_any_tle_pair(text: &str) -> bool {
-    let lines: Vec<&str> = text
-        .lines()
+    let lines = tle_lines(text);
+    let last = lines.len().saturating_sub(1);
+    (0..last).any(|i| pair_matches(lines[i], lines[i + 1], None))
+}
+
+/// Collect the non-empty, right-trimmed lines of `text` into a `Vec`.
+/// Shared between [`parse_tle_text`] and [`has_any_tle_pair`] so the
+/// preprocessing stays identical (CRLF tolerance, blank-line skipping)
+/// no matter which entry point the caller used.
+fn tle_lines(text: &str) -> Vec<&str> {
+    text.lines()
         .map(str::trim_end)
         .filter(|l| !l.is_empty())
-        .collect();
+        .collect()
+}
 
-    let mut i = 0_usize;
-    while i + 1 < lines.len() {
-        let line1 = lines[i];
-        let line2 = lines[i + 1];
-        if line1.starts_with("1 ")
-            && line2.starts_with("2 ")
-            && let (Some(id1), Some(id2)) =
-                (norad_id_from_tle_line(line1), norad_id_from_tle_line(line2))
-            && id1 == id2
-        {
-            return true;
-        }
-        i += 1;
+/// Is `(line1, line2)` a structurally-valid TLE pair, optionally
+/// matching `expected` NORAD id?
+///
+/// Required for any "yes":
+///
+/// * `line1` starts with `"1 "` (canonical TLE line-1 prefix);
+/// * `line2` starts with `"2 "`;
+/// * both lines parse a NORAD id from the catalog field
+///   (columns 3..=7);
+/// * the two ids agree — a corrupted cache could splice line 1 of
+///   sat A with line 2 of sat B and they'd pass the prefix checks
+///   individually; the cross-check catches the Frankenstein case;
+/// * if `expected` is `Some(id)`, the parsed id equals `id`.
+#[allow(clippy::similar_names)] // line1/line2 names match TLE-spec terminology
+fn pair_matches(line1: &str, line2: &str, expected: Option<u32>) -> bool {
+    if !line1.starts_with("1 ") || !line2.starts_with("2 ") {
+        return false;
     }
-    false
+    let (Some(id1), Some(id2)) = (norad_id_from_tle_line(line1), norad_id_from_tle_line(line2))
+    else {
+        return false;
+    };
+    if id1 != id2 {
+        return false;
+    }
+    match expected {
+        Some(target) => id1 == target,
+        None => true,
+    }
 }
 
 /// 0-indexed start of the NORAD catalog number field in TLE line 1
