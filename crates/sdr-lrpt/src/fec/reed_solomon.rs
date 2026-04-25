@@ -134,8 +134,16 @@ const LOG_ZERO: u8 = 255;
 /// Decode failure modes.
 #[derive(Debug, thiserror::Error)]
 pub enum RsError {
-    /// More than `T` byte errors — beyond correction capacity.
-    #[error("uncorrectable: more than T={T} byte errors")]
+    /// The decoder couldn't recover a valid correction. Triggered
+    /// when Berlekamp-Massey produces a degenerate or
+    /// over-capacity locator polynomial, or when Chien search
+    /// fails to find enough roots. **Note:** RS(255, 223)
+    /// guarantees correction only up to `T = 16` byte errors —
+    /// for larger corruption patterns, the decoder may return
+    /// this error OR silently decode to a different valid
+    /// codeword. Outer frame / CRC checks should be the final
+    /// integrity signal.
+    #[error("uncorrectable RS codeword")]
     Uncorrectable,
 }
 
@@ -195,13 +203,23 @@ impl ReedSolomon {
 
     /// Decode one 255-byte RS codeword. Returns the corrected
     /// codeword and the number of byte errors that were
-    /// corrected. Returns `Err(RsError::Uncorrectable)` if more
-    /// than `T = 16` byte errors are present.
+    /// corrected.
+    ///
+    /// **Correction guarantee.** RS(255, 223) is guaranteed to
+    /// recover the original message for any corruption pattern of
+    /// up to `T = 16` byte errors. For larger patterns, the
+    /// decoder may return `Err(RsError::Uncorrectable)` OR
+    /// silently decode to a different valid codeword (an
+    /// inevitable property of any block code at distances
+    /// exceeding T). Callers should treat the outer frame / CRC
+    /// checks as the final integrity signal — never rely on RS
+    /// alone to detect arbitrary corruption.
     ///
     /// # Errors
     ///
-    /// Returns `RsError::Uncorrectable` when the error count
-    /// exceeds `T` and the decoder cannot recover the message.
+    /// Returns `RsError::Uncorrectable` when the decoder cannot
+    /// produce a valid correction (degenerate or over-capacity
+    /// locator, Chien-search root-count mismatch).
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -324,9 +342,12 @@ impl ReedSolomon {
 
         // Bound check: a non-positive degree means BM didn't
         // find a valid locator (degenerate trellis), and a degree
-        // above T means more errors than we can correct (Chien
-        // would otherwise push past `roots[T]` and panic). Both
-        // fail closed.
+        // above T is past the algorithm's safe-correction
+        // capacity (Chien would otherwise push past `roots[T]`
+        // and panic). Both fail closed; >T patterns that DO
+        // produce a low-degree locator can still miscorrect to a
+        // different valid codeword — outer integrity checks are
+        // the final word.
         if deg_lambda == 0 || deg_lambda > T {
             return Err(RsError::Uncorrectable);
         }
@@ -519,12 +540,19 @@ mod tests {
         assert_eq!(&decoded[..K], &message);
     }
 
+    /// Pin one specific T+1-error pattern that the decoder
+    /// flags as uncorrectable. **Note:** RS(255, 223) does NOT
+    /// guarantee detection for every error pattern beyond T —
+    /// a hostile or unlucky pattern can decode to a different
+    /// valid codeword. This test documents that one realistic
+    /// 17-error pattern (positions 0, 11, 22, …) gets caught by
+    /// our decoder; it is not a contract on every possible
+    /// over-capacity input.
     #[test]
-    fn rejects_t_plus_one_errors() {
+    fn rejects_this_t_plus_one_pattern() {
         let rs = ReedSolomon::new();
         let message: [u8; K] = std::array::from_fn(|i| (i * 23 + 11) as u8);
         let mut codeword = rs.encode(&message);
-        // Inject T + 1 = 17 byte errors.
         for k in 0..=T {
             codeword[k * 11] ^= 0x3C;
         }
