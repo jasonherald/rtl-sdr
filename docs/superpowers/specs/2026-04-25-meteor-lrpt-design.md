@@ -22,7 +22,7 @@ A live LRPT viewer shows the image building up during the pass with channel pick
 ### In scope (this epic)
 
 - All four pipeline stages: QPSK demod → Viterbi+RS FEC → CCSDS framing → JPEG image assembly
-- Catalog: Meteor-M 2 (137.100 MHz, degraded but operational) and Meteor-M 2-3 (137.900 MHz, operational). Meteor-M 2-4 stays deferred per #506 until Celestrak publishes a TLE.
+- Catalog (as of April 2026): Meteor-M 2 (137.100 MHz, degraded but operational) and Meteor-M 2-3 (137.900 MHz, operational). Meteor-M 2-4 stays deferred per #506 until Celestrak publishes a TLE.
 - Per-channel + composite PNG export at LOS
 - Auto-record integration via the existing recorder, generalized for non-APT satellites (closes [#514](https://github.com/jasonherald/rtl-sdr/issues/514))
 - Live LRPT viewer with channel/composite picker
@@ -40,7 +40,7 @@ A live LRPT viewer shows the image building up during the pass with channel pick
 
 ## 2. Architecture & data flow
 
-```
+```text
 [I/Q samples from RTL-SDR]
         ↓
    sdr-pipeline                       (existing — same path APT uses)
@@ -101,7 +101,7 @@ Same as APT: the entire 4-stage pipeline runs on the existing audio-thread tap t
 
 ### Dependency graph for the new code
 
-```
+```text
 sdr-dsp           (already exists; gains lrpt:: submodule for stage 1)
    ↑
 sdr-lrpt          (new; depends on sdr-dsp, sdr-types)
@@ -119,7 +119,7 @@ sdr-ui            (already exists; gains lrpt_viewer.rs + sat-recorder generaliz
 
 ### `crates/sdr-dsp/src/lrpt/` (extends existing `sdr-dsp`)
 
-```
+```text
 lrpt/
   mod.rs          // re-exports + LrptDemod top-level processor
   costas.rs       // QPSK Costas loop (carrier recovery)
@@ -132,7 +132,7 @@ Reference: **SDR++'s `decoder_modules/meteor_demodulator/src/`** — `meteor_cos
 
 ### `crates/sdr-lrpt/src/` (new crate)
 
-```
+```text
 src/
   lib.rs          // public API: LrptPipeline, decode_pass(...) entry point
   fec/
@@ -183,7 +183,7 @@ Mirrors `apt_image.rs` exactly — buffers per-channel scan lines, exposes a str
 
 Fresh from scratch, structurally parallel to `apt_viewer.rs` but rendering very different content:
 
-```
+```text
 LrptImageView
   • per-channel buffers (up to 6 AVHRR channels — only those
     actually transmitted on this pass populate)
@@ -246,7 +246,7 @@ match protocol {
 
 APT keeps its current single-file shape. LRPT goes into a per-pass subdirectory because there can be up to 7 artefacts per pass (1 composite + up to 6 channels):
 
-```
+```text
 ~/sdr-recordings/
   apt-NOAA-19-2026-04-25-143022.png            (existing — unchanged)
   lrpt-METEOR-M-2-3-2026-04-25-143022/         (new pattern)
@@ -268,7 +268,7 @@ Eight sub-tickets, mirroring APT's count. Bottom-up: each PR is independently te
 | 2 | **Stage 2a: Viterbi + frame sync + derand.** Rate-1/2 K=7 Viterbi, 32-bit ASM correlator (`0x1ACFFC1D`), CCSDS PN de-randomizer. Tests with bit-vectors encoded by a known reference. | `sdr-lrpt::fec` (new crate, partial) | new |
 | 3 | **Stage 2b: Reed-Solomon (255, 223).** GF(256) arithmetic, CCSDS dual-basis representation, RS decoder. Tests against CCSDS Blue Book test vectors. | `sdr-lrpt::fec` (completes the FEC chain) | new |
 | 4 | **Stage 3: CCSDS framing.** VCDU / CADU parser, M_PDU reassembly across CADU boundaries, virtual-channel demux (image VCs only — non-imaging routed to `Discard` per the #523 deferral). | `sdr-lrpt::ccsds` (new submodule) | new |
-| 5 | **Stage 4: Image assembly + Meteor JPEG.** Meteor's reduced-JPEG decoder (DCT-block per scan-line group), per-channel image buffer, false-color RGB compositor. Includes a small CLI binary `sdr-lrpt-replay` that decodes a fixture frame file → PNGs, end-to-end test of stages 1-5. | `sdr-lrpt::image`, `sdr-radio::lrpt_image` | new |
+| 5 | **Stage 4: Image assembly + Meteor JPEG.** Meteor's reduced-JPEG decoder (DCT-block per scan-line group), per-channel image buffer, false-color RGB compositor. Includes a small CLI binary `sdr-lrpt-replay` that decodes a fixture frame file → PNGs, end-to-end test of stages 1-4. | `sdr-lrpt::image`, `sdr-radio::lrpt_image` | new |
 | 6 | **Auto-record generalization** (closes [#514](https://github.com/jasonherald/rtl-sdr/issues/514)). Add `ImagingProtocol` enum to `sdr-sat`, `imaging_protocol` field to `KnownSatellite`, recorder filter from `is_apt_capable` → `imaging_protocol.is_some()`, `protocol` field on `Action::StartAutoRecord`, branching dispatch in `interpret_action`. Meteor catalog entries stay `None` for now — generalization lands without changing user-visible behaviour. | `sdr-sat`, `sdr-ui::sidebar::satellites_recorder`, `sdr-ui::window` | #514 |
 | 7 | **End-to-end LRPT integration.** New `sdr-ui::lrpt_viewer.rs` (channel picker + RGB composite + pause/export). New `sdr-radio::lrpt_decoder` driver that wires the 4-stage pipeline to the existing audio-thread tap. Flip Meteor-M 2 / Meteor-M 2-3 catalog entries to `imaging_protocol = Some(Lrpt)`. Hook `interpret_action`'s LRPT branch. Update Satellites panel toggle copy. Per-pass subdirectory output paths. | `sdr-ui`, `sdr-radio`, `sdr-sat` | — |
 | 8 | **Docs walkthrough.** `docs/guides/lrpt-reception.md` — antenna requirements (same V-dipole, more SNR-sensitive), "your first Meteor LRPT pass" UI flow, troubleshooting (sync loss / FEC dropouts / missing channels / unfamiliar composite colours). Update `CLAUDE.md` + `README.md`. | `docs/`, `CLAUDE.md`, `README.md` | #469 |
