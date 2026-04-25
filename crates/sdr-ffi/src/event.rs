@@ -59,6 +59,35 @@ pub const SDR_EVT_IQ_RECORDING_STARTED: i32 = 10;
 pub const SDR_EVT_IQ_RECORDING_STOPPED: i32 = 11;
 pub const SDR_EVT_NETWORK_SINK_STATUS: i32 = 12;
 pub const SDR_EVT_RTL_TCP_CONNECTION_STATE: i32 = 13;
+pub const SDR_EVT_SCANNER_STATE_CHANGED: i32 = 14;
+pub const SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED: i32 = 15;
+pub const SDR_EVT_SCANNER_EMPTY_ROTATION: i32 = 16;
+pub const SDR_EVT_SCANNER_MUTEX_STOPPED: i32 = 17;
+
+// ============================================================
+//  Scanner phase discriminants — must match `SdrScannerState`
+//  in `include/sdr_core.h`. Numeric values mirror the variant
+//  order of `sdr_scanner::ScannerState`. Never reorder or
+//  renumber.
+// ============================================================
+
+pub const SDR_SCANNER_STATE_IDLE: i32 = 0;
+pub const SDR_SCANNER_STATE_RETUNING: i32 = 1;
+pub const SDR_SCANNER_STATE_DWELLING: i32 = 2;
+pub const SDR_SCANNER_STATE_LISTENING: i32 = 3;
+pub const SDR_SCANNER_STATE_HANGING: i32 = 4;
+
+// ============================================================
+//  Scanner mutex-stop reasons — must match
+//  `SdrScannerMutexReason` in `include/sdr_core.h`. Mirrors
+//  the variant order of `sdr_core::messages::ScannerMutexReason`.
+//  Never reorder or renumber.
+// ============================================================
+
+pub const SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER: i32 = 0;
+pub const SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER: i32 = 1;
+pub const SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING: i32 = 2;
+pub const SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION: i32 = 3;
 
 // ============================================================
 //  Network sink status discriminants — must match the
@@ -201,6 +230,43 @@ pub struct SdrEventNetworkSinkStatus {
     pub protocol: i32,
 }
 
+/// Payload for `SDR_EVT_SCANNER_STATE_CHANGED`. `state` is one
+/// of the `SDR_SCANNER_STATE_*` discriminants. Per #447 (ABI 0.20).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventScannerStateChanged {
+    pub state: i32,
+}
+
+/// Payload for `SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED`. The
+/// scanner emits this on every channel latch (squelch open on
+/// the new channel) AND on every release back to Idle. When the
+/// scanner is idle (no latched channel), `name_utf8` is NULL and
+/// `frequency_hz` is 0 — the host clears its "active channel"
+/// readout. When latched, `name_utf8` is the bookmark name the
+/// host originally projected via `UpdateScannerChannels` and
+/// `frequency_hz` is the matching `ChannelKey::frequency_hz`.
+///
+/// `name_utf8` is a borrowed pointer into dispatcher-owned
+/// storage; valid only for the duration of the callback. Per
+/// #447 (ABI 0.20).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventScannerActiveChannelChanged {
+    pub name_utf8: *const c_char,
+    pub frequency_hz: u64,
+}
+
+/// Payload for `SDR_EVT_SCANNER_MUTEX_STOPPED`. `reason` is one
+/// of the `SDR_SCANNER_MUTEX_*` discriminants — describes which
+/// side of the scanner ↔ recording / transcription mutex fired.
+/// Per #447 (ABI 0.20).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SdrEventScannerMutexStopped {
+    pub reason: i32,
+}
+
 /// C-layout tagged union of event payloads. Which field is valid
 /// is determined by the `kind` discriminant on the enclosing
 /// `SdrEvent`:
@@ -218,6 +284,12 @@ pub struct SdrEventNetworkSinkStatus {
 /// | `SDR_EVT_AUDIO_RECORDING_STOPPED` | none                         |
 /// | `SDR_EVT_IQ_RECORDING_STARTED`    | `iq_recording.path_utf8`     |
 /// | `SDR_EVT_IQ_RECORDING_STOPPED`    | none                         |
+/// | `SDR_EVT_NETWORK_SINK_STATUS`     | `network_sink_status.{kind,utf8,protocol}` |
+/// | `SDR_EVT_RTL_TCP_CONNECTION_STATE`| `rtl_tcp_connection_state.{kind,utf8,attempt,retry_in_secs,gain_count}` |
+/// | `SDR_EVT_SCANNER_STATE_CHANGED`   | `scanner_state.state`        |
+/// | `SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED` | `scanner_active_channel.{name_utf8,frequency_hz}` |
+/// | `SDR_EVT_SCANNER_EMPTY_ROTATION`  | none                         |
+/// | `SDR_EVT_SCANNER_MUTEX_STOPPED`   | `scanner_mutex_stopped.reason` |
 ///
 /// `_placeholder` exists so `SOURCE_STOPPED` events (which carry
 /// no payload) can still construct the struct with a meaningful
@@ -235,6 +307,9 @@ pub union SdrEventPayload {
     pub iq_recording: SdrEventIqRecording,
     pub network_sink_status: SdrEventNetworkSinkStatus,
     pub rtl_tcp_connection_state: SdrEventRtlTcpConnectionState,
+    pub scanner_state: SdrEventScannerStateChanged,
+    pub scanner_active_channel: SdrEventScannerActiveChannelChanged,
+    pub scanner_mutex_stopped: SdrEventScannerMutexStopped,
     /// Placeholder for kinds that carry no payload (e.g.,
     /// `SDR_EVT_SOURCE_STOPPED`). Accessing this field is always
     /// valid as a zero-byte read.
@@ -514,13 +589,11 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         //     (#336 / #341). Linux-only for now; macOS SwiftUI
         //     gets them when the equivalent VFO overlay +
         //     reset affordances land on that side.
-        //   - `ScannerActiveChannelChanged`, `ScannerStateChanged`,
-        //     `ScannerEmptyRotation`, `ScannerMutexStopped` are the
-        //     scanner Phase 1 UI events (#317). Intentionally
-        //     withheld from ABI v1; the Mac-side scanner ticket
-        //     (tracked separately) will add them when the SwiftUI
-        //     scanner panel is designed — likely as a group at
-        //     the next minor bump.
+        //
+        // Scanner Phase 1 UI events (`ScannerActiveChannelChanged`,
+        // `ScannerStateChanged`, `ScannerEmptyRotation`,
+        // `ScannerMutexStopped`) landed at the FFI boundary in ABI
+        // 0.20 (#447) — see the dedicated arms above.
         //
         // Adding any of these to the ABI is additive (new
         // `SDR_EVT_*` discriminant + new payload struct or reuse
@@ -599,16 +672,94 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
             }
         }
 
+        DspToUi::ScannerStateChanged(state) => {
+            use sdr_scanner::ScannerState;
+            let state_int = match state {
+                ScannerState::Idle => SDR_SCANNER_STATE_IDLE,
+                ScannerState::Retuning => SDR_SCANNER_STATE_RETUNING,
+                ScannerState::Dwelling => SDR_SCANNER_STATE_DWELLING,
+                ScannerState::Listening => SDR_SCANNER_STATE_LISTENING,
+                ScannerState::Hanging => SDR_SCANNER_STATE_HANGING,
+            };
+            SdrEvent {
+                kind: SDR_EVT_SCANNER_STATE_CHANGED,
+                payload: SdrEventPayload {
+                    scanner_state: SdrEventScannerStateChanged { state: state_int },
+                },
+            }
+        }
+
+        DspToUi::ScannerActiveChannelChanged { key, .. } => {
+            // `mode_override` is intentionally NOT exposed at the
+            // FFI boundary — the host already chose the demod
+            // mode when it projected the bookmark into a
+            // `ScannerChannel`, and the scanner's retune already
+            // applied it. The UI just needs the channel identity
+            // for its "active channel" readout.
+            let (name_ptr, frequency_hz, name_cstr) = match key {
+                Some(k) => {
+                    let sanitized = k.name.replace('\0', "?");
+                    let Ok(cstr) = CString::new(sanitized) else {
+                        // Unreachable: replace stripped NULs.
+                        return None;
+                    };
+                    let ptr = cstr.as_ptr();
+                    (ptr, k.frequency_hz, Some(cstr))
+                }
+                None => (std::ptr::null(), 0_u64, None),
+            };
+            owned_cstring = name_cstr;
+            SdrEvent {
+                kind: SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED,
+                payload: SdrEventPayload {
+                    scanner_active_channel: SdrEventScannerActiveChannelChanged {
+                        name_utf8: name_ptr,
+                        frequency_hz,
+                    },
+                },
+            }
+        }
+
+        DspToUi::ScannerEmptyRotation => SdrEvent {
+            kind: SDR_EVT_SCANNER_EMPTY_ROTATION,
+            payload: SdrEventPayload { _placeholder: 0 },
+        },
+
+        DspToUi::ScannerMutexStopped(reason) => {
+            use sdr_core::messages::ScannerMutexReason;
+            let reason_int = match reason {
+                ScannerMutexReason::RecordingStoppedForScanner => {
+                    SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER
+                }
+                ScannerMutexReason::TranscriptionStoppedForScanner => {
+                    SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER
+                }
+                ScannerMutexReason::ScannerStoppedForRecording => {
+                    SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING
+                }
+                ScannerMutexReason::ScannerStoppedForTranscription => {
+                    SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION
+                }
+            };
+            SdrEvent {
+                kind: SDR_EVT_SCANNER_MUTEX_STOPPED,
+                payload: SdrEventPayload {
+                    scanner_mutex_stopped: SdrEventScannerMutexStopped { reason: reason_int },
+                },
+            }
+        }
+
         DspToUi::FftData(_)
         | DspToUi::DemodModeChanged(_)
         | DspToUi::BandwidthChanged(_)
         | DspToUi::VfoOffsetChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
-        | DspToUi::ScannerActiveChannelChanged { .. }
-        | DspToUi::ScannerStateChanged(_)
-        | DspToUi::ScannerEmptyRotation
-        | DspToUi::ScannerMutexStopped(_) => return None,
+        // APT lines (#482) aren't surfaced through the FFI layer
+        // yet — the macOS frontend will gain a native APT viewer
+        // through its own ticket. Drop them here so the Linux UI
+        // side can keep emitting without a Mac-side build break.
+        | DspToUi::AptLine(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))
@@ -883,6 +1034,210 @@ mod tests {
         assert_eq!(SDR_EVT_IQ_RECORDING_STOPPED, 11);
         assert_eq!(SDR_EVT_NETWORK_SINK_STATUS, 12);
         assert_eq!(SDR_EVT_RTL_TCP_CONNECTION_STATE, 13);
+        assert_eq!(SDR_EVT_SCANNER_STATE_CHANGED, 14);
+        assert_eq!(SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED, 15);
+        assert_eq!(SDR_EVT_SCANNER_EMPTY_ROTATION, 16);
+        assert_eq!(SDR_EVT_SCANNER_MUTEX_STOPPED, 17);
+    }
+
+    #[test]
+    fn scanner_state_discriminants_match_header() {
+        // The host-side scanner state readout reads these wire
+        // integers directly, so any renumber breaks every C ABI
+        // consumer without failing a Rust-level type check.
+        assert_eq!(SDR_SCANNER_STATE_IDLE, 0);
+        assert_eq!(SDR_SCANNER_STATE_RETUNING, 1);
+        assert_eq!(SDR_SCANNER_STATE_DWELLING, 2);
+        assert_eq!(SDR_SCANNER_STATE_LISTENING, 3);
+        assert_eq!(SDR_SCANNER_STATE_HANGING, 4);
+    }
+
+    #[test]
+    fn scanner_mutex_reason_discriminants_match_header() {
+        assert_eq!(SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER, 0);
+        assert_eq!(SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER, 1);
+        assert_eq!(SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING, 2);
+        assert_eq!(SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION, 3);
+    }
+
+    #[test]
+    fn translate_scanner_state_changed_listening() {
+        let (event, owned_cstring, _) = translate_event(&DspToUi::ScannerStateChanged(
+            sdr_scanner::ScannerState::Listening,
+        ))
+        .expect("ScannerStateChanged should translate");
+        assert_eq!(event.kind, SDR_EVT_SCANNER_STATE_CHANGED);
+        let payload = unsafe { event.payload.scanner_state };
+        assert_eq!(payload.state, SDR_SCANNER_STATE_LISTENING);
+        assert!(owned_cstring.is_none());
+    }
+
+    /// Fixture name for the latched-channel scanner tests. NOAA
+    /// Weather Radio is a canonical NFM channel with a recognisable
+    /// string, making debug output easy to read. Per `CodeRabbit`
+    /// round 2 on PR #497.
+    const TEST_SCANNER_NAME: &str = "NOAA Weather";
+    /// Fixture frequency paired with `TEST_SCANNER_NAME` — 162.550
+    /// MHz is the NOAA Weather Radio canonical channel. Same
+    /// constant appears in the command-side tests under the same
+    /// name, but keep them crate-private-per-test-module so a
+    /// future refactor that splits the modules doesn't collide.
+    const TEST_SCANNER_FREQ_HZ: u64 = 162_550_000;
+    /// Fixture bandwidth the active-channel event carries in the
+    /// flattened `bandwidth` field. NFM default — the FFI layer
+    /// doesn't read this field, so the exact value is only
+    /// meaningful as a recognisable placeholder in debug dumps.
+    const TEST_SCANNER_BANDWIDTH_HZ: f64 = 12_500.0;
+    /// Interior-NUL fixture for the sanitization test. The
+    /// dispatcher's `replace('\0', '?')` call should turn this
+    /// into "Weather?Channel" before it reaches the callback.
+    const TEST_SCANNER_NAME_WITH_INTERIOR_NUL: &str = "Weather\0Channel";
+    /// Expected output after the dispatcher sanitizes the
+    /// interior NUL in `TEST_SCANNER_NAME_WITH_INTERIOR_NUL`.
+    const TEST_SCANNER_NAME_SANITIZED: &str = "Weather?Channel";
+
+    /// Build a synthetic `DspToUi::ScannerActiveChannelChanged`
+    /// for the FFI translation tests. The flattened `freq_hz` /
+    /// `name` fields are populated by the controller-side helper
+    /// in lockstep with the `key`, so the test fixture mirrors
+    /// that contract — passing the same string for `name` and
+    /// `key.name`. Other fields are filler the FFI doesn't read.
+    fn scanner_active_channel_event(latched_name: Option<&str>, freq_hz: u64) -> DspToUi {
+        let key = latched_name.map(|name| sdr_scanner::ChannelKey {
+            name: name.to_string(),
+            frequency_hz: freq_hz,
+        });
+        DspToUi::ScannerActiveChannelChanged {
+            key,
+            freq_hz,
+            demod_mode: sdr_types::DemodMode::Nfm,
+            bandwidth: TEST_SCANNER_BANDWIDTH_HZ,
+            name: latched_name.unwrap_or("").to_string(),
+            ctcss: None,
+            voice_squelch: None,
+        }
+    }
+
+    #[test]
+    fn translate_scanner_active_channel_latched_carries_name_and_frequency() {
+        let (event, owned_cstring, _) = translate_event(&scanner_active_channel_event(
+            Some(TEST_SCANNER_NAME),
+            TEST_SCANNER_FREQ_HZ,
+        ))
+        .expect("ScannerActiveChannelChanged should translate");
+        assert_eq!(event.kind, SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED);
+        let payload = unsafe { event.payload.scanner_active_channel };
+        assert!(!payload.name_utf8.is_null());
+        assert_eq!(payload.frequency_hz, TEST_SCANNER_FREQ_HZ);
+        // Name lives in the owned CString — pointer must still
+        // resolve to the original bytes via the standard
+        // round-trip through CStr.
+        let as_cstr = unsafe { std::ffi::CStr::from_ptr(payload.name_utf8) };
+        assert_eq!(as_cstr.to_str().unwrap(), TEST_SCANNER_NAME);
+        assert!(owned_cstring.is_some());
+    }
+
+    #[test]
+    fn translate_scanner_active_channel_idle_has_null_name_and_zero_freq() {
+        let (event, owned_cstring, _) = translate_event(&scanner_active_channel_event(None, 0))
+            .expect("idle ScannerActiveChannelChanged should translate");
+        assert_eq!(event.kind, SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED);
+        let payload = unsafe { event.payload.scanner_active_channel };
+        // Idle sentinel: the host clears its "active channel"
+        // readout when it sees (null, 0).
+        assert!(payload.name_utf8.is_null());
+        assert_eq!(payload.frequency_hz, 0);
+        assert!(owned_cstring.is_none());
+    }
+
+    #[test]
+    fn translate_scanner_active_channel_sanitizes_interior_nul_in_name() {
+        // NUL inside the channel name would normally break the
+        // CString conversion; we replace it with '?' rather than
+        // dropping the event (same policy as DeviceInfo /
+        // endpoint strings). A channel name really shouldn't
+        // contain a NUL, but if a host projects one accidentally
+        // we'd rather surface a mangled name than silently drop
+        // the latch event.
+        //
+        // **Bind the owned CString return** — `_owned` rather
+        // than `_` keeps the storage alive for the
+        // `CStr::from_ptr` call below. A bare `_` drops it
+        // immediately at the end of the let binding, leaving
+        // `name_utf8` dangling. Same lifetime contract as the
+        // other translate_*-pattern tests.
+        let (event, _owned_cstring, _) = translate_event(&scanner_active_channel_event(
+            Some(TEST_SCANNER_NAME_WITH_INTERIOR_NUL),
+            TEST_SCANNER_FREQ_HZ,
+        ))
+        .expect("sanitized ScannerActiveChannelChanged should translate");
+        let payload = unsafe { event.payload.scanner_active_channel };
+        let as_cstr = unsafe { std::ffi::CStr::from_ptr(payload.name_utf8) };
+        assert_eq!(as_cstr.to_str().unwrap(), TEST_SCANNER_NAME_SANITIZED);
+    }
+
+    #[test]
+    fn translate_scanner_empty_rotation() {
+        let (event, owned_cstring, _) = translate_event(&DspToUi::ScannerEmptyRotation)
+            .expect("ScannerEmptyRotation should translate");
+        assert_eq!(event.kind, SDR_EVT_SCANNER_EMPTY_ROTATION);
+        assert!(owned_cstring.is_none());
+    }
+
+    #[test]
+    fn translate_scanner_mutex_stopped_maps_all_reasons() {
+        // Pin every `ScannerMutexReason` arm individually — the
+        // host-side toast routing branches on the wire integer
+        // directly, so a silent remap (e.g., a refactor that
+        // reorders the Rust enum) breaks every C ABI consumer
+        // without failing any Rust-level type check. Per
+        // `CodeRabbit` round 1 on PR #497.
+        use sdr_core::messages::ScannerMutexReason;
+        let cases = [
+            (
+                ScannerMutexReason::RecordingStoppedForScanner,
+                SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER,
+            ),
+            (
+                ScannerMutexReason::TranscriptionStoppedForScanner,
+                SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER,
+            ),
+            (
+                ScannerMutexReason::ScannerStoppedForRecording,
+                SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING,
+            ),
+            (
+                ScannerMutexReason::ScannerStoppedForTranscription,
+                SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION,
+            ),
+        ];
+        for (reason, expected_int) in cases {
+            let (event, owned_cstring, _) = translate_event(&DspToUi::ScannerMutexStopped(reason))
+                .expect("ScannerMutexStopped should translate");
+            assert_eq!(event.kind, SDR_EVT_SCANNER_MUTEX_STOPPED);
+            let payload = unsafe { event.payload.scanner_mutex_stopped };
+            assert_eq!(payload.reason, expected_int);
+            assert!(owned_cstring.is_none());
+        }
+    }
+
+    #[test]
+    fn translate_apt_line_is_dropped_at_ffi_boundary() {
+        // `DspToUi::AptLine` is intentionally dropped by the FFI
+        // translation layer — the macOS frontend's APT viewer is a
+        // separate ticket, and forwarding 2 KB-per-line image data
+        // through a C ABI without a host consumer would be wasted
+        // work. Pin that policy with a regression test: a future
+        // change that exposes APT lines through the FFI (or
+        // accidentally lets the variant fall through to the
+        // catch-all panic arm) trips this assert before it can
+        // reach the Mac side. Per CodeRabbit on PR #503.
+        let line = sdr_core::messages::AptLine::default();
+        let msg = DspToUi::AptLine(Box::new(line));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AptLine must not translate to a wire event yet",
+        );
     }
 
     #[test]

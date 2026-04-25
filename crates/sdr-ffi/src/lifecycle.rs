@@ -8,6 +8,7 @@ use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+use sdr_config::ConfigManager;
 use sdr_core::Engine;
 
 use crate::error::{SdrCoreError, clear_last_error, set_last_error};
@@ -21,7 +22,7 @@ use crate::handle::SdrCore;
 /// time `const _` in the test module below asserts the two stay
 /// consistent.
 pub const ABI_VERSION_MAJOR: u32 = 0;
-pub const ABI_VERSION_MINOR: u32 = 18;
+pub const ABI_VERSION_MINOR: u32 = 21;
 
 /// Return the ABI version the library was built with.
 ///
@@ -123,6 +124,39 @@ pub unsafe extern "C" fn sdr_core_create(
             PathBuf::from(s)
         };
 
+        // Build the shared config manager. Empty path → in-memory
+        // (ephemeral, used by tests and any future embedder that
+        // doesn't want on-disk persistence). Non-empty path loads
+        // the JSON file, defaulting to `{}` for missing / malformed
+        // files — ConfigManager::load is forgiving there.
+        //
+        // Auto-save is enabled so host writes (e.g., the sidebar-
+        // session `set_config_string` calls from #449) land on
+        // disk without the host having to call a sync helper.
+        // The auto-save thread is joined automatically on `Drop`
+        // so there's no leak path at destroy.
+        let config = if config_path.as_os_str().is_empty() {
+            None
+        } else {
+            let defaults = serde_json::json!({});
+            match ConfigManager::load(&config_path, &defaults) {
+                Ok(mut cfg) => {
+                    cfg.enable_auto_save();
+                    Some(Arc::new(cfg))
+                }
+                Err(err) => {
+                    // Surface the specific path on failure so the
+                    // host can decide whether to fall back (e.g.,
+                    // present the user with a picker) or bail.
+                    set_last_error(format!(
+                        "sdr_core_create: ConfigManager::load({}) failed: {err}",
+                        config_path.display()
+                    ));
+                    return SdrCoreError::Config.as_int();
+                }
+            }
+        };
+
         // Build the engine. Any spawn failure maps to INTERNAL.
         let engine = match Engine::new(config_path.clone()) {
             Ok(e) => e,
@@ -167,6 +201,7 @@ pub unsafe extern "C" fn sdr_core_create(
         let core = Box::new(SdrCore::new(
             engine,
             config_path,
+            config,
             event_callback,
             dispatcher_handle,
         ));
@@ -334,7 +369,7 @@ mod tests {
     /// build here rather than drifting silently.
     const _: () = {
         assert!(ABI_VERSION_MAJOR == 0);
-        assert!(ABI_VERSION_MINOR == 18);
+        assert!(ABI_VERSION_MINOR == 21);
     };
 
     #[test]

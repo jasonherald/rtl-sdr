@@ -12,8 +12,6 @@ import SdrCoreKit
 struct HeaderToolbar: ToolbarContent {
     @Environment(CoreModel.self) private var model
     @Binding var showingRadioReference: Bool
-    @Binding var showingTranscription: Bool
-    @Binding var showingBookmarks: Bool
 
     var body: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
@@ -46,54 +44,11 @@ struct HeaderToolbar: ToolbarContent {
             .frame(width: 110)
         }
 
-        // Transcription panel toggle — mirrors the GTK transcript
-        // revealer button. Inline + Label-with-text for the same
-        // reason RadioReference below uses that shape (macOS
-        // toolbar display-mode quirks — see the comment on that
-        // button). `systemImage: "text.bubble"` renders a speech
-        // bubble, matches the intent of a live-transcription
-        // view.
-        ToolbarItem(placement: .automatic) {
-            Button {
-                showingTranscription.toggle()
-            } label: {
-                Label(
-                    "Transcription",
-                    systemImage: showingTranscription
-                        ? "text.bubble.fill"
-                        : "text.bubble"
-                )
-            }
-            .help(showingTranscription ? "Hide Transcription Panel" : "Show Transcription Panel")
-        }
-
-        // Bookmarks panel toggle — mirrors the GTK bookmarks
-        // flyout button (issue #339). Same inline-Button +
-        // Label-with-text shape as the other right-flyout and
-        // RadioReference buttons; see the comment block on the
-        // RadioReference item below for the macOS-toolbar
-        // display-mode rationale. `⌘B` opens or closes the
-        // flyout, matching the Linux `Ctrl+B` binding.
-        //
-        // Mutual exclusivity with the transcription panel is
-        // handled at the ContentView level via `.onChange`
-        // handlers — the content area has room for one
-        // right-side flyout at a time, and coordinating the
-        // two `Binding<Bool>`s inside this toolbar closure
-        // would pull ContentView state into the toolbar
-        // struct unnecessarily.
-        ToolbarItem(placement: .automatic) {
-            Button {
-                showingBookmarks.toggle()
-            } label: {
-                Label(
-                    "Bookmarks",
-                    systemImage: showingBookmarks ? "bookmark.fill" : "bookmark"
-                )
-            }
-            .keyboardShortcut("b", modifiers: .command)
-            .help(showingBookmarks ? "Hide Bookmarks Panel (⌘B)" : "Show Bookmarks Panel (⌘B)")
-        }
+        // Transcription + Bookmarks toolbar buttons removed
+        // in #448 — those panels migrated to the right activity
+        // bar (`⌘⇧1` for Transcript, `⌘⇧2` for Bookmarks).
+        // Click the matching activity-bar icon to open or close
+        // each panel.
 
         // RadioReference button — mirrors the GTK header-bar
         // entry point.

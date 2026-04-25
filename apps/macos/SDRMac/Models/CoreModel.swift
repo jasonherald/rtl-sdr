@@ -274,6 +274,53 @@ final class CoreModel {
     var notchFrequencyHz: Float = 1_000
 
     // ==========================================================
+    //  Scanner — issue #447 (ABI 0.20)
+    //
+    //  All four fields are engine-driven: the Mac side issues
+    //  `setScannerEnabled(_:)` and reads back the resulting
+    //  state via the `scannerStateChanged` /
+    //  `scannerActiveChannelChanged` event arms. We don't flip
+    //  these locally — the engine is authoritative.
+    //
+    //  Bookmark → `ScannerChannel` projection isn't wired yet;
+    //  flipping `scannerEnabled` true with no channels leaves
+    //  `scannerState == .idle`. Tracked under #490 (per-bookmark
+    //  scan/priority) — the panel footer surfaces the gap.
+    //
+    //  `scannerDefaultDwellMs` / `scannerDefaultHangMs` ARE
+    //  stored on this model (not engine-side) — they're "default
+    //  fallbacks the host folds into each `ScannerChannel` at
+    //  projection time", same pattern the Linux side uses.
+    //  Persisted via `UserDefaults` at write time.
+    // ==========================================================
+
+    /// Scanner master switch. Set via `setScannerEnabled(_:)`;
+    /// the engine echoes the resulting phase via
+    /// `scannerStateChanged` (which lands in `scannerState`).
+    var scannerEnabled: Bool = false
+
+    /// Scanner phase as last reported by the engine. Drives the
+    /// panel's State row and the lockout button's visibility
+    /// (button shows only when `scannerActiveChannel != nil`).
+    var scannerState: ScannerState = .idle
+
+    /// Channel the scanner is currently latched on, or `nil` when
+    /// idle. Drives the Channel row's subtitle and the lockout
+    /// button's identity (passed to
+    /// `lockoutScannerChannel(name:frequencyHz:)`).
+    var scannerActiveChannel: ScannerActiveChannel? = nil
+
+    /// Default per-channel settle time in ms. The host folds
+    /// this into each projected `ScannerChannel`'s `dwell_ms`
+    /// when the bookmark doesn't carry an override. Range
+    /// matches the Linux side (`DWELL_MIN_MS`..`DWELL_MAX_MS`).
+    var scannerDefaultDwellMs: Int = 100
+
+    /// Default per-channel hang time in ms. Same projection-time
+    /// fallback contract as `scannerDefaultDwellMs`.
+    var scannerDefaultHangMs: Int = 2_000
+
+    // ==========================================================
     //  Audio
     // ==========================================================
 
@@ -369,12 +416,17 @@ final class CoreModel {
     }
 
     /// Most-recent poll snapshot of server stats. `nil` while
-    /// the server isn't running.
+    /// the server isn't running. Aggregates only — per-client
+    /// state moved to the multi-client surface in #391 and
+    /// lands on the Mac side in #496.
     var rtlTcpServerStats: SdrRtlTcpServer.Stats? = nil
 
-    /// Last ~50 commands the client issued, newest first. Fed
-    /// by the poll task that also refreshes `rtlTcpServerStats`.
-    var rtlTcpRecentCommands: [SdrRtlTcpServer.RecentCommand] = []
+    // The pre-#391 single-client `rtlTcpRecentCommands` ring
+    // is gone — recent-commands tracking is per-client now and
+    // requires the multi-client list surface (#496) to map a
+    // client id back to its commands. The panel renders the
+    // server-wide aggregates `connectedCount` / `lifetimeAccepted`
+    // / `totalBytesSent` / `totalBuffersDropped` instead.
 
     /// Last error surfaced from a rtl_tcp server start or poll
     /// attempt. Cleared on successful start; mirrors into a
@@ -750,6 +802,17 @@ final class CoreModel {
             let raw = Int32(UserDefaults.standard.integer(forKey: Self.sourceTypeDefaultsKey))
             sourceType = SourceType(rawValue: raw) ?? .rtlSdr
         }
+        // Last band preset the user picked from the General
+        // panel — restored as just the ID; resolution against
+        // the canonical `bandPresets` slice happens via the
+        // `lastSelectedBandPreset` computed accessor. Doesn't
+        // re-apply the tuning state (the engine's persisted
+        // center/demod/bandwidth are authoritative on launch).
+        if let id = UserDefaults.standard.string(
+            forKey: Self.lastSelectedBandPresetDefaultsKey
+        ) {
+            lastSelectedBandPresetID = id
+        }
         if UserDefaults.standard.object(forKey: Self.agcTypeDefaultsKey) != nil {
             let raw = Int32(UserDefaults.standard.integer(forKey: Self.agcTypeDefaultsKey))
             agcType = SdrCore.AgcType(rawValue: raw) ?? .software
@@ -801,6 +864,26 @@ final class CoreModel {
         if UserDefaults.standard.object(forKey: Self.networkSinkProtocolDefaultsKey) != nil {
             let raw = Int32(UserDefaults.standard.integer(forKey: Self.networkSinkProtocolDefaultsKey))
             networkSinkProtocol = NetworkProtocol(rawValue: raw) ?? .tcpServer
+        }
+
+        // Restore scanner timing defaults — issue #447.
+        // Out-of-range values are silently ignored (the Rust side
+        // also clamps); same defensive pattern as the network
+        // sink port restore above. The setters clamp at write
+        // time so a poisoned defaults entry can only show up
+        // here on first restore — subsequent writes go through
+        // `setScannerDefault{Dwell,Hang}Ms` which clamp.
+        if UserDefaults.standard.object(forKey: Self.scannerDefaultDwellMsDefaultsKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.scannerDefaultDwellMsDefaultsKey)
+            if Self.scannerDwellMsRange.contains(stored) {
+                scannerDefaultDwellMs = stored
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.scannerDefaultHangMsDefaultsKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.scannerDefaultHangMsDefaultsKey)
+            if Self.scannerHangMsRange.contains(stored) {
+                scannerDefaultHangMs = stored
+            }
         }
 
         // Seed the RadioReference credentials flag from the
@@ -871,6 +954,18 @@ final class CoreModel {
         do {
             let c = try SdrCore(configPath: configPath)
             self.core = c
+            // Restore sidebar session from the shared config —
+            // issue #449. Runs AFTER the engine handle is set
+            // because `loadSidebarSession()` reads through the
+            // FFI's config surface, which depends on the
+            // ConfigManager owned by the engine handle. Has to
+            // happen before the SwiftUI scene first paints so the
+            // remembered selection / open state / width is on the
+            // observable properties before ContentView's bindings
+            // wire up. Out-of-range values fall through to the
+            // already-set defaults — same defensive policy as the
+            // rest of the bootstrap restore block.
+            loadSidebarSession()
             // `[weak self]` breaks the retain cycle that would
             // otherwise form: CoreModel → eventTask → closure →
             // self. If the model is dropped (e.g., from a future
@@ -1028,6 +1123,70 @@ final class CoreModel {
             // disconnect / retry buttons gate on it. Per issue
             // #326.
             rtlTcpConnectionState = state
+        case .scannerStateChanged(let state):
+            // Engine is authoritative for the scanner phase —
+            // its state machine fires this on every Idle/Retuning
+            // /Dwelling/Listening/Hanging transition. The panel
+            // reads `scannerState` directly to render the State
+            // row.
+            scannerState = state
+            // Idle is the engine's "rotation parked" sentinel.
+            // The active channel readout could still be lying in
+            // the previous latched value if `scannerEnabled` was
+            // toggled off without the engine emitting a
+            // matching null active-channel event first; clear
+            // proactively so the panel doesn't keep showing a
+            // stale Channel row while State says Off.
+            if state == .idle {
+                scannerActiveChannel = nil
+            }
+        case .scannerActiveChannelChanged(let channel):
+            // `nil` means "scanner returned to idle / no latched
+            // channel" — the panel's Channel row resets to its
+            // placeholder. Non-nil carries the bookmark name +
+            // frequency the lockout button targets.
+            scannerActiveChannel = channel
+        case .scannerEmptyRotation:
+            // All projected channels are absent or locked out
+            // — engine has exhausted its rotation. Surface the
+            // exhausted state immediately rather than waiting
+            // for the next `scannerStateChanged(.idle)` event:
+            // the engine doesn't always emit one (a rotation
+            // that can't find a non-locked channel may settle
+            // straight back to dwelling, then re-emit empty on
+            // the next sweep). Snap state + clear the active
+            // readout so the panel reflects "no rotation
+            // possible right now" without lag.
+            scannerState = .idle
+            scannerActiveChannel = nil
+        case .scannerMutexStopped(let reason):
+            // The scanner ↔ recording / transcription mutex
+            // fired. Two of the four reasons mean the scanner
+            // itself was stopped (ScannerStoppedFor* directions)
+            // — flip `scannerEnabled` false locally so the
+            // panel's master toggle reflects engine truth
+            // immediately. The other two reasons mean the
+            // scanner stopped recording / transcription; the
+            // matching recording-state event arms handle their
+            // own UI sync, so the scanner panel doesn't need
+            // extra work for those directions.
+            //
+            // Toast surfacing for any of the four directions
+            // is a follow-up — we have `reason.toastMessage`
+            // ready, but routing it through a notifications
+            // surface lands separately.
+            switch reason {
+            case .scannerStoppedForRecording, .scannerStoppedForTranscription:
+                scannerEnabled = false
+                scannerState = .idle
+                scannerActiveChannel = nil
+            case .recordingStoppedForScanner, .transcriptionStoppedForScanner:
+                // Inverse direction — the recording / transcription
+                // side stopped, scanner is now running. The
+                // scanner-state event arm above handles the
+                // panel sync; nothing extra here.
+                break
+            }
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -1516,6 +1675,90 @@ final class CoreModel {
     }
 
     // ----------------------------------------------------------
+    //  Scanner — issue #447 (ABI 0.20)
+    // ----------------------------------------------------------
+
+    /// Toggle the scanner master switch. Optimistic — we flip
+    /// `scannerEnabled` immediately so the UI doesn't lag, but
+    /// the engine's `scannerStateChanged` reply is authoritative
+    /// for the resulting phase (`scannerState`). Until #490
+    /// lands the per-bookmark `scan_enabled` projection,
+    /// flipping this on with no scan-enabled bookmarks leaves
+    /// the engine in `.idle` (no rotation to drive), and the
+    /// panel's State row reflects that.
+    func setScannerEnabled(_ on: Bool) {
+        scannerEnabled = on
+        capture { try core?.setScannerEnabled(on) }
+    }
+
+    /// Lock out the channel currently latched (if any) for the
+    /// rest of the scanner session. No-op when the scanner
+    /// isn't latched on a channel. The engine's lockout set is
+    /// session-scoped — disabling the scanner clears it.
+    func lockoutCurrentScannerChannel() {
+        guard let channel = scannerActiveChannel else { return }
+        capture {
+            try core?.lockoutScannerChannel(
+                name: channel.name,
+                frequencyHz: channel.frequencyHz
+            )
+        }
+    }
+
+    /// Allowed range for the default-dwell setting (ms). Mirrors
+    /// the Linux `DWELL_MIN_MS` / `DWELL_MAX_MS` constants; kept
+    /// model-side because the SwiftUI Stepper enforces the same
+    /// bounds AND a non-UI caller (scripted defaults edit, future
+    /// AppleScript / shortcut, test code) can write through the
+    /// setter directly.
+    static let scannerDwellMsRange: ClosedRange<Int> = 50...500
+    /// Allowed range for the default-hang setting (ms). Mirrors
+    /// the Linux `HANG_MIN_MS` / `HANG_MAX_MS` constants.
+    static let scannerHangMsRange: ClosedRange<Int> = 500...5_000
+
+    /// Update the default settle time per-channel (ms). The
+    /// host applies this at projection time; engine doesn't
+    /// store a separate "default" — it sees a fully-resolved
+    /// `dwell_ms` on each `ScannerChannel`. Persisted via
+    /// `UserDefaults` so the choice survives relaunches.
+    ///
+    /// Out-of-range values are clamped at the boundary so a
+    /// non-UI caller can't poison persistent state with a value
+    /// that's silently dropped on next launch (bootstrap also
+    /// validates the range when reading back). Per `CodeRabbit`
+    /// round 1 on PR #497.
+    func setScannerDefaultDwellMs(_ ms: Int) {
+        let range = Self.scannerDwellMsRange
+        let clamped = min(max(ms, range.lowerBound), range.upperBound)
+        scannerDefaultDwellMs = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.scannerDefaultDwellMsDefaultsKey)
+    }
+
+    /// Update the default hang time per-channel (ms). Same
+    /// projection-time fallback contract — and same clamp
+    /// rationale — as the dwell setter.
+    func setScannerDefaultHangMs(_ ms: Int) {
+        let range = Self.scannerHangMsRange
+        let clamped = min(max(ms, range.lowerBound), range.upperBound)
+        scannerDefaultHangMs = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.scannerDefaultHangMsDefaultsKey)
+    }
+
+    /// `UserDefaults` key for the scanner default-dwell (ms).
+    /// Mirrors the Linux config key
+    /// (`crates/sdr-ui/src/sidebar/scanner_panel.rs`'s
+    /// `CONFIG_KEY_DEFAULT_DWELL_MS`); we don't share storage
+    /// with the GTK side yet (separate `UserDefaults` /
+    /// `sdr-config`) but the key name stays identical so a
+    /// future shared-config layer can round-trip without
+    /// renaming.
+    static let scannerDefaultDwellMsDefaultsKey = "scanner_default_dwell_ms"
+
+    /// `UserDefaults` key for the scanner default-hang (ms).
+    /// Same name-parity rationale as the dwell key.
+    static let scannerDefaultHangMsDefaultsKey = "scanner_default_hang_ms"
+
+    // ----------------------------------------------------------
     //  Source (advanced) — #246
     // ----------------------------------------------------------
 
@@ -1850,7 +2093,6 @@ final class CoreModel {
         // Per `CodeRabbit` round 7 on PR #362.
         rtlTcpServerStopping = true
         rtlTcpServerStats = nil
-        rtlTcpRecentCommands = []
 
         let prior = rtlTcpServerLifecycleTask
         let task = Task { [weak self] in
@@ -1925,7 +2167,6 @@ final class CoreModel {
         // is released. Per `CodeRabbit` round 7 on PR #362.
         rtlTcpServerStopping = false
         rtlTcpServerStats = nil
-        rtlTcpRecentCommands = []
         advertiser?.stop()
         server?.stop()
     }
@@ -1965,25 +2206,29 @@ final class CoreModel {
         )
     }
 
-    /// Background poller that refreshes `rtlTcpServerStats` +
-    /// `rtlTcpRecentCommands` on a one-second tick. Runs on
-    /// the main actor (the whole `CoreModel` is `@MainActor`)
-    /// which matches what `@Observable` needs for writes.
+    /// Background poller that refreshes `rtlTcpServerStats`
+    /// on a one-second tick. Runs on the main actor (the whole
+    /// `CoreModel` is `@MainActor`) which matches what
+    /// `@Observable` needs for writes.
+    ///
+    /// The pre-#391 per-client `rtlTcpRecentCommands` refresh
+    /// is gone — recent-commands tracking is per-client now and
+    /// returns under a separate poll keyed by `client.id` once
+    /// the multi-client surface lands (#496).
     private func startRtlTcpPoller() {
         rtlTcpPollTask = Task { [weak self] in
             // Tick cadence slow enough to be negligible on the
-            // main thread, fast enough that "uptime" and data-
-            // rate look live. 1 Hz is the GTK panel's tick too.
+            // main thread, fast enough that aggregate counters
+            // look live. 1 Hz is the GTK panel's tick too.
             let tickNanos: UInt64 = 1_000_000_000
             // Poll-then-sleep ordering so `rtlTcpServerStats`
-            // and `rtlTcpRecentCommands` populate immediately on
-            // server start rather than after a full tick of nil.
-            // Per `CodeRabbit` round 4 on PR #362.
+            // populates immediately on server start rather than
+            // after a full tick of nil. Per `CodeRabbit` round 4
+            // on PR #362.
             while !Task.isCancelled {
                 guard let self, let server = self.rtlTcpServer else { return }
                 do {
                     self.rtlTcpServerStats = try server.stats()
-                    self.rtlTcpRecentCommands = try server.recentCommands()
                 } catch {
                     // Server has gone away (stopped externally,
                     // USB unplug, panic caught by the FFI). Tear
@@ -2354,6 +2599,249 @@ final class CoreModel {
         sourceType = type
         UserDefaults.standard.set(Int(type.rawValue), forKey: Self.sourceTypeDefaultsKey)
         capture { try core?.setSourceType(type) }
+    }
+
+    // ----------------------------------------------------------
+    //  Band presets — persisted last selection
+    //
+    //  Owned by the model rather than by `BandPresetsSection`'s
+    //  local `@State` so the picker's chosen value survives
+    //  panel close + activity swap (the General activity panel
+    //  is rebuilt every time the user reopens it). Persisted
+    //  to UserDefaults too, so the dropdown reflects the user's
+    //  last pick across launches. Per `CodeRabbit` round 1 on
+    //  PR #493.
+    // ----------------------------------------------------------
+
+    /// ID of the last band preset the user picked from the
+    /// General panel's dropdown. Defaults to `"FM Broadcast"`
+    /// on a fresh install — the model's default tuner state
+    /// (100 MHz / WFM) lives in the FM band so this is the
+    /// most natural pick for first launch. The `BandPreset.id`
+    /// is the preset's name string (`"FM Broadcast"`, `"NOAA
+    /// Weather"`, …) — see `apps/macos/SDRMac/Models/BandPreset.swift`.
+    var lastSelectedBandPresetID: String? = "FM Broadcast"
+
+    /// Resolved view of `lastSelectedBandPresetID`. Returns
+    /// `nil` when no preset has been picked yet, or when the
+    /// persisted ID no longer matches any entry in the
+    /// canonical `bandPresets` slice (slice rename or removal).
+    var lastSelectedBandPreset: BandPreset? {
+        guard let id = lastSelectedBandPresetID else { return nil }
+        return bandPresets.first { $0.id == id }
+    }
+
+    /// Apply a preset by routing through the standard tuner
+    /// setters (so squelch / auto-squelch / VFO echoes behave
+    /// identically to a manual tune), then remember the
+    /// selection so the picker reflects it next time the
+    /// General panel opens. Passing `nil` clears the remembered
+    /// pick without retuning. Per `CodeRabbit` round 1 on PR
+    /// #493 (split selection from tune action so the picker can
+    /// also be cleared programmatically).
+    func setLastSelectedBandPreset(_ preset: BandPreset?) {
+        lastSelectedBandPresetID = preset?.id
+        if let id = preset?.id {
+            UserDefaults.standard.set(id, forKey: Self.lastSelectedBandPresetDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.lastSelectedBandPresetDefaultsKey)
+        }
+        if let preset {
+            setCenter(preset.centerFrequencyHz)
+            setDemodMode(preset.demodMode)
+            setBandwidth(preset.bandwidthHz)
+        }
+    }
+
+    /// UserDefaults key for the persisted last-selected preset
+    /// ID. The Mac app persists locally; the Rust config layer
+    /// doesn't round-trip this value (no Linux equivalent —
+    /// the GTK panel uses an in-memory `ComboRow` and resets on
+    /// app restart).
+    static let lastSelectedBandPresetDefaultsKey = "SDRMac.lastSelectedBandPreset"
+
+    // ----------------------------------------------------------
+    //  Sidebar session — issue #449 (ABI 0.21)
+    //
+    //  Six fields, three per side, persisted to the shared
+    //  `sdr-config` JSON file via the engine's config FFI. Keys
+    //  match the Linux side exactly so a user who runs both
+    //  frontends sees consistent state. Values for the
+    //  `*_selected` fields are the activity raw-value strings
+    //  defined on `LeftActivity` / `RightActivity` (which match
+    //  the Linux activity-bar entry names — same source of
+    //  truth).
+    //
+    //  Default values per the spec for #450 and the Linux
+    //  `SidebarSession::default`: left = General, open, 320 px;
+    //  right = Transcript, closed, 420 px. The right default is
+    //  wider than the left because the right side hosts content-
+    //  heavy panels (Transcript / Bookmarks) that read better
+    //  with extra room — same rationale captured on the per-side
+    //  range constants below.
+    //
+    //  These fields are observable @Observable storage so
+    //  ContentView can bind through them (and the activity bar /
+    //  resize gesture writes flow back through the matching
+    //  setters). The setters double-write: update the
+    //  observable property AND push to the engine config so the
+    //  on-disk JSON stays in sync.
+    // ----------------------------------------------------------
+
+    /// Activity selected in the left sidebar — one of the
+    /// `LeftActivity` raw values. Loaded from
+    /// `ui_sidebar_left_selected` on bootstrap; written through
+    /// `setSidebarLeftSelected(_:)` on user picks.
+    var sidebarLeftSelected: String = "general"
+    /// Whether the left panel is currently visible.
+    var sidebarLeftOpen: Bool = true
+    /// Width of the left panel in pixels. Default matches the
+    /// Linux `DEFAULT_SIDEBAR_WIDTH_PX` constant; the per-side
+    /// clamp range below is the spec's floor/ceiling pair.
+    var sidebarLeftWidth: UInt32 = sidebarLeftDefaultWidth
+
+    /// Activity selected in the right sidebar — one of the
+    /// `RightActivity` raw values.
+    var sidebarRightSelected: String = "transcript"
+    /// Whether the right panel is currently visible.
+    var sidebarRightOpen: Bool = false
+    /// Width of the right panel in pixels. Default is wider than
+    /// the left because the right side hosts content-heavy
+    /// panels (Transcript / Bookmarks) that read better with
+    /// extra room.
+    var sidebarRightWidth: UInt32 = sidebarRightDefaultWidth
+
+    /// Config keys — match the Linux constants in
+    /// `crates/sdr-ui/src/sidebar/activity_bar.rs` exactly so a
+    /// user who runs both frontends sees consistent state.
+    static let sidebarLeftSelectedKey = "ui_sidebar_left_selected"
+    static let sidebarLeftOpenKey = "ui_sidebar_left_open"
+    static let sidebarLeftWidthKey = "ui_sidebar_left_width_px"
+    static let sidebarRightSelectedKey = "ui_sidebar_right_selected"
+    static let sidebarRightOpenKey = "ui_sidebar_right_open"
+    static let sidebarRightWidthKey = "ui_sidebar_right_width_px"
+
+    /// Allowed clamp range for the left sidebar's width (px).
+    /// 220 px is the minimum that keeps the panel's `Form`
+    /// section labels readable; 640 px stops a single panel
+    /// from monopolising the window. Matches the Linux
+    /// `LEFT_PANEL_MIN_PX` / `_MAX_PX` constants in
+    /// `crates/sdr-ui/src/sidebar/activity_bar.rs`. Used by
+    /// `setSidebarLeftWidth(_:)` for runtime clamps and by
+    /// the `loadSidebarSession()` restore for validating
+    /// persisted values.
+    ///
+    /// Stored as `Int` rather than `UInt32` because both
+    /// AppKit (`NSSplitView` constraints) and SwiftUI's
+    /// `.frame(minWidth:maxWidth:)` modifier take `CGFloat`,
+    /// and the conversion path is simpler from `Int`. The
+    /// model still persists width as `UInt32` because the
+    /// shared `sdr-config` file uses unsigned ints there.
+    static let sidebarLeftWidthRange: ClosedRange<Int> = 220...640
+
+    /// Allowed clamp range for the right sidebar's width (px).
+    /// 360 px is the minimum that keeps Transcript /
+    /// Bookmarks list rows from truncating timestamps+content;
+    /// 840 px is the upper ceiling. Same Linux-parity
+    /// rationale as `sidebarLeftWidthRange`.
+    static let sidebarRightWidthRange: ClosedRange<Int> = 360...840
+
+    /// Default width applied on a fresh install, on a
+    /// double-click reset of the left handle, and as the seed
+    /// value for the `sidebarLeftWidth` observable property.
+    /// Matches the Linux `DEFAULT_SIDEBAR_WIDTH_PX` constant.
+    static let sidebarLeftDefaultWidth: UInt32 = 320
+
+    /// Default width applied on a fresh install, on a
+    /// double-click reset of the right handle, and as the seed
+    /// value for the `sidebarRightWidth` observable property.
+    /// Wider than the left default because the right side
+    /// hosts content-heavy panels (Transcript / Bookmarks)
+    /// that read better with extra room.
+    static let sidebarRightDefaultWidth: UInt32 = 420
+
+    /// Restore all six sidebar fields from the shared config.
+    /// Called once during `bootstrap()` AFTER the engine is
+    /// alive (the engine handle owns the `ConfigManager` we
+    /// read through). Out-of-range / malformed entries fall
+    /// through to the default value already on the property —
+    /// same defensive policy as the network-sink restore above.
+    private func loadSidebarSession() {
+        guard let core else { return }
+        if let s = core.configString(key: Self.sidebarLeftSelectedKey),
+           LeftActivity(rawValue: s) != nil {
+            sidebarLeftSelected = s
+        }
+        if let b = core.configBool(key: Self.sidebarLeftOpenKey) {
+            sidebarLeftOpen = b
+        }
+        if let w = core.configUInt32(key: Self.sidebarLeftWidthKey),
+           Self.sidebarLeftWidthRange.contains(Int(w)) {
+            sidebarLeftWidth = w
+        }
+        if let s = core.configString(key: Self.sidebarRightSelectedKey),
+           RightActivity(rawValue: s) != nil {
+            sidebarRightSelected = s
+        }
+        if let b = core.configBool(key: Self.sidebarRightOpenKey) {
+            sidebarRightOpen = b
+        }
+        if let w = core.configUInt32(key: Self.sidebarRightWidthKey),
+           Self.sidebarRightWidthRange.contains(Int(w)) {
+            sidebarRightWidth = w
+        }
+    }
+
+    /// Update the left sidebar's selected activity. Validates
+    /// against `LeftActivity` raw values before writing — a
+    /// non-UI caller passing a bogus string can't poison the
+    /// shared config (Linux side would silently ignore it on
+    /// next load anyway, but the round-trip would be sticky
+    /// across sessions).
+    func setSidebarLeftSelected(_ name: String) {
+        guard LeftActivity(rawValue: name) != nil else { return }
+        sidebarLeftSelected = name
+        capture {
+            try core?.setConfigString(key: Self.sidebarLeftSelectedKey, value: name)
+        }
+    }
+
+    func setSidebarLeftOpen(_ open: Bool) {
+        sidebarLeftOpen = open
+        capture { try core?.setConfigBool(key: Self.sidebarLeftOpenKey, value: open) }
+    }
+
+    func setSidebarLeftWidth(_ width: UInt32) {
+        let lo = UInt32(Self.sidebarLeftWidthRange.lowerBound)
+        let hi = UInt32(Self.sidebarLeftWidthRange.upperBound)
+        let clamped = min(max(width, lo), hi)
+        sidebarLeftWidth = clamped
+        capture {
+            try core?.setConfigUInt32(key: Self.sidebarLeftWidthKey, value: clamped)
+        }
+    }
+
+    func setSidebarRightSelected(_ name: String) {
+        guard RightActivity(rawValue: name) != nil else { return }
+        sidebarRightSelected = name
+        capture {
+            try core?.setConfigString(key: Self.sidebarRightSelectedKey, value: name)
+        }
+    }
+
+    func setSidebarRightOpen(_ open: Bool) {
+        sidebarRightOpen = open
+        capture { try core?.setConfigBool(key: Self.sidebarRightOpenKey, value: open) }
+    }
+
+    func setSidebarRightWidth(_ width: UInt32) {
+        let lo = UInt32(Self.sidebarRightWidthRange.lowerBound)
+        let hi = UInt32(Self.sidebarRightWidthRange.upperBound)
+        let clamped = min(max(width, lo), hi)
+        sidebarRightWidth = clamped
+        capture {
+            try core?.setConfigUInt32(key: Self.sidebarRightWidthKey, value: clamped)
+        }
     }
 
     /// Apply the current network-source host/port/protocol to

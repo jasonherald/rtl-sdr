@@ -66,6 +66,32 @@ pub struct SdrRtlTcpAdvertiseOptions {
     pub has_txbuf: bool,
     /// TXT: optional buffer-depth hint in bytes.
     pub txbuf: u64,
+    /// Whether [`Self::codecs`] below is meaningful. `false` (the
+    /// zero-init default) publishes the TXT record with NO
+    /// `codecs=` key, which every browser then treats as
+    /// "legacy-only" — identical to pre-#400 behaviour. Added in
+    /// ABI 0.19 per issue #400.
+    pub has_codecs: bool,
+    /// TXT: compression-mask wire byte. Only used when
+    /// [`Self::has_codecs`] is `true`. Value is a [`CodecMask::
+    /// to_wire`] byte — bit 0 = `None` codec, bit 1 = `LZ4`, etc.
+    /// Typical values: `0x01` = `None`-only (legacy-safe),
+    /// `0x03` = `None + LZ4` (signals the server speaks the
+    /// extended handshake and accepts compression hellos).
+    pub codecs: u8,
+    /// Whether [`Self::auth_required`] below is meaningful.
+    /// `false` (zero-init default) publishes no `auth_required=`
+    /// key — per #395's "omit on false" contract, mDNS browsers
+    /// treat absence as "no auth required." Added in ABI 0.19
+    /// per issue #400.
+    pub has_auth_required: bool,
+    /// TXT: whether the server requires a pre-shared key (#394).
+    /// Only used when [`Self::has_auth_required`] is `true`. The
+    /// FFI advertiser is decoupled from the FFI server (hosts
+    /// publish this independently of [`sdr_rtltcp_server_start`]),
+    /// so it's the caller's responsibility to keep the flag in
+    /// sync with its `ServerConfig.auth_key` state.
+    pub auth_required: bool,
 }
 
 pub struct SdrRtlTcpAdvertiser {
@@ -162,6 +188,27 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
             None
         };
 
+        // `codecs` + `auth_required` project from the
+        // `has_*` gates per #400. Zero-init defaults
+        // (`has_codecs = has_auth_required = false`) yield the
+        // same "omit from TXT" behaviour as pre-ABI-0.19, so
+        // hosts that haven't updated their init still publish
+        // legacy-compatible records.
+        let codecs = if opts.has_codecs {
+            Some(opts.codecs)
+        } else {
+            None
+        };
+        // `auth_required` MUST be `Some(true)` or `None` only —
+        // never `Some(false)`. The #395 mDNS contract is "omit on
+        // false" so clients that gate on key presence don't
+        // misclassify an explicitly-no-auth server as
+        // auth-capable. Per `CodeRabbit` round 1 on PR #418.
+        let auth_required = if opts.has_auth_required && opts.auth_required {
+            Some(true)
+        } else {
+            None
+        };
         let options = AdvertiseOptions {
             port: opts.port,
             instance_name,
@@ -172,23 +219,8 @@ pub unsafe extern "C" fn sdr_rtltcp_advertiser_start(
                 gains: opts.gains,
                 nickname,
                 txbuf,
-                // C ABI host has no codec picker yet — advertise
-                // "unknown / legacy" so vanilla clients keep
-                // working unchanged. Issue #400 tracks extending
-                // `SdrRtlTcpAdvertiseOptions` with `has_codecs` +
-                // `codecs` fields so the Swift macOS app can
-                // advertise compression capability.
-                codecs: None,
-                // `auth_required` publishes via the same FFI
-                // extension as `codecs` when the Swift host wires
-                // up its own advertiser config. Today the FFI
-                // advertiser is decoupled from the FFI server
-                // (Swift publishes advertise options separately),
-                // so default to `None` — downstream mDNS browsers
-                // treat absence as "no auth required" per #395's
-                // omit-on-false contract. Issue #400 covers
-                // extending this struct.
-                auth_required: None,
+                codecs,
+                auth_required,
             },
         };
 
@@ -287,6 +319,23 @@ pub struct SdrRtlTcpDiscoveredServer {
     pub txbuf: u64,
     /// Seconds since the last ServiceResolved for this entry.
     pub last_seen_secs_ago: f64,
+    /// Whether [`Self::codecs`] below carries meaningful data from
+    /// the server's TXT record. `false` = server didn't advertise
+    /// a `codecs=` key (legacy rtl_tcp or pre-ABI-0.19 sdr-rs
+    /// server). ABI 0.19 per #400 / `CodeRabbit` round 1 on
+    /// PR #418.
+    pub has_codecs: bool,
+    /// TXT: advertised compression-mask wire byte. Typical values:
+    /// `0x01` = `None`-only (legacy-safe), `0x03` = `None + LZ4`
+    /// (server accepts compression hellos).
+    pub codecs: u8,
+    /// Whether [`Self::auth_required`] below carries meaningful
+    /// data. `false` = absent from TXT.
+    pub has_auth_required: bool,
+    /// TXT: whether the server requires a pre-shared key for
+    /// handshakes (#394). Only meaningful when
+    /// [`Self::has_auth_required`] is `true`.
+    pub auth_required: bool,
 }
 
 /// Tagged discovery event the browser dispatches.
@@ -545,6 +594,21 @@ fn discovered_server_to_c(
         None => (false, 0),
     };
 
+    // ABI 0.19 (#400): project the same `Option<...>` → `has_*` +
+    // value pair shape as `txbuf` above so callers who check
+    // `has_codecs=false` / `has_auth_required=false` see a clean
+    // "absent from TXT" signal regardless of whatever stale bytes
+    // happen to live in the value field. Per `CodeRabbit` round 1
+    // on PR #418.
+    let (has_codecs, codecs) = match server.txt.codecs {
+        Some(v) => (true, v),
+        None => (false, 0),
+    };
+    let (has_auth_required, auth_required) = match server.txt.auth_required {
+        Some(v) => (true, v),
+        None => (false, false),
+    };
+
     SdrRtlTcpDiscoveredServer {
         instance_name: push(&server.instance_name, strings),
         hostname: push(&server.hostname, strings),
@@ -558,6 +622,10 @@ fn discovered_server_to_c(
         has_txbuf,
         txbuf,
         last_seen_secs_ago,
+        has_codecs,
+        codecs,
+        has_auth_required,
+        auth_required,
     }
 }
 
@@ -575,6 +643,12 @@ fn zeroed_discovered_server() -> SdrRtlTcpDiscoveredServer {
         has_txbuf: false,
         txbuf: 0,
         last_seen_secs_ago: 0.0,
+        // ABI 0.19 defaults — zero-init to match the "absent from
+        // TXT" signal.
+        has_codecs: false,
+        codecs: 0,
+        has_auth_required: false,
+        auth_required: false,
     }
 }
 
@@ -706,6 +780,14 @@ mod tests {
                 nickname: std::ptr::null(),
                 has_txbuf: false,
                 txbuf: 0,
+                // ABI 0.19 defaults — zero-init equivalent so the
+                // base fixture matches pre-#400 behaviour. Tests
+                // that exercise the new fields mutate these after
+                // `happy_path()` returns.
+                has_codecs: false,
+                codecs: 0,
+                has_auth_required: false,
+                auth_required: false,
             };
             Self {
                 _instance: instance,
@@ -847,6 +929,72 @@ mod tests {
         assert_eq!(z.port, 0);
         assert_eq!(z.gains, 0);
         assert!(!z.has_txbuf);
+        // ABI 0.19 (#400) — the new capability-field gates must
+        // default to `false` too so "absent from TXT" is the
+        // zero-init semantic.
+        assert!(!z.has_codecs);
+        assert!(!z.has_auth_required);
+    }
+
+    #[test]
+    fn discovered_server_to_c_projects_codecs_and_auth_required() {
+        // ABI 0.19 contract: `Some(v)` on the Rust side projects
+        // to `(true, v)`; `None` projects to `(false, 0 /
+        // false)`. Pin both directions so a future parser change
+        // that silently drops TXT capability bits fails here.
+        //
+        // `TEST_CODEC_MASK_NONE_AND_LZ4` names the `0x03` wire
+        // byte (None + LZ4 bits) per the project's
+        // "no-magic-numbers" rule. Per `CodeRabbit` round 2 on
+        // PR #418.
+        const TEST_CODEC_MASK_NONE_AND_LZ4: u8 = 0x03;
+
+        let mut strings: Vec<CString> = Vec::new();
+        // Present: None+LZ4 codecs + auth required.
+        let present = DiscoveredServer {
+            instance_name: format!("{TEST_INSTANCE_NAME}._rtl_tcp._tcp.local."),
+            hostname: "test.local.".into(),
+            port: TEST_PORT,
+            addresses: vec![],
+            txt: TxtRecord {
+                tuner: TEST_TUNER.into(),
+                version: TEST_VERSION.into(),
+                gains: TEST_GAIN_COUNT,
+                nickname: String::new(),
+                txbuf: None,
+                codecs: Some(TEST_CODEC_MASK_NONE_AND_LZ4),
+                auth_required: Some(true),
+            },
+            last_seen: Instant::now(),
+        };
+        let projected = discovered_server_to_c(&present, &mut strings);
+        assert!(projected.has_codecs);
+        assert_eq!(projected.codecs, TEST_CODEC_MASK_NONE_AND_LZ4);
+        assert!(projected.has_auth_required);
+        assert!(projected.auth_required);
+
+        // Absent: neither TXT key present.
+        let absent = DiscoveredServer {
+            instance_name: format!("{TEST_INSTANCE_NAME}._rtl_tcp._tcp.local."),
+            hostname: "test.local.".into(),
+            port: TEST_PORT,
+            addresses: vec![],
+            txt: TxtRecord {
+                tuner: TEST_TUNER.into(),
+                version: TEST_VERSION.into(),
+                gains: TEST_GAIN_COUNT,
+                nickname: String::new(),
+                txbuf: None,
+                codecs: None,
+                auth_required: None,
+            },
+            last_seen: Instant::now(),
+        };
+        let projected = discovered_server_to_c(&absent, &mut strings);
+        assert!(!projected.has_codecs);
+        assert_eq!(projected.codecs, 0);
+        assert!(!projected.has_auth_required);
+        assert!(!projected.auth_required);
     }
 
     /// Build a `DiscoveredServer` with the TXT fields wired to

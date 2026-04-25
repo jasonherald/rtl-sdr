@@ -112,6 +112,7 @@ members = [
     "crates/sdr-radio",
     "crates/sdr-config",
     "crates/sdr-radioreference",
+    "crates/sdr-sat",
     "crates/sdr-transcription",
     "crates/sdr-core",
     "crates/sdr-ffi",
@@ -142,6 +143,7 @@ sdr-sink-network = { path = "crates/sdr-sink-network" }
 sdr-radio = { path = "crates/sdr-radio" }
 sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
+sdr-sat = { path = "crates/sdr-sat" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
 sdr-ffi = { path = "crates/sdr-ffi" }
@@ -184,6 +186,14 @@ sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "6
 # System directories / libc
 dirs-next = "2"
 libc = "0.2"
+
+# Satellite tracking (sdr-sat). The `sgp4` crate is the de-facto
+# pure-Rust port of Vallado's SGP4/SDP4 (matches the reference C++
+# implementation, ships the AIAA test vectors). chrono gives us
+# `DateTime<Utc>` for human-friendly pass times — APT scheduling is
+# inherently a "render this in the user's timezone" feature.
+sgp4 = "2.3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 
 # Random number generation. Pulled in for the rtl_tcp optional-auth
 # server (#394) key generator — `OsRng` wraps `/dev/urandom` on
@@ -244,10 +254,26 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # Zero-copy type casting
 bytemuck = { version = "1", features = ["derive"] }
 
+# GPU compute (epic #452 phase 2+). Used by sdr-dsp for the wgpu-backed
+# FFT engine behind the `FftEngine` trait. We target the default wgpu
+# backend set — Vulkan on Linux, Metal on macOS, DX12 on Windows —
+# which is what the `RTL-SDR` project supports anyway. `pollster`
+# drives wgpu's async surface to completion on the sync `FftEngine::
+# forward` path without pulling in a full async runtime.
+wgpu = "29"
+pollster = "0.4"
+
 # GTK4 / UI
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
 cairo-rs = { version = "0.22", features = ["png"] }
+
+# Benchmarking. `default-features = false` drops the `rayon`-backed
+# HTML reporting; we only need the `cargo bench` harness support, which
+# `cargo_bench_support` turns on. Keeping the pin workspace-wide so the
+# GPU-acceleration sub-tickets (#179-#182) pick up the same version as
+# the CPU baseline harness in sdr-dsp.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

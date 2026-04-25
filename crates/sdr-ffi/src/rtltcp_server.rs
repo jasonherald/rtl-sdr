@@ -110,6 +110,23 @@ pub struct SdrRtlTcpServerConfig {
     /// doc for valid range and semantics. Must be 0 iff
     /// `auth_key` is NULL.
     pub auth_key_len: u32,
+    /// Whether [`Self::compression`] below is meaningful. `false`
+    /// (the zero-init default) runs the server with
+    /// [`CodecMask::NONE_ONLY`] — legacy clients negotiate with
+    /// no compression, identical to pre-#400 behaviour. Added in
+    /// ABI 0.19 per issue #400.
+    pub has_compression: bool,
+    /// Compression-mask wire byte. Only used when
+    /// [`Self::has_compression`] is `true`. Value is a
+    /// [`CodecMask::to_wire`] byte. Typical values: `0x01` =
+    /// `None`-only, `0x03` = `None + LZ4` (accept LZ4
+    /// compression hellos + fall back to `None` for vanilla
+    /// clients). Must match the codecs the host is willing to
+    /// advertise via [`SdrRtlTcpAdvertiseOptions::codecs`] on
+    /// mDNS — those two have to stay in sync or clients see
+    /// "server advertises LZ4" but hit a `None`-only negotiation
+    /// at handshake time.
+    pub compression: u8,
 }
 
 /// Aggregate server-lifetime statistics snapshot.
@@ -434,6 +451,28 @@ fn listener_cap_from_c(listener_cap: u32) -> usize {
     }
 }
 
+/// Translate the C-ABI `has_compression` / `compression` pair
+/// into the Rust `ServerConfig::compression` `CodecMask`. The
+/// `has_*` gate is the zero-init-safe opt-in pattern (same as
+/// `has_txbuf` / `has_codecs` on [`SdrRtlTcpAdvertiseOptions`]):
+///
+/// - `has_compression = false` → `CodecMask::NONE_ONLY`, matching
+///   the pre-ABI-0.19 hardcoded behaviour.
+/// - `has_compression = true` → `CodecMask::from_wire(compression)`.
+///
+/// Extracted into its own helper (rather than inlined in
+/// `sdr_rtltcp_server_start`) so the ABI translation path is
+/// unit-testable without the hardware-backed start call.
+/// Matches the [`listener_cap_from_c`] / [`auth_key_from_c`]
+/// shape. Per `CodeRabbit` round 1 on PR #418, issue #400.
+fn compression_from_c(has_compression: bool, compression: u8) -> CodecMask {
+    if has_compression {
+        CodecMask::from_wire(compression)
+    } else {
+        CodecMask::NONE_ONLY
+    }
+}
+
 /// Outcome of [`auth_key_from_c`] — either the server should run
 /// without auth (`None` input, or `Some` with valid length) or
 /// the caller gave a bad pointer/length pair and
@@ -558,17 +597,18 @@ pub unsafe extern "C" fn sdr_rtltcp_server_start(
                 return SdrCoreError::InvalidArg.as_int();
             }
         };
+        // `compression` projects from the `has_compression` gate
+        // per #400 / ABI 0.19. See [`compression_from_c`] for the
+        // full contract (zero-init default = `NONE_ONLY`,
+        // opt-in = `from_wire`). Extracted into the helper so
+        // the ABI promise has unit-test coverage.
+        let compression = compression_from_c(cfg.has_compression, cfg.compression);
         let server_cfg = ServerConfig {
             bind,
             device_index: cfg.device_index,
             initial,
             buffer_capacity,
-            // Compression stays off for the C ABI until the host
-            // adds a codec-mask field to `SdrRtlTcpServerConfig`
-            // (issue #400 tracks extending the C struct). Vanilla
-            // clients keep working; the Linux GTK path is the only
-            // one that currently offers LZ4.
-            compression: CodecMask::NONE_ONLY,
+            compression,
             listener_cap,
             auth_key,
         };
@@ -1213,6 +1253,12 @@ mod tests {
             // the struct docs.
             auth_key: std::ptr::null(),
             auth_key_len: 0,
+            // ABI 0.19 defaults — zero-init equivalent so the base
+            // fixture matches pre-#400 behaviour. Tests that
+            // exercise the new compression mask mutate these after
+            // `base_test_config()` returns.
+            has_compression: false,
+            compression: 0,
         }
     }
 
@@ -1261,6 +1307,49 @@ mod tests {
         // off-by-one that would have passed `listener_cap_from_c(1)
         // == 1` trivially.
         assert_eq!(listener_cap_from_c(7), 7);
+    }
+
+    /// Wire byte for `CodecMask::NONE_ONLY` — pinned here so the
+    /// tests name the protocol value rather than lean on a raw
+    /// hex literal. Matches `CodecMask::NONE_ONLY.to_wire()` by
+    /// construction; if that ever drifts, both this constant
+    /// and the non-test `CodecMask::NONE_ONLY` bits would need
+    /// to shift in lockstep. Per `CodeRabbit` round 2 on
+    /// PR #418.
+    const TEST_CODEC_MASK_NONE_ONLY_WIRE: u8 = 0x01;
+    /// Wire byte for `CodecMask::NONE_AND_LZ4` — None bit +
+    /// LZ4 bit. Same pinning rationale as
+    /// [`TEST_CODEC_MASK_NONE_ONLY_WIRE`].
+    const TEST_CODEC_MASK_NONE_AND_LZ4_WIRE: u8 = 0x03;
+
+    #[test]
+    fn compression_from_c_zero_init_is_none_only() {
+        // ABI 0.19 default: `has_compression = false` + any
+        // `compression` byte → `NONE_ONLY`. This is the "pre-0.19
+        // caller with a zero-init struct stays on the legacy
+        // path" contract. Check both 0 and a non-zero raw byte
+        // to prove the `compression` field is ignored when the
+        // gate is false.
+        assert_eq!(compression_from_c(false, 0), CodecMask::NONE_ONLY);
+        assert_eq!(
+            compression_from_c(false, TEST_CODEC_MASK_NONE_AND_LZ4_WIRE),
+            CodecMask::NONE_ONLY
+        );
+    }
+
+    #[test]
+    fn compression_from_c_opt_in_passes_raw_wire_byte() {
+        // `has_compression = true` → `CodecMask::from_wire(byte)`.
+        // Verify both a `None-only` round-trip and a
+        // `None + LZ4` round-trip.
+        assert_eq!(
+            compression_from_c(true, TEST_CODEC_MASK_NONE_ONLY_WIRE),
+            CodecMask::NONE_ONLY
+        );
+        assert_eq!(
+            compression_from_c(true, TEST_CODEC_MASK_NONE_AND_LZ4_WIRE),
+            CodecMask::NONE_AND_LZ4
+        );
     }
 
     #[test]
@@ -1408,6 +1497,8 @@ mod tests {
             listener_cap: 0,
             auth_key: std::ptr::null(),
             auth_key_len: 0,
+            has_compression: false,
+            compression: 0,
         };
         let mut handle: *mut SdrRtlTcpServer = std::ptr::null_mut();
         let rc = unsafe { sdr_rtltcp_server_start(&raw const opts, &raw mut handle) };

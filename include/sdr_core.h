@@ -56,8 +56,90 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 18
+#define SDR_CORE_ABI_VERSION_MINOR 21
 /*
+ * 0.21 — exposes the shared `sdr-config` JSON file at the FFI
+ * boundary so the macOS SwiftUI host can round-trip sidebar
+ * session state (#449) and other settings against the same
+ * config file the GTK frontend already writes to.
+ *
+ * Additive surface (existing struct layouts and enum values
+ * unchanged):
+ *   - New `SdrCoreError` discriminant `SDR_CORE_ERR_KEY_NOT_FOUND`
+ *     = -10. Returned by the get-* commands when the requested
+ *     key is absent or present with a JSON type the reader
+ *     didn't ask for. Distinct from `SDR_CORE_ERR_INVALID_ARG`
+ *     so hosts can branch on "use default" vs surface error.
+ *   - Six new commands: `sdr_core_config_get_string` (size-then-
+ *     fill pattern, same shape as the rtl_tcp recent-commands
+ *     JSON reader), `sdr_core_config_set_string`,
+ *     `sdr_core_config_get_bool`, `sdr_core_config_set_bool`,
+ *     `sdr_core_config_get_u32`, `sdr_core_config_set_u32`.
+ *   - Auto-save semantics: writes through these entry points
+ *     are flushed to disk by the engine's auto-save thread
+ *     (started at `sdr_core_create` time). The auto-save
+ *     thread is joined automatically on `sdr_core_destroy`,
+ *     so any pending writes land before the call returns.
+ *   - In-memory mode: passing an empty `config_path_utf8` to
+ *     `sdr_core_create` is still valid (and still loads the
+ *     engine), but every config get/set entry point returns
+ *     `SDR_CORE_ERR_INVALID_ARG` with an explanatory
+ *     last-error message — no on-disk JSON to read or write.
+ *
+ * Pre-1.0 minor bumps are breaking by project convention — old
+ * 0.20 hosts must fail fast on the exact-match ABI check.
+ *
+ * 0.20 — exposes the scanner Phase 1 surface (#447) at the FFI
+ * boundary so the macOS SwiftUI scanner panel can drive it.
+ * Additive enum + payload growth:
+ *   - `SdrEventKind` gains four discriminants:
+ *     `SDR_EVT_SCANNER_STATE_CHANGED`        = 14
+ *     `SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED` = 15
+ *     `SDR_EVT_SCANNER_EMPTY_ROTATION`       = 16
+ *     `SDR_EVT_SCANNER_MUTEX_STOPPED`        = 17
+ *   - New helper enums `SdrScannerState` (Idle / Retuning /
+ *     Dwelling / Listening / Hanging) and `SdrScannerMutexReason`
+ *     for the corresponding payload `state` / `reason` fields.
+ *   - New payload structs `SdrEventScannerStateChanged`,
+ *     `SdrEventScannerActiveChannelChanged`,
+ *     `SdrEventScannerMutexStopped` appended to `SdrEventPayload`
+ *     as new union members (existing field offsets unchanged).
+ *   - Three new commands: `sdr_core_set_scanner_enabled`,
+ *     `sdr_core_lockout_scanner_channel`,
+ *     `sdr_core_unlock_scanner_channel`.
+ * The bookmark-list projection (`UpdateScannerChannels`) is NOT
+ * exposed in 0.20 — that follows when the macOS bookmark layer
+ * grows the `scan_enabled` / `priority` fields the Linux side
+ * already has (#490). Until then, the scanner has no channels
+ * to rotate through and the master switch flips without
+ * observable effect; the SwiftUI panel documents this in its
+ * footer.
+ *
+ * Pre-1.0 minor bumps are breaking by project convention — old
+ * 0.19 hosts must fail fast on the exact-match ABI check.
+ *
+ * 0.19 — extends the rtl_tcp FFI surface with codec-mask and
+ * auth-required fields that were previously hardcoded (#307
+ * / #395 follow-ups, issue #400):
+ *   - `SdrRtlTcpAdvertiseOptions` gains `has_codecs` (bool) +
+ *     `codecs` (uint8_t) + `has_auth_required` (bool) +
+ *     `auth_required` (bool) at the tail. Zero-init defaults
+ *     (`has_*` = false) publish the mDNS TXT without the
+ *     `codecs=` / `auth_required=` keys — identical to pre-0.19
+ *     behaviour. Hosts that want to advertise compression or
+ *     auth capability set the `has_*` gate and populate the
+ *     matching value.
+ *   - `SdrRtlTcpServerConfig` gains `has_compression` (bool) +
+ *     `compression` (uint8_t) at the tail. Zero-init default
+ *     (`has_compression = false`) keeps the server on
+ *     `CodecMask::NONE_ONLY`, matching pre-0.19 behaviour.
+ *     Hosts that want LZ4 stream compression flip `has_
+ *     compression = true; compression = 0x03` AND keep the
+ *     matching mDNS `codecs` field in sync.
+ * Both structs grow at the tail so 0.18 consumers must fail
+ * fast on the exact-match ABI check (pre-1.0 rule). No existing
+ * field offsets change.
+ *
  * 0.18 — adds three new discriminants to
  * `SdrRtlTcpConnectionStateKind`:
  *   - SDR_RTL_TCP_STATE_CONTROLLER_BUSY  = 5
@@ -157,6 +239,7 @@ typedef enum SdrCoreError {
     SDR_CORE_ERR_IO             = -7, /* File / network I/O error.      */
     SDR_CORE_ERR_CONFIG         = -8, /* Config load/save error.        */
     SDR_CORE_ERR_AUTH           = -9, /* Remote service rejected credentials (RadioReference). */
+    SDR_CORE_ERR_KEY_NOT_FOUND  = -10, /* Config key absent or wrong type (#449, ABI 0.21). */
 } SdrCoreError;
 
 /*
@@ -325,13 +408,29 @@ void sdr_core_init_logging(int32_t min_level);
 /*
  * Create a new engine instance.
  *
- * `config_path_utf8` is the on-disk config file the engine should
- * eventually load from and persist to. Must be either NULL or a
- * NUL-terminated UTF-8 string. NULL and empty string ("") are
- * equivalent: both run with in-memory defaults and no persistence.
- * v1 engines accept the path and store it for future use but do
- * not yet read or write through it — passing a valid path now
- * means persistence can land in a follow-up without an ABI change.
+ * `config_path_utf8` is the on-disk JSON config file the engine
+ * loads from and persists to. Must be either NULL or a NUL-
+ * terminated UTF-8 string. NULL and empty string ("") are
+ * equivalent: both run in-memory with no persistence (the
+ * "config FFI" entry points below — `sdr_core_config_get_string`
+ * et al. — return `SDR_CORE_ERR_INVALID_ARG` in that mode, with
+ * an explanatory last-error message).
+ *
+ * When the path is non-empty (ABI 0.21+, issue #449):
+ *   - The engine loads the JSON file at create time. A missing
+ *     file is treated as `{}` — the FFI returns
+ *     `SDR_CORE_OK` and starts with an empty config.
+ *     A malformed file (invalid JSON, IO error on a file that
+ *     exists) returns `SDR_CORE_ERR_CONFIG`.
+ *   - An auto-save worker thread is spawned. Writes through
+ *     `sdr_core_config_set_*` land on disk on a periodic tick;
+ *     the worker is joined automatically on `sdr_core_destroy`,
+ *     so any pending writes flush before the destroy call
+ *     returns.
+ *   - The same JSON file is shared with the GTK frontend's
+ *     `sdr_config::ConfigManager` — opening the same path from
+ *     either consumer round-trips the same dotted keys (e.g.
+ *     `ui_sidebar_left_selected`).
  *
  * On success: writes the opaque handle to `*out_handle` and
  * returns `SDR_CORE_OK`. The handle must eventually be released
@@ -346,6 +445,10 @@ void sdr_core_init_logging(int32_t min_level);
  *   SDR_CORE_ERR_INVALID_ARG     — `out_handle` is NULL, or
  *                                 `config_path_utf8` is non-NULL
  *                                 but not valid UTF-8.
+ *   SDR_CORE_ERR_CONFIG          — the on-disk config file
+ *                                 exists but couldn't be loaded
+ *                                 (malformed JSON, permissions,
+ *                                 IO error). ABI 0.21+.
  *   SDR_CORE_ERR_INTERNAL        — DSP thread spawn failed, or a
  *                                 Rust panic crossed the boundary.
  */
@@ -867,6 +970,18 @@ typedef struct SdrRtlTcpServerConfig {
     /* Length in bytes of auth_key. Must be 0 iff auth_key is
      * NULL. See auth_key for valid range + semantics. */
     uint32_t auth_key_len;
+    /* Whether `compression` below is meaningful. `false` (zero-
+     * init) runs the server with `CodecMask::NONE_ONLY` — legacy
+     * clients only, identical to pre-ABI-0.19 behaviour. Added
+     * per #400. */
+    bool     has_compression;
+    /* Compression-mask wire byte. Only used when
+     * has_compression == true. Value is a `CodecMask::to_wire`
+     * byte: 0x01 = None-only (legacy), 0x03 = None + LZ4.
+     * Must match the codecs advertised on mDNS via
+     * `SdrRtlTcpAdvertiseOptions.codecs` or clients see a
+     * false advertisement at discovery time. Added per #400. */
+    uint8_t  compression;
 } SdrRtlTcpServerConfig;
 
 /*
@@ -1193,6 +1308,13 @@ typedef struct SdrRtlTcpAdvertiseOptions {
     const char*  nickname;       /* TXT: user-editable nickname; optional (NULL / "" = no nickname) */
     bool         has_txbuf;      /* TXT: whether `txbuf` below is meaningful */
     uint64_t     txbuf;          /* TXT: optional buffer-depth hint (bytes) */
+    /* ABI 0.19 (#400) — opt-in TXT fields. Zero-init defaults
+     * (has_* = false) omit the key from the TXT record,
+     * matching pre-0.19 behaviour. */
+    bool         has_codecs;         /* whether `codecs` below is meaningful */
+    uint8_t      codecs;             /* TXT: CodecMask wire byte (0x01 = None-only, 0x03 = None+LZ4) */
+    bool         has_auth_required;  /* whether `auth_required` below is meaningful */
+    bool         auth_required;      /* TXT: whether the server requires pre-shared-key auth (#394) */
 } SdrRtlTcpAdvertiseOptions;
 
 /*
@@ -1214,6 +1336,17 @@ typedef struct SdrRtlTcpDiscoveredServer {
     bool        has_txbuf;
     uint64_t    txbuf;
     double      last_seen_secs_ago;
+    /* ABI 0.19 (#400) — read-side TXT capability fields mirroring
+     * `SdrRtlTcpAdvertiseOptions.{has_codecs, codecs, has_auth_required,
+     * auth_required}` so FFI hosts can gate compression / takeover /
+     * role / auth-field reveal decisions against the same capability
+     * signals the server publishes. Zero-init defaults (has_* = false)
+     * map to "server didn't advertise this TXT key" — identical to
+     * how the parser already treats an absent key. */
+    bool        has_codecs;
+    uint8_t     codecs;
+    bool        has_auth_required;
+    bool        auth_required;
 } SdrRtlTcpDiscoveredServer;
 
 /*
@@ -1521,6 +1654,161 @@ int32_t sdr_core_set_fft_size(SdrCore* handle, size_t n);
 int32_t sdr_core_set_fft_window(SdrCore* handle, int32_t window);
 int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
 
+/* --- Scanner (issue #447, ABI 0.20) ------------------------------ */
+
+/*
+ * Master scanner enable / disable. Maps to
+ * `UiToDsp::SetScannerEnabled` on the Rust side. Tripping this on
+ * with no projected channels leaves the engine in
+ * `SDR_SCANNER_STATE_IDLE` (visible via the SCANNER_STATE_CHANGED
+ * event); the host doesn't need to special-case empty rotation.
+ */
+int32_t sdr_core_set_scanner_enabled(SdrCore* handle, bool enabled);
+
+/*
+ * Lock out a channel for the rest of the scanner session.
+ *
+ * `name_utf8` + `frequency_hz` together form the scanner's
+ * `ChannelKey` — they must match the channel's identity at
+ * projection time exactly. The scanner clones the name into its
+ * `HashSet<ChannelKey>`, so the borrowed string is only read for
+ * the duration of the call.
+ *
+ * Lockouts persist until the channel is unlocked (see
+ * `sdr_core_unlock_scanner_channel`), the scanner is disabled,
+ * or the engine is destroyed. Returns `SDR_CORE_ERR_INVALID_ARG`
+ * if `name_utf8` is null or not valid UTF-8.
+ */
+int32_t sdr_core_lockout_scanner_channel(
+    SdrCore*    handle,
+    const char* name_utf8,
+    uint64_t    frequency_hz
+);
+
+/*
+ * Clear a session lockout previously installed by
+ * `sdr_core_lockout_scanner_channel`. No-op if the channel
+ * wasn't locked out. Same `(name_utf8, frequency_hz)` identity
+ * contract as the lockout call.
+ */
+int32_t sdr_core_unlock_scanner_channel(
+    SdrCore*    handle,
+    const char* name_utf8,
+    uint64_t    frequency_hz
+);
+
+/* --- Config — shared `sdr-config` JSON (issue #449, ABI 0.21) --- */
+/*
+ * Read / write keys against the JSON file passed to
+ * `sdr_core_create` as `config_path_utf8`. Round-trips with the
+ * GTK frontend's `ConfigManager` — the same dotted keys (e.g.
+ * `ui_sidebar_left_selected`) work from both sides.
+ *
+ * Concurrency: every entry point takes the engine's internal
+ * `RwLock` for the duration of the call; safe from any thread.
+ * Auto-save runs on a background worker spun up at create time;
+ * it's joined automatically on `sdr_core_destroy` so any pending
+ * writes from this session land on disk before the call returns.
+ *
+ * In-memory mode: when `config_path_utf8` was empty at create
+ * time, every entry point in this section returns
+ * `SDR_CORE_ERR_INVALID_ARG` with an explanatory last-error
+ * message. Hosts should branch on that to decide whether to
+ * fall back to a Mac-local store (e.g. `UserDefaults`) or
+ * surface a "no config file configured" message.
+ */
+
+/*
+ * Read a string-valued config key.
+ *
+ * Size-then-fill pattern:
+ *   1. Pass `out_buf == NULL`, `buf_len == 0`,
+ *      `out_required` non-NULL. On success the required size
+ *      including the trailing NUL is written to
+ *      `*out_required`.
+ *   2. Allocate a buffer of at least `*out_required` bytes,
+ *      then call again with the populated buffer + length.
+ *
+ * Return codes:
+ *   - `SDR_CORE_OK`              — key found; on the fill call,
+ *                                   `out_buf` holds the NUL-
+ *                                   terminated UTF-8 value.
+ *   - `SDR_CORE_ERR_KEY_NOT_FOUND` — key absent or present with
+ *                                    a non-string JSON type.
+ *   - `SDR_CORE_ERR_INVALID_ARG`  — null handle / null key /
+ *                                    empty key / non-NULL
+ *                                    `out_buf` with `buf_len`
+ *                                    too small (the required
+ *                                    size is written to
+ *                                    `out_required` when non-
+ *                                    NULL, so the caller knows
+ *                                    how big to make the
+ *                                    retry buffer).
+ *   - `SDR_CORE_ERR_INVALID_HANDLE` — null / destroyed handle.
+ */
+int32_t sdr_core_config_get_string(
+    SdrCore*    handle,
+    const char* key_utf8,
+    char*       out_buf,
+    size_t      buf_len,
+    size_t*     out_required
+);
+
+/*
+ * Write a string-valued config key. Empty values are accepted
+ * and stored verbatim — distinct from key absence. Returns
+ * `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG` for
+ * null pointers or non-UTF-8 input, `SDR_CORE_ERR_INVALID_HANDLE`
+ * for a null / destroyed handle.
+ */
+int32_t sdr_core_config_set_string(
+    SdrCore*    handle,
+    const char* key_utf8,
+    const char* value_utf8
+);
+
+/*
+ * Read a bool-valued config key. On success writes `*out_value`.
+ * Returns `SDR_CORE_ERR_KEY_NOT_FOUND` (and leaves `*out_value`
+ * untouched) when the key is absent or present with a non-bool
+ * JSON type — the host can keep its default safely.
+ */
+int32_t sdr_core_config_get_bool(
+    SdrCore*    handle,
+    const char* key_utf8,
+    bool*       out_value
+);
+
+/*
+ * Write a bool-valued config key.
+ */
+int32_t sdr_core_config_set_bool(
+    SdrCore*    handle,
+    const char* key_utf8,
+    bool        value
+);
+
+/*
+ * Read a u32-valued config key. Returns
+ * `SDR_CORE_ERR_KEY_NOT_FOUND` when the key is absent, present
+ * with a non-numeric JSON type, or present with a number that
+ * doesn't fit in `uint32_t`.
+ */
+int32_t sdr_core_config_get_u32(
+    SdrCore*    handle,
+    const char* key_utf8,
+    uint32_t*   out_value
+);
+
+/*
+ * Write a u32-valued config key.
+ */
+int32_t sdr_core_config_set_u32(
+    SdrCore*    handle,
+    const char* key_utf8,
+    uint32_t    value
+);
+
 /* ================================================================ */
 /*  Events                                                          */
 /* ================================================================ */
@@ -1573,7 +1861,43 @@ typedef enum SdrEventKind {
     SDR_EVT_IQ_RECORDING_STOPPED    = 11,
     SDR_EVT_NETWORK_SINK_STATUS     = 12, /* ABI 0.9 — issue #247 */
     SDR_EVT_RTL_TCP_CONNECTION_STATE = 13, /* ABI 0.11 — issue #325 */
+    SDR_EVT_SCANNER_STATE_CHANGED         = 14, /* ABI 0.20 — issue #447 */
+    SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED = 15, /* ABI 0.20 — issue #447 */
+    SDR_EVT_SCANNER_EMPTY_ROTATION        = 16, /* ABI 0.20 — issue #447 */
+    SDR_EVT_SCANNER_MUTEX_STOPPED         = 17, /* ABI 0.20 — issue #447 */
 } SdrEventKind;
+
+/* Scanner phase. Discriminant for the `state` field of
+ * `SdrEventScannerStateChanged` below. Mirrors the variant order
+ * of the engine-side `sdr_scanner::ScannerState`. Stable — never
+ * reorder. ABI 0.20.
+ */
+typedef enum SdrScannerState {
+    /* Scanner off, or on with no channels enabled. */
+    SDR_SCANNER_STATE_IDLE      = 0,
+    /* Retune in flight; audio muted, waiting for settle. */
+    SDR_SCANNER_STATE_RETUNING  = 1,
+    /* Settled on the channel; audio still muted; waiting for
+     * a squelch-open event within the dwell window. */
+    SDR_SCANNER_STATE_DWELLING  = 2,
+    /* Squelch open post-settle, audio flowing. */
+    SDR_SCANNER_STATE_LISTENING = 3,
+    /* Squelch closed, hang countdown before advancing. */
+    SDR_SCANNER_STATE_HANGING   = 4,
+} SdrScannerState;
+
+/* Why the scanner ↔ recording / transcription mutex fired.
+ * Discriminant for the `reason` field of
+ * `SdrEventScannerMutexStopped` below. Mirrors
+ * `sdr_core::messages::ScannerMutexReason`. Stable — never
+ * reorder. ABI 0.20.
+ */
+typedef enum SdrScannerMutexReason {
+    SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER     = 0,
+    SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER = 1,
+    SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING     = 2,
+    SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION = 3,
+} SdrScannerMutexReason;
 
 /* Discriminants for the `kind` field of
  * `SdrEventRtlTcpConnectionState` below. Stable — never reorder.
@@ -1703,6 +2027,44 @@ typedef struct SdrEventRtlTcpConnectionState {
 } SdrEventRtlTcpConnectionState;
 
 /*
+ * Payload for SDR_EVT_SCANNER_STATE_CHANGED. `state` is one of the
+ * `SDR_SCANNER_STATE_*` discriminants. ABI 0.20, per #447.
+ */
+typedef struct SdrEventScannerStateChanged {
+    int32_t state;
+} SdrEventScannerStateChanged;
+
+/*
+ * Payload for SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED. The scanner
+ * fires this on every channel latch (squelch open on the new
+ * channel) and on every release back to Idle.
+ *
+ * | scanner state         | name_utf8     | frequency_hz |
+ * |-----------------------|---------------|--------------|
+ * | active (latched)      | bookmark name | channel Hz   |
+ * | idle (no channel)     | NULL          | 0            |
+ *
+ * `name_utf8` is borrowed from dispatcher-owned storage; valid
+ * only for the duration of the callback. ABI 0.20, per #447.
+ */
+typedef struct SdrEventScannerActiveChannelChanged {
+    const char* name_utf8;
+    uint64_t    frequency_hz;
+} SdrEventScannerActiveChannelChanged;
+
+/*
+ * Payload for SDR_EVT_SCANNER_MUTEX_STOPPED. `reason` is one of
+ * the `SDR_SCANNER_MUTEX_*` discriminants — describes which side
+ * of the scanner ↔ recording / transcription mutex fired. ABI
+ * 0.20, per #447.
+ *
+ * SDR_EVT_SCANNER_EMPTY_ROTATION carries no payload.
+ */
+typedef struct SdrEventScannerMutexStopped {
+    int32_t reason;
+} SdrEventScannerMutexStopped;
+
+/*
  * Tagged union of all event payloads. Which union field is valid
  * is determined by the `kind` discriminant on the enclosing
  * SdrEvent (see the table below).
@@ -1722,6 +2084,10 @@ typedef struct SdrEventRtlTcpConnectionState {
  * SDR_EVT_IQ_RECORDING_STOPPED        none (all-zero payload)
  * SDR_EVT_NETWORK_SINK_STATUS         network_sink_status.{kind,utf8,protocol}
  * SDR_EVT_RTL_TCP_CONNECTION_STATE    rtl_tcp_connection_state.{kind,utf8,attempt,retry_in_secs,gain_count}
+ * SDR_EVT_SCANNER_STATE_CHANGED          scanner_state.state
+ * SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED scanner_active_channel.{name_utf8,frequency_hz}
+ * SDR_EVT_SCANNER_EMPTY_ROTATION         none (all-zero payload)
+ * SDR_EVT_SCANNER_MUTEX_STOPPED          scanner_mutex_stopped.reason
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
@@ -1734,6 +2100,9 @@ typedef union SdrEventPayload {
     SdrEventIqRecording       iq_recording;
     SdrEventNetworkSinkStatus      network_sink_status;
     SdrEventRtlTcpConnectionState  rtl_tcp_connection_state;
+    SdrEventScannerStateChanged          scanner_state;
+    SdrEventScannerActiveChannelChanged  scanner_active_channel;
+    SdrEventScannerMutexStopped          scanner_mutex_stopped;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;

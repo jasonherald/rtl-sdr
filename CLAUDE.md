@@ -97,6 +97,32 @@ make lint                        # All of the above + cargo deny + cargo audit
 - All crates use `[lints] workspace = true`
 - `unsafe_code` is denied workspace-wide
 
+### Sidebar architecture
+
+The GTK4 UI uses a VS Code-style activity-bar pattern (epic #420): a narrow icon strip on each window edge switches a `GtkStack` of panels between "activities". Left bar hosts General / Radio / Audio / Display / Scanner / Share; right bar hosts Transcript / Bookmarks. See `docs/design/sidebar-activity-bar-redesign.md` for the full rationale.
+
+**Key files:**
+
+- `crates/sdr-ui/src/sidebar/activity_bar.rs` — the `ActivityBarEntry` struct, the canonical `LEFT_ACTIVITIES` / `RIGHT_ACTIVITIES` slices (single source of truth for icon + shortcut + display name + config-persistence name), `build_activity_bar` widget builder, and `SidebarSession` persistence.
+- `crates/sdr-ui/src/window.rs::build_layout` — nests two `AdwOverlaySplitView`s inside a horizontal `GtkBox` alongside the two activity bars.
+- `crates/sdr-ui/src/window.rs::wire_activity_bar_clicks` — the click-handler semantics: different-button swaps stack + opens panel; same-button toggles panel while keeping the icon selected.
+- `crates/sdr-ui/src/window.rs::build_resize_handle` — custom `GtkGestureDrag` on an invisible 6 px strip at each panel's inner edge, because `AdwOverlaySplitView` has no built-in draggable divider in libadwaita 1.9.
+
+**Adding a new activity:**
+
+1. Append an `ActivityBarEntry` to `LEFT_ACTIVITIES` or `RIGHT_ACTIVITIES` in `activity_bar.rs`. Keep existing entries' order + names stable — they're config keys. Shortcut accelerator uses `<Ctrl>N` / `<Ctrl><Shift>N` per side.
+2. In `window.rs::build_layout`, add a stack child under the new name: `left_stack.add_named(&panel_widget, Some("your-name"))` (or `right_stack`).
+3. Keyboard shortcut registration and help-dialog rows auto-derive from the slice — no wiring changes needed.
+4. If the activity hosts a new panel with its own DSP controls, add a `connect_your_panel(panels, state)` call in `connect_sidebar_panels` matching the pattern of existing panels.
+
+**Panel layout convention:**
+
+Every activity panel is an `AdwPreferencesPage` of flat `AdwPreferencesGroup`s with `title` + short plain-English `description`. We deliberately avoid `AdwExpanderRow` — the expander-row inset stacked on top of the group's own inset read cluttered (verified across General / Radio / Audio / Display / Scanner). "Expanded by default, collapsible" became "always visible, scrollable" and the app looks cleaner for it.
+
+**Session persistence:**
+
+Four config keys per side live in `activity_bar.rs`: `ui_sidebar_{left,right}_{selected,open,width_px}`. Load at launch via `load_session(config)`, apply before wiring handlers (seed-then-wire prevents the initial `set_active` / `set_show_sidebar` calls from writing back). On change, persist via `save_*` helpers. Pixel widths are converted to `AdwOverlaySplitView`'s `[0, 1]` fraction via `apply_sidebar_width`'s one-shot `notify::width` handler once the split view has its first real allocation.
+
 ## C++ Reference
 
 Original SDR++ source is in `original/SDRPlusPlus/` (gitignored).

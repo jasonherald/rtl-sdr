@@ -76,6 +76,9 @@ pub fn build_app() -> adw::Application {
             return;
         }
         window::build_window(app, &config);
+        // Note: the `app.apt-open` action is wired inside
+        // `build_window` (it needs `&Rc<AppState>` for the line
+        // router), not here.
     });
 
     app

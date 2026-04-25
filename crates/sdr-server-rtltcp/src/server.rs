@@ -1635,10 +1635,20 @@ const TCP_KEEPALIVE_IDLE_SECS: u32 = 60;
 /// `TCP_KEEPINTVL`. 10 s gives the zombie three chances to reply
 /// across a ~30 s window — enough to ride out a brief network
 /// hiccup without blowing the detection deadline. Per #393.
+///
+/// Linux-only: macOS exposes only `TCP_KEEPALIVE` (the seconds-
+/// until-first-probe knob); per-probe interval and retry count
+/// are kernel-wide sysctls there. The constant is gated to the
+/// platform that can actually set it so non-Linux targets don't
+/// drag a dead-code warning forward.
+#[cfg(target_os = "linux")]
 const TCP_KEEPALIVE_INTERVAL_SECS: u32 = 10;
 /// How many unanswered probes before the kernel drops the socket.
 /// `TCP_KEEPCNT`. 3 keeps the total dead-peer detection window at
 /// roughly 90 s (idle 60 s + 3 × 10 s probes). Per #393.
+///
+/// Linux-only — same rationale as `TCP_KEEPALIVE_INTERVAL_SECS`.
+#[cfg(target_os = "linux")]
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 fn configure_client_socket(stream: &TcpStream) {
@@ -2550,11 +2560,16 @@ mod tests {
     /// (where total elapsed could approach `2 * AUTH_REPLY_TIMEOUT`
     /// under the header-then-body flow) trips the assertion, but
     /// generous enough to absorb realistic OS scheduling jitter
-    /// on a loaded CI runner. 500 ms lands comfortably in that
-    /// window — one `AUTH_REPLY_TIMEOUT` (5 s) plus slack stays
-    /// well under the 2× regression threshold. Per `CodeRabbit`
-    /// round 3 on PR #405.
-    const AUTH_TIMEOUT_SLACK: Duration = Duration::from_millis(500);
+    /// on a loaded CI runner. The original 500 ms flaked on
+    /// shared GitHub-hosted runners at ~508 ms elapsed (8 ms past
+    /// the budget — pure scheduling noise). Bumped to 1500 ms:
+    /// still well under the 2× regression threshold of 5 s
+    /// (a per-phase revert would land elapsed near 10 s, so
+    /// 5 + 1.5 = 6.5 s is comfortably on the "good" side), while
+    /// giving enough headroom that one OS scheduling hiccup won't
+    /// redden CI. Per `CodeRabbit` round 3 on PR #405, bumped
+    /// per PR #437 CI flake.
+    const AUTH_TIMEOUT_SLACK: Duration = Duration::from_millis(1500);
 
     #[test]
     fn sniff_auth_key_message_times_out_when_client_silent() {

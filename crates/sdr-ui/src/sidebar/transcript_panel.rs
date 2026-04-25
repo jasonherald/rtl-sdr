@@ -866,10 +866,17 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .margin_top(4)
         .build();
 
+    // `WordChar` wraps on word boundaries OR mid-word when a single
+    // token is wider than the panel — critical for monospace-rendered
+    // transcription output, where a long contiguous token (non-Latin
+    // script, URLs, technical jargon) with plain `Word` wrapping
+    // grows the `TextView`'s natural width, propagates up through the
+    // scrolled window, and fights the sidebar `min-sidebar-width`.
+    // That fight reads as layout "bouncing" while captions stream in.
     let text_view = gtk4::TextView::builder()
         .editable(false)
         .cursor_visible(false)
-        .wrap_mode(gtk4::WrapMode::Word)
+        .wrap_mode(gtk4::WrapMode::WordChar)
         .monospace(true)
         .top_margin(8)
         .bottom_margin(8)
@@ -879,6 +886,12 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
 
     let scroll = gtk4::ScrolledWindow::builder()
         .child(&text_view)
+        // `hscrollbar_policy=Never` keeps the horizontal scrollbar
+        // from appearing as a secondary symptom of the above —
+        // with `WordChar` wrapping it's never needed, and an
+        // `Automatic` policy would briefly flash the scrollbar
+        // while content was still renegotiating width.
+        .hscrollbar_policy(gtk4::PolicyType::Never)
         .min_content_height(150)
         .vexpand(true)
         .css_classes(["card"])

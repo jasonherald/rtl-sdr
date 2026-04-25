@@ -44,13 +44,6 @@ const DEFAULT_HEIGHT: i32 = 800;
 /// Sidebar collapse breakpoint width in pixels.
 const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
-/// Slide-in/out duration for right-side flyouts (transcript,
-/// bookmarks) in milliseconds. Centralized so the two
-/// revealers stay in lockstep — drifting values would make
-/// one panel feel snappier than the other when the user
-/// toggles between them.
-const RIGHT_FLYOUT_TRANSITION_MS: u32 = 200;
-
 /// FFT sizes — re-exported from display panel (single source of truth).
 use crate::sidebar::display_panel::FFT_SIZES;
 #[cfg(feature = "sherpa")]
@@ -64,6 +57,13 @@ const DSP_POLL_INTERVAL_MS: u64 = 16;
 
 /// Toast display time (seconds) for scanner "force-disable" notices.
 const SCANNER_TOAST_TIMEOUT_SECS: u32 = 3;
+
+/// Cadence of the Satellites panel's countdown ticker — 1 line/sec
+/// is the smallest interval that produces a visible change in the
+/// pass-row title (which renders to 1-minute granularity for far
+/// passes and to seconds only inside the "starting now" window).
+/// Smaller would burn cycles for no visible benefit.
+const SATELLITES_COUNTDOWN_TICK: Duration = Duration::from_secs(1);
 
 /// Shared "kill the scanner on a manual tune" hook. Built once in
 /// `build_window` and cloned into every manual-change handler
@@ -162,17 +162,22 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let state = AppState::new_shared(ui_tx);
 
     // --- Build UI ---
-    let (
-        split_view,
+    let LayoutHandles {
+        root: layout_root,
+        left_split_view,
+        right_split_view,
+        left_activity_bar,
+        right_activity_bar,
+        left_stack,
+        right_stack,
         panels,
-        spectrum_handle_raw,
+        spectrum_handle: spectrum_handle_raw,
         status_bar,
         transcript_panel,
-        transcript_revealer,
-        bookmarks_revealer,
-    ) = build_split_view(&state, config);
+        general_panel: _general_panel,
+    } = build_layout(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
-    let sidebar_toggle = build_sidebar_toggle(&split_view);
+    let sidebar_toggle = build_sidebar_toggle(&left_split_view);
     let (
         header,
         play_button,
@@ -180,97 +185,183 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         freq_selector,
         screenshot_button,
         rr_button,
+        volume_button,
         favorites_handle,
     ) = build_header_bar(&sidebar_toggle, &state);
 
-    // Bookmarks flyout toggle — packed `pack_end` first so it
-    // ends up LEFT of the transcript toggle in the header's
-    // right cluster. `pack_end` stacks right-to-left, so the
-    // last `pack_end` call sits furthest from the right edge.
-    // Keeping bookmarks near the far edge matches the visual
-    // mapping "click the icon → panel slides in from directly
-    // under it on the right."
-    let bookmarks_toggle = gtk4::ToggleButton::builder()
+    // Header bookmarks shortcut — a plain click-to-navigate button
+    // (not a state toggle). Clicking it routes through the right
+    // activity bar's Bookmarks button, which owns the
+    // show/hide-and-stack-swap logic. Same pattern as `Ctrl+B` —
+    // both go through the activity-bar handler for consistency.
+    let bookmarks_toggle = gtk4::Button::builder()
         .icon_name("user-bookmarks-symbolic")
         .tooltip_text("Toggle bookmarks panel (Ctrl+B)")
         .build();
-    // `tooltip_text` alone isn't reliably announced by screen
-    // readers — set the accessible label explicitly, matching
-    // the pattern used for the other icon-only controls in this
-    // file (pinned servers menu, copy server address, etc.).
     bookmarks_toggle
         .update_property(&[gtk4::accessible::Property::Label("Toggle bookmarks panel")]);
     header.pack_end(&bookmarks_toggle);
 
-    // Restore the flyout open/closed state saved at last shutdown.
-    // Set the toggle's `active` property before wiring the handler
-    // so the initial `set_active` doesn't feed a no-op write back
-    // through `connect_toggled` — `connect_toggled` fires only on
-    // changes, but explicitly wiring the handler after the initial
-    // state is set keeps the "saved state → initial reveal" path
-    // free of config round-trips.
-    let bookmarks_initial_open = config.read(|v| {
-        v.get(sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN)
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    });
-    bookmarks_toggle.set_active(bookmarks_initial_open);
-    bookmarks_revealer.set_reveal_child(bookmarks_initial_open);
-
-    let bookmarks_revealer_clone = bookmarks_revealer.clone();
-    let bookmarks_config = std::sync::Arc::clone(config);
-    bookmarks_toggle.connect_toggled(move |btn| {
-        let open = btn.is_active();
-        bookmarks_revealer_clone.set_reveal_child(open);
-        bookmarks_config.write(|v| {
-            v[sidebar::bookmarks_panel::CONFIG_KEY_FLYOUT_OPEN] = serde_json::json!(open);
-        });
+    let right_bookmarks_btn_weak = right_activity_bar
+        .buttons
+        .get("bookmarks")
+        .map(glib::object::ObjectExt::downgrade);
+    bookmarks_toggle.connect_clicked(move |_| {
+        if let Some(Some(btn)) = right_bookmarks_btn_weak
+            .as_ref()
+            .map(glib::WeakRef::upgrade)
+        {
+            btn.emit_clicked();
+        }
     });
 
-    // Transcript toggle button in header bar.
-    let transcript_button = gtk4::ToggleButton::builder()
+    // Header transcript shortcut — same click-to-navigate pattern.
+    // Drives the right activity bar's Transcript button.
+    let transcript_button = gtk4::Button::builder()
         .icon_name("document-page-setup-symbolic")
-        .tooltip_text("Toggle transcript panel")
+        .tooltip_text("Toggle transcript panel (Ctrl+Shift+1)")
         .build();
+    transcript_button
+        .update_property(&[gtk4::accessible::Property::Label("Toggle transcript panel")]);
     header.pack_end(&transcript_button);
 
-    let revealer_clone = transcript_revealer.clone();
-    transcript_button.connect_toggled(move |btn| {
-        revealer_clone.set_reveal_child(btn.is_active());
-    });
-
-    // Mutual exclusion between the two right-side flyouts —
-    // opening one closes the other so the content area doesn't
-    // end up with both panels stacked. Each toggle's mutex
-    // handler is added AFTER its primary handler (which does the
-    // reveal + config write), so on activation the primary fires
-    // first and the mutex then deactivates the sibling toggle;
-    // the sibling's primary handler in turn hides its revealer.
-    // `set_active(false)` on an already-inactive toggle is a
-    // no-op (GTK suppresses the `toggled` signal when the state
-    // doesn't change), so closing either panel manually doesn't
-    // cascade.
-    let transcript_btn_weak = transcript_button.downgrade();
-    bookmarks_toggle.connect_toggled(move |btn| {
-        if btn.is_active()
-            && let Some(other) = transcript_btn_weak.upgrade()
-            && other.is_active()
+    let right_transcript_btn_weak = right_activity_bar
+        .buttons
+        .get("transcript")
+        .map(glib::object::ObjectExt::downgrade);
+    transcript_button.connect_clicked(move |_| {
+        if let Some(Some(btn)) = right_transcript_btn_weak
+            .as_ref()
+            .map(glib::WeakRef::upgrade)
         {
-            other.set_active(false);
-        }
-    });
-    let bookmarks_toggle_weak = bookmarks_toggle.downgrade();
-    transcript_button.connect_toggled(move |btn| {
-        if btn.is_active()
-            && let Some(other) = bookmarks_toggle_weak.upgrade()
-            && other.is_active()
-        {
-            other.set_active(false);
+            btn.emit_clicked();
         }
     });
 
-    let toolbar_view = build_toolbar_view(&header, &split_view);
-    let breakpoint = build_breakpoint(&split_view);
+    // --- Activity-bar wiring ---
+    //
+    // Both bars use `wire_activity_bar_clicks`: click on a NEW icon
+    // swaps the stack child and opens the panel; click on the
+    // CURRENTLY-selected icon toggles the panel while keeping the
+    // icon selected (design doc §4.2). `:checked` CSS renders the
+    // accent tint via `ToggleButton::active`.
+    //
+    // Seed ordering (closes #428): load the persisted session,
+    // apply to widgets BEFORE wiring the persistence notify
+    // handlers, so the initial `set_active` / `set_visible_child` /
+    // `set_show_sidebar` calls don't write the same value back
+    // through the save path. Matches the "seed-then-wire" pattern
+    // `connect_volume_persistence` uses.
+    let session = sidebar::activity_bar::load_session(config);
+    left_stack.set_visible_child_name(session.left_selected);
+    if let Some(btn) = left_activity_bar.buttons.get(session.left_selected) {
+        btn.set_active(true);
+    }
+    left_split_view.set_show_sidebar(session.left_open);
+    right_stack.set_visible_child_name(session.right_selected);
+    // Seed the right selection as active even when the panel
+    // restores closed. The activity-bar contract (design doc §4.2)
+    // is that an icon stays visually selected through open/close
+    // cycles — the icon is a preview of "which slot opens next".
+    // Without this, `right_stack` + `wire_activity_bar_clicks`
+    // would both treat `session.right_selected` as selected while
+    // the bar shows no active button until the user's first click.
+    if let Some(btn) = right_activity_bar.buttons.get(session.right_selected) {
+        btn.set_active(true);
+    }
+    right_split_view.set_show_sidebar(session.right_open);
+
+    // Restore saved pixel widths via a one-shot `notify::width`
+    // handler — `sidebar_width_fraction` needs the split view's
+    // live allocation to convert pixels → fraction, and the
+    // allocation isn't settled until the widget has mapped. The
+    // `applied` cell flips after the first non-zero width is seen
+    // so subsequent width changes (window resize) leave the
+    // sidebar's fraction alone.
+    //
+    // Fresh sessions (`width_px == None`) route the builder-time
+    // default through the same post-allocation conversion so the
+    // advertised default actually lands: the builder fraction was
+    // derived from `DEFAULT_WIDTH = 1200`, but the right split
+    // view's parent is the left split view's content area (already
+    // narrower by the left sidebar's slice), so the fraction
+    // evaluates against a smaller width and the resulting pixel
+    // value undershoots the target. Routing defaults through
+    // `apply_sidebar_width` with the allocated width fixes that.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    apply_sidebar_width(
+        &left_split_view,
+        session.left_width_px,
+        LEFT_SIDEBAR_DEFAULT_WIDTH as u32,
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    apply_sidebar_width(
+        &right_split_view,
+        session.right_width_px,
+        RIGHT_SIDEBAR_DEFAULT_WIDTH as u32,
+    );
+
+    wire_activity_bar_clicks(
+        &left_activity_bar,
+        &left_stack,
+        &left_split_view,
+        session.left_selected,
+    );
+    wire_activity_bar_clicks(
+        &right_activity_bar,
+        &right_stack,
+        &right_split_view,
+        session.right_selected,
+    );
+
+    // Persistence — wire AFTER the seed so the initial sets don't
+    // round-trip back through config. `save_*` writes are cheap
+    // (`ConfigManager` batches); every activity click / panel
+    // open-close writes.
+    for (&name, btn) in &left_activity_bar.buttons {
+        let config_weak = std::sync::Arc::clone(config);
+        btn.connect_toggled(move |b| {
+            if b.is_active() {
+                sidebar::activity_bar::save_left_selected(&config_weak, name);
+            }
+        });
+    }
+    for (&name, btn) in &right_activity_bar.buttons {
+        let config_weak = std::sync::Arc::clone(config);
+        btn.connect_toggled(move |b| {
+            if b.is_active() {
+                sidebar::activity_bar::save_right_selected(&config_weak, name);
+            }
+        });
+    }
+    let config_left_open = std::sync::Arc::clone(config);
+    left_split_view.connect_show_sidebar_notify(move |sv| {
+        sidebar::activity_bar::save_left_open(&config_left_open, sv.shows_sidebar());
+    });
+    let config_right_open = std::sync::Arc::clone(config);
+    right_split_view.connect_show_sidebar_notify(move |sv| {
+        sidebar::activity_bar::save_right_open(&config_right_open, sv.shows_sidebar());
+    });
+
+    // Header sidebar toggle ↔ left split view `show-sidebar` sync.
+    // Without this, clicking the currently-selected activity icon to
+    // collapse the panel leaves the header toggle stuck in `active`;
+    // the user's next header click then sets `show-sidebar=false`
+    // again (no-op) instead of reopening the panel.
+    let sidebar_toggle_weak = sidebar_toggle.downgrade();
+    left_split_view.connect_show_sidebar_notify(move |sv| {
+        if let Some(toggle) = sidebar_toggle_weak.upgrade()
+            && toggle.is_active() != sv.shows_sidebar()
+        {
+            toggle.set_active(sv.shows_sidebar());
+        }
+    });
+    // Seed the header sidebar toggle to match the restored left
+    // panel state so F9's "is it open?" check starts accurate.
+    sidebar_toggle.set_active(session.left_open);
+
+    let toolbar_view = build_toolbar_view(&header, &layout_root);
+    let breakpoint = build_breakpoint(&left_split_view, &right_split_view);
 
     // Toast overlay wraps the toolbar view for error notifications.
     let toast_overlay = adw::ToastOverlay::new();
@@ -285,6 +376,17 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         .build();
 
     window.add_breakpoint(breakpoint);
+
+    // Wire `app.apt-open` (Ctrl+Shift+A) — opens the live APT
+    // viewer window. Done here rather than in `app.rs::activate`
+    // because the action's line-routing handler reads
+    // `state.apt_viewer`, and `state` is owned by this window.
+    {
+        let app_for_provider = app.clone();
+        let parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>> =
+            Rc::new(move || app_for_provider.windows().into_iter().next());
+        crate::apt_viewer::connect_apt_action(app, &parent_provider, &state);
+    }
 
     // Set initial status bar values and mode-specific control visibility.
     if let Some(mode) = demod_selector::index_to_demod_mode(demod_dropdown.selected()) {
@@ -322,6 +424,8 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &bookmarks_toggle,
         &demod_dropdown,
         &panels.scanner.master_switch,
+        &left_activity_bar,
+        &right_activity_bar,
     );
 
     // Ctrl+? shows keyboard shortcuts dialog.
@@ -359,6 +463,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         config,
         &favorites_handle,
         &scanner_force_disable,
+        &volume_button,
     );
 
     // Seed the scanner with the persisted bookmark list on
@@ -444,6 +549,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let state_freq = Rc::clone(&state);
     let spectrum_for_freq = Rc::clone(&spectrum_handle);
     let force_disable_freq = Rc::clone(&scanner_force_disable);
+    let radio_for_freq = panels.radio.clone();
     freq_selector.connect_frequency_changed(move |freq| {
         tracing::debug!(frequency_hz = freq, "frequency changed");
         // Flip scanner off before dispatching the tune so the
@@ -457,6 +563,10 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         state_freq.send_dsp(UiToDsp::Tune(freq_f64));
         status_bar_for_freq.update_frequency(freq_f64);
         spectrum_for_freq.set_center_frequency(freq_f64);
+        // Feed the FSPL distance estimator in the Radio panel
+        // with the new frequency so the cached distance estimate
+        // uses the right carrier (ticket #164).
+        radio_for_freq.update_distance_frequency(freq_f64);
     });
     // Single demod-change handler: gate → force-disable → dispatch
     // → cosmetic UI updates. Order matters: force-disable must
@@ -724,8 +834,10 @@ fn clear_scanner_active_channel_ui(
     state: &AppState,
 ) {
     *state.scanner_active_key.borrow_mut() = None;
-    scanner_panel.active_channel_label.set_text("Active: —");
-    scanner_panel.lockout_button.set_visible(false);
+    scanner_panel
+        .active_channel_row
+        .set_subtitle(sidebar::scanner_panel::ACTIVE_CHANNEL_PLACEHOLDER);
+    scanner_panel.lockout_row.set_visible(false);
 }
 
 /// Handle a single message from the DSP thread.
@@ -769,6 +881,11 @@ fn handle_dsp_message(
         DspToUi::SignalLevel(level) => {
             status_bar.update_signal_level(level);
             spectrum_handle.push_signal_level(level);
+            // Feed the FSPL distance estimator in the Radio panel
+            // (ticket #164). The panel caches the level + current
+            // frequency so the display refreshes if the user later
+            // tweaks ERP / calibration.
+            radio_panel.update_distance_from_signal(level, state.center_frequency.get());
         }
         DspToUi::Error(err_msg) => {
             tracing::warn!(error = %err_msg, "DSP error");
@@ -1043,8 +1160,8 @@ fn handle_dsp_message(
                 state.center_frequency.set(freq_f64);
                 state.demod_mode.set(demod_mode);
 
-                scanner_panel.active_channel_label.set_text(&format!(
-                    "Active: {} — {}",
+                scanner_panel.active_channel_row.set_subtitle(&format!(
+                    "{} — {}",
                     name,
                     sidebar::navigation_panel::format_frequency(freq_hz),
                 ));
@@ -1110,7 +1227,7 @@ fn handle_dsp_message(
                     radio_panel.set_voice_squelch_open(false);
                 }
 
-                scanner_panel.lockout_button.set_visible(true);
+                scanner_panel.lockout_row.set_visible(true);
             } else {
                 clear_scanner_active_channel_ui(scanner_panel, state);
             }
@@ -1123,9 +1240,7 @@ fn handle_dsp_message(
                 sdr_scanner::ScannerState::Listening => "Listening",
                 sdr_scanner::ScannerState::Hanging => "Hang…",
             };
-            scanner_panel
-                .state_label
-                .set_text(&format!("State: {label}"));
+            scanner_panel.state_row.set_subtitle(label);
         }
         DspToUi::ScannerEmptyRotation => {
             tracing::info!("scanner rotation empty");
@@ -1147,6 +1262,17 @@ fn handle_dsp_message(
             // but relying on that ordering across four stop
             // sites was brittle.
             clear_scanner_active_channel_ui(scanner_panel, state);
+        }
+        DspToUi::AptLine(line) => {
+            // Route the freshly-decoded APT line into the open
+            // viewer, if any. When no viewer is open we silently
+            // drop — the decoder always runs (it's cheap) so the
+            // user can open the viewer mid-pass and start seeing
+            // lines from that moment on, rather than having to
+            // pre-arm before AOS.
+            if let Some(view) = state.apt_viewer.borrow().as_ref() {
+                view.push_line(&line.pixels);
+            }
         }
         DspToUi::ScannerMutexStopped(reason) => {
             tracing::info!(?reason, "scanner mutex stopped");
@@ -1715,31 +1841,87 @@ fn apply_rtl_tcp_connection_state(
     clippy::type_complexity,
     reason = "splitting into a struct would trade one named return for one named struct whose fields are used exactly once by the caller — net neutral for readability, net negative for locality of widget construction"
 )]
-fn build_split_view(
+/// Minimum left-panel width in pixels — narrower than this makes
+/// `AdwPreferencesGroup` content wrap awkwardly (design doc §4.4).
+const LEFT_SIDEBAR_MIN_WIDTH: f64 = 220.0;
+/// Minimum right-panel width. The transcript panel's controls
+/// (model combo, VAD slider, auto-break sliders) need more breathing
+/// room than a preferences row — below this they stack awkwardly
+/// and the transcript text view loses usable line width.
+const RIGHT_SIDEBAR_MIN_WIDTH: f64 = 360.0;
+/// Default left-panel width — matches today's sidebar width.
+const LEFT_SIDEBAR_DEFAULT_WIDTH: f64 = 320.0;
+/// Default right-panel width — gives the transcript panel room for
+/// its wider controls without the user having to resize on every
+/// launch.
+const RIGHT_SIDEBAR_DEFAULT_WIDTH: f64 = 420.0;
+
+/// How much wider than its default a sidebar may be dragged. 2× the
+/// default feels natural — "a little bigger" and "a lot bigger"
+/// without letting the panel overrun the spectrum.
+const SIDEBAR_MAX_WIDTH_MULTIPLIER: f64 = 2.0;
+/// Minimum `sidebar-width-fraction` we write. Guards against the
+/// `AdwOverlaySplitView` pspec's rejection of exactly 0 and the
+/// animator's visual collapse at very small values.
+const SIDEBAR_FRACTION_MIN: f64 = 0.01;
+/// Maximum `sidebar-width-fraction` — symmetric sibling of
+/// [`SIDEBAR_FRACTION_MIN`]. Prevents the content area from being
+/// squeezed to zero even if a pixel clamp miscomputes.
+const SIDEBAR_FRACTION_MAX: f64 = 0.99;
+
+/// Handles returned by [`build_layout`] for downstream wiring. Bundled
+/// into a struct rather than a tuple because the return list grew past
+/// the clippy threshold during the activity-bar scaffolding migration.
+struct LayoutHandles {
+    /// Root horizontal container for the whole window content area.
+    root: gtk4::Box,
+    /// Outer split view — sidebar hosts the left activity stack,
+    /// content hosts the nested right split view.
+    left_split_view: adw::OverlaySplitView,
+    /// Inner split view — sidebar hosts the right activity stack
+    /// (`sidebar_position=End`), content hosts spectrum + status
+    /// + the legacy bookmarks revealer.
+    right_split_view: adw::OverlaySplitView,
+    /// Left activity bar widget + per-entry toggle buttons.
+    left_activity_bar: sidebar::ActivityBar,
+    /// Right activity bar widget + per-entry toggle buttons.
+    right_activity_bar: sidebar::ActivityBar,
+    /// Left panel content switcher — 5 children keyed by entry name.
+    left_stack: gtk4::Stack,
+    /// Right panel content switcher — 1 child keyed `"transcript"`.
+    right_stack: gtk4::Stack,
+    panels: SidebarPanels,
+    spectrum_handle: spectrum::SpectrumHandle,
+    status_bar: StatusBar,
+    transcript_panel: sidebar::transcript_panel::TranscriptPanel,
+    /// General activity panel — landing view. Hosts band presets
+    /// and source as flat `AdwPreferencesGroup`s on an
+    /// `AdwPreferencesPage`. Bookmarks live in the right activity
+    /// stack (not here); `rtl_tcp` share controls live in the Share
+    /// left activity (not here).
+    general_panel: sidebar::GeneralPanel,
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_layout(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-) -> (
-    adw::OverlaySplitView,
-    SidebarPanels,
-    spectrum::SpectrumHandle,
-    StatusBar,
-    sidebar::transcript_panel::TranscriptPanel,
-    gtk4::Revealer,
-    gtk4::Revealer,
-) {
-    // Sidebar — configuration panels.
-    let (sidebar_scroll, panels) = sidebar::build_sidebar();
-    // Restore saved server-panel settings + subscribe to persist
-    // future changes. Runs as soon as panels are built so the
-    // saved values are visible before any user interaction could
-    // otherwise overwrite them.
+) -> LayoutHandles {
+    // Sidebar panels — constructed flat; each lives in its own
+    // activity stack child (no shared scroll wrapper). The
+    // General activity composes band presets + source into an
+    // `AdwPreferencesPage`; Radio / Audio / Display / Scanner /
+    // Share host their respective panel widgets directly until
+    // sub-tickets #423-#426 refactor each into the expander-row
+    // layout. Bookmarks lives in the right activity stack.
+    let panels = sidebar::build_panels();
     sidebar::server_panel::connect_server_panel_persistence(&panels.server, config);
 
-    // Main content area — spectrum display (FFT plot + waterfall) + status bar.
+    let general_panel = sidebar::build_general_panel(&panels.navigation, &panels.source);
+
+    // Spectrum display (FFT + waterfall) + status bar.
     let (spectrum_view, spectrum_handle) = spectrum::build_spectrum_view(state.ui_tx.clone());
     spectrum_view.add_css_class("spectrum-area");
-
-    // Status bar at the bottom.
     let status_bar = status_bar::build_status_bar();
 
     let content_box = gtk4::Box::builder()
@@ -1750,74 +1932,355 @@ fn build_split_view(
     content_box.append(&spectrum_view);
     content_box.append(&status_bar.widget);
 
-    // Transcript panel — slides out from the right.
+    // Transcript panel — the real widget, not a placeholder. Its
+    // root is already an `AdwPreferencesGroup` so it slots straight
+    // into the page wrapper in the right stack, inheriting the same
+    // chrome as every other activity panel.
     let transcript_panel = sidebar::transcript_panel::build_transcript_panel(config);
-    let transcript_scroll = gtk4::ScrolledWindow::builder()
-        .child(&transcript_panel.widget)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
+
+    // Left panel stack — one real panel widget per activity. General
+    // hosts the composed `GeneralPanel` (band presets + bookmarks +
+    // source + rtl_tcp share as expander rows); Radio / Audio /
+    // Display / Scanner host their existing panel widget wrapped in
+    // a scroll so long pages can scroll internally without resizing
+    // the panel's width (design doc §2.4). Sub-tickets #423-#426
+    // later refactor each of those widgets into the expander-row
+    // layout the General panel demonstrates; the `name` strings MUST
+    // remain stable because they're the config-persistence keys
+    // (§5 of the design doc).
+    let left_stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::None)
+        .hexpand(true)
         .vexpand(true)
-        .width_request(320)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
         .build();
+    left_stack.add_named(&general_panel.widget, Some("general"));
+    left_stack.add_named(&panels.radio.widget, Some("radio"));
+    left_stack.add_named(&panels.audio.widget, Some("audio"));
+    left_stack.add_named(&panels.display.widget, Some("display"));
+    left_stack.add_named(&panels.scanner.widget, Some("scanner"));
+    left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
+    left_stack.add_named(&panels.satellites.widget, Some("satellites"));
 
-    let transcript_revealer = gtk4::Revealer::builder()
-        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
-        .reveal_child(false)
-        .child(&transcript_scroll)
-        .hexpand(false)
+    // Right panel stack — single child today, hosts the real
+    // transcript widget (not a placeholder) so transcription keeps
+    // working during the migration window.
+    let right_stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::None)
+        .hexpand(true)
+        .vexpand(true)
         .build();
+    right_stack.add_named(
+        &page_from_group(&transcript_panel.widget),
+        Some("transcript"),
+    );
+    right_stack.add_named(
+        &page_from_group(&panels.bookmarks.widget),
+        Some("bookmarks"),
+    );
+    // Explicitly pin the initial visible child so a future
+    // additional right-activity inserted before transcript doesn't
+    // silently shift what the first `Ctrl+Shift+1` press (or the
+    // header transcript button's click) shows. Matches the contract
+    // `wire_activity_bar_clicks(..., "transcript")` relies on below.
+    right_stack.set_visible_child_name("transcript");
 
-    // Bookmarks flyout — slides out from the right, outermost of
-    // the two right-side panels so the header `Ctrl+B` toggle
-    // reveals an unambiguously right-edge element. Shares the
-    // `SlideLeft` + `RIGHT_FLYOUT_TRANSITION_MS` transition with
-    // the transcript revealer for visual consistency when either
-    // panel opens.
+    // Inner (right) split view — sidebar sits on the trailing edge
+    // so the right activity bar is the rightmost element on-screen.
     //
-    // The flyout widget is built by `build_sidebar` (so it can
-    // share state with the left-sidebar `NavigationPanel`) and
-    // returned on `panels.bookmarks`; here we just pack it into
-    // the revealer. The panel widget already contains its own
-    // vertical scroll for the bookmark list, so no outer scroll
-    // wrap is needed.
-    let bookmarks_revealer = gtk4::Revealer::builder()
-        .transition_type(gtk4::RevealerTransitionType::SlideLeft)
-        .transition_duration(RIGHT_FLYOUT_TRANSITION_MS)
-        .reveal_child(false)
-        .child(&panels.bookmarks.widget)
-        .hexpand(false)
+    // `sidebar_width_fraction` is `[0, 1]` regardless of the
+    // `sidebar-width-unit` we set; the unit only changes how
+    // `min`/`max-sidebar-width` are interpreted. Passing a pixel
+    // value as the fraction panics at property-set even with
+    // `unit = Px` (verified on libadwaita 1.9). So the default
+    // here is a fraction; under nested splits its pixel result
+    // is approximate, and `min-sidebar-width` clamps the transcript
+    // panel up to its 360 px floor when the math would otherwise
+    // leave it narrower. User-driven resize + persistence come from
+    // the drag handle wired below (#429).
+    let right_split_view = adw::OverlaySplitView::builder()
+        .sidebar_position(gtk4::PackType::End)
+        .content(&content_box)
+        .show_sidebar(false)
+        .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
+        .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER)
+        .sidebar_width_fraction(RIGHT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
 
-    // Wrap content + both side revealers in an HBox. Bookmarks
-    // sits rightmost so the header-bar bookmark icon (which is
-    // itself at the far right of the header via `pack_end`) maps
-    // visually to the panel that appears when the user clicks it.
-    let content_with_transcript = gtk4::Box::builder()
+    // Compose the right sidebar with its resize handle on the
+    // leading edge (the boundary with the content area). Dragging
+    // the handle LEFT widens the sidebar; drag-end persists the
+    // new pixel width; double-click resets to the default.
+    let config_right_resize = std::sync::Arc::clone(config);
+    let save_right_width: std::rc::Rc<dyn Fn(u32)> = std::rc::Rc::new(move |px| {
+        sidebar::activity_bar::save_right_width_px(&config_right_resize, px);
+    });
+    let right_handle = build_resize_handle(
+        &right_split_view,
+        ResizeDirection::LeftGrowsSidebar,
+        RIGHT_SIDEBAR_MIN_WIDTH,
+        RIGHT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER,
+        RIGHT_SIDEBAR_DEFAULT_WIDTH,
+        &save_right_width,
+    );
+    let right_sidebar_wrap = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
         .build();
-    content_with_transcript.append(&content_box);
-    content_with_transcript.append(&transcript_revealer);
-    content_with_transcript.append(&bookmarks_revealer);
+    right_sidebar_wrap.append(&right_handle);
+    right_sidebar_wrap.append(&right_stack);
+    right_split_view.set_sidebar(Some(&right_sidebar_wrap));
 
-    let split_view = adw::OverlaySplitView::builder()
-        .sidebar(&sidebar_scroll)
-        .content(&content_with_transcript)
+    // Outer (left) split view — sidebar hosts the left activity
+    // stack. Starts open with "general" visible so a fresh launch
+    // lands on the General panel instead of an empty frame.
+    let left_split_view = adw::OverlaySplitView::builder()
+        .content(&right_split_view)
         .show_sidebar(true)
+        .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
+        .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER)
+        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
         .build();
 
-    (
-        split_view,
+    // Compose the left sidebar with its resize handle on the
+    // trailing edge. Dragging the handle RIGHT widens the sidebar.
+    let config_left_resize = std::sync::Arc::clone(config);
+    let save_left_width: std::rc::Rc<dyn Fn(u32)> = std::rc::Rc::new(move |px| {
+        sidebar::activity_bar::save_left_width_px(&config_left_resize, px);
+    });
+    let left_handle = build_resize_handle(
+        &left_split_view,
+        ResizeDirection::RightGrowsSidebar,
+        LEFT_SIDEBAR_MIN_WIDTH,
+        LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER,
+        LEFT_SIDEBAR_DEFAULT_WIDTH,
+        &save_left_width,
+    );
+    let left_sidebar_wrap = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    left_sidebar_wrap.append(&left_stack);
+    left_sidebar_wrap.append(&left_handle);
+    left_split_view.set_sidebar(Some(&left_sidebar_wrap));
+    left_stack.set_visible_child_name("general");
+
+    let left_activity_bar =
+        sidebar::build_activity_bar(sidebar::LEFT_ACTIVITIES, sidebar::ActivityBarSide::Left);
+    let right_activity_bar =
+        sidebar::build_activity_bar(sidebar::RIGHT_ACTIVITIES, sidebar::ActivityBarSide::Right);
+
+    let root = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    root.append(&left_activity_bar.widget);
+    root.append(&left_split_view);
+    root.append(&right_activity_bar.widget);
+
+    LayoutHandles {
+        root,
+        left_split_view,
+        right_split_view,
+        left_activity_bar,
+        right_activity_bar,
+        left_stack,
+        right_stack,
         panels,
         spectrum_handle,
         status_bar,
         transcript_panel,
-        transcript_revealer,
-        bookmarks_revealer,
-    )
+        general_panel,
+    }
+}
+
+/// Wrap an `AdwPreferencesGroup` in its own `AdwPreferencesPage`
+/// so every activity stack child inherits the same margin/spacing
+/// rhythm as the General panel (Apple-style header padding + group
+/// titles). `AdwPreferencesPage` is itself scrollable internally,
+/// so no extra `GtkScrolledWindow` wrapper is needed.
+fn page_from_group(group: &adw::PreferencesGroup) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    page.add(group);
+    page
+}
+
+/// Apply a pixel width to an `AdwOverlaySplitView` sidebar after
+/// the split view has a real allocation. A single `notify::width`
+/// handler fires once the first non-zero width lands, converts
+/// the target pixels into the `[0, 1]` fraction the widget
+/// accepts, applies it, and then disarms (`applied` flag) so
+/// subsequent width notifications (window resize) leave the
+/// sidebar's fractional preference alone.
+///
+/// `saved_px == Some(px)` uses the persisted value; `None` falls
+/// back to `default_px`. Both cases go through the same
+/// post-allocation conversion so the advertised pixel default
+/// actually lands — builder-time fractions are derived from
+/// `DEFAULT_WIDTH` and evaluate against the split view's
+/// narrower-than-window allocation, so without this the fresh-
+/// session defaults under-shoot their targets.
+fn apply_sidebar_width(split_view: &adw::OverlaySplitView, saved_px: Option<u32>, default_px: u32) {
+    let target_px = saved_px.unwrap_or(default_px);
+    let applied: std::rc::Rc<std::cell::Cell<bool>> = std::rc::Rc::new(std::cell::Cell::new(false));
+    split_view.connect_notify_local(Some("width"), move |sv, _| {
+        if applied.get() {
+            return;
+        }
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let fraction =
+            (f64::from(target_px) / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
+        sv.set_sidebar_width_fraction(fraction);
+        applied.set(true);
+    });
+}
+
+/// Width of the invisible drag strip at a sidebar's inner edge
+/// (design doc §4.4 calls for "thin (4–6 px)"). 6 px gives the
+/// user a forgiving hit target without stealing pixels from the
+/// panel content.
+const RESIZE_HANDLE_WIDTH_PX: i32 = 6;
+
+/// Which direction of drag grows the sidebar. The LEFT split
+/// view's sidebar sits on the leading edge — dragging the handle
+/// right pushes the sidebar-content boundary right and widens the
+/// sidebar. The RIGHT split view's sidebar sits on the trailing
+/// edge (`sidebar_position=End`) — the handle is on its leading
+/// edge, and dragging LEFT widens the sidebar.
+#[derive(Clone, Copy, Debug)]
+enum ResizeDirection {
+    /// Positive `offset_x` widens the sidebar (left split view).
+    RightGrowsSidebar,
+    /// Negative `offset_x` widens the sidebar (right split view).
+    LeftGrowsSidebar,
+}
+
+/// Build an invisible drag-handle widget sized to
+/// [`RESIZE_HANDLE_WIDTH_PX`] and wire it to resize an
+/// `AdwOverlaySplitView` sidebar. Live-resizes during drag,
+/// persists the final width on drag-end via `save_width_px`,
+/// and resets to `default_px` on a left-button double-click
+/// (standard GTK paned-divider pattern).
+///
+/// `AdwOverlaySplitView` only exposes `sidebar-width-fraction`
+/// (range `[0, 1]`); pixel min/max/default are converted to the
+/// fraction against the split view's live allocation every time
+/// the gesture fires, so the clamp reacts correctly to window
+/// resizes.
+fn build_resize_handle(
+    split_view: &adw::OverlaySplitView,
+    direction: ResizeDirection,
+    min_px: f64,
+    max_px: f64,
+    default_px: f64,
+    save_width_px: &std::rc::Rc<dyn Fn(u32)>,
+) -> gtk4::Box {
+    let handle = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .width_request(RESIZE_HANDLE_WIDTH_PX)
+        .css_classes(["sidebar-resize-handle"])
+        .build();
+    if let Some(cursor) = gtk4::gdk::Cursor::from_name("col-resize", None) {
+        handle.set_cursor(Some(&cursor));
+    }
+
+    // Captured at drag-begin so every `drag-update` computes the
+    // new width from the stable starting fraction rather than
+    // integrating floating-point deltas. Without this the gesture
+    // would drift 1–2 px per drag cycle.
+    let start_fraction: std::rc::Rc<std::cell::Cell<f64>> =
+        std::rc::Rc::new(std::cell::Cell::new(0.0));
+
+    // Gesture closures capture `split_view` via `WeakRef` to
+    // break an otherwise-real retain cycle: `split_view` owns
+    // `sidebar`, `sidebar` owns `handle`, `handle` owns the
+    // gesture controllers, the controllers own their closures,
+    // and a strong `split_view.clone()` inside the closures would
+    // close the loop and leak the whole sidebar subtree on window
+    // teardown. Matches the `glib::WeakRef` idiom used elsewhere
+    // in this file (scanner force-disable, RTL-TCP handlers).
+    let drag_gesture = gtk4::GestureDrag::new();
+
+    let split_view_weak = split_view.downgrade();
+    let start_fraction_begin = std::rc::Rc::clone(&start_fraction);
+    drag_gesture.connect_drag_begin(move |_, _, _| {
+        if let Some(sv) = split_view_weak.upgrade() {
+            start_fraction_begin.set(sv.sidebar_width_fraction());
+        }
+    });
+
+    let split_view_weak = split_view.downgrade();
+    let start_fraction_update = std::rc::Rc::clone(&start_fraction);
+    drag_gesture.connect_drag_update(move |_, offset_x, _| {
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let start_px = start_fraction_update.get() * sv_w;
+        let signed_offset = match direction {
+            ResizeDirection::RightGrowsSidebar => offset_x,
+            ResizeDirection::LeftGrowsSidebar => -offset_x,
+        };
+        let new_px = (start_px + signed_offset).clamp(min_px, max_px);
+        // Fraction pspec is `[0, 1]`; guard against 0 which the
+        // widget treats as "collapsed" at the animator level.
+        let new_fraction = (new_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
+        sv.set_sidebar_width_fraction(new_fraction);
+    });
+
+    let split_view_weak = split_view.downgrade();
+    let save_end = std::rc::Rc::clone(save_width_px);
+    drag_gesture.connect_drag_end(move |_, _, _| {
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let final_px = sv.sidebar_width_fraction() * sv_w;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = final_px.round().max(0.0) as u32;
+        save_end(px);
+    });
+    handle.add_controller(drag_gesture);
+
+    // Double-click = reset to default width. Matches the GTK paned-
+    // divider convention users expect ("I messed up my drag, take
+    // me back"). A single click does nothing — the drag gesture
+    // already handles press/release.
+    let click_gesture = gtk4::GestureClick::new();
+    click_gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    let split_view_weak = split_view.downgrade();
+    let save_click = std::rc::Rc::clone(save_width_px);
+    click_gesture.connect_released(move |_, n_press, _, _| {
+        if n_press != 2 {
+            return;
+        }
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let fraction = (default_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
+        sv.set_sidebar_width_fraction(fraction);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = default_px.round().max(0.0) as u32;
+        save_click(px);
+    });
+    handle.add_controller(click_gesture);
+
+    handle
 }
 
 /// Build the sidebar toggle button bound to the split view.
@@ -1872,6 +2335,7 @@ fn build_header_bar(
     header::frequency_selector::FrequencySelector,
     gtk4::Button,
     gtk4::Button,
+    gtk4::ScaleButton,
     FavoritesHeaderHandle,
 ) {
     // Play/stop button
@@ -1920,13 +2384,15 @@ fn build_header_bar(
             "audio-volume-high-symbolic",
         ],
     );
-    volume_button.set_value(1.0);
+    // Initial value + `connect_value_changed` handler are wired in
+    // `build_window` after `connect_audio_panel` runs, so the
+    // persistence + audio-panel mirror rely on the full handle set.
     volume_button.set_tooltip_text(Some("Volume"));
-    let state_vol = Rc::clone(state);
-    volume_button.connect_value_changed(move |_btn, value| {
-        #[allow(clippy::cast_possible_truncation)]
-        state_vol.send_dsp(UiToDsp::SetVolume(value as f32));
-    });
+    // Explicit accessibility label — tooltip text alone isn't
+    // announced reliably by screen readers for icon-only header
+    // controls (same idiom as the bookmarks / transcript / pinned-
+    // servers buttons).
+    volume_button.update_property(&[gtk4::accessible::Property::Label("Volume")]);
 
     // App menu
     let menu_button = build_menu_button();
@@ -1970,6 +2436,7 @@ fn build_header_bar(
         freq_selector,
         screenshot_button,
         rr_button,
+        volume_button,
         favorites_handle,
     )
 }
@@ -2075,18 +2542,94 @@ fn build_menu_button() -> gtk4::MenuButton {
 }
 
 /// Wrap header and content in an `AdwToolbarView`.
-fn build_toolbar_view(
-    header: &adw::HeaderBar,
-    content: &adw::OverlaySplitView,
-) -> adw::ToolbarView {
+fn build_toolbar_view(header: &adw::HeaderBar, content: &gtk4::Box) -> adw::ToolbarView {
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(header);
     toolbar_view.set_content(Some(content));
     toolbar_view
 }
 
-/// Create a breakpoint that collapses the sidebar below `SIDEBAR_BREAKPOINT_PX`.
-fn build_breakpoint(split_view: &adw::OverlaySplitView) -> adw::Breakpoint {
+/// Wire click handlers on every button of a multi-activity bar so:
+///
+/// - Clicking a *different* button swaps the stack's visible child
+///   and forces the split view's sidebar open.
+/// - Clicking the *currently-selected* button keeps that button
+///   visually selected (design doc §4.2 — the user's mental model is
+///   "I'm still in Radio, I just closed the panel for a second") and
+///   toggles the split view's sidebar show/hide.
+///
+/// `initial_selected` must match the stack's initial visible child
+/// and the button the caller pre-activated via `set_active(true)`.
+///
+/// The `:checked` CSS pseudo-class (driven by `ToggleButton::active`)
+/// renders the accent tint — no manual CSS class juggling needed.
+///
+/// Mutual exclusion is enforced manually rather than via
+/// `ToggleButton::set_group`; see `sidebar::activity_bar` module docs.
+///
+/// Only suitable for bars with more than one entry. Single-button
+/// bars (like the right transcript bar today) wire `active` directly
+/// to `show_sidebar` — there's no "select vs. toggle panel"
+/// distinction to preserve.
+fn wire_activity_bar_clicks(
+    bar: &sidebar::ActivityBar,
+    stack: &gtk4::Stack,
+    split_view: &adw::OverlaySplitView,
+    initial_selected: &'static str,
+) {
+    let selected: Rc<RefCell<&'static str>> = Rc::new(RefCell::new(initial_selected));
+
+    for (&name, btn) in &bar.buttons {
+        let selected = Rc::clone(&selected);
+        let bar_buttons: Vec<(&'static str, glib::WeakRef<gtk4::ToggleButton>)> = bar
+            .buttons
+            .iter()
+            .map(|(n, b)| (*n, b.downgrade()))
+            .collect();
+        let stack_weak = stack.downgrade();
+        let split_view_weak = split_view.downgrade();
+        btn.connect_clicked(move |clicked_btn| {
+            let prev = *selected.borrow();
+            if prev == name {
+                // Clicking the already-selected icon keeps it
+                // selected visually (force-restore the `active`
+                // property after GTK's default click-flip) and
+                // toggles the panel open/closed.
+                clicked_btn.set_active(true);
+                if let Some(sv) = split_view_weak.upgrade() {
+                    sv.set_show_sidebar(!sv.shows_sidebar());
+                }
+            } else {
+                // Click on a different activity — deselect siblings,
+                // swap stack child, open panel.
+                for (other_name, weak) in &bar_buttons {
+                    if let Some(other) = weak.upgrade()
+                        && *other_name != name
+                        && other.is_active()
+                    {
+                        other.set_active(false);
+                    }
+                }
+                clicked_btn.set_active(true);
+                if let Some(stk) = stack_weak.upgrade() {
+                    stk.set_visible_child_name(name);
+                }
+                if let Some(sv) = split_view_weak.upgrade() {
+                    sv.set_show_sidebar(true);
+                }
+                *selected.borrow_mut() = name;
+            }
+        });
+    }
+}
+
+/// Create a breakpoint that collapses both sidebars below
+/// `SIDEBAR_BREAKPOINT_PX`. Both split views flip to overlay mode at
+/// narrow widths so the spectrum keeps its minimum real estate.
+fn build_breakpoint(
+    left_split_view: &adw::OverlaySplitView,
+    right_split_view: &adw::OverlaySplitView,
+) -> adw::Breakpoint {
     let condition = adw::BreakpointCondition::new_length(
         adw::BreakpointConditionLengthType::MaxWidth,
         SIDEBAR_BREAKPOINT_PX,
@@ -2094,7 +2637,8 @@ fn build_breakpoint(split_view: &adw::OverlaySplitView) -> adw::Breakpoint {
     );
 
     let breakpoint = adw::Breakpoint::new(condition);
-    breakpoint.add_setter(split_view, "collapsed", Some(&true.into()));
+    breakpoint.add_setter(left_split_view, "collapsed", Some(&true.into()));
+    breakpoint.add_setter(right_split_view, "collapsed", Some(&true.into()));
 
     breakpoint
 }
@@ -2112,6 +2656,7 @@ fn connect_sidebar_panels(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     favorites_header: &FavoritesHeaderHandle,
     scanner_force_disable: &Rc<ScannerForceDisable>,
+    volume_button: &gtk4::ScaleButton,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -2162,7 +2707,63 @@ fn connect_sidebar_panels(
     connect_radio_panel(panels, state, scanner_force_disable);
     connect_display_panel(panels, state, spectrum_handle);
     connect_audio_panel(panels, state);
+    connect_volume_persistence(panels, state, config, volume_button);
+    connect_distance_estimator_persistence(panels, config);
     connect_scanner_panel(panels, state, config);
+    // "Tune to satellite" closure used by the Satellites panel's
+    // per-row play buttons. Mirrors the bookmark-recall dance in
+    // `connect_navigation_panel` end-to-end: forces the scanner
+    // off, updates local `AppState`, sends `Tune` + `SetBandwidth`
+    // to the DSP, and pokes every UI widget / status indicator
+    // that mirrors the radio's tuning state — spectrum centre
+    // line, demod dropdown, bandwidth SpinRow, status bar
+    // frequency / demod-mode label, and the radio panel's mode-
+    // specific control visibility. The dropdown's
+    // `selected-notify` and the spin row's `value-notify`
+    // callbacks fire `SetDemodMode` / a redundant `SetBandwidth`
+    // themselves — idempotent at the DSP, cheaper than threading
+    // a suppress flag through here.
+    let tune_to_satellite: Rc<dyn Fn(u64, sdr_types::DemodMode, u32)> = {
+        let state_t = Rc::clone(state);
+        let freq_selector_t = freq_selector.clone();
+        let demod_dropdown_t = demod_dropdown.clone();
+        let spectrum_t = Rc::clone(spectrum_handle);
+        let force_disable_t = Rc::clone(scanner_force_disable);
+        let bandwidth_row_t = panels.radio.bandwidth_row.clone();
+        let radio_panel_t = panels.radio.clone();
+        let status_bar_t = Rc::clone(status_bar);
+        Rc::new(move |freq_hz, mode, bw_hz| {
+            force_disable_t.trigger("satellite tune");
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "downlink frequencies sit in the 100s of MHz, far \
+                          below f64's 2^53 mantissa ceiling"
+            )]
+            let freq_f64 = freq_hz as f64;
+            let bw_f64 = f64::from(bw_hz);
+            state_t.center_frequency.set(freq_f64);
+            state_t.demod_mode.set(mode);
+            state_t.send_dsp(UiToDsp::Tune(freq_f64));
+            state_t.send_dsp(UiToDsp::SetBandwidth(bw_f64));
+            freq_selector_t.set_frequency(freq_hz);
+            spectrum_t.set_center_frequency(freq_f64);
+            if let Some(idx) = demod_selector::demod_mode_to_index(mode) {
+                demod_dropdown_t.set_selected(idx);
+            }
+            bandwidth_row_t.set_value(bw_f64);
+            // Mode-specific control visibility (e.g. squelch /
+            // deemph rows shown only in NFM/WFM) — must be poked
+            // explicitly because the demod-dropdown notify only
+            // covers the dropdown's own state.
+            radio_panel_t.apply_demod_visibility(mode);
+            // Status bar mirrors. Done last so a panic anywhere
+            // upstream doesn't leave the indicator showing an
+            // optimistic value that the DSP never received.
+            status_bar_t.update_frequency(freq_f64);
+            status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
+        })
+    };
+    connect_satellites_panel(panels, config, &tune_to_satellite);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -2172,6 +2773,7 @@ fn connect_sidebar_panels(
         status_bar,
         spectrum_handle,
         scanner_force_disable,
+        volume_button,
     );
 
     // Mutation-triggered scanner re-projection. Fires on scan
@@ -2865,14 +3467,6 @@ fn connect_rtl_tcp_discovery(
         glib::ControlFlow::Continue
     });
 }
-
-/// Cadence for the USB hotplug poll that drives server-panel
-/// visibility. 3 s is the sweet spot: fast enough that a user
-/// plugging in a dongle sees the panel within the time it takes them
-/// to reach the sidebar with the mouse, slow enough that the
-/// per-tick `rusb::devices()` USB-bus enumerate is invisible in
-/// profile traces.
-const SERVER_PANEL_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Icon name for the un-filled ("not pinned") star on discovery
 /// rows. GNOME Symbolic icon set — `non-starred-symbolic` renders
@@ -3737,140 +4331,46 @@ fn clear_client_auth_key_from_keyring(
     store.delete(&entry)
 }
 
-/// Wire the server panel end-to-end: visibility gating, the master
-/// share-over-network switch, and its downstream start/stop effects.
-/// Errors surface via the `toast_overlay`, and the switch auto-
-/// reverts to its off state so the UI never lies about whether a
-/// server is actually running.
+/// Wire the server panel end-to-end: the master share-over-network
+/// switch (start/stop + control locking), periodic `Server::stats()`
+/// polling (rendered status rows + auto-stop on `has_stopped()`), and
+/// the bandwidth advisory that toggles on the device-default sample
+/// rate. Errors surface via the `toast_overlay`, and the switch
+/// auto-reverts to its off state on start failure so the UI never
+/// lies about whether a server is actually running.
 ///
-/// Visibility rule:
-/// 1. at least one RTL-SDR dongle is visible on the local USB bus
-///    (`sdr_rtlsdr::get_device_count() > 0`), and
-/// 2. the active source type is **not** RTL-SDR — re-exposing the
-///    same dongle over `rtl_tcp` while a local `RtlSdrSource` is
-///    holding it would cause a USB-device double-open, and
-/// 3. OR the server is already running (keep the panel visible so
-///    the user can reach the Stop switch no matter what).
-///
-/// Visibility is recomputed on three triggers so the panel feels
-/// responsive without polling the world: a low-frequency timer that
-/// handles the USB side (hotplug has no GTK signal we can subscribe
-/// to), a `device_row.connect_selected_notify` handler that fires
-/// on every source-type change, and the share-row start/stop path
-/// itself. A `Cell<u32>` tracks the last-seen device count so we
-/// only pay the widget-state-update cost on an actual edge.
-#[allow(
-    clippy::too_many_lines,
-    reason = "GTK signal-wiring: visibility + start-stop + control-locking all share state via nested closures — splitting scatters the captures"
-)]
+/// The panel itself is always visible — Share is its own activity on
+/// the left activity bar (📡), so the legacy hotplug-gated
+/// hide/show timer, the device-count cache, and the
+/// `device_row.connect_selected_notify` handler that fed it are gone.
+/// The start path still rejects a "local RTL-SDR is the active
+/// source" conflict via an exclusivity toast inside the share-switch
+/// handler — that guard is independent of the removed machinery.
 fn connect_server_panel(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
-    use std::cell::Cell;
-
-    let server_widget_weak = panels.server.widget.downgrade();
-    let device_row = panels.source.device_row.clone();
-    let last_seen_count = Rc::new(Cell::new(u32::MAX));
     let running: Rc<RefCell<Option<RunningServer>>> = Rc::new(RefCell::new(None));
 
-    // Pure function: does the combined rule say "show"? A running
-    // server always wins — the user must be able to reach the Stop
-    // switch regardless of hotplug / source-type state.
-    let should_be_visible = |dongle_count: u32, selected: u32, is_running: bool| -> bool {
-        is_running || (dongle_count > 0 && selected != DEVICE_RTLSDR)
-    };
-
-    // Apply visibility, using the cached dongle count. Shared
-    // between the poll tick, the device-row notify handler, and the
-    // start/stop path so all three callers stay in lockstep.
-    let apply_visibility = {
-        let server_widget_weak = server_widget_weak.clone();
-        let device_row = device_row.clone();
-        let last_seen_count = Rc::clone(&last_seen_count);
-        let running = Rc::clone(&running);
-        move || {
-            let Some(widget) = server_widget_weak.upgrade() else {
-                return;
-            };
-            let count = last_seen_count.get();
-            // First invocation before any poll: count is u32::MAX,
-            // which would evaluate true for `> 0`. Treat the
-            // pre-first-tick state as "no dongle yet" so the panel
-            // stays hidden until we actually know — prevents a
-            // flash-of-unwanted-panel during startup.
-            let effective_count = if count == u32::MAX { 0 } else { count };
-            let is_running = running.borrow().is_some();
-            widget.set_visible(should_be_visible(
-                effective_count,
-                device_row.selected(),
-                is_running,
-            ));
-        }
-    };
-
-    // Reapply on source-type change. Cloned because
-    // `connect_selected_notify` takes an `Fn(&ComboRow)` and we want
-    // the same logic as the poll tick.
-    let apply_on_device_change = apply_visibility.clone();
-    panels
-        .source
-        .device_row
-        .connect_selected_notify(move |_| apply_on_device_change());
-
-    // Seed `last_seen_count` on the first tick. Using a glib timer
-    // (rather than running the USB probe synchronously during
-    // wiring) keeps the window-build path fast and avoids a libusb
-    // session init on a thread that may not have one ready.
-    let apply_on_tick = apply_visibility.clone();
-    let poll_widget_weak = server_widget_weak.clone();
-    let poll_last_seen_count = Rc::clone(&last_seen_count);
-    let _ = glib::timeout_add_local(SERVER_PANEL_HOTPLUG_POLL_INTERVAL, move || {
-        // If the widget is gone, tear the poller down — nothing to
-        // show, and we don't want to leak `rusb::devices()` calls
-        // past window close.
-        if poll_widget_weak.upgrade().is_none() {
-            return glib::ControlFlow::Break;
-        }
-        // `sdr_rtlsdr::get_device_count()` is a libusb enumerate
-        // (vendor/product-ID filter over `rusb::devices()`). Fast
-        // enough for the UI thread at a 3 s cadence; no syscall
-        // churn worth moving to a worker.
-        let count = sdr_rtlsdr::get_device_count();
-        // First tick ALWAYS flips the cache off `u32::MAX`, so this
-        // branch fires at least once even if the real count is 0 —
-        // that's the "resolve the panel out of its pre-first-tick
-        // hidden state" moment. Subsequent ticks only apply on a
-        // real edge so we don't churn widget state every 3 s.
-        if count != poll_last_seen_count.get() {
-            tracing::debug!(
-                previous = poll_last_seen_count.get(),
-                current = count,
-                "rtl_tcp server panel: local dongle count changed"
-            );
-            poll_last_seen_count.set(count);
-            apply_on_tick();
-        }
-        glib::ControlFlow::Continue
-    });
+    // Share is now an activity on the left activity bar — always
+    // reachable via the 📡 icon. The legacy hotplug-driven
+    // hide/show timer + device-count cache + device-row notify
+    // were removed with that migration; `sdr_rtlsdr::get_device_count`
+    // is no longer polled on the GTK main loop for visibility,
+    // and the start-server path still rejects the "local dongle is
+    // the active source" conflict via its own exclusivity guard.
 
     // Wire the master share-over-network switch. The handler is the
     // authority on server lifecycle — on toggle we either start a
     // new `Server` (+ optional `Advertiser`) and store the handle,
     // or drop the handle so the accept thread tears down.
-    connect_share_switch(
-        panels,
-        toast_overlay,
-        Rc::clone(&running),
-        apply_visibility.clone(),
-        server_running,
-    );
+    connect_share_switch(panels, toast_overlay, Rc::clone(&running), server_running);
 
     // Poll `Server::stats()` on a timer, render the status rows,
     // and auto-stop the server if `has_stopped()` becomes true
     // (e.g. USB unplug or accept-thread failure).
-    connect_server_status_polling(panels, Rc::clone(&running), apply_visibility);
+    connect_server_status_polling(panels, Rc::clone(&running));
 
     // Bandwidth advisory — toggled on the device-default sample
     // rate. Unlike the source panel's advisory (which also gates
@@ -4055,7 +4555,6 @@ fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
     running: Rc<RefCell<Option<RunningServer>>>,
-    apply_visibility: impl Fn() + Clone + 'static,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
     use std::cell::Cell;
@@ -4258,7 +4757,6 @@ fn connect_share_switch(
             reset_activity_log(&widgets);
             reset_clients_list(&widgets);
         }
-        apply_visibility();
     });
 
     // ====================================================
@@ -4644,7 +5142,6 @@ impl ServerStatusWidgetsWeak {
 fn connect_server_status_polling(
     panels: &SidebarPanels,
     running: Rc<RefCell<Option<RunningServer>>>,
-    apply_visibility: impl Fn() + 'static,
 ) {
     use std::cell::Cell;
 
@@ -4709,7 +5206,6 @@ fn connect_server_status_polling(
             if let Some(share) = share_row_weak.upgrade() {
                 share.set_active(false);
             }
-            apply_visibility();
             return glib::ControlFlow::Continue;
         }
 
@@ -5693,12 +6189,12 @@ fn apply_agc_squelch_mutex(
 /// dongle after app launch sees the slot update to the real
 /// device name within a few seconds without having to restart.
 ///
-/// Shares cadence with `SERVER_PANEL_HOTPLUG_POLL_INTERVAL` as a
-/// deliberate choice — both pollers watch the same libusb bus for
-/// the same vendor/product-filtered device set, so users see
-/// both the source combo and the server panel update on the same
-/// tick. Kept as a separate constant so each poller's sizing can
-/// evolve independently.
+/// Previously shared cadence with a server-panel hotplug poll that
+/// drove panel visibility — that poll was removed when Share became
+/// its own activity icon, but this source-combo poller's 3 s cadence
+/// was tuned for the same reason (user plugs in a dongle, sees the
+/// slot update by the time they reach for the sidebar) so the value
+/// remains a good fit on its own.
 const SOURCE_RTLSDR_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Install a hotplug poller on the source panel that keeps the
@@ -5814,7 +6310,12 @@ fn connect_source_panel(
             ) else {
                 return;
             };
-            let is_network_path = device_row.selected() == DEVICE_RTLTCP;
+            // Raw Network (TCP/UDP IQ) has the same wire-bandwidth
+            // cost profile as rtl_tcp — a high-sample-rate pull
+            // across the network will saturate a 100 Mbit link
+            // either way. The advisory applies equally to both
+            // network-backed source types.
+            let is_network_path = matches!(device_row.selected(), DEVICE_NETWORK | DEVICE_RTLTCP);
             // Bounds-check the sample-rate index: transient
             // out-of-range values from widget-model churn would
             // otherwise satisfy the `>= threshold` compare and
@@ -7017,6 +7518,7 @@ fn restore_bookmark_profile(
     radio: &sidebar::RadioPanel,
     gain_row: &adw::SpinRow,
     agc_row: &adw::ComboRow,
+    volume_button: &gtk4::ScaleButton,
 ) {
     if let Some(sq_en) = bookmark.squelch_enabled {
         state.send_dsp(UiToDsp::SetSquelchEnabled(sq_en));
@@ -7069,7 +7571,19 @@ fn restore_bookmark_profile(
         gain_row.set_value(gain);
     }
     if let Some(vol) = bookmark.volume {
-        state.send_dsp(UiToDsp::SetVolume(vol));
+        // Route through the header `ScaleButton` so the restored
+        // level flows through the single source of truth
+        // `connect_volume_persistence` established: the button's
+        // `value_changed` handler dispatches `SetVolume`, writes
+        // `KEY_AUDIO_VOLUME`, and mirrors into the audio panel's
+        // `volume_row`. Calling `send_dsp(SetVolume(vol))` directly
+        // here would leave the button + audio row + persisted key
+        // showing stale state until the next user edit flicked
+        // them back. `set_value` fires the handler only if the new
+        // value differs from the current one — same idempotency
+        // story as the gain row above.
+        #[allow(clippy::cast_lossless)]
+        volume_button.set_value(vol as f64);
     }
     if let Some(de_idx) = bookmark.deemphasis {
         let deemp = match de_idx {
@@ -7150,6 +7664,7 @@ fn connect_navigation_panel(
     status_bar: &Rc<StatusBar>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     scanner_force_disable: &Rc<ScannerForceDisable>,
+    volume_button: &gtk4::ScaleButton,
 ) {
     // Navigation callback: restore full tuning profile from bookmark.
     let state_nav = Rc::clone(state);
@@ -7161,6 +7676,7 @@ fn connect_navigation_panel(
     let source_nav_gain = panels.source.gain_row.clone();
     let source_nav_agc = panels.source.agc_row.clone();
     let force_disable_nav = Rc::clone(scanner_force_disable);
+    let volume_button_nav = volume_button.clone();
 
     panels.bookmarks.connect_navigate(move |bookmark| {
         // Both bookmark recall AND band-preset selection come in
@@ -7205,6 +7721,7 @@ fn connect_navigation_panel(
             &radio_nav,
             &source_nav_gain,
             &source_nav_agc,
+            &volume_button_nav,
         );
 
         // Update mode-specific control visibility for the restored mode.
@@ -7413,6 +7930,108 @@ fn connect_navigation_panel(
     });
 }
 
+/// Epsilon (in fractional volume units, i.e. `[0.0, 1.0]`) below
+/// which the mirrored volume widgets are considered "already at the
+/// target" and the sync side skips its `set_value` call. Prevents
+/// floating-point round-trip artefacts from causing a trivial
+/// mirror loop between the header `GtkScaleButton` (0.0..=1.0 step
+/// 0.05) and the audio panel `AdwSpinRow` (0..=100 step 1 →
+/// 0.01-per-step when scaled). A half-step worth of slack sits
+/// comfortably below the smallest user-perceptible change.
+const VOLUME_SYNC_EPSILON: f64 = 0.005;
+
+/// Wire volume persistence (closes #419) and two-way sync between
+/// the header `GtkScaleButton` and the audio panel's
+/// `volume_row` `AdwSpinRow`.
+///
+/// The header button is the single source of truth: its
+/// `connect_value_changed` handler is the ONLY path that dispatches
+/// `UiToDsp::SetVolume` and writes to the config. The audio-panel
+/// row drives the button via `set_value` — its own
+/// `connect_value_notify` just mirrors into the button and lets the
+/// button's handler do the real work. That keeps one handler owning
+/// dispatch + persist, and the mirror path stays idempotent.
+///
+/// Startup ordering (load-bearing):
+///   1. Seed both widgets with the saved volume (no handlers yet,
+///      so no dispatch or cascade).
+///   2. Explicit `state.send_dsp(UiToDsp::SetVolume(saved))` —
+///      guarantees the DSP starts at the restored level regardless
+///      of `ScaleButton::set_value` being a no-op on same-value
+///      (closes #424's "no 1-frame blast while config loads"
+///      requirement).
+///   3. Wire the handlers.
+///
+/// Any other code path that mutates volume (bookmark recall,
+/// preferences restore, etc.) must go through
+/// `volume_button.set_value(vol)` so this handler runs — direct
+/// `send_dsp(SetVolume(..))` would leave the button / row / config
+/// showing stale state until the user's next edit.
+fn connect_volume_persistence(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    volume_button: &gtk4::ScaleButton,
+) {
+    let saved_volume = config.read(|v| {
+        v.get(sidebar::audio_panel::KEY_AUDIO_VOLUME)
+            .and_then(serde_json::Value::as_f64)
+            .map_or(1.0, |f| f.clamp(0.0, 1.0))
+    });
+
+    // Seed both widgets BEFORE wiring handlers. Setting values
+    // first means the initial state isn't observed as a
+    // "user change" — no handlers fire, no duplicate dispatch,
+    // no mirror-path cascade. Dispatch is done explicitly below.
+    volume_button.set_value(saved_volume);
+    panels
+        .audio
+        .volume_row
+        .set_value(saved_volume * sidebar::audio_panel::VOLUME_PERCENT_MAX);
+
+    // Guaranteed initial dispatch to the DSP so audio starts at
+    // the restored level regardless of how `ScaleButton::set_value`
+    // interacts with its default (closes #424's "no 1-frame blast
+    // while config loads" requirement).
+    #[allow(clippy::cast_possible_truncation)]
+    state.send_dsp(UiToDsp::SetVolume(saved_volume as f32));
+
+    // Button is the single source of truth: its handler owns
+    // dispatch + persist + mirror-to-row.
+    let state_vol = Rc::clone(state);
+    let config_vol = std::sync::Arc::clone(config);
+    let volume_row_weak = panels.audio.volume_row.downgrade();
+    volume_button.connect_value_changed(move |_btn, value| {
+        #[allow(clippy::cast_possible_truncation)]
+        state_vol.send_dsp(UiToDsp::SetVolume(value as f32));
+        config_vol.write(|v| {
+            v[sidebar::audio_panel::KEY_AUDIO_VOLUME] = serde_json::json!(value);
+        });
+        if let Some(row) = volume_row_weak.upgrade() {
+            let target_pct = value * sidebar::audio_panel::VOLUME_PERCENT_MAX;
+            if (row.value() - target_pct).abs()
+                > VOLUME_SYNC_EPSILON * sidebar::audio_panel::VOLUME_PERCENT_MAX
+            {
+                row.set_value(target_pct);
+            }
+        }
+    });
+
+    // Audio panel row is mirror-only. Drives the button, which
+    // runs the dispatch + config write. The idempotency check
+    // breaks the `btn.set_value → row.set_value → btn.set_value`
+    // loop when the two widgets are already in sync.
+    let volume_button_weak = volume_button.downgrade();
+    panels.audio.volume_row.connect_value_notify(move |row| {
+        let value = (row.value() / sidebar::audio_panel::VOLUME_PERCENT_MAX).clamp(0.0, 1.0);
+        if let Some(btn) = volume_button_weak.upgrade()
+            && (btn.value() - value).abs() > VOLUME_SYNC_EPSILON
+        {
+            btn.set_value(value);
+        }
+    });
+}
+
 /// Connect audio panel controls to DSP commands.
 fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Audio device selector — routes PipeWire output to the selected sink
@@ -7430,10 +8049,7 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     // network config rows so the sidebar layout reflects the
     // active mode. Per issue #247.
     let state_sink_type = Rc::clone(state);
-    let host_row = panels.audio.network_host_row.clone();
-    let port_row = panels.audio.network_port_row.clone();
-    let proto_row = panels.audio.network_protocol_row.clone();
-    let status_row = panels.audio.network_status_row.clone();
+    let network_group = panels.audio.network_sink_group.clone();
     panels
         .audio
         .sink_type_row
@@ -7456,10 +8072,10 @@ fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
                 }
             };
             let network_visible = matches!(new_type, sdr_core::AudioSinkType::Network);
-            host_row.set_visible(network_visible);
-            port_row.set_visible(network_visible);
-            proto_row.set_visible(network_visible);
-            status_row.set_visible(network_visible);
+            // Toggle the whole Network-sink section instead of its
+            // four rows individually — same pattern as the Radio
+            // panel's De-emphasis / CTCSS group-level hides.
+            network_group.set_visible(network_visible);
             state_sink_type.send_dsp(UiToDsp::SetAudioSinkType(new_type));
         });
 
@@ -7611,6 +8227,59 @@ fn unlock_transcription_session_rows(
     }
 }
 
+/// Load saved transmitter ERP and receiver calibration offset
+/// into the Radio panel's FSPL distance estimator rows, and wire
+/// value-change handlers to persist any edits back to the config
+/// (ticket #164). The distance display refresh wiring lives
+/// inside `build_radio_panel` — this function is only about
+/// config ↔ row synchronisation.
+fn connect_distance_estimator_persistence(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use sidebar::radio_panel::{KEY_RADIO_DISTANCE_CALIBRATION_DB, KEY_RADIO_DISTANCE_ERP_WATTS};
+
+    // Seed the rows with the saved values (clamped to the spin
+    // rows' own adjustment bounds via their `set_value`). The
+    // default spin row values were already applied at
+    // `build_radio_panel` time, so `config.read` here only
+    // overrides when a saved value exists.
+    let saved_erp = config.read(|v| {
+        v.get(KEY_RADIO_DISTANCE_ERP_WATTS)
+            .and_then(serde_json::Value::as_f64)
+    });
+    let saved_cal = config.read(|v| {
+        v.get(KEY_RADIO_DISTANCE_CALIBRATION_DB)
+            .and_then(serde_json::Value::as_f64)
+    });
+    if let Some(erp) = saved_erp {
+        panels.radio.erp_row.set_value(erp);
+    }
+    if let Some(cal) = saved_cal {
+        panels.radio.calibration_row.set_value(cal);
+    }
+
+    // Persist-on-change. Uses `value_notify` (not the adjustment's
+    // `value_changed`) to match the signal the in-panel distance
+    // refresh handler is already listening to — both fire on the
+    // same user edit.
+    let config_erp = std::sync::Arc::clone(config);
+    panels.radio.erp_row.connect_value_notify(move |row| {
+        config_erp.write(|v| {
+            v[KEY_RADIO_DISTANCE_ERP_WATTS] = serde_json::json!(row.value());
+        });
+    });
+    let config_cal = std::sync::Arc::clone(config);
+    panels
+        .radio
+        .calibration_row
+        .connect_value_notify(move |row| {
+            config_cal.write(|v| {
+                v[KEY_RADIO_DISTANCE_CALIBRATION_DB] = serde_json::json!(row.value());
+            });
+        });
+}
+
 /// Connect scanner panel controls to DSP commands.
 ///
 /// Wiring:
@@ -7706,6 +8375,499 @@ fn connect_scanner_panel(
         };
         state_lockout.send_dsp(UiToDsp::LockoutScannerChannel(key));
     });
+}
+
+/// Wire the Satellites scheduler panel to its config-persistence
+/// layer, the [`sdr_sat::TleCache`], and a 1 Hz countdown timer.
+///
+/// Two pieces of shared state plumb the handlers together:
+///
+/// * `displayed: Rc<RefCell<Vec<DisplayedPass>>>` — the list of
+///   pass rows currently in `passes_group`. Walked by the 1 Hz
+///   ticker (to update title-line countdowns) and rebuilt by
+///   `recompute` whenever lat/lon/alt changes or a TLE refresh
+///   completes.
+/// * `cache: Arc<TleCache>` — `Arc` (not `Rc`) because the
+///   refresh button hands a clone to `gio::spawn_blocking`, which
+///   requires `Send`. `TleCache` is `Send + Sync`.
+///
+/// The 1 Hz timer holds a `glib::WeakRef<adw::PreferencesGroup>`
+/// to the passes group so it returns `ControlFlow::Break` once
+/// the window is destroyed; same lifecycle pattern as the DSP
+/// poll loop.
+#[allow(clippy::too_many_lines)]
+fn connect_satellites_panel(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+) {
+    use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
+    use sidebar::satellites_panel::{
+        KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, SatellitesPanelWeak,
+        enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh, format_pass_subtitle,
+        format_pass_title, load_auto_record_apt, load_station_alt_m, load_station_lat_deg,
+        load_station_lon_deg, save_auto_record_apt, save_f64, save_tle_last_refresh,
+        tune_target_for_pass,
+    };
+
+    // One pass row + its source `Pass` so the 1 Hz ticker can
+    // refresh the title without re-running pass enumeration.
+    struct DisplayedPass {
+        row: adw::ActionRow,
+        pass: Pass,
+    }
+
+    // Borrow the panel for synchronous setup, then capture only
+    // weak refs in long-lived closures. Cloning the strong panel
+    // into a closure stored on its own widget creates a refcount
+    // cycle (widget → handler → closure → cloned panel → widget)
+    // that prevents teardown — see `SatellitesPanelWeak`'s doc for
+    // the full chain.
+    let panel = &panels.satellites;
+    let panel_weak: SatellitesPanelWeak = panel.downgrade();
+
+    // Restore persisted values BEFORE wiring change-notify handlers,
+    // matching the scanner-panel pattern: `set_value` on a SpinRow
+    // fires `value-changed`, so wiring first would trigger spurious
+    // saves + recomputes during window construction.
+    panel.lat_row.set_value(load_station_lat_deg(config));
+    panel.lon_row.set_value(load_station_lon_deg(config));
+    panel.alt_row.set_value(load_station_alt_m(config));
+    panel
+        .auto_record_switch
+        .set_active(load_auto_record_apt(config));
+    panel
+        .last_refresh_row
+        .set_subtitle(&format_last_refresh(config));
+
+    // `Option<Arc<TleCache>>`. `None` means the platform refused us
+    // a cache directory (rare; sandboxed minimal environments).
+    // Disable TLE-specific UI but keep ground-station persistence,
+    // ZIP lookup, and the auto-record toggle wired — those don't
+    // depend on TLEs and shouldn't go inert just because the cache
+    // is gone.
+    let cache: Option<std::sync::Arc<TleCache>> = match TleCache::new() {
+        Ok(c) => Some(std::sync::Arc::new(c)),
+        Err(e) => {
+            tracing::warn!("Satellites panel: TLE cache unavailable — {e}");
+            panel.refresh_button.set_sensitive(false);
+            panel
+                .last_refresh_row
+                .set_subtitle("Cache directory unavailable");
+            None
+        }
+    };
+
+    let displayed: Rc<RefCell<Vec<DisplayedPass>>> = Rc::new(RefCell::new(Vec::new()));
+    // `recompute` is built unconditionally — when the cache is
+    // unavailable it's a no-op so the lat/lon/alt notify handlers
+    // can call it without branching. When the cache is available
+    // it does the real pass-enumeration + row-rebuild work.
+    let recompute: Rc<dyn Fn()> = if let Some(cache) = cache.as_ref() {
+        let cache_recompute = std::sync::Arc::clone(cache);
+        let panel_weak_recompute = panel_weak.clone();
+        let displayed_recompute = Rc::clone(&displayed);
+        let tune_for_recompute = Rc::clone(tune_to_satellite);
+        Rc::new(move || {
+            let Some(panel) = panel_weak_recompute.upgrade() else {
+                return;
+            };
+            // Drop the previous pass rows — these are throwaway,
+            // built fresh per recompute.
+            for entry in displayed_recompute.borrow_mut().drain(..) {
+                panel.passes_group.remove(&entry.row);
+            }
+            // `passes_status_row` is the always-present empty-state
+            // placeholder. We toggle its *visibility* rather than
+            // detach + reattach. Once a widget is unparented, its
+            // last strong ref lives only on the SatellitesPanel
+            // struct — and that struct is dropped when
+            // `build_window` returns. Toggling visibility keeps the
+            // row parented (and therefore alive) for the lifetime
+            // of the window.
+            let station = GroundStation::new(
+                panel.lat_row.value(),
+                panel.lon_row.value(),
+                panel.alt_row.value(),
+            );
+            let now = chrono::Utc::now();
+            let passes = enumerate_upcoming_passes(&cache_recompute, &station, now);
+
+            if passes.is_empty() {
+                panel.passes_status_row.set_visible(true);
+                return;
+            }
+
+            panel.passes_status_row.set_visible(false);
+            let mut new_rows = Vec::with_capacity(passes.len());
+            for pass in passes {
+                let row = adw::ActionRow::builder()
+                    .title(format_pass_title(&pass, now))
+                    .subtitle(format_pass_subtitle(&pass))
+                    .build();
+                // Per-row play button — one-click tune to the
+                // satellite's downlink with the right demod / BW.
+                // Skipped when the satellite isn't in the catalog
+                // (impossible in practice but the lookup type is
+                // `Option`, so we fail closed — no button rather
+                // than a button that does nothing).
+                if let Some((freq_hz, mode, bw_hz)) = tune_target_for_pass(&pass) {
+                    let play_btn = gtk4::Button::builder()
+                        .icon_name("media-playback-start-symbolic")
+                        .tooltip_text(format!(
+                            "Tune to {} ({})",
+                            pass.satellite,
+                            format_downlink_mhz(freq_hz),
+                        ))
+                        .valign(gtk4::Align::Center)
+                        .css_classes(["flat"])
+                        .build();
+                    // Tooltips aren't read by screen readers — set
+                    // the accessible label too, matching the
+                    // project rule for icon-only buttons.
+                    let a11y_label = format!("Tune to {} downlink", pass.satellite);
+                    play_btn
+                        .update_property(&[gtk4::accessible::Property::Label(a11y_label.as_str())]);
+                    let tune_for_click = Rc::clone(&tune_for_recompute);
+                    play_btn.connect_clicked(move |_| {
+                        tune_for_click(freq_hz, mode, bw_hz);
+                    });
+                    row.add_suffix(&play_btn);
+                }
+                panel.passes_group.add(&row);
+                new_rows.push(DisplayedPass { row, pass });
+            }
+            *displayed_recompute.borrow_mut() = new_rows;
+        })
+    } else {
+        // No cache → no enumeration. Lat/lon/alt notify handlers
+        // still call this on every change; making it a no-op
+        // keeps the call sites branch-free.
+        Rc::new(|| {})
+    };
+
+    // Initial paint — show passes immediately if we already have
+    // cached TLEs from a prior session. (No-op if cache is None.)
+    recompute();
+
+    // Lat / lon / alt — persist on change and re-run pass
+    // enumeration. Cheap: a single SGP4 sweep across ~7
+    // satellites takes well under a millisecond.
+    {
+        let config_lat = std::sync::Arc::clone(config);
+        let recompute_lat = Rc::clone(&recompute);
+        panel.lat_row.connect_value_notify(move |row| {
+            save_f64(&config_lat, KEY_STATION_LAT_DEG, row.value());
+            recompute_lat();
+        });
+    }
+    {
+        let config_lon = std::sync::Arc::clone(config);
+        let recompute_lon = Rc::clone(&recompute);
+        panel.lon_row.connect_value_notify(move |row| {
+            save_f64(&config_lon, KEY_STATION_LON_DEG, row.value());
+            recompute_lon();
+        });
+    }
+    {
+        let config_alt = std::sync::Arc::clone(config);
+        let recompute_alt = Rc::clone(&recompute);
+        panel.alt_row.connect_value_notify(move |row| {
+            save_f64(&config_alt, KEY_STATION_ALT_M, row.value());
+            recompute_alt();
+        });
+    }
+
+    // Auto-record toggle — persist only. The actual "tune the
+    // radio + start APT decoding when a NOAA pass starts" wiring
+    // lands in #482 and reads from the same config key.
+    {
+        let config_auto = std::sync::Arc::clone(config);
+        panel.auto_record_switch.connect_active_notify(move |sw| {
+            save_auto_record_apt(&config_auto, sw.is_active());
+        });
+    }
+
+    // Refresh button — re-download every known satellite's TLE on
+    // a worker thread, update the timestamp row, and rebuild the
+    // pass list. Same `spawn_future_local` + `spawn_blocking`
+    // pattern as the RadioReference search button. Wired only
+    // when the cache is available; otherwise the button was
+    // already disabled above.
+    if let Some(cache_outer) = cache.as_ref() {
+        let cache_refresh = std::sync::Arc::clone(cache_outer);
+        let config_refresh = std::sync::Arc::clone(config);
+        let panel_weak_refresh = panel_weak.clone();
+        let recompute_refresh = Rc::clone(&recompute);
+        panel.refresh_button.connect_clicked(move |_| {
+            let Some(panel) = panel_weak_refresh.upgrade() else {
+                return;
+            };
+            panel.refresh_spinner.set_visible(true);
+            panel.refresh_spinner.start();
+            panel.refresh_button.set_sensitive(false);
+
+            let cache_task = std::sync::Arc::clone(&cache_refresh);
+            let config_done = std::sync::Arc::clone(&config_refresh);
+            let panel_weak_done = panel_weak_refresh.clone();
+            let recompute_done = Rc::clone(&recompute_refresh);
+
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    // `force_refresh` — NOT `tle_text` — because the
+                    // user clicked Refresh and a fresh-cache fast-path
+                    // would let us mark "Last refreshed: now" without
+                    // any actual network fetch. `force_refresh` always
+                    // hits the network and never falls back to a stale
+                    // cache, so a successful return means a real round
+                    // trip happened. A per-satellite failure is logged
+                    // and skipped so a single decommissioned /
+                    // rate-limited entry can't break the whole
+                    // refresh: the user still gets the rest.
+                    let mut last_err: Option<sdr_sat::TleCacheError> = None;
+                    let mut succeeded = 0usize;
+                    for known in KNOWN_SATELLITES {
+                        match cache_task.force_refresh(known.norad_id) {
+                            Ok(_) => succeeded += 1,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "TLE refresh for {} (NORAD {}) failed: {e}",
+                                    known.name,
+                                    known.norad_id,
+                                );
+                                last_err = Some(e);
+                            }
+                        }
+                    }
+                    if succeeded == 0 {
+                        // Every fetch failed — surface the last error so
+                        // the UI can show it. (If at least one
+                        // succeeded, treat the refresh as "done" so
+                        // the user sees the timestamp tick forward.)
+                        Err(last_err.unwrap_or_else(|| {
+                            sdr_sat::TleCacheError::Fetch(
+                                "refresh produced no successful fetches".to_string(),
+                            )
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+
+                let Some(panel) = panel_weak_done.upgrade() else {
+                    return;
+                };
+                panel.refresh_spinner.stop();
+                panel.refresh_spinner.set_visible(false);
+                panel.refresh_button.set_sensitive(true);
+
+                match result {
+                    Ok(Ok(())) => {
+                        let now = chrono::Utc::now();
+                        save_tle_last_refresh(&config_done, now);
+                        panel
+                            .last_refresh_row
+                            .set_subtitle(&format_last_refresh(&config_done));
+                        recompute_done();
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("TLE refresh failed: {e}");
+                        panel
+                            .last_refresh_row
+                            .set_subtitle(&format!("Refresh failed: {e}"));
+                    }
+                    Err(_) => {
+                        tracing::warn!("TLE refresh task panicked");
+                        panel
+                            .last_refresh_row
+                            .set_subtitle("Refresh failed: background task panicked");
+                    }
+                }
+            });
+        });
+    }
+
+    // ZIP code → lat/lon shortcut. We wire BOTH `apply` (apply
+    // button click / Enter when apply-button is sensitive) and
+    // `entry_activated` (Enter, unconditional), then dedupe by an
+    // "in-flight" flag — `apply` won't fire if AdwEntryRow's
+    // internal "has the text been edited?" tracking is in a state
+    // where the apply button is insensitive, but `entry_activated`
+    // fires on Enter regardless. Belt-and-braces is cheaper than
+    // chasing libadwaita's internal sensitivity rules.
+    //
+    // Result text goes to `zip_status_row` (AdwEntryRow has no
+    // subtitle slot of its own). Wired regardless of TLE cache
+    // availability — the ZIP lookup is independent.
+    {
+        let in_flight: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+        let run_lookup: Rc<dyn Fn(adw::EntryRow)> = {
+            let panel_weak_zip = panel_weak.clone();
+            let in_flight_run = Rc::clone(&in_flight);
+            Rc::new(move |entry: adw::EntryRow| {
+                if in_flight_run.get() {
+                    tracing::debug!("Satellites: ZIP lookup ignored — already in flight");
+                    return;
+                }
+                let Some(panel) = panel_weak_zip.upgrade() else {
+                    return;
+                };
+                // Trim once, here, so the trimmed value is what
+                // flows through the lookup. `lookup_us_zip` does its
+                // own trim internally too, but a paste of "  24068 "
+                // showing up as `length=8` in the debug log reads
+                // worse than `length=5`.
+                let zip = entry.text().trim().to_string();
+                if zip.is_empty() {
+                    // Empty entry — nothing to do; treat as a no-op so a
+                    // stray Enter doesn't reset the status row.
+                    return;
+                }
+                in_flight_run.set(true);
+                tracing::debug!("Satellites: ZIP lookup triggered (length={})", zip.len());
+                entry.set_sensitive(false);
+                panel.zip_status_row.set_title("Looking up…");
+
+                let panel_weak_done = panel_weak_zip.clone();
+                let in_flight_done = Rc::clone(&in_flight_run);
+                let zip_for_task = zip.clone();
+                glib::spawn_future_local(async move {
+                    // Chain the two lookups on the worker thread so the
+                    // UI side just gets one result. ZIP failure is fatal
+                    // for this run; elevation failure is logged and
+                    // demoted to `Ok(_, None)` — altitude is best-effort
+                    // since it barely matters for pass prediction
+                    // anyway, and we'd rather populate lat/lon than
+                    // leave the user staring at an error toast.
+                    let result = gio::spawn_blocking(move || -> Result<
+                    (sdr_sat::PostalLocation, Result<f64, String>),
+                    sdr_sat::PostalLookupError,
+                > {
+                    let loc = sdr_sat::lookup_us_zip(&zip_for_task)?;
+                    // Elevation lookup is best-effort — a failure here
+                    // shouldn't fail the whole flow, but we DO want
+                    // the provider error to reach the UI so the user
+                    // can see why altitude didn't update. Pass it
+                    // back as `Err(String)` (cheap to send across
+                    // thread, decoupled from `ElevationLookupError`'s
+                    // type, and the log already scrubbed lat/lon).
+                    let elevation = match sdr_sat::lookup_elevation_m(loc.lat_deg, loc.lon_deg)
+                    {
+                        Ok(m) => Ok(m),
+                        Err(e) => {
+                            // Don't include lat/lon in the log — that's user
+                            // location data. The error message itself is
+                            // safe (it's the upstream HTTP error / parse
+                            // error / dataset-coverage error).
+                            tracing::warn!("elevation lookup failed: {e}");
+                            Err(e.to_string())
+                        }
+                    };
+                    Ok((loc, elevation))
+                })
+                .await;
+
+                    in_flight_done.set(false);
+                    let Some(panel) = panel_weak_done.upgrade() else {
+                        return;
+                    };
+                    panel.zip_row.set_sensitive(true);
+
+                    match result {
+                        Ok(Ok((loc, elevation))) => {
+                            // Order matters slightly: setting lat/lon/alt
+                            // fires `value-notify`, which persists the
+                            // value and triggers `recompute`. Three
+                            // recomputes back-to-back is fine —
+                            // sub-millisecond each.
+                            panel.lat_row.set_value(loc.lat_deg);
+                            panel.lon_row.set_value(loc.lon_deg);
+                            let where_text = if loc.region.is_empty() {
+                                loc.place
+                            } else {
+                                format!("{place}, {region}", place = loc.place, region = loc.region)
+                            };
+                            let status = match elevation {
+                                Ok(alt_m) => {
+                                    panel.alt_row.set_value(alt_m);
+                                    format!("Resolved: {where_text} ({alt_m:.0} m)")
+                                }
+                                Err(e) => {
+                                    // Leave altitude alone but
+                                    // surface the provider error
+                                    // so the user knows what to
+                                    // try next (e.g. retry on a
+                                    // bad network).
+                                    format!("Resolved: {where_text} (altitude unchanged: {e})")
+                                }
+                            };
+                            panel.zip_status_row.set_title(&status);
+                        }
+                        Ok(Err(e)) => {
+                            // Don't include the ZIP in the log — user
+                            // location data, already surfaced inline in
+                            // the status row. Provider error alone is
+                            // enough.
+                            tracing::warn!("ZIP lookup failed: {e}");
+                            panel.zip_status_row.set_title(&e.to_string());
+                        }
+                        Err(_) => {
+                            tracing::warn!("ZIP lookup task panicked");
+                            panel
+                                .zip_status_row
+                                .set_title("Lookup failed: background task panicked");
+                        }
+                    }
+                });
+            })
+        };
+        // Wire both signal paths to the same closure: `apply` for
+        // the apply button click (when libadwaita has flagged the
+        // text as edited), `entry-activated` for raw Enter keys
+        // (always fires, regardless of edit state).
+        {
+            let run = Rc::clone(&run_lookup);
+            panel.zip_row.connect_apply(move |entry| run(entry.clone()));
+        }
+        {
+            let run = Rc::clone(&run_lookup);
+            panel
+                .zip_row
+                .connect_entry_activated(move |entry| run(entry.clone()));
+        }
+    }
+
+    // 1 Hz countdown ticker. Only scheduled when the cache is
+    // available — without it `displayed` stays empty forever and
+    // the timer would tick uselessly. Captures the panel weakly
+    // so the source returns `ControlFlow::Break` once any panel
+    // widget has been dropped (otherwise GLib runs it forever,
+    // holding a strong chain into the `displayed` vec and its
+    // widgets).
+    if cache.is_some() {
+        let panel_weak_tick = panel_weak.clone();
+        let displayed_tick = Rc::clone(&displayed);
+        let recompute_tick = Rc::clone(&recompute);
+        let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
+            if panel_weak_tick.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            let now = chrono::Utc::now();
+            let mut needs_recompute = false;
+            for entry in displayed_tick.borrow().iter() {
+                if entry.pass.end <= now {
+                    needs_recompute = true;
+                    continue;
+                }
+                entry.row.set_title(&format_pass_title(&entry.pass, now));
+            }
+            if needs_recompute {
+                recompute_tick();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 }
 
 /// Connect transcript panel controls to DSP commands.

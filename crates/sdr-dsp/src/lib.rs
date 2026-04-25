@@ -2,6 +2,7 @@
 //!
 //! All functions are pure: no side effects, no thread spawning, no I/O.
 
+pub mod apt;
 pub mod channel;
 pub mod convert;
 pub mod correction;
@@ -14,10 +15,12 @@ pub mod decim_taps;
 pub mod demod;
 pub mod fft;
 pub mod filter;
+pub mod gpu_fft;
 pub mod loops;
 pub mod math;
 pub mod multirate;
 pub mod noise;
+pub mod propagation;
 pub mod stereo;
 pub mod taps;
 pub mod tone_detect;

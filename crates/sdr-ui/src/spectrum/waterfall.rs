@@ -1,9 +1,16 @@
 //! Waterfall display renderer using Cairo.
 //!
-//! Renders a scrolling spectrogram: each FFT frame becomes one horizontal line
-//! in a display buffer, mapped through a colormap for visualization. Uses a
-//! simple shift-down approach — each new line is inserted at the top and all
-//! existing rows shift down by one.
+//! Renders a scrolling spectrogram: each FFT frame becomes one horizontal
+//! line in a display buffer, mapped through a colormap for visualization.
+//! The buffer is laid out in Cairo ARGB32 format as a **logical ring**
+//! — new lines are written at a rotating `top_row` offset and
+//! [`WaterfallRenderer::render`] paints the source surface in two clipped
+//! regions to stitch the wrap back into visual order (newest on top).
+//!
+//! This avoids the per-frame memmove that would otherwise cost
+//! `display_width · (HISTORY_LINES-1) · 4` bytes of ring-buffer
+//! shift-down every frame — ~1 GB/sec at 4K under naive shift-down,
+//! per the epic #452 investigation (PR #458).
 
 use gtk4::cairo;
 
@@ -61,11 +68,21 @@ pub fn supported_texture_width_for(requested: usize) -> usize {
 
 /// Cairo-based renderer for the scrolling waterfall spectrogram.
 ///
-/// Maintains a pixel buffer in Cairo ARGB32 format. New FFT lines are
-/// inserted at the top by shifting existing rows down via `copy_within`.
+/// Maintains a pixel buffer in Cairo ARGB32 format as a **logical ring
+/// buffer**. New FFT lines are written at a rotating `top_row` offset
+/// and `render()` paints the source surface in two clipped regions to
+/// stitch the wrap back into visual-order. This replaces the previous
+/// shift-down-every-row approach, which dominated CPU time at large
+/// display widths (~1 GB/sec of memcpy at 4K per the epic #452
+/// investigation, PR #458).
 pub struct WaterfallRenderer {
     /// Pre-allocated ARGB32 pixel buffer (`width * HISTORY_LINES * 4` bytes).
     /// Cairo ARGB32 is premultiplied alpha, native byte order (BGRA on LE).
+    ///
+    /// Physical layout is decoupled from visual order — the row at
+    /// display position 0 lives at physical row `top_row`, and rows
+    /// wrap modulo `HISTORY_LINES`. See `render()` for the wrap-aware
+    /// paint.
     pixel_buf: Vec<u8>,
     /// Pre-allocated buffer for uploading one row of normalized pixel data.
     row_buffer: Vec<u8>,
@@ -79,6 +96,12 @@ pub struct WaterfallRenderer {
     /// Display range in dB.
     min_db: f32,
     max_db: f32,
+    /// Physical row index of the most recent (top-of-display) line.
+    /// Advances backwards on each `push_line` so the newest row overwrites
+    /// the oldest — exactly the shift-down semantics without the memcpy.
+    ///
+    /// Invariant: `0 ≤ top_row < HISTORY_LINES`.
+    top_row: usize,
 }
 
 impl WaterfallRenderer {
@@ -100,14 +123,17 @@ impl WaterfallRenderer {
             downsample_buf: Vec::with_capacity(MAX_TEXTURE_WIDTH),
             min_db: DEFAULT_MIN_DB,
             max_db: DEFAULT_MAX_DB,
+            top_row: 0,
         }
     }
 
     /// Push one FFT frame as a new row at the top of the display buffer.
     ///
     /// The dB values are normalized to 0..255 using the current display range,
-    /// mapped through the colormap, and written to the top row. Existing rows
-    /// shift down by one.
+    /// mapped through the colormap, and written to the physical row at
+    /// `top_row` after advancing the ring-buffer index backwards. The
+    /// display rendering path (`render()`) handles the wrap-around so
+    /// the visual result is the same as the old shift-down approach.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -127,27 +153,36 @@ impl WaterfallRenderer {
             fft_data
         };
 
+        // Normalize dB values to 0..255. Positions past the FFT's
+        // actual bin count stay at `0` from the `fill(0)` — those
+        // render as `colormap[0]` (the "no signal" floor color),
+        // which is the semantically correct treatment for frequency
+        // regions with no real data.
         let bin_count = display_data.len().min(self.display_width);
-
-        // Normalize dB values to 0..255.
         self.row_buffer.fill(0);
         for (i, &db) in display_data.iter().take(bin_count).enumerate() {
             let normalized = ((db - self.min_db) / db_range).clamp(0.0, 1.0);
             self.row_buffer[i] = (normalized * 255.0).round() as u8;
         }
 
-        // Shift all existing rows down by one row (memmove).
-        let row_bytes = self.display_width * 4;
-        let total_bytes = self.pixel_buf.len();
-        if total_bytes > row_bytes {
-            self.pixel_buf
-                .copy_within(0..total_bytes - row_bytes, row_bytes);
-        }
+        // Advance the ring-buffer index backwards (wrapping). The new
+        // line goes into the slot previously holding the oldest row —
+        // this is the key move that eliminates the per-frame memmove
+        // of `display_width · (HISTORY_LINES-1) · 4` bytes that used to
+        // cost ~1 GB/sec at 4K.
+        self.top_row = (self.top_row + HISTORY_LINES - 1) % HISTORY_LINES;
 
-        // Write the new row at the top (row 0).
-        for (i, &val) in self.row_buffer.iter().take(bin_count).enumerate() {
+        // Write the new row into the physical slot for `top_row`.
+        // Iterate the FULL `display_width`, not just `bin_count` —
+        // this matters specifically because the ring-buffer path
+        // recycles old slots. Skipping the tail would leak the
+        // oldest row's right-edge pixels into the newest row, visible
+        // on narrow-FFT frames (or during FFT size changes).
+        let row_bytes = self.display_width * 4;
+        let row_start = self.top_row * row_bytes;
+        for (i, &val) in self.row_buffer.iter().enumerate() {
             let color = self.colormap_bgra[val as usize];
-            let idx = i * 4;
+            let idx = row_start + i * 4;
             self.pixel_buf[idx] = color[0]; // B
             self.pixel_buf[idx + 1] = color[1]; // G
             self.pixel_buf[idx + 2] = color[2]; // R
@@ -160,6 +195,15 @@ impl WaterfallRenderer {
     /// Blits the pixel buffer as a Cairo `ImageSurface` scaled to the
     /// requested output size. When zoomed in, only the visible frequency
     /// portion is shown by translating and scaling the source surface.
+    ///
+    /// Because the pixel buffer is a logical ring (see `pixel_buf`
+    /// doc comment), the paint is split into two clipped regions —
+    /// one covering physical rows `[top_row..HISTORY_LINES)` at the top
+    /// of the display, and one covering `[0..top_row)` at the bottom.
+    /// Each region uses the same source surface with a different
+    /// `set_source_surface` origin to translate physical rows into
+    /// display positions. Cairo does the composited paint in hardware
+    /// where available.
     #[allow(clippy::cast_precision_loss)]
     pub fn render(
         &self,
@@ -212,30 +256,60 @@ impl WaterfallRenderer {
 
         let visible_width_frac = visible_end_frac - visible_start_frac;
 
-        // Scale and translate the surface so only the visible portion fills
-        // the output area.
+        // Scale so HISTORY_LINES rows × visible display_width cols map
+        // to the requested output rect.
         let _ = cr.save();
-
-        // Y scale: stretch history lines to fill output height.
         let y_scale = f64::from(height) / HISTORY_LINES as f64;
-
-        // X scale: the visible fraction of the surface width maps to output width.
         let x_scale = if visible_width_frac > 0.0 {
             f64::from(width) / (self.display_width as f64 * visible_width_frac)
         } else {
             f64::from(width) / self.display_width as f64
         };
-
         cr.scale(x_scale, y_scale);
 
-        // Offset the surface so the visible start aligns with x=0.
+        // Zoom/pan source offset in pre-scale (source-pixel) units.
         let src_offset_x = -(visible_start_frac * self.display_width as f64);
-        let _ = cr.set_source_surface(&surface, src_offset_x, 0.0);
 
-        // Use NEAREST filtering for crisp bin boundaries.
-        cr.source().set_filter(cairo::Filter::Nearest);
+        // Extent of the display in pre-scale units — the clip rects
+        // reference this so they cover exactly the visible region.
+        let display_extent_x = f64::from(width) / x_scale;
 
-        let _ = cr.paint();
+        // Region A: physical rows [top_row..HISTORY_LINES) → display
+        // rows [0..region_a_rows). The source-surface origin's Y is
+        // set to `-top_row` so that user-space (display) row 0 samples
+        // source row `top_row` — i.e., the newest line lands at the
+        // top of the waterfall, exactly like the old shift-down.
+        let region_a_rows = HISTORY_LINES - self.top_row;
+        if region_a_rows > 0 {
+            let _ = cr.save();
+            cr.rectangle(0.0, 0.0, display_extent_x, region_a_rows as f64);
+            cr.clip();
+            let _ = cr.set_source_surface(&surface, src_offset_x, -(self.top_row as f64));
+            cr.source().set_filter(cairo::Filter::Nearest);
+            let _ = cr.paint();
+            let _ = cr.restore();
+        }
+
+        // Region B: physical rows [0..top_row) → display rows
+        // [region_a_rows..HISTORY_LINES). Source origin Y is set to
+        // `region_a_rows` so that user-space row `region_a_rows` samples
+        // source row 0 — i.e., the wrap stitches the oldest block
+        // seamlessly below region A.
+        if self.top_row > 0 {
+            let _ = cr.save();
+            cr.rectangle(
+                0.0,
+                region_a_rows as f64,
+                display_extent_x,
+                self.top_row as f64,
+            );
+            cr.clip();
+            let _ = cr.set_source_surface(&surface, src_offset_x, region_a_rows as f64);
+            cr.source().set_filter(cairo::Filter::Nearest);
+            let _ = cr.paint();
+            let _ = cr.restore();
+        }
+
         let _ = cr.restore();
     }
 
@@ -252,36 +326,69 @@ impl WaterfallRenderer {
         }
     }
 
-    /// Build a Cairo `ImageSurface` from the pixel buffer, handling stride
-    /// alignment. Cairo may require row strides wider than our tightly-packed
-    /// data; when they differ, rows are padded to match.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
+    /// Query Cairo's required stride for our ARGB32 row width.
+    /// Returns `(stride_bytes, packed_stride_bytes)` so callers can
+    /// decide whether to use a zero-copy packed buffer or a padded
+    /// copy.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn argb32_strides(display_width: usize) -> Result<(i32, i32), String> {
+        let stride = cairo::Format::ARgb32
+            .stride_for_width(display_width as u32)
+            .map_err(|e| format!("stride: {e}"))?;
+        let packed_stride = (display_width * 4) as i32;
+        Ok((stride, packed_stride))
+    }
+
+    /// Re-pack `linear` (tightly-packed `display_width * 4` bytes
+    /// per row) into whatever stride Cairo demands for the given
+    /// width. Returns either the input `Vec` unchanged (when
+    /// Cairo's stride matches the packed stride — the common case
+    /// on typical widths) or a fresh padded copy.
+    ///
+    /// Used by both `to_cairo_surface` and `export_png` to keep
+    /// the ARGB32 packing logic in one place.
+    #[allow(clippy::cast_sign_loss)]
+    fn pack_argb32_for_cairo(
+        mut linear: Vec<u8>,
+        display_width: usize,
+        stride: i32,
+        packed_stride: i32,
+    ) -> Vec<u8> {
+        if stride == packed_stride {
+            return linear;
+        }
+        let row_bytes = display_width * 4;
+        // `stride` comes from `cairo::Format::stride_for_width`, which
+        // returns `Err` on negative values — safe to treat as unsigned.
+        let stride_usize = stride as usize;
+        let mut padded = vec![0u8; stride_usize * HISTORY_LINES];
+        for row in 0..HISTORY_LINES {
+            let src = row * row_bytes;
+            let dst = row * stride_usize;
+            padded[dst..dst + row_bytes].copy_from_slice(&linear[src..src + row_bytes]);
+        }
+        // Drop the unpadded copy explicitly rather than relying on
+        // it falling out of scope — makes the "we're abandoning
+        // this buffer" intent obvious.
+        linear.clear();
+        padded
+    }
+
+    /// Build a Cairo `ImageSurface` over the ring-ordered pixel
+    /// buffer. `render()` handles the ring wrap via two clipped
+    /// paints, so no re-ordering happens here.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn to_cairo_surface(&self) -> Result<cairo::ImageSurface, String> {
         if self.display_width == 0 {
             return Err("no waterfall data".to_string());
         }
-
-        let stride = cairo::Format::ARgb32
-            .stride_for_width(self.display_width as u32)
-            .map_err(|e| format!("stride: {e}"))?;
-
-        let packed_stride = (self.display_width * 4) as i32;
-        let buf = if stride == packed_stride {
-            self.pixel_buf.clone()
-        } else {
-            let mut padded = vec![0u8; stride as usize * HISTORY_LINES];
-            let row_bytes = self.display_width * 4;
-            for row in 0..HISTORY_LINES {
-                let src = row * row_bytes;
-                let dst = row * stride as usize;
-                padded[dst..dst + row_bytes].copy_from_slice(&self.pixel_buf[src..src + row_bytes]);
-            }
-            padded
-        };
+        let (stride, packed_stride) = Self::argb32_strides(self.display_width)?;
+        let buf = Self::pack_argb32_for_cairo(
+            self.pixel_buf.clone(),
+            self.display_width,
+            stride,
+            packed_stride,
+        );
 
         cairo::ImageSurface::create_for_data(
             buf,
@@ -293,9 +400,50 @@ impl WaterfallRenderer {
         .map_err(|e| format!("surface: {e}"))
     }
 
+    /// Walk the ring buffer once to produce a linearly-ordered copy
+    /// of `pixel_buf` — display row 0 on top, row `HISTORY_LINES-1`
+    /// on the bottom. Used by [`Self::export_png`] and covered by a
+    /// dedicated test so the ordering is verifiable without
+    /// round-tripping through PNG I/O.
+    fn linearized_pixel_buf(&self) -> Vec<u8> {
+        let row_bytes = self.display_width * 4;
+        let mut linear = vec![0u8; row_bytes * HISTORY_LINES];
+        for display_row in 0..HISTORY_LINES {
+            let physical_row = (self.top_row + display_row) % HISTORY_LINES;
+            let src = physical_row * row_bytes;
+            let dst = display_row * row_bytes;
+            linear[dst..dst + row_bytes].copy_from_slice(&self.pixel_buf[src..src + row_bytes]);
+        }
+        linear
+    }
+
     /// Export the waterfall display to a PNG file.
+    ///
+    /// The PNG expects rows in visual order (newest on top), but the
+    /// internal `pixel_buf` is in ring-buffer order keyed off
+    /// `top_row` — so this uses [`Self::linearized_pixel_buf`] to
+    /// materialize one allocation of correctly-ordered pixels before
+    /// handing it to Cairo. The allocation cost is negligible for a
+    /// user-triggered "save to PNG" operation.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
-        let surface = self.to_cairo_surface()?;
+        if self.display_width == 0 {
+            return Err("no waterfall data".to_string());
+        }
+
+        let linear = self.linearized_pixel_buf();
+        let (stride, packed_stride) = Self::argb32_strides(self.display_width)?;
+        let buf = Self::pack_argb32_for_cairo(linear, self.display_width, stride, packed_stride);
+
+        let surface = cairo::ImageSurface::create_for_data(
+            buf,
+            cairo::Format::ARgb32,
+            self.display_width as i32,
+            HISTORY_LINES as i32,
+            stride,
+        )
+        .map_err(|e| format!("surface: {e}"))?;
+
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -315,11 +463,14 @@ impl WaterfallRenderer {
     /// Resize the waterfall for a new FFT size.
     ///
     /// Resets history on every call to clear mixed-resolution data.
+    /// The ring-buffer index is reset as well so post-resize renders
+    /// start from a consistent state.
     pub fn resize(&mut self, new_width: usize) {
         let capped_width = supported_texture_width(new_width);
         self.display_width = capped_width;
         self.pixel_buf = vec![0u8; capped_width * HISTORY_LINES * 4];
         self.row_buffer = vec![0u8; capped_width];
+        self.top_row = 0;
         tracing::debug!(width = capped_width, "waterfall display reset");
     }
 }
@@ -390,5 +541,213 @@ mod tests {
     fn supported_width_clamped() {
         assert_eq!(supported_texture_width(8192), MAX_TEXTURE_WIDTH);
         assert_eq!(supported_texture_width(1024), 1024);
+    }
+
+    /// Ring-buffer test fixtures — named so the ring-invariant
+    /// tests read at the level of intent, not at the level of
+    /// specific byte values.
+    const WIDTH_SMALL: usize = 4;
+    const WIDTH_LARGE: usize = 8;
+    const DB_MIN: f32 = 0.0;
+    const DB_MAX: f32 = 100.0;
+    /// Normalizes to `(50 - 0) / 100 = 0.5 → byte 128` — a
+    /// mid-range value that's cleanly distinguishable from both
+    /// the floor (byte 0) and the saturation (byte 255) in the
+    /// ring-buffer placement tests.
+    const DB_MID: f32 = 50.0;
+    /// Normalizes to `1.0 → byte 255` — the saturation end. Used
+    /// by the narrow-FFT test to make the "stale tail" regression
+    /// visually obvious if it recurs.
+    const DB_HIGH: f32 = 100.0;
+    /// Low dB anchor for the linearization ordering test. Paired
+    /// with `DB_HIGH` to make newest-row vs oldest-row easy to
+    /// identify in the linearized output.
+    const DB_LOW: f32 = 0.0;
+
+    /// Helper: read the BGRA pixel at the physical row / column out
+    /// of the renderer's internal buffer. Tests use this to verify
+    /// that the ring-buffer `top_row` advances correctly.
+    fn physical_pixel(r: &WaterfallRenderer, row: usize, col: usize) -> [u8; 4] {
+        let idx = (row * r.display_width + col) * 4;
+        [
+            r.pixel_buf[idx],
+            r.pixel_buf[idx + 1],
+            r.pixel_buf[idx + 2],
+            r.pixel_buf[idx + 3],
+        ]
+    }
+
+    /// Helper: read one BGRA pixel from a linearized buffer.
+    fn linear_pixel(buf: &[u8], width: usize, row: usize, col: usize) -> [u8; 4] {
+        let idx = (row * width + col) * 4;
+        [buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]]
+    }
+
+    #[test]
+    fn ring_buffer_starts_at_zero() {
+        let r = WaterfallRenderer::new(WIDTH_LARGE);
+        assert_eq!(r.top_row, 0);
+        assert!(r.pixel_buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn ring_buffer_advances_backwards_on_push() {
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+        // One push advances `top_row` from 0 to HISTORY_LINES - 1.
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
+        assert_eq!(r.top_row, HISTORY_LINES - 1);
+        // Second push advances to HISTORY_LINES - 2.
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
+        assert_eq!(r.top_row, HISTORY_LINES - 2);
+    }
+
+    #[test]
+    fn ring_buffer_wraps_after_full_cycle() {
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+        for _ in 0..HISTORY_LINES {
+            r.push_line(&[DB_MID; WIDTH_SMALL]);
+        }
+        // After exactly HISTORY_LINES pushes we wrap back to 0.
+        assert_eq!(r.top_row, 0);
+        // One more push: back to HISTORY_LINES - 1.
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
+        assert_eq!(r.top_row, HISTORY_LINES - 1);
+    }
+
+    #[test]
+    fn pushed_row_lands_at_top_row_offset() {
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+
+        // Push a distinctive line: four distinct magnitudes so the
+        // colormap lookup produces distinct per-column outputs.
+        // With the default Turbo colormap we don't care about exact
+        // RGB — we care that the row was written at the current
+        // `top_row`, and the row BEFORE it (physical row `top_row
+        // + 1`, still zeroed) is untouched.
+        r.push_line(&[0.0, 25.0, DB_MID, DB_HIGH]);
+        let first_top = r.top_row;
+        assert_eq!(first_top, HISTORY_LINES - 1);
+        // The new row is non-zero — check the fourth pixel, which
+        // uses colormap[255] and is definitely non-zero for Turbo.
+        let p = physical_pixel(&r, first_top, 3);
+        assert!(p != [0, 0, 0, 0], "new row pixel should be non-zero");
+        // And the row ADJACENT to top_row going the other way
+        // (physical row 0, which will be overwritten last) is still
+        // zero.
+        assert_eq!(physical_pixel(&r, 0, 3), [0, 0, 0, 0]);
+
+        // Push a second line and confirm it lands one physical row
+        // up, not on top of the previous row.
+        r.push_line(&[0.0, 25.0, DB_MID, DB_HIGH]);
+        assert_eq!(r.top_row, HISTORY_LINES - 2);
+        // Previous row unchanged.
+        let p_prev = physical_pixel(&r, first_top, 3);
+        assert_eq!(
+            p, p_prev,
+            "previous row pixel must not be touched by next push"
+        );
+    }
+
+    #[test]
+    fn narrow_fft_does_not_leak_stale_tail() {
+        // Simulates the ring-buffer hazard: after many rows of a
+        // full-width FFT, switch to a narrow FFT. The recycled
+        // physical slot previously held a fully-populated row with
+        // non-zero tail pixels — if `push_line` only writes
+        // `bin_count` pixels, those stale tail pixels bleed into
+        // the new row.
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+
+        // Fill every slot with a fully-saturated full-width row so
+        // the tail positions are non-zero across the whole ring.
+        for _ in 0..HISTORY_LINES {
+            r.push_line(&[DB_HIGH; WIDTH_SMALL]);
+        }
+
+        // Now push a half-width frame — the other two positions
+        // are "past the FFT width" and MUST render as `colormap[0]`,
+        // not the previous row's saturated tail.
+        r.push_line(&[DB_HIGH; WIDTH_SMALL / 2]);
+        let top = r.top_row;
+
+        // Positions 0..WIDTH_SMALL/2: high-level color.
+        let high = physical_pixel(&r, top, 0);
+        // Positions past the FFT width: "no data" color.
+        let no_data = physical_pixel(&r, top, WIDTH_SMALL / 2);
+
+        assert_ne!(
+            high, no_data,
+            "narrow-FFT tail should differ from the data region"
+        );
+        // And no-data must match the colormap's zero entry (the
+        // "floor" color), not the saturated color the old row had.
+        let floor = r.colormap_bgra[0];
+        assert_eq!(
+            no_data, floor,
+            "tail pixels must be colormap[0], not stale ring-buffer content"
+        );
+    }
+
+    #[test]
+    fn resize_resets_ring_index() {
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+        r.push_line(&[DB_MID; WIDTH_SMALL]);
+        assert_eq!(r.top_row, HISTORY_LINES - 1);
+        r.resize(WIDTH_LARGE);
+        assert_eq!(r.top_row, 0);
+        assert!(r.pixel_buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn linearize_places_newest_row_on_top() {
+        // Exercises `linearized_pixel_buf` — the function used by
+        // `export_png` to turn a ring-ordered pixel_buf into
+        // newest-on-top visual order. This is the test CR asked for:
+        // it verifies correct ordering WITHOUT the PNG round-trip,
+        // and works past the ring wrap where ordering is most
+        // likely to break.
+        let mut r = WaterfallRenderer::new(WIDTH_SMALL);
+        r.set_db_range(DB_MIN, DB_MAX);
+
+        // Push HISTORY_LINES+5 frames so we've wrapped once. The
+        // final five frames alternate LOW / HIGH so the newest row
+        // is identifiable by color.
+        for _ in 0..HISTORY_LINES {
+            r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        }
+        // Four low rows then one high row. After these pushes, the
+        // most recent row (which should end up at display row 0) is
+        // the high one.
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_LOW; WIDTH_SMALL]);
+        r.push_line(&[DB_HIGH; WIDTH_SMALL]);
+
+        let floor = r.colormap_bgra[0];
+        let saturation = r.colormap_bgra[255];
+
+        let linear = r.linearized_pixel_buf();
+
+        // Display row 0: the newest push — the saturated row.
+        assert_eq!(
+            linear_pixel(&linear, WIDTH_SMALL, 0, 0),
+            saturation,
+            "display row 0 must be the newest (saturated) line"
+        );
+        // Display rows 1..5: the four `DB_LOW` pushes immediately
+        // before the saturated one.
+        for visual_row in 1..5 {
+            assert_eq!(
+                linear_pixel(&linear, WIDTH_SMALL, visual_row, 0),
+                floor,
+                "display row {visual_row} must be the DB_LOW line"
+            );
+        }
     }
 }

@@ -1,11 +1,14 @@
 //! Server panel — "Share over network" controls exposing a local
 //! RTL-SDR dongle to remote `rtl_tcp` clients.
 //!
-//! This panel is hidden by default. It becomes visible when a local
-//! RTL-SDR dongle is detected AND it's not currently the active
-//! source — exposing the same dongle over `rtl_tcp` while also
-//! receiving from it locally would cause a USB-device double-open,
-//! so the UI gates the panel on the incompatible state.
+//! Always-visible activity panel: lives behind the 📡 Share icon
+//! on the left activity bar. The legacy hotplug-gated hide/show
+//! behaviour was removed when Share became its own activity — the
+//! user's click on the icon is the explicit opt-in gesture, and
+//! the Start switch still errors gracefully when no local RTL-SDR
+//! is plugged in (an exclusivity-guard toast fires if the local
+//! RTL-SDR is currently the active source, since that would cause
+//! a USB double-open).
 //!
 //! The panel itself only builds widgets; the wire-up (start/stop,
 //! stats polling, activity log) lives in `window.rs` alongside the
@@ -274,9 +277,9 @@ const _: () = {
 /// time and disables them while the server is running so the user
 /// can't mutate config out from under a live session.
 pub struct ServerPanel {
-    /// The `AdwPreferencesGroup` widget to pack into the sidebar.
-    /// Hidden by default — `window.rs` toggles visibility based on
-    /// USB hotplug + active-source state.
+    /// The `AdwPreferencesGroup` widget rendered under the Share
+    /// (📡) activity on the left activity bar. Always visible;
+    /// `window.rs` no longer gates it on hotplug state.
     pub widget: adw::PreferencesGroup,
     /// Master share-over-network switch. On → start Server. Off →
     /// stop Server.
@@ -653,9 +656,12 @@ fn build_device_defaults_rows() -> DeviceDefaultsRows {
     }
 }
 
-/// Build the server-panel widgets. The panel is hidden by default;
-/// `window.rs` toggles `widget.set_visible(true)` once a local dongle
-/// is detected and the active source is not RTL-SDR.
+/// Build the server-panel widgets. Always visible — the Share
+/// activity icon in the left activity bar is the user's opt-in
+/// gesture, so the panel no longer hides itself based on hotplug
+/// state. When no dongle is plugged in the Start switch errors
+/// gracefully; the panel's presence under its dedicated icon is
+/// the right UX regardless of current dongle availability.
 #[allow(
     clippy::too_many_lines,
     reason = "widget-assembly function — splitting scatters one-time wire-up across many helpers with no readability win"
@@ -664,7 +670,6 @@ pub fn build_server_panel() -> ServerPanel {
     let widget = adw::PreferencesGroup::builder()
         .title("Share over network")
         .description("Expose this machine's RTL-SDR dongle to remote rtl_tcp clients")
-        .visible(false)
         .build();
 
     let share_row = adw::SwitchRow::builder()

@@ -98,6 +98,21 @@ pub struct AppState {
     /// per-server keyring entry. Empty string when no server is
     /// selected. Per issue #396.
     pub rtl_tcp_active_server: RefCell<String>,
+    /// Currently-open NOAA APT viewer window, or `None` when no
+    /// viewer is open. Set by the viewer's open path (the
+    /// activity-bar / shortcut handler) and cleared by its
+    /// `close-request` signal. The `DspToUi::AptLine` handler in
+    /// `handle_dsp_message` routes incoming lines here — when
+    /// `None`, the lines are dropped (the decoder runs anyway, but
+    /// nothing is displayed). Per epic #468 / ticket #482.
+    ///
+    /// `RefCell<Option<AptImageView>>` rather than
+    /// `RefCell<Option<glib::WeakRef<…>>>` because `AptImageView`
+    /// is internally `Rc`-shared already, and we want the line
+    /// router to fail closed (drop the line) when the viewer's
+    /// `close-request` fires, not when the `GObject`'s last strong
+    /// ref happens to drop.
+    pub apt_viewer: RefCell<Option<crate::apt_viewer::AptImageView>>,
 }
 
 impl AppState {
@@ -119,6 +134,7 @@ impl AppState {
             // AuthFailed is correctly detected as an edge.
             last_rtl_tcp_state_disc: Cell::new(RTL_TCP_STATE_DISC_DISCONNECTED),
             rtl_tcp_active_server: RefCell::new(String::new()),
+            apt_viewer: RefCell::new(None),
         })
     }
 

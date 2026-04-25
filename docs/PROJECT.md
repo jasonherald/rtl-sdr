@@ -278,7 +278,7 @@ The `sdr-rtlsdr` crate replaces C `librtlsdr` entirely. Uses `rusb` for USB comm
 | FFT plot (ImGui drawlist) | `GtkGLArea` shared with waterfall |
 | VFO overlay rectangles | Custom drawing on GL area overlay |
 | Frequency selector digits | Custom `GtkWidget` subclass with scroll-per-digit |
-| Side menu accordion | `AdwPreferencesGroup` in `AdwFlap` sidebar |
+| Side menu accordion | Activity-bar pattern — nested `AdwOverlaySplitView`s switching `GtkStack` panels by icon click (see `CLAUDE.md` → "Sidebar architecture") |
 | Source/sink combo | `AdwComboRow` |
 | Gain slider | `GtkScale` or `AdwSpinRow` |
 | Play/Stop button | `GtkToggleButton` with media icons |

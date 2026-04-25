@@ -616,6 +616,167 @@ public final class SdrCore: @unchecked Sendable {
     }
 
     // ==========================================================
+    //  Scanner — ABI 0.20, issue #447. Master enable + per-
+    //  channel session lockout / unlock. Channel-list projection
+    //  follows in #490 when the macOS bookmark layer grows the
+    //  `scan_enabled` / `priority` fields the Linux side already
+    //  has.
+    // ==========================================================
+
+    /// Master scanner enable / disable. Tripping this on with no
+    /// projected channels leaves the engine in `.idle` (visible
+    /// via the `scannerStateChanged` event); the host doesn't
+    /// need to special-case empty rotation.
+    public func setScannerEnabled(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_scanner_enabled(handle, enabled))
+    }
+
+    /// Lock out a channel for the rest of the scanner session.
+    ///
+    /// `name` + `frequencyHz` together form the scanner's channel
+    /// identity — they must match the channel's identity at
+    /// projection time exactly. Lockouts persist until the
+    /// channel is unlocked (`unlockScannerChannel`), the scanner
+    /// is disabled, or the engine is destroyed.
+    public func lockoutScannerChannel(name: String, frequencyHz: UInt64) throws {
+        try checkRc(name.withCString {
+            sdr_core_lockout_scanner_channel(handle, $0, frequencyHz)
+        })
+    }
+
+    /// Clear a session lockout previously installed by
+    /// `lockoutScannerChannel`. No-op if the channel wasn't
+    /// locked out.
+    public func unlockScannerChannel(name: String, frequencyHz: UInt64) throws {
+        try checkRc(name.withCString {
+            sdr_core_unlock_scanner_channel(handle, $0, frequencyHz)
+        })
+    }
+
+    // ==========================================================
+    //  Config — ABI 0.21, issue #449. Round-trips against the
+    //  shared `sdr-config` JSON file passed to the engine at
+    //  init time. Auto-save runs off a worker thread the engine
+    //  starts; writes here become persistent at the next save
+    //  tick (and on `Drop` / engine destroy at the latest).
+    //
+    //  All getters return `Optional` — `nil` when the key is
+    //  absent OR present with a mismatched type. The two cases
+    //  are deliberately conflated on the Swift side because
+    //  callers want the same fallback ("use my Swift default")
+    //  in both. The C ABI distinguishes them via
+    //  `SDR_CORE_ERR_KEY_NOT_FOUND` for diagnostic logging if a
+    //  future caller needs the split.
+    // ==========================================================
+
+    /// Read a string-valued config key. `nil` when absent or
+    /// stored under a non-string JSON type.
+    ///
+    /// Implementation detail: the engine's config FFI uses a
+    /// size-then-fill contract, so this is a two-pass call. We
+    /// pass `out_required` on the FILL pass too — if another
+    /// thread grew the value between the size probe and the
+    /// fill (a real possibility with the engine's auto-save
+    /// worker plus arbitrary host writes), the FFI returns
+    /// `InvalidArg` with the new required size, and we retry
+    /// with a fresh buffer once. A second growth in the same
+    /// call would be exotic; if it happened we'd give up and
+    /// return `nil` rather than loop unbounded — same policy
+    /// the rtl_tcp recent-commands reader uses.
+    public func configString(key: String) -> String? {
+        // 1. Probe required size.
+        var required: Int = 0
+        let sizeRc = key.withCString { keyPtr in
+            sdr_core_config_get_string(handle, keyPtr, nil, 0, &required)
+        }
+        guard sizeRc == 0 else { return nil }
+        return readConfigStringFill(key: key, capacity: required)
+    }
+
+    /// Run the fill pass of the size-then-fill string read with
+    /// a single retry on inter-call growth. Split out so the
+    /// retry loop stays small and the happy-path stays a flat
+    /// `withCString { ... }`. Per `CodeRabbit` round 1 on
+    /// PR #499.
+    private func readConfigStringFill(key: String, capacity: Int) -> String? {
+        var buf = [CChar](repeating: 0, count: capacity)
+        var required: Int = 0
+        let fillRc = key.withCString { keyPtr in
+            buf.withUnsafeMutableBufferPointer { bufPtr in
+                sdr_core_config_get_string(
+                    handle, keyPtr, bufPtr.baseAddress, bufPtr.count, &required
+                )
+            }
+        }
+        if fillRc == 0 {
+            return String(cString: buf)
+        }
+        // Race: another writer grew the value between the size
+        // probe and this fill. Retry with the FFI's freshly
+        // reported size — but only once, to bound recursion.
+        if fillRc == SdrCoreError.Code.invalidArg.rawValue, required > capacity {
+            var retryBuf = [CChar](repeating: 0, count: required)
+            let retryRc = key.withCString { keyPtr in
+                retryBuf.withUnsafeMutableBufferPointer { bufPtr in
+                    sdr_core_config_get_string(
+                        handle, keyPtr, bufPtr.baseAddress, bufPtr.count, nil
+                    )
+                }
+            }
+            if retryRc == 0 {
+                return String(cString: retryBuf)
+            }
+        }
+        return nil
+    }
+
+    /// Write a string-valued config key. Empty values are
+    /// stored verbatim — distinct from absence (which a
+    /// future read returns as `nil`).
+    public func setConfigString(key: String, value: String) throws {
+        try checkRc(key.withCString { keyPtr in
+            value.withCString { valuePtr in
+                sdr_core_config_set_string(handle, keyPtr, valuePtr)
+            }
+        })
+    }
+
+    /// Read a bool-valued config key. `nil` when absent or
+    /// stored under a non-bool JSON type.
+    public func configBool(key: String) -> Bool? {
+        var out = false
+        let rc = key.withCString { keyPtr in
+            sdr_core_config_get_bool(handle, keyPtr, &out)
+        }
+        return rc == 0 ? out : nil
+    }
+
+    /// Write a bool-valued config key.
+    public func setConfigBool(key: String, value: Bool) throws {
+        try checkRc(key.withCString { keyPtr in
+            sdr_core_config_set_bool(handle, keyPtr, value)
+        })
+    }
+
+    /// Read a u32-valued config key. `nil` when absent, stored
+    /// under a non-numeric type, or stored as a number that
+    /// doesn't fit in `UInt32`.
+    public func configUInt32(key: String) -> UInt32? {
+        var out: UInt32 = 0
+        let rc = key.withCString { keyPtr in
+            sdr_core_config_get_u32(handle, keyPtr, &out)
+        }
+        return rc == 0 ? out : nil
+    }
+
+    /// Write a u32-valued config key.
+    public func setConfigUInt32(key: String, value: UInt32) throws {
+        try checkRc(key.withCString { keyPtr in
+            sdr_core_config_set_u32(handle, keyPtr, value)
+        })
+    }
+
+    // ==========================================================
     //  FFT frame pull
     // ==========================================================
 

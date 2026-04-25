@@ -1,0 +1,21 @@
+[package]
+name = "sdr-sat"
+version = "0.1.0"
+description = "Satellite pass prediction (SGP4) and TLE cache for LEO weather / ham satellites"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+sgp4.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+dirs-next.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
