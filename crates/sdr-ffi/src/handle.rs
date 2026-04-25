@@ -12,6 +12,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 
+use sdr_config::ConfigManager;
 use sdr_core::Engine;
 
 /// Opaque handle the C ABI hands to consumers.
@@ -29,19 +30,36 @@ pub struct SdrCore {
     /// without borrowing the `SdrCore` handle directly.
     pub(crate) event_callback: Arc<EventCallbackGuard>,
 
-    /// Path the host provided to `sdr_core_create`. Stored for future
-    /// config-persistence wiring (the v1 engine doesn't load it yet —
-    /// see the M1 spec deviation note in
-    /// `crates/sdr-core/src/engine.rs`). Holding it here means the
-    /// path threads through the FFI surface in v1 even before the
-    /// engine consumes it, so adding persistence in a follow-up PR
-    /// doesn't require an ABI change.
+    /// Path the host provided to `sdr_core_create`. Stored for
+    /// diagnostics / future migrations — the live read/write path
+    /// goes through `config` below, which owns a `ConfigManager`
+    /// tied to this same file.
     ///
-    /// `#[allow(dead_code)]`: read by the `#[cfg(test)]` integration
-    /// tests in `lifecycle.rs` but not by non-test code yet. Comes
-    /// off once a production call site exists.
+    /// `#[allow(dead_code)]`: read by `#[cfg(test)]` integration
+    /// tests in `lifecycle.rs` (which assert `core.config_path`
+    /// matches what `sdr_core_create` was called with) but not
+    /// by non-test code. Clippy doesn't see test-only reads
+    /// on the lib target.
     #[allow(dead_code)]
     pub(crate) config_path: std::path::PathBuf,
+
+    /// Shared JSON config, tied to `config_path`. Built by
+    /// `sdr_core_create` (loading the on-disk file or starting
+    /// in-memory when `config_path` is empty) and owned for the
+    /// lifetime of the handle. `Arc` so future consumers (an
+    /// eventual engine-side config reader, the RadioReference
+    /// keyring already uses `Arc<ConfigManager>`, …) can clone
+    /// their own reference cheaply. Auto-save runs off a worker
+    /// thread enabled at create time; the writer is joined
+    /// automatically on `Drop` so ffi destroy doesn't need
+    /// special handling.
+    ///
+    /// `None` when the host passed an empty path — in-memory
+    /// mode, used by tests + by future embedders that want
+    /// ephemeral config. FFI config read/write entry points
+    /// return `InvalidArg` in that state so the host can
+    /// distinguish "key absent" from "no config file at all".
+    pub(crate) config: Option<Arc<ConfigManager>>,
 
     /// FFI event dispatcher thread join handle. Spawned at
     /// `sdr_core_create` time, joined at `sdr_core_destroy` so the
@@ -100,6 +118,21 @@ pub(crate) struct EventCallbackState {
     pub in_flight: usize,
 }
 
+// `ConfigManager` stores an `Option<JoinHandle<()>>` for its
+// auto-save worker, and `JoinHandle` transitively contains an
+// `UnsafeCell<Option<Result<(), PanicPayload>>>` that isn't
+// `RefUnwindSafe` by default. The handle's other fields
+// (`Engine`, `Mutex`es, `Arc`s) are all unwind-safe individually;
+// the compound type just can't auto-derive. Asserting these
+// traits by hand is correct because the FFI catch_unwind
+// boundary only ever reads the handle — it doesn't observe
+// partial mutations, and a panic can't leave the handle in an
+// observably-broken state (the poison mechanism on `Mutex` /
+// `RwLock` handles the lock-held case; the `JoinHandle` just
+// owns a finished thread's result).
+impl std::panic::UnwindSafe for SdrCore {}
+impl std::panic::RefUnwindSafe for SdrCore {}
+
 impl SdrCore {
     /// Construct from a successfully-built [`Engine`], the
     /// host-provided config path, and the spawned dispatcher
@@ -107,6 +140,7 @@ impl SdrCore {
     pub(crate) fn new(
         engine: Engine,
         config_path: std::path::PathBuf,
+        config: Option<Arc<ConfigManager>>,
         event_callback: Arc<EventCallbackGuard>,
         dispatcher_handle: std::thread::JoinHandle<()>,
     ) -> Self {
@@ -114,6 +148,7 @@ impl SdrCore {
             engine,
             event_callback,
             config_path,
+            config,
             dispatcher_handle: Mutex::new(Some(dispatcher_handle)),
             audio_tap_dispatcher: Mutex::new(None),
         }

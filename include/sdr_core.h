@@ -56,8 +56,39 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 20
+#define SDR_CORE_ABI_VERSION_MINOR 21
 /*
+ * 0.21 — exposes the shared `sdr-config` JSON file at the FFI
+ * boundary so the macOS SwiftUI host can round-trip sidebar
+ * session state (#449) and other settings against the same
+ * config file the GTK frontend already writes to.
+ *
+ * Additive surface (existing struct layouts and enum values
+ * unchanged):
+ *   - New `SdrCoreError` discriminant `SDR_CORE_ERR_KEY_NOT_FOUND`
+ *     = -10. Returned by the get-* commands when the requested
+ *     key is absent or present with a JSON type the reader
+ *     didn't ask for. Distinct from `SDR_CORE_ERR_INVALID_ARG`
+ *     so hosts can branch on "use default" vs surface error.
+ *   - Six new commands: `sdr_core_config_get_string` (size-then-
+ *     fill pattern, same shape as the rtl_tcp recent-commands
+ *     JSON reader), `sdr_core_config_set_string`,
+ *     `sdr_core_config_get_bool`, `sdr_core_config_set_bool`,
+ *     `sdr_core_config_get_u32`, `sdr_core_config_set_u32`.
+ *   - Auto-save semantics: writes through these entry points
+ *     are flushed to disk by the engine's auto-save thread
+ *     (started at `sdr_core_create` time). The auto-save
+ *     thread is joined automatically on `sdr_core_destroy`,
+ *     so any pending writes land before the call returns.
+ *   - In-memory mode: passing an empty `config_path_utf8` to
+ *     `sdr_core_create` is still valid (and still loads the
+ *     engine), but every config get/set entry point returns
+ *     `SDR_CORE_ERR_INVALID_ARG` with an explanatory
+ *     last-error message — no on-disk JSON to read or write.
+ *
+ * Pre-1.0 minor bumps are breaking by project convention — old
+ * 0.20 hosts must fail fast on the exact-match ABI check.
+ *
  * 0.20 — exposes the scanner Phase 1 surface (#447) at the FFI
  * boundary so the macOS SwiftUI scanner panel can drive it.
  * Additive enum + payload growth:
@@ -208,6 +239,7 @@ typedef enum SdrCoreError {
     SDR_CORE_ERR_IO             = -7, /* File / network I/O error.      */
     SDR_CORE_ERR_CONFIG         = -8, /* Config load/save error.        */
     SDR_CORE_ERR_AUTH           = -9, /* Remote service rejected credentials (RadioReference). */
+    SDR_CORE_ERR_KEY_NOT_FOUND  = -10, /* Config key absent or wrong type (#449, ABI 0.21). */
 } SdrCoreError;
 
 /*
@@ -376,13 +408,29 @@ void sdr_core_init_logging(int32_t min_level);
 /*
  * Create a new engine instance.
  *
- * `config_path_utf8` is the on-disk config file the engine should
- * eventually load from and persist to. Must be either NULL or a
- * NUL-terminated UTF-8 string. NULL and empty string ("") are
- * equivalent: both run with in-memory defaults and no persistence.
- * v1 engines accept the path and store it for future use but do
- * not yet read or write through it — passing a valid path now
- * means persistence can land in a follow-up without an ABI change.
+ * `config_path_utf8` is the on-disk JSON config file the engine
+ * loads from and persists to. Must be either NULL or a NUL-
+ * terminated UTF-8 string. NULL and empty string ("") are
+ * equivalent: both run in-memory with no persistence (the
+ * "config FFI" entry points below — `sdr_core_config_get_string`
+ * et al. — return `SDR_CORE_ERR_INVALID_ARG` in that mode, with
+ * an explanatory last-error message).
+ *
+ * When the path is non-empty (ABI 0.21+, issue #449):
+ *   - The engine loads the JSON file at create time. A missing
+ *     file is treated as `{}` — the FFI returns
+ *     `SDR_CORE_OK` and starts with an empty config.
+ *     A malformed file (invalid JSON, IO error on a file that
+ *     exists) returns `SDR_CORE_ERR_CONFIG`.
+ *   - An auto-save worker thread is spawned. Writes through
+ *     `sdr_core_config_set_*` land on disk on a periodic tick;
+ *     the worker is joined automatically on `sdr_core_destroy`,
+ *     so any pending writes flush before the destroy call
+ *     returns.
+ *   - The same JSON file is shared with the GTK frontend's
+ *     `sdr_config::ConfigManager` — opening the same path from
+ *     either consumer round-trips the same dotted keys (e.g.
+ *     `ui_sidebar_left_selected`).
  *
  * On success: writes the opaque handle to `*out_handle` and
  * returns `SDR_CORE_OK`. The handle must eventually be released
@@ -397,6 +445,10 @@ void sdr_core_init_logging(int32_t min_level);
  *   SDR_CORE_ERR_INVALID_ARG     — `out_handle` is NULL, or
  *                                 `config_path_utf8` is non-NULL
  *                                 but not valid UTF-8.
+ *   SDR_CORE_ERR_CONFIG          — the on-disk config file
+ *                                 exists but couldn't be loaded
+ *                                 (malformed JSON, permissions,
+ *                                 IO error). ABI 0.21+.
  *   SDR_CORE_ERR_INTERNAL        — DSP thread spawn failed, or a
  *                                 Rust panic crossed the boundary.
  */
@@ -1643,6 +1695,118 @@ int32_t sdr_core_unlock_scanner_channel(
     SdrCore*    handle,
     const char* name_utf8,
     uint64_t    frequency_hz
+);
+
+/* --- Config — shared `sdr-config` JSON (issue #449, ABI 0.21) --- */
+/*
+ * Read / write keys against the JSON file passed to
+ * `sdr_core_create` as `config_path_utf8`. Round-trips with the
+ * GTK frontend's `ConfigManager` — the same dotted keys (e.g.
+ * `ui_sidebar_left_selected`) work from both sides.
+ *
+ * Concurrency: every entry point takes the engine's internal
+ * `RwLock` for the duration of the call; safe from any thread.
+ * Auto-save runs on a background worker spun up at create time;
+ * it's joined automatically on `sdr_core_destroy` so any pending
+ * writes from this session land on disk before the call returns.
+ *
+ * In-memory mode: when `config_path_utf8` was empty at create
+ * time, every entry point in this section returns
+ * `SDR_CORE_ERR_INVALID_ARG` with an explanatory last-error
+ * message. Hosts should branch on that to decide whether to
+ * fall back to a Mac-local store (e.g. `UserDefaults`) or
+ * surface a "no config file configured" message.
+ */
+
+/*
+ * Read a string-valued config key.
+ *
+ * Size-then-fill pattern:
+ *   1. Pass `out_buf == NULL`, `buf_len == 0`,
+ *      `out_required` non-NULL. On success the required size
+ *      including the trailing NUL is written to
+ *      `*out_required`.
+ *   2. Allocate a buffer of at least `*out_required` bytes,
+ *      then call again with the populated buffer + length.
+ *
+ * Return codes:
+ *   - `SDR_CORE_OK`              — key found; on the fill call,
+ *                                   `out_buf` holds the NUL-
+ *                                   terminated UTF-8 value.
+ *   - `SDR_CORE_ERR_KEY_NOT_FOUND` — key absent or present with
+ *                                    a non-string JSON type.
+ *   - `SDR_CORE_ERR_INVALID_ARG`  — null handle / null key /
+ *                                    empty key / non-NULL
+ *                                    `out_buf` with `buf_len`
+ *                                    too small (the required
+ *                                    size is written to
+ *                                    `out_required` when non-
+ *                                    NULL, so the caller knows
+ *                                    how big to make the
+ *                                    retry buffer).
+ *   - `SDR_CORE_ERR_INVALID_HANDLE` — null / destroyed handle.
+ */
+int32_t sdr_core_config_get_string(
+    SdrCore*    handle,
+    const char* key_utf8,
+    char*       out_buf,
+    size_t      buf_len,
+    size_t*     out_required
+);
+
+/*
+ * Write a string-valued config key. Empty values are accepted
+ * and stored verbatim — distinct from key absence. Returns
+ * `SDR_CORE_OK` on success, `SDR_CORE_ERR_INVALID_ARG` for
+ * null pointers or non-UTF-8 input, `SDR_CORE_ERR_INVALID_HANDLE`
+ * for a null / destroyed handle.
+ */
+int32_t sdr_core_config_set_string(
+    SdrCore*    handle,
+    const char* key_utf8,
+    const char* value_utf8
+);
+
+/*
+ * Read a bool-valued config key. On success writes `*out_value`.
+ * Returns `SDR_CORE_ERR_KEY_NOT_FOUND` (and leaves `*out_value`
+ * untouched) when the key is absent or present with a non-bool
+ * JSON type — the host can keep its default safely.
+ */
+int32_t sdr_core_config_get_bool(
+    SdrCore*    handle,
+    const char* key_utf8,
+    bool*       out_value
+);
+
+/*
+ * Write a bool-valued config key.
+ */
+int32_t sdr_core_config_set_bool(
+    SdrCore*    handle,
+    const char* key_utf8,
+    bool        value
+);
+
+/*
+ * Read a u32-valued config key. Returns
+ * `SDR_CORE_ERR_KEY_NOT_FOUND` when the key is absent, present
+ * with a non-numeric JSON type, or present with a number that
+ * doesn't fit in `uint32_t`.
+ */
+int32_t sdr_core_config_get_u32(
+    SdrCore*    handle,
+    const char* key_utf8,
+    uint32_t*   out_value
+);
+
+/*
+ * Write a u32-valued config key.
+ */
+int32_t sdr_core_config_set_u32(
+    SdrCore*    handle,
+    const char* key_utf8,
+    uint32_t    value
 );
 
 /* ================================================================ */

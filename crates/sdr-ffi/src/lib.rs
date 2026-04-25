@@ -43,6 +43,7 @@
 
 pub mod audio_tap;
 pub mod command;
+pub mod config;
 pub mod enumerate;
 pub mod error;
 pub mod event;
@@ -66,6 +67,10 @@ pub use command::{
     sdr_core_set_squelch_enabled, sdr_core_set_vfo_offset, sdr_core_set_volume, sdr_core_start,
     sdr_core_start_audio_recording, sdr_core_start_iq_recording, sdr_core_stop,
     sdr_core_stop_audio_recording, sdr_core_stop_iq_recording, sdr_core_tune,
+};
+pub use config::{
+    sdr_core_config_get_bool, sdr_core_config_get_string, sdr_core_config_get_u32,
+    sdr_core_config_set_bool, sdr_core_config_set_string, sdr_core_config_set_u32,
 };
 pub use enumerate::{
     sdr_core_audio_device_count, sdr_core_audio_device_name, sdr_core_audio_device_uid,
