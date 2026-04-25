@@ -190,5 +190,6 @@ mod tests {
         assert_eq!(SdrCoreError::Io.as_int(), -7);
         assert_eq!(SdrCoreError::Config.as_int(), -8);
         assert_eq!(SdrCoreError::Auth.as_int(), -9);
+        assert_eq!(SdrCoreError::KeyNotFound.as_int(), -10);
     }
 }

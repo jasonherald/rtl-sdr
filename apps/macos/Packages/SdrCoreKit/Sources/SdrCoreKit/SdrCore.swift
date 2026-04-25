@@ -671,27 +671,63 @@ public final class SdrCore: @unchecked Sendable {
 
     /// Read a string-valued config key. `nil` when absent or
     /// stored under a non-string JSON type.
+    ///
+    /// Implementation detail: the engine's config FFI uses a
+    /// size-then-fill contract, so this is a two-pass call. We
+    /// pass `out_required` on the FILL pass too — if another
+    /// thread grew the value between the size probe and the
+    /// fill (a real possibility with the engine's auto-save
+    /// worker plus arbitrary host writes), the FFI returns
+    /// `InvalidArg` with the new required size, and we retry
+    /// with a fresh buffer once. A second growth in the same
+    /// call would be exotic; if it happened we'd give up and
+    /// return `nil` rather than loop unbounded — same policy
+    /// the rtl_tcp recent-commands reader uses.
     public func configString(key: String) -> String? {
-        // Two-pass call: ask for the size, then fill a buffer
-        // sized exactly for the value. This matches the FFI's
-        // size-then-fill contract and avoids a fixed-cap
-        // assumption (config values can be arbitrarily long).
+        // 1. Probe required size.
         var required: Int = 0
         let sizeRc = key.withCString { keyPtr in
             sdr_core_config_get_string(handle, keyPtr, nil, 0, &required)
         }
         guard sizeRc == 0 else { return nil }
-        // Allocate the buffer, fill it, decode.
-        var buf = [CChar](repeating: 0, count: required)
+        return readConfigStringFill(key: key, capacity: required)
+    }
+
+    /// Run the fill pass of the size-then-fill string read with
+    /// a single retry on inter-call growth. Split out so the
+    /// retry loop stays small and the happy-path stays a flat
+    /// `withCString { ... }`. Per `CodeRabbit` round 1 on
+    /// PR #499.
+    private func readConfigStringFill(key: String, capacity: Int) -> String? {
+        var buf = [CChar](repeating: 0, count: capacity)
+        var required: Int = 0
         let fillRc = key.withCString { keyPtr in
             buf.withUnsafeMutableBufferPointer { bufPtr in
                 sdr_core_config_get_string(
-                    handle, keyPtr, bufPtr.baseAddress, bufPtr.count, nil
+                    handle, keyPtr, bufPtr.baseAddress, bufPtr.count, &required
                 )
             }
         }
-        guard fillRc == 0 else { return nil }
-        return String(cString: buf)
+        if fillRc == 0 {
+            return String(cString: buf)
+        }
+        // Race: another writer grew the value between the size
+        // probe and this fill. Retry with the FFI's freshly
+        // reported size — but only once, to bound recursion.
+        if fillRc == SdrCoreError.Code.invalidArg.rawValue, required > capacity {
+            var retryBuf = [CChar](repeating: 0, count: required)
+            let retryRc = key.withCString { keyPtr in
+                retryBuf.withUnsafeMutableBufferPointer { bufPtr in
+                    sdr_core_config_get_string(
+                        handle, keyPtr, bufPtr.baseAddress, bufPtr.count, nil
+                    )
+                }
+            }
+            if retryRc == 0 {
+                return String(cString: retryBuf)
+            }
+        }
+        return nil
     }
 
     /// Write a string-valued config key. Empty values are

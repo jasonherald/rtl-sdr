@@ -408,13 +408,29 @@ void sdr_core_init_logging(int32_t min_level);
 /*
  * Create a new engine instance.
  *
- * `config_path_utf8` is the on-disk config file the engine should
- * eventually load from and persist to. Must be either NULL or a
- * NUL-terminated UTF-8 string. NULL and empty string ("") are
- * equivalent: both run with in-memory defaults and no persistence.
- * v1 engines accept the path and store it for future use but do
- * not yet read or write through it — passing a valid path now
- * means persistence can land in a follow-up without an ABI change.
+ * `config_path_utf8` is the on-disk JSON config file the engine
+ * loads from and persists to. Must be either NULL or a NUL-
+ * terminated UTF-8 string. NULL and empty string ("") are
+ * equivalent: both run in-memory with no persistence (the
+ * "config FFI" entry points below — `sdr_core_config_get_string`
+ * et al. — return `SDR_CORE_ERR_INVALID_ARG` in that mode, with
+ * an explanatory last-error message).
+ *
+ * When the path is non-empty (ABI 0.21+, issue #449):
+ *   - The engine loads the JSON file at create time. A missing
+ *     file is treated as `{}` — the FFI returns
+ *     `SDR_CORE_OK` and starts with an empty config.
+ *     A malformed file (invalid JSON, IO error on a file that
+ *     exists) returns `SDR_CORE_ERR_CONFIG`.
+ *   - An auto-save worker thread is spawned. Writes through
+ *     `sdr_core_config_set_*` land on disk on a periodic tick;
+ *     the worker is joined automatically on `sdr_core_destroy`,
+ *     so any pending writes flush before the destroy call
+ *     returns.
+ *   - The same JSON file is shared with the GTK frontend's
+ *     `sdr_config::ConfigManager` — opening the same path from
+ *     either consumer round-trips the same dotted keys (e.g.
+ *     `ui_sidebar_left_selected`).
  *
  * On success: writes the opaque handle to `*out_handle` and
  * returns `SDR_CORE_OK`. The handle must eventually be released
@@ -429,6 +445,10 @@ void sdr_core_init_logging(int32_t min_level);
  *   SDR_CORE_ERR_INVALID_ARG     — `out_handle` is NULL, or
  *                                 `config_path_utf8` is non-NULL
  *                                 but not valid UTF-8.
+ *   SDR_CORE_ERR_CONFIG          — the on-disk config file
+ *                                 exists but couldn't be loaded
+ *                                 (malformed JSON, permissions,
+ *                                 IO error). ABI 0.21+.
  *   SDR_CORE_ERR_INTERNAL        — DSP thread spawn failed, or a
  *                                 Rust panic crossed the boundary.
  */
