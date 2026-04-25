@@ -452,6 +452,25 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         toast_overlay: toast_overlay.downgrade(),
     });
 
+    // Header play/stop button as a set-and-forget hook for any
+    // wiring that needs to start or stop the radio without bypassing
+    // the visible toggle (currently auto-record-on-pass; same idiom
+    // would suit any future "schedule the radio on" feature). Going
+    // through `set_active` reuses the existing
+    // `play_button.connect_toggled` handler — the single place that
+    // updates `state.is_running`, sends `UiToDsp::Start` / `Stop`,
+    // and swaps the icon — so the DSP, `AppState`, and header
+    // button stay aligned. `set_active` is idempotent: GTK only
+    // emits `toggled` on a real state change, so a redundant
+    // `set_playing(true)` while the radio is already running is a
+    // no-op (no duplicate Start dispatch).
+    let set_playing: Rc<dyn Fn(bool)> = {
+        let play_btn = play_button.clone();
+        Rc::new(move |should_play| {
+            play_btn.set_active(should_play);
+        })
+    };
+
     connect_sidebar_panels(
         &panels,
         &state,
@@ -464,6 +483,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &favorites_handle,
         &scanner_force_disable,
         &volume_button,
+        &set_playing,
     );
 
     // Seed the scanner with the persisted bookmark list on
@@ -2657,6 +2677,7 @@ fn connect_sidebar_panels(
     favorites_header: &FavoritesHeaderHandle,
     scanner_force_disable: &Rc<ScannerForceDisable>,
     volume_button: &gtk4::ScaleButton,
+    set_playing: &Rc<dyn Fn(bool)>,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -2770,6 +2791,7 @@ fn connect_sidebar_panels(
         toast_overlay,
         spectrum_handle,
         &tune_to_satellite,
+        set_playing,
     );
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
@@ -8410,6 +8432,7 @@ fn connect_satellites_panel(
     toast_overlay: &adw::ToastOverlay,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    set_playing: &Rc<dyn Fn(bool)>,
 ) {
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_panel::{
@@ -8885,6 +8908,7 @@ fn connect_satellites_panel(
     let interpret_action: Rc<dyn Fn(RecorderAction)> = {
         let state_a = Rc::clone(state);
         let tune_a = Rc::clone(tune_to_satellite);
+        let set_playing_a = Rc::clone(set_playing);
         // Weak ref for the same lifecycle reason as
         // `parent_provider_for_recorder` — strong clone would pin
         // the toast overlay alive past window close.
@@ -8905,21 +8929,29 @@ fn connect_satellites_panel(
                 tracing::info!(
                     "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz",
                 );
-                // If the radio isn't running yet, kick it on so
-                // the AptDecoder actually receives audio. Without
-                // this, auto-record arms at AOS but no `AptLine`s
-                // ever flow — the pass completes with an empty
-                // image. The pre-AOS `was_running == false` is
-                // captured in `SavedTune` so the LOS restore can
-                // stop the radio again, returning to whatever
-                // state the user left it in.
-                if !state_a.is_running.get() {
-                    tracing::info!("auto-record: starting source (was stopped pre-AOS)");
-                    state_a.send_dsp(UiToDsp::Start);
-                    state_a.is_running.set(true);
-                }
+                // Drive Start through the header play button —
+                // its `connect_toggled` handler is the single place
+                // that updates `state.is_running`, dispatches
+                // `UiToDsp::Start`, and swaps the play/stop icon.
+                // `set_active` is a no-op when the radio is
+                // already running, so this is safe to call
+                // unconditionally without a duplicate Start.
+                // The pre-AOS `was_running` flag (captured in
+                // `SavedTune` by the 1 Hz tick before this action
+                // fires) drives the corresponding LOS-side stop.
+                set_playing_a(true);
                 tune_a(freq_hz, mode, bandwidth_hz);
                 crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
+                // Clear the canvas at AOS so a back-to-back pass
+                // (e.g. NOAA 18 → NOAA 19 with overlapping
+                // viewer sessions) starts on a clean image. The
+                // viewer was either just opened above (already
+                // empty) or carried over from a previous pass —
+                // either way, an explicit clear keeps the image
+                // we're about to save scoped to *this* pass.
+                if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                    view.clear();
+                }
             }
             RecorderAction::SavePng(path) => {
                 // Toast based on the *actual* export outcome
@@ -8974,11 +9006,12 @@ fn connect_satellites_panel(
                 // who explicitly turned playback off during the
                 // pass (rare) loses that intent here, but the
                 // expected case (set-and-forget overnight) gets
-                // the right behaviour.
+                // the right behaviour. Routed through
+                // `set_playing` (header play button) so the icon,
+                // `state.is_running`, and DSP all move together.
                 if !saved.was_running {
                     tracing::info!("auto-record: stopping source (was stopped pre-AOS)");
-                    state_a.send_dsp(UiToDsp::Stop);
-                    state_a.is_running.set(false);
+                    set_playing_a(false);
                 }
             }
             RecorderAction::Toast { message, kind } => {

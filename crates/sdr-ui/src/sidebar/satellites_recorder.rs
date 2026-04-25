@@ -230,6 +230,19 @@ impl AutoRecorder {
             if pass.max_elevation_deg < AUTO_RECORD_MIN_ELEV_DEG {
                 continue;
             }
+            // Skip already-finished passes. A stale displayed-pass
+            // snapshot (or a panel that hasn't recomputed since
+            // the user resumed from suspend) can leave entries in
+            // the list whose `end` is already in the past. Without
+            // this guard the loop below would emit
+            // `StartAutoRecord` for a finished pass — the UI
+            // would briefly retune + open the viewer, then save
+            // an empty PNG on the next tick. Pass list is sorted
+            // by start, so we just `continue` rather than `break`
+            // — there could be a future pass behind a stale one.
+            if pass.end <= now {
+                continue;
+            }
             let secs_to_aos = (pass.start - now).num_seconds();
             if !(0..=AOS_LEAD_SECS).contains(&secs_to_aos) && pass.start > now {
                 // Not yet within the lead-in window. The pass list
@@ -458,6 +471,37 @@ mod tests {
         let actions = r.tick(now, &[pass], true, default_tune());
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn idle_skips_passes_already_past_los() {
+        // Suspend / resume: the laptop sleeps mid-session and wakes
+        // up after a pass has already ended. The displayed-pass
+        // list may still carry the finished entry until the next
+        // recompute fires. The recorder must NOT arm for a
+        // finished pass — otherwise we'd briefly retune + open
+        // the viewer and save an empty PNG on the next tick.
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        // Pass ended 30 seconds ago.
+        let mut pass = synthetic_noaa19(now, -660, 600, 50.0); // started -660 s ago, ended -60 s ago
+        // Sanity: this pass is in the past from `now`'s perspective.
+        assert!(pass.end < now);
+        let actions = r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        assert!(matches!(r.state(), State::Idle));
+        assert!(actions.is_empty());
+        // Mutating the pass to make peak elevation match the
+        // threshold + extending end past now would arm — pinning
+        // that the only thing keeping us idle was the LOS check.
+        pass.end = now + ChronoDuration::seconds(720);
+        pass.start = now + ChronoDuration::seconds(3);
+        let actions = r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        assert!(matches!(r.state(), State::BeforePass { .. }));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartAutoRecord { .. }))
+        );
     }
 
     #[test]
