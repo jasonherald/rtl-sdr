@@ -16,7 +16,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, SystemTime};
+
+/// Process-wide monotonic counter for unique tempfile names. Combined
+/// with the process pid below it gives every concurrent write its own
+/// path, so even two threads of the same process can't trample each
+/// other's in-flight cache replacement.
+static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Default cache freshness window. TLEs from Celestrak are updated
 /// every few hours but propagation accuracy stays well within SGP4's
@@ -192,10 +199,22 @@ impl TleCache {
         let stale = is_stale(&path, self.refresh_max_age);
 
         if stale {
-            // Try a refresh. If it succeeds, write to disk and return
-            // the new text; if it fails but a stale cache exists, use
-            // that; otherwise propagate the fetch error.
-            match self.fetch(source) {
+            // Try a refresh. If it succeeds AND the body actually
+            // looks like a TLE file, write to disk and return the new
+            // text. If it fails (or returns something that ISN'T a
+            // TLE — captive portal, HTML 5xx page, proxy error), fall
+            // back to whatever stale copy the cache has.
+            let fetch_result = self.fetch(source).and_then(|text| {
+                if has_any_tle_pair(&text) {
+                    Ok(text)
+                } else {
+                    Err(TleCacheError::Fetch(
+                        "response body did not contain any valid TLE pair (captive portal? HTML error page?)"
+                            .to_string(),
+                    ))
+                }
+            });
+            match fetch_result {
                 Ok(text) => {
                     // Best-effort cache write — a failed write
                     // (read-only fs, disk full, permissions) shouldn't
@@ -296,12 +315,14 @@ impl TleCache {
                 source: e,
             })?;
         }
-        // Per-process tempfile so two concurrent processes hitting the
-        // same cache dir don't trample each other's in-flight write.
-        // Two threads in the same process are still racy on the tmp
-        // file, but our once-a-day refresh cadence makes that
-        // essentially impossible to hit in practice.
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        // Per-call tempfile name: pid + a process-wide atomic counter.
+        // pid disambiguates between concurrent processes hitting the
+        // same cache dir, the counter disambiguates between concurrent
+        // threads of the same process. Either way, every in-flight
+        // write owns its own tempfile path, so no thread can rename
+        // a half-written file out from under another.
+        let tmp_id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{tmp_id}", std::process::id()));
         std::fs::write(&tmp, text).map_err(|e| TleCacheError::Io {
             path: tmp.clone(),
             source: e,
@@ -401,6 +422,44 @@ pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
         i += 1;
     }
     None
+}
+
+/// Does `text` contain at least one structurally-consistent TLE pair?
+/// Used as a sanity check on fetched bodies before they replace the
+/// cache: a captive portal, proxy error page, or HTML maintenance
+/// response from upstream would otherwise poison the on-disk cache
+/// and break the offline fallback.
+///
+/// "Structurally consistent" means: a `1 NNNNN ...` line followed
+/// (with any number of intervening blank lines stripped) by a
+/// `2 NNNNN ...` line where both lines parse a NORAD id and the ids
+/// match. Doesn't validate checksums or any orbital fields — those
+/// would catch more, but the cheap structural check is enough to
+/// reject HTML responses (no `1 ` prefix at the right offset).
+#[must_use]
+#[allow(clippy::similar_names)] // line1/line2 names match TLE-spec terminology
+pub fn has_any_tle_pair(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    let mut i = 0_usize;
+    while i + 1 < lines.len() {
+        let line1 = lines[i];
+        let line2 = lines[i + 1];
+        if line1.starts_with("1 ")
+            && line2.starts_with("2 ")
+            && let (Some(id1), Some(id2)) =
+                (norad_id_from_tle_line(line1), norad_id_from_tle_line(line2))
+            && id1 == id2
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// 0-indexed start of the NORAD catalog number field in TLE line 1
@@ -631,6 +690,39 @@ SOMETHING
     }
 
     #[test]
+    fn has_any_tle_pair_accepts_real_tle_text() {
+        assert!(has_any_tle_pair(SAMPLE_TLE_3LINE));
+        assert!(has_any_tle_pair(SAMPLE_TLE_2LINE));
+    }
+
+    #[test]
+    fn has_any_tle_pair_rejects_html_error_pages() {
+        // What a captive portal / proxy 5xx looks like in practice.
+        let html = "\
+<html><head><title>503 Service Unavailable</title></head>
+<body><h1>Service Unavailable</h1>
+<p>The server is temporarily unable to service your request.</p>
+</body></html>
+";
+        assert!(!has_any_tle_pair(html));
+    }
+
+    #[test]
+    fn has_any_tle_pair_rejects_truncated_or_garbage_text() {
+        assert!(!has_any_tle_pair(""));
+        assert!(!has_any_tle_pair("just some random non-TLE text\n"));
+        // Has a `1 NNNNN` line but no matching `2 NNNNN` line — half a
+        // pair only, must not pass.
+        assert!(!has_any_tle_pair(
+            "1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753\n"
+        ));
+        // Mismatched-id pair — line1 NORAD 5, line2 NORAD 25544.
+        assert!(!has_any_tle_pair(
+            "1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753\n2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234276\n"
+        ));
+    }
+
+    #[test]
     fn write_cache_atomic_rename_lands_file_at_final_path() {
         // Sanity test for the atomic-rename path: write some text,
         // verify the final cache file exists and contains exactly the
@@ -644,15 +736,17 @@ SOMETHING
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "hello cache");
         // No leftover tempfiles in the cache directory.
+        // Tempfiles look like `noaa.tmp.12345.0` — `Path::extension()`
+        // returns the *last* segment (`"0"`), not `"tmp"`, so we have
+        // to scan the filename string for the `.tmp.` infix instead.
         let leftover_tmp_count = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
                 entry
-                    .path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.starts_with("tmp"))
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp."))
             })
             .count();
         assert_eq!(leftover_tmp_count, 0);
