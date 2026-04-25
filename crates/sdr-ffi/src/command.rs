@@ -1197,6 +1197,109 @@ pub unsafe extern "C" fn sdr_core_set_fft_rate(handle: *mut SdrCore, fps: f64) -
     }
 }
 
+// ============================================================
+//  Scanner — #447 / ABI 0.20
+// ============================================================
+//
+// Master enable + per-channel session lockout / unlock. The
+// channel-list projection (`UpdateScannerChannels`) is NOT
+// exposed here yet — that follows when the macOS bookmark
+// layer grows the `scan_enabled` / `priority` fields the Linux
+// `Bookmark` already has (#490). Until then, the scanner has
+// no channels to rotate through and the master switch flips
+// without observable effect; the SwiftUI panel documents this
+// in its footer.
+
+/// Helper: read a borrowed `*const c_char` channel name into a
+/// validated `String` for `LockoutScannerChannel` /
+/// `UnlockScannerChannel` dispatch. Rejects null pointers and
+/// non-UTF-8 input with `SdrCoreError::InvalidArg`. Empty
+/// strings are accepted — the engine treats them as a real
+/// (if unusual) channel name.
+fn read_channel_name(name_utf8: *const c_char, fn_label: &str) -> Result<String, SdrCoreError> {
+    if name_utf8.is_null() {
+        set_last_error(format!("{fn_label}: name pointer is null"));
+        return Err(SdrCoreError::InvalidArg);
+    }
+    // SAFETY: caller contract — name_utf8 is a NUL-terminated
+    // C string for the duration of this call.
+    let cstr = unsafe { CStr::from_ptr(name_utf8) };
+    let Ok(s) = cstr.to_str() else {
+        set_last_error(format!("{fn_label}: name is not valid UTF-8"));
+        return Err(SdrCoreError::InvalidArg);
+    };
+    Ok(s.to_owned())
+}
+
+/// Master scanner enable / disable. Routes to
+/// `UiToDsp::SetScannerEnabled`. Tripping this on with no
+/// projected channels leaves the engine in `Idle` (visible
+/// via `SDR_EVT_SCANNER_STATE_CHANGED`); the host doesn't
+/// need to special-case it. Per #447 (ABI 0.20).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_set_scanner_enabled(handle: *mut SdrCore, enabled: bool) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            send(core, UiToDsp::SetScannerEnabled(enabled))
+        })
+    }
+}
+
+/// Lock out the channel identified by `(name, frequency_hz)`
+/// for the rest of the scanner session. Routes to
+/// `UiToDsp::LockoutScannerChannel`.
+///
+/// `name_utf8` is a NUL-terminated UTF-8 string borrowed for
+/// the duration of the call (the scanner state machine clones
+/// the name into its `HashSet<ChannelKey>`). Per #447 (ABI 0.20).
+///
+/// # Safety
+///
+/// `handle` must be either null or a pointer previously
+/// returned by `sdr_core_create` and not yet destroyed.
+/// `name_utf8` must be either null or a valid pointer to a
+/// NUL-terminated UTF-8 string for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_lockout_scanner_channel(
+    handle: *mut SdrCore,
+    name_utf8: *const c_char,
+    frequency_hz: u64,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let name = read_channel_name(name_utf8, "sdr_core_lockout_scanner_channel")?;
+            send(
+                core,
+                UiToDsp::LockoutScannerChannel(sdr_scanner::ChannelKey { name, frequency_hz }),
+            )
+        })
+    }
+}
+
+/// Clear a session lockout for `(name, frequency_hz)`. Routes
+/// to `UiToDsp::UnlockScannerChannel`. No-op if the channel
+/// wasn't locked out. Per #447 (ABI 0.20).
+///
+/// # Safety
+///
+/// Same contract as `sdr_core_lockout_scanner_channel`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_unlock_scanner_channel(
+    handle: *mut SdrCore,
+    name_utf8: *const c_char,
+    frequency_hz: u64,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            let name = read_channel_name(name_utf8, "sdr_core_unlock_scanner_channel")?;
+            send(
+                core,
+                UiToDsp::UnlockScannerChannel(sdr_scanner::ChannelKey { name, frequency_hz }),
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

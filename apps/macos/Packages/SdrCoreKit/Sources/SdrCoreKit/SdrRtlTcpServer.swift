@@ -118,6 +118,20 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
         }
 
         fileprivate func toC() -> SdrRtlTcpServerConfig {
+            // ABI 0.16 (#392 / `listener_cap`), 0.17 (#394 /
+            // `auth_key` + `auth_key_len`), and 0.19 (#400 /
+            // `has_compression` + `compression`) appended fields
+            // at the tail. The Mac side hasn't surfaced auth /
+            // listener-cap / compression UI yet, so we pass the
+            // documented zero-init defaults that preserve pre-
+            // ABI-0.16 behaviour:
+            //   - listener_cap = 0     → crate default (10)
+            //   - auth_key = NULL,
+            //     auth_key_len = 0     → auth disabled (LAN trust)
+            //   - has_compression = false → CodecMask::NONE_ONLY
+            // When the Mac UI grows controls for any of these,
+            // promote the matching field to a typed Swift
+            // property and forward it from `Config`.
             SdrRtlTcpServerConfig(
                 bind_address: bindAddress.rawValue,
                 port: port,
@@ -128,51 +142,47 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
                 initial_gain_tenths_db: initialGainTenthsDb,
                 initial_ppm: initialPpm,
                 initial_bias_tee: initialBiasTee,
-                initial_direct_sampling: initialDirectSampling.rawValue
+                initial_direct_sampling: initialDirectSampling.rawValue,
+                listener_cap: 0,
+                auth_key: nil,
+                auth_key_len: 0,
+                has_compression: false,
+                compression: 0
             )
         }
     }
 
-    /// Snapshot of server stats. Maps `SdrRtlTcpServerStats` +
-    /// the two string outputs into one value for Swift callers.
+    /// Snapshot of server-wide stats. Maps the post-#391
+    /// (multi-client) `SdrRtlTcpServerStats` shape — aggregates
+    /// only — plus the tuner-name string output into one value.
+    ///
+    /// **Per-client state lives elsewhere now.** Pre-#391 this
+    /// struct carried `hasClient` / `connectedClientAddr` /
+    /// `currentFreqHz` etc. for the single connected client.
+    /// The engine became multi-client in #391; that detail
+    /// moved into `SdrRtlTcpClientInfo` rows fetched through
+    /// `sdr_rtltcp_server_client_list`. The Mac SwiftUI surface
+    /// for that list (per-client rows in the panel + the
+    /// `clientList()` Swift wrapper) lands in #496 — until
+    /// then the panel renders aggregates only.
     public struct Stats: Sendable, Equatable {
-        public var hasClient: Bool
-        public var connectedClientAddr: String
-        public var uptimeSecs: Double
-        public var bytesSent: UInt64
-        public var buffersDropped: UInt64
-        public var currentFreqHz: UInt32
-        public var currentSampleRateHz: UInt32
-        public var currentGainTenthsDb: Int32
-        public var currentGainAuto: Bool
-        /// `true` once the client has issued at least one
-        /// `SetTunerGain` command this session. Tracked
-        /// independently from the mode flag below so hosts can
-        /// distinguish "genuine 0 dB manual gain" from "client
-        /// hasn't asked yet." Per `CodeRabbit` round 7 on
-        /// PR #360.
-        public var hasCurrentGainValue: Bool
-        /// `true` once the client has issued at least one
-        /// `SetGainMode` command this session. Companion to
-        /// `currentGainAuto` — without this flag a `false`
-        /// reading would be indistinguishable from "no mode
-        /// requested yet."
-        public var hasCurrentGainMode: Bool
+        /// Number of clients connected at the moment of the
+        /// snapshot. Membership may change between this read
+        /// and a follow-up `clientList()` call (#496).
+        public var connectedCount: UInt32
+        /// Cumulative bytes fanned out across all clients over
+        /// the server's lifetime. Monotonic.
+        public var totalBytesSent: UInt64
+        /// Cumulative buffer drops across all clients. Monotonic.
+        public var totalBuffersDropped: UInt64
+        /// Cumulative count of clients accepted over the
+        /// server's lifetime. Persists across disconnects.
+        public var lifetimeAccepted: UInt64
+        /// Tuner family name reported by the dongle. Non-empty
+        /// for the entire server lifetime once `start` succeeded.
         public var tunerName: String
+        /// Number of discrete gain steps the tuner advertises.
         public var gainCount: UInt32
-        public var recentCommandsCount: UInt32
-    }
-
-    /// One row of the recent-commands ring — the JSON schema
-    /// the FFI produces.
-    public struct RecentCommand: Sendable, Equatable, Decodable {
-        public let op: String
-        public let secondsAgo: Double
-
-        enum CodingKeys: String, CodingKey {
-            case op
-            case secondsAgo = "seconds_ago"
-        }
     }
 
     // ----------------------------------------------------------
@@ -223,111 +233,49 @@ public final class SdrRtlTcpServer: @unchecked Sendable {
     //  Snapshots
     // ----------------------------------------------------------
 
-    /// Capacity for the client-addr / tuner-name buffers
-    /// handed to `sdr_rtltcp_server_stats`. 64 bytes comfortably
-    /// fits any IPv6 + port string and any RTL-SDR tuner name.
-    private static let statsStringBufferLen = 64
+    /// Capacity for the tuner-name buffer handed to
+    /// `sdr_rtltcp_server_stats`. 64 bytes comfortably fits any
+    /// RTL-SDR tuner family name. The pre-#391 single-client
+    /// peer-address output buffer is gone — peer addresses live
+    /// on per-client `SdrRtlTcpClientInfo` rows now (#496).
+    private static let statsTunerNameBufferLen = 64
 
-    /// Capture a stats snapshot. Throws `SdrCoreError` on a
-    /// stopped server or other FFI error.
+    /// Capture a server-wide stats snapshot. Throws
+    /// `SdrCoreError` on a stopped server or other FFI error.
     ///
     /// The full FFI call runs inside the handle-box lock so a
-    /// concurrent `stop()` can't free the pointer mid-call. Per
-    /// `CodeRabbit` round 1 on PR #360.
+    /// concurrent `stop()` can't free the pointer mid-call —
+    /// same pattern as the engine's own handle wrappers.
+    ///
+    /// Per-client state (peer address, current tuning, recent
+    /// commands) is no longer in this snapshot — fetch it via
+    /// the upcoming `clientList()` / per-client recent-commands
+    /// surface (#496).
     public func stats() throws -> Stats {
         let result: Stats? = try handleBox.withHandle { handle -> Stats in
             var cStats = SdrRtlTcpServerStats()
-            var clientBuf = [CChar](repeating: 0, count: Self.statsStringBufferLen)
-            var tunerBuf = [CChar](repeating: 0, count: Self.statsStringBufferLen)
-            let rc = clientBuf.withUnsafeMutableBufferPointer { clientPtr in
-                tunerBuf.withUnsafeMutableBufferPointer { tunerPtr in
-                    sdr_rtltcp_server_stats(
-                        handle,
-                        &cStats,
-                        clientPtr.baseAddress,
-                        clientPtr.count,
-                        tunerPtr.baseAddress,
-                        tunerPtr.count
-                    )
-                }
+            var tunerBuf = [CChar](repeating: 0, count: Self.statsTunerNameBufferLen)
+            let rc = tunerBuf.withUnsafeMutableBufferPointer { tunerPtr in
+                sdr_rtltcp_server_stats(
+                    handle,
+                    &cStats,
+                    tunerPtr.baseAddress,
+                    tunerPtr.count
+                )
             }
             try checkRc(rc)
             return Stats(
-                hasClient: cStats.has_client,
-                connectedClientAddr: cStringToSwiftString(clientBuf),
-                uptimeSecs: cStats.uptime_secs,
-                bytesSent: cStats.bytes_sent,
-                buffersDropped: cStats.buffers_dropped,
-                currentFreqHz: cStats.current_freq_hz,
-                currentSampleRateHz: cStats.current_sample_rate_hz,
-                currentGainTenthsDb: cStats.current_gain_tenths_db,
-                currentGainAuto: cStats.current_gain_auto,
-                hasCurrentGainValue: cStats.has_current_gain_value,
-                hasCurrentGainMode: cStats.has_current_gain_mode,
+                connectedCount: cStats.connected_count,
+                totalBytesSent: cStats.total_bytes_sent,
+                totalBuffersDropped: cStats.total_buffers_dropped,
+                lifetimeAccepted: cStats.lifetime_accepted,
                 tunerName: cStringToSwiftString(tunerBuf),
-                gainCount: cStats.gain_count,
-                recentCommandsCount: cStats.recent_commands_count
+                gainCount: cStats.gain_count
             )
         }
         guard let stats = result else {
             throw SdrCoreError(code: .notRunning, message: "server already stopped")
         }
         return stats
-    }
-
-    /// Fetch the recent-commands ring as decoded rows. Calls
-    /// through `sdr_rtltcp_server_recent_commands_json` with a
-    /// start-4 KiB buffer and retries if the server reports it
-    /// needs more. Decode failures (bad UTF-8, malformed JSON)
-    /// propagate as `SdrCoreError` — an empty array is a valid
-    /// "no commands" result and shouldn't mask a real
-    /// serialization bug. Per `CodeRabbit` round 1 on PR #360.
-    public func recentCommands() throws -> [RecentCommand] {
-        let result: [RecentCommand]? = try handleBox.withHandle { handle -> [RecentCommand] in
-            var capacity = 4096
-            while true {
-                var buf = [CChar](repeating: 0, count: capacity)
-                var required: Int = 0
-                let rc = buf.withUnsafeMutableBufferPointer { ptr in
-                    sdr_rtltcp_server_recent_commands_json(
-                        handle, ptr.baseAddress, ptr.count, &required
-                    )
-                }
-                // OK (0): buffer was big enough — parse + return.
-                if rc == 0 {
-                    let json = cStringToSwiftString(buf)
-                    guard let data = json.data(using: .utf8) else {
-                        throw SdrCoreError(
-                            code: .internal,
-                            message: "recent-commands JSON is not valid UTF-8"
-                        )
-                    }
-                    do {
-                        return try JSONDecoder().decode([RecentCommand].self, from: data)
-                    } catch {
-                        throw SdrCoreError(
-                            code: .internal,
-                            message: "recent-commands JSON decode failed: \(error)"
-                        )
-                    }
-                }
-                // Too-small-buffer contract: `InvalidArg` with
-                // `required > buf_len`. Any other combination is
-                // a real failure and propagates.
-                if rc == SdrCoreError.Code.invalidArg.rawValue && required > capacity {
-                    // Retry with the server's reported required
-                    // size + a little slack so a race that
-                    // appends a command between calls doesn't
-                    // loop twice.
-                    capacity = required + 128
-                    continue
-                }
-                try checkRc(rc)
-            }
-        }
-        guard let commands = result else {
-            throw SdrCoreError(code: .notRunning, message: "server already stopped")
-        }
-        return commands
     }
 }

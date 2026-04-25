@@ -274,6 +274,53 @@ final class CoreModel {
     var notchFrequencyHz: Float = 1_000
 
     // ==========================================================
+    //  Scanner — issue #447 (ABI 0.20)
+    //
+    //  All four fields are engine-driven: the Mac side issues
+    //  `setScannerEnabled(_:)` and reads back the resulting
+    //  state via the `scannerStateChanged` /
+    //  `scannerActiveChannelChanged` event arms. We don't flip
+    //  these locally — the engine is authoritative.
+    //
+    //  Bookmark → `ScannerChannel` projection isn't wired yet;
+    //  flipping `scannerEnabled` true with no channels leaves
+    //  `scannerState == .idle`. Tracked under #490 (per-bookmark
+    //  scan/priority) — the panel footer surfaces the gap.
+    //
+    //  `scannerDefaultDwellMs` / `scannerDefaultHangMs` ARE
+    //  stored on this model (not engine-side) — they're "default
+    //  fallbacks the host folds into each `ScannerChannel` at
+    //  projection time", same pattern the Linux side uses.
+    //  Persisted via `UserDefaults` at write time.
+    // ==========================================================
+
+    /// Scanner master switch. Set via `setScannerEnabled(_:)`;
+    /// the engine echoes the resulting phase via
+    /// `scannerStateChanged` (which lands in `scannerState`).
+    var scannerEnabled: Bool = false
+
+    /// Scanner phase as last reported by the engine. Drives the
+    /// panel's State row and the lockout button's visibility
+    /// (button shows only when `scannerActiveChannel != nil`).
+    var scannerState: ScannerState = .idle
+
+    /// Channel the scanner is currently latched on, or `nil` when
+    /// idle. Drives the Channel row's subtitle and the lockout
+    /// button's identity (passed to
+    /// `lockoutScannerChannel(name:frequencyHz:)`).
+    var scannerActiveChannel: ScannerActiveChannel? = nil
+
+    /// Default per-channel settle time in ms. The host folds
+    /// this into each projected `ScannerChannel`'s `dwell_ms`
+    /// when the bookmark doesn't carry an override. Range
+    /// matches the Linux side (`DWELL_MIN_MS`..`DWELL_MAX_MS`).
+    var scannerDefaultDwellMs: Int = 100
+
+    /// Default per-channel hang time in ms. Same projection-time
+    /// fallback contract as `scannerDefaultDwellMs`.
+    var scannerDefaultHangMs: Int = 2_000
+
+    // ==========================================================
     //  Audio
     // ==========================================================
 
@@ -369,12 +416,17 @@ final class CoreModel {
     }
 
     /// Most-recent poll snapshot of server stats. `nil` while
-    /// the server isn't running.
+    /// the server isn't running. Aggregates only — per-client
+    /// state moved to the multi-client surface in #391 and
+    /// lands on the Mac side in #496.
     var rtlTcpServerStats: SdrRtlTcpServer.Stats? = nil
 
-    /// Last ~50 commands the client issued, newest first. Fed
-    /// by the poll task that also refreshes `rtlTcpServerStats`.
-    var rtlTcpRecentCommands: [SdrRtlTcpServer.RecentCommand] = []
+    // The pre-#391 single-client `rtlTcpRecentCommands` ring
+    // is gone — recent-commands tracking is per-client now and
+    // requires the multi-client list surface (#496) to map a
+    // client id back to its commands. The panel renders the
+    // server-wide aggregates `connectedCount` / `lifetimeAccepted`
+    // / `totalBytesSent` / `totalBuffersDropped` instead.
 
     /// Last error surfaced from a rtl_tcp server start or poll
     /// attempt. Cleared on successful start; mirrors into a
@@ -814,6 +866,23 @@ final class CoreModel {
             networkSinkProtocol = NetworkProtocol(rawValue: raw) ?? .tcpServer
         }
 
+        // Restore scanner timing defaults — issue #447.
+        // Out-of-range values are silently ignored (the Rust side
+        // also clamps); same defensive pattern as the network
+        // sink port restore above.
+        if UserDefaults.standard.object(forKey: Self.scannerDefaultDwellMsDefaultsKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.scannerDefaultDwellMsDefaultsKey)
+            if (50...500).contains(stored) {
+                scannerDefaultDwellMs = stored
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.scannerDefaultHangMsDefaultsKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.scannerDefaultHangMsDefaultsKey)
+            if (500...5_000).contains(stored) {
+                scannerDefaultHangMs = stored
+            }
+        }
+
         // Seed the RadioReference credentials flag from the
         // keyring so the sidebar panel / settings pane render
         // correctly on first paint without waiting for a user
@@ -1039,6 +1108,43 @@ final class CoreModel {
             // disconnect / retry buttons gate on it. Per issue
             // #326.
             rtlTcpConnectionState = state
+        case .scannerStateChanged(let state):
+            // Engine is authoritative for the scanner phase —
+            // its state machine fires this on every Idle/Retuning
+            // /Dwelling/Listening/Hanging transition. The panel
+            // reads `scannerState` directly to render the State
+            // row.
+            scannerState = state
+            // Idle is the engine's "rotation parked" sentinel.
+            // The active channel readout could still be lying in
+            // the previous latched value if `scannerEnabled` was
+            // toggled off without the engine emitting a
+            // matching null active-channel event first; clear
+            // proactively so the panel doesn't keep showing a
+            // stale Channel row while State says Off.
+            if state == .idle {
+                scannerActiveChannel = nil
+            }
+        case .scannerActiveChannelChanged(let channel):
+            // `nil` means "scanner returned to idle / no latched
+            // channel" — the panel's Channel row resets to its
+            // placeholder. Non-nil carries the bookmark name +
+            // frequency the lockout button targets.
+            scannerActiveChannel = channel
+        case .scannerEmptyRotation:
+            // All projected channels are absent or locked out —
+            // the engine has exhausted its rotation. Currently a
+            // no-op on this side; a follow-up could surface a
+            // toast. The panel's State row reads `.idle` either
+            // way once the engine settles.
+            break
+        case .scannerMutexStopped(let reason):
+            // The scanner ↔ recording / transcription mutex
+            // fired. Currently a no-op: the panel state will
+            // reflect the actual outcome via the next
+            // `scannerStateChanged` / recording-event pair. A
+            // follow-up could surface `reason.toastMessage` here.
+            _ = reason
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -1527,6 +1633,68 @@ final class CoreModel {
     }
 
     // ----------------------------------------------------------
+    //  Scanner — issue #447 (ABI 0.20)
+    // ----------------------------------------------------------
+
+    /// Toggle the scanner master switch. Optimistic — we flip
+    /// `scannerEnabled` immediately so the UI doesn't lag, but
+    /// the engine's `scannerStateChanged` reply is authoritative
+    /// for the resulting phase (`scannerState`). Until #490
+    /// lands the per-bookmark `scan_enabled` projection,
+    /// flipping this on with no scan-enabled bookmarks leaves
+    /// the engine in `.idle` (no rotation to drive), and the
+    /// panel's State row reflects that.
+    func setScannerEnabled(_ on: Bool) {
+        scannerEnabled = on
+        capture { try core?.setScannerEnabled(on) }
+    }
+
+    /// Lock out the channel currently latched (if any) for the
+    /// rest of the scanner session. No-op when the scanner
+    /// isn't latched on a channel. The engine's lockout set is
+    /// session-scoped — disabling the scanner clears it.
+    func lockoutCurrentScannerChannel() {
+        guard let channel = scannerActiveChannel else { return }
+        capture {
+            try core?.lockoutScannerChannel(
+                name: channel.name,
+                frequencyHz: channel.frequencyHz
+            )
+        }
+    }
+
+    /// Update the default settle time per-channel (ms). The
+    /// host applies this at projection time; engine doesn't
+    /// store a separate "default" — it sees a fully-resolved
+    /// `dwell_ms` on each `ScannerChannel`. Persisted via
+    /// `UserDefaults` so the choice survives relaunches.
+    func setScannerDefaultDwellMs(_ ms: Int) {
+        scannerDefaultDwellMs = ms
+        UserDefaults.standard.set(ms, forKey: Self.scannerDefaultDwellMsDefaultsKey)
+    }
+
+    /// Update the default hang time per-channel (ms). Same
+    /// projection-time fallback contract as the dwell setter.
+    func setScannerDefaultHangMs(_ ms: Int) {
+        scannerDefaultHangMs = ms
+        UserDefaults.standard.set(ms, forKey: Self.scannerDefaultHangMsDefaultsKey)
+    }
+
+    /// `UserDefaults` key for the scanner default-dwell (ms).
+    /// Mirrors the Linux config key
+    /// (`crates/sdr-ui/src/sidebar/scanner_panel.rs`'s
+    /// `CONFIG_KEY_DEFAULT_DWELL_MS`); we don't share storage
+    /// with the GTK side yet (separate `UserDefaults` /
+    /// `sdr-config`) but the key name stays identical so a
+    /// future shared-config layer can round-trip without
+    /// renaming.
+    static let scannerDefaultDwellMsDefaultsKey = "scanner_default_dwell_ms"
+
+    /// `UserDefaults` key for the scanner default-hang (ms).
+    /// Same name-parity rationale as the dwell key.
+    static let scannerDefaultHangMsDefaultsKey = "scanner_default_hang_ms"
+
+    // ----------------------------------------------------------
     //  Source (advanced) — #246
     // ----------------------------------------------------------
 
@@ -1861,7 +2029,6 @@ final class CoreModel {
         // Per `CodeRabbit` round 7 on PR #362.
         rtlTcpServerStopping = true
         rtlTcpServerStats = nil
-        rtlTcpRecentCommands = []
 
         let prior = rtlTcpServerLifecycleTask
         let task = Task { [weak self] in
@@ -1936,7 +2103,6 @@ final class CoreModel {
         // is released. Per `CodeRabbit` round 7 on PR #362.
         rtlTcpServerStopping = false
         rtlTcpServerStats = nil
-        rtlTcpRecentCommands = []
         advertiser?.stop()
         server?.stop()
     }
@@ -1976,25 +2142,29 @@ final class CoreModel {
         )
     }
 
-    /// Background poller that refreshes `rtlTcpServerStats` +
-    /// `rtlTcpRecentCommands` on a one-second tick. Runs on
-    /// the main actor (the whole `CoreModel` is `@MainActor`)
-    /// which matches what `@Observable` needs for writes.
+    /// Background poller that refreshes `rtlTcpServerStats`
+    /// on a one-second tick. Runs on the main actor (the whole
+    /// `CoreModel` is `@MainActor`) which matches what
+    /// `@Observable` needs for writes.
+    ///
+    /// The pre-#391 per-client `rtlTcpRecentCommands` refresh
+    /// is gone — recent-commands tracking is per-client now and
+    /// returns under a separate poll keyed by `client.id` once
+    /// the multi-client surface lands (#496).
     private func startRtlTcpPoller() {
         rtlTcpPollTask = Task { [weak self] in
             // Tick cadence slow enough to be negligible on the
-            // main thread, fast enough that "uptime" and data-
-            // rate look live. 1 Hz is the GTK panel's tick too.
+            // main thread, fast enough that aggregate counters
+            // look live. 1 Hz is the GTK panel's tick too.
             let tickNanos: UInt64 = 1_000_000_000
             // Poll-then-sleep ordering so `rtlTcpServerStats`
-            // and `rtlTcpRecentCommands` populate immediately on
-            // server start rather than after a full tick of nil.
-            // Per `CodeRabbit` round 4 on PR #362.
+            // populates immediately on server start rather than
+            // after a full tick of nil. Per `CodeRabbit` round 4
+            // on PR #362.
             while !Task.isCancelled {
                 guard let self, let server = self.rtlTcpServer else { return }
                 do {
                     self.rtlTcpServerStats = try server.stats()
-                    self.rtlTcpRecentCommands = try server.recentCommands()
                 } catch {
                     // Server has gone away (stopped externally,
                     // USB unplug, panic caught by the FFI). Tear

@@ -1635,10 +1635,20 @@ const TCP_KEEPALIVE_IDLE_SECS: u32 = 60;
 /// `TCP_KEEPINTVL`. 10 s gives the zombie three chances to reply
 /// across a ~30 s window — enough to ride out a brief network
 /// hiccup without blowing the detection deadline. Per #393.
+///
+/// Linux-only: macOS exposes only `TCP_KEEPALIVE` (the seconds-
+/// until-first-probe knob); per-probe interval and retry count
+/// are kernel-wide sysctls there. The constant is gated to the
+/// platform that can actually set it so non-Linux targets don't
+/// drag a dead-code warning forward.
+#[cfg(target_os = "linux")]
 const TCP_KEEPALIVE_INTERVAL_SECS: u32 = 10;
 /// How many unanswered probes before the kernel drops the socket.
 /// `TCP_KEEPCNT`. 3 keeps the total dead-peer detection window at
 /// roughly 90 s (idle 60 s + 3 × 10 s probes). Per #393.
+///
+/// Linux-only — same rationale as `TCP_KEEPALIVE_INTERVAL_SECS`.
+#[cfg(target_os = "linux")]
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 fn configure_client_socket(stream: &TcpStream) {

@@ -83,6 +83,17 @@ public final class SdrRtlTcpAdvertiser: @unchecked Sendable {
                 options.tuner.withCString { tunerPtr in
                     options.version.withCString { versionPtr in
                         options.nickname.withCString { nicknamePtr -> Int32 in
+                            // ABI 0.19 (#400) appended four
+                            // opt-in TXT fields at the tail:
+                            // `has_codecs` / `codecs` /
+                            // `has_auth_required` /
+                            // `auth_required`. Mac-side UI for
+                            // any of these (compression toggle,
+                            // auth-required badge) follows in
+                            // #496; until then the wrapper
+                            // publishes neither key, matching
+                            // pre-0.19 advertisement behaviour
+                            // exactly.
                             var opts = SdrRtlTcpAdvertiseOptions(
                                 port: options.port,
                                 instance_name: instancePtr,
@@ -92,7 +103,11 @@ public final class SdrRtlTcpAdvertiser: @unchecked Sendable {
                                 gains: options.gains,
                                 nickname: nicknamePtr,
                                 has_txbuf: options.txbufBytes != nil,
-                                txbuf: options.txbufBytes ?? 0
+                                txbuf: options.txbufBytes ?? 0,
+                                has_codecs: false,
+                                codecs: 0,
+                                has_auth_required: false,
+                                auth_required: false
                             )
                             return withUnsafePointer(to: &opts) { optsPtr in
                                 sdr_rtltcp_advertiser_start(optsPtr, &rawHandle)
