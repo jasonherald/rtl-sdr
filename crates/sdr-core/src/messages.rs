@@ -1,7 +1,10 @@
 //! Message types for communication between the DSP thread and the UI thread.
 
-use sdr_dsp::apt::AptLine;
 use sdr_dsp::voice_squelch::VoiceSquelchMode;
+// Re-export so downstream crates that match on the `DspToUi::AptLine`
+// variant (e.g. `sdr-ffi` for its FFI-drop regression test) can
+// reach the payload type without taking a direct `sdr-dsp` dep.
+pub use sdr_dsp::apt::AptLine;
 use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
 use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
 
@@ -496,6 +499,29 @@ mod tests {
         assert!(matches!(open, DspToUi::VoiceSquelchOpenChanged(true)));
         let closed = DspToUi::VoiceSquelchOpenChanged(false);
         assert!(matches!(closed, DspToUi::VoiceSquelchOpenChanged(false)));
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn apt_line_message_round_trips_boxed_payload() {
+        // Pins the wire shape: `AptLine` carries a `Box<AptLine>`,
+        // not a bare `AptLine`. A future refactor that swaps to an
+        // unboxed payload (or adds a tuple field, or splits the
+        // line into `(pixels, sync_quality)`, etc.) trips this test
+        // before it can silently bloat the enum's stack size.
+        let payload = AptLine {
+            sync_quality: 0.75,
+            input_sample_index: 12_345,
+            ..AptLine::default()
+        };
+        let msg = DspToUi::AptLine(Box::new(payload));
+        match msg {
+            DspToUi::AptLine(boxed) => {
+                assert!((boxed.sync_quality - 0.75).abs() < f32::EPSILON);
+                assert_eq!(boxed.input_sample_index, 12_345);
+            }
+            other => panic!("expected AptLine, got {other:?}"),
+        }
     }
 
     #[test]

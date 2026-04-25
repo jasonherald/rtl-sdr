@@ -18,7 +18,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use sdr_dsp::apt::{AptDecoder, AptLine};
+use sdr_dsp::apt::{AptDecoder, AptLine, READY_QUEUE_CAP};
 use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
@@ -520,9 +520,12 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
             Ok(decoder) => {
                 tracing::info!("APT decoder initialised at {rate_hz} Hz");
                 state.apt_decoder = Some(decoder);
-                // 8 lines of headroom — `AptDecoder` caps its
-                // internal queue at this many per-call.
-                state.apt_lines_buf.resize(8, AptLine::default());
+                // Size the output slice to the decoder's documented
+                // per-call emission cap so a single `process` call
+                // can never need to flush.
+                state
+                    .apt_lines_buf
+                    .resize(READY_QUEUE_CAP, AptLine::default());
             }
             Err(e) => {
                 tracing::warn!("APT decoder init failed at {rate_hz} Hz: {e}");

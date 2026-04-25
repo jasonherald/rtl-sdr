@@ -1222,6 +1222,25 @@ mod tests {
     }
 
     #[test]
+    fn translate_apt_line_is_dropped_at_ffi_boundary() {
+        // `DspToUi::AptLine` is intentionally dropped by the FFI
+        // translation layer — the macOS frontend's APT viewer is a
+        // separate ticket, and forwarding 2 KB-per-line image data
+        // through a C ABI without a host consumer would be wasted
+        // work. Pin that policy with a regression test: a future
+        // change that exposes APT lines through the FFI (or
+        // accidentally lets the variant fall through to the
+        // catch-all panic arm) trips this assert before it can
+        // reach the Mac side. Per CodeRabbit on PR #503.
+        let line = sdr_core::messages::AptLine::default();
+        let msg = DspToUi::AptLine(Box::new(line));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AptLine must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
     fn rtl_tcp_state_discriminants_match_header() {
         assert_eq!(SDR_RTL_TCP_STATE_DISCONNECTED, 0);
         assert_eq!(SDR_RTL_TCP_STATE_CONNECTING, 1);
