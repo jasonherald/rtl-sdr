@@ -515,6 +515,18 @@ const QUALITY_WINNER_DEG: f64 = 40.0;
 const QUALITY_GOOD_DEG: f64 = 25.0;
 const QUALITY_MARGINAL_DEG: f64 = 15.0;
 
+/// Hz → MHz conversion factor for the downlink formatter.
+const HZ_PER_MHZ: f64 = 1_000_000.0;
+/// Decimal-place ceiling for the formatted MHz string. Pinned to
+/// 4 to preserve NOAA 18's 137.9125 MHz off-channel offset; any
+/// catalog entry with finer-than-100-Hz precision would lose
+/// digits past this.
+const DOWNLINK_MAX_DECIMALS: usize = 4;
+/// Decimal-place floor for the formatted MHz string. Padded out
+/// to 3 even for round numbers so every panel row lines up
+/// visually ("137.100" not "137.1").
+const DOWNLINK_MIN_DECIMALS: usize = 3;
+
 /// Map a pass's peak elevation to a one-word quality tag for the
 /// pass row's subtitle. Helps the user spot which upcoming pass is
 /// worth setting an alarm for vs. ones to skip past.
@@ -574,19 +586,19 @@ pub fn tune_target_for_pass(pass: &Pass) -> Option<(u64, sdr_types::DemodMode, u
               that ceiling"
 )]
 pub fn format_downlink_mhz(hz: u64) -> String {
-    let mhz = hz as f64 / 1_000_000.0;
-    // Up to 4 decimals (137.9125), then trim trailing zeros so
-    // 137.100 reads as "137.100" and 145.800 as "145.800" but
+    let mhz = hz as f64 / HZ_PER_MHZ;
+    // Up to MAX decimals (4 → 137.9125), then trim trailing zeros
+    // so 137.100 reads as "137.100" and 145.800 as "145.800" but
     // 137.9125 keeps its 4th digit.
-    let raw = format!("{mhz:.4}");
+    let raw = format!("{mhz:.DOWNLINK_MAX_DECIMALS$}");
     let trimmed = raw.trim_end_matches('0');
     let trimmed = trimmed.trim_end_matches('.');
-    // Always show at least 3 decimals so every entry lines up
+    // Always show at least MIN decimals so every entry lines up
     // visually in the panel ("137.100" not "137.1").
     let dot_idx = trimmed.find('.').unwrap_or(trimmed.len());
     let decimals = trimmed.len().saturating_sub(dot_idx + 1);
-    let formatted = if decimals < 3 {
-        format!("{mhz:.3}")
+    let formatted = if decimals < DOWNLINK_MIN_DECIMALS {
+        format!("{mhz:.DOWNLINK_MIN_DECIMALS$}")
     } else {
         trimmed.to_string()
     };
@@ -898,6 +910,29 @@ mod tests {
         let mut pass = synthetic_pass(now, 30);
         pass.satellite = "MYSTERY-SAT".to_string();
         assert_eq!(downlink_hz_for_pass(&pass), None);
+    }
+
+    #[test]
+    fn tune_target_for_pass_returns_full_tuning_triple() {
+        // Pin the (downlink_hz, demod_mode, bandwidth_hz) triple
+        // for a known catalog entry. A future refactor that splits
+        // or reorders the tuple — or that drifts the catalog
+        // values — fails here before reaching the play-button
+        // wiring layer.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_pass(now, 30); // satellite = "NOAA 19"
+        let target = tune_target_for_pass(&pass).expect("NOAA 19 is in catalog");
+        assert_eq!(target.0, 137_100_000);
+        assert_eq!(target.1, sdr_types::DemodMode::Nfm);
+        assert_eq!(target.2, 38_000);
+    }
+
+    #[test]
+    fn tune_target_for_pass_returns_none_for_unknown_satellite() {
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let mut pass = synthetic_pass(now, 30);
+        pass.satellite = "MYSTERY-SAT".to_string();
+        assert!(tune_target_for_pass(&pass).is_none());
     }
 
     #[test]
