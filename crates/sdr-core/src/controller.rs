@@ -571,8 +571,14 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
 
     match decoder.process(&state.apt_mono_buf, &mut state.apt_lines_buf) {
         Ok(produced) => {
-            for line in state.apt_lines_buf.iter().take(produced) {
-                let _ = dsp_tx.send(DspToUi::AptLine(Box::new(line.clone())));
+            // `mem::take` lifts each emitted line out by swapping in
+            // `AptLine::default()` — moves ownership without the
+            // ~2 KB clone. The next `process` call overwrites the
+            // (now-default) slot regardless, so leaving an empty
+            // line behind is harmless.
+            for slot in state.apt_lines_buf.iter_mut().take(produced) {
+                let line = std::mem::take(slot);
+                let _ = dsp_tx.send(DspToUi::AptLine(Box::new(line)));
             }
         }
         Err(e) => {
