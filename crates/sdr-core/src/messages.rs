@@ -1,5 +1,6 @@
 //! Message types for communication between the DSP thread and the UI thread.
 
+use sdr_dsp::apt::AptLine;
 use sdr_dsp::voice_squelch::VoiceSquelchMode;
 use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
 use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
@@ -140,6 +141,20 @@ pub enum DspToUi {
     /// via the mutex. UI shows a toast describing the
     /// transition.
     ScannerMutexStopped(ScannerMutexReason),
+
+    // --- APT decoder (#482) ---
+    /// One decoded NOAA APT image line. Emitted from the DSP
+    /// thread when the live FM-demodulated audio path's `AptDecoder`
+    /// produces a new line. The UI handler routes it to the open
+    /// `AptImageView` (no-op if the viewer isn't open).
+    ///
+    /// Cadence: ~2 lines/sec during a NOAA APT pass (the spec's
+    /// fixed line rate). Boxed because `AptLine` is ~2 KB while
+    /// every other variant is tiny — boxing keeps the enum's
+    /// stack size in line with the rest, which matters for the
+    /// `mpsc::Receiver::try_recv()` hot path that copies the
+    /// returned `DspToUi` value once per drain.
+    AptLine(Box<AptLine>),
 }
 
 /// Available source types for IQ input.

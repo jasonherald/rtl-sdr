@@ -754,7 +754,12 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::BandwidthChanged(_)
         | DspToUi::VfoOffsetChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
-        | DspToUi::VoiceSquelchOpenChanged(_) => return None,
+        | DspToUi::VoiceSquelchOpenChanged(_)
+        // APT lines (#482) aren't surfaced through the FFI layer
+        // yet — the macOS frontend will gain a native APT viewer
+        // through its own ticket. Drop them here so the Linux UI
+        // side can keep emitting without a Mac-side build break.
+        | DspToUi::AptLine(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

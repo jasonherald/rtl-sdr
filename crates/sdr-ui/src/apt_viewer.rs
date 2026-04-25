@@ -19,10 +19,13 @@
 //!   transient window so the main radio window stays interactive
 //!   during a pass. Header bar carries Pause / Resume + Export PNG.
 //!
-//! `connect_demo_action` wires a temporary `app.apt-demo` action
-//! that pumps a synthetic gradient pass through a freshly-opened
-//! window — useful for visual smoke-testing tonight, replaced by
-//! the real radio-side wiring in #482 (auto-record on overhead pass).
+//! [`connect_apt_action`] wires the `app.apt-open` action
+//! (`Ctrl+Shift+A`). Activating it opens a viewer window and
+//! registers it with [`crate::state::AppState::apt_viewer`] so the
+//! `DspToUi::AptLine` handler in `window.rs` can route real,
+//! live-decoded APT lines into it. Closing the window clears the
+//! `AppState` slot — subsequent decoder lines are then dropped
+//! silently until the user reopens.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -54,17 +57,6 @@ const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 /// most desktop resolutions without the user having to resize.
 const VIEWER_WINDOW_WIDTH: i32 = 800;
 const VIEWER_WINDOW_HEIGHT: i32 = 600;
-
-/// Cadence of the synthetic demo pass — 500 ms = 2 lines/sec, which
-/// is the actual NOAA APT line rate. Real pass wiring (#482) drops
-/// the demo entirely.
-const DEMO_TICK: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Number of lines pumped before the demo timer breaks. 240 ticks at
-/// 2 Hz = 2 minutes — long enough to verify auto-fit + scrolling +
-/// pause + export, short enough that the demo doesn't run forever
-/// even if the window is left open.
-const DEMO_MAX_LINES: u32 = 240;
 
 /// Pure Cairo renderer for an APT scan-line buffer.
 ///
@@ -275,6 +267,11 @@ impl AptImageRenderer {
 /// toolbar callbacks can hold their own handle without lifetime
 /// dance. Push new lines in via [`AptImageView::push_line`]; the
 /// widget queues a redraw automatically (unless paused).
+/// Handle for an open APT viewer. `Clone` is derived (existing
+/// pattern) so the wiring layer can stash a copy in
+/// [`crate::state::AppState`] for the `DspToUi::AptLine` handler
+/// to push lines into — every field is already `Rc`-shared
+/// internally, so cloning is a refcount bump.
 #[derive(Clone)]
 pub struct AptImageView {
     drawing_area: gtk4::DrawingArea,
@@ -389,7 +386,7 @@ impl AptImageView {
 pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     parent: &W,
     title: &str,
-) -> AptImageView {
+) -> (AptImageView, adw::Window) {
     let view = AptImageView::new();
 
     let window = adw::Window::builder()
@@ -457,7 +454,7 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     window.set_content(Some(&toast_overlay));
     window.present();
 
-    view
+    (view, window)
 }
 
 /// Default path the Export PNG button writes to:
@@ -482,99 +479,56 @@ fn show_toast_in<W: gtk4::prelude::IsA<gtk4::Window>>(window: &W, toast: adw::To
     }
 }
 
-// ─── Demo action (smoke-test wiring) ───────────────────────────────────
+// ─── Live viewer action ─────────────────────────────────────────────────
 
-/// Wire the temporary `app.apt-demo` action onto `app`. Activating
-/// it opens an APT viewer window and pumps a synthetic gradient
-/// pass into it at the real APT cadence (2 lines / sec). Useful for
-/// visual smoke-testing the renderer + window plumbing tonight; the
-/// real radio-side wiring lands in #482 (auto-record on overhead
-/// pass) and this action goes away.
-pub fn connect_demo_action(
+/// Wire the `app.apt-open` action onto `app`. Activating it (via the
+/// app menu, the `Ctrl+Shift+A` accelerator, or future activity-bar
+/// entry) opens a non-modal APT viewer window. The window is fed
+/// real `AptLine`s from the DSP-thread decoder via
+/// `state.apt_viewer` — the [`crate::messages::DspToUi::AptLine`]
+/// handler in `window.rs` looks up the active view there and pushes
+/// pixel rows into it.
+///
+/// If the viewer is already open, activating the action again is a
+/// no-op (we don't try to refocus or re-create — the existing window
+/// is already on screen and accepting lines). Closing the window
+/// clears `state.apt_viewer` so the decoder's lines are dropped
+/// silently until the user reopens.
+pub fn connect_apt_action(
     app: &adw::Application,
     parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
+    state: &Rc<crate::state::AppState>,
 ) {
-    let action = gio::SimpleAction::new("apt-demo", None);
+    let action = gio::SimpleAction::new("apt-open", None);
     let parent_provider = Rc::clone(parent_provider);
-    action.connect_activate(glib::clone!(
-        #[strong]
-        parent_provider,
-        move |_, _| {
-            let Some(parent) = parent_provider() else {
-                tracing::warn!("apt-demo invoked with no main window available");
-                return;
-            };
-            spawn_demo_pass(&parent);
+    let state_for_action = Rc::clone(state);
+    action.connect_activate(move |_, _| {
+        if state_for_action.apt_viewer.borrow().is_some() {
+            // Already open — nothing to do. The user can find the
+            // existing window via the OS window switcher.
+            return;
         }
-    ));
-    app.add_action(&action);
-    app.set_accels_for_action("app.apt-demo", &["<Ctrl><Shift>a"]);
-}
-
-/// Open a viewer window and start a [`DEMO_TICK`] timeout that pumps
-/// one synthetic line into it per tick (matching real APT cadence).
-/// Each line is a 2080-pixel left-to-right grayscale gradient with a
-/// row-dependent vertical fade — easy to eyeball as "yep, lines are
-/// arriving in order, the renderer is fitting correctly, the image
-/// is building downward".
-///
-/// The timer holds a `WeakRef` to the underlying `DrawingArea` and
-/// `Weak` references to the renderer / pause state. If the user
-/// closes the viewer window before the demo completes, the next
-/// tick fails to upgrade the weak refs and breaks out cleanly —
-/// no work pumped into a destroyed widget, no lingering ~17 MB
-/// pixel buffer kept alive by the closure for the rest of the
-/// 2-minute schedule.
-fn spawn_demo_pass<W: gtk4::prelude::IsA<gtk4::Window>>(parent: &W) {
-    let view = open_apt_viewer_window(parent, "NOAA APT — Demo Pass (synthetic)");
-
-    // Weak refs to widget + state. Drop the strong `view` immediately
-    // so the timer doesn't keep the window's DrawingArea alive past
-    // the user closing the window.
-    let drawing_area_weak = view.drawing_area.downgrade();
-    let renderer_weak = Rc::downgrade(&view.renderer);
-    let paused_weak = Rc::downgrade(&view.paused);
-    drop(view);
-
-    let row = Rc::new(Cell::new(0_u32));
-    glib::timeout_add_local(DEMO_TICK, move || {
-        // Window gone → nothing left to draw into, exit the timer.
-        let Some(drawing_area) = drawing_area_weak.upgrade() else {
-            return glib::ControlFlow::Break;
+        let Some(parent) = parent_provider() else {
+            tracing::warn!("apt-open invoked with no main window available");
+            return;
         };
-        let Some(renderer) = renderer_weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        let Some(paused) = paused_weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
+        let (view, window) = open_apt_viewer_window(&parent, "NOAA APT");
+        // Stash a clone in AppState so the DSP→UI handler can find
+        // it. The clone is cheap (every field is `Rc`-shared).
+        *state_for_action.apt_viewer.borrow_mut() = Some(view);
 
-        if !paused.get() {
-            let mut pixels = [0_u8; LINE_PIXELS];
-            let r = row.get();
-            // Left-to-right horizontal gradient + a vertical fade so
-            // each row is visibly different from the last — enough
-            // variation that any rendering bug (off-by-one, wrong
-            // stride, scale direction wrong) shows up obviously.
-            #[allow(clippy::cast_possible_truncation)]
-            for (i, p) in pixels.iter_mut().enumerate() {
-                let h = (i * 255 / LINE_PIXELS) as u32;
-                let v = (r.wrapping_mul(7)) % 200; // slow-cycling brightness offset
-                *p = (((h + v) % 256) & 0xff) as u8;
-            }
-            renderer.borrow_mut().push_line(&pixels);
-            drawing_area.queue_draw();
-            row.set(r.wrapping_add(1));
-        }
-
-        // Cap the demo at DEMO_MAX_LINES so it doesn't run forever
-        // even if the user leaves the window open.
-        if row.get() >= DEMO_MAX_LINES {
-            glib::ControlFlow::Break
-        } else {
-            glib::ControlFlow::Continue
-        }
+        // Clear the AppState slot when the user closes the window
+        // — otherwise `DspToUi::AptLine` would keep pushing into a
+        // detached widget tree until the next reopen, and the
+        // viewer state would never reset for a second pass.
+        let state_for_close = Rc::clone(&state_for_action);
+        window.connect_close_request(move |_| {
+            *state_for_close.apt_viewer.borrow_mut() = None;
+            glib::Propagation::Proceed
+        });
     });
+    app.add_action(&action);
+    app.set_accels_for_action("app.apt-open", &["<Ctrl><Shift>a"]);
 }
 
 #[cfg(test)]

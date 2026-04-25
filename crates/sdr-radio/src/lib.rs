@@ -641,6 +641,17 @@ impl RadioModule {
         self.mode
     }
 
+    /// Get the audio output sample rate (Hz). Stable across mode
+    /// switches — the AF chain resamples each demod's native rate
+    /// to this single output rate. Used by downstream consumers
+    /// that need to know the sample rate of `process()`'s output
+    /// buffer (e.g. the NOAA APT decoder tap, which expects an
+    /// input rate strictly greater than 4800 Hz).
+    #[must_use]
+    pub fn audio_sample_rate(&self) -> f64 {
+        self.audio_sample_rate
+    }
+
     /// Get the current demodulator's configuration.
     pub fn demod_config(&self) -> &DemodConfig {
         self.demod.config()

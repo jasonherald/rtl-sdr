@@ -377,6 +377,17 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 
     window.add_breakpoint(breakpoint);
 
+    // Wire `app.apt-open` (Ctrl+Shift+A) — opens the live APT
+    // viewer window. Done here rather than in `app.rs::activate`
+    // because the action's line-routing handler reads
+    // `state.apt_viewer`, and `state` is owned by this window.
+    {
+        let app_for_provider = app.clone();
+        let parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>> =
+            Rc::new(move || app_for_provider.windows().into_iter().next());
+        crate::apt_viewer::connect_apt_action(app, &parent_provider, &state);
+    }
+
     // Set initial status bar values and mode-specific control visibility.
     if let Some(mode) = demod_selector::index_to_demod_mode(demod_dropdown.selected()) {
         let label = header::demod_mode_label(mode);
@@ -1251,6 +1262,17 @@ fn handle_dsp_message(
             // but relying on that ordering across four stop
             // sites was brittle.
             clear_scanner_active_channel_ui(scanner_panel, state);
+        }
+        DspToUi::AptLine(line) => {
+            // Route the freshly-decoded APT line into the open
+            // viewer, if any. When no viewer is open we silently
+            // drop — the decoder always runs (it's cheap) so the
+            // user can open the viewer mid-pass and start seeing
+            // lines from that moment on, rather than having to
+            // pre-arm before AOS.
+            if let Some(view) = state.apt_viewer.borrow().as_ref() {
+                view.push_line(&line.pixels);
+            }
         }
         DspToUi::ScannerMutexStopped(reason) => {
             tracing::info!(?reason, "scanner mutex stopped");
