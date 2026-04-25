@@ -541,11 +541,14 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
     // equivalent to taking either channel for FM-demodulated
     // audio (both channels carry the same baseband signal once
     // any stereo pilot is filtered out by the channel filter).
+    // `extend` over a `map` iterator is exact-size, so `Vec`'s
+    // internal reserve is precise — no manual `reserve` needed.
     state.apt_mono_buf.clear();
-    state.apt_mono_buf.reserve(audio_count);
-    for s in &state.audio_buf[..audio_count] {
-        state.apt_mono_buf.push((s.l + s.r) * 0.5);
-    }
+    state.apt_mono_buf.extend(
+        state.audio_buf[..audio_count]
+            .iter()
+            .map(|s| (s.l + s.r) * 0.5),
+    );
 
     match decoder.process(&state.apt_mono_buf, &mut state.apt_lines_buf) {
         Ok(produced) => {
