@@ -6,7 +6,9 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 
-use crate::{css, window};
+use std::rc::Rc;
+
+use crate::{apt_viewer, css, window};
 
 /// Application ID for the SDR-RS application.
 const APP_ID: &str = "com.sdr.rs";
@@ -76,6 +78,17 @@ pub fn build_app() -> adw::Application {
             return;
         }
         window::build_window(app, &config);
+
+        // Temporary demo wiring for #483 — Ctrl+Shift+A opens an APT
+        // viewer window with a synthetic gradient pass running at the
+        // real 2 lines/sec cadence. Lets us visually smoke-test the
+        // viewer + non-modal window plumbing without a live overhead
+        // pass. Replaced by #482 (auto-record on overhead pass) once
+        // the radio path knows when to open the viewer for real.
+        let app_for_provider = app.clone();
+        let parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>> =
+            Rc::new(move || app_for_provider.windows().into_iter().next());
+        apt_viewer::connect_demo_action(app, &parent_provider);
     });
 
     app

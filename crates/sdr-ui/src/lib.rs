@@ -13,6 +13,7 @@
 
 pub mod antenna;
 pub mod app;
+pub mod apt_viewer;
 pub mod css;
 pub mod header;
 pub mod notify;
