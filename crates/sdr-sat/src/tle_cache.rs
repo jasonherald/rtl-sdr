@@ -281,6 +281,13 @@ impl TleCache {
         Ok(self.client.get().cloned().unwrap_or(new_client))
     }
 
+    /// Write `text` to `path` atomically via the standard
+    /// "write-to-tempfile-then-rename" dance. A power loss / SIGKILL /
+    /// OOM-kill mid-write leaves either the previous stale cache
+    /// intact (rename never happened) or the new fresh content
+    /// (rename succeeded), never a truncated file. Same-directory
+    /// tempfile so the rename stays on the same filesystem and the
+    /// kernel's `rename(2)` atomicity guarantee applies.
     #[allow(clippy::unused_self)] // kept on impl for symmetry with other cache methods
     fn write_cache(&self, path: &Path, text: &str) -> Result<(), TleCacheError> {
         if let Some(parent) = path.parent() {
@@ -289,9 +296,24 @@ impl TleCache {
                 source: e,
             })?;
         }
-        std::fs::write(path, text).map_err(|e| TleCacheError::Io {
-            path: path.to_path_buf(),
+        // Per-process tempfile so two concurrent processes hitting the
+        // same cache dir don't trample each other's in-flight write.
+        // Two threads in the same process are still racy on the tmp
+        // file, but our once-a-day refresh cadence makes that
+        // essentially impossible to hit in practice.
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, text).map_err(|e| TleCacheError::Io {
+            path: tmp.clone(),
             source: e,
+        })?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            // Best-effort cleanup of the orphaned tempfile so we don't
+            // leak it on every failed rename.
+            let _ = std::fs::remove_file(&tmp);
+            TleCacheError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            }
         })
     }
 }
@@ -356,10 +378,17 @@ pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
             }
         };
 
+        // Cross-check: both TLE lines have the NORAD catalog number at
+        // the same column, and a sane file always pairs them. A
+        // corrupted cache could splice line 1 of one satellite with
+        // line 2 of another (both look "valid" individually) — refuse
+        // to return such a Frankenstein pair.
         if line1.starts_with("1 ")
             && line2.starts_with("2 ")
-            && let Some(parsed) = norad_id_from_line1(line1)
-            && parsed == norad_id
+            && let (Some(line1_id), Some(line2_id)) =
+                (norad_id_from_tle_line(line1), norad_id_from_tle_line(line2))
+            && line1_id == norad_id
+            && line2_id == norad_id
         {
             return Some((line1.to_string(), line2.to_string()));
         }
@@ -380,16 +409,17 @@ const TLE_NORAD_START: usize = 2;
 /// 0-indexed exclusive end of the NORAD field (column 7 inclusive).
 const TLE_NORAD_END: usize = 7;
 
-/// Extract the NORAD catalog number from columns 3..=7 of a TLE
-/// line 1 (`"1 NNNNNX ..."`). Returns `None` for malformed lines —
-/// the caller skips and keeps scanning.
+/// Extract the NORAD catalog number from columns 3..=7 of a TLE line.
+/// Works on both line 1 (`"1 NNNNNX ..."`) and line 2 (`"2 NNNNN ..."`)
+/// — the catalog field sits at the same byte offsets in both. Returns
+/// `None` for malformed lines — the caller skips and keeps scanning.
 ///
 /// Uses `str::get` rather than direct slicing so a corrupted cache
 /// file with multi-byte UTF-8 at the parsed byte offsets returns
 /// `None` instead of panicking. (Real Celestrak content is ASCII;
 /// a stray non-ASCII byte usually means the response was an HTML
 /// error page that landed in the cache by accident.)
-fn norad_id_from_line1(line: &str) -> Option<u32> {
+fn norad_id_from_tle_line(line: &str) -> Option<u32> {
     let field = line.get(TLE_NORAD_START..TLE_NORAD_END)?;
     field.trim().parse::<u32>().ok()
 }
@@ -473,8 +503,8 @@ NOAA 19
         // 3-byte UTF-8 char boundary at byte 2 — direct slicing would
         // panic; `str::get` returns None and the parser keeps walking.
         let weird = "1 \u{1F4A9}99U garbage";
-        // norad_id_from_line1 must not panic, must not classify.
-        assert_eq!(norad_id_from_line1(weird), None);
+        // norad_id_from_tle_line must not panic, must not classify.
+        assert_eq!(norad_id_from_tle_line(weird), None);
         // Whole-document parse with the bad line buried inside also
         // must not panic and must skip it cleanly.
         let mixed = format!(
@@ -506,6 +536,22 @@ NEXT NAME LINE NOT A TLE
         let (l1, l2) = parse_tle_text(bad_pair_then_good, 5).unwrap();
         assert!(l1.starts_with("1 00005"));
         assert!(l2.starts_with("2 00005"));
+    }
+
+    #[test]
+    fn parse_rejects_pair_with_mismatched_norad_ids() {
+        // line1 of NORAD 5 spliced with line2 from a different
+        // satellite (NORAD 25544). Both lines individually look like
+        // valid TLE format, but the NORAD ids disagree — the parser
+        // must reject rather than hand back a Frankenstein pair that
+        // would propagate as garbage in SGP4.
+        let mismatched_pair = "\
+VANGUARD 1
+1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
+2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234276
+";
+        assert!(parse_tle_text(mismatched_pair, 5).is_none());
+        assert!(parse_tle_text(mismatched_pair, 25_544).is_none());
     }
 
     #[test]
@@ -582,6 +628,34 @@ SOMETHING
                 tle_source: TleSource::Noaa,
             }
         ));
+    }
+
+    #[test]
+    fn write_cache_atomic_rename_lands_file_at_final_path() {
+        // Sanity test for the atomic-rename path: write some text,
+        // verify the final cache file exists and contains exactly the
+        // text we wrote, and verify no leftover ".tmp.*" siblings
+        // were left behind in the cache directory.
+        let dir = unique_temp_dir("atomic-write");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = TleCache::with_dir(dir.clone());
+        let path = cache.cache_path(TleSource::Noaa);
+        cache.write_cache(&path, "hello cache").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "hello cache");
+        // No leftover tempfiles in the cache directory.
+        let leftover_tmp_count = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.starts_with("tmp"))
+            })
+            .count();
+        assert_eq!(leftover_tmp_count, 0);
     }
 
     #[test]
