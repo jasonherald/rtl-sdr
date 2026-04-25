@@ -5,6 +5,8 @@
 //! (deemphasis, resampling) to convert complex IQ samples into stereo audio.
 
 pub mod af_chain;
+pub mod apt_image;
+pub mod apt_telemetry;
 pub mod demod;
 pub mod if_chain;
 
