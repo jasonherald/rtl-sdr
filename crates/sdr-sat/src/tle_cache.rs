@@ -335,6 +335,15 @@ pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
             let l2 = iter.next()?;
             (l1.to_string(), l2.to_string())
         };
+        // Validate the TLE shape before checking the NORAD id —
+        // garbage input (truncated download, HTML error page in the
+        // cache) can produce a "line1" that looks like one but a
+        // "line2" that's actually the next satellite's name. Skip and
+        // resync on the next iteration rather than handing a bogus
+        // pair to SGP4.
+        if !line1.starts_with("1 ") || !line2.starts_with("2 ") {
+            continue;
+        }
         if let Some(parsed) = norad_id_from_line1(&line1)
             && parsed == norad_id
         {
@@ -349,20 +358,19 @@ pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
 const TLE_NORAD_START: usize = 2;
 /// 0-indexed exclusive end of the NORAD field (column 7 inclusive).
 const TLE_NORAD_END: usize = 7;
-/// Minimum length a TLE line 1 must have for the NORAD field to fit.
-const TLE_LINE1_MIN_LEN: usize = TLE_NORAD_END;
 
 /// Extract the NORAD catalog number from columns 3..=7 of a TLE
 /// line 1 (`"1 NNNNNX ..."`). Returns `None` for malformed lines —
 /// the caller skips and keeps scanning.
+///
+/// Uses `str::get` rather than direct slicing so a corrupted cache
+/// file with multi-byte UTF-8 at the parsed byte offsets returns
+/// `None` instead of panicking. (Real Celestrak content is ASCII;
+/// a stray non-ASCII byte usually means the response was an HTML
+/// error page that landed in the cache by accident.)
 fn norad_id_from_line1(line: &str) -> Option<u32> {
-    if line.len() < TLE_LINE1_MIN_LEN {
-        return None;
-    }
-    line[TLE_NORAD_START..TLE_NORAD_END]
-        .trim()
-        .parse::<u32>()
-        .ok()
+    let field = line.get(TLE_NORAD_START..TLE_NORAD_END)?;
+    field.trim().parse::<u32>().ok()
 }
 
 #[cfg(test)]
@@ -436,6 +444,47 @@ NOAA 19
         assert!(parse_tle_text("", 5).is_none());
         // Garbage.
         assert!(parse_tle_text("not a tle file at all", 5).is_none());
+    }
+
+    #[test]
+    fn parse_does_not_panic_on_multibyte_utf8_in_norad_field() {
+        // A 6-byte string whose first 7 *bytes* happen to span a
+        // 3-byte UTF-8 char boundary at byte 2 — direct slicing would
+        // panic; `str::get` returns None and the parser keeps walking.
+        let weird = "1 \u{1F4A9}99U garbage";
+        // norad_id_from_line1 must not panic, must not classify.
+        assert_eq!(norad_id_from_line1(weird), None);
+        // Whole-document parse with the bad line buried inside also
+        // must not panic and must skip it cleanly.
+        let mixed = format!(
+            "{weird}\n2 00099 ignore\nVANGUARD 1\n1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753\n2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667\n",
+        );
+        let (l1, _) = parse_tle_text(&mixed, 5).unwrap();
+        assert!(l1.starts_with("1 00005"));
+    }
+
+    #[test]
+    fn parse_skips_pair_when_line2_is_not_a_real_tle_line() {
+        // line2 doesn't start with "2 " — a corrupted file or a name
+        // that accidentally landed where a TLE pair was expected.
+        // Parser must skip and keep scanning rather than emit a bogus
+        // (line1, garbage_line2) pair that would misfire downstream.
+        let bad_pair_then_good = "\
+NAME ONE
+1 11111U 99001A   24000.00000000  .00000000  00000-0  10000-3 0  9990
+NEXT NAME LINE NOT A TLE
+1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
+2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667
+";
+        // Asking for NORAD 11111 (the misformatted entry) must NOT
+        // succeed even though its line1 is valid — the partner line
+        // isn't a TLE line.
+        assert!(parse_tle_text(bad_pair_then_good, 11_111).is_none());
+        // The resync test: after skipping the bad pair, the parser
+        // must still find the well-formed entry that follows.
+        let (l1, l2) = parse_tle_text(bad_pair_then_good, 5).unwrap();
+        assert!(l1.starts_with("1 00005"));
+        assert!(l2.starts_with("2 00005"));
     }
 
     #[test]
