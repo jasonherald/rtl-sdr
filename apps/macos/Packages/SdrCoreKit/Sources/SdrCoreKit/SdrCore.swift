@@ -616,6 +616,44 @@ public final class SdrCore: @unchecked Sendable {
     }
 
     // ==========================================================
+    //  Scanner — ABI 0.20, issue #447. Master enable + per-
+    //  channel session lockout / unlock. Channel-list projection
+    //  follows in #490 when the macOS bookmark layer grows the
+    //  `scan_enabled` / `priority` fields the Linux side already
+    //  has.
+    // ==========================================================
+
+    /// Master scanner enable / disable. Tripping this on with no
+    /// projected channels leaves the engine in `.idle` (visible
+    /// via the `scannerStateChanged` event); the host doesn't
+    /// need to special-case empty rotation.
+    public func setScannerEnabled(_ enabled: Bool) throws {
+        try checkRc(sdr_core_set_scanner_enabled(handle, enabled))
+    }
+
+    /// Lock out a channel for the rest of the scanner session.
+    ///
+    /// `name` + `frequencyHz` together form the scanner's channel
+    /// identity — they must match the channel's identity at
+    /// projection time exactly. Lockouts persist until the
+    /// channel is unlocked (`unlockScannerChannel`), the scanner
+    /// is disabled, or the engine is destroyed.
+    public func lockoutScannerChannel(name: String, frequencyHz: UInt64) throws {
+        try checkRc(name.withCString {
+            sdr_core_lockout_scanner_channel(handle, $0, frequencyHz)
+        })
+    }
+
+    /// Clear a session lockout previously installed by
+    /// `lockoutScannerChannel`. No-op if the channel wasn't
+    /// locked out.
+    public func unlockScannerChannel(name: String, frequencyHz: UInt64) throws {
+        try checkRc(name.withCString {
+            sdr_core_unlock_scanner_channel(handle, $0, frequencyHz)
+        })
+    }
+
+    // ==========================================================
     //  FFT frame pull
     // ==========================================================
 

@@ -200,6 +200,76 @@ public enum NetworkSinkStatus: Sendable, Equatable {
     case error(message: String)
 }
 
+/// Scanner phase surfaced via the `scannerStateChanged` engine
+/// event. Mirrors `sdr_scanner::ScannerState` on the Rust side.
+/// Matches `SdrScannerState` in the C header. Per issue #447.
+public enum ScannerState: Int32, Sendable, CaseIterable, Codable {
+    /// Scanner off, or on with no channels enabled.
+    case idle      = 0
+    /// Retune in flight; audio muted, waiting for settle.
+    case retuning  = 1
+    /// Settled on the channel; audio still muted; waiting for
+    /// a squelch-open event within the dwell window.
+    case dwelling  = 2
+    /// Squelch open post-settle, audio flowing.
+    case listening = 3
+    /// Squelch closed, hang countdown before advancing.
+    case hanging   = 4
+
+    /// Single-word label for the scanner panel's State row.
+    /// Matches the GTK panel's vocabulary so the wording stays
+    /// consistent across frontends.
+    public var label: String {
+        switch self {
+        case .idle:      return "Off"
+        case .retuning:  return "Retuning…"
+        case .dwelling:  return "Listening…"
+        case .listening: return "Listening"
+        case .hanging:   return "Hang…"
+        }
+    }
+}
+
+/// Why the scanner ↔ recording / transcription mutex fired.
+/// Surfaced via the `scannerMutexStopped` engine event. Mirrors
+/// `sdr_core::messages::ScannerMutexReason`. Matches
+/// `SdrScannerMutexReason` in the C header. Per issue #447.
+public enum ScannerMutexReason: Int32, Sendable, CaseIterable {
+    /// Scanner activation stopped a running recording.
+    case recordingStoppedForScanner     = 0
+    /// Scanner activation stopped a running transcription.
+    case transcriptionStoppedForScanner = 1
+    /// Recording start stopped an active scanner.
+    case scannerStoppedForRecording     = 2
+    /// Transcription start stopped an active scanner.
+    case scannerStoppedForTranscription = 3
+
+    /// Toast copy describing the transition. The wording mirrors
+    /// the GTK frontend's strings so cross-platform docs and
+    /// support material stay in sync.
+    public var toastMessage: String {
+        switch self {
+        case .recordingStoppedForScanner:
+            return "Recording stopped — scanner started."
+        case .transcriptionStoppedForScanner:
+            return "Transcription stopped — scanner started."
+        case .scannerStoppedForRecording:
+            return "Scanner stopped — recording started."
+        case .scannerStoppedForTranscription:
+            return "Scanner stopped — transcription started."
+        }
+    }
+}
+
+/// Identity of the scanner's currently-latched channel surfaced
+/// via the `scannerActiveChannelChanged` engine event. The
+/// scanner emits a `nil` payload when it returns to idle and a
+/// non-nil one each time it latches on a new channel.
+public struct ScannerActiveChannel: Sendable, Equatable {
+    public let name: String
+    public let frequencyHz: UInt64
+}
+
 /// FFT window function. Matches `SdrFftWindow` in the C header.
 ///
 /// Only three variants because that's what

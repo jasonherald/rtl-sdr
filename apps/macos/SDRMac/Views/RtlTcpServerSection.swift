@@ -25,9 +25,10 @@ private let rtlSdrSampleRates: [UInt32] = [
     3_200_000,
 ]
 
-/// Max lines to render in the activity log — the Rust side's
-/// `recent_commands` ring is bounded at 50 too.
-private let activityLogMaxRows = 50
+// Pre-#391 the panel rendered a per-client recent-commands
+// activity log capped at 50 rows; the multi-client list
+// surface that replaces it lands in #496. Until then the
+// status section below shows server-wide aggregates only.
 
 struct RtlTcpServerSection: View {
     @Environment(CoreModel.self) private var model
@@ -157,9 +158,11 @@ struct RtlTcpServerSection: View {
 
         if model.rtlTcpServerRunning {
             statusRows
-            DisclosureGroup("Activity log") {
-                activityLog
-            }
+            // Per-client activity log is gone for now — the
+            // server's recent-commands ring is per-client (post-
+            // #391) and re-surfacing it requires the multi-
+            // client list path landing on the Mac side. Tracked
+            // in #496.
         }
     }
 
@@ -273,16 +276,27 @@ struct RtlTcpServerSection: View {
     //  Status + activity log
     // ----------------------------------------------------------
 
+    /// Server-wide status rows. Aggregates only — per-client
+    /// detail (peer address, current freq/rate/gain, recent
+    /// commands) requires the multi-client list surface that
+    /// follows in #496. Until then the panel reports the count
+    /// of connected clients plus lifetime totals; clicking an
+    /// individual client to see its tuning state is the
+    /// follow-up.
     @ViewBuilder
     private var statusRows: some View {
         let stats = model.rtlTcpServerStats
-        LabeledContent("Status") {
-            if let stats, stats.hasClient {
-                Text(stats.connectedClientAddr)
-                    .foregroundStyle(.green)
-                    .textSelection(.enabled)
+        LabeledContent("Clients") {
+            if let stats {
+                if stats.connectedCount == 0 {
+                    Text("Waiting for client")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(stats.connectedCount) connected")
+                        .foregroundStyle(.green)
+                }
             } else {
-                Text("Waiting for client")
+                Text("—")
                     .foregroundStyle(.secondary)
             }
         }
@@ -295,78 +309,20 @@ struct RtlTcpServerSection: View {
                 )
                 .foregroundStyle(.secondary)
             }
-            LabeledContent("Uptime") {
-                Text(formatUptime(stats.uptimeSecs))
+            LabeledContent("Lifetime accepted") {
+                Text("\(stats.lifetimeAccepted)")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
-            LabeledContent("Data rate") {
-                Text(formatRate(bytesSent: stats.bytesSent, uptimeSecs: stats.uptimeSecs))
+            LabeledContent("Total bytes sent") {
+                Text(formatBytes(stats.totalBytesSent))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
             }
-            if stats.currentFreqHz > 0 {
-                LabeledContent("Client freq") {
-                    Text(
-                        "\(Double(stats.currentFreqHz) / 1_000_000.0, specifier: "%.3f") MHz"
-                    )
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                }
-            }
-            if stats.currentSampleRateHz > 0 {
-                LabeledContent("Client rate") {
-                    Text(
-                        "\(Double(stats.currentSampleRateHz) / 1_000_000.0, specifier: "%.3f") Msps"
-                    )
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                }
-            }
-            if stats.hasCurrentGainMode {
-                LabeledContent("Client gain mode") {
-                    Text(stats.currentGainAuto ? "Auto" : "Manual")
-                        .foregroundStyle(.secondary)
-                }
-            }
-            if stats.hasCurrentGainValue {
-                LabeledContent("Client gain") {
-                    Text(
-                        "\(Double(stats.currentGainTenthsDb) / 10.0, specifier: "%.1f") dB"
-                    )
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                }
-            }
-            if stats.buffersDropped > 0 {
-                LabeledContent("Dropped") {
-                    Text("\(stats.buffersDropped) buffer(s)")
+            if stats.totalBuffersDropped > 0 {
+                LabeledContent("Dropped (lifetime)") {
+                    Text("\(stats.totalBuffersDropped) buffer(s)")
                         .foregroundStyle(.orange)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var activityLog: some View {
-        if model.rtlTcpRecentCommands.isEmpty {
-            Text("No commands yet.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } else {
-            // Newest-first. The Rust ring is oldest-first;
-            // reversing on render keeps the controller cheap.
-            ForEach(
-                Array(model.rtlTcpRecentCommands.reversed().prefix(activityLogMaxRows).enumerated()),
-                id: \.offset
-            ) { _, cmd in
-                HStack {
-                    Text(cmd.op)
-                        .font(.caption.monospaced())
-                    Spacer()
-                    Text("\(cmd.secondsAgo, specifier: "%.1f")s ago")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -385,22 +341,23 @@ struct RtlTcpServerSection: View {
         model.isRunning && model.sourceType == .rtlSdr
     }
 
-    /// Render seconds-since-connect as `HH:MM:SS`.
-    private func formatUptime(_ secs: Double) -> String {
-        guard secs > 0, secs.isFinite else { return "—" }
-        let whole = Int(secs)
-        let h = whole / 3600
-        let m = (whole % 3600) / 60
-        let s = whole % 60
-        return String(format: "%02d:%02d:%02d", h, m, s)
-    }
-
-    /// Average stream rate in Mbps. Session-cumulative — real
-    /// rolling rate (delta over a short window) is a follow-up
-    /// if the average turns out to be misleading.
-    private func formatRate(bytesSent: UInt64, uptimeSecs: Double) -> String {
-        guard uptimeSecs > 0.25 else { return "—" }
-        let mbps = Double(bytesSent) * 8.0 / uptimeSecs / 1_000_000.0
-        return String(format: "%.2f Mbps", mbps)
+    /// Format a byte count as KiB / MiB / GiB. The lifetime
+    /// total grows fast at typical RTL-SDR rates (~16 Mbps for
+    /// 2 Msps × 8 bits) so a plain "bytes" label gets unreadable
+    /// in minutes.
+    private func formatBytes(_ bytes: UInt64) -> String {
+        let kib: UInt64 = 1_024
+        let mib: UInt64 = kib * 1_024
+        let gib: UInt64 = mib * 1_024
+        if bytes >= gib {
+            return String(format: "%.2f GiB", Double(bytes) / Double(gib))
+        }
+        if bytes >= mib {
+            return String(format: "%.2f MiB", Double(bytes) / Double(mib))
+        }
+        if bytes >= kib {
+            return String(format: "%.2f KiB", Double(bytes) / Double(kib))
+        }
+        return "\(bytes) B"
     }
 }
