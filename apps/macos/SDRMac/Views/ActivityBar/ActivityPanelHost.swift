@@ -45,16 +45,13 @@ struct LeftPanelHost: View {
             // Appearance.
             DisplayPanelView()
         case .scanner:
-            // #447 deferred: the Mac CoreModel doesn't expose
-            // any scanner state yet (the engine's `sdr-scanner`
-            // crate has no FFI surface — the C ABI still
-            // needs the matching commands + events). Until
-            // that lands, clicking Scanner shows a clear
-            // placeholder.
-            ComingSoonPanel(
-                activity: activity,
-                followUpTicket: "#447 — Scanner panel (blocked on FFI surface)"
-            )
+            // #447 — Scanner / Active / Timing sections.
+            // Master switch flips engine state today; the
+            // bookmark→ScannerChannel projection that gives the
+            // scanner channels to rotate through follows in #490
+            // (per-bookmark scan opt-in). The panel's Scanner
+            // section footer documents that gap.
+            ScannerPanelView()
         case .share:
             // Share = rtl_tcp server (and eventually client +
             // discovery). The existing server panel slots in

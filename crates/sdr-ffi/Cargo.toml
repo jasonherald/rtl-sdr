@@ -31,6 +31,11 @@ sdr-types.workspace = true
 # by a future sdr-core refactor that drops the transitive edge.
 sdr-pipeline.workspace = true
 sdr-radio.workspace = true
+# Scanner state types (`ScannerState`, `ChannelKey`, `ScannerChannel`)
+# referenced at the FFI boundary by the scanner command + event
+# surface (#447). Pulled in transitively via sdr-core anyway; same
+# explicit-dep rationale as sdr-pipeline / sdr-radio above.
+sdr-scanner.workspace = true
 # Direct dep on sdr-rtlsdr for the device-enumeration functions
 # (`sdr_core_device_count` / `sdr_core_device_name` in the C ABI).
 # These are static (no handle required), so they don't fit the

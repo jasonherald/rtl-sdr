@@ -56,8 +56,37 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 19
+#define SDR_CORE_ABI_VERSION_MINOR 20
 /*
+ * 0.20 — exposes the scanner Phase 1 surface (#447) at the FFI
+ * boundary so the macOS SwiftUI scanner panel can drive it.
+ * Additive enum + payload growth:
+ *   - `SdrEventKind` gains four discriminants:
+ *     `SDR_EVT_SCANNER_STATE_CHANGED`        = 14
+ *     `SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED` = 15
+ *     `SDR_EVT_SCANNER_EMPTY_ROTATION`       = 16
+ *     `SDR_EVT_SCANNER_MUTEX_STOPPED`        = 17
+ *   - New helper enums `SdrScannerState` (Idle / Retuning /
+ *     Dwelling / Listening / Hanging) and `SdrScannerMutexReason`
+ *     for the corresponding payload `state` / `reason` fields.
+ *   - New payload structs `SdrEventScannerStateChanged`,
+ *     `SdrEventScannerActiveChannelChanged`,
+ *     `SdrEventScannerMutexStopped` appended to `SdrEventPayload`
+ *     as new union members (existing field offsets unchanged).
+ *   - Three new commands: `sdr_core_set_scanner_enabled`,
+ *     `sdr_core_lockout_scanner_channel`,
+ *     `sdr_core_unlock_scanner_channel`.
+ * The bookmark-list projection (`UpdateScannerChannels`) is NOT
+ * exposed in 0.20 — that follows when the macOS bookmark layer
+ * grows the `scan_enabled` / `priority` fields the Linux side
+ * already has (#490). Until then, the scanner has no channels
+ * to rotate through and the master switch flips without
+ * observable effect; the SwiftUI panel documents this in its
+ * footer.
+ *
+ * Pre-1.0 minor bumps are breaking by project convention — old
+ * 0.19 hosts must fail fast on the exact-match ABI check.
+ *
  * 0.19 — extends the rtl_tcp FFI surface with codec-mask and
  * auth-required fields that were previously hardcoded (#307
  * / #395 follow-ups, issue #400):
@@ -1573,6 +1602,49 @@ int32_t sdr_core_set_fft_size(SdrCore* handle, size_t n);
 int32_t sdr_core_set_fft_window(SdrCore* handle, int32_t window);
 int32_t sdr_core_set_fft_rate(SdrCore* handle, double fps);
 
+/* --- Scanner (issue #447, ABI 0.20) ------------------------------ */
+
+/*
+ * Master scanner enable / disable. Maps to
+ * `UiToDsp::SetScannerEnabled` on the Rust side. Tripping this on
+ * with no projected channels leaves the engine in
+ * `SDR_SCANNER_STATE_IDLE` (visible via the SCANNER_STATE_CHANGED
+ * event); the host doesn't need to special-case empty rotation.
+ */
+int32_t sdr_core_set_scanner_enabled(SdrCore* handle, bool enabled);
+
+/*
+ * Lock out a channel for the rest of the scanner session.
+ *
+ * `name_utf8` + `frequency_hz` together form the scanner's
+ * `ChannelKey` — they must match the channel's identity at
+ * projection time exactly. The scanner clones the name into its
+ * `HashSet<ChannelKey>`, so the borrowed string is only read for
+ * the duration of the call.
+ *
+ * Lockouts persist until the channel is unlocked (see
+ * `sdr_core_unlock_scanner_channel`), the scanner is disabled,
+ * or the engine is destroyed. Returns `SDR_CORE_ERR_INVALID_ARG`
+ * if `name_utf8` is null or not valid UTF-8.
+ */
+int32_t sdr_core_lockout_scanner_channel(
+    SdrCore*    handle,
+    const char* name_utf8,
+    uint64_t    frequency_hz
+);
+
+/*
+ * Clear a session lockout previously installed by
+ * `sdr_core_lockout_scanner_channel`. No-op if the channel
+ * wasn't locked out. Same `(name_utf8, frequency_hz)` identity
+ * contract as the lockout call.
+ */
+int32_t sdr_core_unlock_scanner_channel(
+    SdrCore*    handle,
+    const char* name_utf8,
+    uint64_t    frequency_hz
+);
+
 /* ================================================================ */
 /*  Events                                                          */
 /* ================================================================ */
@@ -1625,7 +1697,43 @@ typedef enum SdrEventKind {
     SDR_EVT_IQ_RECORDING_STOPPED    = 11,
     SDR_EVT_NETWORK_SINK_STATUS     = 12, /* ABI 0.9 — issue #247 */
     SDR_EVT_RTL_TCP_CONNECTION_STATE = 13, /* ABI 0.11 — issue #325 */
+    SDR_EVT_SCANNER_STATE_CHANGED         = 14, /* ABI 0.20 — issue #447 */
+    SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED = 15, /* ABI 0.20 — issue #447 */
+    SDR_EVT_SCANNER_EMPTY_ROTATION        = 16, /* ABI 0.20 — issue #447 */
+    SDR_EVT_SCANNER_MUTEX_STOPPED         = 17, /* ABI 0.20 — issue #447 */
 } SdrEventKind;
+
+/* Scanner phase. Discriminant for the `state` field of
+ * `SdrEventScannerStateChanged` below. Mirrors the variant order
+ * of the engine-side `sdr_scanner::ScannerState`. Stable — never
+ * reorder. ABI 0.20.
+ */
+typedef enum SdrScannerState {
+    /* Scanner off, or on with no channels enabled. */
+    SDR_SCANNER_STATE_IDLE      = 0,
+    /* Retune in flight; audio muted, waiting for settle. */
+    SDR_SCANNER_STATE_RETUNING  = 1,
+    /* Settled on the channel; audio still muted; waiting for
+     * a squelch-open event within the dwell window. */
+    SDR_SCANNER_STATE_DWELLING  = 2,
+    /* Squelch open post-settle, audio flowing. */
+    SDR_SCANNER_STATE_LISTENING = 3,
+    /* Squelch closed, hang countdown before advancing. */
+    SDR_SCANNER_STATE_HANGING   = 4,
+} SdrScannerState;
+
+/* Why the scanner ↔ recording / transcription mutex fired.
+ * Discriminant for the `reason` field of
+ * `SdrEventScannerMutexStopped` below. Mirrors
+ * `sdr_core::messages::ScannerMutexReason`. Stable — never
+ * reorder. ABI 0.20.
+ */
+typedef enum SdrScannerMutexReason {
+    SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER     = 0,
+    SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER = 1,
+    SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING     = 2,
+    SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION = 3,
+} SdrScannerMutexReason;
 
 /* Discriminants for the `kind` field of
  * `SdrEventRtlTcpConnectionState` below. Stable — never reorder.
@@ -1755,6 +1863,44 @@ typedef struct SdrEventRtlTcpConnectionState {
 } SdrEventRtlTcpConnectionState;
 
 /*
+ * Payload for SDR_EVT_SCANNER_STATE_CHANGED. `state` is one of the
+ * `SDR_SCANNER_STATE_*` discriminants. ABI 0.20, per #447.
+ */
+typedef struct SdrEventScannerStateChanged {
+    int32_t state;
+} SdrEventScannerStateChanged;
+
+/*
+ * Payload for SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED. The scanner
+ * fires this on every channel latch (squelch open on the new
+ * channel) and on every release back to Idle.
+ *
+ * | scanner state         | name_utf8     | frequency_hz |
+ * |-----------------------|---------------|--------------|
+ * | active (latched)      | bookmark name | channel Hz   |
+ * | idle (no channel)     | NULL          | 0            |
+ *
+ * `name_utf8` is borrowed from dispatcher-owned storage; valid
+ * only for the duration of the callback. ABI 0.20, per #447.
+ */
+typedef struct SdrEventScannerActiveChannelChanged {
+    const char* name_utf8;
+    uint64_t    frequency_hz;
+} SdrEventScannerActiveChannelChanged;
+
+/*
+ * Payload for SDR_EVT_SCANNER_MUTEX_STOPPED. `reason` is one of
+ * the `SDR_SCANNER_MUTEX_*` discriminants — describes which side
+ * of the scanner ↔ recording / transcription mutex fired. ABI
+ * 0.20, per #447.
+ *
+ * SDR_EVT_SCANNER_EMPTY_ROTATION carries no payload.
+ */
+typedef struct SdrEventScannerMutexStopped {
+    int32_t reason;
+} SdrEventScannerMutexStopped;
+
+/*
  * Tagged union of all event payloads. Which union field is valid
  * is determined by the `kind` discriminant on the enclosing
  * SdrEvent (see the table below).
@@ -1774,6 +1920,10 @@ typedef struct SdrEventRtlTcpConnectionState {
  * SDR_EVT_IQ_RECORDING_STOPPED        none (all-zero payload)
  * SDR_EVT_NETWORK_SINK_STATUS         network_sink_status.{kind,utf8,protocol}
  * SDR_EVT_RTL_TCP_CONNECTION_STATE    rtl_tcp_connection_state.{kind,utf8,attempt,retry_in_secs,gain_count}
+ * SDR_EVT_SCANNER_STATE_CHANGED          scanner_state.state
+ * SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED scanner_active_channel.{name_utf8,frequency_hz}
+ * SDR_EVT_SCANNER_EMPTY_ROTATION         none (all-zero payload)
+ * SDR_EVT_SCANNER_MUTEX_STOPPED          scanner_mutex_stopped.reason
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
@@ -1786,6 +1936,9 @@ typedef union SdrEventPayload {
     SdrEventIqRecording       iq_recording;
     SdrEventNetworkSinkStatus      network_sink_status;
     SdrEventRtlTcpConnectionState  rtl_tcp_connection_state;
+    SdrEventScannerStateChanged          scanner_state;
+    SdrEventScannerActiveChannelChanged  scanner_active_channel;
+    SdrEventScannerMutexStopped          scanner_mutex_stopped;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;

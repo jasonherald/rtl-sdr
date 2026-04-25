@@ -43,6 +43,10 @@ private let kIqRecordingStarted    = Int32(SDR_EVT_IQ_RECORDING_STARTED.rawValue
 private let kIqRecordingStopped    = Int32(SDR_EVT_IQ_RECORDING_STOPPED.rawValue)
 private let kNetworkSinkStatus     = Int32(SDR_EVT_NETWORK_SINK_STATUS.rawValue)
 private let kRtlTcpConnectionState = Int32(SDR_EVT_RTL_TCP_CONNECTION_STATE.rawValue)
+private let kScannerStateChanged          = Int32(SDR_EVT_SCANNER_STATE_CHANGED.rawValue)
+private let kScannerActiveChannelChanged  = Int32(SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED.rawValue)
+private let kScannerEmptyRotation         = Int32(SDR_EVT_SCANNER_EMPTY_ROTATION.rawValue)
+private let kScannerMutexStopped          = Int32(SDR_EVT_SCANNER_MUTEX_STOPPED.rawValue)
 
 /// High-level event from the engine.
 ///
@@ -110,6 +114,26 @@ public enum SdrCoreEvent: Sendable, Equatable {
     /// (connect / disconnect / retry countdown tick) so hosts
     /// can drive a live status row. Per issue #325.
     case rtlTcpConnectionState(RtlTcpConnectionState)
+
+    /// Scanner phase transition — host updates the State row in
+    /// the scanner panel. Per issue #447 (ABI 0.20).
+    case scannerStateChanged(ScannerState)
+
+    /// Scanner latched on a new channel (`channel` non-nil) or
+    /// returned to idle (`channel == nil`). Host updates the
+    /// Channel row's subtitle. Per issue #447 (ABI 0.20).
+    case scannerActiveChannelChanged(ScannerActiveChannel?)
+
+    /// Rotation exhausted because all channels are absent or
+    /// locked out. Host can show a brief toast before the panel
+    /// readout resets. Per issue #447 (ABI 0.20).
+    case scannerEmptyRotation
+
+    /// The scanner ↔ recording / transcription mutex fired —
+    /// either the scanner stopped one of those (or vice versa).
+    /// Host shows a toast describing the transition. Per issue
+    /// #447 (ABI 0.20).
+    case scannerMutexStopped(ScannerMutexReason)
 
     /// Translate a C `SdrEvent` into a Swift value.
     ///
@@ -219,6 +243,48 @@ public enum SdrCoreEvent: Sendable, Equatable {
                 // silently, matches the outer `default` policy.
                 return nil
             }
+
+        case kScannerStateChanged:
+            let raw = payload.scanner_state.state
+            guard let state = ScannerState(rawValue: raw) else {
+                // Unknown phase — future ABI extension. Drop
+                // silently rather than mapping to a fallback,
+                // since the host's State-row label would lie.
+                return nil
+            }
+            return .scannerStateChanged(state)
+
+        case kScannerActiveChannelChanged:
+            let active = payload.scanner_active_channel
+            guard let cstr = active.name_utf8 else {
+                // Idle sentinel — scanner cleared the latched
+                // channel. Host clears its readout.
+                return .scannerActiveChannelChanged(nil)
+            }
+            let name = String(cString: cstr)
+            // The Rust side promises non-empty strings on
+            // latched events. An empty name with a non-null
+            // pointer would still be malformed; drop it rather
+            // than leaving the host's readout in an
+            // ambiguous "named with nothing" state.
+            guard !name.isEmpty else { return nil }
+            return .scannerActiveChannelChanged(
+                ScannerActiveChannel(name: name, frequencyHz: active.frequency_hz)
+            )
+
+        case kScannerEmptyRotation:
+            return .scannerEmptyRotation
+
+        case kScannerMutexStopped:
+            let raw = payload.scanner_mutex_stopped.reason
+            guard let reason = ScannerMutexReason(rawValue: raw) else {
+                // Unknown reason — drop silently. A future ABI
+                // extension would land in a known direction; a
+                // pop-a-toast-with-nothing-to-say payload helps
+                // no one.
+                return nil
+            }
+            return .scannerMutexStopped(reason)
 
         case kNetworkSinkStatus:
             let status = payload.network_sink_status
