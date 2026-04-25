@@ -2672,10 +2672,13 @@ final class CoreModel {
     //  the Linux activity-bar entry names — same source of
     //  truth).
     //
-    //  Default values match the Linux `SidebarSession::default`:
-    //  left = General open at 320 px, right = Transcript closed
-    //  at 320 px. The 320 px width matches the GTK
-    //  `DEFAULT_SIDEBAR_WIDTH_PX` constant.
+    //  Default values per the spec for #450 and the Linux
+    //  `SidebarSession::default`: left = General, open, 320 px;
+    //  right = Transcript, closed, 420 px. The right default is
+    //  wider than the left because the right side hosts content-
+    //  heavy panels (Transcript / Bookmarks) that read better
+    //  with extra room — same rationale captured on the per-side
+    //  range constants below.
     //
     //  These fields are observable @Observable storage so
     //  ContentView can bind through them (and the activity bar /
@@ -2692,16 +2695,21 @@ final class CoreModel {
     var sidebarLeftSelected: String = "general"
     /// Whether the left panel is currently visible.
     var sidebarLeftOpen: Bool = true
-    /// Width of the left panel in pixels.
-    var sidebarLeftWidth: UInt32 = 320
+    /// Width of the left panel in pixels. Default matches the
+    /// Linux `DEFAULT_SIDEBAR_WIDTH_PX` constant; the per-side
+    /// clamp range below is the spec's floor/ceiling pair.
+    var sidebarLeftWidth: UInt32 = sidebarLeftDefaultWidth
 
     /// Activity selected in the right sidebar — one of the
     /// `RightActivity` raw values.
     var sidebarRightSelected: String = "transcript"
     /// Whether the right panel is currently visible.
     var sidebarRightOpen: Bool = false
-    /// Width of the right panel in pixels.
-    var sidebarRightWidth: UInt32 = 320
+    /// Width of the right panel in pixels. Default is wider than
+    /// the left because the right side hosts content-heavy
+    /// panels (Transcript / Bookmarks) that read better with
+    /// extra room.
+    var sidebarRightWidth: UInt32 = sidebarRightDefaultWidth
 
     /// Config keys — match the Linux constants in
     /// `crates/sdr-ui/src/sidebar/activity_bar.rs` exactly so a
@@ -2713,13 +2721,44 @@ final class CoreModel {
     static let sidebarRightOpenKey = "ui_sidebar_right_open"
     static let sidebarRightWidthKey = "ui_sidebar_right_width_px"
 
-    /// Hard floor / ceiling for sidebar widths (pixels). The
-    /// GTK side tolerates anything but applies a sane minimum
-    /// in its split-view handler; we mirror that here so a
-    /// hand-edited config can't hand the SwiftUI HSplitView a
-    /// degenerate width that collapses the panel beyond the
-    /// drag-back-out threshold.
-    static let sidebarWidthRange: ClosedRange<UInt32> = 200...800
+    /// Allowed clamp range for the left sidebar's width (px).
+    /// 220 px is the minimum that keeps the panel's `Form`
+    /// section labels readable; 640 px stops a single panel
+    /// from monopolising the window. Matches the Linux
+    /// `LEFT_PANEL_MIN_PX` / `_MAX_PX` constants in
+    /// `crates/sdr-ui/src/sidebar/activity_bar.rs`. Used by
+    /// `setSidebarLeftWidth(_:)` for runtime clamps and by
+    /// the `loadSidebarSession()` restore for validating
+    /// persisted values.
+    ///
+    /// Stored as `Int` rather than `UInt32` because both
+    /// AppKit (`NSSplitView` constraints) and SwiftUI's
+    /// `.frame(minWidth:maxWidth:)` modifier take `CGFloat`,
+    /// and the conversion path is simpler from `Int`. The
+    /// model still persists width as `UInt32` because the
+    /// shared `sdr-config` file uses unsigned ints there.
+    static let sidebarLeftWidthRange: ClosedRange<Int> = 220...640
+
+    /// Allowed clamp range for the right sidebar's width (px).
+    /// 360 px is the minimum that keeps Transcript /
+    /// Bookmarks list rows from truncating timestamps+content;
+    /// 840 px is the upper ceiling. Same Linux-parity
+    /// rationale as `sidebarLeftWidthRange`.
+    static let sidebarRightWidthRange: ClosedRange<Int> = 360...840
+
+    /// Default width applied on a fresh install, on a
+    /// double-click reset of the left handle, and as the seed
+    /// value for the `sidebarLeftWidth` observable property.
+    /// Matches the Linux `DEFAULT_SIDEBAR_WIDTH_PX` constant.
+    static let sidebarLeftDefaultWidth: UInt32 = 320
+
+    /// Default width applied on a fresh install, on a
+    /// double-click reset of the right handle, and as the seed
+    /// value for the `sidebarRightWidth` observable property.
+    /// Wider than the left default because the right side
+    /// hosts content-heavy panels (Transcript / Bookmarks)
+    /// that read better with extra room.
+    static let sidebarRightDefaultWidth: UInt32 = 420
 
     /// Restore all six sidebar fields from the shared config.
     /// Called once during `bootstrap()` AFTER the engine is
@@ -2737,7 +2776,7 @@ final class CoreModel {
             sidebarLeftOpen = b
         }
         if let w = core.configUInt32(key: Self.sidebarLeftWidthKey),
-           Self.sidebarWidthRange.contains(w) {
+           Self.sidebarLeftWidthRange.contains(Int(w)) {
             sidebarLeftWidth = w
         }
         if let s = core.configString(key: Self.sidebarRightSelectedKey),
@@ -2748,7 +2787,7 @@ final class CoreModel {
             sidebarRightOpen = b
         }
         if let w = core.configUInt32(key: Self.sidebarRightWidthKey),
-           Self.sidebarWidthRange.contains(w) {
+           Self.sidebarRightWidthRange.contains(Int(w)) {
             sidebarRightWidth = w
         }
     }
@@ -2773,10 +2812,9 @@ final class CoreModel {
     }
 
     func setSidebarLeftWidth(_ width: UInt32) {
-        let clamped = min(
-            max(width, Self.sidebarWidthRange.lowerBound),
-            Self.sidebarWidthRange.upperBound
-        )
+        let lo = UInt32(Self.sidebarLeftWidthRange.lowerBound)
+        let hi = UInt32(Self.sidebarLeftWidthRange.upperBound)
+        let clamped = min(max(width, lo), hi)
         sidebarLeftWidth = clamped
         capture {
             try core?.setConfigUInt32(key: Self.sidebarLeftWidthKey, value: clamped)
@@ -2797,10 +2835,9 @@ final class CoreModel {
     }
 
     func setSidebarRightWidth(_ width: UInt32) {
-        let clamped = min(
-            max(width, Self.sidebarWidthRange.lowerBound),
-            Self.sidebarWidthRange.upperBound
-        )
+        let lo = UInt32(Self.sidebarRightWidthRange.lowerBound)
+        let hi = UInt32(Self.sidebarRightWidthRange.upperBound)
+        let clamped = min(max(width, lo), hi)
         sidebarRightWidth = clamped
         capture {
             try core?.setConfigUInt32(key: Self.sidebarRightWidthKey, value: clamped)
