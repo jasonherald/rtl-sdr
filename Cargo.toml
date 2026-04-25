@@ -112,6 +112,7 @@ members = [
     "crates/sdr-radio",
     "crates/sdr-config",
     "crates/sdr-radioreference",
+    "crates/sdr-sat",
     "crates/sdr-transcription",
     "crates/sdr-core",
     "crates/sdr-ffi",
@@ -142,6 +143,7 @@ sdr-sink-network = { path = "crates/sdr-sink-network" }
 sdr-radio = { path = "crates/sdr-radio" }
 sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
+sdr-sat = { path = "crates/sdr-sat" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
 sdr-ffi = { path = "crates/sdr-ffi" }
@@ -184,6 +186,14 @@ sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "6
 # System directories / libc
 dirs-next = "2"
 libc = "0.2"
+
+# Satellite tracking (sdr-sat). The `sgp4` crate is the de-facto
+# pure-Rust port of Vallado's SGP4/SDP4 (matches the reference C++
+# implementation, ships the AIAA test vectors). chrono gives us
+# `DateTime<Utc>` for human-friendly pass times — APT scheduling is
+# inherently a "render this in the user's timezone" feature.
+sgp4 = "2.3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 
 # Random number generation. Pulled in for the rtl_tcp optional-auth
 # server (#394) key generator — `OsRng` wraps `/dev/urandom` on
