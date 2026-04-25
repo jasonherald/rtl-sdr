@@ -104,6 +104,13 @@ pub enum TleCacheError {
     },
 }
 
+/// Custom fetcher used by [`TleCache::with_fetcher`]. Receives the
+/// requested source and returns the raw TLE text or a fetch-style
+/// error. Useful for unit tests that need hermetic refetch-path
+/// behaviour, and for users who want to plug in a non-reqwest HTTP
+/// stack (proxy-aware client, custom auth, etc.).
+pub type Fetcher = dyn Fn(TleSource) -> Result<String, TleCacheError> + Send + Sync;
+
 /// Filesystem-backed cache of Celestrak TLE files.
 pub struct TleCache {
     cache_dir: PathBuf,
@@ -116,6 +123,12 @@ pub struct TleCache {
     /// caller, free improvement if a future flow asks for several
     /// sources in a row.
     client: OnceLock<reqwest::blocking::Client>,
+    /// Optional fetcher override. When `Some`, [`TleCache::fetch`]
+    /// short-circuits to this closure instead of building / using the
+    /// reqwest client. Tests use this to make the refetch-path
+    /// regression tests hermetic — no live HTTP, no DNS, no flakiness
+    /// from celestrak.org being slow on a particular CI run.
+    fetcher: Option<Box<Fetcher>>,
 }
 
 impl TleCache {
@@ -141,7 +154,32 @@ impl TleCache {
             refresh_max_age: DEFAULT_REFRESH_MAX_AGE,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             client: OnceLock::new(),
+            fetcher: None,
         }
+    }
+
+    /// Override the network fetcher with a custom closure. Production
+    /// callers normally don't need this — the default reqwest-based
+    /// fetcher Just Works against celestrak.org. Two real uses:
+    ///
+    /// * **Tests** that exercise the refetch path can inject a canned
+    ///   response so the unit suite stays hermetic (no live HTTP,
+    ///   no DNS, no flaky CI from upstream slowness).
+    /// * **Custom HTTP stacks** — a corporate proxy that needs auth,
+    ///   a SOCKS tunnel, etc. Build the request through whatever
+    ///   client is appropriate and hand the body string back.
+    ///
+    /// The closure is called once per refetch attempt; its return
+    /// value goes through the same `has_any_tle_pair` validation as
+    /// the default fetcher, so a closure that returns garbage still
+    /// gets rejected before poisoning the cache.
+    #[must_use]
+    pub fn with_fetcher<F>(mut self, fetcher: F) -> Self
+    where
+        F: Fn(TleSource) -> Result<String, TleCacheError> + Send + Sync + 'static,
+    {
+        self.fetcher = Some(Box::new(fetcher));
+        self
     }
 
     /// Override the cache freshness window. Values shorter than ~1 hour
@@ -262,7 +300,13 @@ impl TleCache {
 
     /// Blocking HTTP fetch of one source file. Reuses the cached
     /// reqwest client across calls for connection + TLS-session pooling.
+    /// If [`TleCache::with_fetcher`] supplied an override, that closure
+    /// runs instead — letting tests stay hermetic and users plug in
+    /// custom HTTP stacks.
     fn fetch(&self, source: TleSource) -> Result<String, TleCacheError> {
+        if let Some(override_fetcher) = &self.fetcher {
+            return override_fetcher(source);
+        }
         let client = self.client()?;
         let url = source.url();
         let response = client
@@ -660,6 +704,13 @@ SOMETHING
         assert!(l1.starts_with("1 00005"));
     }
 
+    /// Canned fetcher for hermetic refetch-path tests: always returns
+    /// a `Fetch` error so we exercise the "fetch failed, fall back to
+    /// stale" branch without touching the network.
+    fn always_fail_fetcher() -> impl Fn(TleSource) -> Result<String, TleCacheError> + Send + Sync {
+        |_| Err(TleCacheError::Fetch("test: fetcher disabled".to_string()))
+    }
+
     #[test]
     fn cache_does_not_trust_html_blob_in_fresh_cache_file() {
         // Pre-validation-gate versions (or a manual
@@ -669,26 +720,21 @@ SOMETHING
         // serves garbage until the file ages out and `tle_for`
         // returns a misleading `NotFound`. The cache must validate
         // the content and treat invalid bodies as a miss → refetch.
-        //
-        // Acceptable outcomes (same logic as the TOCTOU test):
-        //   * Ok(text) — refetch succeeded (online runner)
-        //   * Err(Fetch(_)) — refetch failed, no valid stale to fall
-        //     back on. Either is fine — what matters is we did NOT
-        //     return the HTML blob.
+        // With a canned-fail fetcher, the only valid outcome is
+        // `Fetch(_)` — the test would have proved nothing if it
+        // accepted whatever the live network happened to return.
         let dir = unique_temp_dir("html-blob");
         std::fs::create_dir_all(&dir).unwrap();
-        let cache =
-            TleCache::with_dir(dir.clone()).with_fetch_timeout(StdDuration::from_millis(100));
+        let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
         let path = cache.cache_path(TleSource::Noaa);
         let html = "<html><head><title>503</title></head><body>oops</body></html>\n";
         std::fs::write(&path, html).unwrap();
 
         match cache.tle_text(TleSource::Noaa) {
-            Ok(text) => assert!(
-                !text.contains("<html>"),
-                "cache returned the HTML blob verbatim — corruption was trusted",
-            ),
             Err(TleCacheError::Fetch(_)) => {}
+            Ok(text) => {
+                panic!("cache returned the HTML blob verbatim — corruption was trusted: {text:?}")
+            }
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
     }
@@ -699,23 +745,22 @@ SOMETHING
         // gzip decompression got skipped, or some other tool wrote
         // bytes there) shows up to `read_to_string` as
         // `ErrorKind::InvalidData`. Should self-heal as a miss, NOT
-        // surface as a hard `Io` error, so the next call refetches
-        // cleanly.
+        // surface as a hard `Io` error.
         let dir = unique_temp_dir("non-utf8");
         std::fs::create_dir_all(&dir).unwrap();
-        let cache =
-            TleCache::with_dir(dir.clone()).with_fetch_timeout(StdDuration::from_millis(100));
+        let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
         let path = cache.cache_path(TleSource::Noaa);
-        // 0x80 0x81 0x82 etc. are invalid as UTF-8 lead bytes.
+        // 0xFF 0xFE 0x80 0x81 0x82 are invalid as UTF-8 lead bytes.
         std::fs::write(&path, [0xFF_u8, 0xFE, 0x80, 0x81, 0x82]).unwrap();
 
         match cache.tle_text(TleSource::Noaa) {
-            Ok(_) | Err(TleCacheError::Fetch(_)) => {}
+            Err(TleCacheError::Fetch(_)) => {}
             Err(TleCacheError::Io { ref source, .. })
                 if source.kind() == std::io::ErrorKind::InvalidData =>
             {
                 panic!("non-UTF-8 cache file should self-heal as a miss, not surface as Io error")
             }
+            Ok(text) => panic!("unexpected Ok with binary cache: {text:?}"),
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
     }
@@ -727,40 +772,38 @@ SOMETHING
         // manual rm) before the read. tle_text() must NOT raise a
         // hard `Io(NotFound)` — it must fall through to the refetch
         // path so the race becomes a recoverable network condition,
-        // not a file-not-found bug.
-        //
-        // Acceptable outcomes:
-        //   * Ok(text) — refetch reached upstream and won (CI has
-        //     network, etc.). Contract still satisfied.
-        //   * Err(Fetch(_)) — refetch couldn't reach upstream and
-        //     there's no stale to fall back on (we just deleted it).
-        //     Expected on offline runners.
-        // Forbidden outcome:
-        //   * Err(Io(_)) — means the disappeared file became a hard
-        //     error instead of falling through to fetch. That's the
-        //     bug this test exists to catch.
-        //
-        // Aggressive fetch timeout (100 ms) so the offline path
-        // doesn't slow tests down — networked CI runners take longer
-        // than that to round-trip celestrak.org so they'll usually
-        // hit the Fetch-err branch too, but either branch is fine.
+        // not a file-not-found bug. Canned-fail fetcher pins the
+        // expected outcome to `Fetch(_)` exactly.
         let dir = unique_temp_dir("toctou");
         std::fs::create_dir_all(&dir).unwrap();
-        let cache =
-            TleCache::with_dir(dir.clone()).with_fetch_timeout(StdDuration::from_millis(100));
+        let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
         let path = cache.cache_path(TleSource::Noaa);
         std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
-        // Sanity: fresh-cache fast path works as expected.
+        // Sanity: fresh-cache fast path works (doesn't go through fetch).
         assert!(cache.tle_text(TleSource::Noaa).is_ok());
         // Race: delete the file before the next call.
         std::fs::remove_file(&path).unwrap();
         match cache.tle_text(TleSource::Noaa) {
-            Ok(_) | Err(TleCacheError::Fetch(_)) => {} // both acceptable
+            Err(TleCacheError::Fetch(_)) => {} // expected: fell through to (failing) fetch
             Err(other @ TleCacheError::Io { .. }) => {
                 panic!("TOCTOU race should fall through to fetch, got Io error: {other:?}")
             }
+            Ok(text) => panic!("unexpected Ok with deleted cache + failing fetcher: {text:?}"),
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cache_uses_injected_fetcher_when_set() {
+        // Round-trip the fetcher injection itself: a stale cache
+        // path with a canned-OK fetcher should return the canned
+        // text, NOT make a network call.
+        let dir = unique_temp_dir("inject");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = TleCache::with_dir(dir).with_fetcher(|_| Ok(SAMPLE_TLE_3LINE.to_string()));
+        // No file present → goes through the fetch path.
+        let text = cache.tle_text(TleSource::Noaa).unwrap();
+        assert!(text.contains("VANGUARD 1"));
     }
 
     #[test]
