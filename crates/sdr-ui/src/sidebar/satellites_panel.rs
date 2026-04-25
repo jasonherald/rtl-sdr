@@ -502,14 +502,110 @@ fn read_bool_or(config: &Arc<ConfigManager>, key: &str, default: bool) -> bool {
 
 // ─── Helpers used by the wiring layer ─────────────────────────────────
 
+/// Pass-quality boundaries (degrees of peak elevation). Tuned from
+/// real-world receive experience:
+///
+/// * `>= 40°` → "winner" — clean image, clear land/cloud features.
+/// * `>= 25°` → "good" — recognizable image with some noise at edges.
+/// * `>= 15°` → "marginal" — main features survive but noisy.
+/// * else (down to the [`MIN_PASS_ELEVATION_DEG`] floor) → "barely" —
+///   mostly noise, only worth tuning if nothing better is in the
+///   next few hours.
+const QUALITY_WINNER_DEG: f64 = 40.0;
+const QUALITY_GOOD_DEG: f64 = 25.0;
+const QUALITY_MARGINAL_DEG: f64 = 15.0;
+
+/// Map a pass's peak elevation to a one-word quality tag for the
+/// pass row's subtitle. Helps the user spot which upcoming pass is
+/// worth setting an alarm for vs. ones to skip past.
+#[must_use]
+pub fn pass_quality_label(peak_elev_deg: f64) -> &'static str {
+    if peak_elev_deg >= QUALITY_WINNER_DEG {
+        "winner"
+    } else if peak_elev_deg >= QUALITY_GOOD_DEG {
+        "good"
+    } else if peak_elev_deg >= QUALITY_MARGINAL_DEG {
+        "marginal"
+    } else {
+        "barely"
+    }
+}
+
+/// Look up the downlink frequency for a satellite by its display
+/// name. Returns `None` for satellites that aren't in
+/// [`KNOWN_SATELLITES`] (shouldn't happen in practice — the
+/// pass list is enumerated against that catalog — but the name is
+/// the only key carried on the [`Pass`] type, so a lookup
+/// indirection is the natural shape).
+#[must_use]
+pub fn downlink_hz_for_pass(pass: &Pass) -> Option<u64> {
+    KNOWN_SATELLITES
+        .iter()
+        .find(|s| s.name == pass.satellite)
+        .map(|s| s.downlink_hz)
+}
+
+/// The full tuning triple — frequency, demod mode, channel
+/// bandwidth — for a given pass's satellite. Returned as a tuple
+/// to keep the call site simple (the play-button wiring layer
+/// destructures it directly into the three `UiToDsp` setters).
+/// `None` for the same off-catalog reason as
+/// [`downlink_hz_for_pass`].
+#[must_use]
+pub fn tune_target_for_pass(pass: &Pass) -> Option<(u64, sdr_types::DemodMode, u32)> {
+    KNOWN_SATELLITES
+        .iter()
+        .find(|s| s.name == pass.satellite)
+        .map(|s| (s.downlink_hz, s.demod_mode, s.bandwidth_hz))
+}
+
+/// Format a Hz frequency as a fixed-precision MHz string with
+/// trailing zeros trimmed: `137_100_000` → `"137.100 MHz"`,
+/// `137_912_500` → `"137.9125 MHz"`. Three decimals is enough to
+/// disambiguate every NOAA / Meteor / ISS downlink we ship.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "u64 → f64 here only loses precision past ~2^53; our \
+              downlink frequencies are in the 100s of MHz, far below \
+              that ceiling"
+)]
+pub fn format_downlink_mhz(hz: u64) -> String {
+    let mhz = hz as f64 / 1_000_000.0;
+    // Up to 4 decimals (137.9125), then trim trailing zeros so
+    // 137.100 reads as "137.100" and 145.800 as "145.800" but
+    // 137.9125 keeps its 4th digit.
+    let raw = format!("{mhz:.4}");
+    let trimmed = raw.trim_end_matches('0');
+    let trimmed = trimmed.trim_end_matches('.');
+    // Always show at least 3 decimals so every entry lines up
+    // visually in the panel ("137.100" not "137.1").
+    let dot_idx = trimmed.find('.').unwrap_or(trimmed.len());
+    let decimals = trimmed.len().saturating_sub(dot_idx + 1);
+    let formatted = if decimals < 3 {
+        format!("{mhz:.3}")
+    } else {
+        trimmed.to_string()
+    };
+    format!("{formatted} MHz")
+}
+
 /// Description text shown on a pass row alongside its title-line
-/// countdown. Format: `"max el 56°  ·  AOS 245° → LOS 105°"`.
+/// countdown. Format with downlink + quality tag:
+/// `"winner · 137.100 MHz · max el 56° · AOS 245° → LOS 105°"`.
+/// Falls back to the plain geometry-only form if the satellite
+/// isn't in [`KNOWN_SATELLITES`] (no downlink to display).
 #[must_use]
 pub fn format_pass_subtitle(pass: &Pass) -> String {
-    format!(
+    let quality = pass_quality_label(pass.max_elevation_deg);
+    let geometry = format!(
         "max el {:.0}°  ·  AOS {:.0}° → LOS {:.0}°",
         pass.max_elevation_deg, pass.start_az_deg, pass.end_az_deg,
-    )
+    );
+    match downlink_hz_for_pass(pass) {
+        Some(hz) => format!("{quality}  ·  {}  ·  {geometry}", format_downlink_mhz(hz)),
+        None => format!("{quality}  ·  {geometry}"),
+    }
 }
 
 /// Title-line countdown rendering. Examples:
@@ -731,6 +827,74 @@ mod tests {
         assert!(subtitle.contains("max el 56"));
         assert!(subtitle.contains("AOS 245"));
         assert!(subtitle.contains("LOS 105"));
+    }
+
+    #[test]
+    fn format_pass_subtitle_includes_quality_tag_and_downlink() {
+        // NOAA 19 with 56° peak is a "winner" tier pass; downlink
+        // is 137.100 MHz from the catalog.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_pass(now, 30);
+        let subtitle = format_pass_subtitle(&pass);
+        assert!(subtitle.contains("winner"), "subtitle: {subtitle}");
+        assert!(subtitle.contains("137.100 MHz"), "subtitle: {subtitle}");
+    }
+
+    #[test]
+    fn format_pass_subtitle_falls_back_when_satellite_not_in_catalog() {
+        // A pass for a satellite the panel doesn't know about (user
+        // has manually loaded a TLE, future) — subtitle still works,
+        // just without the freq.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let mut pass = synthetic_pass(now, 30);
+        pass.satellite = "FAKESAT-7".to_string();
+        let subtitle = format_pass_subtitle(&pass);
+        assert!(subtitle.contains("max el 56"), "subtitle: {subtitle}");
+        assert!(!subtitle.contains("MHz"), "subtitle: {subtitle}");
+    }
+
+    #[test]
+    fn pass_quality_label_pins_boundary_values() {
+        // Boundary table: the threshold value itself takes the
+        // higher tier (`>=`), one tick below drops to the next.
+        assert_eq!(pass_quality_label(60.0), "winner");
+        assert_eq!(pass_quality_label(40.0), "winner");
+        assert_eq!(pass_quality_label(39.9), "good");
+        assert_eq!(pass_quality_label(25.0), "good");
+        assert_eq!(pass_quality_label(24.9), "marginal");
+        assert_eq!(pass_quality_label(15.0), "marginal");
+        assert_eq!(pass_quality_label(14.9), "barely");
+        assert_eq!(pass_quality_label(5.0), "barely");
+    }
+
+    #[test]
+    fn format_downlink_mhz_renders_three_decimals_minimum() {
+        // 137.100 MHz reads as "137.100", not "137.1" — the panel
+        // wants every entry to line up visually.
+        assert_eq!(format_downlink_mhz(137_100_000), "137.100 MHz");
+        assert_eq!(format_downlink_mhz(145_800_000), "145.800 MHz");
+    }
+
+    #[test]
+    fn format_downlink_mhz_preserves_extra_precision_when_needed() {
+        // NOAA 18 is on 137.9125 MHz exactly — the formatter must
+        // not round to 3 decimals and lose the off-channel offset.
+        assert_eq!(format_downlink_mhz(137_912_500), "137.9125 MHz");
+    }
+
+    #[test]
+    fn downlink_hz_for_pass_finds_catalog_entry() {
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_pass(now, 30); // satellite = "NOAA 19"
+        assert_eq!(downlink_hz_for_pass(&pass), Some(137_100_000));
+    }
+
+    #[test]
+    fn downlink_hz_for_pass_returns_none_for_unknown_satellite() {
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let mut pass = synthetic_pass(now, 30);
+        pass.satellite = "MYSTERY-SAT".to_string();
+        assert_eq!(downlink_hz_for_pass(&pass), None);
     }
 
     #[test]

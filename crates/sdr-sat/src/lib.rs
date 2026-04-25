@@ -46,6 +46,31 @@ pub struct KnownSatellite {
     /// NORAD catalog number — the canonical satellite identifier.
     /// [`TleCache`] looks up TLEs by this id directly.
     pub norad_id: u32,
+    /// Downlink centre frequency, Hz. Targets the satellite's primary
+    /// imaging signal — APT (137.x MHz) for NOAA, LRPT (137.x MHz) for
+    /// Meteor-M, SSTV (145.8 MHz) for ISS during transmission events.
+    /// Consumed by the Satellites panel's pass-row display and (in
+    /// the upcoming #482b work) by the "tune to this satellite" play
+    /// button.
+    pub downlink_hz: u64,
+    /// Demod mode the receiver should be in for this satellite. NFM
+    /// for everything we ship today: NOAA APT, Meteor LRPT, and ISS
+    /// SSTV all ride wide-FM-style channels and our demod chain
+    /// handles them through the same NFM front-end with a wider
+    /// channel filter. Tracked as a field rather than hardcoded so a
+    /// future amateur-band catalog addition (e.g. AO-92 with FM voice
+    /// vs PSK telemetry) can choose differently without a special
+    /// case in the wiring layer.
+    pub demod_mode: sdr_types::DemodMode,
+    /// Channel bandwidth (Hz) the receiver should use for this
+    /// satellite. APT / LRPT / SSTV all need ~38 kHz of headroom
+    /// past the NFM default 12.5 kHz to capture the full subcarrier
+    /// spectrum without clipping the brighter / darker extremes.
+    /// Same per-satellite philosophy as `demod_mode` — the catalog
+    /// entry is the single source of truth so the play button can
+    /// dispatch a `SetBandwidth` without re-deriving the value from
+    /// signal type.
+    pub bandwidth_hz: u32,
 }
 
 /// Built-in catalog. Order is the order the scheduler UI displays.
@@ -54,32 +79,53 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     KnownSatellite {
         name: "NOAA 15",
         norad_id: 25_338,
+        downlink_hz: 137_620_000,
+        demod_mode: sdr_types::DemodMode::Nfm,
+        bandwidth_hz: 38_000,
     },
     KnownSatellite {
         name: "NOAA 18",
         norad_id: 28_654,
+        downlink_hz: 137_912_500,
+        demod_mode: sdr_types::DemodMode::Nfm,
+        bandwidth_hz: 38_000,
     },
     KnownSatellite {
         name: "NOAA 19",
         norad_id: 33_591,
+        downlink_hz: 137_100_000,
+        demod_mode: sdr_types::DemodMode::Nfm,
+        bandwidth_hz: 38_000,
     },
-    // Meteor-M LRPT — epic #469
+    // Meteor-M LRPT — epic #469. Note: METEOR-M 2 and NOAA 19 share
+    // the 137.100 MHz channel — they're never on simultaneously by
+    // design. The pass scheduler picks whichever is overhead.
     KnownSatellite {
         name: "METEOR-M 2",
         norad_id: 40_069,
+        downlink_hz: 137_100_000,
+        demod_mode: sdr_types::DemodMode::Nfm,
+        bandwidth_hz: 38_000,
     },
     KnownSatellite {
         name: "METEOR-M2 3",
         norad_id: 57_166,
+        downlink_hz: 137_900_000,
+        demod_mode: sdr_types::DemodMode::Nfm,
+        bandwidth_hz: 38_000,
     },
-    KnownSatellite {
-        name: "METEOR-M2 4",
-        norad_id: 61_024,
-    },
-    // ISS SSTV — epic #472
+    // METEOR-M2 4 (NORAD 61024) deliberately omitted — launched 2024,
+    // failed shortly after, no usable TLE on Celestrak (404 from the
+    // GP API). Per #506.
+    // ISS SSTV — epic #472. 145.800 MHz is the primary downlink for
+    // SSTV transmission events and the ARISS voice repeater; both
+    // ride wide-FM and use the same tune-and-listen flow.
     KnownSatellite {
         name: "ISS (ZARYA)",
         norad_id: 25_544,
+        downlink_hz: 145_800_000,
+        demod_mode: sdr_types::DemodMode::Nfm,
+        bandwidth_hz: 38_000,
     },
 ];
 
@@ -109,5 +155,36 @@ mod tests {
         assert!(names.iter().any(|n| n.contains("METEOR")));
         // ISS SSTV
         assert!(names.iter().any(|n| n.contains("ISS")));
+    }
+
+    #[test]
+    fn meteor_m2_4_is_dropped_from_catalog() {
+        // NORAD 61024 (METEOR-M2 4) launched 2024 and failed shortly
+        // after — Celestrak's GP API returns 404 for it. Per #506,
+        // the entry is intentionally absent so refreshes don't
+        // accumulate per-call warn logs for a satellite that will
+        // never produce a pass.
+        assert!(
+            !KNOWN_SATELLITES.iter().any(|s| s.norad_id == 61_024),
+            "METEOR-M2 4 (NORAD 61024) should not be in KNOWN_SATELLITES",
+        );
+    }
+
+    #[test]
+    fn known_satellites_have_imaging_band_downlinks() {
+        // All catalog entries today are weather / imaging / SSTV
+        // satellites that downlink in the 137-148 MHz VHF window.
+        // Pin the range so a future entry with a wildly-wrong freq
+        // (e.g. forgot to convert MHz → Hz, or pasted a different
+        // satellite's value) trips this test rather than reaching
+        // the user as a misconfigured tune button.
+        for s in KNOWN_SATELLITES {
+            assert!(
+                (137_000_000..=148_000_000).contains(&s.downlink_hz),
+                "{} downlink {} Hz is outside the 137-148 MHz VHF imaging band",
+                s.name,
+                s.downlink_hz,
+            );
+        }
     }
 }
