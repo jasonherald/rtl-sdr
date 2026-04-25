@@ -8634,20 +8634,27 @@ fn connect_satellites_panel(
                     // anyway, and we'd rather populate lat/lon than
                     // leave the user staring at an error toast.
                     let result = gio::spawn_blocking(move || -> Result<
-                    (sdr_sat::PostalLocation, Option<f64>),
+                    (sdr_sat::PostalLocation, Result<f64, String>),
                     sdr_sat::PostalLookupError,
                 > {
                     let loc = sdr_sat::lookup_us_zip(&zip_for_task)?;
+                    // Elevation lookup is best-effort — a failure here
+                    // shouldn't fail the whole flow, but we DO want
+                    // the provider error to reach the UI so the user
+                    // can see why altitude didn't update. Pass it
+                    // back as `Err(String)` (cheap to send across
+                    // thread, decoupled from `ElevationLookupError`'s
+                    // type, and the log already scrubbed lat/lon).
                     let elevation = match sdr_sat::lookup_elevation_m(loc.lat_deg, loc.lon_deg)
                     {
-                        Ok(m) => Some(m),
+                        Ok(m) => Ok(m),
                         Err(e) => {
                             // Don't include lat/lon in the log — that's user
-                            // location data, and the failure path is already
-                            // surfaced inline in the status row. Provider
-                            // error message alone is enough for debugging.
+                            // location data. The error message itself is
+                            // safe (it's the upstream HTTP error / parse
+                            // error / dataset-coverage error).
                             tracing::warn!("elevation lookup failed: {e}");
-                            None
+                            Err(e.to_string())
                         }
                     };
                     Ok((loc, elevation))
@@ -8675,16 +8682,17 @@ fn connect_satellites_panel(
                                 format!("{place}, {region}", place = loc.place, region = loc.region)
                             };
                             let status = match elevation {
-                                Some(alt_m) => {
+                                Ok(alt_m) => {
                                     panel.alt_row.set_value(alt_m);
                                     format!("Resolved: {where_text} ({alt_m:.0} m)")
                                 }
-                                None => {
-                                    // Leave altitude alone — the warn
-                                    // log captured the real reason; show
-                                    // a short hint so the user notices
-                                    // altitude wasn't updated.
-                                    format!("Resolved: {where_text} (altitude unchanged)")
+                                Err(e) => {
+                                    // Leave altitude alone but
+                                    // surface the provider error
+                                    // so the user knows what to
+                                    // try next (e.g. retry on a
+                                    // bad network).
+                                    format!("Resolved: {where_text} (altitude unchanged: {e})")
                                 }
                             };
                             panel.zip_status_row.set_title(&status);
