@@ -48,6 +48,14 @@ pub enum SdrCoreError {
     /// (actionable: ask the user) from "server is down" (transient,
     /// retry might work). ABI 0.5 → 0.6.
     Auth = -9,
+    /// A config read was dispatched for a key that doesn't exist
+    /// in the current JSON, or exists with a type the reader
+    /// didn't ask for (e.g. `get_bool` on a string-valued key).
+    /// Distinct from `InvalidArg` so hosts can branch cleanly
+    /// on "key absent → use default" vs "key malformed →
+    /// surface an error". Added for the sidebar session
+    /// surface (issue #449). ABI 0.20 → 0.21.
+    KeyNotFound = -10,
 }
 
 impl SdrCoreError {
@@ -182,5 +190,6 @@ mod tests {
         assert_eq!(SdrCoreError::Io.as_int(), -7);
         assert_eq!(SdrCoreError::Config.as_int(), -8);
         assert_eq!(SdrCoreError::Auth.as_int(), -9);
+        assert_eq!(SdrCoreError::KeyNotFound.as_int(), -10);
     }
 }

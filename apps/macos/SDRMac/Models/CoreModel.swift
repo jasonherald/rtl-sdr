@@ -954,6 +954,18 @@ final class CoreModel {
         do {
             let c = try SdrCore(configPath: configPath)
             self.core = c
+            // Restore sidebar session from the shared config —
+            // issue #449. Runs AFTER the engine handle is set
+            // because `loadSidebarSession()` reads through the
+            // FFI's config surface, which depends on the
+            // ConfigManager owned by the engine handle. Has to
+            // happen before the SwiftUI scene first paints so the
+            // remembered selection / open state / width is on the
+            // observable properties before ContentView's bindings
+            // wire up. Out-of-range values fall through to the
+            // already-set defaults — same defensive policy as the
+            // rest of the bootstrap restore block.
+            loadSidebarSession()
             // `[weak self]` breaks the retain cycle that would
             // otherwise form: CoreModel → eventTask → closure →
             // self. If the model is dropped (e.g., from a future
@@ -2647,6 +2659,153 @@ final class CoreModel {
     /// the GTK panel uses an in-memory `ComboRow` and resets on
     /// app restart).
     static let lastSelectedBandPresetDefaultsKey = "SDRMac.lastSelectedBandPreset"
+
+    // ----------------------------------------------------------
+    //  Sidebar session — issue #449 (ABI 0.21)
+    //
+    //  Six fields, three per side, persisted to the shared
+    //  `sdr-config` JSON file via the engine's config FFI. Keys
+    //  match the Linux side exactly so a user who runs both
+    //  frontends sees consistent state. Values for the
+    //  `*_selected` fields are the activity raw-value strings
+    //  defined on `LeftActivity` / `RightActivity` (which match
+    //  the Linux activity-bar entry names — same source of
+    //  truth).
+    //
+    //  Default values match the Linux `SidebarSession::default`:
+    //  left = General open at 320 px, right = Transcript closed
+    //  at 320 px. The 320 px width matches the GTK
+    //  `DEFAULT_SIDEBAR_WIDTH_PX` constant.
+    //
+    //  These fields are observable @Observable storage so
+    //  ContentView can bind through them (and the activity bar /
+    //  resize gesture writes flow back through the matching
+    //  setters). The setters double-write: update the
+    //  observable property AND push to the engine config so the
+    //  on-disk JSON stays in sync.
+    // ----------------------------------------------------------
+
+    /// Activity selected in the left sidebar — one of the
+    /// `LeftActivity` raw values. Loaded from
+    /// `ui_sidebar_left_selected` on bootstrap; written through
+    /// `setSidebarLeftSelected(_:)` on user picks.
+    var sidebarLeftSelected: String = "general"
+    /// Whether the left panel is currently visible.
+    var sidebarLeftOpen: Bool = true
+    /// Width of the left panel in pixels.
+    var sidebarLeftWidth: UInt32 = 320
+
+    /// Activity selected in the right sidebar — one of the
+    /// `RightActivity` raw values.
+    var sidebarRightSelected: String = "transcript"
+    /// Whether the right panel is currently visible.
+    var sidebarRightOpen: Bool = false
+    /// Width of the right panel in pixels.
+    var sidebarRightWidth: UInt32 = 320
+
+    /// Config keys — match the Linux constants in
+    /// `crates/sdr-ui/src/sidebar/activity_bar.rs` exactly so a
+    /// user who runs both frontends sees consistent state.
+    static let sidebarLeftSelectedKey = "ui_sidebar_left_selected"
+    static let sidebarLeftOpenKey = "ui_sidebar_left_open"
+    static let sidebarLeftWidthKey = "ui_sidebar_left_width_px"
+    static let sidebarRightSelectedKey = "ui_sidebar_right_selected"
+    static let sidebarRightOpenKey = "ui_sidebar_right_open"
+    static let sidebarRightWidthKey = "ui_sidebar_right_width_px"
+
+    /// Hard floor / ceiling for sidebar widths (pixels). The
+    /// GTK side tolerates anything but applies a sane minimum
+    /// in its split-view handler; we mirror that here so a
+    /// hand-edited config can't hand the SwiftUI HSplitView a
+    /// degenerate width that collapses the panel beyond the
+    /// drag-back-out threshold.
+    static let sidebarWidthRange: ClosedRange<UInt32> = 200...800
+
+    /// Restore all six sidebar fields from the shared config.
+    /// Called once during `bootstrap()` AFTER the engine is
+    /// alive (the engine handle owns the `ConfigManager` we
+    /// read through). Out-of-range / malformed entries fall
+    /// through to the default value already on the property —
+    /// same defensive policy as the network-sink restore above.
+    private func loadSidebarSession() {
+        guard let core else { return }
+        if let s = core.configString(key: Self.sidebarLeftSelectedKey),
+           LeftActivity(rawValue: s) != nil {
+            sidebarLeftSelected = s
+        }
+        if let b = core.configBool(key: Self.sidebarLeftOpenKey) {
+            sidebarLeftOpen = b
+        }
+        if let w = core.configUInt32(key: Self.sidebarLeftWidthKey),
+           Self.sidebarWidthRange.contains(w) {
+            sidebarLeftWidth = w
+        }
+        if let s = core.configString(key: Self.sidebarRightSelectedKey),
+           RightActivity(rawValue: s) != nil {
+            sidebarRightSelected = s
+        }
+        if let b = core.configBool(key: Self.sidebarRightOpenKey) {
+            sidebarRightOpen = b
+        }
+        if let w = core.configUInt32(key: Self.sidebarRightWidthKey),
+           Self.sidebarWidthRange.contains(w) {
+            sidebarRightWidth = w
+        }
+    }
+
+    /// Update the left sidebar's selected activity. Validates
+    /// against `LeftActivity` raw values before writing — a
+    /// non-UI caller passing a bogus string can't poison the
+    /// shared config (Linux side would silently ignore it on
+    /// next load anyway, but the round-trip would be sticky
+    /// across sessions).
+    func setSidebarLeftSelected(_ name: String) {
+        guard LeftActivity(rawValue: name) != nil else { return }
+        sidebarLeftSelected = name
+        capture {
+            try core?.setConfigString(key: Self.sidebarLeftSelectedKey, value: name)
+        }
+    }
+
+    func setSidebarLeftOpen(_ open: Bool) {
+        sidebarLeftOpen = open
+        capture { try core?.setConfigBool(key: Self.sidebarLeftOpenKey, value: open) }
+    }
+
+    func setSidebarLeftWidth(_ width: UInt32) {
+        let clamped = min(
+            max(width, Self.sidebarWidthRange.lowerBound),
+            Self.sidebarWidthRange.upperBound
+        )
+        sidebarLeftWidth = clamped
+        capture {
+            try core?.setConfigUInt32(key: Self.sidebarLeftWidthKey, value: clamped)
+        }
+    }
+
+    func setSidebarRightSelected(_ name: String) {
+        guard RightActivity(rawValue: name) != nil else { return }
+        sidebarRightSelected = name
+        capture {
+            try core?.setConfigString(key: Self.sidebarRightSelectedKey, value: name)
+        }
+    }
+
+    func setSidebarRightOpen(_ open: Bool) {
+        sidebarRightOpen = open
+        capture { try core?.setConfigBool(key: Self.sidebarRightOpenKey, value: open) }
+    }
+
+    func setSidebarRightWidth(_ width: UInt32) {
+        let clamped = min(
+            max(width, Self.sidebarWidthRange.lowerBound),
+            Self.sidebarWidthRange.upperBound
+        )
+        sidebarRightWidth = clamped
+        capture {
+            try core?.setConfigUInt32(key: Self.sidebarRightWidthKey, value: clamped)
+        }
+    }
 
     /// Apply the current network-source host/port/protocol to
     /// the engine. Called on explicit Apply in the Source pane
