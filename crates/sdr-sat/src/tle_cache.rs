@@ -242,25 +242,34 @@ impl TleCache {
 
     /// Get-or-build the cached HTTP client. First call builds it from
     /// the current `fetch_timeout`; subsequent calls reuse the same
-    /// instance. Builder methods that change the timeout *after* the
-    /// first fetch don't take effect — by design, since reqwest's
-    /// timeout is baked into the client at build time.
-    fn client(&self) -> Result<&reqwest::blocking::Client, TleCacheError> {
+    /// underlying connection pool (`reqwest::blocking::Client` is
+    /// internally `Arc`-counted, so clones are cheap atomic
+    /// increments — no realloc, no new TLS sessions). Builder methods
+    /// that change the timeout *after* the first fetch don't take
+    /// effect, since reqwest bakes the timeout into the client at
+    /// build time.
+    ///
+    /// `OnceLock::get_or_try_init` would be the idiomatic single-call
+    /// version of this dance, but that's still nightly as of Rust
+    /// 1.95 (`once_cell_try`). Until it stabilises, the manual
+    /// get-or-build-and-clone pattern below avoids both the panic
+    /// path of `.expect` and the dep on the external `once_cell`
+    /// crate.
+    fn client(&self) -> Result<reqwest::blocking::Client, TleCacheError> {
         if let Some(c) = self.client.get() {
-            return Ok(c);
+            return Ok(c.clone());
         }
         let new_client = reqwest::blocking::Client::builder()
             .timeout(self.fetch_timeout)
             .user_agent(concat!("sdr-rs/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| TleCacheError::Fetch(format!("client build: {e}")))?;
-        // If another thread won the race we just drop our local copy;
-        // either way, `get` after `set` returns the canonical client.
-        let _ = self.client.set(new_client);
-        Ok(self
-            .client
-            .get()
-            .expect("client::set succeeded or another thread won the race"))
+        // Race-free publish: if another thread won, their client is
+        // canonical and ours gets dropped. Either way `get` should
+        // return Some afterwards; if for some impossible reason it
+        // doesn't, fall back to our local copy rather than panicking.
+        let _ = self.client.set(new_client.clone());
+        Ok(self.client.get().cloned().unwrap_or(new_client))
     }
 
     #[allow(clippy::unused_self)] // kept on impl for symmetry with other cache methods
@@ -335,14 +344,25 @@ pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
     None
 }
 
+/// 0-indexed start of the NORAD catalog number field in TLE line 1
+/// (column 3 in 1-indexed TLE-spec terms).
+const TLE_NORAD_START: usize = 2;
+/// 0-indexed exclusive end of the NORAD field (column 7 inclusive).
+const TLE_NORAD_END: usize = 7;
+/// Minimum length a TLE line 1 must have for the NORAD field to fit.
+const TLE_LINE1_MIN_LEN: usize = TLE_NORAD_END;
+
 /// Extract the NORAD catalog number from columns 3..=7 of a TLE
 /// line 1 (`"1 NNNNNX ..."`). Returns `None` for malformed lines —
 /// the caller skips and keeps scanning.
 fn norad_id_from_line1(line: &str) -> Option<u32> {
-    if line.len() < 7 {
+    if line.len() < TLE_LINE1_MIN_LEN {
         return None;
     }
-    line[2..7].trim().parse::<u32>().ok()
+    line[TLE_NORAD_START..TLE_NORAD_END]
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 #[cfg(test)]
