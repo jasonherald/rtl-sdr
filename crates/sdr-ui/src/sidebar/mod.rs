@@ -11,6 +11,7 @@ pub mod display_panel;
 pub mod general_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
+pub mod satellites_panel;
 pub mod scanner_panel;
 pub mod server_panel;
 pub mod source_panel;
@@ -26,6 +27,7 @@ pub use display_panel::{DisplayPanel, build_display_panel};
 pub use general_panel::{GeneralPanel, build_general_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
+pub use satellites_panel::{SatellitesPanel, build_satellites_panel};
 pub use scanner_panel::{ScannerPanel, build_scanner_panel};
 pub use server_panel::{ServerPanel, build_server_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
@@ -65,6 +67,11 @@ pub struct SidebarPanels {
     /// issue #317). Master switch, active-channel / state
     /// display, lockout button, default dwell/hang sliders.
     pub scanner: ScannerPanel,
+    /// Satellites scheduler — ground station settings, TLE refresh
+    /// status, upcoming passes, auto-record toggle. Drives the
+    /// "Satellites" left activity (#481), with the auto-record
+    /// switch driving #482's APT-on-pass wiring.
+    pub satellites: SatellitesPanel,
 }
 
 /// Build every sidebar panel. Activity-bar migration: each panel
@@ -81,6 +88,7 @@ pub fn build_panels() -> SidebarPanels {
     let display = build_display_panel();
     let navigation = build_navigation_panel();
     let scanner = build_scanner_panel();
+    let satellites = build_satellites_panel();
     // Flyout is built after navigation because it borrows the
     // left-sidebar `name_entry` — its row actions (recall,
     // delete-of-active) sync the entry field.
@@ -104,5 +112,6 @@ pub fn build_panels() -> SidebarPanels {
         bookmarks,
         server,
         scanner,
+        satellites,
     }
 }

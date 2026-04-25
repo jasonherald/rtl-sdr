@@ -2714,6 +2714,7 @@ dependencies = [
  "reqwest",
  "sdr-types",
  "serde",
+ "serde_json",
  "sgp4",
  "thiserror 2.0.18",
  "tracing",
@@ -2856,6 +2857,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cairo-rs",
+ "chrono",
  "criterion",
  "gtk4",
  "libadwaita",
@@ -2867,6 +2869,7 @@ dependencies = [
  "sdr-radioreference",
  "sdr-rtlsdr",
  "sdr-rtltcp-discovery",
+ "sdr-sat",
  "sdr-scanner",
  "sdr-server-rtltcp",
  "sdr-sink-audio",

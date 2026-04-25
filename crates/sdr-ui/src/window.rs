@@ -58,6 +58,13 @@ const DSP_POLL_INTERVAL_MS: u64 = 16;
 /// Toast display time (seconds) for scanner "force-disable" notices.
 const SCANNER_TOAST_TIMEOUT_SECS: u32 = 3;
 
+/// Cadence of the Satellites panel's countdown ticker — 1 line/sec
+/// is the smallest interval that produces a visible change in the
+/// pass-row title (which renders to 1-minute granularity for far
+/// passes and to seconds only inside the "starting now" window).
+/// Smaller would burn cycles for no visible benefit.
+const SATELLITES_COUNTDOWN_TICK: Duration = Duration::from_secs(1);
+
 /// Shared "kill the scanner on a manual tune" hook. Built once in
 /// `build_window` and cloned into every manual-change handler
 /// (frequency selector, demod dropdown, bandwidth row, bookmark
@@ -1930,6 +1937,7 @@ fn build_layout(
     left_stack.add_named(&panels.display.widget, Some("display"));
     left_stack.add_named(&panels.scanner.widget, Some("scanner"));
     left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
+    left_stack.add_named(&panels.satellites.widget, Some("satellites"));
 
     // Right panel stack — single child today, hosts the real
     // transcript widget (not a placeholder) so transcription keeps
@@ -2680,6 +2688,7 @@ fn connect_sidebar_panels(
     connect_volume_persistence(panels, state, config, volume_button);
     connect_distance_estimator_persistence(panels, config);
     connect_scanner_panel(panels, state, config);
+    connect_satellites_panel(panels, config);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -8291,6 +8300,467 @@ fn connect_scanner_panel(
         };
         state_lockout.send_dsp(UiToDsp::LockoutScannerChannel(key));
     });
+}
+
+/// Wire the Satellites scheduler panel to its config-persistence
+/// layer, the [`sdr_sat::TleCache`], and a 1 Hz countdown timer.
+///
+/// Two pieces of shared state plumb the handlers together:
+///
+/// * `displayed: Rc<RefCell<Vec<DisplayedPass>>>` — the list of
+///   pass rows currently in `passes_group`. Walked by the 1 Hz
+///   ticker (to update title-line countdowns) and rebuilt by
+///   `recompute` whenever lat/lon/alt changes or a TLE refresh
+///   completes.
+/// * `cache: Arc<TleCache>` — `Arc` (not `Rc`) because the
+///   refresh button hands a clone to `gio::spawn_blocking`, which
+///   requires `Send`. `TleCache` is `Send + Sync`.
+///
+/// The 1 Hz timer holds a `glib::WeakRef<adw::PreferencesGroup>`
+/// to the passes group so it returns `ControlFlow::Break` once
+/// the window is destroyed; same lifecycle pattern as the DSP
+/// poll loop.
+#[allow(clippy::too_many_lines)]
+fn connect_satellites_panel(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
+    use sidebar::satellites_panel::{
+        KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, SatellitesPanelWeak,
+        enumerate_upcoming_passes, format_last_refresh, format_pass_subtitle, format_pass_title,
+        load_auto_record_apt, load_station_alt_m, load_station_lat_deg, load_station_lon_deg,
+        save_auto_record_apt, save_f64, save_tle_last_refresh,
+    };
+
+    // One pass row + its source `Pass` so the 1 Hz ticker can
+    // refresh the title without re-running pass enumeration.
+    struct DisplayedPass {
+        row: adw::ActionRow,
+        pass: Pass,
+    }
+
+    // Borrow the panel for synchronous setup, then capture only
+    // weak refs in long-lived closures. Cloning the strong panel
+    // into a closure stored on its own widget creates a refcount
+    // cycle (widget → handler → closure → cloned panel → widget)
+    // that prevents teardown — see `SatellitesPanelWeak`'s doc for
+    // the full chain.
+    let panel = &panels.satellites;
+    let panel_weak: SatellitesPanelWeak = panel.downgrade();
+
+    // Restore persisted values BEFORE wiring change-notify handlers,
+    // matching the scanner-panel pattern: `set_value` on a SpinRow
+    // fires `value-changed`, so wiring first would trigger spurious
+    // saves + recomputes during window construction.
+    panel.lat_row.set_value(load_station_lat_deg(config));
+    panel.lon_row.set_value(load_station_lon_deg(config));
+    panel.alt_row.set_value(load_station_alt_m(config));
+    panel
+        .auto_record_switch
+        .set_active(load_auto_record_apt(config));
+    panel
+        .last_refresh_row
+        .set_subtitle(&format_last_refresh(config));
+
+    // `Option<Arc<TleCache>>`. `None` means the platform refused us
+    // a cache directory (rare; sandboxed minimal environments).
+    // Disable TLE-specific UI but keep ground-station persistence,
+    // ZIP lookup, and the auto-record toggle wired — those don't
+    // depend on TLEs and shouldn't go inert just because the cache
+    // is gone.
+    let cache: Option<std::sync::Arc<TleCache>> = match TleCache::new() {
+        Ok(c) => Some(std::sync::Arc::new(c)),
+        Err(e) => {
+            tracing::warn!("Satellites panel: TLE cache unavailable — {e}");
+            panel.refresh_button.set_sensitive(false);
+            panel
+                .last_refresh_row
+                .set_subtitle("Cache directory unavailable");
+            None
+        }
+    };
+
+    let displayed: Rc<RefCell<Vec<DisplayedPass>>> = Rc::new(RefCell::new(Vec::new()));
+    // `recompute` is built unconditionally — when the cache is
+    // unavailable it's a no-op so the lat/lon/alt notify handlers
+    // can call it without branching. When the cache is available
+    // it does the real pass-enumeration + row-rebuild work.
+    let recompute: Rc<dyn Fn()> = if let Some(cache) = cache.as_ref() {
+        let cache_recompute = std::sync::Arc::clone(cache);
+        let panel_weak_recompute = panel_weak.clone();
+        let displayed_recompute = Rc::clone(&displayed);
+        Rc::new(move || {
+            let Some(panel) = panel_weak_recompute.upgrade() else {
+                return;
+            };
+            // Drop the previous pass rows — these are throwaway,
+            // built fresh per recompute.
+            for entry in displayed_recompute.borrow_mut().drain(..) {
+                panel.passes_group.remove(&entry.row);
+            }
+            // `passes_status_row` is the always-present empty-state
+            // placeholder. We toggle its *visibility* rather than
+            // detach + reattach. Once a widget is unparented, its
+            // last strong ref lives only on the SatellitesPanel
+            // struct — and that struct is dropped when
+            // `build_window` returns. Toggling visibility keeps the
+            // row parented (and therefore alive) for the lifetime
+            // of the window.
+            let station = GroundStation::new(
+                panel.lat_row.value(),
+                panel.lon_row.value(),
+                panel.alt_row.value(),
+            );
+            let now = chrono::Utc::now();
+            let passes = enumerate_upcoming_passes(&cache_recompute, &station, now);
+
+            if passes.is_empty() {
+                panel.passes_status_row.set_visible(true);
+                return;
+            }
+
+            panel.passes_status_row.set_visible(false);
+            let mut new_rows = Vec::with_capacity(passes.len());
+            for pass in passes {
+                let row = adw::ActionRow::builder()
+                    .title(format_pass_title(&pass, now))
+                    .subtitle(format_pass_subtitle(&pass))
+                    .build();
+                panel.passes_group.add(&row);
+                new_rows.push(DisplayedPass { row, pass });
+            }
+            *displayed_recompute.borrow_mut() = new_rows;
+        })
+    } else {
+        // No cache → no enumeration. Lat/lon/alt notify handlers
+        // still call this on every change; making it a no-op
+        // keeps the call sites branch-free.
+        Rc::new(|| {})
+    };
+
+    // Initial paint — show passes immediately if we already have
+    // cached TLEs from a prior session. (No-op if cache is None.)
+    recompute();
+
+    // Lat / lon / alt — persist on change and re-run pass
+    // enumeration. Cheap: a single SGP4 sweep across ~7
+    // satellites takes well under a millisecond.
+    {
+        let config_lat = std::sync::Arc::clone(config);
+        let recompute_lat = Rc::clone(&recompute);
+        panel.lat_row.connect_value_notify(move |row| {
+            save_f64(&config_lat, KEY_STATION_LAT_DEG, row.value());
+            recompute_lat();
+        });
+    }
+    {
+        let config_lon = std::sync::Arc::clone(config);
+        let recompute_lon = Rc::clone(&recompute);
+        panel.lon_row.connect_value_notify(move |row| {
+            save_f64(&config_lon, KEY_STATION_LON_DEG, row.value());
+            recompute_lon();
+        });
+    }
+    {
+        let config_alt = std::sync::Arc::clone(config);
+        let recompute_alt = Rc::clone(&recompute);
+        panel.alt_row.connect_value_notify(move |row| {
+            save_f64(&config_alt, KEY_STATION_ALT_M, row.value());
+            recompute_alt();
+        });
+    }
+
+    // Auto-record toggle — persist only. The actual "tune the
+    // radio + start APT decoding when a NOAA pass starts" wiring
+    // lands in #482 and reads from the same config key.
+    {
+        let config_auto = std::sync::Arc::clone(config);
+        panel.auto_record_switch.connect_active_notify(move |sw| {
+            save_auto_record_apt(&config_auto, sw.is_active());
+        });
+    }
+
+    // Refresh button — re-download every known satellite's TLE on
+    // a worker thread, update the timestamp row, and rebuild the
+    // pass list. Same `spawn_future_local` + `spawn_blocking`
+    // pattern as the RadioReference search button. Wired only
+    // when the cache is available; otherwise the button was
+    // already disabled above.
+    if let Some(cache_outer) = cache.as_ref() {
+        let cache_refresh = std::sync::Arc::clone(cache_outer);
+        let config_refresh = std::sync::Arc::clone(config);
+        let panel_weak_refresh = panel_weak.clone();
+        let recompute_refresh = Rc::clone(&recompute);
+        panel.refresh_button.connect_clicked(move |_| {
+            let Some(panel) = panel_weak_refresh.upgrade() else {
+                return;
+            };
+            panel.refresh_spinner.set_visible(true);
+            panel.refresh_spinner.start();
+            panel.refresh_button.set_sensitive(false);
+
+            let cache_task = std::sync::Arc::clone(&cache_refresh);
+            let config_done = std::sync::Arc::clone(&config_refresh);
+            let panel_weak_done = panel_weak_refresh.clone();
+            let recompute_done = Rc::clone(&recompute_refresh);
+
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    // `force_refresh` — NOT `tle_text` — because the
+                    // user clicked Refresh and a fresh-cache fast-path
+                    // would let us mark "Last refreshed: now" without
+                    // any actual network fetch. `force_refresh` always
+                    // hits the network and never falls back to a stale
+                    // cache, so a successful return means a real round
+                    // trip happened. A per-satellite failure is logged
+                    // and skipped so a single decommissioned /
+                    // rate-limited entry can't break the whole
+                    // refresh: the user still gets the rest.
+                    let mut last_err: Option<sdr_sat::TleCacheError> = None;
+                    let mut succeeded = 0usize;
+                    for known in KNOWN_SATELLITES {
+                        match cache_task.force_refresh(known.norad_id) {
+                            Ok(_) => succeeded += 1,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "TLE refresh for {} (NORAD {}) failed: {e}",
+                                    known.name,
+                                    known.norad_id,
+                                );
+                                last_err = Some(e);
+                            }
+                        }
+                    }
+                    if succeeded == 0 {
+                        // Every fetch failed — surface the last error so
+                        // the UI can show it. (If at least one
+                        // succeeded, treat the refresh as "done" so
+                        // the user sees the timestamp tick forward.)
+                        Err(last_err.unwrap_or_else(|| {
+                            sdr_sat::TleCacheError::Fetch(
+                                "refresh produced no successful fetches".to_string(),
+                            )
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+
+                let Some(panel) = panel_weak_done.upgrade() else {
+                    return;
+                };
+                panel.refresh_spinner.stop();
+                panel.refresh_spinner.set_visible(false);
+                panel.refresh_button.set_sensitive(true);
+
+                match result {
+                    Ok(Ok(())) => {
+                        let now = chrono::Utc::now();
+                        save_tle_last_refresh(&config_done, now);
+                        panel
+                            .last_refresh_row
+                            .set_subtitle(&format_last_refresh(&config_done));
+                        recompute_done();
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("TLE refresh failed: {e}");
+                        panel
+                            .last_refresh_row
+                            .set_subtitle(&format!("Refresh failed: {e}"));
+                    }
+                    Err(_) => {
+                        tracing::warn!("TLE refresh task panicked");
+                        panel
+                            .last_refresh_row
+                            .set_subtitle("Refresh failed: background task panicked");
+                    }
+                }
+            });
+        });
+    }
+
+    // ZIP code → lat/lon shortcut. We wire BOTH `apply` (apply
+    // button click / Enter when apply-button is sensitive) and
+    // `entry_activated` (Enter, unconditional), then dedupe by an
+    // "in-flight" flag — `apply` won't fire if AdwEntryRow's
+    // internal "has the text been edited?" tracking is in a state
+    // where the apply button is insensitive, but `entry_activated`
+    // fires on Enter regardless. Belt-and-braces is cheaper than
+    // chasing libadwaita's internal sensitivity rules.
+    //
+    // Result text goes to `zip_status_row` (AdwEntryRow has no
+    // subtitle slot of its own). Wired regardless of TLE cache
+    // availability — the ZIP lookup is independent.
+    {
+        let in_flight: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+        let run_lookup: Rc<dyn Fn(adw::EntryRow)> = {
+            let panel_weak_zip = panel_weak.clone();
+            let in_flight_run = Rc::clone(&in_flight);
+            Rc::new(move |entry: adw::EntryRow| {
+                if in_flight_run.get() {
+                    tracing::debug!("Satellites: ZIP lookup ignored — already in flight");
+                    return;
+                }
+                let Some(panel) = panel_weak_zip.upgrade() else {
+                    return;
+                };
+                // Trim once, here, so the trimmed value is what
+                // flows through the lookup. `lookup_us_zip` does its
+                // own trim internally too, but a paste of "  24068 "
+                // showing up as `length=8` in the debug log reads
+                // worse than `length=5`.
+                let zip = entry.text().trim().to_string();
+                if zip.is_empty() {
+                    // Empty entry — nothing to do; treat as a no-op so a
+                    // stray Enter doesn't reset the status row.
+                    return;
+                }
+                in_flight_run.set(true);
+                tracing::debug!("Satellites: ZIP lookup triggered (length={})", zip.len());
+                entry.set_sensitive(false);
+                panel.zip_status_row.set_title("Looking up…");
+
+                let panel_weak_done = panel_weak_zip.clone();
+                let in_flight_done = Rc::clone(&in_flight_run);
+                let zip_for_task = zip.clone();
+                glib::spawn_future_local(async move {
+                    // Chain the two lookups on the worker thread so the
+                    // UI side just gets one result. ZIP failure is fatal
+                    // for this run; elevation failure is logged and
+                    // demoted to `Ok(_, None)` — altitude is best-effort
+                    // since it barely matters for pass prediction
+                    // anyway, and we'd rather populate lat/lon than
+                    // leave the user staring at an error toast.
+                    let result = gio::spawn_blocking(move || -> Result<
+                    (sdr_sat::PostalLocation, Result<f64, String>),
+                    sdr_sat::PostalLookupError,
+                > {
+                    let loc = sdr_sat::lookup_us_zip(&zip_for_task)?;
+                    // Elevation lookup is best-effort — a failure here
+                    // shouldn't fail the whole flow, but we DO want
+                    // the provider error to reach the UI so the user
+                    // can see why altitude didn't update. Pass it
+                    // back as `Err(String)` (cheap to send across
+                    // thread, decoupled from `ElevationLookupError`'s
+                    // type, and the log already scrubbed lat/lon).
+                    let elevation = match sdr_sat::lookup_elevation_m(loc.lat_deg, loc.lon_deg)
+                    {
+                        Ok(m) => Ok(m),
+                        Err(e) => {
+                            // Don't include lat/lon in the log — that's user
+                            // location data. The error message itself is
+                            // safe (it's the upstream HTTP error / parse
+                            // error / dataset-coverage error).
+                            tracing::warn!("elevation lookup failed: {e}");
+                            Err(e.to_string())
+                        }
+                    };
+                    Ok((loc, elevation))
+                })
+                .await;
+
+                    in_flight_done.set(false);
+                    let Some(panel) = panel_weak_done.upgrade() else {
+                        return;
+                    };
+                    panel.zip_row.set_sensitive(true);
+
+                    match result {
+                        Ok(Ok((loc, elevation))) => {
+                            // Order matters slightly: setting lat/lon/alt
+                            // fires `value-notify`, which persists the
+                            // value and triggers `recompute`. Three
+                            // recomputes back-to-back is fine —
+                            // sub-millisecond each.
+                            panel.lat_row.set_value(loc.lat_deg);
+                            panel.lon_row.set_value(loc.lon_deg);
+                            let where_text = if loc.region.is_empty() {
+                                loc.place
+                            } else {
+                                format!("{place}, {region}", place = loc.place, region = loc.region)
+                            };
+                            let status = match elevation {
+                                Ok(alt_m) => {
+                                    panel.alt_row.set_value(alt_m);
+                                    format!("Resolved: {where_text} ({alt_m:.0} m)")
+                                }
+                                Err(e) => {
+                                    // Leave altitude alone but
+                                    // surface the provider error
+                                    // so the user knows what to
+                                    // try next (e.g. retry on a
+                                    // bad network).
+                                    format!("Resolved: {where_text} (altitude unchanged: {e})")
+                                }
+                            };
+                            panel.zip_status_row.set_title(&status);
+                        }
+                        Ok(Err(e)) => {
+                            // Don't include the ZIP in the log — user
+                            // location data, already surfaced inline in
+                            // the status row. Provider error alone is
+                            // enough.
+                            tracing::warn!("ZIP lookup failed: {e}");
+                            panel.zip_status_row.set_title(&e.to_string());
+                        }
+                        Err(_) => {
+                            tracing::warn!("ZIP lookup task panicked");
+                            panel
+                                .zip_status_row
+                                .set_title("Lookup failed: background task panicked");
+                        }
+                    }
+                });
+            })
+        };
+        // Wire both signal paths to the same closure: `apply` for
+        // the apply button click (when libadwaita has flagged the
+        // text as edited), `entry-activated` for raw Enter keys
+        // (always fires, regardless of edit state).
+        {
+            let run = Rc::clone(&run_lookup);
+            panel.zip_row.connect_apply(move |entry| run(entry.clone()));
+        }
+        {
+            let run = Rc::clone(&run_lookup);
+            panel
+                .zip_row
+                .connect_entry_activated(move |entry| run(entry.clone()));
+        }
+    }
+
+    // 1 Hz countdown ticker. Only scheduled when the cache is
+    // available — without it `displayed` stays empty forever and
+    // the timer would tick uselessly. Captures the panel weakly
+    // so the source returns `ControlFlow::Break` once any panel
+    // widget has been dropped (otherwise GLib runs it forever,
+    // holding a strong chain into the `displayed` vec and its
+    // widgets).
+    if cache.is_some() {
+        let panel_weak_tick = panel_weak.clone();
+        let displayed_tick = Rc::clone(&displayed);
+        let recompute_tick = Rc::clone(&recompute);
+        let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
+            if panel_weak_tick.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            let now = chrono::Utc::now();
+            let mut needs_recompute = false;
+            for entry in displayed_tick.borrow().iter() {
+                if entry.pass.end <= now {
+                    needs_recompute = true;
+                    continue;
+                }
+                entry.row.set_title(&format_pass_title(&entry.pass, now));
+            }
+            if needs_recompute {
+                recompute_tick();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 }
 
 /// Connect transcript panel controls to DSP commands.
