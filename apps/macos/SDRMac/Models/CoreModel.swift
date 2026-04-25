@@ -869,16 +869,19 @@ final class CoreModel {
         // Restore scanner timing defaults — issue #447.
         // Out-of-range values are silently ignored (the Rust side
         // also clamps); same defensive pattern as the network
-        // sink port restore above.
+        // sink port restore above. The setters clamp at write
+        // time so a poisoned defaults entry can only show up
+        // here on first restore — subsequent writes go through
+        // `setScannerDefault{Dwell,Hang}Ms` which clamp.
         if UserDefaults.standard.object(forKey: Self.scannerDefaultDwellMsDefaultsKey) != nil {
             let stored = UserDefaults.standard.integer(forKey: Self.scannerDefaultDwellMsDefaultsKey)
-            if (50...500).contains(stored) {
+            if Self.scannerDwellMsRange.contains(stored) {
                 scannerDefaultDwellMs = stored
             }
         }
         if UserDefaults.standard.object(forKey: Self.scannerDefaultHangMsDefaultsKey) != nil {
             let stored = UserDefaults.standard.integer(forKey: Self.scannerDefaultHangMsDefaultsKey)
-            if (500...5_000).contains(stored) {
+            if Self.scannerHangMsRange.contains(stored) {
                 scannerDefaultHangMs = stored
             }
         }
@@ -1132,19 +1135,46 @@ final class CoreModel {
             // frequency the lockout button targets.
             scannerActiveChannel = channel
         case .scannerEmptyRotation:
-            // All projected channels are absent or locked out —
-            // the engine has exhausted its rotation. Currently a
-            // no-op on this side; a follow-up could surface a
-            // toast. The panel's State row reads `.idle` either
-            // way once the engine settles.
-            break
+            // All projected channels are absent or locked out
+            // — engine has exhausted its rotation. Surface the
+            // exhausted state immediately rather than waiting
+            // for the next `scannerStateChanged(.idle)` event:
+            // the engine doesn't always emit one (a rotation
+            // that can't find a non-locked channel may settle
+            // straight back to dwelling, then re-emit empty on
+            // the next sweep). Snap state + clear the active
+            // readout so the panel reflects "no rotation
+            // possible right now" without lag.
+            scannerState = .idle
+            scannerActiveChannel = nil
         case .scannerMutexStopped(let reason):
             // The scanner ↔ recording / transcription mutex
-            // fired. Currently a no-op: the panel state will
-            // reflect the actual outcome via the next
-            // `scannerStateChanged` / recording-event pair. A
-            // follow-up could surface `reason.toastMessage` here.
-            _ = reason
+            // fired. Two of the four reasons mean the scanner
+            // itself was stopped (ScannerStoppedFor* directions)
+            // — flip `scannerEnabled` false locally so the
+            // panel's master toggle reflects engine truth
+            // immediately. The other two reasons mean the
+            // scanner stopped recording / transcription; the
+            // matching recording-state event arms handle their
+            // own UI sync, so the scanner panel doesn't need
+            // extra work for those directions.
+            //
+            // Toast surfacing for any of the four directions
+            // is a follow-up — we have `reason.toastMessage`
+            // ready, but routing it through a notifications
+            // surface lands separately.
+            switch reason {
+            case .scannerStoppedForRecording, .scannerStoppedForTranscription:
+                scannerEnabled = false
+                scannerState = .idle
+                scannerActiveChannel = nil
+            case .recordingStoppedForScanner, .transcriptionStoppedForScanner:
+                // Inverse direction — the recording / transcription
+                // side stopped, scanner is now running. The
+                // scanner-state event arm above handles the
+                // panel sync; nothing extra here.
+                break
+            }
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -1663,21 +1693,43 @@ final class CoreModel {
         }
     }
 
+    /// Allowed range for the default-dwell setting (ms). Mirrors
+    /// the Linux `DWELL_MIN_MS` / `DWELL_MAX_MS` constants; kept
+    /// model-side because the SwiftUI Stepper enforces the same
+    /// bounds AND a non-UI caller (scripted defaults edit, future
+    /// AppleScript / shortcut, test code) can write through the
+    /// setter directly.
+    static let scannerDwellMsRange: ClosedRange<Int> = 50...500
+    /// Allowed range for the default-hang setting (ms). Mirrors
+    /// the Linux `HANG_MIN_MS` / `HANG_MAX_MS` constants.
+    static let scannerHangMsRange: ClosedRange<Int> = 500...5_000
+
     /// Update the default settle time per-channel (ms). The
     /// host applies this at projection time; engine doesn't
     /// store a separate "default" — it sees a fully-resolved
     /// `dwell_ms` on each `ScannerChannel`. Persisted via
     /// `UserDefaults` so the choice survives relaunches.
+    ///
+    /// Out-of-range values are clamped at the boundary so a
+    /// non-UI caller can't poison persistent state with a value
+    /// that's silently dropped on next launch (bootstrap also
+    /// validates the range when reading back). Per `CodeRabbit`
+    /// round 1 on PR #497.
     func setScannerDefaultDwellMs(_ ms: Int) {
-        scannerDefaultDwellMs = ms
-        UserDefaults.standard.set(ms, forKey: Self.scannerDefaultDwellMsDefaultsKey)
+        let range = Self.scannerDwellMsRange
+        let clamped = min(max(ms, range.lowerBound), range.upperBound)
+        scannerDefaultDwellMs = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.scannerDefaultDwellMsDefaultsKey)
     }
 
     /// Update the default hang time per-channel (ms). Same
-    /// projection-time fallback contract as the dwell setter.
+    /// projection-time fallback contract — and same clamp
+    /// rationale — as the dwell setter.
     func setScannerDefaultHangMs(_ ms: Int) {
-        scannerDefaultHangMs = ms
-        UserDefaults.standard.set(ms, forKey: Self.scannerDefaultHangMsDefaultsKey)
+        let range = Self.scannerHangMsRange
+        let clamped = min(max(ms, range.lowerBound), range.upperBound)
+        scannerDefaultHangMs = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.scannerDefaultHangMsDefaultsKey)
     }
 
     /// `UserDefaults` key for the scanner default-dwell (ms).

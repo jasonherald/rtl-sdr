@@ -1150,19 +1150,40 @@ mod tests {
     }
 
     #[test]
-    fn translate_scanner_mutex_stopped_for_recording() {
+    fn translate_scanner_mutex_stopped_maps_all_reasons() {
+        // Pin every `ScannerMutexReason` arm individually — the
+        // host-side toast routing branches on the wire integer
+        // directly, so a silent remap (e.g., a refactor that
+        // reorders the Rust enum) breaks every C ABI consumer
+        // without failing any Rust-level type check. Per
+        // `CodeRabbit` round 1 on PR #497.
         use sdr_core::messages::ScannerMutexReason;
-        let (event, owned_cstring, _) = translate_event(&DspToUi::ScannerMutexStopped(
-            ScannerMutexReason::ScannerStoppedForRecording,
-        ))
-        .expect("ScannerMutexStopped should translate");
-        assert_eq!(event.kind, SDR_EVT_SCANNER_MUTEX_STOPPED);
-        let payload = unsafe { event.payload.scanner_mutex_stopped };
-        assert_eq!(
-            payload.reason,
-            SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING
-        );
-        assert!(owned_cstring.is_none());
+        let cases = [
+            (
+                ScannerMutexReason::RecordingStoppedForScanner,
+                SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER,
+            ),
+            (
+                ScannerMutexReason::TranscriptionStoppedForScanner,
+                SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER,
+            ),
+            (
+                ScannerMutexReason::ScannerStoppedForRecording,
+                SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING,
+            ),
+            (
+                ScannerMutexReason::ScannerStoppedForTranscription,
+                SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION,
+            ),
+        ];
+        for (reason, expected_int) in cases {
+            let (event, owned_cstring, _) = translate_event(&DspToUi::ScannerMutexStopped(reason))
+                .expect("ScannerMutexStopped should translate");
+            assert_eq!(event.kind, SDR_EVT_SCANNER_MUTEX_STOPPED);
+            let payload = unsafe { event.payload.scanner_mutex_stopped };
+            assert_eq!(payload.reason, expected_int);
+            assert!(owned_cstring.is_none());
+        }
     }
 
     #[test]

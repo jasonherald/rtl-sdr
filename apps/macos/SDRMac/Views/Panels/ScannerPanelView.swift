@@ -77,11 +77,18 @@ private struct ActiveChannelSection: View {
             // frequency. Idle: em-dash placeholder. Subtitle
             // wraps to multiple lines naturally — no
             // `.lineLimit(1)` so long names stay readable.
+            //
+            // `.textSelection(.enabled)` matches the pattern used
+            // across the other Mac panels (TranscriptionPanel,
+            // SourceSection, SettingsView) — long bookmark names
+            // like "KY State Police District 7 Dispatch" are
+            // selectable for paste into a search / log.
             LabeledContent("Channel") {
                 Text(channelLabel)
                     .font(.callout)
                     .foregroundStyle(model.scannerActiveChannel == nil ? .secondary : .primary)
                     .multilineTextAlignment(.trailing)
+                    .textSelection(.enabled)
             }
 
             // State row — tracks the engine's `ScannerState`
@@ -140,7 +147,7 @@ private struct TimingSection: View {
                         get: { model.scannerDefaultDwellMs },
                         set: { model.setScannerDefaultDwellMs($0) }
                     ),
-                    in: 50...500,
+                    in: CoreModel.scannerDwellMsRange,
                     step: 10
                 ) {
                     Text("\(model.scannerDefaultDwellMs) ms")
@@ -155,7 +162,7 @@ private struct TimingSection: View {
                         get: { model.scannerDefaultHangMs },
                         set: { model.setScannerDefaultHangMs($0) }
                     ),
-                    in: 500...5_000,
+                    in: CoreModel.scannerHangMsRange,
                     step: 100
                 ) {
                     Text("\(model.scannerDefaultHangMs) ms")
