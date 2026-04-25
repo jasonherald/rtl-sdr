@@ -45,9 +45,29 @@ impl Gardner {
     /// `omega_gain` and `mu_gain` are independent loop gains —
     /// see SDR++'s `meteor_demodulator/src/main.cpp` for the
     /// canonical values (1e-6 and 0.01 for Meteor).
-    #[must_use]
-    pub fn new(samples_per_symbol: f32, omega_gain: f32, mu_gain: f32) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if any input is not
+    /// finite, or `samples_per_symbol` is not positive. Project
+    /// convention for DSP constructors: NaN / Inf inputs would
+    /// silently break timing recovery rather than fail loudly.
+    pub fn new(
+        samples_per_symbol: f32,
+        omega_gain: f32,
+        mu_gain: f32,
+    ) -> Result<Self, sdr_types::DspError> {
+        if !samples_per_symbol.is_finite() || samples_per_symbol <= 0.0 {
+            return Err(sdr_types::DspError::InvalidParameter(format!(
+                "samples_per_symbol must be finite and positive, got {samples_per_symbol}"
+            )));
+        }
+        if !omega_gain.is_finite() || !mu_gain.is_finite() {
+            return Err(sdr_types::DspError::InvalidParameter(format!(
+                "omega_gain ({omega_gain}) and mu_gain ({mu_gain}) must both be finite"
+            )));
+        }
+        Ok(Self {
             mu: 0.0,
             omega: samples_per_symbol,
             omega_mid: samples_per_symbol,
@@ -55,7 +75,7 @@ impl Gardner {
             gain_omega: omega_gain,
             mid: Complex::new(0.0, 0.0),
             pending: Vec::with_capacity(8),
-        }
+        })
     }
 
     /// Push one input sample. May produce 0 or 1 output symbols
@@ -114,7 +134,7 @@ mod tests {
         // other input sample is a symbol, alternating with a
         // (zero) sample between. Gardner should converge to
         // emitting one output per input pair.
-        let mut g = Gardner::new(2.0, 1e-6, 0.01);
+        let mut g = Gardner::new(2.0, 1e-6, 0.01).expect("Gardner::new");
         let mut emitted = 0_usize;
         for n in 0..2000 {
             let on_symbol = n % 2 == 0;

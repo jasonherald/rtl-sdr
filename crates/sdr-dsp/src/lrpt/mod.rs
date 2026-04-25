@@ -66,7 +66,7 @@ impl LrptDemod {
         Ok(Self {
             rrc: RrcFilter::new(2),
             costas: Costas::new(COSTAS_LOOP_BW)?,
-            gardner: Gardner::new(2.0, GARDNER_OMEGA_GAIN, GARDNER_MU_GAIN),
+            gardner: Gardner::new(2.0, GARDNER_OMEGA_GAIN, GARDNER_MU_GAIN)?,
         })
     }
 

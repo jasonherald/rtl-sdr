@@ -8,6 +8,9 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use sdr_dsp::lrpt::LrptDemod;
 use sdr_types::Complex;
 
+/// 1 second of input at the demod's 144 ksps working sample rate.
+const SAMPLES_1S: usize = 144_000;
+
 fn bench_demod(c: &mut Criterion) {
     let symbols = [
         Complex::new(0.707, 0.707),
@@ -15,8 +18,7 @@ fn bench_demod(c: &mut Criterion) {
         Complex::new(0.707, -0.707),
         Complex::new(-0.707, -0.707),
     ];
-    // 1 second of input at 144 ksps = 144_000 complex samples.
-    let buf: Vec<Complex> = (0..144_000_usize)
+    let buf: Vec<Complex> = (0..SAMPLES_1S)
         .map(|n| {
             if n % 2 == 0 {
                 symbols[(n / 2) % 4]

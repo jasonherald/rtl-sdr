@@ -9,6 +9,10 @@
 
 use sdr_types::Complex;
 
+/// Maximum soft-bit magnitude. Symmetric around zero so the
+/// downstream FEC can index it as a signed Euclidean distance.
+const SOFT_BIT_MAX: f32 = 127.0;
+
 /// Slice one recovered QPSK symbol to two soft i8 bits. Output
 /// `[i_bit, q_bit]` order matches CCSDS 131.0-B-3 convention: the
 /// I-axis carries the high (G1) bit, Q-axis the low (G2).
@@ -23,7 +27,9 @@ pub fn slice_soft(sample: Complex) -> [i8; 2] {
     reason = "explicit clamp to [-127, 127] keeps the cast lossless"
 )]
 fn scale(x: f32) -> i8 {
-    (x * 127.0).round().clamp(-127.0, 127.0) as i8
+    (x * SOFT_BIT_MAX)
+        .round()
+        .clamp(-SOFT_BIT_MAX, SOFT_BIT_MAX) as i8
 }
 
 #[cfg(test)]

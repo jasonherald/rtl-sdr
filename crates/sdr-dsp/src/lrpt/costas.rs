@@ -29,10 +29,16 @@ impl Costas {
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` if the synthesized
-    /// alpha/beta are rejected by `PhaseControlLoop::new` (only
-    /// happens for non-finite or otherwise pathological `loop_bw`).
+    /// Returns `DspError::InvalidParameter` if `loop_bw` is not
+    /// finite or not positive — `critically_damped` would otherwise
+    /// fold NaN into the alpha/beta coefficients and silently
+    /// corrupt every later `process` call.
     pub fn new(loop_bw: f32) -> Result<Self, DspError> {
+        if !loop_bw.is_finite() || loop_bw <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "loop_bw must be finite and positive, got {loop_bw}"
+            )));
+        }
         let (alpha, beta) = PhaseControlLoop::critically_damped(loop_bw);
         let pcl = PhaseControlLoop::new(
             alpha, beta, 0.0, // initial phase

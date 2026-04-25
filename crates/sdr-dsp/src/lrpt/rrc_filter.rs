@@ -49,6 +49,10 @@ impl RrcFilter {
                   centered loop variable fits trivially in i32 / f32"
     )]
     pub fn new(samples_per_symbol: usize) -> Self {
+        // Defensive guard: rrc_impulse divides by samples_per_symbol.
+        // Today's only caller (`LrptDemod::new`) hardcodes 2, but the
+        // constructor is `pub` so a future caller could pass 0.
+        debug_assert!(samples_per_symbol > 0, "samples_per_symbol must be > 0");
         let mut taps = [0.0_f32; NUM_TAPS];
         let mid = (NUM_TAPS / 2) as i32;
         for (i, tap) in taps.iter_mut().enumerate() {
