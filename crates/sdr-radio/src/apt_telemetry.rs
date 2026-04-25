@@ -113,8 +113,12 @@ pub struct AptTelemetrySide {
     /// The 8-step grayscale calibration ramp (wedges 1–8). Should be
     /// roughly monotonically increasing from dark to bright.
     pub grayscale_ramp: [u8; 8],
-    /// AVHRR channel encoded in wedge 16, or `None` if the wedge value
-    /// matched none of wedges 1–6 closely enough to classify.
+    /// AVHRR channel encoded in wedge 16, or `None` if classification
+    /// was unreliable. `None` covers two failure modes: the calibration
+    /// ramp's dynamic range was too narrow (flat black/white/noise),
+    /// or wedge 16's value was more than [`MAX_CHANNEL_MATCH_DISTANCE`]
+    /// units off from every channel-bearing wedge (1–6) — i.e. lodged
+    /// between two wedges or off the end of the ramp altogether.
     pub channel_id: Option<AvhrrChannel>,
     /// Quality of the frame-sync lock for this side, in `[0.0, 1.0]`.
     /// Pearson correlation between the candidate's first 64 line
@@ -311,9 +315,18 @@ const CHANNEL_ID_MAPPING: [AvhrrChannel; 6] = [
 /// Map a wedge-16 brightness value to an AVHRR channel by finding which
 /// of wedges 1–6 of the calibration ramp it most closely matches.
 ///
-/// Returns `None` if the calibration ramp's range is too narrow to
-/// confidently classify (e.g. the side has nothing but noise) — protects
-/// against false positives when the image isn't really showing telemetry.
+/// Returns `None` when classification is unreliable, in either of two
+/// cases:
+///
+/// * The decoded calibration ramp's dynamic range is below
+///   [`MIN_RAMP_RANGE`] — the side is flat black / white / noise, no
+///   meaningful comparison is possible.
+/// * Wedge 16 is more than [`MAX_CHANNEL_MATCH_DISTANCE`] units away
+///   from every channel-bearing wedge (1–6). Real telemetry lands
+///   close to one of those wedges; a large distance means the value
+///   is wedged between two of them (ambiguous) or beyond the channel
+///   range altogether (non-spec) — both cases get rejected rather
+///   than guessed.
 fn classify_channel_wedge(wedge16: u8, grayscale_ramp: [u8; 8]) -> Option<AvhrrChannel> {
     // If the ramp's dynamic range is tiny, it's not a real telemetry
     // strip — bail rather than emit a noise classification.
@@ -324,13 +337,16 @@ fn classify_channel_wedge(wedge16: u8, grayscale_ramp: [u8; 8]) -> Option<AvhrrC
     }
 
     let mut best_idx = 0_usize;
-    let mut best_distance = u16::MAX;
+    let mut best_distance = u8::MAX;
     for (i, &ramp_value) in grayscale_ramp.iter().take(6).enumerate() {
-        let distance = u16::from(wedge16.abs_diff(ramp_value));
+        let distance = wedge16.abs_diff(ramp_value);
         if distance < best_distance {
             best_distance = distance;
             best_idx = i;
         }
+    }
+    if best_distance > MAX_CHANNEL_MATCH_DISTANCE {
+        return None;
     }
     Some(CHANNEL_ID_MAPPING[best_idx])
 }
@@ -340,6 +356,17 @@ fn classify_channel_wedge(wedge16: u8, grayscale_ramp: [u8; 8]) -> Option<AvhrrC
 /// means the channel is either flat black, flat white, or noise — none
 /// of which can reliably classify wedge 16.
 const MIN_RAMP_RANGE: u8 = 32;
+
+/// Maximum allowed distance (in raw u8 units) between wedge 16 and the
+/// nearest of wedges 1–6 for the classification to be considered
+/// unambiguous. The smallest gap between adjacent ramp wedges is
+/// `31 - 8 = 23`, so half that (11) would be the strictest "uniquely
+/// closer to one wedge than its neighbour" cutoff. We use a slightly
+/// looser 24 to tolerate per-line normalization jitter and channel
+/// noise — anything more than 24 units off from every channel-bearing
+/// wedge means the value is solidly between two wedges (or off the end
+/// of the ramp), and we'd rather emit `None` than guess wrong.
+const MAX_CHANNEL_MATCH_DISTANCE: u8 = 24;
 
 #[cfg(test)]
 #[allow(
@@ -352,12 +379,69 @@ mod tests {
     use sdr_dsp::apt::AptLine;
     use std::time::Instant;
 
+    // ─── Fixture constants ────────────────────────────────────────────
+    //
+    // Hoisted so the same load-bearing values can be retuned in one
+    // place if upstream design parameters change, and so future readers
+    // don't have to re-derive what e.g. "0.95" means in context.
+
     /// Tight pre-allocation for [`AptImage`] in tests — well under
     /// [`crate::apt_image::DEFAULT_MAX_LINES`].
     const TEST_MAX_LINES: usize = 256;
 
     /// Quality value high enough to clear the [`AptImage`] gap-fill threshold.
     const TEST_GOOD_QUALITY: f32 = 0.92;
+
+    /// Frame-start offset used by the arbitrary-offset sync test. Picked
+    /// to be relatively prime to [`LINES_PER_WEDGE`] (8) so the offset
+    /// can't accidentally align with a wedge boundary and pass for
+    /// trivial reasons.
+    const TEST_FRAME_OFFSET: usize = 37;
+
+    /// Mid-grey value painted across an entire image to exercise the
+    /// "flat ramp, refuse to classify" branch. Anything in the middle
+    /// of the u8 range works — 120 just keeps it visibly distinct from
+    /// the spec ramp's actual values.
+    const TEST_FLAT_GREY: u8 = 120;
+
+    /// Mid-grey wedge value used as a placeholder for spacecraft-
+    /// telemetry wedges 9–15 in the synthetic-frame builder. The
+    /// channel-ID test is insensitive to this exact value.
+    const TEST_PLACEHOLDER_WEDGE: u8 = 128;
+
+    /// Quality threshold for "near-perfect frame sync" assertions.
+    /// At this threshold the decoded ramp matches the spec template
+    /// to within line-rounding noise.
+    const TEST_GOOD_SYNC_QUALITY: f32 = 0.95;
+
+    /// Upper bound on `frame_sync_quality` for pseudo-random input.
+    /// Random data shouldn't be able to fake the spec ramp's specific
+    /// 8-step shape past this threshold.
+    const TEST_NOISE_SYNC_CEILING: f32 = 0.85;
+
+    /// LCG seed for the noise-cycle test. Picked so the resulting noise
+    /// pattern doesn't accidentally correlate with the spec ramp.
+    const LCG_SEED_NOISE_CYCLE: u32 = 0x00C0_FFEE;
+    /// LCG seed for the random-input frame-sync ceiling test.
+    const LCG_SEED_RANDOM: u32 = 0xDEAD_BEEF;
+    /// BSD libc's well-known LCG multiplier and increment. Notoriously
+    /// poor as a real RNG but plenty unstructured for "no-pattern" test
+    /// inputs, and pulling in a `rand` dep just for these tests would
+    /// be overkill.
+    const LCG_MULTIPLIER: u32 = 1_103_515_245;
+    const LCG_INCREMENT: u32 = 12_345;
+
+    /// Tiny LCG step used by the noise tests. Returns a u8 sample by
+    /// taking the middle bits of the new state — same byte distribution
+    /// as `(state >> 16) & 0xff`. Shared between the noise-cycle test
+    /// and the random-input ceiling test so we don't dup the prime
+    /// constants in two places.
+    fn lcg_step(state: &mut u32) -> u8 {
+        *state = state
+            .wrapping_mul(LCG_MULTIPLIER)
+            .wrapping_add(LCG_INCREMENT);
+        ((*state >> 16) & 0xff) as u8
+    }
 
     /// Build a synthetic 2080-pixel scan line with the given wedge value
     /// painted across both telemetry strips and zeros elsewhere. Lets us
@@ -401,14 +485,14 @@ mod tests {
             } else {
                 // Wedges 9–15 (spacecraft telemetry): mid-grey, irrelevant
                 // to the channel-ID test.
-                128
+                TEST_PLACEHOLDER_WEDGE
             };
             let val_b = if wedge_idx < 8 {
                 SPEC_GRAYSCALE_RAMP[wedge_idx]
             } else if wedge_idx == 15 {
                 wedge16_b
             } else {
-                128
+                TEST_PLACEHOLDER_WEDGE
             };
             let mut apt_line = AptLine {
                 sync_quality: TEST_GOOD_QUALITY,
@@ -501,12 +585,12 @@ mod tests {
         assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch4ThermalIr));
 
         assert!(
-            result.side_a.frame_sync_quality > 0.95,
+            result.side_a.frame_sync_quality > TEST_GOOD_SYNC_QUALITY,
             "expected near-perfect sync, got {:.3}",
             result.side_a.frame_sync_quality,
         );
         assert!(
-            result.side_b.frame_sync_quality > 0.95,
+            result.side_b.frame_sync_quality > TEST_GOOD_SYNC_QUALITY,
             "expected near-perfect sync, got {:.3}",
             result.side_b.frame_sync_quality,
         );
@@ -514,14 +598,19 @@ mod tests {
 
     #[test]
     fn frame_sync_locks_at_arbitrary_offset() {
-        // Shift frame start by 37 lines. Decoder must still lock onto the
-        // ramp and return the right channel ID even though "line 0" of
-        // the buffer isn't the start of a frame.
-        let image = synth_image_with_frame(3, SPEC_GRAYSCALE_RAMP[0], SPEC_GRAYSCALE_RAMP[5], 37);
+        // Shift frame start by TEST_FRAME_OFFSET lines. Decoder must still lock
+        // onto the ramp and return the right channel ID even though "line 0"
+        // of the buffer isn't the start of a frame.
+        let image = synth_image_with_frame(
+            3,
+            SPEC_GRAYSCALE_RAMP[0],
+            SPEC_GRAYSCALE_RAMP[5],
+            TEST_FRAME_OFFSET,
+        );
         let result = decode_telemetry(&image).unwrap();
         assert_eq!(result.side_a.channel_id, Some(AvhrrChannel::Ch1Visible));
         assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch5ThermalIr));
-        assert!(result.side_a.frame_sync_quality > 0.95);
+        assert!(result.side_a.frame_sync_quality > TEST_GOOD_SYNC_QUALITY);
     }
 
     #[test]
@@ -547,10 +636,9 @@ mod tests {
         let clean_lines: Vec<_> = image.lines().iter().skip(FRAME_LINES).cloned().collect();
         image = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
 
-        let mut state: u32 = 0x00C0_FFEE;
+        let mut state: u32 = LCG_SEED_NOISE_CYCLE;
         for _ in 0..FRAME_LINES {
-            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            let noise_byte = ((state >> 16) & 0xff) as u8;
+            let noise_byte = lcg_step(&mut state);
             let mut noisy_pixels = [0_u8; LINE_PIXELS];
             for p in &mut noisy_pixels[TELEMETRY_A_START..TELEMETRY_A_END] {
                 *p = noise_byte;
@@ -575,10 +663,16 @@ mod tests {
         }
 
         let result = decode_telemetry(&image).expect("two clean cycles is enough");
-        assert_eq!(result.side_a.channel_id, Some(AvhrrChannel::Ch3aShortwaveIr));
-        assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch3aShortwaveIr));
+        assert_eq!(
+            result.side_a.channel_id,
+            Some(AvhrrChannel::Ch3aShortwaveIr)
+        );
+        assert_eq!(
+            result.side_b.channel_id,
+            Some(AvhrrChannel::Ch3aShortwaveIr)
+        );
         assert!(
-            result.side_a.frame_sync_quality > 0.95,
+            result.side_a.frame_sync_quality > TEST_GOOD_SYNC_QUALITY,
             "should lock onto the clean cycle past the noisy one, got {:.3}",
             result.side_a.frame_sync_quality,
         );
@@ -616,7 +710,7 @@ mod tests {
                 sync_quality: TEST_GOOD_QUALITY,
                 ..AptLine::default()
             };
-            line.pixels = line_with_wedge(120, 120);
+            line.pixels = line_with_wedge(TEST_FLAT_GREY, TEST_FLAT_GREY);
             img.push_line(&line, Instant::now());
         }
         let result = decode_telemetry(&img).unwrap();
@@ -625,19 +719,42 @@ mod tests {
     }
 
     #[test]
+    fn channel_id_returns_none_for_wedge16_off_the_ramp() {
+        // Calibration ramp decodes correctly, but wedge 16 lands in
+        // off-the-ramp territory: no spec channel encodes a value >
+        // wedge[5]=159, so a wedge16 of 250 is ~91 units from the
+        // nearest channel-bearing wedge — way past
+        // MAX_CHANNEL_MATCH_DISTANCE. Classification must refuse
+        // rather than guess at the closest wedge in range. (Adjacent
+        // wedges are only 23–32 apart, so values strictly *between*
+        // wedges still fall within the threshold and do classify;
+        // the threshold is specifically a guard against off-end /
+        // non-spec wedge16 values.)
+        let off_ramp_value = 250_u8;
+        let image = synth_image_with_frame(2, off_ramp_value, off_ramp_value, 0);
+        let result = decode_telemetry(&image).unwrap();
+        assert!(
+            result.side_a.channel_id.is_none(),
+            "wedge16={off_ramp_value} is past the channel range, must not classify",
+        );
+        assert!(result.side_b.channel_id.is_none());
+        // But the ramp itself decoded fine — sync quality is high.
+        assert!(result.side_a.frame_sync_quality > TEST_GOOD_SYNC_QUALITY);
+    }
+
+    #[test]
     fn frame_sync_quality_is_near_zero_for_random_input() {
         // Build a buffer of pseudo-random per-line telemetry averages
         // and confirm the correlation-based quality stays low — the
         // monotonic ramp template shouldn't lock onto noise.
-        let mut state: u32 = 0xDEAD_BEEF;
+        let mut state: u32 = LCG_SEED_RANDOM;
         let mut avgs = vec![0_u8; FRAME_LINES * 2];
         for v in &mut avgs {
-            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            *v = ((state >> 16) & 0xff) as u8;
+            *v = lcg_step(&mut state);
         }
         let side = decode_side(&avgs).unwrap();
         assert!(
-            side.frame_sync_quality < 0.85,
+            side.frame_sync_quality < TEST_NOISE_SYNC_CEILING,
             "noise should not yield strong sync, got {:.3}",
             side.frame_sync_quality,
         );
