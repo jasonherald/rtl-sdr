@@ -90,12 +90,25 @@ pub enum State {
 /// snapshot captures both, restore replays both. Without this,
 /// LOS would re-tune to bare centre frequency and the user would
 /// lose whatever signal they had pinned with a VFO drag pre-AOS.
+///
+/// `was_running` snapshots the source's playback state so the
+/// LOS restore can return to it. If the user had playback off
+/// when auto-record armed (a common "set it and forget it"
+/// scenario), we want to leave them off post-LOS — not silently
+/// keep the radio chewing CPU after the pass ended.
+///
+/// `bandwidth_hz` is `u32` to match `Action::StartAutoRecord`
+/// and `KnownSatellite::bandwidth_hz` — single integral type
+/// for every cross-boundary handoff. The bandwidth row uses
+/// `f64` internally but we round at the snapshot boundary so
+/// the restore path doesn't have to.
 #[derive(Debug, Clone, Copy)]
 pub struct SavedTune {
     pub freq_hz: f64,
     pub vfo_offset_hz: f64,
     pub mode: DemodMode,
-    pub bandwidth_hz: f64,
+    pub bandwidth_hz: u32,
+    pub was_running: bool,
 }
 
 /// Side effects the wiring layer must perform on each transition.
@@ -395,7 +408,8 @@ mod tests {
             freq_hz: 100_000_000.0,
             vfo_offset_hz: 0.0,
             mode: DemodMode::Wfm,
-            bandwidth_hz: 200_000.0,
+            bandwidth_hz: 200_000,
+            was_running: true,
         }
     }
 
@@ -513,7 +527,8 @@ mod tests {
             freq_hz: 89_700_000.0,
             vfo_offset_hz: 25_000.0, // pin a non-zero offset for the round trip
             mode: DemodMode::Wfm,
-            bandwidth_hz: 200_000.0,
+            bandwidth_hz: 200_000,
+            was_running: false,
         };
         // Walk all transitions.
         r.tick(now, std::slice::from_ref(&pass), true, saved);
@@ -531,13 +546,16 @@ mod tests {
         assert!(matches!(r.state(), State::Idle));
         // Restore action carries the original saved tune,
         // including the VFO offset (so a user's drag position
-        // survives the auto-record round trip).
+        // survives the auto-record round trip) and the
+        // pre-AOS playback state (so a stopped radio doesn't
+        // silently keep running after LOS).
         match &actions[0] {
             Action::RestoreTune(t) => {
                 assert_eq!(t.freq_hz, 89_700_000.0);
                 assert_eq!(t.vfo_offset_hz, 25_000.0);
                 assert_eq!(t.mode, DemodMode::Wfm);
-                assert_eq!(t.bandwidth_hz, 200_000.0);
+                assert_eq!(t.bandwidth_hz, 200_000);
+                assert!(!t.was_running);
             }
             other => panic!("expected RestoreTune, got {other:?}"),
         }

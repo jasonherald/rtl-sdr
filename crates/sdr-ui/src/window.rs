@@ -8905,6 +8905,19 @@ fn connect_satellites_panel(
                 tracing::info!(
                     "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz",
                 );
+                // If the radio isn't running yet, kick it on so
+                // the AptDecoder actually receives audio. Without
+                // this, auto-record arms at AOS but no `AptLine`s
+                // ever flow — the pass completes with an empty
+                // image. The pre-AOS `was_running == false` is
+                // captured in `SavedTune` so the LOS restore can
+                // stop the radio again, returning to whatever
+                // state the user left it in.
+                if !state_a.is_running.get() {
+                    tracing::info!("auto-record: starting source (was stopped pre-AOS)");
+                    state_a.send_dsp(UiToDsp::Start);
+                    state_a.is_running.set(true);
+                }
                 tune_a(freq_hz, mode, bandwidth_hz);
                 crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
             }
@@ -8943,17 +8956,11 @@ fn connect_satellites_panel(
                 #[allow(
                     clippy::cast_sign_loss,
                     clippy::cast_possible_truncation,
-                    reason = "saved values came from the same widgets we're feeding back; \
-                              both are non-negative and well within u64/u32"
+                    reason = "saved freq came from the same widget we're feeding back; \
+                              non-negative and well within u64"
                 )]
                 let freq_hz = saved.freq_hz as u64;
-                #[allow(
-                    clippy::cast_sign_loss,
-                    clippy::cast_possible_truncation,
-                    reason = "user-set bandwidth is rounded to the nearest Hz on the way back"
-                )]
-                let bandwidth_hz = saved.bandwidth_hz.round() as u32;
-                tune_a(freq_hz, saved.mode, bandwidth_hz);
+                tune_a(freq_hz, saved.mode, saved.bandwidth_hz);
                 // Replay the user's pre-AOS VFO offset so a
                 // dragged-from-centre carrier comes back. The
                 // existing `DspToUi::VfoOffsetChanged` handler
@@ -8961,6 +8968,18 @@ fn connect_satellites_panel(
                 // bar when the DSP echoes the change, so we
                 // don't have to mirror those widgets manually.
                 state_a.send_dsp(UiToDsp::SetVfoOffset(saved.vfo_offset_hz));
+                // If the user had playback off pre-AOS, we
+                // started the radio at AOS to make audio flow —
+                // honour that round trip and stop it now. A user
+                // who explicitly turned playback off during the
+                // pass (rare) loses that intent here, but the
+                // expected case (set-and-forget overnight) gets
+                // the right behaviour.
+                if !saved.was_running {
+                    tracing::info!("auto-record: stopping source (was stopped pre-AOS)");
+                    state_a.send_dsp(UiToDsp::Stop);
+                    state_a.is_running.set(false);
+                }
             }
             RecorderAction::Toast { message, kind } => {
                 if matches!(kind, ToastKind::Warn) {
@@ -9009,11 +9028,23 @@ fn connect_satellites_panel(
                 .map(|e| e.pass.clone())
                 .collect();
             let auto_record_on = panel.auto_record_switch.is_active();
+            // Round f64 SpinRow value to u32 at the snapshot
+            // boundary so SavedTune carries a clean integer for
+            // the eventual restore — no per-restore rounding.
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "user-set bandwidth is non-negative and \
+                          fits in u32 for any realistic SDR channel \
+                          width; the SpinRow's own min is positive"
+            )]
+            let bandwidth_hz_u32 = bandwidth_row_tick.value().round() as u32;
             let now_tune = SavedTune {
                 freq_hz: state_tick.center_frequency.get(),
                 vfo_offset_hz: spectrum_tick.vfo_offset_hz(),
                 mode: state_tick.demod_mode.get(),
-                bandwidth_hz: bandwidth_row_tick.value(),
+                bandwidth_hz: bandwidth_hz_u32,
+                was_running: state_tick.is_running.get(),
             };
             let actions =
                 recorder_tick
