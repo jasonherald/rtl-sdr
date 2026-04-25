@@ -452,6 +452,25 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         toast_overlay: toast_overlay.downgrade(),
     });
 
+    // Header play/stop button as a set-and-forget hook for any
+    // wiring that needs to start or stop the radio without bypassing
+    // the visible toggle (currently auto-record-on-pass; same idiom
+    // would suit any future "schedule the radio on" feature). Going
+    // through `set_active` reuses the existing
+    // `play_button.connect_toggled` handler — the single place that
+    // updates `state.is_running`, sends `UiToDsp::Start` / `Stop`,
+    // and swaps the icon — so the DSP, `AppState`, and header
+    // button stay aligned. `set_active` is idempotent: GTK only
+    // emits `toggled` on a real state change, so a redundant
+    // `set_playing(true)` while the radio is already running is a
+    // no-op (no duplicate Start dispatch).
+    let set_playing: Rc<dyn Fn(bool)> = {
+        let play_btn = play_button.clone();
+        Rc::new(move |should_play| {
+            play_btn.set_active(should_play);
+        })
+    };
+
     connect_sidebar_panels(
         &panels,
         &state,
@@ -464,6 +483,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         &favorites_handle,
         &scanner_force_disable,
         &volume_button,
+        &set_playing,
     );
 
     // Seed the scanner with the persisted bookmark list on
@@ -2657,6 +2677,7 @@ fn connect_sidebar_panels(
     favorites_header: &FavoritesHeaderHandle,
     scanner_force_disable: &Rc<ScannerForceDisable>,
     volume_button: &gtk4::ScaleButton,
+    set_playing: &Rc<dyn Fn(bool)>,
 ) {
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -2763,7 +2784,15 @@ fn connect_sidebar_panels(
             status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
         })
     };
-    connect_satellites_panel(panels, config, &tune_to_satellite);
+    connect_satellites_panel(
+        panels,
+        config,
+        state,
+        toast_overlay,
+        spectrum_handle,
+        &tune_to_satellite,
+        set_playing,
+    );
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -8399,7 +8428,11 @@ fn connect_scanner_panel(
 fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    state: &Rc<AppState>,
+    toast_overlay: &adw::ToastOverlay,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    set_playing: &Rc<dyn Fn(bool)>,
 ) {
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_panel::{
@@ -8408,6 +8441,9 @@ fn connect_satellites_panel(
         format_pass_title, load_auto_record_apt, load_station_alt_m, load_station_lat_deg,
         load_station_lon_deg, save_auto_record_apt, save_f64, save_tle_last_refresh,
         tune_target_for_pass,
+    };
+    use sidebar::satellites_recorder::{
+        Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
     };
 
     // One pass row + its source `Pass` so the 1 Hz ticker can
@@ -8845,14 +8881,207 @@ fn connect_satellites_panel(
     // widget has been dropped (otherwise GLib runs it forever,
     // holding a strong chain into the `displayed` vec and its
     // widgets).
+    // Auto-record-on-pass state machine (#482b). Driven from the
+    // same 1 Hz tick that updates pass-row countdowns — no second
+    // GLib source. The recorder itself is pure (returns
+    // `Vec<RecorderAction>`); the closure below interprets each
+    // action against the live UI / DSP / filesystem.
+    let recorder: Rc<RefCell<AutoRecorder>> = Rc::new(RefCell::new(AutoRecorder::new()));
+
+    // Parent-window resolver for the auto-open-viewer side effect.
+    // Walks up the widget tree from the satellites page; falls
+    // back to `None` if the widget has been detached, in which
+    // case the open is silently skipped. Holds a `WeakRef` so the
+    // 1 Hz timer's `panel_weak.upgrade() == None` exit gate can
+    // actually fire — a strong clone here would keep the panel
+    // widget alive and the timer would never break.
+    let parent_provider_for_recorder: Rc<dyn Fn() -> Option<gtk4::Window>> = {
+        let widget_weak = panel.widget.downgrade();
+        Rc::new(move || {
+            widget_weak
+                .upgrade()
+                .and_then(|w| w.root())
+                .and_then(|r| r.downcast::<gtk4::Window>().ok())
+        })
+    };
+
+    let interpret_action: Rc<dyn Fn(RecorderAction)> = {
+        let state_a = Rc::clone(state);
+        let tune_a = Rc::clone(tune_to_satellite);
+        let set_playing_a = Rc::clone(set_playing);
+        // Weak ref for the same lifecycle reason as
+        // `parent_provider_for_recorder` — strong clone would pin
+        // the toast overlay alive past window close.
+        let toast_overlay_weak = toast_overlay.downgrade();
+        let parent_provider_a = Rc::clone(&parent_provider_for_recorder);
+        // Scanner master switch handle for the LOS-side restore.
+        // Set-active here fires the switch's `connect_active_notify`
+        // handler, which re-dispatches `SetScannerEnabled(true)` and
+        // re-arms the engine — same path the user takes when they
+        // flip the switch by hand.
+        let scanner_switch_a = panels.scanner.master_switch.clone();
+        let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
+            if let Some(overlay) = overlay_weak.upgrade() {
+                overlay.add_toast(adw::Toast::new(msg));
+            }
+        };
+        Rc::new(move |action: RecorderAction| match action {
+            RecorderAction::StartAutoRecord {
+                satellite,
+                freq_hz,
+                mode,
+                bandwidth_hz,
+            } => {
+                tracing::info!(
+                    "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz",
+                );
+                // Drive Start through the header play button —
+                // its `connect_toggled` handler is the single place
+                // that updates `state.is_running`, dispatches
+                // `UiToDsp::Start`, and swaps the play/stop icon.
+                // `set_active` is a no-op when the radio is
+                // already running, so this is safe to call
+                // unconditionally without a duplicate Start.
+                // The pre-AOS `was_running` flag (captured in
+                // `SavedTune` by the 1 Hz tick before this action
+                // fires) drives the corresponding LOS-side stop.
+                set_playing_a(true);
+                tune_a(freq_hz, mode, bandwidth_hz);
+                // Zero the live VFO offset for the auto-record
+                // pass. The user's pre-AOS offset (a manual
+                // VFO drag away from centre) is preserved in
+                // `SavedTune` for the LOS restore, but during
+                // the pass the demod must align *exactly* with
+                // the satellite's downlink — otherwise we'd
+                // demod at `freq_hz + saved_offset` and the
+                // APT subcarrier would land outside the
+                // channel filter. The DSP's
+                // `DspToUi::VfoOffsetChanged` echo updates the
+                // spectrum widget, freq selector, and status
+                // bar; no manual mirror needed.
+                state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
+                crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
+                // Clear the canvas at AOS so a back-to-back pass
+                // (e.g. NOAA 18 → NOAA 19 with overlapping
+                // viewer sessions) starts on a clean image. The
+                // viewer was either just opened above (already
+                // empty) or carried over from a previous pass —
+                // either way, an explicit clear keeps the image
+                // we're about to save scoped to *this* pass.
+                if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                    view.clear();
+                }
+            }
+            RecorderAction::SavePng(path) => {
+                // Toast based on the *actual* export outcome
+                // rather than announcing success up front — the
+                // recorder doesn't know whether the user closed
+                // the viewer mid-pass or whether disk write will
+                // succeed.
+                let result_msg = if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                    match view.export_png(&path) {
+                        Ok(()) => {
+                            tracing::info!("auto-record PNG saved to {path:?}");
+                            format!("Pass complete — image saved to {}", path.display())
+                        }
+                        Err(e) => {
+                            tracing::warn!("auto-record PNG export to {path:?} failed: {e}");
+                            format!("Pass complete but PNG save failed: {e}")
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "auto-record SavePng but no APT viewer is open (user closed mid-pass)",
+                    );
+                    "Pass complete, but the APT viewer was closed — no image saved".to_string()
+                };
+                post_toast(&toast_overlay_weak, &result_msg);
+            }
+            RecorderAction::RestoreTune(saved) => {
+                tracing::info!(
+                    "auto-record LOS: restoring tune to {} Hz (offset {} Hz), BW {} Hz",
+                    saved.freq_hz,
+                    saved.vfo_offset_hz,
+                    saved.bandwidth_hz,
+                );
+                #[allow(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "saved freq came from the same widget we're feeding back; \
+                              non-negative and well within u64"
+                )]
+                let freq_hz = saved.freq_hz as u64;
+                tune_a(freq_hz, saved.mode, saved.bandwidth_hz);
+                // Replay the user's pre-AOS VFO offset so a
+                // dragged-from-centre carrier comes back. The
+                // existing `DspToUi::VfoOffsetChanged` handler
+                // updates the spectrum + freq selector + status
+                // bar when the DSP echoes the change, so we
+                // don't have to mirror those widgets manually.
+                state_a.send_dsp(UiToDsp::SetVfoOffset(saved.vfo_offset_hz));
+                // If the user had playback off pre-AOS, we
+                // started the radio at AOS to make audio flow —
+                // honour that round trip and stop it now. A user
+                // who explicitly turned playback off during the
+                // pass (rare) loses that intent here, but the
+                // expected case (set-and-forget overnight) gets
+                // the right behaviour. Routed through
+                // `set_playing` (header play button) so the icon,
+                // `state.is_running`, and DSP all move together.
+                if !saved.was_running {
+                    tracing::info!("auto-record: stopping source (was stopped pre-AOS)");
+                    set_playing_a(false);
+                }
+                // Re-arm the scanner if it was running pre-AOS.
+                // The AOS-side `tune_a` call goes through
+                // `tune_to_satellite`, which fires
+                // `ScannerForceDisable::trigger("satellite tune")`
+                // as a manual-tune side effect — without this
+                // restore, an active pre-AOS scan would be left
+                // permanently off after the pass. Same idiom as
+                // `was_running`: snapshot the user's pre-AOS
+                // state, return them to it. `set_active(true)`
+                // fires the switch's notify handler, which
+                // dispatches `SetScannerEnabled(true)` to the
+                // engine — same path a manual flip takes.
+                if saved.scanner_running && !scanner_switch_a.is_active() {
+                    tracing::info!("auto-record: re-arming scanner (was running pre-AOS)");
+                    scanner_switch_a.set_active(true);
+                }
+            }
+            RecorderAction::Toast { message, kind } => {
+                if matches!(kind, ToastKind::Warn) {
+                    // No dedicated warn styling on AdwToast; the
+                    // message itself carries the severity. Tracing
+                    // captures it for the log either way.
+                    tracing::warn!("auto-record: {message}");
+                }
+                post_toast(&toast_overlay_weak, &message);
+            }
+        })
+    };
+
     if cache.is_some() {
         let panel_weak_tick = panel_weak.clone();
         let displayed_tick = Rc::clone(&displayed);
         let recompute_tick = Rc::clone(&recompute);
+        let recorder_tick = Rc::clone(&recorder);
+        let interpret_tick = Rc::clone(&interpret_action);
+        let state_tick = Rc::clone(state);
+        let bandwidth_row_tick = panels.radio.bandwidth_row.clone();
+        let spectrum_tick = Rc::clone(spectrum_handle);
+        // Scanner master switch — read for the per-tick snapshot so
+        // SavedTune carries scanner state across AOS → LOS, written
+        // by `interpret_action::RestoreTune` to re-arm the scanner
+        // if it was running pre-AOS. Strong clone because the tick
+        // already captures other panel widgets (bandwidth_row);
+        // when the panel is dropped the tick's `panel_weak.upgrade`
+        // returns None and we Break, dropping the chain.
+        let scanner_switch_tick = panels.scanner.master_switch.clone();
         let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
-            if panel_weak_tick.upgrade().is_none() {
+            let Some(panel) = panel_weak_tick.upgrade() else {
                 return glib::ControlFlow::Break;
-            }
+            };
             let now = chrono::Utc::now();
             let mut needs_recompute = false;
             for entry in displayed_tick.borrow().iter() {
@@ -8861,6 +9090,45 @@ fn connect_satellites_panel(
                     continue;
                 }
                 entry.row.set_title(&format_pass_title(&entry.pass, now));
+            }
+            // Drive the auto-record state machine. Snapshot the
+            // pass list (cloned out of the displayed vec to keep
+            // the borrow short) and the current tune so the
+            // recorder gets a consistent view. Capture the VFO
+            // offset alongside centre frequency — a user-dragged
+            // carrier position needs to survive the AOS→LOS round
+            // trip.
+            let passes_snapshot: Vec<Pass> = displayed_tick
+                .borrow()
+                .iter()
+                .map(|e| e.pass.clone())
+                .collect();
+            let auto_record_on = panel.auto_record_switch.is_active();
+            // Round f64 SpinRow value to u32 at the snapshot
+            // boundary so SavedTune carries a clean integer for
+            // the eventual restore — no per-restore rounding.
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "user-set bandwidth is non-negative and \
+                          fits in u32 for any realistic SDR channel \
+                          width; the SpinRow's own min is positive"
+            )]
+            let bandwidth_hz_u32 = bandwidth_row_tick.value().round() as u32;
+            let now_tune = SavedTune {
+                freq_hz: state_tick.center_frequency.get(),
+                vfo_offset_hz: spectrum_tick.vfo_offset_hz(),
+                mode: state_tick.demod_mode.get(),
+                bandwidth_hz: bandwidth_hz_u32,
+                was_running: state_tick.is_running.get(),
+                scanner_running: scanner_switch_tick.is_active(),
+            };
+            let actions =
+                recorder_tick
+                    .borrow_mut()
+                    .tick(now, &passes_snapshot, auto_record_on, now_tune);
+            for action in actions {
+                interpret_tick(action);
             }
             if needs_recompute {
                 recompute_tick();

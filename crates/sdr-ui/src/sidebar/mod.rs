@@ -12,6 +12,7 @@ pub mod general_panel;
 pub mod navigation_panel;
 pub mod radio_panel;
 pub mod satellites_panel;
+pub mod satellites_recorder;
 pub mod scanner_panel;
 pub mod server_panel;
 pub mod source_panel;
