@@ -196,59 +196,56 @@ impl TleCache {
     /// See [`TleCache::tle_for`].
     pub fn tle_text(&self, source: TleSource) -> Result<String, TleCacheError> {
         let path = self.cache_path(source);
-        let stale = is_stale(&path, self.refresh_max_age);
 
-        if stale {
-            // Try a refresh. If it succeeds AND the body actually
-            // looks like a TLE file, write to disk and return the new
-            // text. If it fails (or returns something that ISN'T a
-            // TLE — captive portal, HTML 5xx page, proxy error), fall
-            // back to whatever stale copy the cache has.
-            let fetch_result = self.fetch(source).and_then(|text| {
-                if has_any_tle_pair(&text) {
-                    Ok(text)
-                } else {
-                    Err(TleCacheError::Fetch(
-                        "response body did not contain any valid TLE pair (captive portal? HTML error page?)"
-                            .to_string(),
-                    ))
-                }
-            });
-            match fetch_result {
-                Ok(text) => {
-                    // Best-effort cache write — a failed write
-                    // (read-only fs, disk full, permissions) shouldn't
-                    // throw away network-fresh TLE data. Log and move
-                    // on; the next call will just refetch.
-                    if let Err(e) = self.write_cache(&path, &text) {
-                        tracing::warn!(
-                            "TLE cache write for {:?} failed ({e}); returning fresh in-memory copy",
-                            source,
-                        );
-                    }
-                    return Ok(text);
-                }
-                Err(fetch_err) => {
-                    if let Some(cached) = read_file(&path)? {
-                        tracing::warn!(
-                            "TLE fetch for {:?} failed ({fetch_err}); using stale cache",
-                            source,
-                        );
-                        return Ok(cached);
-                    }
-                    return Err(fetch_err);
-                }
-            }
+        // Fast path: cache file is fresh AND still readable. If a TOCTOU
+        // race steals the file between the mtime check and the read
+        // (concurrent process, cache cleaner like tmpfiles.d, manual
+        // `rm`), fall through to the refetch path rather than turning
+        // a survivable transient into a hard error.
+        if !is_stale(&path, self.refresh_max_age)
+            && let Some(cached) = read_file(&path)?
+        {
+            return Ok(cached);
         }
 
-        // Cache is fresh — read from disk.
-        read_file(&path)?.ok_or_else(|| TleCacheError::Io {
-            path,
-            source: std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "fresh cache file disappeared between mtime check and read",
-            ),
-        })
+        // Slow path: fetch from upstream, validate, write to disk.
+        // If the fetch (or validation) fails, fall back to whatever
+        // stale copy still happens to exist. If even that's gone,
+        // surface the original fetch error.
+        let fetch_result = self.fetch(source).and_then(|text| {
+            if has_any_tle_pair(&text) {
+                Ok(text)
+            } else {
+                Err(TleCacheError::Fetch(
+                    "response body did not contain any valid TLE pair (captive portal? HTML error page?)"
+                        .to_string(),
+                ))
+            }
+        });
+        match fetch_result {
+            Ok(text) => {
+                // Best-effort cache write — a failed write (read-only
+                // fs, disk full, permissions) shouldn't throw away
+                // network-fresh TLE data. Log and move on.
+                if let Err(e) = self.write_cache(&path, &text) {
+                    tracing::warn!(
+                        "TLE cache write for {:?} failed ({e}); returning fresh in-memory copy",
+                        source,
+                    );
+                }
+                Ok(text)
+            }
+            Err(fetch_err) => {
+                if let Some(cached) = read_file(&path)? {
+                    tracing::warn!(
+                        "TLE fetch for {:?} failed ({fetch_err}); using stale cache",
+                        source,
+                    );
+                    return Ok(cached);
+                }
+                Err(fetch_err)
+            }
+        }
     }
 
     /// Blocking HTTP fetch of one source file. Reuses the cached
@@ -377,7 +374,7 @@ fn is_stale(path: &Path, max_age: StdDuration) -> bool {
 /// implementation was vulnerable to that case).
 #[must_use]
 #[allow(clippy::similar_names)] // line1/line2 names match TLE-spec terminology
-pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
+pub(crate) fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
     let lines = tle_lines(text);
     let last = lines.len().saturating_sub(1);
     for i in 0..last {
@@ -401,7 +398,7 @@ pub fn parse_tle_text(text: &str, norad_id: u32) -> Option<(String, String)> {
 /// check is enough to reject HTML responses (no `1 ` prefix at the
 /// right offset, no NORAD id at the right column, mismatched ids).
 #[must_use]
-pub fn has_any_tle_pair(text: &str) -> bool {
+pub(crate) fn has_any_tle_pair(text: &str) -> bool {
     let lines = tle_lines(text);
     let last = lines.len().saturating_sub(1);
     (0..last).any(|i| pair_matches(lines[i], lines[i + 1], None))
@@ -471,7 +468,7 @@ fn norad_id_from_tle_line(line: &str) -> Option<u32> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -634,6 +631,49 @@ SOMETHING
         );
         let (l1, _) = parse_tle_text(with_noise, 5).unwrap();
         assert!(l1.starts_with("1 00005"));
+    }
+
+    #[test]
+    fn cache_falls_through_to_fetch_when_fresh_file_disappears() {
+        // TOCTOU window: cache file passes the mtime freshness check,
+        // then gets deleted (concurrent process, cache cleaner,
+        // manual rm) before the read. tle_text() must NOT raise a
+        // hard `Io(NotFound)` — it must fall through to the refetch
+        // path so the race becomes a recoverable network condition,
+        // not a file-not-found bug.
+        //
+        // Acceptable outcomes:
+        //   * Ok(text) — refetch reached upstream and won (CI has
+        //     network, etc.). Contract still satisfied.
+        //   * Err(Fetch(_)) — refetch couldn't reach upstream and
+        //     there's no stale to fall back on (we just deleted it).
+        //     Expected on offline runners.
+        // Forbidden outcome:
+        //   * Err(Io(_)) — means the disappeared file became a hard
+        //     error instead of falling through to fetch. That's the
+        //     bug this test exists to catch.
+        //
+        // Aggressive fetch timeout (100 ms) so the offline path
+        // doesn't slow tests down — networked CI runners take longer
+        // than that to round-trip celestrak.org so they'll usually
+        // hit the Fetch-err branch too, but either branch is fine.
+        let dir = unique_temp_dir("toctou");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TleCache::with_dir(dir.clone()).with_fetch_timeout(StdDuration::from_millis(100));
+        let path = cache.cache_path(TleSource::Noaa);
+        std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
+        // Sanity: fresh-cache fast path works as expected.
+        assert!(cache.tle_text(TleSource::Noaa).is_ok());
+        // Race: delete the file before the next call.
+        std::fs::remove_file(&path).unwrap();
+        match cache.tle_text(TleSource::Noaa) {
+            Ok(_) | Err(TleCacheError::Fetch(_)) => {} // both acceptable
+            Err(other @ TleCacheError::Io { .. }) => {
+                panic!("TOCTOU race should fall through to fetch, got Io error: {other:?}")
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]
