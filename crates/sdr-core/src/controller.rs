@@ -2349,6 +2349,21 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     }
 
     state.source = None;
+
+    // Hard stream discontinuity — flush APT decoder state so a
+    // subsequent Start can't bleed pre-stop accumulator/ready
+    // lines into the new session and emit a stale first line.
+    // The decoder itself stays allocated so the next Start
+    // doesn't pay re-init cost (filter taps, resampler tables);
+    // we only clear its in-flight buffers via `AptDecoder::reset`.
+    // Cross-mode preservation (NFM → WFM → NFM mid-pass) is a
+    // *soft* discontinuity and intentionally stays untouched —
+    // the user keeps decoding the same pass.
+    if let Some(decoder) = state.apt_decoder.as_mut() {
+        decoder.reset();
+    }
+    state.apt_mono_buf.clear();
+
     tracing::info!("source closed");
 }
 
