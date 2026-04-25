@@ -503,32 +503,46 @@ pub fn connect_apt_action(
     let parent_provider = Rc::clone(parent_provider);
     let state_for_action = Rc::clone(state);
     action.connect_activate(move |_, _| {
-        if state_for_action.apt_viewer.borrow().is_some() {
-            // Already open — nothing to do. The user can find the
-            // existing window via the OS window switcher.
-            return;
-        }
-        let Some(parent) = parent_provider() else {
-            tracing::warn!("apt-open invoked with no main window available");
-            return;
-        };
-        let (view, window) = open_apt_viewer_window(&parent, "NOAA APT");
-        // Stash a clone in AppState so the DSP→UI handler can find
-        // it. The clone is cheap (every field is `Rc`-shared).
-        *state_for_action.apt_viewer.borrow_mut() = Some(view);
-
-        // Clear the AppState slot when the user closes the window
-        // — otherwise `DspToUi::AptLine` would keep pushing into a
-        // detached widget tree until the next reopen, and the
-        // viewer state would never reset for a second pass.
-        let state_for_close = Rc::clone(&state_for_action);
-        window.connect_close_request(move |_| {
-            *state_for_close.apt_viewer.borrow_mut() = None;
-            glib::Propagation::Proceed
-        });
+        open_apt_viewer_if_needed(&parent_provider, &state_for_action);
     });
     app.add_action(&action);
     app.set_accels_for_action("app.apt-open", &["<Ctrl><Shift>a"]);
+}
+
+/// Open the APT viewer window if it isn't already open, registering
+/// the new view in `state.apt_viewer` and wiring `close-request` to
+/// clear that slot. No-op if a viewer is already open.
+///
+/// Pulled out of `connect_apt_action` so the auto-record-on-pass
+/// path (#482b) can fire the same open flow at AOS without going
+/// through the GIO action system.
+pub fn open_apt_viewer_if_needed(
+    parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
+    state: &Rc<crate::state::AppState>,
+) {
+    if state.apt_viewer.borrow().is_some() {
+        // Already open — nothing to do. The user can find the
+        // existing window via the OS window switcher.
+        return;
+    }
+    let Some(parent) = parent_provider() else {
+        tracing::warn!("apt-open invoked with no main window available");
+        return;
+    };
+    let (view, window) = open_apt_viewer_window(&parent, "NOAA APT");
+    // Stash a clone in AppState so the DSP→UI handler can find
+    // it. The clone is cheap (every field is `Rc`-shared).
+    *state.apt_viewer.borrow_mut() = Some(view);
+
+    // Clear the AppState slot when the user closes the window
+    // — otherwise `DspToUi::AptLine` would keep pushing into a
+    // detached widget tree until the next reopen, and the viewer
+    // state would never reset for a second pass.
+    let state_for_close = Rc::clone(state);
+    window.connect_close_request(move |_| {
+        *state_for_close.apt_viewer.borrow_mut() = None;
+        glib::Propagation::Proceed
+    });
 }
 
 #[cfg(test)]

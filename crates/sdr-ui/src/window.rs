@@ -2763,7 +2763,7 @@ fn connect_sidebar_panels(
             status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
         })
     };
-    connect_satellites_panel(panels, config, &tune_to_satellite);
+    connect_satellites_panel(panels, config, state, toast_overlay, &tune_to_satellite);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -8399,6 +8399,8 @@ fn connect_scanner_panel(
 fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    state: &Rc<AppState>,
+    toast_overlay: &adw::ToastOverlay,
     tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
 ) {
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
@@ -8408,6 +8410,9 @@ fn connect_satellites_panel(
         format_pass_title, load_auto_record_apt, load_station_alt_m, load_station_lat_deg,
         load_station_lon_deg, save_auto_record_apt, save_f64, save_tle_last_refresh,
         tune_target_for_pass,
+    };
+    use sidebar::satellites_recorder::{
+        Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
     };
 
     // One pass row + its source `Pass` so the 1 Hz ticker can
@@ -8845,14 +8850,104 @@ fn connect_satellites_panel(
     // widget has been dropped (otherwise GLib runs it forever,
     // holding a strong chain into the `displayed` vec and its
     // widgets).
+    // Auto-record-on-pass state machine (#482b). Driven from the
+    // same 1 Hz tick that updates pass-row countdowns — no second
+    // GLib source. The recorder itself is pure (returns
+    // `Vec<RecorderAction>`); the closure below interprets each
+    // action against the live UI / DSP / filesystem.
+    let recorder: Rc<RefCell<AutoRecorder>> = Rc::new(RefCell::new(AutoRecorder::new()));
+
+    // Parent-window resolver for the auto-open-viewer side effect.
+    // Walks up the widget tree from the satellites page; falls
+    // back to `None` if the widget has been detached, in which
+    // case the open is silently skipped — matches the
+    // already-open no-op semantics.
+    let parent_provider_for_recorder: Rc<dyn Fn() -> Option<gtk4::Window>> = {
+        let widget = panel.widget.clone();
+        Rc::new(move || {
+            widget
+                .root()
+                .and_then(|r| r.downcast::<gtk4::Window>().ok())
+        })
+    };
+
+    let interpret_action: Rc<dyn Fn(RecorderAction)> = {
+        let state_a = Rc::clone(state);
+        let tune_a = Rc::clone(tune_to_satellite);
+        let toast_overlay_a = toast_overlay.clone();
+        let parent_provider_a = Rc::clone(&parent_provider_for_recorder);
+        Rc::new(move |action: RecorderAction| match action {
+            RecorderAction::StartAutoRecord {
+                satellite,
+                freq_hz,
+                mode,
+                bandwidth_hz,
+            } => {
+                tracing::info!(
+                    "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz",
+                );
+                tune_a(freq_hz, mode, bandwidth_hz);
+                crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
+            }
+            RecorderAction::SavePng(path) => {
+                if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                    if let Err(e) = view.export_png(&path) {
+                        tracing::warn!("auto-record PNG export to {path:?} failed: {e}");
+                    } else {
+                        tracing::info!("auto-record PNG saved to {path:?}");
+                    }
+                } else {
+                    tracing::warn!(
+                        "auto-record SavePng but no APT viewer is open (user closed mid-pass)",
+                    );
+                }
+            }
+            RecorderAction::RestoreTune(saved) => {
+                tracing::info!(
+                    "auto-record LOS: restoring tune to {} Hz, BW {} Hz",
+                    saved.freq_hz,
+                    saved.bandwidth_hz,
+                );
+                #[allow(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "saved values came from the same widgets we're feeding back; \
+                              both are non-negative and well within u64/u32"
+                )]
+                let freq_hz = saved.freq_hz as u64;
+                #[allow(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "user-set bandwidth is rounded to the nearest Hz on the way back"
+                )]
+                let bandwidth_hz = saved.bandwidth_hz.round() as u32;
+                tune_a(freq_hz, saved.mode, bandwidth_hz);
+            }
+            RecorderAction::Toast { message, kind } => {
+                let toast = adw::Toast::new(&message);
+                if matches!(kind, ToastKind::Warn) {
+                    // No dedicated warn styling on AdwToast; the
+                    // message itself carries the severity. Tracing
+                    // captures it for the log either way.
+                    tracing::warn!("auto-record: {message}");
+                }
+                toast_overlay_a.add_toast(toast);
+            }
+        })
+    };
+
     if cache.is_some() {
         let panel_weak_tick = panel_weak.clone();
         let displayed_tick = Rc::clone(&displayed);
         let recompute_tick = Rc::clone(&recompute);
+        let recorder_tick = Rc::clone(&recorder);
+        let interpret_tick = Rc::clone(&interpret_action);
+        let state_tick = Rc::clone(state);
+        let bandwidth_row_tick = panels.radio.bandwidth_row.clone();
         let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
-            if panel_weak_tick.upgrade().is_none() {
+            let Some(panel) = panel_weak_tick.upgrade() else {
                 return glib::ControlFlow::Break;
-            }
+            };
             let now = chrono::Utc::now();
             let mut needs_recompute = false;
             for entry in displayed_tick.borrow().iter() {
@@ -8861,6 +8956,28 @@ fn connect_satellites_panel(
                     continue;
                 }
                 entry.row.set_title(&format_pass_title(&entry.pass, now));
+            }
+            // Drive the auto-record state machine. Snapshot the
+            // pass list (cloned out of the displayed vec to keep
+            // the borrow short) and the current tune so the
+            // recorder gets a consistent view.
+            let passes_snapshot: Vec<Pass> = displayed_tick
+                .borrow()
+                .iter()
+                .map(|e| e.pass.clone())
+                .collect();
+            let auto_record_on = panel.auto_record_switch.is_active();
+            let now_tune = SavedTune {
+                freq_hz: state_tick.center_frequency.get(),
+                mode: state_tick.demod_mode.get(),
+                bandwidth_hz: bandwidth_row_tick.value(),
+            };
+            let actions =
+                recorder_tick
+                    .borrow_mut()
+                    .tick(now, &passes_snapshot, auto_record_on, now_tune);
+            for action in actions {
+                interpret_tick(action);
             }
             if needs_recompute {
                 recompute_tick();
