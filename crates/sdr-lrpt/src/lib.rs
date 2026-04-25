@@ -21,4 +21,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ccsds;
 pub mod fec;
