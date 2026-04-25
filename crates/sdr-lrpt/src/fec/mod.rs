@@ -12,9 +12,11 @@
 //! and [`Derandomizer`]. Reed-Solomon lands in Task 3.
 
 pub mod derand;
+pub mod reed_solomon;
 pub mod sync;
 pub mod viterbi;
 
 pub use derand::Derandomizer;
-pub use sync::{ASM, SYNC_THRESHOLD, SyncCorrelator};
+pub use reed_solomon::{K as RS_K, N as RS_N, ReedSolomon, RsError, T as RS_T};
+pub use sync::{ASM, ASM_BITS, SYNC_THRESHOLD, SyncCorrelator};
 pub use viterbi::{POLYA, POLYB, TRACEBACK_DEPTH, ViterbiDecoder};
