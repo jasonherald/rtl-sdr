@@ -423,6 +423,15 @@ struct DspState {
     /// `AptDecoder` docs); the decoder won't emit more than this in
     /// a single call.
     apt_lines_buf: Vec<AptLine>,
+    /// Most recent audio sample rate that `AptDecoder::new` rejected
+    /// (or `None` if every prior init succeeded / hasn't been tried).
+    /// Guards against the audio-block hot loop retrying — and
+    /// log-spamming — on a rate the decoder will never accept (e.g.
+    /// a future audio-rate change to something below the 4800 Hz
+    /// Nyquist floor). Cleared in `cleanup` alongside the decoder
+    /// reset so a fresh source restart always gets one fresh
+    /// init attempt.
+    apt_init_failed_at_rate: Option<u32>,
 }
 
 impl DspState {
@@ -498,6 +507,7 @@ impl DspState {
             apt_decoder: None,
             apt_mono_buf: Vec::new(),
             apt_lines_buf: Vec::new(),
+            apt_init_failed_at_rate: None,
         })
     }
 }
@@ -516,10 +526,18 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
     if state.apt_decoder.is_none() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let rate_hz = state.radio.audio_sample_rate() as u32;
+        // Guard against retry-spamming the warn log on a rate the
+        // decoder will reject. If we've already tried this exact
+        // rate and it failed, silently bail until either the rate
+        // changes (next-block check) or `cleanup` clears the cache.
+        if state.apt_init_failed_at_rate == Some(rate_hz) {
+            return;
+        }
         match AptDecoder::new(rate_hz) {
             Ok(decoder) => {
                 tracing::info!("APT decoder initialised at {rate_hz} Hz");
                 state.apt_decoder = Some(decoder);
+                state.apt_init_failed_at_rate = None;
                 // Size the output slice to the decoder's documented
                 // per-call emission cap so a single `process` call
                 // can never need to flush.
@@ -529,6 +547,7 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
             }
             Err(e) => {
                 tracing::warn!("APT decoder init failed at {rate_hz} Hz: {e}");
+                state.apt_init_failed_at_rate = Some(rate_hz);
                 return;
             }
         }
@@ -2366,6 +2385,11 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
         decoder.reset();
     }
     state.apt_mono_buf.clear();
+    // Clear the failed-init guard so a fresh Start gets a fresh
+    // init attempt — the user may have tweaked the radio audio
+    // rate between sessions, and we don't want a stale failure
+    // memo to silently suppress a now-valid rate.
+    state.apt_init_failed_at_rate = None;
 
     tracing::info!("source closed");
 }
