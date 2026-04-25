@@ -654,6 +654,93 @@ public final class SdrCore: @unchecked Sendable {
     }
 
     // ==========================================================
+    //  Config — ABI 0.21, issue #449. Round-trips against the
+    //  shared `sdr-config` JSON file passed to the engine at
+    //  init time. Auto-save runs off a worker thread the engine
+    //  starts; writes here become persistent at the next save
+    //  tick (and on `Drop` / engine destroy at the latest).
+    //
+    //  All getters return `Optional` — `nil` when the key is
+    //  absent OR present with a mismatched type. The two cases
+    //  are deliberately conflated on the Swift side because
+    //  callers want the same fallback ("use my Swift default")
+    //  in both. The C ABI distinguishes them via
+    //  `SDR_CORE_ERR_KEY_NOT_FOUND` for diagnostic logging if a
+    //  future caller needs the split.
+    // ==========================================================
+
+    /// Read a string-valued config key. `nil` when absent or
+    /// stored under a non-string JSON type.
+    public func configString(key: String) -> String? {
+        // Two-pass call: ask for the size, then fill a buffer
+        // sized exactly for the value. This matches the FFI's
+        // size-then-fill contract and avoids a fixed-cap
+        // assumption (config values can be arbitrarily long).
+        var required: Int = 0
+        let sizeRc = key.withCString { keyPtr in
+            sdr_core_config_get_string(handle, keyPtr, nil, 0, &required)
+        }
+        guard sizeRc == 0 else { return nil }
+        // Allocate the buffer, fill it, decode.
+        var buf = [CChar](repeating: 0, count: required)
+        let fillRc = key.withCString { keyPtr in
+            buf.withUnsafeMutableBufferPointer { bufPtr in
+                sdr_core_config_get_string(
+                    handle, keyPtr, bufPtr.baseAddress, bufPtr.count, nil
+                )
+            }
+        }
+        guard fillRc == 0 else { return nil }
+        return String(cString: buf)
+    }
+
+    /// Write a string-valued config key. Empty values are
+    /// stored verbatim — distinct from absence (which a
+    /// future read returns as `nil`).
+    public func setConfigString(key: String, value: String) throws {
+        try checkRc(key.withCString { keyPtr in
+            value.withCString { valuePtr in
+                sdr_core_config_set_string(handle, keyPtr, valuePtr)
+            }
+        })
+    }
+
+    /// Read a bool-valued config key. `nil` when absent or
+    /// stored under a non-bool JSON type.
+    public func configBool(key: String) -> Bool? {
+        var out = false
+        let rc = key.withCString { keyPtr in
+            sdr_core_config_get_bool(handle, keyPtr, &out)
+        }
+        return rc == 0 ? out : nil
+    }
+
+    /// Write a bool-valued config key.
+    public func setConfigBool(key: String, value: Bool) throws {
+        try checkRc(key.withCString { keyPtr in
+            sdr_core_config_set_bool(handle, keyPtr, value)
+        })
+    }
+
+    /// Read a u32-valued config key. `nil` when absent, stored
+    /// under a non-numeric type, or stored as a number that
+    /// doesn't fit in `UInt32`.
+    public func configUInt32(key: String) -> UInt32? {
+        var out: UInt32 = 0
+        let rc = key.withCString { keyPtr in
+            sdr_core_config_get_u32(handle, keyPtr, &out)
+        }
+        return rc == 0 ? out : nil
+    }
+
+    /// Write a u32-valued config key.
+    public func setConfigUInt32(key: String, value: UInt32) throws {
+        try checkRc(key.withCString { keyPtr in
+            sdr_core_config_set_u32(handle, keyPtr, value)
+        })
+    }
+
+    // ==========================================================
     //  FFT frame pull
     // ==========================================================
 

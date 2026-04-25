@@ -48,61 +48,71 @@ struct ContentView: View {
     @State private var showingRadioReference: Bool = false
 
     // ----------------------------------------------------------
-    //  Activity-bar selections — new in #442
+    //  Activity-bar selections + width drag — sidebar session
     //
-    //  Ephemeral for scaffolding; session persistence wires
-    //  these bindings into `sdr-config` via #449.
+    //  Selection / open / width all live on CoreModel
+    //  (`sidebarLeft*` / `sidebarRight*`) so the activity-bar
+    //  click handler and the resize gesture write straight to
+    //  the shared `sdr-config` JSON via the engine FFI.
+    //  CoreModel restores from config in `bootstrap()` BEFORE
+    //  this view first paints, so the @Observable bindings
+    //  here pick up the persisted state without flashing the
+    //  default first. Per #449.
+    //
+    //  `liveLeftWidth` / `liveRightWidth` track the live drag
+    //  position separately so we don't write to the shared
+    //  config on every pixel. The drag-end commit pushes the
+    //  final value to `model.setSidebar*Width` in one shot.
     // ----------------------------------------------------------
 
-    /// Currently-selected left activity. Stays stable across
-    /// panel open/close so the icon highlight persists when
-    /// the user collapses the panel via a second click.
-    /// `leftPanelOpen` controls visibility independently.
-    /// This split mirrors the Linux
-    /// `ui_sidebar_left_{selected,open}` config-key pair, so
-    /// #449's session-persistence wires both bindings into
-    /// the shared sdr-config JSON. Per `CodeRabbit` round 1
-    /// on PR #491.
-    @State private var leftSelection: LeftActivity = .general
-    @State private var leftPanelOpen: Bool = true
-
-    /// Same split for the right bar. Defaults: Transcript
-    /// remembered as the active activity, panel starts closed
-    /// — matches Linux startup.
-    @State private var rightSelection: RightActivity = .transcript
-    @State private var rightPanelOpen: Bool = false
-
-    /// Ideal width of a left / right panel. `HSplitView` in
-    /// #450 will let the user drag these; today they're fixed.
-    private static let leftPanelWidth: CGFloat = 280
-    private static let rightPanelWidth: CGFloat = 360
+    /// Live drag width for the left panel — `nil` when no drag
+    /// is in progress (the model's `sidebarLeftWidth` drives
+    /// the layout in that case). Set on drag start, updated on
+    /// drag, cleared + flushed to the model on drag end.
+    @State private var liveLeftWidth: CGFloat? = nil
+    /// Same pattern for the right panel.
+    @State private var liveRightWidth: CGFloat? = nil
 
     var body: some View {
-        HStack(spacing: 0) {
+        @Bindable var model = model
+        let leftSelectionBinding = Binding<LeftActivity>(
+            get: { LeftActivity(rawValue: model.sidebarLeftSelected) ?? .general },
+            set: { model.setSidebarLeftSelected($0.rawValue) }
+        )
+        let leftOpenBinding = Binding<Bool>(
+            get: { model.sidebarLeftOpen },
+            set: { model.setSidebarLeftOpen($0) }
+        )
+        let rightSelectionBinding = Binding<RightActivity>(
+            get: { RightActivity(rawValue: model.sidebarRightSelected) ?? .transcript },
+            set: { model.setSidebarRightSelected($0.rawValue) }
+        )
+        let rightOpenBinding = Binding<Bool>(
+            get: { model.sidebarRightOpen },
+            set: { model.setSidebarRightOpen($0) }
+        )
+        let leftWidth = liveLeftWidth ?? CGFloat(model.sidebarLeftWidth)
+        let rightWidth = liveRightWidth ?? CGFloat(model.sidebarRightWidth)
+
+        return HStack(spacing: 0) {
             // Left activity bar — always visible.
             ActivityBarView(
-                selection: $leftSelection,
-                isOpen: $leftPanelOpen,
+                selection: leftSelectionBinding,
+                isOpen: leftOpenBinding,
                 shortcutModifiers: .command
             )
             Divider()
 
-            // Left panel — visible only when `leftPanelOpen`.
-            // The remembered `leftSelection` stays put when
-            // closed so a re-open snaps back to the same panel.
-            // Placeholder bodies during scaffolding; real
-            // panels land in #443–#447.
-            if leftPanelOpen {
-                LeftPanelHost(activity: leftSelection)
-                    .frame(width: Self.leftPanelWidth)
-                Divider()
+            // Left panel — visible only when `sidebarLeftOpen`.
+            // The remembered selection stays put when closed
+            // so a re-open snaps back to the same panel.
+            if model.sidebarLeftOpen {
+                LeftPanelHost(activity: leftSelectionBinding.wrappedValue)
+                    .frame(width: leftWidth)
+                resizeHandle(side: .left)
             }
 
-            // Detail column — spectrum + status bar. The
-            // pre-redesign right-side flyouts (Transcription,
-            // Bookmarks) moved to the right activity-bar
-            // panels in #448, so the detail column is now
-            // just the visualization stack.
+            // Detail column — spectrum + status bar.
             VStack(spacing: 0) {
                 CenterView()
                 StatusBar()
@@ -110,25 +120,20 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
 
             // Right panel — driven by the right activity bar.
-            // Hosts TranscriptionPanel or BookmarksPanel
-            // depending on `rightSelection`; bookmarks gets
-            // the `isOpen` binding so its X close button
-            // toggles the activity bar's state directly.
-            if rightPanelOpen {
-                Divider()
+            if model.sidebarRightOpen {
+                resizeHandle(side: .right)
                 RightPanelHost(
-                    activity: rightSelection,
-                    isOpen: $rightPanelOpen
+                    activity: rightSelectionBinding.wrappedValue,
+                    isOpen: rightOpenBinding
                 )
-                .frame(width: Self.rightPanelWidth)
+                .frame(width: rightWidth)
             }
             Divider()
 
-            // Right activity bar — always visible. One icon
-            // in scaffolding; #448 adds the second.
+            // Right activity bar — always visible.
             ActivityBarView(
-                selection: $rightSelection,
-                isOpen: $rightPanelOpen,
+                selection: rightSelectionBinding,
+                isOpen: rightOpenBinding,
                 shortcutModifiers: [.command, .shift]
             )
         }
@@ -205,6 +210,108 @@ struct ContentView: View {
                 bad output. Reinstall a matching build.
                 """)
         }
+    }
+
+    /// Which sidebar a resize handle controls. Drag direction
+    /// is inverted between sides — dragging the left handle
+    /// rightward grows the left panel, while dragging the
+    /// right handle leftward grows the right panel.
+    private enum Side {
+        case left, right
+    }
+
+    /// Visible 1 px divider wrapped in an 8 px invisible hit
+    /// target. Mirrors the GTK `build_resize_handle` pattern
+    /// (custom gesture on a narrow strip — `HSplitView` would
+    /// also work but takes over more layout decisions than we
+    /// want here, since the panels and bars are part of the
+    /// same `HStack`).
+    ///
+    /// **Color.white.opacity(0.001) over Color.clear** —
+    /// SwiftUI treats a `.clear` fill as non-hit-testable even
+    /// with an explicit `contentShape`. A near-zero-opacity
+    /// fill is visually identical but draws (and therefore
+    /// hits) normally. This is the documented SwiftUI
+    /// workaround — any opacity > 0 will do; we pick 0.001 to
+    /// stay inside the "no pixels drawn" optimization. Kept as
+    /// a constant on the view so a future Retina cap or
+    /// cursor-snap tweak stays in one place.
+    ///
+    /// Live-drag width is held in `liveLeftWidth` /
+    /// `liveRightWidth` so we don't write to the shared config
+    /// on every pixel; the on-drag-end commit pushes the final
+    /// value through the model setter (which clamps + writes
+    /// to the FFI config).
+    private func resizeHandle(side: Side) -> some View {
+        let baseWidth: CGFloat = side == .left
+            ? CGFloat(model.sidebarLeftWidth)
+            : CGFloat(model.sidebarRightWidth)
+        // 8 px of draggable strip centered on the 1 px divider.
+        // Wider than the divider so the hit target is forgiving
+        // — matches macOS's own HSplitView separator feel.
+        let hitWidth: CGFloat = 8
+        return Color.white.opacity(0.001)
+            .frame(width: hitWidth)
+            .overlay(
+                // The visible 1 px line. Uses the system
+                // separator color so the divider looks native
+                // in both Light and Dark modes and tracks any
+                // accent-tint changes the user makes.
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor))
+                    .frame(width: 1)
+            )
+            .contentShape(Rectangle())
+            .onHover { inside in
+                // Push/pop gives stable cursor behavior when
+                // the drag crosses above / below other views
+                // — a `set`-only approach can leave the resize
+                // cursor stuck after a fast exit.
+                if inside {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let delta = value.translation.width
+                        let next: CGFloat
+                        switch side {
+                        case .left:
+                            next = baseWidth + delta
+                        case .right:
+                            next = baseWidth - delta
+                        }
+                        // Clamp to the model's configured range
+                        // so the live preview stays inside the
+                        // visible bounds (setter clamps too).
+                        let lo = CGFloat(CoreModel.sidebarWidthRange.lowerBound)
+                        let hi = CGFloat(CoreModel.sidebarWidthRange.upperBound)
+                        let clamped = min(max(next, lo), hi)
+                        switch side {
+                        case .left: liveLeftWidth = clamped
+                        case .right: liveRightWidth = clamped
+                        }
+                    }
+                    .onEnded { _ in
+                        // Commit the final width to CoreModel
+                        // (which writes to the shared config).
+                        switch side {
+                        case .left:
+                            if let w = liveLeftWidth {
+                                model.setSidebarLeftWidth(UInt32(w.rounded()))
+                            }
+                            liveLeftWidth = nil
+                        case .right:
+                            if let w = liveRightWidth {
+                                model.setSidebarRightWidth(UInt32(w.rounded()))
+                            }
+                            liveRightWidth = nil
+                        }
+                    }
+            )
     }
 }
 
