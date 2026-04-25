@@ -40,6 +40,10 @@ pub const PKT_MAX_LEN: usize = 4096;
 /// without paying for re-allocs in steady state.
 const INITIAL_BUFFER_CAPACITY: usize = 8192;
 
+/// `M_PDU` first-header-pointer mask: low 11 bits of the 16-bit
+/// header word (top 5 bits are reserved).
+const FHP_MASK: u16 = 0x07FF;
+
 /// Reassembles CCSDS packets from a stream of VCDU `M_PDU` regions.
 pub struct MpduReassembler {
     buffer: Vec<u8>,
@@ -85,7 +89,7 @@ impl MpduReassembler {
         }
         // FHP: low 11 bits of first 2 bytes (top 5 bits reserved).
         let fhp_word = u16::from_be_bytes([region[0], region[1]]);
-        let fhp = fhp_word & 0x07FF;
+        let fhp = fhp_word & FHP_MASK;
         let payload = &region[MPDU_HEADER_LEN..];
         if self.in_sync {
             self.buffer.extend_from_slice(payload);
@@ -180,7 +184,7 @@ mod tests {
     /// by `packets` concatenated starting at that offset.
     fn build_region(fhp: u16, packets: &[Vec<u8>]) -> Vec<u8> {
         let mut buf = vec![0_u8; MPDU_HEADER_LEN + MPDU_DATA_LEN];
-        let fhp_word = fhp & 0x07FF;
+        let fhp_word = fhp & FHP_MASK;
         buf[0..2].copy_from_slice(&fhp_word.to_be_bytes());
         let mut offset = MPDU_HEADER_LEN + fhp as usize;
         for p in packets {
@@ -197,6 +201,11 @@ mod tests {
         let mut p = Vec::with_capacity(PKT_HEADER_LEN + payload.len());
         // Bytes 0-1: version=0 + type=0 + secondary header flag=0
         // + APID (low 11 bits).
+        // 0x07FF = APID field width (low 11 bits of the first
+        // 16-bit word per CCSDS 133.0-B-1). Same numeric value
+        // as FHP_MASK, but a different field — kept inline here
+        // since this is test fixture code with a fixed test APID
+        // already inside the field's range.
         let header_word = apid & 0x07FF;
         p.extend_from_slice(&header_word.to_be_bytes());
         // Bytes 2-3: sequence flags (top 2) + sequence count (low
@@ -250,7 +259,7 @@ mod tests {
         // lives at byte offset tail.len() of this data field."
         let fhp2 = tail.len() as u16;
         let mut region2 = vec![0_u8; MPDU_HEADER_LEN + MPDU_DATA_LEN];
-        region2[0..2].copy_from_slice(&(fhp2 & 0x07FF).to_be_bytes());
+        region2[0..2].copy_from_slice(&(fhp2 & FHP_MASK).to_be_bytes());
         region2[MPDU_HEADER_LEN..MPDU_HEADER_LEN + tail.len()].copy_from_slice(&tail);
         let mut r = MpduReassembler::new();
         let out1 = r.push(&region1).expect("push 1");
@@ -342,7 +351,7 @@ mod tests {
         // 0x05DC = 1500 decimal. Larger than the 882-byte data
         // field on purpose; the masking is there to keep the FHP
         // in the valid 11-bit range.
-        let bad_fhp: u16 = 0x05DC & 0x07FF;
+        let bad_fhp: u16 = 0x05DC & FHP_MASK;
         region[0..2].copy_from_slice(&bad_fhp.to_be_bytes());
         let out = r.push(&region).expect("push");
         assert!(out.is_empty());

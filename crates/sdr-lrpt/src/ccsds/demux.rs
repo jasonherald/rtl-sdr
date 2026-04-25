@@ -116,7 +116,7 @@ impl Demux {
         let raw_packets = r.push(region).unwrap_or_default();
         raw_packets
             .into_iter()
-            .filter_map(|raw| parse_packet(&raw, header.virtual_channel_id))
+            .filter_map(|raw| parse_packet(raw, header.virtual_channel_id))
             .collect()
     }
 }
@@ -128,7 +128,7 @@ fn is_imaging_vcid(vcid: u8) -> bool {
     vcid == VCID_AVHRR
 }
 
-fn parse_packet(raw: &[u8], vcid: u8) -> Option<ImagePacket> {
+fn parse_packet(mut raw: Vec<u8>, vcid: u8) -> Option<ImagePacket> {
     if raw.len() < PKT_HEADER_LEN {
         return None;
     }
@@ -141,11 +141,16 @@ fn parse_packet(raw: &[u8], vcid: u8) -> Option<ImagePacket> {
     }
     let seq_word = u16::from_be_bytes([raw[2], raw[3]]);
     let sequence_count = seq_word & SEQUENCE_COUNT_MASK;
+    // Reuse the raw packet buffer as the payload Vec — drain
+    // the 6-byte primary header out and `raw` becomes the
+    // payload directly. Saves an allocation + memcpy per packet
+    // in the steady-state imaging path.
+    raw.drain(..PKT_HEADER_LEN);
     Some(ImagePacket {
         vcid,
         apid,
         sequence_count,
-        payload: raw[PKT_HEADER_LEN..].to_vec(),
+        payload: raw,
     })
 }
 
@@ -173,6 +178,10 @@ mod tests {
         buf[4] = (counter & 0xFF) as u8;
         // Bytes 5-7: replay flag + insert zone — all zero.
         // M_PDU region starts at VCDU_HEADER_LEN.
+        // 0x07FF = 11-bit FHP field width (= mpdu::FHP_MASK,
+        // which is private to that module). Bare literal here
+        // since this is test fixture code with FHP values
+        // already in range; not worth the visibility dance.
         let fhp_be = (fhp & 0x07FF).to_be_bytes();
         buf[VCDU_HEADER_LEN] = fhp_be[0];
         buf[VCDU_HEADER_LEN + 1] = fhp_be[1];
