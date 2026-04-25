@@ -17,6 +17,7 @@ pub mod fft;
 pub mod filter;
 pub mod gpu_fft;
 pub mod loops;
+pub mod lrpt;
 pub mod math;
 pub mod multirate;
 pub mod noise;

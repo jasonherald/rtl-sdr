@@ -92,3 +92,32 @@ jobs:
       # deny.toml is actually exercised by CI.
       - name: cargo-deny (sherpa-cuda graph)
         run: cargo deny --no-default-features --features sherpa-cuda check sources
+
+  # Coverage gate for the sdr-lrpt crate (epic #469). Pure-data
+  # crate with no GTK / async surface, so the 90% threshold is
+  # achievable without contortion. Gated `if: false` here in stage 1
+  # — Task 2 (sdr-lrpt crate creation) flips this to `if: true`.
+  coverage:
+    name: Coverage gate (sdr-lrpt)
+    if: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake \
+            libgtk-4-dev libadwaita-1-dev libusb-1.0-0-dev \
+            libpipewire-0.3-dev libclang-dev libdbus-1-dev
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov
+      - name: Coverage gate
+        run: |
+          cargo llvm-cov --package sdr-lrpt \
+            --fail-under-lines 90 \
+            --fail-under-regions 90
