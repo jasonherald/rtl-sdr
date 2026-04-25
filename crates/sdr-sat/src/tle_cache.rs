@@ -197,21 +197,31 @@ impl TleCache {
     pub fn tle_text(&self, source: TleSource) -> Result<String, TleCacheError> {
         let path = self.cache_path(source);
 
-        // Fast path: cache file is fresh AND still readable. If a TOCTOU
-        // race steals the file between the mtime check and the read
-        // (concurrent process, cache cleaner like tmpfiles.d, manual
-        // `rm`), fall through to the refetch path rather than turning
-        // a survivable transient into a hard error.
+        // Fast path: cache file is fresh, readable, AND structurally
+        // a TLE file. Mtime + read alone aren't enough — older builds
+        // or a manual `echo > cache.txt` could have left HTML or
+        // garbage at this path, and we'd otherwise keep serving it
+        // until the file ages out (and `tle_for` would surface a
+        // misleading `NotFound` even when upstream is healthy). If a
+        // TOCTOU race steals the file between mtime check and read,
+        // or the cached content fails validation, fall through to
+        // the refetch path so the cache self-heals.
         if !is_stale(&path, self.refresh_max_age)
             && let Some(cached) = read_file(&path)?
         {
-            return Ok(cached);
+            if has_any_tle_pair(&cached) {
+                return Ok(cached);
+            }
+            tracing::warn!(
+                "ignoring corrupted fresh TLE cache for {:?}; refetching",
+                source,
+            );
         }
 
         // Slow path: fetch from upstream, validate, write to disk.
         // If the fetch (or validation) fails, fall back to whatever
-        // stale copy still happens to exist. If even that's gone,
-        // surface the original fetch error.
+        // stale copy still happens to exist *and validates*. If even
+        // that's gone or corrupted, surface the original fetch error.
         let fetch_result = self.fetch(source).and_then(|text| {
             if has_any_tle_pair(&text) {
                 Ok(text)
@@ -236,7 +246,9 @@ impl TleCache {
                 Ok(text)
             }
             Err(fetch_err) => {
-                if let Some(cached) = read_file(&path)? {
+                if let Some(cached) = read_file(&path)?
+                    && has_any_tle_pair(&cached)
+                {
                     tracing::warn!(
                         "TLE fetch for {:?} failed ({fetch_err}); using stale cache",
                         source,
@@ -336,10 +348,25 @@ impl TleCache {
     }
 }
 
+/// Read a UTF-8 file or return `None` for "not present-ish".
+///
+/// `NotFound` and `InvalidData` (non-UTF-8 contents — e.g. a corrupt
+/// or binary cache file from another tool) are both treated as a
+/// cache miss. `tle_text` falls through to the refetch path on miss,
+/// so the cache self-heals immediately on the next successful fetch
+/// rather than blocking the user until the mtime ages the bad file
+/// out. Other I/O errors (permissions, mid-read failures) propagate.
 fn read_file(path: &Path) -> Result<Option<String>, TleCacheError> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(TleCacheError::Io {
             path: path.to_path_buf(),
             source: e,
@@ -631,6 +658,66 @@ SOMETHING
         );
         let (l1, _) = parse_tle_text(with_noise, 5).unwrap();
         assert!(l1.starts_with("1 00005"));
+    }
+
+    #[test]
+    fn cache_does_not_trust_html_blob_in_fresh_cache_file() {
+        // Pre-validation-gate versions (or a manual
+        // `echo $whatever > cache.txt`) could have left HTML or
+        // arbitrary text in the cache path. Mtime says it's fresh,
+        // read says it's UTF-8 — but if we trust it, every call
+        // serves garbage until the file ages out and `tle_for`
+        // returns a misleading `NotFound`. The cache must validate
+        // the content and treat invalid bodies as a miss → refetch.
+        //
+        // Acceptable outcomes (same logic as the TOCTOU test):
+        //   * Ok(text) — refetch succeeded (online runner)
+        //   * Err(Fetch(_)) — refetch failed, no valid stale to fall
+        //     back on. Either is fine — what matters is we did NOT
+        //     return the HTML blob.
+        let dir = unique_temp_dir("html-blob");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TleCache::with_dir(dir.clone()).with_fetch_timeout(StdDuration::from_millis(100));
+        let path = cache.cache_path(TleSource::Noaa);
+        let html = "<html><head><title>503</title></head><body>oops</body></html>\n";
+        std::fs::write(&path, html).unwrap();
+
+        match cache.tle_text(TleSource::Noaa) {
+            Ok(text) => assert!(
+                !text.contains("<html>"),
+                "cache returned the HTML blob verbatim — corruption was trusted",
+            ),
+            Err(TleCacheError::Fetch(_)) => {}
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_treats_non_utf8_cache_file_as_a_miss() {
+        // A binary blob in the cache (say, a partial download where
+        // gzip decompression got skipped, or some other tool wrote
+        // bytes there) shows up to `read_to_string` as
+        // `ErrorKind::InvalidData`. Should self-heal as a miss, NOT
+        // surface as a hard `Io` error, so the next call refetches
+        // cleanly.
+        let dir = unique_temp_dir("non-utf8");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TleCache::with_dir(dir.clone()).with_fetch_timeout(StdDuration::from_millis(100));
+        let path = cache.cache_path(TleSource::Noaa);
+        // 0x80 0x81 0x82 etc. are invalid as UTF-8 lead bytes.
+        std::fs::write(&path, [0xFF_u8, 0xFE, 0x80, 0x81, 0x82]).unwrap();
+
+        match cache.tle_text(TleSource::Noaa) {
+            Ok(_) | Err(TleCacheError::Fetch(_)) => {}
+            Err(TleCacheError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidData =>
+            {
+                panic!("non-UTF-8 cache file should self-heal as a miss, not surface as Io error")
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]
