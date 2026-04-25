@@ -38,6 +38,8 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use gtk4::glib;
+use gtk4::prelude::ObjectExt;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
@@ -99,6 +101,13 @@ pub const MIN_PASS_ELEVATION_DEG: f64 = 5.0;
 /// of advance planning info; cheap to compute (a few hundred
 /// elevation evaluations per satellite per call).
 pub const PASS_LOOKAHEAD_HOURS: i64 = 24;
+
+/// Seconds per minute / hour, named so the countdown formatter in
+/// [`format_pass_title`] reads as logic rather than as a wall of
+/// `60`s and `3_600`s. Per project convention (CLAUDE.md "DSP
+/// conventions"): name magic numbers.
+const SECS_PER_MINUTE: i64 = 60;
+const SECS_PER_HOUR: i64 = 60 * SECS_PER_MINUTE;
 
 // ─── Config keys ───────────────────────────────────────────────────────
 
@@ -178,6 +187,105 @@ pub struct SatellitesPanel {
     /// lookahead window. Removed from the group when real pass
     /// rows are added; re-added when the list goes empty.
     pub passes_status_row: adw::ActionRow,
+}
+
+/// Weak counterpart of [`SatellitesPanel`] — every field is a
+/// `glib::WeakRef`, so capturing one of these in a long-lived
+/// closure (signal handler, `GLib` timer, async task) does NOT pin
+/// the panel widgets alive.
+///
+/// **Why this exists:** the strong [`SatellitesPanel`] is `Clone`,
+/// which made it tempting to capture clones inside closures stored
+/// on the panel's own widgets — but doing so creates a refcount
+/// cycle (widget → handler → closure → cloned panel → widget). The
+/// cycle blocks teardown forever, including the 1 Hz countdown
+/// timer's `WeakRef::upgrade` exit check (the upgrade keeps
+/// returning `Some` because the panel can't drop). Using these
+/// weak refs in every closure breaks the cycle and lets the panel
+/// drop cleanly when the window closes.
+///
+/// `Clone` is derived so the same weak handle can be cheaply
+/// cloned into multiple closures.
+#[derive(Clone)]
+pub struct SatellitesPanelWeak {
+    /// Weak ref to [`SatellitesPanel::widget`].
+    pub widget: glib::WeakRef<adw::PreferencesPage>,
+    /// Weak ref to [`SatellitesPanel::lat_row`].
+    pub lat_row: glib::WeakRef<adw::SpinRow>,
+    /// Weak ref to [`SatellitesPanel::lon_row`].
+    pub lon_row: glib::WeakRef<adw::SpinRow>,
+    /// Weak ref to [`SatellitesPanel::alt_row`].
+    pub alt_row: glib::WeakRef<adw::SpinRow>,
+    /// Weak ref to [`SatellitesPanel::zip_row`].
+    pub zip_row: glib::WeakRef<adw::EntryRow>,
+    /// Weak ref to [`SatellitesPanel::zip_spinner`].
+    pub zip_spinner: glib::WeakRef<gtk4::Spinner>,
+    /// Weak ref to [`SatellitesPanel::zip_status_row`].
+    pub zip_status_row: glib::WeakRef<adw::ActionRow>,
+    /// Weak ref to [`SatellitesPanel::last_refresh_row`].
+    pub last_refresh_row: glib::WeakRef<adw::ActionRow>,
+    /// Weak ref to [`SatellitesPanel::refresh_button`].
+    pub refresh_button: glib::WeakRef<gtk4::Button>,
+    /// Weak ref to [`SatellitesPanel::refresh_spinner`].
+    pub refresh_spinner: glib::WeakRef<gtk4::Spinner>,
+    /// Weak ref to [`SatellitesPanel::auto_record_switch`].
+    pub auto_record_switch: glib::WeakRef<adw::SwitchRow>,
+    /// Weak ref to [`SatellitesPanel::passes_group`].
+    pub passes_group: glib::WeakRef<adw::PreferencesGroup>,
+    /// Weak ref to [`SatellitesPanel::passes_status_row`].
+    pub passes_status_row: glib::WeakRef<adw::ActionRow>,
+}
+
+impl SatellitesPanel {
+    /// Build a [`SatellitesPanelWeak`] suitable for capture in
+    /// long-lived closures. See the type-level doc on
+    /// `SatellitesPanelWeak` for why we use this everywhere instead
+    /// of `Clone`.
+    #[must_use]
+    pub fn downgrade(&self) -> SatellitesPanelWeak {
+        SatellitesPanelWeak {
+            widget: self.widget.downgrade(),
+            lat_row: self.lat_row.downgrade(),
+            lon_row: self.lon_row.downgrade(),
+            alt_row: self.alt_row.downgrade(),
+            zip_row: self.zip_row.downgrade(),
+            zip_spinner: self.zip_spinner.downgrade(),
+            zip_status_row: self.zip_status_row.downgrade(),
+            last_refresh_row: self.last_refresh_row.downgrade(),
+            refresh_button: self.refresh_button.downgrade(),
+            refresh_spinner: self.refresh_spinner.downgrade(),
+            auto_record_switch: self.auto_record_switch.downgrade(),
+            passes_group: self.passes_group.downgrade(),
+            passes_status_row: self.passes_status_row.downgrade(),
+        }
+    }
+}
+
+impl SatellitesPanelWeak {
+    /// Atomic upgrade — returns `Some(SatellitesPanel)` only if
+    /// every widget is still alive. Returns `None` the moment
+    /// any single field's underlying `GObject` has been dropped, so
+    /// callers can short-circuit cleanly with a single `let-else`
+    /// rather than threading partial-upgrade error handling
+    /// through every closure body.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<SatellitesPanel> {
+        Some(SatellitesPanel {
+            widget: self.widget.upgrade()?,
+            lat_row: self.lat_row.upgrade()?,
+            lon_row: self.lon_row.upgrade()?,
+            alt_row: self.alt_row.upgrade()?,
+            zip_row: self.zip_row.upgrade()?,
+            zip_spinner: self.zip_spinner.upgrade()?,
+            zip_status_row: self.zip_status_row.upgrade()?,
+            last_refresh_row: self.last_refresh_row.upgrade()?,
+            refresh_button: self.refresh_button.upgrade()?,
+            refresh_spinner: self.refresh_spinner.upgrade()?,
+            auto_record_switch: self.auto_record_switch.upgrade()?,
+            passes_group: self.passes_group.upgrade()?,
+            passes_status_row: self.passes_status_row.upgrade()?,
+        })
+    }
 }
 
 /// Build the Satellites scheduler panel widgets with first-run
@@ -406,16 +514,25 @@ pub fn format_pass_title(pass: &Pass, now: DateTime<Utc>) -> String {
     let to_start = pass.start - now;
     let to_end = pass.end - now;
     let secs = to_start.num_seconds();
-    let label = if secs > 3_600 {
-        let h = secs / 3_600;
-        let m = (secs % 3_600) / 60;
+    // Boundary conventions:
+    // * `>= SECS_PER_HOUR` means a pass exactly 60 min away reads
+    //   "in 1h 00m", not "in 60 min".
+    // * `>= SECS_PER_MINUTE` means a pass exactly 60 s away reads
+    //   "in 1 min", not "starting now".
+    // * In the "in progress" branch, floor-div would render the
+    //   first minute of an active pass as "0 min in"; clamp to 1
+    //   so the user never sees a zero count for a running pass.
+    let label = if secs >= SECS_PER_HOUR {
+        let h = secs / SECS_PER_HOUR;
+        let m = (secs % SECS_PER_HOUR) / SECS_PER_MINUTE;
         format!("in {h}h {m:02}m")
-    } else if secs > 60 {
-        format!("in {} min", secs / 60)
+    } else if secs >= SECS_PER_MINUTE {
+        format!("in {} min", secs / SECS_PER_MINUTE)
     } else if secs > 0 {
         "starting now".to_string()
     } else if to_end.num_seconds() > 0 {
-        format!("in progress ({} min in)", -secs / 60)
+        let mins_in = ((-secs) / SECS_PER_MINUTE).max(1);
+        format!("in progress ({mins_in} min in)")
     } else {
         "ended".to_string()
     };
@@ -645,5 +762,47 @@ mod tests {
         // Pass ended 30 minutes ago.
         let pass = synthetic_pass(now, -42);
         assert_eq!(format_pass_title(&pass, now), "NOAA 19 — ended");
+    }
+
+    #[test]
+    fn format_pass_title_at_exact_one_hour_uses_h_m_format() {
+        // Boundary: a pass starting in exactly 60 min should read
+        // "in 1h 00m", not "in 60 min". The strict `>` version of
+        // this code surfaced the latter — fixed via `>=`.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_pass(now, 60);
+        assert_eq!(format_pass_title(&pass, now), "NOAA 19 — in 1h 00m");
+    }
+
+    #[test]
+    fn format_pass_title_at_exact_one_minute_says_one_min() {
+        // Boundary: a pass starting in exactly 60 s should read
+        // "in 1 min", not "starting now". `>=` fixes this.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_pass(now, 1);
+        assert_eq!(format_pass_title(&pass, now), "NOAA 19 — in 1 min");
+    }
+
+    #[test]
+    fn format_pass_title_clamps_in_progress_min_to_at_least_one() {
+        // First 60 seconds of an active pass: floor-div would say
+        // "0 min in", which reads like the pass hasn't started.
+        // Clamp to a minimum of 1 so the user always sees a real
+        // count.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        // Pass started 30 seconds ago, ends in 12 minutes.
+        let pass = Pass {
+            satellite: "NOAA 19".to_string(),
+            start: now - ChronoDuration::seconds(30),
+            end: now + ChronoDuration::minutes(12),
+            max_elevation_deg: 45.0,
+            max_el_time: now + ChronoDuration::minutes(5),
+            start_az_deg: 0.0,
+            end_az_deg: 0.0,
+        };
+        assert_eq!(
+            format_pass_title(&pass, now),
+            "NOAA 19 — in progress (1 min in)"
+        );
     }
 }
