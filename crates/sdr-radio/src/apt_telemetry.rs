@@ -220,12 +220,13 @@ fn find_frame_start(line_avgs: &[u8]) -> (usize, f32) {
     debug_assert!(line_avgs.len() >= FRAME_LINES);
 
     // We need a full frame past the chosen offset for wedge extraction,
-    // so cap the scan range to `len - FRAME_LINES`. Within a single
-    // frame's worth of slack (FRAME_LINES candidate offsets) is enough —
-    // beyond that we'd just be re-scoring identical patterns from
-    // subsequent cycles.
+    // so cap the scan range to `len - FRAME_LINES`. Scan *every* valid
+    // start, not just the first cycle: if the first cycle at a given
+    // phase is noisy or partially gap-filled and a later cycle at the
+    // same phase is clean, we want the clean one to win — same phase
+    // but a higher correlation score.
     let max_offset = line_avgs.len().saturating_sub(FRAME_LINES);
-    let scan_range = max_offset.min(FRAME_LINES - 1) + 1;
+    let scan_range = max_offset + 1;
 
     let mut best = (0_usize, f32::NEG_INFINITY);
     for offset in 0..scan_range {
@@ -521,6 +522,66 @@ mod tests {
         assert_eq!(result.side_a.channel_id, Some(AvhrrChannel::Ch1Visible));
         assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch5ThermalIr));
         assert!(result.side_a.frame_sync_quality > 0.95);
+    }
+
+    #[test]
+    fn frame_sync_prefers_clean_cycle_over_noisy_earlier_cycle() {
+        // Build a 3-cycle synthetic image, then deliberately corrupt the
+        // first cycle's calibration ramp by overwriting the per-line
+        // pixels with a pseudo-random pattern. The decoder should still
+        // emit the right channel ID — it must scan past the noisy first
+        // cycle and lock onto the clean second cycle, not just pick the
+        // best phase within the first 128 lines.
+        let mut image = synth_image_with_frame(
+            3,
+            SPEC_GRAYSCALE_RAMP[2], // wedge16 = wedge3 → Ch3a Shortwave IR
+            SPEC_GRAYSCALE_RAMP[2],
+            0,
+        );
+
+        // Corrupt the first cycle's lines in place: replace each line's
+        // pixels with a deterministic noise pattern. We can't mutate
+        // `AptImage`'s lines() through its public API (sealed by design),
+        // so reconstruct: take the second/third cycles verbatim and
+        // prepend a fresh noise cycle.
+        let clean_lines: Vec<_> = image.lines().iter().skip(FRAME_LINES).cloned().collect();
+        image = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+
+        let mut state: u32 = 0x00C0_FFEE;
+        for _ in 0..FRAME_LINES {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let noise_byte = ((state >> 16) & 0xff) as u8;
+            let mut noisy_pixels = [0_u8; LINE_PIXELS];
+            for p in &mut noisy_pixels[TELEMETRY_A_START..TELEMETRY_A_END] {
+                *p = noise_byte;
+            }
+            for p in &mut noisy_pixels[TELEMETRY_B_START..TELEMETRY_B_END] {
+                *p = noise_byte;
+            }
+            let mut line = AptLine {
+                sync_quality: TEST_GOOD_QUALITY,
+                ..AptLine::default()
+            };
+            line.pixels = noisy_pixels;
+            image.push_line(&line, Instant::now());
+        }
+        for clean in clean_lines {
+            let mut line = AptLine {
+                sync_quality: clean.sync_quality,
+                ..AptLine::default()
+            };
+            line.pixels = clean.pixels;
+            image.push_line(&line, Instant::now());
+        }
+
+        let result = decode_telemetry(&image).expect("two clean cycles is enough");
+        assert_eq!(result.side_a.channel_id, Some(AvhrrChannel::Ch3aShortwaveIr));
+        assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch3aShortwaveIr));
+        assert!(
+            result.side_a.frame_sync_quality > 0.95,
+            "should lock onto the clean cycle past the noisy one, got {:.3}",
+            result.side_a.frame_sync_quality,
+        );
     }
 
     #[test]
