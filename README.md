@@ -263,7 +263,7 @@ sdr-rs
 
 ## Architecture
 
-22-member Rust workspace (root binary + 21 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
+23-member Rust workspace (root binary + 22 library crates) plus a macOS Xcode project that shares the engine via a C ABI:
 
 ```text
 sdr (binary)              Linux entry point
