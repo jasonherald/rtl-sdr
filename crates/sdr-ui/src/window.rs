@@ -58,6 +58,13 @@ const DSP_POLL_INTERVAL_MS: u64 = 16;
 /// Toast display time (seconds) for scanner "force-disable" notices.
 const SCANNER_TOAST_TIMEOUT_SECS: u32 = 3;
 
+/// Cadence of the Satellites panel's countdown ticker — 1 line/sec
+/// is the smallest interval that produces a visible change in the
+/// pass-row title (which renders to 1-minute granularity for far
+/// passes and to seconds only inside the "starting now" window).
+/// Smaller would burn cycles for no visible benefit.
+const SATELLITES_COUNTDOWN_TICK: Duration = Duration::from_secs(1);
+
 /// Shared "kill the scanner on a manual tune" hook. Built once in
 /// `build_window` and cloned into every manual-change handler
 /// (frequency selector, demod dropdown, bandwidth row, bookmark
@@ -8599,8 +8606,13 @@ fn connect_satellites_panel(
                 let Some(panel) = panel_weak_zip.upgrade() else {
                     return;
                 };
-                let zip = entry.text().to_string();
-                if zip.trim().is_empty() {
+                // Trim once, here, so the trimmed value is what
+                // flows through the lookup. `lookup_us_zip` does its
+                // own trim internally too, but a paste of "  24068 "
+                // showing up as `length=8` in the debug log reads
+                // worse than `length=5`.
+                let zip = entry.text().trim().to_string();
+                if zip.is_empty() {
                     // Empty entry — nothing to do; treat as a no-op so a
                     // stray Enter doesn't reset the status row.
                     return;
@@ -8722,7 +8734,7 @@ fn connect_satellites_panel(
         let panel_weak_tick = panel_weak.clone();
         let displayed_tick = Rc::clone(&displayed);
         let recompute_tick = Rc::clone(&recompute);
-        let _ = glib::timeout_add_local(Duration::from_secs(1), move || {
+        let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
             if panel_weak_tick.upgrade().is_none() {
                 return glib::ControlFlow::Break;
             }
