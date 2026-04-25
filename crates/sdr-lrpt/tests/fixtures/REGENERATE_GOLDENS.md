@@ -24,12 +24,31 @@ into our fixtures:
 ```bash
 # In a scratch dir outside the repo:
 git clone https://github.com/Digitelektro/MeteorDemod.git
-cd MeteorDemod && mkdir build && cd build && cmake .. && make
+cd MeteorDemod
+# IMPORTANT: pin the reference decoder revision so future
+# regenerations produce byte-identical output. Update this SHA
+# whenever you intentionally bump the reference; otherwise
+# regenerated goldens will drift for reasons unrelated to our
+# code. Current pin: see crates/sdr-lrpt/tests/fixtures/golden/
+# REFERENCE_REVISION.txt (committed alongside the goldens).
+git checkout "$(cat /path/to/sdr-rs/crates/sdr-lrpt/tests/fixtures/golden/REFERENCE_REVISION.txt)"
+mkdir build && cd build && cmake .. && make
 ./MeteorDemod -m oqpsk -i path/to/known_pass.iq -o out
 
 # Copy the relevant artefacts into our fixtures:
 cp out/frames.bin /path/to/sdr-rs/crates/sdr-lrpt/tests/fixtures/golden/frames.bin
 cp out/composite.png /path/to/sdr-rs/crates/sdr-lrpt/tests/fixtures/golden/composite.png
+```
+
+The `REFERENCE_REVISION.txt` file lands alongside the first set
+of real-pass goldens in Task 5; it'll contain a single SHA line
+like `a1b2c3d4...`. To intentionally update the pinned revision:
+
+```bash
+# In your MeteorDemod checkout:
+git rev-parse HEAD > /path/to/sdr-rs/crates/sdr-lrpt/tests/fixtures/golden/REFERENCE_REVISION.txt
+# ... then regenerate all goldens against the new revision and
+# commit the lot together.
 ```
 
 ### IQ recording

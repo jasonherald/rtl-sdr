@@ -22,9 +22,19 @@ use super::vcdu::Vcdu;
 /// Mask for the 24-bit VCDU frame counter.
 const VCDU_COUNTER_MASK: u32 = 0x00FF_FFFF;
 
+/// CCSDS packet primary header APID field width (bits 0-10 of
+/// the first 16-bit word). Used to mask the APID out of the
+/// header word.
+const APID_MASK: u16 = 0x07FF;
+
+/// CCSDS packet primary header sequence-count field width (bits
+/// 0-13 of the second 16-bit word; top 2 bits are sequence
+/// flags, masked off here).
+const SEQUENCE_COUNT_MASK: u16 = 0x3FFF;
+
 /// CCSDS idle APID — reserved for fill packets per CCSDS Blue
 /// Book 133.0-B-1 §4.1.2.6.7. Never carries useful data.
-const APID_IDLE: u16 = 0x07FF;
+const APID_IDLE: u16 = APID_MASK; // 0x07FF
 
 /// APID 0 is also filtered: not formally reserved by CCSDS, but
 /// it's what the `M_PDU` reassembler emits when it walks zero-
@@ -123,16 +133,14 @@ fn parse_packet(raw: &[u8], vcid: u8) -> Option<ImagePacket> {
         return None;
     }
     let header_word = u16::from_be_bytes([raw[0], raw[1]]);
-    // CCSDS packet primary header bits 0-10 are APID.
-    let apid = header_word & 0x07FF;
+    let apid = header_word & APID_MASK;
     // Drop CCSDS idle packets and zero-APID fill — neither
     // carries imagery (see APID_IDLE / APID_ZERO doc comments).
     if apid == APID_IDLE || apid == APID_ZERO {
         return None;
     }
     let seq_word = u16::from_be_bytes([raw[2], raw[3]]);
-    // Bits 0-13 are sequence count; top 2 are sequence flags.
-    let sequence_count = seq_word & 0x3FFF;
+    let sequence_count = seq_word & SEQUENCE_COUNT_MASK;
     Some(ImagePacket {
         vcid,
         apid,

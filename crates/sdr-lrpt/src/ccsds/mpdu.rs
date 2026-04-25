@@ -19,8 +19,26 @@ use super::{FHP_NO_HEADER, MPDU_DATA_LEN, MPDU_HEADER_LEN};
 /// CCSDS packet primary header length.
 pub const PKT_HEADER_LEN: usize = 6;
 
-/// Minimum CCSDS packet length (header only).
+/// Minimum CCSDS packet length (header + 1-byte payload — the
+/// length field is zero-based, so a 0 length field means a 1-byte
+/// payload).
 pub const PKT_MIN_LEN: usize = PKT_HEADER_LEN + 1;
+
+/// Maximum plausible CCSDS packet length for Meteor AVHRR. The
+/// CCSDS spec maxes out at 65 542 bytes (16-bit length + 7), but
+/// realistic Meteor imagery packets fit comfortably under 4 KB —
+/// anything bigger is RS miscorrection turning a length field
+/// into garbage. Capping here is the integrity gate that prevents
+/// the `M_PDU` layer from emitting bogus multi-kB "packets" the
+/// downstream image stage would then have to defend against.
+pub const PKT_MAX_LEN: usize = 4096;
+
+/// Initial allocation for the cross-VCDU reassembly buffer.
+/// One `M_PDU` data field is 882 bytes, so 8 KB holds ~9 fields
+/// of buffered partial data before re-allocation. Plenty of
+/// headroom for any realistic packet-spans-many-VCDUs case
+/// without paying for re-allocs in steady state.
+const INITIAL_BUFFER_CAPACITY: usize = 8192;
 
 /// Reassembles CCSDS packets from a stream of VCDU `M_PDU` regions.
 pub struct MpduReassembler {
@@ -47,7 +65,7 @@ impl MpduReassembler {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(8192),
+            buffer: Vec::with_capacity(INITIAL_BUFFER_CAPACITY),
             in_sync: false,
         }
     }
@@ -83,21 +101,50 @@ impl MpduReassembler {
             self.buffer.extend_from_slice(&payload[fhp as usize..]);
             self.in_sync = true;
         }
-        // Try to emit packets from the buffer.
+        // Try to emit packets from the buffer. Walk a `consumed`
+        // cursor instead of draining per packet — `Vec::drain`
+        // shifts the remaining bytes each call, which becomes
+        // O(n²) when many small packets are packed in one push.
+        // Single drain at the end keeps the hot path linear.
         let mut packets = Vec::new();
+        let mut consumed: usize = 0;
         loop {
-            if self.buffer.len() < PKT_HEADER_LEN {
+            let avail = &self.buffer[consumed..];
+            if avail.len() < PKT_HEADER_LEN {
                 break;
             }
             // CCSDS packet primary header bytes 4-5: zero-based
             // length field (actual length = field + 1 + header).
-            let pkt_len_field = u16::from_be_bytes([self.buffer[4], self.buffer[5]]);
+            let pkt_len_field = u16::from_be_bytes([avail[4], avail[5]]);
             let total_len = PKT_HEADER_LEN + pkt_len_field as usize + 1;
-            if self.buffer.len() < total_len {
+            // Integrity gate FIRST — before checking whether the
+            // buffer holds total_len bytes. RS decode returns Ok
+            // for some over-T corruption patterns (silently
+            // miscorrected codewords; see
+            // sdr_lrpt::fec::reed_solomon::RsError docs), so a
+            // claim of "60 KB packet incoming" usually means RS
+            // turned a length-field byte into garbage. Without
+            // checking here first we'd just sit and wait for
+            // bytes that will never come, freezing the
+            // reassembler. CCSDS 133.0-B-1 §4.1.2.6.1: packet
+            // version is always 000 (top 3 bits of byte 0).
+            let version = avail[0] >> 5;
+            if version != 0 || !(PKT_MIN_LEN..=PKT_MAX_LEN).contains(&total_len) {
+                tracing::warn!(
+                    "M_PDU rejecting implausible packet (version={version}, total_len={total_len}); RS likely miscorrected, losing sync",
+                );
+                self.in_sync = false;
+                self.buffer.clear();
+                return Ok(packets);
+            }
+            if avail.len() < total_len {
                 break;
             }
-            packets.push(self.buffer[..total_len].to_vec());
-            self.buffer.drain(..total_len);
+            packets.push(avail[..total_len].to_vec());
+            consumed += total_len;
+        }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
         }
         Ok(packets)
     }
@@ -241,6 +288,47 @@ mod tests {
         bad_region[0..2].copy_from_slice(&FHP_NO_HEADER.to_be_bytes());
         let out = r.push(&bad_region).expect("push noheader");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn integrity_gate_rejects_implausible_packet() {
+        // After RS decode an Ok(...) result CAN still contain
+        // miscorrected bytes (see RsError docs). The M_PDU layer
+        // is the first place we can sanity-check what falls out:
+        // CCSDS packet version must be 0, length must be in a
+        // realistic range. This test plants a "valid-looking"
+        // packet header with a 60 KB length field — well past
+        // PKT_MAX_LEN — and asserts the reassembler drops the
+        // packet AND loses sync rather than emitting it.
+        let mut region = vec![0_u8; MPDU_HEADER_LEN + MPDU_DATA_LEN];
+        region[0..2].copy_from_slice(&0_u16.to_be_bytes()); // FHP=0
+        // Bytes 8-9 of the buffer are bytes 6-7 of the packet
+        // (length field). Set length field = 0xEFFF → total_len
+        // = 6 + 0xEFFF + 1 = 0xF006 (~60 KB), past PKT_MAX_LEN.
+        region[MPDU_HEADER_LEN + 4] = 0xEF;
+        region[MPDU_HEADER_LEN + 5] = 0xFF;
+        let mut r = MpduReassembler::new();
+        let out = r.push(&region).expect("push");
+        assert!(out.is_empty(), "implausible-length packet must not emit");
+        assert!(!r.is_in_sync(), "integrity-gate failure should lose sync");
+    }
+
+    #[test]
+    fn integrity_gate_rejects_nonzero_version() {
+        // CCSDS 133.0-B-1: packet version is always 000. A non-
+        // zero top-3-bits value of byte 0 means RS miscorrected
+        // (or the buffer is misaligned). Drop + lose sync.
+        let mut region = vec![0_u8; MPDU_HEADER_LEN + MPDU_DATA_LEN];
+        region[0..2].copy_from_slice(&0_u16.to_be_bytes()); // FHP=0
+        // Plant a packet with version=001 (top 3 bits of byte 0).
+        region[MPDU_HEADER_LEN] = 0b0010_0001;
+        // Sane length so the only failure mode is the version check.
+        region[MPDU_HEADER_LEN + 4] = 0;
+        region[MPDU_HEADER_LEN + 5] = 5; // total_len = 6+5+1 = 12
+        let mut r = MpduReassembler::new();
+        let out = r.push(&region).expect("push");
+        assert!(out.is_empty(), "non-zero-version packet must not emit");
+        assert!(!r.is_in_sync(), "integrity-gate failure should lose sync");
     }
 
     #[test]
