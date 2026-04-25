@@ -79,3 +79,10 @@ harness = false
 [[bench]]
 name = "detection"
 harness = false
+
+# LRPT QPSK demod throughput (epic #469 stage 1). Measures the
+# end-to-end demod chain on 1 second of synthetic 144 ksps input —
+# the perf floor for stage-1 regression detection.
+[[bench]]
+name = "lrpt_demod"
+harness = false
