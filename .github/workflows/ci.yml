@@ -95,11 +95,10 @@ jobs:
 
   # Coverage gate for the sdr-lrpt crate (epic #469). Pure-data
   # crate with no GTK / async surface, so the 90% threshold is
-  # achievable without contortion. Gated `if: false` here in stage 1
-  # — Task 2 (sdr-lrpt crate creation) flips this to `if: true`.
+  # achievable without contortion. Enabled now that the crate
+  # exists (Task 2 ships the first FEC modules).
   coverage:
     name: Coverage gate (sdr-lrpt)
-    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

@@ -113,6 +113,7 @@ members = [
     "crates/sdr-config",
     "crates/sdr-radioreference",
     "crates/sdr-sat",
+    "crates/sdr-lrpt",
     "crates/sdr-transcription",
     "crates/sdr-core",
     "crates/sdr-ffi",
