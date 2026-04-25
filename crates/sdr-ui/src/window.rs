@@ -8914,6 +8914,12 @@ fn connect_satellites_panel(
         // the toast overlay alive past window close.
         let toast_overlay_weak = toast_overlay.downgrade();
         let parent_provider_a = Rc::clone(&parent_provider_for_recorder);
+        // Scanner master switch handle for the LOS-side restore.
+        // Set-active here fires the switch's `connect_active_notify`
+        // handler, which re-dispatches `SetScannerEnabled(true)` and
+        // re-arms the engine — same path the user takes when they
+        // flip the switch by hand.
+        let scanner_switch_a = panels.scanner.master_switch.clone();
         let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
             if let Some(overlay) = overlay_weak.upgrade() {
                 overlay.add_toast(adw::Toast::new(msg));
@@ -8941,6 +8947,19 @@ fn connect_satellites_panel(
                 // fires) drives the corresponding LOS-side stop.
                 set_playing_a(true);
                 tune_a(freq_hz, mode, bandwidth_hz);
+                // Zero the live VFO offset for the auto-record
+                // pass. The user's pre-AOS offset (a manual
+                // VFO drag away from centre) is preserved in
+                // `SavedTune` for the LOS restore, but during
+                // the pass the demod must align *exactly* with
+                // the satellite's downlink — otherwise we'd
+                // demod at `freq_hz + saved_offset` and the
+                // APT subcarrier would land outside the
+                // channel filter. The DSP's
+                // `DspToUi::VfoOffsetChanged` echo updates the
+                // spectrum widget, freq selector, and status
+                // bar; no manual mirror needed.
+                state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
                 crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
                 // Clear the canvas at AOS so a back-to-back pass
                 // (e.g. NOAA 18 → NOAA 19 with overlapping
@@ -9013,6 +9032,22 @@ fn connect_satellites_panel(
                     tracing::info!("auto-record: stopping source (was stopped pre-AOS)");
                     set_playing_a(false);
                 }
+                // Re-arm the scanner if it was running pre-AOS.
+                // The AOS-side `tune_a` call goes through
+                // `tune_to_satellite`, which fires
+                // `ScannerForceDisable::trigger("satellite tune")`
+                // as a manual-tune side effect — without this
+                // restore, an active pre-AOS scan would be left
+                // permanently off after the pass. Same idiom as
+                // `was_running`: snapshot the user's pre-AOS
+                // state, return them to it. `set_active(true)`
+                // fires the switch's notify handler, which
+                // dispatches `SetScannerEnabled(true)` to the
+                // engine — same path a manual flip takes.
+                if saved.scanner_running && !scanner_switch_a.is_active() {
+                    tracing::info!("auto-record: re-arming scanner (was running pre-AOS)");
+                    scanner_switch_a.set_active(true);
+                }
             }
             RecorderAction::Toast { message, kind } => {
                 if matches!(kind, ToastKind::Warn) {
@@ -9035,6 +9070,14 @@ fn connect_satellites_panel(
         let state_tick = Rc::clone(state);
         let bandwidth_row_tick = panels.radio.bandwidth_row.clone();
         let spectrum_tick = Rc::clone(spectrum_handle);
+        // Scanner master switch — read for the per-tick snapshot so
+        // SavedTune carries scanner state across AOS → LOS, written
+        // by `interpret_action::RestoreTune` to re-arm the scanner
+        // if it was running pre-AOS. Strong clone because the tick
+        // already captures other panel widgets (bandwidth_row);
+        // when the panel is dropped the tick's `panel_weak.upgrade`
+        // returns None and we Break, dropping the chain.
+        let scanner_switch_tick = panels.scanner.master_switch.clone();
         let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
             let Some(panel) = panel_weak_tick.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -9078,6 +9121,7 @@ fn connect_satellites_panel(
                 mode: state_tick.demod_mode.get(),
                 bandwidth_hz: bandwidth_hz_u32,
                 was_running: state_tick.is_running.get(),
+                scanner_running: scanner_switch_tick.is_active(),
             };
             let actions =
                 recorder_tick

@@ -102,6 +102,14 @@ pub enum State {
 /// for every cross-boundary handoff. The bandwidth row uses
 /// `f64` internally but we round at the snapshot boundary so
 /// the restore path doesn't have to.
+///
+/// `scanner_running` snapshots the scanner's master-switch
+/// state. The wiring layer's `tune_to_satellite` helper
+/// force-disables the scanner as a manual-tune side effect
+/// (same path bookmark recall takes) — so without restoring
+/// here, an active pre-AOS scan session would be left off
+/// after the pass ends. Mirrors `was_running`'s "return the
+/// user to whatever they had configured" intent.
 #[derive(Debug, Clone, Copy)]
 pub struct SavedTune {
     pub freq_hz: f64,
@@ -109,6 +117,7 @@ pub struct SavedTune {
     pub mode: DemodMode,
     pub bandwidth_hz: u32,
     pub was_running: bool,
+    pub scanner_running: bool,
 }
 
 /// Side effects the wiring layer must perform on each transition.
@@ -423,6 +432,7 @@ mod tests {
             mode: DemodMode::Wfm,
             bandwidth_hz: 200_000,
             was_running: true,
+            scanner_running: false,
         }
     }
 
@@ -573,6 +583,7 @@ mod tests {
             mode: DemodMode::Wfm,
             bandwidth_hz: 200_000,
             was_running: false,
+            scanner_running: true, // pin: pre-AOS scan must come back at LOS
         };
         // Walk all transitions.
         r.tick(now, std::slice::from_ref(&pass), true, saved);
@@ -590,9 +601,12 @@ mod tests {
         assert!(matches!(r.state(), State::Idle));
         // Restore action carries the original saved tune,
         // including the VFO offset (so a user's drag position
-        // survives the auto-record round trip) and the
-        // pre-AOS playback state (so a stopped radio doesn't
-        // silently keep running after LOS).
+        // survives the auto-record round trip), the pre-AOS
+        // playback state (so a stopped radio doesn't silently
+        // keep running after LOS), and the pre-AOS scanner
+        // state (since `tune_a` force-disables the scanner at
+        // AOS, so a previously-running scan would otherwise be
+        // dropped permanently).
         match &actions[0] {
             Action::RestoreTune(t) => {
                 assert_eq!(t.freq_hz, 89_700_000.0);
@@ -600,6 +614,7 @@ mod tests {
                 assert_eq!(t.mode, DemodMode::Wfm);
                 assert_eq!(t.bandwidth_hz, 200_000);
                 assert!(!t.was_running);
+                assert!(t.scanner_running);
             }
             other => panic!("expected RestoreTune, got {other:?}"),
         }
