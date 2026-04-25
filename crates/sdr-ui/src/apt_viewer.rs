@@ -38,13 +38,8 @@ use sdr_dsp::apt::LINE_PIXELS;
 /// Maximum lines we'll keep in the renderer. NOAA APT bounds a pass
 /// at ~1800 lines (15 min × 2 lines/sec); 2048 leaves headroom for
 /// the longest plausible high-elevation pass without ever growing
-/// the underlying Vec at runtime.
+/// the underlying surface at runtime.
 pub const MAX_LINES: usize = 2_048;
-
-/// Size of the pre-allocated pixel buffer in bytes. ARGB32 = 4 bytes
-/// per pixel × 2080 px wide × 2048 lines max ≈ 17 MB. Pre-reserved
-/// at construction so `push_line` never allocates during a live pass.
-const PIXEL_BUF_BYTES: usize = LINE_PIXELS * 4 * MAX_LINES;
 
 /// Background colour painted before any APT data is pushed (or
 /// behind the image when the widget is wider than the image's
@@ -52,13 +47,39 @@ const PIXEL_BUF_BYTES: usize = LINE_PIXELS * 4 * MAX_LINES;
 /// stands out.
 const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 
+// ─── Window + demo tuning ──────────────────────────────────────────────
+
+/// Default size for the viewer's transient window. ~4:3 lets the
+/// 2080×~1800-aspect APT image fit a usable amount of pixels at
+/// most desktop resolutions without the user having to resize.
+const VIEWER_WINDOW_WIDTH: i32 = 800;
+const VIEWER_WINDOW_HEIGHT: i32 = 600;
+
+/// Cadence of the synthetic demo pass — 500 ms = 2 lines/sec, which
+/// is the actual NOAA APT line rate. Real pass wiring (#482) drops
+/// the demo entirely.
+const DEMO_TICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Number of lines pumped before the demo timer breaks. 240 ticks at
+/// 2 Hz = 2 minutes — long enough to verify auto-fit + scrolling +
+/// pause + export, short enough that the demo doesn't run forever
+/// even if the window is left open.
+const DEMO_MAX_LINES: u32 = 240;
+
 /// Pure Cairo renderer for an APT scan-line buffer.
 ///
-/// Owns an ARGB32 pixel buffer, knows how to push grayscale lines
-/// into it (expanded to ARGB32 with full alpha), render to a Cairo
-/// context with auto-fit, and export to PNG.
+/// Owns a persistent ARGB32 [`cairo::ImageSurface`] sized for a full
+/// pass at construction. `push_line` writes new rows directly into
+/// the surface's backing data; `render` and `export_png` use the
+/// surface as a paint source — no per-draw cloning of the ~17 MB
+/// pixel buffer (which was a real concern: at the cap, a window
+/// resize during a live pass would memcpy 14+ MB on the GTK main
+/// thread per frame).
 pub struct AptImageRenderer {
-    pixel_buf: Vec<u8>,
+    /// Persistent ARGB32 surface, `LINE_PIXELS × MAX_LINES`. Rows
+    /// past `n_lines` stay zeroed (alpha 0); render-time clipping
+    /// keeps them out of the visible output.
+    surface: cairo::ImageSurface,
     n_lines: usize,
 }
 
@@ -69,39 +90,75 @@ impl Default for AptImageRenderer {
 }
 
 impl AptImageRenderer {
-    /// Build an empty renderer. Pre-allocates the full pixel buffer
-    /// so `push_line` is alloc-free in steady state.
+    /// Build an empty renderer with a full-pass-sized backing surface.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Cairo can't allocate the (`LINE_PIXELS` × `MAX_LINES`)
+    /// ARGB32 surface — about 17 MB of zeroed memory. Realistically
+    /// unreachable on any machine that's running a desktop in the
+    /// first place; the alternative would be a fallible constructor
+    /// that callers would have to plumb errors through for a
+    /// for-all-practical-purposes-infallible allocation.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn new() -> Self {
+        let surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            LINE_PIXELS as i32,
+            MAX_LINES as i32,
+        )
+        .expect("APT renderer: ARGB32 surface allocation (~17 MB) failed at startup");
         Self {
-            pixel_buf: Vec::with_capacity(PIXEL_BUF_BYTES),
+            surface,
             n_lines: 0,
         }
     }
 
-    /// Append one APT scan line of width [`LINE_PIXELS`] to the image.
-    /// Pixels are stored as ARGB32 (each greyscale value goes into
-    /// B, G, R; alpha is `0xFF`). No-op once [`MAX_LINES`] is reached
-    /// — a real pass never gets close to the cap, but the bound
-    /// keeps memory deterministic.
+    /// Append one APT scan line of width [`LINE_PIXELS`] to the
+    /// image. Greyscale values go straight into the surface's
+    /// backing data as ARGB32 (B/G/R/A — Cairo's
+    /// little-endian ARGB32 layout, alpha = `0xFF`). No allocation,
+    /// no buffer growth — we wrote the row directly into the
+    /// pre-allocated surface. No-op once [`MAX_LINES`] is reached.
     pub fn push_line(&mut self, pixels: &[u8; LINE_PIXELS]) {
         if self.n_lines >= MAX_LINES {
             return;
         }
-        for &g in pixels {
-            // Cairo ARGB32 on little-endian is laid out as B, G, R, A.
-            self.pixel_buf.push(g);
-            self.pixel_buf.push(g);
-            self.pixel_buf.push(g);
-            self.pixel_buf.push(0xFF);
+        let stride = match usize::try_from(self.surface.stride()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("APT renderer: invalid surface stride: {e}");
+                return;
+            }
+        };
+        let row_offset = self.n_lines * stride;
+        let mut data = match self.surface.data() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("APT renderer: surface data lock failed: {e}");
+                return;
+            }
+        };
+        for (i, &g) in pixels.iter().enumerate() {
+            let pixel_offset = row_offset + i * 4;
+            data[pixel_offset] = g;
+            data[pixel_offset + 1] = g;
+            data[pixel_offset + 2] = g;
+            data[pixel_offset + 3] = 0xFF;
         }
+        // `data` guard drops here, flushing the surface for cairo.
+        drop(data);
         self.n_lines += 1;
     }
 
-    /// Reset to an empty buffer. Capacity is retained — the next
-    /// pass reuses the same allocation.
+    /// Reset to an empty image. Zeroes the surface bytes (fully
+    /// transparent everywhere) so subsequent passes start from a
+    /// clean canvas; the surface itself is preserved.
     pub fn clear(&mut self) {
-        self.pixel_buf.clear();
+        if let Ok(mut data) = self.surface.data() {
+            data.fill(0);
+        }
         self.n_lines = 0;
     }
 
@@ -117,18 +174,21 @@ impl AptImageRenderer {
         self.n_lines == 0
     }
 
-    /// Paint the buffered image into `cr`, scaled to fit `(width,
-    /// height)` while preserving the `LINE_PIXELS : n_lines` aspect.
-    /// The image is centered horizontally and top-aligned vertically
-    /// — the live pass naturally builds downward, and a top-aligned
-    /// view lets the user see the latest line at the bottom of the
-    /// painted area.
+    /// Paint the buffered image into `cr`, scaled to fit
+    /// `(width, height)` while preserving the
+    /// `LINE_PIXELS : n_lines` aspect. Centred horizontally,
+    /// top-aligned vertically — the live pass naturally builds
+    /// downward.
+    ///
+    /// Uses the persistent backing surface as the paint source plus
+    /// a clipping rectangle, so this method is `&self` and runs
+    /// without copying the pixel buffer.
     ///
     /// # Errors
     ///
-    /// Returns a stringified Cairo error if surface construction or
-    /// painting fails. Callers usually want to log the error and
-    /// continue — drawing failures shouldn't kill the UI.
+    /// Returns a stringified Cairo error on paint failure. Callers
+    /// usually log and continue — drawing failures shouldn't kill
+    /// the UI.
     #[allow(clippy::cast_precision_loss)]
     pub fn render(&self, cr: &cairo::Context, width: i32, height: i32) -> Result<(), String> {
         cr.set_source_rgb(BACKGROUND_RGB[0], BACKGROUND_RGB[1], BACKGROUND_RGB[2]);
@@ -138,29 +198,40 @@ impl AptImageRenderer {
             return Ok(());
         }
 
-        let surface = self.to_cairo_surface()?;
         let img_w = LINE_PIXELS as f64;
         let img_h = self.n_lines as f64;
         let scale = (f64::from(width) / img_w).min(f64::from(height) / img_h);
-        let draw_w = img_w * scale;
-        let off_x = (f64::from(width) - draw_w) / 2.0;
+        let off_x = (f64::from(width) - img_w * scale) / 2.0;
 
         cr.save().map_err(|e| format!("save: {e}"))?;
         cr.translate(off_x, 0.0);
         cr.scale(scale, scale);
-        cr.set_source_surface(&surface, 0.0, 0.0)
+        cr.set_source_surface(&self.surface, 0.0, 0.0)
             .map_err(|e| format!("set_source_surface: {e}"))?;
-        cr.paint().map_err(|e| format!("image paint: {e}"))?;
+        // Rectangle + fill clips the paint to the populated rows;
+        // rows past n_lines stay alpha-0 in the surface and would
+        // paint as nothing under `paint()` anyway, but clipping
+        // here also bounds the layout area cleanly.
+        cr.rectangle(0.0, 0.0, img_w, img_h);
+        cr.fill().map_err(|e| format!("image fill: {e}"))?;
         cr.restore().map_err(|e| format!("restore: {e}"))?;
         Ok(())
     }
 
     /// Save the current image to a PNG file.
     ///
+    /// Builds a one-shot tightly-sized export surface
+    /// (`LINE_PIXELS × n_lines`) by painting from the persistent
+    /// backing surface. Tightly-sized output keeps the PNG file
+    /// from carrying tons of empty alpha-0 padding rows past the
+    /// real data.
+    ///
     /// # Errors
     ///
-    /// Returns a stringified error from filesystem creation, surface
-    /// construction, or Cairo's PNG encoder.
+    /// Returns a stringified error from filesystem creation,
+    /// surface construction, paint operations, or Cairo's PNG
+    /// encoder.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn export_png(&self, path: &Path) -> Result<(), String> {
         if self.n_lines == 0 {
             return Err("no APT image data to export".to_string());
@@ -168,47 +239,30 @@ impl AptImageRenderer {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
-        let surface = self.to_cairo_surface()?;
+
+        let export_surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            LINE_PIXELS as i32,
+            self.n_lines as i32,
+        )
+        .map_err(|e| format!("export surface: {e}"))?;
+        let cr =
+            cairo::Context::new(&export_surface).map_err(|e| format!("export context: {e}"))?;
+        cr.set_source_surface(&self.surface, 0.0, 0.0)
+            .map_err(|e| format!("export set_source_surface: {e}"))?;
+        // LINE_PIXELS / n_lines are both bounded by MAX_LINES — well
+        // under f64's 52-bit mantissa, no real precision loss.
+        #[allow(clippy::cast_precision_loss)]
+        cr.rectangle(0.0, 0.0, LINE_PIXELS as f64, self.n_lines as f64);
+        cr.fill().map_err(|e| format!("export fill: {e}"))?;
+        drop(cr);
+
         let mut file = std::fs::File::create(path).map_err(|e| format!("file: {e}"))?;
-        surface
+        export_surface
             .write_to_png(&mut file)
             .map_err(|e| format!("png: {e}"))?;
         tracing::info!(?path, lines = self.n_lines, "APT image exported to PNG");
         Ok(())
-    }
-
-    /// Build a Cairo `ImageSurface` over the current pixel buffer.
-    /// Pads to Cairo's expected stride if it differs from our packed
-    /// `LINE_PIXELS * 4` layout (it usually doesn't for sane widths,
-    /// but the pad path matches the waterfall renderer's careful
-    /// handling).
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn to_cairo_surface(&self) -> Result<cairo::ImageSurface, String> {
-        let stride = cairo::Format::ARgb32
-            .stride_for_width(LINE_PIXELS as u32)
-            .map_err(|e| format!("stride: {e}"))?;
-        let packed_stride = (LINE_PIXELS * 4) as i32;
-        let buf = if stride == packed_stride {
-            self.pixel_buf.clone()
-        } else {
-            let stride_usize = usize::try_from(stride).map_err(|e| format!("stride: {e}"))?;
-            let row_bytes = LINE_PIXELS * 4;
-            let mut padded = vec![0_u8; stride_usize * self.n_lines];
-            for row in 0..self.n_lines {
-                let src = row * row_bytes;
-                let dst = row * stride_usize;
-                padded[dst..dst + row_bytes].copy_from_slice(&self.pixel_buf[src..src + row_bytes]);
-            }
-            padded
-        };
-        cairo::ImageSurface::create_for_data(
-            buf,
-            cairo::Format::ARgb32,
-            LINE_PIXELS as i32,
-            self.n_lines as i32,
-            stride,
-        )
-        .map_err(|e| format!("surface: {e}"))
     }
 }
 
@@ -266,20 +320,17 @@ impl AptImageView {
         &self.drawing_area
     }
 
-    /// Append one scan line and queue a redraw.
-    ///
-    /// Honors the pause toggle: while paused, lines are silently
-    /// dropped so the view freezes on whatever was last shown. Real
-    /// captures should probably keep accumulating in the underlying
-    /// `AptImage` and just stop *visually* updating — that's a
-    /// follow-up; for a live pass viewer the simple "freeze the
-    /// canvas" semantics are fine.
+    /// Append one scan line. The line is *always* buffered into the
+    /// renderer regardless of pause state — pausing only suppresses
+    /// the `queue_draw()` call. This keeps the user from losing
+    /// scanlines while inspecting the image (a paused live pass on
+    /// the real radio path would otherwise produce a PNG with gaps
+    /// for whatever rows arrived during the inspection window).
     pub fn push_line(&self, pixels: &[u8; LINE_PIXELS]) {
-        if self.paused.get() {
-            return;
-        }
         self.renderer.borrow_mut().push_line(pixels);
-        self.drawing_area.queue_draw();
+        if !self.paused.get() {
+            self.drawing_area.queue_draw();
+        }
     }
 
     /// Wipe all buffered scan lines and queue a redraw.
@@ -288,9 +339,17 @@ impl AptImageView {
         self.drawing_area.queue_draw();
     }
 
-    /// Toggle pause / resume. Paused views ignore `push_line` calls.
+    /// Toggle pause / resume. Pausing freezes the visible canvas;
+    /// scanlines pushed while paused still accumulate in the
+    /// renderer (so nothing is lost) and become visible on resume
+    /// via a forced single redraw.
     pub fn set_paused(&self, paused: bool) {
-        self.paused.set(paused);
+        let was_paused = self.paused.replace(paused);
+        if was_paused && !paused {
+            // Resuming — force one redraw so any rows pushed during
+            // the pause window become visible immediately.
+            self.drawing_area.queue_draw();
+        }
     }
 
     /// `true` if the view is currently paused.
@@ -335,8 +394,8 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
 
     let window = adw::Window::builder()
         .title(title)
-        .default_width(800)
-        .default_height(600)
+        .default_width(VIEWER_WINDOW_WIDTH)
+        .default_height(VIEWER_WINDOW_HEIGHT)
         .transient_for(parent)
         .modal(false)
         .build();
@@ -365,23 +424,26 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         .build();
     export_btn.update_property(&[gtk4::accessible::Property::Label("Export APT image to PNG")]);
     let export_view = view.clone();
-    let window_for_export = window.clone();
+    // Weak window ref so the closure (which lives on the export
+    // button, which lives in the window) doesn't form a strong
+    // retention cycle keeping the window + ~17 MB image surface
+    // alive after the user closes the viewer. Upgrade-or-skip
+    // means a stray click on a button mid-teardown is a no-op.
+    let window_for_export = window.downgrade();
     export_btn.connect_clicked(move |_| {
+        let Some(window_for_export) = window_for_export.upgrade() else {
+            return;
+        };
         let path = default_export_path();
-        match export_view.export_png(&path) {
-            Ok(()) => {
-                let toast = adw::Toast::builder()
-                    .title(format!("Saved {}", path.display()))
-                    .build();
-                show_toast_in(&window_for_export, toast);
-            }
-            Err(e) => {
-                let toast = adw::Toast::builder()
-                    .title(format!("PNG export failed: {e}"))
-                    .build();
-                show_toast_in(&window_for_export, toast);
-            }
-        }
+        let toast = match export_view.export_png(&path) {
+            Ok(()) => adw::Toast::builder()
+                .title(format!("Saved {}", path.display()))
+                .build(),
+            Err(e) => adw::Toast::builder()
+                .title(format!("PNG export failed: {e}"))
+                .build(),
+        };
+        show_toast_in(&window_for_export, toast);
     });
     header.pack_end(&export_btn);
 
@@ -449,8 +511,8 @@ pub fn connect_demo_action(
     app.set_accels_for_action("app.apt-demo", &["<Ctrl><Shift>a"]);
 }
 
-/// Open a viewer window and start a 500 ms timeout that pumps one
-/// synthetic line into it per tick (2 lines/sec, matching real APT).
+/// Open a viewer window and start a [`DEMO_TICK`] timeout that pumps
+/// one synthetic line into it per tick (matching real APT cadence).
 /// Each line is a 2080-pixel left-to-right grayscale gradient with a
 /// row-dependent vertical fade — easy to eyeball as "yep, lines are
 /// arriving in order, the renderer is fitting correctly, the image
@@ -475,7 +537,7 @@ fn spawn_demo_pass<W: gtk4::prelude::IsA<gtk4::Window>>(parent: &W) {
     drop(view);
 
     let row = Rc::new(Cell::new(0_u32));
-    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+    glib::timeout_add_local(DEMO_TICK, move || {
         // Window gone → nothing left to draw into, exit the timer.
         let Some(drawing_area) = drawing_area_weak.upgrade() else {
             return glib::ControlFlow::Break;
@@ -505,11 +567,9 @@ fn spawn_demo_pass<W: gtk4::prelude::IsA<gtk4::Window>>(parent: &W) {
             row.set(r.wrapping_add(1));
         }
 
-        // Stop after 2 minutes of synthetic pass (240 lines) —
-        // long enough to verify auto-fit kicks in, short enough that
-        // the demo doesn't run forever even if the user leaves the
-        // window open.
-        if row.get() >= 240 {
+        // Cap the demo at DEMO_MAX_LINES so it doesn't run forever
+        // even if the user leaves the window open.
+        if row.get() >= DEMO_MAX_LINES {
             glib::ControlFlow::Break
         } else {
             glib::ControlFlow::Continue
@@ -546,18 +606,26 @@ mod tests {
     }
 
     #[test]
-    fn push_line_extends_buffer_by_one_line() {
+    fn push_line_increments_n_lines() {
         let mut r = AptImageRenderer::new();
-        let initial_capacity = r.pixel_buf.capacity();
         r.push_line(&synth_line(0));
         assert_eq!(r.n_lines(), 1);
-        assert_eq!(r.pixel_buf.len(), LINE_PIXELS * 4);
-        // Pre-allocation must hold for at least the small test push.
-        assert_eq!(
-            r.pixel_buf.capacity(),
-            initial_capacity,
-            "push_line shouldn't realloc against the pre-allocated buffer",
-        );
+        r.push_line(&synth_line(1));
+        assert_eq!(r.n_lines(), 2);
+    }
+
+    #[test]
+    fn surface_dimensions_match_max_lines_at_construction() {
+        // The surface is allocated full-size up front so push_line
+        // never has to grow it. Lock that invariant down so a future
+        // refactor can't accidentally make it lazy and lose the
+        // alloc-free hot-path guarantee.
+        let r = AptImageRenderer::new();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        {
+            assert_eq!(r.surface.width(), LINE_PIXELS as i32);
+            assert_eq!(r.surface.height(), MAX_LINES as i32);
+        }
     }
 
     #[test]
@@ -571,23 +639,24 @@ mod tests {
         // One more push past the cap is a no-op.
         r.push_line(&synth_line(0));
         assert_eq!(r.n_lines(), MAX_LINES);
-        assert_eq!(r.pixel_buf.len(), LINE_PIXELS * 4 * MAX_LINES);
     }
 
     #[test]
-    fn clear_resets_lines_but_keeps_capacity() {
+    fn clear_resets_lines_and_zeroes_surface_pixels() {
         let mut r = AptImageRenderer::new();
         for _ in 0..TEST_LINE_COUNT {
-            r.push_line(&synth_line(0));
+            r.push_line(&synth_line(0xAA));
         }
-        let cap = r.pixel_buf.capacity();
         r.clear();
         assert!(r.is_empty());
         assert_eq!(r.n_lines(), 0);
-        assert_eq!(
-            r.pixel_buf.capacity(),
-            cap,
-            "clear shouldn't release the pre-allocated buffer",
+        // The first row of the surface should now be all zeroes
+        // (alpha-0 transparent), matching what `cairo::ImageSurface::create`
+        // gives a fresh surface.
+        let data = r.surface.data().unwrap();
+        assert!(
+            data[0..LINE_PIXELS * 4].iter().all(|&b| b == 0),
+            "clear() should zero the surface bytes",
         );
     }
 
@@ -599,8 +668,9 @@ mod tests {
         line[1] = 0xC0;
         r.push_line(&line);
         // Cairo ARGB32 little-endian: B, G, R, A
-        assert_eq!(&r.pixel_buf[0..4], &[0x80, 0x80, 0x80, 0xFF]);
-        assert_eq!(&r.pixel_buf[4..8], &[0xC0, 0xC0, 0xC0, 0xFF]);
+        let data = r.surface.data().unwrap();
+        assert_eq!(&data[0..4], &[0x80, 0x80, 0x80, 0xFF]);
+        assert_eq!(&data[4..8], &[0xC0, 0xC0, 0xC0, 0xFF]);
     }
 
     #[test]
