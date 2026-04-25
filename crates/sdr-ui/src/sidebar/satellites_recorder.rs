@@ -272,8 +272,19 @@ impl AutoRecorder {
                 mode,
                 bandwidth_hz,
             });
+            // "Starting" reads wrong if we missed the lead window
+            // (laptop wake, recompute lag, etc.) and the pass is
+            // already underway — in that case the user sees the
+            // toast announcing "starting" while the pass clock is
+            // already counting down. `in progress` is the honest
+            // phrasing for that case.
+            let phase = if pass.start <= now {
+                "in progress"
+            } else {
+                "starting"
+            };
             actions.push(Action::Toast {
-                message: format!("{} pass starting — auto-recording", pass.satellite),
+                message: format!("{} pass {phase} — auto-recording", pass.satellite),
                 kind: ToastKind::Info,
             });
             self.state = State::BeforePass {
@@ -445,7 +456,44 @@ mod tests {
         let actions = r.tick(now, &[pass], true, default_tune());
         assert!(matches!(r.state(), State::BeforePass { .. }));
         assert!(matches!(actions[0], Action::StartAutoRecord { .. }));
-        assert!(matches!(actions[1], Action::Toast { .. }));
+        // Pre-AOS arming reports "starting" — the pass hasn't
+        // crossed `pass.start` yet.
+        match &actions[1] {
+            Action::Toast { message, .. } => {
+                assert!(
+                    message.contains("starting"),
+                    "expected starting copy, got: {message}",
+                );
+            }
+            other => panic!("expected Toast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_arms_for_already_started_pass_uses_in_progress_copy() {
+        // Missed the lead window — the laptop woke from suspend
+        // mid-pass, or the 1 Hz tick stalled long enough that the
+        // displayed-pass entry crosses `pass.start` before
+        // `tick_idle` saw it. Recorder still arms (pass.end is
+        // future, eligibility holds) but the toast must read "in
+        // progress" — saying "starting" when the pass clock is
+        // already running would lie to the user.
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        // Pass started 30 s ago, ends in 9.5 min — eligible by
+        // every other gate (NOAA, 50° peak, end > now).
+        let pass = synthetic_noaa19(now, -30, 600, 50.0);
+        let actions = r.tick(now, &[pass], true, default_tune());
+        assert!(matches!(r.state(), State::BeforePass { .. }));
+        match &actions[1] {
+            Action::Toast { message, .. } => {
+                assert!(
+                    message.contains("in progress"),
+                    "expected in-progress copy, got: {message}",
+                );
+            }
+            other => panic!("expected Toast, got {other:?}"),
+        }
     }
 
     #[test]
