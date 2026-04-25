@@ -145,16 +145,15 @@ pub struct SatellitesPanel {
     /// fires `apply` and `connect_satellites_panel` runs the lookup,
     /// updating `lat_row` and `lon_row`. Result text lands in
     /// [`zip_status_row`](Self::zip_status_row) — `AdwEntryRow` has
-    /// no subtitle slot of its own.
+    /// no subtitle slot of its own. No custom spinner suffix on
+    /// purpose — it conflicts with the built-in apply button.
     pub zip_row: adw::EntryRow,
-    /// Spinner shown next to the apply button while a lookup is in
-    /// flight. Toggled by `connect_satellites_panel`.
-    pub zip_spinner: gtk4::Spinner,
-    /// Status / feedback row for ZIP lookups. Hidden on first launch;
-    /// `connect_satellites_panel` reveals it on the first lookup
-    /// attempt and rewrites the title with success ("Resolved:
-    /// Christiansburg, VA") or failure ("ZIP 99999 not found in
-    /// postal database") text.
+    /// Status / feedback row for ZIP lookups. Always visible — the
+    /// initial title is a hint ("Type a US ZIP code and press ↵")
+    /// that gets rewritten by `connect_satellites_panel` on each
+    /// lookup attempt: "Looking up…" while in flight, then
+    /// "Resolved: Christiansburg, VA (647 m)" or the error text
+    /// from `PostalLookupError::Display` on failure.
     pub zip_status_row: adw::ActionRow,
 
     // TLE status group ------------------------------------------------------
@@ -218,8 +217,6 @@ pub struct SatellitesPanelWeak {
     pub alt_row: glib::WeakRef<adw::SpinRow>,
     /// Weak ref to [`SatellitesPanel::zip_row`].
     pub zip_row: glib::WeakRef<adw::EntryRow>,
-    /// Weak ref to [`SatellitesPanel::zip_spinner`].
-    pub zip_spinner: glib::WeakRef<gtk4::Spinner>,
     /// Weak ref to [`SatellitesPanel::zip_status_row`].
     pub zip_status_row: glib::WeakRef<adw::ActionRow>,
     /// Weak ref to [`SatellitesPanel::last_refresh_row`].
@@ -249,7 +246,6 @@ impl SatellitesPanel {
             lon_row: self.lon_row.downgrade(),
             alt_row: self.alt_row.downgrade(),
             zip_row: self.zip_row.downgrade(),
-            zip_spinner: self.zip_spinner.downgrade(),
             zip_status_row: self.zip_status_row.downgrade(),
             last_refresh_row: self.last_refresh_row.downgrade(),
             refresh_button: self.refresh_button.downgrade(),
@@ -276,7 +272,6 @@ impl SatellitesPanelWeak {
             lon_row: self.lon_row.upgrade()?,
             alt_row: self.alt_row.upgrade()?,
             zip_row: self.zip_row.upgrade()?,
-            zip_spinner: self.zip_spinner.upgrade()?,
             zip_status_row: self.zip_status_row.upgrade()?,
             last_refresh_row: self.last_refresh_row.upgrade()?,
             refresh_button: self.refresh_button.upgrade()?,
@@ -329,16 +324,32 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     // `apply` signal that `connect_satellites_panel` listens on. The
     // wiring layer runs the network lookup off-thread and writes
     // back to `lat_row`/`lon_row` on success.
+    //
+    // Deliberately NO custom suffix widget: AdwEntryRow's built-in
+    // apply button lives in the suffix slot, and an earlier attempt
+    // to pack a `gtk4::Spinner` next to it broke the apply button —
+    // the user's Enter / click stopped firing the `apply` signal,
+    // presumably because the layout pushed the apply button out of
+    // its normal position. The status row below carries
+    // "Looking up…" / "Resolved: …" text instead, which is plenty
+    // of feedback for a sub-second lookup.
     let zip_row = adw::EntryRow::builder()
         .title("US ZIP code")
         .show_apply_button(true)
         .input_purpose(gtk4::InputPurpose::Digits)
         .build();
-    let zip_spinner = gtk4::Spinner::builder().visible(false).build();
-    zip_row.add_suffix(&zip_spinner);
     station_group.add(&zip_row);
 
-    let zip_status_row = adw::ActionRow::builder().visible(false).build();
+    // Always visible — toggling `visible(false) → set_visible(true)`
+    // on rows packed into an `AdwPreferencesGroup` doesn't always
+    // surface the row reliably (the group's internal listbox caches
+    // child measurements at construction). Always-visible with a
+    // hint title is also better UX: the user sees the affordance
+    // without having to attempt a lookup first.
+    let zip_status_row = adw::ActionRow::builder()
+        .title("Type a US ZIP code and press ↵")
+        .css_classes(["dim-label"])
+        .build();
     station_group.add(&zip_status_row);
 
     page.add(&station_group);
@@ -410,7 +421,6 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         lon_row,
         alt_row,
         zip_row,
-        zip_spinner,
         zip_status_row,
         last_refresh_row,
         refresh_button,
@@ -557,7 +567,13 @@ pub fn enumerate_upcoming_passes(
     let to = from + ChronoDuration::hours(PASS_LOOKAHEAD_HOURS);
     let mut passes = Vec::new();
     for known in KNOWN_SATELLITES {
-        match cache.tle_for(known.norad_id) {
+        // `cached_tle_for` (NOT `tle_for`) — this loop runs on the
+        // GTK main thread on every lat/lon/alt edit, and `tle_for`
+        // can trigger a synchronous HTTP fetch on cache miss /
+        // staleness. A network call here would freeze the panel
+        // mid-edit. The user explicitly refreshes via the button,
+        // which uses `force_refresh` off-thread instead.
+        match cache.cached_tle_for(known.norad_id) {
             Ok((line1, line2)) => match Satellite::from_tle(known.name, &line1, &line2) {
                 Ok(sat) => {
                     let mut found =
@@ -664,17 +680,25 @@ mod tests {
     #[test]
     fn format_last_refresh_renders_rfc3339_in_local_time() {
         // 2024-06-15T18:30:00Z is unambiguous; we don't pin the
-        // local-formatted string (it depends on the test
-        // runner's TZ) but assert the formatter doesn't return
-        // the raw RFC3339 string OR "Never".
+        // local-formatted string (it depends on the test runner's
+        // TZ). Pin two timezone-independent invariants instead:
+        //
+        //   1. The output isn't the literal "Never" placeholder.
+        //   2. The output isn't the raw RFC3339 string — i.e. byte
+        //      10 is the date-vs-time separator, and the formatter
+        //      uses a space (`%Y-%m-%d %H:%M %Z`) where RFC3339
+        //      uses `T`. Checking *that specific position* avoids
+        //      false negatives from timezone abbreviations like
+        //      `UTC` / `EDT` / `PDT` that happen to contain a `T`.
         let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({
             "sat_tle_last_refresh": "2024-06-15T18:30:00Z",
         })));
         let formatted = format_last_refresh(&cfg);
         assert_ne!(formatted, "Never");
-        assert!(
-            !formatted.contains('T'),
-            "RFC3339 'T' separator leaked into user-facing format: {formatted}"
+        assert_eq!(
+            formatted.chars().nth(10),
+            Some(' '),
+            "expected a space at position 10 (date/time separator); got: {formatted}",
         );
     }
 

@@ -8375,13 +8375,6 @@ fn connect_satellites_panel(
     };
 
     let displayed: Rc<RefCell<Vec<DisplayedPass>>> = Rc::new(RefCell::new(Vec::new()));
-    // `passes_status_row` is the empty-state placeholder built by
-    // `build_satellites_panel`. We attach / detach it manually here
-    // (no "is this row in the group?" query on AdwPreferencesGroup)
-    // and track membership via this flag — `true` initially because
-    // `build_satellites_panel` adds the row.
-    let status_attached: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(true));
-
     // `recompute` is built unconditionally — when the cache is
     // unavailable it's a no-op so the lat/lon/alt notify handlers
     // can call it without branching. When the cache is available
@@ -8390,21 +8383,23 @@ fn connect_satellites_panel(
         let cache_recompute = std::sync::Arc::clone(cache);
         let panel_weak_recompute = panel_weak.clone();
         let displayed_recompute = Rc::clone(&displayed);
-        let status_recompute = Rc::clone(&status_attached);
         Rc::new(move || {
             let Some(panel) = panel_weak_recompute.upgrade() else {
                 return;
             };
-            // Tear down whatever is currently in the passes group so we
-            // can rebuild from a clean slate.
-            if status_recompute.get() {
-                panel.passes_group.remove(&panel.passes_status_row);
-                status_recompute.set(false);
-            }
+            // Drop the previous pass rows — these are throwaway,
+            // built fresh per recompute.
             for entry in displayed_recompute.borrow_mut().drain(..) {
                 panel.passes_group.remove(&entry.row);
             }
-
+            // `passes_status_row` is the always-present empty-state
+            // placeholder. We toggle its *visibility* rather than
+            // detach + reattach. Once a widget is unparented, its
+            // last strong ref lives only on the SatellitesPanel
+            // struct — and that struct is dropped when
+            // `build_window` returns. Toggling visibility keeps the
+            // row parented (and therefore alive) for the lifetime
+            // of the window.
             let station = GroundStation::new(
                 panel.lat_row.value(),
                 panel.lon_row.value(),
@@ -8414,11 +8409,11 @@ fn connect_satellites_panel(
             let passes = enumerate_upcoming_passes(&cache_recompute, &station, now);
 
             if passes.is_empty() {
-                panel.passes_group.add(&panel.passes_status_row);
-                status_recompute.set(true);
+                panel.passes_status_row.set_visible(true);
                 return;
             }
 
+            panel.passes_status_row.set_visible(false);
             let mut new_rows = Vec::with_capacity(passes.len());
             for pass in passes {
                 let row = adw::ActionRow::builder()
@@ -8505,17 +8500,20 @@ fn connect_satellites_panel(
 
             glib::spawn_future_local(async move {
                 let result = gio::spawn_blocking(move || {
-                    // Walk every known satellite. `tle_text` writes
-                    // the freshened entry to disk and returns the body
-                    // — we discard the body, the on-disk cache is what
-                    // subsequent `tle_for` lookups read. A failure on
-                    // any one satellite is logged and skipped so a
-                    // single decommissioned/rate-limited entry can't
-                    // break the whole refresh: the user gets the rest.
+                    // `force_refresh` — NOT `tle_text` — because the
+                    // user clicked Refresh and a fresh-cache fast-path
+                    // would let us mark "Last refreshed: now" without
+                    // any actual network fetch. `force_refresh` always
+                    // hits the network and never falls back to a stale
+                    // cache, so a successful return means a real round
+                    // trip happened. A per-satellite failure is logged
+                    // and skipped so a single decommissioned /
+                    // rate-limited entry can't break the whole
+                    // refresh: the user still gets the rest.
                     let mut last_err: Option<sdr_sat::TleCacheError> = None;
                     let mut succeeded = 0usize;
                     for known in KNOWN_SATELLITES {
-                        match cache_task.tle_text(known.norad_id) {
+                        match cache_task.force_refresh(known.norad_id) {
                             Ok(_) => succeeded += 1,
                             Err(e) => {
                                 tracing::warn!(
@@ -8576,40 +8574,54 @@ fn connect_satellites_panel(
         });
     }
 
-    // ZIP code → lat/lon shortcut. The apply button is built in by
-    // AdwEntryRow; clicking it (or pressing Enter on a non-empty
-    // entry) emits `apply`. Run the lookup on a worker thread, then
-    // write the resolved coords back to `lat_row` / `lon_row` —
-    // their existing `value-notify` handlers persist + recompute,
-    // so we don't have to repeat that work here. Result text goes
-    // to `zip_status_row` (AdwEntryRow has no subtitle slot of
-    // its own) so the user can see what came back without leaving
-    // the panel. Wired regardless of TLE cache availability — the
-    // ZIP lookup is independent.
+    // ZIP code → lat/lon shortcut. We wire BOTH `apply` (apply
+    // button click / Enter when apply-button is sensitive) and
+    // `entry_activated` (Enter, unconditional), then dedupe by an
+    // "in-flight" flag — `apply` won't fire if AdwEntryRow's
+    // internal "has the text been edited?" tracking is in a state
+    // where the apply button is insensitive, but `entry_activated`
+    // fires on Enter regardless. Belt-and-braces is cheaper than
+    // chasing libadwaita's internal sensitivity rules.
+    //
+    // Result text goes to `zip_status_row` (AdwEntryRow has no
+    // subtitle slot of its own). Wired regardless of TLE cache
+    // availability — the ZIP lookup is independent.
     {
-        let panel_weak_zip = panel_weak.clone();
-        panel.zip_row.connect_apply(move |entry| {
-            let Some(panel) = panel_weak_zip.upgrade() else {
-                return;
-            };
-            let zip = entry.text().to_string();
-            panel.zip_spinner.set_visible(true);
-            panel.zip_spinner.start();
-            entry.set_sensitive(false);
-            panel.zip_status_row.set_title("Looking up…");
-            panel.zip_status_row.set_visible(true);
+        let in_flight: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+        let run_lookup: Rc<dyn Fn(adw::EntryRow)> = {
+            let panel_weak_zip = panel_weak.clone();
+            let in_flight_run = Rc::clone(&in_flight);
+            Rc::new(move |entry: adw::EntryRow| {
+                if in_flight_run.get() {
+                    tracing::debug!("Satellites: ZIP lookup ignored — already in flight");
+                    return;
+                }
+                let Some(panel) = panel_weak_zip.upgrade() else {
+                    return;
+                };
+                let zip = entry.text().to_string();
+                if zip.trim().is_empty() {
+                    // Empty entry — nothing to do; treat as a no-op so a
+                    // stray Enter doesn't reset the status row.
+                    return;
+                }
+                in_flight_run.set(true);
+                tracing::debug!("Satellites: ZIP lookup triggered (length={})", zip.len());
+                entry.set_sensitive(false);
+                panel.zip_status_row.set_title("Looking up…");
 
-            let panel_weak_done = panel_weak_zip.clone();
-            let zip_for_task = zip.clone();
-            glib::spawn_future_local(async move {
-                // Chain the two lookups on the worker thread so the
-                // UI side just gets one result. ZIP failure is fatal
-                // for this run; elevation failure is logged and
-                // demoted to `Ok(_, None)` — altitude is best-effort
-                // since it barely matters for pass prediction
-                // anyway, and we'd rather populate lat/lon than
-                // leave the user staring at an error toast.
-                let result = gio::spawn_blocking(move || -> Result<
+                let panel_weak_done = panel_weak_zip.clone();
+                let in_flight_done = Rc::clone(&in_flight_run);
+                let zip_for_task = zip.clone();
+                glib::spawn_future_local(async move {
+                    // Chain the two lookups on the worker thread so the
+                    // UI side just gets one result. ZIP failure is fatal
+                    // for this run; elevation failure is logged and
+                    // demoted to `Ok(_, None)` — altitude is best-effort
+                    // since it barely matters for pass prediction
+                    // anyway, and we'd rather populate lat/lon than
+                    // leave the user staring at an error toast.
+                    let result = gio::spawn_blocking(move || -> Result<
                     (sdr_sat::PostalLocation, Option<f64>),
                     sdr_sat::PostalLookupError,
                 > {
@@ -8618,11 +8630,11 @@ fn connect_satellites_panel(
                     {
                         Ok(m) => Some(m),
                         Err(e) => {
-                            tracing::warn!(
-                                "elevation lookup at ({lat:.4}, {lon:.4}) failed: {e}",
-                                lat = loc.lat_deg,
-                                lon = loc.lon_deg,
-                            );
+                            // Don't include lat/lon in the log — that's user
+                            // location data, and the failure path is already
+                            // surfaced inline in the status row. Provider
+                            // error message alone is enough for debugging.
+                            tracing::warn!("elevation lookup failed: {e}");
                             None
                         }
                     };
@@ -8630,55 +8642,73 @@ fn connect_satellites_panel(
                 })
                 .await;
 
-                let Some(panel) = panel_weak_done.upgrade() else {
-                    return;
-                };
-                panel.zip_spinner.stop();
-                panel.zip_spinner.set_visible(false);
-                panel.zip_row.set_sensitive(true);
+                    in_flight_done.set(false);
+                    let Some(panel) = panel_weak_done.upgrade() else {
+                        return;
+                    };
+                    panel.zip_row.set_sensitive(true);
 
-                match result {
-                    Ok(Ok((loc, elevation))) => {
-                        // Order matters slightly: setting lat/lon/alt
-                        // fires `value-notify`, which persists the
-                        // value and triggers `recompute`. Three
-                        // recomputes back-to-back is fine —
-                        // sub-millisecond each.
-                        panel.lat_row.set_value(loc.lat_deg);
-                        panel.lon_row.set_value(loc.lon_deg);
-                        let where_text = if loc.region.is_empty() {
-                            loc.place
-                        } else {
-                            format!("{place}, {region}", place = loc.place, region = loc.region)
-                        };
-                        let status = match elevation {
-                            Some(alt_m) => {
-                                panel.alt_row.set_value(alt_m);
-                                format!("Resolved: {where_text} ({alt_m:.0} m)")
-                            }
-                            None => {
-                                // Leave altitude alone — the warn
-                                // log captured the real reason; show
-                                // a short hint so the user notices
-                                // altitude wasn't updated.
-                                format!("Resolved: {where_text} (altitude unchanged)")
-                            }
-                        };
-                        panel.zip_status_row.set_title(&status);
+                    match result {
+                        Ok(Ok((loc, elevation))) => {
+                            // Order matters slightly: setting lat/lon/alt
+                            // fires `value-notify`, which persists the
+                            // value and triggers `recompute`. Three
+                            // recomputes back-to-back is fine —
+                            // sub-millisecond each.
+                            panel.lat_row.set_value(loc.lat_deg);
+                            panel.lon_row.set_value(loc.lon_deg);
+                            let where_text = if loc.region.is_empty() {
+                                loc.place
+                            } else {
+                                format!("{place}, {region}", place = loc.place, region = loc.region)
+                            };
+                            let status = match elevation {
+                                Some(alt_m) => {
+                                    panel.alt_row.set_value(alt_m);
+                                    format!("Resolved: {where_text} ({alt_m:.0} m)")
+                                }
+                                None => {
+                                    // Leave altitude alone — the warn
+                                    // log captured the real reason; show
+                                    // a short hint so the user notices
+                                    // altitude wasn't updated.
+                                    format!("Resolved: {where_text} (altitude unchanged)")
+                                }
+                            };
+                            panel.zip_status_row.set_title(&status);
+                        }
+                        Ok(Err(e)) => {
+                            // Don't include the ZIP in the log — user
+                            // location data, already surfaced inline in
+                            // the status row. Provider error alone is
+                            // enough.
+                            tracing::warn!("ZIP lookup failed: {e}");
+                            panel.zip_status_row.set_title(&e.to_string());
+                        }
+                        Err(_) => {
+                            tracing::warn!("ZIP lookup task panicked");
+                            panel
+                                .zip_status_row
+                                .set_title("Lookup failed: background task panicked");
+                        }
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!("ZIP lookup for {zip:?} failed: {e}");
-                        panel.zip_status_row.set_title(&e.to_string());
-                    }
-                    Err(_) => {
-                        tracing::warn!("ZIP lookup task panicked");
-                        panel
-                            .zip_status_row
-                            .set_title("Lookup failed: background task panicked");
-                    }
-                }
-            });
-        });
+                });
+            })
+        };
+        // Wire both signal paths to the same closure: `apply` for
+        // the apply button click (when libadwaita has flagged the
+        // text as edited), `entry-activated` for raw Enter keys
+        // (always fires, regardless of edit state).
+        {
+            let run = Rc::clone(&run_lookup);
+            panel.zip_row.connect_apply(move |entry| run(entry.clone()));
+        }
+        {
+            let run = Rc::clone(&run_lookup);
+            panel
+                .zip_row
+                .connect_entry_activated(move |entry| run(entry.clone()));
+        }
     }
 
     // 1 Hz countdown ticker. Only scheduled when the cache is

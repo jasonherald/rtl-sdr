@@ -206,12 +206,81 @@ impl TleCache {
     /// cached entry — the user gets *something* rather than a blank
     /// scheduler. On no-cache + no-network, returns the fetch error.
     ///
+    /// **GTK callers — beware:** the freshness check can trigger a
+    /// blocking HTTP fetch. For UI-thread paths (e.g. recomputing the
+    /// pass list after a lat/lon edit) prefer
+    /// [`TleCache::cached_tle_for`], which is read-only and never
+    /// touches the network.
+    ///
     /// # Errors
     ///
     /// Surfaces [`TleCacheError`] for network, I/O, or lookup failures.
     pub fn tle_for(&self, norad_id: u32) -> Result<(String, String), TleCacheError> {
         let text = self.tle_text(norad_id)?;
         parse_tle_text(&text, norad_id).ok_or(TleCacheError::NotFound { norad_id })
+    }
+
+    /// Cache-only lookup. Reads whatever's on disk, validates the
+    /// content, and returns the matching TLE pair. **Never** makes a
+    /// network call, regardless of cache freshness — staleness is the
+    /// caller's problem (the satellites panel reschedules an explicit
+    /// refresh button click for that).
+    ///
+    /// Used by the UI's pass-recompute path so a lat/lon/alt edit
+    /// can't accidentally block the GTK main loop on synchronous HTTP
+    /// + cache writes.
+    ///
+    /// # Errors
+    ///
+    /// * [`TleCacheError::NotFound`] — cache file missing, unreadable,
+    ///   structurally invalid, or doesn't contain `norad_id`.
+    /// * [`TleCacheError::Io`] — file system read failure (other than
+    ///   not-found / non-UTF-8, both of which are demoted to `NotFound`
+    ///   so the caller doesn't see a fatal Io for a routine miss).
+    pub fn cached_tle_for(&self, norad_id: u32) -> Result<(String, String), TleCacheError> {
+        let path = self.cache_path(norad_id);
+        let cached = read_file(&path)?.ok_or(TleCacheError::NotFound { norad_id })?;
+        if !has_any_tle_pair(&cached) {
+            return Err(TleCacheError::NotFound { norad_id });
+        }
+        parse_tle_text(&cached, norad_id).ok_or(TleCacheError::NotFound { norad_id })
+    }
+
+    /// Forced network fetch. Bypasses the freshness check and the
+    /// stale-cache fallback — used by the manual "Refresh" button so
+    /// a click always means "do the network round-trip" and the
+    /// timestamp can only advance on a real success.
+    ///
+    /// On success, the response is validated and written to the cache
+    /// just like the slow path of [`TleCache::tle_text`].
+    ///
+    /// # Errors
+    ///
+    /// * [`TleCacheError::Fetch`] — network failure, non-2xx status,
+    ///   or upstream returned a body that isn't a valid TLE (HTML
+    ///   error page, captive portal, etc.). The cache is **not**
+    ///   updated and the on-disk copy (stale or otherwise) is left
+    ///   untouched.
+    /// * [`TleCacheError::Io`] — only if writing the freshly-fetched
+    ///   body to disk failed; the in-memory body is still returned.
+    pub fn force_refresh(&self, norad_id: u32) -> Result<String, TleCacheError> {
+        let text = self.fetch(norad_id).and_then(|text| {
+            if has_any_tle_pair(&text) {
+                Ok(text)
+            } else {
+                Err(TleCacheError::Fetch(
+                    "response body did not contain any valid TLE pair (captive portal? HTML error page?)"
+                        .to_string(),
+                ))
+            }
+        })?;
+        let path = self.cache_path(norad_id);
+        if let Err(e) = self.write_cache(&path, &text) {
+            tracing::warn!(
+                "TLE cache write for NORAD {norad_id} failed ({e}); returning fresh in-memory copy",
+            );
+        }
+        Ok(text)
     }
 
     /// Get the raw TLE text for one satellite, refreshing on disk if
@@ -852,6 +921,139 @@ SOMETHING
         let cache = TleCache::with_dir(dir);
         let err = cache.tle_for(99_999).unwrap_err();
         assert!(matches!(err, TleCacheError::NotFound { norad_id: 99_999 }));
+    }
+
+    #[test]
+    fn cached_tle_for_does_not_call_network_on_miss() {
+        // The whole point of `cached_tle_for`: a UI-thread caller
+        // can ask "what TLE do we have on disk?" without risking a
+        // synchronous HTTP fetch. Drop a canned-fail fetcher in to
+        // pin that — a network call here would surface as Fetch
+        // error, but cache_only should never hit that path.
+        let dir = unique_temp_dir("cached-only-miss");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = TleCache::with_dir(dir).with_fetcher(always_fail_fetcher());
+        // No file present.
+        let err = cache.cached_tle_for(33_591).unwrap_err();
+        assert!(
+            matches!(err, TleCacheError::NotFound { norad_id: 33_591 }),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cached_tle_for_returns_pair_when_file_is_present() {
+        let dir = unique_temp_dir("cached-only-hit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.tle");
+        std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
+        let cache = TleCache::with_dir(dir).with_fetcher(always_fail_fetcher());
+        let (l1, l2) = cache.cached_tle_for(5).unwrap();
+        assert!(l1.starts_with("1 00005"));
+        assert!(l2.starts_with("2 00005"));
+    }
+
+    #[test]
+    fn cached_tle_for_never_invokes_the_fetcher_even_when_stale() {
+        // The contract for `cached_tle_for`: zero network calls,
+        // regardless of cache freshness. Pin it by counting fetcher
+        // invocations — that's the actual UI-thread invariant we
+        // care about. (`tle_text` falls back to stale cache on
+        // fetch failure, so its return value can't differentiate
+        // "fetched and failed" from "served stale", which is why we
+        // count fetcher calls instead.)
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = unique_temp_dir("cached-only-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.tle");
+        std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
+        // Sleep one tick + use a 1-ns refresh window so the file
+        // looks "stale" to anyone who'd consult freshness.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let calls = StdArc::new(AtomicU32::new(0));
+        let calls_for_fetcher = StdArc::clone(&calls);
+        let cache = TleCache::with_dir(dir)
+            .with_refresh_max_age(std::time::Duration::from_nanos(1))
+            .with_fetcher(move |_| {
+                calls_for_fetcher.fetch_add(1, Ordering::Relaxed);
+                Err(TleCacheError::Fetch("test: fetcher disabled".to_string()))
+            });
+        // Even with a stale cache file, `cached_tle_for` returns
+        // the on-disk copy and never calls the fetcher.
+        let (l1, _l2) = cache.cached_tle_for(5).unwrap();
+        assert!(l1.starts_with("1 00005"));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "cached_tle_for invoked the fetcher",
+        );
+    }
+
+    #[test]
+    fn cached_tle_for_returns_not_found_for_corrupted_body() {
+        // Validation gate applies on the read path too — a stray
+        // HTML response (or a manual `echo` into the cache) must
+        // surface as NotFound rather than be served as garbage.
+        let dir = unique_temp_dir("cached-only-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.tle");
+        std::fs::write(&path, "<html>not a TLE</html>\n").unwrap();
+        let cache = TleCache::with_dir(dir).with_fetcher(always_fail_fetcher());
+        let err = cache.cached_tle_for(5).unwrap_err();
+        assert!(matches!(err, TleCacheError::NotFound { norad_id: 5 }));
+    }
+
+    #[test]
+    fn force_refresh_always_calls_fetcher_even_when_cache_is_fresh() {
+        // The whole point of `force_refresh`: a manual Refresh click
+        // must trigger a real network call so the timestamp is
+        // meaningful, even if the cache happens to be fresh.
+        // Inject a fetcher that records call counts and verify
+        // it fires.
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = unique_temp_dir("force-refresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-populate the cache with a fresh, valid file.
+        let path = dir.join("5.tle");
+        std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
+        let calls = StdArc::new(AtomicU32::new(0));
+        let calls_for_fetcher = StdArc::clone(&calls);
+        let cache = TleCache::with_dir(dir).with_fetcher(move |_| {
+            calls_for_fetcher.fetch_add(1, Ordering::Relaxed);
+            Ok(SAMPLE_TLE_3LINE.to_string())
+        });
+        // Sanity: tle_text would NOT call the fetcher because the
+        // cache is fresh.
+        let _ = cache.tle_text(5).unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "tle_text spuriously fetched"
+        );
+        // force_refresh must always fetch.
+        let _ = cache.force_refresh(5).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // And again — every call hits the network.
+        let _ = cache.force_refresh(5).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn force_refresh_does_not_fall_back_to_stale_cache_on_failure() {
+        // The "Last refreshed" timestamp must mean a real refresh
+        // succeeded — so a network failure with a stale-but-valid
+        // cache file present must still surface as Err. Otherwise
+        // a click on Refresh while offline could march the
+        // timestamp forward without any new data.
+        let dir = unique_temp_dir("force-refresh-no-fallback");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.tle");
+        std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
+        let cache = TleCache::with_dir(dir).with_fetcher(always_fail_fetcher());
+        let err = cache.force_refresh(5).unwrap_err();
+        assert!(matches!(err, TleCacheError::Fetch(_)));
     }
 
     #[test]
