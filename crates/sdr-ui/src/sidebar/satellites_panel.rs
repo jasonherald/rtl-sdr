@@ -859,11 +859,16 @@ mod tests {
     fn format_pass_subtitle_falls_back_when_satellite_not_in_catalog() {
         // A pass for a satellite the panel doesn't know about (user
         // has manually loaded a TLE, future) — subtitle still works,
-        // just without the freq.
+        // just without the freq. The fallback is still
+        // `quality · geometry`, NOT geometry-only — assert all three
+        // invariants so a regression that drops the quality tag in
+        // the off-catalog branch trips here rather than reaching the
+        // user as an inconsistent row.
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let mut pass = synthetic_pass(now, 30);
         pass.satellite = "FAKESAT-7".to_string();
         let subtitle = format_pass_subtitle(&pass);
+        assert!(subtitle.contains("winner"), "subtitle: {subtitle}");
         assert!(subtitle.contains("max el 56"), "subtitle: {subtitle}");
         assert!(!subtitle.contains("MHz"), "subtitle: {subtitle}");
     }
