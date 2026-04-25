@@ -188,6 +188,11 @@ pub fn parity_8(b: u8) -> u8 {
 mod tests {
     use super::*;
 
+    /// Soft-symbol magnitude for clean-signal test fixtures.
+    /// Saturated to ±127 — the largest distance the soft slicer
+    /// produces, modeling a noiseless encoded stream.
+    const CLEAN_SOFT_MAG: i8 = 127;
+
     /// Encode a bitstream with the standard CCSDS convolutional
     /// encoder (medet polynomial convention, full 7-bit shift
     /// register, input bit at position K-1 = 6). Used to generate
@@ -201,21 +206,34 @@ mod tests {
             reason = "K = 7, shift count fits in u8"
         )]
         let high_bit_pos: u8 = (K - 1) as u8; // = 6
+        let push_pair = |out: &mut Vec<i8>, g1: u8, g2: u8| {
+            out.push(if g1 == 0 {
+                CLEAN_SOFT_MAG
+            } else {
+                -CLEAN_SOFT_MAG
+            });
+            out.push(if g2 == 0 {
+                CLEAN_SOFT_MAG
+            } else {
+                -CLEAN_SOFT_MAG
+            });
+        };
         for &b in bits {
             shift_reg = (shift_reg >> 1) | ((b & 1) << high_bit_pos);
-            let g1 = parity_8(shift_reg & POLYA);
-            let g2 = parity_8(shift_reg & POLYB);
-            // Encode as ±127 soft symbols (clean signal).
-            out.push(if g1 == 0 { 127 } else { -127 });
-            out.push(if g2 == 0 { 127 } else { -127 });
+            push_pair(
+                &mut out,
+                parity_8(shift_reg & POLYA),
+                parity_8(shift_reg & POLYB),
+            );
         }
         // Flush — append K-1 zeros to drain the encoder.
         for _ in 0..(K - 1) {
             shift_reg >>= 1;
-            let g1 = parity_8(shift_reg & POLYA);
-            let g2 = parity_8(shift_reg & POLYB);
-            out.push(if g1 == 0 { 127 } else { -127 });
-            out.push(if g2 == 0 { 127 } else { -127 });
+            push_pair(
+                &mut out,
+                parity_8(shift_reg & POLYA),
+                parity_8(shift_reg & POLYB),
+            );
         }
         out
     }
@@ -239,20 +257,24 @@ mod tests {
                 decoded.push(bit);
             }
         }
-        // Drop the warmup region — the first `TRACEBACK_DEPTH`
-        // emissions happen while the trellis is still committing
-        // to a path, so they're not necessarily aligned with the
-        // input. The steady-state region should match exactly.
-        let aligned = &decoded[..decoded.len().min(input_bits.len())];
-        let mismatches = aligned
+        // `decoded[i]` aligns with `input_bits[i]` directly (the
+        // decoder only starts emitting once the traceback window
+        // is full, so there's no warmup prefix in the output
+        // stream — the emitted bits ARE the steady-state output
+        // for input positions 0, 1, 2, …).
+        assert!(
+            decoded.len() >= 100,
+            "expected at least 100 emitted bits for meaningful coverage, got {}",
+            decoded.len(),
+        );
+        let mismatches = decoded
             .iter()
             .zip(input_bits.iter())
-            .skip(TRACEBACK_DEPTH)
             .filter(|(a, b)| a != b)
             .count();
         assert_eq!(
             mismatches, 0,
-            "clean-signal round-trip must have zero bit errors after warmup",
+            "clean-signal round-trip must have zero bit errors"
         );
     }
 
@@ -272,10 +294,22 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Minimum proptest bitstream length. The decoder only starts
+    /// emitting after `TRACEBACK_DEPTH + 1` pushes; a tighter
+    /// minimum produces too few decoded bits for the property to
+    /// meaningfully exercise the steady-state path. 350 input
+    /// bits → ~125 emitted bits, which is plenty of coverage and
+    /// still small enough to keep proptest cases fast.
+    const PROPTEST_MIN_LEN: usize = TRACEBACK_DEPTH + 125;
+
+    /// Minimum number of decoded bits we require per proptest
+    /// case for the assertions to be non-vacuous.
+    const PROPTEST_MIN_DECODED: usize = 100;
+
     proptest! {
         #[test]
         fn viterbi_recovers_random_bitstreams(
-            bits in proptest::collection::vec(0..2_u8, 100..500)
+            bits in proptest::collection::vec(0..2_u8, PROPTEST_MIN_LEN..500)
         ) {
             let encoded = ccsds_encode(&bits);
             let mut dec = ViterbiDecoder::new();
@@ -285,11 +319,18 @@ mod proptests {
                     decoded.push(bit);
                 }
             }
-            let aligned = &decoded[..decoded.len().min(bits.len())];
-            let mismatches = aligned
+            // `decoded[i]` aligns with `bits[i]` directly — no
+            // warmup prefix in the emitted stream. Pin a minimum
+            // decoded count so a shrunken case can't accidentally
+            // pass with a near-empty mismatch count.
+            prop_assert!(
+                decoded.len() >= PROPTEST_MIN_DECODED,
+                "decoded {} bits, want >= {}",
+                decoded.len(), PROPTEST_MIN_DECODED,
+            );
+            let mismatches = decoded
                 .iter()
                 .zip(bits.iter())
-                .skip(TRACEBACK_DEPTH)
                 .filter(|(a, b)| a != b)
                 .count();
             prop_assert_eq!(mismatches, 0);
@@ -297,7 +338,7 @@ mod proptests {
 
         #[test]
         fn viterbi_corrects_single_bit_errors(
-            bits in proptest::collection::vec(0..2_u8, 200..400),
+            bits in proptest::collection::vec(0..2_u8, PROPTEST_MIN_LEN..500),
             error_idx in 0_usize..200,
         ) {
             let mut encoded = ccsds_encode(&bits);
@@ -312,11 +353,14 @@ mod proptests {
                     decoded.push(bit);
                 }
             }
-            let aligned = &decoded[..decoded.len().min(bits.len())];
-            let mismatches = aligned
+            prop_assert!(
+                decoded.len() >= PROPTEST_MIN_DECODED,
+                "decoded {} bits, want >= {}",
+                decoded.len(), PROPTEST_MIN_DECODED,
+            );
+            let mismatches = decoded
                 .iter()
                 .zip(bits.iter())
-                .skip(TRACEBACK_DEPTH)
                 .filter(|(a, b)| a != b)
                 .count();
             // Single-bit error in a rate-1/2 K=7 code should be

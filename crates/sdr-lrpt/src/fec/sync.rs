@@ -13,6 +13,12 @@
 /// CCSDS attached sync marker.
 pub const ASM: u32 = 0x1ACF_FC1D;
 
+/// Bit width of the ASM correlation window. Pinned as a constant
+/// so the decoder logic, helper code, and tests share one source
+/// of truth — changing the ASM size (CCSDS doesn't, but in case a
+/// derived spec ever does) lands in one place.
+pub const ASM_BITS: usize = 32;
+
 /// Maximum Hamming distance for a sync hit. 4/32 ≈ 87.5% match.
 pub const SYNC_THRESHOLD: u32 = 4;
 
@@ -44,7 +50,7 @@ impl SyncCorrelator {
     pub fn push(&mut self, bit: u8) -> Option<u64> {
         self.window = (self.window << 1) | u32::from(bit & 1);
         self.bits_seen += 1;
-        if self.bits_seen < 32 {
+        if self.bits_seen < ASM_BITS as u64 {
             return None;
         }
         if (self.window ^ ASM).count_ones() <= SYNC_THRESHOLD {
@@ -63,12 +69,12 @@ mod tests {
     /// correlator, returning the first hit position (or None).
     fn push_pattern(s: &mut SyncCorrelator, pattern: u32) -> Option<u64> {
         let mut hit = None;
-        for i in 0..32 {
+        for i in 0..ASM_BITS {
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "shift index 0..32 is well-defined for u32"
+                reason = "shift index 0..ASM_BITS=32 is well-defined for u32"
             )]
-            let bit = ((pattern >> (31 - i)) & 1) as u8;
+            let bit = ((pattern >> (ASM_BITS - 1 - i)) & 1) as u8;
             if let Some(pos) = s.push(bit) {
                 hit = Some(pos);
             }
@@ -126,21 +132,21 @@ mod tests {
     }
 
     #[test]
-    fn emits_no_hits_during_first_32_bits() {
+    fn emits_no_hits_during_first_window() {
         let mut s = SyncCorrelator::new();
-        // Even if the first 32 input bits happen to spell out ASM,
-        // the bits_seen guard prevents an emission until the full
-        // window has been observed.
-        for i in 0..32 {
+        // Even if the first ASM_BITS input bits happen to spell
+        // out ASM, the bits_seen guard prevents an emission until
+        // the full window has been observed.
+        for i in 0..ASM_BITS {
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "shift index 0..32 is well-defined for u32"
+                reason = "shift index 0..ASM_BITS=32 is well-defined for u32"
             )]
-            let bit = ((ASM >> (31 - i)) & 1) as u8;
-            // First 31 pushes must return None; the 32nd push
-            // completes the window and may emit.
+            let bit = ((ASM >> (ASM_BITS - 1 - i)) & 1) as u8;
+            // First (ASM_BITS - 1) pushes must return None; the
+            // last push completes the window and may emit.
             let result = s.push(bit);
-            if i < 31 {
+            if i < ASM_BITS - 1 {
                 assert!(result.is_none(), "premature emission at bit {i}");
             }
         }

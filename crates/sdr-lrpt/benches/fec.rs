@@ -22,9 +22,16 @@ const SYNC_BITS: usize = 1_000_000;
 /// a single Meteor pass after CADU framing strips overhead.
 const DERAND_BYTES: usize = 1_000_000;
 
+/// Soft-symbol amplitude for the synthetic Viterbi bench input.
+/// Slightly under the ±127 saturation point so the bench
+/// exercises the typical "clean signal but not slammed against
+/// the rails" branch metric path the production demod produces.
+const SOFT_POS: i8 = 100;
+const SOFT_NEG: i8 = -100;
+
 fn bench_viterbi(c: &mut Criterion) {
     let symbols: Vec<i8> = (0..VITERBI_BIT_PAIRS * 2)
-        .map(|n| if n & 1 == 0 { 100 } else { -100 })
+        .map(|n| if n & 1 == 0 { SOFT_POS } else { SOFT_NEG })
         .collect();
     c.bench_function("viterbi_10k_bit_pairs", |b| {
         b.iter(|| {

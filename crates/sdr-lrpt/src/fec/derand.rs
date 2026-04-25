@@ -75,7 +75,14 @@ impl Derandomizer {
     /// Push one byte; returns the de-randomized byte.
     pub fn process(&mut self, byte: u8) -> u8 {
         let out = byte ^ PN_TABLE[self.pos];
-        self.pos = (self.pos + 1) % PN_PERIOD;
+        // Branch-wrap instead of `% PN_PERIOD`: avoids a division
+        // on every byte in the hot path. The compiler is welcome
+        // to recognize the `% 255` modulus and emit the same code,
+        // but the branch form is unambiguously cheap.
+        self.pos += 1;
+        if self.pos == PN_PERIOD {
+            self.pos = 0;
+        }
         out
     }
 }
