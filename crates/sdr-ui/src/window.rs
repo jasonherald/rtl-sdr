@@ -2710,7 +2710,60 @@ fn connect_sidebar_panels(
     connect_volume_persistence(panels, state, config, volume_button);
     connect_distance_estimator_persistence(panels, config);
     connect_scanner_panel(panels, state, config);
-    connect_satellites_panel(panels, config);
+    // "Tune to satellite" closure used by the Satellites panel's
+    // per-row play buttons. Mirrors the bookmark-recall dance in
+    // `connect_navigation_panel` end-to-end: forces the scanner
+    // off, updates local `AppState`, sends `Tune` + `SetBandwidth`
+    // to the DSP, and pokes every UI widget / status indicator
+    // that mirrors the radio's tuning state — spectrum centre
+    // line, demod dropdown, bandwidth SpinRow, status bar
+    // frequency / demod-mode label, and the radio panel's mode-
+    // specific control visibility. The dropdown's
+    // `selected-notify` and the spin row's `value-notify`
+    // callbacks fire `SetDemodMode` / a redundant `SetBandwidth`
+    // themselves — idempotent at the DSP, cheaper than threading
+    // a suppress flag through here.
+    let tune_to_satellite: Rc<dyn Fn(u64, sdr_types::DemodMode, u32)> = {
+        let state_t = Rc::clone(state);
+        let freq_selector_t = freq_selector.clone();
+        let demod_dropdown_t = demod_dropdown.clone();
+        let spectrum_t = Rc::clone(spectrum_handle);
+        let force_disable_t = Rc::clone(scanner_force_disable);
+        let bandwidth_row_t = panels.radio.bandwidth_row.clone();
+        let radio_panel_t = panels.radio.clone();
+        let status_bar_t = Rc::clone(status_bar);
+        Rc::new(move |freq_hz, mode, bw_hz| {
+            force_disable_t.trigger("satellite tune");
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "downlink frequencies sit in the 100s of MHz, far \
+                          below f64's 2^53 mantissa ceiling"
+            )]
+            let freq_f64 = freq_hz as f64;
+            let bw_f64 = f64::from(bw_hz);
+            state_t.center_frequency.set(freq_f64);
+            state_t.demod_mode.set(mode);
+            state_t.send_dsp(UiToDsp::Tune(freq_f64));
+            state_t.send_dsp(UiToDsp::SetBandwidth(bw_f64));
+            freq_selector_t.set_frequency(freq_hz);
+            spectrum_t.set_center_frequency(freq_f64);
+            if let Some(idx) = demod_selector::demod_mode_to_index(mode) {
+                demod_dropdown_t.set_selected(idx);
+            }
+            bandwidth_row_t.set_value(bw_f64);
+            // Mode-specific control visibility (e.g. squelch /
+            // deemph rows shown only in NFM/WFM) — must be poked
+            // explicitly because the demod-dropdown notify only
+            // covers the dropdown's own state.
+            radio_panel_t.apply_demod_visibility(mode);
+            // Status bar mirrors. Done last so a panic anywhere
+            // upstream doesn't leave the indicator showing an
+            // optimistic value that the DSP never received.
+            status_bar_t.update_frequency(freq_f64);
+            status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
+        })
+    };
+    connect_satellites_panel(panels, config, &tune_to_satellite);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -8346,13 +8399,15 @@ fn connect_scanner_panel(
 fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
 ) {
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_panel::{
         KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, SatellitesPanelWeak,
-        enumerate_upcoming_passes, format_last_refresh, format_pass_subtitle, format_pass_title,
-        load_auto_record_apt, load_station_alt_m, load_station_lat_deg, load_station_lon_deg,
-        save_auto_record_apt, save_f64, save_tle_last_refresh,
+        enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh, format_pass_subtitle,
+        format_pass_title, load_auto_record_apt, load_station_alt_m, load_station_lat_deg,
+        load_station_lon_deg, save_auto_record_apt, save_f64, save_tle_last_refresh,
+        tune_target_for_pass,
     };
 
     // One pass row + its source `Pass` so the 1 Hz ticker can
@@ -8412,6 +8467,7 @@ fn connect_satellites_panel(
         let cache_recompute = std::sync::Arc::clone(cache);
         let panel_weak_recompute = panel_weak.clone();
         let displayed_recompute = Rc::clone(&displayed);
+        let tune_for_recompute = Rc::clone(tune_to_satellite);
         Rc::new(move || {
             let Some(panel) = panel_weak_recompute.upgrade() else {
                 return;
@@ -8449,6 +8505,35 @@ fn connect_satellites_panel(
                     .title(format_pass_title(&pass, now))
                     .subtitle(format_pass_subtitle(&pass))
                     .build();
+                // Per-row play button — one-click tune to the
+                // satellite's downlink with the right demod / BW.
+                // Skipped when the satellite isn't in the catalog
+                // (impossible in practice but the lookup type is
+                // `Option`, so we fail closed — no button rather
+                // than a button that does nothing).
+                if let Some((freq_hz, mode, bw_hz)) = tune_target_for_pass(&pass) {
+                    let play_btn = gtk4::Button::builder()
+                        .icon_name("media-playback-start-symbolic")
+                        .tooltip_text(format!(
+                            "Tune to {} ({})",
+                            pass.satellite,
+                            format_downlink_mhz(freq_hz),
+                        ))
+                        .valign(gtk4::Align::Center)
+                        .css_classes(["flat"])
+                        .build();
+                    // Tooltips aren't read by screen readers — set
+                    // the accessible label too, matching the
+                    // project rule for icon-only buttons.
+                    let a11y_label = format!("Tune to {} downlink", pass.satellite);
+                    play_btn
+                        .update_property(&[gtk4::accessible::Property::Label(a11y_label.as_str())]);
+                    let tune_for_click = Rc::clone(&tune_for_recompute);
+                    play_btn.connect_clicked(move |_| {
+                        tune_for_click(freq_hz, mode, bw_hz);
+                    });
+                    row.add_suffix(&play_btn);
+                }
                 panel.passes_group.add(&row);
                 new_rows.push(DisplayedPass { row, pass });
             }
