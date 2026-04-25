@@ -113,6 +113,7 @@ members = [
     "crates/sdr-config",
     "crates/sdr-radioreference",
     "crates/sdr-sat",
+    "crates/sdr-lrpt",
     "crates/sdr-transcription",
     "crates/sdr-core",
     "crates/sdr-ffi",
@@ -144,6 +145,7 @@ sdr-radio = { path = "crates/sdr-radio" }
 sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-sat = { path = "crates/sdr-sat" }
+sdr-lrpt = { path = "crates/sdr-lrpt" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
 sdr-ffi = { path = "crates/sdr-ffi" }

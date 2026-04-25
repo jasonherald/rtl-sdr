@@ -1,0 +1,25 @@
+[package]
+name = "sdr-lrpt"
+version = "0.1.0"
+description = "Meteor-M LRPT post-demod decoder: FEC, CCSDS framing, image assembly"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sdr-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+criterion.workspace = true
+
+[lints]
+workspace = true
+
+# Benchmarks for stage-2a FEC chain (Viterbi + sync + derand). Sets
+# the per-stage performance floor for regression detection.
+[[bench]]
+name = "fec"
+harness = false
