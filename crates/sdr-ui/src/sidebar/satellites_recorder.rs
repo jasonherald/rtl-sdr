@@ -146,13 +146,18 @@ pub struct SavedTune {
 /// Returned from `tick` so the state machine itself stays pure.
 #[derive(Debug, Clone)]
 pub enum Action {
-    /// Tune the radio to the satellite's downlink and open the APT
-    /// viewer window. Fired on `Idle → BeforePass`.
+    /// Tune the radio to the satellite's downlink and open the
+    /// protocol-appropriate live viewer. Fired on `Idle →
+    /// BeforePass`. The wiring layer's `interpret_action`
+    /// matches on `protocol` to dispatch to the right decoder /
+    /// viewer (APT today, LRPT in Task 7 of epic #469, SSTV in
+    /// epic #472). Per #514.
     StartAutoRecord {
         satellite: String,
         freq_hz: u64,
         mode: DemodMode,
         bandwidth_hz: u32,
+        protocol: sdr_sat::ImagingProtocol,
     },
     /// Open a WAV writer at `audio_path` to capture the
     /// demodulated audio for the duration of the pass. Fired
@@ -274,19 +279,23 @@ impl AutoRecorder {
             return Vec::new();
         }
         // Find the soonest eligible upcoming pass. Eligibility:
-        // 1. Satellite is in our catalog (lookup yields tune target).
-        //    LRPT-only satellites are out — the APT decoder won't
-        //    decode their signal even if we tune to it.
-        // 2. Peak elevation meets the quality threshold.
-        // 3. AOS is within `AOS_LEAD_SECS` (start tuning a few
+        // 1. Satellite is in our catalog (lookup yields tune
+        //    target).
+        // 2. Catalog entry has `imaging_protocol = Some(_)`. None
+        //    means the satellite is in the catalog for pass-
+        //    prediction display only — auto-record doesn't have
+        //    a decoder + viewer wired for it yet (Meteor LRPT
+        //    until Task 7 of #469; ISS SSTV until #472). Per
+        //    #514 — replaced the old hardcoded `is_apt_capable`
+        //    NOAA-name check.
+        // 3. Peak elevation meets the quality threshold.
+        // 4. AOS is within `AOS_LEAD_SECS` (start tuning a few
         //    seconds early so the pipeline is ready at AOS proper).
         for pass in passes {
-            let Some((freq_hz, mode, bandwidth_hz)) = tune_target_for_pass(pass) else {
+            let Some((freq_hz, mode, bandwidth_hz, Some(protocol))) = tune_target_for_pass(pass)
+            else {
                 continue;
             };
-            if !is_apt_capable(&pass.satellite) {
-                continue;
-            }
             if pass.max_elevation_deg < AUTO_RECORD_MIN_ELEV_DEG {
                 continue;
             }
@@ -330,6 +339,7 @@ impl AutoRecorder {
                 freq_hz,
                 mode,
                 bandwidth_hz,
+                protocol,
             });
             if let Some(path) = &audio_path {
                 actions.push(Action::StartAutoAudioRecord(path.clone()));
@@ -448,17 +458,10 @@ impl AutoRecorder {
     }
 }
 
-/// Is this satellite something we can actually decode in the APT
-/// viewer? NOAA POES (15 / 18 / 19) carry the analog APT subcarrier
-/// our decoder is built for. METEOR-M / ISS use different
-/// modulations (LRPT / SSTV) and would tune correctly but produce
-/// no decoded image — pointless to auto-record them today. When
-/// LRPT / SSTV decoders ship (epics #469 / #472) this gate will
-/// loosen accordingly.
-#[must_use]
-fn is_apt_capable(satellite_name: &str) -> bool {
-    matches!(satellite_name, "NOAA 15" | "NOAA 18" | "NOAA 19")
-}
+// `is_apt_capable` removed in PR closing #514 — replaced by the
+// catalog-driven `imaging_protocol.is_some()` filter in
+// `tick_idle`. Adding a new protocol now only requires flipping
+// `imaging_protocol` on the `KnownSatellite` entry.
 
 /// Build the export path for a satellite + timestamp:
 /// `~/sdr-recordings/apt-NOAA-19-2026-04-25-143015.png`.

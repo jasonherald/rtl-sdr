@@ -8550,7 +8550,12 @@ fn connect_satellites_panel(
                 // (impossible in practice but the lookup type is
                 // `Option`, so we fail closed — no button rather
                 // than a button that does nothing).
-                if let Some((freq_hz, mode, bw_hz)) = tune_target_for_pass(&pass) {
+                // Per-row play button: ignore the 4th element
+                // (`Option<ImagingProtocol>`) — manual tune is a
+                // user-initiated action and works on any catalog
+                // entry. Only the auto-record path filters on
+                // `Some(protocol)`.
+                if let Some((freq_hz, mode, bw_hz, _protocol)) = tune_target_for_pass(&pass) {
                     let play_btn = gtk4::Button::builder()
                         .icon_name("media-playback-start-symbolic")
                         .tooltip_text(format!(
@@ -8946,9 +8951,10 @@ fn connect_satellites_panel(
                 freq_hz,
                 mode,
                 bandwidth_hz,
+                protocol,
             } => {
                 tracing::info!(
-                    "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz",
+                    "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz, protocol {protocol:?}",
                 );
                 // Drive Start through the header play button —
                 // its `connect_toggled` handler is the single place
@@ -8975,16 +8981,42 @@ fn connect_satellites_panel(
                 // spectrum widget, freq selector, and status
                 // bar; no manual mirror needed.
                 state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
-                crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
-                // Clear the canvas at AOS so a back-to-back pass
-                // (e.g. NOAA 18 → NOAA 19 with overlapping
-                // viewer sessions) starts on a clean image. The
-                // viewer was either just opened above (already
-                // empty) or carried over from a previous pass —
-                // either way, an explicit clear keeps the image
-                // we're about to save scoped to *this* pass.
-                if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
-                    view.clear();
+                // Per-protocol viewer dispatch. Adding a new
+                // protocol means adding a match arm here +
+                // flipping `imaging_protocol` on the catalog
+                // entry — no recorder change needed. Per #514.
+                match protocol {
+                    sdr_sat::ImagingProtocol::Apt => {
+                        crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
+                        // Clear the canvas at AOS so a back-to-back
+                        // pass (e.g. NOAA 18 → NOAA 19 with
+                        // overlapping viewer sessions) starts on a
+                        // clean image. The viewer was either just
+                        // opened above (already empty) or carried
+                        // over from a previous pass — either way,
+                        // an explicit clear keeps the image we're
+                        // about to save scoped to *this* pass.
+                        if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                            view.clear();
+                        }
+                    }
+                    sdr_sat::ImagingProtocol::Lrpt => {
+                        // Task 7 of epic #469 wires the LRPT live
+                        // viewer + decoder driver. This branch is
+                        // reachable today only if a catalog entry
+                        // is flipped to `Some(Lrpt)` ahead of that
+                        // wiring — log + toast so it's visible
+                        // rather than silently no-op.
+                        tracing::warn!(
+                            "auto-record fired for LRPT satellite {satellite} but the LRPT viewer is not yet wired (Task 7 of epic #469)",
+                        );
+                        post_toast(
+                            &toast_overlay_weak,
+                            &format!(
+                                "{satellite}: LRPT auto-record arrived early — viewer ships in epic #469 Task 7"
+                            ),
+                        );
+                    }
                 }
             }
             RecorderAction::StartAutoAudioRecord(path) => {

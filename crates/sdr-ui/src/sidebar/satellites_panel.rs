@@ -609,15 +609,39 @@ pub fn downlink_hz_for_pass(pass: &Pass) -> Option<u64> {
     known_satellite_for_pass(pass).map(|s| s.downlink_hz)
 }
 
-/// The full tuning triple — frequency, demod mode, channel
-/// bandwidth — for a given pass's satellite. Returned as a tuple
-/// to keep the call site simple (the play-button wiring layer
-/// destructures it directly into the three `UiToDsp` setters).
-/// `None` for the same off-catalog reason as
+/// The full tuning quadruple — frequency, demod mode, channel
+/// bandwidth, imaging protocol — for a given pass's satellite.
+/// Returned as a tuple to keep the call site simple (the
+/// play-button wiring layer destructures it directly into the
+/// three `UiToDsp` setters; the recorder filters on the
+/// fourth element).
+///
+/// The fourth element is `Option<ImagingProtocol>` so the play
+/// button stays available on every catalog satellite (manual
+/// tune is a user-initiated action). The recorder, in contrast,
+/// only fires on satellites whose protocol is `Some(_)` — that
+/// gate replaces the prior hardcoded `is_apt_capable` filter.
+///
+/// Returns `None` only when the pass's satellite isn't in
+/// [`KNOWN_SATELLITES`] at all (off-catalog), same condition as
 /// [`downlink_hz_for_pass`].
 #[must_use]
-pub fn tune_target_for_pass(pass: &Pass) -> Option<(u64, sdr_types::DemodMode, u32)> {
-    known_satellite_for_pass(pass).map(|s| (s.downlink_hz, s.demod_mode, s.bandwidth_hz))
+pub fn tune_target_for_pass(
+    pass: &Pass,
+) -> Option<(
+    u64,
+    sdr_types::DemodMode,
+    u32,
+    Option<sdr_sat::ImagingProtocol>,
+)> {
+    known_satellite_for_pass(pass).map(|s| {
+        (
+            s.downlink_hz,
+            s.demod_mode,
+            s.bandwidth_hz,
+            s.imaging_protocol,
+        )
+    })
 }
 
 /// Format a Hz frequency as a fixed-precision MHz string with
@@ -964,18 +988,35 @@ mod tests {
     }
 
     #[test]
-    fn tune_target_for_pass_returns_full_tuning_triple() {
-        // Pin the (downlink_hz, demod_mode, bandwidth_hz) triple
-        // for a known catalog entry. A future refactor that splits
-        // or reorders the tuple — or that drifts the catalog
-        // values — fails here before reaching the play-button
-        // wiring layer.
+    fn tune_target_for_pass_returns_full_tuning_quadruple() {
+        // Pin the (downlink_hz, demod_mode, bandwidth_hz,
+        // imaging_protocol) quadruple for a known catalog entry.
+        // A future refactor that splits or reorders the tuple —
+        // or that drifts the catalog values — fails here before
+        // reaching the play-button wiring layer or the recorder.
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_pass(now, 30); // satellite = "NOAA 19"
         let target = tune_target_for_pass(&pass).expect("NOAA 19 is in catalog");
         assert_eq!(target.0, 137_100_000);
         assert_eq!(target.1, sdr_types::DemodMode::Nfm);
         assert_eq!(target.2, 38_000);
+        assert_eq!(target.3, Some(sdr_sat::ImagingProtocol::Apt));
+    }
+
+    #[test]
+    fn tune_target_for_pass_returns_none_protocol_for_meteor() {
+        // Meteor passes are in the catalog (so the play button +
+        // upcoming-passes display work) but `imaging_protocol`
+        // is None until Task 7 of epic #469. Recorder filters on
+        // this; play button does not.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let mut pass = synthetic_pass(now, 30);
+        pass.satellite = "METEOR-M 2".to_string();
+        let target = tune_target_for_pass(&pass).expect("METEOR-M 2 is in catalog");
+        assert_eq!(
+            target.3, None,
+            "Meteor protocol stays None until Task 7 wires the LRPT viewer"
+        );
     }
 
     #[test]
