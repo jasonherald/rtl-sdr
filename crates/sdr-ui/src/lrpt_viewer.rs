@@ -30,8 +30,14 @@
 //! (`Ctrl+Shift+L`). Activating it opens a viewer window and
 //! registers the shared `LrptImage` handle with the DSP
 //! controller via `UiToDsp::SetLrptImage`. Closing the window
-//! sends `UiToDsp::ClearLrptImage` so the decoder tap goes
-//! silent until the user reopens.
+//! is **purely a UI teardown** — the DSP capture stays running
+//! and the shared image keeps accumulating decoded rows so the
+//! recorder's LOS save still produces a per-pass directory.
+//! The decoder is gated by `current_mode == Lrpt` and the
+//! source-stop cleanup path (an explicit detach via
+//! `UiToDsp::ClearLrptImage` is reserved as future API surface
+//! and never sent today). Per `CodeRabbit` rounds 7 + 8 on PR
+//! #543.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1000,8 +1006,12 @@ fn show_toast_in<W: gtk4::prelude::IsA<gtk4::Window>>(window: &W, toast: adw::To
 /// activity-bar entry) opens a non-modal LRPT viewer window
 /// and informs the DSP controller about the shared image
 /// handle so the LRPT decoder tap starts pushing scan lines
-/// into it. Closing the window clears both the `AppState` slot
-/// and the DSP-side handle.
+/// into it. Closing the window clears the `AppState` slot
+/// (the GTK widget tree drops with the window) but leaves the
+/// DSP-side decoder + shared image attached so an in-flight
+/// auto-record pass keeps capturing — see the close-request
+/// comment in [`open_lrpt_viewer_if_needed`] and the
+/// module-level docs above for the lifecycle rationale.
 pub fn connect_lrpt_action(
     app: &adw::Application,
     parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
@@ -1020,7 +1030,9 @@ pub fn connect_lrpt_action(
 /// Open the LRPT viewer window if it isn't already open.
 /// Registers the new view in `state.lrpt_viewer`, hands the
 /// shared image to the DSP thread, and wires `close-request`
-/// to tear both down.
+/// to cancel the view's `glib` timers + drop the `AppState` slot.
+/// The DSP capture (decoder + shared image) intentionally
+/// outlives the window — see the close-request body for why.
 ///
 /// Pulled out of [`connect_lrpt_action`] so the auto-record
 /// path (Task 7.5) can fire the same open flow at AOS without
