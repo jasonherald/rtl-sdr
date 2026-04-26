@@ -1682,11 +1682,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetLrptImage(image) => {
             tracing::info!("LRPT image handle attached — decoder tap will push lines");
             state.lrpt_image = Some(image);
-            // Drop any existing decoder so the next tap call
-            // lazy-rebuilds against the new image handle.
-            // Otherwise scan lines would keep flowing into the
-            // *previous* pass's image.
-            state.lrpt_decoder = None;
+            // Decoder state intentionally NOT dropped here.
+            // `AppState::lrpt_image` is a long-lived singleton
+            // — every `SetLrptImage` carries the same handle —
+            // so reattach is logically a no-op for the decoder.
+            // Earlier draft dropped it defensively, but that
+            // turned the round-11 (`CodeRabbit` PR #543)
+            // defensive re-send in `open_lrpt_viewer_if_needed`
+            // into a mid-pass decoder reset that lost Viterbi /
+            // sync state on every viewer reuse. Decoder
+            // lifecycle stays owned by source-stop cleanup —
+            // same contract `ClearLrptImage` codifies (round 1).
         }
 
         UiToDsp::ClearLrptImage => {

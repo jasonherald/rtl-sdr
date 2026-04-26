@@ -1132,6 +1132,16 @@ pub fn open_lrpt_viewer_if_needed(
     state: &Rc<crate::state::AppState>,
 ) {
     if state.lrpt_viewer.borrow().is_some() {
+        // Defensive re-attach: if a future code path ever
+        // detaches the DSP-side image (today nothing sends
+        // `ClearLrptImage`, but a future refactor might), the
+        // existing-viewer fast-path would silently leave the
+        // tap muted. Re-sending `SetLrptImage` is idempotent
+        // — the controller's handler no longer drops the
+        // decoder on attach (round 11 paired change), so
+        // mid-pass decoder state survives the round-trip. Per
+        // `CodeRabbit` round 11 on PR #543.
+        state.send_dsp(UiToDsp::SetLrptImage(state.lrpt_image.clone()));
         return;
     }
     let Some(parent) = parent_provider() else {
