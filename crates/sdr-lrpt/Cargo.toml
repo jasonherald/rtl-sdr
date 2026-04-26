@@ -10,6 +10,10 @@ repository.workspace = true
 sdr-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# PNG export for the per-channel + composite outputs. Local dep
+# rather than workspace because no other crate uses it yet; hoist
+# to workspace.dependencies if a second consumer arrives.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 proptest = "1"
