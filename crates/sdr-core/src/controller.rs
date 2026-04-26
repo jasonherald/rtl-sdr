@@ -2816,15 +2816,17 @@ fn process_iq_block(
                             }
                         }
 
-                        // Apply volume with perceptual (power-law) scaling.
-                        // Quadratic curve maps the linear slider to perceived loudness.
-                        let vol = state.volume * state.volume;
-                        for s in &mut state.audio_buf[..audio_count] {
-                            s.l *= vol;
-                            s.r *= vol;
-                        }
-
-                        // Write to audio recording file (post-volume).
+                        // Write to audio recording file BEFORE the
+                        // volume scale (closes #532). The recorder is
+                        // a diagnostic artifact — it should capture
+                        // what the demodulator produced, not what the
+                        // speaker played. A muted overnight pass used
+                        // to fill 200+ MB of disk with all-zero
+                        // samples; the user only discovered the bug
+                        // when they tried to replay the WAV. Now the
+                        // recording is independent of the volume knob,
+                        // matching the APT decoder tap (line ~2632)
+                        // which is also pre-volume.
                         if let Some(writer) = &mut state.audio_writer
                             && let Err(e) = writer.write_stereo(&state.audio_buf[..audio_count])
                         {
@@ -2833,6 +2835,14 @@ fn process_iq_block(
                             let _ = dsp_tx
                                 .send(DspToUi::Error("Audio recording write failed".to_string()));
                             let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
+                        }
+
+                        // Apply volume with perceptual (power-law) scaling.
+                        // Quadratic curve maps the linear slider to perceived loudness.
+                        let vol = state.volume * state.volume;
+                        for s in &mut state.audio_buf[..audio_count] {
+                            s.l *= vol;
+                            s.r *= vol;
                         }
 
                         // Scanner mute: fill the audio buffer with
