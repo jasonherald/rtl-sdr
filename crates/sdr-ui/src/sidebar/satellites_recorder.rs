@@ -238,8 +238,17 @@ impl AutoRecorder {
     /// skipped — the state machine stays in `Idle` rather than
     /// transitioning to `BeforePass`, so no AOS-side actions
     /// fire and no LOS cleanup fires either.
+    ///
+    /// **Crate-private** so external callers can only use
+    /// [`Self::new`], which encodes today's "fully wired"
+    /// reality (`[Apt]`). Per CR round 2 on PR #541: exposing
+    /// the variadic builder publicly would let the wiring
+    /// layer opt into protocols whose LOS flow isn't actually
+    /// safe yet. When Task 7 of epic #469 finishes the LRPT
+    /// wiring, flip `new()` to default to `[Apt, Lrpt]` rather
+    /// than re-exporting this builder.
     #[must_use]
-    pub fn with_supported_protocols(supported: &[sdr_sat::ImagingProtocol]) -> Self {
+    fn with_supported_protocols(supported: &[sdr_sat::ImagingProtocol]) -> Self {
         Self {
             state: State::Idle,
             supported_protocols: supported.to_vec(),
@@ -507,10 +516,31 @@ impl AutoRecorder {
     }
 }
 
-// `is_apt_capable` removed in PR closing #514 — replaced by the
-// catalog-driven `imaging_protocol.is_some()` filter in
-// `tick_idle`. Adding a new protocol now only requires flipping
-// `imaging_protocol` on the `KnownSatellite` entry.
+// `is_apt_capable` removed in PR closing #514. Replaced by a
+// two-layer eligibility gate in `tick_idle`:
+//
+// 1. The catalog-driven `imaging_protocol.is_some()` check —
+//    keeps non-imaging satellites (Meteor / ISS today) out of
+//    the auto-record flow while still letting them surface in
+//    the upcoming-passes list and respond to the play button.
+//    Source of truth: [`sdr_sat::KnownSatellite::imaging_protocol`].
+//
+// 2. The `self.supported_protocols.contains(&protocol)` check —
+//    deny-by-default safety net keyed on what the wiring layer
+//    can actually handle in `interpret_action`. Without this,
+//    a catalog entry flipped to `Some(Lrpt)` ahead of Task 7
+//    wiring would still transition the state machine through
+//    `BeforePass → Recording → Finalizing`, so the LOS-side
+//    `SavePng` (no-op) and `RestoreTune` (clobbers user state)
+//    would fire even though the AOS side fail-closed. Per CR
+//    round 2 on PR #541. Source of truth: the
+//    `AutoRecorder::new()` constructor in this file.
+//
+// Adding a new protocol means: (a) add the variant to
+// `sdr_sat::ImagingProtocol`, (b) flip the relevant
+// `KnownSatellite::imaging_protocol`, (c) add a `match` arm in
+// `window.rs::interpret_action`, (d) update `new()` to include
+// the new protocol in the default supported set.
 
 /// Build the export path for a satellite + timestamp:
 /// `~/sdr-recordings/apt-NOAA-19-2026-04-25-143015.png`.
@@ -1282,16 +1312,30 @@ mod tests {
         // default), an APT-flagged catalog entry arms the
         // recorder as expected. Pins the negative-test contract
         // above by showing the gate is the only thing stopping
-        // the unsupported case.
+        // the unsupported case. Per CR round 2 on PR #541:
+        // assert the dispatched payload's `protocol` field
+        // explicitly so a future regression that ships
+        // `StartAutoRecord` with the wrong protocol (e.g. an
+        // off-by-one indexing into the catalog) fails here.
         let mut r = AutoRecorder::with_supported_protocols(&[sdr_sat::ImagingProtocol::Apt]);
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
         let actions = r.tick(now, &[pass], true, false, default_tune());
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::StartAutoRecord { .. })),
-            "supported protocol must arm the recorder",
+        let dispatched = actions.iter().find_map(|a| match a {
+            Action::StartAutoRecord {
+                satellite,
+                protocol,
+                ..
+            } => Some((satellite.clone(), *protocol)),
+            _ => None,
+        });
+        let (satellite, protocol) =
+            dispatched.expect("supported protocol must emit StartAutoRecord");
+        assert_eq!(satellite, "NOAA 19");
+        assert_eq!(
+            protocol,
+            sdr_sat::ImagingProtocol::Apt,
+            "dispatched protocol must match the catalog entry's flag",
         );
         assert!(matches!(r.state(), State::BeforePass { .. }));
     }
