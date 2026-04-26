@@ -38,6 +38,8 @@ use libadwaita::prelude::*;
 
 use sdr_dsp::apt::LINE_PIXELS;
 
+use crate::viewer::ViewerError;
+
 /// Maximum lines we'll keep in the renderer. NOAA APT bounds a pass
 /// at ~1800 lines (15 min × 2 lines/sec); 2048 leaves headroom for
 /// the longest plausible high-elevation pass without ever growing
@@ -178,13 +180,25 @@ impl AptImageRenderer {
     ///
     /// # Errors
     ///
-    /// Returns a stringified Cairo error on paint failure. Callers
-    /// usually log and continue — drawing failures shouldn't kill
-    /// the UI.
+    /// # Errors
+    ///
+    /// Returns [`ViewerError::Cairo`] if any of the Cairo
+    /// operations (`paint`, `save`, `restore`,
+    /// `set_source_surface`, `fill`) fail. Callers usually log
+    /// and continue — drawing failures shouldn't kill the UI.
+    /// Per issue #545 (was `Result<(), String>` before).
     #[allow(clippy::cast_precision_loss)]
-    pub fn render(&self, cr: &cairo::Context, width: i32, height: i32) -> Result<(), String> {
+    pub fn render(
+        &self,
+        cr: &cairo::Context,
+        width: i32,
+        height: i32,
+    ) -> Result<(), ViewerError> {
         cr.set_source_rgb(BACKGROUND_RGB[0], BACKGROUND_RGB[1], BACKGROUND_RGB[2]);
-        cr.paint().map_err(|e| format!("background paint: {e}"))?;
+        cr.paint().map_err(|e| ViewerError::Cairo {
+            op: "background paint",
+            source: e,
+        })?;
 
         if self.n_lines == 0 || width <= 0 || height <= 0 {
             return Ok(());
@@ -195,18 +209,30 @@ impl AptImageRenderer {
         let scale = (f64::from(width) / img_w).min(f64::from(height) / img_h);
         let off_x = (f64::from(width) - img_w * scale) / 2.0;
 
-        cr.save().map_err(|e| format!("save: {e}"))?;
+        cr.save().map_err(|e| ViewerError::Cairo {
+            op: "save",
+            source: e,
+        })?;
         cr.translate(off_x, 0.0);
         cr.scale(scale, scale);
         cr.set_source_surface(&self.surface, 0.0, 0.0)
-            .map_err(|e| format!("set_source_surface: {e}"))?;
+            .map_err(|e| ViewerError::Cairo {
+                op: "set_source_surface",
+                source: e,
+            })?;
         // Rectangle + fill clips the paint to the populated rows;
         // rows past n_lines stay alpha-0 in the surface and would
         // paint as nothing under `paint()` anyway, but clipping
         // here also bounds the layout area cleanly.
         cr.rectangle(0.0, 0.0, img_w, img_h);
-        cr.fill().map_err(|e| format!("image fill: {e}"))?;
-        cr.restore().map_err(|e| format!("restore: {e}"))?;
+        cr.fill().map_err(|e| ViewerError::Cairo {
+            op: "image fill",
+            source: e,
+        })?;
+        cr.restore().map_err(|e| ViewerError::Cairo {
+            op: "restore",
+            source: e,
+        })?;
         Ok(())
     }
 
@@ -220,16 +246,21 @@ impl AptImageRenderer {
     ///
     /// # Errors
     ///
-    /// Returns a stringified error from filesystem creation,
-    /// surface construction, paint operations, or Cairo's PNG
-    /// encoder.
+    /// Returns [`ViewerError::EmptyChannel`] (with `apid: None`
+    /// — APT has no APIDs) when there's nothing to export, or a
+    /// `Cairo` / `Io` / `PngEncode` variant on the failing step.
+    /// Per issue #545 (was `Result<(), String>` before).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn export_png(&self, path: &Path) -> Result<(), String> {
+    pub fn export_png(&self, path: &Path) -> Result<(), ViewerError> {
         if self.n_lines == 0 {
-            return Err("no APT image data to export".to_string());
+            return Err(ViewerError::EmptyChannel { apid: None });
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
+                op: "create_dir_all",
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
 
         let export_surface = cairo::ImageSurface::create(
@@ -237,22 +268,35 @@ impl AptImageRenderer {
             LINE_PIXELS as i32,
             self.n_lines as i32,
         )
-        .map_err(|e| format!("export surface: {e}"))?;
-        let cr =
-            cairo::Context::new(&export_surface).map_err(|e| format!("export context: {e}"))?;
+        .map_err(|e| ViewerError::Cairo {
+            op: "export surface",
+            source: e,
+        })?;
+        let cr = cairo::Context::new(&export_surface).map_err(|e| ViewerError::Cairo {
+            op: "export context",
+            source: e,
+        })?;
         cr.set_source_surface(&self.surface, 0.0, 0.0)
-            .map_err(|e| format!("export set_source_surface: {e}"))?;
+            .map_err(|e| ViewerError::Cairo {
+                op: "export set_source_surface",
+                source: e,
+            })?;
         // LINE_PIXELS / n_lines are both bounded by MAX_LINES — well
         // under f64's 52-bit mantissa, no real precision loss.
         #[allow(clippy::cast_precision_loss)]
         cr.rectangle(0.0, 0.0, LINE_PIXELS as f64, self.n_lines as f64);
-        cr.fill().map_err(|e| format!("export fill: {e}"))?;
+        cr.fill().map_err(|e| ViewerError::Cairo {
+            op: "export fill",
+            source: e,
+        })?;
         drop(cr);
 
-        let mut file = std::fs::File::create(path).map_err(|e| format!("file: {e}"))?;
-        export_surface
-            .write_to_png(&mut file)
-            .map_err(|e| format!("png: {e}"))?;
+        let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
+            op: "file create",
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        export_surface.write_to_png(&mut file)?;
         tracing::info!(?path, lines = self.n_lines, "APT image exported to PNG");
         Ok(())
     }
@@ -360,8 +404,10 @@ impl AptImageView {
     ///
     /// # Errors
     ///
-    /// Propagates any error from the underlying renderer.
-    pub fn export_png(&self, path: &Path) -> Result<(), String> {
+    /// Propagates any [`ViewerError`] from the underlying
+    /// renderer (per issue #545 — was `Result<(), String>`
+    /// before).
+    pub fn export_png(&self, path: &Path) -> Result<(), ViewerError> {
         self.renderer.borrow().export_png(path)
     }
 
