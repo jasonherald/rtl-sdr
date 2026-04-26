@@ -48,13 +48,22 @@ use sdr_radio::lrpt_image::LrptImage;
 
 use crate::messages::UiToDsp;
 
-/// Maximum lines we'll keep per channel. A Meteor-M LRPT pass
-/// runs ~10 min and AVHRR-on-Meteor scan lines arrive at
-/// roughly 1 Hz, so ~600 lines is a typical full pass; 1024
-/// gives comfortable headroom for the longest plausible
-/// high-elevation pass without ever growing the surface at
-/// runtime.
-pub const MAX_LINES: usize = 1_024;
+/// Maximum lines we'll keep per channel. The MSU-MR scanner on
+/// Meteor-M produces AVHRR-style imagery at ~6 scan lines per
+/// second per channel; a long high-elevation pass (~15 min above
+/// horizon) is therefore ~5400 lines, and a typical 10-min pass
+/// is ~3600. 8192 gives ~2× headroom for the longest plausible
+/// pass without ever growing the surface at runtime — the
+/// previous 1024 cap clipped roughly the last 80 % of even a
+/// nominal pass. Per `CodeRabbit` round 2 on PR #543.
+///
+/// Memory cost is lazy: the per-APID Cairo surface only
+/// allocates when that channel first receives a line. At the
+/// cap, one channel is `IMAGE_WIDTH × MAX_LINES × 4 B` ≈ 51 MB.
+/// A typical pass with three active AVHRR channels therefore
+/// peaks around 150 MB, which matches the rest of the SDR
+/// pipeline's working-set budget.
+pub const MAX_LINES: usize = 8_192;
 
 /// Background colour painted before any LRPT data is received
 /// (and behind the image when the widget is wider than the
@@ -518,6 +527,12 @@ impl LrptImageView {
                     continue;
                 }
                 let known = renderer.channels.contains_key(&apid);
+                // Track lines actually pushed so the bounds-guard
+                // skip path can't permanently strand un-copied
+                // rows. Same fix as `lrpt_decoder::harvest_new_lines`
+                // — the parallel watermark on the DSP side. Per
+                // `CodeRabbit` round 2 on PR #543.
+                let mut pushed = already;
                 for line_idx in already..channel.lines {
                     let start = line_idx * IMAGE_WIDTH;
                     let end = start + IMAGE_WIDTH;
@@ -532,8 +547,9 @@ impl LrptImageView {
                         break;
                     }
                     renderer.push_line(apid, &channel.pixels[start..end]);
+                    pushed = line_idx + 1;
                 }
-                last_seen.insert(apid, channel.lines);
+                last_seen.insert(apid, pushed);
                 if !known {
                     new_apids.push(apid);
                 }
