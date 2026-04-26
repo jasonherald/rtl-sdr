@@ -195,11 +195,19 @@ impl LrptPipeline {
             let mcu_col = (mcu_id + m) as usize;
             // mcu_id is a single payload byte (0-255) and m is
             // 0..14, so mcu_col can reach 268 — past the 196
-            // MCUS_PER_LINE bound. ImageAssembler::place_mcu
-            // silently drops out-of-bounds columns, but it's
-            // worth a trace because it indicates a corrupt
-            // packet header (post-RS miscorrection or upstream
-            // demux desync).
+            // MCUS_PER_LINE bound. Skip the place_mcu call
+            // entirely on out-of-range columns: place_mcu's
+            // internal guard would drop the block, but only
+            // AFTER growing the channel buffer's row count
+            // (composite.rs: needed_lines extension runs before
+            // the column check), so a corrupt mcu_id would
+            // permanently inflate channel height with blank
+            // rows. Per CR round 3.
+            //
+            // Trace surfaces the corruption so it's visible in
+            // debug logs without breaking real-time flow.
+            // Causes upstream: post-RS miscorrection of the
+            // packet header byte, or demux desync.
             if mcu_col >= MCUS_PER_LINE {
                 tracing::trace!(
                     "out-of-range mcu_col {mcu_col} (max {max}) on APID {apid} packet {pkt}",
@@ -207,6 +215,7 @@ impl LrptPipeline {
                     apid = packet.apid,
                     pkt = packet.sequence_count,
                 );
+                continue;
             }
             self.assembler
                 .place_mcu(packet.apid, mcu_row, mcu_col, &block);
@@ -495,6 +504,34 @@ mod tests {
         assert!(
             p.decoders.is_empty(),
             "all-zero VCDU yields no image packets"
+        );
+    }
+
+    #[test]
+    fn consume_packet_skips_place_mcu_on_out_of_range_column() {
+        // CR round 3: when mcu_id pushes mcu_col past the
+        // MCUS_PER_LINE bound (e.g. corrupt packet header
+        // post-RS miscorrection), the place_mcu call must be
+        // skipped entirely — not just have its block silently
+        // dropped after the channel buffer's row count was
+        // already grown. Otherwise corrupt packets would
+        // permanently inflate channel height with blank rows.
+        //
+        // mcu_id = 200 + the loop's m ∈ 0..14 → mcu_col ranges
+        // from 200 to 213, all past MCUS_PER_LINE = 196.
+        let mut p = LrptPipeline::new();
+        let mut pkt = synthetic_image_packet(64, 100);
+        pkt.payload[0] = 200; // overwrite the mcu_id byte
+        p.consume_packet(&pkt);
+        // Channel state was created (we passed the early
+        // returns), and the JPEG decode loop ran successfully
+        // for all 14 MCUs — but every placement was skipped
+        // because the columns were out of range. The assembler
+        // must NOT have inflated the channel buffer.
+        assert!(p.decoders.contains_key(&64));
+        assert!(
+            p.assembler.channel(64).is_none(),
+            "out-of-range columns must skip place_mcu entirely",
         );
     }
 }

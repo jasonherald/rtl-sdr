@@ -225,16 +225,32 @@ impl JpegDecoder {
                 }
                 break;
             }
+            // Pre-validate that the AC symbol won't run past
+            // coefficient 63 BEFORE writing any zeros or fetching
+            // any value bits. Without this, an AC symbol whose
+            // run + value would land on k > 63 used to break the
+            // loop mid-symbol, leaving `bit_offset` part-way
+            // through the value bits and desyncing the next MCU.
+            // Per CR round 3.
+            //
+            // `needed` slots:
+            //   size > 0          : run zeros + 1 coefficient
+            //   run == 15, size 0 : ZRL writes 16 zeros total
+            //   anything else with size == 0 is invalid AC code
+            let needed = if ac.size > 0 {
+                usize::from(ac.run) + 1
+            } else if ac.run == 15 {
+                16
+            } else {
+                return Err(JpegError::BadAcCode);
+            };
+            if k + needed > MCU_SAMPLES {
+                return Err(JpegError::BadAcCode);
+            }
             // Skip `run` zeros then place the next coefficient.
             for _ in 0..ac.run {
-                if k >= 64 {
-                    break;
-                }
                 zdct[k] = 0.0;
                 k += 1;
-            }
-            if k >= 64 {
-                break;
             }
             if ac.size > 0 {
                 let n = fetch_n_bits(bytes, bit_offset, ac.size as usize)?;
@@ -245,10 +261,10 @@ impl JpegDecoder {
                 let coeff = map_range(ac.size, n) as f32;
                 zdct[k] = coeff;
                 k += 1;
-            } else if ac.run == 15 {
-                // ZRL: 16 zeros + no value (run=15 case writes
-                // one extra zero on top of the run we already
-                // wrote above).
+            } else {
+                // ZRL — guaranteed by the `needed` branch above
+                // (run == 15, size == 0). Writes one extra zero
+                // on top of the 15 the run loop already wrote.
                 zdct[k] = 0.0;
                 k += 1;
             }
@@ -886,6 +902,53 @@ mod tests {
         assert!(
             matches!(result, Err(JpegError::EndOfStream)),
             "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn decode_mcu_rejects_ac_run_past_coefficient_63() {
+        // CR round 3: an AC symbol whose run + value would land
+        // past coefficient 63 must be rejected as a malformed
+        // code rather than silently breaking the AC loop and
+        // leaving bit_offset mid-symbol.
+        //
+        // Trigger: DC=0 (cat 0, code "00", 2 bits) then 4 × ZRL.
+        // Each ZRL writes 16 zeros — after 3 ZRLs k = 1 + 48 = 49,
+        // and the 4th ZRL needs 16 more slots which would land at
+        // k = 65, tripping the `k + needed > MCU_SAMPLES` guard.
+        //
+        // ZRL's actual code value depends on the AC table walk
+        // order, so look it up rather than hardcoding the bits.
+        let decoder = JpegDecoder::new();
+        let zrl = decoder
+            .ac_table
+            .iter()
+            .find(|e| e.run == 15 && e.size == 0)
+            .expect("ZRL must exist in AC table");
+
+        // Pack DC "00" (2 zero bits — already in the bit
+        // accumulator) + 4 × ZRL code, MSB-first.
+        let mut bits: u64 = 0;
+        let mut nbits: u32 = 2;
+        for _ in 0..4 {
+            bits = (bits << zrl.len) | u64::from(zrl.code);
+            nbits += u32::from(zrl.len);
+        }
+        let pad = (8 - (nbits % 8)) % 8;
+        bits <<= pad;
+        let total_bytes = (nbits + pad) as usize / 8;
+        let mut bytes = vec![0_u8; total_bytes];
+        for i in (0..total_bytes).rev() {
+            bytes[i] = (bits & 0xFF) as u8;
+            bits >>= 8;
+        }
+
+        let mut dec = JpegDecoder::new();
+        let mut bit_offset = 0_usize;
+        let result = dec.decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH);
+        assert!(
+            matches!(result, Err(JpegError::BadAcCode)),
+            "4x ZRL overshoots coefficient 63; expected BadAcCode, got {result:?}"
         );
     }
 }
