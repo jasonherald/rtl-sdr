@@ -68,6 +68,13 @@ pub enum State {
         /// took over. Restored at LOS so the user comes back to
         /// whatever they were listening to.
         saved_tune: SavedTune,
+        /// PNG export path computed at AOS using the AOS
+        /// timestamp. Stored on state so the LOS-side
+        /// `Action::SavePng` uses the same timestamp as
+        /// `audio_path` — without this the filenames would
+        /// differ by exactly the pass duration (CR round 1
+        /// on PR #534).
+        png_path: PathBuf,
         /// Audio recording path the wiring layer was asked to
         /// open at AOS. `Some(path)` means we'll fire
         /// [`Action::StopAutoAudioRecord`] at LOS to close it
@@ -83,6 +90,7 @@ pub enum State {
     Recording {
         pass: Pass,
         saved_tune: SavedTune,
+        png_path: PathBuf,
         audio_path: Option<PathBuf>,
     },
     /// Pass ended; PNG export and tune restore are pending. This
@@ -236,13 +244,15 @@ impl AutoRecorder {
                 pass,
                 tuned_at,
                 saved_tune,
+                png_path,
                 audio_path,
-            } => self.tick_before_pass(now, pass, tuned_at, saved_tune, audio_path),
+            } => self.tick_before_pass(now, pass, tuned_at, saved_tune, png_path, audio_path),
             State::Recording {
                 pass,
                 saved_tune,
+                png_path,
                 audio_path,
-            } => self.tick_recording(now, pass, saved_tune, audio_path),
+            } => self.tick_recording(now, pass, saved_tune, png_path, audio_path),
             State::Finalizing {
                 pass,
                 saved_tune,
@@ -306,6 +316,13 @@ impl AutoRecorder {
             // Fall through: pass is in the lead-in window OR has
             // already started (we missed the lead — start tuning
             // immediately).
+            //
+            // Both filenames use the AOS timestamp so PNG and
+            // WAV pair by string match. CR round 1 on PR #534
+            // caught the prior bug: png_path_for was called at
+            // LOS while audio_path_for was called at AOS, so a
+            // 10-min pass produced filenames 10 min apart.
+            let png_path = png_path_for(pass, now);
             let audio_path = audio_record_on.then(|| audio_path_for(pass, now));
             let mut actions = Vec::with_capacity(3);
             actions.push(Action::StartAutoRecord {
@@ -336,6 +353,7 @@ impl AutoRecorder {
                 pass: pass.clone(),
                 tuned_at: now,
                 saved_tune: now_tune,
+                png_path,
                 audio_path,
             };
             return actions;
@@ -349,6 +367,7 @@ impl AutoRecorder {
         pass: Pass,
         tuned_at: DateTime<Utc>,
         saved_tune: SavedTune,
+        png_path: PathBuf,
         audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         // LOS already arrived (e.g. the 1 Hz driver stalled on a
@@ -356,9 +375,9 @@ impl AutoRecorder {
         // entirely inside the settle window). Skip straight to
         // finalizing AND emit the SavePng — otherwise we'd jump
         // to Idle on the next tick without ever exporting the
-        // image.
+        // image. `png_path` was computed at AOS so the filename
+        // pairs with `audio_path`.
         if pass.end <= now {
-            let png_path = png_path_for(&pass, now);
             let mut actions = Vec::with_capacity(2);
             actions.push(Action::SavePng(png_path.clone()));
             if audio_path.is_some() {
@@ -376,6 +395,7 @@ impl AutoRecorder {
             self.state = State::Recording {
                 pass,
                 saved_tune,
+                png_path,
                 audio_path,
             };
         }
@@ -387,6 +407,7 @@ impl AutoRecorder {
         now: DateTime<Utc>,
         pass: Pass,
         saved_tune: SavedTune,
+        png_path: PathBuf,
         audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         if pass.end <= now {
@@ -395,8 +416,8 @@ impl AutoRecorder {
             // export's actual outcome). Announcing "image saved"
             // here would lie if the user closed the viewer
             // mid-pass or `export_png` errored on disk-full /
-            // permissions.
-            let png_path = png_path_for(&pass, now);
+            // permissions. `png_path` was computed at AOS so
+            // the filename pairs with `audio_path`.
             let mut actions = Vec::with_capacity(2);
             actions.push(Action::SavePng(png_path.clone()));
             if audio_path.is_some() {
@@ -873,29 +894,112 @@ mod tests {
     }
 
     #[test]
-    fn audio_path_pairs_with_png_path() {
-        // PNG and WAV must share the same satellite slug + local
-        // timestamp so a post-pass file picker can pair them by
-        // filename match. Per #533. Locking both paths together
-        // here also serves as a regression test against a future
-        // refactor that splits the timestamp between the two.
+    fn audio_path_pairs_with_png_path_on_same_timestamp() {
+        // Helper-function level pairing: with the same timestamp
+        // input, PNG and WAV stems differ only in the "apt-" /
+        // "audio-" prefix and the extension. This is the
+        // contract `pass_recording_path` is supposed to enforce.
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 30, 15).unwrap();
         let pass = synthetic_noaa19(now, 0, 720, 50.0);
         let png = png_path_for(&pass, now);
         let audio = audio_path_for(&pass, now);
         let png_stem = png.file_stem().unwrap().to_string_lossy().to_string();
         let audio_stem = audio.file_stem().unwrap().to_string_lossy().to_string();
-        // Strip the prefix differences ("apt-" vs "audio-") and
-        // confirm the rest (slug + timestamp) matches verbatim.
         let png_tail = png_stem.strip_prefix("apt-").unwrap();
         let audio_tail = audio_stem.strip_prefix("audio-").unwrap();
         assert_eq!(png_tail, audio_tail, "slug+timestamp must match");
-        // Extension differs, parent dir matches.
         assert_eq!(png.parent(), audio.parent());
         assert!(
             audio
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+        );
+    }
+
+    #[test]
+    fn audio_and_png_paths_share_aos_timestamp_across_pass_duration() {
+        // CR round 1 on PR #534 caught the production bug the
+        // previous unit test missed: png_path_for was called at
+        // LOS while audio_path_for was called at AOS, so a
+        // typical 10-15 minute pass produced filenames that
+        // differed by the entire pass duration — breaking the
+        // "pair by filename match" contract.
+        //
+        // Drive the state machine through a real AOS → settle →
+        // LOS transition, capturing the audio path the recorder
+        // emitted at AOS and the png path it emitted at LOS,
+        // then assert their timestamp tails match. Without the
+        // pre-compute-png-at-AOS fix this test fails by exactly
+        // the pass duration.
+        let mut r = AutoRecorder::new();
+        let now_aos = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        // Pass starts in 3 s (inside the 5 s lead-in window),
+        // lasts 720 s — large enough that an LOS-timestamped
+        // png_path would be obviously wrong vs the AOS-
+        // timestamped audio_path (12-minute delta).
+        let pass = synthetic_noaa19(now_aos, 3, 720, 50.0);
+
+        // AOS — capture the audio path the recorder asked for.
+        let aos_actions = r.tick(
+            now_aos,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        let audio_path = aos_actions
+            .iter()
+            .find_map(|a| match a {
+                Action::StartAutoAudioRecord(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("StartAutoAudioRecord at AOS");
+
+        // Settle, then LOS at a wall-clock time clearly after
+        // AOS. If png_path were re-computed at LOS, this delta
+        // would surface as a different timestamp in the PNG
+        // filename.
+        let after_settle = now_aos + ChronoDuration::seconds(SETTLE_SECS + 1);
+        r.tick(
+            after_settle,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        let los_plus = pass.end + ChronoDuration::seconds(1);
+        let los_actions = r.tick(
+            los_plus,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        let png_path = los_actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SavePng(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("SavePng at LOS");
+
+        // The defining assertion: the timestamp tail of the PNG
+        // matches the timestamp tail of the WAV. Strip the
+        // "apt-NOAA-19-" / "audio-NOAA-19-" prefix and compare
+        // verbatim.
+        let png_stem = png_path.file_stem().unwrap().to_string_lossy().to_string();
+        let audio_stem = audio_path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let png_ts = png_stem.strip_prefix("apt-NOAA-19-").unwrap();
+        let audio_ts = audio_stem.strip_prefix("audio-NOAA-19-").unwrap();
+        assert_eq!(
+            png_ts, audio_ts,
+            "PNG and WAV must share the AOS timestamp (regression: \
+             pre-fix produced png={png_ts} vs audio={audio_ts}, \
+             differing by the pass duration)",
         );
     }
 
