@@ -413,9 +413,6 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // Set initial status bar values and mode-specific control visibility.
     if let Some(mode) = demod_selector::index_to_demod_mode(demod_dropdown.selected()) {
         let label = header::demod_mode_label(mode);
-        let bw = panels.radio.bandwidth_row.value();
-        status_bar.update_demod(label, bw);
-
         panels.radio.apply_demod_visibility(mode);
         // Seed the bandwidth row's allowed range to the initial
         // demod (WFM by default — 50 kHz to 250 kHz). Without
@@ -423,7 +420,14 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         // [100 Hz, 250 kHz] envelope until the user changes
         // mode for the first time, letting them dial out-of-range
         // values that the demod silently rejects (issue #505).
-        update_bandwidth_row_range_for_mode(&panels.radio, mode);
+        update_bandwidth_row_range_for_mode(&panels.radio, &state, mode);
+        // Status-bar bandwidth read AFTER the clamp so a saved
+        // out-of-range value (e.g. an older config restoring an
+        // 80 kHz NFM bandwidth) shows the corrected value rather
+        // than the stale pre-clamp one. Per `CodeRabbit` round 1
+        // on PR #548 (outside-diff item).
+        let bw = panels.radio.bandwidth_row.value();
+        status_bar.update_demod(label, bw);
     }
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
@@ -1071,10 +1075,10 @@ fn handle_dsp_message(
             update_vfo_reset_button_visibility(radio_panel, spectrum_handle, state);
             // Retune the bandwidth row's allowed range to the
             // new mode's [min, max] so the user can't dial a
-            // value the demod will silently reject. Also clamps
-            // the current value into the new range — see issue
-            // #505 for why this matters.
-            update_bandwidth_row_range_for_mode(radio_panel, new_mode);
+            // value the demod will silently reject. Helper
+            // self-suppresses around its auto-clamp — see issue
+            // #505 + CR round 1 on PR #548 for why.
+            update_bandwidth_row_range_for_mode(radio_panel, state, new_mode);
         }
         DspToUi::BandwidthChanged(bw) => {
             // DSP-confirmed bandwidth change. Update BOTH the
@@ -1264,7 +1268,13 @@ fn handle_dsp_message(
                 // previous mode's range would be silently
                 // clamped here and the displayed value would
                 // drift from the actually-applied filter (#505).
-                update_bandwidth_row_range_for_mode(radio_panel, demod_mode);
+                // The helper self-suppresses around its own
+                // auto-clamp, so we don't need to wrap that call
+                // in the suppress flag — only the explicit
+                // `set_value` for the scanner-supplied bandwidth
+                // below needs suppression. Per `CodeRabbit`
+                // round 1 on PR #548.
+                update_bandwidth_row_range_for_mode(radio_panel, state, demod_mode);
                 state.suppress_bandwidth_notify.set(true);
                 radio_panel.bandwidth_row.set_value(bandwidth);
                 state.suppress_bandwidth_notify.set(false);
@@ -7252,14 +7262,27 @@ fn update_bandwidth_reset_sensitivity(radio: &sidebar::radio_panel::RadioPanel, 
 /// Also clamps the row's current value into the new range —
 /// without that, switching from WFM at 200 kHz to NFM would
 /// leave the displayed 200 kHz reading stale until the user
-/// manually adjusts. Setting the value here triggers the
-/// `connect_value_notify` handler, which dispatches a
-/// `SetBandwidth` to the controller. That's the right
-/// behaviour: the controller's `SetBandwidth` handler also
-/// calls `set_bandwidth` on the radio module, which would
-/// otherwise still hold the stale 200 kHz internally.
+/// manually adjusts.
+///
+/// **Self-suppresses `value-notify` around the auto-clamp
+/// `set_value`.** Without that suppression, the clamp would
+/// route through the spin-row's `connect_value_notify` handler
+/// — which is the MANUAL-bandwidth-change path. That path
+/// fires `force_disable.trigger("manual bandwidth change")`,
+/// which would stop the scanner mid-retune (the scanner-driven
+/// mode-change path calls this helper before its own
+/// `set_value`), and dispatch a redundant `SetBandwidth`
+/// command. Per `CodeRabbit` round 1 on PR #548. The clamp is
+/// programmatic (the UI snapping to a mode change), not user
+/// input, so no manual-side effects should fire.
+///
+/// The DSP doesn't need to be told about the clamp — the
+/// caller is responsible for sending its own `SetBandwidth`
+/// (or, in the DSP-echo case, the controller already changed
+/// the bandwidth as part of the mode change).
 fn update_bandwidth_row_range_for_mode(
     radio: &sidebar::radio_panel::RadioPanel,
+    state: &AppState,
     mode: sdr_types::DemodMode,
 ) {
     let Ok(min_bw) = sdr_radio::demod::min_bandwidth_for_mode(mode) else {
@@ -7280,10 +7303,21 @@ fn update_bandwidth_row_range_for_mode(
     adj.set_lower(min_bw);
     adj.set_upper(max_bw);
     let current = radio.bandwidth_row.value();
-    if current < min_bw {
-        radio.bandwidth_row.set_value(min_bw);
+    let target = if current < min_bw {
+        Some(min_bw)
     } else if current > max_bw {
-        radio.bandwidth_row.set_value(max_bw);
+        Some(max_bw)
+    } else {
+        None
+    };
+    if let Some(new_value) = target {
+        // Suppress only around the actual `set_value` — keep
+        // the suppress window as narrow as possible so a
+        // genuinely-user-driven `value-notify` racing the GTK
+        // main loop can't accidentally get swallowed.
+        state.suppress_bandwidth_notify.set(true);
+        radio.bandwidth_row.set_value(new_value);
+        state.suppress_bandwidth_notify.set(false);
     }
 }
 

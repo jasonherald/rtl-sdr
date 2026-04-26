@@ -299,12 +299,30 @@ mod tests {
 
     #[test]
     fn min_bandwidth_for_mode_pins_known_values() {
-        // Specific values from the issue triage on #505 — if any
-        // of these change, that's a UX-affecting bandwidth
-        // boundary shift and the panel range calc needs revisit.
-        assert!((max_bandwidth_for_mode(DemodMode::Nfm).unwrap() - 50_000.0).abs() < f64::EPSILON);
-        assert!((max_bandwidth_for_mode(DemodMode::Wfm).unwrap() - 250_000.0).abs() < f64::EPSILON);
-        assert!((max_bandwidth_for_mode(DemodMode::Cw).unwrap() - 500.0).abs() < f64::EPSILON);
-        assert!((min_bandwidth_for_mode(DemodMode::Cw).unwrap() - 50.0).abs() < f64::EPSILON);
+        // Per-mode bandwidth boundaries the panel range calc
+        // relies on. Named constants rather than inline literals
+        // so a future boundary shift is auditable in diffs. Per
+        // `CodeRabbit` round 1 on PR #548.
+        const EXPECTED_NFM_MAX_BW_HZ: f64 = 50_000.0;
+        const EXPECTED_WFM_MAX_BW_HZ: f64 = 250_000.0;
+        const EXPECTED_CW_MAX_BW_HZ: f64 = 500.0;
+        const EXPECTED_CW_MIN_BW_HZ: f64 = 50.0;
+
+        assert!(
+            (max_bandwidth_for_mode(DemodMode::Nfm).unwrap() - EXPECTED_NFM_MAX_BW_HZ).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (max_bandwidth_for_mode(DemodMode::Wfm).unwrap() - EXPECTED_WFM_MAX_BW_HZ).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (max_bandwidth_for_mode(DemodMode::Cw).unwrap() - EXPECTED_CW_MAX_BW_HZ).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (min_bandwidth_for_mode(DemodMode::Cw).unwrap() - EXPECTED_CW_MIN_BW_HZ).abs()
+                < f64::EPSILON
+        );
     }
 }

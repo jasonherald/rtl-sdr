@@ -313,11 +313,20 @@ impl SpectrumHandle {
     /// during the gesture, so this method isn't on their hot
     /// path — it exists for the panel-side and DSP-echo
     /// reflection paths. Per issue #504.
+    ///
+    /// **No clamping here.** The drag path uses
+    /// [`vfo_overlay::VfoState::clamp_bandwidth`] which enforces
+    /// a global `[500 Hz, 250 kHz]` envelope — appropriate as a
+    /// safety net for unbounded user drag input, but wrong for
+    /// values arriving via DSP echo. Those values have already
+    /// been clamped to the active demod's actual `[min, max]`
+    /// (CW: `[50, 500]`, NFM: `[1k, 50k]`, etc.) by the demod's
+    /// own `set_bandwidth`. Re-clamping to the global envelope
+    /// here would push CW's 50 Hz bandwidth back up to 500 Hz,
+    /// desyncing the visible width from the actual filter. Per
+    /// `CodeRabbit` round 1 on PR #548.
     pub fn set_vfo_bandwidth(&self, bandwidth_hz: f64) {
-        let mut vfo = self.vfo_state.borrow_mut();
-        vfo.bandwidth_hz = bandwidth_hz;
-        vfo.clamp_bandwidth();
-        drop(vfo);
+        self.vfo_state.borrow_mut().bandwidth_hz = bandwidth_hz;
         self.fft_area.queue_draw();
         self.waterfall_area.queue_draw();
     }
