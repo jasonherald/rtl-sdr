@@ -1099,11 +1099,24 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
 }
 
 /// Default path the Export PNG button writes to:
-/// `~/sdr-recordings/lrpt-{apid}-YYYY-MM-DD-HHMMSS.png`.
+/// `~/sdr-recordings/lrpt-{apid}-YYYY-MM-DD-HHMMSS-uuuuuu.png`.
+///
+/// The microsecond suffix prevents collisions when the user
+/// rapid-fires the export button on the same channel within the
+/// same second — without it, the second export silently
+/// overwrote the first via `File::create`'s truncate semantics.
+/// Per `CodeRabbit` round 13 on PR #543.
 fn default_export_path(apid: Option<u16>) -> PathBuf {
     let timestamp = glib::DateTime::now_local()
-        .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
-        .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
+        .as_ref()
+        .ok()
+        .and_then(|dt| {
+            let stamp = dt.format("%Y-%m-%d-%H%M%S").ok()?;
+            // glib's `microsecond()` is 0..=999_999, zero-padded
+            // to 6 digits keeps lexical-sort matching wall-clock.
+            Some(format!("{stamp}-{usec:06}", usec = dt.microsecond()))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     let apid_part = apid.map_or_else(|| "unknown".to_string(), |a| format!("apid{a}"));
     glib::home_dir()
         .join("sdr-recordings")
@@ -1175,6 +1188,21 @@ pub fn open_lrpt_viewer_if_needed(
         // mid-pass decoder state survives the round-trip. Per
         // `CodeRabbit` round 11 on PR #543.
         state.send_dsp(UiToDsp::SetLrptImage(state.lrpt_image.clone()));
+        // Raise the existing window so `Ctrl+Shift+L` actually
+        // surfaces a buried / minimised viewer instead of being
+        // a silent no-op. Weak-ref upgrade fails closed: if the
+        // window is gone but the AppState slot wasn't cleared
+        // yet (close-request race), we just skip — the slot
+        // will clear momentarily anyway. Per `CodeRabbit`
+        // round 13 on PR #543.
+        if let Some(window) = state
+            .lrpt_viewer_window
+            .borrow()
+            .as_ref()
+            .and_then(glib::WeakRef::upgrade)
+        {
+            window.present();
+        }
         return;
     }
     let Some(parent) = parent_provider() else {
@@ -1184,6 +1212,7 @@ pub fn open_lrpt_viewer_if_needed(
     let image = state.lrpt_image.clone();
     let (view, window) = open_lrpt_viewer_window(&parent, "Meteor-M LRPT", image.clone());
     *state.lrpt_viewer.borrow_mut() = Some(view);
+    *state.lrpt_viewer_window.borrow_mut() = Some(window.downgrade());
     state.send_dsp(UiToDsp::SetLrptImage(image));
 
     let state_for_close = Rc::clone(state);
@@ -1197,6 +1226,7 @@ pub fn open_lrpt_viewer_if_needed(
             view.shutdown();
         }
         *state_for_close.lrpt_viewer.borrow_mut() = None;
+        *state_for_close.lrpt_viewer_window.borrow_mut() = None;
         // Deliberately NOT sending `UiToDsp::ClearLrptImage`
         // here — the DSP-side decoder + shared image stay
         // attached so the DSP keeps decoding into the shared
