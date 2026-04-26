@@ -283,8 +283,10 @@ hand-export from the viewer after fixing the underlying issue.
 
 - **Meteor-M LRPT** (epic [#469](https://github.com/jasonherald/rtl-sdr/issues/469))
   — Russian polar weather satellites at 137 MHz, digital
-  modulation, full-colour images. Same antenna works. Decoder
-  isn't shipped yet (LRPT is a separate codebase from APT).
+  modulation, multi-channel imagery. Same antenna works.
+  Shipped end-to-end — see
+  [`lrpt-reception.md`](lrpt-reception.md) for the
+  walkthrough.
 - **ISS SSTV** (epic [#472](https://github.com/jasonherald/rtl-sdr/issues/472))
   — the International Space Station occasionally broadcasts
   SSTV images on 145.800 MHz during commemoration events.

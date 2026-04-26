@@ -130,7 +130,7 @@ Four config keys per side live in `activity_bar.rs`: `ui_sidebar_{left,right}_{s
 
 ### Satellite reception
 
-NOAA APT (epic #468) is shipped end-to-end. Future weather-sat work (Meteor-M LRPT #469, ISS SSTV #472) will reuse the same scaffolding.
+NOAA APT (epic #468) and Meteor-M LRPT (epic #469) are both shipped end-to-end. ISS SSTV (#472) is the remaining weather-sat epic and will reuse the same scaffolding.
 
 **Key files:**
 
@@ -142,10 +142,17 @@ NOAA APT (epic #468) is shipped end-to-end. Future weather-sat work (Meteor-M LR
 - `crates/sdr-ui/src/sidebar/satellites_panel.rs` — Satellites activity panel: ground-station entry, TLE refresh, upcoming passes list, auto-record toggle.
 - `crates/sdr-ui/src/sidebar/satellites_recorder.rs` — Auto-record state machine (Idle → BeforePass → Recording → Finalizing). **Pure** — `tick()` returns `Vec<Action>`, the wiring layer in `window.rs::connect_satellites_panel` interprets each. Keep state-machine logic in this module so it stays unit-testable without a GTK harness.
 - `crates/sdr-ui/src/apt_viewer.rs` — Live image viewer window with Pause/Resume + Export PNG header buttons.
+- `crates/sdr-radio/src/lrpt_decoder.rs` — LRPT counterpart of `apt_decode_tap`: bridges the post-VFO IQ buffer to `LrptDemod` (QPSK) → `LrptPipeline` (Viterbi → ASM sync → derand → RS → demux → JPEG) → `LrptImage` shared assembler. Per-APID line watermark prevents double-push.
+- `crates/sdr-radio/src/demod/lrpt.rs` — `LrptDemodulator`: silent-passthrough demod that pins `RadioModule`'s IF rate to 144 ksps (`sdr_dsp::lrpt::SAMPLE_RATE_HZ`) so the controller's `lrpt_decode_tap` reads `radio_input` at the rate the QPSK demod expects.
+- `crates/sdr-ui/src/lrpt_viewer.rs` — Multi-channel live LRPT viewer with per-APID Cairo surfaces, dynamic channel dropdown, Pause/Resume + Export PNG header buttons. Polls the shared `LrptImage` at 4 Hz; PNG export uses `gio::spawn_blocking` so encoding doesn't freeze the GTK main loop.
 
-**User-facing walkthrough:** `docs/guides/apt-reception.md`.
+**User-facing walkthroughs:** `docs/guides/apt-reception.md`, `docs/guides/lrpt-reception.md`.
 
-**PNG output path:** `~/sdr-recordings/apt-{satellite-slug}-{local-timestamp}.png` — `png_path_for` in `satellites_recorder.rs` is the single source of truth.
+**Output paths** (all under `~/sdr-recordings/`):
+- APT: `apt-{satellite-slug}-{local-timestamp}.png` (single PNG per pass).
+- LRPT: `lrpt-{satellite-slug}-{local-timestamp}/apid{N}.png` (per-pass directory holding one PNG per AVHRR APID — LRPT is multispectral). Audio recording is suppressed for LRPT regardless of the user toggle: the demod is silent and ~170 MB of stereo silence per pass would be wasteful.
+
+`png_path_for` and `lrpt_dir_for` in `satellites_recorder.rs` are the single sources of truth for those paths; the recorder's `PassOutput` enum dispatches APT to `Action::SavePng` and LRPT to `Action::SaveLrptPass`.
 
 ## C++ Reference
 

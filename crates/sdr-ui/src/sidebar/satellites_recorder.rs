@@ -113,7 +113,9 @@ pub enum State {
         /// cleanly. `None` means audio recording is off for this
         /// pass — either the user toggle was off at AOS, or the
         /// pass is LRPT (whose audio path is silent stereo and
-        /// wastes ~170 MB per 10-min pass for no benefit). The
+        /// wastes ~115 MB per 10-min pass for no benefit — 48 kHz
+        /// × 2 ch × 2 B × 600 s, the WAV writer's hardcoded
+        /// `AUDIO_SAMPLE_RATE` × `AUDIO_CHANNELS`). The
         /// captured value persists across the AOS toggle so a
         /// user flipping it mid-pass can't leave a half-stopped
         /// writer.
@@ -450,10 +452,13 @@ impl AutoRecorder {
             // Audio recording is suppressed for LRPT regardless
             // of the user toggle: the LRPT demod is a silent
             // passthrough (the imagery is the artifact), and
-            // recording 10+ minutes of stereo silence at 144 kHz
-            // would burn ~170 MB per pass for no value. The
-            // toggle still applies to APT — voice/audio capture
-            // is genuinely useful there.
+            // the WAV writer's hardcoded 48 kHz × 2 ch × 2 B
+            // means 10+ minutes of stereo silence would burn
+            // ~115 MB per pass for no value. (`144 kHz` is the
+            // demod's IF rate, not the WAV writer's; an earlier
+            // draft conflated the two.) The toggle still
+            // applies to APT — voice/audio capture is genuinely
+            // useful there.
             let want_audio = audio_record_on && protocol != sdr_sat::ImagingProtocol::Lrpt;
             let audio_path = want_audio.then(|| audio_path_for(pass, now));
             let mut actions = Vec::with_capacity(3);
@@ -1618,12 +1623,13 @@ mod tests {
 
     #[test]
     fn lrpt_pass_suppresses_audio_recording_even_when_toggle_on() {
-        // LRPT's demod is a silent passthrough — recording 10+
-        // minutes of stereo silence at 144 kHz wastes ~170 MB
-        // per pass for no value. The recorder must suppress
-        // audio for LRPT regardless of the user's "also save
-        // audio" toggle. The toggle still applies to APT —
-        // voice/audio capture is genuinely useful there.
+        // LRPT's demod is a silent passthrough; the WAV writer
+        // is hardcoded at 48 kHz stereo, so 10+ minutes of
+        // silence would burn ~115 MB per pass for no value.
+        // The recorder must suppress audio for LRPT regardless
+        // of the user's "also save audio" toggle. The toggle
+        // still applies to APT — voice/audio capture is
+        // genuinely useful there.
         let mut r = lrpt_recorder();
         let now_aos = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_meteor_m2(now_aos, 3, 600, 50.0);
