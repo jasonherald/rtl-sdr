@@ -23,10 +23,10 @@
 //! → image assembly → PNG. A single binary that exercises
 //! every stage of epic #469.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use sdr_dsp::lrpt::LrptDemod;
+use sdr_dsp::lrpt::{LrptDemod, SAMPLE_RATE_HZ};
 use sdr_lrpt::{
     LrptPipeline,
     image::{save_channel, save_composite},
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(in_path: &str, out_dir: &PathBuf) -> Result<(), String> {
+fn run(in_path: &str, out_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
 
     let iq_bytes = std::fs::read(in_path).map_err(|e| format!("read {in_path}: {e}"))?;
@@ -83,8 +83,8 @@ fn run(in_path: &str, out_dir: &PathBuf) -> Result<(), String> {
         clippy::cast_precision_loss,
         reason = "n_samples is bounded by file size; even hours-long captures stay below f64's 52-bit mantissa"
     )]
-    let duration_s = n_samples as f64 / 144_000.0;
-    eprintln!("input: {n_samples} samples ({duration_s:.1} s @ 144 ksps)");
+    let duration_s = n_samples as f64 / f64::from(SAMPLE_RATE_HZ);
+    eprintln!("input: {n_samples} samples ({duration_s:.1} s @ {SAMPLE_RATE_HZ} Hz)");
 
     let mut demod = LrptDemod::new().map_err(|e| format!("LrptDemod::new: {e}"))?;
     let mut pipeline = LrptPipeline::new();
