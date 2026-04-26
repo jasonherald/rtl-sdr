@@ -253,20 +253,22 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // through the save path. Matches the "seed-then-wire" pattern
     // `connect_volume_persistence` uses.
     let session = sidebar::activity_bar::load_session(config);
+    // Stack visible-child is set unconditionally so the right
+    // panel is staged for the next open even when the sidebar
+    // restores closed; the icon active state, by contrast, only
+    // mirrors actual on-screen panel visibility (issue #518 —
+    // an active icon over a hidden panel is misleading).
     left_stack.set_visible_child_name(session.left_selected);
-    if let Some(btn) = left_activity_bar.buttons.get(session.left_selected) {
+    if session.left_open
+        && let Some(btn) = left_activity_bar.buttons.get(session.left_selected)
+    {
         btn.set_active(true);
     }
     left_split_view.set_show_sidebar(session.left_open);
     right_stack.set_visible_child_name(session.right_selected);
-    // Seed the right selection as active even when the panel
-    // restores closed. The activity-bar contract (design doc §4.2)
-    // is that an icon stays visually selected through open/close
-    // cycles — the icon is a preview of "which slot opens next".
-    // Without this, `right_stack` + `wire_activity_bar_clicks`
-    // would both treat `session.right_selected` as selected while
-    // the bar shows no active button until the user's first click.
-    if let Some(btn) = right_activity_bar.buttons.get(session.right_selected) {
+    if session.right_open
+        && let Some(btn) = right_activity_bar.buttons.get(session.right_selected)
+    {
         btn.set_active(true);
     }
     right_split_view.set_show_sidebar(session.right_open);
@@ -342,6 +344,20 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     right_split_view.connect_show_sidebar_notify(move |sv| {
         sidebar::activity_bar::save_right_open(&config_right_open, sv.shows_sidebar());
     });
+
+    // Sync activity-bar icon active state to the sidebar's
+    // `show-sidebar` property regardless of who toggled it
+    // (header sidebar button, F9 shortcut, breakpoint collapse,
+    // future programmatic callers). Per issue #518: the icon's
+    // highlight should mean "this panel is on screen right now",
+    // not "this slot will open next" — the click handler in
+    // `wire_activity_bar_clicks` owns the user-driven case;
+    // these notify handlers cover external toggles. The
+    // active-icon update mirrors the click handler's resolution
+    // (active iff sidebar shown AND this is the visible-stack
+    // child).
+    sync_activity_bar_to_sidebar_visibility(&left_split_view, &left_activity_bar, &left_stack);
+    sync_activity_bar_to_sidebar_visibility(&right_split_view, &right_activity_bar, &right_stack);
 
     // Header sidebar toggle ↔ left split view `show-sidebar` sync.
     // Without this, clicking the currently-selected activity icon to
@@ -2617,13 +2633,30 @@ fn wire_activity_bar_clicks(
         btn.connect_clicked(move |clicked_btn| {
             let prev = *selected.borrow();
             if prev == name {
-                // Clicking the already-selected icon keeps it
-                // selected visually (force-restore the `active`
-                // property after GTK's default click-flip) and
-                // toggles the panel open/closed.
-                clicked_btn.set_active(true);
+                // Clicking the already-selected icon toggles the
+                // panel open/closed. The icon's `active` property
+                // tracks the panel's NEW visibility — active
+                // when shown, inactive when hidden — so the
+                // highlight always reflects "this panel is on
+                // screen right now". Per issue #518: the earlier
+                // `set_active(true)` unconditionally re-asserted
+                // the highlight even after a close, which was
+                // misleading (icon glowed but panel was gone).
+                //
+                // GTK's default click handler already flipped
+                // `active`, so we'd otherwise see two flips per
+                // click. Setting it explicitly here pins the
+                // icon state to the resolved sidebar visibility
+                // regardless of GTK's intermediate flip.
                 if let Some(sv) = split_view_weak.upgrade() {
-                    sv.set_show_sidebar(!sv.shows_sidebar());
+                    let new_shown = !sv.shows_sidebar();
+                    sv.set_show_sidebar(new_shown);
+                    clicked_btn.set_active(new_shown);
+                } else {
+                    // Split view torn down — preserve the
+                    // previous "icon stays active" behaviour
+                    // since we can't observe panel state.
+                    clicked_btn.set_active(true);
                 }
             } else {
                 // Click on a different activity — deselect siblings,
@@ -2647,6 +2680,45 @@ fn wire_activity_bar_clicks(
             }
         });
     }
+}
+
+/// Wire a `connect_show_sidebar_notify` that keeps the activity
+/// bar's icon active state in sync with the sidebar's visibility
+/// regardless of who toggled it. Companion to
+/// [`wire_activity_bar_clicks`] — that handles the user-clicks-
+/// the-icon path; this handles every OTHER way `show-sidebar`
+/// can flip (header sidebar button, F9 keyboard shortcut, the
+/// breakpoint collapsing the sidebar at narrow widths, future
+/// programmatic toggles).
+///
+/// Without this, an external toggle would leave the icon stale —
+/// e.g. user opens panel via icon (icon active), closes panel
+/// via header button (sidebar gone, icon still active). Per
+/// issue #518.
+fn sync_activity_bar_to_sidebar_visibility(
+    split_view: &adw::OverlaySplitView,
+    bar: &sidebar::ActivityBar,
+    stack: &gtk4::Stack,
+) {
+    let buttons: Vec<(&'static str, glib::WeakRef<gtk4::ToggleButton>)> = bar
+        .buttons
+        .iter()
+        .map(|(n, b)| (*n, b.downgrade()))
+        .collect();
+    let stack_weak = stack.downgrade();
+    split_view.connect_show_sidebar_notify(move |sv| {
+        let shown = sv.shows_sidebar();
+        let visible_name = stack_weak
+            .upgrade()
+            .and_then(|s| s.visible_child_name().map(|gs| gs.to_string()));
+        for (name, weak) in &buttons {
+            let Some(btn) = weak.upgrade() else { continue };
+            let should_be_active = shown && visible_name.as_deref() == Some(*name);
+            if btn.is_active() != should_be_active {
+                btn.set_active(should_be_active);
+            }
+        }
+    });
 }
 
 /// Create a breakpoint that collapses both sidebars below
