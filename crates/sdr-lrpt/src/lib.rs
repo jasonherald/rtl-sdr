@@ -26,7 +26,7 @@ pub mod fec;
 pub mod image;
 
 use crate::ccsds::{Demux, ImagePacket};
-use crate::image::{ImageAssembler, JpegDecoder};
+use crate::image::{ImageAssembler, JpegDecoder, MCUS_PER_LINE};
 
 /// MCUs encoded per Meteor LRPT image packet. Per medet's
 /// `mcu_per_packet`. Drives the per-packet decode loop and the
@@ -190,9 +190,24 @@ impl LrptPipeline {
             };
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "mcu_id + m is bounded by mcu_per_line = 196"
+                reason = "mcu_id + m fits in usize on every supported target"
             )]
             let mcu_col = (mcu_id + m) as usize;
+            // mcu_id is a single payload byte (0-255) and m is
+            // 0..14, so mcu_col can reach 268 — past the 196
+            // MCUS_PER_LINE bound. ImageAssembler::place_mcu
+            // silently drops out-of-bounds columns, but it's
+            // worth a trace because it indicates a corrupt
+            // packet header (post-RS miscorrection or upstream
+            // demux desync).
+            if mcu_col >= MCUS_PER_LINE {
+                tracing::trace!(
+                    "out-of-range mcu_col {mcu_col} (max {max}) on APID {apid} packet {pkt}",
+                    max = MCUS_PER_LINE - 1,
+                    apid = packet.apid,
+                    pkt = packet.sequence_count,
+                );
+            }
             self.assembler
                 .place_mcu(packet.apid, mcu_row, mcu_col, &block);
         }

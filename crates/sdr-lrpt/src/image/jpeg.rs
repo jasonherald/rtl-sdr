@@ -110,6 +110,11 @@ pub struct JpegDecoder {
     /// 16-bit-window → DC category. -1 = no match.
     dc_lookup: Box<[i16; 65536]>,
     ac_table: Vec<AcEntry>,
+    /// Precomputed 8×8 cosine table for the IDCT inner loop.
+    /// Hoisted from a global `OnceLock` to a per-decoder field
+    /// (per CR round 2) so the hot path doesn't pay the
+    /// `OnceLock::get_or_init` atomic load per IDCT call.
+    cosine: [[f32; 8]; 8],
     /// Running DC predictor (across MCUs in the same packet).
     last_dc: f32,
 }
@@ -143,6 +148,7 @@ impl JpegDecoder {
             ac_lookup,
             dc_lookup,
             ac_table,
+            cosine: build_cosine_table(),
             last_dc: 0.0,
         }
     }
@@ -256,7 +262,7 @@ impl JpegDecoder {
 
         // Step 4: inverse DCT.
         let mut img = [0_f32; MCU_SAMPLES];
-        idct_8x8(&dct, &mut img);
+        idct_8x8(&dct, &mut img, &self.cosine);
 
         // Step 5: level-shift + clamp + pack into 8×8 block.
         let mut block: Block8x8 = [[0_u8; MCU_SIDE]; MCU_SIDE];
@@ -507,8 +513,11 @@ fn build_ac_table() -> Vec<AcEntry> {
 /// Inverse 8×8 DCT (naive O(N⁴) — adequate at Meteor's
 /// ~400 IDCTs/second budget). Direct port of medet's
 /// `flt_idct_8x8`.
-fn idct_8x8(input: &[f32; MCU_SAMPLES], output: &mut [f32; MCU_SAMPLES]) {
-    let cosine = cosine_table();
+///
+/// `cosine` is the precomputed 8×8 cosine table; the caller
+/// owns it (typically a [`JpegDecoder`] field) so this hot
+/// function doesn't pay a per-call atomic load.
+fn idct_8x8(input: &[f32; MCU_SAMPLES], output: &mut [f32; MCU_SAMPLES], cosine: &[[f32; 8]; 8]) {
     let alpha = alpha_table();
     for y in 0..MCU_SIDE {
         for x in 0..MCU_SIDE {
@@ -527,25 +536,22 @@ fn idct_8x8(input: &[f32; MCU_SAMPLES], output: &mut [f32; MCU_SAMPLES]) {
     }
 }
 
-/// Precomputed 8×8 cosine table.
-fn cosine_table() -> [[f32; 8]; 8] {
-    // Computed once and stuffed inline; runtime cost is the
-    // first `cosine_table()` call (which initializes the static
-    // via std::sync::OnceLock under the hood).
-    static TABLE: std::sync::OnceLock<[[f32; 8]; 8]> = std::sync::OnceLock::new();
-    *TABLE.get_or_init(|| {
-        let mut t = [[0.0_f32; 8]; 8];
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "loop indices 0..8 fit exactly in f32"
-        )]
-        for (y, row) in t.iter_mut().enumerate() {
-            for (x, slot) in row.iter_mut().enumerate() {
-                *slot = (PI / 16.0 * (2.0 * y as f32 + 1.0) * x as f32).cos();
-            }
+/// Build the 8×8 cosine table used by [`idct_8x8`]. Called
+/// once per [`JpegDecoder::new`]; the result is stored in the
+/// decoder so the IDCT inner loop can read it without any
+/// synchronization.
+fn build_cosine_table() -> [[f32; 8]; 8] {
+    let mut t = [[0.0_f32; 8]; 8];
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "loop indices 0..8 fit exactly in f32"
+    )]
+    for (y, row) in t.iter_mut().enumerate() {
+        for (x, slot) in row.iter_mut().enumerate() {
+            *slot = (PI / 16.0 * (2.0 * y as f32 + 1.0) * x as f32).cos();
         }
-        t
-    })
+    }
+    t
 }
 
 /// Precomputed alpha vector — `alpha[0] = 1/√2`, rest = 1.
@@ -621,7 +627,8 @@ mod tests {
     fn idct_zero_block_returns_zero() {
         let zeros = [0_f32; MCU_SAMPLES];
         let mut out = [0_f32; MCU_SAMPLES];
-        idct_8x8(&zeros, &mut out);
+        let cosine = build_cosine_table();
+        idct_8x8(&zeros, &mut out, &cosine);
         for &v in &out {
             assert!(v.abs() < 1e-5, "IDCT of zeros should be zero, got {v}");
         }
@@ -635,7 +642,8 @@ mod tests {
         let mut input = [0_f32; MCU_SAMPLES];
         input[0] = 800.0;
         let mut out = [0_f32; MCU_SAMPLES];
-        idct_8x8(&input, &mut out);
+        let cosine = build_cosine_table();
+        idct_8x8(&input, &mut out, &cosine);
         let expected = 800.0 / 8.0;
         for &v in &out {
             assert!(
