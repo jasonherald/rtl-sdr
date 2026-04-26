@@ -87,18 +87,20 @@ const BYTES_PER_PIXEL: usize = 4;
 
 /// Default size for the viewer window. A typical Meteor MSU-MR
 /// pass produces ~3600 lines × 1568 px (portrait, ~1:2 aspect)
-/// at full duration, so the image will scroll vertically inside
-/// the window for most of the pass. The default 900 × 600
-/// landscape footprint is chosen for ergonomics rather than
-/// aspect match: it sits comfortably alongside the main radio
-/// window on a typical 1080p+ desktop, fills well during the
-/// early-pass phase when the image is still short and wide, and
-/// the user can resize freely once they see how the pass is
-/// developing. (Pre-round-2 the comment claimed "wider than
-/// tall because typical pass heights are ~600 lines" — that
-/// assumption was based on the old 1024-line cap and stopped
-/// holding once `MAX_LINES` bumped to 8192.) Per `CodeRabbit`
-/// round 14 on PR #543.
+/// at full duration. There's no scroll path — `DrawingArea`
+/// sits directly under `ToolbarView` and `LrptImageRenderer::render`
+/// scales the full image to fit the available area, preserving
+/// aspect — so the visible pixels per scan-line drop as the
+/// image grows tall. The default 900 × 600 landscape footprint
+/// is chosen for ergonomics rather than aspect match: it sits
+/// comfortably alongside the main radio window on a typical
+/// 1080p+ desktop, fills well during the early-pass phase when
+/// the image is still short and wide, and the user can resize
+/// freely once they see how the pass is developing. (Pre-round-2
+/// the comment claimed "wider than tall because typical pass
+/// heights are ~600 lines" — that assumption was based on the
+/// old 1024-line cap and stopped holding once `MAX_LINES`
+/// bumped to 8192.) Per `CodeRabbit` rounds 14 + 15 on PR #543.
 const VIEWER_WINDOW_WIDTH: i32 = 900;
 const VIEWER_WINDOW_HEIGHT: i32 = 600;
 
@@ -832,21 +834,27 @@ impl LrptImageView {
     /// Drains any pending rows from the shared `LrptImage`
     /// into the renderer first, so the export captures the tail
     /// of the pass even if it arrived after the most recent
-    /// poll tick. Without this, the LOS `SaveLrptPass` flow —
-    /// which exports immediately on receipt of the LOS action,
-    /// not on the next 250 ms poll — would systematically miss
-    /// the last fraction-of-a-second of decoded data. Per
-    /// `CodeRabbit` round 1 on PR #543.
+    /// poll tick. Without this, an immediate-export flow would
+    /// systematically miss the last fraction-of-a-second of
+    /// decoded data. Per `CodeRabbit` round 1 on PR #543.
     ///
-    /// **Caller is responsible for off-main-thread dispatch.**
-    /// This function performs Cairo PNG encoding + filesystem
-    /// I/O synchronously and will freeze the GTK main loop on
-    /// large images. Use [`Self::snapshot_active_channel`] +
-    /// [`write_greyscale_png`] inside `gio::spawn_blocking` for
-    /// the GTK click-handler path. The recorder LOS handler in
-    /// `window.rs` already does this; the manual Export PNG
-    /// button in [`open_lrpt_viewer_window`] does too. Per
-    /// `CodeRabbit` rounds 7 + 8 + 10 on PR #543.
+    /// **Main-thread only.** `drain_new_lines` invokes
+    /// `DrawingArea::queue_draw`, which GTK4 requires on the
+    /// main thread, so this method cannot be moved to
+    /// `gio::spawn_blocking` directly. It also performs
+    /// synchronous Cairo PNG encoding + filesystem I/O — large
+    /// images (~50 MB cap) will freeze the GTK main loop while
+    /// it runs. For the GTK click-handler / LOS-save path, use
+    /// [`Self::snapshot_active_channel`] on the main thread
+    /// (cheap mutex-clone, also drains rows + queues the redraw)
+    /// followed by [`write_greyscale_png`] inside
+    /// `gio::spawn_blocking` — that's how the manual Export PNG
+    /// button in [`open_lrpt_viewer_window`] and the recorder's
+    /// `RecorderAction::SaveLrptPass` handler in `window.rs`
+    /// dispatch heavy exports today. Kept as a convenience for
+    /// any future caller that genuinely wants the synchronous
+    /// path (small test exports, scripted batch flows). Per
+    /// `CodeRabbit` round 15 on PR #543.
     ///
     /// # Errors
     ///
