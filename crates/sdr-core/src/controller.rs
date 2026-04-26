@@ -2512,19 +2512,37 @@ fn rtl_sdr_replay_persisted_settings(
     }
 
     // Discrete gain index — only when the FFI/scanner side has
-    // explicitly chosen one. Skip the bounds re-check here; the
-    // live `UiToDsp::SetGainByIndex` handler did it at dispatch
-    // time, and the freshly-opened source's gain table is the
-    // same dongle hardware so the index is still in range.
-    if let Some(index) = state.tuner_gain_index
-        && let Err(e) = source.set_gain_by_index(index)
-    {
-        tracing::warn!(
-            error = %e,
-            index,
-            "re-applying persisted tuner gain index on source open failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
+    // explicitly chosen one. Bounds-check against the freshly-
+    // opened source's gain table: the index can be stale (set
+    // via FFI before any source was open, or persisted from a
+    // prior session against a different dongle), and replaying
+    // it unchecked produces a recurring startup toast on every
+    // open until the user overwrites it. Mirrors the live
+    // `UiToDsp::SetGainByIndex` handler's pre-check. Skip when
+    // `gains().len() == 0` — the rtl_tcp path can't populate it
+    // synchronously, but the replay helper is gated to
+    // `SourceType::RtlSdr` upstream, where the local USB driver
+    // does fill the table at open time. Per CR round 1 on
+    // PR #553.
+    if let Some(index) = state.tuner_gain_index {
+        let gains_len = source.gains().len();
+        if gains_len > 0 && (index as usize) >= gains_len {
+            tracing::warn!(
+                index,
+                gains_len,
+                "re-applying persisted tuner gain index rejected: out of range"
+            );
+            let _ = dsp_tx.send(DspToUi::Error(format!(
+                "Gain index {index} out of range (source has {gains_len} gains)"
+            )));
+        } else if let Err(e) = source.set_gain_by_index(index) {
+            tracing::warn!(
+                error = %e,
+                index,
+                "re-applying persisted tuner gain index on source open failed"
+            );
+            let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
+        }
     }
 
     if let Err(e) = source.set_bias_tee(state.bias_tee_enabled) {
