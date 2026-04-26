@@ -43,6 +43,20 @@ impl Default for LrptImage {
     }
 }
 
+// Manual `Debug` so callers can put `LrptImage` in derived-`Debug`
+// enums (e.g. `UiToDsp::SetLrptImage`) without forcing
+// `ImageAssembler` to expose its internals through derived
+// `Debug`. The handle is opaque from the outside — the only
+// observable identity is its existence — so a placeholder print
+// is faithful and avoids accidentally locking the mutex from a
+// `Debug` formatter (which would otherwise let a panic'd holder
+// poison logging too).
+impl std::fmt::Debug for LrptImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LrptImage").finish_non_exhaustive()
+    }
+}
+
 /// Acquire the assembler lock, recovering from a poisoned mutex
 /// by logging a warning and returning the inner guard via
 /// [`PoisonError::into_inner`].

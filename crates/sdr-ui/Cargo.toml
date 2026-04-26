@@ -43,6 +43,10 @@ sdr-dsp.workspace = true
 sdr-pipeline.workspace = true
 sdr-config.workspace = true
 sdr-radio.workspace = true
+# LRPT image-assembler types (`IMAGE_WIDTH`, `ChannelBuffer`) used
+# by the live LRPT viewer to decode the shared `LrptImage`
+# handle's per-APID scan-line buffers.
+sdr-lrpt.workspace = true
 sdr-rtlsdr.workspace = true
 # Satellite pass predictor — used by the Satellites scheduler panel
 # to enumerate upcoming overhead passes and refresh TLEs from

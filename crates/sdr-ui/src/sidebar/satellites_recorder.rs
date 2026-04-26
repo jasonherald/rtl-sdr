@@ -50,6 +50,38 @@ const AOS_LEAD_SECS: i64 = 5;
 /// "actually receiving" status.
 const SETTLE_SECS: i64 = 3;
 
+/// Where the per-pass imagery should land. Computed at AOS by
+/// branching on [`sdr_sat::ImagingProtocol`] and stored on the
+/// in-flight state so the LOS-side save uses the same path.
+///
+/// APT writes a single PNG; LRPT writes one PNG per AVHRR
+/// channel (APID) into a directory, since LRPT is multispectral
+/// and a single file can't represent all the data the user
+/// actually wants to keep. Per epic #469 task 7.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PassOutput {
+    /// Single PNG file (NOAA APT). Wiring layer dispatches via
+    /// [`Action::SavePng`].
+    AptPng(PathBuf),
+    /// Directory holding one PNG per APID (Meteor-M LRPT).
+    /// Wiring layer dispatches via [`Action::SaveLrptPass`] —
+    /// the directory is created lazily by the wiring layer's
+    /// per-channel save loop.
+    LrptDir(PathBuf),
+}
+
+impl PassOutput {
+    /// Stable per-protocol discriminant for tests and logs.
+    /// Avoids matching on `Debug`-formatted strings.
+    #[must_use]
+    pub fn protocol(&self) -> sdr_sat::ImagingProtocol {
+        match self {
+            Self::AptPng(_) => sdr_sat::ImagingProtocol::Apt,
+            Self::LrptDir(_) => sdr_sat::ImagingProtocol::Lrpt,
+        }
+    }
+}
+
 /// Recorder lifecycle. Each variant carries the data the next
 /// transition needs so the caller doesn't have to thread state
 /// through the call site.
@@ -68,37 +100,41 @@ pub enum State {
         /// took over. Restored at LOS so the user comes back to
         /// whatever they were listening to.
         saved_tune: SavedTune,
-        /// PNG export path computed at AOS using the AOS
+        /// Per-pass imagery target computed at AOS using the AOS
         /// timestamp. Stored on state so the LOS-side
-        /// `Action::SavePng` uses the same timestamp as
-        /// `audio_path` — without this the filenames would
-        /// differ by exactly the pass duration (CR round 1
-        /// on PR #534).
-        png_path: PathBuf,
+        /// `Action::SavePng` / `Action::SaveLrptPass` uses the
+        /// same timestamp as `audio_path` — without this the
+        /// filenames would differ by exactly the pass duration
+        /// (CR round 1 on PR #534).
+        output: PassOutput,
         /// Audio recording path the wiring layer was asked to
         /// open at AOS. `Some(path)` means we'll fire
         /// [`Action::StopAutoAudioRecord`] at LOS to close it
-        /// cleanly. `None` means the audio toggle was off when
-        /// AOS fired and there's no in-flight recording. The
+        /// cleanly. `None` means audio recording is off for this
+        /// pass — either the user toggle was off at AOS, or the
+        /// pass is LRPT (whose audio path is silent stereo and
+        /// wastes ~170 MB per 10-min pass for no benefit). The
         /// captured value persists across the AOS toggle so a
         /// user flipping it mid-pass can't leave a half-stopped
         /// writer.
         audio_path: Option<PathBuf>,
     },
-    /// Pass is in progress; APT decoder is producing the live
-    /// image. No per-tick work needed — we just wait for LOS.
+    /// Pass is in progress; the protocol-specific decoder is
+    /// producing live image data. No per-tick work needed — we
+    /// just wait for LOS.
     Recording {
         pass: Pass,
         saved_tune: SavedTune,
-        png_path: PathBuf,
+        output: PassOutput,
         audio_path: Option<PathBuf>,
     },
-    /// Pass ended; PNG export and tune restore are pending. This
-    /// state is single-tick: the next `tick` advances to `Idle`.
+    /// Pass ended; image export and tune restore are pending.
+    /// This state is single-tick: the next `tick` advances to
+    /// `Idle`.
     Finalizing {
         pass: Pass,
         saved_tune: SavedTune,
-        png_path: PathBuf,
+        output: PassOutput,
         audio_path: Option<PathBuf>,
     },
 }
@@ -166,9 +202,19 @@ pub enum Action {
     /// to `UiToDsp::StartAudioRecording(path)`. Per #533.
     StartAutoAudioRecord(PathBuf),
     /// Save the in-flight APT image to `png_path`. Fired on
-    /// `Recording → Finalizing`. Caller is expected to call
-    /// `AptImageView::export_png` against the open viewer.
+    /// `Recording → Finalizing` for APT passes. Caller is
+    /// expected to call `AptImageView::export_png` against the
+    /// open viewer.
     SavePng(PathBuf),
+    /// Save the in-flight LRPT pass into the given directory.
+    /// Fired on `Recording → Finalizing` for LRPT passes.
+    /// Caller walks every APID known to `LrptImageView` and
+    /// writes one PNG per channel into the directory (creating
+    /// it if needed). Per epic #469 task 7.4. Distinct from
+    /// `SavePng` so the wiring layer's per-protocol export
+    /// strategy is statically separated — no path-meaning
+    /// overload.
+    SaveLrptPass(PathBuf),
     /// Stop the in-flight WAV writer opened by
     /// [`Action::StartAutoAudioRecord`]. Fired alongside
     /// [`Action::SavePng`] on LOS, but only when audio recording
@@ -220,14 +266,17 @@ impl Default for AutoRecorder {
 }
 
 impl AutoRecorder {
-    /// Build a recorder that arms only on
-    /// [`sdr_sat::ImagingProtocol::Apt`]. Today's only fully-
-    /// wired auto-record path. Task 7 of epic #469 will swap
-    /// callers to [`Self::with_supported_protocols`] passing
-    /// `[Apt, Lrpt]`.
+    /// Build a recorder that arms on every imaging protocol the
+    /// wiring layer has fully wired in `interpret_action`
+    /// (decoder tap, viewer open, LOS save). As of epic #469
+    /// task 7 that's `[Apt, Lrpt]`; ISS SSTV adds `Sstv` once
+    /// epic #472 ships.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_supported_protocols(&[sdr_sat::ImagingProtocol::Apt])
+        Self::with_supported_protocols(&[
+            sdr_sat::ImagingProtocol::Apt,
+            sdr_sat::ImagingProtocol::Lrpt,
+        ])
     }
 
     /// Build a recorder that arms only on the given imaging
@@ -294,21 +343,21 @@ impl AutoRecorder {
                 pass,
                 tuned_at,
                 saved_tune,
-                png_path,
+                output,
                 audio_path,
-            } => self.tick_before_pass(now, pass, tuned_at, saved_tune, png_path, audio_path),
+            } => self.tick_before_pass(now, pass, tuned_at, saved_tune, output, audio_path),
             State::Recording {
                 pass,
                 saved_tune,
-                png_path,
+                output,
                 audio_path,
-            } => self.tick_recording(now, pass, saved_tune, png_path, audio_path),
+            } => self.tick_recording(now, pass, saved_tune, output, audio_path),
             State::Finalizing {
                 pass,
                 saved_tune,
-                png_path,
+                output,
                 audio_path,
-            } => self.tick_finalizing(pass, saved_tune, png_path, audio_path),
+            } => self.tick_finalizing(pass, saved_tune, output, audio_path),
         }
     }
 
@@ -384,13 +433,29 @@ impl AutoRecorder {
             // already started (we missed the lead — start tuning
             // immediately).
             //
-            // Both filenames use the AOS timestamp so PNG and
-            // WAV pair by string match. CR round 1 on PR #534
-            // caught the prior bug: png_path_for was called at
-            // LOS while audio_path_for was called at AOS, so a
-            // 10-min pass produced filenames 10 min apart.
-            let png_path = png_path_for(pass, now);
-            let audio_path = audio_record_on.then(|| audio_path_for(pass, now));
+            // Imagery and audio paths use the same AOS timestamp
+            // so the artifacts pair by string match. CR round 1
+            // on PR #534 caught the prior bug: png_path_for was
+            // called at LOS while audio_path_for was called at
+            // AOS, so a 10-min pass produced filenames 10 min
+            // apart.
+            //
+            // Per epic #469 task 7.4, the imagery target depends
+            // on the protocol: APT writes a single PNG; LRPT
+            // writes a directory of per-channel PNGs.
+            let output = match protocol {
+                sdr_sat::ImagingProtocol::Apt => PassOutput::AptPng(png_path_for(pass, now)),
+                sdr_sat::ImagingProtocol::Lrpt => PassOutput::LrptDir(lrpt_dir_for(pass, now)),
+            };
+            // Audio recording is suppressed for LRPT regardless
+            // of the user toggle: the LRPT demod is a silent
+            // passthrough (the imagery is the artifact), and
+            // recording 10+ minutes of stereo silence at 144 kHz
+            // would burn ~170 MB per pass for no value. The
+            // toggle still applies to APT — voice/audio capture
+            // is genuinely useful there.
+            let want_audio = audio_record_on && protocol != sdr_sat::ImagingProtocol::Lrpt;
+            let audio_path = want_audio.then(|| audio_path_for(pass, now));
             let mut actions = Vec::with_capacity(3);
             actions.push(Action::StartAutoRecord {
                 satellite: pass.satellite.clone(),
@@ -421,7 +486,7 @@ impl AutoRecorder {
                 pass: pass.clone(),
                 tuned_at: now,
                 saved_tune: now_tune,
-                png_path,
+                output,
                 audio_path,
             };
             return actions;
@@ -435,26 +500,26 @@ impl AutoRecorder {
         pass: Pass,
         tuned_at: DateTime<Utc>,
         saved_tune: SavedTune,
-        png_path: PathBuf,
+        output: PassOutput,
         audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         // LOS already arrived (e.g. the 1 Hz driver stalled on a
         // sleep / suspend cycle, or a very short pass elapsed
         // entirely inside the settle window). Skip straight to
-        // finalizing AND emit the SavePng — otherwise we'd jump
-        // to Idle on the next tick without ever exporting the
-        // image. `png_path` was computed at AOS so the filename
-        // pairs with `audio_path`.
+        // finalizing AND emit the protocol-appropriate save —
+        // otherwise we'd jump to Idle on the next tick without
+        // ever exporting the image. `output` was computed at AOS
+        // so the path pairs with `audio_path`.
         if pass.end <= now {
             let mut actions = Vec::with_capacity(2);
-            actions.push(Action::SavePng(png_path.clone()));
+            actions.push(save_action_for(&output));
             if audio_path.is_some() {
                 actions.push(Action::StopAutoAudioRecord);
             }
             self.state = State::Finalizing {
                 pass: pass.clone(),
                 saved_tune,
-                png_path,
+                output,
                 audio_path,
             };
             return actions;
@@ -463,7 +528,7 @@ impl AutoRecorder {
             self.state = State::Recording {
                 pass,
                 saved_tune,
-                png_path,
+                output,
                 audio_path,
             };
         }
@@ -475,26 +540,27 @@ impl AutoRecorder {
         now: DateTime<Utc>,
         pass: Pass,
         saved_tune: SavedTune,
-        png_path: PathBuf,
+        output: PassOutput,
         audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         if pass.end <= now {
-            // Emit `SavePng` only — the success / failure toast
-            // is the wiring layer's responsibility (it knows the
-            // export's actual outcome). Announcing "image saved"
-            // here would lie if the user closed the viewer
-            // mid-pass or `export_png` errored on disk-full /
-            // permissions. `png_path` was computed at AOS so
-            // the filename pairs with `audio_path`.
+            // Emit the protocol-appropriate save action — the
+            // success / failure toast is the wiring layer's
+            // responsibility (it knows the export's actual
+            // outcome). Announcing "image saved" here would lie
+            // if the user closed the viewer mid-pass or
+            // `export_png` errored on disk-full / permissions.
+            // `output` was computed at AOS so the path pairs
+            // with `audio_path`.
             let mut actions = Vec::with_capacity(2);
-            actions.push(Action::SavePng(png_path.clone()));
+            actions.push(save_action_for(&output));
             if audio_path.is_some() {
                 actions.push(Action::StopAutoAudioRecord);
             }
             self.state = State::Finalizing {
                 pass,
                 saved_tune,
-                png_path,
+                output,
                 audio_path,
             };
             return actions;
@@ -506,7 +572,7 @@ impl AutoRecorder {
         &mut self,
         _pass: Pass,
         saved_tune: SavedTune,
-        _png_path: PathBuf,
+        _output: PassOutput,
         _audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         // Single-tick state: SavePng was issued on entry; restore
@@ -542,13 +608,26 @@ impl AutoRecorder {
 // `window.rs::interpret_action`, (d) update `new()` to include
 // the new protocol in the default supported set.
 
-/// Build the export path for a satellite + timestamp:
+/// Build the export path for an APT pass:
 /// `~/sdr-recordings/apt-NOAA-19-2026-04-25-143015.png`.
 /// Centralised here so the `SavePng` action and the toast message
 /// can't drift on naming.
 #[must_use]
 fn png_path_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
     pass_recording_path(pass, now, "apt", "png")
+}
+
+/// Build the export directory for an LRPT pass:
+/// `~/sdr-recordings/lrpt-METEOR-M2-3-2026-04-25-143015`.
+///
+/// The wiring layer creates the directory lazily and writes one
+/// PNG per APID inside it (e.g. `apid64.png`, `apid65.png`).
+/// LRPT is multispectral — a single file can't capture every
+/// channel — so the per-pass artifact is a directory rather
+/// than a file. Per epic #469 task 7.4.
+#[must_use]
+fn lrpt_dir_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
+    pass_recording_dir(pass, now, "lrpt")
 }
 
 /// Build the audio-recording path for a satellite + timestamp:
@@ -560,32 +639,70 @@ fn audio_path_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
     pass_recording_path(pass, now, "audio", "wav")
 }
 
-/// Shared filename builder for the per-pass artifacts — the PNG
-/// (`png_path_for`) and the WAV (`audio_path_for`) both go through
-/// here so a future filename-format tweak only touches one place.
+/// Project a [`PassOutput`] to the matching save action. Lives
+/// here (and not as `impl PassOutput`) because [`Action`] is a
+/// recorder concept and we want the variant→action mapping
+/// localised to the state-machine module — anyone touching the
+/// dispatch reads it next to the variant emission.
+#[must_use]
+fn save_action_for(output: &PassOutput) -> Action {
+    match output {
+        PassOutput::AptPng(p) => Action::SavePng(p.clone()),
+        PassOutput::LrptDir(p) => Action::SaveLrptPass(p.clone()),
+    }
+}
+
+/// Shared filename builder for the per-pass file artifacts —
+/// the APT PNG (`png_path_for`) and the WAV (`audio_path_for`)
+/// both go through here so a future filename-format tweak only
+/// touches one place.
 fn pass_recording_path(pass: &Pass, now: DateTime<Utc>, prefix: &str, extension: &str) -> PathBuf {
-    let stamp = now
-        .with_timezone(&chrono::Local)
-        .format("%Y-%m-%d-%H%M%S")
-        .to_string();
-    // Sanitize the satellite name for filesystem safety: spaces /
-    // parens / etc become hyphens. We control the name source
-    // (KNOWN_SATELLITES) so a heavy-handed sanitizer is fine.
-    let sat_slug: String = pass
+    glib::home_dir().join("sdr-recordings").join(format!(
+        "{prefix}-{sat}-{stamp}.{extension}",
+        sat = pass_satellite_slug(pass),
+        stamp = pass_timestamp(now),
+    ))
+}
+
+/// Shared directory builder for per-pass directory artifacts —
+/// the LRPT pass directory (`lrpt_dir_for`) goes through here.
+/// Same satellite-slug + timestamp logic as the file builder
+/// minus the extension. Pulled out as a sibling rather than a
+/// special case in `pass_recording_path` so the call sites stay
+/// readable and the "no extension" axis isn't smuggled through
+/// an empty-string parameter.
+fn pass_recording_dir(pass: &Pass, now: DateTime<Utc>, prefix: &str) -> PathBuf {
+    glib::home_dir().join("sdr-recordings").join(format!(
+        "{prefix}-{sat}-{stamp}",
+        sat = pass_satellite_slug(pass),
+        stamp = pass_timestamp(now),
+    ))
+}
+
+/// Filesystem-safe slug for a pass's satellite name: spaces /
+/// parens / etc become hyphens, and runs of hyphens collapse so
+/// "NOAA 19" → "NOAA-19" (not "NOAA--19"). We control the name
+/// source ([`sdr_sat::KNOWN_SATELLITES`]) so a heavy-handed
+/// sanitizer is fine.
+fn pass_satellite_slug(pass: &Pass) -> String {
+    let raw: String = pass
         .satellite
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    // Collapse runs of `-` so "NOAA 19" → "NOAA-19", not
-    // "NOAA--19", and trim leading/trailing.
-    let sat_slug = sat_slug
-        .split('-')
+    raw.split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("-");
-    glib::home_dir()
-        .join("sdr-recordings")
-        .join(format!("{prefix}-{sat_slug}-{stamp}.{extension}"))
+        .join("-")
+}
+
+/// AOS timestamp formatted in the user's local timezone, used
+/// in every per-pass artifact name so the PNG / directory / WAV
+/// triplet pair by string match.
+fn pass_timestamp(now: DateTime<Utc>) -> String {
+    now.with_timezone(&chrono::Local)
+        .format("%Y-%m-%d-%H%M%S")
+        .to_string()
 }
 
 // `glib` is referenced via the GTK4 stack but only available on
@@ -702,14 +819,22 @@ mod tests {
     }
 
     #[test]
-    fn idle_does_not_arm_for_non_apt_satellite() {
-        // METEOR-M is in the catalog but uses LRPT, not APT —
-        // tuning would succeed but the APT decoder would never
-        // produce a meaningful image.
+    fn idle_does_not_arm_for_unflagged_satellite() {
+        // ISS is in the catalog but `imaging_protocol: None`
+        // (SSTV decoder + viewer ship in epic #472). The
+        // recorder must skip it — tuning would succeed but no
+        // decoder would produce imagery, and the LOS-side save
+        // would emit an action with no backing data.
+        //
+        // Pre-task-7 of epic #469 this test used Meteor as the
+        // unflagged-protocol fixture; once Meteor flipped to
+        // `Some(Lrpt)` we needed a different unflagged catalog
+        // entry. ISS is the canonical "in the catalog for
+        // pass display, no auto-record yet" case.
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let mut pass = synthetic_noaa19(now, 3, 720, 50.0);
-        pass.satellite = "METEOR-M 2".to_string();
+        pass.satellite = "ISS (ZARYA)".to_string();
         let actions = r.tick(now, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
@@ -1347,5 +1472,224 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_meteor_m2(now, 0, 600, 50.0);
         assert_eq!(pass.satellite, "METEOR-M 2");
+    }
+
+    // ─── Per-pass output paths (epic #469 task 7.4) ──────────
+
+    #[test]
+    fn lrpt_dir_includes_satellite_slug_and_no_extension() {
+        // LRPT's per-pass artifact is a directory, not a file —
+        // pin the slug + stamp + lack-of-extension contract so
+        // a future filename refactor doesn't accidentally
+        // reintroduce a `.png` suffix that would conflict with
+        // the per-channel files written inside the directory.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 30, 15).unwrap();
+        let pass = synthetic_meteor_m2(now, 0, 720, 50.0);
+        let dir = lrpt_dir_for(&pass, now);
+        let s = dir.to_string_lossy().to_string();
+        assert!(s.contains("lrpt-METEOR-M-2-"), "got {s}");
+        assert!(
+            dir.extension().is_none(),
+            "LRPT pass artifact must be a directory, not a file: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn lrpt_dir_pairs_with_audio_path_on_same_timestamp() {
+        // If the user has the audio toggle on, a future scenario
+        // (hypothetically — see suppression test below) the WAV
+        // and the LRPT directory must share a timestamp so a
+        // post-pass viewer can pair them by string match. Same
+        // contract `audio_path_pairs_with_png_path_on_same_timestamp`
+        // enforces for APT.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 30, 15).unwrap();
+        let pass = synthetic_meteor_m2(now, 0, 720, 50.0);
+        let dir = lrpt_dir_for(&pass, now);
+        let audio = audio_path_for(&pass, now);
+        let dir_name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let audio_stem = audio.file_stem().unwrap().to_string_lossy().to_string();
+        let dir_tail = dir_name.strip_prefix("lrpt-").unwrap();
+        let audio_tail = audio_stem.strip_prefix("audio-").unwrap();
+        assert_eq!(dir_tail, audio_tail, "slug+timestamp must match");
+        assert_eq!(dir.parent(), audio.parent());
+    }
+
+    #[test]
+    fn pass_output_protocol_dispatch_matches_variant() {
+        // The `protocol()` discriminant mirrors the variant
+        // 1:1 — pin it so a future variant addition without
+        // updating `protocol()` fails this test loudly instead
+        // of silently dispatching to the wrong save action.
+        let apt = PassOutput::AptPng(PathBuf::from("/tmp/apt.png"));
+        let lrpt = PassOutput::LrptDir(PathBuf::from("/tmp/lrpt-dir"));
+        assert_eq!(apt.protocol(), sdr_sat::ImagingProtocol::Apt);
+        assert_eq!(lrpt.protocol(), sdr_sat::ImagingProtocol::Lrpt);
+    }
+
+    #[test]
+    fn save_action_for_apt_emits_save_png() {
+        let action = save_action_for(&PassOutput::AptPng(PathBuf::from("/tmp/apt.png")));
+        assert!(matches!(action, Action::SavePng(_)));
+    }
+
+    #[test]
+    fn save_action_for_lrpt_emits_save_lrpt_pass() {
+        let action = save_action_for(&PassOutput::LrptDir(PathBuf::from("/tmp/lrpt-dir")));
+        assert!(matches!(action, Action::SaveLrptPass(_)));
+    }
+
+    /// LRPT recorder configured with both Apt + Lrpt support so
+    /// the Meteor pass actually arms. The default constructor
+    /// only supports `[Apt]` today (Task 7.5 flips it to
+    /// `[Apt, Lrpt]`); these tests need the wider set to
+    /// exercise the LRPT path.
+    fn lrpt_recorder() -> AutoRecorder {
+        AutoRecorder::with_supported_protocols(&[
+            sdr_sat::ImagingProtocol::Apt,
+            sdr_sat::ImagingProtocol::Lrpt,
+        ])
+    }
+
+    #[test]
+    fn lrpt_pass_at_aos_emits_save_lrpt_pass_at_los() {
+        // End-to-end: Meteor pass through AOS → settle → LOS
+        // dispatches `Action::SaveLrptPass` (NOT `Action::SavePng`)
+        // because the per-pass artifact is a directory of
+        // per-channel PNGs.
+        //
+        // Lock the wiring contract so a future refactor that
+        // accidentally routes the LRPT path through the APT
+        // save action fails this test instead of the user's
+        // disk (the directory path would land where the APT
+        // save handler expects a file).
+        let mut r = lrpt_recorder();
+        let now_aos = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_meteor_m2(now_aos, 3, 600, 50.0);
+
+        // AOS — arm the recorder.
+        let aos_actions = r.tick(
+            now_aos,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        // CR-bait check: the LRPT arm must dispatch the
+        // protocol on Action::StartAutoRecord so the wiring
+        // layer can route to the LRPT viewer/decoder.
+        assert!(aos_actions.iter().any(|a| matches!(
+            a,
+            Action::StartAutoRecord {
+                protocol: sdr_sat::ImagingProtocol::Lrpt,
+                ..
+            }
+        )));
+
+        // Advance through settle to Recording, then to LOS.
+        let after_settle = now_aos + ChronoDuration::seconds(SETTLE_SECS + 1);
+        let _ = r.tick(
+            after_settle,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        assert!(matches!(r.state(), State::Recording { .. }));
+
+        let after_los = pass.end + ChronoDuration::seconds(1);
+        let los_actions = r.tick(
+            after_los,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        assert!(
+            los_actions
+                .iter()
+                .any(|a| matches!(a, Action::SaveLrptPass(_))),
+            "LRPT LOS must emit SaveLrptPass, got {los_actions:?}"
+        );
+        assert!(
+            !los_actions.iter().any(|a| matches!(a, Action::SavePng(_))),
+            "LRPT LOS must NOT emit SavePng (that's APT-only), got {los_actions:?}"
+        );
+    }
+
+    #[test]
+    fn lrpt_pass_suppresses_audio_recording_even_when_toggle_on() {
+        // LRPT's demod is a silent passthrough — recording 10+
+        // minutes of stereo silence at 144 kHz wastes ~170 MB
+        // per pass for no value. The recorder must suppress
+        // audio for LRPT regardless of the user's "also save
+        // audio" toggle. The toggle still applies to APT —
+        // voice/audio capture is genuinely useful there.
+        let mut r = lrpt_recorder();
+        let now_aos = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_meteor_m2(now_aos, 3, 600, 50.0);
+
+        // Toggle ON, but Meteor pass should still skip the
+        // StartAutoAudioRecord emission.
+        let aos_actions = r.tick(
+            now_aos,
+            std::slice::from_ref(&pass),
+            true,
+            true, // audio_record_on
+            default_tune(),
+        );
+        assert!(
+            !aos_actions
+                .iter()
+                .any(|a| matches!(a, Action::StartAutoAudioRecord(_))),
+            "LRPT pass must NOT start audio recording even with toggle on; got {aos_actions:?}"
+        );
+
+        // Drive to LOS — must also skip StopAutoAudioRecord
+        // (no recording was started, so stopping would be a
+        // no-op disguised as a real action).
+        let after_settle = now_aos + ChronoDuration::seconds(SETTLE_SECS + 1);
+        let _ = r.tick(
+            after_settle,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        let after_los = pass.end + ChronoDuration::seconds(1);
+        let los_actions = r.tick(
+            after_los,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        assert!(
+            !los_actions
+                .iter()
+                .any(|a| matches!(a, Action::StopAutoAudioRecord)),
+            "LRPT LOS must NOT emit StopAutoAudioRecord (no recording was started); got {los_actions:?}"
+        );
+    }
+
+    #[test]
+    fn apt_pass_still_records_audio_with_toggle_on() {
+        // Inverse of the LRPT suppression — make sure the LRPT
+        // gate didn't accidentally mute APT audio recording.
+        let mut r = lrpt_recorder();
+        let now_aos = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now_aos, 3, 600, 50.0);
+        let aos_actions = r.tick(
+            now_aos,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        assert!(
+            aos_actions
+                .iter()
+                .any(|a| matches!(a, Action::StartAutoAudioRecord(_))),
+            "APT pass with audio toggle on must emit StartAutoAudioRecord; got {aos_actions:?}"
+        );
     }
 }

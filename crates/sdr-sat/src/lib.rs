@@ -94,14 +94,15 @@ pub struct KnownSatellite {
     /// the upcoming #482b work) by the "tune to this satellite" play
     /// button.
     pub downlink_hz: u64,
-    /// Demod mode the receiver should be in for this satellite. NFM
-    /// for everything we ship today: NOAA APT, Meteor LRPT, and ISS
-    /// SSTV all ride wide-FM-style channels and our demod chain
-    /// handles them through the same NFM front-end with a wider
-    /// channel filter. Tracked as a field rather than hardcoded so a
-    /// future amateur-band catalog addition (e.g. AO-92 with FM voice
-    /// vs PSK telemetry) can choose differently without a special
-    /// case in the wiring layer.
+    /// Demod mode the receiver should be in for this satellite.
+    /// NFM for NOAA APT and ISS (wide-FM-style audio channels);
+    /// LRPT for Meteor-M (the controller's `lrpt_decode_tap`
+    /// drives the QPSK demod + FEC chain off the post-VFO IQ
+    /// at 144 ksps, and the LRPT mode's silent-passthrough demod
+    /// makes that the IF rate). Tracked as a field rather than
+    /// hardcoded so a future amateur-band catalog addition
+    /// (e.g. AO-92 with FM voice vs PSK telemetry) can choose
+    /// differently without a special case in the wiring layer.
     pub demod_mode: sdr_types::DemodMode,
     /// Channel bandwidth (Hz) the receiver should use for this
     /// satellite. APT / LRPT / SSTV all need ~38 kHz of headroom
@@ -153,24 +154,35 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     // Meteor-M LRPT — epic #469. Note: METEOR-M 2 and NOAA 19 share
     // the 137.100 MHz channel — they're never on simultaneously by
     // design. The pass scheduler picks whichever is overhead.
-    // `imaging_protocol: None` keeps these out of the auto-record
-    // flow until Task 7 wires the live LRPT viewer; user can still
-    // see upcoming passes in the panel.
+    // `imaging_protocol: Some(Lrpt)` enrolls these in the
+    // auto-record flow per epic #469 task 7. The recorder
+    // constructor's `supported_protocols` set now includes
+    // `Lrpt`, the wiring layer's `interpret_action` opens the
+    // LRPT viewer + signals the DSP to attach the decoder, and
+    // the LOS save walks every decoded APID into a per-pass
+    // directory.
     KnownSatellite {
         name: "METEOR-M 2",
         norad_id: 40_069,
         downlink_hz: 137_100_000,
-        demod_mode: sdr_types::DemodMode::Nfm,
+        // LRPT mode runs the IF chain at 144 ksps and feeds the
+        // post-VFO IQ straight into the QPSK demod + FEC chain
+        // via the controller's `lrpt_decode_tap` (epic #469
+        // task 7.3). NFM would smear the QPSK constellation.
+        demod_mode: sdr_types::DemodMode::Lrpt,
+        // `set_bandwidth` is a no-op in LRPT mode (the demod's
+        // channel filter is locked at the IF rate); we keep the
+        // shared default for consistency with other entries.
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
-        imaging_protocol: None,
+        imaging_protocol: Some(ImagingProtocol::Lrpt),
     },
     KnownSatellite {
         name: "METEOR-M2 3",
         norad_id: 57_166,
         downlink_hz: 137_900_000,
-        demod_mode: sdr_types::DemodMode::Nfm,
+        demod_mode: sdr_types::DemodMode::Lrpt,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
-        imaging_protocol: None,
+        imaging_protocol: Some(ImagingProtocol::Lrpt),
     },
     // METEOR-M2 4 (NORAD 61024) deliberately omitted — launched 2024,
     // failed shortly after, no usable TLE on Celestrak (404 from the
@@ -272,16 +284,22 @@ mod tests {
                 s.name,
             );
         }
-        // METEOR satellites → None for this PR. Task 7 of epic
-        // #469 flips them to Some(Lrpt) once the live LRPT
-        // viewer + decoder driver are wired.
-        for s in KNOWN_SATELLITES
+        // METEOR satellites → Lrpt (epic #469 task 7). Both
+        // METEOR-M 2 and METEOR-M2 3 ship with Some(Lrpt) once
+        // the live LRPT viewer + decoder driver are wired.
+        let meteors: Vec<&KnownSatellite> = KNOWN_SATELLITES
             .iter()
             .filter(|s| s.name.starts_with("METEOR"))
-        {
+            .collect();
+        assert!(
+            !meteors.is_empty(),
+            "catalog regression: no METEOR entries found",
+        );
+        for s in meteors {
             assert_eq!(
-                s.imaging_protocol, None,
-                "{} should be None until Task 7 of epic #469",
+                s.imaging_protocol,
+                Some(ImagingProtocol::Lrpt),
+                "{} should be Lrpt (Meteor LRPT shipped in epic #469 task 7)",
                 s.name,
             );
         }

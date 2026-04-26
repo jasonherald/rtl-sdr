@@ -113,6 +113,27 @@ pub struct AppState {
     /// `close-request` fires, not when the `GObject`'s last strong
     /// ref happens to drop.
     pub apt_viewer: RefCell<Option<crate::apt_viewer::AptImageView>>,
+    /// Currently-open Meteor-M LRPT viewer window, or `None`
+    /// when no viewer is open. Same lifecycle pattern as
+    /// `apt_viewer` above. Per epic #469 task 7.
+    pub lrpt_viewer: RefCell<Option<crate::lrpt_viewer::LrptImageView>>,
+    /// Weak handle to the open LRPT viewer window so the
+    /// `app.lrpt-open` action can `present()` (raise) an
+    /// already-open-but-buried viewer instead of being a
+    /// silent no-op. Cleared by the viewer's `close-request`
+    /// alongside `lrpt_viewer`. Weak rather than strong so the
+    /// `AppState` slot doesn't keep the window alive past its
+    /// natural lifetime (the GTK toplevel registry owns the
+    /// strong ref). Per `CodeRabbit` round 13 on PR #543.
+    pub lrpt_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// Long-lived shared image handle for the LRPT decoder /
+    /// viewer. Allocated once per process — every pass reuses
+    /// the same handle so the open viewer's poll tick keeps
+    /// reading from the same `Arc<Mutex<…>>` even as the DSP
+    /// thread tears down + re-inits the per-pass decoder.
+    /// Cleared between passes via `LrptImage::clear` rather
+    /// than reconstructed.
+    pub lrpt_image: sdr_radio::lrpt_image::LrptImage,
 }
 
 impl AppState {
@@ -135,6 +156,9 @@ impl AppState {
             last_rtl_tcp_state_disc: Cell::new(RTL_TCP_STATE_DISC_DISCONNECTED),
             rtl_tcp_active_server: RefCell::new(String::new()),
             apt_viewer: RefCell::new(None),
+            lrpt_viewer: RefCell::new(None),
+            lrpt_viewer_window: RefCell::new(None),
+            lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
         })
     }
 

@@ -386,6 +386,12 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         let parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>> =
             Rc::new(move || app_for_provider.windows().into_iter().next());
         crate::apt_viewer::connect_apt_action(app, &parent_provider, &state);
+        // Same wiring for the LRPT viewer (`Ctrl+Shift+L` /
+        // `app.lrpt-open`). Sharing the parent_provider closure
+        // would be possible but each `connect_*_action` clones
+        // it internally — passing twice keeps the call sites
+        // symmetric. Per epic #469 task 7.5.
+        crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
     }
 
     // Set initial status bar values and mode-specific control visibility.
@@ -9017,39 +9023,43 @@ fn connect_satellites_panel(
                         }
                     }
                     sdr_sat::ImagingProtocol::Lrpt => {
-                        // **Should be unreachable** — the
-                        // `AutoRecorder` constructor in this
-                        // module passes
-                        // `supported_protocols = [Apt]`, so the
-                        // recorder's `tick_idle` filter rejects
-                        // any catalog entry flagged
-                        // `Some(Lrpt)` before reaching the
-                        // wiring layer. Per CR round 2 on PR
-                        // #541.
+                        // **Order is load-bearing.** Reset the
+                        // shared image AND the viewer canvas
+                        // BEFORE starting playback / retuning
+                        // so the freshly-tuned LRPT decoder
+                        // can't push pass-1 leftover rows (or
+                        // race the clear and erase the first
+                        // few rows of the new pass). Per
+                        // CodeRabbit round 8 on PR #543.
                         //
-                        // Kept as defense-in-depth: if a future
-                        // refactor breaks the recorder gate
-                        // (e.g. someone passes a wider supported
-                        // set without wiring the viewer), this
-                        // branch makes the failure visible
-                        // (error log + user-facing toast) and
-                        // fails closed (no playback / tune /
-                        // VFO mutation).
-                        //
-                        // Task 7 of epic #469 replaces this
-                        // entire branch with the LRPT viewer-
-                        // open + decoder-tap wiring (and the
-                        // recorder constructor flips to
-                        // `[Apt, Lrpt]`).
-                        tracing::error!(
-                            "auto-record fired for LRPT satellite {satellite} but the recorder gate should have prevented this — please file a bug",
+                        // The viewer is opened first so the
+                        // `view.clear()` call below can target
+                        // it — the open path also sends
+                        // `UiToDsp::SetLrptImage(handle)` to
+                        // the DSP thread, which lazy-inits the
+                        // decoder against the (now-cleared)
+                        // shared image. Catalog's
+                        // `demod_mode: Lrpt` lines up the
+                        // controller's IF rate (144 ksps) with
+                        // the QPSK demod's expected sample rate
+                        // — without that, `radio_input` would
+                        // be at the wrong rate and the demod's
+                        // resampler would sit at the wrong
+                        // setpoint. Per epic #469 task 7.
+                        crate::lrpt_viewer::open_lrpt_viewer_if_needed(
+                            &parent_provider_a,
+                            &state_a,
                         );
-                        post_toast(
-                            &toast_overlay_weak,
-                            &format!(
-                                "{satellite}: LRPT auto-record arrived early — viewer ships in epic #469 Task 7"
-                            ),
-                        );
+                        state_a.lrpt_image.clear();
+                        if let Some(view) = state_a.lrpt_viewer.borrow().as_ref() {
+                            view.clear();
+                        }
+                        // Now safe to start playback + retune;
+                        // any decoded rows from this point
+                        // forward land in the cleared image.
+                        set_playing_a(true);
+                        tune_a(freq_hz, mode, bandwidth_hz);
+                        state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
                     }
                 }
             }
@@ -9085,6 +9095,138 @@ fn connect_satellites_panel(
                     "Pass complete, but the APT viewer was closed — no image saved".to_string()
                 };
                 post_toast(&toast_overlay_weak, &result_msg);
+            }
+            RecorderAction::SaveLrptPass(dir) => {
+                // Walk every APID present in the SHARED `LrptImage`
+                // (the DSP-side decoder's destination — the source
+                // of truth) and write one PNG per channel into the
+                // per-pass directory (creating it lazily). Decoupled
+                // from the live viewer in `CodeRabbit` round 7 on
+                // PR #543: the previous implementation went through
+                // `state.lrpt_viewer` and produced "no image saved"
+                // toasts whenever the user dismissed the live
+                // window mid-pass — even though the DSP had been
+                // happily decoding into the shared image the
+                // whole time. Reading directly from
+                // `state.lrpt_image` makes the LOS save robust
+                // against viewer close: the decoder runs as long
+                // as the demod mode is `Lrpt`, and the captured
+                // imagery survives any number of viewer cycles.
+                // Snapshot every non-empty APID's pixel buffer
+                // on the main thread (cheap — `snapshot_channel`
+                // clones the per-channel `Vec<u8>` under a brief
+                // mutex hold), then move the encoding + file
+                // I/O off to a worker via `gio::spawn_blocking`.
+                // PNG encoding for a full multi-channel pass is
+                // multiple MB per APID and can take seconds; doing
+                // it inline on the 1 Hz countdown tick would
+                // freeze the UI right when the auto-record toast
+                // and tune-restore should be landing. Per
+                // CodeRabbit round 8 on PR #543. Established
+                // pattern in this file (TLE refresh @ 8678,
+                // bookmark import @ 8805).
+                let snapshots: Vec<(u16, sdr_lrpt::image::ChannelBuffer)> = {
+                    let mut sorted = state_a.lrpt_image.channel_apids();
+                    sorted.sort_unstable();
+                    sorted
+                        .into_iter()
+                        .filter_map(|apid| {
+                            state_a
+                                .lrpt_image
+                                .snapshot_channel(apid)
+                                .filter(|s| s.lines > 0)
+                                .map(|s| (apid, s))
+                        })
+                        .collect()
+                };
+                let toast_overlay_weak_for_save = toast_overlay_weak.clone();
+                glib::spawn_future_local(async move {
+                    let dir_for_msg = dir.clone();
+                    let result_msg = gio::spawn_blocking(move || {
+                        if snapshots.is_empty() {
+                            tracing::warn!(
+                                "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
+                            );
+                            return format!(
+                                "Pass complete, but no LRPT channels decoded — nothing saved to {}",
+                                dir.display()
+                            );
+                        }
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            // Per-pass directory created up
+                            // front so a disk-full / permissions
+                            // failure surfaces as a single
+                            // observable error rather than `N`
+                            // per-channel warnings. Per
+                            // CodeRabbit round 1 on PR #543.
+                            tracing::warn!(
+                                "auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",
+                            );
+                            return format!(
+                                "Pass complete but couldn't create {}: {e}",
+                                dir.display()
+                            );
+                        }
+                        let mut saved = 0_usize;
+                        let mut errors: Vec<String> = Vec::new();
+                        for (apid, snap) in snapshots {
+                            let path = dir.join(format!("apid{apid}.png"));
+                            match crate::lrpt_viewer::write_greyscale_png(
+                                &path,
+                                &snap.pixels,
+                                sdr_lrpt::image::IMAGE_WIDTH,
+                                snap.lines,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        ?path,
+                                        apid,
+                                        lines = snap.lines,
+                                        "auto-record LRPT channel saved",
+                                    );
+                                    saved += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "auto-record LRPT export for APID {apid} to {path:?} failed: {e}",
+                                    );
+                                    errors.push(format!("APID {apid}: {e}"));
+                                }
+                            }
+                        }
+                        if errors.is_empty() {
+                            format!(
+                                "Pass complete — {saved} LRPT channel(s) saved to {}",
+                                dir.display()
+                            )
+                        } else {
+                            format!(
+                                "Pass complete — {saved} channel(s) saved, {} failed: {}",
+                                errors.len(),
+                                errors.join("; ")
+                            )
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        // `gio::spawn_blocking`'s join error is a
+                        // panic payload (`Box<dyn Any + Send>`),
+                        // which doesn't implement `Display`.
+                        // Format via `Debug` on the worker side
+                        // and just report a generic message to
+                        // the user — a panicking PNG encoder is
+                        // a logic bug, not something the user
+                        // can act on.
+                        tracing::warn!(
+                            "auto-record SaveLrptPass: worker thread panicked: {e:?}",
+                        );
+                        format!(
+                            "Pass complete but PNG worker panicked (target was {})",
+                            dir_for_msg.display()
+                        )
+                    });
+                    post_toast(&toast_overlay_weak_for_save, &result_msg);
+                });
             }
             RecorderAction::RestoreTune(saved) => {
                 tracing::info!(
