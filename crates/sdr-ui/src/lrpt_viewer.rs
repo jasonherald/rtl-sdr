@@ -538,6 +538,14 @@ pub fn write_greyscale_png(
         dim: "height",
         value: height,
     })?;
+    // Zero-size guard runs BEFORE buffer-shape validation so a
+    // call like `write_greyscale_png(path, &[1], 0, 1)` reports
+    // the dedicated `ZeroSized` discriminant rather than masking
+    // it as a generic `InvalidBuffer`. Callers (and the user-
+    // facing toast) match on these distinctly. Per CR on PR #550.
+    if width == 0 || height == 0 {
+        return Err(ViewerError::ZeroSized);
+    }
     let expected = width
         .checked_mul(height)
         .ok_or(ViewerError::DimensionTooLarge {
@@ -552,9 +560,6 @@ pub fn write_greyscale_png(
             height,
             expected,
         )));
-    }
-    if width == 0 || height == 0 {
-        return Err(ViewerError::ZeroSized);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
@@ -1613,6 +1618,18 @@ mod tests {
         let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-zero.png");
         let result = write_greyscale_png(&path, &[], 0, 0);
         assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_greyscale_png_zero_dim_with_pixels_reports_zero_sized() {
+        // Pin the CR-requested ordering: a zero-dim call with a
+        // non-empty pixel buffer must surface as `ZeroSized`, not
+        // mask as the generic `InvalidBuffer` length-mismatch.
+        // Per CR on PR #550.
+        let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-zero-dim-pixels.png");
+        let result = write_greyscale_png(&path, &[1_u8], 0, 1);
+        assert!(matches!(result, Err(crate::viewer::ViewerError::ZeroSized)));
         assert!(!path.exists());
     }
 }

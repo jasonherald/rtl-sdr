@@ -40,7 +40,13 @@ use std::path::PathBuf;
 /// Errors returned by the APT and LRPT image viewers' renderer
 /// and PNG-export paths. Constructed at the failing call site
 /// so the `Display` output identifies which step failed.
+///
+/// Marked `#[non_exhaustive]` because the module docs explicitly
+/// say new variants land here as either viewer needs them — a
+/// future addition would otherwise break exhaustive matches in
+/// downstream callers. Per CR on PR #550.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ViewerError {
     /// A Cairo drawing or surface operation failed. `op` names
     /// the failing call (`"paint"`, `"save"`, `"restore"`,
@@ -168,21 +174,20 @@ mod tests {
 
     #[test]
     fn cairo_error_display_includes_op_identifier() {
-        // We can't easily synthesise a real `cairo::Error` in a
-        // unit test (the variants are open-ended), but we can
-        // pin the message format by checking that the `op` field
-        // surfaces as part of any future `Display` output. This
-        // test serves as a contract-pin via the `Debug` impl,
-        // which is good enough for the format-stability
-        // assertion.
-        let dbg = format!(
-            "{:?}",
+        // Pins the user-facing `Display` contract — the `op`
+        // identifier must surface in the `#[error(...)]` string
+        // so toasts and log lines name the failing call site.
+        // `Debug` is too lenient (always prints field names
+        // verbatim) and would mask a future `#[error(...)]`
+        // regression. Per CR on PR #550.
+        let msg = format!(
+            "{}",
             ViewerError::Cairo {
                 op: "test paint",
                 source: cairo::Error::NoMemory,
             }
         );
-        assert!(dbg.contains("test paint"));
+        assert!(msg.contains("test paint"), "got {msg}");
     }
 
     #[test]

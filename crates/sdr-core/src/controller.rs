@@ -301,6 +301,14 @@ struct DspState {
     /// and to the newly-opened source when the source is rebuilt
     /// from a path or source-type change. Per issue #236.
     file_looping: bool,
+    /// RTL-SDR USB bias-T (5 V on coax) toggle. Persisted in
+    /// state so a `SetBiasTee` dispatched while no source is
+    /// open isn't silently dropped — `open_source` re-applies
+    /// the value to the freshly-built RTL-SDR source. Without
+    /// this, first-play after restart would always start with
+    /// bias-T off regardless of the persisted UI switch.
+    /// Per CR round 1 on PR #550.
+    bias_tee_enabled: bool,
 
     // Pre-allocated buffers
     iq_buf: Vec<Complex>,
@@ -510,6 +518,7 @@ impl DspState {
             rtl_tcp_auth_key: None,
             file_path: std::path::PathBuf::new(),
             file_looping: false,
+            bias_tee_enabled: false,
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
@@ -1548,6 +1557,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetBiasTee(enabled) => {
             tracing::debug!(enabled, "set bias tee");
+            // Persist FIRST so a dispatch with no live source
+            // (e.g. startup before the user hits Play) survives
+            // until `open_source` runs. Per CR on PR #550.
+            state.bias_tee_enabled = enabled;
             if let Some(source) = &mut state.source
                 && let Err(e) = source.set_bias_tee(enabled)
             {
@@ -2435,6 +2448,29 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
     }
 
     source.start().map_err(|e| e.to_string())?;
+
+    // Re-apply persisted bias-T to the freshly-opened RTL-SDR
+    // source. The `SetBiasTee` handler stores the value in
+    // state but only forwards to the live source — without
+    // this, a user who toggled bias-T while no source was
+    // open (or whose persisted-true value was dispatched at
+    // startup before Play) would land here with the dongle's
+    // GPIO still in its power-on default. Always apply (not
+    // gated on `bias_tee_enabled` being `true`) so an explicit
+    // `false` also wins over any stale GPIO state from a prior
+    // app. No-op for non-RTL-SDR sources, so we gate on
+    // `SourceType::RtlSdr`. Warn-and-continue on failure —
+    // bias-T is non-critical and the source is otherwise
+    // streaming. Per CR on PR #550.
+    if state.source_type == SourceType::RtlSdr
+        && let Err(e) = source.set_bias_tee(state.bias_tee_enabled)
+    {
+        tracing::warn!(
+            error = %e,
+            enabled = state.bias_tee_enabled,
+            "re-applying persisted bias-T on source open failed"
+        );
+    }
 
     // Sync sample rate from the source (file sources have fixed rates).
     state.sample_rate = source.sample_rate();

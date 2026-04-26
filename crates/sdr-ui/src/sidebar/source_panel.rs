@@ -263,8 +263,10 @@ pub struct SourcePanel {
     /// RTL-SDR bias tee toggle. Powers an inline LNA over the
     /// coax (V3+ dongles only — older clones lack the circuit
     /// and the driver returns Err on those, surfaced as a
-    /// toast). Visibility-gated to RTL-SDR USB (and `rtl_tcp`
-    /// when the user has remote-bias-T toggle wired). Per
+    /// toast). Visibility-gated to local RTL-SDR USB only in
+    /// this panel (hidden for Network / File / `rtl_tcp`).
+    /// `rtl_tcp` has its own remote-bias-T default in the
+    /// share-server panel rather than reusing this row. Per
     /// issue #537.
     pub bias_tee_row: adw::SwitchRow,
     /// Network hostname entry.

@@ -6526,11 +6526,11 @@ fn connect_source_panel(
         // Dispatch the persisted value once at startup so the
         // dongle's GPIO matches the UI from the first source
         // open, not just after the user toggles. The
-        // controller's source slot may be `None` here (no
-        // source open yet); the SetBiasTee handler is a no-op
-        // in that case, and the value re-applies via the
-        // `set_active`-triggered notify the next time around.
-        // Cheap to send either way.
+        // `SetBiasTee` handler stores the value in `DspState`
+        // up-front, and `open_source` re-applies it to the
+        // freshly-opened RTL-SDR source — so this dispatch
+        // works regardless of whether a source is open at
+        // startup. Per CR on PR #550.
         state.send_dsp(UiToDsp::SetBiasTee(persisted));
     }
     let state_bias_tee = Rc::clone(state);
