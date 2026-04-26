@@ -9100,98 +9100,98 @@ fn connect_satellites_panel(
                 post_toast(&toast_overlay_weak, &result_msg);
             }
             RecorderAction::SaveLrptPass(dir) => {
-                // Walk every APID known to the LRPT viewer and
-                // write one PNG per channel into the per-pass
-                // directory (creating it lazily). Toast reports
-                // the count actually written — closed viewer or
-                // an empty pass collapses to a clear message
-                // rather than a silent success. Per epic #469
-                // task 7.4. The full per-channel save loop lives
-                // here (not on `LrptImageView`) because the
-                // viewer's PNG export only knows about the
-                // currently-active channel; the per-pass
-                // artifact wants every channel.
-                let result_msg = if let Some(view) = state_a.lrpt_viewer.borrow().as_ref() {
-                    let apids = view.known_apids();
-                    if apids.is_empty() {
-                        tracing::warn!(
-                            "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
-                        );
-                        format!(
-                            "Pass complete, but no LRPT channels decoded — nothing saved to {}",
-                            dir.display()
-                        )
-                    } else if let Err(e) = std::fs::create_dir_all(&dir) {
-                        // The recorder hands us a path that
-                        // doesn't exist yet — `LrptImageRenderer::export_png`
-                        // creates the *parent* lazily, but for
-                        // an LRPT pass each export's parent is
-                        // the same directory, so creating it
-                        // up front avoids the chance of a race
-                        // (the per-APID files all create the
-                        // same parent on first use). Also gives
-                        // us a single observable failure point
-                        // for "disk full / permissions" rather
-                        // than `N` toasts. Per CodeRabbit
-                        // round 1 on PR #543.
-                        tracing::warn!(
-                            "auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",
-                        );
-                        format!("Pass complete but couldn't create {}: {e}", dir.display())
-                    } else {
-                        // Save the currently-active channel last
-                        // so the viewer comes out of the loop
-                        // pointing at whatever the user had open
-                        // — the temporary set_active_apid below
-                        // is the only way to get the per-channel
-                        // export path through the existing
-                        // `export_png` API without adding a
-                        // by-APID variant.
-                        let user_active = view.active_apid();
-                        let mut saved = 0_usize;
-                        let mut errors: Vec<String> = Vec::new();
-                        let mut sorted = apids;
-                        sorted.sort_unstable();
-                        for apid in sorted {
-                            if !view.set_active_apid(apid) {
-                                continue;
-                            }
-                            let path = dir.join(format!("apid{apid}.png"));
-                            match view.export_png(&path) {
-                                Ok(()) => {
-                                    tracing::info!(?path, apid, "auto-record LRPT channel saved");
-                                    saved += 1;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "auto-record LRPT export for APID {apid} to {path:?} failed: {e}",
-                                    );
-                                    errors.push(format!("APID {apid}: {e}"));
-                                }
-                            }
+                // Walk every APID present in the SHARED `LrptImage`
+                // (the DSP-side decoder's destination — the source
+                // of truth) and write one PNG per channel into the
+                // per-pass directory (creating it lazily). Decoupled
+                // from the live viewer in `CodeRabbit` round 7 on
+                // PR #543: the previous implementation went through
+                // `state.lrpt_viewer` and produced "no image saved"
+                // toasts whenever the user dismissed the live
+                // window mid-pass — even though the DSP had been
+                // happily decoding into the shared image the
+                // whole time. Reading directly from
+                // `state.lrpt_image` makes the LOS save robust
+                // against viewer close: the decoder runs as long
+                // as the demod mode is `Lrpt`, and the captured
+                // imagery survives any number of viewer cycles.
+                let mut sorted = state_a.lrpt_image.channel_apids();
+                sorted.sort_unstable();
+                let result_msg = if sorted.is_empty() {
+                    tracing::warn!(
+                        "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
+                    );
+                    format!(
+                        "Pass complete, but no LRPT channels decoded — nothing saved to {}",
+                        dir.display()
+                    )
+                } else if let Err(e) = std::fs::create_dir_all(&dir) {
+                    // Per-pass directory created up front so a
+                    // disk-full / permissions failure surfaces as
+                    // a single observable error rather than `N`
+                    // per-channel warnings. Per CodeRabbit
+                    // round 1 on PR #543.
+                    tracing::warn!(
+                        "auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",
+                    );
+                    format!("Pass complete but couldn't create {}: {e}", dir.display())
+                } else {
+                    let mut saved = 0_usize;
+                    let mut errors: Vec<String> = Vec::new();
+                    for apid in sorted {
+                        let Some(snap) = state_a.lrpt_image.snapshot_channel(apid) else {
+                            // Disappeared between channel_apids
+                            // and snapshot_channel — racy with a
+                            // future clear; treat as empty.
+                            continue;
+                        };
+                        if snap.lines == 0 {
+                            continue;
                         }
-                        // Restore the user's selection.
-                        if let Some(apid) = user_active {
-                            view.set_active_apid(apid);
-                        }
-                        if errors.is_empty() {
-                            format!(
-                                "Pass complete — {saved} LRPT channel(s) saved to {}",
-                                dir.display()
-                            )
-                        } else {
-                            format!(
-                                "Pass complete — {saved} channel(s) saved, {} failed: {}",
-                                errors.len(),
-                                errors.join("; ")
-                            )
+                        let path = dir.join(format!("apid{apid}.png"));
+                        match crate::lrpt_viewer::write_greyscale_png(
+                            &path,
+                            &snap.pixels,
+                            sdr_lrpt::image::IMAGE_WIDTH,
+                            snap.lines,
+                        ) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    ?path,
+                                    apid,
+                                    lines = snap.lines,
+                                    "auto-record LRPT channel saved",
+                                );
+                                saved += 1;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "auto-record LRPT export for APID {apid} to {path:?} failed: {e}",
+                                );
+                                errors.push(format!("APID {apid}: {e}"));
+                            }
                         }
                     }
-                } else {
-                    tracing::warn!(
-                        "auto-record SaveLrptPass but no LRPT viewer is open (user closed mid-pass)",
-                    );
-                    "Pass complete, but the LRPT viewer was closed — no image saved".to_string()
+                    if saved == 0 && errors.is_empty() {
+                        // Every channel had `lines == 0` — pass
+                        // saw APID metadata but no actual pixel
+                        // data (very-low-elevation noise pass).
+                        format!(
+                            "Pass complete, but every LRPT channel was empty — nothing saved to {}",
+                            dir.display()
+                        )
+                    } else if errors.is_empty() {
+                        format!(
+                            "Pass complete — {saved} LRPT channel(s) saved to {}",
+                            dir.display()
+                        )
+                    } else {
+                        format!(
+                            "Pass complete — {saved} channel(s) saved, {} failed: {}",
+                            errors.len(),
+                            errors.join("; ")
+                        )
+                    }
                 };
                 post_toast(&toast_overlay_weak, &result_msg);
             }

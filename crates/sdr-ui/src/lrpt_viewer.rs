@@ -431,6 +431,82 @@ impl LrptImageRenderer {
     }
 }
 
+// ─── Standalone PNG writer ─────────────────────────────────────────────
+
+/// Write a tightly-sized PNG of greyscale `pixels` (one byte per
+/// pixel, row-major, length `width * height`) to `path`.
+///
+/// Builds a one-shot ARGB32 surface — same Cairo path
+/// `LrptImageRenderer::export_png` uses, but reading from a raw
+/// pixel slice rather than a cached per-channel surface. Pulled
+/// out as a free function so the LOS `SaveLrptPass` handler in
+/// `window.rs` can write per-channel PNGs straight from
+/// `state.lrpt_image` without going through a viewer renderer
+/// — the recorder needs to save imagery whether or not the user
+/// has the live viewer open. Per `CodeRabbit` round 7 on PR #543.
+///
+/// # Errors
+///
+/// Returns a stringified error from filesystem creation, surface
+/// construction, the surface-data lock, or Cairo's PNG encoder.
+/// Pixel-buffer length mismatch (`pixels.len() != width * height`)
+/// is reported as a stringified error rather than silently
+/// truncating.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub fn write_greyscale_png(
+    path: &Path,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    let expected = width
+        .checked_mul(height)
+        .ok_or_else(|| format!("greyscale PNG: width*height overflow ({width} × {height})"))?;
+    if pixels.len() != expected {
+        return Err(format!(
+            "greyscale PNG: pixel buffer length {} doesn't match width*height ({}*{} = {})",
+            pixels.len(),
+            width,
+            height,
+            expected,
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err("greyscale PNG: zero-sized image".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+
+    let mut surface =
+        cairo::ImageSurface::create(cairo::Format::ARgb32, width as i32, height as i32)
+            .map_err(|e| format!("export surface: {e}"))?;
+    {
+        let stride =
+            usize::try_from(surface.stride()).map_err(|e| format!("invalid stride: {e}"))?;
+        let mut data = surface
+            .data()
+            .map_err(|e| format!("surface data lock: {e}"))?;
+        for row in 0..height {
+            let row_offset = row * stride;
+            let pixel_row_offset = row * width;
+            for col in 0..width {
+                let g = pixels[pixel_row_offset + col];
+                let pixel_offset = row_offset + col * BYTES_PER_PIXEL;
+                data[pixel_offset] = g;
+                data[pixel_offset + 1] = g;
+                data[pixel_offset + 2] = g;
+                data[pixel_offset + 3] = 0xFF;
+            }
+        }
+    }
+    let mut file = std::fs::File::create(path).map_err(|e| format!("file: {e}"))?;
+    surface
+        .write_to_png(&mut file)
+        .map_err(|e| format!("png: {e}"))?;
+    Ok(())
+}
+
 // ─── GTK widget ────────────────────────────────────────────────────────
 
 /// Live Meteor LRPT image viewer widget.
@@ -977,7 +1053,21 @@ pub fn open_lrpt_viewer_if_needed(
             view.shutdown();
         }
         *state_for_close.lrpt_viewer.borrow_mut() = None;
-        state_for_close.send_dsp(UiToDsp::ClearLrptImage);
+        // Deliberately NOT sending `UiToDsp::ClearLrptImage`
+        // here — the DSP-side decoder + shared image stay
+        // attached so the DSP keeps decoding into the shared
+        // image regardless of viewer presence. Closing the
+        // viewer mid-pass used to drop all subsequent rows
+        // and break the LOS `SaveLrptPass` save (the recorder
+        // would post "no image saved" even though decoding
+        // was still feasible). Now the recorder reads the
+        // shared image directly at LOS, so viewer close is
+        // purely a UI teardown. The decoder remains gated by
+        // `current_mode == Lrpt` and the source-stop cleanup
+        // path, so closing the viewer in manual LRPT mode
+        // doesn't burn CPU forever — switching demod or
+        // stopping the source still tears it down. Per
+        // `CodeRabbit` round 7 on PR #543.
         glib::Propagation::Proceed
     });
 }
@@ -1183,5 +1273,49 @@ mod tests {
             "exported file isn't a valid PNG (header mismatch)",
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_greyscale_png_round_trips_to_a_real_file() {
+        // Pin the new free-function path used by the LOS
+        // `SaveLrptPass` handler in `window.rs`. Per
+        // `CodeRabbit` round 7 on PR #543.
+        use std::io::Read;
+        const W: usize = 32;
+        const H: usize = 8;
+        let pixels: Vec<u8> = (0..W * H)
+            .map(|i| u8::try_from(i & 0xff).unwrap_or(0))
+            .collect();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!("sdr-ui-lrpt-bare-{nanos}.png"));
+        write_greyscale_png(&path, &pixels, W, H).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert!(metadata.len() > 0);
+        let mut header = [0_u8; 8];
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.read_exact(&mut header).unwrap();
+        assert_eq!(&header, b"\x89PNG\r\n\x1a\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_greyscale_png_rejects_size_mismatch() {
+        let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-mismatch.png");
+        let result = write_greyscale_png(&path, &[0_u8; 10], 4, 4);
+        assert!(result.is_err());
+        assert!(
+            !path.exists(),
+            "no file should be written on size-mismatch error"
+        );
+    }
+
+    #[test]
+    fn write_greyscale_png_rejects_zero_size() {
+        let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-zero.png");
+        let result = write_greyscale_png(&path, &[], 0, 0);
+        assert!(result.is_err());
+        assert!(!path.exists());
     }
 }
