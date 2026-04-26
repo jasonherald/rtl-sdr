@@ -458,13 +458,25 @@ impl LrptImageRenderer {
 /// Pixel-buffer length mismatch (`pixels.len() != width * height`)
 /// is reported as a stringified error rather than silently
 /// truncating.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn write_greyscale_png(
     path: &Path,
     pixels: &[u8],
     width: usize,
     height: usize,
 ) -> Result<(), String> {
+    // Validate dimensions fit Cairo's `i32` API up front. The
+    // earlier draft `as i32`-cast both, which silently wraps for
+    // any usize > i32::MAX (2.1 G) into a negative or bogus
+    // surface request. Practically unreachable for LRPT
+    // (IMAGE_WIDTH = 1568, MAX_LINES = 8192) but
+    // `write_greyscale_png` is a `pub` library function and the
+    // `#[allow(cast_possible_wrap)]` would have hidden the
+    // wrap, not prevented it. Per `CodeRabbit` round 9 on PR
+    // #543.
+    let width_i32 = i32::try_from(width)
+        .map_err(|_| format!("greyscale PNG: width {width} exceeds i32::MAX"))?;
+    let height_i32 = i32::try_from(height)
+        .map_err(|_| format!("greyscale PNG: height {height} exceeds i32::MAX"))?;
     let expected = width
         .checked_mul(height)
         .ok_or_else(|| format!("greyscale PNG: width*height overflow ({width} × {height})"))?;
@@ -484,9 +496,8 @@ pub fn write_greyscale_png(
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
 
-    let mut surface =
-        cairo::ImageSurface::create(cairo::Format::ARgb32, width as i32, height as i32)
-            .map_err(|e| format!("export surface: {e}"))?;
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width_i32, height_i32)
+        .map_err(|e| format!("export surface: {e}"))?;
     {
         let stride =
             usize::try_from(surface.stride()).map_err(|e| format!("invalid stride: {e}"))?;
@@ -678,6 +689,17 @@ impl LrptImageView {
                 // side, plus `PushOutcome::consumed()` for the
                 // renderer-side failure case. Per `CodeRabbit`
                 // rounds 2 + 3 on PR #543.
+                // Track whether ANY row actually painted this
+                // pass. `Capped` / `InvalidLine` advance the
+                // watermark (so the row is "consumed" — see
+                // `PushOutcome::consumed`) but don't change the
+                // visible canvas, and `TransientFailure` doesn't
+                // even advance. Without this distinction, a
+                // channel parked at MAX_LINES would queue a redraw
+                // every 250 ms tick forever — wasted GPU work
+                // for an unchanged image. Per `CodeRabbit` round
+                // 9 on PR #543.
+                let mut painted_any = false;
                 let mut pushed = already;
                 for line_idx in already..channel.lines {
                     let start = line_idx * IMAGE_WIDTH;
@@ -700,10 +722,15 @@ impl LrptImageView {
                         // tick will pick up where we left off.
                         break;
                     }
+                    if matches!(outcome, PushOutcome::Pushed) {
+                        painted_any = true;
+                    }
                     pushed = line_idx + 1;
                 }
                 last_seen.insert(apid, pushed);
-                any_new = true;
+                if painted_any {
+                    any_new = true;
+                }
             }
         });
         drop(renderer);
