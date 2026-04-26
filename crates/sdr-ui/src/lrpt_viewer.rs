@@ -93,6 +93,13 @@ const VIEWER_WINDOW_HEIGHT: i32 = 600;
 /// content here, just discrete row appends.
 const POLL_INTERVAL_MS: u32 = 250;
 
+/// Refresh interval for the channel-dropdown population tick.
+/// Channel discovery on Meteor is rare (a handful of APIDs per
+/// pass, all surfaced within the first minute), so 1 Hz is
+/// plenty — anything faster would burn CPU on idle string
+/// compares. Per `CodeRabbit` round 5 on PR #543.
+const DROPDOWN_REFRESH_INTERVAL_MS: u32 = 1_000;
+
 /// What [`LrptImageRenderer::push_line`] did with the row.
 /// Drives the caller's per-APID watermark: rows that were
 /// committed (or permanently dropped because they're either
@@ -572,7 +579,6 @@ impl LrptImageView {
     /// the DSP thread on the lock for any longer than the
     /// strict copy time.
     pub fn drain_new_lines(&self) {
-        let mut new_apids: Vec<u16> = Vec::new();
         let mut any_new = false;
         let mut last_seen = self.last_seen_lines.borrow_mut();
         let mut renderer = self.renderer.borrow_mut();
@@ -582,7 +588,6 @@ impl LrptImageView {
                 if channel.lines <= already {
                     continue;
                 }
-                let known = renderer.channels.contains_key(&apid);
                 // Track lines actually consumed so the watermark
                 // doesn't advance past either the bounds-guard
                 // skip path OR a transient renderer failure
@@ -616,9 +621,6 @@ impl LrptImageView {
                     pushed = line_idx + 1;
                 }
                 last_seen.insert(apid, pushed);
-                if !known {
-                    new_apids.push(apid);
-                }
                 any_new = true;
             }
         });
@@ -738,33 +740,36 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     // held during the `set_selected` calls.
     let view_for_tick = view.clone();
     let dropdown_clone = dropdown.clone();
-    let refresh_id = glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
-        let mut current = view_for_tick.known_apids();
-        current.sort_unstable();
-        if *dropdown_apids.borrow() == current {
-            return glib::ControlFlow::Continue;
-        }
-        let active = view_for_tick.active_apid();
-        model.splice(0, model.n_items(), &[]);
-        for &apid in &current {
-            model.append(&format!("APID {apid}"));
-        }
-        dropdown_apids.borrow_mut().clone_from(&current);
-        dropdown_clone.set_sensitive(!current.is_empty());
-        if let Some(active) = active {
-            if let Some(pos) = current.iter().position(|&a| a == active) {
-                #[allow(clippy::cast_possible_truncation)]
-                dropdown_clone.set_selected(pos as u32);
+    let refresh_id = glib::timeout_add_local(
+        std::time::Duration::from_millis(u64::from(DROPDOWN_REFRESH_INTERVAL_MS)),
+        move || {
+            let mut current = view_for_tick.known_apids();
+            current.sort_unstable();
+            if *dropdown_apids.borrow() == current {
+                return glib::ControlFlow::Continue;
             }
-        } else if !current.is_empty() {
-            // No previous selection — pick the first APID
-            // (sorted) so the user sees something the moment
-            // data arrives. The `selected_notify` handler above
-            // will route the choice into the renderer.
-            dropdown_clone.set_selected(0);
-        }
-        glib::ControlFlow::Continue
-    });
+            let active = view_for_tick.active_apid();
+            model.splice(0, model.n_items(), &[]);
+            for &apid in &current {
+                model.append(&format!("APID {apid}"));
+            }
+            dropdown_apids.borrow_mut().clone_from(&current);
+            dropdown_clone.set_sensitive(!current.is_empty());
+            if let Some(active) = active {
+                if let Some(pos) = current.iter().position(|&a| a == active) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    dropdown_clone.set_selected(pos as u32);
+                }
+            } else if !current.is_empty() {
+                // No previous selection — pick the first APID
+                // (sorted) so the user sees something the moment
+                // data arrives. The `selected_notify` handler above
+                // will route the choice into the renderer.
+                dropdown_clone.set_selected(0);
+            }
+            glib::ControlFlow::Continue
+        },
+    );
     view.register_source(refresh_id);
 
     dropdown
