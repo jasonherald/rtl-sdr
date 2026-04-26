@@ -85,6 +85,42 @@ const VIEWER_WINDOW_HEIGHT: i32 = 600;
 /// content here, just discrete row appends.
 const POLL_INTERVAL_MS: u32 = 250;
 
+/// What [`LrptImageRenderer::push_line`] did with the row.
+/// Drives the caller's per-APID watermark: rows that were
+/// committed (or permanently dropped because they're either
+/// malformed or past the channel's [`MAX_LINES`] cap) advance the
+/// watermark; transient renderer failures leave the row in the
+/// source so the next poll can retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// Row was written into the per-APID Cairo surface.
+    Pushed,
+    /// Channel already at [`MAX_LINES`] — row intentionally
+    /// dropped. Caller should advance its watermark; further
+    /// data for this channel will keep hitting the cap no
+    /// matter how many retries.
+    Capped,
+    /// Caller bug — pixel slice didn't match [`IMAGE_WIDTH`].
+    /// Caller should advance its watermark; the data is
+    /// malformed at the source and retrying won't help.
+    InvalidLine,
+    /// Transient renderer-side failure (surface allocation,
+    /// stride conversion, or surface-data lock). Caller should
+    /// NOT advance its watermark — the next poll might succeed
+    /// (alloc relief, lock contention clearing).
+    TransientFailure,
+}
+
+impl PushOutcome {
+    /// `true` when the caller should advance its watermark past
+    /// this row. `false` means "leave it in the source for the
+    /// next poll to retry" — used only for [`Self::TransientFailure`].
+    #[must_use]
+    pub fn consumed(self) -> bool {
+        !matches!(self, Self::TransientFailure)
+    }
+}
+
 /// Pure Cairo renderer for a multi-channel LRPT image buffer.
 ///
 /// Owns one persistent ARGB32 [`cairo::ImageSurface`] per APID,
@@ -191,25 +227,33 @@ impl LrptImageRenderer {
     /// surface for `apid`, lazy-allocating the surface on the
     /// first push for that APID. Greyscale values go into the
     /// surface's backing data as ARGB32 (B/G/R/A — Cairo's
-    /// little-endian layout, alpha = `0xFF`). No-op once
-    /// [`MAX_LINES`] is reached for that channel.
+    /// little-endian layout, alpha = `0xFF`).
     ///
-    /// If `pixels.len()` doesn't equal [`IMAGE_WIDTH`], the line
-    /// is dropped with a warning — caller bug; this can't be
-    /// recovered from at the renderer layer.
-    pub fn push_line(&mut self, apid: u16, pixels: &[u8]) {
+    /// Returns a [`PushOutcome`] that callers (specifically
+    /// [`LrptImageView::drain_new_lines`]) inspect to decide
+    /// whether to advance their per-APID watermark. Pushed and
+    /// permanently-dropped rows (cap reached, malformed input)
+    /// advance the watermark; transient renderer failures
+    /// (surface alloc, stride conversion, surface-data lock)
+    /// leave the row in the source so the next poll can retry.
+    /// Per `CodeRabbit` round 3 on PR #543.
+    pub fn push_line(&mut self, apid: u16, pixels: &[u8]) -> PushOutcome {
         if pixels.len() != IMAGE_WIDTH {
             tracing::warn!(
                 "LRPT renderer: ignoring line for APID {apid} with {} pixels (expected {IMAGE_WIDTH})",
                 pixels.len(),
             );
-            return;
+            // Caller bug. Watermark should still advance —
+            // retrying with the same malformed input will only
+            // reproduce the same warn forever.
+            return PushOutcome::InvalidLine;
         }
         // Lazy alloc; `ChannelSurface::new` returns `None` if
-        // Cairo can't acquire the ~6 MB ARGB32 surface. Drop
-        // the line with a warn rather than panicking — the
-        // viewer keeps working for any already-allocated
-        // channels and the next line will retry.
+        // Cairo can't acquire the ~MAX-LINES-sized ARGB32
+        // surface. Drop the line with a warn rather than
+        // panicking — and report the failure as transient so
+        // the next poll retries (alloc may succeed later under
+        // memory pressure relief).
         let entry = match self.channels.entry(apid) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -217,19 +261,22 @@ impl LrptImageRenderer {
                     tracing::warn!(
                         "LRPT renderer: surface alloc failed for APID {apid}; dropping line",
                     );
-                    return;
+                    return PushOutcome::TransientFailure;
                 };
                 e.insert(surface)
             }
         };
         if entry.n_lines >= MAX_LINES {
-            return;
+            // Surface full — advance watermark anyway. Further
+            // data for this channel will keep hitting the cap
+            // no matter how many times we retry.
+            return PushOutcome::Capped;
         }
         let stride = match usize::try_from(entry.surface.stride()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("LRPT renderer: invalid surface stride: {e}");
-                return;
+                return PushOutcome::TransientFailure;
             }
         };
         let row_offset = entry.n_lines * stride;
@@ -237,7 +284,7 @@ impl LrptImageRenderer {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("LRPT renderer: surface data lock failed: {e}");
-                return;
+                return PushOutcome::TransientFailure;
             }
         };
         for (i, &g) in pixels.iter().enumerate() {
@@ -256,6 +303,7 @@ impl LrptImageRenderer {
         if self.active.is_none() {
             self.active = Some(apid);
         }
+        PushOutcome::Pushed
     }
 
     /// Drop all per-channel surfaces. The `HashMap` allocation
@@ -527,11 +575,14 @@ impl LrptImageView {
                     continue;
                 }
                 let known = renderer.channels.contains_key(&apid);
-                // Track lines actually pushed so the bounds-guard
-                // skip path can't permanently strand un-copied
-                // rows. Same fix as `lrpt_decoder::harvest_new_lines`
-                // — the parallel watermark on the DSP side. Per
-                // `CodeRabbit` round 2 on PR #543.
+                // Track lines actually consumed so the watermark
+                // doesn't advance past either the bounds-guard
+                // skip path OR a transient renderer failure
+                // (surface alloc / stride / lock). Same shape as
+                // `lrpt_decoder::harvest_new_lines` on the DSP
+                // side, plus `PushOutcome::consumed()` for the
+                // renderer-side failure case. Per `CodeRabbit`
+                // rounds 2 + 3 on PR #543.
                 let mut pushed = already;
                 for line_idx in already..channel.lines {
                     let start = line_idx * IMAGE_WIDTH;
@@ -546,7 +597,14 @@ impl LrptImageView {
                         );
                         break;
                     }
-                    renderer.push_line(apid, &channel.pixels[start..end]);
+                    let outcome = renderer.push_line(apid, &channel.pixels[start..end]);
+                    if !outcome.consumed() {
+                        // Transient failure — leave this row in
+                        // the source so the next poll retries.
+                        // Don't break the outer loop; the next
+                        // tick will pick up where we left off.
+                        break;
+                    }
                     pushed = line_idx + 1;
                 }
                 last_seen.insert(apid, pushed);
@@ -658,13 +716,24 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     // can cancel it when the window closes; otherwise the closure's
     // `view.clone()` would keep the view + ~6 MB-per-channel
     // surfaces alive forever.
+    //
+    // **Borrow scoping:** GTK4's `gtk4::DropDown::set_selected`
+    // emits `notify::selected` SYNCHRONOUSLY inside the setter,
+    // which means the `connect_selected_notify` handler above
+    // re-enters this same `dropdown_apids` `RefCell` to look
+    // up the APID for the new index. If we held a `borrow_mut()`
+    // across `set_selected(...)`, that re-entrance would panic
+    // with "already borrowed". Per `CodeRabbit` round 3 on PR
+    // #543. The borrows below are kept tight: an immutable
+    // `borrow()` for the equality compare, a fresh
+    // `borrow_mut()` for the `clone_from`, and zero borrows
+    // held during the `set_selected` calls.
     let view_for_tick = view.clone();
     let dropdown_clone = dropdown.clone();
     let refresh_id = glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
         let mut current = view_for_tick.known_apids();
         current.sort_unstable();
-        let mut existing = dropdown_apids.borrow_mut();
-        if *existing == current {
+        if *dropdown_apids.borrow() == current {
             return glib::ControlFlow::Continue;
         }
         let active = view_for_tick.active_apid();
@@ -672,7 +741,7 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
         for &apid in &current {
             model.append(&format!("APID {apid}"));
         }
-        (*existing).clone_from(&current);
+        dropdown_apids.borrow_mut().clone_from(&current);
         dropdown_clone.set_sensitive(!current.is_empty());
         if let Some(active) = active {
             if let Some(pos) = current.iter().position(|&a| a == active) {
@@ -934,11 +1003,19 @@ mod tests {
     fn push_line_caps_at_max_lines_per_channel() {
         let mut r = LrptImageRenderer::new();
         for _ in 0..MAX_LINES {
-            r.push_line(APID_TEST, &synth_line(TEST_PIXEL));
+            assert_eq!(
+                r.push_line(APID_TEST, &synth_line(TEST_PIXEL)),
+                PushOutcome::Pushed,
+            );
         }
         assert_eq!(r.n_lines(APID_TEST), MAX_LINES);
-        // One more push past the cap is a no-op.
-        r.push_line(APID_TEST, &synth_line(TEST_PIXEL));
+        // One more push past the cap reports `Capped` — caller's
+        // watermark should still advance (further pushes won't
+        // succeed no matter how many retries).
+        assert_eq!(
+            r.push_line(APID_TEST, &synth_line(TEST_PIXEL)),
+            PushOutcome::Capped,
+        );
         assert_eq!(r.n_lines(APID_TEST), MAX_LINES);
     }
 
@@ -946,10 +1023,25 @@ mod tests {
     fn push_line_with_wrong_width_is_dropped() {
         let mut r = LrptImageRenderer::new();
         // IMAGE_WIDTH is 1568; deliberately pass a short slice.
-        r.push_line(APID_TEST, &[TEST_PIXEL; 16]);
+        assert_eq!(
+            r.push_line(APID_TEST, &[TEST_PIXEL; 16]),
+            PushOutcome::InvalidLine,
+        );
         // No surface allocated, no line counted.
         assert_eq!(r.n_lines(APID_TEST), 0);
         assert!(r.known_apids().is_empty());
+    }
+
+    #[test]
+    fn push_outcome_consumed_pins_watermark_semantics() {
+        // Pin the contract `LrptImageView::drain_new_lines`
+        // depends on: only `TransientFailure` leaves the row
+        // in the source for retry. Per `CodeRabbit` round 3
+        // on PR #543.
+        assert!(PushOutcome::Pushed.consumed());
+        assert!(PushOutcome::Capped.consumed());
+        assert!(PushOutcome::InvalidLine.consumed());
+        assert!(!PushOutcome::TransientFailure.consumed());
     }
 
     #[test]
