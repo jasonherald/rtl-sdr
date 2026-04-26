@@ -26,6 +26,7 @@ pub mod fec;
 pub mod image;
 
 use crate::ccsds::{Demux, ImagePacket};
+use crate::fec::FecChain;
 use crate::image::{ImageAssembler, JpegDecoder, MCUS_PER_LINE, fill_dqt};
 
 /// MCUs encoded per Meteor LRPT image packet. Per medet's
@@ -94,6 +95,7 @@ impl ChannelDecoder {
 /// or saves PNGs at LOS via [`crate::image::save_channel`] /
 /// [`crate::image::save_composite`].
 pub struct LrptPipeline {
+    fec: FecChain,
     demux: Demux,
     decoders: std::collections::HashMap<u16, ChannelDecoder>,
     assembler: ImageAssembler,
@@ -109,14 +111,30 @@ impl LrptPipeline {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            fec: FecChain::new(),
             demux: Demux::new(),
             decoders: std::collections::HashMap::new(),
             assembler: ImageAssembler::new(),
         }
     }
 
+    /// Push one soft-symbol pair from the QPSK demod through the
+    /// full FEC chain. When the chain emits a complete VCDU
+    /// (Viterbi → ASM sync → derand → RS-decode), it's
+    /// immediately routed through demux + image assembly.
+    /// Caller-friendly: one call per demod output, no buffering
+    /// required at the call site.
+    pub fn push_symbol(&mut self, soft: [i8; 2]) {
+        if let Some(vcdu) = self.fec.push_symbol(soft) {
+            self.push_vcdu(&vcdu);
+        }
+    }
+
     /// Push one [`VCDU_TOTAL_LEN`]-byte VCDU. Drives demux →
     /// per-channel JPEG decode → image-assembler placement.
+    /// Public so the [`crate::fec::FecChain`] CLI replay path
+    /// (and tests with synthetic VCDUs) can skip the FEC stage
+    /// entirely.
     pub fn push_vcdu(&mut self, vcdu_bytes: &[u8]) {
         for packet in self.demux.push(vcdu_bytes) {
             self.consume_packet(&packet);
@@ -272,6 +290,7 @@ impl LrptPipeline {
     /// Reset the pipeline (clear all state). Called between
     /// passes when the recorder fires `RestoreTune`.
     pub fn reset(&mut self) {
+        self.fec.reset();
         self.demux = Demux::new();
         self.decoders.clear();
         self.assembler.clear();
