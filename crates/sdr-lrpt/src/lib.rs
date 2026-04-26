@@ -189,10 +189,24 @@ impl LrptPipeline {
         let Some(first) = decoder.first_pkt else {
             return;
         };
-        let row_pkt = (pkt - first).max(0);
+        let row_pkt = pkt - first;
+        // Per CR round 8: drop pre-anchor packets entirely
+        // instead of clamping them to row 0. The previous
+        // `.max(0)` would silently snap a corrupted-but-not-
+        // wrap reversal (caught by WRAP_MIN_BACKWARD_DELTA
+        // above) onto the first image row, overwriting real
+        // data. Trace-log the drop so the corruption stays
+        // visible during debug runs.
+        if row_pkt < 0 {
+            tracing::trace!(
+                "dropping pre-anchor packet on APID {apid}: first={first} pkt={pkt}",
+                apid = packet.apid,
+            );
+            return;
+        }
         #[allow(
             clippy::cast_sign_loss,
-            reason = "row_pkt is non-negative after the .max(0)"
+            reason = "row_pkt is non-negative after the row_pkt < 0 early return above"
         )]
         let mcu_row = (row_pkt / PACKETS_PER_ROW_GROUP) as usize;
 
@@ -567,6 +581,41 @@ mod tests {
             "1-step reversal must NOT trigger wrap correction"
         );
         assert_eq!(dec.last_pkt, Some(99));
+    }
+
+    #[test]
+    fn consume_packet_drops_pre_anchor_packet() {
+        // CR round 8: a packet whose pkt < first_pkt (after
+        // wrap handling) used to be silently snapped to row 0
+        // by `.max(0)`, overwriting real first-row data. The
+        // fix returns early instead.
+        //
+        // Anchor APID 65 (whose offset = -14 from the first
+        // sequence_count). With initial pkt = 100, first_pkt
+        // becomes 86. Then push pkt = 80 — small backward
+        // step (≤ WRAP_MIN_BACKWARD_DELTA), so the wrap fix
+        // does NOT move first_pkt; row_pkt = 80 - 86 = -6,
+        // which would have clamped to 0 before the fix.
+        //
+        // First push lands at row 0 (writes assembler data).
+        // Second push must NOT add more pixels — the drop
+        // happens before `place_mcu` is called.
+        let mut p = LrptPipeline::new();
+        let pkt_a = synthetic_image_packet(65, 100);
+        p.consume_packet(&pkt_a);
+        let pixels_after_first = p.assembler.channel(65).map_or(0, |c| c.pixels.len());
+        assert!(
+            pixels_after_first > 0,
+            "first packet must populate assembler",
+        );
+
+        let pkt_b = synthetic_image_packet(65, 80);
+        p.consume_packet(&pkt_b);
+        let pixels_after_second = p.assembler.channel(65).map_or(0, |c| c.pixels.len());
+        assert_eq!(
+            pixels_after_second, pixels_after_first,
+            "pre-anchor packet must be dropped, not overwrite row 0",
+        );
     }
 
     #[test]

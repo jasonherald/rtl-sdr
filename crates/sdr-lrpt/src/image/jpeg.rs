@@ -200,10 +200,19 @@ impl JpegDecoder {
         bit_offset: &mut usize,
         dqt: &Dqt,
     ) -> Result<Block8x8, JpegError> {
+        // Per CR round 8: decode through local shadow state
+        // (`next_offset` for bit_offset, `next_dc` for self.last_dc)
+        // and only commit the shadows back to the caller-visible
+        // fields once the MCU has fully decoded. On any
+        // intermediate Err the caller's `bit_offset` and the
+        // decoder's `last_dc` stay at their pre-call values, so
+        // the public streaming API is transactional.
+        let mut next_offset = *bit_offset;
+        let mut next_dc = self.last_dc;
         let mut zdct = [0_f32; MCU_SAMPLES];
 
         // Step 1: DC delta.
-        let dc_window = peek_n_bits(bytes, *bit_offset, HUFF_LOOKAHEAD_BITS)?;
+        let dc_window = peek_n_bits(bytes, next_offset, HUFF_LOOKAHEAD_BITS)?;
         let dc_cat_signed = self.dc_lookup[dc_window as usize];
         if dc_cat_signed < 0 {
             return Err(JpegError::BadDcCode);
@@ -215,16 +224,15 @@ impl JpegDecoder {
         )]
         let dc_cat = dc_cat_signed as u8;
         // The LUT can match a code via zero-padded peek bits; only
-        // advance bit_offset if those bits actually exist. Per CR
-        // round 7.
+        // advance if those bits actually exist. Per CR round 7.
         ensure_n_bits_available(
             bytes,
-            *bit_offset,
+            next_offset,
             usize::from(DC_CAT_BIT_LEN[dc_cat as usize]),
         )?;
-        *bit_offset += DC_CAT_BIT_LEN[dc_cat as usize] as usize;
+        next_offset += DC_CAT_BIT_LEN[dc_cat as usize] as usize;
         let dc_value_bits = if dc_cat > 0 {
-            fetch_n_bits(bytes, bit_offset, dc_cat as usize)?
+            fetch_n_bits(bytes, &mut next_offset, dc_cat as usize)?
         } else {
             0
         };
@@ -233,13 +241,13 @@ impl JpegDecoder {
             reason = "DC delta is bounded by ±2^11 (category ≤ 11), well within f32 mantissa"
         )]
         let dc_delta = map_range(dc_cat, dc_value_bits) as f32;
-        zdct[0] = dc_delta + self.last_dc;
-        self.last_dc = zdct[0];
+        next_dc += dc_delta;
+        zdct[0] = next_dc;
 
         // Step 2: AC run-length pairs until end-of-block.
         let mut k: usize = 1;
         while k < 64 {
-            let ac_window = peek_n_bits(bytes, *bit_offset, HUFF_LOOKAHEAD_BITS)?;
+            let ac_window = peek_n_bits(bytes, next_offset, HUFF_LOOKAHEAD_BITS)?;
             let ac_idx_signed = self.ac_lookup[ac_window as usize];
             if ac_idx_signed < 0 {
                 return Err(JpegError::BadAcCode);
@@ -251,8 +259,8 @@ impl JpegDecoder {
             let ac = self.ac_table[ac_idx_signed as usize];
             // Same zero-padded-peek hazard as DC above: only
             // advance if the matched code's bits actually exist.
-            ensure_n_bits_available(bytes, *bit_offset, usize::from(ac.len))?;
-            *bit_offset += ac.len as usize;
+            ensure_n_bits_available(bytes, next_offset, usize::from(ac.len))?;
+            next_offset += ac.len as usize;
             // EOB marker: run=0 size=0.
             if ac.run == 0 && ac.size == 0 {
                 zdct[k..].fill(0.0);
@@ -286,7 +294,7 @@ impl JpegDecoder {
                 k += 1;
             }
             if ac.size > 0 {
-                let n = fetch_n_bits(bytes, bit_offset, ac.size as usize)?;
+                let n = fetch_n_bits(bytes, &mut next_offset, ac.size as usize)?;
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "AC coefficient is bounded by ±2^10 (size ≤ 10 in practice), within f32 mantissa"
@@ -327,9 +335,37 @@ impl JpegDecoder {
                 block[y][x] = clamped;
             }
         }
+        // Commit shadow state — the MCU has decoded fully without
+        // any intermediate Err. Per CR round 8: leaving these
+        // commits to the very end keeps `decode_mcu` transactional
+        // (caller's bit_offset and decoder's last_dc stay at the
+        // pre-call values on any error path above).
+        *bit_offset = next_offset;
+        self.last_dc = next_dc;
         Ok(block)
     }
 }
+
+/// Lower bound (exclusive) of the Meteor JPEG quality band that
+/// uses the `5000 / qf` scaling rule. Below or at this threshold
+/// the linear `200 - 2 * qf` rule applies instead.
+const QUALITY_HYPERBOLIC_MIN: f32 = 20.0;
+/// Upper bound (exclusive) of the same hyperbolic band. At or
+/// above this quality the linear rule takes over again.
+const QUALITY_HYPERBOLIC_MAX: f32 = 50.0;
+/// Numerator of the hyperbolic quality rule: `f = HYP_NUM / qf`
+/// for qf ∈ (`QUALITY_HYPERBOLIC_MIN`, `QUALITY_HYPERBOLIC_MAX`).
+const QUALITY_HYPERBOLIC_NUM: f32 = 5000.0;
+/// Constant term of the linear quality rule: `f = LIN_BASE - LIN_SLOPE * qf`.
+const QUALITY_LINEAR_BASE: f32 = 200.0;
+/// Slope of the linear quality rule.
+const QUALITY_LINEAR_SLOPE: f32 = 2.0;
+/// Divisor that scales `f * QUANT_TEMPLATE[i]` back into the JPEG
+/// quantization range. Lifted directly from medet's `met_jpg.pas`.
+const QUALITY_TEMPLATE_DIVISOR: f32 = 100.0;
+/// Floor applied per-slot — JPEG dequantization divides by
+/// `dqt[i]`, so a zero would blow up the IDCT input.
+const QUALITY_MIN_DQT: f32 = 1.0;
 
 /// Per-packet quantization table — derived from the standard
 /// template scaled by the packet's quality byte. Public so the
@@ -337,20 +373,20 @@ impl JpegDecoder {
 /// same `Dqt` to every MCU in that packet.
 pub fn fill_dqt(q: u8) -> Dqt {
     let qf = f32::from(q);
-    let f = if qf > 20.0 && qf < 50.0 {
-        5000.0 / qf
+    let f = if qf > QUALITY_HYPERBOLIC_MIN && qf < QUALITY_HYPERBOLIC_MAX {
+        QUALITY_HYPERBOLIC_NUM / qf
     } else {
-        200.0 - 2.0 * qf
+        QUALITY_LINEAR_BASE - QUALITY_LINEAR_SLOPE * qf
     };
     let mut dqt: Dqt = [0_u16; MCU_SAMPLES];
     for (i, slot) in dqt.iter_mut().enumerate() {
-        let scaled = (f * f32::from(QUANT_TEMPLATE[i]) / 100.0).round();
+        let scaled = (f * f32::from(QUANT_TEMPLATE[i]) / QUALITY_TEMPLATE_DIVISOR).round();
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "max scaled value is QUANT_TEMPLATE max (121) × max f (≈238 from 5000/qf at qf≈21) / 100 ≈ 288, fits in u16"
         )]
-        let raw = scaled.max(1.0) as u16;
+        let raw = scaled.max(QUALITY_MIN_DQT) as u16;
         *slot = raw;
     }
     dqt
@@ -1070,6 +1106,39 @@ mod tests {
         assert!(
             matches!(result, Err(JpegError::EndOfStream)),
             "matched DC cat 0 (2 bits) at bit_offset=7 of 8-bit payload must EOF, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn decode_mcu_is_transactional_on_error() {
+        // CR round 8: on any intermediate Err, the caller's
+        // bit_offset and the decoder's last_dc must stay at
+        // their pre-call values. Otherwise a streaming caller
+        // is left with a poisoned predictor / half-advanced
+        // offset that desyncs the next MCU.
+        //
+        // Trigger: bit_offset=7 in an 8-bit payload (same as
+        // the truncated-DC test above) — `ensure_n_bits_available`
+        // returns EndOfStream AFTER the LUT match. Confirm
+        // both bit_offset and last_dc are unchanged after
+        // the call returns Err.
+        // Pre-set last_dc to a non-zero sentinel so an
+        // accidental commit-on-error would clobber it visibly.
+        const PRE_DC: f32 = 99.0;
+        let bytes = [0xE0_u8];
+        let mut decoder = JpegDecoder::new();
+        decoder.last_dc = PRE_DC;
+        let mut bit_offset = 7_usize;
+        let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
+        let result = decoder.decode_mcu(&bytes, &mut bit_offset, &dqt);
+        assert!(matches!(result, Err(JpegError::EndOfStream)));
+        assert_eq!(
+            bit_offset, 7,
+            "caller's bit_offset must not advance on error"
+        );
+        assert_eq!(
+            decoder.last_dc, PRE_DC,
+            "decoder's last_dc must not change on error"
         );
     }
 }
