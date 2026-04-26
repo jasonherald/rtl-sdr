@@ -2778,12 +2778,15 @@ dependencies = [
 name = "sdr-lrpt"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "criterion",
  "image",
  "proptest",
+ "sdr-dsp",
  "sdr-types",
  "thiserror 2.0.18",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

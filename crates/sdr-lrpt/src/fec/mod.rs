@@ -11,11 +11,13 @@
 //! This PR (Task 2) ships [`ViterbiDecoder`], [`SyncCorrelator`],
 //! and [`Derandomizer`]. Reed-Solomon lands in Task 3.
 
+pub mod chain;
 pub mod derand;
 pub mod reed_solomon;
 pub mod sync;
 pub mod viterbi;
 
+pub use chain::FecChain;
 pub use derand::Derandomizer;
 pub use reed_solomon::{K as RS_K, N as RS_N, ReedSolomon, RsError, T as RS_T};
 pub use sync::{ASM, ASM_BITS, SYNC_THRESHOLD, SyncCorrelator};
