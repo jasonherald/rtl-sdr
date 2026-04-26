@@ -56,9 +56,9 @@ const ZIGZAG: [u8; 64] = [
 ];
 
 /// Per-category bit-offset for the standard JPEG DC Huffman
-/// table. Index = DC category (0-11); value = total Huffman code
-/// length in bits (length includes the variable-length suffix
-/// for category > 0).
+/// table. Index = DC category (0-11); value = Huffman code
+/// length in bits (code only; the variable-length value suffix
+/// of `cat` bits is fetched separately by `decode_mcu`).
 const DC_CAT_BIT_LEN: [u8; 12] = [2, 3, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9];
 
 /// Standard JPEG AC Huffman table preamble + symbols. First 16
@@ -220,9 +220,7 @@ impl JpegDecoder {
             *bit_offset += ac.len as usize;
             // EOB marker: run=0 size=0.
             if ac.run == 0 && ac.size == 0 {
-                for slot in zdct.iter_mut().take(64).skip(k) {
-                    *slot = 0.0;
-                }
+                zdct[k..].fill(0.0);
                 break;
             }
             // Pre-validate that the AC symbol won't run past
