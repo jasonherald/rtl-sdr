@@ -9,6 +9,7 @@ pub mod apt_image;
 pub mod apt_telemetry;
 pub mod demod;
 pub mod if_chain;
+pub mod lrpt_image;
 
 use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, DEEMPHASIS_TAU_US};
 use sdr_dsp::multirate::RationalResampler;

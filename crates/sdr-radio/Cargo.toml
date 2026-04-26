@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 sdr-types.workspace = true
 sdr-dsp.workspace = true
+sdr-lrpt.workspace = true
 sdr-pipeline.workspace = true
 serde.workspace = true
 thiserror.workspace = true
