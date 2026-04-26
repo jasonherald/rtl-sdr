@@ -1100,6 +1100,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // Persist FIRST so a dispatch with no live source
             // survives until `open_source` runs. Per #551.
             state.tuner_gain_tenths_db = gain_tenths;
+            // Clear the indexed-gain cache so this dB value is
+            // authoritative on the next reopen. The replay
+            // helper applies dB then index, so a leftover
+            // `Some(index)` from a prior `SetGainByIndex`
+            // dispatch would otherwise overwrite the newer dB
+            // value. Per CR round 2 on PR #553.
+            state.tuner_gain_index = None;
             if let Some(source) = &mut state.source
                 && let Err(e) = source.set_gain(gain_tenths)
             {
