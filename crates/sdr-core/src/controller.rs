@@ -309,6 +309,31 @@ struct DspState {
     /// bias-T off regardless of the persisted UI switch.
     /// Per CR round 1 on PR #550.
     bias_tee_enabled: bool,
+    /// RTL-SDR direct-sampling mode (0 = disabled, 1 = I, 2 = Q).
+    /// Persist-and-replay companion to `bias_tee_enabled` —
+    /// see [issue `#551`].
+    direct_sampling_mode: i32,
+    /// RTL-SDR tuner offset-tuning toggle (E4000-only, harmless
+    /// no-op on other tuners). Per issue `#551`.
+    offset_tuning_enabled: bool,
+    /// RTL2832U digital AGC (separate from the tuner AGC tracked
+    /// by `tuner_agc_auto`). Per issue `#551`.
+    rtl_agc_enabled: bool,
+    /// Tuner gain mode — `true` = automatic (AGC), `false` =
+    /// manual (caller-supplied gain). Per issue `#551`.
+    tuner_agc_auto: bool,
+    /// Manual tuner gain in tenths of a dB (librtlsdr units).
+    /// Only meaningful when `tuner_agc_auto` is `false` — applied
+    /// unconditionally on replay because librtlsdr ignores it
+    /// while AGC is on. Per issue `#551`.
+    tuner_gain_tenths_db: i32,
+    /// Manual gain index for `UiToDsp::SetGainByIndex` (FFI-side
+    /// alternative to `tuner_gain_tenths_db`). `None` until the
+    /// caller has explicitly chosen one — replay skipped while
+    /// `None`. Per issue `#551`.
+    tuner_gain_index: Option<u32>,
+    /// Clock PPM correction. Per issue `#551`.
+    ppm_correction: i32,
 
     // Pre-allocated buffers
     iq_buf: Vec<Complex>,
@@ -519,6 +544,13 @@ impl DspState {
             file_path: std::path::PathBuf::new(),
             file_looping: false,
             bias_tee_enabled: false,
+            direct_sampling_mode: 0,
+            offset_tuning_enabled: false,
+            rtl_agc_enabled: false,
+            tuner_agc_auto: false,
+            tuner_gain_tenths_db: 0,
+            tuner_gain_index: None,
+            ppm_correction: 0,
             iq_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             processed_buf: vec![Complex::default(); IQ_PAIRS_PER_READ],
             fft_buf: vec![0.0; DEFAULT_FFT_SIZE],
@@ -1063,18 +1095,31 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetGain(gain_db) => {
             tracing::debug!(gain_db, "set gain");
             #[allow(clippy::cast_possible_truncation)]
-            if let Some(source) = &mut state.source {
-                // Source gain is in tenths of dB (e.g., 49.6 dB = 496)
-                let gain_tenths = (gain_db * 10.0) as i32;
-                if let Err(e) = source.set_gain(gain_tenths) {
-                    tracing::warn!("set gain failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
-                }
+            // Source gain is in tenths of dB (e.g., 49.6 dB = 496)
+            let gain_tenths = (gain_db * 10.0) as i32;
+            // Persist FIRST so a dispatch with no live source
+            // survives until `open_source` runs. Per #551.
+            state.tuner_gain_tenths_db = gain_tenths;
+            // Clear the indexed-gain cache so this dB value is
+            // authoritative on the next reopen. The replay
+            // helper applies dB then index, so a leftover
+            // `Some(index)` from a prior `SetGainByIndex`
+            // dispatch would otherwise overwrite the newer dB
+            // value. Per CR round 2 on PR #553.
+            state.tuner_gain_index = None;
+            if let Some(source) = &mut state.source
+                && let Err(e) = source.set_gain(gain_tenths)
+            {
+                tracing::warn!("set gain failed: {e}");
+                let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
             }
         }
 
         UiToDsp::SetAgc(enabled) => {
             tracing::debug!(enabled, "set AGC");
+            // Persist FIRST so a dispatch with no live source
+            // survives until `open_source` runs. Per #551.
+            state.tuner_agc_auto = enabled;
             if let Some(source) = &mut state.source {
                 // AGC enabled = automatic gain (manual=false), AGC disabled = manual gain
                 if let Err(e) = source.set_gain_mode(!enabled) {
@@ -1571,7 +1616,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetDirectSampling(mode) => {
             tracing::debug!(mode, "set direct sampling");
-            if !(DIRECT_SAMPLING_MIN..=DIRECT_SAMPLING_MAX).contains(&mode) {
+            if (DIRECT_SAMPLING_MIN..=DIRECT_SAMPLING_MAX).contains(&mode) {
+                // Persist FIRST so a dispatch with no live source
+                // survives until `open_source` runs. Per #551.
+                state.direct_sampling_mode = mode;
+                if let Some(source) = &mut state.source
+                    && let Err(e) = source.set_direct_sampling(mode)
+                {
+                    tracing::warn!("set direct sampling failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
+                }
+            } else {
                 tracing::warn!(
                     "set direct sampling rejected: mode {mode} out of range \
                      ({DIRECT_SAMPLING_MIN}..={DIRECT_SAMPLING_MAX})"
@@ -1580,16 +1635,14 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     "Direct sampling mode {mode} out of range \
                      ({DIRECT_SAMPLING_MIN}..={DIRECT_SAMPLING_MAX})"
                 )));
-            } else if let Some(source) = &mut state.source
-                && let Err(e) = source.set_direct_sampling(mode)
-            {
-                tracing::warn!("set direct sampling failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
             }
         }
 
         UiToDsp::SetOffsetTuning(enabled) => {
             tracing::debug!(enabled, "set offset tuning");
+            // Persist FIRST so a dispatch with no live source
+            // survives until `open_source` runs. Per #551.
+            state.offset_tuning_enabled = enabled;
             if let Some(source) = &mut state.source
                 && let Err(e) = source.set_offset_tuning(enabled)
             {
@@ -1600,6 +1653,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetRtlAgc(enabled) => {
             tracing::debug!(enabled, "set RTL AGC");
+            // Persist FIRST so a dispatch with no live source
+            // survives until `open_source` runs. Per #551.
+            state.rtl_agc_enabled = enabled;
             if let Some(source) = &mut state.source
                 && let Err(e) = source.set_rtl_agc(enabled)
             {
@@ -1610,6 +1666,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetGainByIndex(index) => {
             tracing::debug!(index, "set gain by index");
+            // Persist FIRST so a dispatch with no live source
+            // survives until `open_source` runs. The bounds
+            // check below depends on the live source's gain
+            // table, so we can only validate when a source is
+            // present — replay also bounds-checks against the
+            // freshly-opened source. Per #551.
+            state.tuner_gain_index = Some(index);
             if let Some(source) = &mut state.source {
                 // Bounds-check the index. Two sources of truth for
                 // the legal count:
@@ -1659,6 +1722,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetPpmCorrection(ppm) => {
             tracing::debug!(ppm, "set PPM correction");
+            // Persist FIRST so a dispatch with no live source
+            // survives until `open_source` runs. Per #551.
+            state.ppm_correction = ppm;
             if let Some(source) = &mut state.source
                 && let Err(e) = source.set_ppm_correction(ppm)
             {
@@ -2366,6 +2432,139 @@ fn rebuild_rtl_tcp_source(
     state.source = Some(source);
 }
 
+/// Re-apply the persisted RTL-SDR settings tracked on
+/// [`DspState`] to a freshly-opened source. Each setting is
+/// best-effort — we warn-log and toast on failure but never
+/// abort the source open, since these are non-critical
+/// configuration knobs and the source is otherwise streaming.
+///
+/// Called from [`open_source`] after `source.start()` succeeds,
+/// gated on `SourceType::RtlSdr` because every replayed setting
+/// is RTL-SDR-specific (no-op on Network/File/RtlTcp). The
+/// source argument is `&mut dyn Source` so this runs against
+/// the freshly-built `Box<dyn Source>` before it's stored on
+/// `state.source`.
+///
+/// Replay order matches the rationale in the call site comment:
+/// PPM (clock baseline) → path-shaping toggles (direct-sampling,
+/// offset-tuning, RTL-AGC) → tuner gain mode + value (manual or
+/// AGC) → bias-T last (LNA power should follow the established
+/// signal path, not lead it).
+///
+/// Per issue #551.
+fn rtl_sdr_replay_persisted_settings(
+    state: &DspState,
+    source: &mut dyn Source,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+) {
+    if let Err(e) = source.set_ppm_correction(state.ppm_correction) {
+        tracing::warn!(
+            error = %e,
+            ppm = state.ppm_correction,
+            "re-applying persisted PPM correction on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("PPM correction failed: {e}")));
+    }
+
+    if let Err(e) = source.set_direct_sampling(state.direct_sampling_mode) {
+        tracing::warn!(
+            error = %e,
+            mode = state.direct_sampling_mode,
+            "re-applying persisted direct-sampling mode on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
+    }
+
+    if let Err(e) = source.set_offset_tuning(state.offset_tuning_enabled) {
+        tracing::warn!(
+            error = %e,
+            enabled = state.offset_tuning_enabled,
+            "re-applying persisted offset-tuning on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("Offset tuning failed: {e}")));
+    }
+
+    if let Err(e) = source.set_rtl_agc(state.rtl_agc_enabled) {
+        tracing::warn!(
+            error = %e,
+            enabled = state.rtl_agc_enabled,
+            "re-applying persisted RTL AGC on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("RTL AGC failed: {e}")));
+    }
+
+    // Tuner gain mode: `set_gain_mode(manual)` where
+    // `manual = !tuner_agc_auto`. Apply BEFORE the manual gain
+    // value so a switch into manual mode lands at the persisted
+    // value instead of the dongle's reset default.
+    if let Err(e) = source.set_gain_mode(!state.tuner_agc_auto) {
+        tracing::warn!(
+            error = %e,
+            agc_auto = state.tuner_agc_auto,
+            "re-applying persisted tuner AGC mode on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("AGC failed: {e}")));
+    }
+
+    // Manual tuner gain. librtlsdr ignores this when AGC is on,
+    // so we always apply — explicit-OFF AGC + persisted gain
+    // takes effect; AGC-on + persisted gain is a harmless write.
+    if let Err(e) = source.set_gain(state.tuner_gain_tenths_db) {
+        tracing::warn!(
+            error = %e,
+            gain_tenths = state.tuner_gain_tenths_db,
+            "re-applying persisted tuner gain on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
+    }
+
+    // Discrete gain index — only when the FFI/scanner side has
+    // explicitly chosen one. Bounds-check against the freshly-
+    // opened source's gain table: the index can be stale (set
+    // via FFI before any source was open, or persisted from a
+    // prior session against a different dongle), and replaying
+    // it unchecked produces a recurring startup toast on every
+    // open until the user overwrites it. Mirrors the live
+    // `UiToDsp::SetGainByIndex` handler's pre-check. Skip when
+    // `gains().len() == 0` — the rtl_tcp path can't populate it
+    // synchronously, but the replay helper is gated to
+    // `SourceType::RtlSdr` upstream, where the local USB driver
+    // does fill the table at open time. Per CR round 1 on
+    // PR #553.
+    if let Some(index) = state.tuner_gain_index {
+        let gains_len = source.gains().len();
+        if gains_len > 0 && (index as usize) >= gains_len {
+            tracing::warn!(
+                index,
+                gains_len,
+                "re-applying persisted tuner gain index rejected: out of range"
+            );
+            let _ = dsp_tx.send(DspToUi::Error(format!(
+                "Gain index {index} out of range (source has {gains_len} gains)"
+            )));
+        } else if let Err(e) = source.set_gain_by_index(index) {
+            tracing::warn!(
+                error = %e,
+                index,
+                "re-applying persisted tuner gain index on source open failed"
+            );
+            let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
+        }
+    }
+
+    if let Err(e) = source.set_bias_tee(state.bias_tee_enabled) {
+        tracing::warn!(
+            error = %e,
+            enabled = state.bias_tee_enabled,
+            "re-applying persisted bias-T on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!(
+            "Bias tee {} failed: {e}",
+            if state.bias_tee_enabled { "on" } else { "off" }
+        )));
+    }
+}
+
 /// Open the active IQ source and configure it for streaming.
 fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(), String> {
     let mut source: Box<dyn Source> = match state.source_type {
@@ -2449,33 +2648,33 @@ fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(
 
     source.start().map_err(|e| e.to_string())?;
 
-    // Re-apply persisted bias-T to the freshly-opened RTL-SDR
-    // source. The `SetBiasTee` handler stores the value in
-    // state but only forwards to the live source — without
-    // this, a user who toggled bias-T while no source was
-    // open (or whose persisted-true value was dispatched at
-    // startup before Play) would land here with the dongle's
-    // GPIO still in its power-on default. Always apply (not
-    // gated on `bias_tee_enabled` being `true`) so an explicit
-    // `false` also wins over any stale GPIO state from a prior
-    // app. No-op for non-RTL-SDR sources, so we gate on
-    // `SourceType::RtlSdr`. Warn-and-continue on failure, AND
-    // surface a non-fatal toast so the user isn't left with a
-    // switch that silently lies about hardware state — mirrors
-    // the live `UiToDsp::SetBiasTee` handler's error path.
-    // Per CR round 2 on PR #550.
-    if state.source_type == SourceType::RtlSdr
-        && let Err(e) = source.set_bias_tee(state.bias_tee_enabled)
-    {
-        tracing::warn!(
-            error = %e,
-            enabled = state.bias_tee_enabled,
-            "re-applying persisted bias-T on source open failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!(
-            "Bias tee {} failed: {e}",
-            if state.bias_tee_enabled { "on" } else { "off" }
-        )));
+    // Re-apply persisted RTL-SDR settings to the freshly-opened
+    // source. Each `UiToDsp::SetX` handler writes to state up-
+    // front (so dispatches with no live source aren't lost) and
+    // forwards to the live source if any. Without this replay,
+    // first-play after restart would land with each setting at
+    // the dongle's power-on default rather than the user's
+    // persisted choice.
+    //
+    // All settings always apply (not gated on non-default
+    // values) so explicit OFF / 0 / disabled-mode also wins
+    // over any stale state from a prior app. No-op for non-RTL-
+    // SDR sources, so we gate on `SourceType::RtlSdr`. Warn-
+    // and-continue on each failure plus a non-fatal toast so
+    // the user isn't left with a UI switch that silently lies
+    // about hardware state.
+    //
+    // Replay order: PPM first (clock baseline that affects the
+    // tuner's sample-rate / freq accuracy), then path-shaping
+    // toggles (direct sampling, offset tuning, RTL-AGC), then
+    // tuner gain mode + value, then bias-T (LNA power last so
+    // earlier failures don't leave the LNA powered without the
+    // intended signal path).
+    //
+    // Per #551 (and CR round 2 on PR #550 for the bias-T
+    // template).
+    if state.source_type == SourceType::RtlSdr {
+        rtl_sdr_replay_persisted_settings(state, source.as_mut(), dsp_tx);
     }
 
     // Sync sample rate from the source (file sources have fixed rates).
@@ -3168,6 +3367,24 @@ mod tests {
         // VFO starts as None (created on device open).
         assert!(state.vfo.is_none());
         assert!((state.vfo_offset - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dsp_state_rtl_sdr_persist_fields_default_correctly() {
+        // Pins the persist-and-reapply defaults for issue #551.
+        // Each of these fields is replayed unconditionally to a
+        // freshly-opened RTL-SDR source; defaults must match the
+        // dongle's power-on state so first launch (no persisted
+        // dispatch yet) doesn't change hardware behavior.
+        let state = DspState::new().unwrap();
+        assert!(!state.bias_tee_enabled);
+        assert_eq!(state.direct_sampling_mode, 0);
+        assert!(!state.offset_tuning_enabled);
+        assert!(!state.rtl_agc_enabled);
+        assert!(!state.tuner_agc_auto);
+        assert_eq!(state.tuner_gain_tenths_db, 0);
+        assert!(state.tuner_gain_index.is_none());
+        assert_eq!(state.ppm_correction, 0);
     }
 
     #[test]
