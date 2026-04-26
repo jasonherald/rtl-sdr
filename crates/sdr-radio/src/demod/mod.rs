@@ -7,6 +7,7 @@
 mod am;
 mod cw;
 mod dsb;
+mod lrpt;
 mod lsb;
 mod nfm;
 mod raw;
@@ -48,6 +49,7 @@ pub(crate) fn process_with_agc_to_stereo(
 pub use am::AmDemodulator;
 pub use cw::CwDemodulator;
 pub use dsb::DsbDemodulator;
+pub use lrpt::LrptDemodulator;
 pub use lsb::LsbDemodulator;
 pub use nfm::NfmDemodulator;
 pub use raw::RawDemodulator;
@@ -146,6 +148,7 @@ pub fn create_demodulator(
         DemodMode::Dsb => Ok(Box::new(DsbDemodulator::new()?)),
         DemodMode::Cw => Ok(Box::new(CwDemodulator::new()?)),
         DemodMode::Raw => Ok(Box::new(RawDemodulator::new())),
+        DemodMode::Lrpt => Ok(Box::new(LrptDemodulator::new())),
     }
 }
 
@@ -185,6 +188,7 @@ mod tests {
             DemodMode::Dsb,
             DemodMode::Cw,
             DemodMode::Raw,
+            DemodMode::Lrpt,
         ];
         for mode in modes {
             let demod = create_demodulator(mode);
@@ -203,6 +207,7 @@ mod tests {
             DemodMode::Dsb,
             DemodMode::Cw,
             DemodMode::Raw,
+            DemodMode::Lrpt,
         ];
         for mode in modes {
             let demod = create_demodulator(mode).unwrap();

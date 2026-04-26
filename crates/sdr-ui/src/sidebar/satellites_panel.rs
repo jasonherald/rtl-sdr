@@ -411,8 +411,8 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .build();
 
     let auto_record_switch = adw::SwitchRow::builder()
-        .title("Auto-record APT passes")
-        .subtitle("Tune to the satellite, start the decoder, save the image at LOS.")
+        .title("Auto-record satellite passes")
+        .subtitle("Tune to the satellite, start the decoder, save the imagery at LOS. Works for NOAA APT and Meteor-M LRPT.")
         .active(false)
         .build();
     recording_group.add(&auto_record_switch);
@@ -422,9 +422,15 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     // AOS so a mid-pass toggle can't leave a half-stopped writer.
     // Per #533. Also depends on #532 (pre-volume WAV writer) to
     // capture usable audio when speakers are muted.
+    //
+    // LRPT passes ignore this toggle even when it's on — the
+    // demod is silent (the imagery is the artifact) so a 10-min
+    // pass would write ~170 MB of stereo silence for no value.
+    // The recorder enforces this in `tick_idle`. Per epic #469
+    // task 7.4.
     let auto_record_audio_switch = adw::SwitchRow::builder()
         .title("Also save audio (.wav)")
-        .subtitle("Capture demodulated audio alongside the image. Pairs with the PNG by filename.")
+        .subtitle("Capture demodulated audio alongside the image. Pairs with the PNG by filename. APT only — LRPT passes are silent.")
         .active(false)
         .build();
     recording_group.add(&auto_record_audio_switch);
@@ -1004,18 +1010,21 @@ mod tests {
     }
 
     #[test]
-    fn tune_target_for_pass_returns_none_protocol_for_meteor() {
-        // Meteor passes are in the catalog (so the play button +
-        // upcoming-passes display work) but `imaging_protocol`
-        // is None until Task 7 of epic #469. Recorder filters on
-        // this; play button does not.
+    fn tune_target_for_pass_returns_lrpt_protocol_for_meteor() {
+        // Per epic #469 task 7, METEOR-M 2 / METEOR-M2 3 are now
+        // flagged `Some(ImagingProtocol::Lrpt)` in the catalog so
+        // the recorder enrolls them in the auto-record flow. The
+        // play button still uses the same `tune_target_for_pass`
+        // path; the protocol field is only consumed by the
+        // recorder, so this test pins the catalog→LRPT routing.
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let mut pass = synthetic_pass(now, 30);
         pass.satellite = "METEOR-M 2".to_string();
         let target = tune_target_for_pass(&pass).expect("METEOR-M 2 is in catalog");
         assert_eq!(
-            target.3, None,
-            "Meteor protocol stays None until Task 7 wires the LRPT viewer"
+            target.3,
+            Some(sdr_sat::ImagingProtocol::Lrpt),
+            "Meteor protocol must be Lrpt after epic #469 task 7",
         );
     }
 

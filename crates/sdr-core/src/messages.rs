@@ -348,6 +348,22 @@ pub enum UiToDsp {
     StartIqRecording(std::path::PathBuf),
     /// Stop IQ recording and finalize the WAV file.
     StopIqRecording,
+    /// Hand the DSP thread a clone of the shared
+    /// `sdr_radio::lrpt_image::LrptImage` handle the live LRPT
+    /// viewer reads from. Sent by the wiring layer at AOS for
+    /// LRPT auto-record passes (or whenever the user opens the
+    /// LRPT viewer manually). The DSP thread stores the handle
+    /// and pushes decoded scan lines into it whenever the LRPT
+    /// decoder tap runs (`current_mode` == `DemodMode::Lrpt`).
+    /// Per epic #469 task 7.
+    SetLrptImage(sdr_radio::lrpt_image::LrptImage),
+    /// Drop the shared LRPT image handle. Sent at LOS / when
+    /// the live viewer closes — stops the LRPT decoder from
+    /// pushing further lines (next AOS will re-set with a fresh
+    /// handle). Decoder state itself stays alive until the
+    /// next source-stop, mirroring the APT decoder's
+    /// "decoder kept across mode toggles" behavior.
+    ClearLrptImage,
     /// Start sending audio to the transcription engine.
     EnableTranscription(std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>),
     /// Stop sending audio to the transcription engine.

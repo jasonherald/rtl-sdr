@@ -386,6 +386,12 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         let parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>> =
             Rc::new(move || app_for_provider.windows().into_iter().next());
         crate::apt_viewer::connect_apt_action(app, &parent_provider, &state);
+        // Same wiring for the LRPT viewer (`Ctrl+Shift+L` /
+        // `app.lrpt-open`). Sharing the parent_provider closure
+        // would be possible but each `connect_*_action` clones
+        // it internally — passing twice keeps the call sites
+        // symmetric. Per epic #469 task 7.5.
+        crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
     }
 
     // Set initial status bar values and mode-specific control visibility.
@@ -9017,39 +9023,46 @@ fn connect_satellites_panel(
                         }
                     }
                     sdr_sat::ImagingProtocol::Lrpt => {
-                        // **Should be unreachable** — the
-                        // `AutoRecorder` constructor in this
-                        // module passes
-                        // `supported_protocols = [Apt]`, so the
-                        // recorder's `tick_idle` filter rejects
-                        // any catalog entry flagged
-                        // `Some(Lrpt)` before reaching the
-                        // wiring layer. Per CR round 2 on PR
-                        // #541.
+                        // Same shape as the APT branch above —
+                        // start playback, tune, zero the VFO,
+                        // open the protocol's live viewer, and
+                        // clear the canvas so back-to-back passes
+                        // start fresh.
                         //
-                        // Kept as defense-in-depth: if a future
-                        // refactor breaks the recorder gate
-                        // (e.g. someone passes a wider supported
-                        // set without wiring the viewer), this
-                        // branch makes the failure visible
-                        // (error log + user-facing toast) and
-                        // fails closed (no playback / tune /
-                        // VFO mutation).
-                        //
-                        // Task 7 of epic #469 replaces this
-                        // entire branch with the LRPT viewer-
-                        // open + decoder-tap wiring (and the
-                        // recorder constructor flips to
-                        // `[Apt, Lrpt]`).
-                        tracing::error!(
-                            "auto-record fired for LRPT satellite {satellite} but the recorder gate should have prevented this — please file a bug",
+                        // The LRPT viewer's open path also sends
+                        // `UiToDsp::SetLrptImage(handle)` to the
+                        // DSP thread, which lazy-inits the LRPT
+                        // decoder against that handle on the next
+                        // `lrpt_decode_tap` call. Catalog's
+                        // `demod_mode: Lrpt` lines up the
+                        // controller's IF rate (144 ksps) with
+                        // the QPSK demod's expected sample rate
+                        // — without that, `radio_input` would be
+                        // at the wrong rate and the demod's
+                        // resampler would sit at the wrong
+                        // setpoint. Per epic #469 task 7.
+                        set_playing_a(true);
+                        tune_a(freq_hz, mode, bandwidth_hz);
+                        state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
+                        crate::lrpt_viewer::open_lrpt_viewer_if_needed(
+                            &parent_provider_a,
+                            &state_a,
                         );
-                        post_toast(
-                            &toast_overlay_weak,
-                            &format!(
-                                "{satellite}: LRPT auto-record arrived early — viewer ships in epic #469 Task 7"
-                            ),
-                        );
+                        // Reset the shared image so the new pass
+                        // paints onto a clean canvas. The
+                        // `LrptDecoder::reset()` between-pass
+                        // hook in the controller flushes its own
+                        // per-APID watermark + pipeline state —
+                        // here we wipe the assembler buffer so
+                        // the *next* pass's first scan line
+                        // doesn't show up below leftover rows
+                        // from a previous pass that the user
+                        // might still have buffered in the
+                        // viewer.
+                        state_a.lrpt_image.clear();
+                        if let Some(view) = state_a.lrpt_viewer.borrow().as_ref() {
+                            view.clear();
+                        }
                     }
                 }
             }
@@ -9083,6 +9096,85 @@ fn connect_satellites_panel(
                         "auto-record SavePng but no APT viewer is open (user closed mid-pass)",
                     );
                     "Pass complete, but the APT viewer was closed — no image saved".to_string()
+                };
+                post_toast(&toast_overlay_weak, &result_msg);
+            }
+            RecorderAction::SaveLrptPass(dir) => {
+                // Walk every APID known to the LRPT viewer and
+                // write one PNG per channel into the per-pass
+                // directory (creating it lazily). Toast reports
+                // the count actually written — closed viewer or
+                // an empty pass collapses to a clear message
+                // rather than a silent success. Per epic #469
+                // task 7.4. The full per-channel save loop lives
+                // here (not on `LrptImageView`) because the
+                // viewer's PNG export only knows about the
+                // currently-active channel; the per-pass
+                // artifact wants every channel.
+                let result_msg = if let Some(view) = state_a.lrpt_viewer.borrow().as_ref() {
+                    let apids = view.known_apids();
+                    if apids.is_empty() {
+                        tracing::warn!(
+                            "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
+                        );
+                        format!(
+                            "Pass complete, but no LRPT channels decoded — nothing saved to {}",
+                            dir.display()
+                        )
+                    } else {
+                        // Save the currently-active channel last
+                        // so the viewer comes out of the loop
+                        // pointing at whatever the user had open
+                        // — the temporary set_active_apid below
+                        // is the only way to get the per-channel
+                        // export path through the existing
+                        // `export_png` API without adding a
+                        // by-APID variant.
+                        let user_active = view.active_apid();
+                        let mut saved = 0_usize;
+                        let mut errors: Vec<String> = Vec::new();
+                        let mut sorted = apids;
+                        sorted.sort_unstable();
+                        for apid in sorted {
+                            if !view.set_active_apid(apid) {
+                                continue;
+                            }
+                            let path = dir.join(format!("apid{apid}.png"));
+                            match view.export_png(&path) {
+                                Ok(()) => {
+                                    tracing::info!(?path, apid, "auto-record LRPT channel saved");
+                                    saved += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "auto-record LRPT export for APID {apid} to {path:?} failed: {e}",
+                                    );
+                                    errors.push(format!("APID {apid}: {e}"));
+                                }
+                            }
+                        }
+                        // Restore the user's selection.
+                        if let Some(apid) = user_active {
+                            view.set_active_apid(apid);
+                        }
+                        if errors.is_empty() {
+                            format!(
+                                "Pass complete — {saved} LRPT channel(s) saved to {}",
+                                dir.display()
+                            )
+                        } else {
+                            format!(
+                                "Pass complete — {saved} channel(s) saved, {} failed: {}",
+                                errors.len(),
+                                errors.join("; ")
+                            )
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "auto-record SaveLrptPass but no LRPT viewer is open (user closed mid-pass)",
+                    );
+                    "Pass complete, but the LRPT viewer was closed — no image saved".to_string()
                 };
                 post_toast(&toast_overlay_weak, &result_msg);
             }

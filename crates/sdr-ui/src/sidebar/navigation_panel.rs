@@ -322,6 +322,7 @@ pub fn demod_mode_to_string(mode: DemodMode) -> String {
         DemodMode::Dsb => "DSB",
         DemodMode::Cw => "CW",
         DemodMode::Raw => "RAW",
+        DemodMode::Lrpt => "LRPT",
     }
     .to_string()
 }

@@ -22,6 +22,7 @@ use sdr_dsp::apt::{AptDecoder, AptLine, READY_QUEUE_CAP};
 use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
+use sdr_radio::lrpt_decoder::LrptDecoder;
 
 use crate::sink_slot::{
     AudioSinkSlot, AudioSinkType, DEFAULT_NETWORK_SINK_HOST, DEFAULT_NETWORK_SINK_PORT,
@@ -432,6 +433,22 @@ struct DspState {
     /// reset so a fresh source restart always gets one fresh
     /// init attempt.
     apt_init_failed_at_rate: Option<u32>,
+    /// Meteor-M LRPT decoder driver. Lazy-init when the demod
+    /// mode first switches to `DemodMode::Lrpt`; teardown in
+    /// `cleanup` (per-source-stop). The driver owns
+    /// `LrptDemod` + `LrptPipeline` + the per-APID line-
+    /// watermark map; the shared `LrptImage` handle is wired
+    /// in from the UI side via `UiToDsp::SetLrptImage` so the
+    /// live viewer reads from the same buffer this driver
+    /// pushes lines into. Per epic #469 task 7.
+    lrpt_decoder: Option<LrptDecoder>,
+    /// Shared image handle the LRPT decoder pushes scan lines
+    /// into. `None` until the UI side wires it via
+    /// `UiToDsp::SetLrptImage`; in that case the controller
+    /// simply doesn't run the LRPT tap (auto-record will set
+    /// it at AOS, manual LRPT-mode use without a viewer is a
+    /// silent-but-harmless state).
+    lrpt_image: Option<sdr_radio::lrpt_image::LrptImage>,
 }
 
 impl DspState {
@@ -508,6 +525,8 @@ impl DspState {
             apt_mono_buf: Vec::new(),
             apt_lines_buf: Vec::new(),
             apt_init_failed_at_rate: None,
+            lrpt_decoder: None,
+            lrpt_image: None,
         })
     }
 }
@@ -585,6 +604,54 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
             tracing::warn!("APT decode failed: {e}");
         }
     }
+}
+
+/// Meteor-M LRPT decode tap — IQ counterpart of [`apt_decode_tap`].
+/// Lazy-initialises the decoder against the shared
+/// `LrptImage` handle the wiring layer set via
+/// `UiToDsp::SetLrptImage`, then streams the post-VFO IQ slice
+/// (`radio_input` — already at 144 ksps thanks to the
+/// `DemodMode::Lrpt` IF rate) through the full LRPT chain
+/// (QPSK demod, FEC, image assembler). Emitted scan lines
+/// land in the shared `LrptImage` for the live viewer to read.
+///
+/// Only runs when (a) `current_mode == DemodMode::Lrpt` and (b)
+/// the wiring layer has handed us a `LrptImage` handle. Without
+/// the handle, the tap is silent — manual LRPT-mode use without
+/// a viewer harmlessly produces no output. Per epic #469 task 7.
+///
+/// Takes the decoder + image references directly (rather than
+/// `&mut DspState`) so the call site can hold a live borrow of
+/// `radio_input` — which itself points into a separate state
+/// field (`vfo_buf` or `processed_buf`) — without violating
+/// borrow-disjointness.
+fn lrpt_decode_tap(
+    decoder_slot: &mut Option<LrptDecoder>,
+    image: Option<&sdr_radio::lrpt_image::LrptImage>,
+    radio_input: &[Complex],
+) {
+    let Some(image) = image else {
+        return;
+    };
+    if decoder_slot.is_none() {
+        match LrptDecoder::new(image.clone()) {
+            Ok(decoder) => {
+                tracing::info!(
+                    "LRPT decoder initialised at {} Hz IF rate",
+                    sdr_dsp::lrpt::SAMPLE_RATE_HZ
+                );
+                *decoder_slot = Some(decoder);
+            }
+            Err(e) => {
+                tracing::warn!("LRPT decoder init failed: {e}");
+                return;
+            }
+        }
+    }
+    let Some(decoder) = decoder_slot.as_mut() else {
+        return;
+    };
+    decoder.process(radio_input);
 }
 
 /// Handle a single UI command.
@@ -1612,6 +1679,25 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
         }
 
+        UiToDsp::SetLrptImage(image) => {
+            tracing::info!("LRPT image handle attached — decoder tap will push lines");
+            state.lrpt_image = Some(image);
+            // Drop any existing decoder so the next tap call
+            // lazy-rebuilds against the new image handle.
+            // Otherwise scan lines would keep flowing into the
+            // *previous* pass's image.
+            state.lrpt_decoder = None;
+        }
+
+        UiToDsp::ClearLrptImage => {
+            tracing::info!("LRPT image handle cleared — decoder tap is silent");
+            state.lrpt_image = None;
+            // Drop the decoder too — without an image there's
+            // nowhere for harvested lines to land, and we want
+            // a fresh pipeline on the next attach anyway.
+            state.lrpt_decoder = None;
+        }
+
         UiToDsp::StartIqRecording(path) => {
             tracing::info!(?path, "start IQ recording");
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2397,6 +2483,19 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // memo to silently suppress a now-valid rate.
     state.apt_init_failed_at_rate = None;
 
+    // Same semantics for the LRPT decoder (#469): flush
+    // in-flight Viterbi traceback / sync window / RS path /
+    // image assembler so the next Start paints a clean canvas.
+    // If reset's demod-rebuild fails (practically unreachable;
+    // see `LrptDemod::new`), drop the decoder entirely so the
+    // next tap call lazily re-initialises.
+    if let Some(decoder) = state.lrpt_decoder.as_mut()
+        && let Err(e) = decoder.reset()
+    {
+        tracing::warn!("LRPT decoder reset failed; dropping for re-init: {e}");
+        state.lrpt_decoder = None;
+    }
+
     tracing::info!("source closed");
 }
 
@@ -2597,6 +2696,23 @@ fn process_iq_block(
                     // No VFO configured — pass frontend output directly (fallback).
                     &state.processed_buf[..processed_count]
                 };
+
+                // Meteor-M LRPT decode tap (#469). Only runs in
+                // LRPT mode — the demod is a silent passthrough
+                // sized so `radio_input` is at the LRPT working
+                // sample rate (144 ksps), which is exactly what
+                // the QPSK demod + FEC chain expects. Tapped
+                // BEFORE `radio.process` so we read the IQ
+                // before the passthrough discards it; harvested
+                // scan lines flow into the shared `LrptImage`
+                // the live viewer reads from.
+                if state.radio.current_mode() == sdr_types::DemodMode::Lrpt {
+                    lrpt_decode_tap(
+                        &mut state.lrpt_decoder,
+                        state.lrpt_image.as_ref(),
+                        radio_input,
+                    );
+                }
 
                 // Process through radio module for audio output.
                 let max_out = state.radio.max_output_samples(radio_input.len());

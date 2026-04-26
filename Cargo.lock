@@ -3004,6 +3004,7 @@ dependencies = [
  "sdr-config",
  "sdr-core",
  "sdr-dsp",
+ "sdr-lrpt",
  "sdr-pipeline",
  "sdr-radio",
  "sdr-radioreference",

@@ -17,6 +17,14 @@ pub enum DemodMode {
     Cw,
     /// Raw IQ passthrough.
     Raw,
+    /// Meteor-M LRPT receive mode. Like `Raw` but the
+    /// `RadioModule` runs at 144 ksps IF rate (the LRPT working
+    /// rate per `sdr_dsp::lrpt::SAMPLE_RATE_HZ`) so the post-VFO
+    /// IQ is fed straight into the QPSK demod + FEC chain by
+    /// the controller's LRPT tap. Audio output is silent stereo
+    /// — there's no listenable signal mid-pass; the imagery is
+    /// the artifact. Per epic #469 Task 7.
+    Lrpt,
 }
 
 /// Network IQ sample format — matches SDR++ `SampleType` enum.
