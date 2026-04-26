@@ -45,6 +45,17 @@ const PACKETS_PER_ROW_GROUP: i32 = 43;
 /// of a non-monotonic step.
 const SEQUENCE_COUNT_MODULUS: i32 = 1 << 14;
 
+/// Minimum backward delta that distinguishes a real
+/// `SEQUENCE_COUNT_MODULUS` wraparound from a small reordering
+/// or a corrupted sequence-count byte. Set to half the modulus:
+/// any backward step ≥ 8192 must be a wrap (the next packet
+/// can't legitimately be that far behind), while a smaller
+/// reversal is more likely a glitch the wrap fix would massively
+/// over-correct. Per CR round 7 — the prior unconditional
+/// `pkt < last` walked `first_pkt` back 16384 on any reversal,
+/// shifting later MCU placements hundreds of rows.
+const WRAP_MIN_BACKWARD_DELTA: i32 = SEQUENCE_COUNT_MODULUS / 2;
+
 /// Image-packet payload header length in bytes: 1 byte MCU id +
 /// 2 bytes `scan_hdr` + 2 bytes `seg_hdr` + 1 byte quality.
 /// JPEG-coded MCU stream begins immediately after.
@@ -153,12 +164,25 @@ impl LrptPipeline {
             decoder.last_pkt = Some(pkt);
         }
         // 14-bit sequence count wraps at SEQUENCE_COUNT_MODULUS.
-        // If the new pkt is less than the previous one (allowing
-        // for jitter), assume a wrap.
+        // Only treat large backward steps (≥ half the modulus)
+        // as a wrap — a small reversal is more likely a corrupted
+        // sequence-count byte (post-RS miscorrection or demux
+        // desync), and the prior unconditional wrap fix would
+        // shift first_pkt back 16384 in those cases, jumping
+        // future MCU placements by hundreds of rows. Per CR
+        // round 7. Smaller reversals are trace-logged for
+        // visibility but do not move first_pkt.
         if let (Some(last), Some(first)) = (decoder.last_pkt, decoder.first_pkt)
             && pkt < last
         {
-            decoder.first_pkt = Some(first - SEQUENCE_COUNT_MODULUS);
+            if last - pkt >= WRAP_MIN_BACKWARD_DELTA {
+                decoder.first_pkt = Some(first - SEQUENCE_COUNT_MODULUS);
+            } else {
+                tracing::trace!(
+                    "non-wrap sequence-count reversal on APID {apid}: last={last} pkt={pkt}",
+                    apid = packet.apid,
+                );
+            }
         }
         decoder.last_pkt = Some(pkt);
 
@@ -405,10 +429,12 @@ mod tests {
     #[test]
     fn consume_packet_handles_sequence_count_wraparound() {
         // The 14-bit sequence counter wraps at SEQUENCE_COUNT_MODULUS
-        // (16384). When we observe a sequence_count strictly less
-        // than the previous one, walk first_pkt back by one
-        // modulus so the row-index calc keeps producing
-        // monotonically increasing rows across the wrap boundary.
+        // (16384). When we observe a backward step ≥ half the
+        // modulus, walk first_pkt back by one modulus so the
+        // row-index calc keeps producing monotonically increasing
+        // rows across the wrap boundary. (Smaller backward steps
+        // are treated as corruption — see
+        // `consume_packet_ignores_small_sequence_count_reversal`.)
         let mut p = LrptPipeline::new();
         // Establish anchor at a high sequence count near the
         // wrap boundary. SEQUENCE_COUNT_MODULUS - 4 = 16380,
@@ -507,6 +533,40 @@ mod tests {
             p.decoders.is_empty(),
             "all-zero VCDU yields no image packets"
         );
+    }
+
+    #[test]
+    fn consume_packet_ignores_small_sequence_count_reversal() {
+        // CR round 7: a small backward step in sequence_count is
+        // more likely a corrupted header (post-RS miscorrection,
+        // upstream demux desync) than a real wrap. The prior
+        // unconditional `pkt < last` would walk first_pkt back
+        // 16384 in those cases, jumping later MCU placements by
+        // hundreds of rows. The fixed gate requires the backward
+        // delta to be at least WRAP_MIN_BACKWARD_DELTA
+        // (= SEQUENCE_COUNT_MODULUS / 2 = 8192) before treating
+        // it as a wrap.
+        //
+        // Push pkt=100, then pkt=99 (one step back, NOT a wrap).
+        // first_pkt must NOT be moved by SEQUENCE_COUNT_MODULUS.
+        let mut p = LrptPipeline::new();
+        let pkt_a = synthetic_image_packet(64, 100);
+        p.consume_packet(&pkt_a);
+        let first_before = p
+            .decoders
+            .get(&64)
+            .expect("apid 64 channel created")
+            .first_pkt
+            .expect("first_pkt set on initial packet");
+        let pkt_b = synthetic_image_packet(64, 99);
+        p.consume_packet(&pkt_b);
+        let dec = p.decoders.get(&64).expect("apid 64 still present");
+        assert_eq!(
+            dec.first_pkt,
+            Some(first_before),
+            "1-step reversal must NOT trigger wrap correction"
+        );
+        assert_eq!(dec.last_pkt, Some(99));
     }
 
     #[test]

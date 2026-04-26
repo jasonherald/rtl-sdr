@@ -214,6 +214,14 @@ impl JpegDecoder {
             reason = "guarded by the dc_cat_signed < 0 branch above; DC category ∈ [0, 11] always fits in u8"
         )]
         let dc_cat = dc_cat_signed as u8;
+        // The LUT can match a code via zero-padded peek bits; only
+        // advance bit_offset if those bits actually exist. Per CR
+        // round 7.
+        ensure_n_bits_available(
+            bytes,
+            *bit_offset,
+            usize::from(DC_CAT_BIT_LEN[dc_cat as usize]),
+        )?;
         *bit_offset += DC_CAT_BIT_LEN[dc_cat as usize] as usize;
         let dc_value_bits = if dc_cat > 0 {
             fetch_n_bits(bytes, bit_offset, dc_cat as usize)?
@@ -241,6 +249,9 @@ impl JpegDecoder {
                 reason = "guarded by the ac_idx_signed < 0 branch above"
             )]
             let ac = self.ac_table[ac_idx_signed as usize];
+            // Same zero-padded-peek hazard as DC above: only
+            // advance if the matched code's bits actually exist.
+            ensure_n_bits_available(bytes, *bit_offset, usize::from(ac.len))?;
             *bit_offset += ac.len as usize;
             // EOB marker: run=0 size=0.
             if ac.run == 0 && ac.size == 0 {
@@ -403,6 +414,20 @@ fn peek_n_bits(bytes: &[u8], bit_offset: usize, n: usize) -> Result<u16, JpegErr
     )]
     let padded = (result << (HUFF_LOOKAHEAD_BITS - n)) as u16;
     Ok(padded)
+}
+
+/// Verify that `n` bits are actually present in `bytes` starting at
+/// `bit_offset`. Used to gate Huffman-code consumption AFTER the
+/// LUT lookup has matched, because [`peek_n_bits`] zero-pads short
+/// windows — without this guard a payload tail of `101` could be
+/// accepted as the 4-bit AC EOB code (`1010`) and `bit_offset` would
+/// advance past the end of the stream. Per CR round 7.
+fn ensure_n_bits_available(bytes: &[u8], bit_offset: usize, n: usize) -> Result<(), JpegError> {
+    let total_bits = bytes.len() * 8;
+    match bit_offset.checked_add(n) {
+        Some(end) if end <= total_bits => Ok(()),
+        _ => Err(JpegError::EndOfStream),
+    }
 }
 
 /// Fetch the next `n` bits from `bytes`, advancing `bit_offset`.
@@ -978,6 +1003,73 @@ mod tests {
         assert!(
             matches!(result, Err(JpegError::BadAcCode)),
             "4x ZRL overshoots coefficient 63; expected BadAcCode, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_n_bits_available_validates_bounds() {
+        // Direct test of the helper's contract: returns Ok when
+        // `bit_offset + n` is in bounds, EndOfStream otherwise,
+        // including the checked_add overflow path.
+        let bytes = [0xFF_u8; 2]; // 16 bits
+        assert!(ensure_n_bits_available(&bytes, 0, 16).is_ok());
+        assert!(ensure_n_bits_available(&bytes, 8, 8).is_ok());
+        assert!(matches!(
+            ensure_n_bits_available(&bytes, 8, 9),
+            Err(JpegError::EndOfStream)
+        ));
+        assert!(matches!(
+            ensure_n_bits_available(&bytes, usize::MAX, 1),
+            Err(JpegError::EndOfStream)
+        ));
+    }
+
+    #[test]
+    fn decode_mcu_rejects_truncated_dc_code() {
+        // CR round 7: peek_n_bits zero-pads short windows so a
+        // truncated tail can spuriously match a Huffman LUT
+        // entry. The AFTER-match availability check must catch
+        // that and return EndOfStream rather than advance
+        // bit_offset past the end of the payload.
+        //
+        // Trigger: empty payload with bit_offset already past
+        // the start. peek returns EndOfStream directly here.
+        // For the matched-code-but-not-enough-bits path, build
+        // a 1-byte payload whose last 4 bits look like a valid
+        // DC code prefix but where there isn't room for the
+        // category's value suffix.
+        //
+        // DC cat 6 has code 0b1110 (4 bits) + 6 value bits
+        // (10 bits total). Pack DC "1110" left-aligned in one
+        // byte = 0b1110_0000 = 0xE0. After matching cat 6, the
+        // pre-CR code would advance bit_offset by 4 then try to
+        // fetch 6 value bits — but only 4 bits remain in the
+        // payload after the code, so fetch_n_bits would EOF
+        // anyway. The new pre-advance guard makes the failure
+        // mode crisper: ensure_n_bits_available catches the
+        // missing code bits BEFORE advancing.
+        //
+        // To exercise the ensure_n_bits_available branch
+        // specifically, construct a payload where the LUT
+        // matches via padding bits. 1-byte payload `0b1110_0000`
+        // peeked at bit_offset=4 sees only 4 valid bits
+        // (`0000`) followed by 12 zero pads — the all-zeros
+        // window matches DC cat 0 (code "00"). With cat 0
+        // requiring 2 code bits and only 4 actual bits left
+        // (bit_offset=4 in an 8-bit payload), the pre-advance
+        // guard accepts the 2-bit consumption. To force the
+        // failure, peek at bit_offset=7: only 1 valid bit
+        // remains, but the LUT will still match cat 0 (the
+        // all-zero window). The pre-advance guard rejects
+        // because 7 + 2 = 9 > 8.
+        let bytes = [0xE0_u8]; // 8 valid bits
+        let mut decoder = JpegDecoder::new();
+        let mut bit_offset = 7_usize;
+        let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
+        let result = decoder.decode_mcu(&bytes, &mut bit_offset, &dqt);
+        assert!(
+            matches!(result, Err(JpegError::EndOfStream)),
+            "matched DC cat 0 (2 bits) at bit_offset=7 of 8-bit payload must EOF, got {result:?}"
         );
     }
 }
