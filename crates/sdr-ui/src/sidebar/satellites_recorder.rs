@@ -194,8 +194,23 @@ pub enum ToastKind {
 }
 
 /// The recorder.
+///
+/// Carries the set of imaging protocols the wiring layer has
+/// fully wired (decoder + viewer + LOS save). Catalog entries
+/// whose protocol isn't in this set are skipped at AOS — the
+/// state machine never transitions to `BeforePass`, so the LOS-
+/// side `SavePng` / `RestoreTune` actions never fire either.
+///
+/// This is the primary defense against "catalog flipped to
+/// `Some(Lrpt)` ahead of Task 7 wiring": without this gate, an
+/// unsupported protocol would arm the recorder, the wiring
+/// layer's `interpret_action` would fail-closed at AOS, but
+/// `RestoreTune` at LOS would still clobber any user retunes
+/// during the pass and `SavePng` would post a confusing
+/// "viewer was closed" toast. Per CR round 2 on PR #541.
 pub struct AutoRecorder {
     state: State,
+    supported_protocols: Vec<sdr_sat::ImagingProtocol>,
 }
 
 impl Default for AutoRecorder {
@@ -205,9 +220,30 @@ impl Default for AutoRecorder {
 }
 
 impl AutoRecorder {
+    /// Build a recorder that arms only on
+    /// [`sdr_sat::ImagingProtocol::Apt`]. Today's only fully-
+    /// wired auto-record path. Task 7 of epic #469 will swap
+    /// callers to [`Self::with_supported_protocols`] passing
+    /// `[Apt, Lrpt]`.
     #[must_use]
     pub fn new() -> Self {
-        Self { state: State::Idle }
+        Self::with_supported_protocols(&[sdr_sat::ImagingProtocol::Apt])
+    }
+
+    /// Build a recorder that arms only on the given imaging
+    /// protocols. The slice is the set of protocols the wiring
+    /// layer has fully wired in `interpret_action` (decoder
+    /// tap, viewer open, LOS save). Catalog entries whose
+    /// `imaging_protocol` falls outside this set are silently
+    /// skipped — the state machine stays in `Idle` rather than
+    /// transitioning to `BeforePass`, so no AOS-side actions
+    /// fire and no LOS cleanup fires either.
+    #[must_use]
+    pub fn with_supported_protocols(supported: &[sdr_sat::ImagingProtocol]) -> Self {
+        Self {
+            state: State::Idle,
+            supported_protocols: supported.to_vec(),
+        }
     }
 
     /// Snapshot of the current state — exposed so the wiring layer
@@ -288,14 +324,27 @@ impl AutoRecorder {
         //    until Task 7 of #469; ISS SSTV until #472). Per
         //    #514 — replaced the old hardcoded `is_apt_capable`
         //    NOAA-name check.
-        // 3. Peak elevation meets the quality threshold.
-        // 4. AOS is within `AOS_LEAD_SECS` (start tuning a few
+        // 3. Protocol is in `self.supported_protocols`. Per CR
+        //    round 2 on PR #541: even if a catalog entry is
+        //    flipped to `Some(Lrpt)` ahead of the wiring layer
+        //    actually supporting it, the state machine refuses
+        //    to arm. Without this gate, the recorder would
+        //    transition to `BeforePass`, the wiring layer's
+        //    fail-closed AOS branch would no-op, but the
+        //    LOS-side `SavePng` + `RestoreTune` actions would
+        //    still fire — clobbering any user retunes during
+        //    the pass.
+        // 4. Peak elevation meets the quality threshold.
+        // 5. AOS is within `AOS_LEAD_SECS` (start tuning a few
         //    seconds early so the pipeline is ready at AOS proper).
         for pass in passes {
             let Some((freq_hz, mode, bandwidth_hz, Some(protocol))) = tune_target_for_pass(pass)
             else {
                 continue;
             };
+            if !self.supported_protocols.contains(&protocol) {
+                continue;
+            }
             if pass.max_elevation_deg < AUTO_RECORD_MIN_ELEV_DEG {
                 continue;
             }
@@ -1100,5 +1149,159 @@ mod tests {
                 .any(|a| matches!(a, Action::StopAutoAudioRecord)),
             "in-flight audio recording must stop at LOS even after toggle flip",
         );
+    }
+
+    /// Build a synthetic METEOR-M 2 pass. Used by the
+    /// supported-protocols-gate tests below — the catalog flags
+    /// METEOR-M 2 with `imaging_protocol: None` today, but
+    /// these tests need to simulate "what happens if a future
+    /// edit flips it to `Some(Lrpt)` before the wiring layer
+    /// supports it." The recorder gate is what saves us in
+    /// that scenario.
+    fn synthetic_meteor_m2(
+        now: DateTime<Utc>,
+        aos_offset_secs: i64,
+        duration_secs: i64,
+        peak_elev_deg: f64,
+    ) -> Pass {
+        let start = now + ChronoDuration::seconds(aos_offset_secs);
+        Pass {
+            satellite: "METEOR-M 2".to_string(),
+            start,
+            end: start + ChronoDuration::seconds(duration_secs),
+            max_elevation_deg: peak_elev_deg,
+            max_el_time: start + ChronoDuration::seconds(duration_secs / 2),
+            start_az_deg: 245.0,
+            end_az_deg: 105.0,
+        }
+    }
+
+    #[test]
+    fn unsupported_protocol_does_not_arm_recorder() {
+        // CR round 2 on PR #541: a catalog entry with a protocol
+        // outside `supported_protocols` must NOT arm the recorder
+        // — `tick_idle` keeps the state at `Idle` rather than
+        // transitioning to `BeforePass`. This is the primary
+        // defense against "Meteor catalog flipped to Some(Lrpt)
+        // ahead of Task 7 wiring": without this gate, the
+        // wiring layer's fail-closed AOS branch would no-op,
+        // but the LOS-side `SavePng` + `RestoreTune` would
+        // still fire and clobber the user's mid-pass state.
+        //
+        // Simulate the bad-future scenario by using a recorder
+        // configured for `Apt` only, then feeding it a synthetic
+        // pass for a satellite the catalog flags as a different
+        // protocol (METEOR-M 2 with — once Task 7 ships —
+        // `Some(Lrpt)`). Even after we monkeypatch the catalog
+        // entry to advertise Lrpt, the recorder must refuse to
+        // arm.
+        //
+        // The recorder consults the catalog directly via
+        // `tune_target_for_pass`, so monkeypatching the catalog
+        // isn't possible from a test. Instead use the inverse
+        // construction: build a recorder that supports NOTHING
+        // (`with_supported_protocols(&[])`), then feed it an
+        // APT-flagged NOAA pass. Same code path — the
+        // protocol-gate `continue` fires either way.
+        let mut r = AutoRecorder::with_supported_protocols(&[]);
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let actions = r.tick(now, &[pass], true, false, default_tune());
+        // No actions of any kind — no StartAutoRecord, no Toast,
+        // no transition.
+        assert!(
+            actions.is_empty(),
+            "unsupported protocol must not arm the recorder; got {actions:?}"
+        );
+        assert!(
+            matches!(r.state(), State::Idle),
+            "state must stay Idle, not transition to BeforePass"
+        );
+    }
+
+    #[test]
+    fn unsupported_protocol_blocks_full_pass_lifecycle() {
+        // Drives the recorder through the entire would-be pass
+        // lifecycle (AOS → settle → LOS) on an unsupported
+        // protocol and asserts NO actions ever fire — most
+        // importantly, no LOS-side `SavePng` or `RestoreTune`
+        // (which would clobber the user's mid-pass state).
+        let mut r = AutoRecorder::with_supported_protocols(&[]);
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+
+        // AOS: gated out, no actions, state stays Idle.
+        let aos = r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        assert!(aos.is_empty());
+        assert!(matches!(r.state(), State::Idle));
+
+        // Settle window — still no transition.
+        let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
+        let mid = r.tick(
+            after_settle,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        assert!(mid.is_empty());
+        assert!(matches!(r.state(), State::Idle));
+
+        // LOS — most important: NO SavePng / RestoreTune fire.
+        // Without the supported-protocols gate, `BeforePass →
+        // Recording → Finalizing` would have transitioned by
+        // now and we'd see those cleanup actions here.
+        let los_plus = pass.end + ChronoDuration::seconds(1);
+        let los = r.tick(
+            los_plus,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        assert!(
+            !los.iter().any(|a| matches!(a, Action::SavePng(_))),
+            "no SavePng on unsupported-protocol LOS",
+        );
+        assert!(
+            !los.iter().any(|a| matches!(a, Action::RestoreTune(_))),
+            "no RestoreTune on unsupported-protocol LOS — the user's mid-pass state must not be clobbered",
+        );
+        assert!(matches!(r.state(), State::Idle));
+    }
+
+    #[test]
+    fn supported_protocol_arms_recorder_normally() {
+        // Sanity: with `supported_protocols = [Apt]` (the
+        // default), an APT-flagged catalog entry arms the
+        // recorder as expected. Pins the negative-test contract
+        // above by showing the gate is the only thing stopping
+        // the unsupported case.
+        let mut r = AutoRecorder::with_supported_protocols(&[sdr_sat::ImagingProtocol::Apt]);
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let actions = r.tick(now, &[pass], true, false, default_tune());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartAutoRecord { .. })),
+            "supported protocol must arm the recorder",
+        );
+        assert!(matches!(r.state(), State::BeforePass { .. }));
+    }
+
+    #[test]
+    fn meteor_synthetic_pass_helper_works() {
+        // Sanity for the helper itself — pins the satellite
+        // name our gate tests rely on.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_meteor_m2(now, 0, 600, 50.0);
+        assert_eq!(pass.satellite, "METEOR-M 2");
     }
 }

@@ -9017,21 +9017,32 @@ fn connect_satellites_panel(
                         }
                     }
                     sdr_sat::ImagingProtocol::Lrpt => {
-                        // Task 7 of epic #469 wires the LRPT
-                        // live viewer + decoder driver. This
-                        // branch is reachable today only if a
-                        // catalog entry is flipped to
-                        // `Some(Lrpt)` ahead of that wiring.
-                        // Fail closed: log + toast WITHOUT
-                        // touching playback / tune / VFO state
-                        // so the user's pre-AOS tune survives
-                        // intact. Task 7 will replace this with
-                        // actual viewer-open + decoder-tap
-                        // wiring (which will then run the same
-                        // set_playing / tune / VFO sequence as
-                        // the APT arm above).
-                        tracing::warn!(
-                            "auto-record fired for LRPT satellite {satellite} but the LRPT viewer is not yet wired (Task 7 of epic #469); leaving radio state untouched",
+                        // **Should be unreachable** — the
+                        // `AutoRecorder` constructor in this
+                        // module passes
+                        // `supported_protocols = [Apt]`, so the
+                        // recorder's `tick_idle` filter rejects
+                        // any catalog entry flagged
+                        // `Some(Lrpt)` before reaching the
+                        // wiring layer. Per CR round 2 on PR
+                        // #541.
+                        //
+                        // Kept as defense-in-depth: if a future
+                        // refactor breaks the recorder gate
+                        // (e.g. someone passes a wider supported
+                        // set without wiring the viewer), this
+                        // branch makes the failure visible
+                        // (error log + user-facing toast) and
+                        // fails closed (no playback / tune /
+                        // VFO mutation).
+                        //
+                        // Task 7 of epic #469 replaces this
+                        // entire branch with the LRPT viewer-
+                        // open + decoder-tap wiring (and the
+                        // recorder constructor flips to
+                        // `[Apt, Lrpt]`).
+                        tracing::error!(
+                            "auto-record fired for LRPT satellite {satellite} but the recorder gate should have prevented this — please file a bug",
                         );
                         post_toast(
                             &toast_overlay_weak,
