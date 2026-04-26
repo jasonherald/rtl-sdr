@@ -702,7 +702,17 @@ impl LrptImageView {
         struct PendingChannel {
             apid: u16,
             already: usize,
-            rows: Vec<Vec<u8>>,
+            /// Flat tail of the channel's pixel buffer — every
+            /// row from `already` to `min(channel.lines,
+            /// available_lines)` packed contiguously, ready for
+            /// `chunks_exact(IMAGE_WIDTH)` in phase 2. One heap
+            /// alloc per APID per drain instead of one per row;
+            /// matters on viewer reopen mid-pass when there can
+            /// be thousands of unseen rows for a single APID
+            /// and the per-row alloc would churn the allocator
+            /// at 4 Hz under the shared-image mutex. Per
+            /// `CodeRabbit` round 17 on PR #543.
+            pixels: Vec<u8>,
         }
 
         // Phase 1 — under shared-image lock.
@@ -715,27 +725,29 @@ impl LrptImageView {
                     if channel.lines <= already {
                         continue;
                     }
-                    let mut rows = Vec::with_capacity(channel.lines - already);
-                    for line_idx in already..channel.lines {
-                        let start = line_idx * IMAGE_WIDTH;
-                        let end = start + IMAGE_WIDTH;
-                        if end > channel.pixels.len() {
-                            // Defensive — see lrpt_decoder::harvest_new_lines
-                            // for the parallel guard. Structurally
-                            // unreachable; the warn protects against
-                            // a future refactor of the assembler
-                            // buffer.
-                            tracing::warn!(
-                                "LRPT view: channel {apid} pixel buffer shorter than expected; skipping line {line_idx}",
-                            );
-                            break;
-                        }
-                        rows.push(channel.pixels[start..end].to_vec());
+                    // Defensive — see lrpt_decoder::harvest_new_lines
+                    // for the parallel guard. Structurally
+                    // unreachable; the warn protects against
+                    // a future refactor of the assembler buffer
+                    // that drops the "pixels grows by full-line
+                    // increments" invariant.
+                    let available_lines = channel.pixels.len() / IMAGE_WIDTH;
+                    if available_lines < channel.lines {
+                        tracing::warn!(
+                            "LRPT view: channel {apid} pixel buffer shorter than expected; truncating at line {available_lines} (claimed lines = {})",
+                            channel.lines,
+                        );
                     }
+                    let end_line = channel.lines.min(available_lines);
+                    if end_line <= already {
+                        continue;
+                    }
+                    let start = already * IMAGE_WIDTH;
+                    let end = end_line * IMAGE_WIDTH;
                     acc.push(PendingChannel {
                         apid,
                         already,
-                        rows,
+                        pixels: channel.pixels[start..end].to_vec(),
                     });
                 }
             });
@@ -784,7 +796,10 @@ impl LrptImageView {
             // `CodeRabbit` round 9 on PR #543.
             let mut painted_any = false;
             let mut pushed = p.already;
-            for (offset, row) in p.rows.iter().enumerate() {
+            // `chunks_exact` views the flat tail buffer as
+            // per-row slices without further allocation. Per
+            // `CodeRabbit` round 17 on PR #543.
+            for (offset, row) in p.pixels.chunks_exact(IMAGE_WIDTH).enumerate() {
                 let outcome = renderer.push_line(p.apid, row);
                 if !outcome.consumed() {
                     // Transient failure — leave this row in the
