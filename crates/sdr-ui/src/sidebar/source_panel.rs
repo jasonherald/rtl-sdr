@@ -52,6 +52,16 @@ pub const KEY_LEGACY_AGC_ENABLED: &str = "rtl_sdr_agc_enabled";
 /// LNA. Per issue #537.
 pub const KEY_SOURCE_RTL_BIAS_TEE: &str = "src_rtl_bias_tee";
 
+/// Config key for persisted manual tuner gain in dB. Only
+/// applied when AGC is `Off` (hardware/software AGC overrides
+/// manual gain). Default `0.0` matches the spin row's initial
+/// value. Per issue `#551`.
+pub const KEY_SOURCE_RTL_GAIN_DB: &str = "src_rtl_gain_db";
+
+/// Config key for persisted PPM frequency correction. Default
+/// `0` (no correction). Per issue `#551`.
+pub const KEY_SOURCE_RTL_PPM: &str = "src_rtl_ppm";
+
 /// Device selector index for RTL-SDR.
 pub const DEVICE_RTLSDR: u32 = 0;
 /// Device selector index for Network.
@@ -1142,6 +1152,43 @@ pub fn save_source_rtl_bias_tee(config: &Arc<ConfigManager>, enabled: bool) {
     });
 }
 
+/// Load the persisted manual tuner gain in dB. Default `0.0` —
+/// matches the spin row's initial value. Per issue `#551`.
+#[must_use]
+pub fn load_source_rtl_gain_db(config: &Arc<ConfigManager>) -> f64 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_RTL_GAIN_DB)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Persist the manual tuner gain in dB. Per issue `#551`.
+pub fn save_source_rtl_gain_db(config: &Arc<ConfigManager>, gain_db: f64) {
+    config.write(|v| {
+        v[KEY_SOURCE_RTL_GAIN_DB] = serde_json::json!(gain_db);
+    });
+}
+
+/// Load the persisted PPM frequency correction. Default `0`.
+/// Per issue `#551`.
+#[must_use]
+pub fn load_source_rtl_ppm(config: &Arc<ConfigManager>) -> i32 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_RTL_PPM)
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Persist the PPM frequency correction. Per issue `#551`.
+pub fn save_source_rtl_ppm(config: &Arc<ConfigManager>, ppm: i32) {
+    config.write(|v| {
+        v[KEY_SOURCE_RTL_PPM] = serde_json::json!(ppm);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,5 +1619,29 @@ mod tests {
             v[KEY_SOURCE_RTL_BIAS_TEE] = serde_json::json!("not a bool");
         });
         assert!(!load_source_rtl_bias_tee(&config));
+    }
+
+    /// #551 persistence: gain in dB.
+    #[test]
+    fn source_rtl_gain_db_round_trip_and_default() {
+        let config = make_config();
+        assert!((load_source_rtl_gain_db(&config) - 0.0).abs() < f64::EPSILON);
+        save_source_rtl_gain_db(&config, 35.5);
+        assert!((load_source_rtl_gain_db(&config) - 35.5).abs() < f64::EPSILON);
+        config.write(|v| v[KEY_SOURCE_RTL_GAIN_DB] = serde_json::json!("not a number"));
+        assert!((load_source_rtl_gain_db(&config) - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// #551 persistence: PPM correction.
+    #[test]
+    fn source_rtl_ppm_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(load_source_rtl_ppm(&config), 0);
+        save_source_rtl_ppm(&config, -25);
+        assert_eq!(load_source_rtl_ppm(&config), -25);
+        save_source_rtl_ppm(&config, 50);
+        assert_eq!(load_source_rtl_ppm(&config), 50);
+        config.write(|v| v[KEY_SOURCE_RTL_PPM] = serde_json::json!("not a number"));
+        assert_eq!(load_source_rtl_ppm(&config), 0);
     }
 }

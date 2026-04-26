@@ -6582,9 +6582,24 @@ fn connect_source_panel(
     // at the source — both hardware and software AGC
     // renormalize the signal, so any gain write during those
     // modes is discarded downstream anyway.
+    // Restore persisted manual gain BEFORE wiring the notify
+    // handler — otherwise the programmatic `set_value` fires
+    // `connect_value_notify` and the in-flight `set_value`
+    // re-dispatches with the freshly-loaded value redundantly.
+    // Same idiom as the bias-T restore. Per #551.
+    {
+        let persisted_gain = sidebar::source_panel::load_source_rtl_gain_db(config);
+        panels.source.gain_row.set_value(persisted_gain);
+        state.send_dsp(UiToDsp::SetGain(persisted_gain));
+    }
     let state_gain = Rc::clone(state);
     let agc_row_for_gain = panels.source.agc_row.downgrade();
+    let config_gain = std::sync::Arc::clone(config);
     panels.source.gain_row.connect_value_notify(move |row| {
+        // Persist the slider value even when AGC is on — the
+        // user's last manual gain should survive an AGC-on /
+        // restart / AGC-off cycle. Per #551.
+        sidebar::source_panel::save_source_rtl_gain_db(&config_gain, row.value());
         if let Some(agc_row) = agc_row_for_gain.upgrade() {
             let agc_type = sidebar::source_panel::agc_type_from_selected(agc_row.selected());
             if !matches!(agc_type, Some(sidebar::source_panel::AgcType::Off)) {
@@ -6843,11 +6858,21 @@ fn connect_source_panel(
             state_iq_corr.send_dsp(UiToDsp::SetIqCorrection(row.is_active()));
         });
 
-    // PPM correction
+    // PPM correction. Restore persisted value before wiring
+    // the notify handler — same idiom as bias-T / gain. Per
+    // #551.
+    {
+        let persisted_ppm = sidebar::source_panel::load_source_rtl_ppm(config);
+        panels.source.ppm_row.set_value(f64::from(persisted_ppm));
+        state.send_dsp(UiToDsp::SetPpmCorrection(persisted_ppm));
+    }
     let state_ppm = Rc::clone(state);
+    let config_ppm = std::sync::Arc::clone(config);
     panels.source.ppm_row.connect_value_notify(move |row| {
         #[allow(clippy::cast_possible_truncation)]
-        state_ppm.send_dsp(UiToDsp::SetPpmCorrection(row.value() as i32));
+        let ppm = row.value() as i32;
+        sidebar::source_panel::save_source_rtl_ppm(&config_ppm, ppm);
+        state_ppm.send_dsp(UiToDsp::SetPpmCorrection(ppm));
     });
 
     // rtl_tcp connection controls — Disconnect + Retry now.
