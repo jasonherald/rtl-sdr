@@ -826,6 +826,19 @@ mod tests {
         let iq_stop = UiToDsp::StopIqRecording;
         assert!(matches!(iq_stop, UiToDsp::StopIqRecording));
 
+        // LRPT image-handle attach / detach (epic #469 task 7)
+        // — pin the variant shape so a future change to the
+        // `LrptImage` payload type or a rename of `ClearLrptImage`
+        // fails this regression net rather than silently
+        // breaking the controller's `lrpt_decode_tap` plumbing.
+        // Per CodeRabbit round 1 on PR #543.
+        let lrpt_image = sdr_radio::lrpt_image::LrptImage::new();
+        let set_lrpt = UiToDsp::SetLrptImage(lrpt_image);
+        assert!(matches!(set_lrpt, UiToDsp::SetLrptImage(_)));
+
+        let clear_lrpt = UiToDsp::ClearLrptImage;
+        assert!(matches!(clear_lrpt, UiToDsp::ClearLrptImage));
+
         let (tx, _rx) = std::sync::mpsc::sync_channel::<sdr_transcription::TranscriptionInput>(1);
         let enable = UiToDsp::EnableTranscription(tx);
         assert!(matches!(enable, UiToDsp::EnableTranscription(_)));

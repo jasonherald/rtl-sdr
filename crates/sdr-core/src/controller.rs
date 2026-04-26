@@ -1692,10 +1692,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::ClearLrptImage => {
             tracing::info!("LRPT image handle cleared — decoder tap is silent");
             state.lrpt_image = None;
-            // Drop the decoder too — without an image there's
-            // nowhere for harvested lines to land, and we want
-            // a fresh pipeline on the next attach anyway.
-            state.lrpt_decoder = None;
+            // Decoder state stays alive — the tap is already
+            // disabled because `lrpt_image` is None, and
+            // teardown / reset belong to the source-stop
+            // cleanup path. Mirrors the APT decoder, which
+            // also keeps its state across stop-listening /
+            // resume-listening cycles so resumed listening
+            // doesn't pay re-init cost. The `messages.rs`
+            // doc-comment for `ClearLrptImage` codifies this
+            // contract; an earlier draft contradicted it by
+            // dropping the decoder here. Per CodeRabbit
+            // round 1 on PR #543.
         }
 
         UiToDsp::StartIqRecording(path) => {

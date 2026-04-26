@@ -104,6 +104,11 @@ impl LrptDecoder {
             if channel.lines <= already {
                 continue;
             }
+            // Track lines actually pushed so that if the bounds
+            // guard below trips, the watermark doesn't jump past
+            // un-pushed rows and permanently drop them. Per
+            // CodeRabbit round 1 on PR #543.
+            let mut pushed = already;
             for line_idx in already..channel.lines {
                 let start = line_idx * IMAGE_WIDTH;
                 let end = start + IMAGE_WIDTH;
@@ -119,8 +124,9 @@ impl LrptDecoder {
                     break;
                 }
                 self.image.push_line(apid, &channel.pixels[start..end]);
+                pushed = line_idx + 1;
             }
-            self.last_pushed_lines.insert(apid, channel.lines);
+            self.last_pushed_lines.insert(apid, pushed);
         }
     }
 

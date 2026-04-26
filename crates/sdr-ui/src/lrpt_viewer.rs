@@ -98,23 +98,26 @@ struct ChannelSurface {
 
 impl ChannelSurface {
     /// Allocate a fresh full-pass-sized surface for one APID.
-    /// Mirrors [`crate::apt_viewer::AptImageRenderer::new`]'s
-    /// expectation that a desktop machine can spare ~6 MB at
-    /// startup; the alternative would be a fallible API the
-    /// rest of the renderer would have to plumb errors through
-    /// for a for-all-practical-purposes-infallible alloc.
+    /// Returns `None` if Cairo can't allocate the (~6 MB) ARGB32
+    /// surface — practically unreachable on any desktop machine,
+    /// but the library-crate "no panic" rule still applies.
+    /// Per `CodeRabbit` round 1 on PR #543: the earlier draft
+    /// panicked via `.expect()` even though `sdr-ui` is a
+    /// library crate. Callers (`LrptImageRenderer::push_line`)
+    /// degrade gracefully — log a warning and drop the line
+    /// rather than killing the GTK main loop.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn new() -> Self {
+    fn new() -> Option<Self> {
         let surface = cairo::ImageSurface::create(
             cairo::Format::ARgb32,
             IMAGE_WIDTH as i32,
             MAX_LINES as i32,
         )
-        .expect("LRPT renderer: ARGB32 surface allocation (~6 MB) failed at startup");
-        Self {
+        .ok()?;
+        Some(Self {
             surface,
             n_lines: 0,
-        }
+        })
     }
 }
 
@@ -193,10 +196,23 @@ impl LrptImageRenderer {
             );
             return;
         }
-        let entry = self
-            .channels
-            .entry(apid)
-            .or_insert_with(ChannelSurface::new);
+        // Lazy alloc; `ChannelSurface::new` returns `None` if
+        // Cairo can't acquire the ~6 MB ARGB32 surface. Drop
+        // the line with a warn rather than panicking — the
+        // viewer keeps working for any already-allocated
+        // channels and the next line will retry.
+        let entry = match self.channels.entry(apid) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let Some(surface) = ChannelSurface::new() else {
+                    tracing::warn!(
+                        "LRPT renderer: surface alloc failed for APID {apid}; dropping line",
+                    );
+                    return;
+                };
+                e.insert(surface)
+            }
+        };
         if entry.n_lines >= MAX_LINES {
             return;
         }
@@ -370,6 +386,14 @@ pub struct LrptImageView {
     /// so the viewer's poll tick is O(new lines), not O(total
     /// lines)).
     last_seen_lines: Rc<RefCell<HashMap<u16, usize>>>,
+    /// `glib` source IDs of timeouts spawned by the view (the
+    /// drain tick) and by `open_lrpt_viewer_window` (the
+    /// channel-dropdown refresh tick). [`Self::shutdown`]
+    /// removes them all so the closures' `Rc` chains drop and
+    /// the view + ~6 MB-per-channel surfaces don't leak past
+    /// the window's close-request. Per `CodeRabbit` round 1 on
+    /// PR #543.
+    timeout_ids: Rc<RefCell<Vec<glib::SourceId>>>,
 }
 
 impl LrptImageView {
@@ -382,6 +406,7 @@ impl LrptImageView {
         let paused = Rc::new(Cell::new(false));
         let last_seen_lines: Rc<RefCell<HashMap<u16, usize>>> =
             Rc::new(RefCell::new(HashMap::new()));
+        let timeout_ids: Rc<RefCell<Vec<glib::SourceId>>> = Rc::new(RefCell::new(Vec::new()));
 
         let drawing_area = gtk4::DrawingArea::builder()
             .hexpand(true)
@@ -400,19 +425,42 @@ impl LrptImageView {
             image,
             paused,
             last_seen_lines,
+            timeout_ids,
         };
 
         // Poll tick: drain new lines + queue redraw on change.
         let view_for_tick = view.clone();
-        glib::timeout_add_local(
+        let drain_id = glib::timeout_add_local(
             std::time::Duration::from_millis(u64::from(POLL_INTERVAL_MS)),
             move || {
                 view_for_tick.drain_new_lines();
                 glib::ControlFlow::Continue
             },
         );
+        view.timeout_ids.borrow_mut().push(drain_id);
 
         view
+    }
+
+    /// Register an external `glib` source (e.g. the
+    /// channel-dropdown refresh tick spawned by
+    /// [`open_lrpt_viewer_window`]) so it gets cleaned up by
+    /// [`Self::shutdown`] alongside the internal drain tick.
+    pub fn register_source(&self, id: glib::SourceId) {
+        self.timeout_ids.borrow_mut().push(id);
+    }
+
+    /// Cancel every registered `glib` source. Called on the
+    /// viewer window's `close-request` so the timeout closures
+    /// drop their `Rc` clones of the view's inner state — without
+    /// this, the view + ~6 MB-per-channel surfaces stay alive in
+    /// the main context until the application exits. Safe to
+    /// call more than once (subsequent calls are no-ops because
+    /// the `Vec` is drained).
+    pub fn shutdown(&self) {
+        for id in std::mem::take(&mut *self.timeout_ids.borrow_mut()) {
+            id.remove();
+        }
     }
 
     /// The underlying `GtkDrawingArea`. Pack into a layout
@@ -500,10 +548,20 @@ impl LrptImageView {
         }
     }
 
-    /// Clear all buffered lines and reset the watermark map.
+    /// Clear all buffered lines and reset the watermark map,
+    /// AND clear the backing shared `LrptImage` so the next
+    /// drain tick can't replay any rows that were still in the
+    /// shared assembler at the time of the clear. Without that,
+    /// reopening the viewer mid-pass — or starting a new pass
+    /// while the wiring layer hasn't yet cleared the shared
+    /// image itself — would repopulate the canvas with the
+    /// previous pass's pixels and contaminate later exports.
+    /// Per `CodeRabbit` round 1 on PR #543.
+    ///
     /// Between-pass cleanup; the next pass starts on a clean
-    /// canvas.
+    /// canvas. Idempotent — calling twice is harmless.
     pub fn clear(&self) {
+        self.image.clear();
         self.renderer.borrow_mut().clear();
         self.last_seen_lines.borrow_mut().clear();
         self.drawing_area.queue_draw();
@@ -529,10 +587,20 @@ impl LrptImageView {
     /// Save the active channel's image to a PNG. Same error
     /// semantics as [`LrptImageRenderer::export_png`].
     ///
+    /// Drains any pending rows from the shared `LrptImage`
+    /// into the renderer first, so the export captures the tail
+    /// of the pass even if it arrived after the most recent
+    /// poll tick. Without this, the LOS `SaveLrptPass` flow —
+    /// which exports immediately on receipt of the LOS action,
+    /// not on the next 250 ms poll — would systematically miss
+    /// the last fraction-of-a-second of decoded data. Per
+    /// `CodeRabbit` round 1 on PR #543.
+    ///
     /// # Errors
     ///
     /// Propagates any error from the underlying renderer.
     pub fn export_png(&self, path: &Path) -> Result<(), String> {
+        self.drain_new_lines();
         self.renderer.borrow().export_png(path)
     }
 }
@@ -570,16 +638,20 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
 
     // Refresh tick — runs at 1 Hz (channel discovery is rare;
     // a faster cadence would burn CPU on idle string compares).
-    let view = view.clone();
+    // Register the source on the view so `LrptImageView::shutdown`
+    // can cancel it when the window closes; otherwise the closure's
+    // `view.clone()` would keep the view + ~6 MB-per-channel
+    // surfaces alive forever.
+    let view_for_tick = view.clone();
     let dropdown_clone = dropdown.clone();
-    glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
-        let mut current = view.known_apids();
+    let refresh_id = glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+        let mut current = view_for_tick.known_apids();
         current.sort_unstable();
         let mut existing = dropdown_apids.borrow_mut();
         if *existing == current {
             return glib::ControlFlow::Continue;
         }
-        let active = view.active_apid();
+        let active = view_for_tick.active_apid();
         model.splice(0, model.n_items(), &[]);
         for &apid in &current {
             model.append(&format!("APID {apid}"));
@@ -600,6 +672,7 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
         }
         glib::ControlFlow::Continue
     });
+    view.register_source(refresh_id);
 
     dropdown
 }
@@ -767,6 +840,14 @@ pub fn open_lrpt_viewer_if_needed(
 
     let state_for_close = Rc::clone(state);
     window.connect_close_request(move |_| {
+        // Cancel the view's drain + dropdown-refresh timeouts
+        // BEFORE we drop the AppState slot; otherwise their
+        // closures' `Rc<view>` clones keep the view + ~6 MB-
+        // per-channel surfaces alive until the application
+        // exits. Per `CodeRabbit` round 1 on PR #543.
+        if let Some(view) = state_for_close.lrpt_viewer.borrow().as_ref() {
+            view.shutdown();
+        }
         *state_for_close.lrpt_viewer.borrow_mut() = None;
         state_for_close.send_dsp(UiToDsp::ClearLrptImage);
         glib::Propagation::Proceed

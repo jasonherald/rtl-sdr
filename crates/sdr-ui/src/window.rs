@@ -9121,6 +9121,23 @@ fn connect_satellites_panel(
                             "Pass complete, but no LRPT channels decoded — nothing saved to {}",
                             dir.display()
                         )
+                    } else if let Err(e) = std::fs::create_dir_all(&dir) {
+                        // The recorder hands us a path that
+                        // doesn't exist yet — `LrptImageRenderer::export_png`
+                        // creates the *parent* lazily, but for
+                        // an LRPT pass each export's parent is
+                        // the same directory, so creating it
+                        // up front avoids the chance of a race
+                        // (the per-APID files all create the
+                        // same parent on first use). Also gives
+                        // us a single observable failure point
+                        // for "disk full / permissions" rather
+                        // than `N` toasts. Per CodeRabbit
+                        // round 1 on PR #543.
+                        tracing::warn!(
+                            "auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",
+                        );
+                        format!("Pass complete but couldn't create {}: {e}", dir.display())
                     } else {
                         // Save the currently-active channel last
                         // so the viewer comes out of the loop

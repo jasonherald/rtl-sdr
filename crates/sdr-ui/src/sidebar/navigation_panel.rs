@@ -343,6 +343,12 @@ fn string_to_demod_mode(s: &str) -> DemodMode {
         "DSB" => DemodMode::Dsb,
         "CW" => DemodMode::Cw,
         "RAW" => DemodMode::Raw,
+        // Per CodeRabbit round 1 on PR #543: this arm was
+        // missing, so a Meteor bookmark saved as "LRPT" parsed
+        // back as `Nfm` on next load — silently demoting the
+        // user's catalog-driven LRPT tune. Mirrors the
+        // serializer's `DemodMode::Lrpt => "LRPT"`.
+        "LRPT" => DemodMode::Lrpt,
         // "NFM" and any unrecognized string default to NFM.
         _ => DemodMode::Nfm,
     }
@@ -1149,11 +1155,15 @@ mod tests {
             DemodMode::Dsb,
             DemodMode::Cw,
             DemodMode::Raw,
+            // Per CodeRabbit round 1 on PR #543 — pin Lrpt
+            // bidirectionally so a future variant addition
+            // can't silently demote LRPT bookmarks back to NFM.
+            DemodMode::Lrpt,
         ];
         for mode in modes {
             let s = demod_mode_to_string(mode);
             let back = string_to_demod_mode(&s);
-            assert_eq!(mode, back);
+            assert_eq!(mode, back, "roundtrip failed for {mode:?}");
         }
     }
 
