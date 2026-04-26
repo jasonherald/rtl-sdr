@@ -401,6 +401,13 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar.update_demod(label, bw);
 
         panels.radio.apply_demod_visibility(mode);
+        // Seed the bandwidth row's allowed range to the initial
+        // demod (WFM by default — 50 kHz to 250 kHz). Without
+        // this, the row's adjustment carries the panel-level
+        // [100 Hz, 250 kHz] envelope until the user changes
+        // mode for the first time, letting them dial out-of-range
+        // values that the demod silently rejects (issue #505).
+        update_bandwidth_row_range_for_mode(&panels.radio, mode);
     }
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
@@ -1046,23 +1053,43 @@ fn handle_dsp_message(
             // default. Per issue #341.
             update_bandwidth_reset_sensitivity(radio_panel, state);
             update_vfo_reset_button_visibility(radio_panel, spectrum_handle, state);
+            // Retune the bandwidth row's allowed range to the
+            // new mode's [min, max] so the user can't dial a
+            // value the demod will silently reject. Also clamps
+            // the current value into the new range — see issue
+            // #505 for why this matters.
+            update_bandwidth_row_range_for_mode(radio_panel, new_mode);
         }
         DspToUi::BandwidthChanged(bw) => {
-            // DSP-originated bandwidth change (typically a VFO drag
-            // on the spectrum). Reflect it in the Radio panel's
-            // spin row so the numeric readout stays in lockstep
-            // with the active filter width.
+            // DSP-confirmed bandwidth change. Update BOTH the
+            // Radio panel's spin row AND the spectrum's visible
+            // VFO width so they stay in lockstep with the active
+            // filter regardless of where the change originated:
             //
-            // Set the suppress flag around the `set_value` call so
-            // the spin's `connect_value_notify` handler knows this
-            // update is DSP-originated and doesn't dispatch a
-            // redundant `UiToDsp::SetBandwidth` back to the
-            // controller. Restored after the set_value returns so
+            // - VFO drag on the spectrum: the drag handler
+            //   already mutated `vfo_state.bandwidth_hz` inline
+            //   for instant visual feedback, so the
+            //   `set_vfo_bandwidth` below is a redundant
+            //   confirm. Cheap.
+            // - Radio panel `AdwSpinRow` / reset button /
+            //   scanner retune / mode switch: those paths only
+            //   sent the `SetBandwidth` command. Without the
+            //   spectrum update here, the visible VFO width
+            //   stays at whatever the previous drag put it at
+            //   — which was issue #504.
+            //
+            // Set the `suppress_bandwidth_notify` flag around
+            // the spin row's `set_value` so its
+            // `connect_value_notify` handler knows this update
+            // is DSP-originated and doesn't dispatch a redundant
+            // `UiToDsp::SetBandwidth` back to the controller.
+            // Restored after the set_value returns so
             // user-originated edits from the next event loop tick
             // are dispatched normally.
             state.suppress_bandwidth_notify.set(true);
             radio_panel.bandwidth_row.set_value(bw);
             state.suppress_bandwidth_notify.set(false);
+            spectrum_handle.set_vfo_bandwidth(bw);
         }
         DspToUi::VfoOffsetChanged(offset) => {
             // DSP-originated VFO offset change — typically a
@@ -1215,6 +1242,13 @@ fn handle_dsp_message(
                 // the radio panel reflects the scanner's channel
                 // instead of the previous mode's row set.
                 radio_panel.apply_demod_visibility(demod_mode);
+                // Retune the bandwidth row's range to the new
+                // mode BEFORE the set_value below — otherwise a
+                // scanner channel with bandwidth outside the
+                // previous mode's range would be silently
+                // clamped here and the displayed value would
+                // drift from the actually-applied filter (#505).
+                update_bandwidth_row_range_for_mode(radio_panel, demod_mode);
                 state.suppress_bandwidth_notify.set(true);
                 radio_panel.bandwidth_row.set_value(bandwidth);
                 state.suppress_bandwidth_notify.set(false);
@@ -7130,6 +7164,55 @@ fn update_bandwidth_reset_sensitivity(radio: &sidebar::radio_panel::RadioPanel, 
     let current = radio.bandwidth_row.value();
     let at_default = (current - default).abs() < BANDWIDTH_RESET_TOLERANCE_HZ;
     radio.bandwidth_reset_button.set_sensitive(!at_default);
+}
+
+/// Retune the bandwidth `AdwSpinRow`'s allowed range to the
+/// active demod's `[min_bandwidth, max_bandwidth]`. Called
+/// whenever the demod mode changes so the row can't accept
+/// values the demod will silently reject — that mismatch was
+/// the root cause of issue #505 (audio stutter at panel-
+/// bandwidth > per-mode max). The panel-level constants
+/// `MIN_BANDWIDTH_HZ` / `MAX_BANDWIDTH_HZ` set the absolute
+/// envelope the row can ever cover (covers WFM's full
+/// 1-250 kHz range); this helper narrows it to the active
+/// mode's actual range on every demod change.
+///
+/// Also clamps the row's current value into the new range —
+/// without that, switching from WFM at 200 kHz to NFM would
+/// leave the displayed 200 kHz reading stale until the user
+/// manually adjusts. Setting the value here triggers the
+/// `connect_value_notify` handler, which dispatches a
+/// `SetBandwidth` to the controller. That's the right
+/// behaviour: the controller's `SetBandwidth` handler also
+/// calls `set_bandwidth` on the radio module, which would
+/// otherwise still hold the stale 200 kHz internally.
+fn update_bandwidth_row_range_for_mode(
+    radio: &sidebar::radio_panel::RadioPanel,
+    mode: sdr_types::DemodMode,
+) {
+    let Ok(min_bw) = sdr_radio::demod::min_bandwidth_for_mode(mode) else {
+        tracing::warn!(
+            ?mode,
+            "min_bandwidth_for_mode failed — leaving bandwidth row range unchanged"
+        );
+        return;
+    };
+    let Ok(max_bw) = sdr_radio::demod::max_bandwidth_for_mode(mode) else {
+        tracing::warn!(
+            ?mode,
+            "max_bandwidth_for_mode failed — leaving bandwidth row range unchanged"
+        );
+        return;
+    };
+    let adj = radio.bandwidth_row.adjustment();
+    adj.set_lower(min_bw);
+    adj.set_upper(max_bw);
+    let current = radio.bandwidth_row.value();
+    if current < min_bw {
+        radio.bandwidth_row.set_value(min_bw);
+    } else if current > max_bw {
+        radio.bandwidth_row.set_value(max_bw);
+    }
 }
 
 /// Tolerance (Hz) for the "VFO offset is at 0" comparison in

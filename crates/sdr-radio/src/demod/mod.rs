@@ -171,6 +171,41 @@ pub fn default_bandwidth_for_mode(mode: sdr_types::DemodMode) -> Result<f64, Dsp
     Ok(create_demodulator(mode)?.config().default_bandwidth)
 }
 
+/// Maximum bandwidth (Hz) the demodulator will accept for the
+/// given mode. UI uses this to clamp the Radio panel's
+/// bandwidth `SpinRow` to the active demod's actual range —
+/// without it the `SpinRow` allows up to a global cap (250 kHz)
+/// while NFM / AM / SSB / CW silently reject anything past
+/// their own per-mode max, producing the audio-stutter symptom
+/// in issue #505 (channel filter widens, demod's audio LPF
+/// stays at the previous value, demod processes IQ wildly out
+/// of its design assumptions).
+///
+/// Same caveats as [`default_bandwidth_for_mode`] — constructs
+/// a throwaway demodulator each call to read its config; cheap
+/// enough for UI use on demod-mode changes.
+///
+/// # Errors
+///
+/// Returns `DspError` if demod construction fails. Same
+/// "shouldn't happen for any current variant" guarantee as
+/// `default_bandwidth_for_mode`. Per issue #505.
+pub fn max_bandwidth_for_mode(mode: sdr_types::DemodMode) -> Result<f64, DspError> {
+    Ok(create_demodulator(mode)?.config().max_bandwidth)
+}
+
+/// Minimum bandwidth (Hz) the demodulator will accept for the
+/// given mode. Companion to [`max_bandwidth_for_mode`] for
+/// the same reason — see #505. Especially important for CW
+/// (50 Hz min vs the panel's previous 100 Hz floor).
+///
+/// # Errors
+///
+/// See [`max_bandwidth_for_mode`].
+pub fn min_bandwidth_for_mode(mode: sdr_types::DemodMode) -> Result<f64, DspError> {
+    Ok(create_demodulator(mode)?.config().min_bandwidth)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -224,5 +259,52 @@ mod tests {
             );
             assert!(!demod.name().is_empty(), "{mode:?} name must not be empty");
         }
+    }
+
+    #[test]
+    fn min_max_bandwidth_for_mode_match_demod_config() {
+        // Pin the helpers' contract: they MUST return the same
+        // min/max as `DemodConfig` for every mode. The UI uses
+        // them to clamp the Radio panel SpinRow's allowed range
+        // (issue #505); a divergence here would let the row
+        // accept values the demod silently rejects.
+        let modes = [
+            DemodMode::Wfm,
+            DemodMode::Nfm,
+            DemodMode::Am,
+            DemodMode::Usb,
+            DemodMode::Lsb,
+            DemodMode::Dsb,
+            DemodMode::Cw,
+            DemodMode::Raw,
+            DemodMode::Lrpt,
+        ];
+        for mode in modes {
+            let demod = create_demodulator(mode).unwrap();
+            let cfg = demod.config();
+            let min = min_bandwidth_for_mode(mode).unwrap();
+            let max = max_bandwidth_for_mode(mode).unwrap();
+            assert!(
+                (min - cfg.min_bandwidth).abs() < f64::EPSILON,
+                "{mode:?}: min_bandwidth_for_mode {min} != DemodConfig {}",
+                cfg.min_bandwidth,
+            );
+            assert!(
+                (max - cfg.max_bandwidth).abs() < f64::EPSILON,
+                "{mode:?}: max_bandwidth_for_mode {max} != DemodConfig {}",
+                cfg.max_bandwidth,
+            );
+        }
+    }
+
+    #[test]
+    fn min_bandwidth_for_mode_pins_known_values() {
+        // Specific values from the issue triage on #505 — if any
+        // of these change, that's a UX-affecting bandwidth
+        // boundary shift and the panel range calc needs revisit.
+        assert!((max_bandwidth_for_mode(DemodMode::Nfm).unwrap() - 50_000.0).abs() < f64::EPSILON);
+        assert!((max_bandwidth_for_mode(DemodMode::Wfm).unwrap() - 250_000.0).abs() < f64::EPSILON);
+        assert!((max_bandwidth_for_mode(DemodMode::Cw).unwrap() - 500.0).abs() < f64::EPSILON);
+        assert!((min_bandwidth_for_mode(DemodMode::Cw).unwrap() - 50.0).abs() < f64::EPSILON);
     }
 }
