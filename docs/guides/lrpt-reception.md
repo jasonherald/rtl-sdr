@@ -112,8 +112,8 @@ arms NOAA APT also arms METEOR-M passes — the recorder branches
 on the catalog entry's protocol field internally. The "Also save
 audio (.wav)" sub-toggle is honoured for APT but ignored for
 LRPT (LRPT's demod is a silent passthrough — recording 10+
-minutes of stereo silence at 144 ksps would waste ~170 MB per
-pass for no benefit).
+minutes of 48 kHz stereo silence would waste ~115 MB per pass
+for no benefit).
 
 That's it for setup. The rest happens automatically when the
 next eligible Meteor pass arrives.

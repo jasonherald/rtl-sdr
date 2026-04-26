@@ -425,9 +425,10 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     //
     // LRPT passes ignore this toggle even when it's on — the
     // demod is silent (the imagery is the artifact) so a 10-min
-    // pass would write ~170 MB of stereo silence for no value.
-    // The recorder enforces this in `tick_idle`. Per epic #469
-    // task 7.4.
+    // pass would write ~115 MB of 48 kHz stereo silence
+    // (`AUDIO_SAMPLE_RATE × AUDIO_CHANNELS × 2 B × 600 s`) for
+    // no value. The recorder enforces this in `tick_idle`. Per
+    // epic #469 task 7.4.
     let auto_record_audio_switch = adw::SwitchRow::builder()
         .title("Also save audio (.wav)")
         .subtitle("Capture demodulated audio alongside the image. Pairs with the PNG by filename. APT only — LRPT passes are silent.")
