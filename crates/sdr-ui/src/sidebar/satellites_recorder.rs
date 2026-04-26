@@ -68,16 +68,30 @@ pub enum State {
         /// took over. Restored at LOS so the user comes back to
         /// whatever they were listening to.
         saved_tune: SavedTune,
+        /// Audio recording path the wiring layer was asked to
+        /// open at AOS. `Some(path)` means we'll fire
+        /// [`Action::StopAutoAudioRecord`] at LOS to close it
+        /// cleanly. `None` means the audio toggle was off when
+        /// AOS fired and there's no in-flight recording. The
+        /// captured value persists across the AOS toggle so a
+        /// user flipping it mid-pass can't leave a half-stopped
+        /// writer.
+        audio_path: Option<PathBuf>,
     },
     /// Pass is in progress; APT decoder is producing the live
     /// image. No per-tick work needed — we just wait for LOS.
-    Recording { pass: Pass, saved_tune: SavedTune },
+    Recording {
+        pass: Pass,
+        saved_tune: SavedTune,
+        audio_path: Option<PathBuf>,
+    },
     /// Pass ended; PNG export and tune restore are pending. This
     /// state is single-tick: the next `tick` advances to `Idle`.
     Finalizing {
         pass: Pass,
         saved_tune: SavedTune,
         png_path: PathBuf,
+        audio_path: Option<PathBuf>,
     },
 }
 
@@ -132,10 +146,23 @@ pub enum Action {
         mode: DemodMode,
         bandwidth_hz: u32,
     },
+    /// Open a WAV writer at `audio_path` to capture the
+    /// demodulated audio for the duration of the pass. Fired
+    /// alongside [`Action::StartAutoRecord`] only when the user
+    /// has the "also save audio" toggle on. Wiring layer maps
+    /// to `UiToDsp::StartAudioRecording(path)`. Per #533.
+    StartAutoAudioRecord(PathBuf),
     /// Save the in-flight APT image to `png_path`. Fired on
     /// `Recording → Finalizing`. Caller is expected to call
     /// `AptImageView::export_png` against the open viewer.
     SavePng(PathBuf),
+    /// Stop the in-flight WAV writer opened by
+    /// [`Action::StartAutoAudioRecord`]. Fired alongside
+    /// [`Action::SavePng`] on LOS, but only when audio recording
+    /// was actually started at AOS — flipping the toggle mid-
+    /// pass does NOT retroactively start or stop recording.
+    /// Wiring layer maps to `UiToDsp::StopAudioRecording`.
+    StopAutoAudioRecord,
     /// Restore the radio to the pre-recording tune. Fired on
     /// `Finalizing → Idle`. Caller dispatches the same triple
     /// through the same primitive the play button uses.
@@ -186,6 +213,12 @@ impl AutoRecorder {
     /// in-flight pass keeps running to LOS regardless, but no new
     /// passes will arm).
     ///
+    /// `audio_record_on` reflects the "also save audio" toggle.
+    /// Sampled exclusively at AOS — flipping it mid-pass does NOT
+    /// retroactively start or stop a recording (avoids leaving a
+    /// half-stopped writer behind, and matches the `auto_record_on`
+    /// "in-flight pass keeps running" semantics).
+    ///
     /// `now_tune` is the radio's current `(freq_hz, mode,
     /// bandwidth_hz)`. Captured at AOS as the `saved_tune` for the
     /// in-flight pass so a later LOS can restore.
@@ -194,21 +227,28 @@ impl AutoRecorder {
         now: DateTime<Utc>,
         passes: &[Pass],
         auto_record_on: bool,
+        audio_record_on: bool,
         now_tune: SavedTune,
     ) -> Vec<Action> {
         match self.state.clone() {
-            State::Idle => self.tick_idle(now, passes, auto_record_on, now_tune),
+            State::Idle => self.tick_idle(now, passes, auto_record_on, audio_record_on, now_tune),
             State::BeforePass {
                 pass,
                 tuned_at,
                 saved_tune,
-            } => self.tick_before_pass(now, pass, tuned_at, saved_tune),
-            State::Recording { pass, saved_tune } => self.tick_recording(now, pass, saved_tune),
+                audio_path,
+            } => self.tick_before_pass(now, pass, tuned_at, saved_tune, audio_path),
+            State::Recording {
+                pass,
+                saved_tune,
+                audio_path,
+            } => self.tick_recording(now, pass, saved_tune, audio_path),
             State::Finalizing {
                 pass,
                 saved_tune,
                 png_path,
-            } => self.tick_finalizing(pass, saved_tune, png_path),
+                audio_path,
+            } => self.tick_finalizing(pass, saved_tune, png_path, audio_path),
         }
     }
 
@@ -217,6 +257,7 @@ impl AutoRecorder {
         now: DateTime<Utc>,
         passes: &[Pass],
         auto_record_on: bool,
+        audio_record_on: bool,
         now_tune: SavedTune,
     ) -> Vec<Action> {
         if !auto_record_on {
@@ -265,13 +306,17 @@ impl AutoRecorder {
             // Fall through: pass is in the lead-in window OR has
             // already started (we missed the lead — start tuning
             // immediately).
-            let mut actions = Vec::with_capacity(2);
+            let audio_path = audio_record_on.then(|| audio_path_for(pass, now));
+            let mut actions = Vec::with_capacity(3);
             actions.push(Action::StartAutoRecord {
                 satellite: pass.satellite.clone(),
                 freq_hz,
                 mode,
                 bandwidth_hz,
             });
+            if let Some(path) = &audio_path {
+                actions.push(Action::StartAutoAudioRecord(path.clone()));
+            }
             // "Starting" reads wrong if we missed the lead window
             // (laptop wake, recompute lag, etc.) and the pass is
             // already underway — in that case the user sees the
@@ -291,6 +336,7 @@ impl AutoRecorder {
                 pass: pass.clone(),
                 tuned_at: now,
                 saved_tune: now_tune,
+                audio_path,
             };
             return actions;
         }
@@ -303,6 +349,7 @@ impl AutoRecorder {
         pass: Pass,
         tuned_at: DateTime<Utc>,
         saved_tune: SavedTune,
+        audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         // LOS already arrived (e.g. the 1 Hz driver stalled on a
         // sleep / suspend cycle, or a very short pass elapsed
@@ -312,15 +359,25 @@ impl AutoRecorder {
         // image.
         if pass.end <= now {
             let png_path = png_path_for(&pass, now);
+            let mut actions = Vec::with_capacity(2);
+            actions.push(Action::SavePng(png_path.clone()));
+            if audio_path.is_some() {
+                actions.push(Action::StopAutoAudioRecord);
+            }
             self.state = State::Finalizing {
                 pass: pass.clone(),
                 saved_tune,
-                png_path: png_path.clone(),
+                png_path,
+                audio_path,
             };
-            return vec![Action::SavePng(png_path)];
+            return actions;
         }
         if (now - tuned_at).num_seconds() >= SETTLE_SECS {
-            self.state = State::Recording { pass, saved_tune };
+            self.state = State::Recording {
+                pass,
+                saved_tune,
+                audio_path,
+            };
         }
         Vec::new()
     }
@@ -330,6 +387,7 @@ impl AutoRecorder {
         now: DateTime<Utc>,
         pass: Pass,
         saved_tune: SavedTune,
+        audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         if pass.end <= now {
             // Emit `SavePng` only — the success / failure toast
@@ -339,12 +397,18 @@ impl AutoRecorder {
             // mid-pass or `export_png` errored on disk-full /
             // permissions.
             let png_path = png_path_for(&pass, now);
+            let mut actions = Vec::with_capacity(2);
+            actions.push(Action::SavePng(png_path.clone()));
+            if audio_path.is_some() {
+                actions.push(Action::StopAutoAudioRecord);
+            }
             self.state = State::Finalizing {
                 pass,
                 saved_tune,
-                png_path: png_path.clone(),
+                png_path,
+                audio_path,
             };
-            return vec![Action::SavePng(png_path)];
+            return actions;
         }
         Vec::new()
     }
@@ -354,6 +418,7 @@ impl AutoRecorder {
         _pass: Pass,
         saved_tune: SavedTune,
         _png_path: PathBuf,
+        _audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         // Single-tick state: SavePng was issued on entry; restore
         // tune and return to Idle.
@@ -380,6 +445,22 @@ fn is_apt_capable(satellite_name: &str) -> bool {
 /// can't drift on naming.
 #[must_use]
 fn png_path_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
+    pass_recording_path(pass, now, "apt", "png")
+}
+
+/// Build the audio-recording path for a satellite + timestamp:
+/// `~/sdr-recordings/audio-NOAA-19-2026-04-25-143015.wav`.
+/// Pairs with [`png_path_for`] — same sat slug + timestamp so a
+/// post-pass viewer can pair PNG with WAV by filename match.
+#[must_use]
+fn audio_path_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
+    pass_recording_path(pass, now, "audio", "wav")
+}
+
+/// Shared filename builder for the per-pass artifacts — the PNG
+/// (`png_path_for`) and the WAV (`audio_path_for`) both go through
+/// here so a future filename-format tweak only touches one place.
+fn pass_recording_path(pass: &Pass, now: DateTime<Utc>, prefix: &str, extension: &str) -> PathBuf {
     let stamp = now
         .with_timezone(&chrono::Local)
         .format("%Y-%m-%d-%H%M%S")
@@ -401,7 +482,7 @@ fn png_path_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
         .join("-");
     glib::home_dir()
         .join("sdr-recordings")
-        .join(format!("apt-{sat_slug}-{stamp}.png"))
+        .join(format!("{prefix}-{sat_slug}-{stamp}.{extension}"))
 }
 
 // `glib` is referenced via the GTK4 stack but only available on
@@ -453,7 +534,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass starts in 3 s — inside the 5 s lead-in.
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
-        let actions = r.tick(now, &[pass], true, default_tune());
+        let actions = r.tick(now, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::BeforePass { .. }));
         assert!(matches!(actions[0], Action::StartAutoRecord { .. }));
         // Pre-AOS arming reports "starting" — the pass hasn't
@@ -483,7 +564,7 @@ mod tests {
         // Pass started 30 s ago, ends in 9.5 min — eligible by
         // every other gate (NOAA, 50° peak, end > now).
         let pass = synthetic_noaa19(now, -30, 600, 50.0);
-        let actions = r.tick(now, &[pass], true, default_tune());
+        let actions = r.tick(now, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::BeforePass { .. }));
         match &actions[1] {
             Action::Toast { message, .. } => {
@@ -501,7 +582,7 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
-        let actions = r.tick(now, &[pass], false, default_tune());
+        let actions = r.tick(now, &[pass], false, false, default_tune());
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -512,7 +593,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // 20° peak — "marginal" tier, below the 25° "good" floor.
         let pass = synthetic_noaa19(now, 3, 720, 20.0);
-        let actions = r.tick(now, &[pass], true, default_tune());
+        let actions = r.tick(now, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -526,7 +607,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let mut pass = synthetic_noaa19(now, 3, 720, 50.0);
         pass.satellite = "METEOR-M 2".to_string();
-        let actions = r.tick(now, &[pass], true, default_tune());
+        let actions = r.tick(now, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -545,7 +626,13 @@ mod tests {
         let mut pass = synthetic_noaa19(now, -660, 600, 50.0); // started -660 s ago, ended -60 s ago
         // Sanity: this pass is in the past from `now`'s perspective.
         assert!(pass.end < now);
-        let actions = r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        let actions = r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
         // Mutating the pass to make peak elevation match the
@@ -553,7 +640,13 @@ mod tests {
         // that the only thing keeping us idle was the LOS check.
         pass.end = now + ChronoDuration::seconds(720);
         pass.start = now + ChronoDuration::seconds(3);
-        let actions = r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        let actions = r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::BeforePass { .. }));
         assert!(
             actions
@@ -568,7 +661,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass starts in 10 min. Way outside the 5 s lead-in.
         let pass = synthetic_noaa19(now, 600, 720, 50.0);
-        let actions = r.tick(now, &[pass], true, default_tune());
+        let actions = r.tick(now, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -579,15 +672,27 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
         // Initial arm.
-        r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::BeforePass { .. }));
         // Pre-settle tick: still in BeforePass.
         let later = now + ChronoDuration::seconds(2);
-        r.tick(later, std::slice::from_ref(&pass), true, default_tune());
+        r.tick(
+            later,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::BeforePass { .. }));
         // Past settle window: advance to Recording.
         let later = now + ChronoDuration::seconds(SETTLE_SECS);
-        r.tick(later, &[pass], true, default_tune());
+        r.tick(later, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::Recording { .. }));
     }
 
@@ -596,18 +701,25 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 600, 50.0); // 10 min pass
-        r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
         r.tick(
             after_settle,
             std::slice::from_ref(&pass),
             true,
+            false,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Recording { .. }));
         // Tick past LOS.
         let los_plus_one = pass.end + ChronoDuration::seconds(1);
-        let actions = r.tick(los_plus_one, &[pass], true, default_tune());
+        let actions = r.tick(los_plus_one, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::Finalizing { .. }));
         // Only `SavePng` — the success / failure toast is the
         // wiring layer's responsibility now (it knows the export
@@ -634,18 +746,25 @@ mod tests {
             scanner_running: true, // pin: pre-AOS scan must come back at LOS
         };
         // Walk all transitions.
-        r.tick(now, std::slice::from_ref(&pass), true, saved);
+        r.tick(now, std::slice::from_ref(&pass), true, false, saved);
         let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
         r.tick(
             after_settle,
             std::slice::from_ref(&pass),
             true,
+            false,
             default_tune(),
         );
         let los_plus = pass.end + ChronoDuration::seconds(1);
-        r.tick(los_plus, std::slice::from_ref(&pass), true, default_tune());
+        r.tick(
+            los_plus,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Finalizing { .. }));
-        let actions = r.tick(los_plus, &[pass], true, default_tune());
+        let actions = r.tick(los_plus, &[pass], true, false, default_tune());
         assert!(matches!(r.state(), State::Idle));
         // Restore action carries the original saved tune,
         // including the VFO offset (so a user's drag position
@@ -679,11 +798,23 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 60, 50.0); // 1 min pass, 3 s lead-in
-        r.tick(now, std::slice::from_ref(&pass), true, default_tune());
+        r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::BeforePass { .. }));
         // Jump to a moment past LOS (simulate stalled driver).
         let post_los = pass.end + ChronoDuration::seconds(5);
-        let actions = r.tick(post_los, std::slice::from_ref(&pass), true, default_tune());
+        let actions = r.tick(
+            post_los,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Finalizing { .. }));
         assert!(
             actions.iter().any(|a| matches!(a, Action::SavePng(_))),
@@ -697,12 +828,19 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass_a = synthetic_noaa19(now, 3, 720, 50.0);
         // Arm + settle into Recording.
-        r.tick(now, std::slice::from_ref(&pass_a), true, default_tune());
+        r.tick(
+            now,
+            std::slice::from_ref(&pass_a),
+            true,
+            false,
+            default_tune(),
+        );
         let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
         r.tick(
             after_settle,
             std::slice::from_ref(&pass_a),
             true,
+            false,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Recording { .. }));
@@ -710,7 +848,7 @@ mod tests {
         // The recorder should ignore it — Recording stays put.
         let mut pass_b = synthetic_noaa19(now, 30, 720, 60.0);
         pass_b.satellite = "NOAA 18".to_string();
-        let actions = r.tick(after_settle, &[pass_a, pass_b], true, default_tune());
+        let actions = r.tick(after_settle, &[pass_a, pass_b], true, false, default_tune());
         assert!(matches!(r.state(), State::Recording { .. }));
         // No StartAutoRecord action emitted.
         assert!(
@@ -731,6 +869,129 @@ mod tests {
             std::path::Path::new(&s)
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        );
+    }
+
+    #[test]
+    fn audio_path_pairs_with_png_path() {
+        // PNG and WAV must share the same satellite slug + local
+        // timestamp so a post-pass file picker can pair them by
+        // filename match. Per #533. Locking both paths together
+        // here also serves as a regression test against a future
+        // refactor that splits the timestamp between the two.
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 30, 15).unwrap();
+        let pass = synthetic_noaa19(now, 0, 720, 50.0);
+        let png = png_path_for(&pass, now);
+        let audio = audio_path_for(&pass, now);
+        let png_stem = png.file_stem().unwrap().to_string_lossy().to_string();
+        let audio_stem = audio.file_stem().unwrap().to_string_lossy().to_string();
+        // Strip the prefix differences ("apt-" vs "audio-") and
+        // confirm the rest (slug + timestamp) matches verbatim.
+        let png_tail = png_stem.strip_prefix("apt-").unwrap();
+        let audio_tail = audio_stem.strip_prefix("audio-").unwrap();
+        assert_eq!(png_tail, audio_tail, "slug+timestamp must match");
+        // Extension differs, parent dir matches.
+        assert_eq!(png.parent(), audio.parent());
+        assert!(
+            audio
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+        );
+    }
+
+    #[test]
+    fn audio_toggle_off_does_not_emit_audio_actions() {
+        // Per #533: with the audio toggle off at AOS, the recorder
+        // must NOT emit StartAutoAudioRecord at AOS or
+        // StopAutoAudioRecord at LOS. PNG path is unaffected.
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        // AOS with audio_record_on = false.
+        let aos_actions = r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        assert!(
+            aos_actions
+                .iter()
+                .any(|a| matches!(a, Action::StartAutoRecord { .. }))
+        );
+        assert!(
+            !aos_actions
+                .iter()
+                .any(|a| matches!(a, Action::StartAutoAudioRecord(_))),
+            "audio toggle off → no StartAutoAudioRecord",
+        );
+        // Settle + LOS — audio toggle flipped on mid-pass should
+        // NOT retroactively emit StartAutoAudioRecord, and there
+        // must be no StopAutoAudioRecord at LOS either (because
+        // we never started one).
+        let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
+        r.tick(
+            after_settle,
+            std::slice::from_ref(&pass),
+            true,
+            true,
+            default_tune(),
+        );
+        let los_plus = pass.end + ChronoDuration::seconds(1);
+        let los_actions = r.tick(los_plus, &[pass], true, true, default_tune());
+        assert!(los_actions.iter().any(|a| matches!(a, Action::SavePng(_))));
+        assert!(
+            !los_actions
+                .iter()
+                .any(|a| matches!(a, Action::StopAutoAudioRecord)),
+            "no audio recording was started → no StopAutoAudioRecord",
+        );
+    }
+
+    #[test]
+    fn audio_toggle_on_emits_paired_start_and_stop() {
+        // Per #533: audio_record_on at AOS emits
+        // StartAutoAudioRecord(path) alongside StartAutoRecord;
+        // LOS emits StopAutoAudioRecord alongside SavePng.
+        // The audio path must share the satellite slug with the
+        // PNG path the LOS emits.
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let aos_actions = r.tick(now, std::slice::from_ref(&pass), true, true, default_tune());
+        let audio_path = aos_actions.iter().find_map(|a| match a {
+            Action::StartAutoAudioRecord(p) => Some(p.clone()),
+            _ => None,
+        });
+        let audio_path = audio_path.expect("audio toggle on must emit StartAutoAudioRecord");
+        assert!(
+            audio_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("audio-NOAA-19-")
+        );
+        // Settle then LOS — flipping the audio toggle off mid-
+        // pass should NOT cancel the in-flight stop. The stop
+        // fires at LOS unconditionally based on the captured
+        // audio_path.
+        let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
+        r.tick(
+            after_settle,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        let los_plus = pass.end + ChronoDuration::seconds(1);
+        let los_actions = r.tick(los_plus, &[pass], true, false, default_tune());
+        assert!(los_actions.iter().any(|a| matches!(a, Action::SavePng(_))));
+        assert!(
+            los_actions
+                .iter()
+                .any(|a| matches!(a, Action::StopAutoAudioRecord)),
+            "in-flight audio recording must stop at LOS even after toggle flip",
         );
     }
 }

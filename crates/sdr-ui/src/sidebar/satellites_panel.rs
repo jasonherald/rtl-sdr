@@ -121,6 +121,10 @@ pub const KEY_STATION_ALT_M: &str = "sat_station_alt_m";
 pub const KEY_TLE_LAST_REFRESH: &str = "sat_tle_last_refresh";
 /// Persisted "auto-record APT passes" toggle.
 pub const KEY_AUTO_RECORD_APT: &str = "sat_auto_record_apt";
+/// Persisted "also save audio (.wav) on auto-record" toggle.
+/// Pairs with [`KEY_AUTO_RECORD_APT`] — only meaningful when
+/// auto-record is on. Default: `false` (opt-in). Per #533.
+pub const KEY_AUTO_RECORD_AUDIO: &str = "sat_auto_record_audio";
 
 // ─── Panel ─────────────────────────────────────────────────────────────
 
@@ -174,6 +178,13 @@ pub struct SatellitesPanel {
     /// Auto-record toggle — drives #482's "open APT viewer +
     /// start decoding when a NOAA pass starts" wiring.
     pub auto_record_switch: adw::SwitchRow,
+    /// "Also save audio (.wav)" toggle — when on AND
+    /// `auto_record_switch` is on, the recorder fires
+    /// `Action::StartAutoAudioRecord` at AOS and
+    /// `Action::StopAutoAudioRecord` at LOS so the pass's
+    /// demodulated audio lands in `~/sdr-recordings/audio-{slug}-
+    /// {timestamp}.wav` paired with the PNG. Per #533.
+    pub auto_record_audio_switch: adw::SwitchRow,
 
     // Next passes group -----------------------------------------------------
     /// The preferences group hosting the dynamically-built pass
@@ -227,6 +238,8 @@ pub struct SatellitesPanelWeak {
     pub refresh_spinner: glib::WeakRef<gtk4::Spinner>,
     /// Weak ref to [`SatellitesPanel::auto_record_switch`].
     pub auto_record_switch: glib::WeakRef<adw::SwitchRow>,
+    /// Weak ref to [`SatellitesPanel::auto_record_audio_switch`].
+    pub auto_record_audio_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::passes_group`].
     pub passes_group: glib::WeakRef<adw::PreferencesGroup>,
     /// Weak ref to [`SatellitesPanel::passes_status_row`].
@@ -251,6 +264,7 @@ impl SatellitesPanel {
             refresh_button: self.refresh_button.downgrade(),
             refresh_spinner: self.refresh_spinner.downgrade(),
             auto_record_switch: self.auto_record_switch.downgrade(),
+            auto_record_audio_switch: self.auto_record_audio_switch.downgrade(),
             passes_group: self.passes_group.downgrade(),
             passes_status_row: self.passes_status_row.downgrade(),
         }
@@ -277,6 +291,7 @@ impl SatellitesPanelWeak {
             refresh_button: self.refresh_button.upgrade()?,
             refresh_spinner: self.refresh_spinner.upgrade()?,
             auto_record_switch: self.auto_record_switch.upgrade()?,
+            auto_record_audio_switch: self.auto_record_audio_switch.upgrade()?,
             passes_group: self.passes_group.upgrade()?,
             passes_status_row: self.passes_status_row.upgrade()?,
         })
@@ -290,6 +305,10 @@ impl SatellitesPanelWeak {
 /// (avoids spurious save-on-restore feedback during window
 /// construction).
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear panel layout — ground-station group, TLE group, recording group (now with two switches per #533), and passes group are easier to follow as one block than artificially split into helpers"
+)]
 pub fn build_satellites_panel() -> SatellitesPanel {
     let page = adw::PreferencesPage::new();
 
@@ -397,6 +416,18 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .active(false)
         .build();
     recording_group.add(&auto_record_switch);
+
+    // Pairs with auto-record. Only takes effect when both this
+    // and `auto_record_switch` are on; sampled exclusively at
+    // AOS so a mid-pass toggle can't leave a half-stopped writer.
+    // Per #533. Also depends on #532 (pre-volume WAV writer) to
+    // capture usable audio when speakers are muted.
+    let auto_record_audio_switch = adw::SwitchRow::builder()
+        .title("Also save audio (.wav)")
+        .subtitle("Capture demodulated audio alongside the image. Pairs with the PNG by filename.")
+        .active(false)
+        .build();
+    recording_group.add(&auto_record_audio_switch);
     page.add(&recording_group);
 
     // ─── Upcoming Passes ──────────────────────────────────────
@@ -426,6 +457,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         refresh_button,
         refresh_spinner,
         auto_record_switch,
+        auto_record_audio_switch,
         passes_group,
         passes_status_row,
     }
@@ -461,6 +493,13 @@ pub fn load_auto_record_apt(config: &Arc<ConfigManager>) -> bool {
     read_bool_or(config, KEY_AUTO_RECORD_APT, false)
 }
 
+/// Read the persisted "also save audio" toggle. Defaults to
+/// `false` (opt-in). Per #533.
+#[must_use]
+pub fn load_auto_record_audio(config: &Arc<ConfigManager>) -> bool {
+    read_bool_or(config, KEY_AUTO_RECORD_AUDIO, false)
+}
+
 /// Persist `value` under `key`. Single helper for the three
 /// lat/lon/alt `SpinRow` change-notify handlers.
 pub fn save_f64(config: &Arc<ConfigManager>, key: &str, value: f64) {
@@ -473,6 +512,13 @@ pub fn save_f64(config: &Arc<ConfigManager>, key: &str, value: f64) {
 pub fn save_auto_record_apt(config: &Arc<ConfigManager>, value: bool) {
     config.write(|v| {
         v[KEY_AUTO_RECORD_APT] = serde_json::json!(value);
+    });
+}
+
+/// Persist `value` under [`KEY_AUTO_RECORD_AUDIO`].
+pub fn save_auto_record_audio(config: &Arc<ConfigManager>, value: bool) {
+    config.write(|v| {
+        v[KEY_AUTO_RECORD_AUDIO] = serde_json::json!(value);
     });
 }
 

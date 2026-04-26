@@ -8438,9 +8438,9 @@ fn connect_satellites_panel(
     use sidebar::satellites_panel::{
         KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, SatellitesPanelWeak,
         enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh, format_pass_subtitle,
-        format_pass_title, load_auto_record_apt, load_station_alt_m, load_station_lat_deg,
-        load_station_lon_deg, save_auto_record_apt, save_f64, save_tle_last_refresh,
-        tune_target_for_pass,
+        format_pass_title, load_auto_record_apt, load_auto_record_audio, load_station_alt_m,
+        load_station_lat_deg, load_station_lon_deg, save_auto_record_apt, save_auto_record_audio,
+        save_f64, save_tle_last_refresh, tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
@@ -8472,6 +8472,9 @@ fn connect_satellites_panel(
     panel
         .auto_record_switch
         .set_active(load_auto_record_apt(config));
+    panel
+        .auto_record_audio_switch
+        .set_active(load_auto_record_audio(config));
     panel
         .last_refresh_row
         .set_subtitle(&format_last_refresh(config));
@@ -8622,6 +8625,18 @@ fn connect_satellites_panel(
         panel.auto_record_switch.connect_active_notify(move |sw| {
             save_auto_record_apt(&config_auto, sw.is_active());
         });
+    }
+
+    // "Also save audio" toggle — persist only. The recorder's
+    // 1 Hz tick samples this switch's `is_active()` at AOS.
+    // Per #533.
+    {
+        let config_audio = std::sync::Arc::clone(config);
+        panel
+            .auto_record_audio_switch
+            .connect_active_notify(move |sw| {
+                save_auto_record_audio(&config_audio, sw.is_active());
+            });
     }
 
     // Refresh button — re-download every known satellite's TLE on
@@ -8972,6 +8987,14 @@ fn connect_satellites_panel(
                     view.clear();
                 }
             }
+            RecorderAction::StartAutoAudioRecord(path) => {
+                tracing::info!("auto-record AOS: opening WAV writer at {path:?}");
+                state_a.send_dsp(UiToDsp::StartAudioRecording(path));
+            }
+            RecorderAction::StopAutoAudioRecord => {
+                tracing::info!("auto-record LOS: closing WAV writer");
+                state_a.send_dsp(UiToDsp::StopAudioRecording);
+            }
             RecorderAction::SavePng(path) => {
                 // Toast based on the *actual* export outcome
                 // rather than announcing success up front — the
@@ -9104,6 +9127,12 @@ fn connect_satellites_panel(
                 .map(|e| e.pass.clone())
                 .collect();
             let auto_record_on = panel.auto_record_switch.is_active();
+            // Per #533: the "also save audio" toggle is sampled
+            // exclusively at AOS by the state machine; flipping
+            // it mid-pass does NOT retroactively start or stop
+            // recording (matches `auto_record_on`'s
+            // "in-flight pass keeps running" semantics).
+            let audio_record_on = panel.auto_record_audio_switch.is_active();
             // Round f64 SpinRow value to u32 at the snapshot
             // boundary so SavedTune carries a clean integer for
             // the eventual restore — no per-restore rounding.
@@ -9123,10 +9152,13 @@ fn connect_satellites_panel(
                 was_running: state_tick.is_running.get(),
                 scanner_running: scanner_switch_tick.is_active(),
             };
-            let actions =
-                recorder_tick
-                    .borrow_mut()
-                    .tick(now, &passes_snapshot, auto_record_on, now_tune);
+            let actions = recorder_tick.borrow_mut().tick(
+                now,
+                &passes_snapshot,
+                auto_record_on,
+                audio_record_on,
+                now_tune,
+            );
             for action in actions {
                 interpret_tick(action);
             }
