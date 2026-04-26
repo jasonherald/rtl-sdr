@@ -8550,7 +8550,12 @@ fn connect_satellites_panel(
                 // (impossible in practice but the lookup type is
                 // `Option`, so we fail closed — no button rather
                 // than a button that does nothing).
-                if let Some((freq_hz, mode, bw_hz)) = tune_target_for_pass(&pass) {
+                // Per-row play button: ignore the 4th element
+                // (`Option<ImagingProtocol>`) — manual tune is a
+                // user-initiated action and works on any catalog
+                // entry. Only the auto-record path filters on
+                // `Some(protocol)`.
+                if let Some((freq_hz, mode, bw_hz, _protocol)) = tune_target_for_pass(&pass) {
                     let play_btn = gtk4::Button::builder()
                         .icon_name("media-playback-start-symbolic")
                         .tooltip_text(format!(
@@ -8946,45 +8951,106 @@ fn connect_satellites_panel(
                 freq_hz,
                 mode,
                 bandwidth_hz,
+                protocol,
             } => {
                 tracing::info!(
-                    "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz",
+                    "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz, protocol {protocol:?}",
                 );
-                // Drive Start through the header play button —
-                // its `connect_toggled` handler is the single place
-                // that updates `state.is_running`, dispatches
-                // `UiToDsp::Start`, and swaps the play/stop icon.
-                // `set_active` is a no-op when the radio is
-                // already running, so this is safe to call
-                // unconditionally without a duplicate Start.
-                // The pre-AOS `was_running` flag (captured in
-                // `SavedTune` by the 1 Hz tick before this action
-                // fires) drives the corresponding LOS-side stop.
-                set_playing_a(true);
-                tune_a(freq_hz, mode, bandwidth_hz);
-                // Zero the live VFO offset for the auto-record
-                // pass. The user's pre-AOS offset (a manual
-                // VFO drag away from centre) is preserved in
-                // `SavedTune` for the LOS restore, but during
-                // the pass the demod must align *exactly* with
-                // the satellite's downlink — otherwise we'd
-                // demod at `freq_hz + saved_offset` and the
-                // APT subcarrier would land outside the
-                // channel filter. The DSP's
-                // `DspToUi::VfoOffsetChanged` echo updates the
-                // spectrum widget, freq selector, and status
-                // bar; no manual mirror needed.
-                state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
-                crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
-                // Clear the canvas at AOS so a back-to-back pass
-                // (e.g. NOAA 18 → NOAA 19 with overlapping
-                // viewer sessions) starts on a clean image. The
-                // viewer was either just opened above (already
-                // empty) or carried over from a previous pass —
-                // either way, an explicit clear keeps the image
-                // we're about to save scoped to *this* pass.
-                if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
-                    view.clear();
+                // Per-protocol viewer dispatch. Adding a new
+                // protocol means adding a match arm here +
+                // flipping `imaging_protocol` on the catalog
+                // entry — no recorder change needed. Per #514.
+                //
+                // **Fail closed on unsupported protocols.** All
+                // AOS side effects (set_playing, tune, zero VFO,
+                // open viewer) live INSIDE each arm rather than
+                // unconditionally before the match. Per CR
+                // round 1 on PR #541: if a catalog entry is
+                // flipped to `Some(Lrpt)` ahead of Task 7 wiring
+                // the LRPT viewer, the user's tune state must
+                // NOT be hijacked just to land in a no-op
+                // branch.
+                match protocol {
+                    sdr_sat::ImagingProtocol::Apt => {
+                        // Drive Start through the header play
+                        // button — its `connect_toggled` handler
+                        // is the single place that updates
+                        // `state.is_running`, dispatches
+                        // `UiToDsp::Start`, and swaps the
+                        // play/stop icon. `set_active` is a
+                        // no-op when the radio is already
+                        // running, so this is safe to call
+                        // unconditionally without a duplicate
+                        // Start. The pre-AOS `was_running` flag
+                        // (captured in `SavedTune` by the 1 Hz
+                        // tick before this action fires) drives
+                        // the corresponding LOS-side stop.
+                        set_playing_a(true);
+                        tune_a(freq_hz, mode, bandwidth_hz);
+                        // Zero the live VFO offset for the
+                        // auto-record pass. The user's pre-AOS
+                        // offset (a manual VFO drag away from
+                        // centre) is preserved in `SavedTune`
+                        // for the LOS restore, but during the
+                        // pass the demod must align *exactly*
+                        // with the satellite's downlink —
+                        // otherwise we'd demod at `freq_hz +
+                        // saved_offset` and the APT subcarrier
+                        // would land outside the channel
+                        // filter. The DSP's
+                        // `DspToUi::VfoOffsetChanged` echo
+                        // updates the spectrum widget, freq
+                        // selector, and status bar; no manual
+                        // mirror needed.
+                        state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
+                        crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
+                        // Clear the canvas at AOS so a back-to-back
+                        // pass (e.g. NOAA 18 → NOAA 19 with
+                        // overlapping viewer sessions) starts on a
+                        // clean image. The viewer was either just
+                        // opened above (already empty) or carried
+                        // over from a previous pass — either way,
+                        // an explicit clear keeps the image we're
+                        // about to save scoped to *this* pass.
+                        if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                            view.clear();
+                        }
+                    }
+                    sdr_sat::ImagingProtocol::Lrpt => {
+                        // **Should be unreachable** — the
+                        // `AutoRecorder` constructor in this
+                        // module passes
+                        // `supported_protocols = [Apt]`, so the
+                        // recorder's `tick_idle` filter rejects
+                        // any catalog entry flagged
+                        // `Some(Lrpt)` before reaching the
+                        // wiring layer. Per CR round 2 on PR
+                        // #541.
+                        //
+                        // Kept as defense-in-depth: if a future
+                        // refactor breaks the recorder gate
+                        // (e.g. someone passes a wider supported
+                        // set without wiring the viewer), this
+                        // branch makes the failure visible
+                        // (error log + user-facing toast) and
+                        // fails closed (no playback / tune /
+                        // VFO mutation).
+                        //
+                        // Task 7 of epic #469 replaces this
+                        // entire branch with the LRPT viewer-
+                        // open + decoder-tap wiring (and the
+                        // recorder constructor flips to
+                        // `[Apt, Lrpt]`).
+                        tracing::error!(
+                            "auto-record fired for LRPT satellite {satellite} but the recorder gate should have prevented this — please file a bug",
+                        );
+                        post_toast(
+                            &toast_overlay_weak,
+                            &format!(
+                                "{satellite}: LRPT auto-record arrived early — viewer ships in epic #469 Task 7"
+                            ),
+                        );
+                    }
                 }
             }
             RecorderAction::StartAutoAudioRecord(path) => {

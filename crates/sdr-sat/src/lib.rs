@@ -53,6 +53,29 @@ pub const IMAGING_BAND_MIN_HZ: u64 = 137_000_000;
 /// VHF imaging-band upper bound (Hz). See [`IMAGING_BAND_MIN_HZ`].
 pub const IMAGING_BAND_MAX_HZ: u64 = 148_000_000;
 
+/// Imaging protocol the receiver should use for a given catalog
+/// satellite. Drives the auto-record dispatch in
+/// `sidebar::satellites_recorder` so APT vs LRPT vs SSTV (future)
+/// each get their own decoder + viewer without the recorder
+/// itself caring about protocol details.
+///
+/// `None` on a [`KnownSatellite::imaging_protocol`] means "in the
+/// catalog for pass-prediction display purposes, but auto-record
+/// is not yet wired for this satellite's protocol." The recorder's
+/// eligibility filter excludes those entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImagingProtocol {
+    /// NOAA Automatic Picture Transmission (analog FM with 2.4 kHz
+    /// AM subcarrier on 137 MHz). Decoded by `sdr_dsp::apt::AptDecoder`
+    /// + assembled by `sdr_radio::apt_image::AptImage`.
+    Apt,
+    /// Meteor-M Low-Rate Picture Transmission (QPSK + CCSDS framing
+    /// on 137 MHz). Decoded by `sdr_dsp::lrpt::LrptDemod` +
+    /// `sdr_lrpt::LrptPipeline`. Wiring lands in Task 7 (epic #469).
+    Lrpt,
+    // Sstv variant added in epic #472 for ISS SSTV reception.
+}
+
 /// A satellite the user-facing scheduler ships with by default. The list
 /// is intentionally tight — we want passes to "just work" for the most
 /// common LEO weather / ham satellites without making the user paste
@@ -89,6 +112,15 @@ pub struct KnownSatellite {
     /// dispatch a `SetBandwidth` without re-deriving the value from
     /// signal type.
     pub bandwidth_hz: u32,
+    /// Imaging protocol for auto-record dispatch. `None` means the
+    /// satellite is in the catalog for pass-prediction display
+    /// (so the user sees upcoming passes and can manually tune)
+    /// but the auto-record path doesn't have a decoder + viewer
+    /// for it yet. NOAA APT shipped in epic #468; Meteor LRPT
+    /// flips from `None` to `Some(Lrpt)` in Task 7 of epic #469
+    /// alongside the live LRPT viewer; ISS SSTV gets `Some(Sstv)`
+    /// in epic #472.
+    pub imaging_protocol: Option<ImagingProtocol>,
 }
 
 /// Built-in catalog. Order is the order the scheduler UI displays.
@@ -100,6 +132,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         downlink_hz: 137_620_000,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        imaging_protocol: Some(ImagingProtocol::Apt),
     },
     KnownSatellite {
         name: "NOAA 18",
@@ -107,6 +140,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         downlink_hz: 137_912_500,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        imaging_protocol: Some(ImagingProtocol::Apt),
     },
     KnownSatellite {
         name: "NOAA 19",
@@ -114,16 +148,21 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         downlink_hz: 137_100_000,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        imaging_protocol: Some(ImagingProtocol::Apt),
     },
     // Meteor-M LRPT — epic #469. Note: METEOR-M 2 and NOAA 19 share
     // the 137.100 MHz channel — they're never on simultaneously by
     // design. The pass scheduler picks whichever is overhead.
+    // `imaging_protocol: None` keeps these out of the auto-record
+    // flow until Task 7 wires the live LRPT viewer; user can still
+    // see upcoming passes in the panel.
     KnownSatellite {
         name: "METEOR-M 2",
         norad_id: 40_069,
         downlink_hz: 137_100_000,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        imaging_protocol: None,
     },
     KnownSatellite {
         name: "METEOR-M2 3",
@@ -131,6 +170,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         downlink_hz: 137_900_000,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        imaging_protocol: None,
     },
     // METEOR-M2 4 (NORAD 61024) deliberately omitted — launched 2024,
     // failed shortly after, no usable TLE on Celestrak (404 from the
@@ -138,12 +178,15 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     // ISS SSTV — epic #472. 145.800 MHz is the primary downlink for
     // SSTV transmission events and the ARISS voice repeater; both
     // ride wide-FM and use the same tune-and-listen flow.
+    // `imaging_protocol: None` until epic #472 ships the SSTV
+    // decoder + viewer.
     KnownSatellite {
         name: "ISS (ZARYA)",
         norad_id: 25_544,
         downlink_hz: 145_800_000,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        imaging_protocol: None,
     },
 ];
 
@@ -206,5 +249,50 @@ mod tests {
                 IMAGING_BAND_MAX_HZ,
             );
         }
+    }
+
+    #[test]
+    fn known_satellites_have_expected_protocol_assignments() {
+        // Pin the catalog's protocol assignments so a future
+        // catalog edit can't silently change the auto-record
+        // dispatch. The recorder's eligibility filter keys on
+        // `imaging_protocol.is_some()`, so flipping a satellite
+        // from None → Some (or vice versa) IS a behavior change
+        // that should fail this test.
+        //
+        // NOAA satellites → Apt (shipped in epic #468 / PR #513).
+        for s in KNOWN_SATELLITES
+            .iter()
+            .filter(|s| s.name.starts_with("NOAA"))
+        {
+            assert_eq!(
+                s.imaging_protocol,
+                Some(ImagingProtocol::Apt),
+                "{} should be APT (NOAA APT shipped in epic #468)",
+                s.name,
+            );
+        }
+        // METEOR satellites → None for this PR. Task 7 of epic
+        // #469 flips them to Some(Lrpt) once the live LRPT
+        // viewer + decoder driver are wired.
+        for s in KNOWN_SATELLITES
+            .iter()
+            .filter(|s| s.name.starts_with("METEOR"))
+        {
+            assert_eq!(
+                s.imaging_protocol, None,
+                "{} should be None until Task 7 of epic #469",
+                s.name,
+            );
+        }
+        // ISS → None. Becomes Some(Sstv) in epic #472.
+        let iss = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.name.contains("ISS"))
+            .expect("ISS in catalog");
+        assert_eq!(
+            iss.imaging_protocol, None,
+            "ISS should be None until epic #472"
+        );
     }
 }
