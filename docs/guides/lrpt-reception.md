@@ -58,7 +58,13 @@ serious about LRPT, get the notch.
 
 ---
 
-## Active satellites (2026)
+## Active satellites (as of April 2026)
+
+Operational status changes — by the time you read this, one of
+these may have failed and a successor may be aloft. Check
+[N2YO](https://www.n2yo.com/?s=Meteor) or
+[Heavens-Above](https://heavens-above.com) for current health
+before relying on a specific bird.
 
 Two operational LRPT satellites are in the catalog by default:
 
@@ -224,19 +230,17 @@ in order:
 
 ### "Pass complete, but no LRPT channels decoded"
 
-The recorder armed and the radio tuned, but no CCSDS image
-packets reached the JPEG decoder. Same root causes as the
-empty-dropdown case — the recorder ran the full lifecycle and
-the per-pass directory is created but stays empty.
+The recorder armed and the radio tuned, but no usable image
+data reached the assembler — either the QPSK loop never locked,
+or the demux saw APID metadata briefly without sustaining
+enough packet decode to produce any actual pixel data. Same
+root causes as the empty-dropdown case (see above).
 
-### "Pass complete, but every LRPT channel was empty"
-
-Stranger case: the demux saw APID metadata (so the FEC chain
-locked at some point) but no actual pixel data made it through
-JPEG decode. Usually means a very low-elevation pass where the
-SNR fluctuated enough to lock briefly but not enough to sustain
-useful packet decode. The per-pass directory is still created,
-just empty.
+The per-pass directory is **not** created in this case — when
+no channel snapshots exist to write, `SaveLrptPass` skips the
+mkdir entirely and posts the toast against the would-have-been
+path. So you won't see an empty `lrpt-METEOR-…/` directory
+hanging around in `~/sdr-recordings/` after a failed pass.
 
 ### Image is striped with horizontal black gaps
 
