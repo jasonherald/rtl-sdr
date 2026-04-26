@@ -71,6 +71,14 @@ pub const MAX_LINES: usize = 8_192;
 /// stands out, matching the APT viewer's palette.
 const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 
+/// Bytes per pixel for Cairo's ARGB32 surface format —
+/// `B`, `G`, `R`, `A` in little-endian byte order. Pulled out
+/// of the hot-path pixel-copy loop in
+/// [`LrptImageRenderer::push_line`] so a future format change
+/// (e.g. RGB24 for the LRPT RGB-composite mode) is a one-line
+/// edit. Per `CodeRabbit` round 4 on PR #543.
+const BYTES_PER_PIXEL: usize = 4;
+
 /// Default size for the viewer window. Wider than tall because
 /// LRPT scan width (1568 px) is greater than typical pass
 /// heights (~600 lines) — landscape layout fills better.
@@ -288,7 +296,7 @@ impl LrptImageRenderer {
             }
         };
         for (i, &g) in pixels.iter().enumerate() {
-            let pixel_offset = row_offset + i * 4;
+            let pixel_offset = row_offset + i * BYTES_PER_PIXEL;
             data[pixel_offset] = g;
             data[pixel_offset + 1] = g;
             data[pixel_offset + 2] = g;
