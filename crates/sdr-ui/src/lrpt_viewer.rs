@@ -85,18 +85,34 @@ const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 /// edit. Per `CodeRabbit` round 4 on PR #543.
 const BYTES_PER_PIXEL: usize = 4;
 
-/// Default size for the viewer window. Wider than tall because
-/// LRPT scan width (1568 px) is greater than typical pass
-/// heights (~600 lines) — landscape layout fills better.
+/// Default size for the viewer window. A typical Meteor MSU-MR
+/// pass produces ~3600 lines × 1568 px (portrait, ~1:2 aspect)
+/// at full duration, so the image will scroll vertically inside
+/// the window for most of the pass. The default 900 × 600
+/// landscape footprint is chosen for ergonomics rather than
+/// aspect match: it sits comfortably alongside the main radio
+/// window on a typical 1080p+ desktop, fills well during the
+/// early-pass phase when the image is still short and wide, and
+/// the user can resize freely once they see how the pass is
+/// developing. (Pre-round-2 the comment claimed "wider than
+/// tall because typical pass heights are ~600 lines" — that
+/// assumption was based on the old 1024-line cap and stopped
+/// holding once `MAX_LINES` bumped to 8192.) Per `CodeRabbit`
+/// round 14 on PR #543.
 const VIEWER_WINDOW_WIDTH: i32 = 900;
 const VIEWER_WINDOW_HEIGHT: i32 = 600;
 
 /// Poll interval the view uses to drain new scan lines from
-/// the shared `LrptImage` and queue redraws. 250 ms (4 Hz) is
-/// faster than the satellite's ~1 Hz line cadence so users see
-/// data the moment it lands, without burning CPU on a tight
-/// loop. 60 FPS would be wasteful — there's no smooth-motion
-/// content here, just discrete row appends.
+/// the shared `LrptImage` and queue redraws. MSU-MR produces
+/// ~6 scan lines per second per channel; 250 ms (4 Hz) keeps
+/// the viewer one tick behind the line arrival rate at most,
+/// which feels responsive without burning CPU on a tight
+/// loop. A faster cadence wouldn't pay off — multiple lines
+/// land per tick anyway and `drain_new_lines` already batches
+/// them. 60 FPS would be wasteful: there's no smooth-motion
+/// content here, just discrete row appends. Per `CodeRabbit`
+/// round 14 on PR #543 (refreshed from the older "~1 Hz" copy
+/// that predated the round-2 MSU-MR rate research).
 const POLL_INTERVAL_MS: u32 = 250;
 
 /// Refresh interval for the channel-dropdown population tick.
