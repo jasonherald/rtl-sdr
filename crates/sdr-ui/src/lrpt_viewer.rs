@@ -164,7 +164,7 @@ struct ChannelSurface {
 
 impl ChannelSurface {
     /// Allocate a fresh full-pass-sized surface for one APID.
-    /// Returns `None` if Cairo can't allocate the (~6 MB) ARGB32
+    /// Returns `None` if Cairo can't allocate the (~51 MB) ARGB32
     /// surface — practically unreachable on any desktop machine,
     /// but the library-crate "no panic" rule still applies.
     /// Per `CodeRabbit` round 1 on PR #543: the earlier draft
@@ -328,7 +328,7 @@ impl LrptImageRenderer {
     }
 
     /// Drop all per-channel surfaces. The `HashMap` allocation
-    /// itself is preserved, but each ~6 MB surface is freed —
+    /// itself is preserved, but each ~51 MB surface is freed —
     /// callers (between-pass cleanup) typically rebuild from
     /// scratch as new channels reappear.
     pub fn clear(&mut self) {
@@ -555,7 +555,7 @@ pub struct LrptImageView {
     /// drain tick) and by `open_lrpt_viewer_window` (the
     /// channel-dropdown refresh tick). [`Self::shutdown`]
     /// removes them all so the closures' `Rc` chains drop and
-    /// the view + ~6 MB-per-channel surfaces don't leak past
+    /// the view + ~51 MB-per-channel surfaces don't leak past
     /// the window's close-request. Per `CodeRabbit` round 1 on
     /// PR #543.
     timeout_ids: Rc<RefCell<Vec<glib::SourceId>>>,
@@ -618,7 +618,7 @@ impl LrptImageView {
     /// Cancel every registered `glib` source. Called on the
     /// viewer window's `close-request` so the timeout closures
     /// drop their `Rc` clones of the view's inner state — without
-    /// this, the view + ~6 MB-per-channel surfaces stay alive in
+    /// this, the view + ~51 MB-per-channel surfaces stay alive in
     /// the main context until the application exits. Safe to
     /// call more than once (subsequent calls are no-ops because
     /// the `Vec` is drained).
@@ -789,12 +789,42 @@ impl LrptImageView {
     /// the last fraction-of-a-second of decoded data. Per
     /// `CodeRabbit` round 1 on PR #543.
     ///
+    /// **Caller is responsible for off-main-thread dispatch.**
+    /// This function performs Cairo PNG encoding + filesystem
+    /// I/O synchronously and will freeze the GTK main loop on
+    /// large images. Use [`Self::snapshot_active_channel`] +
+    /// [`write_greyscale_png`] inside `gio::spawn_blocking` for
+    /// the GTK click-handler path. The recorder LOS handler in
+    /// `window.rs` already does this; the manual Export PNG
+    /// button in [`open_lrpt_viewer_window`] does too. Per
+    /// `CodeRabbit` rounds 7 + 8 + 10 on PR #543.
+    ///
     /// # Errors
     ///
     /// Propagates any error from the underlying renderer.
     pub fn export_png(&self, path: &Path) -> Result<(), String> {
         self.drain_new_lines();
         self.renderer.borrow().export_png(path)
+    }
+
+    /// Snapshot the currently-active channel's pixel data into
+    /// an owned `(apid, ChannelBuffer)` pair. Used by the
+    /// manual Export PNG button to hand the heavy encoding work
+    /// to `gio::spawn_blocking` without holding `Rc`-shared
+    /// renderer state across the future. Drains pending rows
+    /// from the shared `LrptImage` first so the snapshot
+    /// captures the tail of the pass.
+    ///
+    /// Returns `None` if no APID is currently selected, or if
+    /// the active APID has no decoded rows in the shared image.
+    pub fn snapshot_active_channel(&self) -> Option<(u16, sdr_lrpt::image::ChannelBuffer)> {
+        self.drain_new_lines();
+        let apid = self.renderer.borrow().active_apid()?;
+        let snap = self.image.snapshot_channel(apid)?;
+        if snap.lines == 0 {
+            return None;
+        }
+        Some((apid, snap))
     }
 }
 
@@ -833,7 +863,7 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     // a faster cadence would burn CPU on idle string compares).
     // Register the source on the view so `LrptImageView::shutdown`
     // can cancel it when the window closes; otherwise the closure's
-    // `view.clone()` would keep the view + ~6 MB-per-channel
+    // `view.clone()` would keep the view + ~51 MB-per-channel
     // surfaces alive forever.
     //
     // **Borrow scoping:** GTK4's `gtk4::DropDown::set_selected`
@@ -963,30 +993,62 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     let export_view = view.clone();
     let window_for_export = window.downgrade();
     export_btn.connect_clicked(move |_| {
-        let Some(window_for_export) = window_for_export.upgrade() else {
+        let Some(window_now) = window_for_export.upgrade() else {
             return;
         };
-        // Drain pending rows BEFORE deriving the export path —
-        // `drain_new_lines` may auto-select the first decoded
-        // APID (the renderer's `push_line` does so on first
-        // push to any channel), and we want the filename to
-        // reflect that resolved channel rather than the
-        // pre-drain `None` (which would land at
-        // `lrpt-unknown-...png`). `LrptImageView::export_png`
-        // also drains internally, but by that point we'd have
-        // already baked the stale APID into the path. Per
-        // `CodeRabbit` round 6 on PR #543.
-        export_view.drain_new_lines();
-        let path = default_export_path(export_view.active_apid());
-        let toast = match export_view.export_png(&path) {
-            Ok(()) => adw::Toast::builder()
-                .title(format!("Saved {}", path.display()))
-                .build(),
-            Err(e) => adw::Toast::builder()
-                .title(format!("PNG export failed: {e}"))
-                .build(),
+        // Snapshot the active channel's pixels on the GTK main
+        // thread (drains pending rows + clones the per-channel
+        // Vec<u8> under a brief mutex hold, then off-main-thread
+        // does the heavy PNG encoding + filesystem I/O via
+        // `gio::spawn_blocking`. Same pattern the LOS
+        // `SaveLrptPass` handler uses; before this round, the
+        // manual Export PNG button froze the GTK main loop on
+        // any large channel because Cairo PNG encoding is
+        // O(width × n_lines) and not negligible at the
+        // ≤8192-line cap. Per `CodeRabbit` round 10 on PR #543.
+        let Some((apid, snap)) = export_view.snapshot_active_channel() else {
+            // Either no APID is selected, or the active channel
+            // has no decoded rows yet. Surface as a clear toast
+            // rather than an opaque "no active channel" error.
+            show_toast_in(
+                &window_now,
+                adw::Toast::builder()
+                    .title("No LRPT channel data to export yet")
+                    .build(),
+            );
+            return;
         };
-        show_toast_in(&window_for_export, toast);
+        // Filename is derived AFTER the snapshot so the resolved
+        // APID lands in it (see CodeRabbit round 6 on PR #543).
+        let path = default_export_path(Some(apid));
+        let window_weak = window_now.downgrade();
+        glib::spawn_future_local(async move {
+            let path_for_msg = path.clone();
+            let result = gio::spawn_blocking(move || {
+                write_greyscale_png(&path, &snap.pixels, IMAGE_WIDTH, snap.lines)
+            })
+            .await;
+            let toast = match result {
+                Ok(Ok(())) => adw::Toast::builder()
+                    .title(format!("Saved {}", path_for_msg.display()))
+                    .build(),
+                Ok(Err(e)) => adw::Toast::builder()
+                    .title(format!("PNG export failed: {e}"))
+                    .build(),
+                Err(e) => {
+                    // Worker thread panicked. `Box<dyn Any>`
+                    // doesn't implement Display — log via Debug,
+                    // surface a generic message.
+                    tracing::warn!("manual LRPT export worker panicked: {e:?}");
+                    adw::Toast::builder()
+                        .title("PNG export worker panicked")
+                        .build()
+                }
+            };
+            if let Some(window) = window_weak.upgrade() {
+                show_toast_in(&window, toast);
+            }
+        });
     });
     header.pack_end(&export_btn);
 
@@ -1085,7 +1147,7 @@ pub fn open_lrpt_viewer_if_needed(
     window.connect_close_request(move |_| {
         // Cancel the view's drain + dropdown-refresh timeouts
         // BEFORE we drop the AppState slot; otherwise their
-        // closures' `Rc<view>` clones keep the view + ~6 MB-
+        // closures' `Rc<view>` clones keep the view + ~51 MB-
         // per-channel surfaces alive until the application
         // exits. Per `CodeRabbit` round 1 on PR #543.
         if let Some(view) = state_for_close.lrpt_viewer.borrow().as_ref() {
