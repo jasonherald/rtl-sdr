@@ -175,10 +175,13 @@ mod tests {
         // test serves as a contract-pin via the `Debug` impl,
         // which is good enough for the format-stability
         // assertion.
-        let dbg = format!("{:?}", ViewerError::Cairo {
-            op: "test paint",
-            source: cairo::Error::NoMemory,
-        });
+        let dbg = format!(
+            "{:?}",
+            ViewerError::Cairo {
+                op: "test paint",
+                source: cairo::Error::NoMemory,
+            }
+        );
         assert!(dbg.contains("test paint"));
     }
 

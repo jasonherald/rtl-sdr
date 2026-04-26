@@ -372,12 +372,7 @@ impl LrptImageRenderer {
     /// usually log and continue — drawing failures shouldn't
     /// kill the UI. Per issue #545.
     #[allow(clippy::cast_precision_loss)]
-    pub fn render(
-        &self,
-        cr: &cairo::Context,
-        width: i32,
-        height: i32,
-    ) -> Result<(), ViewerError> {
+    pub fn render(&self, cr: &cairo::Context, width: i32, height: i32) -> Result<(), ViewerError> {
         cr.set_source_rgb(BACKGROUND_RGB[0], BACKGROUND_RGB[1], BACKGROUND_RGB[2]);
         cr.paint().map_err(|e| ViewerError::Cairo {
             op: "background paint",
