@@ -37,6 +37,12 @@ pub const MCU_SAMPLES: usize = MCU_SIDE * MCU_SIDE; // 64
 /// Pixel values in a decoded 8×8 MCU.
 pub type Block8x8 = [[u8; MCU_SIDE]; MCU_SIDE];
 
+/// Per-packet quantization table — one `u16` per zigzag slot.
+/// Built once per image packet by [`fill_dqt`] and threaded into
+/// every [`JpegDecoder::decode_mcu`] call so the hot loop doesn't
+/// recompute it 14 times per packet.
+pub type Dqt = [u16; MCU_SAMPLES];
+
 /// Standard JPEG luminance quantization template (see JPEG ISO/
 /// IEC 10918-1 Annex K). Meteor scales this per-packet by a
 /// quality byte; `fill_dqt` does the scaling.
@@ -54,6 +60,18 @@ const ZIGZAG: [u8; 64] = [
     18, 24, 31, 40, 44, 53, 10, 19, 23, 32, 39, 45, 52, 54, 20, 22, 33, 38, 46, 51, 55, 60, 21, 34,
     37, 47, 50, 56, 59, 61, 35, 36, 48, 49, 57, 58, 62, 63,
 ];
+
+/// Bit-window width for Huffman code lookup. The decoder peeks
+/// this many bits, indexes a flat LUT keyed by the window, and
+/// reads back the Huffman entry — turning a per-symbol bit-by-bit
+/// walk into a single load. 16 bits is the maximum standard JPEG
+/// Huffman code length, so any valid code fits inside one window.
+const HUFF_LOOKAHEAD_BITS: usize = 16;
+
+/// Number of entries in each Huffman LUT (`2 ^ HUFF_LOOKAHEAD_BITS`
+/// = 65536). Each entry is an `i16` storing either the table
+/// index for a matched code or `-1` for "no match".
+const HUFF_LUT_SIZE: usize = 1 << HUFF_LOOKAHEAD_BITS;
 
 /// Per-category bit-offset for the standard JPEG DC Huffman
 /// table. Index = DC category (0-11); value = Huffman code
@@ -105,10 +123,10 @@ pub enum JpegError {
 /// lookup tables (built once at construction); per-MCU state is
 /// the running DC predictor.
 pub struct JpegDecoder {
-    /// 16-bit-window → AC table index. -1 = no match.
-    ac_lookup: Box<[i16; 65536]>,
-    /// 16-bit-window → DC category. -1 = no match.
-    dc_lookup: Box<[i16; 65536]>,
+    /// `HUFF_LOOKAHEAD_BITS`-window → AC table index. -1 = no match.
+    ac_lookup: Box<[i16; HUFF_LUT_SIZE]>,
+    /// `HUFF_LOOKAHEAD_BITS`-window → DC category. -1 = no match.
+    dc_lookup: Box<[i16; HUFF_LUT_SIZE]>,
     ac_table: Vec<AcEntry>,
     /// Precomputed 8×8 cosine table for the IDCT inner loop.
     /// Hoisted from a global `OnceLock` to a per-decoder field
@@ -129,16 +147,21 @@ impl JpegDecoder {
     #[must_use]
     #[allow(
         clippy::large_stack_arrays,
-        reason = "two 65536-entry i16 LUTs are heap-allocated via Box::new — the stack pressure is the boxed initializer, not the final storage; smaller LUTs would defeat the O(1) Huffman lookup"
+        reason = "two HUFF_LUT_SIZE-entry i16 LUTs are heap-allocated via Box::new — the stack pressure is the boxed initializer, not the final storage; smaller LUTs would defeat the O(1) Huffman lookup"
     )]
     pub fn new() -> Self {
         let ac_table = build_ac_table();
-        let mut ac_lookup = Box::new([-1_i16; 65536]);
-        let mut dc_lookup = Box::new([-1_i16; 65536]);
-        for w in 0_u32..65536 {
+        let mut ac_lookup = Box::new([-1_i16; HUFF_LUT_SIZE]);
+        let mut dc_lookup = Box::new([-1_i16; HUFF_LUT_SIZE]);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "HUFF_LUT_SIZE = 2^16 = 65536 fits exactly in u32"
+        )]
+        let lut_size_u32 = HUFF_LUT_SIZE as u32;
+        for w in 0_u32..lut_size_u32 {
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "loop bound 0..65536 fits in u16"
+                reason = "loop bound 0..HUFF_LUT_SIZE = 2^16 fits in u16"
             )]
             let w16 = w as u16;
             ac_lookup[w as usize] = lookup_ac(w16, &ac_table);
@@ -159,9 +182,11 @@ impl JpegDecoder {
         self.last_dc = 0.0;
     }
 
-    /// Decode one 8×8 MCU from the bit stream `bytes`. `quality`
-    /// is the per-packet quantization-table scaling byte (Meteor
-    /// transmits this in the image-packet payload header).
+    /// Decode one 8×8 MCU from the bit stream `bytes`. `dqt` is
+    /// the per-packet quantization table — caller computes it
+    /// once per packet via [`fill_dqt`] and passes the same
+    /// reference to every MCU in the packet so the dequant
+    /// step doesn't recompute it 14 times in the inner loop.
     /// Returns the decoded pixel block on success.
     ///
     /// # Errors
@@ -173,13 +198,12 @@ impl JpegDecoder {
         &mut self,
         bytes: &[u8],
         bit_offset: &mut usize,
-        quality: u8,
+        dqt: &Dqt,
     ) -> Result<Block8x8, JpegError> {
-        let dqt = fill_dqt(quality);
         let mut zdct = [0_f32; MCU_SAMPLES];
 
         // Step 1: DC delta.
-        let dc_window = peek_n_bits(bytes, *bit_offset, 16)?;
+        let dc_window = peek_n_bits(bytes, *bit_offset, HUFF_LOOKAHEAD_BITS)?;
         let dc_cat_signed = self.dc_lookup[dc_window as usize];
         if dc_cat_signed < 0 {
             return Err(JpegError::BadDcCode);
@@ -207,7 +231,7 @@ impl JpegDecoder {
         // Step 2: AC run-length pairs until end-of-block.
         let mut k: usize = 1;
         while k < 64 {
-            let ac_window = peek_n_bits(bytes, *bit_offset, 16)?;
+            let ac_window = peek_n_bits(bytes, *bit_offset, HUFF_LOOKAHEAD_BITS)?;
             let ac_idx_signed = self.ac_lookup[ac_window as usize];
             if ac_idx_signed < 0 {
                 return Err(JpegError::BadAcCode);
@@ -297,15 +321,17 @@ impl JpegDecoder {
 }
 
 /// Per-packet quantization table — derived from the standard
-/// template scaled by the packet's quality byte.
-fn fill_dqt(q: u8) -> [u16; 64] {
+/// template scaled by the packet's quality byte. Public so the
+/// LRPT pipeline can compute it once per packet and pass the
+/// same `Dqt` to every MCU in that packet.
+pub fn fill_dqt(q: u8) -> Dqt {
     let qf = f32::from(q);
     let f = if qf > 20.0 && qf < 50.0 {
         5000.0 / qf
     } else {
         200.0 - 2.0 * qf
     };
-    let mut dqt = [0_u16; 64];
+    let mut dqt: Dqt = [0_u16; MCU_SAMPLES];
     for (i, slot) in dqt.iter_mut().enumerate() {
         let scaled = (f * f32::from(QUANT_TEMPLATE[i]) / 100.0).round();
         #[allow(
@@ -351,7 +377,7 @@ fn map_range(cat: u8, value: u16) -> i32 {
 /// `EndOfStream` is reserved for [`fetch_n_bits`] — the actual
 /// consume operation that asks for bits we don't have.
 fn peek_n_bits(bytes: &[u8], bit_offset: usize, n: usize) -> Result<u16, JpegError> {
-    debug_assert!(n <= 16);
+    debug_assert!(n <= HUFF_LOOKAHEAD_BITS);
     let total_bits = bytes.len() * 8;
     if bit_offset >= total_bits {
         return Err(JpegError::EndOfStream);
@@ -368,20 +394,20 @@ fn peek_n_bits(bytes: &[u8], bit_offset: usize, n: usize) -> Result<u16, JpegErr
         };
         result = (result << 1) | u32::from(bit);
     }
-    // Left-pad to 16 bits so callers can index a 65k LUT
-    // directly off the value (matches medet's bio_peek_n_bits
-    // convention).
+    // Left-pad to HUFF_LOOKAHEAD_BITS so callers can index the
+    // HUFF_LUT_SIZE-entry LUT directly off the value (matches
+    // medet's bio_peek_n_bits convention).
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "result < 2^n ≤ 2^16, fits in u16 after the shift below"
+        reason = "result < 2^n ≤ 2^HUFF_LOOKAHEAD_BITS, fits in u16 after the shift below"
     )]
-    let padded = (result << (16 - n)) as u16;
+    let padded = (result << (HUFF_LOOKAHEAD_BITS - n)) as u16;
     Ok(padded)
 }
 
 /// Fetch the next `n` bits from `bytes`, advancing `bit_offset`.
 fn fetch_n_bits(bytes: &[u8], bit_offset: &mut usize, n: usize) -> Result<u16, JpegError> {
-    debug_assert!(n <= 16);
+    debug_assert!(n <= HUFF_LOOKAHEAD_BITS);
     let mut result: u16 = 0;
     for _ in 0..n {
         let byte_idx = *bit_offset / 8;
@@ -437,9 +463,10 @@ fn lookup_dc(w: u16) -> i16 {
 fn lookup_ac(w: u16, table: &[AcEntry]) -> i16 {
     for (i, e) in table.iter().enumerate() {
         // Right-shift to align `w` with the entry's code length,
-        // then mask to the entry's bit width. Mask uses u32
-        // so e.len = 16 doesn't overflow `1_u16 << 16`.
-        let shifted = u32::from(w) >> (16 - e.len);
+        // then mask to the entry's bit width. Mask uses u32 so
+        // e.len = HUFF_LOOKAHEAD_BITS doesn't overflow
+        // `1_u16 << HUFF_LOOKAHEAD_BITS`.
+        let shifted = u32::from(w) >> (HUFF_LOOKAHEAD_BITS - usize::from(e.len));
         let mask = (1_u32 << e.len) - 1;
         if (shifted & mask) == u32::from(e.code) {
             #[allow(
@@ -458,13 +485,13 @@ fn lookup_ac(w: u16, table: &[AcEntry]) -> i16 {
 /// values arrays. Direct port of medet's `default_huffman_table`.
 #[allow(
     clippy::large_stack_arrays,
-    reason = "the 65536-entry slot table is the canonical (length, position) addressing space matching medet's port; called once per JpegDecoder construction"
+    reason = "the HUFF_LUT_SIZE-entry slot table is the canonical (length, position) addressing space matching medet's port; called once per JpegDecoder construction"
 )]
 fn build_ac_table() -> Vec<AcEntry> {
     let bits = &T_AC_0[0..16];
     let values = &T_AC_0[16..];
     // Distribute symbols into per-length slots.
-    let mut v = vec![0_u8; 65536];
+    let mut v = vec![0_u8; HUFF_LUT_SIZE];
     let mut p = 0_usize;
     for k in 1..=16 {
         for i in 0..bits[k - 1] as usize {
@@ -844,8 +871,9 @@ mod tests {
         let bytes = [0x28_u8];
         let mut decoder = JpegDecoder::new();
         let mut bit_offset = 0_usize;
+        let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
         let block = decoder
-            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .decode_mcu(&bytes, &mut bit_offset, &dqt)
             .expect("minimal MCU should decode");
         assert_eq!(bit_offset, 6, "consumed exactly 6 bits");
         for (y, row) in block.iter().enumerate() {
@@ -869,12 +897,13 @@ mod tests {
         let bytes = [0x28_u8]; // same minimal stream
         let mut decoder = JpegDecoder::new();
         let mut bit_offset = 0_usize;
+        let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
         let block_a = decoder
-            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .decode_mcu(&bytes, &mut bit_offset, &dqt)
             .expect("first MCU");
         bit_offset = 0;
         let block_b = decoder
-            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .decode_mcu(&bytes, &mut bit_offset, &dqt)
             .expect("second MCU");
         assert_eq!(block_a, block_b, "DC=0 streams must match exactly");
         // Now write a non-zero DC and confirm reset clears the
@@ -883,7 +912,7 @@ mod tests {
         decoder.reset_dc();
         bit_offset = 0;
         let block_c = decoder
-            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .decode_mcu(&bytes, &mut bit_offset, &dqt)
             .expect("post-reset MCU");
         assert_eq!(
             block_c, block_a,
@@ -896,7 +925,8 @@ mod tests {
         // Zero-length payload: the very first peek should EOF.
         let mut decoder = JpegDecoder::new();
         let mut bit_offset = 0_usize;
-        let result = decoder.decode_mcu(&[], &mut bit_offset, QUALITY_LOWER_BRANCH);
+        let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
+        let result = decoder.decode_mcu(&[], &mut bit_offset, &dqt);
         assert!(
             matches!(result, Err(JpegError::EndOfStream)),
             "got {result:?}"
@@ -943,7 +973,8 @@ mod tests {
 
         let mut dec = JpegDecoder::new();
         let mut bit_offset = 0_usize;
-        let result = dec.decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH);
+        let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
+        let result = dec.decode_mcu(&bytes, &mut bit_offset, &dqt);
         assert!(
             matches!(result, Err(JpegError::BadAcCode)),
             "4x ZRL overshoots coefficient 63; expected BadAcCode, got {result:?}"

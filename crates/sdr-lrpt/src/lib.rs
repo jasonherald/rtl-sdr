@@ -26,7 +26,7 @@ pub mod fec;
 pub mod image;
 
 use crate::ccsds::{Demux, ImagePacket};
-use crate::image::{ImageAssembler, JpegDecoder, MCUS_PER_LINE};
+use crate::image::{ImageAssembler, JpegDecoder, MCUS_PER_LINE, fill_dqt};
 
 /// MCUs encoded per Meteor LRPT image packet. Per medet's
 /// `mcu_per_packet`. Drives the per-packet decode loop and the
@@ -173,14 +173,16 @@ impl LrptPipeline {
         let mcu_row = (row_pkt / PACKETS_PER_ROW_GROUP) as usize;
 
         // Reset DC predictor per packet — Meteor packets are
-        // independently coded.
+        // independently coded. Compute DQT once for the packet
+        // (it depends only on the per-packet quality byte) and
+        // pass the same reference into every per-MCU decode so
+        // the inner loop doesn't recompute it 14 times. Per CR
+        // round 6.
         decoder.jpeg.reset_dc();
+        let dqt = fill_dqt(quality);
         let mut bit_offset = 0_usize;
         for m in 0..MCUS_PER_PACKET {
-            let Ok(block) = decoder
-                .jpeg
-                .decode_mcu(jpeg_bytes, &mut bit_offset, quality)
-            else {
+            let Ok(block) = decoder.jpeg.decode_mcu(jpeg_bytes, &mut bit_offset, &dqt) else {
                 tracing::trace!(
                     "JPEG decode failed at MCU {m} of APID {apid} packet {pkt}",
                     apid = packet.apid,

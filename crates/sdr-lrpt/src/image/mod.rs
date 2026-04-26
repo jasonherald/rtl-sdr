@@ -11,5 +11,5 @@ pub mod jpeg;
 pub mod png_export;
 
 pub use composite::{ChannelBuffer, IMAGE_WIDTH, ImageAssembler, MCUS_PER_LINE};
-pub use jpeg::{Block8x8, JpegDecoder, JpegError, MCU_SAMPLES, MCU_SIDE};
+pub use jpeg::{Block8x8, Dqt, JpegDecoder, JpegError, MCU_SAMPLES, MCU_SIDE, fill_dqt};
 pub use png_export::{PngExportError, save_channel, save_composite};
