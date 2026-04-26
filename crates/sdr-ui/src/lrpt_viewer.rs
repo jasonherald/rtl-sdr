@@ -745,15 +745,34 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
         move || {
             let mut current = view_for_tick.known_apids();
             current.sort_unstable();
-            if *dropdown_apids.borrow() == current {
+            // Cheap sync check: bail out only if BOTH the APID
+            // list AND the dropdown's selected channel still
+            // match the renderer's active APID. The selected-
+            // sync arm guards against an external caller
+            // (`SaveLrptPass` walks active_apid through every
+            // channel; future programmatic API users) changing
+            // `view.active_apid()` without changing the list,
+            // which the previous list-only fast-path would have
+            // ignored — leaving the dropdown stuck on the wrong
+            // channel until the next list change. Per
+            // `CodeRabbit` round 6 on PR #543.
+            let active = view_for_tick.active_apid();
+            let apids_unchanged = *dropdown_apids.borrow() == current;
+            #[allow(clippy::cast_possible_truncation)]
+            let selected_apid = {
+                let apids = dropdown_apids.borrow();
+                apids.get(dropdown_clone.selected() as usize).copied()
+            };
+            if apids_unchanged && selected_apid == active {
                 return glib::ControlFlow::Continue;
             }
-            let active = view_for_tick.active_apid();
-            model.splice(0, model.n_items(), &[]);
-            for &apid in &current {
-                model.append(&format!("APID {apid}"));
+            if !apids_unchanged {
+                model.splice(0, model.n_items(), &[]);
+                for &apid in &current {
+                    model.append(&format!("APID {apid}"));
+                }
+                dropdown_apids.borrow_mut().clone_from(&current);
             }
-            dropdown_apids.borrow_mut().clone_from(&current);
             dropdown_clone.set_sensitive(!current.is_empty());
             if let Some(active) = active {
                 if let Some(pos) = current.iter().position(|&a| a == active) {
@@ -838,6 +857,17 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         let Some(window_for_export) = window_for_export.upgrade() else {
             return;
         };
+        // Drain pending rows BEFORE deriving the export path —
+        // `drain_new_lines` may auto-select the first decoded
+        // APID (the renderer's `push_line` does so on first
+        // push to any channel), and we want the filename to
+        // reflect that resolved channel rather than the
+        // pre-drain `None` (which would land at
+        // `lrpt-unknown-...png`). `LrptImageView::export_png`
+        // also drains internally, but by that point we'd have
+        // already baked the stale APID into the path. Per
+        // `CodeRabbit` round 6 on PR #543.
+        export_view.drain_new_lines();
         let path = default_export_path(export_view.active_apid());
         let toast = match export_view.export_png(&path) {
             Ok(()) => adw::Toast::builder()
