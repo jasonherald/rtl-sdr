@@ -321,17 +321,31 @@ fn map_range(cat: u8, value: u16) -> i32 {
 
 /// Peek the next `n` bits from `bytes` starting at `bit_offset`,
 /// MSB-first. Returns the bits right-aligned in a u16.
+///
+/// Zero-pads any portion of the window that runs off the end of
+/// `bytes` rather than erroring — `decode_mcu` always asks for a
+/// full 16-bit window into the LUT, but the actual Huffman code
+/// inside that window may be much shorter (a final EOB can be a
+/// 4-bit code at the very end of the payload). Erroring on a
+/// partial peek would reject those valid trailing codes.
+/// `EndOfStream` is reserved for [`fetch_n_bits`] — the actual
+/// consume operation that asks for bits we don't have.
 fn peek_n_bits(bytes: &[u8], bit_offset: usize, n: usize) -> Result<u16, JpegError> {
     debug_assert!(n <= 16);
+    let total_bits = bytes.len() * 8;
+    if bit_offset >= total_bits {
+        return Err(JpegError::EndOfStream);
+    }
     let mut result: u32 = 0;
     for i in 0..n {
         let bit_pos = bit_offset + i;
-        let byte_idx = bit_pos / 8;
-        if byte_idx >= bytes.len() {
-            return Err(JpegError::EndOfStream);
-        }
-        let bit_in_byte = 7 - (bit_pos % 8);
-        let bit = (bytes[byte_idx] >> bit_in_byte) & 1;
+        let bit = if bit_pos < total_bits {
+            let byte_idx = bit_pos / 8;
+            let bit_in_byte = 7 - (bit_pos % 8);
+            (bytes[byte_idx] >> bit_in_byte) & 1
+        } else {
+            0
+        };
         result = (result << 1) | u32::from(bit);
     }
     // Left-pad to 16 bits so callers can index a 65k LUT
@@ -666,5 +680,204 @@ mod tests {
         dec.last_dc = 42.0;
         dec.reset_dc();
         assert_eq!(dec.last_dc, 0.0);
+    }
+
+    /// Quality byte that selects the upper branch of `fill_dqt`'s
+    /// piecewise function (`f = 5000 / qf`, valid range 20 < q < 50).
+    const QUALITY_UPPER_BRANCH: u8 = 30;
+    /// Quality byte that selects the lower branch (`f = 200 - 2 * qf`).
+    /// 60 sits comfortably inside `qf >= 50`.
+    const QUALITY_LOWER_BRANCH: u8 = 60;
+    /// Quality byte that drives `f` very small so the per-slot
+    /// `max(1.0)` clamp actually fires — exercises the "minimum 1"
+    /// guard that prevents divide-by-zero downstream.
+    const QUALITY_MAX: u8 = 100;
+    /// Expected level-shift output for an all-zero DCT block:
+    /// IDCT(0) = 0, then `+128` level shift. Pin this so a future
+    /// refactor that drops the level shift fails a test.
+    const LEVEL_SHIFT_OFFSET: u8 = 128;
+
+    #[test]
+    fn peek_n_bits_zero_pads_partial_window_at_end_of_stream() {
+        // CR round 1: peek into a 16-bit LUT must succeed even
+        // when fewer than 16 bits remain. Construct a 1-byte
+        // payload (8 bits available) and ask for 16 bits at
+        // offset 0 — the high 8 bits should be the byte's
+        // contents and the low 8 bits should be zero-padded.
+        let bytes = [0xA5_u8]; // 1010 0101
+        let peeked = peek_n_bits(&bytes, 0, 16).expect("partial peek must succeed");
+        assert_eq!(
+            peeked, 0xA500,
+            "high 8 bits = byte, low 8 bits zero-padded; got {peeked:#06x}"
+        );
+    }
+
+    #[test]
+    fn peek_n_bits_returns_eof_when_offset_past_end() {
+        // Reserved-EOF case: when bit_offset itself is past the
+        // available bits, peek must return EndOfStream so the
+        // decoder can break the AC loop instead of looping
+        // forever on a zero-padded code.
+        let bytes = [0xA5_u8];
+        // 8 bits available, ask for 16 starting at bit 8 — that's
+        // exactly at the boundary. Peeking from bit 8 should EOF
+        // because 8 >= total_bits (= 8).
+        let result = peek_n_bits(&bytes, 8, 16);
+        assert!(
+            matches!(result, Err(JpegError::EndOfStream)),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_n_bits_advances_offset_and_returns_eof_past_end() {
+        // Fetch is the actual consume operation — it MUST
+        // surface EOF when the requested bits run past the
+        // available payload, since the decoder relies on that
+        // signal to abort mid-MCU.
+        let bytes = [0xFF_u8];
+        let mut ofs = 4_usize;
+        let four = fetch_n_bits(&bytes, &mut ofs, 4).expect("4 bits available");
+        assert_eq!(four, 0b1111);
+        assert_eq!(ofs, 8);
+        // Now ask for one more bit — the byte is exhausted.
+        let result = fetch_n_bits(&bytes, &mut ofs, 1);
+        assert!(
+            matches!(result, Err(JpegError::EndOfStream)),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_dc_returns_negative_for_invalid_window() {
+        // The DC table covers categories 0-11, all of which
+        // start with a 1-bit prefix that lookup_dc handles. The
+        // only unmapped windows are those whose top 7 bits are
+        // 0b1111111 followed by a non-canonical continuation —
+        // those should return -1 so decode_mcu can surface
+        // BadDcCode.
+        let invalid = 0xFFFE_u16; // top 7 bits all 1 + non-canonical
+        assert_eq!(lookup_dc(invalid), -1);
+    }
+
+    #[test]
+    fn lookup_dc_decodes_each_known_category() {
+        // Walk the DC code table — code "00" + cat-specific
+        // suffixes — and verify each maps to the right category.
+        // (Bits beyond the code length don't matter; the helper
+        // only inspects the prefix.)
+        assert_eq!(lookup_dc(0b00 << 14), 0); // cat 0: code 00
+        assert_eq!(lookup_dc(0b010 << 13), 1); // cat 1: code 010
+        assert_eq!(lookup_dc(0b011 << 13), 2);
+        assert_eq!(lookup_dc(0b100 << 13), 3);
+        assert_eq!(lookup_dc(0b101 << 13), 4);
+        assert_eq!(lookup_dc(0b110 << 13), 5);
+        assert_eq!(lookup_dc(0b1110 << 12), 6); // cat 6: code 1110
+        assert_eq!(lookup_dc(0b11110 << 11), 7);
+        assert_eq!(lookup_dc(0b11_1110 << 10), 8);
+        assert_eq!(lookup_dc(0b111_1110 << 9), 9);
+        assert_eq!(lookup_dc(0b1111_1110 << 8), 10);
+        assert_eq!(lookup_dc(0b1_1111_1110 << 7), 11);
+    }
+
+    #[test]
+    fn fill_dqt_branches_on_quality_band() {
+        // Coverage gate: exercise both arms of the piecewise
+        // `f` formula. Different quality bands give different
+        // dqt magnitudes — pin "different" rather than exact
+        // values so QUANT_TEMPLATE refactors don't break this.
+        let lo = fill_dqt(QUALITY_UPPER_BRANCH);
+        let hi = fill_dqt(QUALITY_LOWER_BRANCH);
+        assert_ne!(lo, hi, "different quality bands must produce different dqt");
+        // Both must satisfy the `max(1.0)` floor.
+        assert!(lo.iter().all(|&v| v >= 1));
+        assert!(hi.iter().all(|&v| v >= 1));
+        // Highest quality should produce dqt ≈ 0 in the formula
+        // but the floor saturates everything to 1.
+        let max = fill_dqt(QUALITY_MAX);
+        assert!(
+            max.iter().all(|&v| v == 1),
+            "max-quality dqt must be all 1s"
+        );
+    }
+
+    #[test]
+    fn decode_mcu_minimal_stream_produces_uniform_block() {
+        // End-to-end smoke test of `decode_mcu`'s success path —
+        // the only path that exercises zigzag-unscramble + IDCT +
+        // level-shift in one call. Largely uncovered by the
+        // construction-only tests above.
+        //
+        // Bitstream: DC code "00" (cat 0, delta=0) then AC EOB
+        // code "1010" (run=0, size=0). Total 6 bits, packed
+        // MSB-first into one byte. Trailing zero bits don't
+        // matter — decode_mcu hits EOB and stops.
+        //   bits:  0 0 1 0 1 0 _ _
+        //          ────── ─────── ──
+        //           DC      EOB    pad
+        //   byte:  0b0010_1000 = 0x28
+        //
+        // Result: zdct = [0; 64] → IDCT zeros → +128 level shift
+        // → every pixel = 128.
+        let bytes = [0x28_u8];
+        let mut decoder = JpegDecoder::new();
+        let mut bit_offset = 0_usize;
+        let block = decoder
+            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .expect("minimal MCU should decode");
+        assert_eq!(bit_offset, 6, "consumed exactly 6 bits");
+        for (y, row) in block.iter().enumerate() {
+            for (x, &p) in row.iter().enumerate() {
+                assert_eq!(
+                    p, LEVEL_SHIFT_OFFSET,
+                    "pixel ({y}, {x}) should be {LEVEL_SHIFT_OFFSET} after level shift"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_mcu_dc_predictor_carries_across_calls() {
+        // The DC predictor accumulates across consecutive MCUs
+        // in the same packet (decoder.last_dc), then `reset_dc`
+        // zeros it between packets. Verify that the second
+        // identical "delta=0" MCU stream produces the same
+        // pixels as the first — the predictor stays at 0 because
+        // both deltas are 0.
+        let bytes = [0x28_u8]; // same minimal stream
+        let mut decoder = JpegDecoder::new();
+        let mut bit_offset = 0_usize;
+        let block_a = decoder
+            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .expect("first MCU");
+        bit_offset = 0;
+        let block_b = decoder
+            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .expect("second MCU");
+        assert_eq!(block_a, block_b, "DC=0 streams must match exactly");
+        // Now write a non-zero DC and confirm reset clears the
+        // predictor for the third call.
+        decoder.last_dc = 42.0;
+        decoder.reset_dc();
+        bit_offset = 0;
+        let block_c = decoder
+            .decode_mcu(&bytes, &mut bit_offset, QUALITY_LOWER_BRANCH)
+            .expect("post-reset MCU");
+        assert_eq!(
+            block_c, block_a,
+            "post-reset MCU must match the from-zero baseline"
+        );
+    }
+
+    #[test]
+    fn decode_mcu_eos_on_empty_input() {
+        // Zero-length payload: the very first peek should EOF.
+        let mut decoder = JpegDecoder::new();
+        let mut bit_offset = 0_usize;
+        let result = decoder.decode_mcu(&[], &mut bit_offset, QUALITY_LOWER_BRANCH);
+        assert!(
+            matches!(result, Err(JpegError::EndOfStream)),
+            "got {result:?}"
+        );
     }
 }

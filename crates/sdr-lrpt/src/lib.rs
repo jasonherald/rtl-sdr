@@ -237,4 +237,249 @@ mod tests {
         p.push_vcdu(&[0_u8; 100]);
         assert!(p.assembler.channels().next().is_none());
     }
+
+    // ─── consume_packet path tests ──────────────────────────────
+    //
+    // The full IQ→VCDU FEC chain isn't wired into LrptPipeline
+    // yet (deferred to a follow-up PR), so we exercise
+    // `consume_packet` directly with hand-built `ImagePacket`s.
+    // These tests pin the per-channel anchoring math (medet's
+    // `progress_image` rules), the 14-bit sequence-count
+    // wraparound, the APID 70 timestamp drop, and the short-
+    // payload guard — none of which the demux-driven
+    // `pipeline_constructible_and_resets` test reaches with its
+    // all-zeros input.
+
+    /// Quality byte that selects the lower branch of `fill_dqt`.
+    /// 60 sits comfortably inside `qf >= 50`.
+    const TEST_QUALITY: u8 = 60;
+    /// Per-MCU header length the `consume_packet` path expects:
+    /// 1 byte `mcu_id` + 2 bytes `scan_hdr` + 2 bytes `seg_hdr`
+    /// + 1 byte quality.
+    const HEADER_LEN: usize = IMAGE_PACKET_HEADER_LEN;
+    /// VCID for the AVHRR imaging stream — propagated through
+    /// the demux. `consume_packet` doesn't actually inspect it
+    /// (decisions are by APID), but the struct requires the
+    /// field.
+    const TEST_VCID: u8 = 5;
+    /// Bit pattern for one minimal-MCU encoded as a back-to-back
+    /// 6-bit code stream.
+    /// Every 4 MCUs (= 24 bits = 3 bytes) cycle through this
+    /// pattern; with 14 MCUs we get 3 full cycles + a 2-byte
+    /// tail. See [`MCU_TAIL_2B`] for the partial-cycle remainder.
+    const MCU_PATTERN_3B: [u8; 3] = [0x28, 0xA2, 0x8A];
+    /// Trailing 2 bytes after 3 full [`MCU_PATTERN_3B`] cycles —
+    /// encodes MCUs 13 + 14, with the last 4 bits zero-padded.
+    const MCU_TAIL_2B: [u8; 2] = [0x28, 0xA0];
+    /// Number of full [`MCU_PATTERN_3B`] cycles in the
+    /// 14-MCU synthetic packet payload.
+    const MCU_PATTERN_CYCLES: usize = 3;
+    /// Total post-header bytes the synthetic packet appends.
+    /// Pinned so a future change to the 14-MCU layout fails
+    /// `synthetic_image_packet`'s `debug_assert_eq!`.
+    const SYNTHETIC_TAIL_LEN: usize = MCU_PATTERN_CYCLES * 3 + 2;
+
+    /// Build an [`ImagePacket`] whose payload is a valid header +
+    /// 14 minimal-MCU bitstreams stitched together. The decoder
+    /// loop will succeed on every MCU and place 14 blocks into
+    /// the assembler.
+    fn synthetic_image_packet(apid: u16, sequence_count: u16) -> ImagePacket {
+        let mut payload = vec![0_u8; HEADER_LEN];
+        payload[0] = 0; // mcu_id starts at column 0
+        payload[5] = TEST_QUALITY; // per-packet quality byte
+        // Append 14 minimal MCUs back-to-back as one bit stream.
+        // Each MCU is 6 bits (DC code "00" = cat 0, delta=0;
+        // then AC EOB code "1010"). 14 × 6 = 84 bits = 10 full
+        // bytes + 4 trailing pad bits. See MCU_PATTERN_3B for
+        // the cycle derivation.
+        for _ in 0..MCU_PATTERN_CYCLES {
+            payload.extend_from_slice(&MCU_PATTERN_3B);
+        }
+        payload.extend_from_slice(&MCU_TAIL_2B);
+        debug_assert_eq!(payload.len() - HEADER_LEN, SYNTHETIC_TAIL_LEN);
+        ImagePacket {
+            vcid: TEST_VCID,
+            apid,
+            sequence_count,
+            payload,
+        }
+    }
+
+    #[test]
+    fn consume_packet_drops_apid_70_timestamp() {
+        // APID 70 carries the on-board timestamp packet, not
+        // imagery. consume_packet must drop it before any
+        // channel state is touched.
+        let mut p = LrptPipeline::new();
+        let pkt = synthetic_image_packet(APID_ONBOARD_TIME, 0);
+        p.consume_packet(&pkt);
+        assert!(p.assembler.channels().next().is_none());
+        assert!(
+            p.decoders.is_empty(),
+            "no channel state allocated for apid 70"
+        );
+    }
+
+    #[test]
+    fn consume_packet_drops_short_payload() {
+        // Payload too short to even hold the 6-byte header —
+        // must early-return without touching any state.
+        let mut p = LrptPipeline::new();
+        let pkt = ImagePacket {
+            vcid: TEST_VCID,
+            apid: 64,
+            sequence_count: 100,
+            payload: vec![0_u8; HEADER_LEN - 1],
+        };
+        p.consume_packet(&pkt);
+        assert!(p.assembler.channels().next().is_none());
+    }
+
+    #[test]
+    fn consume_packet_anchors_apid_64_at_zero_offset() {
+        // APID 64 is the "first" channel; medet anchors it with
+        // offset = 0, so first_pkt = sequence_count.
+        let mut p = LrptPipeline::new();
+        let pkt = synthetic_image_packet(64, 100);
+        p.consume_packet(&pkt);
+        let dec = p.decoders.get(&64).expect("apid 64 channel created");
+        assert_eq!(dec.first_pkt, Some(100), "no offset for apid 64");
+        assert_eq!(dec.last_pkt, Some(100));
+    }
+
+    #[test]
+    fn consume_packet_anchors_apid_65_with_minus_14_offset() {
+        // medet's per-channel anchoring: APID 65 = -14 (one
+        // packet group of MCUS_PER_PACKET).
+        let mut p = LrptPipeline::new();
+        let pkt = synthetic_image_packet(65, 100);
+        p.consume_packet(&pkt);
+        let dec = p.decoders.get(&65).expect("apid 65 channel created");
+        assert_eq!(dec.first_pkt, Some(100 - i32::from(MCUS_PER_PACKET)));
+    }
+
+    #[test]
+    fn consume_packet_anchors_apid_66_with_minus_28_offset() {
+        // medet's per-channel anchoring: APID 66 / 68 = -28
+        // (two MCUS_PER_PACKET groups). Pin both APIDs so a
+        // future per-APID rewrite that breaks 68 doesn't slip
+        // through.
+        let mut p = LrptPipeline::new();
+        let pkt66 = synthetic_image_packet(66, 200);
+        p.consume_packet(&pkt66);
+        let dec66 = p.decoders.get(&66).expect("apid 66 channel created");
+        assert_eq!(dec66.first_pkt, Some(200 - 2 * i32::from(MCUS_PER_PACKET)));
+
+        let pkt68 = synthetic_image_packet(68, 300);
+        p.consume_packet(&pkt68);
+        let dec68 = p.decoders.get(&68).expect("apid 68 channel created");
+        assert_eq!(dec68.first_pkt, Some(300 - 2 * i32::from(MCUS_PER_PACKET)));
+    }
+
+    #[test]
+    fn consume_packet_handles_sequence_count_wraparound() {
+        // The 14-bit sequence counter wraps at SEQUENCE_COUNT_MODULUS
+        // (16384). When we observe a sequence_count strictly less
+        // than the previous one, walk first_pkt back by one
+        // modulus so the row-index calc keeps producing
+        // monotonically increasing rows across the wrap boundary.
+        let mut p = LrptPipeline::new();
+        // Establish anchor at a high sequence count near the
+        // wrap boundary. SEQUENCE_COUNT_MODULUS - 4 = 16380,
+        // well within u16 range.
+        #[allow(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "SEQUENCE_COUNT_MODULUS = 16384 fits in u16; -4 stays positive"
+        )]
+        let near = (SEQUENCE_COUNT_MODULUS - 4) as u16;
+        let near_wrap = synthetic_image_packet(64, near);
+        p.consume_packet(&near_wrap);
+        let first_before = p
+            .decoders
+            .get(&64)
+            .expect("apid 64 channel created")
+            .first_pkt
+            .expect("first_pkt set on initial packet");
+        // Push a second packet whose sequence_count has wrapped.
+        let after_wrap = synthetic_image_packet(64, 2);
+        p.consume_packet(&after_wrap);
+        let dec = p.decoders.get(&64).expect("apid 64 still present");
+        assert_eq!(
+            dec.first_pkt,
+            Some(first_before - SEQUENCE_COUNT_MODULUS),
+            "first_pkt must walk back by one modulus on wrap"
+        );
+        assert_eq!(dec.last_pkt, Some(2));
+    }
+
+    #[test]
+    fn consume_packet_decodes_mcus_into_assembler() {
+        // End-to-end smoke test: a synthetic packet with a
+        // valid header + 14 minimal MCUs decodes successfully
+        // and writes 14 MCUs (= one packet's worth of one row)
+        // into the assembler under the packet's APID.
+        let mut p = LrptPipeline::new();
+        let pkt = synthetic_image_packet(64, 100);
+        p.consume_packet(&pkt);
+        // The assembler now has channel 64 with at least one
+        // row's worth of pixels (8 lines × IMAGE_WIDTH).
+        let ch = p.assembler.channel(64).expect("channel 64 populated");
+        assert!(
+            ch.lines >= 8,
+            "at least 8 lines should be present, got {}",
+            ch.lines
+        );
+        // Every placed MCU is a uniform 128-valued block (the
+        // minimal-stream output). The first 14 MCUs occupy
+        // columns 0..14 of row 0; verify a sample pixel inside
+        // the first MCU.
+        assert_eq!(
+            ch.pixels[0], 128,
+            "first MCU pixel should be level-shifted 128"
+        );
+    }
+
+    #[test]
+    fn consume_packet_breaks_loop_on_jpeg_error() {
+        // Header is valid but the MCU bitstream is empty —
+        // first decode_mcu call returns EndOfStream, which
+        // triggers the `else` branch and breaks the loop.
+        // No MCUs land in the assembler.
+        let mut p = LrptPipeline::new();
+        let pkt = ImagePacket {
+            vcid: TEST_VCID,
+            apid: 64,
+            sequence_count: 100,
+            payload: {
+                let mut payload = vec![0_u8; HEADER_LEN];
+                payload[5] = TEST_QUALITY;
+                payload
+            },
+        };
+        p.consume_packet(&pkt);
+        // Channel state was created (we passed the early
+        // returns) but the assembler has no actual MCU pixels —
+        // place_mcu was never called.
+        assert!(p.decoders.contains_key(&64));
+        assert!(
+            p.assembler.channel(64).is_none(),
+            "no pixels on JPEG decode failure"
+        );
+    }
+
+    #[test]
+    fn push_vcdu_drives_demux_into_consume_packet() {
+        // The exposed entry point. We don't have a synthetic
+        // VCDU helper at this layer (that lives in ccsds), so
+        // just confirm that pushing the all-zero VCDU (which
+        // the demux silently drops because APID is 0 / IDLE)
+        // doesn't allocate channel state.
+        let mut p = LrptPipeline::new();
+        p.push_vcdu(&vec![0_u8; VCDU_TOTAL_LEN]);
+        assert!(
+            p.decoders.is_empty(),
+            "all-zero VCDU yields no image packets"
+        );
+    }
 }

@@ -28,7 +28,7 @@
 //! decoder feed and using the existing snapshot for export.
 
 use sdr_lrpt::image::{ChannelBuffer, ImageAssembler};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Cloneable handle over a shared [`ImageAssembler`]. All clones
 /// read and write the same underlying buffer.
@@ -43,6 +43,26 @@ impl Default for LrptImage {
     }
 }
 
+/// Acquire the assembler lock, recovering from a poisoned mutex
+/// by logging a warning and returning the inner guard via
+/// [`PoisonError::into_inner`].
+///
+/// Poisoning here means a previous decoder thread panicked while
+/// holding the lock — the in-flight VCDU placement may have left
+/// the buffer mid-mutation, but `ImageAssembler` operations are
+/// individually atomic (they don't span across calls), so the
+/// next read/write still observes consistent per-channel state.
+/// Silently swallowing the lock as the previous code did meant
+/// a single panic anywhere in the decoder would permanently mute
+/// the live viewer; recovering keeps the pipeline alive at the
+/// cost of one warn log.
+fn lock_or_recover(inner: &Mutex<ImageAssembler>) -> MutexGuard<'_, ImageAssembler> {
+    inner.lock().unwrap_or_else(|e: PoisonError<_>| {
+        tracing::warn!("LrptImage mutex poisoned, recovering — a decoder thread panicked");
+        e.into_inner()
+    })
+}
+
 impl LrptImage {
     /// Start a fresh pass with an empty assembler.
     #[must_use]
@@ -55,9 +75,8 @@ impl LrptImage {
     /// Push a complete scan line for `apid`. Used by callers
     /// that already have a row buffered.
     pub fn push_line(&self, apid: u16, line: &[u8]) {
-        if let Ok(mut a) = self.inner.lock() {
-            a.push_line(apid, line);
-        }
+        let mut a = lock_or_recover(&self.inner);
+        a.push_line(apid, line);
     }
 
     /// Snapshot of channel `apid` as it stands right now, or
@@ -66,7 +85,7 @@ impl LrptImage {
     /// long renders.
     #[must_use]
     pub fn snapshot_channel(&self, apid: u16) -> Option<ChannelBuffer> {
-        let a = self.inner.lock().ok()?;
+        let a = lock_or_recover(&self.inner);
         a.channel(apid).cloned()
     }
 
@@ -74,25 +93,22 @@ impl LrptImage {
     /// MCU / line for, in unspecified order.
     #[must_use]
     pub fn channel_apids(&self) -> Vec<u16> {
-        let Ok(a) = self.inner.lock() else {
-            return Vec::new();
-        };
+        let a = lock_or_recover(&self.inner);
         a.channels().map(|(&apid, _)| apid).collect()
     }
 
     /// Borrow the assembler under lock for save / composite ops
     /// at LOS. Caller is expected to keep the closure short —
     /// other threads block on the mutex while it runs.
-    pub fn with_assembler<R>(&self, f: impl FnOnce(&ImageAssembler) -> R) -> Option<R> {
-        let a = self.inner.lock().ok()?;
-        Some(f(&a))
+    pub fn with_assembler<R>(&self, f: impl FnOnce(&ImageAssembler) -> R) -> R {
+        let a = lock_or_recover(&self.inner);
+        f(&a)
     }
 
     /// Clear all accumulated channels — call between passes.
     pub fn clear(&self) {
-        if let Ok(mut a) = self.inner.lock() {
-            a.clear();
-        }
+        let mut a = lock_or_recover(&self.inner);
+        a.clear();
     }
 }
 
@@ -101,16 +117,26 @@ mod tests {
     use super::*;
     use sdr_lrpt::image::IMAGE_WIDTH;
 
-    /// APID used in single-channel persistence checks. Any value
-    /// in the AVHRR range works (64–69); 64 is the conventional
-    /// "first channel" used elsewhere in the test suite.
+    /// Primary APID used in single-channel persistence checks.
+    /// Any value in the AVHRR range works (64–69); 64 is the
+    /// conventional "first channel" used elsewhere in the test
+    /// suite.
     const APID_TEST: u16 = 64;
+    /// Secondary APID for multi-channel listing checks. Distinct
+    /// from `APID_TEST` so the sort-and-compare assertion in
+    /// `channel_apids_lists_pushed_channels` actually exercises
+    /// the multi-channel path.
+    const APID_TEST_2: u16 = 65;
 
     /// Marker pixel value pushed in `push_then_snapshot_round_trip`.
     /// Distinct from 0 (empty buffer fill) and 0xFF (saturation)
     /// so a regression that returned a default-constructed buffer
     /// would fail loudly instead of silently matching.
     const TEST_PIXEL: u8 = 42;
+    /// Marker pixel for the second channel in the listing test.
+    /// Distinct from `TEST_PIXEL` so a swapped-channel bug would
+    /// surface in any future per-channel content assertion.
+    const TEST_PIXEL_2: u8 = 99;
 
     #[test]
     fn push_then_snapshot_round_trip() {
@@ -130,11 +156,11 @@ mod tests {
     #[test]
     fn channel_apids_lists_pushed_channels() {
         let img = LrptImage::new();
-        img.push_line(64, &vec![1; IMAGE_WIDTH]);
-        img.push_line(65, &vec![2; IMAGE_WIDTH]);
+        img.push_line(APID_TEST, &vec![TEST_PIXEL; IMAGE_WIDTH]);
+        img.push_line(APID_TEST_2, &vec![TEST_PIXEL_2; IMAGE_WIDTH]);
         let mut apids = img.channel_apids();
         apids.sort_unstable();
-        assert_eq!(apids, vec![64, 65]);
+        assert_eq!(apids, vec![APID_TEST, APID_TEST_2]);
     }
 
     #[test]
@@ -164,9 +190,64 @@ mod tests {
     fn with_assembler_runs_closure_under_lock() {
         let img = LrptImage::new();
         img.push_line(APID_TEST, &vec![TEST_PIXEL; IMAGE_WIDTH]);
-        let lines = img
-            .with_assembler(|a| a.channel(APID_TEST).map(|c| c.lines))
-            .expect("lock acquired");
+        let lines = img.with_assembler(|a| a.channel(APID_TEST).map(|c| c.lines));
         assert_eq!(lines, Some(1));
+    }
+
+    #[test]
+    #[allow(
+        clippy::panic,
+        reason = "test deliberately panics on a worker thread to poison the mutex; the panic is the test fixture"
+    )]
+    fn recovers_from_poisoned_mutex() {
+        // Per CR round 1: a panic on a decoder thread used to
+        // permanently mute the live viewer because every
+        // subsequent `inner.lock()` would return Err and the
+        // silent-swallow code path skipped the operation. With
+        // poison recovery, the next push/snapshot still works —
+        // we just emit a warn log.
+        use std::sync::Arc;
+        use std::thread;
+
+        let img = LrptImage::new();
+        img.push_line(APID_TEST, &vec![TEST_PIXEL; IMAGE_WIDTH]);
+
+        // Poison the mutex: spawn a thread that locks then
+        // panics. The Arc/Mutex we share with `img` will be
+        // marked poisoned when the thread unwinds.
+        let inner = Arc::clone(&img.inner);
+        let _ = thread::spawn(move || {
+            let _guard = inner.lock().expect("first lock");
+            panic!("intentional panic to poison the mutex");
+        })
+        .join();
+        assert!(
+            img.inner.is_poisoned(),
+            "test setup: mutex must be poisoned"
+        );
+
+        // The pre-poison line must still be readable, AND new
+        // writes must still land. Both routes go through
+        // `lock_or_recover`.
+        let snap = img
+            .snapshot_channel(APID_TEST)
+            .expect("snapshot post-poison");
+        assert_eq!(snap.pixels[0], TEST_PIXEL);
+        img.push_line(APID_TEST_2, &vec![TEST_PIXEL_2; IMAGE_WIDTH]);
+        let snap2 = img
+            .snapshot_channel(APID_TEST_2)
+            .expect("write post-poison");
+        assert_eq!(snap2.pixels[0], TEST_PIXEL_2);
+
+        // channel_apids and clear must also recover, not return
+        // empty / no-op.
+        let mut apids = img.channel_apids();
+        apids.sort_unstable();
+        assert_eq!(apids, vec![APID_TEST, APID_TEST_2]);
+        img.clear();
+        assert!(
+            img.channel_apids().is_empty(),
+            "clear must work post-poison"
+        );
     }
 }
