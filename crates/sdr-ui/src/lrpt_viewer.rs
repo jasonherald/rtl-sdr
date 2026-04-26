@@ -743,7 +743,24 @@ impl LrptImageView {
         };
 
         // Phase 2 — outside the shared-image lock.
-        let mut any_new = false;
+        //
+        // Only the renderer's currently-active APID is painted
+        // by `LrptImageRenderer::render`, so the redraw should
+        // fire ONLY when that channel got a row this tick.
+        // Hidden APIDs that just gained rows are off-screen —
+        // their data lands in the per-channel surface but isn't
+        // visible until the user picks them in the dropdown,
+        // and the dropdown's own selected_notify handler will
+        // queue a redraw when that happens. Per `CodeRabbit`
+        // round 16 on PR #543.
+        //
+        // The auto-select transition (active was None, first
+        // ever push promotes it to Some(apid)) is covered by
+        // the per-channel comparison below: after `push_line`
+        // the renderer's `active_apid()` matches `p.apid`, so
+        // the same `painted_any && active == Some(p.apid)` gate
+        // catches the auto-select case naturally.
+        let mut visible_dirty = false;
         let mut last_seen = self.last_seen_lines.borrow_mut();
         let mut renderer = self.renderer.borrow_mut();
         for p in pending {
@@ -780,14 +797,14 @@ impl LrptImageView {
                 pushed = p.already + offset + 1;
             }
             last_seen.insert(p.apid, pushed);
-            if painted_any {
-                any_new = true;
+            if painted_any && renderer.active_apid() == Some(p.apid) {
+                visible_dirty = true;
             }
         }
         drop(renderer);
         drop(last_seen);
 
-        if any_new && !self.paused.get() {
+        if visible_dirty && !self.paused.get() {
             self.drawing_area.queue_draw();
         }
     }
@@ -844,17 +861,30 @@ impl LrptImageView {
     /// `gio::spawn_blocking` directly. It also performs
     /// synchronous Cairo PNG encoding + filesystem I/O — large
     /// images (~50 MB cap) will freeze the GTK main loop while
-    /// it runs. For the GTK click-handler / LOS-save path, use
-    /// [`Self::snapshot_active_channel`] on the main thread
-    /// (cheap mutex-clone, also drains rows + queues the redraw)
-    /// followed by [`write_greyscale_png`] inside
-    /// `gio::spawn_blocking` — that's how the manual Export PNG
-    /// button in [`open_lrpt_viewer_window`] and the recorder's
-    /// `RecorderAction::SaveLrptPass` handler in `window.rs`
-    /// dispatch heavy exports today. Kept as a convenience for
-    /// any future caller that genuinely wants the synchronous
-    /// path (small test exports, scripted batch flows). Per
-    /// `CodeRabbit` round 15 on PR #543.
+    /// it runs.
+    ///
+    /// For off-main-thread use the production paths take two
+    /// different routes:
+    ///
+    /// - The manual Export PNG button in
+    ///   [`open_lrpt_viewer_window`] calls
+    ///   [`Self::snapshot_active_channel`] on the main thread
+    ///   (cheap mutex-clone, also drains rows + queues the
+    ///   redraw), then writes the PNG inside
+    ///   `gio::spawn_blocking` via [`write_greyscale_png`].
+    /// - The recorder's `RecorderAction::SaveLrptPass` handler
+    ///   in `window.rs` snapshots per-APID `ChannelBuffer`s
+    ///   directly from `AppState::lrpt_image` (it doesn't go
+    ///   through the viewer at all — the LOS save needs to
+    ///   work even when the user has closed the window
+    ///   mid-pass), then writes one PNG per channel inside
+    ///   `gio::spawn_blocking` via the same
+    ///   [`write_greyscale_png`].
+    ///
+    /// Kept as a convenience for any future caller that
+    /// genuinely wants the synchronous main-thread path (small
+    /// test exports, scripted batch flows). Per `CodeRabbit`
+    /// rounds 15 + 16 on PR #543.
     ///
     /// # Errors
     ///
