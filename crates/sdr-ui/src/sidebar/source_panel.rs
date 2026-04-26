@@ -44,6 +44,14 @@ pub const KEY_AGC_TYPE: &str = "rtl_sdr_agc_type";
 /// don't lose their AGC setting on first launch.
 pub const KEY_LEGACY_AGC_ENABLED: &str = "rtl_sdr_agc_enabled";
 
+/// Config key for the persisted bias-T toggle. Powers an
+/// inline LNA over the dongle's coax connector — only
+/// meaningful on RTL-SDR hardware that has the bias-T circuit
+/// (V3+; older clones don't). Default `false` so users without
+/// powered antennas don't accidentally feed 5 V into a passive
+/// LNA. Per issue #537.
+pub const KEY_SOURCE_RTL_BIAS_TEE: &str = "src_rtl_bias_tee";
+
 /// Device selector index for RTL-SDR.
 pub const DEVICE_RTLSDR: u32 = 0;
 /// Device selector index for Network.
@@ -252,6 +260,15 @@ pub struct SourcePanel {
     pub agc_row: adw::ComboRow,
     /// RTL-SDR PPM frequency correction.
     pub ppm_row: adw::SpinRow,
+    /// RTL-SDR bias tee toggle. Powers an inline LNA over the
+    /// coax (V3+ dongles only — older clones lack the circuit
+    /// and the driver returns Err on those, surfaced as a
+    /// toast). Visibility-gated to local RTL-SDR USB only in
+    /// this panel (hidden for Network / File / `rtl_tcp`).
+    /// `rtl_tcp` has its own remote-bias-T default in the
+    /// share-server panel rather than reusing this row. Per
+    /// issue #537.
+    pub bias_tee_row: adw::SwitchRow,
     /// Network hostname entry.
     pub hostname_row: adw::EntryRow,
     /// Network port number.
@@ -375,7 +392,13 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
 const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
 
 /// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM correction.
-fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::ComboRow, adw::SpinRow) {
+fn build_rtlsdr_rows() -> (
+    adw::ComboRow,
+    adw::SpinRow,
+    adw::ComboRow,
+    adw::SpinRow,
+    adw::SwitchRow,
+) {
     let sample_rate_model = gtk4::StringList::new(&[
         "250 kHz",
         "1.024 MHz",
@@ -431,7 +454,17 @@ fn build_rtlsdr_rows() -> (adw::ComboRow, adw::SpinRow, adw::ComboRow, adw::Spin
         .digits(0)
         .build();
 
-    (sample_rate_row, gain_row, agc_row, ppm_row)
+    // Bias tee — powers an inline LNA over the coax. Off by
+    // default so users without powered antennas don't drive
+    // unexpected current into a passive antenna's centre
+    // conductor. Per issue #537.
+    let bias_tee_row = adw::SwitchRow::builder()
+        .title("Bias-T")
+        .subtitle("Power an inline LNA over the antenna coax")
+        .active(false)
+        .build();
+
+    (sample_rate_row, gain_row, agc_row, ppm_row, bias_tee_row)
 }
 
 /// Build network-specific rows: hostname, port, protocol.
@@ -498,6 +531,7 @@ fn connect_device_visibility(
     gain_row: &adw::SpinRow,
     agc_row: &adw::ComboRow,
     ppm_row: &adw::SpinRow,
+    bias_tee_row: &adw::SwitchRow,
     hostname_row: &adw::EntryRow,
     port_row: &adw::SpinRow,
     protocol_row: &adw::ComboRow,
@@ -512,6 +546,8 @@ fn connect_device_visibility(
         agc_row,
         #[weak]
         ppm_row,
+        #[weak]
+        bias_tee_row,
         #[weak]
         hostname_row,
         #[weak]
@@ -538,6 +574,10 @@ fn connect_device_visibility(
             gain_row.set_visible(tune_controls_visible);
             agc_row.set_visible(tune_controls_visible);
             ppm_row.set_visible(tune_controls_visible);
+            // Bias tee is local-RTL-SDR only — see the
+            // initial-visibility block for the same gating
+            // rationale. Per issue #537.
+            bias_tee_row.set_visible(is_rtlsdr);
 
             // Hostname / port entry is shared between raw-IQ Network
             // and RTL-TCP modes. Protocol (TCP/UDP) only applies to
@@ -583,7 +623,7 @@ pub fn build_source_panel() -> SourcePanel {
         .model(&device_model)
         .build();
 
-    let (sample_rate_row, gain_row, agc_row, ppm_row) = build_rtlsdr_rows();
+    let (sample_rate_row, gain_row, agc_row, ppm_row, bias_tee_row) = build_rtlsdr_rows();
     let (hostname_row, port_row, protocol_row) = build_network_rows();
     let file_path_row = adw::EntryRow::builder()
         .title("File Path")
@@ -680,6 +720,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&gain_row);
     group.add(&agc_row);
     group.add(&ppm_row);
+    group.add(&bias_tee_row);
     group.add(&hostname_row);
     group.add(&port_row);
     group.add(&protocol_row);
@@ -706,6 +747,12 @@ pub fn build_source_panel() -> SourcePanel {
     gain_row.set_visible(tune_controls_visible);
     agc_row.set_visible(tune_controls_visible);
     ppm_row.set_visible(tune_controls_visible);
+    // Bias tee is local-RTL-SDR only — the rtl_tcp wire
+    // protocol exposes a bias-T command but the rtl_tcp client
+    // doesn't currently surface it in this panel (the
+    // server-side panel has its own toggle). Keep this row
+    // hidden on RTL-TCP to match. Per issue #537.
+    bias_tee_row.set_visible(is_rtlsdr);
     hostname_row.set_visible(is_network || is_rtltcp);
     port_row.set_visible(is_network || is_rtltcp);
     protocol_row.set_visible(is_network);
@@ -726,6 +773,7 @@ pub fn build_source_panel() -> SourcePanel {
         &gain_row,
         &agc_row,
         &ppm_row,
+        &bias_tee_row,
         &hostname_row,
         &port_row,
         &protocol_row,
@@ -749,6 +797,7 @@ pub fn build_source_panel() -> SourcePanel {
         gain_row,
         agc_row,
         ppm_row,
+        bias_tee_row,
         hostname_row,
         port_row,
         protocol_row,
@@ -1069,6 +1118,27 @@ pub fn load_agc_type(config: &Arc<ConfigManager>) -> AgcType {
 pub fn save_agc_type(config: &Arc<ConfigManager>, agc_type: AgcType) {
     config.write(|v| {
         v[KEY_AGC_TYPE] = serde_json::to_value(agc_type).unwrap_or(serde_json::Value::Null);
+    });
+}
+
+/// Load the persisted bias-T toggle. Defaults to `false` —
+/// users without powered antennas should never have 5 V on
+/// the coax accidentally on first launch. Per issue #537.
+#[must_use]
+pub fn load_source_rtl_bias_tee(config: &Arc<ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_SOURCE_RTL_BIAS_TEE)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Persist the bias-T toggle. Written on every
+/// `bias_tee_row.connect_active_notify` event in
+/// `window.rs::connect_source_panel`. Per issue #537.
+pub fn save_source_rtl_bias_tee(config: &Arc<ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_SOURCE_RTL_BIAS_TEE] = serde_json::json!(enabled);
     });
 }
 
@@ -1468,5 +1538,39 @@ mod tests {
         // `u32::MAX` is the `gtk4::INVALID_LIST_POSITION`
         // sentinel; make sure we don't panic or coerce.
         assert_eq!(agc_type_from_selected(u32::MAX), None);
+    }
+
+    // --- Bias-T persistence tests (#537) ---
+
+    /// Fresh config (no key present) defaults to `false`.
+    /// "Safe by default" — a user without a powered antenna
+    /// shouldn't get 5 V on the coax on first launch.
+    #[test]
+    fn load_source_rtl_bias_tee_defaults_to_off() {
+        let config = make_config();
+        assert!(!load_source_rtl_bias_tee(&config));
+    }
+
+    /// Round-trip: write `true`, read back `true`.
+    #[test]
+    fn save_and_load_source_rtl_bias_tee_round_trip() {
+        let config = make_config();
+        save_source_rtl_bias_tee(&config, true);
+        assert!(load_source_rtl_bias_tee(&config));
+        save_source_rtl_bias_tee(&config, false);
+        assert!(!load_source_rtl_bias_tee(&config));
+    }
+
+    /// Corrupt value (wrong JSON type) falls back to default
+    /// rather than panicking. Mirrors the
+    /// `load_agc_type_tolerates_corrupt_new_key` resilience
+    /// pattern.
+    #[test]
+    fn load_source_rtl_bias_tee_tolerates_non_bool() {
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_SOURCE_RTL_BIAS_TEE] = serde_json::json!("not a bool");
+        });
+        assert!(!load_source_rtl_bias_tee(&config));
     }
 }

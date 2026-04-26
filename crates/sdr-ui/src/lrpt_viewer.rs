@@ -53,6 +53,7 @@ use sdr_lrpt::image::IMAGE_WIDTH;
 use sdr_radio::lrpt_image::LrptImage;
 
 use crate::messages::UiToDsp;
+use crate::viewer::ViewerError;
 
 /// Maximum lines we'll keep per channel. The MSU-MR scanner on
 /// Meteor-M produces AVHRR-style imagery at ~6 scan lines per
@@ -365,13 +366,16 @@ impl LrptImageRenderer {
     ///
     /// # Errors
     ///
-    /// Returns a stringified Cairo error on paint failure.
-    /// Callers usually log and continue — drawing failures
-    /// shouldn't kill the UI.
+    /// Returns [`ViewerError::Cairo`] on paint failure. Callers
+    /// usually log and continue — drawing failures shouldn't
+    /// kill the UI. Per issue #545.
     #[allow(clippy::cast_precision_loss)]
-    pub fn render(&self, cr: &cairo::Context, width: i32, height: i32) -> Result<(), String> {
+    pub fn render(&self, cr: &cairo::Context, width: i32, height: i32) -> Result<(), ViewerError> {
         cr.set_source_rgb(BACKGROUND_RGB[0], BACKGROUND_RGB[1], BACKGROUND_RGB[2]);
-        cr.paint().map_err(|e| format!("background paint: {e}"))?;
+        cr.paint().map_err(|e| ViewerError::Cairo {
+            op: "background paint",
+            source: e,
+        })?;
 
         let Some(apid) = self.active else {
             return Ok(());
@@ -388,14 +392,26 @@ impl LrptImageRenderer {
         let scale = (f64::from(width) / img_w).min(f64::from(height) / img_h);
         let off_x = (f64::from(width) - img_w * scale) / 2.0;
 
-        cr.save().map_err(|e| format!("save: {e}"))?;
+        cr.save().map_err(|e| ViewerError::Cairo {
+            op: "save",
+            source: e,
+        })?;
         cr.translate(off_x, 0.0);
         cr.scale(scale, scale);
         cr.set_source_surface(&channel.surface, 0.0, 0.0)
-            .map_err(|e| format!("set_source_surface: {e}"))?;
+            .map_err(|e| ViewerError::Cairo {
+                op: "set_source_surface",
+                source: e,
+            })?;
         cr.rectangle(0.0, 0.0, img_w, img_h);
-        cr.fill().map_err(|e| format!("image fill: {e}"))?;
-        cr.restore().map_err(|e| format!("restore: {e}"))?;
+        cr.fill().map_err(|e| ViewerError::Cairo {
+            op: "image fill",
+            source: e,
+        })?;
+        cr.restore().map_err(|e| ViewerError::Cairo {
+            op: "restore",
+            source: e,
+        })?;
         Ok(())
     }
 
@@ -406,22 +422,27 @@ impl LrptImageRenderer {
     ///
     /// # Errors
     ///
-    /// Returns a stringified error if no channel is active /
-    /// has data, or from filesystem creation, surface
-    /// construction, paint operations, or Cairo's PNG encoder.
+    /// Returns [`ViewerError::NoActiveChannel`] when no APID is
+    /// selected, [`ViewerError::EmptyChannel`] when the active
+    /// channel has no decoded rows yet, or `Cairo` / `Io` /
+    /// `PngEncode` on the failing step. Per issue #545.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn export_png(&self, path: &Path) -> Result<(), String> {
+    pub fn export_png(&self, path: &Path) -> Result<(), ViewerError> {
         let Some(apid) = self.active else {
-            return Err("no LRPT channel selected for export".to_string());
+            return Err(ViewerError::NoActiveChannel);
         };
         let Some(channel) = self.channels.get(&apid) else {
-            return Err(format!("LRPT channel APID {apid} has no data to export"));
+            return Err(ViewerError::EmptyChannel { apid: Some(apid) });
         };
         if channel.n_lines == 0 {
-            return Err(format!("LRPT channel APID {apid} has no data to export"));
+            return Err(ViewerError::EmptyChannel { apid: Some(apid) });
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
+                op: "create_dir_all",
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
 
         let export_surface = cairo::ImageSurface::create(
@@ -429,22 +450,35 @@ impl LrptImageRenderer {
             IMAGE_WIDTH as i32,
             channel.n_lines as i32,
         )
-        .map_err(|e| format!("export surface: {e}"))?;
-        let cr =
-            cairo::Context::new(&export_surface).map_err(|e| format!("export context: {e}"))?;
+        .map_err(|e| ViewerError::Cairo {
+            op: "export surface",
+            source: e,
+        })?;
+        let cr = cairo::Context::new(&export_surface).map_err(|e| ViewerError::Cairo {
+            op: "export context",
+            source: e,
+        })?;
         cr.set_source_surface(&channel.surface, 0.0, 0.0)
-            .map_err(|e| format!("export set_source_surface: {e}"))?;
+            .map_err(|e| ViewerError::Cairo {
+                op: "export set_source_surface",
+                source: e,
+            })?;
         // IMAGE_WIDTH and n_lines are well under f64's mantissa
         // — bounded by MAX_LINES — so no real precision loss.
         #[allow(clippy::cast_precision_loss)]
         cr.rectangle(0.0, 0.0, IMAGE_WIDTH as f64, channel.n_lines as f64);
-        cr.fill().map_err(|e| format!("export fill: {e}"))?;
+        cr.fill().map_err(|e| ViewerError::Cairo {
+            op: "export fill",
+            source: e,
+        })?;
         drop(cr);
 
-        let mut file = std::fs::File::create(path).map_err(|e| format!("file: {e}"))?;
-        export_surface
-            .write_to_png(&mut file)
-            .map_err(|e| format!("png: {e}"))?;
+        let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
+            op: "file create",
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        export_surface.write_to_png(&mut file)?;
         tracing::info!(
             ?path,
             apid,
@@ -471,17 +505,20 @@ impl LrptImageRenderer {
 ///
 /// # Errors
 ///
-/// Returns a stringified error from filesystem creation, surface
-/// construction, the surface-data lock, or Cairo's PNG encoder.
-/// Pixel-buffer length mismatch (`pixels.len() != width * height`)
-/// is reported as a stringified error rather than silently
-/// truncating.
+/// Returns a [`ViewerError`] variant identifying the failing
+/// step: `DimensionTooLarge` if `width` or `height` exceeds
+/// `i32::MAX` (Cairo's API limit), `InvalidBuffer` if
+/// `pixels.len()` doesn't match `width * height`, `ZeroSized`
+/// if either dimension is 0, and `Io` / `Cairo` /
+/// `SurfaceDataLock` / `InvalidStride` / `PngEncode` for the
+/// downstream Cairo and filesystem failures. Per issue #545
+/// (was `Result<(), String>` before).
 pub fn write_greyscale_png(
     path: &Path,
     pixels: &[u8],
     width: usize,
     height: usize,
-) -> Result<(), String> {
+) -> Result<(), ViewerError> {
     // Validate dimensions fit Cairo's `i32` API up front. The
     // earlier draft `as i32`-cast both, which silently wraps for
     // any usize > i32::MAX (2.1 G) into a negative or bogus
@@ -491,37 +528,53 @@ pub fn write_greyscale_png(
     // `#[allow(cast_possible_wrap)]` would have hidden the
     // wrap, not prevented it. Per `CodeRabbit` round 9 on PR
     // #543.
-    let width_i32 = i32::try_from(width)
-        .map_err(|_| format!("greyscale PNG: width {width} exceeds i32::MAX"))?;
-    let height_i32 = i32::try_from(height)
-        .map_err(|_| format!("greyscale PNG: height {height} exceeds i32::MAX"))?;
+    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "width",
+        value: width,
+    })?;
+    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "height",
+        value: height,
+    })?;
+    // Zero-size guard runs BEFORE buffer-shape validation so a
+    // call like `write_greyscale_png(path, &[1], 0, 1)` reports
+    // the dedicated `ZeroSized` discriminant rather than masking
+    // it as a generic `InvalidBuffer`. Callers (and the user-
+    // facing toast) match on these distinctly. Per CR on PR #550.
+    if width == 0 || height == 0 {
+        return Err(ViewerError::ZeroSized);
+    }
     let expected = width
         .checked_mul(height)
-        .ok_or_else(|| format!("greyscale PNG: width*height overflow ({width} × {height})"))?;
+        .ok_or(ViewerError::DimensionTooLarge {
+            dim: "width × height",
+            value: usize::MAX,
+        })?;
     if pixels.len() != expected {
-        return Err(format!(
-            "greyscale PNG: pixel buffer length {} doesn't match width*height ({}*{} = {})",
+        return Err(ViewerError::InvalidBuffer(format!(
+            "greyscale PNG pixel buffer length {} doesn't match width*height ({}*{} = {})",
             pixels.len(),
             width,
             height,
             expected,
-        ));
-    }
-    if width == 0 || height == 0 {
-        return Err("greyscale PNG: zero-sized image".to_string());
+        )));
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
+            op: "create_dir_all",
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
 
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width_i32, height_i32)
-        .map_err(|e| format!("export surface: {e}"))?;
+        .map_err(|e| ViewerError::Cairo {
+            op: "export surface",
+            source: e,
+        })?;
     {
-        let stride =
-            usize::try_from(surface.stride()).map_err(|e| format!("invalid stride: {e}"))?;
-        let mut data = surface
-            .data()
-            .map_err(|e| format!("surface data lock: {e}"))?;
+        let stride = usize::try_from(surface.stride())?;
+        let mut data = surface.data()?;
         for row in 0..height {
             let row_offset = row * stride;
             let pixel_row_offset = row * width;
@@ -535,10 +588,12 @@ pub fn write_greyscale_png(
             }
         }
     }
-    let mut file = std::fs::File::create(path).map_err(|e| format!("file: {e}"))?;
-    surface
-        .write_to_png(&mut file)
-        .map_err(|e| format!("png: {e}"))?;
+    let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
+        op: "file create",
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    surface.write_to_png(&mut file)?;
     Ok(())
 }
 
@@ -903,8 +958,10 @@ impl LrptImageView {
     ///
     /// # Errors
     ///
-    /// Propagates any error from the underlying renderer.
-    pub fn export_png(&self, path: &Path) -> Result<(), String> {
+    /// Propagates any [`ViewerError`] from the underlying
+    /// renderer (per issue #545 — was `Result<(), String>`
+    /// before).
+    pub fn export_png(&self, path: &Path) -> Result<(), ViewerError> {
         self.drain_new_lines();
         self.renderer.borrow().export_png(path)
     }
@@ -1559,6 +1616,18 @@ mod tests {
         let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-zero.png");
         let result = write_greyscale_png(&path, &[], 0, 0);
         assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_greyscale_png_zero_dim_with_pixels_reports_zero_sized() {
+        // Pin the CR-requested ordering: a zero-dim call with a
+        // non-empty pixel buffer must surface as `ZeroSized`, not
+        // mask as the generic `InvalidBuffer` length-mismatch.
+        // Per CR on PR #550.
+        let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-zero-dim-pixels.png");
+        let result = write_greyscale_png(&path, &[1_u8], 0, 1);
+        assert!(matches!(result, Err(crate::viewer::ViewerError::ZeroSized)));
         assert!(!path.exists());
     }
 }

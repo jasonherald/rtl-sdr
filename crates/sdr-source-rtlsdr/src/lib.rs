@@ -427,6 +427,23 @@ impl Source for RtlSdrSource {
         }
         Ok(())
     }
+
+    fn set_bias_tee(&mut self, enabled: bool) -> Result<(), SourceError> {
+        // Routes through `rtlsdr_set_bias_tee` (GPIO 0). Older
+        // V3-clone dongles lack the bias-T circuit entirely; the
+        // driver returns Err on those — surfaced as a
+        // `TuneFailed` toast rather than crashing. Per issue
+        // #537. The Source-trait default is a silent no-op so
+        // every other source type (file, network) ignores the
+        // command — only the live RTL-SDR USB path actually
+        // toggles hardware.
+        if let Some(device) = &mut self.device {
+            device
+                .set_bias_tee(enabled)
+                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

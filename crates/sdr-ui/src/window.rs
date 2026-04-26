@@ -6512,6 +6512,38 @@ fn connect_source_panel(
             state_dc_block.send_dsp(UiToDsp::SetDcBlocking(row.is_active()));
         });
 
+    // Bias-T toggle (#537). Powers an inline LNA over the
+    // RTL-SDR's coax. The startup restore must run BEFORE
+    // wiring the change-notify handler — same idiom as the
+    // satellites-panel auto-record toggle: a programmatic
+    // `set_active` fires `connect_active_notify`, which would
+    // otherwise re-save the just-loaded value (cheap) AND
+    // dispatch a redundant `SetBiasTee` (also cheap, but
+    // misleading in tracing logs).
+    {
+        let persisted = sidebar::source_panel::load_source_rtl_bias_tee(config);
+        panels.source.bias_tee_row.set_active(persisted);
+        // Dispatch the persisted value once at startup so the
+        // dongle's GPIO matches the UI from the first source
+        // open, not just after the user toggles. The
+        // `SetBiasTee` handler stores the value in `DspState`
+        // up-front, and `open_source` re-applies it to the
+        // freshly-opened RTL-SDR source — so this dispatch
+        // works regardless of whether a source is open at
+        // startup. Per CR on PR #550.
+        state.send_dsp(UiToDsp::SetBiasTee(persisted));
+    }
+    let state_bias_tee = Rc::clone(state);
+    let config_bias_tee = std::sync::Arc::clone(config);
+    panels
+        .source
+        .bias_tee_row
+        .connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            sidebar::source_panel::save_source_rtl_bias_tee(&config_bias_tee, enabled);
+            state_bias_tee.send_dsp(UiToDsp::SetBiasTee(enabled));
+        });
+
     // IQ inversion toggle
     let state_iq_inv = Rc::clone(state);
     panels

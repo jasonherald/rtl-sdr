@@ -26,6 +26,7 @@ pub mod spectrum;
 pub mod state;
 pub mod status_bar;
 pub mod ui_helpers;
+pub mod viewer;
 pub mod window;
 
 // Re-exports from sdr-core for backward compat with internal modules.
