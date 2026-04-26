@@ -302,6 +302,35 @@ impl SpectrumHandle {
         self.waterfall_area.queue_draw();
     }
 
+    /// Programmatically set the VFO's visible channel-filter
+    /// width. Called from `DspToUi::BandwidthChanged` so a
+    /// bandwidth change originating outside the spectrum (Radio
+    /// panel `AdwSpinRow`, reset button, mode switch, scanner
+    /// retune) updates the visible VFO rectangle on the
+    /// waterfall, not just the panel's numeric readout.
+    ///
+    /// VFO drag handles update `vfo_state.bandwidth_hz` inline
+    /// during the gesture, so this method isn't on their hot
+    /// path — it exists for the panel-side and DSP-echo
+    /// reflection paths. Per issue #504.
+    ///
+    /// **No clamping here.** The drag path uses
+    /// [`vfo_overlay::VfoState::clamp_bandwidth`] which enforces
+    /// a global `[500 Hz, 250 kHz]` envelope — appropriate as a
+    /// safety net for unbounded user drag input, but wrong for
+    /// values arriving via DSP echo. Those values have already
+    /// been clamped to the active demod's actual `[min, max]`
+    /// (CW: `[50, 500]`, NFM: `[1k, 50k]`, etc.) by the demod's
+    /// own `set_bandwidth`. Re-clamping to the global envelope
+    /// here would push CW's 50 Hz bandwidth back up to 500 Hz,
+    /// desyncing the visible width from the actual filter. Per
+    /// `CodeRabbit` round 1 on PR #548.
+    pub fn set_vfo_bandwidth(&self, bandwidth_hz: f64) {
+        self.vfo_state.borrow_mut().bandwidth_hz = bandwidth_hz;
+        self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
+    }
+
     /// Current VFO offset (Hz from tuner center). Used by the
     /// reset-affordance visibility logic so the floating button
     /// can decide whether the VFO is in a non-default state
