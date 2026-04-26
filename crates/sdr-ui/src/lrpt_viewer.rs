@@ -366,8 +366,6 @@ impl LrptImageRenderer {
     ///
     /// # Errors
     ///
-    /// # Errors
-    ///
     /// Returns [`ViewerError::Cairo`] on paint failure. Callers
     /// usually log and continue — drawing failures shouldn't
     /// kill the UI. Per issue #545.

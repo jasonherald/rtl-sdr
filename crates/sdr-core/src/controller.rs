@@ -696,7 +696,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             state.audio_frames_written = 0;
             state.iq_samples_read = 0;
             state.diag_log_at = std::time::Instant::now();
-            match open_source(state) {
+            match open_source(state, dsp_tx) {
                 Ok(()) => {
                     // Start the audio sink -- if it fails, log but continue
                     // so the spectrum display still works. Discriminate the
@@ -1420,7 +1420,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             }
             // Restart with the new source type if was playing
             if was_running {
-                match open_source(state) {
+                match open_source(state, dsp_tx) {
                     Ok(()) => {
                         // Clear the audio-sink offline latch on
                         // a successful restart, same as the
@@ -2367,7 +2367,7 @@ fn rebuild_rtl_tcp_source(
 }
 
 /// Open the active IQ source and configure it for streaming.
-fn open_source(state: &mut DspState) -> Result<(), String> {
+fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(), String> {
     let mut source: Box<dyn Source> = match state.source_type {
         SourceType::RtlSdr => Box::new(RtlSdrSource::new(DEVICE_INDEX)),
         SourceType::Network => Box::new(sdr_source_network::NetworkSource::new(
@@ -2459,9 +2459,11 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
     // gated on `bias_tee_enabled` being `true`) so an explicit
     // `false` also wins over any stale GPIO state from a prior
     // app. No-op for non-RTL-SDR sources, so we gate on
-    // `SourceType::RtlSdr`. Warn-and-continue on failure —
-    // bias-T is non-critical and the source is otherwise
-    // streaming. Per CR on PR #550.
+    // `SourceType::RtlSdr`. Warn-and-continue on failure, AND
+    // surface a non-fatal toast so the user isn't left with a
+    // switch that silently lies about hardware state — mirrors
+    // the live `UiToDsp::SetBiasTee` handler's error path.
+    // Per CR round 2 on PR #550.
     if state.source_type == SourceType::RtlSdr
         && let Err(e) = source.set_bias_tee(state.bias_tee_enabled)
     {
@@ -2470,6 +2472,10 @@ fn open_source(state: &mut DspState) -> Result<(), String> {
             enabled = state.bias_tee_enabled,
             "re-applying persisted bias-T on source open failed"
         );
+        let _ = dsp_tx.send(DspToUi::Error(format!(
+            "Bias tee {} failed: {e}",
+            if state.bias_tee_enabled { "on" } else { "off" }
+        )));
     }
 
     // Sync sample rate from the source (file sources have fixed rates).
