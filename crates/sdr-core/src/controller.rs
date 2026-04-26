@@ -449,6 +449,15 @@ struct DspState {
     /// it at AOS, manual LRPT-mode use without a viewer is a
     /// silent-but-harmless state).
     lrpt_image: Option<sdr_radio::lrpt_image::LrptImage>,
+    /// One-shot guard: set to `true` when `LrptDecoder::new`
+    /// fails, so subsequent `lrpt_decode_tap` calls return
+    /// early instead of retrying init (and warn-logging) on
+    /// every IQ chunk. Cleared in `cleanup` so a fresh `Start`
+    /// gets a fresh attempt. Mirrors `apt_init_failed_at_rate`
+    /// — without this, a sustained init failure would spam the
+    /// log at the IQ block rate (~100 Hz) until source-stop.
+    /// Per `CodeRabbit` round 12 on PR #543.
+    lrpt_init_failed: bool,
 }
 
 impl DspState {
@@ -527,6 +536,7 @@ impl DspState {
             apt_init_failed_at_rate: None,
             lrpt_decoder: None,
             lrpt_image: None,
+            lrpt_init_failed: false,
         })
     }
 }
@@ -629,10 +639,19 @@ fn lrpt_decode_tap(
     decoder_slot: &mut Option<LrptDecoder>,
     image: Option<&sdr_radio::lrpt_image::LrptImage>,
     radio_input: &[Complex],
+    init_failed: &mut bool,
 ) {
     let Some(image) = image else {
         return;
     };
+    // One-shot guard: a previous init attempt failed. Skip
+    // until source-stop cleanup clears the flag, otherwise
+    // we'd warn-log on every IQ chunk (~100 Hz). Per
+    // `CodeRabbit` round 12 on PR #543 — mirrors the
+    // `apt_init_failed_at_rate` guard on the APT side.
+    if *init_failed {
+        return;
+    }
     if decoder_slot.is_none() {
         match LrptDecoder::new(image.clone()) {
             Ok(decoder) => {
@@ -644,6 +663,7 @@ fn lrpt_decode_tap(
             }
             Err(e) => {
                 tracing::warn!("LRPT decoder init failed: {e}");
+                *init_failed = true;
                 return;
             }
         }
@@ -2508,6 +2528,10 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
         tracing::warn!("LRPT decoder reset failed; dropping for re-init: {e}");
         state.lrpt_decoder = None;
     }
+    // Clear the failed-init guard so a fresh Start gets a fresh
+    // init attempt. Mirror `apt_init_failed_at_rate` above. Per
+    // `CodeRabbit` round 12 on PR #543.
+    state.lrpt_init_failed = false;
 
     tracing::info!("source closed");
 }
@@ -2724,6 +2748,7 @@ fn process_iq_block(
                         &mut state.lrpt_decoder,
                         state.lrpt_image.as_ref(),
                         radio_input,
+                        &mut state.lrpt_init_failed,
                     );
                 }
 

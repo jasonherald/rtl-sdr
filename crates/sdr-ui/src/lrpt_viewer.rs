@@ -672,67 +672,100 @@ impl LrptImageView {
     /// the DSP thread on the lock for any longer than the
     /// strict copy time.
     pub fn drain_new_lines(&self) {
+        // Two-phase to keep the shared `LrptImage` mutex hold
+        // bounded. Phase 1 (under lock): walk the assembler and
+        // copy out the new rows per APID into owned `Vec<u8>`s.
+        // Phase 2 (lock released): hand the rows to the renderer,
+        // which may lazy-alloc a ~51 MB Cairo surface and acquire
+        // its surface-data lock — neither operation is fast
+        // enough to hold the assembler mutex across, since that
+        // would stall the DSP-thread writer behind it. Per
+        // `CodeRabbit` round 12 on PR #543.
+        struct PendingChannel {
+            apid: u16,
+            already: usize,
+            rows: Vec<Vec<u8>>,
+        }
+
+        // Phase 1 — under shared-image lock.
+        let pending: Vec<PendingChannel> = {
+            let last_seen = self.last_seen_lines.borrow();
+            let mut acc: Vec<PendingChannel> = Vec::new();
+            self.image.with_assembler(|a| {
+                for (&apid, channel) in a.channels() {
+                    let already = last_seen.get(&apid).copied().unwrap_or(0);
+                    if channel.lines <= already {
+                        continue;
+                    }
+                    let mut rows = Vec::with_capacity(channel.lines - already);
+                    for line_idx in already..channel.lines {
+                        let start = line_idx * IMAGE_WIDTH;
+                        let end = start + IMAGE_WIDTH;
+                        if end > channel.pixels.len() {
+                            // Defensive — see lrpt_decoder::harvest_new_lines
+                            // for the parallel guard. Structurally
+                            // unreachable; the warn protects against
+                            // a future refactor of the assembler
+                            // buffer.
+                            tracing::warn!(
+                                "LRPT view: channel {apid} pixel buffer shorter than expected; skipping line {line_idx}",
+                            );
+                            break;
+                        }
+                        rows.push(channel.pixels[start..end].to_vec());
+                    }
+                    acc.push(PendingChannel {
+                        apid,
+                        already,
+                        rows,
+                    });
+                }
+            });
+            acc
+        };
+
+        // Phase 2 — outside the shared-image lock.
         let mut any_new = false;
         let mut last_seen = self.last_seen_lines.borrow_mut();
         let mut renderer = self.renderer.borrow_mut();
-        self.image.with_assembler(|a| {
-            for (&apid, channel) in a.channels() {
-                let already = last_seen.get(&apid).copied().unwrap_or(0);
-                if channel.lines <= already {
-                    continue;
+        for p in pending {
+            // Track lines actually consumed so the watermark
+            // doesn't advance past either the bounds-guard
+            // skip path OR a transient renderer failure
+            // (surface alloc / stride / lock). Same shape as
+            // `lrpt_decoder::harvest_new_lines` on the DSP
+            // side, plus `PushOutcome::consumed()` for the
+            // renderer-side failure case. Per `CodeRabbit`
+            // rounds 2 + 3 on PR #543.
+            //
+            // `painted_any` only flips on `PushOutcome::Pushed`.
+            // `Capped` / `InvalidLine` advance the watermark (so
+            // the row is "consumed" — see `PushOutcome::consumed`)
+            // but don't change the visible canvas, and
+            // `TransientFailure` doesn't even advance. Without
+            // this distinction, a channel parked at MAX_LINES
+            // would queue a redraw every 250 ms tick forever —
+            // wasted GPU work for an unchanged image. Per
+            // `CodeRabbit` round 9 on PR #543.
+            let mut painted_any = false;
+            let mut pushed = p.already;
+            for (offset, row) in p.rows.iter().enumerate() {
+                let outcome = renderer.push_line(p.apid, row);
+                if !outcome.consumed() {
+                    // Transient failure — leave this row in the
+                    // source so the next poll retries.
+                    break;
                 }
-                // Track lines actually consumed so the watermark
-                // doesn't advance past either the bounds-guard
-                // skip path OR a transient renderer failure
-                // (surface alloc / stride / lock). Same shape as
-                // `lrpt_decoder::harvest_new_lines` on the DSP
-                // side, plus `PushOutcome::consumed()` for the
-                // renderer-side failure case. Per `CodeRabbit`
-                // rounds 2 + 3 on PR #543.
-                // Track whether ANY row actually painted this
-                // pass. `Capped` / `InvalidLine` advance the
-                // watermark (so the row is "consumed" — see
-                // `PushOutcome::consumed`) but don't change the
-                // visible canvas, and `TransientFailure` doesn't
-                // even advance. Without this distinction, a
-                // channel parked at MAX_LINES would queue a redraw
-                // every 250 ms tick forever — wasted GPU work
-                // for an unchanged image. Per `CodeRabbit` round
-                // 9 on PR #543.
-                let mut painted_any = false;
-                let mut pushed = already;
-                for line_idx in already..channel.lines {
-                    let start = line_idx * IMAGE_WIDTH;
-                    let end = start + IMAGE_WIDTH;
-                    if end > channel.pixels.len() {
-                        // Defensive — see lrpt_decoder::harvest_new_lines
-                        // for the parallel guard. Structurally
-                        // unreachable; the warn protects against a
-                        // future refactor of the assembler buffer.
-                        tracing::warn!(
-                            "LRPT view: channel {apid} pixel buffer shorter than expected; skipping line {line_idx}",
-                        );
-                        break;
-                    }
-                    let outcome = renderer.push_line(apid, &channel.pixels[start..end]);
-                    if !outcome.consumed() {
-                        // Transient failure — leave this row in
-                        // the source so the next poll retries.
-                        // Don't break the outer loop; the next
-                        // tick will pick up where we left off.
-                        break;
-                    }
-                    if matches!(outcome, PushOutcome::Pushed) {
-                        painted_any = true;
-                    }
-                    pushed = line_idx + 1;
+                if matches!(outcome, PushOutcome::Pushed) {
+                    painted_any = true;
                 }
-                last_seen.insert(apid, pushed);
-                if painted_any {
-                    any_new = true;
-                }
+                pushed = p.already + offset + 1;
             }
-        });
+            last_seen.insert(p.apid, pushed);
+            if painted_any {
+                any_new = true;
+            }
+        }
         drop(renderer);
         drop(last_seen);
 
