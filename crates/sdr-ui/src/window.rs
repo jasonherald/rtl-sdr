@@ -444,7 +444,18 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     );
 
     // On window close, signal the worker to stop without blocking.
+    // Tracing line + backtrace on entry so we can pinpoint the
+    // cascade when the close was unexpected (a recent user report
+    // had the entire app exit after auto-record LOS — only the
+    // viewer should have closed). Backtrace is `Backtrace::capture`
+    // so it costs nothing unless `RUST_BACKTRACE=1` is set. Per
+    // PR #558 auto-record-close investigation.
     window.connect_close_request(move |_| {
+        let bt = std::backtrace::Backtrace::capture();
+        tracing::info!(
+            backtrace = ?bt,
+            "main window close-request fired",
+        );
         transcription_engine.borrow_mut().shutdown_nonblocking();
         glib::Propagation::Proceed
     });
@@ -7187,12 +7198,28 @@ fn connect_source_panel(
         // `apply_rtl_tcp_connect`'s programmatic writes when
         // those match the cache). Per CodeRabbit round 4 on
         // PR #408.
-        invalidate_rtl_tcp_active_server_on_edit(
-            &state_host,
-            &hostname_for_host,
-            &port_for_host,
-            &auth_key_for_host,
-        );
+        //
+        // Skip the invalidation during RTL-TCP hydration: the
+        // startup hydration in `connect_rtl_tcp_discovery`
+        // rewrites this row from the last-connected RTL-TCP
+        // server (only when the persisted source type is
+        // RTL-TCP), and `apply_rtl_tcp_connect` writes the
+        // cache *after* the row writes — so an unguarded
+        // invalidate would clear the cache the hydration just
+        // restored AND blank the auth row before the auth-row
+        // handler had a chance to push the saved key. The
+        // `apply_rtl_tcp_connect` path handles cache and auth
+        // row deterministically itself; we just need to stay
+        // out of its way here. Per `CodeRabbit` round 3 on PR
+        // #558.
+        if !state_host.rtl_tcp_hydration_in_progress.get() {
+            invalidate_rtl_tcp_active_server_on_edit(
+                &state_host,
+                &hostname_for_host,
+                &port_for_host,
+                &auth_key_for_host,
+            );
+        }
         let hostname = row.text().to_string();
         // Skip the raw-Network disk-write when this change came
         // from an RTL-TCP hydration. The user's independent
@@ -7234,12 +7261,17 @@ fn connect_source_panel(
     let port_row_for_port = panels.source.port_row.clone();
     let auth_key_for_port = panels.source.rtl_tcp_auth_key_row.clone();
     panels.source.port_row.connect_value_notify(move |row| {
-        invalidate_rtl_tcp_active_server_on_edit(
-            &state_port,
-            &host_for_port,
-            &port_row_for_port,
-            &auth_key_for_port,
-        );
+        // Skip the invalidation during RTL-TCP hydration; see
+        // hostname handler above for the rationale. Per
+        // `CodeRabbit` round 3 on PR #558.
+        if !state_port.rtl_tcp_hydration_in_progress.get() {
+            invalidate_rtl_tcp_active_server_on_edit(
+                &state_port,
+                &host_for_port,
+                &port_row_for_port,
+                &auth_key_for_port,
+            );
+        }
         let hostname = host_for_port.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = row.value() as u16;
@@ -7279,17 +7311,22 @@ fn connect_source_panel(
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let port = port_for_proto.value() as u16;
             let selected = row.selected();
-            // Skip the raw-Network disk-write during RTL-TCP
-            // hydration; see hostname handler above. Per
-            // CodeRabbit round 1 on PR #558.
-            if !state_proto.rtl_tcp_hydration_in_progress.get() {
-                sidebar::source_panel::save_source_network_protocol_index(&config_proto, selected);
-            }
+            // Validate the selected index BEFORE persisting so a
+            // transient out-of-range value during widget churn
+            // can't land in config (matches the sample-rate /
+            // device / decimation handlers' early-return pattern).
+            // Per `CodeRabbit` round 3 on PR #558.
             let protocol = match selected {
                 NETWORK_PROTOCOL_TCPCLIENT_IDX => sdr_types::Protocol::TcpClient,
                 NETWORK_PROTOCOL_UDP_IDX => sdr_types::Protocol::Udp,
                 _ => return, // ignore transient indices
             };
+            // Skip the raw-Network disk-write during RTL-TCP
+            // hydration; see hostname handler above. Per
+            // `CodeRabbit` round 1 on PR #558.
+            if !state_proto.rtl_tcp_hydration_in_progress.get() {
+                sidebar::source_panel::save_source_network_protocol_index(&config_proto, selected);
+            }
             // Suppress per-edit dispatch during hydration; see
             // hostname handler above. Per `CodeRabbit` round 2 on
             // PR #558.
@@ -9724,6 +9761,7 @@ fn connect_satellites_panel(
                         .as_ref()
                         .and_then(glib::WeakRef::upgrade)
                 {
+                    tracing::info!("auto-record LOS: closing APT viewer window after PNG save");
                     window.close();
                 }
             }
@@ -9910,6 +9948,9 @@ fn connect_satellites_panel(
                             .as_ref()
                             .and_then(glib::WeakRef::upgrade)
                     {
+                        tracing::info!(
+                            "auto-record LOS: closing LRPT viewer window after PNG save"
+                        );
                         window.close();
                     }
                 });
