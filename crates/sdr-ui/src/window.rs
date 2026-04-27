@@ -6733,6 +6733,78 @@ fn connect_source_panel(
             state_bias_tee.send_dsp(UiToDsp::SetBiasTee(enabled));
         });
 
+    // Direct sampling combo (#538). Same restore-then-wire idiom
+    // as bias-T above. The persisted value is the combo index
+    // (0/1/2), which is also the `rtlsdr_set_direct_sampling`
+    // mode argument — cast straight to `i32` for the dispatch.
+    {
+        let persisted = sidebar::source_panel::load_source_rtl_direct_sampling_mode(config);
+        if persisted <= sidebar::source_panel::DIRECT_SAMPLING_MAX_IDX {
+            panels.source.direct_sampling_row.set_selected(persisted);
+            #[allow(clippy::cast_possible_wrap, reason = "u32 <= 2 fits in i32 trivially")]
+            state.send_dsp(UiToDsp::SetDirectSampling(persisted as i32));
+        }
+    }
+    let state_direct = Rc::clone(state);
+    let config_direct = std::sync::Arc::clone(config);
+    let toast_overlay_direct = toast_overlay.downgrade();
+    panels
+        .source
+        .direct_sampling_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Validate before persisting (mirrors the
+            // protocol_row / sample-rate / device / decimation
+            // early-return-on-invalid pattern). GTK can briefly
+            // emit out-of-range values during widget-model
+            // churn; persisting them would leave the next
+            // restart pinned to a non-existent direct-sampling
+            // mode. Per `CodeRabbit` round 3 on PR #558.
+            if idx > sidebar::source_panel::DIRECT_SAMPLING_MAX_IDX {
+                return;
+            }
+            sidebar::source_panel::save_source_rtl_direct_sampling_mode(&config_direct, idx);
+            #[allow(clippy::cast_possible_wrap, reason = "idx <= 2 fits in i32 trivially")]
+            state_direct.send_dsp(UiToDsp::SetDirectSampling(idx as i32));
+            // Surface a tune-guidance toast: enabling direct
+            // sampling routes the antenna straight to the ADC,
+            // which silences VHF/UHF (the R820T tuner is now
+            // bypassed); disabling it puts the tuner back in
+            // path, which silences HF. Either direction needs a
+            // manual retune to be useful, and a toast saves the
+            // user from staring at noise wondering why. Per
+            // `CodeRabbit` round 1 on PR #559 / closes #538
+            // objective.
+            if let Some(overlay) = toast_overlay_direct.upgrade() {
+                let msg = if idx == sidebar::source_panel::DIRECT_SAMPLING_DISABLED_IDX {
+                    "Direct Sampling off — retune to VHF/UHF."
+                } else {
+                    "Direct Sampling on — retune to an HF frequency (< 28 MHz)."
+                };
+                overlay.add_toast(adw::Toast::new(msg));
+            }
+        });
+
+    // Offset tuning toggle (#539). Same restore-then-wire idiom
+    // as bias-T above. The controller bridge
+    // (`UiToDsp::SetOffsetTuning`) was already plumbed; only
+    // wiring is new here.
+    {
+        let persisted = sidebar::source_panel::load_source_rtl_offset_tuning(config);
+        panels.source.offset_tuning_row.set_active(persisted);
+        state.send_dsp(UiToDsp::SetOffsetTuning(persisted));
+    }
+    let state_offset = Rc::clone(state);
+    let config_offset = std::sync::Arc::clone(config);
+    panels
+        .source
+        .offset_tuning_row
+        .connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            sidebar::source_panel::save_source_rtl_offset_tuning(&config_offset, enabled);
+            state_offset.send_dsp(UiToDsp::SetOffsetTuning(enabled));
+        });
+
     // IQ inversion toggle. Restore-then-wire (#552).
     {
         let persisted = sidebar::source_panel::load_source_iq_inversion(config);

@@ -73,6 +73,34 @@ pub const KEY_SOURCE_RTL_GAIN_DB: &str = "src_rtl_gain_db";
 /// `0` (no correction). Per issue `#551`.
 pub const KEY_SOURCE_RTL_PPM: &str = "src_rtl_ppm";
 
+/// Config key for persisted RTL2832 direct-sampling mode.
+/// Stored as the same `i32` mode value the
+/// `rtlsdr_set_direct_sampling` C ABI expects — `0` disables
+/// direct sampling (normal tuner path), `1` selects the I
+/// branch and `2` selects the Q branch (both bypass the tuner
+/// for HF reception). Default `0`. Per issue #538.
+pub const KEY_SOURCE_RTL_DIRECT_SAMPLING_MODE: &str = "src_rtl_direct_sampling";
+
+/// Config key for persisted RTL-SDR offset-tuning toggle.
+/// Default `false` — support varies by tuner/driver (E4000
+/// honors it; R820T/R828D reject with `InvalidParameter`; the
+/// driver also rejects while direct sampling is enabled), so
+/// the default keeps tuning behavior predictable across
+/// hardware variants. Per issue #539.
+pub const KEY_SOURCE_RTL_OFFSET_TUNING: &str = "src_rtl_offset_tuning";
+
+/// Direct-sampling combo indices. Order is load-bearing —
+/// matches the `rtlsdr_set_direct_sampling` mode argument the
+/// driver expects (0/1/2). The combo's user-visible label list
+/// in [`build_rtlsdr_rows`] is built in the same order so the
+/// selected index can be cast straight to the driver mode.
+pub const DIRECT_SAMPLING_DISABLED_IDX: u32 = 0;
+pub const DIRECT_SAMPLING_I_BRANCH_IDX: u32 = 1;
+pub const DIRECT_SAMPLING_Q_BRANCH_IDX: u32 = 2;
+/// Highest valid direct-sampling combo index, used by the
+/// loader to bound-check persisted values.
+pub const DIRECT_SAMPLING_MAX_IDX: u32 = DIRECT_SAMPLING_Q_BRANCH_IDX;
+
 // ─── Source-panel persistence keys (#552) ───────────────────────────
 // Top-level + frontend + per-source-type config rows that today
 // reset to widget defaults across restart. Mechanical mirror of
@@ -328,6 +356,25 @@ pub struct SourcePanel {
     /// share-server panel rather than reusing this row. Per
     /// issue #537.
     pub bias_tee_row: adw::SwitchRow,
+    /// RTL-SDR direct-sampling combo (Disabled / I branch /
+    /// Q branch). Q branch is how RTL-SDR Blog v3+ dongles tune
+    /// below 28 MHz — the R820T tuner cuts off there, but the
+    /// RTL2832 ADC can sample I or Q directly when the tuner is
+    /// bypassed. Visibility-gated to local RTL-SDR USB only in
+    /// this panel (hidden for Network / File / `rtl_tcp`). Per
+    /// issue #538.
+    pub direct_sampling_row: adw::ComboRow,
+    /// RTL-SDR offset-tuning toggle. Pushes the LO away from
+    /// the tuned frequency to dodge the DC spike. Most relevant
+    /// on E4000 tuners; support varies by tuner and driver, and
+    /// unsupported hardware (R820T / R828D) rejects the request
+    /// with `InvalidParameter`. The change-notify handler in
+    /// `connect_source_panel` surfaces driver rejections as a
+    /// `TuneFailed` toast so the user gets a clear "your tuner
+    /// doesn't support this" rather than a silent no-op. Same
+    /// visibility gate as the rest of the RTL-SDR-specific
+    /// rows. Per issue #539.
+    pub offset_tuning_row: adw::SwitchRow,
     /// Network hostname entry.
     pub hostname_row: adw::EntryRow,
     /// Network port number.
@@ -452,12 +499,15 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
 /// fallback matches the widget's initial selection.
 pub(crate) const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
 
-/// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM correction.
+/// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM
+/// correction, bias tee, direct sampling, offset tuning.
 fn build_rtlsdr_rows() -> (
     adw::ComboRow,
     adw::SpinRow,
     adw::ComboRow,
     adw::SpinRow,
+    adw::SwitchRow,
+    adw::ComboRow,
     adw::SwitchRow,
 ) {
     let sample_rate_model = gtk4::StringList::new(&[
@@ -525,7 +575,43 @@ fn build_rtlsdr_rows() -> (
         .active(false)
         .build();
 
-    (sample_rate_row, gain_row, agc_row, ppm_row, bias_tee_row)
+    // Direct sampling — Disabled / I branch / Q branch. Order is
+    // load-bearing: the combo's selected index is cast straight
+    // to the `rtlsdr_set_direct_sampling` `mode` argument
+    // (0/1/2). Disabled is the default — only RTL-SDR Blog v3+
+    // dongles benefit, and only when the user is tuning HF.
+    // Per issue #538.
+    let direct_sampling_model = gtk4::StringList::new(&["Disabled", "I branch", "Q branch"]);
+    let direct_sampling_row = adw::ComboRow::builder()
+        .title("Direct Sampling")
+        .subtitle("Bypass the tuner for HF reception (RTL-SDR Blog v3+)")
+        .model(&direct_sampling_model)
+        .selected(DIRECT_SAMPLING_DISABLED_IDX)
+        .build();
+
+    // Offset tuning — pushes the LO away from the requested
+    // centre frequency to dodge the DC spike that lives at the
+    // LO position. Most relevant on E4000 tuners; support
+    // varies by tuner and driver. R820T/R828D reject the
+    // request with `InvalidParameter` (surfaced as a
+    // `TuneFailed` toast by the wiring in `window.rs`). Off by
+    // default to keep behavior predictable across hardware. Per
+    // issue #539.
+    let offset_tuning_row = adw::SwitchRow::builder()
+        .title("Offset Tuning")
+        .subtitle("Shift LO off the tuned freq to avoid the DC spike")
+        .active(false)
+        .build();
+
+    (
+        sample_rate_row,
+        gain_row,
+        agc_row,
+        ppm_row,
+        bias_tee_row,
+        direct_sampling_row,
+        offset_tuning_row,
+    )
 }
 
 /// Build network-specific rows: hostname, port, protocol.
@@ -584,6 +670,67 @@ fn build_common_rows() -> (
     )
 }
 
+/// Apply the per-device visibility policy to every row whose
+/// visibility depends on the selected source type. Single source
+/// of truth for the policy — both [`build_source_panel`]'s
+/// initial render block AND [`connect_device_visibility`]'s
+/// `connect_selected_notify` handler call this so they can never
+/// drift as rows evolve. Per `CodeRabbit` round 1 on PR #559.
+///
+/// Policy:
+/// - **Tune controls** (sample rate, gain, AGC, PPM): visible
+///   for local RTL-SDR USB AND remote `rtl_tcp` — both route
+///   through the `Source` trait's `set_gain` / `set_gain_mode` /
+///   `set_ppm_correction` hooks, and `RtlTcpSource` forwards
+///   them as wire commands.
+/// - **Bias tee, direct sampling, offset tuning**: visible only
+///   for local RTL-SDR USB. The `rtl_tcp` wire protocol exposes
+///   equivalents but this panel doesn't surface them today (the
+///   server-side panel has its own bias-T toggle); the `Source`
+///   trait defaults silently drop these commands on
+///   file/network sources.
+/// - **Hostname / port**: visible for raw-IQ Network AND
+///   `rtl_tcp` — both dial a host:port. **Protocol** (TCP / UDP)
+///   only applies to raw Network — `rtl_tcp` always rides on
+///   TCP.
+/// - **File path**: visible only for File source.
+#[allow(clippy::too_many_arguments)]
+fn apply_source_row_visibility(
+    selected: u32,
+    sample_rate_row: &adw::ComboRow,
+    gain_row: &adw::SpinRow,
+    agc_row: &adw::ComboRow,
+    ppm_row: &adw::SpinRow,
+    bias_tee_row: &adw::SwitchRow,
+    direct_sampling_row: &adw::ComboRow,
+    offset_tuning_row: &adw::SwitchRow,
+    hostname_row: &adw::EntryRow,
+    port_row: &adw::SpinRow,
+    protocol_row: &adw::ComboRow,
+    file_path_row: &adw::EntryRow,
+) {
+    let is_rtlsdr = selected == DEVICE_RTLSDR;
+    let is_network = selected == DEVICE_NETWORK;
+    let is_file = selected == DEVICE_FILE;
+    let is_rtltcp = selected == DEVICE_RTLTCP;
+
+    let tune_controls_visible = is_rtlsdr || is_rtltcp;
+    sample_rate_row.set_visible(tune_controls_visible);
+    gain_row.set_visible(tune_controls_visible);
+    agc_row.set_visible(tune_controls_visible);
+    ppm_row.set_visible(tune_controls_visible);
+
+    bias_tee_row.set_visible(is_rtlsdr);
+    direct_sampling_row.set_visible(is_rtlsdr);
+    offset_tuning_row.set_visible(is_rtlsdr);
+
+    hostname_row.set_visible(is_network || is_rtltcp);
+    port_row.set_visible(is_network || is_rtltcp);
+    protocol_row.set_visible(is_network);
+
+    file_path_row.set_visible(is_file);
+}
+
 /// Wire the device selector to show/hide source-specific rows.
 #[allow(clippy::too_many_arguments)]
 fn connect_device_visibility(
@@ -593,6 +740,8 @@ fn connect_device_visibility(
     agc_row: &adw::ComboRow,
     ppm_row: &adw::SpinRow,
     bias_tee_row: &adw::SwitchRow,
+    direct_sampling_row: &adw::ComboRow,
+    offset_tuning_row: &adw::SwitchRow,
     hostname_row: &adw::EntryRow,
     port_row: &adw::SpinRow,
     protocol_row: &adw::ComboRow,
@@ -610,6 +759,10 @@ fn connect_device_visibility(
         #[weak]
         bias_tee_row,
         #[weak]
+        direct_sampling_row,
+        #[weak]
+        offset_tuning_row,
+        #[weak]
         hostname_row,
         #[weak]
         port_row,
@@ -619,36 +772,20 @@ fn connect_device_visibility(
         file_path_row,
         move |row| {
             let selected = row.selected();
-            let is_rtlsdr = selected == DEVICE_RTLSDR;
-            let is_network = selected == DEVICE_NETWORK;
-            let is_file = selected == DEVICE_FILE;
-            let is_rtltcp = selected == DEVICE_RTLTCP;
-
-            // Tuning controls are meaningful for both the local dongle
-            // AND a remote rtl_tcp server (they route through the
-            // Source trait's set_gain / set_gain_mode / set_ppm_correction
-            // hooks, which RtlTcpSource implements by forwarding wire
-            // commands). Sample-rate row too — UiToDsp::SetSampleRate
-            // goes through Source::set_sample_rate either way.
-            let tune_controls_visible = is_rtlsdr || is_rtltcp;
-            sample_rate_row.set_visible(tune_controls_visible);
-            gain_row.set_visible(tune_controls_visible);
-            agc_row.set_visible(tune_controls_visible);
-            ppm_row.set_visible(tune_controls_visible);
-            // Bias tee is local-RTL-SDR only — see the
-            // initial-visibility block for the same gating
-            // rationale. Per issue #537.
-            bias_tee_row.set_visible(is_rtlsdr);
-
-            // Hostname / port entry is shared between raw-IQ Network
-            // and RTL-TCP modes. Protocol (TCP/UDP) only applies to
-            // raw Network — RTL-TCP always rides on TCP.
-            hostname_row.set_visible(is_network || is_rtltcp);
-            port_row.set_visible(is_network || is_rtltcp);
-            protocol_row.set_visible(is_network);
-
-            file_path_row.set_visible(is_file);
-
+            apply_source_row_visibility(
+                selected,
+                &sample_rate_row,
+                &gain_row,
+                &agc_row,
+                &ppm_row,
+                &bias_tee_row,
+                &direct_sampling_row,
+                &offset_tuning_row,
+                &hostname_row,
+                &port_row,
+                &protocol_row,
+                &file_path_row,
+            );
             tracing::debug!(device = selected, "source device changed");
         }
     ));
@@ -684,7 +821,15 @@ pub fn build_source_panel() -> SourcePanel {
         .model(&device_model)
         .build();
 
-    let (sample_rate_row, gain_row, agc_row, ppm_row, bias_tee_row) = build_rtlsdr_rows();
+    let (
+        sample_rate_row,
+        gain_row,
+        agc_row,
+        ppm_row,
+        bias_tee_row,
+        direct_sampling_row,
+        offset_tuning_row,
+    ) = build_rtlsdr_rows();
     let (hostname_row, port_row, protocol_row) = build_network_rows();
     let file_path_row = adw::EntryRow::builder()
         .title("File Path")
@@ -782,6 +927,8 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&agc_row);
     group.add(&ppm_row);
     group.add(&bias_tee_row);
+    group.add(&direct_sampling_row);
+    group.add(&offset_tuning_row);
     group.add(&hostname_row);
     group.add(&port_row);
     group.add(&protocol_row);
@@ -797,27 +944,32 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&rtl_tcp_auth_key_row);
     group.add(&bandwidth_advisory_row);
 
-    // Derive initial visibility from the selected device.
+    // Derive initial visibility from the selected device. Funnel
+    // through the same helper the change-notify handler uses so
+    // the policy lives in exactly one place. Per `CodeRabbit`
+    // round 1 on PR #559.
     let selected = device_row.selected();
-    let is_rtlsdr = selected == DEVICE_RTLSDR;
-    let is_network = selected == DEVICE_NETWORK;
-    let is_file = selected == DEVICE_FILE;
+    apply_source_row_visibility(
+        selected,
+        &sample_rate_row,
+        &gain_row,
+        &agc_row,
+        &ppm_row,
+        &bias_tee_row,
+        &direct_sampling_row,
+        &offset_tuning_row,
+        &hostname_row,
+        &port_row,
+        &protocol_row,
+        &file_path_row,
+    );
+    // RTL-TCP-specific rows aren't part of `apply_source_row_
+    // visibility` — they're handled by `connect_rtl_tcp_visibility`
+    // below for change-notify, but the initial render still
+    // needs to seed them. `is_rtltcp` is recomputed locally
+    // because the helper consumes `selected` and doesn't return
+    // the projection.
     let is_rtltcp = selected == DEVICE_RTLTCP;
-    let tune_controls_visible = is_rtlsdr || is_rtltcp;
-    sample_rate_row.set_visible(tune_controls_visible);
-    gain_row.set_visible(tune_controls_visible);
-    agc_row.set_visible(tune_controls_visible);
-    ppm_row.set_visible(tune_controls_visible);
-    // Bias tee is local-RTL-SDR only — the rtl_tcp wire
-    // protocol exposes a bias-T command but the rtl_tcp client
-    // doesn't currently surface it in this panel (the
-    // server-side panel has its own toggle). Keep this row
-    // hidden on RTL-TCP to match. Per issue #537.
-    bias_tee_row.set_visible(is_rtlsdr);
-    hostname_row.set_visible(is_network || is_rtltcp);
-    port_row.set_visible(is_network || is_rtltcp);
-    protocol_row.set_visible(is_network);
-    file_path_row.set_visible(is_file);
     rtl_tcp_discovered_row.set_visible(is_rtltcp);
     rtl_tcp_status_row.set_visible(is_rtltcp);
     rtl_tcp_role_row.set_visible(is_rtltcp);
@@ -835,6 +987,8 @@ pub fn build_source_panel() -> SourcePanel {
         &agc_row,
         &ppm_row,
         &bias_tee_row,
+        &direct_sampling_row,
+        &offset_tuning_row,
         &hostname_row,
         &port_row,
         &protocol_row,
@@ -859,6 +1013,8 @@ pub fn build_source_panel() -> SourcePanel {
         agc_row,
         ppm_row,
         bias_tee_row,
+        direct_sampling_row,
+        offset_tuning_row,
         hostname_row,
         port_row,
         protocol_row,
@@ -1200,6 +1356,54 @@ pub fn load_source_rtl_bias_tee(config: &Arc<ConfigManager>) -> bool {
 pub fn save_source_rtl_bias_tee(config: &Arc<ConfigManager>, enabled: bool) {
     config.write(|v| {
         v[KEY_SOURCE_RTL_BIAS_TEE] = serde_json::json!(enabled);
+    });
+}
+
+/// Load the persisted RTL2832 direct-sampling combo index.
+/// Defaults to [`DIRECT_SAMPLING_DISABLED_IDX`] when the key is
+/// missing, the value isn't numeric, or the parsed value falls
+/// outside the legal range `0..=DIRECT_SAMPLING_MAX_IDX` (e.g.
+/// a future build added more modes and the user rolled back).
+/// Per issue #538.
+#[must_use]
+pub fn load_source_rtl_direct_sampling_mode(config: &Arc<ConfigManager>) -> u32 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_RTL_DIRECT_SAMPLING_MODE)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&idx| idx <= DIRECT_SAMPLING_MAX_IDX)
+            .unwrap_or(DIRECT_SAMPLING_DISABLED_IDX)
+    })
+}
+
+/// Persist the direct-sampling combo index. Written on every
+/// `direct_sampling_row.connect_selected_notify` event in
+/// `window.rs::connect_source_panel`. Per issue #538.
+pub fn save_source_rtl_direct_sampling_mode(config: &Arc<ConfigManager>, mode: u32) {
+    config.write(|v| {
+        v[KEY_SOURCE_RTL_DIRECT_SAMPLING_MODE] = serde_json::json!(mode);
+    });
+}
+
+/// Load the persisted offset-tuning toggle. Defaults to `false`
+/// — most R820T-family dongles ignore the setting anyway, and a
+/// false default keeps tuning behavior predictable across
+/// hardware variants. Per issue #539.
+#[must_use]
+pub fn load_source_rtl_offset_tuning(config: &Arc<ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_SOURCE_RTL_OFFSET_TUNING)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Persist the offset-tuning toggle. Written on every
+/// `offset_tuning_row.connect_active_notify` event in
+/// `window.rs::connect_source_panel`. Per issue #539.
+pub fn save_source_rtl_offset_tuning(config: &Arc<ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_SOURCE_RTL_OFFSET_TUNING] = serde_json::json!(enabled);
     });
 }
 
@@ -1871,6 +2075,54 @@ mod tests {
             v[KEY_SOURCE_RTL_BIAS_TEE] = serde_json::json!("not a bool");
         });
         assert!(!load_source_rtl_bias_tee(&config));
+    }
+
+    /// #538 persistence: direct-sampling combo index.
+    #[test]
+    fn source_rtl_direct_sampling_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(
+            load_source_rtl_direct_sampling_mode(&config),
+            DIRECT_SAMPLING_DISABLED_IDX
+        );
+        save_source_rtl_direct_sampling_mode(&config, DIRECT_SAMPLING_Q_BRANCH_IDX);
+        assert_eq!(
+            load_source_rtl_direct_sampling_mode(&config),
+            DIRECT_SAMPLING_Q_BRANCH_IDX
+        );
+        save_source_rtl_direct_sampling_mode(&config, DIRECT_SAMPLING_I_BRANCH_IDX);
+        assert_eq!(
+            load_source_rtl_direct_sampling_mode(&config),
+            DIRECT_SAMPLING_I_BRANCH_IDX
+        );
+        // Corrupt value falls back to Disabled.
+        config.write(|v| v[KEY_SOURCE_RTL_DIRECT_SAMPLING_MODE] = serde_json::json!("not a u64"));
+        assert_eq!(
+            load_source_rtl_direct_sampling_mode(&config),
+            DIRECT_SAMPLING_DISABLED_IDX
+        );
+        // Out-of-range numeric falls back to Disabled — covers
+        // a stale config from a future build that added more
+        // direct-sampling modes than this build understands.
+        config.write(|v| v[KEY_SOURCE_RTL_DIRECT_SAMPLING_MODE] = serde_json::json!(99));
+        assert_eq!(
+            load_source_rtl_direct_sampling_mode(&config),
+            DIRECT_SAMPLING_DISABLED_IDX
+        );
+    }
+
+    /// #539 persistence: offset-tuning toggle.
+    #[test]
+    fn source_rtl_offset_tuning_round_trip_and_default() {
+        let config = make_config();
+        assert!(!load_source_rtl_offset_tuning(&config));
+        save_source_rtl_offset_tuning(&config, true);
+        assert!(load_source_rtl_offset_tuning(&config));
+        save_source_rtl_offset_tuning(&config, false);
+        assert!(!load_source_rtl_offset_tuning(&config));
+        // Corrupt value falls back to false.
+        config.write(|v| v[KEY_SOURCE_RTL_OFFSET_TUNING] = serde_json::json!("not a bool"));
+        assert!(!load_source_rtl_offset_tuning(&config));
     }
 
     /// #551 persistence: gain in dB.

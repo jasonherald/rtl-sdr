@@ -444,6 +444,61 @@ impl Source for RtlSdrSource {
         }
         Ok(())
     }
+
+    fn set_direct_sampling(&mut self, mode: i32) -> Result<(), SourceError> {
+        // Routes through `rtlsdr_set_direct_sampling`. Mode 0
+        // disables direct sampling (normal tuner path); 1 selects
+        // the I branch and 2 selects the Q branch — both bypass
+        // the tuner entirely and feed the ADC straight from the
+        // antenna input, which is how RTL-SDR Blog v3+ dongles
+        // tune below 28 MHz (the R820T tuner cuts off there).
+        // Most users want Q branch on a v3 dongle. Per issue
+        // #538.
+        //
+        // Defense-in-depth boundary check: the UI handler in
+        // `connect_source_panel` already validates the combo
+        // index against `DIRECT_SAMPLING_MAX_IDX` and the
+        // persistence loader range-clamps before dispatch, but
+        // any future caller (FFI consumer, scripted DSP test,
+        // etc.) could still wire a malformed `mode` here. Reject
+        // out-of-range values with a clear error rather than
+        // forwarding to the driver, which would either silently
+        // misbehave or surface a confusing low-level error. Per
+        // `CodeRabbit` round 1 on PR #559.
+        if !(0..=2).contains(&mode) {
+            return Err(SourceError::TuneFailed(format!(
+                "invalid direct sampling mode: {mode} (expected 0..=2)"
+            )));
+        }
+        if let Some(device) = &mut self.device {
+            device
+                .set_direct_sampling(mode)
+                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn set_offset_tuning(&mut self, enabled: bool) -> Result<(), SourceError> {
+        // Routes through `rtlsdr_set_offset_tuning`. Pushes the
+        // local oscillator off the tuned frequency so the DC
+        // spike that lives at the LO doesn't sit on top of the
+        // signal of interest. Most relevant on E4000 tuners; on
+        // R820T / R828D the driver in
+        // `crates/sdr-rtlsdr/src/device/frequency.rs` returns
+        // `InvalidParameter` ("offset tuning not supported for
+        // R82XX tuners"), and the call is also rejected while
+        // direct sampling is enabled. We surface either rejection
+        // as a `TuneFailed` toast rather than crashing — the user
+        // sees a clear "your tuner doesn't support this" message
+        // instead of a no-op. Per issue #539 + `CodeRabbit`
+        // round 1 on PR #559.
+        if let Some(device) = &mut self.device {
+            device
+                .set_offset_tuning(enabled)
+                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

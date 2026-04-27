@@ -16,7 +16,18 @@ use crate::init_event::InitEvent;
 use crate::sherpa_model::{self, SherpaModel};
 
 /// Bounded channel capacity for audio buffers from DSP → backend.
-pub(super) const AUDIO_CHANNEL_CAPACITY: usize = 256;
+///
+/// Sized to absorb a worst-case worker stall — sherpa Moonshine
+/// inference can take 1–2 seconds on a single utterance, and at
+/// typical NFM block cadence that's hundreds of audio chunks
+/// queued behind the worker. The previous `256` slot ceiling
+/// filled inside one decode and surfaced as a flood of
+/// `transcription channel full; retrying squelch edge next
+/// block` warns; `1024` gives enough headroom that a normal
+/// worker pause doesn't spam the log even when the warn is
+/// throttled. Per FYI-flood reported during PR for issues
+/// #538 / #539.
+pub(super) const AUDIO_CHANNEL_CAPACITY: usize = 1024;
 
 /// Polling interval for the audio receive loop when checking for cancellation.
 pub(super) const AUDIO_RECV_TIMEOUT: Duration = Duration::from_millis(100);
