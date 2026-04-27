@@ -6989,10 +6989,22 @@ fn connect_source_panel(
     // as bias-T above. The controller bridge
     // (`UiToDsp::SetOffsetTuning`) was already plumbed; only
     // wiring is new here.
+    //
+    // Only DISPATCH the persisted value when it's `true`. The
+    // librtlsdr R820T-family branch returns `InvalidParameter`
+    // for every `set_offset_tuning` call regardless of value —
+    // dispatching `false` at startup (the default for users
+    // who've never touched the toggle) generates a spurious
+    // "Offset tuning failed" toast on the vast majority of
+    // dongles. The driver default already matches `false`, so
+    // skipping the dispatch is semantically a no-op. Per issue
+    // #564.
     {
         let persisted = sidebar::source_panel::load_source_rtl_offset_tuning(config);
         panels.source.offset_tuning_row.set_active(persisted);
-        state.send_dsp(UiToDsp::SetOffsetTuning(persisted));
+        if persisted {
+            state.send_dsp(UiToDsp::SetOffsetTuning(true));
+        }
     }
     let state_offset = Rc::clone(state);
     let config_offset = std::sync::Arc::clone(config);
