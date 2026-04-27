@@ -50,6 +50,22 @@ pub struct AppState {
     pub is_running: Cell<bool>,
     /// Current center frequency in Hz.
     pub center_frequency: Cell<f64>,
+    /// Latest VFO offset (Hz) the DSP is known to hold. Updated
+    /// from the [`spectrum::SpectrumHandle::connect_vfo_offset_changed`]
+    /// callback (which fires on both DSP echo via
+    /// `DspToUi::VfoOffsetChanged` AND direct user-drag dispatches),
+    /// so it stays in sync regardless of which path produced the
+    /// change.
+    ///
+    /// Read by [`crate::doppler_tracker`]'s wiring in `window.rs`
+    /// to gate its rate-limited `SetVfoOffset` dispatches —
+    /// without this echo-driven baseline, an external write
+    /// (spectrum drag, auto-record AOS reset) would leave the
+    /// tracker's local "last dispatched" value stale and the
+    /// next Doppler dispatch could be falsely suppressed by
+    /// `DOPPLER_DISPATCH_THRESHOLD_HZ`. Per CR round 7 on PR
+    /// #554.
+    pub last_dispatched_vfo_offset_hz: Cell<f64>,
     /// Current demodulation mode.
     pub demod_mode: Cell<DemodMode>,
     /// Sender for dispatching commands to the DSP thread.
@@ -144,6 +160,7 @@ impl AppState {
         Rc::new(Self {
             is_running: Cell::new(false),
             center_frequency: Cell::new(DEFAULT_CENTER_FREQUENCY_HZ),
+            last_dispatched_vfo_offset_hz: Cell::new(0.0),
             demod_mode: Cell::new(DemodMode::Wfm),
             ui_tx,
             suppress_bandwidth_notify: Cell::new(false),

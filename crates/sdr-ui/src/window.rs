@@ -603,6 +603,16 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     let state_for_vfo = Rc::clone(&state);
     let fs_for_vfo = freq_selector.clone();
     spectrum_handle.connect_vfo_offset_changed(move |offset_hz| {
+        // Single source of truth for the actual VFO offset DSP
+        // currently holds. Fires from BOTH the DSP echo
+        // (`DspToUi::VfoOffsetChanged`) and direct user-drag
+        // dispatches, so any path that mutates the VFO offset
+        // (auto-record AOS reset, spectrum drag, our own
+        // Doppler ticks, click-to-tune, etc.) keeps this in
+        // sync. Doppler's rate-limit gate reads from here so it
+        // never compares against a stale local baseline. Per CR
+        // round 7 on PR #554.
+        state_for_vfo.last_dispatched_vfo_offset_hz.set(offset_hz);
         let center = state_for_vfo.center_frequency.get();
         let tuned = center + offset_hz;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -9744,17 +9754,18 @@ fn connect_doppler_tracker(
 
     let tracker: Rc<RefCell<DopplerTracker>> = Rc::new(RefCell::new(DopplerTracker::new(initial)));
 
-    // Shared dispatch baseline: read by the 4 Hz recompute tick
-    // for its rate-limit gate; written by every path that
-    // dispatches a `SetVfoOffset` so subsequent material-change
-    // comparisons are against the latest actual DSP state, not a
-    // stale Doppler value. Per CR round 1 on PR #554: without
-    // resetting on the master-off and trigger-disengage fallbacks,
-    // a re-engagement could land within `DOPPLER_DISPATCH_THRESHOLD_HZ`
-    // of the prior live value and the first dispatch would be
-    // suppressed — leaving DSP on the user-reference baseline
-    // while the status bar shows active Doppler.
-    let last_dispatched: Rc<std::cell::Cell<f64>> = Rc::new(std::cell::Cell::new(0.0));
+    // The dispatch baseline lives on `AppState` as
+    // `last_dispatched_vfo_offset_hz` — written by the
+    // `connect_vfo_offset_changed` callback, which fires from
+    // BOTH the DSP echo (`DspToUi::VfoOffsetChanged`) and direct
+    // user-drag dispatches. The tracker reads from there for
+    // its rate-limit gate, so external writes (auto-record AOS
+    // reset, spectrum drag) keep the baseline in sync — no
+    // stale local value to worry about. Per CR round 7 on PR
+    // #554. The fallback paths below also write the baseline
+    // directly when they dispatch a `SetVfoOffset(user_ref)`
+    // flush, so re-engagement within `DOPPLER_DISPATCH_THRESHOLD_HZ`
+    // of the prior live value isn't suppressed.
 
     // Master-switch handler that drives the tracker. (A separate
     // change-notify handler in `restore_doppler_switch` already
@@ -9767,7 +9778,6 @@ fn connect_doppler_tracker(
         let tracker = Rc::clone(&tracker);
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
-        let last_dispatched = Rc::clone(&last_dispatched);
         panels
             .satellites
             .doppler_switch
@@ -9786,7 +9796,7 @@ fn connect_doppler_tracker(
                 // CR round 3 on PR #554.
                 if was_active && let Some(offset) = final_offset {
                     state.send_dsp(UiToDsp::SetVfoOffset(offset));
-                    last_dispatched.set(offset);
+                    state.last_dispatched_vfo_offset_hz.set(offset);
                     status_bar.update_doppler(None);
                 }
             });
@@ -9806,7 +9816,6 @@ fn connect_doppler_tracker(
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
         let panel_weak = panels.satellites.downgrade();
-        let last_dispatched = Rc::clone(&last_dispatched);
         let _ = glib::timeout_add_local(DOPPLER_TRIGGER_TICK, move || {
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -9912,7 +9921,7 @@ fn connect_doppler_tracker(
                     // the status badge.
                     drop(t);
                     state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
-                    last_dispatched.set(prior_user_ref);
+                    state.last_dispatched_vfo_offset_hz.set(prior_user_ref);
                     status_bar.update_doppler(None);
                 }
             }
@@ -9932,7 +9941,6 @@ fn connect_doppler_tracker(
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
         let panel_weak = panels.satellites.downgrade();
-        let last_dispatched = Rc::clone(&last_dispatched);
         let _ = glib::timeout_add_local(DOPPLER_RECOMPUTE_TICK, move || {
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -9959,7 +9967,7 @@ fn connect_doppler_tracker(
                 let _ = t.set_active(None);
                 drop(t);
                 state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
-                last_dispatched.set(prior_user_ref);
+                state.last_dispatched_vfo_offset_hz.set(prior_user_ref);
                 status_bar.update_doppler(None);
                 return glib::ControlFlow::Continue;
             }
@@ -9997,9 +10005,17 @@ fn connect_doppler_tracker(
             // format hides sub-100-Hz jitter naturally.
             status_bar.update_doppler(Some(doppler));
             // SetVfoOffset is rate-limited to material changes.
-            if (live - last_dispatched.get()).abs() > DOPPLER_DISPATCH_THRESHOLD_HZ {
+            // Baseline lives on `AppState` and is kept in sync by
+            // the `connect_vfo_offset_changed` callback (fires on
+            // both DSP echo and direct user-drag dispatches). Per
+            // CR round 7 on PR #554. We also write it eagerly at
+            // dispatch so a fast back-to-back tick before the
+            // echo round-trip doesn't over-dispatch — the echo
+            // arrives later with the same value, harmless.
+            let baseline = state.last_dispatched_vfo_offset_hz.get();
+            if (live - baseline).abs() > DOPPLER_DISPATCH_THRESHOLD_HZ {
                 state.send_dsp(UiToDsp::SetVfoOffset(live));
-                last_dispatched.set(live);
+                state.last_dispatched_vfo_offset_hz.set(live);
             }
             glib::ControlFlow::Continue
         });
