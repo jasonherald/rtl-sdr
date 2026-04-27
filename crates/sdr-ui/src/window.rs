@@ -9383,6 +9383,28 @@ fn connect_satellites_panel(
                     "Pass complete, but the APT viewer was closed — no image saved".to_string()
                 };
                 post_toast(&toast_overlay_weak, &result_msg);
+                // Close the APT viewer window now that the PNG
+                // is on disk — resets the viewer for the next
+                // pass instead of carrying stale lines forward.
+                // Per a user request during PR #554 live testing:
+                // "after we get LOS and save the png and/or wav
+                // file have it close the open window which
+                // resets it for the next time."
+                //
+                // Weak-ref upgrade fails closed: if the user
+                // already dismissed the window, there's nothing
+                // to close. The close-request handler in
+                // `open_apt_viewer_if_needed` clears both
+                // `apt_viewer` and `apt_viewer_window` slots so
+                // the next AOS opens a fresh viewer.
+                if let Some(window) = state_a
+                    .apt_viewer_window
+                    .borrow()
+                    .as_ref()
+                    .and_then(glib::WeakRef::upgrade)
+                {
+                    window.close();
+                }
             }
             RecorderAction::SaveLrptPass(dir) => {
                 // Walk every APID present in the SHARED `LrptImage`
@@ -9428,6 +9450,11 @@ fn connect_satellites_panel(
                         .collect()
                 };
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
+                // Clone state for the post-save viewer-close
+                // — we need to read `state.lrpt_viewer_window`
+                // after the spawn_blocking completes, which
+                // requires capturing state into the future.
+                let state_lrpt_close = Rc::clone(&state_a);
                 glib::spawn_future_local(async move {
                     let dir_for_msg = dir.clone();
                     let result_msg = gio::spawn_blocking(move || {
@@ -9514,6 +9541,29 @@ fn connect_satellites_panel(
                         )
                     });
                     post_toast(&toast_overlay_weak_for_save, &result_msg);
+                    // Close the LRPT viewer window now that the
+                    // PNGs are on disk — resets the viewer for
+                    // the next pass instead of carrying stale
+                    // APIDs forward. Per a user request during
+                    // PR #554 live testing.
+                    //
+                    // Runs on the GLib main loop (we re-entered
+                    // it via `spawn_future_local`), so the weak
+                    // upgrade + `.close()` is main-thread-safe.
+                    // Weak-ref upgrade fails closed: if the user
+                    // already dismissed the window, there's
+                    // nothing to close. The close-request
+                    // handler in `open_lrpt_viewer_if_needed`
+                    // clears the AppState slots so the next AOS
+                    // opens a fresh viewer.
+                    if let Some(window) = state_lrpt_close
+                        .lrpt_viewer_window
+                        .borrow()
+                        .as_ref()
+                        .and_then(glib::WeakRef::upgrade)
+                    {
+                        window.close();
+                    }
                 });
             }
             RecorderAction::RestoreTune(saved) => {
@@ -9919,6 +9969,20 @@ fn connect_doppler_tracker(
                     // the pre-engage user reference (captured
                     // before `set_active` reset it) and clear
                     // the status badge.
+                    //
+                    // We don't need to explicitly clear the
+                    // tracker's `user_reference_offset_hz` here
+                    // — `set_active(None)` already did it on
+                    // line 216 of `doppler_tracker.rs` (the
+                    // `if changed { self.user_reference_offset_hz = 0.0; }`
+                    // branch), and the
+                    // `satellite_to_none_resets_user_reference_offset`
+                    // unit test pins that invariant. The
+                    // `prior_user_ref` we dispatch is the value
+                    // captured pre-`set_active`, so DSP gets the
+                    // user's pre-engage baseline; the tracker's
+                    // own field is already 0 for the next
+                    // engagement. Per CR round 8 on PR #554.
                     drop(t);
                     state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
                     state.last_dispatched_vfo_offset_hz.set(prior_user_ref);

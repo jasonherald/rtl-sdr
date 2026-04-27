@@ -129,6 +129,16 @@ pub struct AppState {
     /// `close-request` fires, not when the `GObject`'s last strong
     /// ref happens to drop.
     pub apt_viewer: RefCell<Option<crate::apt_viewer::AptImageView>>,
+    /// Weak handle to the open APT viewer window. Populated by
+    /// [`crate::apt_viewer::open_apt_viewer_if_needed`]; cleared
+    /// by the window's `close-request` handler alongside
+    /// `apt_viewer`. Auto-record's LOS save path uses this to
+    /// `.close()` the viewer after the PNG export finishes so
+    /// the next pass starts with a fresh viewer instead of
+    /// stale lines from the prior pass. Mirrors the
+    /// `lrpt_viewer_window` weak-ref pattern. Per a user
+    /// request during PR #554 live testing.
+    pub apt_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
     /// Currently-open Meteor-M LRPT viewer window, or `None`
     /// when no viewer is open. Same lifecycle pattern as
     /// `apt_viewer` above. Per epic #469 task 7.
@@ -173,6 +183,7 @@ impl AppState {
             last_rtl_tcp_state_disc: Cell::new(RTL_TCP_STATE_DISC_DISCONNECTED),
             rtl_tcp_active_server: RefCell::new(String::new()),
             apt_viewer: RefCell::new(None),
+            apt_viewer_window: RefCell::new(None),
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
@@ -202,6 +213,24 @@ mod tests {
         assert!(!state.is_running.get());
         assert!((state.center_frequency.get() - DEFAULT_CENTER_FREQUENCY_HZ).abs() < f64::EPSILON);
         assert_eq!(state.demod_mode.get(), DemodMode::Wfm);
+    }
+
+    #[test]
+    fn last_dispatched_vfo_offset_hz_defaults_to_zero() {
+        // Pin the Doppler dispatch baseline default. Per CR
+        // round 8 on PR #554 — without this regression test, a
+        // future change to the seeded value would silently break
+        // the rate-limit gate's "compare against actual current
+        // DSP state" invariant. The first 4 Hz Doppler tick
+        // computes `live - baseline`; if `baseline` starts at
+        // anything but 0, that comparison is wrong until the
+        // first echo from a real `SetVfoOffset` lands.
+        let state = make_test_state();
+        assert!(
+            (state.last_dispatched_vfo_offset_hz.get() - 0.0).abs() < f64::EPSILON,
+            "got {}",
+            state.last_dispatched_vfo_offset_hz.get()
+        );
     }
 
     #[test]
