@@ -278,14 +278,19 @@ pub enum Action {
     StopAutoAudioRecord,
     /// Flush in-flight imaging-decoder state between passes.
     /// Fired alongside [`Action::SavePng`] /
-    /// [`Action::SaveLrptPass`] on the `Recording → Finalizing`
-    /// transition. Without it, when the user was already
-    /// running pre-AOS (`SavedTune.was_running == true`), the
-    /// source stays open across the LOS → AOS boundary and the
-    /// LRPT pipeline's `ImageAssembler` + APT decoder
-    /// accumulator retain pass N's state when pass N+1 begins.
-    /// Wiring layer maps to `UiToDsp::ResetImagingDecoders`.
-    /// Per issue #544.
+    /// [`Action::SaveLrptPass`] on either LOS transition path —
+    /// the normal `Recording → Finalizing` (end-of-pass) AND
+    /// the `BeforePass → Finalizing` short-circuit (1 Hz driver
+    /// stalled, or pass entirely inside the settle window).
+    /// Both paths build the action vec via `los_actions_for`,
+    /// which guarantees save → optional stop-audio → reset
+    /// ordering. Without it, when the user was already running
+    /// pre-AOS (`SavedTune.was_running == true`), the source
+    /// stays open across the LOS → AOS boundary and the LRPT
+    /// pipeline's `ImageAssembler` + APT decoder accumulator
+    /// retain pass N's state when pass N+1 begins. Wiring
+    /// layer maps to `UiToDsp::ResetImagingDecoders`. Per
+    /// issue #544 + `CodeRabbit` round 1 on PR #560.
     ResetImagingDecoders,
     /// Restore the radio to the pre-recording tune. Fired on
     /// `Finalizing → Idle`. Caller dispatches the same triple
@@ -1217,12 +1222,7 @@ mod tests {
             default_tune(),
         );
         assert!(matches!(r.state(), State::Finalizing { .. }));
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::ResetImagingDecoders)),
-            "BeforePass→Finalizing must emit Action::ResetImagingDecoders even when stalled past LOS; got {actions:?}",
-        );
+        assert_save_before_reset(&actions, "BeforePass-stall LOS");
     }
 
     #[test]
@@ -1875,6 +1875,31 @@ mod tests {
     /// stays open across the LOS → AOS boundary. Pinning the
     /// emit here so the wiring layer's between-pass cleanup
     /// hook can't go stealth-quiet on a refactor.
+    ///
+    /// Helper for the three LOS-reset tests below: assert the
+    /// LOS contract that save runs BEFORE reset — the save
+    /// action's snapshot read of the shared `LrptImage` would
+    /// otherwise capture an empty buffer instead of the
+    /// just-finished pass. Pure positional assertion, panics
+    /// with a clear message that includes the offending action
+    /// vec. Per `CodeRabbit` round 2 on PR #560.
+    fn assert_save_before_reset(actions: &[Action], label: &str) {
+        let save_idx = actions
+            .iter()
+            .position(|a| matches!(a, Action::SavePng(_) | Action::SaveLrptPass(_)))
+            .unwrap_or_else(|| panic!("{label}: LOS must emit a save action; got {actions:?}"));
+        let reset_idx = actions
+            .iter()
+            .position(|a| matches!(a, Action::ResetImagingDecoders))
+            .unwrap_or_else(|| {
+                panic!("{label}: LOS must emit Action::ResetImagingDecoders; got {actions:?}")
+            });
+        assert!(
+            save_idx < reset_idx,
+            "{label}: save must precede reset; got {actions:?}",
+        );
+    }
+
     #[test]
     fn los_emits_reset_imaging_decoders() {
         let mut r = AutoRecorder::new();
@@ -1897,12 +1922,7 @@ mod tests {
         );
         let los_plus = pass.end + ChronoDuration::seconds(1);
         let los_actions = r.tick(los_plus, &[pass], true, false, default_tune());
-        assert!(
-            los_actions
-                .iter()
-                .any(|a| matches!(a, Action::ResetImagingDecoders)),
-            "LOS must emit Action::ResetImagingDecoders; got {los_actions:?}",
-        );
+        assert_save_before_reset(&los_actions, "single-pass LOS");
     }
 
     /// Per #544: two back-to-back passes must each emit their
@@ -1947,6 +1967,7 @@ mod tests {
             .filter(|a| matches!(a, Action::ResetImagingDecoders))
             .count();
         assert_eq!(reset_count_1, 1, "pass 1 LOS must emit exactly one reset");
+        assert_save_before_reset(&los_1_actions, "pass 1 LOS");
 
         // Settle from Finalizing back to Idle (the next tick after
         // LOS does Finalizing → Idle and emits RestoreTune).
@@ -1978,5 +1999,6 @@ mod tests {
             .filter(|a| matches!(a, Action::ResetImagingDecoders))
             .count();
         assert_eq!(reset_count_2, 1, "pass 2 LOS must emit exactly one reset");
+        assert_save_before_reset(&los_2_actions, "pass 2 LOS");
     }
 }
