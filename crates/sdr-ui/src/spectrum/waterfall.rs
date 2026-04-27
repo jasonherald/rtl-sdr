@@ -14,7 +14,9 @@
 
 use gtk4::cairo;
 
+use super::ScannerAxisLock;
 use super::colormap;
+use super::fft_plot::bin_to_locked_x;
 
 /// Number of history lines stored in the display buffer.
 const HISTORY_LINES: usize = 1024;
@@ -187,6 +189,91 @@ impl WaterfallRenderer {
             self.pixel_buf[idx + 1] = color[1]; // G
             self.pixel_buf[idx + 2] = color[2]; // R
             self.pixel_buf[idx + 3] = color[3]; // A
+        }
+    }
+
+    /// Push a new FFT line under the scanner X-axis lock. Sibling
+    /// of [`Self::push_line`]. The narrow FFT data lands in the
+    /// active channel's pixel slice of the wider locked range;
+    /// the rest of the row gets `colormap[0]` (the "no signal"
+    /// floor colour, dark grey) so historical rows render as a
+    /// sparse spatial picture of the channels the scanner has
+    /// touched. Per issue #516.
+    ///
+    /// Behaviour notes:
+    /// - When `lock.active_channel_hz` is `None` (scanner mode
+    ///   engaged but no channel currently sampled), the entire
+    ///   row gets `colormap[0]`. This still advances the ring
+    ///   buffer so historical rows scroll downward at the
+    ///   normal cadence even during retunes between channels.
+    /// - Bins falling outside `[lock.min_hz, lock.max_hz]` are
+    ///   silently dropped — happens when the FFT span exceeds
+    ///   the locked range (rare; LF/HF dongles with the
+    ///   scanner band entirely fitting inside one FFT frame).
+    /// - Per-pixel max-pool: when multiple bins map to the
+    ///   same pixel (channel narrower than the FFT), the
+    ///   loudest bin wins. Same trade-off as `downsample_to`
+    ///   for the unlocked path — preserves peaks.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn push_line_locked(&mut self, fft_data: &[f32], full_bw_hz: f64, lock: &ScannerAxisLock) {
+        let db_range = self.max_db - self.min_db;
+        if !db_range.is_finite() || db_range <= 0.0 {
+            return;
+        }
+
+        // Step 1 — fill the row with the dark-grey "no signal"
+        // floor. We always do this even when active is None so
+        // the ring buffer gets fresh content (rather than a
+        // stale row from N rotations ago) on every push.
+        self.row_buffer.fill(0);
+
+        // Step 2 — when a channel is active, project narrow
+        // bins into the active slice's pixels.
+        if let Some(active_hz) = lock.active_channel_hz {
+            let n_bins = fft_data.len();
+            let w = self.display_width as f64;
+            for (i, &db) in fft_data.iter().enumerate() {
+                let x = bin_to_locked_x(
+                    i,
+                    n_bins,
+                    full_bw_hz,
+                    active_hz,
+                    lock.min_hz,
+                    lock.max_hz,
+                    w,
+                );
+                if !x.is_finite() || x < 0.0 || x >= w {
+                    continue;
+                }
+                let pixel_idx = x as usize;
+                let normalized = ((db - self.min_db) / db_range).clamp(0.0, 1.0);
+                let val = (normalized * 255.0).round() as u8;
+                // Per-pixel max-pool: narrow channels squeeze
+                // many bins per pixel, and we want the loudest
+                // to win. Same rationale as `downsample_to` for
+                // the unlocked path. Per issue #516.
+                if val > self.row_buffer[pixel_idx] {
+                    self.row_buffer[pixel_idx] = val;
+                }
+            }
+        }
+
+        // Step 3 — advance the ring + write pixels. Identical
+        // to the unlocked tail-end of `push_line`.
+        self.top_row = (self.top_row + HISTORY_LINES - 1) % HISTORY_LINES;
+        let row_bytes = self.display_width * 4;
+        let row_start = self.top_row * row_bytes;
+        for (i, &val) in self.row_buffer.iter().enumerate() {
+            let color = self.colormap_bgra[val as usize];
+            let idx = row_start + i * 4;
+            self.pixel_buf[idx] = color[0];
+            self.pixel_buf[idx + 1] = color[1];
+            self.pixel_buf[idx + 2] = color[2];
+            self.pixel_buf[idx + 3] = color[3];
         }
     }
 
@@ -747,6 +834,87 @@ mod tests {
                 linear_pixel(&linear, WIDTH_SMALL, visual_row, 0),
                 floor,
                 "display row {visual_row} must be the DB_LOW line"
+            );
+        }
+    }
+
+    /// Per #516: scanner-axis sparse fill. With a 4 MHz locked
+    /// range and a 250 kHz FFT centred at 146 MHz, only the
+    /// pixel slice corresponding to `[145.875, 146.125] MHz`
+    /// should carry signal-coloured pixels; the rest of the row
+    /// must read `colormap[0]` ("no signal" floor).
+    #[test]
+    fn push_line_locked_writes_only_active_slice() {
+        const WIDTH: usize = 1024;
+        let mut r = WaterfallRenderer::new(WIDTH);
+        r.set_db_range(DEFAULT_MIN_DB, DEFAULT_MAX_DB);
+        let floor = r.colormap_bgra[0];
+        let saturation = r.colormap_bgra[255];
+
+        // 250 kHz FFT, all bins at saturation. Channel sits in
+        // the middle of a 4 MHz scanner range.
+        let fft = vec![0.0_f32; 256]; // 0 dB == DEFAULT_MAX_DB == sat
+        let lock = ScannerAxisLock {
+            min_hz: 144_000_000.0,
+            max_hz: 148_000_000.0,
+            active_channel_hz: Some(146_000_000.0),
+            active_channel_bw_hz: Some(25_000.0),
+        };
+        r.push_line_locked(&fft, 250_000.0, &lock);
+
+        let linear = r.linearized_pixel_buf();
+        // Active channel + FFT span maps to absolute frequency
+        // [145.875M, 146.125M]. Within the [144M, 148M] range
+        // and 1024 px width, the FFT's first bin lands at
+        // pixel 480 and the last bin lands at pixel 544
+        // (inclusive — `bin_to_locked_x` puts bin N-1 at
+        // exactly active + bw/2, which yields `x = 544.0` for
+        // these inputs). Outside `[480, 544]`, every pixel
+        // must be `colormap[0]`.
+        for px in 0..WIDTH {
+            let bgra = linear_pixel(&linear, WIDTH, 0, px);
+            if (480..=544).contains(&px) {
+                assert_eq!(
+                    bgra, saturation,
+                    "px {px} (inside active slice) must carry signal colour"
+                );
+            } else {
+                assert_eq!(
+                    bgra, floor,
+                    "px {px} (outside active slice) must carry colormap[0]"
+                );
+            }
+        }
+    }
+
+    /// Per #516: when the scanner has engaged but no channel is
+    /// active yet (between `enter_scanner_mode` and the first
+    /// `set_scanner_active_channel`), the push must still
+    /// advance the ring and produce a uniform `colormap[0]` row
+    /// — historical rows scroll downward at the normal cadence,
+    /// just dark.
+    #[test]
+    fn push_line_locked_with_no_active_channel_fills_dark() {
+        const WIDTH: usize = 1024;
+        let mut r = WaterfallRenderer::new(WIDTH);
+        r.set_db_range(DEFAULT_MIN_DB, DEFAULT_MAX_DB);
+        let floor = r.colormap_bgra[0];
+
+        let fft = vec![0.0_f32; 256];
+        let lock = ScannerAxisLock {
+            min_hz: 144_000_000.0,
+            max_hz: 148_000_000.0,
+            active_channel_hz: None,
+            active_channel_bw_hz: None,
+        };
+        r.push_line_locked(&fft, 250_000.0, &lock);
+
+        let linear = r.linearized_pixel_buf();
+        for px in 0..WIDTH {
+            assert_eq!(
+                linear_pixel(&linear, WIDTH, 0, px),
+                floor,
+                "px {px}: with no active channel, the entire row must be colormap[0]",
             );
         }
     }

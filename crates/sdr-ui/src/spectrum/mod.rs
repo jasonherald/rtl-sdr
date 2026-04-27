@@ -248,7 +248,18 @@ impl SpectrumHandle {
             if target_width != s.renderer.texture_width() {
                 s.renderer.resize(data.len());
             }
-            s.renderer.push_line(data);
+            // Scanner-axis lock takes precedence: project narrow
+            // bins into the active channel's pixel slice with
+            // dark-grey fill of unsampled regions, so historical
+            // rows render as a sparse spatial picture of every
+            // channel the scanner has touched. Per issue #516.
+            let lock = *self.scanner_axis_lock.borrow();
+            if let Some(lock) = lock {
+                s.renderer
+                    .push_line_locked(data, self.full_bandwidth.get(), &lock);
+            } else {
+                s.renderer.push_line(data);
+            }
         }
         self.waterfall_area.queue_draw();
     }
@@ -550,6 +561,7 @@ pub fn build_spectrum_view(
         Rc::clone(&waterfall_state),
         Rc::clone(&vfo_state),
         Rc::clone(&full_bandwidth),
+        Rc::clone(&scanner_axis_lock),
     );
     let signal_history_area =
         build_signal_history_area(Rc::clone(&signal_history_state), &min_db, &max_db);
@@ -775,6 +787,7 @@ fn build_waterfall_area(
     state: Rc<RefCell<Option<WaterfallState>>>,
     vfo_state: Rc<RefCell<VfoState>>,
     full_bandwidth: Rc<Cell<f64>>,
+    scanner_axis_lock: Rc<RefCell<Option<ScannerAxisLock>>>,
 ) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::builder()
         .hexpand(true)
@@ -783,6 +796,21 @@ fn build_waterfall_area(
 
     area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow().as_ref() {
+            // Scanner-axis lock: pixels are pre-projected to
+            // the wide locked range at push time, so the
+            // renderer just needs a no-zoom call (display
+            // matches full surface 1:1). VFO overlay is
+            // suppressed because its drag-to-tune semantics
+            // don't apply to a multi-channel range. Per issue
+            // #516.
+            let lock = *scanner_axis_lock.borrow();
+            if lock.is_some() {
+                let bw = full_bandwidth.get();
+                let half = bw / 2.0;
+                s.renderer.render(cr, width, height, -half, half, bw);
+                return;
+            }
+
             let vfo = vfo_state.borrow();
             s.renderer.render(
                 cr,
