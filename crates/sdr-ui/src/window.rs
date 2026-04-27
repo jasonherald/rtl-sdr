@@ -632,6 +632,38 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar_for_vfo.update_frequency(tuned);
     });
 
+    // Scanner-locked click-to-tune (#563). When the scanner-axis
+    // lock is engaged and the user clicks the spectrum, the
+    // gesture handler calls this callback with the absolute
+    // frequency under the click. We force-disable the scanner
+    // (which tears down the lock via the master switch's
+    // `connect_active_notify`), then dispatch a normal manual
+    // tune — same end shape as the freq-selector path below.
+    // Force-disable runs FIRST so the engine sees
+    // `SetScannerEnabled(false)` before the `Tune`, and the
+    // subsequent retune lands on an Idle scanner.
+    let status_bar_for_locked_click = Rc::clone(&status_bar_demod);
+    let state_for_locked_click = Rc::clone(&state);
+    let spectrum_for_locked_click = Rc::clone(&spectrum_handle);
+    let freq_selector_for_locked_click = freq_selector.clone();
+    let force_disable_for_locked_click = Rc::clone(&scanner_force_disable);
+    let radio_for_locked_click = panels.radio.clone();
+    spectrum_handle.connect_locked_click_to_tune(move |freq_hz| {
+        tracing::debug!(
+            freq_hz,
+            "scanner-locked click-to-tune: force-disable + tune"
+        );
+        force_disable_for_locked_click.trigger("scanner spectrum click");
+        state_for_locked_click.center_frequency.set(freq_hz);
+        state_for_locked_click.send_dsp(UiToDsp::Tune(freq_hz));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let freq_u64 = freq_hz.max(0.0) as u64;
+        freq_selector_for_locked_click.set_frequency(freq_u64);
+        status_bar_for_locked_click.update_frequency(freq_hz);
+        spectrum_for_locked_click.set_center_frequency(freq_hz);
+        radio_for_locked_click.update_distance_frequency(freq_hz);
+    });
+
     let status_bar_for_freq = Rc::clone(&status_bar_demod);
     let state_freq = Rc::clone(&state);
     let spectrum_for_freq = Rc::clone(&spectrum_handle);
