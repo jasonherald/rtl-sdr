@@ -32,11 +32,14 @@
 //!
 //! ## GC
 //!
-//! `fired` is pruned every tick: any entry whose `pass.end` is in
-//! the past is dropped. So the set's size is bounded by
-//! "concurrently in-flight or upcoming passes" — typically a
-//! handful at most. Without GC the set would grow unbounded over
-//! a long-running session.
+//! `fired` is pruned every [`tick`](NotifyScheduler::tick): an
+//! entry is dropped once `pass.start + GC_GRACE` is in the past.
+//! `GC_GRACE` is sized to outlast any realistic LEO pass plus a
+//! margin (30 min today) so an in-window notification can't get a
+//! duplicate fire from the GC racing the next tick. The set's
+//! steady-state size is bounded by "concurrently in-flight or
+//! upcoming passes" — typically a handful at most. Without GC the
+//! set would grow unbounded over a long-running session.
 
 use std::collections::HashSet;
 

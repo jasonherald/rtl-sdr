@@ -491,12 +491,25 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // viewer should have closed). Backtrace is `Backtrace::capture`
     // so it costs nothing unless `RUST_BACKTRACE=1` is set. Per
     // PR #558 auto-record-close investigation.
+    //
+    // Also unregister `app.tune-satellite` here. The action was
+    // registered on the GApplication (because notification action
+    // targets resolve against the app's action map), but its
+    // closure captures window-owned widgets via `tune_to_satellite`.
+    // A pre-pass notification that sits in the daemon and gets
+    // clicked AFTER the window closes would fire the closure
+    // against destroyed widgets — silent setter calls + a `Tune`
+    // dispatch into a torn-down DSP channel. Removing the action
+    // on close means that click is treated as "no such action"
+    // rather than "tune via stale state". Per CR round 1 on PR #568.
+    let app_for_close = app.clone();
     window.connect_close_request(move |_| {
         let bt = std::backtrace::Backtrace::capture();
         tracing::info!(
             backtrace = ?bt,
             "main window close-request fired",
         );
+        app_for_close.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
         transcription_engine.borrow_mut().shutdown_nonblocking();
         glib::Propagation::Proceed
     });
@@ -9680,7 +9693,6 @@ fn connect_satellites_panel(
                     // wouldn't drop the bell_btn, which would keep
                     // the closure (and the Vec) pinned forever.
                     let displayed_for_toggle = Rc::downgrade(&displayed_recompute);
-                    let satellite_for_toggle = pass.satellite.clone();
                     bell_btn.connect_toggled(move |b| {
                         let active = b.is_active();
                         {
@@ -9703,11 +9715,19 @@ fn connect_satellites_panel(
                         // simply skip mirroring — the watched-set
                         // write above is the only persistent
                         // effect that matters at that point.
+                        //
+                        // Match siblings by NORAD id, not display
+                        // name: the watched set is keyed by id, and
+                        // any future catalog drift where two entries
+                        // share a label (alternate names, alias
+                        // entries) would otherwise toggle the wrong
+                        // satellite's bells. Per CR round 1 on PR
+                        // #568.
                         let Some(displayed) = displayed_for_toggle.upgrade() else {
                             return;
                         };
                         for entry in displayed.borrow().iter() {
-                            if entry.pass.satellite == satellite_for_toggle
+                            if norad_id_for_pass(&entry.pass) == Some(norad_id)
                                 && let Some(other) = &entry.bell_btn
                                 && other.as_ptr() != b.as_ptr()
                                 && other.is_active() != active

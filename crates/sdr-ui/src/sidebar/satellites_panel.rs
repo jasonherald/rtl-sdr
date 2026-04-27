@@ -440,7 +440,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     let notify_group = adw::PreferencesGroup::builder()
         .title("Notifications")
         .description(
-            "Click 🔔 next to a pass to subscribe; you'll get a desktop \
+            "Click the bell next to a pass to subscribe; you'll get a desktop \
              alert this many minutes before the satellite comes overhead.",
         )
         .build();
@@ -676,8 +676,15 @@ pub fn load_notify_lead_min(config: &Arc<ConfigManager>) -> u32 {
     raw.clamp(NOTIFY_LEAD_MIN_LOWER, NOTIFY_LEAD_MIN_UPPER)
 }
 
-/// Persist the pre-pass notify lead time (whole minutes). Per #510.
+/// Persist the pre-pass notify lead time (whole minutes). Clamps
+/// to `[NOTIFY_LEAD_MIN_LOWER, NOTIFY_LEAD_MIN_UPPER]` before
+/// writing — `load_notify_lead_min` clamps on read too, but
+/// clamping at the writer keeps the on-disk contract honest for
+/// any caller (tests, CLI tooling, future scripted edits) that
+/// hands us a raw value. Per #510 / CR round 1 on PR #568.
 pub fn save_notify_lead_min(config: &Arc<ConfigManager>, lead_min: u32) {
+    use super::satellites_notify::{NOTIFY_LEAD_MIN_LOWER, NOTIFY_LEAD_MIN_UPPER};
+    let lead_min = lead_min.clamp(NOTIFY_LEAD_MIN_LOWER, NOTIFY_LEAD_MIN_UPPER);
     config.write(|v| {
         v[KEY_NOTIFY_LEAD_MIN] = serde_json::json!(lead_min);
     });
@@ -1081,7 +1088,7 @@ mod tests {
         // Mixed-type array — strings / out-of-u32-range numbers
         // get silently dropped; the valid u32s survive.
         let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({
-            "sat_watched_norad_ids": [33591, "junk", 9999999999u64, 40069],
+            "sat_watched_norad_ids": [33591, "junk", 9_999_999_999_u64, 40069],
         })));
         let loaded = load_watched_satellites(&cfg);
         let expected: std::collections::HashSet<u32> = [33591u32, 40069u32].into_iter().collect();
