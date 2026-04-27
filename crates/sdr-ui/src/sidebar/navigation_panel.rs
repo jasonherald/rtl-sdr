@@ -431,6 +431,30 @@ pub fn project_scanner_channels(
         .collect()
 }
 
+/// Compute the (min, max) frequency envelope of a scanner channel
+/// list — the lower edge of the lowest-frequency channel's
+/// passband to the upper edge of the highest-frequency channel's
+/// passband, both in absolute Hz. Used by the scanner-axis-lock
+/// (#516) to pin the spectrum/waterfall X axis to the full range
+/// the scanner sweeps across.
+///
+/// Returns `None` if the channel list is empty (scanner has no
+/// channels selected, so there's no meaningful range to lock).
+/// Per issue #516.
+#[must_use]
+pub fn scanner_channel_envelope(channels: &[sdr_scanner::ScannerChannel]) -> Option<(f64, f64)> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for ch in channels {
+        let half_bw = ch.bandwidth / 2.0;
+        #[allow(clippy::cast_precision_loss)]
+        let center = ch.key.frequency_hz as f64;
+        min = min.min(center - half_bw);
+        max = max.max(center + half_bw);
+    }
+    if max > min { Some((min, max)) } else { None }
+}
+
 /// Convenience: read the persisted default dwell/hang from config,
 /// project the bookmark list into scanner channels, and dispatch
 /// `UiToDsp::UpdateScannerChannels` so the running scanner picks up
@@ -1451,5 +1475,74 @@ mod tests {
         // Demod mode is parsed from the string form on the bookmark.
         assert_eq!(ch.demod_mode, DemodMode::Nfm);
         assert!((ch.bandwidth - 12_500.0).abs() < f64::EPSILON);
+    }
+
+    /// Per #516: envelope of an empty channel list is `None`.
+    #[test]
+    fn scanner_channel_envelope_empty_returns_none() {
+        let channels: Vec<sdr_scanner::ScannerChannel> = Vec::new();
+        assert_eq!(scanner_channel_envelope(&channels), None);
+    }
+
+    /// Per #516: single channel returns
+    /// `(centre - bw/2, centre + bw/2)`.
+    #[test]
+    fn scanner_channel_envelope_single_channel() {
+        let channels = vec![sdr_scanner::ScannerChannel {
+            key: sdr_scanner::ChannelKey {
+                name: "WX".to_string(),
+                frequency_hz: 162_550_000,
+            },
+            demod_mode: DemodMode::Nfm,
+            bandwidth: 12_500.0,
+            ctcss: None,
+            voice_squelch: None,
+            priority: 0,
+            dwell_ms: 1_000,
+            hang_ms: 3_000,
+        }];
+        let env = scanner_channel_envelope(&channels);
+        assert_eq!(env, Some((162_543_750.0, 162_556_250.0)));
+    }
+
+    /// Per #516: multiple channels span lowest-edge to
+    /// highest-edge across the union of all passbands. Channels
+    /// with different bandwidths are handled correctly — the
+    /// envelope must reach the actual edge of the WIDEST
+    /// channel at each end, not just the centres.
+    #[test]
+    fn scanner_channel_envelope_multi_channel_uses_edges() {
+        let channels = vec![
+            sdr_scanner::ScannerChannel {
+                key: sdr_scanner::ChannelKey {
+                    name: "Lower (NFM)".to_string(),
+                    frequency_hz: 146_000_000,
+                },
+                demod_mode: DemodMode::Nfm,
+                bandwidth: 12_500.0,
+                ctcss: None,
+                voice_squelch: None,
+                priority: 0,
+                dwell_ms: 1_000,
+                hang_ms: 3_000,
+            },
+            sdr_scanner::ScannerChannel {
+                key: sdr_scanner::ChannelKey {
+                    name: "Upper (WFM)".to_string(),
+                    frequency_hz: 155_000_000,
+                },
+                demod_mode: DemodMode::Wfm,
+                bandwidth: 200_000.0,
+                ctcss: None,
+                voice_squelch: None,
+                priority: 0,
+                dwell_ms: 1_000,
+                hang_ms: 3_000,
+            },
+        ];
+        let env = scanner_channel_envelope(&channels);
+        // Lower edge: 146M - 6250 = 145.99375M
+        // Upper edge: 155M + 100k = 155.100M
+        assert_eq!(env, Some((145_993_750.0, 155_100_000.0)));
     }
 }

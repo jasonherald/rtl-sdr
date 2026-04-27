@@ -916,6 +916,29 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 /// engine sending a separate `ActiveChannelChanged { key: None }`
 /// event in the same tick — which it does today, but relying on
 /// that ordering across four sites was brittle.
+/// Sync the Display panel's read-only "Scanner axis" status row
+/// to match the current scanner-axis-lock state. Called from
+/// every site that engages / disengages the lock — the master
+/// switch handler in `connect_scanner_panel`, plus the DSP
+/// scanner-stop fan-out (`ScannerEmptyRotation`,
+/// `ScannerMutexStopped`) so the row tracks the actual lock
+/// state instead of just the master switch position. Per issue
+/// #516.
+fn update_scanner_axis_status_row(row: &adw::ActionRow, range_hz: Option<(f64, f64)>) {
+    if let Some((min_hz, max_hz)) = range_hz {
+        let subtitle = format!(
+            "{} – {}",
+            spectrum::frequency_axis::format_frequency(min_hz),
+            spectrum::frequency_axis::format_frequency(max_hz),
+        );
+        row.set_subtitle(&subtitle);
+        row.set_visible(true);
+    } else {
+        row.set_subtitle("");
+        row.set_visible(false);
+    }
+}
+
 fn clear_scanner_active_channel_ui(
     scanner_panel: &sidebar::scanner_panel::ScannerPanel,
     state: &AppState,
@@ -1292,6 +1315,13 @@ fn handle_dsp_message(
                 let freq_f64 = freq_hz as f64;
                 state.center_frequency.set(freq_f64);
                 state.demod_mode.set(demod_mode);
+                // Push the active-channel context to the
+                // scanner-axis lock — drives the highlight
+                // band over the channel's bandwidth and the
+                // narrow-FFT projection into the locked X
+                // axis. No-op when the lock isn't engaged.
+                // Per issue #516.
+                spectrum_handle.set_scanner_active_channel(freq_f64, bandwidth);
 
                 scanner_panel.active_channel_row.set_subtitle(&format!(
                     "{} — {}",
@@ -2903,7 +2933,7 @@ fn connect_sidebar_panels(
     connect_audio_panel(panels, state);
     connect_volume_persistence(panels, state, config, volume_button);
     connect_distance_estimator_persistence(panels, config);
-    connect_scanner_panel(panels, state, config);
+    connect_scanner_panel(panels, state, config, spectrum_handle);
     // "Tune to satellite" closure used by the Satellites panel's
     // per-row play buttons. Mirrors the bookmark-recall dance in
     // `connect_navigation_panel` end-to-end: forces the scanner
@@ -8982,6 +9012,7 @@ fn connect_scanner_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
 ) {
     let scanner = &panels.scanner;
 
@@ -8998,9 +9029,55 @@ fn connect_scanner_panel(
     //     dispatch is idempotent at the engine — it's cheaper to
     //     pay one extra message per event than to add a suppress
     //     flag for every DSP-origin sync site.
+    // Master switch dispatches `SetScannerEnabled` AND drives
+    // the spectrum's scanner-axis lock. On enable, compute the
+    // (min, max) envelope of all scanner-flagged bookmarks and
+    // push it to the spectrum so the X axis pins to that range
+    // until the scanner stops. On disable, clear the lock so
+    // the spectrum reverts to "current channel ± half BW".
+    // The display panel's status row mirrors the lock state via
+    // the `update_scanner_axis_status_row` helper. Per issue
+    // #516.
     let state_switch = Rc::clone(state);
+    let bookmarks_for_switch = Rc::clone(&panels.bookmarks);
+    let config_for_switch = std::sync::Arc::clone(config);
+    let spectrum_for_switch = Rc::clone(spectrum_handle);
+    let display_axis_row = panels.display.scanner_axis_row.clone();
     scanner.master_switch.connect_active_notify(move |sw| {
-        state_switch.send_dsp(UiToDsp::SetScannerEnabled(sw.is_active()));
+        let enabled = sw.is_active();
+        state_switch.send_dsp(UiToDsp::SetScannerEnabled(enabled));
+        if enabled {
+            // Project the live bookmark list through the
+            // shared scanner-channel projector so the envelope
+            // tracks the same default-dwell/hang resolution
+            // the engine sees.
+            let default_dwell_ms =
+                sidebar::scanner_panel::load_default_dwell_ms(&config_for_switch);
+            let default_hang_ms = sidebar::scanner_panel::load_default_hang_ms(&config_for_switch);
+            let channels = sidebar::navigation_panel::project_scanner_channels(
+                &bookmarks_for_switch.bookmarks.borrow(),
+                default_dwell_ms,
+                default_hang_ms,
+            );
+            if let Some((min_hz, max_hz)) =
+                sidebar::navigation_panel::scanner_channel_envelope(&channels)
+            {
+                spectrum_for_switch.enter_scanner_mode(min_hz, max_hz);
+                update_scanner_axis_status_row(&display_axis_row, Some((min_hz, max_hz)));
+            } else {
+                // No scan-enabled channels — leave the lock
+                // disengaged. Status row stays hidden so the
+                // user gets the standard "scanner is off"
+                // appearance. The engine itself will handle
+                // the empty channel set via its existing
+                // empty-rotation path.
+                spectrum_for_switch.exit_scanner_mode();
+                update_scanner_axis_status_row(&display_axis_row, None);
+            }
+        } else {
+            spectrum_for_switch.exit_scanner_mode();
+            update_scanner_axis_status_row(&display_axis_row, None);
+        }
     });
 
     // Restore persisted slider values BEFORE wiring the notify
