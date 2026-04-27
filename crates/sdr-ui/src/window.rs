@@ -586,10 +586,33 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 
     // Wire VFO offset changes (click-to-tune / drag) to the frequency display
     // and status bar so the header shows the actual tuned frequency.
+    //
+    // TODO(#521 follow-up): wire additive `user_reference_offset` into
+    // `DopplerTracker` here so a user drag during an active Doppler-
+    // tracked pass becomes a per-pass fine-tune instead of getting
+    // overwritten on the next 4 Hz recompute. Deferred from Task 7
+    // because the spectrum widget's drag handler dispatches
+    // `UiToDsp::SetVfoOffset` directly via its own `dsp_tx` clone
+    // (bypassing `AppState::send_dsp`), so threading the tracker
+    // here would require either hoisting `Rc<RefCell<DopplerTracker>>`
+    // onto `AppState` or routing the spectrum drag through the
+    // wiring layer. v1 behaviour: user drag wins for the current
+    // tick, then the next 4 Hz Doppler recompute reasserts —
+    // acceptable per spec §4 note.
     let status_bar_for_vfo = Rc::clone(&status_bar_demod);
     let state_for_vfo = Rc::clone(&state);
     let fs_for_vfo = freq_selector.clone();
     spectrum_handle.connect_vfo_offset_changed(move |offset_hz| {
+        // Single source of truth for the actual VFO offset DSP
+        // currently holds. Fires from BOTH the DSP echo
+        // (`DspToUi::VfoOffsetChanged`) and direct user-drag
+        // dispatches, so any path that mutates the VFO offset
+        // (auto-record AOS reset, spectrum drag, our own
+        // Doppler ticks, click-to-tune, etc.) keeps this in
+        // sync. Doppler's rate-limit gate reads from here so it
+        // never compares against a stale local baseline. Per CR
+        // round 7 on PR #554.
+        state_for_vfo.last_dispatched_vfo_offset_hz.set(offset_hz);
         let center = state_for_vfo.center_frequency.get();
         let tuned = center + offset_hz;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -711,7 +734,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                 );
             }
         }
-        state_for_vfo_reset.send_dsp(UiToDsp::SetVfoOffset(0.0));
+        state_for_vfo_reset.dispatch_vfo_offset(0.0);
     });
 
     // --- Poll DspToUi channel and shared FFT buffer from the GTK main loop ---
@@ -2914,6 +2937,7 @@ fn connect_sidebar_panels(
         spectrum_handle,
         &tune_to_satellite,
         set_playing,
+        status_bar,
     );
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
@@ -8676,7 +8700,7 @@ fn connect_scanner_panel(
 /// to the passes group so it returns `ControlFlow::Break` once
 /// the window is destroyed; same lifecycle pattern as the DSP
 /// poll loop.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -8685,6 +8709,7 @@ fn connect_satellites_panel(
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
     set_playing: &Rc<dyn Fn(bool)>,
+    status_bar: &Rc<StatusBar>,
 ) {
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_panel::{
@@ -8894,6 +8919,23 @@ fn connect_satellites_panel(
             .connect_active_notify(move |sw| {
                 save_auto_record_audio(&config_audio, sw.is_active());
             });
+    }
+
+    // Doppler-correction tracker (#521).
+    //
+    // Two-layer wiring:
+    //   1. `restore_doppler_switch` runs ALWAYS — restores the
+    //      persisted master-switch value to the widget and
+    //      wires its change-notify to save back. This way the
+    //      user's preference survives a launch even when the
+    //      TLE cache is unavailable. Per CR round 1 on PR #554.
+    //   2. `connect_doppler_tracker` runs only when the TLE
+    //      cache is available — without TLEs we can't propagate
+    //      SGP4 to evaluate the trigger or compute the offset,
+    //      so there's nothing for the *behavior* to do.
+    restore_doppler_switch(panels, config);
+    if let Some(cache_doppler) = cache.as_ref() {
+        connect_doppler_tracker(panels, state, cache_doppler, status_bar);
     }
 
     // Refresh button — re-download every known satellite's TLE on
@@ -9254,7 +9296,7 @@ fn connect_satellites_panel(
                         // updates the spectrum widget, freq
                         // selector, and status bar; no manual
                         // mirror needed.
-                        state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
+                        state_a.dispatch_vfo_offset(0.0);
                         crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
                         // Clear the canvas at AOS so a back-to-back
                         // pass (e.g. NOAA 18 → NOAA 19 with
@@ -9305,7 +9347,7 @@ fn connect_satellites_panel(
                         // forward land in the cleared image.
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
-                        state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
+                        state_a.dispatch_vfo_offset(0.0);
                     }
                 }
             }
@@ -9323,10 +9365,12 @@ fn connect_satellites_panel(
                 // recorder doesn't know whether the user closed
                 // the viewer mid-pass or whether disk write will
                 // succeed.
+                let mut export_ok = false;
                 let result_msg = if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
                     match view.export_png(&path) {
                         Ok(()) => {
                             tracing::info!("auto-record PNG saved to {path:?}");
+                            export_ok = true;
                             format!("Pass complete — image saved to {}", path.display())
                         }
                         Err(e) => {
@@ -9341,6 +9385,32 @@ fn connect_satellites_panel(
                     "Pass complete, but the APT viewer was closed — no image saved".to_string()
                 };
                 post_toast(&toast_overlay_weak, &result_msg);
+                // Close the APT viewer window now that the PNG
+                // is on disk — resets the viewer for the next
+                // pass instead of carrying stale lines forward.
+                // Per a user request during PR #554 live testing.
+                //
+                // Only close on a successful export — if the save
+                // failed (Cairo error, disk full, etc.) the user
+                // probably wants to inspect the in-memory image
+                // and manually retry the export. Closing would
+                // discard the only copy. Per CR round 9 on PR #554.
+                //
+                // Weak-ref upgrade fails closed: if the user
+                // already dismissed the window, there's nothing
+                // to close. The close-request handler in
+                // `open_apt_viewer_if_needed` clears both
+                // `apt_viewer` and `apt_viewer_window` slots so
+                // the next AOS opens a fresh viewer.
+                if export_ok
+                    && let Some(window) = state_a
+                        .apt_viewer_window
+                        .borrow()
+                        .as_ref()
+                        .and_then(glib::WeakRef::upgrade)
+                {
+                    window.close();
+                }
             }
             RecorderAction::SaveLrptPass(dir) => {
                 // Walk every APID present in the SHARED `LrptImage`
@@ -9386,16 +9456,30 @@ fn connect_satellites_panel(
                         .collect()
                 };
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
+                // Clone state for the post-save viewer-close
+                // — we need to read `state.lrpt_viewer_window`
+                // after the spawn_blocking completes, which
+                // requires capturing state into the future.
+                let state_lrpt_close = Rc::clone(&state_a);
                 glib::spawn_future_local(async move {
                     let dir_for_msg = dir.clone();
-                    let result_msg = gio::spawn_blocking(move || {
+                    // Tuple return: (toast message, saved-at-least-one).
+                    // The flag gates the post-save viewer close —
+                    // we keep the viewer open on total-failure
+                    // outcomes so the user can inspect the in-
+                    // memory image and manually retry the export.
+                    // Per CR round 9 on PR #554.
+                    let (result_msg, save_ok) = gio::spawn_blocking(move || {
                         if snapshots.is_empty() {
                             tracing::warn!(
                                 "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
                             );
-                            return format!(
-                                "Pass complete, but no LRPT channels decoded — nothing saved to {}",
-                                dir.display()
+                            return (
+                                format!(
+                                    "Pass complete, but no LRPT channels decoded — nothing saved to {}",
+                                    dir.display()
+                                ),
+                                false,
                             );
                         }
                         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -9408,9 +9492,9 @@ fn connect_satellites_panel(
                             tracing::warn!(
                                 "auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",
                             );
-                            return format!(
-                                "Pass complete but couldn't create {}: {e}",
-                                dir.display()
+                            return (
+                                format!("Pass complete but couldn't create {}: {e}", dir.display()),
+                                false,
                             );
                         }
                         let mut saved = 0_usize;
@@ -9440,7 +9524,7 @@ fn connect_satellites_panel(
                                 }
                             }
                         }
-                        if errors.is_empty() {
+                        let msg = if errors.is_empty() {
                             format!(
                                 "Pass complete — {saved} LRPT channel(s) saved to {}",
                                 dir.display()
@@ -9451,7 +9535,12 @@ fn connect_satellites_panel(
                                 errors.len(),
                                 errors.join("; ")
                             )
-                        }
+                        };
+                        // Treat "at least one channel saved" as
+                        // success for close-purposes — partial-
+                        // success outcomes still produced disk
+                        // artifacts the user can inspect.
+                        (msg, saved > 0)
                     })
                     .await
                     .unwrap_or_else(|e| {
@@ -9466,12 +9555,48 @@ fn connect_satellites_panel(
                         tracing::warn!(
                             "auto-record SaveLrptPass: worker thread panicked: {e:?}",
                         );
-                        format!(
-                            "Pass complete but PNG worker panicked (target was {})",
-                            dir_for_msg.display()
+                        (
+                            format!(
+                                "Pass complete but PNG worker panicked (target was {})",
+                                dir_for_msg.display()
+                            ),
+                            false,
                         )
                     });
                     post_toast(&toast_overlay_weak_for_save, &result_msg);
+                    // Close the LRPT viewer window now that the
+                    // PNGs are on disk — resets the viewer for
+                    // the next pass instead of carrying stale
+                    // APIDs forward. Per a user request during
+                    // PR #554 live testing.
+                    //
+                    // Only close when at least one channel
+                    // actually saved (`save_ok`) — on total-
+                    // failure outcomes (no APIDs decoded, dir
+                    // create failed, every channel errored, or
+                    // worker panicked) keep the viewer open so
+                    // the user can inspect the in-memory image
+                    // and manually retry the export. Per CR
+                    // round 9 on PR #554.
+                    //
+                    // Runs on the GLib main loop (we re-entered
+                    // it via `spawn_future_local`), so the weak
+                    // upgrade + `.close()` is main-thread-safe.
+                    // Weak-ref upgrade fails closed: if the user
+                    // already dismissed the window, there's
+                    // nothing to close. The close-request
+                    // handler in `open_lrpt_viewer_if_needed`
+                    // clears the AppState slots so the next AOS
+                    // opens a fresh viewer.
+                    if save_ok
+                        && let Some(window) = state_lrpt_close
+                            .lrpt_viewer_window
+                            .borrow()
+                            .as_ref()
+                            .and_then(glib::WeakRef::upgrade)
+                    {
+                        window.close();
+                    }
                 });
             }
             RecorderAction::RestoreTune(saved) => {
@@ -9495,7 +9620,7 @@ fn connect_satellites_panel(
                 // updates the spectrum + freq selector + status
                 // bar when the DSP echoes the change, so we
                 // don't have to mirror those widgets manually.
-                state_a.send_dsp(UiToDsp::SetVfoOffset(saved.vfo_offset_hz));
+                state_a.dispatch_vfo_offset(saved.vfo_offset_hz);
                 // If the user had playback off pre-AOS, we
                 // started the radio at AOS to make audio flow —
                 // honour that round trip and stop it now. A user
@@ -9618,6 +9743,380 @@ fn connect_satellites_panel(
             }
             if needs_recompute {
                 recompute_tick();
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+}
+
+/// Cadence of the Doppler tracker's trigger re-evaluation —
+/// 1 Hz. Spec §2's overhead-and-frequency-match test only
+/// needs to flip on horizon crossing / dial change, which is
+/// always slower than 1 s. Cheap: one SGP4 propagate per
+/// catalog entry within the ±20 kHz window — typically zero
+/// or one sat at a time.
+const DOPPLER_TRIGGER_TICK: Duration = Duration::from_secs(1);
+
+/// Cadence of the Doppler tracker's offset recompute — 4 Hz
+/// (250 ms). Per spec §3, fast enough that the residual
+/// frequency error between updates stays inside the channel
+/// filter, slow enough that the bus + status-bar updates
+/// don't hammer GTK.
+const DOPPLER_RECOMPUTE_TICK: Duration = Duration::from_millis(250);
+
+/// Minimum |Δoffset| (Hz) before re-dispatching `SetVfoOffset`
+/// from the 4 Hz recompute tick. Sub-5-Hz changes are below
+/// the channel filter's pass-band granularity for any LEO
+/// imaging downlink we care about, so suppressing them is
+/// pure bus-traffic relief.
+const DOPPLER_DISPATCH_THRESHOLD_HZ: f64 = 5.0;
+
+/// Restore the persisted Doppler master-switch state to the
+/// widget and wire change-notify to save back. Always called,
+/// regardless of TLE-cache availability — the user's preference
+/// must survive a launch where the cache happened to be
+/// unavailable. The behavioral wiring (timers + tracker) lives
+/// in [`connect_doppler_tracker`] and is gated separately.
+/// Per CR round 1 on PR #554.
+fn restore_doppler_switch(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let persisted = sidebar::satellites_panel::load_doppler_tracking_enabled(config);
+    panels.satellites.doppler_switch.set_active(persisted);
+
+    let config = std::sync::Arc::clone(config);
+    panels
+        .satellites
+        .doppler_switch
+        .connect_active_notify(move |row| {
+            sidebar::satellites_panel::save_doppler_tracking_enabled(&config, row.is_active());
+        });
+}
+
+/// Wire the [`DopplerTracker`](crate::doppler_tracker::DopplerTracker):
+/// 1 Hz trigger re-evaluation tick, 4 Hz offset-recompute
+/// tick, status-bar update, [`UiToDsp::SetVfoOffset`] dispatch
+/// (rate-limited to changes >`DOPPLER_DISPATCH_THRESHOLD_HZ`).
+/// Per #521 and the design spec at
+/// `docs/superpowers/specs/2026-04-26-doppler-correction-design.md`.
+///
+/// Master-switch persistence + initial restore happens in
+/// [`restore_doppler_switch`], which is called unconditionally
+/// from [`connect_satellites_panel`]. This function adds a
+/// **second** change-notify handler on the same widget that
+/// drives the tracker model — multiple GTK signal handlers on
+/// one widget fire independently, no conflict. Wired only when
+/// the TLE cache is available; without TLEs the trigger
+/// re-evaluate has no candidate to engage.
+#[allow(
+    clippy::too_many_lines,
+    reason = "three chained closures (master-switch handler + two timers) all \
+              live in one function so they share the `tracker` and \
+              `last_dispatched` Rcs by direct clone; splitting would mean \
+              hoisting those onto AppState, which the design spec §4 \
+              already explicitly defers"
+)]
+fn connect_doppler_tracker(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    cache: &std::sync::Arc<sdr_sat::TleCache>,
+    status_bar: &Rc<StatusBar>,
+) {
+    use crate::doppler_tracker::{
+        Candidate, DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz,
+        pick_active_satellite,
+    };
+    use sdr_sat::{GroundStation, KNOWN_SATELLITES, Satellite, track};
+
+    // Read the widget's current state — it was already restored
+    // (and a persistence handler wired) by `restore_doppler_switch`,
+    // which runs unconditionally before we enter this cache-gated
+    // path. Per CR round 1 on PR #554.
+    let initial = panels.satellites.doppler_switch.is_active();
+
+    let tracker: Rc<RefCell<DopplerTracker>> = Rc::new(RefCell::new(DopplerTracker::new(initial)));
+
+    // The dispatch baseline lives on `AppState` as
+    // `last_dispatched_vfo_offset_hz` — written by the
+    // `connect_vfo_offset_changed` callback, which fires from
+    // BOTH the DSP echo (`DspToUi::VfoOffsetChanged`) and direct
+    // user-drag dispatches. The tracker reads from there for
+    // its rate-limit gate, so external writes (auto-record AOS
+    // reset, spectrum drag) keep the baseline in sync — no
+    // stale local value to worry about. Per CR round 7 on PR
+    // #554. The fallback paths below also write the baseline
+    // directly when they dispatch a `SetVfoOffset(user_ref)`
+    // flush, so re-engagement within `DOPPLER_DISPATCH_THRESHOLD_HZ`
+    // of the prior live value isn't suppressed.
+
+    // Master-switch handler that drives the tracker. (A separate
+    // change-notify handler in `restore_doppler_switch` already
+    // persists the value — multiple GTK signal handlers fire
+    // independently, no conflict.) On disable, `set_master_enabled`
+    // atomically clears `active`, captures and resets
+    // `user_reference_offset_hz`, and returns the captured value
+    // for us to flush to DSP.
+    {
+        let tracker = Rc::clone(&tracker);
+        let state = Rc::clone(state);
+        let status_bar = Rc::clone(status_bar);
+        panels
+            .satellites
+            .doppler_switch
+            .connect_active_notify(move |row| {
+                let enabled = row.is_active();
+                let mut t = tracker.borrow_mut();
+                let was_active = t.active().is_some();
+                let final_offset = t.set_master_enabled(enabled);
+                drop(t);
+                // Only dispatch the fallback `SetVfoOffset` when
+                // a satellite was actually being tracked. Without
+                // this guard, toggling Doppler off while no
+                // satellite is engaged would still send
+                // `SetVfoOffset(0.0)` and clobber any non-zero
+                // VFO offset the user had set independently. Per
+                // CR round 3 on PR #554.
+                if was_active && let Some(offset) = final_offset {
+                    state.dispatch_vfo_offset(offset);
+                    status_bar.update_doppler(None);
+                }
+            });
+    }
+
+    // 1 Hz trigger re-evaluation tick: rebuild the candidate
+    // list from catalog × frequency match × ground station ×
+    // cached TLEs, run `pick_active_satellite`, and call
+    // `set_active` on the tracker. On a transition to None
+    // (e.g. user retunes off the satellite, or the satellite
+    // sets), dispatch a final SetVfoOffset(user_reference) and
+    // clear the status bar — same teardown the master-switch
+    // handler does for the off-while-active case.
+    {
+        let tracker = Rc::clone(&tracker);
+        let cache = std::sync::Arc::clone(cache);
+        let state = Rc::clone(state);
+        let status_bar = Rc::clone(status_bar);
+        let panel_weak = panels.satellites.downgrade();
+        let _ = glib::timeout_add_local(DOPPLER_TRIGGER_TICK, move || {
+            let Some(panel) = panel_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let mut t = tracker.borrow_mut();
+            if !t.master_enabled() {
+                return glib::ControlFlow::Continue;
+            }
+            // Build the ground station from the live panel
+            // values — the user can edit lat/lon/alt mid-pass
+            // and the tracker should follow.
+            let station = GroundStation::new(
+                panel.lat_row.value(),
+                panel.lon_row.value(),
+                panel.alt_row.value(),
+            );
+            let now = chrono::Utc::now();
+            let current_freq = state.center_frequency.get();
+
+            // Build the candidate list: every catalog entry
+            // whose downlink is within ±FREQ_MATCH_TOLERANCE_HZ
+            // of the radio's current centre frequency, paired
+            // with its currently-evaluated elevation. Iterate
+            // in `KNOWN_SATELLITES` order so the spec §2
+            // tie-break (earlier entry wins) is deterministic.
+            let mut candidates: Vec<Candidate> = Vec::new();
+            for sat in KNOWN_SATELLITES {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "catalog downlinks sit in the 100s of MHz, well \
+                              below f64's 2^53 mantissa ceiling"
+                )]
+                let downlink = sat.downlink_hz as f64;
+                if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
+                    continue;
+                }
+                let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
+                    continue;
+                };
+                let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
+                    continue;
+                };
+                let Ok(track) = track(&station, &parsed, now) else {
+                    continue;
+                };
+                candidates.push(Candidate {
+                    satellite: sat,
+                    elevation_deg: track.elevation_deg,
+                });
+            }
+
+            let new_active = pick_active_satellite(t.master_enabled(), &candidates);
+            // Capture pre-`set_active` state so we can:
+            //   1. Flush back to the prior user reference on a
+            //      Some → None disengage (`set_active` resets
+            //      `user_reference_offset_hz` to 0 on any change,
+            //      so reading it AFTER would always give 0).
+            //   2. Decide whether this is a fresh engagement
+            //      (None → Some) vs. a satellite swap
+            //      (Some(A) → Some(B)) — only the former should
+            //      seed `user_reference_offset_hz` from the live
+            //      spectrum offset. On a swap, the live offset
+            //      is `prior_user_ref + prior_doppler`; reseeding
+            //      with that would copy the previous pass's
+            //      Doppler into the new pass's baseline (a
+            //      double-count). Per CR round 4 on PR #554.
+            let prior_user_ref = t.user_reference_offset_hz();
+            let prior_active_some = t.active().is_some();
+            let changed = t.set_active(new_active);
+            if changed {
+                if new_active.is_some() {
+                    if prior_active_some {
+                        // Some(A) → Some(B) satellite swap.
+                        // Restore the pre-swap user_reference
+                        // (which `set_active` just reset to 0)
+                        // so it survives the satellite change.
+                        // Per CR round 5 on PR #554.
+                        t.set_user_reference_offset_hz(prior_user_ref);
+                    } else {
+                        // None → Some fresh engagement. Seed
+                        // `user_reference_offset_hz` from the
+                        // synchronously-tracked DSP baseline on
+                        // `AppState` so this pass's Doppler tracks
+                        // ON TOP of any offset the user had set
+                        // before AOS — and so disengage at LOS
+                        // restores that exact value via the
+                        // Some → None flush path.
+                        //
+                        // Round 6 deferred this seed because the
+                        // only available source was `spectrum.vfo_offset_hz()`,
+                        // which lags DSP echoes — auto-record's
+                        // AOS-side `SetVfoOffset(0.0)` would not yet
+                        // be reflected when the trigger tick fired,
+                        // so we'd capture the stale pre-AOS value.
+                        // Round 7 added `state.last_dispatched_vfo_offset_hz`,
+                        // which the `connect_vfo_offset_changed`
+                        // callback updates on every DSP echo (and
+                        // every direct user-drag dispatch). That
+                        // gives us the synchronously-tracked source
+                        // of truth the deferral was waiting for.
+                        // Per CR round 9 on PR #554.
+                        let baseline = state.last_dispatched_vfo_offset_hz.get();
+                        t.set_user_reference_offset_hz(baseline);
+                    }
+                    // No dispatch here — the next 4 Hz tick will
+                    // dispatch `live = user_reference + doppler`.
+                } else {
+                    // Disengaged — flush the live offset back to
+                    // the pre-engage user reference (captured
+                    // before `set_active` reset it) and clear
+                    // the status badge.
+                    //
+                    // We don't need to explicitly clear the
+                    // tracker's `user_reference_offset_hz` here
+                    // — `set_active(None)` already did it on
+                    // line 216 of `doppler_tracker.rs` (the
+                    // `if changed { self.user_reference_offset_hz = 0.0; }`
+                    // branch), and the
+                    // `satellite_to_none_resets_user_reference_offset`
+                    // unit test pins that invariant. The
+                    // `prior_user_ref` we dispatch is the value
+                    // captured pre-`set_active`, so DSP gets the
+                    // user's pre-engage baseline; the tracker's
+                    // own field is already 0 for the next
+                    // engagement. Per CR round 8 on PR #554.
+                    drop(t);
+                    state.dispatch_vfo_offset(prior_user_ref);
+                    status_bar.update_doppler(None);
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // 4 Hz offset-recompute tick: while a satellite is active,
+    // recompute the Doppler shift and dispatch a SetVfoOffset
+    // (rate-limited to changes >DOPPLER_DISPATCH_THRESHOLD_HZ
+    // to avoid spamming the bus). Update the status-bar label
+    // every tick — the kHz/0.1 rounded format already hides
+    // sub-100-Hz wobble, no further suppression needed.
+    {
+        let tracker = Rc::clone(&tracker);
+        let cache = std::sync::Arc::clone(cache);
+        let state = Rc::clone(state);
+        let status_bar = Rc::clone(status_bar);
+        let panel_weak = panels.satellites.downgrade();
+        let _ = glib::timeout_add_local(DOPPLER_RECOMPUTE_TICK, move || {
+            let Some(panel) = panel_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let active_sat = tracker.borrow().active();
+            let Some(sat) = active_sat else {
+                return glib::ControlFlow::Continue;
+            };
+            // Has the user retuned away from the active satellite?
+            // If so, disengage NOW rather than wait up to 1 s for
+            // the trigger tick — otherwise stale Doppler keeps
+            // dispatching against the new center frequency for up
+            // to a full second. Per CR round 5 on PR #554.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "catalog downlinks sit in the 100s of MHz, well \
+                          below f64's 2^53 mantissa ceiling"
+            )]
+            let downlink = sat.downlink_hz as f64;
+            let current_freq = state.center_frequency.get();
+            if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
+                let mut t = tracker.borrow_mut();
+                let prior_user_ref = t.user_reference_offset_hz();
+                let _ = t.set_active(None);
+                drop(t);
+                state.dispatch_vfo_offset(prior_user_ref);
+                status_bar.update_doppler(None);
+                return glib::ControlFlow::Continue;
+            }
+            let station = GroundStation::new(
+                panel.lat_row.value(),
+                panel.lon_row.value(),
+                panel.alt_row.value(),
+            );
+            let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
+                // TLE evicted between trigger evaluation and
+                // recompute — dormant for this tick; the next
+                // 1 Hz trigger tick will drop the active sat
+                // since `cached_tle_for` will fail there too.
+                return glib::ControlFlow::Continue;
+            };
+            let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
+                return glib::ControlFlow::Continue;
+            };
+            let now = chrono::Utc::now();
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "catalog downlinks sit in the 100s of MHz, well \
+                          below f64's 2^53 mantissa ceiling"
+            )]
+            let carrier = sat.downlink_hz as f64;
+            let Ok(doppler) = compute_doppler_offset_hz(&parsed, &station, now, carrier) else {
+                tracing::debug!(
+                    satellite = sat.name,
+                    "Doppler recompute: SGP4 propagate failed; skipping tick"
+                );
+                return glib::ControlFlow::Continue;
+            };
+            let live = tracker.borrow().live_offset_hz(doppler);
+            // Status bar updates every tick — the kHz/0.1
+            // format hides sub-100-Hz jitter naturally.
+            status_bar.update_doppler(Some(doppler));
+            // SetVfoOffset is rate-limited to material changes.
+            // Baseline lives on `AppState` and is kept in sync by
+            // the `connect_vfo_offset_changed` callback (fires on
+            // both DSP echo and direct user-drag dispatches). Per
+            // CR round 7 on PR #554. We also write it eagerly at
+            // dispatch so a fast back-to-back tick before the
+            // echo round-trip doesn't over-dispatch — the echo
+            // arrives later with the same value, harmless.
+            let baseline = state.last_dispatched_vfo_offset_hz.get();
+            if (live - baseline).abs() > DOPPLER_DISPATCH_THRESHOLD_HZ {
+                state.dispatch_vfo_offset(live);
             }
             glib::ControlFlow::Continue
         });

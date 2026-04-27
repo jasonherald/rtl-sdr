@@ -50,6 +50,22 @@ pub struct AppState {
     pub is_running: Cell<bool>,
     /// Current center frequency in Hz.
     pub center_frequency: Cell<f64>,
+    /// Latest VFO offset (Hz) the DSP is known to hold. Updated
+    /// from the [`spectrum::SpectrumHandle::connect_vfo_offset_changed`]
+    /// callback (which fires on both DSP echo via
+    /// `DspToUi::VfoOffsetChanged` AND direct user-drag dispatches),
+    /// so it stays in sync regardless of which path produced the
+    /// change.
+    ///
+    /// Read by [`crate::doppler_tracker`]'s wiring in `window.rs`
+    /// to gate its rate-limited `SetVfoOffset` dispatches —
+    /// without this echo-driven baseline, an external write
+    /// (spectrum drag, auto-record AOS reset) would leave the
+    /// tracker's local "last dispatched" value stale and the
+    /// next Doppler dispatch could be falsely suppressed by
+    /// `DOPPLER_DISPATCH_THRESHOLD_HZ`. Per CR round 7 on PR
+    /// #554.
+    pub last_dispatched_vfo_offset_hz: Cell<f64>,
     /// Current demodulation mode.
     pub demod_mode: Cell<DemodMode>,
     /// Sender for dispatching commands to the DSP thread.
@@ -113,6 +129,16 @@ pub struct AppState {
     /// `close-request` fires, not when the `GObject`'s last strong
     /// ref happens to drop.
     pub apt_viewer: RefCell<Option<crate::apt_viewer::AptImageView>>,
+    /// Weak handle to the open APT viewer window. Populated by
+    /// [`crate::apt_viewer::open_apt_viewer_if_needed`]; cleared
+    /// by the window's `close-request` handler alongside
+    /// `apt_viewer`. Auto-record's LOS save path uses this to
+    /// `.close()` the viewer after the PNG export finishes so
+    /// the next pass starts with a fresh viewer instead of
+    /// stale lines from the prior pass. Mirrors the
+    /// `lrpt_viewer_window` weak-ref pattern. Per a user
+    /// request during PR #554 live testing.
+    pub apt_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
     /// Currently-open Meteor-M LRPT viewer window, or `None`
     /// when no viewer is open. Same lifecycle pattern as
     /// `apt_viewer` above. Per epic #469 task 7.
@@ -144,6 +170,7 @@ impl AppState {
         Rc::new(Self {
             is_running: Cell::new(false),
             center_frequency: Cell::new(DEFAULT_CENTER_FREQUENCY_HZ),
+            last_dispatched_vfo_offset_hz: Cell::new(0.0),
             demod_mode: Cell::new(DemodMode::Wfm),
             ui_tx,
             suppress_bandwidth_notify: Cell::new(false),
@@ -156,6 +183,7 @@ impl AppState {
             last_rtl_tcp_state_disc: Cell::new(RTL_TCP_STATE_DISC_DISCONNECTED),
             rtl_tcp_active_server: RefCell::new(String::new()),
             apt_viewer: RefCell::new(None),
+            apt_viewer_window: RefCell::new(None),
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
@@ -167,6 +195,28 @@ impl AppState {
         if let Err(e) = self.ui_tx.send(msg) {
             tracing::warn!("failed to send DSP command: {e}");
         }
+    }
+
+    /// Dispatch `UiToDsp::SetVfoOffset(hz)` AND synchronously
+    /// update [`Self::last_dispatched_vfo_offset_hz`] in the
+    /// same call. Use this for every programmatic VFO-offset
+    /// dispatch (auto-record AOS reset, LOS `RestoreTune`, mode-
+    /// change reset, Doppler tracker sends, etc.) so the
+    /// Doppler dispatch-baseline cell stays in sync without
+    /// waiting for the `DspToUi::VfoOffsetChanged` echo to
+    /// round-trip through the controller.
+    ///
+    /// The `connect_vfo_offset_changed` callback in `window.rs`
+    /// also writes the cell on echo (and on direct
+    /// spectrum-widget drag dispatches that update the spectrum
+    /// locally), so this helper's optimistic write is reconciled
+    /// with the actual applied value when the echo lands —
+    /// matching values overwrite harmlessly; clamped or
+    /// rejected values overwrite to truth. Per CR round 10 on
+    /// PR #554.
+    pub fn dispatch_vfo_offset(&self, hz: f64) {
+        self.last_dispatched_vfo_offset_hz.set(hz);
+        self.send_dsp(UiToDsp::SetVfoOffset(hz));
     }
 }
 
@@ -185,6 +235,24 @@ mod tests {
         assert!(!state.is_running.get());
         assert!((state.center_frequency.get() - DEFAULT_CENTER_FREQUENCY_HZ).abs() < f64::EPSILON);
         assert_eq!(state.demod_mode.get(), DemodMode::Wfm);
+    }
+
+    #[test]
+    fn last_dispatched_vfo_offset_hz_defaults_to_zero() {
+        // Pin the Doppler dispatch baseline default. Per CR
+        // round 8 on PR #554 — without this regression test, a
+        // future change to the seeded value would silently break
+        // the rate-limit gate's "compare against actual current
+        // DSP state" invariant. The first 4 Hz Doppler tick
+        // computes `live - baseline`; if `baseline` starts at
+        // anything but 0, that comparison is wrong until the
+        // first echo from a real `SetVfoOffset` lands.
+        let state = make_test_state();
+        assert!(
+            (state.last_dispatched_vfo_offset_hz.get() - 0.0).abs() < f64::EPSILON,
+            "got {}",
+            state.last_dispatched_vfo_offset_hz.get()
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod antenna;
 pub mod app;
 pub mod apt_viewer;
 pub mod css;
+pub mod doppler_tracker;
 pub mod header;
 pub mod lrpt_viewer;
 pub mod notify;

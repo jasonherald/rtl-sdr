@@ -572,14 +572,23 @@ pub fn open_apt_viewer_if_needed(
     // Stash a clone in AppState so the DSP→UI handler can find
     // it. The clone is cheap (every field is `Rc`-shared).
     *state.apt_viewer.borrow_mut() = Some(view);
+    // Stash a weak ref to the window so the auto-record LOS path
+    // can `.close()` the viewer after the PNG export finishes,
+    // resetting it for the next pass. Weak ref so the AppState
+    // slot doesn't keep the window alive past its natural
+    // lifetime (the GTK toplevel registry owns the strong ref).
+    // Same pattern as `lrpt_viewer_window`.
+    *state.apt_viewer_window.borrow_mut() = Some(window.downgrade());
 
-    // Clear the AppState slot when the user closes the window
+    // Clear the AppState slots when the user closes the window
+    // (or when the auto-record path closes it programmatically)
     // — otherwise `DspToUi::AptLine` would keep pushing into a
     // detached widget tree until the next reopen, and the viewer
     // state would never reset for a second pass.
     let state_for_close = Rc::clone(state);
     window.connect_close_request(move |_| {
         *state_for_close.apt_viewer.borrow_mut() = None;
+        *state_for_close.apt_viewer_window.borrow_mut() = None;
         glib::Propagation::Proceed
     });
 }

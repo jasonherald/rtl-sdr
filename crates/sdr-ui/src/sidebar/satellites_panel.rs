@@ -125,6 +125,10 @@ pub const KEY_AUTO_RECORD_APT: &str = "sat_auto_record_apt";
 /// Pairs with [`KEY_AUTO_RECORD_APT`] — only meaningful when
 /// auto-record is on. Default: `false` (opt-in). Per #533.
 pub const KEY_AUTO_RECORD_AUDIO: &str = "sat_auto_record_audio";
+/// Config key for the persisted Doppler-tracking master switch
+/// (Satellites panel). Default `true` so first-launch users get
+/// auto-corrected passes out of the box. Per issue #521.
+pub const KEY_DOPPLER_TRACKING_ENABLED: &str = "sat_doppler_tracking_enabled";
 
 // ─── Panel ─────────────────────────────────────────────────────────────
 
@@ -185,6 +189,11 @@ pub struct SatellitesPanel {
     /// demodulated audio lands in `~/sdr-recordings/audio-{slug}-
     /// {timestamp}.wav` paired with the PNG. Per #533.
     pub auto_record_audio_switch: adw::SwitchRow,
+    /// Master switch for Doppler-correction tracking during
+    /// satellite passes. Default ON. When OFF, the
+    /// `DopplerTracker` stays dormant regardless of frequency
+    /// match or pass schedule. Per issue #521.
+    pub doppler_switch: adw::SwitchRow,
 
     // Next passes group -----------------------------------------------------
     /// The preferences group hosting the dynamically-built pass
@@ -240,6 +249,8 @@ pub struct SatellitesPanelWeak {
     pub auto_record_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::auto_record_audio_switch`].
     pub auto_record_audio_switch: glib::WeakRef<adw::SwitchRow>,
+    /// Weak ref to [`SatellitesPanel::doppler_switch`].
+    pub doppler_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::passes_group`].
     pub passes_group: glib::WeakRef<adw::PreferencesGroup>,
     /// Weak ref to [`SatellitesPanel::passes_status_row`].
@@ -265,6 +276,7 @@ impl SatellitesPanel {
             refresh_spinner: self.refresh_spinner.downgrade(),
             auto_record_switch: self.auto_record_switch.downgrade(),
             auto_record_audio_switch: self.auto_record_audio_switch.downgrade(),
+            doppler_switch: self.doppler_switch.downgrade(),
             passes_group: self.passes_group.downgrade(),
             passes_status_row: self.passes_status_row.downgrade(),
         }
@@ -292,6 +304,7 @@ impl SatellitesPanelWeak {
             refresh_spinner: self.refresh_spinner.upgrade()?,
             auto_record_switch: self.auto_record_switch.upgrade()?,
             auto_record_audio_switch: self.auto_record_audio_switch.upgrade()?,
+            doppler_switch: self.doppler_switch.upgrade()?,
             passes_group: self.passes_group.upgrade()?,
             passes_status_row: self.passes_status_row.upgrade()?,
         })
@@ -435,6 +448,21 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .active(false)
         .build();
     recording_group.add(&auto_record_audio_switch);
+
+    let doppler_switch = adw::SwitchRow::builder()
+        .title("Doppler tracking")
+        .subtitle("Auto-correct frequency drift during satellite passes")
+        // Default ON — matches the persisted-default contract in
+        // `load_doppler_tracking_enabled`. The wiring layer in
+        // `window.rs::restore_doppler_switch` overrides this with
+        // the persisted value, but if that wiring is ever skipped
+        // the widget should still reflect "default ON" rather than
+        // a misleading `false`. Per CR round 1 on PR #554.
+        .active(true)
+        .build();
+    // Same group as the auto-record switches — these are all
+    // "behavior toggles for the satellites workflow". Per #521.
+    recording_group.add(&doppler_switch);
     page.add(&recording_group);
 
     // ─── Upcoming Passes ──────────────────────────────────────
@@ -465,6 +493,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         refresh_spinner,
         auto_record_switch,
         auto_record_audio_switch,
+        doppler_switch,
         passes_group,
         passes_status_row,
     }
@@ -507,6 +536,18 @@ pub fn load_auto_record_audio(config: &Arc<ConfigManager>) -> bool {
     read_bool_or(config, KEY_AUTO_RECORD_AUDIO, false)
 }
 
+/// Load the persisted Doppler-tracking master switch. Defaults
+/// to `true` — fresh installs get auto-correction without
+/// requiring the user to find and flip the switch. Per #521.
+#[must_use]
+pub fn load_doppler_tracking_enabled(config: &Arc<ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_DOPPLER_TRACKING_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    })
+}
+
 /// Persist `value` under `key`. Single helper for the three
 /// lat/lon/alt `SpinRow` change-notify handlers.
 pub fn save_f64(config: &Arc<ConfigManager>, key: &str, value: f64) {
@@ -526,6 +567,13 @@ pub fn save_auto_record_apt(config: &Arc<ConfigManager>, value: bool) {
 pub fn save_auto_record_audio(config: &Arc<ConfigManager>, value: bool) {
     config.write(|v| {
         v[KEY_AUTO_RECORD_AUDIO] = serde_json::json!(value);
+    });
+}
+
+/// Persist the Doppler-tracking master switch. Per #521.
+pub fn save_doppler_tracking_enabled(config: &Arc<ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_DOPPLER_TRACKING_ENABLED] = serde_json::json!(enabled);
     });
 }
 
@@ -1132,5 +1180,36 @@ mod tests {
             format_pass_title(&pass, now),
             "NOAA 19 — in progress (1 min in)"
         );
+    }
+
+    fn make_config() -> Arc<ConfigManager> {
+        Arc::new(ConfigManager::in_memory(&serde_json::json!({})))
+    }
+
+    #[test]
+    fn load_doppler_tracking_enabled_defaults_to_on() {
+        let config = make_config();
+        // Spec §7.1: default ON so fresh installs get auto-
+        // correction without user discovery.
+        assert!(load_doppler_tracking_enabled(&config));
+    }
+
+    #[test]
+    fn save_and_load_doppler_tracking_enabled_round_trip() {
+        let config = make_config();
+        save_doppler_tracking_enabled(&config, false);
+        assert!(!load_doppler_tracking_enabled(&config));
+        save_doppler_tracking_enabled(&config, true);
+        assert!(load_doppler_tracking_enabled(&config));
+    }
+
+    #[test]
+    fn load_doppler_tracking_enabled_tolerates_non_bool() {
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_DOPPLER_TRACKING_ENABLED] = serde_json::json!("not a bool");
+        });
+        // Falls back to the default (true), not a panic.
+        assert!(load_doppler_tracking_enabled(&config));
     }
 }
