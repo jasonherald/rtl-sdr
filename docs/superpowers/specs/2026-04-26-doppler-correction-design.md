@@ -54,7 +54,7 @@ Pure DSP shift, zero hardware churn, zero glitches. Limited to ±half the fronte
 
 For everything we ship as of April 2026 (NOAA APT, Meteor LRPT, ISS SSTV), max Doppler is ±5 kHz over a full pass — VFO offset alone handles 100% of these passes without ever approaching the bandwidth limit.
 
-**Out of scope for v1:** SDR center-frequency retune. Architectured-around (a future need for narrow-bandwidth modes or HEO/deep-space could add a coarse-retune branch in the same `DopplerTracker` without touching the activation rule), but not implemented today.
+**Out of scope for v1:** SDR center-frequency retune. Architectured-around (a future need for narrow-bandwidth modes or HEO/deep-space could add a coarse-retune branch in the same `DopplerTracker` without touching the activation rule), but not implemented as of April 2026.
 
 ## 4. Manual-override behavior — additive (DEFERRED in v1)
 
@@ -202,7 +202,7 @@ Real NOAA pass — observe the status bar showing the parabolic offset curve. Au
 
 ## 10. Out of scope (explicitly)
 
-- **SDR center-freq retune** — VFO-only is sufficient for everything we ship today. Future-proofing left as an extension point in `DopplerTracker`'s tick handler, not pre-implemented.
+- **SDR center-freq retune** — VFO-only is sufficient for everything we ship as of April 2026. Future-proofing left as an extension point in `DopplerTracker`'s tick handler, not pre-implemented.
 - **Sparkline / Doppler graph** — the live numeric readout is enough for v1; a graph is a "fun visualization" rather than functional improvement.
 - **Per-satellite tuning curves** — some users might want to bias their Doppler curve (e.g. for older satellites with known oscillator drift). Out of scope; the additive `user_reference_offset` covers ad-hoc cases without per-satellite persistence.
 - **Geostationary satellites** — zero Doppler by definition; tracker would no-op, no special handling needed.

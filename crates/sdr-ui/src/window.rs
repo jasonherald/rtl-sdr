@@ -8925,7 +8925,7 @@ fn connect_satellites_panel(
     //      so there's nothing for the *behavior* to do.
     restore_doppler_switch(panels, config);
     if let Some(cache_doppler) = cache.as_ref() {
-        connect_doppler_tracker(panels, state, cache_doppler, status_bar);
+        connect_doppler_tracker(panels, state, cache_doppler, status_bar, spectrum_handle);
     }
 
     // Refresh button — re-download every known satellite's TLE on
@@ -9729,6 +9729,7 @@ fn connect_doppler_tracker(
     state: &Rc<AppState>,
     cache: &std::sync::Arc<sdr_sat::TleCache>,
     status_bar: &Rc<StatusBar>,
+    spectrum: &Rc<spectrum::SpectrumHandle>,
 ) {
     use crate::doppler_tracker::{
         Candidate, DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz,
@@ -9777,12 +9778,17 @@ fn connect_doppler_tracker(
                 let was_active = t.active().is_some();
                 let final_offset = t.set_master_enabled(enabled);
                 drop(t);
-                if let Some(offset) = final_offset {
+                // Only dispatch the fallback `SetVfoOffset` when
+                // a satellite was actually being tracked. Without
+                // this guard, toggling Doppler off while no
+                // satellite is engaged would still send
+                // `SetVfoOffset(0.0)` and clobber any non-zero
+                // VFO offset the user had set independently. Per
+                // CR round 3 on PR #554.
+                if was_active && let Some(offset) = final_offset {
                     state.send_dsp(UiToDsp::SetVfoOffset(offset));
                     last_dispatched.set(offset);
-                    if was_active {
-                        status_bar.update_doppler(None);
-                    }
+                    status_bar.update_doppler(None);
                 }
             });
     }
@@ -9802,6 +9808,7 @@ fn connect_doppler_tracker(
         let status_bar = Rc::clone(status_bar);
         let panel_weak = panels.satellites.downgrade();
         let last_dispatched = Rc::clone(&last_dispatched);
+        let spectrum = Rc::clone(spectrum);
         let _ = glib::timeout_add_local(DOPPLER_TRIGGER_TICK, move || {
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -9854,18 +9861,37 @@ fn connect_doppler_tracker(
             }
 
             let new_active = pick_active_satellite(t.master_enabled(), &candidates);
+            // Capture the pre-`set_active` user reference so we
+            // can flush back to it on a Some → None transition
+            // — `set_active` resets `user_reference_offset_hz`
+            // to 0 on any change, so reading it AFTER the call
+            // would always give 0. Per CR round 3 on PR #554.
+            let prior_user_ref = t.user_reference_offset_hz();
             let changed = t.set_active(new_active);
-            if changed && new_active.is_none() {
-                // Disengaged — flush the live offset back to the
-                // user's reference and clear the status badge.
-                // (Engagement-side work happens on the 4 Hz
-                // recompute tick — no need to dispatch here for
-                // a None → Some transition.)
-                let user_ref = t.user_reference_offset_hz();
-                drop(t);
-                state.send_dsp(UiToDsp::SetVfoOffset(user_ref));
-                last_dispatched.set(user_ref);
-                status_bar.update_doppler(None);
+            if changed {
+                if new_active.is_some() {
+                    // Engaged (or swapped to a new satellite) —
+                    // seed `user_reference_offset_hz` from the
+                    // current spectrum VFO offset so this pass's
+                    // Doppler tracks ON TOP of whatever offset
+                    // the user had set independently. Without
+                    // this seed, a non-zero pre-engagement offset
+                    // would be silently clobbered to 0 on the
+                    // next 4 Hz tick. Per CR round 3 on PR #554.
+                    let current_offset = spectrum.vfo_offset_hz();
+                    t.set_user_reference_offset_hz(current_offset);
+                    // No dispatch here — the next 4 Hz tick will
+                    // dispatch `live = user_reference + doppler`.
+                } else {
+                    // Disengaged — flush the live offset back to
+                    // the pre-engage user reference (captured
+                    // before `set_active` reset it) and clear
+                    // the status badge.
+                    drop(t);
+                    state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
+                    last_dispatched.set(prior_user_ref);
+                    status_bar.update_doppler(None);
+                }
             }
             glib::ControlFlow::Continue
         });

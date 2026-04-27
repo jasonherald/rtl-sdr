@@ -834,11 +834,16 @@ Find the function that builds the panel — search for `let auto_record_audio_sw
     let doppler_switch = adw::SwitchRow::builder()
         .title("Doppler tracking")
         .subtitle("Auto-correct frequency drift during satellite passes")
-        .active(false)
+        // Default ON — matches the persisted-default contract.
+        // The wiring layer in Task 6 overrides this with the
+        // persisted value, but if that wiring is ever skipped
+        // the widget should still reflect "default ON" rather
+        // than a misleading false.
+        .active(true)
         .build();
 ```
 
-(`.active(false)` is the temporary widget default; the actual restored value is set by the wiring layer in Task 6 BEFORE wiring the change-notify handler.)
+(`.active(true)` matches the documented default-ON contract; the actual restored value is set by the wiring layer in Task 6 BEFORE wiring the change-notify handler.)
 
 Now find where `auto_record_audio_switch` is added to its `AdwPreferencesGroup` (search for `.add_row(&auto_record_audio_switch)` or similar). Add immediately after it:
 
@@ -933,15 +938,22 @@ impl DopplerTracker {
     /// Update the master switch. Caller (wiring layer) is
     /// responsible for persisting the new value via
     /// `save_doppler_tracking_enabled`.
-    pub fn set_master_enabled(&mut self, enabled: bool) {
+    ///
+    /// On a transition to disabled, atomically clears the active
+    /// satellite, captures `user_reference_offset_hz`, resets it
+    /// to 0, and returns `Some(captured)` so the wiring layer
+    /// can dispatch one final `SetVfoOffset(captured)` to flush
+    /// DSP back to the user-reference baseline. Returns `None`
+    /// on enable transitions or no-change calls.
+    pub fn set_master_enabled(&mut self, enabled: bool) -> Option<f64> {
         self.master_enabled = enabled;
         if !enabled {
-            // Spec §2: when trigger conditions go false (master
-            // off counts), reset the active satellite. The
-            // wiring layer handles the final SetVfoOffset(
-            // user_reference_offset) dispatch.
+            let final_offset_hz = self.user_reference_offset_hz;
             self.active = None;
+            self.user_reference_offset_hz = 0.0;
+            return Some(final_offset_hz);
         }
+        None
     }
 
     /// Whether the master switch is currently on.
@@ -1286,13 +1298,25 @@ fn connect_doppler_tracker(
     // (rate-limited to changes >5 Hz to avoid spamming the bus).
     // Update the status bar label every tick (rounded to 0.1 kHz
     // so visual jitter is suppressed naturally).
+    //
+    // Note: `last_dispatched` is hoisted into the function scope
+    // (above the master-switch handler block) as
+    // `Rc<Cell<f64>>` and cloned into all three closures —
+    // master-switch, 1 Hz trigger, 4 Hz recompute. Each path
+    // that dispatches `SetVfoOffset` also writes the dispatched
+    // value to `last_dispatched.set(...)` so the next 4 Hz
+    // tick's threshold comparison is against the latest actual
+    // DSP state, not a stale Doppler value. Without this, a
+    // quick disengage→re-engage could land the next computed
+    // offset within `DOPPLER_DISPATCH_THRESHOLD_HZ` of the
+    // stale value and the first dispatch would be suppressed.
     {
         let tracker = Rc::clone(&tracker);
         let cache = Arc::clone(cache);
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
         let panels_weak = panels.satellites.downgrade();
-        let last_dispatched = Rc::new(Cell::new(0.0_f64));
+        let last_dispatched = Rc::clone(&last_dispatched);  // hoisted from above
         glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             let Some(panel) = panels_weak.upgrade() else {
                 return glib::ControlFlow::Break;
