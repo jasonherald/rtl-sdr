@@ -940,7 +940,22 @@ fn refresh_scanner_axis_lock(
         default_hang_ms,
     );
     if let Some((min_hz, max_hz)) = sidebar::navigation_panel::scanner_channel_envelope(&channels) {
+        // Snapshot the active-channel context BEFORE
+        // `enter_scanner_mode` resets it to `None`. Without
+        // this, a mid-scan bookmark mutation (the user toggles
+        // a `scan_enabled` flag while a channel is being
+        // sampled) would briefly clear the FFT highlight band
+        // and waterfall projection until the next
+        // `ScannerActiveChannelChanged` event arrived — a
+        // visually jarring blink during live editing. Per
+        // `CodeRabbit` round 2 on PR #562.
+        let prior_active = spectrum_handle
+            .scanner_axis_lock()
+            .and_then(|lock| lock.active_channel_hz.zip(lock.active_channel_bw_hz));
         spectrum_handle.enter_scanner_mode(min_hz, max_hz);
+        if let Some((freq_hz, bw_hz)) = prior_active {
+            spectrum_handle.set_scanner_active_channel(freq_hz, bw_hz);
+        }
         update_scanner_axis_status_row(status_row, Some((min_hz, max_hz)));
     } else {
         spectrum_handle.exit_scanner_mode();

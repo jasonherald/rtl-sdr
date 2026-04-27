@@ -231,6 +231,19 @@ impl WaterfallRenderer {
         // stale row from N rotations ago) on every push.
         self.row_buffer.fill(0);
 
+        // Zero-width guard. `new(0)` / `resize(0)` produce a
+        // renderer with `display_width == 0`; the projection
+        // below would underflow `w - 1.0` to negative and cast
+        // to a huge `usize`, panicking on the
+        // `self.row_buffer[pixel_idx]` index. Skip the projection
+        // and the pixel-row write — but DO advance the ring so
+        // historical rows still scroll downward at the normal
+        // cadence. Per `CodeRabbit` round 2 on PR #562.
+        if self.display_width == 0 {
+            self.top_row = (self.top_row + HISTORY_LINES - 1) % HISTORY_LINES;
+            return;
+        }
+
         // Step 2 — when a channel is active, project narrow
         // bins into the active slice's pixels.
         if let Some(active_hz) = lock.active_channel_hz {
