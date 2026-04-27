@@ -189,6 +189,11 @@ pub struct SatellitesPanel {
     /// demodulated audio lands in `~/sdr-recordings/audio-{slug}-
     /// {timestamp}.wav` paired with the PNG. Per #533.
     pub auto_record_audio_switch: adw::SwitchRow,
+    /// Master switch for Doppler-correction tracking during
+    /// satellite passes. Default ON. When OFF, the
+    /// `DopplerTracker` stays dormant regardless of frequency
+    /// match or pass schedule. Per issue #521.
+    pub doppler_switch: adw::SwitchRow,
 
     // Next passes group -----------------------------------------------------
     /// The preferences group hosting the dynamically-built pass
@@ -244,6 +249,8 @@ pub struct SatellitesPanelWeak {
     pub auto_record_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::auto_record_audio_switch`].
     pub auto_record_audio_switch: glib::WeakRef<adw::SwitchRow>,
+    /// Weak ref to [`SatellitesPanel::doppler_switch`].
+    pub doppler_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::passes_group`].
     pub passes_group: glib::WeakRef<adw::PreferencesGroup>,
     /// Weak ref to [`SatellitesPanel::passes_status_row`].
@@ -269,6 +276,7 @@ impl SatellitesPanel {
             refresh_spinner: self.refresh_spinner.downgrade(),
             auto_record_switch: self.auto_record_switch.downgrade(),
             auto_record_audio_switch: self.auto_record_audio_switch.downgrade(),
+            doppler_switch: self.doppler_switch.downgrade(),
             passes_group: self.passes_group.downgrade(),
             passes_status_row: self.passes_status_row.downgrade(),
         }
@@ -296,6 +304,7 @@ impl SatellitesPanelWeak {
             refresh_spinner: self.refresh_spinner.upgrade()?,
             auto_record_switch: self.auto_record_switch.upgrade()?,
             auto_record_audio_switch: self.auto_record_audio_switch.upgrade()?,
+            doppler_switch: self.doppler_switch.upgrade()?,
             passes_group: self.passes_group.upgrade()?,
             passes_status_row: self.passes_status_row.upgrade()?,
         })
@@ -439,6 +448,15 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .active(false)
         .build();
     recording_group.add(&auto_record_audio_switch);
+
+    let doppler_switch = adw::SwitchRow::builder()
+        .title("Doppler tracking")
+        .subtitle("Auto-correct frequency drift during satellite passes")
+        .active(false)
+        .build();
+    // Same group as the auto-record switches — these are all
+    // "behavior toggles for the satellites workflow". Per #521.
+    recording_group.add(&doppler_switch);
     page.add(&recording_group);
 
     // ─── Upcoming Passes ──────────────────────────────────────
@@ -469,6 +487,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         refresh_spinner,
         auto_record_switch,
         auto_record_audio_switch,
+        doppler_switch,
         passes_group,
         passes_status_row,
     }
