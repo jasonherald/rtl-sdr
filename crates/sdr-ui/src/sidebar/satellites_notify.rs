@@ -73,18 +73,21 @@ struct NotifyKey {
 /// on individual fields instead of comparing whole actions.
 #[derive(Debug, Clone)]
 pub enum Action {
-    /// Fire a "satellite overhead in N minutes" notification.
+    /// Fire a "satellite overhead in N minutes" notification. The
+    /// satellite display name is carried on `pass.satellite` — no
+    /// separate `sat_name` field, since duplicating it would
+    /// allocate the same string twice per fire (once on the Pass
+    /// clone, once on the field) for no payoff. Per CR round 2 on
+    /// PR #568.
     Fire {
         /// NORAD catalog id — passed through to the notification's
         /// "Tune" action target so the action handler can look the
         /// satellite up in `KNOWN_SATELLITES` for downlink / mode /
         /// bandwidth.
         norad_id: u32,
-        /// Display name of the satellite (e.g. `"NOAA 19"`).
-        sat_name: String,
-        /// The pass itself — the wiring layer reads `start`,
-        /// `max_elevation_deg`, `start_az_deg`, `end_az_deg` from
-        /// it for the notification body.
+        /// The pass itself — the wiring layer reads `satellite`,
+        /// `start`, `max_elevation_deg`, `start_az_deg`,
+        /// `end_az_deg` from it for the notification body.
         pass: Pass,
         /// Lead-time in minutes the user configured. Carried so
         /// the notification body can read "in 5 min" rather than
@@ -176,7 +179,6 @@ impl NotifyScheduler {
             }
             actions.push(Action::Fire {
                 norad_id,
-                sat_name: pass.satellite.clone(),
                 pass: pass.clone(),
                 lead_min,
             });
@@ -224,12 +226,11 @@ mod tests {
         match &actions[0] {
             Action::Fire {
                 norad_id,
-                sat_name,
+                pass,
                 lead_min,
-                ..
             } => {
                 assert_eq!(*norad_id, 33591);
-                assert_eq!(sat_name, "NOAA 19");
+                assert_eq!(pass.satellite, "NOAA 19");
                 assert_eq!(*lead_min, 5);
             }
         }

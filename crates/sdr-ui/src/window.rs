@@ -10804,7 +10804,6 @@ fn connect_satellites_panel(
                         norad_id,
                         pass,
                         lead_min,
-                        ..
                     } => {
                         crate::notify::send_pass_alert(&pass, norad_id, lead_min);
                     }
