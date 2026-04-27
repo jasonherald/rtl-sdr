@@ -72,6 +72,13 @@ pub struct DisplayPanel {
     pub averaging_row: adw::ComboRow,
     /// Theme selector (System / Dark / Light).
     pub theme_row: adw::ComboRow,
+    /// Read-only status row showing the current scanner-mode
+    /// X-axis lock range. Hidden when the scanner is disabled;
+    /// updated by the wiring layer's
+    /// `SetScannerEnabled` / `ScannerActiveChannelChanged` /
+    /// scanner-stop handlers as the lock engages, the active
+    /// channel changes, or the lock disengages. Per issue #516.
+    pub scanner_axis_row: adw::ActionRow,
 }
 
 /// Build the display settings panel.
@@ -223,10 +230,27 @@ pub fn build_display_panel() -> DisplayPanel {
         .build();
     appearance_group.add(&theme_row);
 
+    // Scanner-mode read-only status row. Subtitle is set by the
+    // wiring layer when the scanner-axis lock engages /
+    // updates / disengages — empty subtitle when scanner is off.
+    // Visibility is also wiring-layer-driven (hidden when off,
+    // shown when locked) so users not running the scanner don't
+    // see a confusing always-empty row. Per issue #516.
+    let scanner_axis_row = adw::ActionRow::builder()
+        .title("Scanner axis")
+        .visible(false)
+        .build();
+    let scanner_group = adw::PreferencesGroup::builder()
+        .title("Scanner")
+        .description("X-axis range when the scanner is active")
+        .build();
+    scanner_group.add(&scanner_axis_row);
+
     let page = adw::PreferencesPage::new();
     page.add(&fft_group);
     page.add(&waterfall_group);
     page.add(&levels_group);
+    page.add(&scanner_group);
     page.add(&appearance_group);
 
     // FFT size and window function connected via window.rs
@@ -242,6 +266,7 @@ pub fn build_display_panel() -> DisplayPanel {
         fill_mode_row,
         averaging_row,
         theme_row,
+        scanner_axis_row,
     }
 }
 

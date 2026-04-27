@@ -18,7 +18,7 @@ use std::rc::Rc;
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use fft_plot::FftPlotRenderer;
+use fft_plot::{FftPlotRenderer, SCANNER_HIGHLIGHT_COLOR};
 use signal_history::SignalHistoryRenderer;
 use vfo_overlay::{BwHandle, HitZone, VfoOverlayRenderer, VfoState};
 use waterfall::WaterfallRenderer;
@@ -119,6 +119,18 @@ pub struct SpectrumHandle {
     full_bandwidth: Rc<Cell<f64>>,
     /// Tuner center frequency in Hz (for absolute frequency labels).
     center_freq: Rc<Cell<f64>>,
+    /// Scanner-mode X-axis lock. `Some` while the scanner is
+    /// active — pins the spectrum + waterfall to a wide band
+    /// covering all scanner channels' downlink frequencies, so
+    /// retunes between channels don't recentre the X axis on
+    /// every hop. The narrow FFT data the dongle actually
+    /// produces gets projected into the active channel's slice
+    /// of the wide range; unsampled bands render as dark grey
+    /// noise floor instead of being skipped. Active channel is
+    /// highlighted with a vertical band so the user can read
+    /// "where in the band is the scanner picking things up?"
+    /// at a glance. Per issue #516.
+    scanner_axis_lock: Rc<RefCell<Option<ScannerAxisLock>>>,
     /// Floating "Reset VFO" button overlaid on the top-right of
     /// the spectrum area. Visibility is driven by window.rs:
     /// visible when bandwidth ≠ mode default OR vfo offset ≠ 0.
@@ -126,6 +138,46 @@ pub struct SpectrumHandle {
     /// `AppState` to compute the mode's default bandwidth).
     /// Per issue #341.
     pub vfo_reset_button: gtk4::Button,
+}
+
+/// Snapshot of the scanner X-axis lock — what frequency range
+/// the spectrum / waterfall is pinned to, and which channel is
+/// currently being sampled (if any).
+///
+/// Lifecycle:
+/// 1. `enter_scanner_mode(min, max)` — wiring layer pushes the
+///    union of all scanner-channel downlink frequencies. The
+///    lock is `Some` from this point until `exit_scanner_mode`,
+///    so the X axis stays pinned even while the scanner is
+///    between channels.
+/// 2. `set_scanner_active_channel(freq, bw)` — wiring layer
+///    pushes the current active-channel context on every
+///    `ScannerActiveChannelChanged` event. Drives the
+///    highlight-band overlay and the FFT data projection.
+/// 3. `exit_scanner_mode()` — wiring layer clears the lock when
+///    the scanner is disabled / hits empty rotation / a manual
+///    tune supersedes it. The X axis reverts to the normal
+///    "current channel ± half BW" view.
+///
+/// Per issue #516.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScannerAxisLock {
+    /// Lower bound of the locked X axis, absolute Hz.
+    pub min_hz: f64,
+    /// Upper bound of the locked X axis, absolute Hz.
+    pub max_hz: f64,
+    /// Centre frequency of the channel the scanner is currently
+    /// sampling, absolute Hz. `None` between
+    /// `enter_scanner_mode` and the first
+    /// `set_scanner_active_channel` call (e.g. the first retune
+    /// hasn't completed yet).
+    pub active_channel_hz: Option<f64>,
+    /// Channel filter bandwidth of the active channel, in Hz.
+    /// Used to size the highlight band and project the narrow
+    /// FFT bins into the correct slice of the wide range.
+    /// Always paired with `active_channel_hz` — both `Some` or
+    /// both `None`.
+    pub active_channel_bw_hz: Option<f64>,
 }
 
 impl SpectrumHandle {
@@ -196,7 +248,18 @@ impl SpectrumHandle {
             if target_width != s.renderer.texture_width() {
                 s.renderer.resize(data.len());
             }
-            s.renderer.push_line(data);
+            // Scanner-axis lock takes precedence: project narrow
+            // bins into the active channel's pixel slice with
+            // dark-grey fill of unsampled regions, so historical
+            // rows render as a sparse spatial picture of every
+            // channel the scanner has touched. Per issue #516.
+            let lock = *self.scanner_axis_lock.borrow();
+            if let Some(lock) = lock {
+                s.renderer
+                    .push_line_locked(data, self.full_bandwidth.get(), &lock);
+            } else {
+                s.renderer.push_line(data);
+            }
         }
         self.waterfall_area.queue_draw();
     }
@@ -285,6 +348,123 @@ impl SpectrumHandle {
         self.vfo_state.borrow_mut().offset_hz = 0.0;
         self.fft_area.queue_draw();
         self.waterfall_area.queue_draw();
+    }
+
+    /// Engage the scanner X-axis lock. The wiring layer calls
+    /// this on `UiToDsp::SetScannerEnabled(true)` with the
+    /// (min, max) envelope of all scanner-channel downlink
+    /// frequencies. From this point until `exit_scanner_mode`,
+    /// the spectrum + waterfall stay pinned to that range —
+    /// retunes between channels no longer recentre the X axis.
+    ///
+    /// Initial state: `active_channel_*` is `None` until the
+    /// first `set_scanner_active_channel` call. The renderer
+    /// should treat that gap as "scanner mode is on but no
+    /// channel is currently being sampled" — wide axis with
+    /// no highlight band yet. Per issue #516.
+    pub fn enter_scanner_mode(&self, min_hz: f64, max_hz: f64) {
+        debug_assert!(
+            min_hz < max_hz,
+            "enter_scanner_mode: min ({min_hz}) must be < max ({max_hz})",
+        );
+        // Release-build guard: invalid bounds (non-finite or
+        // inverted) would silently produce broken projections
+        // (division by zero / negative span / NaN-poisoned
+        // pixels) where `debug_assert!` is compiled out. Log
+        // and bail instead of engaging the lock with garbage.
+        // Per `CodeRabbit` round 1 on PR #562.
+        if !min_hz.is_finite() || !max_hz.is_finite() || min_hz >= max_hz {
+            tracing::warn!(
+                min_hz,
+                max_hz,
+                "enter_scanner_mode: ignoring invalid lock bounds",
+            );
+            return;
+        }
+        *self.scanner_axis_lock.borrow_mut() = Some(ScannerAxisLock {
+            min_hz,
+            max_hz,
+            active_channel_hz: None,
+            active_channel_bw_hz: None,
+        });
+        self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
+    }
+
+    /// Update the active-channel context within an engaged
+    /// scanner-axis lock. The wiring layer calls this on every
+    /// `DspToUi::ScannerActiveChannelChanged` event with the
+    /// channel's centre frequency and bandwidth. Drives the
+    /// highlight-band overlay and the FFT/waterfall projection
+    /// of narrow data into the wide range.
+    ///
+    /// No-op when the lock is not engaged — the wiring layer
+    /// guards against race ordering by always calling
+    /// `enter_scanner_mode` first, but a stray
+    /// `ScannerActiveChannelChanged` arriving after
+    /// `exit_scanner_mode` (e.g. mid-shutdown) shouldn't cause
+    /// the lock to mysteriously re-engage. Also rejects
+    /// non-finite frequency / bandwidth and non-positive
+    /// bandwidth — invalid values would silently produce
+    /// broken projections in release builds where
+    /// `debug_assert!` is compiled out. Per issue #516 +
+    /// `CodeRabbit` round 1 on PR #562.
+    pub fn set_scanner_active_channel(&self, freq_hz: f64, bw_hz: f64) {
+        if !freq_hz.is_finite() || !bw_hz.is_finite() || bw_hz <= 0.0 {
+            tracing::trace!(
+                freq_hz,
+                bw_hz,
+                "set_scanner_active_channel: ignoring invalid channel context",
+            );
+            return;
+        }
+        if let Some(lock) = self.scanner_axis_lock.borrow_mut().as_mut() {
+            lock.active_channel_hz = Some(freq_hz);
+            lock.active_channel_bw_hz = Some(bw_hz);
+            self.fft_area.queue_draw();
+            self.waterfall_area.queue_draw();
+        }
+    }
+
+    /// Clear the active-channel context within an engaged
+    /// scanner-axis lock — keeps the wide X axis pinned but
+    /// drops the highlight band and the narrow-data
+    /// projection. The wiring layer calls this on
+    /// `ScannerActiveChannelChanged { key: None }` (scanner
+    /// went idle without disengaging the lock — e.g. between
+    /// rotations, or after the rotation drained but before the
+    /// engine flips back to Idle). Without this, the previous
+    /// channel's highlight + projection stays rendered until
+    /// the next hop or scanner exit. Per `CodeRabbit` round 1
+    /// on PR #562.
+    pub fn clear_scanner_active_channel(&self) {
+        if let Some(lock) = self.scanner_axis_lock.borrow_mut().as_mut() {
+            lock.active_channel_hz = None;
+            lock.active_channel_bw_hz = None;
+            self.fft_area.queue_draw();
+            self.waterfall_area.queue_draw();
+        }
+    }
+
+    /// Disengage the scanner X-axis lock. Wiring layer calls
+    /// this on `UiToDsp::SetScannerEnabled(false)`, scanner
+    /// empty rotation, or any user manual tune that supersedes
+    /// the scanner. The X axis reverts to the normal "current
+    /// channel ± half BW" view on the next render. Per issue
+    /// #516.
+    pub fn exit_scanner_mode(&self) {
+        *self.scanner_axis_lock.borrow_mut() = None;
+        self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
+    }
+
+    /// Read-only accessor for the current lock state. Used by
+    /// the Display panel's status row to render the locked
+    /// range, and by tests to assert state-machine transitions.
+    /// Per issue #516.
+    #[must_use]
+    pub fn scanner_axis_lock(&self) -> Option<ScannerAxisLock> {
+        *self.scanner_axis_lock.borrow()
     }
 
     /// Programmatically update the VFO overlay's offset-from-center.
@@ -392,6 +572,7 @@ pub fn build_spectrum_view(
     let vfo_offset_callback: VfoOffsetCallback = Rc::new(RefCell::new(None));
     let full_bandwidth: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
     let center_freq: Rc<Cell<f64>> = Rc::new(Cell::new(100_000_000.0)); // default 100 MHz
+    let scanner_axis_lock: Rc<RefCell<Option<ScannerAxisLock>>> = Rc::new(RefCell::new(None));
 
     // Initialize renderer state eagerly (no GL context needed).
     *fft_state.borrow_mut() = Some(FftPlotState {
@@ -421,11 +602,13 @@ pub fn build_spectrum_view(
         &cursor_callback,
         &full_bandwidth,
         &center_freq,
+        &scanner_axis_lock,
     );
     let waterfall_area = build_waterfall_area(
         Rc::clone(&waterfall_state),
         Rc::clone(&vfo_state),
         Rc::clone(&full_bandwidth),
+        Rc::clone(&scanner_axis_lock),
     );
     let signal_history_area =
         build_signal_history_area(Rc::clone(&signal_history_state), &min_db, &max_db);
@@ -523,6 +706,7 @@ pub fn build_spectrum_view(
         vfo_offset_callback,
         full_bandwidth,
         center_freq,
+        scanner_axis_lock,
         vfo_reset_button,
     };
 
@@ -540,6 +724,7 @@ fn build_fft_area(
     cursor_callback: &CursorCallback,
     full_bandwidth: &Rc<Cell<f64>>,
     center_freq: &Rc<Cell<f64>>,
+    scanner_axis_lock: &Rc<RefCell<Option<ScannerAxisLock>>>,
 ) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::builder()
         .hexpand(true)
@@ -553,8 +738,33 @@ fn build_fft_area(
     let vfo_render = Rc::clone(vfo_state);
     let full_bw_render = Rc::clone(full_bandwidth);
     let center_freq_render = Rc::clone(center_freq);
+    let scanner_lock_render = Rc::clone(scanner_axis_lock);
     area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow_mut().as_mut() {
+            // Scanner-axis lock takes precedence: when the
+            // scanner is engaged, X axis is pinned to the
+            // channel envelope and the narrow FFT data lands
+            // in the active channel's slice. The VFO overlay
+            // is suppressed in scanner mode — its meaning
+            // (drag-to-tune within the current channel)
+            // doesn't apply when the X axis represents a wide
+            // multi-channel range. Per issue #516.
+            let lock = *scanner_lock_render.borrow();
+            if let Some(lock) = lock {
+                s.renderer.render_locked(
+                    cr,
+                    &s.current_data,
+                    width,
+                    height,
+                    min_db_render.get(),
+                    max_db_render.get(),
+                    fill_render.get(),
+                    full_bw_render.get(),
+                    &lock,
+                );
+                return;
+            }
+
             let vfo = vfo_render.borrow();
             s.renderer.render(
                 cr,
@@ -580,6 +790,7 @@ fn build_fft_area(
     let cursor_min = Rc::clone(min_db);
     let cursor_max = Rc::clone(max_db);
     let cursor_cb = Rc::clone(cursor_callback);
+    let cursor_lock = Rc::clone(scanner_axis_lock);
     let area_weak_motion = area.downgrade();
     motion.connect_motion(move |_ctrl, x, y| {
         let Some(area) = area_weak_motion.upgrade() else {
@@ -591,9 +802,22 @@ fn build_fft_area(
             return;
         }
 
-        let vfo = cursor_vfo.borrow();
-        let freq_hz = vfo.pixel_to_hz(x, width);
-        drop(vfo);
+        // Pixel → frequency in lock-aware fashion. In scanner
+        // mode the X axis spans `[lock.min_hz, lock.max_hz]`
+        // absolutely; out of mode it's center-relative via the
+        // VFO's `pixel_to_hz`. Without this branch the cursor
+        // readout shows wildly wrong frequencies in scanner
+        // mode (it'd report values relative to the wandering
+        // active-channel centre instead of the wide locked
+        // range). Per `CodeRabbit` round 1 on PR #562.
+        let lock = *cursor_lock.borrow();
+        let freq_hz = if let Some(lock) = lock {
+            let frac = (x / width).clamp(0.0, 1.0);
+            lock.min_hz + frac * (lock.max_hz - lock.min_hz)
+        } else {
+            let vfo = cursor_vfo.borrow();
+            vfo.pixel_to_hz(x, width)
+        };
 
         let lo = cursor_min.get();
         let hi = cursor_max.get();
@@ -624,6 +848,7 @@ fn build_waterfall_area(
     state: Rc<RefCell<Option<WaterfallState>>>,
     vfo_state: Rc<RefCell<VfoState>>,
     full_bandwidth: Rc<Cell<f64>>,
+    scanner_axis_lock: Rc<RefCell<Option<ScannerAxisLock>>>,
 ) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::builder()
         .hexpand(true)
@@ -632,6 +857,50 @@ fn build_waterfall_area(
 
     area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow().as_ref() {
+            // Scanner-axis lock: pixels are pre-projected to
+            // the wide locked range at push time, so the
+            // renderer just needs a no-zoom call (display
+            // matches full surface 1:1). VFO overlay is
+            // suppressed because its drag-to-tune semantics
+            // don't apply to a multi-channel range. Per issue
+            // #516.
+            let lock = *scanner_axis_lock.borrow();
+            if let Some(lock) = lock {
+                let bw = full_bandwidth.get();
+                let half = bw / 2.0;
+                s.renderer.render(cr, width, height, -half, half, bw);
+                // Scanner-axis active-channel highlight band —
+                // mirrors the FFT plot's `render_locked` band
+                // so the user has a continuous visual anchor
+                // for "where is the scanner sampling right
+                // now?" across both panels. Drawn AFTER the
+                // texture blit so it overlays the data; spans
+                // the full height for visibility while the
+                // historical rows scroll past underneath. Per
+                // `CodeRabbit` round 3 on PR #562.
+                if let (Some(active_hz), Some(active_bw)) =
+                    (lock.active_channel_hz, lock.active_channel_bw_hz)
+                {
+                    let span = lock.max_hz - lock.min_hz;
+                    if span > 0.0 {
+                        let w = f64::from(width);
+                        let h = f64::from(height);
+                        let band_min_x = w * (active_hz - active_bw / 2.0 - lock.min_hz) / span;
+                        let band_max_x = w * (active_hz + active_bw / 2.0 - lock.min_hz) / span;
+                        let band_w = (band_max_x - band_min_x).max(1.0);
+                        cr.set_source_rgba(
+                            SCANNER_HIGHLIGHT_COLOR[0],
+                            SCANNER_HIGHLIGHT_COLOR[1],
+                            SCANNER_HIGHLIGHT_COLOR[2],
+                            SCANNER_HIGHLIGHT_COLOR[3],
+                        );
+                        cr.rectangle(band_min_x, 0.0, band_w, h);
+                        let _ = cr.fill();
+                    }
+                }
+                return;
+            }
+
             let vfo = vfo_state.borrow();
             s.renderer.render(
                 cr,

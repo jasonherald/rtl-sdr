@@ -7,7 +7,18 @@
 
 use gtk4::cairo;
 
+use super::ScannerAxisLock;
 use super::frequency_axis;
+
+/// Highlight-band overlay color for the active scanner channel
+/// (when scanner-axis lock is engaged). Faint accent blue so
+/// the band reads as a "this is what we're sampling" affordance
+/// without obscuring the trace beneath it. `pub(super)` so
+/// the waterfall draw closure in `mod.rs` can paint a matching
+/// band — visual continuity between the FFT plot and waterfall
+/// panels matters here. Per issue #516 + `CodeRabbit` round 3
+/// on PR #562.
+pub(super) const SCANNER_HIGHLIGHT_COLOR: [f64; 4] = [0.3, 0.7, 1.0, 0.18];
 
 /// Maximum bins for display rendering.
 /// FFT data wider than this is max-pooled down before drawing.
@@ -84,6 +95,52 @@ impl Default for FftPlotRenderer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Map an FFT bin index to a pixel X within a wide locked
+/// X axis. Pure projection helper extracted for unit testing —
+/// the rendering call sites in [`FftPlotRenderer::render_locked`]
+/// and the waterfall sparse-fill use the same math, and
+/// projection drift between them would manifest as a
+/// half-pixel-misaligned highlight band that's hard to spot
+/// visually. Per issue #516.
+///
+/// # Arguments
+///
+/// * `bin_index` — FFT bin number, 0..n_bins-1. After fftshift,
+///   bin 0 is the most negative offset from the active channel
+///   centre and bin n_bins-1 is the most positive.
+/// * `n_bins` — total bin count in the FFT frame.
+/// * `full_bw_hz` — span of the FFT (effective sample rate
+///   after decimation). Bin 0 maps to `-full_bw/2` relative to
+///   the active channel; bin n_bins-1 maps to `+full_bw/2`.
+/// * `active_channel_hz` — absolute centre frequency of the
+///   channel the scanner is sampling.
+/// * `axis_min_hz`, `axis_max_hz` — the locked X axis bounds.
+/// * `w` — pixel width of the drawing area.
+///
+/// Returns the pixel X coordinate (may fall outside `0..w` if
+/// the bin's absolute frequency is outside the locked range —
+/// caller is responsible for clipping).
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub(super) fn bin_to_locked_x(
+    bin_index: usize,
+    n_bins: usize,
+    full_bw_hz: f64,
+    active_channel_hz: f64,
+    axis_min_hz: f64,
+    axis_max_hz: f64,
+    w: f64,
+) -> f64 {
+    let n = (n_bins.saturating_sub(1)).max(1) as f64;
+    let bin_freq_relative = -full_bw_hz / 2.0 + (bin_index as f64 / n) * full_bw_hz;
+    let bin_freq_abs = active_channel_hz + bin_freq_relative;
+    let span = axis_max_hz - axis_min_hz;
+    if span <= 0.0 {
+        return 0.0;
+    }
+    w * (bin_freq_abs - axis_min_hz) / span
 }
 
 impl FftPlotRenderer {
@@ -195,6 +252,177 @@ impl FftPlotRenderer {
         let _ = cr.stroke();
 
         // Return the downsample buffer to self for reuse next frame.
+        let _ = display_data;
+        self.downsample_buf = ds_buf;
+    }
+
+    /// Render the FFT plot with the scanner X-axis lock engaged.
+    ///
+    /// Sibling of [`Self::render`] for scanner mode. Same Cairo
+    /// commands (background → grid → trace → fill → stroke)
+    /// but the projection math uses absolute frequencies
+    /// against the locked range instead of center-relative
+    /// offsets. The narrow FFT bins land in the active
+    /// channel's slice of the wide canvas; the rest of the X
+    /// axis stays at the background colour (no trace), which
+    /// gives the issue #516's "active channel's slice has
+    /// signal, the rest is empty" appearance.
+    ///
+    /// Renders a faint highlight band over the active channel's
+    /// bandwidth so the user can read "this is what we're
+    /// sampling right now" at a glance — same role the existing
+    /// VFO overlay plays in the unlocked case.
+    ///
+    /// # Arguments
+    ///
+    /// * `cr`, `fft_data`, `width`, `height`, `min_db`, `max_db`,
+    ///   `fill_enabled` — same as [`Self::render`].
+    /// * `full_bandwidth` — span of the FFT frame (post-
+    ///   decimation effective sample rate). Used to map bins to
+    ///   relative offsets from the active channel's centre.
+    /// * `lock` — current scanner-axis lock state. The render
+    ///   uses `lock.min_hz`/`lock.max_hz` for the X axis,
+    ///   `lock.active_channel_hz`/`bw_hz` for the trace
+    ///   placement and the highlight band.
+    ///
+    /// Per issue #516.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+    pub fn render_locked(
+        &mut self,
+        cr: &cairo::Context,
+        fft_data: &[f32],
+        width: i32,
+        height: i32,
+        min_db: f32,
+        max_db: f32,
+        fill_enabled: bool,
+        full_bandwidth: f64,
+        lock: &ScannerAxisLock,
+    ) {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let db_range = max_db - min_db;
+        if db_range <= 0.0 {
+            return;
+        }
+        let w = f64::from(width);
+        let h = f64::from(height);
+
+        // Background.
+        cr.set_source_rgba(
+            BACKGROUND_COLOR[0],
+            BACKGROUND_COLOR[1],
+            BACKGROUND_COLOR[2],
+            BACKGROUND_COLOR[3],
+        );
+        let _ = cr.paint();
+
+        // Grid + labels span the locked range absolutely. We
+        // pass `display_start_hz = 0` and `display_end_hz =
+        // span` plus `center_freq_hz = lock.min_hz` to
+        // `draw_grid` — the existing helper computes
+        // `abs_start = center + display_start = lock.min_hz`
+        // and `abs_end = center + display_end = lock.max_hz`,
+        // which is exactly what we want.
+        let span = lock.max_hz - lock.min_hz;
+        Self::draw_grid(cr, w, h, min_db, max_db, 0.0, span, lock.min_hz);
+
+        // Active-channel highlight band — drawn BEFORE the
+        // trace so the trace renders on top. Skip when no
+        // channel is active yet (lock engaged but first retune
+        // hasn't completed) — empty grid only.
+        if let (Some(active_hz), Some(active_bw)) =
+            (lock.active_channel_hz, lock.active_channel_bw_hz)
+            && span > 0.0
+        {
+            let band_min_x = w * (active_hz - active_bw / 2.0 - lock.min_hz) / span;
+            let band_max_x = w * (active_hz + active_bw / 2.0 - lock.min_hz) / span;
+            let band_w = (band_max_x - band_min_x).max(1.0);
+            cr.set_source_rgba(
+                SCANNER_HIGHLIGHT_COLOR[0],
+                SCANNER_HIGHLIGHT_COLOR[1],
+                SCANNER_HIGHLIGHT_COLOR[2],
+                SCANNER_HIGHLIGHT_COLOR[3],
+            );
+            cr.rectangle(band_min_x, 0.0, band_w, h);
+            let _ = cr.fill();
+        }
+
+        // Trace — only renders if we know which channel is
+        // active. Bins project to absolute X via
+        // `bin_to_locked_x`.
+        let Some(active_hz) = lock.active_channel_hz else {
+            return;
+        };
+        if fft_data.is_empty() {
+            return;
+        }
+
+        let mut ds_buf = std::mem::take(&mut self.downsample_buf);
+        let display_data = downsample_fft(fft_data, &mut ds_buf);
+
+        let db_range_f64 = f64::from(db_range);
+        let min_db_f64 = f64::from(min_db);
+        let bin_count = display_data.len();
+        for (i, &db) in display_data.iter().enumerate() {
+            let x = bin_to_locked_x(
+                i,
+                bin_count,
+                full_bandwidth,
+                active_hz,
+                lock.min_hz,
+                lock.max_hz,
+                w,
+            );
+            let y = h * (1.0 - ((f64::from(db) - min_db_f64) / db_range_f64).clamp(0.0, 1.0));
+            if i == 0 {
+                cr.move_to(x, y);
+            } else {
+                cr.line_to(x, y);
+            }
+        }
+
+        if fill_enabled {
+            // Close the fill polygon along the bottom of the
+            // active channel's slice — NOT the full canvas
+            // width, otherwise the fill would extend across the
+            // entire locked range (visually overstating where
+            // we're sampling).
+            let last_x = bin_to_locked_x(
+                bin_count - 1,
+                bin_count,
+                full_bandwidth,
+                active_hz,
+                lock.min_hz,
+                lock.max_hz,
+                w,
+            );
+            let first_x = bin_to_locked_x(
+                0,
+                bin_count,
+                full_bandwidth,
+                active_hz,
+                lock.min_hz,
+                lock.max_hz,
+                w,
+            );
+            cr.line_to(last_x, h);
+            cr.line_to(first_x, h);
+            cr.close_path();
+            cr.set_source_rgba(FILL_COLOR[0], FILL_COLOR[1], FILL_COLOR[2], FILL_COLOR[3]);
+            let _ = cr.fill_preserve();
+        }
+
+        cr.set_source_rgba(
+            TRACE_COLOR[0],
+            TRACE_COLOR[1],
+            TRACE_COLOR[2],
+            TRACE_COLOR[3],
+        );
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+
         let _ = display_data;
         self.downsample_buf = ds_buf;
     }
@@ -333,5 +561,123 @@ impl FftPlotRenderer {
                 cr.line_to(x, y);
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod tests {
+    use super::*;
+
+    /// Reference scenario: scanner channels span 144–148 MHz
+    /// (4 MHz wide), active channel sits at 146 MHz with a
+    /// 250 kHz FFT. The active centre should land at exactly
+    /// the middle of an 800 px-wide canvas (50% in, 400 px).
+    #[test]
+    fn bin_to_locked_x_centres_active_channel() {
+        let n_bins = 1024;
+        let full_bw = 250_000.0;
+        let active_hz = 146_000_000.0;
+        let axis_min = 144_000_000.0;
+        let axis_max = 148_000_000.0;
+        let w = 800.0;
+
+        // The mid-bin (n_bins/2) corresponds to bin_freq_relative = 0,
+        // i.e. exactly at active_channel_hz. For odd offsets the
+        // bin numbering means the closest "centre bin" is
+        // n_bins/2; check that one.
+        let mid_bin = n_bins / 2;
+        let x = bin_to_locked_x(mid_bin, n_bins, full_bw, active_hz, axis_min, axis_max, w);
+        // Expected: w * (146M - 144M) / (148M - 144M) = w * 0.5 = 400.0
+        // Mid-bin is one bin above true centre because of the
+        // (i / (n-1)) projection — small offset, well within
+        // 1 px on an 800 px canvas.
+        assert!((x - 400.0).abs() < 1.0, "expected ~400.0, got {x}");
+    }
+
+    /// Endpoint behaviour: bin 0 must land at the leading edge
+    /// of the active channel's slice (active - bw/2), and the
+    /// final bin must land at the trailing edge (active + bw/2).
+    #[test]
+    fn bin_to_locked_x_endpoints_align_with_channel_edges() {
+        let n_bins = 1024;
+        let full_bw = 250_000.0;
+        let active_hz = 146_000_000.0;
+        let axis_min = 144_000_000.0;
+        let axis_max = 148_000_000.0;
+        let w = 800.0;
+
+        // bin 0 → active - bw/2 = 145.875 MHz → x = 800 * (145.875M - 144M) / 4M = 375.0
+        let x_first = bin_to_locked_x(0, n_bins, full_bw, active_hz, axis_min, axis_max, w);
+        assert!(
+            (x_first - 375.0).abs() < 0.1,
+            "expected ~375.0 for bin 0, got {x_first}",
+        );
+
+        // bin n-1 → active + bw/2 = 146.125 MHz → x = 800 * (146.125M - 144M) / 4M = 425.0
+        let x_last = bin_to_locked_x(
+            n_bins - 1,
+            n_bins,
+            full_bw,
+            active_hz,
+            axis_min,
+            axis_max,
+            w,
+        );
+        assert!(
+            (x_last - 425.0).abs() < 0.1,
+            "expected ~425.0 for last bin, got {x_last}",
+        );
+    }
+
+    /// Active channel near the lower edge of the locked range.
+    /// Verifies the active slice can land at the leading edge
+    /// of the canvas (left side) without going negative.
+    #[test]
+    fn bin_to_locked_x_handles_active_at_lower_edge() {
+        let n_bins = 1024;
+        let full_bw = 250_000.0;
+        let active_hz = 144_125_000.0; // active - bw/2 = axis_min
+        let axis_min = 144_000_000.0;
+        let axis_max = 148_000_000.0;
+        let w = 800.0;
+
+        let x_first = bin_to_locked_x(0, n_bins, full_bw, active_hz, axis_min, axis_max, w);
+        assert!(x_first.abs() < 0.1, "expected ~0.0, got {x_first}");
+    }
+
+    /// Degenerate input: zero-width axis. Helper must not divide
+    /// by zero; returning 0.0 is fine because the caller's
+    /// drawing code clips degenerate dimensions anyway.
+    #[test]
+    fn bin_to_locked_x_zero_span_returns_zero() {
+        let x = bin_to_locked_x(
+            100,
+            1024,
+            250_000.0,
+            146_000_000.0,
+            146_000_000.0,
+            146_000_000.0,
+            800.0,
+        );
+        assert_eq!(x, 0.0);
+    }
+
+    /// Single-bin input: avoid div-by-zero on `(n-1)` in the
+    /// projection. Returns the expected first-bin position
+    /// (active - bw/2).
+    #[test]
+    fn bin_to_locked_x_single_bin_does_not_panic() {
+        let x = bin_to_locked_x(
+            0,
+            1,
+            250_000.0,
+            146_000_000.0,
+            144_000_000.0,
+            148_000_000.0,
+            800.0,
+        );
+        // active - bw/2 = 145.875 MHz → x = 800 * (145.875M - 144M) / 4M = 375.0
+        assert!((x - 375.0).abs() < 0.1, "expected ~375.0, got {x}");
     }
 }
