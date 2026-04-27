@@ -1160,10 +1160,26 @@ fn attach_drag_gesture(
     let area_weak_update = area.downgrade();
     let dsp_tx_update = dsp_tx.clone();
     let offset_cb = Rc::clone(vfo_offset_callback);
+    let drag_lock_update = Rc::clone(scanner_axis_lock);
     drag.connect_drag_update(move |_gesture, offset_x, _offset_y| {
         let Some(area) = area_weak_update.upgrade() else {
             return;
         };
+        // Re-check the lock at every update tick. If the
+        // scanner engaged mid-gesture (e.g. a Doppler retune
+        // hit at the same moment the user started dragging),
+        // bail and clear the local drag flags so subsequent
+        // updates also short-circuit. Without this, a drag
+        // begun before the lock engaged would keep emitting
+        // `SetVfoOffset` / `SetBandwidth` against a wide
+        // multi-channel axis where the math is meaningless.
+        // Per `CodeRabbit` round 1 on PR #565.
+        if drag_lock_update.borrow().is_some() {
+            let mut vfo = vfo_update.borrow_mut();
+            vfo.dragging = false;
+            vfo.bw_dragging = None;
+            return;
+        }
         let width = f64::from(area.width());
         let mut vfo = vfo_update.borrow_mut();
 
