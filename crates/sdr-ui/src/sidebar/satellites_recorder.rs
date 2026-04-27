@@ -26,8 +26,8 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use sdr_sat::Pass;
 use sdr_radio::af_chain::CtcssMode;
+use sdr_sat::Pass;
 use sdr_types::DemodMode;
 
 use crate::sidebar::satellites_panel::tune_target_for_pass;
@@ -1016,20 +1016,32 @@ mod tests {
 
     #[test]
     fn finalizing_advances_to_idle_with_restore_action() {
+        // Scoped typed constants for the round-trip pins. Each
+        // value is intentionally distinct from the recorder's
+        // defaults / the `default_tune` fixture so a regression
+        // that resets a field would fail loudly. Declared before
+        // any statements per clippy's `items_after_statements`.
+        // Per CR round 1 on PR #557.
+        const SAVED_FREQ_HZ: f64 = 89_700_000.0;
+        const SAVED_VFO_OFFSET_HZ: f64 = 25_000.0;
+        const SAVED_BANDWIDTH_HZ: u32 = 200_000;
+        const SAVED_SQUELCH_DB: f32 = -42.5;
+        const SAVED_CTCSS_TONE_HZ: f32 = 100.0;
+
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 60, 50.0);
         let saved = SavedTune {
-            freq_hz: 89_700_000.0,
-            vfo_offset_hz: 25_000.0, // pin a non-zero offset for the round trip
+            freq_hz: SAVED_FREQ_HZ,
+            vfo_offset_hz: SAVED_VFO_OFFSET_HZ, // pin a non-zero offset for the round trip
             mode: DemodMode::Wfm,
-            bandwidth_hz: 200_000,
+            bandwidth_hz: SAVED_BANDWIDTH_HZ,
             was_running: false,
             scanner_running: true, // pin: pre-AOS scan must come back at LOS
             // pin: pre-AOS audio-chain settings must come back at LOS
             squelch_enabled: true,
-            squelch_db: -42.5,
-            ctcss_mode: CtcssMode::Tone(100.0),
+            squelch_db: SAVED_SQUELCH_DB,
+            ctcss_mode: CtcssMode::Tone(SAVED_CTCSS_TONE_HZ),
             fm_if_nr_enabled: true,
         };
         // Walk all transitions.
@@ -1063,18 +1075,20 @@ mod tests {
         // dropped permanently).
         match &actions[0] {
             Action::RestoreTune(t) => {
-                assert_eq!(t.freq_hz, 89_700_000.0);
-                assert_eq!(t.vfo_offset_hz, 25_000.0);
+                assert_eq!(t.freq_hz, SAVED_FREQ_HZ);
+                assert_eq!(t.vfo_offset_hz, SAVED_VFO_OFFSET_HZ);
                 assert_eq!(t.mode, DemodMode::Wfm);
-                assert_eq!(t.bandwidth_hz, 200_000);
+                assert_eq!(t.bandwidth_hz, SAVED_BANDWIDTH_HZ);
                 assert!(!t.was_running);
                 assert!(t.scanner_running);
                 // Audio-chain pre-AOS state survives round-trip
                 // (#555 / #556): squelch enable + level, CTCSS
                 // mode, and FM IF NR all come back.
                 assert!(t.squelch_enabled);
-                assert!((t.squelch_db - (-42.5)).abs() < f32::EPSILON);
-                assert!(matches!(t.ctcss_mode, CtcssMode::Tone(hz) if (hz - 100.0).abs() < f32::EPSILON));
+                assert!((t.squelch_db - SAVED_SQUELCH_DB).abs() < f32::EPSILON);
+                assert!(
+                    matches!(t.ctcss_mode, CtcssMode::Tone(hz) if (hz - SAVED_CTCSS_TONE_HZ).abs() < f32::EPSILON)
+                );
                 assert!(t.fm_if_nr_enabled);
             }
             other => panic!("expected RestoreTune, got {other:?}"),

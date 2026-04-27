@@ -13,6 +13,7 @@ use libadwaita::prelude::*;
 use sdr_core::Engine;
 use sdr_pipeline::iq_frontend::FftWindow;
 use sdr_radio::DeemphasisMode;
+use sdr_radio::af_chain::CtcssMode;
 use sdr_rtltcp_discovery::{
     AdvertiseOptions, Advertiser, Browser, DiscoveredServer, DiscoveryEvent, TxtRecord,
     local_hostname,
@@ -9290,8 +9291,11 @@ fn connect_satellites_panel(
                     if squelch_enabled_row_a.is_active() {
                         squelch_enabled_row_a.set_active(false);
                     }
-                    if ctcss_row_a.selected() != 0 {
-                        ctcss_row_a.set_selected(0);
+                    let off_idx = sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(
+                        CtcssMode::Off,
+                    );
+                    if ctcss_row_a.selected() != off_idx {
+                        ctcss_row_a.set_selected(off_idx);
                     }
                     if fm_if_nr_row_a.is_active() {
                         fm_if_nr_row_a.set_active(false);
@@ -9299,6 +9303,18 @@ fn connect_satellites_panel(
                 };
                 match protocol {
                     sdr_sat::ImagingProtocol::Apt => {
+                        // **Order is load-bearing.** Force the
+                        // audio chain off BEFORE start/tune so
+                        // the very first samples through the
+                        // freshly-tuned demod aren't gated by a
+                        // stale squelch / CTCSS / FM-IF-NR
+                        // setting. Otherwise low-SNR AOS rows
+                        // race against the change-notify chain
+                        // dispatching the SetX messages and the
+                        // first few scan lines could be silenced
+                        // before the demod even sees them. Per
+                        // CR round 1 on PR #557.
+                        force_audio_chain_off();
                         // Drive Start through the header play
                         // button — its `connect_toggled` handler
                         // is the single place that updates
@@ -9314,7 +9330,6 @@ fn connect_satellites_panel(
                         // the corresponding LOS-side stop.
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
-                        force_audio_chain_off();
                         // Zero the live VFO offset for the
                         // auto-record pass. The user's pre-AOS
                         // offset (a manual VFO drag away from
@@ -9376,13 +9391,19 @@ fn connect_satellites_panel(
                         if let Some(view) = state_a.lrpt_viewer.borrow().as_ref() {
                             view.clear();
                         }
+                        // Force audio chain off BEFORE start/tune
+                        // so the freshly-tuned demod isn't gated
+                        // by a stale squelch / CTCSS / FM-IF-NR
+                        // setting. Per CR round 1 on PR #557 —
+                        // see APT arm above for the full
+                        // rationale.
+                        force_audio_chain_off();
                         // Now safe to start playback + retune;
                         // any decoded rows from this point
                         // forward land in the cleared image.
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
                         state_a.dispatch_vfo_offset(0.0);
-                        force_audio_chain_off();
                     }
                 }
             }
@@ -9669,27 +9690,20 @@ fn connect_satellites_panel(
                     tracing::info!("auto-record: stopping source (was stopped pre-AOS)");
                     set_playing_a(false);
                 }
-                // Re-arm the scanner if it was running pre-AOS.
-                // The AOS-side `tune_a` call goes through
-                // `tune_to_satellite`, which fires
-                // `ScannerForceDisable::trigger("satellite tune")`
-                // as a manual-tune side effect — without this
-                // restore, an active pre-AOS scan would be left
-                // permanently off after the pass. Same idiom as
-                // `was_running`: snapshot the user's pre-AOS
-                // state, return them to it. `set_active(true)`
-                // fires the switch's notify handler, which
-                // dispatches `SetScannerEnabled(true)` to the
-                // engine — same path a manual flip takes.
-                if saved.scanner_running && !scanner_switch_a.is_active() {
-                    tracing::info!("auto-record: re-arming scanner (was running pre-AOS)");
-                    scanner_switch_a.set_active(true);
-                }
-                // Restore the pre-AOS audio-chain settings via the
-                // same `set_*`-fires-notify pattern. Per #555 / #556.
-                // Squelch level is restored unconditionally
-                // (cheap, idempotent on equal value); the toggles
-                // are guarded against no-op writes for cleaner
+                // **Order is load-bearing.** Restore the audio-
+                // chain settings BEFORE re-arming the scanner.
+                // A scanner that wakes back up while the audio
+                // chain is still in its forced-off pass state
+                // would briefly run with wrong squelch / CTCSS /
+                // FM-IF-NR — wasting the first dwell or two on
+                // un-gated noise. Per CR round 1 on PR #557.
+                //
+                // Same `set_*`-fires-notify pattern the rest of
+                // this handler uses (and that the AOS-side
+                // `force_audio_chain_off` mirrors). Squelch
+                // level is restored unconditionally (cheap,
+                // idempotent on equal value); the toggles are
+                // guarded against no-op writes for cleaner
                 // tracing logs.
                 #[allow(
                     clippy::cast_possible_truncation,
@@ -9709,6 +9723,22 @@ fn connect_satellites_panel(
                 }
                 if saved.fm_if_nr_enabled != fm_if_nr_row_a.is_active() {
                     fm_if_nr_row_a.set_active(saved.fm_if_nr_enabled);
+                }
+                // Re-arm the scanner if it was running pre-AOS.
+                // The AOS-side `tune_a` call goes through
+                // `tune_to_satellite`, which fires
+                // `ScannerForceDisable::trigger("satellite tune")`
+                // as a manual-tune side effect — without this
+                // restore, an active pre-AOS scan would be left
+                // permanently off after the pass. Same idiom as
+                // `was_running`: snapshot the user's pre-AOS
+                // state, return them to it. `set_active(true)`
+                // fires the switch's notify handler, which
+                // dispatches `SetScannerEnabled(true)` to the
+                // engine — same path a manual flip takes.
+                if saved.scanner_running && !scanner_switch_a.is_active() {
+                    tracing::info!("auto-record: re-arming scanner (was running pre-AOS)");
+                    scanner_switch_a.set_active(true);
                 }
             }
             RecorderAction::Toast { message, kind } => {
