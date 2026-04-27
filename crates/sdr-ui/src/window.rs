@@ -9697,12 +9697,23 @@ fn connect_satellites_panel(
                         let active = b.is_active();
                         {
                             let mut set = watched_for_toggle.borrow_mut();
-                            if active {
-                                set.insert(norad_id);
+                            // `HashSet::insert` / `HashSet::remove`
+                            // return whether membership actually
+                            // changed. Skip the config write when it
+                            // didn't — sibling-mirror re-enters this
+                            // handler for every other row of the
+                            // same satellite, and without the guard
+                            // every mirror would issue an identical
+                            // save_watched_satellites call. Per CR
+                            // round 3 on PR #568.
+                            let changed = if active {
+                                set.insert(norad_id)
                             } else {
-                                set.remove(&norad_id);
+                                set.remove(&norad_id)
+                            };
+                            if changed {
+                                save_watched_satellites(&config_for_toggle, &set);
                             }
-                            save_watched_satellites(&config_for_toggle, &set);
                         }
                         // Mirror across sibling rows. `set_active`
                         // is a no-op when the state already matches,
