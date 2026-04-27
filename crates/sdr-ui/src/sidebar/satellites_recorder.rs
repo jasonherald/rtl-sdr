@@ -276,6 +276,22 @@ pub enum Action {
     /// pass does NOT retroactively start or stop recording.
     /// Wiring layer maps to `UiToDsp::StopAudioRecording`.
     StopAutoAudioRecord,
+    /// Flush in-flight imaging-decoder state between passes.
+    /// Fired alongside [`Action::SavePng`] /
+    /// [`Action::SaveLrptPass`] on either LOS transition path —
+    /// the normal `Recording → Finalizing` (end-of-pass) AND
+    /// the `BeforePass → Finalizing` short-circuit (1 Hz driver
+    /// stalled, or pass entirely inside the settle window).
+    /// Both paths build the action vec via `los_actions_for`,
+    /// which guarantees save → optional stop-audio → reset
+    /// ordering. Without it, when the user was already running
+    /// pre-AOS (`SavedTune.was_running == true`), the source
+    /// stays open across the LOS → AOS boundary and the LRPT
+    /// pipeline's `ImageAssembler` + APT decoder accumulator
+    /// retain pass N's state when pass N+1 begins. Wiring
+    /// layer maps to `UiToDsp::ResetImagingDecoders`. Per
+    /// issue #544 + `CodeRabbit` round 1 on PR #560.
+    ResetImagingDecoders,
     /// Restore the radio to the pre-recording tune. Fired on
     /// `Finalizing → Idle`. Caller dispatches the same triple
     /// through the same primitive the play button uses.
@@ -566,13 +582,13 @@ impl AutoRecorder {
         // finalizing AND emit the protocol-appropriate save —
         // otherwise we'd jump to Idle on the next tick without
         // ever exporting the image. `output` was computed at AOS
-        // so the path pairs with `audio_path`.
+        // so the path pairs with `audio_path`. Same action vec
+        // as the `tick_recording` LOS path — both go through
+        // `los_actions_for` so the BeforePass-stall edge case
+        // gets the same `ResetImagingDecoders` flush. Per
+        // CodeRabbit round 1 on PR #560.
         if pass.end <= now {
-            let mut actions = Vec::with_capacity(2);
-            actions.push(save_action_for(&output));
-            if audio_path.is_some() {
-                actions.push(Action::StopAutoAudioRecord);
-            }
+            let actions = los_actions_for(&output, audio_path.is_some());
             self.state = State::Finalizing {
                 pass: pass.clone(),
                 saved_tune,
@@ -601,19 +617,14 @@ impl AutoRecorder {
         audio_path: Option<PathBuf>,
     ) -> Vec<Action> {
         if pass.end <= now {
-            // Emit the protocol-appropriate save action — the
-            // success / failure toast is the wiring layer's
-            // responsibility (it knows the export's actual
-            // outcome). Announcing "image saved" here would lie
-            // if the user closed the viewer mid-pass or
-            // `export_png` errored on disk-full / permissions.
-            // `output` was computed at AOS so the path pairs
-            // with `audio_path`.
-            let mut actions = Vec::with_capacity(2);
-            actions.push(save_action_for(&output));
-            if audio_path.is_some() {
-                actions.push(Action::StopAutoAudioRecord);
-            }
+            // Same action vec as the `tick_before_pass` LOS
+            // short-circuit — both paths go through
+            // `los_actions_for` so a stalled BeforePass tick
+            // gets the same `ResetImagingDecoders` flush. The
+            // helper documents the ordering rationale (save →
+            // stop audio → reset decoders) and the idempotency
+            // contract with the source-stop reset.
+            let actions = los_actions_for(&output, audio_path.is_some());
             self.state = State::Finalizing {
                 pass,
                 saved_tune,
@@ -707,6 +718,41 @@ fn save_action_for(output: &PassOutput) -> Action {
         PassOutput::AptPng(p) => Action::SavePng(p.clone()),
         PassOutput::LrptDir(p) => Action::SaveLrptPass(p.clone()),
     }
+}
+
+/// Build the action vec for a `Recording → Finalizing` (or
+/// `BeforePass → Finalizing` short-circuit) LOS transition.
+/// Both paths emit the same actions in the same order:
+///
+/// 1. Protocol-appropriate save (`SavePng` for APT,
+///    `SaveLrptPass` for LRPT) — must run BEFORE the reset so
+///    the export can still snapshot the just-finished pass's
+///    pixels.
+/// 2. `StopAutoAudioRecord` — only when audio was started at
+///    AOS. Toggling the audio switch mid-pass doesn't
+///    retroactively start or stop recording.
+/// 3. `ResetImagingDecoders` — flush the in-flight APT / LRPT
+///    decoder buffers so the next pass starts clean. When
+///    `was_running == true` pre-AOS, this is the only hook
+///    between passes; when `was_running == false`, the
+///    subsequent `RestoreTune` triggers source-stop which
+///    resets again — idempotent. Per issue #544.
+///
+/// Centralising this into one helper guards against the
+/// `tick_before_pass` short-circuit (1 Hz driver stalled, or
+/// pass entirely inside the settle window) silently dropping
+/// the reset action — both call sites stay in lockstep on what
+/// "LOS finalisation" means. Per `CodeRabbit` round 1 on PR
+/// #560.
+#[must_use]
+fn los_actions_for(output: &PassOutput, has_audio: bool) -> Vec<Action> {
+    let mut actions = Vec::with_capacity(3);
+    actions.push(save_action_for(output));
+    if has_audio {
+        actions.push(Action::StopAutoAudioRecord);
+    }
+    actions.push(Action::ResetImagingDecoders);
+    actions
 }
 
 /// Shared filename builder for the per-pass file artifacts —
@@ -1141,6 +1187,42 @@ mod tests {
             actions.iter().any(|a| matches!(a, Action::SavePng(_))),
             "BeforePass→Finalizing must emit SavePng even when stalled past LOS"
         );
+    }
+
+    /// Regression for the BeforePass-stall LOS edge case
+    /// (`#544` + `CodeRabbit` round 1 on PR #560). The
+    /// `tick_before_pass` short-circuit jumps straight to
+    /// `Finalizing` without entering `Recording` — earlier
+    /// drafts of the #544 fix only added `ResetImagingDecoders`
+    /// to the `tick_recording` LOS path, so a stalled driver
+    /// would skip the reset and leak APT/LRPT state into the
+    /// next pass on exactly the edge case the issue is trying
+    /// to close. Both LOS paths now go through the shared
+    /// `los_actions_for` helper; this test pins that the
+    /// stalled-BeforePass path still emits the reset.
+    #[test]
+    fn los_during_before_pass_still_emits_reset_imaging_decoders() {
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 60, 50.0);
+        r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        assert!(matches!(r.state(), State::BeforePass { .. }));
+        let post_los = pass.end + ChronoDuration::seconds(5);
+        let actions = r.tick(
+            post_los,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        assert!(matches!(r.state(), State::Finalizing { .. }));
+        assert_save_before_reset(&actions, "BeforePass-stall LOS");
     }
 
     #[test]
@@ -1785,5 +1867,138 @@ mod tests {
                 .any(|a| matches!(a, Action::StartAutoAudioRecord(_))),
             "APT pass with audio toggle on must emit StartAutoAudioRecord; got {aos_actions:?}"
         );
+    }
+
+    /// Per #544: LOS must emit `ResetImagingDecoders` so the
+    /// in-flight APT/LRPT decoder state from the just-finished
+    /// pass doesn't bleed into the next one when the source
+    /// stays open across the LOS → AOS boundary. Pinning the
+    /// emit here so the wiring layer's between-pass cleanup
+    /// hook can't go stealth-quiet on a refactor.
+    ///
+    /// Helper for the three LOS-reset tests below: assert the
+    /// LOS contract that save runs BEFORE reset — the save
+    /// action's snapshot read of the shared `LrptImage` would
+    /// otherwise capture an empty buffer instead of the
+    /// just-finished pass. Pure positional assertion, panics
+    /// with a clear message that includes the offending action
+    /// vec. Per `CodeRabbit` round 2 on PR #560.
+    fn assert_save_before_reset(actions: &[Action], label: &str) {
+        let save_idx = actions
+            .iter()
+            .position(|a| matches!(a, Action::SavePng(_) | Action::SaveLrptPass(_)))
+            .unwrap_or_else(|| panic!("{label}: LOS must emit a save action; got {actions:?}"));
+        let reset_idx = actions
+            .iter()
+            .position(|a| matches!(a, Action::ResetImagingDecoders))
+            .unwrap_or_else(|| {
+                panic!("{label}: LOS must emit Action::ResetImagingDecoders; got {actions:?}")
+            });
+        assert!(
+            save_idx < reset_idx,
+            "{label}: save must precede reset; got {actions:?}",
+        );
+    }
+
+    #[test]
+    fn los_emits_reset_imaging_decoders() {
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
+        r.tick(
+            after_settle,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            default_tune(),
+        );
+        let los_plus = pass.end + ChronoDuration::seconds(1);
+        let los_actions = r.tick(los_plus, &[pass], true, false, default_tune());
+        assert_save_before_reset(&los_actions, "single-pass LOS");
+    }
+
+    /// Per #544: two back-to-back passes must each emit their
+    /// own `ResetImagingDecoders` — the recorder's state machine
+    /// is reusable across passes (`Idle → BeforePass → Recording
+    /// → Finalizing → Idle` is the per-pass cycle). Without a
+    /// reset between them, an overnight unattended setup with
+    /// 4-6 LRPT passes would accrete the pipeline's
+    /// `ImageAssembler` state monotonically.
+    #[test]
+    fn two_back_to_back_passes_each_emit_reset() {
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+
+        // Pass 1.
+        let pass1 = synthetic_noaa19(now, 3, 720, 50.0);
+        r.tick(
+            now,
+            std::slice::from_ref(&pass1),
+            true,
+            false,
+            default_tune(),
+        );
+        let after_settle_1 = now + ChronoDuration::seconds(SETTLE_SECS + 1);
+        r.tick(
+            after_settle_1,
+            std::slice::from_ref(&pass1),
+            true,
+            false,
+            default_tune(),
+        );
+        let los_1 = pass1.end + ChronoDuration::seconds(1);
+        let los_1_actions = r.tick(
+            los_1,
+            std::slice::from_ref(&pass1),
+            true,
+            false,
+            default_tune(),
+        );
+        let reset_count_1 = los_1_actions
+            .iter()
+            .filter(|a| matches!(a, Action::ResetImagingDecoders))
+            .count();
+        assert_eq!(reset_count_1, 1, "pass 1 LOS must emit exactly one reset");
+        assert_save_before_reset(&los_1_actions, "pass 1 LOS");
+
+        // Settle from Finalizing back to Idle (the next tick after
+        // LOS does Finalizing → Idle and emits RestoreTune).
+        let post_los_1 = los_1 + ChronoDuration::seconds(1);
+        r.tick(post_los_1, &[pass1], true, false, default_tune());
+
+        // Pass 2 — fresh AOS, schedule it after pass 1 completed.
+        let pass2_aos = post_los_1 + ChronoDuration::seconds(60);
+        let pass2 = synthetic_noaa19(pass2_aos, 0, 720, 50.0);
+        r.tick(
+            pass2_aos,
+            std::slice::from_ref(&pass2),
+            true,
+            false,
+            default_tune(),
+        );
+        let after_settle_2 = pass2_aos + ChronoDuration::seconds(SETTLE_SECS + 1);
+        r.tick(
+            after_settle_2,
+            std::slice::from_ref(&pass2),
+            true,
+            false,
+            default_tune(),
+        );
+        let los_2 = pass2.end + ChronoDuration::seconds(1);
+        let los_2_actions = r.tick(los_2, &[pass2], true, false, default_tune());
+        let reset_count_2 = los_2_actions
+            .iter()
+            .filter(|a| matches!(a, Action::ResetImagingDecoders))
+            .count();
+        assert_eq!(reset_count_2, 1, "pass 2 LOS must emit exactly one reset");
+        assert_save_before_reset(&los_2_actions, "pass 2 LOS");
     }
 }

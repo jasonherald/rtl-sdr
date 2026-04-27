@@ -1856,6 +1856,23 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // round 1 on PR #543.
         }
 
+        UiToDsp::ResetImagingDecoders => {
+            // Between-pass reset for the auto-record flow when
+            // the source stays open across pass boundaries
+            // (`was_running == true` pre-AOS keeps `set_playing`
+            // engaged at LOS, so the source-stop path doesn't
+            // run and `cleanup`'s reset never fires). Without
+            // this, the LRPT pipeline's internal
+            // `ImageAssembler` retains every previous pass's
+            // pixels (~6 MB per channel per pass) and the APT
+            // decoder's accumulator + ready queue grow
+            // monotonically. Same field reset as `cleanup`,
+            // factored out into `reset_imaging_decoders` so
+            // both call sites stay in lockstep. Per issue #544.
+            tracing::info!("auto-record: imaging decoders reset between passes");
+            reset_imaging_decoders(state);
+        }
+
         UiToDsp::StartIqRecording(path) => {
             tracing::info!(?path, "start IQ recording");
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -2788,43 +2805,57 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
 
     state.source = None;
 
-    // Hard stream discontinuity — flush APT decoder state so a
-    // subsequent Start can't bleed pre-stop accumulator/ready
-    // lines into the new session and emit a stale first line.
-    // The decoder itself stays allocated so the next Start
-    // doesn't pay re-init cost (filter taps, resampler tables);
-    // we only clear its in-flight buffers via `AptDecoder::reset`.
-    // Cross-mode preservation (NFM → WFM → NFM mid-pass) is a
-    // *soft* discontinuity and intentionally stays untouched —
-    // the user keeps decoding the same pass.
+    // Hard stream discontinuity — flush imaging-decoder state so
+    // a subsequent Start can't bleed pre-stop accumulator / ready
+    // lines / Viterbi traceback / image-assembler pixels into
+    // the new session. Decoders themselves stay allocated so the
+    // next Start doesn't pay re-init cost (filter taps,
+    // resampler tables, FEC tables); only their in-flight
+    // buffers get cleared. Cross-mode preservation (NFM → WFM →
+    // NFM mid-pass) is a *soft* discontinuity and intentionally
+    // stays untouched — the user keeps decoding the same pass.
+    reset_imaging_decoders(state);
+
+    tracing::info!("source closed");
+}
+
+/// Flush APT and LRPT decoder state without dropping the
+/// decoders themselves. Used by both [`cleanup`] (full source
+/// stop) and the [`UiToDsp::ResetImagingDecoders`] handler
+/// (between-pass reset for auto-record sessions where the
+/// source stays open). Per issue #544.
+///
+/// What gets reset:
+/// - `state.apt_decoder` — accumulator + ready queue + sync
+///   tracker via [`sdr_dsp::AptDecoder::reset`]. The filter
+///   taps and resampler tables stay allocated.
+/// - `state.apt_mono_buf` — scratch buffer for the L+R downmix
+///   (cleared, kept allocated).
+/// - `state.apt_init_failed_at_rate` — clear the cached
+///   per-rate init-failure memo so the next session retries
+///   even if a previous attempt failed.
+/// - `state.lrpt_decoder` — Viterbi traceback + ASM sync
+///   window + RS path + image assembler via
+///   [`sdr_radio::LrptDecoder::reset`]. If `reset` fails (the
+///   demod rebuild it does internally is practically
+///   unreachable), drop the decoder so the next tap call lazily
+///   re-initialises.
+/// - `state.lrpt_init_failed` — same rationale as the APT
+///   memo.
+fn reset_imaging_decoders(state: &mut DspState) {
     if let Some(decoder) = state.apt_decoder.as_mut() {
         decoder.reset();
     }
     state.apt_mono_buf.clear();
-    // Clear the failed-init guard so a fresh Start gets a fresh
-    // init attempt — the user may have tweaked the radio audio
-    // rate between sessions, and we don't want a stale failure
-    // memo to silently suppress a now-valid rate.
     state.apt_init_failed_at_rate = None;
 
-    // Same semantics for the LRPT decoder (#469): flush
-    // in-flight Viterbi traceback / sync window / RS path /
-    // image assembler so the next Start paints a clean canvas.
-    // If reset's demod-rebuild fails (practically unreachable;
-    // see `LrptDemod::new`), drop the decoder entirely so the
-    // next tap call lazily re-initialises.
     if let Some(decoder) = state.lrpt_decoder.as_mut()
         && let Err(e) = decoder.reset()
     {
         tracing::warn!("LRPT decoder reset failed; dropping for re-init: {e}");
         state.lrpt_decoder = None;
     }
-    // Clear the failed-init guard so a fresh Start gets a fresh
-    // init attempt. Mirror `apt_init_failed_at_rate` above. Per
-    // `CodeRabbit` round 12 on PR #543.
     state.lrpt_init_failed = false;
-
-    tracing::info!("source closed");
 }
 
 /// Rebuild the IQ frontend with the current sample rate, preserving user settings.

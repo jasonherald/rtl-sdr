@@ -419,6 +419,18 @@ pub enum UiToDsp {
     /// `EmptyRotation` (all channels locked) this resumes
     /// rotation automatically.
     UnlockScannerChannel(sdr_scanner::ChannelKey),
+    /// Flush in-flight imaging-decoder state (APT + LRPT) without
+    /// closing the source. The source-stop path (`cleanup`)
+    /// already does this on full Stop, but the auto-record flow
+    /// when `was_running == true` pre-AOS keeps the source open
+    /// across pass boundaries — leaving the LRPT pipeline's
+    /// `ImageAssembler` and the APT decoder's accumulator
+    /// retaining state from pass N when pass N+1 begins. The
+    /// auto-record state machine emits this at the
+    /// `Recording → Finalizing` transition (LOS) so each pass
+    /// starts with clean decoder state regardless of whether the
+    /// source is power-cycled. Per issue #544.
+    ResetImagingDecoders,
 }
 
 #[cfg(test)]
@@ -1055,5 +1067,16 @@ mod tests {
 
         let unlock = UiToDsp::UnlockScannerChannel(key);
         assert!(matches!(unlock, UiToDsp::UnlockScannerChannel(_)));
+    }
+
+    /// Shape regression for `UiToDsp::ResetImagingDecoders`. The
+    /// auto-record state machine's `Recording → Finalizing`
+    /// transition emits this — a rename / removal would fail the
+    /// recorder's wiring at runtime, so pin the variant here. Per
+    /// issue #544.
+    #[test]
+    fn test_reset_imaging_decoders_variant() {
+        let msg = UiToDsp::ResetImagingDecoders;
+        assert!(matches!(msg, UiToDsp::ResetImagingDecoders));
     }
 }

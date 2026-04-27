@@ -9802,6 +9802,24 @@ fn connect_satellites_panel(
                 tracing::info!("auto-record LOS: closing WAV writer");
                 state_a.send_dsp(UiToDsp::StopAudioRecording);
             }
+            RecorderAction::ResetImagingDecoders => {
+                // Between-pass decoder flush. The state machine
+                // emits this at every `Recording → Finalizing`
+                // transition (LOS), AFTER the save action's
+                // snapshot read of the shared `LrptImage`. When
+                // `was_running == true` pre-AOS this is the only
+                // hook between passes — `RestoreTune` keeps the
+                // source open across LOS → AOS, so the
+                // source-stop reset never fires. When
+                // `was_running == false` the subsequent
+                // `set_playing(false)` in `RestoreTune` triggers
+                // the source-stop path which resets again —
+                // idempotent (`reset_imaging_decoders` only
+                // touches in-flight buffers), so the
+                // double-reset is harmless. Per issue #544.
+                tracing::info!("auto-record LOS: resetting imaging decoders");
+                state_a.send_dsp(UiToDsp::ResetImagingDecoders);
+            }
             RecorderAction::SavePng(path) => {
                 // Toast based on the *actual* export outcome
                 // rather than announcing success up front — the
