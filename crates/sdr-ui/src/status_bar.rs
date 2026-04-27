@@ -82,6 +82,14 @@ pub struct StatusBar {
     pub antenna_separator: gtk4::Separator,
     /// Label showing cursor frequency and power readout.
     pub cursor_label: gtk4::Label,
+    /// Live Doppler-correction readout. Format: `Doppler: -1.4 kHz`
+    /// (signed, 0.1 kHz precision). Hidden when no satellite is
+    /// being tracked. Per issue #521.
+    pub doppler_label: gtk4::Label,
+    /// Separator widget packed immediately before `doppler_label`.
+    /// Visibility toggled in lockstep with the label so hiding
+    /// the label doesn't leave a stray separator.
+    pub doppler_separator: gtk4::Separator,
     /// `rtl_tcp` role badge — "Controller" (accent color) or
     /// "Listener" (dim) when connected to an `rtl_tcp` server.
     /// Hidden when the source isn't `rtl_tcp` or when the
@@ -167,6 +175,22 @@ impl StatusBar {
         }
     }
 
+    /// Update the Doppler-correction readout.
+    /// `Some(hz)` shows `Doppler: -1.4 kHz` (signed, kHz, 1 decimal).
+    /// `None` hides the label and its separator. Per issue #521.
+    pub fn update_doppler(&self, offset_hz: Option<f64>) {
+        if let Some(hz) = offset_hz {
+            let khz = hz / 1000.0;
+            self.doppler_label
+                .set_label(&format!("Doppler: {khz:+.1} kHz"));
+            self.doppler_label.set_visible(true);
+            self.doppler_separator.set_visible(true);
+        } else {
+            self.doppler_label.set_visible(false);
+            self.doppler_separator.set_visible(false);
+        }
+    }
+
     /// Update the cursor readout with frequency and power at the mouse position.
     ///
     /// When `power_db` is `f32::NEG_INFINITY`, the cursor has left the area
@@ -210,6 +234,10 @@ pub fn build_status_bar() -> StatusBar {
     let antenna_label = make_label(DEFAULT_ANTENNA_TEXT);
     let antenna_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
     let cursor_label = make_label(DEFAULT_CURSOR_TEXT);
+    let doppler_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
+    doppler_separator.set_visible(false);
+    let doppler_label = make_label("Doppler: +0.0 kHz");
+    doppler_label.set_visible(false);
     let role_label = make_label(DEFAULT_ROLE_TEXT);
     role_label.set_visible(false);
     let role_separator = gtk4::Separator::new(gtk4::Orientation::Vertical);
@@ -236,6 +264,8 @@ pub fn build_status_bar() -> StatusBar {
     widget.append(&antenna_label);
     widget.append(&gtk4::Separator::new(gtk4::Orientation::Vertical));
     widget.append(&cursor_label);
+    widget.append(&doppler_separator);
+    widget.append(&doppler_label);
     widget.append(&role_separator);
     widget.append(&role_label);
 
@@ -248,6 +278,8 @@ pub fn build_status_bar() -> StatusBar {
         antenna_label,
         antenna_separator,
         cursor_label,
+        doppler_label,
+        doppler_separator,
         role_label,
         role_separator,
     }
@@ -328,5 +360,29 @@ mod tests {
     fn format_bandwidth_hz() {
         assert_eq!(format_bandwidth(500.0), "500 Hz");
         assert_eq!(format_bandwidth(0.0), "0 Hz");
+    }
+
+    #[test]
+    fn doppler_label_format_signed_one_decimal_khz() {
+        // Spec §7.2: format is `Doppler: -1.4 kHz`, signed, kHz,
+        // 1 decimal. Pin the format here so a future "drop the
+        // sign for positive" or "show in Hz" change is forced
+        // through review.
+        // We can't construct a StatusBar in unit tests without
+        // GTK, so we test the format directly.
+        let hz: f64 = -1_437.5;
+        let khz = hz / 1000.0;
+        let formatted = format!("Doppler: {khz:+.1} kHz");
+        assert_eq!(formatted, "Doppler: -1.4 kHz");
+
+        let hz_pos: f64 = 2_700.0;
+        let khz_pos = hz_pos / 1000.0;
+        let formatted_pos = format!("Doppler: {khz_pos:+.1} kHz");
+        assert_eq!(formatted_pos, "Doppler: +2.7 kHz");
+
+        let hz_zero: f64 = 0.0;
+        let khz_zero = hz_zero / 1000.0;
+        let formatted_zero = format!("Doppler: {khz_zero:+.1} kHz");
+        assert_eq!(formatted_zero, "Doppler: +0.0 kHz");
     }
 }
