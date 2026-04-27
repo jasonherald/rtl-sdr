@@ -32,6 +32,19 @@ type CursorCallback = Rc<RefCell<Option<Box<dyn Fn(f64, f32)>>>>;
 /// user click-to-tunes or drags the VFO to a new frequency offset.
 type VfoOffsetCallback = Rc<RefCell<Option<Box<dyn Fn(f64)>>>>;
 
+/// Scanner-mode click-to-tune callback — invoked with the
+/// **absolute** frequency (in Hz) under the click when the
+/// scanner-axis lock is engaged. The wiring layer registers a
+/// callback that force-disables the scanner (via
+/// `ScannerForceDisable::trigger`, which flips the master
+/// switch and tears down the lock) and dispatches a manual
+/// tune. Distinct from `VfoOffsetCallback` because the
+/// dispatch shape is different — `UiToDsp::Tune(absolute)`,
+/// not `UiToDsp::SetVfoOffset(relative)` — and because the
+/// scanner-disable side-effect needs widget access that
+/// `attach_click_gesture` doesn't have. Per issue #563.
+type LockedClickCallback = Rc<RefCell<Option<Box<dyn Fn(f64)>>>>;
+
 /// Number of FFT bins for the display (used for initial buffer sizing).
 const FFT_SIZE: usize = 2048;
 
@@ -114,6 +127,12 @@ pub struct SpectrumHandle {
     /// (click-to-tune or drag). Used by `window.rs` to update the frequency
     /// display and status bar.
     vfo_offset_callback: VfoOffsetCallback,
+    /// Callback invoked on click in scanner-locked mode, with the
+    /// absolute frequency under the click. Lets the wiring layer
+    /// force-disable the scanner and tune absolutely without
+    /// `attach_click_gesture` needing direct access to
+    /// `ScannerForceDisable`. Per issue #563.
+    locked_click_callback: LockedClickCallback,
     /// Full (unzoomed) FFT bandwidth in Hz, set by `set_display_bandwidth()`.
     /// Used by the FFT plot and waterfall renderers for zoom mapping.
     full_bandwidth: Rc<Cell<f64>>,
@@ -546,6 +565,21 @@ impl SpectrumHandle {
     pub fn connect_vfo_offset_changed<F: Fn(f64) + 'static>(&self, f: F) {
         *self.vfo_offset_callback.borrow_mut() = Some(Box::new(f));
     }
+
+    /// Register a callback invoked on click in scanner-locked
+    /// mode, with the **absolute** frequency (Hz) under the
+    /// click. The wiring layer registers a callback that
+    /// force-disables the scanner (which tears down the lock
+    /// via the master switch's `connect_active_notify`) and
+    /// dispatches `UiToDsp::Tune(absolute)` plus the usual
+    /// frequency-display + spectrum-centre + status-bar
+    /// updates. Without this, click in scanner mode would
+    /// dispatch a centre-relative VFO offset against a
+    /// wandering active-channel centre — semantically broken.
+    /// Per issue #563.
+    pub fn connect_locked_click_to_tune<F: Fn(f64) + 'static>(&self, f: F) {
+        *self.locked_click_callback.borrow_mut() = Some(Box::new(f));
+    }
 }
 
 /// Height in pixels for the collapsible signal history area.
@@ -570,6 +604,7 @@ pub fn build_spectrum_view(
     let fill_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(true));
     let cursor_callback: CursorCallback = Rc::new(RefCell::new(None));
     let vfo_offset_callback: VfoOffsetCallback = Rc::new(RefCell::new(None));
+    let locked_click_callback: LockedClickCallback = Rc::new(RefCell::new(None));
     let full_bandwidth: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
     let center_freq: Rc<Cell<f64>> = Rc::new(Cell::new(100_000_000.0)); // default 100 MHz
     let scanner_axis_lock: Rc<RefCell<Option<ScannerAxisLock>>> = Rc::new(RefCell::new(None));
@@ -619,8 +654,16 @@ pub fn build_spectrum_view(
         &vfo_state,
         dsp_tx.clone(),
         &vfo_offset_callback,
+        &scanner_axis_lock,
+        &locked_click_callback,
     );
-    attach_drag_gesture(&waterfall_area, &vfo_state, dsp_tx, &vfo_offset_callback);
+    attach_drag_gesture(
+        &waterfall_area,
+        &vfo_state,
+        dsp_tx,
+        &vfo_offset_callback,
+        &scanner_axis_lock,
+    );
     attach_scroll_gesture(&waterfall_area, &vfo_state);
 
     // Also attach scroll-to-zoom on the FFT area for convenience.
@@ -704,6 +747,7 @@ pub fn build_spectrum_view(
         avg_buffer: Rc::new(RefCell::new(Vec::new())),
         cursor_callback,
         vfo_offset_callback,
+        locked_click_callback,
         full_bandwidth,
         center_freq,
         scanner_axis_lock,
@@ -945,22 +989,60 @@ fn build_signal_history_area(
 /// Attach a click-to-tune gesture to a `DrawingArea`.
 ///
 /// Single-clicking sets the VFO center to the clicked frequency.
+#[allow(clippy::too_many_arguments)]
 fn attach_click_gesture(
     area: &gtk4::DrawingArea,
     vfo_state: &Rc<RefCell<VfoState>>,
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
     vfo_offset_callback: &VfoOffsetCallback,
+    scanner_axis_lock: &Rc<RefCell<Option<ScannerAxisLock>>>,
+    locked_click_callback: &LockedClickCallback,
 ) {
     let click = gtk4::GestureClick::new();
 
     let vfo_state = Rc::clone(vfo_state);
     let area_weak = area.downgrade();
     let offset_cb = Rc::clone(vfo_offset_callback);
+    let click_lock = Rc::clone(scanner_axis_lock);
+    let locked_click_cb = Rc::clone(locked_click_callback);
     click.connect_pressed(move |_gesture, _n_press, x, _y| {
         let Some(area) = area_weak.upgrade() else {
             return;
         };
         let width = f64::from(area.width());
+
+        // Scanner-locked path: the X axis represents an
+        // absolute multi-channel range, not a centre-relative
+        // VFO. A click here means "I see something interesting,
+        // jump to it" — which only makes sense after force-
+        // disabling the scanner so the radio actually parks on
+        // the chosen frequency. The wiring layer's callback
+        // handles both: flips the master switch off (which
+        // tears down the lock via `connect_active_notify`)
+        // and dispatches `UiToDsp::Tune(absolute_freq)`. Skip
+        // the regular SetVfoOffset path entirely — it'd dispatch
+        // a centre-relative offset against a wandering active-
+        // channel centre, which is meaningless. Per issue #563.
+        let lock_snapshot = *click_lock.borrow();
+        if let Some(lock) = lock_snapshot {
+            if width <= 0.0 {
+                return;
+            }
+            let frac = (x / width).clamp(0.0, 1.0);
+            let abs_freq_hz = lock.min_hz + frac * (lock.max_hz - lock.min_hz);
+            tracing::debug!(
+                click_x = x,
+                width,
+                abs_freq_hz,
+                "scanner-locked click-to-tune: dispatching absolute tune"
+            );
+            if let Some(cb) = locked_click_cb.borrow().as_ref() {
+                cb(abs_freq_hz);
+            }
+            area.queue_draw();
+            return;
+        }
+
         let mut vfo = vfo_state.borrow_mut();
         let hz = vfo.pixel_to_hz(x, width);
         // Snapshot display span + max span BEFORE mutating offset so
@@ -1005,12 +1087,13 @@ fn attach_click_gesture(
 }
 
 /// Attach a drag gesture for VFO center movement and bandwidth handle adjustment.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 fn attach_drag_gesture(
     area: &gtk4::DrawingArea,
     vfo_state: &Rc<RefCell<VfoState>>,
     dsp_tx: std::sync::mpsc::Sender<UiToDsp>,
     vfo_offset_callback: &VfoOffsetCallback,
+    scanner_axis_lock: &Rc<RefCell<Option<ScannerAxisLock>>>,
 ) {
     let drag = gtk4::GestureDrag::new();
 
@@ -1023,10 +1106,24 @@ fn attach_drag_gesture(
     let start_offset = Rc::clone(&drag_start_offset_hz);
     let start_bw = Rc::clone(&drag_start_bw_hz);
     let area_weak_begin = area.downgrade();
+    let drag_lock = Rc::clone(scanner_axis_lock);
     drag.connect_drag_begin(move |_gesture, x, _y| {
         let Some(area) = area_weak_begin.upgrade() else {
             return;
         };
+        // Suppress drag entirely while the scanner-axis lock
+        // is engaged. Drag-VFO and drag-bandwidth are inherently
+        // single-channel operations; the wide multi-channel
+        // axis has no compatible meaning. The user can still
+        // click-to-tune (see `attach_click_gesture`'s lock-aware
+        // path), which force-disables the scanner before
+        // tuning. Per issue #563.
+        if drag_lock.borrow().is_some() {
+            let mut vfo = vfo_begin.borrow_mut();
+            vfo.dragging = false;
+            vfo.bw_dragging = None;
+            return;
+        }
         let width = f64::from(area.width());
         let mut vfo = vfo_begin.borrow_mut();
         let hit = vfo.hit_test(x, width);
@@ -1063,10 +1160,26 @@ fn attach_drag_gesture(
     let area_weak_update = area.downgrade();
     let dsp_tx_update = dsp_tx.clone();
     let offset_cb = Rc::clone(vfo_offset_callback);
+    let drag_lock_update = Rc::clone(scanner_axis_lock);
     drag.connect_drag_update(move |_gesture, offset_x, _offset_y| {
         let Some(area) = area_weak_update.upgrade() else {
             return;
         };
+        // Re-check the lock at every update tick. If the
+        // scanner engaged mid-gesture (e.g. a Doppler retune
+        // hit at the same moment the user started dragging),
+        // bail and clear the local drag flags so subsequent
+        // updates also short-circuit. Without this, a drag
+        // begun before the lock engaged would keep emitting
+        // `SetVfoOffset` / `SetBandwidth` against a wide
+        // multi-channel axis where the math is meaningless.
+        // Per `CodeRabbit` round 1 on PR #565.
+        if drag_lock_update.borrow().is_some() {
+            let mut vfo = vfo_update.borrow_mut();
+            vfo.dragging = false;
+            vfo.bw_dragging = None;
+            return;
+        }
         let width = f64::from(area.width());
         let mut vfo = vfo_update.borrow_mut();
 

@@ -109,6 +109,47 @@ impl ScannerForceDisable {
     }
 }
 
+/// Apply a manual tune originated by user UI interaction —
+/// shared between the freq-selector `connect_frequency_changed`
+/// handler and the scanner-locked spectrum click callback. Both
+/// follow the same five-step recipe:
+///
+/// 1. Force-disable the scanner so the engine sees
+///    `SetScannerEnabled(false)` BEFORE the `Tune` lands —
+///    avoids racing a scanner retune with the manual tune.
+/// 2. Update the cached center frequency in `AppState`.
+/// 3. Dispatch `UiToDsp::Tune` to the engine.
+/// 4. Sync the status bar's frequency readout.
+/// 5. Sync the spectrum widget's centre + the Radio panel's
+///    FSPL distance estimator (#164).
+///
+/// Per-caller specifics that DON'T fit the helper:
+/// - The freq-selector widget itself: scanner-locked click
+///   needs to push the new value INTO it (the click came from
+///   the spectrum); freq-selector handler skips that step (the
+///   value originated there).
+/// - Bookmark recall: also restores demod mode + bandwidth +
+///   tuning profile, which is a different shape and stays
+///   inline in `connect_navigation_panel`.
+///
+/// Per `CodeRabbit` round 1 on PR #565.
+fn apply_manual_tune(
+    freq_hz: f64,
+    reason: &str,
+    state: &Rc<AppState>,
+    force_disable: &ScannerForceDisable,
+    status_bar: &Rc<StatusBar>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    radio_panel: &sidebar::radio_panel::RadioPanel,
+) {
+    force_disable.trigger(reason);
+    state.center_frequency.set(freq_hz);
+    state.send_dsp(UiToDsp::Tune(freq_hz));
+    status_bar.update_frequency(freq_hz);
+    spectrum_handle.set_center_frequency(freq_hz);
+    radio_panel.update_distance_frequency(freq_hz);
+}
+
 /// Build and present the main application window.
 #[allow(clippy::too_many_lines)]
 pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::ConfigManager>) {
@@ -632,28 +673,69 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         status_bar_for_vfo.update_frequency(tuned);
     });
 
-    let status_bar_for_freq = Rc::clone(&status_bar_demod);
+    // Scanner-locked click-to-tune (#563). When the scanner-axis
+    // lock is engaged and the user clicks the spectrum, the
+    // gesture handler calls this callback with the absolute
+    // frequency under the click. We force-disable the scanner
+    // (which tears down the lock via the master switch's
+    // `connect_active_notify`), then dispatch a normal manual
+    // tune via the shared `apply_manual_tune` helper — same
+    // end shape as the freq-selector path below. Locked-click
+    // additionally syncs the freq-selector widget (the click
+    // came from the spectrum, not the selector, so the
+    // selector display needs catching up); the freq-selector
+    // handler skips that step because the value originated
+    // there. Per `CodeRabbit` round 1 on PR #565.
+    let state_for_locked_click = Rc::clone(&state);
+    let status_bar_for_locked_click = Rc::clone(&status_bar_demod);
+    let spectrum_for_locked_click = Rc::clone(&spectrum_handle);
+    let freq_selector_for_locked_click = freq_selector.clone();
+    let force_disable_for_locked_click = Rc::clone(&scanner_force_disable);
+    let radio_for_locked_click = panels.radio.clone();
+    spectrum_handle.connect_locked_click_to_tune(move |freq_hz| {
+        tracing::debug!(
+            freq_hz,
+            "scanner-locked click-to-tune: force-disable + tune"
+        );
+        apply_manual_tune(
+            freq_hz,
+            "scanner spectrum click",
+            &state_for_locked_click,
+            &force_disable_for_locked_click,
+            &status_bar_for_locked_click,
+            &spectrum_for_locked_click,
+            &radio_for_locked_click,
+        );
+        // The click originated on the spectrum — the freq
+        // selector widget didn't move, so push the new value
+        // into it manually. (The freq-selector handler skips
+        // this step because the value came FROM the selector.)
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let freq_u64 = freq_hz.max(0.0) as u64;
+        freq_selector_for_locked_click.set_frequency(freq_u64);
+    });
+
     let state_freq = Rc::clone(&state);
+    let status_bar_for_freq = Rc::clone(&status_bar_demod);
     let spectrum_for_freq = Rc::clone(&spectrum_handle);
     let force_disable_freq = Rc::clone(&scanner_force_disable);
     let radio_for_freq = panels.radio.clone();
     freq_selector.connect_frequency_changed(move |freq| {
         tracing::debug!(frequency_hz = freq, "frequency changed");
-        // Flip scanner off before dispatching the tune so the
-        // engine receives the `SetScannerEnabled(false)` first —
-        // the subsequent `Tune` then lands on an Idle scanner and
-        // doesn't race a retune command.
-        force_disable_freq.trigger("manual tune");
         #[allow(clippy::cast_precision_loss)]
         let freq_f64 = freq as f64;
-        state_freq.center_frequency.set(freq_f64);
-        state_freq.send_dsp(UiToDsp::Tune(freq_f64));
-        status_bar_for_freq.update_frequency(freq_f64);
-        spectrum_for_freq.set_center_frequency(freq_f64);
-        // Feed the FSPL distance estimator in the Radio panel
-        // with the new frequency so the cached distance estimate
-        // uses the right carrier (ticket #164).
-        radio_for_freq.update_distance_frequency(freq_f64);
+        apply_manual_tune(
+            freq_f64,
+            "manual tune",
+            &state_freq,
+            &force_disable_freq,
+            &status_bar_for_freq,
+            &spectrum_for_freq,
+            &radio_for_freq,
+        );
+        // No `freq_selector.set_frequency` here — the value
+        // ORIGINATED in the selector, calling set on it would
+        // be a no-op at best and a feedback loop at worst.
     });
     // Single demod-change handler: gate → force-disable → dispatch
     // → cosmetic UI updates. Order matters: force-disable must
@@ -6989,10 +7071,22 @@ fn connect_source_panel(
     // as bias-T above. The controller bridge
     // (`UiToDsp::SetOffsetTuning`) was already plumbed; only
     // wiring is new here.
+    //
+    // Only DISPATCH the persisted value when it's `true`. The
+    // librtlsdr R820T-family branch returns `InvalidParameter`
+    // for every `set_offset_tuning` call regardless of value —
+    // dispatching `false` at startup (the default for users
+    // who've never touched the toggle) generates a spurious
+    // "Offset tuning failed" toast on the vast majority of
+    // dongles. The driver default already matches `false`, so
+    // skipping the dispatch is semantically a no-op. Per issue
+    // #564.
     {
         let persisted = sidebar::source_panel::load_source_rtl_offset_tuning(config);
         panels.source.offset_tuning_row.set_active(persisted);
-        state.send_dsp(UiToDsp::SetOffsetTuning(persisted));
+        if persisted {
+            state.send_dsp(UiToDsp::SetOffsetTuning(true));
+        }
     }
     let state_offset = Rc::clone(state);
     let config_offset = std::sync::Arc::clone(config);

@@ -2542,10 +2542,26 @@ fn rtl_sdr_replay_persisted_settings(
         let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
     }
 
-    if let Err(e) = source.set_offset_tuning(state.offset_tuning_enabled) {
+    // Only replay an *enabled* offset-tuning state. The
+    // librtlsdr R820T-family branch returns `InvalidParameter`
+    // for every `set_offset_tuning` call regardless of the
+    // value — even setting it to `false`, which is already the
+    // driver default. Replaying `false` on every source open
+    // therefore generated a spurious "Offset tuning failed"
+    // toast for the vast majority of users (R820T2 / R828D
+    // dongles) at every Play / source-type switch / source-
+    // restart, even when they never enabled the toggle.
+    // Replaying `true` still goes through — that's the actual
+    // hardware-state restore path that matters for E4000
+    // tuners. The user-driven toggle (the `SetOffsetTuning`
+    // handler at line ~1693) keeps surfacing errors so an
+    // explicit user action gets explicit feedback. Per issue
+    // #564.
+    if state.offset_tuning_enabled
+        && let Err(e) = source.set_offset_tuning(true)
+    {
         tracing::warn!(
             error = %e,
-            enabled = state.offset_tuning_enabled,
             "re-applying persisted offset-tuning on source open failed"
         );
         let _ = dsp_tx.send(DspToUi::Error(format!("Offset tuning failed: {e}")));
