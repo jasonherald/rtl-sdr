@@ -544,6 +544,7 @@ pub fn build_spectrum_view(
         &cursor_callback,
         &full_bandwidth,
         &center_freq,
+        &scanner_axis_lock,
     );
     let waterfall_area = build_waterfall_area(
         Rc::clone(&waterfall_state),
@@ -664,6 +665,7 @@ fn build_fft_area(
     cursor_callback: &CursorCallback,
     full_bandwidth: &Rc<Cell<f64>>,
     center_freq: &Rc<Cell<f64>>,
+    scanner_axis_lock: &Rc<RefCell<Option<ScannerAxisLock>>>,
 ) -> gtk4::DrawingArea {
     let area = gtk4::DrawingArea::builder()
         .hexpand(true)
@@ -677,8 +679,33 @@ fn build_fft_area(
     let vfo_render = Rc::clone(vfo_state);
     let full_bw_render = Rc::clone(full_bandwidth);
     let center_freq_render = Rc::clone(center_freq);
+    let scanner_lock_render = Rc::clone(scanner_axis_lock);
     area.set_draw_func(move |_area, cr, width, height| {
         if let Some(s) = state.borrow_mut().as_mut() {
+            // Scanner-axis lock takes precedence: when the
+            // scanner is engaged, X axis is pinned to the
+            // channel envelope and the narrow FFT data lands
+            // in the active channel's slice. The VFO overlay
+            // is suppressed in scanner mode — its meaning
+            // (drag-to-tune within the current channel)
+            // doesn't apply when the X axis represents a wide
+            // multi-channel range. Per issue #516.
+            let lock = *scanner_lock_render.borrow();
+            if let Some(lock) = lock {
+                s.renderer.render_locked(
+                    cr,
+                    &s.current_data,
+                    width,
+                    height,
+                    min_db_render.get(),
+                    max_db_render.get(),
+                    fill_render.get(),
+                    full_bw_render.get(),
+                    &lock,
+                );
+                return;
+            }
+
             let vfo = vfo_render.borrow();
             s.renderer.render(
                 cr,
