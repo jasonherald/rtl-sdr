@@ -110,6 +110,106 @@ pub fn compute_doppler_offset_hz(
     Ok(track.doppler_shift_hz(carrier_hz))
 }
 
+/// Stateful coordinator for the per-window Doppler tracker. The
+/// timers, GTK widgets, and DSP-channel dispatch live in the
+/// wiring layer (`window.rs::connect_doppler_tracker`); this
+/// type owns the model state — master switch, current active
+/// satellite, additive user reference offset — and exposes a
+/// small set of methods the wiring layer drives on each tick or
+/// re-evaluation.
+///
+/// Decoupled from GTK so the state-transition logic is unit-
+/// testable headlessly. Same pattern as `satellites_recorder`'s
+/// pure-tick / interpret-action split.
+#[derive(Debug, Default)]
+pub struct DopplerTracker {
+    master_enabled: bool,
+    active: Option<&'static KnownSatellite>,
+    user_reference_offset_hz: f64,
+}
+
+impl DopplerTracker {
+    /// Construct with the persisted master-switch value. Pass
+    /// the result of
+    /// `sidebar::satellites_panel::load_doppler_tracking_enabled`.
+    #[must_use]
+    pub fn new(master_enabled: bool) -> Self {
+        Self {
+            master_enabled,
+            active: None,
+            user_reference_offset_hz: 0.0,
+        }
+    }
+
+    /// Update the master switch. Caller (wiring layer) is
+    /// responsible for persisting the new value via
+    /// `save_doppler_tracking_enabled`.
+    pub fn set_master_enabled(&mut self, enabled: bool) {
+        self.master_enabled = enabled;
+        if !enabled {
+            // Spec §2: when trigger conditions go false (master
+            // off counts), reset the active satellite. The
+            // wiring layer handles the final SetVfoOffset(
+            // user_reference_offset) dispatch.
+            self.active = None;
+        }
+    }
+
+    /// Whether the master switch is currently on.
+    #[must_use]
+    pub fn master_enabled(&self) -> bool {
+        self.master_enabled
+    }
+
+    /// Current additive user reference offset (Hz). Set by the
+    /// wiring layer when the user manually drags the VFO offset
+    /// slider; Doppler tracking adds on top of this. Per spec §4.
+    #[must_use]
+    pub fn user_reference_offset_hz(&self) -> f64 {
+        self.user_reference_offset_hz
+    }
+
+    /// Update the additive user reference offset. Called when
+    /// the user manually drags the VFO offset slider. Per spec §4.
+    pub fn set_user_reference_offset_hz(&mut self, hz: f64) {
+        self.user_reference_offset_hz = hz;
+    }
+
+    /// Replace the currently-active satellite (or clear it). On
+    /// a transition between distinct satellites or to-None, the
+    /// `user_reference_offset_hz` resets to 0 — Doppler tracking
+    /// is per-pass, and so is any user fine-tune. Returns true
+    /// if the active satellite changed (useful for the wiring
+    /// layer to know it needs to dispatch a `SetVfoOffset` and/or
+    /// update the status bar).
+    pub fn set_active(&mut self, satellite: Option<&'static KnownSatellite>) -> bool {
+        let changed = match (self.active, satellite) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !std::ptr::eq(a, b),
+            _ => true,
+        };
+        if changed {
+            // Spec §4 reset semantics: per-pass reference offset.
+            self.user_reference_offset_hz = 0.0;
+            self.active = satellite;
+        }
+        changed
+    }
+
+    /// Currently-active satellite (if any).
+    #[must_use]
+    pub fn active(&self) -> Option<&'static KnownSatellite> {
+        self.active
+    }
+
+    /// Compose the live VFO offset to dispatch:
+    /// `live = user_reference + doppler`. Per spec §4.
+    #[must_use]
+    pub fn live_offset_hz(&self, doppler_hz: f64) -> f64 {
+        self.user_reference_offset_hz + doppler_hz
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -363,5 +463,98 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let result = compute_doppler_offset_hz(&sat, &test_station(), when, 0.0).unwrap();
         assert!((result - 0.0).abs() < f64::EPSILON, "got {result}");
+    }
+
+    #[test]
+    fn tracker_constructs_with_persisted_master_value() {
+        let on = DopplerTracker::new(true);
+        assert!(on.master_enabled());
+        assert!(on.active().is_none());
+        assert!((on.user_reference_offset_hz() - 0.0).abs() < f64::EPSILON);
+
+        let off = DopplerTracker::new(false);
+        assert!(!off.master_enabled());
+    }
+
+    #[test]
+    fn set_master_disabled_clears_active_satellite() {
+        let mut t = DopplerTracker::new(true);
+        let _ = t.set_active(Some(noaa_15()));
+        assert_eq!(t.active().map(|s| s.name), Some("NOAA 15"));
+        t.set_master_enabled(false);
+        assert!(t.active().is_none());
+    }
+
+    #[test]
+    fn set_master_enabled_does_not_immediately_engage() {
+        // Re-enabling the master switch shouldn't synthesize a
+        // satellite — the wiring layer's re-evaluate tick is
+        // what decides which (if any) satellite to engage.
+        let mut t = DopplerTracker::new(false);
+        t.set_master_enabled(true);
+        assert!(t.active().is_none());
+    }
+
+    #[test]
+    fn set_active_returns_true_only_on_change() {
+        let mut t = DopplerTracker::new(true);
+        assert!(t.set_active(Some(noaa_15())), "None → Some is a change");
+        assert!(
+            !t.set_active(Some(noaa_15())),
+            "Some(X) → Some(X) is not a change"
+        );
+        assert!(
+            t.set_active(Some(noaa_18())),
+            "Some(X) → Some(Y) is a change"
+        );
+        assert!(t.set_active(None), "Some → None is a change");
+        assert!(!t.set_active(None), "None → None is not a change");
+    }
+
+    #[test]
+    fn satellite_swap_resets_user_reference_offset() {
+        // Spec §4 reset semantics: per-pass reference offset.
+        let mut t = DopplerTracker::new(true);
+        let _ = t.set_active(Some(noaa_15()));
+        t.set_user_reference_offset_hz(500.0);
+        assert!((t.user_reference_offset_hz() - 500.0).abs() < f64::EPSILON);
+
+        // Swap to a different satellite — offset resets.
+        let _ = t.set_active(Some(noaa_18()));
+        assert!((t.user_reference_offset_hz() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn satellite_to_none_resets_user_reference_offset() {
+        let mut t = DopplerTracker::new(true);
+        let _ = t.set_active(Some(noaa_15()));
+        t.set_user_reference_offset_hz(500.0);
+        let _ = t.set_active(None);
+        assert!((t.user_reference_offset_hz() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn same_satellite_set_active_preserves_user_reference_offset() {
+        // If the satellite doesn't change (re-evaluate just
+        // confirms what's already there), the user's manual
+        // tune offset should NOT reset.
+        let mut t = DopplerTracker::new(true);
+        let _ = t.set_active(Some(noaa_15()));
+        t.set_user_reference_offset_hz(500.0);
+        let _ = t.set_active(Some(noaa_15()));
+        assert!(
+            (t.user_reference_offset_hz() - 500.0).abs() < f64::EPSILON,
+            "user offset must survive a no-op set_active"
+        );
+    }
+
+    #[test]
+    fn live_offset_is_additive() {
+        // Spec §4: live_offset = user_reference + doppler.
+        let mut t = DopplerTracker::new(true);
+        t.set_user_reference_offset_hz(300.0);
+        assert!((t.live_offset_hz(-1_400.0) - (-1_100.0)).abs() < f64::EPSILON);
+        assert!((t.live_offset_hz(2_700.0) - 3_000.0).abs() < f64::EPSILON);
+        assert!((t.live_offset_hz(0.0) - 300.0).abs() < f64::EPSILON);
     }
 }
