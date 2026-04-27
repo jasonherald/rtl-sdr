@@ -62,6 +62,44 @@ pub const KEY_SOURCE_RTL_GAIN_DB: &str = "src_rtl_gain_db";
 /// `0` (no correction). Per issue `#551`.
 pub const KEY_SOURCE_RTL_PPM: &str = "src_rtl_ppm";
 
+// ─── Source-panel persistence keys (#552) ───────────────────────────
+// Top-level + frontend + per-source-type config rows that today
+// reset to widget defaults across restart. Mechanical mirror of
+// the `KEY_SOURCE_RTL_*` pattern for tuner-specific settings —
+// each key has a matching `load_*` / `save_*` pair below and a
+// `connect_source_panel` restore-then-wire block in `window.rs`.
+
+/// Currently-selected source type (RTL-SDR / Network / File /
+/// RTL-TCP). Stored as the combo-row index per the `DEVICE_*`
+/// constants (`DEVICE_RTLSDR` / `DEVICE_NETWORK` / etc.).
+/// Default `DEVICE_RTLSDR` (`0`). Per issue `#552`.
+pub const KEY_SOURCE_DEVICE_INDEX: &str = "src_device_index";
+/// Sample rate dropdown index (into `SAMPLE_RATES`). Default
+/// matches the widget's initial selection. Per issue `#552`.
+pub const KEY_SOURCE_SAMPLE_RATE_INDEX: &str = "src_sample_rate_index";
+/// Decimation dropdown index (into `DECIMATION_FACTORS`).
+/// Default `0` (1× / no decimation). Per issue `#552`.
+pub const KEY_SOURCE_DECIMATION_INDEX: &str = "src_decimation_index";
+/// DC blocking toggle on the IQ frontend. Default `true`
+/// matches the widget's initial state. Per issue `#552`.
+pub const KEY_SOURCE_DC_BLOCKING: &str = "src_dc_blocking";
+/// IQ DC correction toggle. Default `false`. Per issue `#552`.
+pub const KEY_SOURCE_IQ_CORRECTION: &str = "src_iq_correction";
+/// IQ swap toggle. Default `false`. Per issue `#552`.
+pub const KEY_SOURCE_IQ_INVERSION: &str = "src_iq_inversion";
+/// Raw-Network source hostname. Default `"localhost"`. Note:
+/// the `rtl_tcp` client maintains its own per-server hostname/port
+/// state via `KEY_RTL_TCP_CLIENT_FAVORITES` — this key is for
+/// the raw IQ-stream Network source only. Per issue `#552`.
+pub const KEY_SOURCE_NETWORK_HOSTNAME: &str = "src_network_hostname";
+/// Raw-Network source port. Default `1234`. Per issue `#552`.
+pub const KEY_SOURCE_NETWORK_PORT: &str = "src_network_port";
+/// Raw-Network protocol dropdown index (into TCP/UDP). Default
+/// `NETWORK_PROTOCOL_TCPCLIENT_IDX`. Per issue `#552`.
+pub const KEY_SOURCE_NETWORK_PROTOCOL_INDEX: &str = "src_network_protocol_index";
+/// File source playback path. Default empty. Per issue `#552`.
+pub const KEY_SOURCE_FILE_PATH: &str = "src_file_path";
+
 /// Device selector index for RTL-SDR.
 pub const DEVICE_RTLSDR: u32 = 0;
 /// Device selector index for Network.
@@ -1189,6 +1227,190 @@ pub fn save_source_rtl_ppm(config: &Arc<ConfigManager>, ppm: i32) {
     });
 }
 
+// ─── #552 source-panel persistence helpers ──────────────────────────
+//
+// All follow the same shape as `load_source_rtl_*` /
+// `save_source_rtl_*`: a tolerant `load` that falls back to a
+// safe default on missing-key or wrong-type, paired with an
+// idempotent `save`. The wiring layer in
+// `window.rs::connect_source_panel` calls each `save_*` from the
+// row's change-notify handler and each `load_*` once at panel
+// build time (restore-before-wire idiom).
+
+/// Load the persisted source-type combo index. Defaults to
+/// [`DEVICE_RTLSDR`].
+#[must_use]
+pub fn load_source_device_index(config: &Arc<ConfigManager>) -> u32 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_DEVICE_INDEX)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(DEVICE_RTLSDR)
+    })
+}
+
+pub fn save_source_device_index(config: &Arc<ConfigManager>, index: u32) {
+    config.write(|v| {
+        v[KEY_SOURCE_DEVICE_INDEX] = serde_json::json!(index);
+    });
+}
+
+/// Load the persisted sample-rate combo index. Defaults to `0`
+/// (the first entry in `SAMPLE_RATES`, matching the widget's
+/// initial selection at panel build time).
+#[must_use]
+pub fn load_source_sample_rate_index(config: &Arc<ConfigManager>) -> u32 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_SAMPLE_RATE_INDEX)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0)
+    })
+}
+
+pub fn save_source_sample_rate_index(config: &Arc<ConfigManager>, index: u32) {
+    config.write(|v| {
+        v[KEY_SOURCE_SAMPLE_RATE_INDEX] = serde_json::json!(index);
+    });
+}
+
+/// Load the persisted decimation combo index. Defaults to `0`
+/// (1× decimation).
+#[must_use]
+pub fn load_source_decimation_index(config: &Arc<ConfigManager>) -> u32 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_DECIMATION_INDEX)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0)
+    })
+}
+
+pub fn save_source_decimation_index(config: &Arc<ConfigManager>, index: u32) {
+    config.write(|v| {
+        v[KEY_SOURCE_DECIMATION_INDEX] = serde_json::json!(index);
+    });
+}
+
+/// Load the persisted DC-blocking toggle. Defaults to `true`
+/// (matches the widget's initial state).
+#[must_use]
+pub fn load_source_dc_blocking(config: &Arc<ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_SOURCE_DC_BLOCKING)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    })
+}
+
+pub fn save_source_dc_blocking(config: &Arc<ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_SOURCE_DC_BLOCKING] = serde_json::json!(enabled);
+    });
+}
+
+/// Load the persisted IQ-correction toggle. Defaults to `false`.
+#[must_use]
+pub fn load_source_iq_correction(config: &Arc<ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_SOURCE_IQ_CORRECTION)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+pub fn save_source_iq_correction(config: &Arc<ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_SOURCE_IQ_CORRECTION] = serde_json::json!(enabled);
+    });
+}
+
+/// Load the persisted IQ-swap toggle. Defaults to `false`.
+#[must_use]
+pub fn load_source_iq_inversion(config: &Arc<ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_SOURCE_IQ_INVERSION)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+pub fn save_source_iq_inversion(config: &Arc<ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_SOURCE_IQ_INVERSION] = serde_json::json!(enabled);
+    });
+}
+
+/// Load the persisted raw-Network hostname. Defaults to
+/// `"localhost"` (matches the widget's initial value).
+#[must_use]
+pub fn load_source_network_hostname(config: &Arc<ConfigManager>) -> String {
+    config.read(|v| {
+        v.get(KEY_SOURCE_NETWORK_HOSTNAME)
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| "localhost".to_string(), ToString::to_string)
+    })
+}
+
+pub fn save_source_network_hostname(config: &Arc<ConfigManager>, hostname: &str) {
+    config.write(|v| {
+        v[KEY_SOURCE_NETWORK_HOSTNAME] = serde_json::json!(hostname);
+    });
+}
+
+/// Load the persisted raw-Network port. Defaults to `1234`
+/// (matches `DEFAULT_PORT`).
+#[must_use]
+pub fn load_source_network_port(config: &Arc<ConfigManager>) -> u16 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_NETWORK_PORT)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u16::try_from(n).ok())
+            .unwrap_or(1234)
+    })
+}
+
+pub fn save_source_network_port(config: &Arc<ConfigManager>, port: u16) {
+    config.write(|v| {
+        v[KEY_SOURCE_NETWORK_PORT] = serde_json::json!(port);
+    });
+}
+
+/// Load the persisted raw-Network protocol combo index.
+/// Defaults to [`NETWORK_PROTOCOL_TCPCLIENT_IDX`].
+#[must_use]
+pub fn load_source_network_protocol_index(config: &Arc<ConfigManager>) -> u32 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_NETWORK_PROTOCOL_INDEX)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(NETWORK_PROTOCOL_TCPCLIENT_IDX)
+    })
+}
+
+pub fn save_source_network_protocol_index(config: &Arc<ConfigManager>, index: u32) {
+    config.write(|v| {
+        v[KEY_SOURCE_NETWORK_PROTOCOL_INDEX] = serde_json::json!(index);
+    });
+}
+
+/// Load the persisted File-source playback path. Defaults to
+/// the empty string (no file selected).
+#[must_use]
+pub fn load_source_file_path(config: &Arc<ConfigManager>) -> String {
+    config.read(|v| {
+        v.get(KEY_SOURCE_FILE_PATH)
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(String::new, ToString::to_string)
+    })
+}
+
+pub fn save_source_file_path(config: &Arc<ConfigManager>, path: &str) {
+    config.write(|v| {
+        v[KEY_SOURCE_FILE_PATH] = serde_json::json!(path);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1643,5 +1865,121 @@ mod tests {
         assert_eq!(load_source_rtl_ppm(&config), 50);
         config.write(|v| v[KEY_SOURCE_RTL_PPM] = serde_json::json!("not a number"));
         assert_eq!(load_source_rtl_ppm(&config), 0);
+    }
+
+    // ─── #552 persistence round-trips ─────────────────────────
+
+    #[test]
+    fn source_device_index_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(load_source_device_index(&config), DEVICE_RTLSDR);
+        save_source_device_index(&config, DEVICE_NETWORK);
+        assert_eq!(load_source_device_index(&config), DEVICE_NETWORK);
+        config.write(|v| v[KEY_SOURCE_DEVICE_INDEX] = serde_json::json!("nope"));
+        assert_eq!(load_source_device_index(&config), DEVICE_RTLSDR);
+    }
+
+    #[test]
+    fn source_sample_rate_index_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(load_source_sample_rate_index(&config), 0);
+        save_source_sample_rate_index(&config, 3);
+        assert_eq!(load_source_sample_rate_index(&config), 3);
+        config.write(|v| v[KEY_SOURCE_SAMPLE_RATE_INDEX] = serde_json::json!("nope"));
+        assert_eq!(load_source_sample_rate_index(&config), 0);
+    }
+
+    #[test]
+    fn source_decimation_index_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(load_source_decimation_index(&config), 0);
+        save_source_decimation_index(&config, 2);
+        assert_eq!(load_source_decimation_index(&config), 2);
+        config.write(|v| v[KEY_SOURCE_DECIMATION_INDEX] = serde_json::json!("nope"));
+        assert_eq!(load_source_decimation_index(&config), 0);
+    }
+
+    #[test]
+    fn source_dc_blocking_round_trip_and_default() {
+        let config = make_config();
+        assert!(load_source_dc_blocking(&config));
+        save_source_dc_blocking(&config, false);
+        assert!(!load_source_dc_blocking(&config));
+        save_source_dc_blocking(&config, true);
+        assert!(load_source_dc_blocking(&config));
+        config.write(|v| v[KEY_SOURCE_DC_BLOCKING] = serde_json::json!("nope"));
+        assert!(load_source_dc_blocking(&config));
+    }
+
+    #[test]
+    fn source_iq_correction_round_trip_and_default() {
+        let config = make_config();
+        assert!(!load_source_iq_correction(&config));
+        save_source_iq_correction(&config, true);
+        assert!(load_source_iq_correction(&config));
+        config.write(|v| v[KEY_SOURCE_IQ_CORRECTION] = serde_json::json!("nope"));
+        assert!(!load_source_iq_correction(&config));
+    }
+
+    #[test]
+    fn source_iq_inversion_round_trip_and_default() {
+        let config = make_config();
+        assert!(!load_source_iq_inversion(&config));
+        save_source_iq_inversion(&config, true);
+        assert!(load_source_iq_inversion(&config));
+        config.write(|v| v[KEY_SOURCE_IQ_INVERSION] = serde_json::json!("nope"));
+        assert!(!load_source_iq_inversion(&config));
+    }
+
+    #[test]
+    fn source_network_hostname_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(load_source_network_hostname(&config), "localhost");
+        save_source_network_hostname(&config, "shack-pi.local");
+        assert_eq!(load_source_network_hostname(&config), "shack-pi.local");
+        config.write(|v| v[KEY_SOURCE_NETWORK_HOSTNAME] = serde_json::json!(42));
+        assert_eq!(load_source_network_hostname(&config), "localhost");
+    }
+
+    #[test]
+    fn source_network_port_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(load_source_network_port(&config), 1234);
+        save_source_network_port(&config, 8888);
+        assert_eq!(load_source_network_port(&config), 8888);
+        // out-of-range u16 falls back
+        config.write(|v| v[KEY_SOURCE_NETWORK_PORT] = serde_json::json!(70_000));
+        assert_eq!(load_source_network_port(&config), 1234);
+        config.write(|v| v[KEY_SOURCE_NETWORK_PORT] = serde_json::json!("nope"));
+        assert_eq!(load_source_network_port(&config), 1234);
+    }
+
+    #[test]
+    fn source_network_protocol_index_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(
+            load_source_network_protocol_index(&config),
+            NETWORK_PROTOCOL_TCPCLIENT_IDX
+        );
+        save_source_network_protocol_index(&config, NETWORK_PROTOCOL_UDP_IDX);
+        assert_eq!(
+            load_source_network_protocol_index(&config),
+            NETWORK_PROTOCOL_UDP_IDX
+        );
+        config.write(|v| v[KEY_SOURCE_NETWORK_PROTOCOL_INDEX] = serde_json::json!("nope"));
+        assert_eq!(
+            load_source_network_protocol_index(&config),
+            NETWORK_PROTOCOL_TCPCLIENT_IDX
+        );
+    }
+
+    #[test]
+    fn source_file_path_round_trip_and_default() {
+        let config = make_config();
+        assert_eq!(load_source_file_path(&config), "");
+        save_source_file_path(&config, "/tmp/iq.wav");
+        assert_eq!(load_source_file_path(&config), "/tmp/iq.wav");
+        config.write(|v| v[KEY_SOURCE_FILE_PATH] = serde_json::json!(42));
+        assert_eq!(load_source_file_path(&config), "");
     }
 }

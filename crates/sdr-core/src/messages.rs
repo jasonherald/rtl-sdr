@@ -10,19 +10,22 @@ use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
 
 use crate::sink_slot::{AudioSinkType, NetworkSinkStatus};
 
-/// Why the scanner↔recording/transcription mutex fired.
-/// Surfaced to the UI via `DspToUi::ScannerMutexStopped` so the
-/// appropriate toast can be shown.
+/// Why the scanner↔recording mutex fired. Surfaced to the UI
+/// via `DspToUi::ScannerMutexStopped` so the appropriate toast
+/// can be shown.
+///
+/// Scanner ↔ transcription mutex was removed — the two are
+/// designed to coexist as of PR #558 (issue #517 emits
+/// per-channel markers in the transcript log when the scanner
+/// hops). The two surviving variants cover the recording leg,
+/// which still mutexes with both scanner activation and
+/// transcription start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScannerMutexReason {
     /// Scanner activation stopped a running recording.
     RecordingStoppedForScanner,
-    /// Scanner activation stopped a running transcription.
-    TranscriptionStoppedForScanner,
     /// Recording start stopped an active scanner.
     ScannerStoppedForRecording,
-    /// Transcription start stopped an active scanner.
-    ScannerStoppedForTranscription,
 }
 
 /// Messages sent from the DSP pipeline thread to the UI main loop.
@@ -1017,23 +1020,11 @@ mod tests {
             mutex_rec,
             DspToUi::ScannerMutexStopped(ScannerMutexReason::RecordingStoppedForScanner)
         ));
-        let mutex_trans =
-            DspToUi::ScannerMutexStopped(ScannerMutexReason::TranscriptionStoppedForScanner);
-        assert!(matches!(
-            mutex_trans,
-            DspToUi::ScannerMutexStopped(ScannerMutexReason::TranscriptionStoppedForScanner)
-        ));
         let mutex_scan_rec =
             DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForRecording);
         assert!(matches!(
             mutex_scan_rec,
             DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForRecording)
-        ));
-        let mutex_scan_trans =
-            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForTranscription);
-        assert!(matches!(
-            mutex_scan_trans,
-            DspToUi::ScannerMutexStopped(ScannerMutexReason::ScannerStoppedForTranscription)
         ));
     }
 

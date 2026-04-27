@@ -97,6 +97,20 @@ pub struct AppState {
     /// moving the stored value out, which interferes with the
     /// borrow-and-clone pattern the button handler uses.
     pub scanner_active_key: RefCell<Option<sdr_scanner::ChannelKey>>,
+    /// Channel name buffered for lazy emission of a transcript
+    /// channel-marker (#517). Written by the
+    /// `DspToUi::ScannerActiveChannelChanged` handler when the
+    /// scanner switches to a non-idle channel; consumed by the
+    /// `TranscriptionEvent::Text` handler when the next
+    /// transcribed text arrives. The lazy approach skips marker
+    /// emission entirely when (a) transcription is OFF (no
+    /// `TranscriptionEvent::Text` ever fires, so the buffered
+    /// name stays unconsumed), and (b) the scanner hops past a
+    /// channel without producing any audio (the next channel
+    /// overwrites the buffered name before it's consumed).
+    /// Squashes runs of empty-channel hops to a single marker
+    /// at the next channel that actually produces text.
+    pub pending_channel_marker: RefCell<Option<String>>,
     /// Previous `rtl_tcp` connection state discriminant, used to
     /// detect edge transitions into terminal role-denial states
     /// (`ControllerBusy`, `AuthRequired`, `AuthFailed`). The toast
@@ -176,6 +190,7 @@ impl AppState {
             suppress_bandwidth_notify: Cell::new(false),
             suppress_demod_notify: Cell::new(false),
             scanner_active_key: RefCell::new(None),
+            pending_channel_marker: RefCell::new(None),
             // Initialize to `RTL_TCP_STATE_DISC_DISCONNECTED` — same
             // as the connection manager's initial state so the first
             // real transition into ControllerBusy / AuthRequired /

@@ -224,6 +224,53 @@ pub struct TranscriptPanel {
     pub clear_button: gtk4::Button,
 }
 
+/// Append a channel-marker divider line to a transcript
+/// `gtk4::TextView`. Called from the wiring layer's
+/// `DspToUi::ScannerActiveChannelChanged` handler whenever the
+/// scanner switches to a non-idle channel — gives the reader a
+/// navigation anchor so transcribed text from different channels
+/// doesn't bleed together visually. Per issue #517.
+///
+/// Format: `─── HH:MM:SS · {channel_name} ───`. Styled dim +
+/// italic via a lazily-installed `channel_marker` `TextTag` on
+/// the buffer's tag table so it stands apart from regular
+/// transcript rows.
+///
+/// Freestanding rather than a method on `TranscriptPanel` so the
+/// call site in `window.rs::handle_dsp_message` only has to
+/// thread a `&gtk4::TextView` clone (cheap — GTK widgets are
+/// Rc-internal) instead of the whole panel.
+pub fn push_channel_marker(text_view: &gtk4::TextView, channel_name: &str) {
+    let buf = text_view.buffer();
+    let tag_table = buf.tag_table();
+    let tag = tag_table.lookup("channel_marker").unwrap_or_else(|| {
+        let new_tag = gtk4::TextTag::builder()
+            .name("channel_marker")
+            .style(gtk4::pango::Style::Italic)
+            .foreground("#888888")
+            .build();
+        tag_table.add(&new_tag);
+        new_tag
+    });
+
+    let timestamp = chrono::Local::now().format("%H:%M:%S");
+    let marker_text = format!("─── {timestamp} · {channel_name} ───\n");
+
+    let start_offset = buf.end_iter().offset();
+    let mut end_iter = buf.end_iter();
+    buf.insert(&mut end_iter, &marker_text);
+    let start_iter = buf.iter_at_offset(start_offset);
+    let end_iter = buf.end_iter();
+    buf.apply_tag(&tag, &start_iter, &end_iter);
+
+    // Auto-scroll to the bottom so the new marker is visible
+    // even when the user hasn't manually scrolled along. Same
+    // idiom as the regular transcript-text insert.
+    let mark = buf.create_mark(None, &buf.end_iter(), false);
+    text_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
+    buf.delete_mark(&mark);
+}
+
 /// Specification for a persisted-millisecond `AdwSpinRow`. Used by
 /// [`build_persisted_ms_slider`] to construct the three Auto Break
 /// timing sliders from one code path.

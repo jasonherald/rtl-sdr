@@ -1847,15 +1847,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::EnableTranscription(tx) => {
-            if state.scanner.is_enabled() {
-                let cmds = state
-                    .scanner
-                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
-                apply_scanner_commands(state, dsp_tx, cmds);
-                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                    ScannerMutexReason::ScannerStoppedForTranscription,
-                ));
-            }
+            // Scanner ↔ transcription mutex was REMOVED — the two
+            // are designed to coexist (issue #517 emits per-channel
+            // markers in the transcript log when the scanner hops).
+            // Recording ↔ transcription mutex still applies because
+            // a running WAV writer + concurrent transcription tap
+            // produced inconsistent audio flow in earlier rounds.
             // Recording ↔ transcription leg of the mutex. Both
             // `stop_any_recording` sends cover the UI (it emits
             // `AudioRecordingStopped` / `IqRecordingStopped`), so
@@ -1994,18 +1991,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
         // --- Scanner (#317) ---
         UiToDsp::SetScannerEnabled(enabled) => {
-            if enabled {
-                if stop_any_recording(state, dsp_tx) {
-                    let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                        ScannerMutexReason::RecordingStoppedForScanner,
-                    ));
-                }
-                if stop_transcription(state) {
-                    let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                        ScannerMutexReason::TranscriptionStoppedForScanner,
-                    ));
-                }
+            if enabled && stop_any_recording(state, dsp_tx) {
+                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+                    ScannerMutexReason::RecordingStoppedForScanner,
+                ));
             }
+            // Scanner ↔ transcription mutex was REMOVED — the two
+            // are designed to coexist (issue #517).
             let cmds = state
                 .scanner
                 .handle_event(sdr_scanner::ScannerEvent::SetEnabled(enabled));

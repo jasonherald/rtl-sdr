@@ -85,9 +85,13 @@ pub const SDR_SCANNER_STATE_HANGING: i32 = 4;
 // ============================================================
 
 pub const SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER: i32 = 0;
-pub const SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER: i32 = 1;
+// Discriminant 1 was `TRANSCRIPTION_STOPPED_FOR_SCANNER`, removed
+// when the scanner ↔ transcription mutex was deleted (PR #558 /
+// issue #517 — the two are designed to coexist). Slot left
+// unused so existing discriminants keep their numeric values.
 pub const SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING: i32 = 2;
-pub const SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION: i32 = 3;
+// Discriminant 3 was `SCANNER_STOPPED_FOR_TRANSCRIPTION`, also
+// removed by the mutex deletion above.
 
 // ============================================================
 //  Network sink status discriminants — must match the
@@ -731,14 +735,8 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
                 ScannerMutexReason::RecordingStoppedForScanner => {
                     SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER
                 }
-                ScannerMutexReason::TranscriptionStoppedForScanner => {
-                    SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER
-                }
                 ScannerMutexReason::ScannerStoppedForRecording => {
                     SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING
-                }
-                ScannerMutexReason::ScannerStoppedForTranscription => {
-                    SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION
                 }
             };
             SdrEvent {
@@ -1055,9 +1053,12 @@ mod tests {
     #[test]
     fn scanner_mutex_reason_discriminants_match_header() {
         assert_eq!(SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER, 0);
-        assert_eq!(SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER, 1);
         assert_eq!(SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING, 2);
-        assert_eq!(SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION, 3);
+        // Discriminants 1 and 3 (`TRANSCRIPTION_STOPPED_FOR_SCANNER`
+        // and `SCANNER_STOPPED_FOR_TRANSCRIPTION`) were removed
+        // when the scanner ↔ transcription mutex was deleted —
+        // the slots are intentionally left unfilled to keep the
+        // remaining discriminants stable.
     }
 
     #[test]
@@ -1199,16 +1200,8 @@ mod tests {
                 SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER,
             ),
             (
-                ScannerMutexReason::TranscriptionStoppedForScanner,
-                SDR_SCANNER_MUTEX_TRANSCRIPTION_STOPPED_FOR_SCANNER,
-            ),
-            (
                 ScannerMutexReason::ScannerStoppedForRecording,
                 SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING,
-            ),
-            (
-                ScannerMutexReason::ScannerStoppedForTranscription,
-                SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_TRANSCRIPTION,
             ),
         ];
         for (reason, expected_int) in cases {
