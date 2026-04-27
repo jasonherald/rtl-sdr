@@ -3267,6 +3267,20 @@ fn connect_rtl_tcp_discovery(
         hostname_row.set_text(&last.host);
         port_row.set_value(f64::from(last.port));
         state.rtl_tcp_hydration_in_progress.set(false);
+        // Emit the canonical `SetNetworkConfig` for the restored
+        // RTL-TCP endpoint *after* the flag clears, mirroring
+        // `apply_rtl_tcp_connect`'s own post-hydration dispatch.
+        // Without this, the only `SetNetworkConfig` the DSP saw
+        // came from `connect_source_panel`'s raw-Network restore
+        // a moment earlier — so first Play on a persisted
+        // RTL-TCP session would dial the stale raw-Network
+        // endpoint until the user nudged a row by hand. Per
+        // `CodeRabbit` round 4 on PR #558.
+        state.send_dsp(UiToDsp::SetNetworkConfig {
+            hostname: last.host.clone(),
+            port: last.port,
+            protocol: sdr_types::Protocol::TcpClient,
+        });
     }
 
     // Poll the discovery channel from the main thread. Cheap enough
