@@ -9239,6 +9239,7 @@ fn connect_satellites_panel(
         // LOS via the same `set_*` notify chain that any user flip
         // takes. Per #555 (squelch + CTCSS) and #556 (FM IF NR).
         let squelch_enabled_row_a = panels.radio.squelch_enabled_row.clone();
+        let auto_squelch_row_a = panels.radio.auto_squelch_row.clone();
         let squelch_level_row_a = panels.radio.squelch_level_row.clone();
         let ctcss_row_a = panels.radio.ctcss_row.clone();
         let fm_if_nr_row_a = panels.radio.fm_if_nr_row.clone();
@@ -9290,6 +9291,9 @@ fn connect_satellites_panel(
                 let force_audio_chain_off = || {
                     if squelch_enabled_row_a.is_active() {
                         squelch_enabled_row_a.set_active(false);
+                    }
+                    if auto_squelch_row_a.is_active() {
+                        auto_squelch_row_a.set_active(false);
                     }
                     let off_idx =
                         sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(CtcssMode::Off);
@@ -9715,6 +9719,9 @@ fn connect_satellites_panel(
                 if saved.squelch_enabled != squelch_enabled_row_a.is_active() {
                     squelch_enabled_row_a.set_active(saved.squelch_enabled);
                 }
+                if saved.auto_squelch_enabled != auto_squelch_row_a.is_active() {
+                    auto_squelch_row_a.set_active(saved.auto_squelch_enabled);
+                }
                 let saved_ctcss_idx =
                     sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(saved.ctcss_mode);
                 if ctcss_row_a.selected() != saved_ctcss_idx {
@@ -9775,6 +9782,7 @@ fn connect_satellites_panel(
         // signals (squelch / CTCSS gate audio; FM IF NR zeros the
         // sidebands the APT subcarrier lives in). Per #555 / #556.
         let squelch_enabled_row_tick = panels.radio.squelch_enabled_row.clone();
+        let auto_squelch_row_tick = panels.radio.auto_squelch_row.clone();
         let squelch_level_row_tick = panels.radio.squelch_level_row.clone();
         let ctcss_row_tick = panels.radio.ctcss_row.clone();
         let fm_if_nr_row_tick = panels.radio.fm_if_nr_row.clone();
@@ -9835,6 +9843,7 @@ fn connect_satellites_panel(
                 was_running: state_tick.is_running.get(),
                 scanner_running: scanner_switch_tick.is_active(),
                 squelch_enabled: squelch_enabled_row_tick.is_active(),
+                auto_squelch_enabled: auto_squelch_row_tick.is_active(),
                 squelch_db: squelch_db_f32,
                 ctcss_mode: sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
                     ctcss_row_tick.selected(),

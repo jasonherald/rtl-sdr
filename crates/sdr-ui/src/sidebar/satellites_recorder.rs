@@ -211,6 +211,12 @@ pub struct SavedTune {
     /// Pre-AOS squelch master-switch state. Forced OFF at AOS,
     /// restored at LOS. Per #555.
     pub squelch_enabled: bool,
+    /// Pre-AOS auto-squelch toggle. Auto-squelch tracks the
+    /// noise floor and gates audio dynamically — same audio-
+    /// gating bug class as manual squelch, just adaptive.
+    /// Forced OFF at AOS, restored at LOS. Per CR round 2 on
+    /// PR #557.
+    pub auto_squelch_enabled: bool,
     /// Pre-AOS squelch threshold (dBFS). Restored verbatim at
     /// LOS — leaving it untouched during the pass would be
     /// fine on its own (squelch is disabled), but persisting
@@ -796,6 +802,7 @@ mod tests {
             was_running: true,
             scanner_running: false,
             squelch_enabled: false,
+            auto_squelch_enabled: false,
             squelch_db: -50.0,
             ctcss_mode: CtcssMode::Off,
             fm_if_nr_enabled: false,
@@ -1040,6 +1047,7 @@ mod tests {
             scanner_running: true, // pin: pre-AOS scan must come back at LOS
             // pin: pre-AOS audio-chain settings must come back at LOS
             squelch_enabled: true,
+            auto_squelch_enabled: true,
             squelch_db: SAVED_SQUELCH_DB,
             ctcss_mode: CtcssMode::Tone(SAVED_CTCSS_TONE_HZ),
             fm_if_nr_enabled: true,
@@ -1082,9 +1090,10 @@ mod tests {
                 assert!(!t.was_running);
                 assert!(t.scanner_running);
                 // Audio-chain pre-AOS state survives round-trip
-                // (#555 / #556): squelch enable + level, CTCSS
-                // mode, and FM IF NR all come back.
+                // (#555 / #556): squelch enable + auto-squelch +
+                // level, CTCSS mode, and FM IF NR all come back.
                 assert!(t.squelch_enabled);
+                assert!(t.auto_squelch_enabled);
                 assert!((t.squelch_db - SAVED_SQUELCH_DB).abs() < f32::EPSILON);
                 assert!(
                     matches!(t.ctcss_mode, CtcssMode::Tone(hz) if (hz - SAVED_CTCSS_TONE_HZ).abs() < f32::EPSILON)
