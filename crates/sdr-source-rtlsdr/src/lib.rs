@@ -444,6 +444,38 @@ impl Source for RtlSdrSource {
         }
         Ok(())
     }
+
+    fn set_direct_sampling(&mut self, mode: i32) -> Result<(), SourceError> {
+        // Routes through `rtlsdr_set_direct_sampling`. Mode 0
+        // disables direct sampling (normal tuner path); 1 selects
+        // the I branch and 2 selects the Q branch — both bypass
+        // the tuner entirely and feed the ADC straight from the
+        // antenna input, which is how RTL-SDR Blog v3+ dongles
+        // tune below 28 MHz (the R820T tuner cuts off there).
+        // Most users want Q branch on a v3 dongle. Per issue
+        // #538.
+        if let Some(device) = &mut self.device {
+            device
+                .set_direct_sampling(mode)
+                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn set_offset_tuning(&mut self, enabled: bool) -> Result<(), SourceError> {
+        // Routes through `rtlsdr_set_offset_tuning`. Pushes the
+        // local oscillator off the tuned frequency so the DC
+        // spike that lives at the LO doesn't sit on top of the
+        // signal of interest. Most relevant on E4000 tuners; on
+        // R820T / R820T2 the driver returns Ok but the operation
+        // is a no-op in hardware. Per issue #539.
+        if let Some(device) = &mut self.device {
+            device
+                .set_offset_tuning(enabled)
+                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
