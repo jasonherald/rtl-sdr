@@ -454,6 +454,26 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     });
     header.pack_start(&pause_btn);
 
+    // Clear button — wipes the buffered scan lines and queues a
+    // redraw. Useful when (a) the user just exported a pass and
+    // wants a clean canvas before the next AOS, or (b) a static-
+    // noise patch from a non-pass test filled the surface and
+    // they want a fresh start before the next real signal
+    // arrives. Without this, the only recourse is closing the
+    // viewer window and waiting for the next AOS to re-open it.
+    // The `AptImageView::clear` primitive already exists; this
+    // just wires it to a control. Per issue #515.
+    let clear_btn = gtk4::Button::builder()
+        .icon_name("edit-clear-all-symbolic")
+        .tooltip_text("Clear the image buffer and start fresh")
+        .build();
+    clear_btn.update_property(&[gtk4::accessible::Property::Label("Clear APT image buffer")]);
+    let clear_view = view.clone();
+    clear_btn.connect_clicked(move |_| {
+        clear_view.clear();
+    });
+    header.pack_start(&clear_btn);
+
     let export_btn = gtk4::Button::builder()
         .icon_name("document-save-symbolic")
         .tooltip_text("Export the current APT image to PNG")
