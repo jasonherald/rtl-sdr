@@ -196,6 +196,28 @@ impl AppState {
             tracing::warn!("failed to send DSP command: {e}");
         }
     }
+
+    /// Dispatch `UiToDsp::SetVfoOffset(hz)` AND synchronously
+    /// update [`Self::last_dispatched_vfo_offset_hz`] in the
+    /// same call. Use this for every programmatic VFO-offset
+    /// dispatch (auto-record AOS reset, LOS `RestoreTune`, mode-
+    /// change reset, Doppler tracker sends, etc.) so the
+    /// Doppler dispatch-baseline cell stays in sync without
+    /// waiting for the `DspToUi::VfoOffsetChanged` echo to
+    /// round-trip through the controller.
+    ///
+    /// The `connect_vfo_offset_changed` callback in `window.rs`
+    /// also writes the cell on echo (and on direct
+    /// spectrum-widget drag dispatches that update the spectrum
+    /// locally), so this helper's optimistic write is reconciled
+    /// with the actual applied value when the echo lands —
+    /// matching values overwrite harmlessly; clamped or
+    /// rejected values overwrite to truth. Per CR round 10 on
+    /// PR #554.
+    pub fn dispatch_vfo_offset(&self, hz: f64) {
+        self.last_dispatched_vfo_offset_hz.set(hz);
+        self.send_dsp(UiToDsp::SetVfoOffset(hz));
+    }
 }
 
 #[cfg(test)]

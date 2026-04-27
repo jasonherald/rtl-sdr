@@ -734,7 +734,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
                 );
             }
         }
-        state_for_vfo_reset.send_dsp(UiToDsp::SetVfoOffset(0.0));
+        state_for_vfo_reset.dispatch_vfo_offset(0.0);
     });
 
     // --- Poll DspToUi channel and shared FFT buffer from the GTK main loop ---
@@ -9296,7 +9296,7 @@ fn connect_satellites_panel(
                         // updates the spectrum widget, freq
                         // selector, and status bar; no manual
                         // mirror needed.
-                        state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
+                        state_a.dispatch_vfo_offset(0.0);
                         crate::apt_viewer::open_apt_viewer_if_needed(&parent_provider_a, &state_a);
                         // Clear the canvas at AOS so a back-to-back
                         // pass (e.g. NOAA 18 → NOAA 19 with
@@ -9347,7 +9347,7 @@ fn connect_satellites_panel(
                         // forward land in the cleared image.
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
-                        state_a.send_dsp(UiToDsp::SetVfoOffset(0.0));
+                        state_a.dispatch_vfo_offset(0.0);
                     }
                 }
             }
@@ -9620,7 +9620,7 @@ fn connect_satellites_panel(
                 // updates the spectrum + freq selector + status
                 // bar when the DSP echoes the change, so we
                 // don't have to mirror those widgets manually.
-                state_a.send_dsp(UiToDsp::SetVfoOffset(saved.vfo_offset_hz));
+                state_a.dispatch_vfo_offset(saved.vfo_offset_hz);
                 // If the user had playback off pre-AOS, we
                 // started the radio at AOS to make audio flow —
                 // honour that round trip and stop it now. A user
@@ -9878,8 +9878,7 @@ fn connect_doppler_tracker(
                 // VFO offset the user had set independently. Per
                 // CR round 3 on PR #554.
                 if was_active && let Some(offset) = final_offset {
-                    state.send_dsp(UiToDsp::SetVfoOffset(offset));
-                    state.last_dispatched_vfo_offset_hz.set(offset);
+                    state.dispatch_vfo_offset(offset);
                     status_bar.update_doppler(None);
                 }
             });
@@ -10025,8 +10024,7 @@ fn connect_doppler_tracker(
                     // own field is already 0 for the next
                     // engagement. Per CR round 8 on PR #554.
                     drop(t);
-                    state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
-                    state.last_dispatched_vfo_offset_hz.set(prior_user_ref);
+                    state.dispatch_vfo_offset(prior_user_ref);
                     status_bar.update_doppler(None);
                 }
             }
@@ -10071,8 +10069,7 @@ fn connect_doppler_tracker(
                 let prior_user_ref = t.user_reference_offset_hz();
                 let _ = t.set_active(None);
                 drop(t);
-                state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
-                state.last_dispatched_vfo_offset_hz.set(prior_user_ref);
+                state.dispatch_vfo_offset(prior_user_ref);
                 status_bar.update_doppler(None);
                 return glib::ControlFlow::Continue;
             }
@@ -10119,8 +10116,7 @@ fn connect_doppler_tracker(
             // arrives later with the same value, harmless.
             let baseline = state.last_dispatched_vfo_offset_hz.get();
             if (live - baseline).abs() > DOPPLER_DISPATCH_THRESHOLD_HZ {
-                state.send_dsp(UiToDsp::SetVfoOffset(live));
-                state.last_dispatched_vfo_offset_hz.set(live);
+                state.dispatch_vfo_offset(live);
             }
             glib::ControlFlow::Continue
         });
