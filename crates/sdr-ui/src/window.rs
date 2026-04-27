@@ -8911,15 +8911,21 @@ fn connect_satellites_panel(
             });
     }
 
-    // Doppler-correction tracker (#521). Wired only when the
-    // TLE cache is available — without TLEs we can't propagate
-    // SGP4 to evaluate the trigger or compute the offset, so
-    // there's nothing for the tracker to do. The doppler switch
-    // itself remains visible (and persisted) so the user's
-    // preference survives a launch where the cache happened to
-    // be unavailable.
+    // Doppler-correction tracker (#521).
+    //
+    // Two-layer wiring:
+    //   1. `restore_doppler_switch` runs ALWAYS — restores the
+    //      persisted master-switch value to the widget and
+    //      wires its change-notify to save back. This way the
+    //      user's preference survives a launch even when the
+    //      TLE cache is unavailable. Per CR round 1 on PR #554.
+    //   2. `connect_doppler_tracker` runs only when the TLE
+    //      cache is available — without TLEs we can't propagate
+    //      SGP4 to evaluate the trigger or compute the offset,
+    //      so there's nothing for the *behavior* to do.
+    restore_doppler_switch(panels, config);
     if let Some(cache_doppler) = cache.as_ref() {
-        connect_doppler_tracker(panels, state, config, cache_doppler, status_bar);
+        connect_doppler_tracker(panels, state, cache_doppler, status_bar);
     }
 
     // Refresh button — re-download every known satellite's TLE on
@@ -9683,10 +9689,40 @@ const DOPPLER_DISPATCH_THRESHOLD_HZ: f64 = 5.0;
 /// Wired only when the TLE cache is available — see
 /// [`connect_satellites_panel`].
 #[allow(clippy::too_many_lines)]
+/// Restore the persisted Doppler master-switch state to the
+/// widget and wire change-notify to save back. Always called,
+/// regardless of TLE-cache availability — the user's preference
+/// must survive a launch where the cache happened to be
+/// unavailable. The behavioral wiring (timers + tracker) lives
+/// in [`connect_doppler_tracker`] and is gated separately.
+/// Per CR round 1 on PR #554.
+fn restore_doppler_switch(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let persisted = sidebar::satellites_panel::load_doppler_tracking_enabled(config);
+    panels.satellites.doppler_switch.set_active(persisted);
+
+    let config = std::sync::Arc::clone(config);
+    panels
+        .satellites
+        .doppler_switch
+        .connect_active_notify(move |row| {
+            sidebar::satellites_panel::save_doppler_tracking_enabled(&config, row.is_active());
+        });
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "three chained closures (master-switch handler + two timers) all \
+              live in one function so they share the `tracker` and \
+              `last_dispatched` Rcs by direct clone; splitting would mean \
+              hoisting those onto AppState, which the design spec §4 \
+              already explicitly defers"
+)]
 fn connect_doppler_tracker(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
-    config: &std::sync::Arc<sdr_config::ConfigManager>,
     cache: &std::sync::Arc<sdr_sat::TleCache>,
     status_bar: &Rc<StatusBar>,
 ) {
@@ -9696,41 +9732,54 @@ fn connect_doppler_tracker(
     };
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Satellite, track};
 
-    // Restore the persisted master-switch value BEFORE wiring the
-    // notify handler — same idiom as the lat/lon/alt/auto-record
-    // restore above. Otherwise the programmatic `set_active`
-    // fires the notify handler and re-saves the just-loaded
-    // value redundantly.
-    let persisted = sidebar::satellites_panel::load_doppler_tracking_enabled(config);
-    panels.satellites.doppler_switch.set_active(persisted);
+    // Read the widget's current state — it was already restored
+    // (and a persistence handler wired) by `restore_doppler_switch`,
+    // which runs unconditionally before we enter this cache-gated
+    // path. Per CR round 1 on PR #554.
+    let initial = panels.satellites.doppler_switch.is_active();
 
     let tracker: Rc<RefCell<DopplerTracker>> =
-        Rc::new(RefCell::new(DopplerTracker::new(persisted)));
+        Rc::new(RefCell::new(DopplerTracker::new(initial)));
 
-    // Master-switch change handler: persist + update tracker.
-    // If the switch goes off while a satellite is active,
-    // dispatch a final `SetVfoOffset(user_reference)` so the
-    // VFO doesn't get stuck on the last computed Doppler value,
-    // and clear the status bar label.
+    // Shared dispatch baseline: read by the 4 Hz recompute tick
+    // for its rate-limit gate; written by every path that
+    // dispatches a `SetVfoOffset` so subsequent material-change
+    // comparisons are against the latest actual DSP state, not a
+    // stale Doppler value. Per CR round 1 on PR #554: without
+    // resetting on the master-off and trigger-disengage fallbacks,
+    // a re-engagement could land within `DOPPLER_DISPATCH_THRESHOLD_HZ`
+    // of the prior live value and the first dispatch would be
+    // suppressed — leaving DSP on the user-reference baseline
+    // while the status bar shows active Doppler.
+    let last_dispatched: Rc<std::cell::Cell<f64>> = Rc::new(std::cell::Cell::new(0.0));
+
+    // Master-switch handler that drives the tracker. (A separate
+    // change-notify handler in `restore_doppler_switch` already
+    // persists the value — multiple GTK signal handlers fire
+    // independently, no conflict.) On disable, `set_master_enabled`
+    // atomically clears `active`, captures and resets
+    // `user_reference_offset_hz`, and returns the captured value
+    // for us to flush to DSP.
     {
         let tracker = Rc::clone(&tracker);
-        let config = std::sync::Arc::clone(config);
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
+        let last_dispatched = Rc::clone(&last_dispatched);
         panels
             .satellites
             .doppler_switch
             .connect_active_notify(move |row| {
                 let enabled = row.is_active();
-                sidebar::satellites_panel::save_doppler_tracking_enabled(&config, enabled);
                 let mut t = tracker.borrow_mut();
                 let was_active = t.active().is_some();
-                t.set_master_enabled(enabled);
-                if !enabled && was_active {
-                    let user_ref = t.user_reference_offset_hz();
-                    drop(t);
-                    state.send_dsp(UiToDsp::SetVfoOffset(user_ref));
-                    status_bar.update_doppler(None);
+                let final_offset = t.set_master_enabled(enabled);
+                drop(t);
+                if let Some(offset) = final_offset {
+                    state.send_dsp(UiToDsp::SetVfoOffset(offset));
+                    last_dispatched.set(offset);
+                    if was_active {
+                        status_bar.update_doppler(None);
+                    }
                 }
             });
     }
@@ -9749,6 +9798,7 @@ fn connect_doppler_tracker(
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
         let panel_weak = panels.satellites.downgrade();
+        let last_dispatched = Rc::clone(&last_dispatched);
         let _ = glib::timeout_add_local(DOPPLER_TRIGGER_TICK, move || {
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -9811,6 +9861,7 @@ fn connect_doppler_tracker(
                 let user_ref = t.user_reference_offset_hz();
                 drop(t);
                 state.send_dsp(UiToDsp::SetVfoOffset(user_ref));
+                last_dispatched.set(user_ref);
                 status_bar.update_doppler(None);
             }
             glib::ControlFlow::Continue
@@ -9829,7 +9880,7 @@ fn connect_doppler_tracker(
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
         let panel_weak = panels.satellites.downgrade();
-        let last_dispatched: Rc<std::cell::Cell<f64>> = Rc::new(std::cell::Cell::new(0.0));
+        let last_dispatched = Rc::clone(&last_dispatched);
         let _ = glib::timeout_add_local(DOPPLER_RECOMPUTE_TICK, move || {
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;

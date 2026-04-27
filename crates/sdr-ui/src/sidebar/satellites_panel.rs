@@ -452,7 +452,13 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     let doppler_switch = adw::SwitchRow::builder()
         .title("Doppler tracking")
         .subtitle("Auto-correct frequency drift during satellite passes")
-        .active(false)
+        // Default ON — matches the persisted-default contract in
+        // `load_doppler_tracking_enabled`. The wiring layer in
+        // `window.rs::restore_doppler_switch` overrides this with
+        // the persisted value, but if that wiring is ever skipped
+        // the widget should still reflect "default ON" rather than
+        // a misleading `false`. Per CR round 1 on PR #554.
+        .active(true)
         .build();
     // Same group as the auto-record switches — these are all
     // "behavior toggles for the satellites workflow". Per #521.

@@ -433,7 +433,7 @@ Add these tests to the `#[cfg(test)] mod tests` block (append to the existing te
     }
 
     #[test]
-    fn compute_doppler_offset_sign_matches_approaching_recedeing() {
+    fn compute_doppler_offset_sign_matches_approaching_receding() {
         // Spec §5: positive Doppler when approaching, negative
         // when receding. Formula is `Δf = -f₀ · ṙ / c`, so a
         // positive range-rate (receding) must give negative Δf.
@@ -609,7 +609,7 @@ Find the `#[cfg(test)] mod tests` block in `satellites_panel.rs`. Find any exist
 If `make_config()` doesn't exist as a helper in this file's tests, look at how other `load_*` tests in nearby files (e.g. `source_panel.rs`) construct their `Arc<ConfigManager>` — likely:
 ```rust
 fn make_config() -> Arc<ConfigManager> {
-    Arc::new(ConfigManager::new_in_memory().expect("config"))
+    Arc::new(ConfigManager::in_memory(&serde_json::json!({})))
 }
 ```
 

@@ -38,13 +38,13 @@ When the trigger conditions go from true → false (pass ends, user re-tunes off
 
 | Case | Outcome |
 |---|---|
-| Auto-record AOS tunes to NOAA 15 | Freq matches, satellite is by definition overhead → engages |
-| User manually tunes to NOAA 15 mid-pass | Freq matches, satellite overhead → engages |
+| Auto-record AOS tunes to NOAA 15 | Freq matches, satellite is by definition above the horizon at AOS → engages |
+| User manually tunes to NOAA 15 mid-pass | Freq matches, satellite above the horizon → engages |
 | User manually tunes to NOAA 15 between passes | Freq matches, but below horizon → does NOT engage (correctly!) |
 | User tunes off-satellite | Freq doesn't match → disengages |
 | User has no ground station coords set | "Above horizon" can't be evaluated → tracker stays dormant, status bar hidden |
 
-No special "is auto-record running?" branch is needed; auto-record sets the frequency to the satellite, AOS makes the satellite overhead, and the auto-detect rule fires naturally.
+No special "is auto-record running?" branch is needed; auto-record sets the frequency to the satellite, AOS puts the satellite above the horizon, and the auto-detect rule fires naturally.
 
 ## 3. Where the correction lands in the signal path
 
@@ -56,57 +56,57 @@ For everything we ship today (NOAA APT, Meteor LRPT, ISS SSTV), max Doppler is �
 
 **Out of scope for v1:** SDR center-frequency retune. Architectured-around (a future need for narrow-bandwidth modes or HEO/deep-space could add a coarse-retune branch in the same `DopplerTracker` without touching the activation rule), but not implemented today.
 
-## 4. Manual-override behavior — additive
+## 4. Manual-override behavior — additive (DEFERRED in v1)
 
-The user dragging the VFO offset slider while Doppler is active changes a per-session `user_reference_offset`. Doppler tracks **on top** of that:
+> **v1 status:** the `user_reference_offset` field exists on `DopplerTracker` and the `live_offset_hz()` method computes the additive sum, but the **wiring** that updates `user_reference_offset` from a user VFO-slider drag is deferred. Reason: the spectrum widget's drag/click-to-tune path (`crates/sdr-ui/src/spectrum/mod.rs`) dispatches `UiToDsp::SetVfoOffset` directly via its own `dsp_tx` clone, completely bypassing `AppState::send_dsp` and the Doppler wiring layer. Hooking it requires either hoisting `Rc<RefCell<DopplerTracker>>` onto `AppState` (touches every spectrum-construction call site) or re-routing the spectrum drag through the wiring layer. v1 lands the model + the call site comment; the wiring is filed as a follow-up.
+>
+> **v1 effective behavior:** a user drag wins for ≤250 ms (until the next 4 Hz Doppler recompute), then Doppler reasserts. Acceptable for a v1 — see PR #554 and its CR thread.
 
-```
+The intended (post-deferral) design: the user dragging the VFO offset slider while Doppler is active changes a per-session `user_reference_offset`. Doppler tracks **on top** of that:
+
+```text
 live_offset = user_reference_offset + doppler_correction
 ```
 
-So:
+So (once wired):
 
 - User can fine-tune for personal taste (offset by +500 Hz to bias toward USB sideband, etc.) and Doppler still tracks correctly relative to that.
 - A manual drag does NOT disable Doppler ("respectful of agency" but creates the "wait, why is Doppler off?" surprise — rejected).
 - A manual drag is NOT overwritten on the next tick ("Doppler wins" — feels paternalistic, fights the user — rejected).
 
-**Reset semantics:** `user_reference_offset` resets to 0 when the active satellite changes (new pass, different satellite, or trigger conditions go false). It does NOT persist across passes — Doppler tracking is per-pass, and so is any user fine-tune on top of it.
+**Reset semantics:** `user_reference_offset` resets to 0 when the active satellite changes (new pass, different satellite, or trigger conditions go false), AND when the master switch is toggled off. It does NOT persist across passes — Doppler tracking is per-pass, and so is any user fine-tune on top of it.
 
-## 5. Range-rate / Doppler calculation — new `sdr-sat` API
+## 5. Range-rate / Doppler calculation — wraps existing `sdr-sat` API
+
+> **v1 reality:** this section originally proposed a new `sdr_sat::doppler_offset_hz(...)` function. **It turned out the math was already shipped in `sdr-sat`** — `sdr_sat::track(station, satellite, when)` returns a `Track` whose `Track::doppler_shift_hz(carrier_hz)` method computes Δf using the same formula. The crate boundary is therefore unchanged: the new code lives entirely in `sdr-ui`.
+
+`crates/sdr-ui/src/doppler_tracker.rs::compute_doppler_offset_hz` is a thin wrapper over the existing API:
 
 ```rust
-// crates/sdr-sat/src/lib.rs (new public function)
-
-/// Compute the predicted Doppler shift in Hz for the given
-/// satellite at the given UTC instant, observed from the
-/// given ground station. Sign convention: positive when
-/// the satellite is approaching (receive frequency > nominal
-/// carrier), negative when receding.
-///
-/// Pure function over SGP4 propagation — no caching, no I/O.
-/// Caller (the UI's `DopplerTracker`) is responsible for
-/// rate-limiting and threading.
-pub fn doppler_offset_hz(
-    satellite: &KnownSatellite,
+// crates/sdr-ui/src/doppler_tracker.rs
+pub fn compute_doppler_offset_hz(
+    satellite: &Satellite,
     station: &GroundStation,
     when: chrono::DateTime<chrono::Utc>,
-    tle: &Tle,
-) -> Result<f64, DopplerError>;
+    carrier_hz: f64,
+) -> Result<f64, DopplerError> {
+    let track = sdr_sat::track(station, satellite, when)?;
+    Ok(track.doppler_shift_hz(carrier_hz))
+}
 ```
 
-**Math:**
+**Math (implemented inside `sdr-sat::track` + `Track::doppler_shift_hz`):**
 
 1. SGP4 propagate the TLE to `when` → ECI position + velocity (km, km/s).
-2. Convert to topocentric ENU (east-north-up) coordinates relative to `station`.
-3. Range vector r = sat_pos − station_pos (m).
-4. Range-rate ṙ = (r · v) / |r| (m/s, signed: positive = receding).
-5. Doppler Δf = −ṙ · f_carrier / c (Hz). The negation makes "approaching" produce positive Δf, matching the table in §1.
+2. Compute range vector and range-rate in ECI (no topocentric conversion needed — the dot product `r · v` is frame-invariant).
+3. Range-rate ṙ in km/s, signed: positive = receding.
+4. Doppler Δf = −ṙ · f_carrier / c (Hz). The negation makes "approaching" produce positive Δf, matching the table in §1.
 
-**Carrier frequency:** read from `satellite.downlink_hz`. Not from the user's current center frequency — the catalog value is the truth and is what the SGP4-propagated geometry was implicitly computed for.
+See `crates/sdr-sat/src/passes.rs::track` for the full implementation, including how station velocity (ω × r_station_eci) is added to satellite velocity for the relative range-rate.
 
-**Step 4 detail:** range-rate from ECI velocities can be computed without explicitly constructing the topocentric frame, since the dot product `r · v` is frame-invariant once both are expressed in the same Cartesian frame. We can just compute everything in ECI, which avoids a frame-conversion step. This is the standard "satellite Doppler from TLE" approach — see e.g. the [Vallado MATLAB code](https://www.celestrak.org/software/vallado-sw.php) or [predict4java](https://github.com/davidmoten/predict4java)'s `passDetails`.
+**Carrier frequency:** read from `satellite.downlink_hz` (catalog truth). Not from the user's current center frequency.
 
-**Reuse:** the existing TLE cache (`sdr-sat::tle_cache`, 24 h cached against Celestrak `gp.php?CATNR=…`) is the source of `Tle`. No new I/O. The existing `GroundStation` config (lat/lon/alt) is the source of `station`.
+**Reuse:** the existing TLE cache (`sdr-sat::TleCache`, 24 h cached against Celestrak `gp.php?CATNR=…`) is the source of TLE strings. The existing `GroundStation` config (lat/lon/alt from the Satellites panel rows) is the source of `station`.
 
 ## 6. The `DopplerTracker` (sdr-ui)
 
@@ -146,7 +146,7 @@ The two timers are decoupled because trigger evaluation is cheap-and-rare while 
 
 Add an `AdwSwitchRow` to the existing `AdwPreferencesGroup` in the Satellites activity panel (alongside auto-record APT / auto-record audio toggles):
 
-```
+```text
 🛰  Doppler tracking
     Auto-correct frequency drift during satellite passes.
 ```

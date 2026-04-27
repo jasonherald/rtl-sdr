@@ -144,15 +144,32 @@ impl DopplerTracker {
     /// Update the master switch. Caller (wiring layer) is
     /// responsible for persisting the new value via
     /// `save_doppler_tracking_enabled`.
-    pub fn set_master_enabled(&mut self, enabled: bool) {
+    ///
+    /// On a transition to **disabled**, the tracker atomically:
+    ///   - clears the active satellite (matching `set_active(None)` semantics)
+    ///   - captures the current `user_reference_offset_hz`
+    ///   - resets `user_reference_offset_hz` to 0
+    ///   - returns `Some(captured)` so the wiring layer can
+    ///     dispatch one final `SetVfoOffset(captured)` to flush
+    ///     the DSP back to the user-reference baseline (or 0 if
+    ///     they hadn't touched the slider).
+    ///
+    /// Returns `None` on enable transitions (or no-change calls)
+    /// — engagement of a satellite is the trigger re-evaluate
+    /// tick's job, not this method's. Per CR round 1 on PR #554:
+    /// before this change the wiring layer needed a "dispatch
+    /// first, then clear later" dance that left
+    /// `user_reference_offset_hz` non-zero across master-off,
+    /// breaking parity with `set_active(None)`.
+    pub fn set_master_enabled(&mut self, enabled: bool) -> Option<f64> {
         self.master_enabled = enabled;
         if !enabled {
-            // Spec §2: when trigger conditions go false (master
-            // off counts), reset the active satellite. The
-            // wiring layer handles the final SetVfoOffset(
-            // user_reference_offset) dispatch.
+            let final_offset_hz = self.user_reference_offset_hz;
             self.active = None;
+            self.user_reference_offset_hz = 0.0;
+            return Some(final_offset_hz);
         }
+        None
     }
 
     /// Whether the master switch is currently on.
@@ -354,102 +371,150 @@ mod tests {
         "2 33591  98.9537 187.4203 0013993 172.1068 188.0327 14.13465738887193";
 
     fn test_station() -> GroundStation {
-        // San Francisco-ish — coords matter only insofar as the
-        // satellite is overhead during the chosen propagate time.
+        // San Francisco-ish — picked because NOAA 19's polar orbit
+        // delivers passes everywhere; the actual lat/lon doesn't
+        // shape the test outcomes once we use `upcoming_passes` to
+        // find a real pass relative to this station.
         GroundStation::new(37.7749, -122.4194, 50.0)
+    }
+
+    /// TLE epoch as a UTC instant (decoded from
+    /// `NOAA_19_TLE_LINE1` field 4: year 26, day-of-year 116.58781).
+    /// Used as the search anchor for finding a real pass — SGP4
+    /// is most accurate within a few days of epoch, and CR
+    /// round 1 on PR #554 flagged that propagating ~28 months
+    /// before epoch (the prior 2024-01-01 anchor) made the
+    /// "monotonic across a pass" assertion meaningless.
+    fn tle_epoch_utc() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-04-26T14:06:26Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Locate the first NOAA 19 pass over `test_station()` within
+    /// 48 hours of the TLE epoch, and return (`AOS`, `TCA`, `LOS`)
+    /// timestamps. Panics if no pass is found (would be a TLE-or-
+    /// math regression — there are typically ~6 passes per day
+    /// from any mid-latitude station).
+    fn first_pass_aos_tca_los(
+        sat: &Satellite,
+        station: &GroundStation,
+    ) -> (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) {
+        let from = tle_epoch_utc();
+        let to = from + chrono::Duration::hours(48);
+        // 5° minimum elevation: low enough to admit the typical
+        // horizon-to-horizon NOAA pass shape, high enough to
+        // exclude the marginal grazes that don't actually have
+        // useful Doppler curve geometry.
+        let pass = sdr_sat::upcoming_passes(station, sat, from, to, 5.0)
+            .into_iter()
+            .next()
+            .expect("a NOAA 19 pass should fall within 48 h of epoch");
+        (pass.start, pass.max_el_time, pass.end)
     }
 
     #[test]
     fn compute_doppler_offset_returns_signed_value_at_known_time() {
-        // Sanity: the function returns SOMETHING and doesn't
-        // error on a satellite-not-overhead time. The exact
-        // sign/magnitude depends on geometry, but the call
-        // shape and error path are pinned.
+        // Sanity: the function returns a value in the right
+        // ballpark when sampled mid-pass. Pinning the call shape
+        // and the order-of-magnitude (±10 kHz fits the entire
+        // ±5 kHz Doppler envelope at 137 MHz with margin).
         let sat = Satellite::from_tle("NOAA 19", NOAA_19_TLE_LINE1, NOAA_19_TLE_LINE2)
             .expect("TLE parses");
-        let when = chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let result = compute_doppler_offset_hz(&sat, &test_station(), when, 137_100_000.0).unwrap();
+        let station = test_station();
+        let (_aos, tca, _los) = first_pass_aos_tca_los(&sat, &station);
+        let result = compute_doppler_offset_hz(&sat, &station, tca, 137_100_000.0).unwrap();
         assert!(
             result.abs() < 10_000.0,
-            "Doppler magnitude should fit within ±10 kHz at 137 MHz: got {result}"
+            "Doppler magnitude at TCA should fit within ±10 kHz at 137 MHz: got {result}"
         );
     }
 
     #[test]
-    fn compute_doppler_offset_curves_through_zero_during_overhead_pass() {
-        // Spec §1: across a pass, Doppler sweeps positive →
-        // zero at TCA → negative. Sample three instants 4 min
-        // apart; check the offset trends from positive toward
-        // negative (or vice versa — sign depends on which side
-        // of the orbit the station sees). The key invariant is
-        // monotonicity: it should always be moving in one
-        // direction across a single pass.
+    #[allow(
+        clippy::similar_names,
+        reason = "AOS / TCA / LOS are the canonical satellite-tracking \
+                  pass milestones; the d_aos/d_tca/d_los names mirror \
+                  them directly and are clearer than synonyms would be"
+    )]
+    fn compute_doppler_offset_pass_shape_aos_to_los() {
+        // Spec §1: across a pass, Doppler sweeps positive at AOS
+        // (satellite approaching) → through ~zero at TCA → to
+        // negative at LOS (satellite receding). Anchored to a
+        // real pass found via `upcoming_passes` so the assertions
+        // are meaningful — not just "the value moved 100 Hz".
         let sat = Satellite::from_tle("NOAA 19", NOAA_19_TLE_LINE1, NOAA_19_TLE_LINE2)
             .expect("TLE parses");
         let station = test_station();
         let carrier = 137_100_000.0_f64;
+        let (aos, tca, los) = first_pass_aos_tca_los(&sat, &station);
 
-        // Three instants 4 min apart somewhere in the propagation
-        // window. Don't assume any specific pass falls in this
-        // window — just check that the offset CHANGES monotonically,
-        // which is true outside TCA's brief sign-flip moment.
-        let t0 = chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let t1 = t0 + chrono::Duration::minutes(4);
-        let t2 = t0 + chrono::Duration::minutes(8);
+        let d_aos = compute_doppler_offset_hz(&sat, &station, aos, carrier).unwrap();
+        let d_tca = compute_doppler_offset_hz(&sat, &station, tca, carrier).unwrap();
+        let d_los = compute_doppler_offset_hz(&sat, &station, los, carrier).unwrap();
 
-        let d0 = compute_doppler_offset_hz(&sat, &station, t0, carrier).unwrap();
-        let d1 = compute_doppler_offset_hz(&sat, &station, t1, carrier).unwrap();
-        let d2 = compute_doppler_offset_hz(&sat, &station, t2, carrier).unwrap();
-
-        // Doppler should change appreciably over 8 minutes of
-        // satellite motion (the satellite covers ~3500 km in
-        // that span — geometry definitely changes).
-        let total_swing = (d2 - d0).abs();
+        // AOS = approaching = positive Doppler.
         assert!(
-            total_swing > 100.0,
-            "Doppler should swing >100 Hz over 8 min: d0={d0} d1={d1} d2={d2}"
+            d_aos > 0.0,
+            "AOS Doppler should be positive (approaching): d_aos={d_aos}"
+        );
+        // LOS = receding = negative Doppler.
+        assert!(
+            d_los < 0.0,
+            "LOS Doppler should be negative (receding): d_los={d_los}"
+        );
+        // Monotonic decrease across the pass.
+        assert!(
+            d_aos > d_tca && d_tca > d_los,
+            "Doppler should decrease monotonically AOS→TCA→LOS: \
+             d_aos={d_aos}, d_tca={d_tca}, d_los={d_los}"
+        );
+        // |TCA| < |AOS| AND |TCA| < |LOS|: at TCA the satellite is
+        // closest to the station, so the radial velocity component
+        // is at its smallest magnitude.
+        assert!(
+            d_tca.abs() < d_aos.abs() && d_tca.abs() < d_los.abs(),
+            "Doppler magnitude should be smallest at TCA: \
+             |d_aos|={}, |d_tca|={}, |d_los|={}",
+            d_aos.abs(),
+            d_tca.abs(),
+            d_los.abs()
         );
     }
 
     #[test]
-    fn compute_doppler_offset_sign_matches_approaching_recedeing() {
+    fn compute_doppler_offset_sign_matches_approaching_receding() {
         // Spec §5: positive Doppler when approaching, negative
         // when receding. Formula is `Δf = -f₀ · ṙ / c`, so a
         // positive range-rate (receding) must give negative Δf.
-        //
-        // We can't easily construct a synthetic "approaching at
-        // 5 km/s" test without implementing our own SGP4, but we
-        // can verify the formula's sign by computing the offset
-        // for the same satellite at two adjacent times and
-        // checking that the SIGN of the offset matches the SIGN
-        // implied by the geometry change. This is a regression
-        // pin against accidentally flipping the sign.
+        // Anchored to AOS so we know the satellite is genuinely
+        // approaching — `range_rate_km_s` will be sharply
+        // negative and the sign assertion is meaningful.
         let sat = Satellite::from_tle("NOAA 19", NOAA_19_TLE_LINE1, NOAA_19_TLE_LINE2)
             .expect("TLE parses");
         let station = test_station();
         let carrier = 137_100_000.0_f64;
+        let (aos, _tca, _los) = first_pass_aos_tca_los(&sat, &station);
 
-        let when = chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let track = sdr_sat::track(&station, &sat, when).expect("track ok");
-        let doppler = compute_doppler_offset_hz(&sat, &station, when, carrier).unwrap();
+        let track = sdr_sat::track(&station, &sat, aos).expect("track ok");
+        let doppler = compute_doppler_offset_hz(&sat, &station, aos, carrier).unwrap();
 
-        // Sign relationship: doppler = -carrier * range_rate / c.
-        // So `doppler` and `range_rate` always have OPPOSITE signs.
-        if track.range_rate_km_s.abs() > 0.01 {
-            let opposite_signs = (doppler > 0.0 && track.range_rate_km_s < 0.0)
-                || (doppler < 0.0 && track.range_rate_km_s > 0.0);
-            assert!(
-                opposite_signs,
-                "doppler={doppler} should be opposite sign to range_rate={}",
-                track.range_rate_km_s
-            );
-        }
+        // At AOS, range_rate_km_s should be negative (approaching)
+        // and doppler should be positive — opposite signs by the
+        // formula `Δf = -f₀ · ṙ / c`.
+        assert!(
+            track.range_rate_km_s < 0.0,
+            "AOS range-rate should be negative (approaching): {}",
+            track.range_rate_km_s
+        );
+        assert!(
+            doppler > 0.0,
+            "AOS Doppler should be positive (approaching): {doppler}"
+        );
     }
 
     #[test]
@@ -481,8 +546,32 @@ mod tests {
         let mut t = DopplerTracker::new(true);
         let _ = t.set_active(Some(noaa_15()));
         assert_eq!(t.active().map(|s| s.name), Some("NOAA 15"));
-        t.set_master_enabled(false);
+        let final_offset = t.set_master_enabled(false);
         assert!(t.active().is_none());
+        // Returns Some on disable transition. Per CR round 1
+        // on PR #554.
+        assert_eq!(final_offset, Some(0.0));
+    }
+
+    #[test]
+    fn set_master_disabled_resets_user_reference_offset_and_returns_it() {
+        // Spec §4 reset semantics + CR round 1 on PR #554:
+        // master-off must reset `user_reference_offset_hz` to
+        // match `set_active(None)` semantics, AND return the
+        // pre-reset value so the wiring layer can dispatch one
+        // final `SetVfoOffset(captured)` to flush DSP.
+        let mut t = DopplerTracker::new(true);
+        let _ = t.set_active(Some(noaa_15()));
+        t.set_user_reference_offset_hz(750.0);
+
+        let final_offset = t.set_master_enabled(false);
+
+        assert_eq!(final_offset, Some(750.0), "must return pre-reset value");
+        assert!(t.active().is_none(), "active must be cleared");
+        assert!(
+            (t.user_reference_offset_hz() - 0.0).abs() < f64::EPSILON,
+            "user_reference_offset_hz must reset to 0"
+        );
     }
 
     #[test]
@@ -491,8 +580,11 @@ mod tests {
         // satellite — the wiring layer's re-evaluate tick is
         // what decides which (if any) satellite to engage.
         let mut t = DopplerTracker::new(false);
-        t.set_master_enabled(true);
+        let result = t.set_master_enabled(true);
         assert!(t.active().is_none());
+        // Enable transitions return None — only disables return
+        // a flush-offset.
+        assert_eq!(result, None);
     }
 
     #[test]

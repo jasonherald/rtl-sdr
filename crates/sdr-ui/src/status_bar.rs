@@ -39,6 +39,12 @@ const DEFAULT_ANTENNA_TEXT: &str = "λ/2 -- · λ/4 --";
 /// Default cursor readout text when the cursor is not over the spectrum.
 const DEFAULT_CURSOR_TEXT: &str = "Cursor: --";
 
+/// Hertz per kilohertz — used by [`StatusBar::update_doppler`]
+/// to format the offset in kHz with a signed 1-decimal display.
+/// Per CR round 1 on PR #554 (project guideline: named constants
+/// for magic numbers).
+const HZ_PER_KHZ: f64 = 1_000.0;
+
 /// Role badge state rendered by the status bar when connected
 /// to an `rtl_tcp` server. Variants carry role provenance
 /// explicitly — the API that previously took an `Option<bool>`
@@ -180,7 +186,7 @@ impl StatusBar {
     /// `None` hides the label and its separator. Per issue #521.
     pub fn update_doppler(&self, offset_hz: Option<f64>) {
         if let Some(hz) = offset_hz {
-            let khz = hz / 1000.0;
+            let khz = hz / HZ_PER_KHZ;
             self.doppler_label
                 .set_label(&format!("Doppler: {khz:+.1} kHz"));
             self.doppler_label.set_visible(true);
@@ -371,17 +377,17 @@ mod tests {
         // We can't construct a StatusBar in unit tests without
         // GTK, so we test the format directly.
         let hz: f64 = -1_437.5;
-        let khz = hz / 1000.0;
+        let khz = hz / HZ_PER_KHZ;
         let formatted = format!("Doppler: {khz:+.1} kHz");
         assert_eq!(formatted, "Doppler: -1.4 kHz");
 
         let hz_pos: f64 = 2_700.0;
-        let khz_pos = hz_pos / 1000.0;
+        let khz_pos = hz_pos / HZ_PER_KHZ;
         let formatted_pos = format!("Doppler: {khz_pos:+.1} kHz");
         assert_eq!(formatted_pos, "Doppler: +2.7 kHz");
 
         let hz_zero: f64 = 0.0;
-        let khz_zero = hz_zero / 1000.0;
+        let khz_zero = hz_zero / HZ_PER_KHZ;
         let formatted_zero = format!("Doppler: {khz_zero:+.1} kHz");
         assert_eq!(formatted_zero, "Doppler: +0.0 kHz");
     }
