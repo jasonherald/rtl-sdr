@@ -50,8 +50,7 @@ use crate::sidebar::display_panel::FFT_SIZES;
 #[cfg(feature = "sherpa")]
 use crate::sidebar::transcript_panel::DISPLAY_MODE_FINAL_IDX;
 
-/// Decimation factors available in the source panel dropdown (must match panel order).
-const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
+use crate::sidebar::source_panel::DECIMATION_FACTORS;
 
 /// Interval in milliseconds for polling the DSP→UI channel.
 const DSP_POLL_INTERVAL_MS: u64 = 16;
@@ -911,6 +910,13 @@ fn clear_scanner_active_channel_ui(
     state: &AppState,
 ) {
     *state.scanner_active_key.borrow_mut() = None;
+    // Drop any buffered channel-marker hop so the next transcript
+    // text doesn't inherit a divider from a channel that's no
+    // longer active. Reaches every stop path that funnels through
+    // this helper (`ScannerActiveChannelChanged { key: None }`,
+    // `ScannerEmptyRotation`, `ScannerMutexStopped`). Per
+    // CodeRabbit round 1 on PR #558.
+    *state.pending_channel_marker.borrow_mut() = None;
     scanner_panel
         .active_channel_row
         .set_subtitle(sidebar::scanner_panel::ACTIVE_CHANNEL_PLACEHOLDER);
@@ -1245,19 +1251,25 @@ fn handle_dsp_message(
             // before the widget sync below so a racing user click
             // during this frame sees the latest key.
             state.scanner_active_key.borrow_mut().clone_from(&key);
-            // Buffer the channel name for lazy marker emission.
-            // The transcription text-event handler will consume
-            // this when the next transcribed line arrives — that
-            // way markers only appear when there's actual audio
-            // to attribute. If the scanner hops past a quiet
+            // Buffer the channel name + hop time for lazy marker
+            // emission. The transcription text-event handler will
+            // consume this when the next transcribed line arrives
+            // — that way markers only appear when there's actual
+            // audio to attribute. If the scanner hops past a quiet
             // channel before any text fires, the next channel's
             // name overwrites the buffer and the silent channel
             // never gets a marker. If transcription is off, no
-            // text events fire at all, so the buffered name
-            // simply stays unconsumed (gets overwritten on each
-            // hop) and no markers ever appear in the panel.
-            // Per issue #517 + initial-smoke feedback on PR #558.
-            *state.pending_channel_marker.borrow_mut() = key.as_ref().map(|_| name.clone());
+            // text events fire at all, so the buffered hop simply
+            // stays unconsumed (gets overwritten on each hop) and
+            // no markers ever appear in the panel. The hop time
+            // is captured here (`chrono::Local::now()`) — not at
+            // render time — so the marker reflects when the
+            // scanner actually switched, even if the transcription
+            // backend lags by a few seconds. Per issue #517 +
+            // initial-smoke feedback on PR #558 + CodeRabbit
+            // round 1 on PR #558.
+            *state.pending_channel_marker.borrow_mut() =
+                key.as_ref().map(|_| (chrono::Local::now(), name.clone()));
             if key.is_some() {
                 // Update the cached tuning state so downstream
                 // reads (bandwidth notify's status-bar rewrite,
@@ -3216,9 +3228,17 @@ fn connect_rtl_tcp_discovery(
     // first tick. Pinning TCP first keeps the restore both silent
     // to the user and correct end-to-end.
     if let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery) {
+        // Same guarded-rewrite idiom as `apply_rtl_tcp_connect`:
+        // hydrating the last-connected RTL-TCP server must not
+        // overwrite `KEY_SOURCE_NETWORK_*` (the raw-Network
+        // triple). The persistence handlers for those rows
+        // observe the flag and skip the disk-write. Per
+        // CodeRabbit round 1 on PR #558.
+        state.rtl_tcp_hydration_in_progress.set(true);
         protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
         hostname_row.set_text(&last.host);
         port_row.set_value(f64::from(last.port));
+        state.rtl_tcp_hydration_in_progress.set(false);
     }
 
     // Poll the discovery channel from the main thread. Cheap enough
@@ -3766,9 +3786,18 @@ fn apply_rtl_tcp_connect(
     };
 
     let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
+    // Guard the programmatic row rewrites so the persistence
+    // handlers don't clobber `KEY_SOURCE_NETWORK_*` (which
+    // belong to the user's independent raw-Network selection)
+    // with the RTL-TCP endpoint. The handlers still dispatch
+    // `SetNetworkConfig` so the running session re-points; only
+    // the disk-write is skipped. Per CodeRabbit round 1 on PR
+    // #558.
+    state.rtl_tcp_hydration_in_progress.set(true);
     protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
     hostname_row.set_text(host);
     port_row.set_value(f64::from(port));
+    state.rtl_tcp_hydration_in_progress.set(false);
     // Restore saved per-server state (#396) BEFORE the
     // `SetNetworkConfig` / `SetSourceType` dispatch so the DSP
     // thread's first use of the new endpoint already carries the
@@ -6532,10 +6561,18 @@ fn connect_source_panel(
         .sample_rate_row
         .connect_selected_notify(move |row| {
             let idx = row.selected();
+            // Validate before persisting. GTK can briefly emit
+            // out-of-range values during widget-model churn (e.g.
+            // teardown / rebuild on style changes); persisting
+            // those would corrupt the config file across restart.
+            // Mirror the protocol_row pattern further down: bail
+            // when the index doesn't map to a real sample rate.
+            // Per CodeRabbit round 1 on PR #558.
+            let Some(&rate) = SAMPLE_RATES.get(idx as usize) else {
+                return;
+            };
             sidebar::source_panel::save_source_sample_rate_index(&config_sr, idx);
-            if let Some(&rate) = SAMPLE_RATES.get(idx as usize) {
-                state_sr.send_dsp(UiToDsp::SetSampleRate(rate));
-            }
+            state_sr.send_dsp(UiToDsp::SetSampleRate(rate));
             apply_on_sr();
         });
     // Source-type (device) selector. Restore-then-wire (#552).
@@ -6556,6 +6593,25 @@ fn connect_source_panel(
         // source types and the user rolled back).
         if persisted_idx <= sidebar::source_panel::DEVICE_RTLTCP {
             panels.source.device_row.set_selected(persisted_idx);
+            // Dispatch the restored source type to the DSP so a
+            // saved Network / File / RTL-TCP selection takes
+            // effect at startup. The change-notify handler that
+            // dispatches `SetSourceType` from user clicks is
+            // wired AFTER this restore block runs, and even if it
+            // were wired first, programmatic `set_selected` to a
+            // value that already matches the row's default (0 =
+            // RTL-SDR) wouldn't fire it. Explicit dispatch closes
+            // both gaps. Per CodeRabbit round 1 on PR #558.
+            let source_type = match persisted_idx {
+                sidebar::source_panel::DEVICE_RTLSDR => Some(SourceType::RtlSdr),
+                sidebar::source_panel::DEVICE_NETWORK => Some(SourceType::Network),
+                sidebar::source_panel::DEVICE_FILE => Some(SourceType::File),
+                sidebar::source_panel::DEVICE_RTLTCP => Some(SourceType::RtlTcp),
+                _ => None,
+            };
+            if let Some(source_type) = source_type {
+                state.send_dsp(UiToDsp::SetSourceType(source_type));
+            }
         }
     }
     let config_device = std::sync::Arc::clone(config);
@@ -6564,7 +6620,15 @@ fn connect_source_panel(
         .source
         .device_row
         .connect_selected_notify(move |row| {
-            sidebar::source_panel::save_source_device_index(&config_device, row.selected());
+            let idx = row.selected();
+            // Validate before persisting (same rationale as the
+            // sample-rate row above). `DEVICE_RTLTCP` is the
+            // highest valid index. Per CodeRabbit round 1 on
+            // PR #558.
+            if idx > sidebar::source_panel::DEVICE_RTLTCP {
+                return;
+            }
+            sidebar::source_panel::save_source_device_index(&config_device, idx);
             apply_on_device();
         });
 
@@ -6660,10 +6724,14 @@ fn connect_source_panel(
         .decimation_row
         .connect_selected_notify(move |row| {
             let idx = row.selected();
+            // Validate before persisting (same rationale as the
+            // sample-rate row above). Per CodeRabbit round 1 on
+            // PR #558.
+            let Some(&factor) = DECIMATION_FACTORS.get(idx as usize) else {
+                return;
+            };
             sidebar::source_panel::save_source_decimation_index(&config_decim, idx);
-            if let Some(&factor) = DECIMATION_FACTORS.get(idx as usize) {
-                state_decim.send_dsp(UiToDsp::SetDecimation(factor));
-            }
+            state_decim.send_dsp(UiToDsp::SetDecimation(factor));
         });
 
     // Gain control. Sensitivity is gated by AGC — see the `AGC
@@ -7109,7 +7177,14 @@ fn connect_source_panel(
             &auth_key_for_host,
         );
         let hostname = row.text().to_string();
-        sidebar::source_panel::save_source_network_hostname(&config_host, &hostname);
+        // Skip the raw-Network disk-write when this change came
+        // from an RTL-TCP hydration. The user's independent
+        // raw-Network hostname stays in `KEY_SOURCE_NETWORK_*`
+        // and round-trips across restart on its own. Per
+        // CodeRabbit round 1 on PR #558.
+        if !state_host.rtl_tcp_hydration_in_progress.get() {
+            sidebar::source_panel::save_source_network_hostname(&config_host, &hostname);
+        }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = port_for_host.value() as u16;
         let protocol = if proto_for_host.selected() == NETWORK_PROTOCOL_UDP_IDX {
@@ -7141,7 +7216,12 @@ fn connect_source_panel(
         let hostname = host_for_port.text().to_string();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let port = row.value() as u16;
-        sidebar::source_panel::save_source_network_port(&config_port, port);
+        // Skip the raw-Network disk-write during RTL-TCP
+        // hydration; see hostname handler above. Per CodeRabbit
+        // round 1 on PR #558.
+        if !state_port.rtl_tcp_hydration_in_progress.get() {
+            sidebar::source_panel::save_source_network_port(&config_port, port);
+        }
         let protocol = if proto_for_port.selected() == NETWORK_PROTOCOL_UDP_IDX {
             sdr_types::Protocol::Udp
         } else {
@@ -7167,7 +7247,12 @@ fn connect_source_panel(
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let port = port_for_proto.value() as u16;
             let selected = row.selected();
-            sidebar::source_panel::save_source_network_protocol_index(&config_proto, selected);
+            // Skip the raw-Network disk-write during RTL-TCP
+            // hydration; see hostname handler above. Per
+            // CodeRabbit round 1 on PR #558.
+            if !state_proto.rtl_tcp_hydration_in_progress.get() {
+                sidebar::source_panel::save_source_network_protocol_index(&config_proto, selected);
+            }
             let protocol = match selected {
                 NETWORK_PROTOCOL_TCPCLIENT_IDX => sdr_types::Protocol::TcpClient,
                 NETWORK_PROTOCOL_UDP_IDX => sdr_types::Protocol::Udp,
@@ -10772,6 +10857,14 @@ fn connect_transcript_panel(
                         state_clone
                             .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
                     }
+                    // Drop any channel-marker buffered while
+                    // transcription was off — the first text
+                    // event after re-enable should attribute to
+                    // the *next* hop, not whichever channel the
+                    // scanner happened to land on during the
+                    // off period. Per CodeRabbit round 1 on PR
+                    // #558.
+                    *state_clone.pending_channel_marker.borrow_mut() = None;
 
                     status_label.set_text("Starting...");
                     status_label.set_visible(true);
@@ -10907,13 +11000,15 @@ fn connect_transcript_panel(
                                         // actual audio to attribute, so
                                         // a quiet channel never produces
                                         // a divider.
-                                        if let Some(channel_name) = state_for_marker
-                                            .pending_channel_marker
-                                            .borrow_mut()
-                                            .take()
+                                        if let Some((switched_at, channel_name)) =
+                                            state_for_marker
+                                                .pending_channel_marker
+                                                .borrow_mut()
+                                                .take()
                                         {
                                             sidebar::transcript_panel::push_channel_marker(
                                                 &tv,
+                                                switched_at,
                                                 &channel_name,
                                             );
                                         }
@@ -11105,6 +11200,11 @@ fn connect_transcript_panel(
                 &auto_break_min_segment_row.downgrade(),
             );
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
+            // Drop any pending channel-marker so a stray scanner
+            // hop that landed during the live session doesn't
+            // poison the next enable's first text event. Per
+            // CodeRabbit round 1 on PR #558.
+            *state_clone.pending_channel_marker.borrow_mut() = None;
             engine_clone.borrow_mut().shutdown_nonblocking();
             status_label.set_text("");
             status_label.set_visible(false);

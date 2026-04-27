@@ -8,7 +8,18 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
+use sdr_source_rtlsdr::SAMPLE_RATES;
 use sdr_types::RtlTcpConnectionState;
+
+/// Decimation factors available in the source panel dropdown.
+/// Order is load-bearing: the dropdown row uses the slice index
+/// as the persisted combo index, and `DECIMATION_FACTORS[idx]` is
+/// the multiplier sent to the DSP. Lives here (not in `window.rs`)
+/// so the persistence loader [`load_source_decimation_index`] can
+/// bound-check against `DECIMATION_FACTORS.len()` without
+/// `window.rs` having to expose the slice. Per `CodeRabbit`
+/// round 1 on PR #558.
+pub const DECIMATION_FACTORS: &[u32] = &[1, 2, 4, 8, 16];
 
 /// Config key for the persisted list of favorited `rtl_tcp`
 /// servers. Stored as a JSON array of [`FavoriteEntry`] objects,
@@ -437,7 +448,9 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
 }
 
 /// Default sample rate selector index (2.4 MHz = index 7).
-const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
+/// Shared with [`load_source_sample_rate_index`] so the loader's
+/// fallback matches the widget's initial selection.
+pub(crate) const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
 
 /// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM correction.
 fn build_rtlsdr_rows() -> (
@@ -1238,13 +1251,17 @@ pub fn save_source_rtl_ppm(config: &Arc<ConfigManager>, ppm: i32) {
 // build time (restore-before-wire idiom).
 
 /// Load the persisted source-type combo index. Defaults to
-/// [`DEVICE_RTLSDR`].
+/// [`DEVICE_RTLSDR`] when the key is missing, the value isn't a
+/// `u64`, or the parsed index falls outside `0..=DEVICE_RTLTCP`
+/// (e.g. a future build added more source types and the user
+/// rolled back). Per `CodeRabbit` round 1 on PR #558.
 #[must_use]
 pub fn load_source_device_index(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
         v.get(KEY_SOURCE_DEVICE_INDEX)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
+            .filter(|&idx| idx <= DEVICE_RTLTCP)
             .unwrap_or(DEVICE_RTLSDR)
     })
 }
@@ -1255,16 +1272,21 @@ pub fn save_source_device_index(config: &Arc<ConfigManager>, index: u32) {
     });
 }
 
-/// Load the persisted sample-rate combo index. Defaults to `0`
-/// (the first entry in `SAMPLE_RATES`, matching the widget's
-/// initial selection at panel build time).
+/// Load the persisted sample-rate combo index. Falls back to
+/// [`DEFAULT_SAMPLE_RATE_INDEX`] (matches the widget's initial
+/// selection at panel build time) when the key is missing, the
+/// value isn't numeric, or the parsed index is out of range
+/// (`>= SAMPLE_RATES.len()`). Per `CodeRabbit` round 1 on PR #558
+/// — the prior literal-`0` fallback would silently downgrade a
+/// fresh install to 250 kHz instead of the intended 2.4 MHz.
 #[must_use]
 pub fn load_source_sample_rate_index(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
         v.get(KEY_SOURCE_SAMPLE_RATE_INDEX)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0)
+            .filter(|&idx| (idx as usize) < SAMPLE_RATES.len())
+            .unwrap_or(DEFAULT_SAMPLE_RATE_INDEX)
     })
 }
 
@@ -1275,13 +1297,17 @@ pub fn save_source_sample_rate_index(config: &Arc<ConfigManager>, index: u32) {
 }
 
 /// Load the persisted decimation combo index. Defaults to `0`
-/// (1× decimation).
+/// (1× decimation, the widget's initial selection) when the key
+/// is missing, the value isn't numeric, or the parsed index is
+/// out of range (`>= DECIMATION_FACTORS.len()`). Per
+/// `CodeRabbit` round 1 on PR #558.
 #[must_use]
 pub fn load_source_decimation_index(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
         v.get(KEY_SOURCE_DECIMATION_INDEX)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
+            .filter(|&idx| (idx as usize) < DECIMATION_FACTORS.len())
             .unwrap_or(0)
     })
 }
@@ -1376,14 +1402,18 @@ pub fn save_source_network_port(config: &Arc<ConfigManager>, port: u16) {
     });
 }
 
-/// Load the persisted raw-Network protocol combo index.
-/// Defaults to [`NETWORK_PROTOCOL_TCPCLIENT_IDX`].
+/// Load the persisted raw-Network protocol combo index. Defaults
+/// to [`NETWORK_PROTOCOL_TCPCLIENT_IDX`] when the key is missing,
+/// the value isn't numeric, or the parsed index falls outside
+/// `0..=NETWORK_PROTOCOL_UDP_IDX`. Per `CodeRabbit` round 1 on
+/// PR #558.
 #[must_use]
 pub fn load_source_network_protocol_index(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
         v.get(KEY_SOURCE_NETWORK_PROTOCOL_INDEX)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
+            .filter(|&idx| idx <= NETWORK_PROTOCOL_UDP_IDX)
             .unwrap_or(NETWORK_PROTOCOL_TCPCLIENT_IDX)
     })
 }
@@ -1877,16 +1907,36 @@ mod tests {
         assert_eq!(load_source_device_index(&config), DEVICE_NETWORK);
         config.write(|v| v[KEY_SOURCE_DEVICE_INDEX] = serde_json::json!("nope"));
         assert_eq!(load_source_device_index(&config), DEVICE_RTLSDR);
+        // Out-of-range numeric: a future build that added more
+        // source types and was rolled back must fall back, not
+        // pin the combo to a non-existent index.
+        config.write(|v| v[KEY_SOURCE_DEVICE_INDEX] = serde_json::json!(999));
+        assert_eq!(load_source_device_index(&config), DEVICE_RTLSDR);
     }
 
     #[test]
     fn source_sample_rate_index_round_trip_and_default() {
         let config = make_config();
-        assert_eq!(load_source_sample_rate_index(&config), 0);
+        // Missing key falls back to the panel's actual default
+        // (DEFAULT_SAMPLE_RATE_INDEX = 7 = 2.4 MHz), not 0
+        // (250 kHz). Per CodeRabbit round 1 on PR #558.
+        assert_eq!(
+            load_source_sample_rate_index(&config),
+            DEFAULT_SAMPLE_RATE_INDEX
+        );
         save_source_sample_rate_index(&config, 3);
         assert_eq!(load_source_sample_rate_index(&config), 3);
         config.write(|v| v[KEY_SOURCE_SAMPLE_RATE_INDEX] = serde_json::json!("nope"));
-        assert_eq!(load_source_sample_rate_index(&config), 0);
+        assert_eq!(
+            load_source_sample_rate_index(&config),
+            DEFAULT_SAMPLE_RATE_INDEX
+        );
+        // Out-of-range numeric falls back to default.
+        config.write(|v| v[KEY_SOURCE_SAMPLE_RATE_INDEX] = serde_json::json!(9999));
+        assert_eq!(
+            load_source_sample_rate_index(&config),
+            DEFAULT_SAMPLE_RATE_INDEX
+        );
     }
 
     #[test]
@@ -1896,6 +1946,9 @@ mod tests {
         save_source_decimation_index(&config, 2);
         assert_eq!(load_source_decimation_index(&config), 2);
         config.write(|v| v[KEY_SOURCE_DECIMATION_INDEX] = serde_json::json!("nope"));
+        assert_eq!(load_source_decimation_index(&config), 0);
+        // Out-of-range numeric falls back to 1× decimation.
+        config.write(|v| v[KEY_SOURCE_DECIMATION_INDEX] = serde_json::json!(99));
         assert_eq!(load_source_decimation_index(&config), 0);
     }
 
@@ -1967,6 +2020,12 @@ mod tests {
             NETWORK_PROTOCOL_UDP_IDX
         );
         config.write(|v| v[KEY_SOURCE_NETWORK_PROTOCOL_INDEX] = serde_json::json!("nope"));
+        assert_eq!(
+            load_source_network_protocol_index(&config),
+            NETWORK_PROTOCOL_TCPCLIENT_IDX
+        );
+        // Out-of-range numeric falls back to TCP-client (idx 0).
+        config.write(|v| v[KEY_SOURCE_NETWORK_PROTOCOL_INDEX] = serde_json::json!(42));
         assert_eq!(
             load_source_network_protocol_index(&config),
             NETWORK_PROTOCOL_TCPCLIENT_IDX

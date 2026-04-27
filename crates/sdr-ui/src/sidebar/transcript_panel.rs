@@ -240,7 +240,18 @@ pub struct TranscriptPanel {
 /// call site in `window.rs::handle_dsp_message` only has to
 /// thread a `&gtk4::TextView` clone (cheap — GTK widgets are
 /// Rc-internal) instead of the whole panel.
-pub fn push_channel_marker(text_view: &gtk4::TextView, channel_name: &str) {
+///
+/// `switched_at` is the wall-clock instant the scanner emitted
+/// `ScannerActiveChannelChanged` — captured at hop time and
+/// passed through here. Render time can lag by seconds when the
+/// transcription backend is busy, so using `chrono::Local::now()`
+/// inside this helper would stamp markers with the wrong time on
+/// busy passes. Per `CodeRabbit` round 1 on PR #558.
+pub fn push_channel_marker(
+    text_view: &gtk4::TextView,
+    switched_at: chrono::DateTime<chrono::Local>,
+    channel_name: &str,
+) {
     let buf = text_view.buffer();
     let tag_table = buf.tag_table();
     let tag = tag_table.lookup("channel_marker").unwrap_or_else(|| {
@@ -253,7 +264,7 @@ pub fn push_channel_marker(text_view: &gtk4::TextView, channel_name: &str) {
         new_tag
     });
 
-    let timestamp = chrono::Local::now().format("%H:%M:%S");
+    let timestamp = switched_at.format("%H:%M:%S");
     let marker_text = format!("─── {timestamp} · {channel_name} ───\n");
 
     let start_offset = buf.end_iter().offset();

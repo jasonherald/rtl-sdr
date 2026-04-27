@@ -364,11 +364,26 @@ struct DspState {
     /// `CodeRabbit` round 1 on PR #349.
     audio_tap_phase: usize,
 
-    /// Last known squelch gate state, used to detect open/close edge
-    /// transitions so we only emit one `SquelchOpened` / `SquelchClosed`
-    /// event per transition instead of one per audio chunk. Initialized
-    /// to `false` (matches `IfChain`'s initial closed state).
+    /// Last known squelch gate state, used by the SCANNER edge detector
+    /// to emit one `ScannerEvent::SquelchEdge` per transition instead
+    /// of one per audio chunk. Initialized to `false` (matches
+    /// `IfChain`'s initial closed state). Reset on tune / mode /
+    /// bandwidth boundaries so a fresh open at the new channel always
+    /// emits an Open edge. Per `CodeRabbit` round 1 on PR #558 — the
+    /// scanner ↔ transcription mutex removal exposed that the same
+    /// field used to be reset by `EnableTranscription` /
+    /// `DisableTranscription`, which now perturbs the scanner's edge
+    /// detection. The transcription tap has its own
+    /// `transcription_squelch_was_open` tracker below.
     squelch_was_open: bool,
+
+    /// Last known squelch gate state, used by the TRANSCRIPTION audio
+    /// tap to decide when to emit `TranscriptionInput::SquelchOpened`
+    /// / `SquelchClosed` edge messages. Independent of
+    /// `squelch_was_open` so toggling the transcription tap (which
+    /// resets this tracker) doesn't fire a spurious scanner edge on
+    /// the next block. Per `CodeRabbit` round 1 on PR #558.
+    transcription_squelch_was_open: bool,
 
     /// Last observed CTCSS sustained-gate state, used to emit
     /// `DspToUi::CtcssSustainedChanged` only on edges so the UI
@@ -561,6 +576,7 @@ impl DspState {
             audio_tap_tx: None,
             audio_tap_phase: 0,
             squelch_was_open: false,
+            transcription_squelch_was_open: false,
             ctcss_was_sustained: false,
             voice_squelch_was_open: true,
             audio_frames_written: 0,
@@ -908,6 +924,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     // from before the mode switch.
                     state.audio_tap_phase = 0;
                     state.squelch_was_open = false;
+                    state.transcription_squelch_was_open = false;
                     // Mode switch rebuilds the AF chain + CTCSS
                     // detector + voice squelch — edge trackers
                     // must match the new closed state.
@@ -1858,22 +1875,29 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // `AudioRecordingStopped` / `IqRecordingStopped`), so
             // the recording buttons flip off automatically.
             stop_any_recording(state, dsp_tx);
-            // Reset the squelch edge tracker when a new tap is wired up.
-            // Without this, a previous session that ended with squelch open
-            // leaves `squelch_was_open == true`, so the first chunk of the
-            // new session sees `now_open == was_open` and no SquelchOpened
-            // edge is emitted — the offline Auto Break state machine would
-            // stay in Idle and drop the entire current transmission until
-            // the next open/close cycle.
-            state.squelch_was_open = false;
+            // Reset the TRANSCRIPTION-side squelch edge tracker when a
+            // new tap is wired up. Without this, a previous session
+            // that ended with squelch open leaves the tracker `true`,
+            // so the first chunk of the new session sees `now_open ==
+            // was_open` and no SquelchOpened edge is emitted — the
+            // offline Auto Break state machine would stay in Idle and
+            // drop the entire current transmission until the next
+            // open/close cycle. The SCANNER tracker
+            // (`squelch_was_open`) is intentionally NOT reset here:
+            // doing so used to fire a spurious `ScannerEvent::SquelchEdge`
+            // on the next block once the mutex was removed (the two
+            // are now designed to coexist). Per CodeRabbit round 1 on
+            // PR #558.
+            state.transcription_squelch_was_open = false;
             state.transcription_tx = Some(tx);
             tracing::info!("transcription audio tap enabled");
         }
         UiToDsp::DisableTranscription => {
             state.transcription_tx = None;
-            // Mirror the reset on disable so a subsequent EnableTranscription
-            // always starts from a known state.
-            state.squelch_was_open = false;
+            // Mirror the reset on disable so a subsequent
+            // EnableTranscription always starts from a known state.
+            // Scanner tracker is independent and stays intact.
+            state.transcription_squelch_was_open = false;
             tracing::info!("transcription audio tap disabled");
         }
 
@@ -2028,9 +2052,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 /// Reset the per-tune engine state that MUST NOT carry over a
 /// frequency / demod / bandwidth change:
 ///
-/// 1. The controller-side squelch-edge tracker
-///    (`state.squelch_was_open`) — so a fresh `SquelchEdge::Open`
-///    at the new channel isn't suppressed by the previous
+/// 1. The controller-side squelch-edge trackers
+///    (`state.squelch_was_open` for the scanner +
+///    `state.transcription_squelch_was_open` for the offline
+///    transcription tap) — so a fresh `SquelchEdge::Open` at
+///    the new channel isn't suppressed by the previous
 ///    channel's trailing open state. Originally added for the
 ///    scanner retune path (PR #372 round 3); the same risk
 ///    applies to every manual tune / mode / bandwidth change.
@@ -2045,9 +2071,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 ///
 /// Call from every UI-origin retune site (`UiToDsp::Tune`,
 /// `SetDemodMode`, `SetBandwidth`) and the scanner retune
-/// path. Cheap — two field writes plus an `if`-guarded reset.
+/// path. Cheap — three field writes plus an `if`-guarded reset.
 fn on_tune_change(state: &mut DspState) {
     state.squelch_was_open = false;
+    state.transcription_squelch_was_open = false;
     state.radio.rearm_auto_squelch();
 }
 
@@ -2082,7 +2109,9 @@ fn stop_transcription(state: &mut DspState) -> bool {
     if state.transcription_tx.take().is_some() {
         // Mirror the reset from the explicit DisableTranscription
         // handler — next EnableTranscription starts fresh.
-        state.squelch_was_open = false;
+        // Scanner tracker stays intact (the two are independent
+        // since the scanner ↔ transcription mutex was removed).
+        state.transcription_squelch_was_open = false;
         true
     } else {
         false
@@ -3046,7 +3075,12 @@ fn process_iq_block(
                         // (Dwelling→Listening, Listening→Hanging) apply to any
                         // mode. This runs outside the transcription gate below so
                         // the scanner sees every transition even when the
-                        // transcription tap is inactive.
+                        // transcription tap is inactive. The scanner tracker
+                        // is advanced IMMEDIATELY on emit so it stays
+                        // independent of the transcription tap's retry-on-Full
+                        // logic below — toggling transcription must not perturb
+                        // scanner edge detection. Per CodeRabbit round 1 on PR
+                        // #558.
                         let now_open = state.radio.if_chain().squelch_open();
                         if now_open != state.squelch_was_open {
                             let scanner_edge = if now_open {
@@ -3057,6 +3091,7 @@ fn process_iq_block(
                             let scan_cmds = state
                                 .scanner
                                 .handle_event(sdr_scanner::ScannerEvent::SquelchEdge(scanner_edge));
+                            state.squelch_was_open = now_open;
                             apply_scanner_commands(state, dsp_tx, scan_cmds);
                         }
 
@@ -3070,15 +3105,16 @@ fn process_iq_block(
                             let mut send_error = false;
                             // True unless we tried to send an edge event and hit
                             // `TrySendError::Full`. Squelch edges are one-shot
-                            // state transitions — if we advance `squelch_was_open`
-                            // without the downstream having received the edge,
-                            // the Auto Break state machine misses the transition
-                            // entirely and gets stuck in Idle/Recording until the
-                            // 30s safety flush fires. Retry on the next block by
-                            // leaving the tracker unchanged.
-                            let mut advance_tracker = true;
+                            // state transitions — if we advance the transcription
+                            // tracker without the downstream having received the
+                            // edge, the Auto Break state machine misses the
+                            // transition entirely and gets stuck in
+                            // Idle/Recording until the 30s safety flush fires.
+                            // Retry on the next block by leaving the tracker
+                            // unchanged.
+                            let mut advance_transcription_tracker = true;
 
-                            if now_open != state.squelch_was_open
+                            if now_open != state.transcription_squelch_was_open
                                 && state.radio.current_mode() == sdr_types::DemodMode::Nfm
                             {
                                 let edge = if now_open {
@@ -3097,7 +3133,7 @@ fn process_iq_block(
                                         // tracker so we retry this edge on the
                                         // next audio block instead of silently
                                         // dropping it.
-                                        advance_tracker = false;
+                                        advance_transcription_tracker = false;
                                         tracing::warn!(
                                             ?now_open,
                                             "transcription channel full; retrying squelch edge next block"
@@ -3105,8 +3141,8 @@ fn process_iq_block(
                                     }
                                 }
                             }
-                            if advance_tracker {
-                                state.squelch_was_open = now_open;
+                            if advance_transcription_tracker {
+                                state.transcription_squelch_was_open = now_open;
                             }
 
                             if !send_error {
@@ -3130,12 +3166,12 @@ fn process_iq_block(
                                     "transcription receiver disconnected, disabling tap"
                                 );
                             }
-                        } else {
-                            // No transcription tap: advance the tracker
-                            // unconditionally so the scanner doesn't see
-                            // the same edge repeatedly on every block.
-                            state.squelch_was_open = now_open;
                         }
+                        // No `else` branch — the scanner block above
+                        // advances `state.squelch_was_open` itself, so
+                        // edge tracking stays correct whether or not
+                        // the transcription tap is wired. Per CodeRabbit
+                        // round 1 on PR #558.
 
                         // Generic audio tap: downsample to 16 kHz mono
                         // and try_send. Pre-volume (like the transcription

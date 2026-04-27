@@ -85,13 +85,19 @@ pub const SDR_SCANNER_STATE_HANGING: i32 = 4;
 // ============================================================
 
 pub const SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER: i32 = 0;
-// Discriminant 1 was `TRANSCRIPTION_STOPPED_FOR_SCANNER`, removed
-// when the scanner ↔ transcription mutex was deleted (PR #558 /
-// issue #517 — the two are designed to coexist). Slot left
-// unused so existing discriminants keep their numeric values.
+/// Reserved ABI slot. Discriminant 1 was previously
+/// `TRANSCRIPTION_STOPPED_FOR_SCANNER`; removed when the scanner ↔
+/// transcription mutex was deleted (PR #558 / issue #517 — the two
+/// are designed to coexist). Kept as a named reserved constant so
+/// the C ABI in `include/sdr_core.h` keeps its numeric layout and
+/// future discriminants don't accidentally reuse the slot. Per
+/// `CodeRabbit` round 1 on PR #558.
+pub const SDR_SCANNER_MUTEX_RESERVED_1: i32 = 1;
 pub const SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING: i32 = 2;
-// Discriminant 3 was `SCANNER_STOPPED_FOR_TRANSCRIPTION`, also
-// removed by the mutex deletion above.
+/// Reserved ABI slot. Discriminant 3 was previously
+/// `SCANNER_STOPPED_FOR_TRANSCRIPTION`; removed alongside slot 1
+/// above.
+pub const SDR_SCANNER_MUTEX_RESERVED_3: i32 = 3;
 
 // ============================================================
 //  Network sink status discriminants — must match the
@@ -1053,12 +1059,15 @@ mod tests {
     #[test]
     fn scanner_mutex_reason_discriminants_match_header() {
         assert_eq!(SDR_SCANNER_MUTEX_RECORDING_STOPPED_FOR_SCANNER, 0);
+        // Discriminants 1 and 3 are reserved ABI slots — the
+        // scanner ↔ transcription mutex variants that used to
+        // live here were removed in PR #558 when the two
+        // subsystems were redesigned to coexist. The slots stay
+        // pinned so future discriminants don't reuse them and
+        // perturb the wire format.
+        assert_eq!(SDR_SCANNER_MUTEX_RESERVED_1, 1);
         assert_eq!(SDR_SCANNER_MUTEX_SCANNER_STOPPED_FOR_RECORDING, 2);
-        // Discriminants 1 and 3 (`TRANSCRIPTION_STOPPED_FOR_SCANNER`
-        // and `SCANNER_STOPPED_FOR_TRANSCRIPTION`) were removed
-        // when the scanner ↔ transcription mutex was deleted —
-        // the slots are intentionally left unfilled to keep the
-        // remaining discriminants stable.
+        assert_eq!(SDR_SCANNER_MUTEX_RESERVED_3, 3);
     }
 
     #[test]
