@@ -902,20 +902,6 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     window.present();
 }
 
-/// Clear the scanner's active-channel UI surfaces back to the
-/// idle look: empty cache, placeholder label, hidden lockout
-/// button. Shared between the four events that mean "scanner
-/// isn't parked on a channel anymore":
-///   - `ScannerActiveChannelChanged { key: None }` (explicit
-///     idle edge)
-///   - `ScannerEmptyRotation` (rotation exhausted)
-///   - `ScannerMutexStopped::ScannerStoppedFor{Recording,Transcription}`
-///     (mutex fired)
-///
-/// Without the helper, those stop paths would depend on the
-/// engine sending a separate `ActiveChannelChanged { key: None }`
-/// event in the same tick — which it does today, but relying on
-/// that ordering across four sites was brittle.
 /// Recompute the scanner X-axis envelope from the live
 /// bookmark list and refresh the spectrum's lock + Display
 /// panel status row. Called from both the scanner master-
@@ -953,8 +939,32 @@ fn refresh_scanner_axis_lock(
             .scanner_axis_lock()
             .and_then(|lock| lock.active_channel_hz.zip(lock.active_channel_bw_hz));
         spectrum_handle.enter_scanner_mode(min_hz, max_hz);
+        // Reapply only if the prior active channel still exists
+        // in the refreshed scanner set. If the user just
+        // disabled or deleted the bookmark that was the active
+        // channel, reinstating its highlight would resurrect a
+        // channel that's no longer being sampled — the
+        // highlight would linger until the next DSP hop event
+        // arrived. Match by exact (frequency, bandwidth) tuple
+        // — same fields the prior tuple was sourced from, so
+        // float equality is safe (identical bit patterns
+        // round-trip through the SpectrumHandle store). Per
+        // `CodeRabbit` round 4 on PR #562.
         if let Some((freq_hz, bw_hz)) = prior_active {
-            spectrum_handle.set_scanner_active_channel(freq_hz, bw_hz);
+            #[allow(clippy::cast_precision_loss)]
+            let still_present = channels.iter().any(|ch| {
+                let center = ch.key.frequency_hz as f64;
+                (center - freq_hz).abs() < f64::EPSILON
+                    && (ch.bandwidth - bw_hz).abs() < f64::EPSILON
+            });
+            if still_present {
+                spectrum_handle.set_scanner_active_channel(freq_hz, bw_hz);
+            }
+            // Else: leave `active_channel_*` cleared by
+            // `enter_scanner_mode` above. The next
+            // `ScannerActiveChannelChanged` event from the DSP
+            // engine will fill it in, matching the "scanner on,
+            // no active channel" state.
         }
         update_scanner_axis_status_row(status_row, Some((min_hz, max_hz)));
     } else {
@@ -986,6 +996,20 @@ fn update_scanner_axis_status_row(row: &adw::ActionRow, range_hz: Option<(f64, f
     }
 }
 
+/// Clear the scanner's active-channel UI surfaces back to the
+/// idle look: empty cache, placeholder label, hidden lockout
+/// button. Shared between the four events that mean "scanner
+/// isn't parked on a channel anymore":
+///   - `ScannerActiveChannelChanged { key: None }` (explicit
+///     idle edge)
+///   - `ScannerEmptyRotation` (rotation exhausted)
+///   - `ScannerMutexStopped::ScannerStoppedFor{Recording,Transcription}`
+///     (mutex fired)
+///
+/// Without the helper, those stop paths would depend on the
+/// engine sending a separate `ActiveChannelChanged { key: None }`
+/// event in the same tick — which it does today, but relying on
+/// that ordering across four sites was brittle.
 fn clear_scanner_active_channel_ui(
     scanner_panel: &sidebar::scanner_panel::ScannerPanel,
     state: &AppState,
