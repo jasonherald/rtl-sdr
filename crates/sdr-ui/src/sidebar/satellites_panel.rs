@@ -129,6 +129,13 @@ pub const KEY_AUTO_RECORD_AUDIO: &str = "sat_auto_record_audio";
 /// (Satellites panel). Default `true` so first-launch users get
 /// auto-corrected passes out of the box. Per issue #521.
 pub const KEY_DOPPLER_TRACKING_ENABLED: &str = "sat_doppler_tracking_enabled";
+/// Config key for the watched-satellites NORAD-id list (per #510).
+/// Stored as a JSON array of `u32`. Empty / missing → no
+/// notifications fire.
+pub const KEY_WATCHED_SATELLITES: &str = "sat_watched_norad_ids";
+/// Config key for the user-configurable pre-pass notify lead time,
+/// in whole minutes. Per #510.
+pub const KEY_NOTIFY_LEAD_MIN: &str = "sat_notify_lead_min";
 
 // ─── Panel ─────────────────────────────────────────────────────────────
 
@@ -177,6 +184,14 @@ pub struct SatellitesPanel {
     /// in flight. Sibling to the button rather than wrapping it so
     /// the button stays clickable visually after the fetch ends.
     pub refresh_spinner: gtk4::Spinner,
+
+    // Notifications group ---------------------------------------------------
+    /// Pre-pass desktop-alert lead time, in whole minutes
+    /// (`NOTIFY_LEAD_MIN_LOWER..=NOTIFY_LEAD_MIN_UPPER`). Drives
+    /// the `NotifyScheduler` ticker — the user clicks 🔔 next to a
+    /// pass to subscribe; this row controls *how early* the alert
+    /// fires. Per #510.
+    pub notify_lead_row: adw::SpinRow,
 
     // Recording group -------------------------------------------------------
     /// Auto-record toggle — drives #482's "open APT viewer +
@@ -245,6 +260,8 @@ pub struct SatellitesPanelWeak {
     pub refresh_button: glib::WeakRef<gtk4::Button>,
     /// Weak ref to [`SatellitesPanel::refresh_spinner`].
     pub refresh_spinner: glib::WeakRef<gtk4::Spinner>,
+    /// Weak ref to [`SatellitesPanel::notify_lead_row`].
+    pub notify_lead_row: glib::WeakRef<adw::SpinRow>,
     /// Weak ref to [`SatellitesPanel::auto_record_switch`].
     pub auto_record_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::auto_record_audio_switch`].
@@ -274,6 +291,7 @@ impl SatellitesPanel {
             last_refresh_row: self.last_refresh_row.downgrade(),
             refresh_button: self.refresh_button.downgrade(),
             refresh_spinner: self.refresh_spinner.downgrade(),
+            notify_lead_row: self.notify_lead_row.downgrade(),
             auto_record_switch: self.auto_record_switch.downgrade(),
             auto_record_audio_switch: self.auto_record_audio_switch.downgrade(),
             doppler_switch: self.doppler_switch.downgrade(),
@@ -302,6 +320,7 @@ impl SatellitesPanelWeak {
             last_refresh_row: self.last_refresh_row.upgrade()?,
             refresh_button: self.refresh_button.upgrade()?,
             refresh_spinner: self.refresh_spinner.upgrade()?,
+            notify_lead_row: self.notify_lead_row.upgrade()?,
             auto_record_switch: self.auto_record_switch.upgrade()?,
             auto_record_audio_switch: self.auto_record_audio_switch.upgrade()?,
             doppler_switch: self.doppler_switch.upgrade()?,
@@ -417,6 +436,27 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     tle_group.add(&last_refresh_row);
     page.add(&tle_group);
 
+    // ─── Notifications ─────────────────────────────────────────
+    let notify_group = adw::PreferencesGroup::builder()
+        .title("Notifications")
+        .description(
+            "Click 🔔 next to a pass to subscribe; you'll get a desktop \
+             alert this many minutes before the satellite comes overhead.",
+        )
+        .build();
+
+    let notify_lead_row = adw::SpinRow::with_range(
+        f64::from(super::satellites_notify::NOTIFY_LEAD_MIN_LOWER),
+        f64::from(super::satellites_notify::NOTIFY_LEAD_MIN_UPPER),
+        1.0,
+    );
+    notify_lead_row.set_title("Lead time");
+    notify_lead_row.set_subtitle("Minutes before AOS to fire the alert");
+    notify_lead_row.set_digits(0);
+    notify_lead_row.set_value(f64::from(super::satellites_notify::DEFAULT_NOTIFY_LEAD_MIN));
+    notify_group.add(&notify_lead_row);
+    page.add(&notify_group);
+
     // ─── Recording ─────────────────────────────────────────────
     let recording_group = adw::PreferencesGroup::builder()
         .title("Recording")
@@ -491,6 +531,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         last_refresh_row,
         refresh_button,
         refresh_spinner,
+        notify_lead_row,
         auto_record_switch,
         auto_record_audio_switch,
         doppler_switch,
@@ -574,6 +615,71 @@ pub fn save_auto_record_audio(config: &Arc<ConfigManager>, value: bool) {
 pub fn save_doppler_tracking_enabled(config: &Arc<ConfigManager>, enabled: bool) {
     config.write(|v| {
         v[KEY_DOPPLER_TRACKING_ENABLED] = serde_json::json!(enabled);
+    });
+}
+
+/// Load the persisted set of watched-satellite NORAD ids. Per #510.
+/// Stored as a JSON array; entries with the wrong type are dropped
+/// silently (cheaper than refusing the whole list, and still safe
+/// because non-watched ids just don't fire notifications).
+#[must_use]
+pub fn load_watched_satellites(config: &Arc<ConfigManager>) -> std::collections::HashSet<u32> {
+    config.read(|v| {
+        v.get(KEY_WATCHED_SATELLITES)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .filter_map(|n| u32::try_from(n).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// Persist the watched-satellite NORAD-id set. Sorted on write so
+/// the JSON file diffs cleanly across saves (set iteration order is
+/// non-deterministic; sorting makes config commits readable).
+///
+/// Generic over `BuildHasher` so call sites that build the set with
+/// the default hasher don't have to thread a hasher type through —
+/// per the `clippy::implicit_hasher` recommendation. Cheap: every
+/// path is monomorphized inline.
+pub fn save_watched_satellites<S: std::hash::BuildHasher>(
+    config: &Arc<ConfigManager>,
+    watched: &std::collections::HashSet<u32, S>,
+) {
+    let mut sorted: Vec<u32> = watched.iter().copied().collect();
+    sorted.sort_unstable();
+    config.write(|v| {
+        v[KEY_WATCHED_SATELLITES] = serde_json::json!(sorted);
+    });
+}
+
+/// Load the persisted lead-minutes for pre-pass notifications.
+/// Defaults to [`super::satellites_notify::DEFAULT_NOTIFY_LEAD_MIN`]
+/// and clamps to the `[NOTIFY_LEAD_MIN_LOWER, NOTIFY_LEAD_MIN_UPPER]`
+/// range so a hand-edited config can't push us into degenerate
+/// states (e.g. `0` would flicker between fire and miss every
+/// tick). Per #510.
+#[must_use]
+pub fn load_notify_lead_min(config: &Arc<ConfigManager>) -> u32 {
+    use super::satellites_notify::{
+        DEFAULT_NOTIFY_LEAD_MIN, NOTIFY_LEAD_MIN_LOWER, NOTIFY_LEAD_MIN_UPPER,
+    };
+    let raw = config.read(|v| {
+        v.get(KEY_NOTIFY_LEAD_MIN)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(DEFAULT_NOTIFY_LEAD_MIN)
+    });
+    raw.clamp(NOTIFY_LEAD_MIN_LOWER, NOTIFY_LEAD_MIN_UPPER)
+}
+
+/// Persist the pre-pass notify lead time (whole minutes). Per #510.
+pub fn save_notify_lead_min(config: &Arc<ConfigManager>, lead_min: u32) {
+    config.write(|v| {
+        v[KEY_NOTIFY_LEAD_MIN] = serde_json::json!(lead_min);
     });
 }
 
@@ -662,6 +768,16 @@ fn known_satellite_for_pass(pass: &Pass) -> Option<&'static sdr_sat::KnownSatell
 #[must_use]
 pub fn downlink_hz_for_pass(pass: &Pass) -> Option<u64> {
     known_satellite_for_pass(pass).map(|s| s.downlink_hz)
+}
+
+/// Look up the NORAD catalog id for a pass's satellite. Returns
+/// `None` for off-catalog passes — same condition as
+/// [`downlink_hz_for_pass`]. Used by the notify scheduler (#510)
+/// to key the watched-satellite set without leaking the
+/// `KNOWN_SATELLITES` shape into [`super::satellites_notify`].
+#[must_use]
+pub fn norad_id_for_pass(pass: &Pass) -> Option<u32> {
+    known_satellite_for_pass(pass).map(|s| s.norad_id)
 }
 
 /// The full tuning quadruple — frequency, demod mode, channel
@@ -944,6 +1060,68 @@ mod tests {
             "sat_tle_last_refresh": "garbage timestamp",
         })));
         assert_eq!(format_last_refresh(&cfg), "garbage timestamp");
+    }
+
+    #[test]
+    fn watched_satellites_round_trip() {
+        let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({})));
+        // Empty initial state.
+        assert!(load_watched_satellites(&cfg).is_empty());
+        // Save → load round-trip.
+        let mut watched = std::collections::HashSet::new();
+        watched.insert(33591u32); // NOAA 19
+        watched.insert(40069u32); // METEOR-M2 2
+        save_watched_satellites(&cfg, &watched);
+        let loaded = load_watched_satellites(&cfg);
+        assert_eq!(loaded, watched);
+    }
+
+    #[test]
+    fn watched_satellites_load_skips_invalid_entries() {
+        // Mixed-type array — strings / out-of-u32-range numbers
+        // get silently dropped; the valid u32s survive.
+        let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            "sat_watched_norad_ids": [33591, "junk", 9999999999u64, 40069],
+        })));
+        let loaded = load_watched_satellites(&cfg);
+        let expected: std::collections::HashSet<u32> = [33591u32, 40069u32].into_iter().collect();
+        assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn notify_lead_min_default_when_unset() {
+        let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({})));
+        assert_eq!(
+            load_notify_lead_min(&cfg),
+            super::super::satellites_notify::DEFAULT_NOTIFY_LEAD_MIN
+        );
+    }
+
+    #[test]
+    fn notify_lead_min_clamps_out_of_range() {
+        // 0 is below NOTIFY_LEAD_MIN_LOWER (1) — clamps up.
+        let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            "sat_notify_lead_min": 0,
+        })));
+        assert_eq!(
+            load_notify_lead_min(&cfg),
+            super::super::satellites_notify::NOTIFY_LEAD_MIN_LOWER
+        );
+        // 999 is above NOTIFY_LEAD_MIN_UPPER — clamps down.
+        let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({
+            "sat_notify_lead_min": 999,
+        })));
+        assert_eq!(
+            load_notify_lead_min(&cfg),
+            super::super::satellites_notify::NOTIFY_LEAD_MIN_UPPER
+        );
+    }
+
+    #[test]
+    fn notify_lead_min_round_trip() {
+        let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({})));
+        save_notify_lead_min(&cfg, 12);
+        assert_eq!(load_notify_lead_min(&cfg), 12);
     }
 
     fn synthetic_pass(now: DateTime<Utc>, offset_min: i64) -> Pass {
