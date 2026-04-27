@@ -902,6 +902,35 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     window.present();
 }
 
+/// Outcome of a [`refresh_scanner_axis_lock`] call. Lets the
+/// bookmark-mutation caller (which has access to the scanner
+/// sidebar widgets) keep `state.scanner_active_key`,
+/// `active_channel_row`, and `lockout_row` in sync when a
+/// refresh drops the previously-active channel from the
+/// rotation — otherwise the sidebar would still show the old
+/// channel name (and the lockout button stays visible) until
+/// the next `ScannerActiveChannelChanged` event arrived. The
+/// master-switch caller ignores the return because it engages
+/// the lock from a clean slate (no prior active to drop). Per
+/// `CodeRabbit` round 5 on PR #562.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScannerAxisRefreshOutcome {
+    /// Lock state didn't change in a way the sidebar cares
+    /// about: either the prior active channel still exists in
+    /// the new set (highlight reinstated), or there was no
+    /// prior active to begin with, or the lock was disengaged
+    /// because the channel set went empty.
+    Unchanged,
+    /// The prior active channel is no longer in the refreshed
+    /// scanner set (user disabled `scan_enabled` on it or
+    /// deleted the bookmark mid-scan). Caller should clear the
+    /// scanner-sidebar surfaces via
+    /// `clear_scanner_active_channel_ui` so the displayed
+    /// channel name + lockout-row visibility match the actual
+    /// "scanner on, no active channel" state.
+    ActiveChannelDropped,
+}
+
 /// Recompute the scanner X-axis envelope from the live
 /// bookmark list and refresh the spectrum's lock + Display
 /// panel status row. Called from both the scanner master-
@@ -912,12 +941,16 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 /// second call site, scan-list edits silently let the lock
 /// stay pinned to a stale range until the user flips the
 /// master switch off-and-on. Per #516 smoke feedback.
+///
+/// Returns [`ScannerAxisRefreshOutcome::ActiveChannelDropped`]
+/// when the previously-active channel got removed from the new
+/// scanner set (so the caller can clear its sidebar surfaces).
 fn refresh_scanner_axis_lock(
     bookmarks: &[sidebar::navigation_panel::Bookmark],
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     spectrum_handle: &spectrum::SpectrumHandle,
     status_row: &adw::ActionRow,
-) {
+) -> ScannerAxisRefreshOutcome {
     let default_dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
     let default_hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
     let channels = sidebar::navigation_panel::project_scanner_channels(
@@ -950,7 +983,7 @@ fn refresh_scanner_axis_lock(
         // float equality is safe (identical bit patterns
         // round-trip through the SpectrumHandle store). Per
         // `CodeRabbit` round 4 on PR #562.
-        if let Some((freq_hz, bw_hz)) = prior_active {
+        let outcome = if let Some((freq_hz, bw_hz)) = prior_active {
             #[allow(clippy::cast_precision_loss)]
             let still_present = channels.iter().any(|ch| {
                 let center = ch.key.frequency_hz as f64;
@@ -959,17 +992,33 @@ fn refresh_scanner_axis_lock(
             });
             if still_present {
                 spectrum_handle.set_scanner_active_channel(freq_hz, bw_hz);
+                ScannerAxisRefreshOutcome::Unchanged
+            } else {
+                // Leave `active_channel_*` cleared by
+                // `enter_scanner_mode` above (matches the
+                // "scanner on, no active channel" state) AND
+                // tell the caller the active was dropped, so
+                // the sidebar widgets get cleared in the same
+                // tick instead of waiting for the next DSP
+                // `ScannerActiveChannelChanged` event.
+                ScannerAxisRefreshOutcome::ActiveChannelDropped
             }
-            // Else: leave `active_channel_*` cleared by
-            // `enter_scanner_mode` above. The next
-            // `ScannerActiveChannelChanged` event from the DSP
-            // engine will fill it in, matching the "scanner on,
-            // no active channel" state.
-        }
+        } else {
+            ScannerAxisRefreshOutcome::Unchanged
+        };
         update_scanner_axis_status_row(status_row, Some((min_hz, max_hz)));
+        outcome
     } else {
+        // No channels left in the scanner set. The lock
+        // disengages, so the sidebar's active-channel surfaces
+        // also belong cleared — but `clear_scanner_active_channel_ui`
+        // already runs on the engine-side `ScannerEmptyRotation`
+        // event that this code path implies. Reporting
+        // `Unchanged` here keeps the bookmark-mutation
+        // callback from double-clearing.
         spectrum_handle.exit_scanner_mode();
         update_scanner_axis_status_row(status_row, None);
+        ScannerAxisRefreshOutcome::Unchanged
     }
 }
 
@@ -3120,6 +3169,7 @@ fn connect_sidebar_panels(
     let state_for_mutated = Rc::clone(state);
     let config_for_mutated = std::sync::Arc::clone(config);
     let scanner_switch_for_mutated = panels.scanner.master_switch.clone();
+    let scanner_panel_for_mutated = panels.scanner.clone();
     let spectrum_for_mutated = Rc::clone(spectrum_handle);
     let display_axis_row_for_mutated = panels.display.scanner_axis_row.clone();
     panels.bookmarks.connect_mutated(move || {
@@ -3138,12 +3188,24 @@ fn connect_sidebar_panels(
         // — the lock is already disengaged. Per issue #516
         // smoke feedback.
         if scanner_switch_for_mutated.is_active() {
-            refresh_scanner_axis_lock(
+            let outcome = refresh_scanner_axis_lock(
                 &bookmarks.bookmarks.borrow(),
                 &config_for_mutated,
                 &spectrum_for_mutated,
                 &display_axis_row_for_mutated,
             );
+            // If the helper dropped the previously-active
+            // channel (user disabled `scan_enabled` on the
+            // active bookmark or deleted it), clear the
+            // scanner-sidebar surfaces so the displayed
+            // channel name + lockout-row visibility match.
+            // Without this, the spectrum highlight clears
+            // immediately but the sidebar stays stale until
+            // the next `ScannerActiveChannelChanged` event.
+            // Per `CodeRabbit` round 5 on PR #562.
+            if outcome == ScannerAxisRefreshOutcome::ActiveChannelDropped {
+                clear_scanner_active_channel_ui(&scanner_panel_for_mutated, &state_for_mutated);
+            }
         }
     });
 }
@@ -9166,9 +9228,12 @@ fn connect_scanner_panel(
             // mid-scan scan-flag toggles + adds/deletes pick up
             // on the next master-switch flip. The same helper
             // also fires from the bookmark mutation callback to
-            // refresh while the scanner is already running. Per
-            // issue #516.
-            refresh_scanner_axis_lock(
+            // refresh while the scanner is already running.
+            // Outcome is irrelevant here: this enable path
+            // engages the lock from a clean slate (no prior
+            // active to drop), so `ActiveChannelDropped` can't
+            // fire. Per issue #516.
+            let _ = refresh_scanner_axis_lock(
                 &bookmarks_for_switch.bookmarks.borrow(),
                 &config_for_switch,
                 &spectrum_for_switch,
