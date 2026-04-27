@@ -54,6 +54,16 @@ const DEFAULT_FFT_SIZE: usize = 2048;
 /// number in either place.
 const DIAG_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Minimum interval between successive
+/// "transcription channel full; retrying squelch edge next block"
+/// warnings. Without throttling, the warning fires on every DSP
+/// block the edge stays pending — at typical block cadence
+/// that's 100+ lines/sec for as long as the worker is decoding,
+/// which buries the rest of the trace log. The suppressed-count
+/// is reported alongside the next emitted warning so the
+/// operator can see the burst magnitude without the line spam.
+const TRANSCRIPTION_FULL_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Default FFT display rate in FPS (matches SDR++ default of 20).
 /// Lower rate reduces Mesa GL driver memory pressure from per-frame
 /// buffer uploads.
@@ -406,6 +416,23 @@ struct DspState {
     /// Next wall-clock deadline for the periodic diagnostic log.
     diag_log_at: std::time::Instant,
 
+    /// Last wall-clock instant we emitted the
+    /// "transcription channel full; retrying squelch edge next
+    /// block" warning. Used to throttle the warning to one per
+    /// `TRANSCRIPTION_FULL_WARN_INTERVAL` window — without this,
+    /// a backed-up worker (sherpa Moonshine inference taking 1–2
+    /// seconds, Whisper taking 5+) would log on every DSP block
+    /// the edge stays pending, drowning the rest of the trace
+    /// log at 100+ lines/sec. Per FYI-flood reported during PR
+    /// for issues #538 / #539.
+    transcription_full_warn_at: std::time::Instant,
+    /// Count of warnings suppressed by the throttle since the
+    /// last emitted warning. Logged alongside the next warn so
+    /// the operator can see how bad the backpressure burst was
+    /// rather than "one per second forever" obscuring the
+    /// magnitude.
+    transcription_full_suppressed: u32,
+
     /// Last observed voice-squelch open state. Mirrors the CTCSS
     /// tracker pattern — we only emit edge events, and the UI
     /// status indicator subscribes to those. The initial value
@@ -582,6 +609,8 @@ impl DspState {
             audio_frames_written: 0,
             iq_samples_read: 0,
             diag_log_at: std::time::Instant::now(),
+            transcription_full_warn_at: std::time::Instant::now(),
+            transcription_full_suppressed: 0,
             last_rtl_tcp_state: RtlTcpConnectionState::Disconnected,
             rtl_tcp_poll_at: std::time::Instant::now(),
             scanner: sdr_scanner::Scanner::new(),
@@ -3134,10 +3163,31 @@ fn process_iq_block(
                                         // next audio block instead of silently
                                         // dropping it.
                                         advance_transcription_tracker = false;
-                                        tracing::warn!(
-                                            ?now_open,
-                                            "transcription channel full; retrying squelch edge next block"
-                                        );
+                                        // Throttle the warning to one per
+                                        // `TRANSCRIPTION_FULL_WARN_INTERVAL`
+                                        // window — a backed-up worker can
+                                        // hold this edge pending for many
+                                        // blocks, and an unthrottled warn
+                                        // floods the trace log. The
+                                        // suppressed-count gets reported
+                                        // alongside the next emitted
+                                        // warning so the burst magnitude
+                                        // stays observable.
+                                        state.transcription_full_suppressed =
+                                            state.transcription_full_suppressed.saturating_add(1);
+                                        if state.transcription_full_warn_at.elapsed()
+                                            >= TRANSCRIPTION_FULL_WARN_INTERVAL
+                                        {
+                                            let suppressed = state.transcription_full_suppressed;
+                                            tracing::warn!(
+                                                ?now_open,
+                                                suppressed_in_window = suppressed,
+                                                "transcription channel full; retrying squelch edge next block"
+                                            );
+                                            state.transcription_full_suppressed = 0;
+                                            state.transcription_full_warn_at =
+                                                std::time::Instant::now();
+                                        }
                                     }
                                 }
                             }
