@@ -4,7 +4,7 @@
 
 **Goal:** Continuously correct the receive frequency for satellite Doppler shift during a pass, so the user's audio doesn't drift and the APT / LRPT / SSTV decoders stay locked.
 
-**Cross-protocol:** applies to NOAA APT (epic [#468](https://github.com/jasonherald/rtl-sdr/issues/468), shipped), Meteor-M LRPT (epic [#469](https://github.com/jasonherald/rtl-sdr/issues/469), shipped), and ISS SSTV (epic [#472](https://github.com/jasonherald/rtl-sdr/issues/472), pending). Not just LRPT despite living under the LRPT post-MVP epic.
+**Cross-protocol** (status as of April 2026): applies to NOAA APT (epic [#468](https://github.com/jasonherald/rtl-sdr/issues/468), shipped), Meteor-M LRPT (epic [#469](https://github.com/jasonherald/rtl-sdr/issues/469), shipped), and ISS SSTV (epic [#472](https://github.com/jasonherald/rtl-sdr/issues/472), pending). Not just LRPT despite living under the LRPT post-MVP epic.
 
 ---
 
@@ -52,7 +52,7 @@ No special "is auto-record running?" branch is needed; auto-record sets the freq
 
 Pure DSP shift, zero hardware churn, zero glitches. Limited to ±half the frontend bandwidth (typically 2.4 Msps with VFO bandwidth of ~50–250 kHz), so a ±3 kHz Doppler shift fits comfortably in the middle 5% of the window.
 
-For everything we ship today (NOAA APT, Meteor LRPT, ISS SSTV), max Doppler is ±5 kHz over a full pass — VFO offset alone handles 100% of current passes without ever approaching the bandwidth limit.
+For everything we ship as of April 2026 (NOAA APT, Meteor LRPT, ISS SSTV), max Doppler is ±5 kHz over a full pass — VFO offset alone handles 100% of these passes without ever approaching the bandwidth limit.
 
 **Out of scope for v1:** SDR center-frequency retune. Architectured-around (a future need for narrow-bandwidth modes or HEO/deep-space could add a coarse-retune branch in the same `DopplerTracker` without touching the activation rule), but not implemented today.
 
@@ -155,7 +155,7 @@ Default **ON**. Persisted via new helper:
 
 ```rust
 // crates/sdr-ui/src/sidebar/satellites_panel.rs
-pub const KEY_DOPPLER_TRACKING_ENABLED: &str = "satellites_doppler_tracking";
+pub const KEY_DOPPLER_TRACKING_ENABLED: &str = "sat_doppler_tracking_enabled";
 pub fn load_doppler_tracking_enabled(config: &Arc<ConfigManager>) -> bool;  // default true
 pub fn save_doppler_tracking_enabled(config: &Arc<ConfigManager>, enabled: bool);
 ```
@@ -184,11 +184,13 @@ The label updates on every 4 Hz tick along with the offset dispatch, so user see
 
 ## 9. Test plan
 
-### 9.1 Pure-function tests in `sdr-sat`
+### 9.1 Pure-function tests for the Doppler math path
 
-- `doppler_offset_hz` known-pass test: feed a captured TLE for NOAA 15 plus a station and a sequence of UTC instants spanning AOS → TCA → LOS, assert Doppler curve is monotone-decreasing through the pass and crosses zero within ±15 s of TCA.
-- Sign-convention test: synthetic "satellite directly approaching at 5 km/s" vs "directly receding at 5 km/s" — assert positive Doppler for approach, negative for recession.
-- No-pass test: satellite below horizon → returns Doppler value anyway (the function is pure SGP4; the activation gate handles "not in pass"). Verify it doesn't error.
+The math itself ships in `sdr-sat::track().doppler_shift_hz()` (already covered by `sdr-sat`'s own test suite). The new `compute_doppler_offset_hz` wrapper in `crates/sdr-ui/src/doppler_tracker.rs` is what gets tested here:
+
+- **Known-pass shape test:** feed a captured TLE for NOAA 19 plus a station, find a real upcoming pass via `sdr_sat::upcoming_passes(...)`, sample `compute_doppler_offset_hz(...)` at AOS / TCA / LOS, and assert: AOS Doppler positive (approaching), LOS Doppler negative (receding), monotonic decrease across the pass, |TCA| < |AOS| AND |TCA| < |LOS| (radial velocity smallest at TCA).
+- **Sign-convention regression pin:** at AOS, assert `range_rate_km_s < 0` (approaching) AND `compute_doppler_offset_hz(...) > 0` — opposite signs by the formula `Δf = -f₀ · ṙ / c`. Guards against an accidental sign flip in either layer.
+- **Edge-case test:** `compute_doppler_offset_hz(..., carrier_hz = 0.0)` returns 0 regardless of geometry (formula multiplies by `frequency_hz`).
 
 ### 9.2 `DopplerTracker` unit tests in `sdr-ui`
 

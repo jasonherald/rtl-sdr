@@ -112,18 +112,26 @@ pub fn pick_active_satellite(
     if !master_enabled {
         return None;
     }
-    candidates
+    let above: Vec<Candidate> = candidates
         .iter()
+        .copied()
         .filter(|c| c.elevation_deg > 0.0)
-        // `max_by` keeps the first element on equal keys, so a
-        // tie among above-horizon matches resolves to the one
-        // earlier in `candidates` — which the caller orders by
-        // `KNOWN_SATELLITES`. Per spec §2 deterministic tie-break.
-        .max_by(|a, b| {
-            a.elevation_deg
-                .partial_cmp(&b.elevation_deg)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .collect();
+    // Two-pass: find the maximum elevation, then return the
+    // first candidate that matches it. `Iterator::max_by` keeps
+    // the LAST equal element in Rust (not the first), which would
+    // break the spec §2 deterministic tie-break (caller passes
+    // candidates in `KNOWN_SATELLITES` order, earlier wins). Match
+    // the production implementation in
+    // `crates/sdr-ui/src/doppler_tracker.rs`.
+    let max_elev = above.iter().map(|c| c.elevation_deg).reduce(f64::max)?;
+    // Exact equality is intentional: `max_elev` came from the same
+    // `f64` values in `above`, so this is identity comparison of a
+    // value we already read — not a computed approximation.
+    #[allow(clippy::float_cmp)]
+    above
+        .into_iter()
+        .find(|c| c.elevation_deg == max_elev)
         .map(|c| c.satellite)
 }
 

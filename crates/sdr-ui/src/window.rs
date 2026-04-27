@@ -9678,17 +9678,6 @@ const DOPPLER_RECOMPUTE_TICK: Duration = Duration::from_millis(250);
 /// pure bus-traffic relief.
 const DOPPLER_DISPATCH_THRESHOLD_HZ: f64 = 5.0;
 
-/// Wire the [`DopplerTracker`](crate::doppler_tracker::DopplerTracker):
-/// master-switch persistence + change notify, 1 Hz trigger
-/// re-evaluation tick, 4 Hz offset-recompute tick, status-bar
-/// update, [`UiToDsp::SetVfoOffset`] dispatch (rate-limited
-/// to changes >`DOPPLER_DISPATCH_THRESHOLD_HZ`). Per #521 and
-/// the design spec at
-/// `docs/superpowers/specs/2026-04-26-doppler-correction-design.md`.
-///
-/// Wired only when the TLE cache is available — see
-/// [`connect_satellites_panel`].
-#[allow(clippy::too_many_lines)]
 /// Restore the persisted Doppler master-switch state to the
 /// widget and wire change-notify to save back. Always called,
 /// regardless of TLE-cache availability — the user's preference
@@ -9712,6 +9701,21 @@ fn restore_doppler_switch(
         });
 }
 
+/// Wire the [`DopplerTracker`](crate::doppler_tracker::DopplerTracker):
+/// 1 Hz trigger re-evaluation tick, 4 Hz offset-recompute
+/// tick, status-bar update, [`UiToDsp::SetVfoOffset`] dispatch
+/// (rate-limited to changes >`DOPPLER_DISPATCH_THRESHOLD_HZ`).
+/// Per #521 and the design spec at
+/// `docs/superpowers/specs/2026-04-26-doppler-correction-design.md`.
+///
+/// Master-switch persistence + initial restore happens in
+/// [`restore_doppler_switch`], which is called unconditionally
+/// from [`connect_satellites_panel`]. This function adds a
+/// **second** change-notify handler on the same widget that
+/// drives the tracker model — multiple GTK signal handlers on
+/// one widget fire independently, no conflict. Wired only when
+/// the TLE cache is available; without TLEs the trigger
+/// re-evaluate has no candidate to engage.
 #[allow(
     clippy::too_many_lines,
     reason = "three chained closures (master-switch handler + two timers) all \
@@ -9738,8 +9742,7 @@ fn connect_doppler_tracker(
     // path. Per CR round 1 on PR #554.
     let initial = panels.satellites.doppler_switch.is_active();
 
-    let tracker: Rc<RefCell<DopplerTracker>> =
-        Rc::new(RefCell::new(DopplerTracker::new(initial)));
+    let tracker: Rc<RefCell<DopplerTracker>> = Rc::new(RefCell::new(DopplerTracker::new(initial)));
 
     // Shared dispatch baseline: read by the 4 Hz recompute tick
     // for its rate-limit gate; written by every path that
