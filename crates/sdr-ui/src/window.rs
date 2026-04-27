@@ -8925,7 +8925,7 @@ fn connect_satellites_panel(
     //      so there's nothing for the *behavior* to do.
     restore_doppler_switch(panels, config);
     if let Some(cache_doppler) = cache.as_ref() {
-        connect_doppler_tracker(panels, state, cache_doppler, status_bar, spectrum_handle);
+        connect_doppler_tracker(panels, state, cache_doppler, status_bar);
     }
 
     // Refresh button — re-download every known satellite's TLE on
@@ -9729,7 +9729,6 @@ fn connect_doppler_tracker(
     state: &Rc<AppState>,
     cache: &std::sync::Arc<sdr_sat::TleCache>,
     status_bar: &Rc<StatusBar>,
-    spectrum: &Rc<spectrum::SpectrumHandle>,
 ) {
     use crate::doppler_tracker::{
         Candidate, DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz,
@@ -9808,7 +9807,6 @@ fn connect_doppler_tracker(
         let status_bar = Rc::clone(status_bar);
         let panel_weak = panels.satellites.downgrade();
         let last_dispatched = Rc::clone(&last_dispatched);
-        let spectrum = Rc::clone(spectrum);
         let _ = glib::timeout_add_local(DOPPLER_TRIGGER_TICK, move || {
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -9881,27 +9879,30 @@ fn connect_doppler_tracker(
             if changed {
                 if new_active.is_some() {
                     if prior_active_some {
-                        // Some(A) → Some(B) satellite swap. The
-                        // user's manual fine-tune offset belongs
-                        // to the user, not to a specific pass —
-                        // restore the pre-swap `user_reference`
+                        // Some(A) → Some(B) satellite swap.
+                        // Restore the pre-swap user_reference
                         // (which `set_active` just reset to 0)
-                        // so the new pass continues to track ON
-                        // TOP of it. Per CR round 5 on PR #554:
-                        // round-4's "leave user_ref at 0 on
-                        // swap" was wrong — losing the user's
-                        // offset on a swap is hostile UX.
+                        // so it survives the satellite change.
+                        // Per CR round 5 on PR #554.
                         t.set_user_reference_offset_hz(prior_user_ref);
-                    } else {
-                        // Fresh engagement (None → Some) — seed
-                        // `user_reference_offset_hz` from the
-                        // current spectrum VFO offset so this
-                        // pass's Doppler tracks ON TOP of any
-                        // offset the user had set independently.
-                        // Per CR round 3 on PR #554.
-                        let current_offset = spectrum.vfo_offset_hz();
-                        t.set_user_reference_offset_hz(current_offset);
                     }
+                    // None → Some (fresh engagement): leave
+                    // `user_reference_offset_hz` at 0. We used to
+                    // seed it from `spectrum.vfo_offset_hz()` to
+                    // preserve the user's pre-engage manual
+                    // offset, but `SpectrumHandle` lags DSP
+                    // echoes — auto-record's AOS path forces
+                    // `SetVfoOffset(0.0)` before the spectrum
+                    // sees it, so seeding from spectrum at engage
+                    // time would capture the stale pre-AOS value
+                    // and the 4 Hz tick would then overwrite the
+                    // intended-zero offset with `stale + doppler`.
+                    // Spec §4 already defers the additive override
+                    // pending a synchronously-tracked source of
+                    // truth (last_sent_vfo_offset on AppState);
+                    // engagement seeding is part of the same
+                    // deferral. Per CR round 6 on PR #554.
+                    //
                     // No dispatch here — the next 4 Hz tick will
                     // dispatch `live = user_reference + doppler`.
                 } else {

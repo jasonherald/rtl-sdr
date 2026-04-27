@@ -116,35 +116,54 @@ See `crates/sdr-sat/src/passes.rs::track` for the full implementation, including
 
 ## 6. The `DopplerTracker` (sdr-ui)
 
-New module: `crates/sdr-ui/src/doppler_tracker.rs`. One per `AppWindow`.
+New module: `crates/sdr-ui/src/doppler_tracker.rs`. The shipped design is a small **pure state model** + a thin compute helper; all timers, persistence, GTK widgets, status-bar updates, and dispatch state live in the window-level wiring layer. (Spec originally proposed a fat `DopplerTracker` owning everything; the shipped split is cleaner and unit-testable headlessly.)
 
 ```rust
+// crates/sdr-ui/src/doppler_tracker.rs
+
+#[derive(Debug, Default)]
 pub struct DopplerTracker {
-    config: Arc<ConfigManager>,
-    state: Rc<AppState>,
-    enabled: Cell<bool>,                              // master switch
-    active: RefCell<Option<ActiveSatellite>>,         // current trigger result
-    user_reference_offset: Cell<f64>,                 // additive manual offset
-    last_dispatched_offset: Cell<f64>,                // for change-detection
-    tick_id: RefCell<Option<glib::SourceId>>,         // 4 Hz timer
-    eval_id: RefCell<Option<glib::SourceId>>,         // 1 Hz re-evaluate trigger
+    master_enabled: bool,
+    active: Option<&'static KnownSatellite>,
+    user_reference_offset_hz: f64,
 }
 
-struct ActiveSatellite {
-    catalog: &'static KnownSatellite,
-    tle: Tle,                                         // cached at engage time
-    engaged_at: chrono::DateTime<chrono::Utc>,
+impl DopplerTracker {
+    pub fn new(master_enabled: bool) -> Self;
+    pub fn set_master_enabled(&mut self, enabled: bool) -> Option<f64>;
+    pub fn master_enabled(&self) -> bool;
+    pub fn set_user_reference_offset_hz(&mut self, hz: f64);
+    pub fn user_reference_offset_hz(&self) -> f64;
+    pub fn set_active(&mut self, sat: Option<&'static KnownSatellite>) -> bool;
+    pub fn active(&self) -> Option<&'static KnownSatellite>;
+    pub fn live_offset_hz(&self, doppler_hz: f64) -> f64;
 }
+
+pub fn compute_doppler_offset_hz(
+    sat: &Satellite,
+    station: &GroundStation,
+    when: DateTime<Utc>,
+    carrier_hz: f64,
+) -> Result<f64, DopplerError>;
+
+pub fn pick_active_satellite(
+    master_enabled: bool,
+    candidates: &[Candidate],
+) -> Option<&'static KnownSatellite>;
 ```
 
-**Two timers:**
+The wiring lives in `crates/sdr-ui/src/window.rs` as **two functions**:
 
-1. **4 Hz tick** — recompute Doppler offset for the active satellite. Update the status bar label every tick (rounded to 0.1 kHz, so visual jitter is suppressed naturally). Dispatch `UiToDsp::SetVfoOffset(user_reference + doppler)` only when the new offset differs from `last_dispatched_offset` by more than 5 Hz — this rate-limits the controller bus on the sub-Hz wobble between SGP4 ticks without affecting the visible label or the actual tracking smoothness (5 Hz < 1/8 of a typical NFM bin width, well below audible).
-2. **1 Hz re-evaluate** — re-check the trigger conditions (frequency match + above horizon + master switch). On state change (engage / disengage / satellite swap), tear down or reconfigure the 4 Hz tick.
+- **`restore_doppler_switch(panels, config)`** — runs **unconditionally** at window construction. Restores the persisted master-switch value to the `AdwSwitchRow` and wires `connect_active_notify` to `save_doppler_tracking_enabled`. Independent of TLE-cache availability so the user's preference always persists.
+- **`connect_doppler_tracker(panels, state, cache, status_bar)`** — runs only when the TLE cache is available. Owns the `Rc<RefCell<DopplerTracker>>`, the `Rc<Cell<f64>>` for the dispatch baseline, and **two `glib::timeout_add_local` timers**:
+  1. **4 Hz tick** (`DOPPLER_RECOMPUTE_TICK = 250ms`) — checks the active satellite's freq-match (immediately disengages on retune-away), recomputes Doppler via `compute_doppler_offset_hz`, dispatches `UiToDsp::SetVfoOffset(live)` rate-limited to >`DOPPLER_DISPATCH_THRESHOLD_HZ = 5 Hz` changes, updates the status-bar label.
+  2. **1 Hz re-evaluate** (`DOPPLER_TRIGGER_TICK = 1s`) — rebuilds the candidate list from catalog × frequency match × ground station × cached TLEs, calls `pick_active_satellite`, then `set_active`. On disengage transitions, dispatches the captured pre-engage `user_reference_offset_hz`.
 
-The two timers are decoupled because trigger evaluation is cheap-and-rare while offset computation is cheap-and-frequent. Same module, same `Rc`, no cross-thread anything — both fire on the GTK main loop.
+  Plus a third change-notify handler on `panels.satellites.doppler_switch` that drives the tracker model when the master switch toggles (separate from the persistence handler in `restore_doppler_switch` — multiple GTK signal handlers fire independently).
 
-**SGP4 cost:** one propagation per 250 ms tick, plus one per 1 s re-evaluate. SGP4 is microseconds — total CPU cost is negligible.
+**Why split:** decoupling state from wiring keeps the model unit-testable headlessly (20+ tests in `doppler_tracker.rs`), keeps the wiring layer's GTK-specific concerns out of the model, and makes the persistence-vs-behavior gating clean (persistence always; behavior only when TLE cache available).
+
+**SGP4 cost:** one propagation per 250 ms tick, plus one per 1 s re-evaluate per catalog candidate. SGP4 is microseconds — total CPU cost is negligible.
 
 ## 7. UI surface
 
@@ -200,7 +219,12 @@ The math itself ships in `sdr-sat::track().doppler_shift_hz()` (already covered 
 
 ### 9.2 `DopplerTracker` unit tests in `sdr-ui`
 
-`DopplerTracker` should be testable headless — its state machine is pure logic over inputs (current freq, master switch, ground station, TLE cache, time). Mirror the `satellites_recorder.rs` "pure tick → Vec<Action>" pattern: factor the trigger evaluation into a `fn evaluate(...) -> TriggerState` that takes inputs and returns a value, then unit-test `evaluate` against a matrix of (freq match × elevation × master switch × ground station present) cases.
+`DopplerTracker` is testable headless — the state model holds no GTK / Rc / SourceId, so methods can be exercised directly. The trigger evaluation factors out as `pick_active_satellite(master_enabled, candidates) -> Option<&KnownSatellite>` (the caller does the SGP4 propagate to build candidates, the function picks the winner). Tests in `crates/sdr-ui/src/doppler_tracker.rs::tests` cover:
+
+- `pick_active_satellite` matrix: master-off, no candidates, single match, below-horizon rejection, zero-elevation rejection, multi-sat tie-break by elevation, deterministic tie-break by candidate order, mixed above/below.
+- `DopplerTracker` state transitions: master enable/disable (return-value contract, no-op short-circuit), `set_active` swap/disengage semantics (model-layer reset vs. wiring-layer compensation), additive `live_offset_hz`.
+
+The wiring layer (`window.rs::connect_doppler_tracker`) is GTK + glib-timer territory; not headlessly testable. Verified via §9.3 smoke (real pass).
 
 ### 9.3 Smoke (live)
 

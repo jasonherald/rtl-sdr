@@ -154,14 +154,20 @@ impl DopplerTracker {
     ///     the DSP back to the user-reference baseline (or 0 if
     ///     they hadn't touched the slider).
     ///
-    /// Returns `None` on enable transitions (or no-change calls)
-    /// — engagement of a satellite is the trigger re-evaluate
-    /// tick's job, not this method's. Per CR round 1 on PR #554:
-    /// before this change the wiring layer needed a "dispatch
-    /// first, then clear later" dance that left
-    /// `user_reference_offset_hz` non-zero across master-off,
-    /// breaking parity with `set_active(None)`.
+    /// Returns `None` on enable transitions and on no-change
+    /// calls — engagement of a satellite is the trigger re-
+    /// evaluate tick's job, not this method's.
+    ///
+    /// Short-circuits on no-change (`enabled == self.master_enabled`)
+    /// returning `None` immediately without touching state, so
+    /// a redundant `connect_active_notify` firing (which GTK
+    /// can produce on programmatic `set_active` of an unchanged
+    /// value) doesn't synthesize a fake "transition to disabled"
+    /// dispatch. Per CR round 6 on PR #554.
     pub fn set_master_enabled(&mut self, enabled: bool) -> Option<f64> {
+        if enabled == self.master_enabled {
+            return None;
+        }
         self.master_enabled = enabled;
         if !enabled {
             let final_offset_hz = self.user_reference_offset_hz;
@@ -520,13 +526,15 @@ mod tests {
     #[test]
     fn compute_doppler_offset_zero_carrier_returns_zero() {
         // Edge case: f₀ = 0 should yield 0 regardless of geometry
-        // (the formula multiplies by `frequency_hz`).
+        // (the formula multiplies by `frequency_hz`). Use a
+        // timestamp inside the TLE validity window so this test
+        // doesn't become a spurious failure if `sdr_sat::track`
+        // ever tightens its epoch budget. Per CR round 6 on PR
+        // #554.
         let sat = Satellite::from_tle("NOAA 19", NOAA_19_TLE_LINE1, NOAA_19_TLE_LINE2)
             .expect("TLE parses");
-        let when = chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let result = compute_doppler_offset_hz(&sat, &test_station(), when, 0.0).unwrap();
+        let result =
+            compute_doppler_offset_hz(&sat, &test_station(), tle_epoch_utc(), 0.0).unwrap();
         assert!((result - 0.0).abs() < f64::EPSILON, "got {result}");
     }
 
