@@ -125,6 +125,10 @@ pub const KEY_AUTO_RECORD_APT: &str = "sat_auto_record_apt";
 /// Pairs with [`KEY_AUTO_RECORD_APT`] — only meaningful when
 /// auto-record is on. Default: `false` (opt-in). Per #533.
 pub const KEY_AUTO_RECORD_AUDIO: &str = "sat_auto_record_audio";
+/// Config key for the persisted Doppler-tracking master switch
+/// (Satellites panel). Default `true` so first-launch users get
+/// auto-corrected passes out of the box. Per issue #521.
+pub const KEY_DOPPLER_TRACKING_ENABLED: &str = "sat_doppler_tracking_enabled";
 
 // ─── Panel ─────────────────────────────────────────────────────────────
 
@@ -507,6 +511,18 @@ pub fn load_auto_record_audio(config: &Arc<ConfigManager>) -> bool {
     read_bool_or(config, KEY_AUTO_RECORD_AUDIO, false)
 }
 
+/// Load the persisted Doppler-tracking master switch. Defaults
+/// to `true` — fresh installs get auto-correction without
+/// requiring the user to find and flip the switch. Per #521.
+#[must_use]
+pub fn load_doppler_tracking_enabled(config: &Arc<ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_DOPPLER_TRACKING_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    })
+}
+
 /// Persist `value` under `key`. Single helper for the three
 /// lat/lon/alt `SpinRow` change-notify handlers.
 pub fn save_f64(config: &Arc<ConfigManager>, key: &str, value: f64) {
@@ -526,6 +542,13 @@ pub fn save_auto_record_apt(config: &Arc<ConfigManager>, value: bool) {
 pub fn save_auto_record_audio(config: &Arc<ConfigManager>, value: bool) {
     config.write(|v| {
         v[KEY_AUTO_RECORD_AUDIO] = serde_json::json!(value);
+    });
+}
+
+/// Persist the Doppler-tracking master switch. Per #521.
+pub fn save_doppler_tracking_enabled(config: &Arc<ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_DOPPLER_TRACKING_ENABLED] = serde_json::json!(enabled);
     });
 }
 
@@ -1132,5 +1155,36 @@ mod tests {
             format_pass_title(&pass, now),
             "NOAA 19 — in progress (1 min in)"
         );
+    }
+
+    fn make_config() -> Arc<ConfigManager> {
+        Arc::new(ConfigManager::in_memory(&serde_json::json!({})))
+    }
+
+    #[test]
+    fn load_doppler_tracking_enabled_defaults_to_on() {
+        let config = make_config();
+        // Spec §7.1: default ON so fresh installs get auto-
+        // correction without user discovery.
+        assert!(load_doppler_tracking_enabled(&config));
+    }
+
+    #[test]
+    fn save_and_load_doppler_tracking_enabled_round_trip() {
+        let config = make_config();
+        save_doppler_tracking_enabled(&config, false);
+        assert!(!load_doppler_tracking_enabled(&config));
+        save_doppler_tracking_enabled(&config, true);
+        assert!(load_doppler_tracking_enabled(&config));
+    }
+
+    #[test]
+    fn load_doppler_tracking_enabled_tolerates_non_bool() {
+        let config = make_config();
+        config.write(|v| {
+            v[KEY_DOPPLER_TRACKING_ENABLED] = serde_json::json!("not a bool");
+        });
+        // Falls back to the default (true), not a panic.
+        assert!(load_doppler_tracking_enabled(&config));
     }
 }
