@@ -9365,10 +9365,12 @@ fn connect_satellites_panel(
                 // recorder doesn't know whether the user closed
                 // the viewer mid-pass or whether disk write will
                 // succeed.
+                let mut export_ok = false;
                 let result_msg = if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
                     match view.export_png(&path) {
                         Ok(()) => {
                             tracing::info!("auto-record PNG saved to {path:?}");
+                            export_ok = true;
                             format!("Pass complete — image saved to {}", path.display())
                         }
                         Err(e) => {
@@ -9386,10 +9388,13 @@ fn connect_satellites_panel(
                 // Close the APT viewer window now that the PNG
                 // is on disk — resets the viewer for the next
                 // pass instead of carrying stale lines forward.
-                // Per a user request during PR #554 live testing:
-                // "after we get LOS and save the png and/or wav
-                // file have it close the open window which
-                // resets it for the next time."
+                // Per a user request during PR #554 live testing.
+                //
+                // Only close on a successful export — if the save
+                // failed (Cairo error, disk full, etc.) the user
+                // probably wants to inspect the in-memory image
+                // and manually retry the export. Closing would
+                // discard the only copy. Per CR round 9 on PR #554.
                 //
                 // Weak-ref upgrade fails closed: if the user
                 // already dismissed the window, there's nothing
@@ -9397,11 +9402,12 @@ fn connect_satellites_panel(
                 // `open_apt_viewer_if_needed` clears both
                 // `apt_viewer` and `apt_viewer_window` slots so
                 // the next AOS opens a fresh viewer.
-                if let Some(window) = state_a
-                    .apt_viewer_window
-                    .borrow()
-                    .as_ref()
-                    .and_then(glib::WeakRef::upgrade)
+                if export_ok
+                    && let Some(window) = state_a
+                        .apt_viewer_window
+                        .borrow()
+                        .as_ref()
+                        .and_then(glib::WeakRef::upgrade)
                 {
                     window.close();
                 }
@@ -9457,14 +9463,23 @@ fn connect_satellites_panel(
                 let state_lrpt_close = Rc::clone(&state_a);
                 glib::spawn_future_local(async move {
                     let dir_for_msg = dir.clone();
-                    let result_msg = gio::spawn_blocking(move || {
+                    // Tuple return: (toast message, saved-at-least-one).
+                    // The flag gates the post-save viewer close —
+                    // we keep the viewer open on total-failure
+                    // outcomes so the user can inspect the in-
+                    // memory image and manually retry the export.
+                    // Per CR round 9 on PR #554.
+                    let (result_msg, save_ok) = gio::spawn_blocking(move || {
                         if snapshots.is_empty() {
                             tracing::warn!(
                                 "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
                             );
-                            return format!(
-                                "Pass complete, but no LRPT channels decoded — nothing saved to {}",
-                                dir.display()
+                            return (
+                                format!(
+                                    "Pass complete, but no LRPT channels decoded — nothing saved to {}",
+                                    dir.display()
+                                ),
+                                false,
                             );
                         }
                         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -9477,9 +9492,9 @@ fn connect_satellites_panel(
                             tracing::warn!(
                                 "auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",
                             );
-                            return format!(
-                                "Pass complete but couldn't create {}: {e}",
-                                dir.display()
+                            return (
+                                format!("Pass complete but couldn't create {}: {e}", dir.display()),
+                                false,
                             );
                         }
                         let mut saved = 0_usize;
@@ -9509,7 +9524,7 @@ fn connect_satellites_panel(
                                 }
                             }
                         }
-                        if errors.is_empty() {
+                        let msg = if errors.is_empty() {
                             format!(
                                 "Pass complete — {saved} LRPT channel(s) saved to {}",
                                 dir.display()
@@ -9520,7 +9535,12 @@ fn connect_satellites_panel(
                                 errors.len(),
                                 errors.join("; ")
                             )
-                        }
+                        };
+                        // Treat "at least one channel saved" as
+                        // success for close-purposes — partial-
+                        // success outcomes still produced disk
+                        // artifacts the user can inspect.
+                        (msg, saved > 0)
                     })
                     .await
                     .unwrap_or_else(|e| {
@@ -9535,9 +9555,12 @@ fn connect_satellites_panel(
                         tracing::warn!(
                             "auto-record SaveLrptPass: worker thread panicked: {e:?}",
                         );
-                        format!(
-                            "Pass complete but PNG worker panicked (target was {})",
-                            dir_for_msg.display()
+                        (
+                            format!(
+                                "Pass complete but PNG worker panicked (target was {})",
+                                dir_for_msg.display()
+                            ),
+                            false,
                         )
                     });
                     post_toast(&toast_overlay_weak_for_save, &result_msg);
@@ -9546,6 +9569,15 @@ fn connect_satellites_panel(
                     // the next pass instead of carrying stale
                     // APIDs forward. Per a user request during
                     // PR #554 live testing.
+                    //
+                    // Only close when at least one channel
+                    // actually saved (`save_ok`) — on total-
+                    // failure outcomes (no APIDs decoded, dir
+                    // create failed, every channel errored, or
+                    // worker panicked) keep the viewer open so
+                    // the user can inspect the in-memory image
+                    // and manually retry the export. Per CR
+                    // round 9 on PR #554.
                     //
                     // Runs on the GLib main loop (we re-entered
                     // it via `spawn_future_local`), so the weak
@@ -9556,11 +9588,12 @@ fn connect_satellites_panel(
                     // handler in `open_lrpt_viewer_if_needed`
                     // clears the AppState slots so the next AOS
                     // opens a fresh viewer.
-                    if let Some(window) = state_lrpt_close
-                        .lrpt_viewer_window
-                        .borrow()
-                        .as_ref()
-                        .and_then(glib::WeakRef::upgrade)
+                    if save_ok
+                        && let Some(window) = state_lrpt_close
+                            .lrpt_viewer_window
+                            .borrow()
+                            .as_ref()
+                            .and_then(glib::WeakRef::upgrade)
                     {
                         window.close();
                     }
@@ -9944,24 +9977,32 @@ fn connect_doppler_tracker(
                         // so it survives the satellite change.
                         // Per CR round 5 on PR #554.
                         t.set_user_reference_offset_hz(prior_user_ref);
+                    } else {
+                        // None → Some fresh engagement. Seed
+                        // `user_reference_offset_hz` from the
+                        // synchronously-tracked DSP baseline on
+                        // `AppState` so this pass's Doppler tracks
+                        // ON TOP of any offset the user had set
+                        // before AOS — and so disengage at LOS
+                        // restores that exact value via the
+                        // Some → None flush path.
+                        //
+                        // Round 6 deferred this seed because the
+                        // only available source was `spectrum.vfo_offset_hz()`,
+                        // which lags DSP echoes — auto-record's
+                        // AOS-side `SetVfoOffset(0.0)` would not yet
+                        // be reflected when the trigger tick fired,
+                        // so we'd capture the stale pre-AOS value.
+                        // Round 7 added `state.last_dispatched_vfo_offset_hz`,
+                        // which the `connect_vfo_offset_changed`
+                        // callback updates on every DSP echo (and
+                        // every direct user-drag dispatch). That
+                        // gives us the synchronously-tracked source
+                        // of truth the deferral was waiting for.
+                        // Per CR round 9 on PR #554.
+                        let baseline = state.last_dispatched_vfo_offset_hz.get();
+                        t.set_user_reference_offset_hz(baseline);
                     }
-                    // None → Some (fresh engagement): leave
-                    // `user_reference_offset_hz` at 0. We used to
-                    // seed it from `spectrum.vfo_offset_hz()` to
-                    // preserve the user's pre-engage manual
-                    // offset, but `SpectrumHandle` lags DSP
-                    // echoes — auto-record's AOS path forces
-                    // `SetVfoOffset(0.0)` before the spectrum
-                    // sees it, so seeding from spectrum at engage
-                    // time would capture the stale pre-AOS value
-                    // and the 4 Hz tick would then overwrite the
-                    // intended-zero offset with `stale + doppler`.
-                    // Spec §4 already defers the additive override
-                    // pending a synchronously-tracked source of
-                    // truth (last_sent_vfo_offset on AppState);
-                    // engagement seeding is part of the same
-                    // deferral. Per CR round 6 on PR #554.
-                    //
                     // No dispatch here — the next 4 Hz tick will
                     // dispatch `live = user_reference + doppler`.
                 } else {

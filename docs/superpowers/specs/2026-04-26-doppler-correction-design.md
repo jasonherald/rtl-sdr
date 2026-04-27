@@ -15,7 +15,7 @@ A polar-orbit satellite at ~800 km altitude moves at ~7.5 km/s relative to a fix
 | Phase | Range-rate | Doppler shift |
 |---|---|---|
 | AOS (approaching, low elevation) | ≈ +6 km/s | ≈ +2.7 kHz |
-| TCA (overhead) | ≈ 0 | ≈ 0 Hz |
+| TCA (closest approach) | ≈ 0 | ≈ 0 Hz |
 | LOS (receding, low elevation) | ≈ −6 km/s | ≈ −2.7 kHz |
 
 So the carrier sweeps roughly ±3 kHz across the pass, hitting +2.7 → 0 → −2.7. For NFM with 40 kHz channel bandwidth this is "audible drift but you stay locked." For LRPT QPSK the demod tolerates it but loses headroom. For ISS SSTV (long single-image transmission) it's enough to walk the user out of tune mid-image.
