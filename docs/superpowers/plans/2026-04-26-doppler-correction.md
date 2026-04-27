@@ -1202,27 +1202,46 @@ fn connect_doppler_tracker(
 
     let tracker = Rc::new(RefCell::new(DopplerTracker::new(persisted)));
 
-    // Master-switch change handler: persist + update tracker.
+    // Shared dispatch baseline: read by the 4 Hz recompute tick
+    // for its rate-limit gate; written by every path that
+    // dispatches `SetVfoOffset` (master-switch handler, 1 Hz
+    // trigger tick, 4 Hz recompute tick) so subsequent material-
+    // change comparisons land against the latest actual DSP
+    // state, not a stale Doppler value. Without this shared
+    // baseline, a quick disengage→re-engage could land the next
+    // computed offset within `DOPPLER_DISPATCH_THRESHOLD_HZ` of
+    // the prior live value and the first dispatch would be
+    // suppressed — DSP would stay on user-reference while the
+    // status bar showed active Doppler.
+    let last_dispatched: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+
+    // Master-switch change handler: update tracker.
     // If the switch goes off, dispatch a final SetVfoOffset(
     // user_reference_offset) so the offset doesn't stick on the
     // last Doppler value, and clear the status bar label.
     {
         let tracker = Rc::clone(&tracker);
-        let config = Arc::clone(config);
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
+        let last_dispatched = Rc::clone(&last_dispatched);
         panels
             .satellites
             .doppler_switch
             .connect_active_notify(move |row| {
                 let enabled = row.is_active();
-                sidebar::satellites_panel::save_doppler_tracking_enabled(&config, enabled);
                 let mut t = tracker.borrow_mut();
                 let was_active = t.active().is_some();
-                t.set_master_enabled(enabled);
-                if !enabled && was_active {
-                    let user_ref = t.user_reference_offset_hz();
+                // `set_master_enabled` returns `Some(captured_user_ref)`
+                // on a disable transition (atomically clears active +
+                // resets user_reference + returns the pre-reset value
+                // for us to flush). Only dispatch the fallback when
+                // a satellite was actually being tracked, otherwise
+                // we'd clobber the user's independently-set offset.
+                if let Some(user_ref) = t.set_master_enabled(enabled)
+                    && was_active
+                {
                     state.send_dsp(UiToDsp::SetVfoOffset(user_ref));
+                    last_dispatched.set(user_ref);  // sync the shared baseline
                     status_bar.update_doppler(None);
                 }
             });
@@ -1238,6 +1257,8 @@ fn connect_doppler_tracker(
         let cache = Arc::clone(cache);
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
+        let last_dispatched = Rc::clone(&last_dispatched);
+        let spectrum = Rc::clone(spectrum);
         let panels_weak = panels.satellites.downgrade();
         glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
             let Some(panel) = panels_weak.upgrade() else {
@@ -1282,12 +1303,35 @@ fn connect_doppler_tracker(
             }
 
             let new_active = pick_active_satellite(t.master_enabled(), &candidates);
+            // Capture pre-`set_active` state. `set_active` resets
+            // `user_reference_offset_hz` to 0 on any change, so we
+            // must read it BEFORE the call to flush back to the
+            // correct pre-engage value on disengage. We also need
+            // to know whether a satellite was active (None→Some
+            // engages and seeds; Some(A)→Some(B) swaps and does
+            // NOT reseed — the spectrum offset at swap time is
+            // `prior_user_ref + prior_doppler` and reseeding would
+            // double-count Doppler).
+            let prior_user_ref = t.user_reference_offset_hz();
+            let prior_active_some = t.active().is_some();
             let changed = t.set_active(new_active);
-            if changed && new_active.is_none() {
-                // Disengaged — flush the offset and clear the badge.
-                let user_ref = t.user_reference_offset_hz();
-                state.send_dsp(UiToDsp::SetVfoOffset(user_ref));
-                status_bar.update_doppler(None);
+            if changed {
+                if new_active.is_some() {
+                    if !prior_active_some {
+                        // Fresh engagement — seed user_reference
+                        // from the live spectrum VFO offset so
+                        // this pass's Doppler tracks ON TOP of
+                        // any offset the user had set.
+                        let current_offset = spectrum.vfo_offset_hz();
+                        t.set_user_reference_offset_hz(current_offset);
+                    }
+                    // No dispatch — the next 4 Hz tick handles it.
+                } else {
+                    // Disengaged — flush back to pre-engage user_ref.
+                    state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
+                    last_dispatched.set(prior_user_ref);  // sync the shared baseline
+                    status_bar.update_doppler(None);
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -1298,25 +1342,13 @@ fn connect_doppler_tracker(
     // (rate-limited to changes >5 Hz to avoid spamming the bus).
     // Update the status bar label every tick (rounded to 0.1 kHz
     // so visual jitter is suppressed naturally).
-    //
-    // Note: `last_dispatched` is hoisted into the function scope
-    // (above the master-switch handler block) as
-    // `Rc<Cell<f64>>` and cloned into all three closures —
-    // master-switch, 1 Hz trigger, 4 Hz recompute. Each path
-    // that dispatches `SetVfoOffset` also writes the dispatched
-    // value to `last_dispatched.set(...)` so the next 4 Hz
-    // tick's threshold comparison is against the latest actual
-    // DSP state, not a stale Doppler value. Without this, a
-    // quick disengage→re-engage could land the next computed
-    // offset within `DOPPLER_DISPATCH_THRESHOLD_HZ` of the
-    // stale value and the first dispatch would be suppressed.
     {
         let tracker = Rc::clone(&tracker);
         let cache = Arc::clone(cache);
         let state = Rc::clone(state);
         let status_bar = Rc::clone(status_bar);
         let panels_weak = panels.satellites.downgrade();
-        let last_dispatched = Rc::clone(&last_dispatched);  // hoisted from above
+        let last_dispatched = Rc::clone(&last_dispatched);  // declared once at the function scope above
         glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             let Some(panel) = panels_weak.upgrade() else {
                 return glib::ControlFlow::Break;

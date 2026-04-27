@@ -9861,27 +9861,41 @@ fn connect_doppler_tracker(
             }
 
             let new_active = pick_active_satellite(t.master_enabled(), &candidates);
-            // Capture the pre-`set_active` user reference so we
-            // can flush back to it on a Some → None transition
-            // — `set_active` resets `user_reference_offset_hz`
-            // to 0 on any change, so reading it AFTER the call
-            // would always give 0. Per CR round 3 on PR #554.
+            // Capture pre-`set_active` state so we can:
+            //   1. Flush back to the prior user reference on a
+            //      Some → None disengage (`set_active` resets
+            //      `user_reference_offset_hz` to 0 on any change,
+            //      so reading it AFTER would always give 0).
+            //   2. Decide whether this is a fresh engagement
+            //      (None → Some) vs. a satellite swap
+            //      (Some(A) → Some(B)) — only the former should
+            //      seed `user_reference_offset_hz` from the live
+            //      spectrum offset. On a swap, the live offset
+            //      is `prior_user_ref + prior_doppler`; reseeding
+            //      with that would copy the previous pass's
+            //      Doppler into the new pass's baseline (a
+            //      double-count). Per CR round 4 on PR #554.
             let prior_user_ref = t.user_reference_offset_hz();
+            let prior_active_some = t.active().is_some();
             let changed = t.set_active(new_active);
             if changed {
                 if new_active.is_some() {
-                    // Engaged (or swapped to a new satellite) —
-                    // seed `user_reference_offset_hz` from the
-                    // current spectrum VFO offset so this pass's
-                    // Doppler tracks ON TOP of whatever offset
-                    // the user had set independently. Without
-                    // this seed, a non-zero pre-engagement offset
-                    // would be silently clobbered to 0 on the
-                    // next 4 Hz tick. Per CR round 3 on PR #554.
-                    let current_offset = spectrum.vfo_offset_hz();
-                    t.set_user_reference_offset_hz(current_offset);
+                    if !prior_active_some {
+                        // Fresh engagement (None → Some) — seed
+                        // `user_reference_offset_hz` from the
+                        // current spectrum VFO offset so this
+                        // pass's Doppler tracks ON TOP of any
+                        // offset the user had set independently.
+                        // Per CR round 3 on PR #554.
+                        let current_offset = spectrum.vfo_offset_hz();
+                        t.set_user_reference_offset_hz(current_offset);
+                    }
                     // No dispatch here — the next 4 Hz tick will
                     // dispatch `live = user_reference + doppler`.
+                    // For swaps, `set_active` already reset
+                    // `user_reference_offset_hz` to 0 per spec
+                    // §4 reset semantics; the new pass's live
+                    // offset will be just `doppler` (correct).
                 } else {
                     // Disengaged — flush the live offset back to
                     // the pre-engage user reference (captured
