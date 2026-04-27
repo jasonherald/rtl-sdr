@@ -446,9 +446,23 @@ pub fn scanner_channel_envelope(channels: &[sdr_scanner::ScannerChannel]) -> Opt
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     for ch in channels {
-        let half_bw = ch.bandwidth / 2.0;
+        // Skip malformed channels (NaN / Inf / non-positive
+        // bandwidth) so a single bad bookmark can't poison the
+        // envelope math and silently drop the lock.
+        // `f64::min` / `f64::max` propagate NaN per IEEE 754,
+        // so even one NaN bandwidth would taint `min`/`max`
+        // and make the final `max > min` check fail (returning
+        // `None` for an otherwise-valid channel set). Per
+        // `CodeRabbit` round 1 on PR #562.
+        if !ch.bandwidth.is_finite() || ch.bandwidth <= 0.0 {
+            continue;
+        }
         #[allow(clippy::cast_precision_loss)]
         let center = ch.key.frequency_hz as f64;
+        if !center.is_finite() {
+            continue;
+        }
+        let half_bw = ch.bandwidth / 2.0;
         min = min.min(center - half_bw);
         max = max.max(center + half_bw);
     }

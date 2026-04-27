@@ -1437,6 +1437,13 @@ fn handle_dsp_message(
 
                 scanner_panel.lockout_row.set_visible(true);
             } else {
+                // Scanner went idle but lock stays engaged
+                // (between rotations or before engine flips
+                // back to Idle). Drop the active-channel
+                // context so the highlight band + narrow-data
+                // projection clear; wide axis stays pinned.
+                // Per `CodeRabbit` round 1 on PR #562.
+                spectrum_handle.clear_scanner_active_channel();
                 clear_scanner_active_channel_ui(scanner_panel, state);
             }
         }

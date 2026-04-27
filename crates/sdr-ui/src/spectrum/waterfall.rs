@@ -246,10 +246,18 @@ impl WaterfallRenderer {
                     lock.max_hz,
                     w,
                 );
-                if !x.is_finite() || x < 0.0 || x >= w {
+                // Allow `x == w` so a bin landing exactly on
+                // the upper-bound pixel (boundary-aligned
+                // inputs — last bin maps to `active + bw/2`,
+                // which can equal `axis_max_hz` when the
+                // active channel sits at the upper envelope
+                // edge) still renders. Clamp via `min(w-1)` so
+                // the cast below is in-range. Per `CodeRabbit`
+                // round 1 on PR #562.
+                if !x.is_finite() || x < 0.0 || x > w {
                     continue;
                 }
-                let pixel_idx = x as usize;
+                let pixel_idx = x.min(w - 1.0) as usize;
                 let normalized = ((db - self.min_db) / db_range).clamp(0.0, 1.0);
                 let val = (normalized * 255.0).round() as u8;
                 // Per-pixel max-pool: narrow channels squeeze

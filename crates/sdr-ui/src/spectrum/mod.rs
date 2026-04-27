@@ -367,6 +367,20 @@ impl SpectrumHandle {
             min_hz < max_hz,
             "enter_scanner_mode: min ({min_hz}) must be < max ({max_hz})",
         );
+        // Release-build guard: invalid bounds (non-finite or
+        // inverted) would silently produce broken projections
+        // (division by zero / negative span / NaN-poisoned
+        // pixels) where `debug_assert!` is compiled out. Log
+        // and bail instead of engaging the lock with garbage.
+        // Per `CodeRabbit` round 1 on PR #562.
+        if !min_hz.is_finite() || !max_hz.is_finite() || min_hz >= max_hz {
+            tracing::warn!(
+                min_hz,
+                max_hz,
+                "enter_scanner_mode: ignoring invalid lock bounds",
+            );
+            return;
+        }
         *self.scanner_axis_lock.borrow_mut() = Some(ScannerAxisLock {
             min_hz,
             max_hz,
@@ -389,11 +403,44 @@ impl SpectrumHandle {
     /// `enter_scanner_mode` first, but a stray
     /// `ScannerActiveChannelChanged` arriving after
     /// `exit_scanner_mode` (e.g. mid-shutdown) shouldn't cause
-    /// the lock to mysteriously re-engage. Per issue #516.
+    /// the lock to mysteriously re-engage. Also rejects
+    /// non-finite frequency / bandwidth and non-positive
+    /// bandwidth — invalid values would silently produce
+    /// broken projections in release builds where
+    /// `debug_assert!` is compiled out. Per issue #516 +
+    /// `CodeRabbit` round 1 on PR #562.
     pub fn set_scanner_active_channel(&self, freq_hz: f64, bw_hz: f64) {
+        if !freq_hz.is_finite() || !bw_hz.is_finite() || bw_hz <= 0.0 {
+            tracing::trace!(
+                freq_hz,
+                bw_hz,
+                "set_scanner_active_channel: ignoring invalid channel context",
+            );
+            return;
+        }
         if let Some(lock) = self.scanner_axis_lock.borrow_mut().as_mut() {
             lock.active_channel_hz = Some(freq_hz);
             lock.active_channel_bw_hz = Some(bw_hz);
+            self.fft_area.queue_draw();
+            self.waterfall_area.queue_draw();
+        }
+    }
+
+    /// Clear the active-channel context within an engaged
+    /// scanner-axis lock — keeps the wide X axis pinned but
+    /// drops the highlight band and the narrow-data
+    /// projection. The wiring layer calls this on
+    /// `ScannerActiveChannelChanged { key: None }` (scanner
+    /// went idle without disengaging the lock — e.g. between
+    /// rotations, or after the rotation drained but before the
+    /// engine flips back to Idle). Without this, the previous
+    /// channel's highlight + projection stays rendered until
+    /// the next hop or scanner exit. Per `CodeRabbit` round 1
+    /// on PR #562.
+    pub fn clear_scanner_active_channel(&self) {
+        if let Some(lock) = self.scanner_axis_lock.borrow_mut().as_mut() {
+            lock.active_channel_hz = None;
+            lock.active_channel_bw_hz = None;
             self.fft_area.queue_draw();
             self.waterfall_area.queue_draw();
         }
@@ -743,6 +790,7 @@ fn build_fft_area(
     let cursor_min = Rc::clone(min_db);
     let cursor_max = Rc::clone(max_db);
     let cursor_cb = Rc::clone(cursor_callback);
+    let cursor_lock = Rc::clone(scanner_axis_lock);
     let area_weak_motion = area.downgrade();
     motion.connect_motion(move |_ctrl, x, y| {
         let Some(area) = area_weak_motion.upgrade() else {
@@ -754,9 +802,22 @@ fn build_fft_area(
             return;
         }
 
-        let vfo = cursor_vfo.borrow();
-        let freq_hz = vfo.pixel_to_hz(x, width);
-        drop(vfo);
+        // Pixel → frequency in lock-aware fashion. In scanner
+        // mode the X axis spans `[lock.min_hz, lock.max_hz]`
+        // absolutely; out of mode it's center-relative via the
+        // VFO's `pixel_to_hz`. Without this branch the cursor
+        // readout shows wildly wrong frequencies in scanner
+        // mode (it'd report values relative to the wandering
+        // active-channel centre instead of the wide locked
+        // range). Per `CodeRabbit` round 1 on PR #562.
+        let lock = *cursor_lock.borrow();
+        let freq_hz = if let Some(lock) = lock {
+            let frac = (x / width).clamp(0.0, 1.0);
+            lock.min_hz + frac * (lock.max_hz - lock.min_hz)
+        } else {
+            let vfo = cursor_vfo.borrow();
+            vfo.pixel_to_hz(x, width)
+        };
 
         let lo = cursor_min.get();
         let hi = cursor_max.get();
