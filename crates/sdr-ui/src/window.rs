@@ -491,12 +491,25 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // viewer should have closed). Backtrace is `Backtrace::capture`
     // so it costs nothing unless `RUST_BACKTRACE=1` is set. Per
     // PR #558 auto-record-close investigation.
+    //
+    // Also unregister `app.tune-satellite` here. The action was
+    // registered on the GApplication (because notification action
+    // targets resolve against the app's action map), but its
+    // closure captures window-owned widgets via `tune_to_satellite`.
+    // A pre-pass notification that sits in the daemon and gets
+    // clicked AFTER the window closes would fire the closure
+    // against destroyed widgets — silent setter calls + a `Tune`
+    // dispatch into a torn-down DSP channel. Removing the action
+    // on close means that click is treated as "no such action"
+    // rather than "tune via stale state". Per CR round 1 on PR #568.
+    let app_for_close = app.clone();
     window.connect_close_request(move |_| {
         let bt = std::backtrace::Backtrace::capture();
         tracing::info!(
             backtrace = ?bt,
             "main window close-request fired",
         );
+        app_for_close.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
         transcription_engine.borrow_mut().shutdown_nonblocking();
         glib::Propagation::Proceed
     });
@@ -557,6 +570,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     };
 
     connect_sidebar_panels(
+        app,
         &panels,
         &state,
         &spectrum_handle,
@@ -3091,6 +3105,7 @@ fn build_breakpoint(
 /// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_sidebar_panels(
+    app: &adw::Application,
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
@@ -3209,6 +3224,38 @@ fn connect_sidebar_panels(
             status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
         })
     };
+    // Register `app.tune-satellite` so the "Tune" button on a #510
+    // pre-pass desktop notification can route back to the same
+    // tune closure the panel's per-row play buttons use. Action
+    // target is the satellite's NORAD id (`u32`); the handler
+    // looks the entry up in `KNOWN_SATELLITES` for downlink /
+    // demod / bandwidth.
+    {
+        let tune_for_action = Rc::clone(&tune_to_satellite);
+        let action = gio::SimpleAction::new(
+            crate::notify::TUNE_SATELLITE_ACTION,
+            Some(glib::VariantTy::UINT32),
+        );
+        action.connect_activate(move |_, param| {
+            let Some(norad_id) = param.and_then(glib::Variant::get::<u32>) else {
+                tracing::warn!("tune-satellite action fired without a u32 target");
+                return;
+            };
+            let Some(known) = sdr_sat::KNOWN_SATELLITES
+                .iter()
+                .find(|s| s.norad_id == norad_id)
+            else {
+                tracing::warn!(
+                    norad_id,
+                    "tune-satellite action target not in KNOWN_SATELLITES",
+                );
+                return;
+            };
+            tune_for_action(known.downlink_hz, known.demod_mode, known.bandwidth_hz);
+        });
+        app.add_action(&action);
+    }
+
     connect_satellites_panel(
         panels,
         config,
@@ -9433,22 +9480,30 @@ fn connect_satellites_panel(
     status_bar: &Rc<StatusBar>,
 ) {
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
+    use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
         KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, SatellitesPanelWeak,
         enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh, format_pass_subtitle,
-        format_pass_title, load_auto_record_apt, load_auto_record_audio, load_station_alt_m,
-        load_station_lat_deg, load_station_lon_deg, save_auto_record_apt, save_auto_record_audio,
-        save_f64, save_tle_last_refresh, tune_target_for_pass,
+        format_pass_title, load_auto_record_apt, load_auto_record_audio, load_notify_lead_min,
+        load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
+        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio, save_f64,
+        save_tle_last_refresh, save_watched_satellites, tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
     };
 
     // One pass row + its source `Pass` so the 1 Hz ticker can
-    // refresh the title without re-running pass enumeration.
+    // refresh the title without re-running pass enumeration. The
+    // optional bell `ToggleButton` is held so the watch-toggle
+    // handler can mirror the active state across every row whose
+    // satellite matches — multiple NOAA 19 passes in the visible
+    // list must all reflect the same subscription state. `None`
+    // for off-catalog passes (no NORAD id → no notify).
     struct DisplayedPass {
         row: adw::ActionRow,
         pass: Pass,
+        bell_btn: Option<gtk4::ToggleButton>,
     }
 
     // Borrow the panel for synchronous setup, then capture only
@@ -9468,6 +9523,9 @@ fn connect_satellites_panel(
     panel.lon_row.set_value(load_station_lon_deg(config));
     panel.alt_row.set_value(load_station_alt_m(config));
     panel
+        .notify_lead_row
+        .set_value(f64::from(load_notify_lead_min(config)));
+    panel
         .auto_record_switch
         .set_active(load_auto_record_apt(config));
     panel
@@ -9476,6 +9534,20 @@ fn connect_satellites_panel(
     panel
         .last_refresh_row
         .set_subtitle(&format_last_refresh(config));
+
+    {
+        let config_lead = std::sync::Arc::clone(config);
+        panel.notify_lead_row.connect_value_notify(move |row| {
+            #[allow(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "SpinRow is bounded NOTIFY_LEAD_MIN_LOWER..=UPPER \
+                          (positive, < u32::MAX)"
+            )]
+            let value = row.value().round() as u32;
+            sidebar::satellites_panel::save_notify_lead_min(&config_lead, value);
+        });
+    }
 
     // `Option<Arc<TleCache>>`. `None` means the platform refused us
     // a cache directory (rare; sandboxed minimal environments).
@@ -9496,6 +9568,17 @@ fn connect_satellites_panel(
     };
 
     let displayed: Rc<RefCell<Vec<DisplayedPass>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // #510 — per-satellite watched-set + notify scheduler. Loaded
+    // from config so the user's selections survive restarts. The
+    // set is mutated from two sites: (a) the bell toggle on each
+    // pass row (write-through to config); (b) read-only by the
+    // 1 Hz tick that drives the scheduler.
+    let watched: Rc<RefCell<std::collections::HashSet<u32>>> =
+        Rc::new(RefCell::new(load_watched_satellites(config)));
+    let notify_scheduler: Rc<RefCell<NotifyScheduler>> =
+        Rc::new(RefCell::new(NotifyScheduler::new()));
+
     // `recompute` is built unconditionally — when the cache is
     // unavailable it's a no-op so the lat/lon/alt notify handlers
     // can call it without branching. When the cache is available
@@ -9505,6 +9588,8 @@ fn connect_satellites_panel(
         let panel_weak_recompute = panel_weak.clone();
         let displayed_recompute = Rc::clone(&displayed);
         let tune_for_recompute = Rc::clone(tune_to_satellite);
+        let watched_for_recompute = Rc::clone(&watched);
+        let config_for_recompute = std::sync::Arc::clone(config);
         Rc::new(move || {
             let Some(panel) = panel_weak_recompute.upgrade() else {
                 return;
@@ -9576,8 +9661,103 @@ fn connect_satellites_panel(
                     });
                     row.add_suffix(&play_btn);
                 }
+                // 🔔 watch-toggle (#510) — per-satellite, NOT
+                // per-pass. Toggling on row N flips the user's
+                // subscription for THIS satellite. Mirrored across
+                // sibling rows in the toggle handler so two rows
+                // of the same satellite (NOAA 19 typically has 4-6
+                // passes per day) stay in sync. `None` for
+                // off-catalog passes — no NORAD id, no
+                // notification target, no button.
+                let bell_btn = if let Some(norad_id) = norad_id_for_pass(&pass) {
+                    let initial_active = watched_for_recompute.borrow().contains(&norad_id);
+                    let bell_btn = gtk4::ToggleButton::builder()
+                        .icon_name("alarm-symbolic")
+                        .active(initial_active)
+                        .tooltip_text(format!(
+                            "Notify before {} passes (T-pre-pass alert)",
+                            pass.satellite,
+                        ))
+                        .valign(gtk4::Align::Center)
+                        .css_classes(["flat"])
+                        .build();
+                    let a11y_label = format!("Notify before {} passes", pass.satellite);
+                    bell_btn
+                        .update_property(&[gtk4::accessible::Property::Label(a11y_label.as_str())]);
+                    let watched_for_toggle = Rc::clone(&watched_for_recompute);
+                    let config_for_toggle = std::sync::Arc::clone(&config_for_recompute);
+                    // `Weak` (not strong `Rc`) breaks the cycle:
+                    // bell_btn → handler closure → Rc → Vec
+                    // <DisplayedPass> → bell_btn. With a strong ref
+                    // here, removing rows from `passes_group`
+                    // wouldn't drop the bell_btn, which would keep
+                    // the closure (and the Vec) pinned forever.
+                    let displayed_for_toggle = Rc::downgrade(&displayed_recompute);
+                    bell_btn.connect_toggled(move |b| {
+                        let active = b.is_active();
+                        {
+                            let mut set = watched_for_toggle.borrow_mut();
+                            // `HashSet::insert` / `HashSet::remove`
+                            // return whether membership actually
+                            // changed. Skip the config write when it
+                            // didn't — sibling-mirror re-enters this
+                            // handler for every other row of the
+                            // same satellite, and without the guard
+                            // every mirror would issue an identical
+                            // save_watched_satellites call. Per CR
+                            // round 3 on PR #568.
+                            let changed = if active {
+                                set.insert(norad_id)
+                            } else {
+                                set.remove(&norad_id)
+                            };
+                            if changed {
+                                save_watched_satellites(&config_for_toggle, &set);
+                            }
+                        }
+                        // Mirror across sibling rows. `set_active`
+                        // is a no-op when the state already matches,
+                        // so the recursion terminates after one
+                        // round-trip per sibling. The pointer
+                        // compare keeps us from re-entering THIS
+                        // button's own handler. If the displayed
+                        // Vec has already been dropped (window
+                        // teardown), the upgrade fails and we
+                        // simply skip mirroring — the watched-set
+                        // write above is the only persistent
+                        // effect that matters at that point.
+                        //
+                        // Match siblings by NORAD id, not display
+                        // name: the watched set is keyed by id, and
+                        // any future catalog drift where two entries
+                        // share a label (alternate names, alias
+                        // entries) would otherwise toggle the wrong
+                        // satellite's bells. Per CR round 1 on PR
+                        // #568.
+                        let Some(displayed) = displayed_for_toggle.upgrade() else {
+                            return;
+                        };
+                        for entry in displayed.borrow().iter() {
+                            if norad_id_for_pass(&entry.pass) == Some(norad_id)
+                                && let Some(other) = &entry.bell_btn
+                                && other.as_ptr() != b.as_ptr()
+                                && other.is_active() != active
+                            {
+                                other.set_active(active);
+                            }
+                        }
+                    });
+                    row.add_suffix(&bell_btn);
+                    Some(bell_btn)
+                } else {
+                    None
+                };
                 panel.passes_group.add(&row);
-                new_rows.push(DisplayedPass { row, pass });
+                new_rows.push(DisplayedPass {
+                    row,
+                    pass,
+                    bell_btn,
+                });
             }
             *displayed_recompute.borrow_mut() = new_rows;
         })
@@ -10510,6 +10690,13 @@ fn connect_satellites_panel(
         let state_tick = Rc::clone(state);
         let bandwidth_row_tick = panels.radio.bandwidth_row.clone();
         let spectrum_tick = Rc::clone(spectrum_handle);
+        // #510 — notify scheduler + watched-set + lead time. The
+        // lead time is read fresh from config on every tick so a
+        // user edit (once we expose a setting) takes effect
+        // immediately without restarting the timer.
+        let watched_tick = Rc::clone(&watched);
+        let notify_scheduler_tick = Rc::clone(&notify_scheduler);
+        let config_tick = std::sync::Arc::clone(config);
         // Scanner master switch — read for the per-tick snapshot so
         // SavedTune carries scanner state across AOS → LOS, written
         // by `interpret_action::RestoreTune` to re-arm the scanner
@@ -10602,6 +10789,38 @@ fn connect_satellites_panel(
             for action in actions {
                 interpret_tick(action);
             }
+
+            // #510 — pre-pass desktop alerts. Walk the displayed
+            // pass list, map each to (norad_id, &Pass), feed the
+            // scheduler. Pure function in / pure actions out;
+            // notification I/O happens in the action loop below.
+            let lead_min = load_notify_lead_min(&config_tick);
+            let lead = chrono::Duration::minutes(i64::from(lead_min));
+            let watched_snapshot = watched_tick.borrow().clone();
+            let notify_actions = {
+                let displayed_borrow = displayed_tick.borrow();
+                let pairs: Vec<(u32, &Pass)> = displayed_borrow
+                    .iter()
+                    .filter_map(|e| norad_id_for_pass(&e.pass).map(|id| (id, &e.pass)))
+                    .collect();
+                notify_scheduler_tick
+                    .borrow_mut()
+                    .tick(now, lead, lead_min, pairs, |id| {
+                        watched_snapshot.contains(&id)
+                    })
+            };
+            for action in notify_actions {
+                match action {
+                    NotifyAction::Fire {
+                        norad_id,
+                        pass,
+                        lead_min,
+                    } => {
+                        crate::notify::send_pass_alert(&pass, norad_id, lead_min);
+                    }
+                }
+            }
+
             if needs_recompute {
                 recompute_tick();
             }
