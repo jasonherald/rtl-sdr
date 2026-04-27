@@ -9291,9 +9291,8 @@ fn connect_satellites_panel(
                     if squelch_enabled_row_a.is_active() {
                         squelch_enabled_row_a.set_active(false);
                     }
-                    let off_idx = sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(
-                        CtcssMode::Off,
-                    );
+                    let off_idx =
+                        sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(CtcssMode::Off);
                     if ctcss_row_a.selected() != off_idx {
                         ctcss_row_a.set_selected(off_idx);
                     }
