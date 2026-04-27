@@ -3227,13 +3227,30 @@ fn connect_rtl_tcp_discovery(
     // `SetNetworkConfig` against the RTL-TCP endpoint on the very
     // first tick. Pinning TCP first keeps the restore both silent
     // to the user and correct end-to-end.
-    if let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery) {
+    // Only hydrate the shared host / port / protocol row triple
+    // with the last-connected RTL-TCP server when the persisted
+    // source type is actually RTL-TCP. If the user was last on
+    // raw Network, the values restored by `connect_source_panel`
+    // a moment earlier (KEY_SOURCE_NETWORK_*) are the right ones
+    // to keep visible — overwriting them with an unrelated
+    // RTL-TCP endpoint just because one was once connected would
+    // surprise the user on every restart. Per `CodeRabbit` round
+    // 2 on PR #558.
+    let restored_source_is_rtl_tcp =
+        sidebar::source_panel::load_source_device_index(&config_for_discovery)
+            == sidebar::source_panel::DEVICE_RTLTCP;
+    if restored_source_is_rtl_tcp
+        && let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery)
+    {
         // Same guarded-rewrite idiom as `apply_rtl_tcp_connect`:
         // hydrating the last-connected RTL-TCP server must not
         // overwrite `KEY_SOURCE_NETWORK_*` (the raw-Network
         // triple). The persistence handlers for those rows
-        // observe the flag and skip the disk-write. Per
-        // CodeRabbit round 1 on PR #558.
+        // observe the flag and skip the disk-write, AND skip
+        // the `SetNetworkConfig` dispatch so the three row
+        // mutations don't kick three intermediate reconnects
+        // against a partially-rewritten triple. Per `CodeRabbit`
+        // rounds 1 and 2 on PR #558.
         state.rtl_tcp_hydration_in_progress.set(true);
         protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
         hostname_row.set_text(&last.host);
@@ -7192,11 +7209,21 @@ fn connect_source_panel(
         } else {
             sdr_types::Protocol::TcpClient
         };
-        state_host.send_dsp(UiToDsp::SetNetworkConfig {
-            hostname,
-            port,
-            protocol,
-        });
+        // Suppress per-edit `SetNetworkConfig` dispatch while a
+        // hydration is rewriting all three rows in sequence. The
+        // sequence would otherwise cause three intermediate
+        // reconnect attempts (one per row), each against a
+        // partially-rewritten triple. `apply_rtl_tcp_connect`
+        // dispatches a single canonical `SetNetworkConfig` after
+        // clearing the flag, so the final state still reaches
+        // the DSP. Per `CodeRabbit` round 2 on PR #558.
+        if !state_host.rtl_tcp_hydration_in_progress.get() {
+            state_host.send_dsp(UiToDsp::SetNetworkConfig {
+                hostname,
+                port,
+                protocol,
+            });
+        }
     });
 
     // Network port
@@ -7227,11 +7254,16 @@ fn connect_source_panel(
         } else {
             sdr_types::Protocol::TcpClient
         };
-        state_port.send_dsp(UiToDsp::SetNetworkConfig {
-            hostname,
-            port,
-            protocol,
-        });
+        // Suppress per-edit dispatch during hydration; see
+        // hostname handler above. Per `CodeRabbit` round 2 on
+        // PR #558.
+        if !state_port.rtl_tcp_hydration_in_progress.get() {
+            state_port.send_dsp(UiToDsp::SetNetworkConfig {
+                hostname,
+                port,
+                protocol,
+            });
+        }
     });
 
     // Network protocol
@@ -7258,11 +7290,16 @@ fn connect_source_panel(
                 NETWORK_PROTOCOL_UDP_IDX => sdr_types::Protocol::Udp,
                 _ => return, // ignore transient indices
             };
-            state_proto.send_dsp(UiToDsp::SetNetworkConfig {
-                hostname,
-                port,
-                protocol,
-            });
+            // Suppress per-edit dispatch during hydration; see
+            // hostname handler above. Per `CodeRabbit` round 2 on
+            // PR #558.
+            if !state_proto.rtl_tcp_hydration_in_progress.get() {
+                state_proto.send_dsp(UiToDsp::SetNetworkConfig {
+                    hostname,
+                    port,
+                    protocol,
+                });
+            }
         });
 
     // Connection-role picker (#396). The selector flips between

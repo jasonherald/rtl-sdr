@@ -3145,7 +3145,19 @@ fn process_iq_block(
                                 state.transcription_squelch_was_open = now_open;
                             }
 
-                            if !send_error {
+                            // Skip the sample send while a squelch edge is
+                            // pending retry (i.e. we hit `TrySendError::Full`
+                            // above and chose not to advance the tracker).
+                            // Without this, if the worker drains one slot
+                            // between the failed edge `try_send` and this
+                            // sample `try_send`, audio for the new state
+                            // would arrive BEFORE the missing
+                            // `SquelchOpened` / `SquelchClosed` edge — Auto
+                            // Break would keep buffering the new utterance
+                            // into the previous segment until the edge
+                            // finally lands on the next block. Per
+                            // `CodeRabbit` round 2 on PR #558.
+                            if !send_error && advance_transcription_tracker {
                                 let mut interleaved = Vec::with_capacity(audio_count * 2);
                                 for s in &state.audio_buf[..audio_count] {
                                     interleaved.push(s.l);
