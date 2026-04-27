@@ -6747,6 +6747,7 @@ fn connect_source_panel(
     }
     let state_direct = Rc::clone(state);
     let config_direct = std::sync::Arc::clone(config);
+    let toast_overlay_direct = toast_overlay.downgrade();
     panels
         .source
         .direct_sampling_row
@@ -6765,6 +6766,23 @@ fn connect_source_panel(
             sidebar::source_panel::save_source_rtl_direct_sampling_mode(&config_direct, idx);
             #[allow(clippy::cast_possible_wrap, reason = "idx <= 2 fits in i32 trivially")]
             state_direct.send_dsp(UiToDsp::SetDirectSampling(idx as i32));
+            // Surface a tune-guidance toast: enabling direct
+            // sampling routes the antenna straight to the ADC,
+            // which silences VHF/UHF (the R820T tuner is now
+            // bypassed); disabling it puts the tuner back in
+            // path, which silences HF. Either direction needs a
+            // manual retune to be useful, and a toast saves the
+            // user from staring at noise wondering why. Per
+            // `CodeRabbit` round 1 on PR #559 / closes #538
+            // objective.
+            if let Some(overlay) = toast_overlay_direct.upgrade() {
+                let msg = if idx == sidebar::source_panel::DIRECT_SAMPLING_DISABLED_IDX {
+                    "Direct Sampling off — retune to VHF/UHF."
+                } else {
+                    "Direct Sampling on — retune to an HF frequency (< 28 MHz)."
+                };
+                overlay.add_toast(adw::Toast::new(msg));
+            }
         });
 
     // Offset tuning toggle (#539). Same restore-then-wire idiom

@@ -3172,9 +3172,18 @@ fn process_iq_block(
                                         // suppressed-count gets reported
                                         // alongside the next emitted
                                         // warning so the burst magnitude
-                                        // stays observable.
-                                        state.transcription_full_suppressed =
-                                            state.transcription_full_suppressed.saturating_add(1);
+                                        // stays observable. Note: the
+                                        // counter is incremented ONLY on
+                                        // the suppressed path — the event
+                                        // that actually triggers the warn
+                                        // is reported as the warn itself
+                                        // and is not added to
+                                        // `suppressed_in_window`. So
+                                        // `suppressed_in_window=0` means
+                                        // "the warn is firing for the
+                                        // first event in this window;
+                                        // nothing extra was hidden". Per
+                                        // `CodeRabbit` round 1 on PR #559.
                                         if state.transcription_full_warn_at.elapsed()
                                             >= TRANSCRIPTION_FULL_WARN_INTERVAL
                                         {
@@ -3187,6 +3196,10 @@ fn process_iq_block(
                                             state.transcription_full_suppressed = 0;
                                             state.transcription_full_warn_at =
                                                 std::time::Instant::now();
+                                        } else {
+                                            state.transcription_full_suppressed = state
+                                                .transcription_full_suppressed
+                                                .saturating_add(1);
                                         }
                                     }
                                 }

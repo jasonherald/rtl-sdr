@@ -660,6 +660,67 @@ fn build_common_rows() -> (
     )
 }
 
+/// Apply the per-device visibility policy to every row whose
+/// visibility depends on the selected source type. Single source
+/// of truth for the policy — both [`build_source_panel`]'s
+/// initial render block AND [`connect_device_visibility`]'s
+/// `connect_selected_notify` handler call this so they can never
+/// drift as rows evolve. Per `CodeRabbit` round 1 on PR #559.
+///
+/// Policy:
+/// - **Tune controls** (sample rate, gain, AGC, PPM): visible
+///   for local RTL-SDR USB AND remote `rtl_tcp` — both route
+///   through the `Source` trait's `set_gain` / `set_gain_mode` /
+///   `set_ppm_correction` hooks, and `RtlTcpSource` forwards
+///   them as wire commands.
+/// - **Bias tee, direct sampling, offset tuning**: visible only
+///   for local RTL-SDR USB. The `rtl_tcp` wire protocol exposes
+///   equivalents but this panel doesn't surface them today (the
+///   server-side panel has its own bias-T toggle); the `Source`
+///   trait defaults silently drop these commands on
+///   file/network sources.
+/// - **Hostname / port**: visible for raw-IQ Network AND
+///   `rtl_tcp` — both dial a host:port. **Protocol** (TCP / UDP)
+///   only applies to raw Network — `rtl_tcp` always rides on
+///   TCP.
+/// - **File path**: visible only for File source.
+#[allow(clippy::too_many_arguments)]
+fn apply_source_row_visibility(
+    selected: u32,
+    sample_rate_row: &adw::ComboRow,
+    gain_row: &adw::SpinRow,
+    agc_row: &adw::ComboRow,
+    ppm_row: &adw::SpinRow,
+    bias_tee_row: &adw::SwitchRow,
+    direct_sampling_row: &adw::ComboRow,
+    offset_tuning_row: &adw::SwitchRow,
+    hostname_row: &adw::EntryRow,
+    port_row: &adw::SpinRow,
+    protocol_row: &adw::ComboRow,
+    file_path_row: &adw::EntryRow,
+) {
+    let is_rtlsdr = selected == DEVICE_RTLSDR;
+    let is_network = selected == DEVICE_NETWORK;
+    let is_file = selected == DEVICE_FILE;
+    let is_rtltcp = selected == DEVICE_RTLTCP;
+
+    let tune_controls_visible = is_rtlsdr || is_rtltcp;
+    sample_rate_row.set_visible(tune_controls_visible);
+    gain_row.set_visible(tune_controls_visible);
+    agc_row.set_visible(tune_controls_visible);
+    ppm_row.set_visible(tune_controls_visible);
+
+    bias_tee_row.set_visible(is_rtlsdr);
+    direct_sampling_row.set_visible(is_rtlsdr);
+    offset_tuning_row.set_visible(is_rtlsdr);
+
+    hostname_row.set_visible(is_network || is_rtltcp);
+    port_row.set_visible(is_network || is_rtltcp);
+    protocol_row.set_visible(is_network);
+
+    file_path_row.set_visible(is_file);
+}
+
 /// Wire the device selector to show/hide source-specific rows.
 #[allow(clippy::too_many_arguments)]
 fn connect_device_visibility(
@@ -701,44 +762,20 @@ fn connect_device_visibility(
         file_path_row,
         move |row| {
             let selected = row.selected();
-            let is_rtlsdr = selected == DEVICE_RTLSDR;
-            let is_network = selected == DEVICE_NETWORK;
-            let is_file = selected == DEVICE_FILE;
-            let is_rtltcp = selected == DEVICE_RTLTCP;
-
-            // Tuning controls are meaningful for both the local dongle
-            // AND a remote rtl_tcp server (they route through the
-            // Source trait's set_gain / set_gain_mode / set_ppm_correction
-            // hooks, which RtlTcpSource implements by forwarding wire
-            // commands). Sample-rate row too — UiToDsp::SetSampleRate
-            // goes through Source::set_sample_rate either way.
-            let tune_controls_visible = is_rtlsdr || is_rtltcp;
-            sample_rate_row.set_visible(tune_controls_visible);
-            gain_row.set_visible(tune_controls_visible);
-            agc_row.set_visible(tune_controls_visible);
-            ppm_row.set_visible(tune_controls_visible);
-            // Bias tee is local-RTL-SDR only — see the
-            // initial-visibility block for the same gating
-            // rationale. Per issue #537.
-            bias_tee_row.set_visible(is_rtlsdr);
-            // Direct sampling + offset tuning are local-RTL-SDR-only;
-            // the rtl_tcp wire protocol exposes equivalents but
-            // we don't surface them through this panel today, and
-            // the `Source` trait's defaults silently drop the
-            // command on file/network sources. Per issues #538 /
-            // #539.
-            direct_sampling_row.set_visible(is_rtlsdr);
-            offset_tuning_row.set_visible(is_rtlsdr);
-
-            // Hostname / port entry is shared between raw-IQ Network
-            // and RTL-TCP modes. Protocol (TCP/UDP) only applies to
-            // raw Network — RTL-TCP always rides on TCP.
-            hostname_row.set_visible(is_network || is_rtltcp);
-            port_row.set_visible(is_network || is_rtltcp);
-            protocol_row.set_visible(is_network);
-
-            file_path_row.set_visible(is_file);
-
+            apply_source_row_visibility(
+                selected,
+                &sample_rate_row,
+                &gain_row,
+                &agc_row,
+                &ppm_row,
+                &bias_tee_row,
+                &direct_sampling_row,
+                &offset_tuning_row,
+                &hostname_row,
+                &port_row,
+                &protocol_row,
+                &file_path_row,
+            );
             tracing::debug!(device = selected, "source device changed");
         }
     ));
@@ -897,31 +934,32 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&rtl_tcp_auth_key_row);
     group.add(&bandwidth_advisory_row);
 
-    // Derive initial visibility from the selected device.
+    // Derive initial visibility from the selected device. Funnel
+    // through the same helper the change-notify handler uses so
+    // the policy lives in exactly one place. Per `CodeRabbit`
+    // round 1 on PR #559.
     let selected = device_row.selected();
-    let is_rtlsdr = selected == DEVICE_RTLSDR;
-    let is_network = selected == DEVICE_NETWORK;
-    let is_file = selected == DEVICE_FILE;
+    apply_source_row_visibility(
+        selected,
+        &sample_rate_row,
+        &gain_row,
+        &agc_row,
+        &ppm_row,
+        &bias_tee_row,
+        &direct_sampling_row,
+        &offset_tuning_row,
+        &hostname_row,
+        &port_row,
+        &protocol_row,
+        &file_path_row,
+    );
+    // RTL-TCP-specific rows aren't part of `apply_source_row_
+    // visibility` — they're handled by `connect_rtl_tcp_visibility`
+    // below for change-notify, but the initial render still
+    // needs to seed them. `is_rtltcp` is recomputed locally
+    // because the helper consumes `selected` and doesn't return
+    // the projection.
     let is_rtltcp = selected == DEVICE_RTLTCP;
-    let tune_controls_visible = is_rtlsdr || is_rtltcp;
-    sample_rate_row.set_visible(tune_controls_visible);
-    gain_row.set_visible(tune_controls_visible);
-    agc_row.set_visible(tune_controls_visible);
-    ppm_row.set_visible(tune_controls_visible);
-    // Bias tee is local-RTL-SDR only — the rtl_tcp wire
-    // protocol exposes a bias-T command but the rtl_tcp client
-    // doesn't currently surface it in this panel (the
-    // server-side panel has its own toggle). Keep this row
-    // hidden on RTL-TCP to match. Per issue #537.
-    bias_tee_row.set_visible(is_rtlsdr);
-    // Direct sampling and offset tuning are local-RTL-SDR-only —
-    // same gating rationale as bias tee. Per issues #538 / #539.
-    direct_sampling_row.set_visible(is_rtlsdr);
-    offset_tuning_row.set_visible(is_rtlsdr);
-    hostname_row.set_visible(is_network || is_rtltcp);
-    port_row.set_visible(is_network || is_rtltcp);
-    protocol_row.set_visible(is_network);
-    file_path_row.set_visible(is_file);
     rtl_tcp_discovered_row.set_visible(is_rtltcp);
     rtl_tcp_status_row.set_visible(is_rtltcp);
     rtl_tcp_role_row.set_visible(is_rtltcp);
