@@ -604,14 +604,24 @@ mod tests {
     }
 
     #[test]
-    fn satellite_swap_resets_user_reference_offset() {
-        // Spec §4 reset semantics: per-pass reference offset.
+    fn set_active_swap_resets_user_reference_offset_at_model_layer() {
+        // **Model-layer** behavior: `set_active` unconditionally
+        // resets `user_reference_offset_hz` on any change.
+        //
+        // Production-level behavior (spec §4 reset semantics)
+        // differs: the wiring layer in `window.rs` captures
+        // `prior_user_ref` BEFORE calling `set_active` and
+        // immediately restores it afterward on Some(A) → Some(B)
+        // swaps so the user's manual fine-tune offset survives.
+        // The model's reset behavior is what the wiring layer
+        // compensates against. Per CR round 5 on PR #554.
         let mut t = DopplerTracker::new(true);
         let _ = t.set_active(Some(noaa_15()));
         t.set_user_reference_offset_hz(500.0);
         assert!((t.user_reference_offset_hz() - 500.0).abs() < f64::EPSILON);
 
-        // Swap to a different satellite — offset resets.
+        // Swap to a different satellite — offset resets at model
+        // layer (wiring-layer restoration is tested via smoke).
         let _ = t.set_active(Some(noaa_18()));
         assert!((t.user_reference_offset_hz() - 0.0).abs() < f64::EPSILON);
     }

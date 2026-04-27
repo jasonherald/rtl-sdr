@@ -971,7 +971,7 @@ impl DopplerTracker {
     }
 
     /// Update the additive user reference offset. Called when
-    /// the user manually drags the VFO offset slider. Per #4.
+    /// the user manually drags the VFO offset slider. Per spec §4.
     pub fn set_user_reference_offset_hz(&mut self, hz: f64) {
         self.user_reference_offset_hz = hz;
     }
@@ -1180,12 +1180,30 @@ Create a new function near `connect_satellites_panel`:
 /// tick, status-bar update, SetVfoOffset dispatch. Per #521 and
 /// the design spec at
 /// `docs/superpowers/specs/2026-04-26-doppler-correction-design.md`.
+/// Restore the persisted Doppler master-switch state to the
+/// widget and wire change-notify to save back. Always called
+/// (regardless of TLE-cache availability) so the user's
+/// preference survives a launch where the cache happens to be
+/// unavailable. Behavior wiring (timers + tracker) lives in
+/// [`connect_doppler_tracker`] and is gated separately.
+fn restore_doppler_switch(
+    panels: &Panels,
+    config: &Arc<ConfigManager>,
+) {
+    let persisted = sidebar::satellites_panel::load_doppler_tracking_enabled(config);
+    panels.satellites.doppler_switch.set_active(persisted);
+    let config = Arc::clone(config);
+    panels.satellites.doppler_switch.connect_active_notify(move |row| {
+        sidebar::satellites_panel::save_doppler_tracking_enabled(&config, row.is_active());
+    });
+}
+
 fn connect_doppler_tracker(
     panels: &Panels,
     state: &Rc<AppState>,
-    config: &Arc<ConfigManager>,
     cache: &Arc<TleCache>,
     status_bar: &Rc<StatusBar>,
+    spectrum: &Rc<spectrum::SpectrumHandle>,
 ) {
     use crate::doppler_tracker::{
         Candidate, DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz,
@@ -1193,14 +1211,14 @@ fn connect_doppler_tracker(
     };
     use sdr_sat::{GroundStation, Satellite, KNOWN_SATELLITES, track};
 
-    // Restore the persisted master-switch value BEFORE wiring the
-    // notify handler — same idiom as bias-T / gain / PPM. Otherwise
-    // the programmatic `set_active` fires the notify handler and
-    // re-saves the just-loaded value redundantly.
-    let persisted = sidebar::satellites_panel::load_doppler_tracking_enabled(config);
-    panels.satellites.doppler_switch.set_active(persisted);
-
-    let tracker = Rc::new(RefCell::new(DopplerTracker::new(persisted)));
+    // The widget was already restored (and persistence wired) by
+    // `restore_doppler_switch`; read its current state to seed
+    // the tracker. Multiple `connect_active_notify` handlers on
+    // the same widget fire independently in GTK, so the
+    // persistence handler from `restore_doppler_switch` and the
+    // tracker-driving handler below coexist cleanly.
+    let initial = panels.satellites.doppler_switch.is_active();
+    let tracker = Rc::new(RefCell::new(DopplerTracker::new(initial)));
 
     // Shared dispatch baseline: read by the 4 Hz recompute tick
     // for its rate-limit gate; written by every path that
@@ -1393,7 +1411,10 @@ fn connect_doppler_tracker(
 Find the body of `connect_satellites_panel`. At a sensible place (near where the auto-record handlers are wired), add:
 
 ```rust
-    connect_doppler_tracker(panels, state, config, &cache, status_bar);
+    restore_doppler_switch(panels, config);
+    if let Some(cache_doppler) = cache.as_ref() {
+        connect_doppler_tracker(panels, state, cache_doppler, status_bar, spectrum_handle);
+    }
 ```
 
 (The exact arguments depend on what's in scope at that point in `connect_satellites_panel`. Use `Rc::clone` / `Arc::clone` as needed.)

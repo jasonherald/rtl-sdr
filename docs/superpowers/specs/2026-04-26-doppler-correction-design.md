@@ -74,7 +74,13 @@ So (once wired):
 - A manual drag does NOT disable Doppler ("respectful of agency" but creates the "wait, why is Doppler off?" surprise — rejected).
 - A manual drag is NOT overwritten on the next tick ("Doppler wins" — feels paternalistic, fights the user — rejected).
 
-**Reset semantics:** `user_reference_offset` resets to 0 when the active satellite changes (new pass, different satellite, or trigger conditions go false), AND when the master switch is toggled off. It does NOT persist across passes — Doppler tracking is per-pass, and so is any user fine-tune on top of it.
+**Reset semantics:**
+
+- **Fresh engagement** (None → Some at AOS): `user_reference_offset` is **seeded** from the live spectrum VFO offset so this pass's Doppler tracks ON TOP of whatever offset the user had set before AOS.
+- **Satellite swap** (Some(A) → Some(B), e.g. NOAA 19 dropping below NOAA 18 in elevation mid-pass): `user_reference_offset` is **preserved** across the swap. The user's fine-tune offset belongs to the user, not to a specific satellite — losing it on a swap would be hostile UX. (Per CR round 5 on PR #554 — the original spec text said "resets to 0 on satellite change" but that was wrong.)
+- **Disengagement** (Some → None at LOS, master off, or retune away): the pre-disengage `user_reference_offset` is captured and dispatched as one final `SetVfoOffset(captured)` so the VFO returns to the user's pre-tracking baseline. After the dispatch, `user_reference_offset` returns to 0.
+
+Note: `user_reference_offset` itself is per-tracking-session, NOT persisted to disk. A fresh app launch starts at 0 and is seeded on the next AOS.
 
 ## 5. Range-rate / Doppler calculation — wraps existing `sdr-sat` API
 
@@ -179,7 +185,7 @@ The label updates on every 4 Hz tick along with the offset dispatch, so user see
 | User changes `KNOWN_SATELLITES` order at runtime | Can't happen — catalog is `&'static`. |
 | User toggles master switch off mid-pass | Re-evaluate fires, trigger goes false, dispatch `SetVfoOffset(user_reference_offset)`, tracker dormant. |
 | User toggles master switch on mid-pass while tuned to a satellite | Re-evaluate fires, trigger goes true, engage. |
-| User retunes to a *different* satellite mid-pass | Re-evaluate fires, sees new active satellite, swaps. `user_reference_offset` resets to 0 (per §4 reset semantics). |
+| User retunes to a *different* satellite mid-pass | Re-evaluate fires, sees new active satellite, swaps. `user_reference_offset` is preserved across the swap (per §4 reset semantics) so the user's manual fine-tune survives. |
 | Satellite drops below horizon while still tuned to its frequency | Re-evaluate fires, trigger goes false (elevation ≤ 0), dispatch final `SetVfoOffset(user_reference_offset)`, tracker dormant. |
 
 ## 9. Test plan

@@ -9880,7 +9880,19 @@ fn connect_doppler_tracker(
             let changed = t.set_active(new_active);
             if changed {
                 if new_active.is_some() {
-                    if !prior_active_some {
+                    if prior_active_some {
+                        // Some(A) → Some(B) satellite swap. The
+                        // user's manual fine-tune offset belongs
+                        // to the user, not to a specific pass —
+                        // restore the pre-swap `user_reference`
+                        // (which `set_active` just reset to 0)
+                        // so the new pass continues to track ON
+                        // TOP of it. Per CR round 5 on PR #554:
+                        // round-4's "leave user_ref at 0 on
+                        // swap" was wrong — losing the user's
+                        // offset on a swap is hostile UX.
+                        t.set_user_reference_offset_hz(prior_user_ref);
+                    } else {
                         // Fresh engagement (None → Some) — seed
                         // `user_reference_offset_hz` from the
                         // current spectrum VFO offset so this
@@ -9892,10 +9904,6 @@ fn connect_doppler_tracker(
                     }
                     // No dispatch here — the next 4 Hz tick will
                     // dispatch `live = user_reference + doppler`.
-                    // For swaps, `set_active` already reset
-                    // `user_reference_offset_hz` to 0 per spec
-                    // §4 reset semantics; the new pass's live
-                    // offset will be just `doppler` (correct).
                 } else {
                     // Disengaged — flush the live offset back to
                     // the pre-engage user reference (captured
@@ -9928,10 +9936,32 @@ fn connect_doppler_tracker(
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            let t = tracker.borrow();
-            let Some(sat) = t.active() else {
+            let active_sat = tracker.borrow().active();
+            let Some(sat) = active_sat else {
                 return glib::ControlFlow::Continue;
             };
+            // Has the user retuned away from the active satellite?
+            // If so, disengage NOW rather than wait up to 1 s for
+            // the trigger tick — otherwise stale Doppler keeps
+            // dispatching against the new center frequency for up
+            // to a full second. Per CR round 5 on PR #554.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "catalog downlinks sit in the 100s of MHz, well \
+                          below f64's 2^53 mantissa ceiling"
+            )]
+            let downlink = sat.downlink_hz as f64;
+            let current_freq = state.center_frequency.get();
+            if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
+                let mut t = tracker.borrow_mut();
+                let prior_user_ref = t.user_reference_offset_hz();
+                let _ = t.set_active(None);
+                drop(t);
+                state.send_dsp(UiToDsp::SetVfoOffset(prior_user_ref));
+                last_dispatched.set(prior_user_ref);
+                status_bar.update_doppler(None);
+                return glib::ControlFlow::Continue;
+            }
             let station = GroundStation::new(
                 panel.lat_row.value(),
                 panel.lon_row.value(),
@@ -9961,7 +9991,7 @@ fn connect_doppler_tracker(
                 );
                 return glib::ControlFlow::Continue;
             };
-            let live = t.live_offset_hz(doppler);
+            let live = tracker.borrow().live_offset_hz(doppler);
             // Status bar updates every tick — the kHz/0.1
             // format hides sub-100-Hz jitter naturally.
             status_bar.update_doppler(Some(doppler));
