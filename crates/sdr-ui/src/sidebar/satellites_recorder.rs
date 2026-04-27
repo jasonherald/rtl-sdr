@@ -173,7 +173,8 @@ pub enum State {
 /// user to whatever they had configured" intent.
 ///
 /// The audio-chain snapshot fields (`squelch_enabled`,
-/// `squelch_db`, `ctcss_mode`, `fm_if_nr_enabled`) capture
+/// `auto_squelch_enabled`, `squelch_db`, `ctcss_mode`,
+/// `fm_if_nr_enabled`) capture
 /// the user's pre-AOS state for IF/AF settings that must be
 /// **force-disabled during a satellite pass** because they're
 /// destructive to data-bearing FM modulation:
@@ -1031,7 +1032,10 @@ mod tests {
         // Per CR round 1 on PR #557.
         const SAVED_FREQ_HZ: f64 = 89_700_000.0;
         const SAVED_VFO_OFFSET_HZ: f64 = 25_000.0;
-        const SAVED_BANDWIDTH_HZ: u32 = 200_000;
+        // Distinct from `default_tune()`'s 200_000 so a
+        // regression that resets bandwidth to the fixture
+        // default fails loudly. Per CR round 3 on PR #557.
+        const SAVED_BANDWIDTH_HZ: u32 = 180_000;
         const SAVED_SQUELCH_DB: f32 = -42.5;
         const SAVED_CTCSS_TONE_HZ: f32 = 100.0;
 
