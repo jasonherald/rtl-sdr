@@ -97,6 +97,27 @@ pub struct AppState {
     /// moving the stored value out, which interferes with the
     /// borrow-and-clone pattern the button handler uses.
     pub scanner_active_key: RefCell<Option<sdr_scanner::ChannelKey>>,
+    /// Channel hop buffered for lazy emission of a transcript
+    /// channel-marker (#517). Written by the
+    /// `DspToUi::ScannerActiveChannelChanged` handler when the
+    /// scanner switches to a non-idle channel; consumed by the
+    /// `TranscriptionEvent::Text` handler when the next
+    /// transcribed text arrives. The lazy approach skips marker
+    /// emission entirely when (a) transcription is OFF (no
+    /// `TranscriptionEvent::Text` ever fires, so the buffered
+    /// hop stays unconsumed), and (b) the scanner hops past a
+    /// channel without producing any audio (the next channel
+    /// overwrites the buffered hop before it's consumed).
+    /// Squashes runs of empty-channel hops to a single marker
+    /// at the next channel that actually produces text.
+    ///
+    /// Stored as `(switched_at, channel_name)` so the marker
+    /// renders the actual hop time rather than render time —
+    /// otherwise a busy transcription backend with seconds of
+    /// buffered audio would stamp markers with a clock that
+    /// drifts past the real channel switch. Per `CodeRabbit`
+    /// round 1 on PR #558.
+    pub pending_channel_marker: RefCell<Option<(chrono::DateTime<chrono::Local>, String)>>,
     /// Previous `rtl_tcp` connection state discriminant, used to
     /// detect edge transitions into terminal role-denial states
     /// (`ControllerBusy`, `AuthRequired`, `AuthFailed`). The toast
@@ -114,6 +135,19 @@ pub struct AppState {
     /// per-server keyring entry. Empty string when no server is
     /// selected. Per issue #396.
     pub rtl_tcp_active_server: RefCell<String>,
+    /// `true` while `apply_rtl_tcp_connect` (or the matching
+    /// startup hydration in `connect_rtl_tcp_discovery`) is
+    /// programmatically rewriting the shared
+    /// `hostname_row` / `port_row` / `protocol_row` triple to
+    /// point at an RTL-TCP server. The change-notify handlers
+    /// for those rows always dispatch `SetNetworkConfig` (so the
+    /// running session re-points), but they MUST NOT persist the
+    /// values to `KEY_SOURCE_NETWORK_*` while this flag is set —
+    /// the user's independent raw-network selection lives in
+    /// those keys and would otherwise be silently overwritten by
+    /// every RTL-TCP hydration. Per `CodeRabbit` round 1 on PR
+    /// #558.
+    pub rtl_tcp_hydration_in_progress: std::cell::Cell<bool>,
     /// Currently-open NOAA APT viewer window, or `None` when no
     /// viewer is open. Set by the viewer's open path (the
     /// activity-bar / shortcut handler) and cleared by its
@@ -176,12 +210,14 @@ impl AppState {
             suppress_bandwidth_notify: Cell::new(false),
             suppress_demod_notify: Cell::new(false),
             scanner_active_key: RefCell::new(None),
+            pending_channel_marker: RefCell::new(None),
             // Initialize to `RTL_TCP_STATE_DISC_DISCONNECTED` — same
             // as the connection manager's initial state so the first
             // real transition into ControllerBusy / AuthRequired /
             // AuthFailed is correctly detected as an edge.
             last_rtl_tcp_state_disc: Cell::new(RTL_TCP_STATE_DISC_DISCONNECTED),
             rtl_tcp_active_server: RefCell::new(String::new()),
+            rtl_tcp_hydration_in_progress: std::cell::Cell::new(false),
             apt_viewer: RefCell::new(None),
             apt_viewer_window: RefCell::new(None),
             lrpt_viewer: RefCell::new(None),
