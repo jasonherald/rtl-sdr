@@ -27,6 +27,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use sdr_sat::Pass;
+use sdr_radio::af_chain::CtcssMode;
 use sdr_types::DemodMode;
 
 use crate::sidebar::satellites_panel::tune_target_for_pass;
@@ -170,6 +171,35 @@ pub enum State {
 /// here, an active pre-AOS scan session would be left off
 /// after the pass ends. Mirrors `was_running`'s "return the
 /// user to whatever they had configured" intent.
+///
+/// The audio-chain snapshot fields (`squelch_enabled`,
+/// `squelch_db`, `ctcss_mode`, `fm_if_nr_enabled`) capture
+/// the user's pre-AOS state for IF/AF settings that must be
+/// **force-disabled during a satellite pass** because they're
+/// destructive to data-bearing FM modulation:
+///
+/// - **Squelch / CTCSS** (#555): gate audio when SNR / tone
+///   thresholds aren't met. APT image quality depends on
+///   getting EVERY scan line; gating low-SNR rows to silence
+///   produces black-streaked or fully-black PNGs.
+/// - **FM IF NR** (#556): frequency-domain peak-bin filter
+///   that zeros all FFT bins except the dominant one. Kills
+///   the FM sidebands where the APT 2.4 kHz subcarrier and
+///   ISS SSTV tone modulation live.
+///
+/// Wiring layer flips the corresponding widgets to disabled
+/// at AOS (firing the existing change-notify dispatch chain)
+/// and back to the saved values at LOS. User-visible — same
+/// pattern as `scanner_running`.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "snapshot of tune + audio-chain state for the auto-record AOS→LOS \
+              round trip — the bool fields each correspond to a distinct user \
+              widget that has to be restored after the pass; collapsing them \
+              into a sub-struct (e.g. `SavedAudioChain`) would obscure the \
+              one-field-per-restored-widget mapping that makes the wiring \
+              layer's restore loop trivially auditable"
+)]
 #[derive(Debug, Clone, Copy)]
 pub struct SavedTune {
     pub freq_hz: f64,
@@ -178,6 +208,21 @@ pub struct SavedTune {
     pub bandwidth_hz: u32,
     pub was_running: bool,
     pub scanner_running: bool,
+    /// Pre-AOS squelch master-switch state. Forced OFF at AOS,
+    /// restored at LOS. Per #555.
+    pub squelch_enabled: bool,
+    /// Pre-AOS squelch threshold (dBFS). Restored verbatim at
+    /// LOS — leaving it untouched during the pass would be
+    /// fine on its own (squelch is disabled), but persisting
+    /// the user's preferred level avoids a silent reset on a
+    /// "force-disable + force-defaults" approach.
+    pub squelch_db: f32,
+    /// Pre-AOS CTCSS mode (Off / Tone(hz)). Forced to Off at
+    /// AOS, restored at LOS. Per #555.
+    pub ctcss_mode: CtcssMode,
+    /// Pre-AOS FM IF NR toggle. Forced OFF at AOS, restored at
+    /// LOS. Per #556.
+    pub fm_if_nr_enabled: bool,
 }
 
 /// Side effects the wiring layer must perform on each transition.
@@ -750,6 +795,10 @@ mod tests {
             bandwidth_hz: 200_000,
             was_running: true,
             scanner_running: false,
+            squelch_enabled: false,
+            squelch_db: -50.0,
+            ctcss_mode: CtcssMode::Off,
+            fm_if_nr_enabled: false,
         }
     }
 
@@ -977,6 +1026,11 @@ mod tests {
             bandwidth_hz: 200_000,
             was_running: false,
             scanner_running: true, // pin: pre-AOS scan must come back at LOS
+            // pin: pre-AOS audio-chain settings must come back at LOS
+            squelch_enabled: true,
+            squelch_db: -42.5,
+            ctcss_mode: CtcssMode::Tone(100.0),
+            fm_if_nr_enabled: true,
         };
         // Walk all transitions.
         r.tick(now, std::slice::from_ref(&pass), true, false, saved);
@@ -1015,6 +1069,13 @@ mod tests {
                 assert_eq!(t.bandwidth_hz, 200_000);
                 assert!(!t.was_running);
                 assert!(t.scanner_running);
+                // Audio-chain pre-AOS state survives round-trip
+                // (#555 / #556): squelch enable + level, CTCSS
+                // mode, and FM IF NR all come back.
+                assert!(t.squelch_enabled);
+                assert!((t.squelch_db - (-42.5)).abs() < f32::EPSILON);
+                assert!(matches!(t.ctcss_mode, CtcssMode::Tone(hz) if (hz - 100.0).abs() < f32::EPSILON));
+                assert!(t.fm_if_nr_enabled);
             }
             other => panic!("expected RestoreTune, got {other:?}"),
         }

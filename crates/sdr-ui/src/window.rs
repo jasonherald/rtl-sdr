@@ -9234,6 +9234,13 @@ fn connect_satellites_panel(
         // re-arms the engine — same path the user takes when they
         // flip the switch by hand.
         let scanner_switch_a = panels.scanner.master_switch.clone();
+        // Audio-chain widgets — force-disabled at AOS, restored at
+        // LOS via the same `set_*` notify chain that any user flip
+        // takes. Per #555 (squelch + CTCSS) and #556 (FM IF NR).
+        let squelch_enabled_row_a = panels.radio.squelch_enabled_row.clone();
+        let squelch_level_row_a = panels.radio.squelch_level_row.clone();
+        let ctcss_row_a = panels.radio.ctcss_row.clone();
+        let fm_if_nr_row_a = panels.radio.fm_if_nr_row.clone();
         let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
             if let Some(overlay) = overlay_weak.upgrade() {
                 overlay.add_toast(adw::Toast::new(msg));
@@ -9264,6 +9271,32 @@ fn connect_satellites_panel(
                 // the LRPT viewer, the user's tune state must
                 // NOT be hijacked just to land in a no-op
                 // branch.
+                // Audio-chain force-off helper. Flips the three
+                // user-visible widgets to disabled; each one's
+                // `connect_*_notify` handler then dispatches the
+                // corresponding `UiToDsp::Set*` message — same
+                // path a manual flip takes. Per #555 (squelch +
+                // CTCSS) / #556 (FM IF NR). Idempotent: a
+                // `set_active(false)` on an already-false switch
+                // is a no-op (no notify fired, no redundant
+                // dispatch).
+                //
+                // Called inside each protocol arm rather than
+                // before the match so an unsupported protocol
+                // doesn't hijack the user's audio chain (mirrors
+                // the AOS side-effect-isolation rule from CR
+                // round 1 on PR #541).
+                let force_audio_chain_off = || {
+                    if squelch_enabled_row_a.is_active() {
+                        squelch_enabled_row_a.set_active(false);
+                    }
+                    if ctcss_row_a.selected() != 0 {
+                        ctcss_row_a.set_selected(0);
+                    }
+                    if fm_if_nr_row_a.is_active() {
+                        fm_if_nr_row_a.set_active(false);
+                    }
+                };
                 match protocol {
                     sdr_sat::ImagingProtocol::Apt => {
                         // Drive Start through the header play
@@ -9281,6 +9314,7 @@ fn connect_satellites_panel(
                         // the corresponding LOS-side stop.
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
+                        force_audio_chain_off();
                         // Zero the live VFO offset for the
                         // auto-record pass. The user's pre-AOS
                         // offset (a manual VFO drag away from
@@ -9348,6 +9382,7 @@ fn connect_satellites_panel(
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
                         state_a.dispatch_vfo_offset(0.0);
+                        force_audio_chain_off();
                     }
                 }
             }
@@ -9650,6 +9685,31 @@ fn connect_satellites_panel(
                     tracing::info!("auto-record: re-arming scanner (was running pre-AOS)");
                     scanner_switch_a.set_active(true);
                 }
+                // Restore the pre-AOS audio-chain settings via the
+                // same `set_*`-fires-notify pattern. Per #555 / #556.
+                // Squelch level is restored unconditionally
+                // (cheap, idempotent on equal value); the toggles
+                // are guarded against no-op writes for cleaner
+                // tracing logs.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "saved.squelch_db came from the same SpinRow we're \
+                              feeding back into; round-trip preserves precision \
+                              well within the row's range"
+                )]
+                let squelch_db_f64 = f64::from(saved.squelch_db);
+                squelch_level_row_a.set_value(squelch_db_f64);
+                if saved.squelch_enabled != squelch_enabled_row_a.is_active() {
+                    squelch_enabled_row_a.set_active(saved.squelch_enabled);
+                }
+                let saved_ctcss_idx =
+                    sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(saved.ctcss_mode);
+                if ctcss_row_a.selected() != saved_ctcss_idx {
+                    ctcss_row_a.set_selected(saved_ctcss_idx);
+                }
+                if saved.fm_if_nr_enabled != fm_if_nr_row_a.is_active() {
+                    fm_if_nr_row_a.set_active(saved.fm_if_nr_enabled);
+                }
             }
             RecorderAction::Toast { message, kind } => {
                 if matches!(kind, ToastKind::Warn) {
@@ -9680,6 +9740,15 @@ fn connect_satellites_panel(
         // when the panel is dropped the tick's `panel_weak.upgrade`
         // returns None and we Break, dropping the chain.
         let scanner_switch_tick = panels.scanner.master_switch.clone();
+        // Audio-chain widgets snapshotted into SavedTune so the
+        // pre-AOS state can be restored at LOS. AOS force-disables
+        // these because they're destructive to data-bearing FM
+        // signals (squelch / CTCSS gate audio; FM IF NR zeros the
+        // sidebands the APT subcarrier lives in). Per #555 / #556.
+        let squelch_enabled_row_tick = panels.radio.squelch_enabled_row.clone();
+        let squelch_level_row_tick = panels.radio.squelch_level_row.clone();
+        let ctcss_row_tick = panels.radio.ctcss_row.clone();
+        let fm_if_nr_row_tick = panels.radio.fm_if_nr_row.clone();
         let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
             let Some(panel) = panel_weak_tick.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -9723,6 +9792,12 @@ fn connect_satellites_panel(
                           width; the SpinRow's own min is positive"
             )]
             let bandwidth_hz_u32 = bandwidth_row_tick.value().round() as u32;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "squelch SpinRow value is in dBFS, bounded by the row's \
+                          configured min/max (well within f32 range)"
+            )]
+            let squelch_db_f32 = squelch_level_row_tick.value() as f32;
             let now_tune = SavedTune {
                 freq_hz: state_tick.center_frequency.get(),
                 vfo_offset_hz: spectrum_tick.vfo_offset_hz(),
@@ -9730,6 +9805,12 @@ fn connect_satellites_panel(
                 bandwidth_hz: bandwidth_hz_u32,
                 was_running: state_tick.is_running.get(),
                 scanner_running: scanner_switch_tick.is_active(),
+                squelch_enabled: squelch_enabled_row_tick.is_active(),
+                squelch_db: squelch_db_f32,
+                ctcss_mode: sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
+                    ctcss_row_tick.selected(),
+                ),
+                fm_if_nr_enabled: fm_if_nr_row_tick.is_active(),
             };
             let actions = recorder_tick.borrow_mut().tick(
                 now,
