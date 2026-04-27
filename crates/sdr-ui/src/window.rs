@@ -916,6 +916,38 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
 /// engine sending a separate `ActiveChannelChanged { key: None }`
 /// event in the same tick — which it does today, but relying on
 /// that ordering across four sites was brittle.
+/// Recompute the scanner X-axis envelope from the live
+/// bookmark list and refresh the spectrum's lock + Display
+/// panel status row. Called from both the scanner master-
+/// switch handler (when the user flips it on) AND the bookmark
+/// mutation callback (when the user toggles `scan_enabled` /
+/// deletes / adds a bookmark mid-scan, which can shift the
+/// envelope without the master switch moving). Without the
+/// second call site, scan-list edits silently let the lock
+/// stay pinned to a stale range until the user flips the
+/// master switch off-and-on. Per #516 smoke feedback.
+fn refresh_scanner_axis_lock(
+    bookmarks: &[sidebar::navigation_panel::Bookmark],
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    spectrum_handle: &spectrum::SpectrumHandle,
+    status_row: &adw::ActionRow,
+) {
+    let default_dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
+    let default_hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
+    let channels = sidebar::navigation_panel::project_scanner_channels(
+        bookmarks,
+        default_dwell_ms,
+        default_hang_ms,
+    );
+    if let Some((min_hz, max_hz)) = sidebar::navigation_panel::scanner_channel_envelope(&channels) {
+        spectrum_handle.enter_scanner_mode(min_hz, max_hz);
+        update_scanner_axis_status_row(status_row, Some((min_hz, max_hz)));
+    } else {
+        spectrum_handle.exit_scanner_mode();
+        update_scanner_axis_status_row(status_row, None);
+    }
+}
+
 /// Sync the Display panel's read-only "Scanner axis" status row
 /// to match the current scanner-axis-lock state. Called from
 /// every site that engages / disengages the lock — the master
@@ -2867,7 +2899,7 @@ fn build_breakpoint(
 }
 
 /// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_sidebar_panels(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -3028,6 +3060,9 @@ fn connect_sidebar_panels(
     let bookmarks_weak = Rc::downgrade(&panels.bookmarks);
     let state_for_mutated = Rc::clone(state);
     let config_for_mutated = std::sync::Arc::clone(config);
+    let scanner_switch_for_mutated = panels.scanner.master_switch.clone();
+    let spectrum_for_mutated = Rc::clone(spectrum_handle);
+    let display_axis_row_for_mutated = panels.display.scanner_axis_row.clone();
     panels.bookmarks.connect_mutated(move || {
         let Some(bookmarks) = bookmarks_weak.upgrade() else {
             return;
@@ -3037,6 +3072,20 @@ fn connect_sidebar_panels(
             &state_for_mutated,
             &config_for_mutated,
         );
+        // Mid-scan scan-flag toggle / add / delete: recompute
+        // the X-axis envelope while the lock is engaged so the
+        // axis tracks the new range without requiring a master-
+        // switch off-and-on. No-op when the scanner isn't on
+        // — the lock is already disengaged. Per issue #516
+        // smoke feedback.
+        if scanner_switch_for_mutated.is_active() {
+            refresh_scanner_axis_lock(
+                &bookmarks.bookmarks.borrow(),
+                &config_for_mutated,
+                &spectrum_for_mutated,
+                &display_axis_row_for_mutated,
+            );
+        }
     });
 }
 
@@ -9047,33 +9096,18 @@ fn connect_scanner_panel(
         let enabled = sw.is_active();
         state_switch.send_dsp(UiToDsp::SetScannerEnabled(enabled));
         if enabled {
-            // Project the live bookmark list through the
-            // shared scanner-channel projector so the envelope
-            // tracks the same default-dwell/hang resolution
-            // the engine sees.
-            let default_dwell_ms =
-                sidebar::scanner_panel::load_default_dwell_ms(&config_for_switch);
-            let default_hang_ms = sidebar::scanner_panel::load_default_hang_ms(&config_for_switch);
-            let channels = sidebar::navigation_panel::project_scanner_channels(
+            // Compute envelope from the LIVE bookmark list so
+            // mid-scan scan-flag toggles + adds/deletes pick up
+            // on the next master-switch flip. The same helper
+            // also fires from the bookmark mutation callback to
+            // refresh while the scanner is already running. Per
+            // issue #516.
+            refresh_scanner_axis_lock(
                 &bookmarks_for_switch.bookmarks.borrow(),
-                default_dwell_ms,
-                default_hang_ms,
+                &config_for_switch,
+                &spectrum_for_switch,
+                &display_axis_row,
             );
-            if let Some((min_hz, max_hz)) =
-                sidebar::navigation_panel::scanner_channel_envelope(&channels)
-            {
-                spectrum_for_switch.enter_scanner_mode(min_hz, max_hz);
-                update_scanner_axis_status_row(&display_axis_row, Some((min_hz, max_hz)));
-            } else {
-                // No scan-enabled channels — leave the lock
-                // disengaged. Status row stays hidden so the
-                // user gets the standard "scanner is off"
-                // appearance. The engine itself will handle
-                // the empty channel set via its existing
-                // empty-rotation path.
-                spectrum_for_switch.exit_scanner_mode();
-                update_scanner_axis_status_row(&display_axis_row, None);
-            }
         } else {
             spectrum_for_switch.exit_scanner_mode();
             update_scanner_axis_status_row(&display_axis_row, None);
