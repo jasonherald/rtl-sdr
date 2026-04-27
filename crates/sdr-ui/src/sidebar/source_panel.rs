@@ -82,8 +82,11 @@ pub const KEY_SOURCE_RTL_PPM: &str = "src_rtl_ppm";
 pub const KEY_SOURCE_RTL_DIRECT_SAMPLING_MODE: &str = "src_rtl_direct_sampling";
 
 /// Config key for persisted RTL-SDR offset-tuning toggle.
-/// Default `false` — most users have R820T-family dongles
-/// where the setting is a no-op anyway. Per issue #539.
+/// Default `false` — support varies by tuner/driver (E4000
+/// honors it; R820T/R828D reject with `InvalidParameter`; the
+/// driver also rejects while direct sampling is enabled), so
+/// the default keeps tuning behavior predictable across
+/// hardware variants. Per issue #539.
 pub const KEY_SOURCE_RTL_OFFSET_TUNING: &str = "src_rtl_offset_tuning";
 
 /// Direct-sampling combo indices. Order is load-bearing —
@@ -362,10 +365,14 @@ pub struct SourcePanel {
     /// issue #538.
     pub direct_sampling_row: adw::ComboRow,
     /// RTL-SDR offset-tuning toggle. Pushes the LO away from
-    /// the tuned frequency to dodge the DC spike. Mostly
-    /// relevant on E4000 tuners; on R820T / R820T2 the driver
-    /// returns Ok but the operation is a no-op in hardware.
-    /// Same visibility gate as the rest of the RTL-SDR-specific
+    /// the tuned frequency to dodge the DC spike. Most relevant
+    /// on E4000 tuners; support varies by tuner and driver, and
+    /// unsupported hardware (R820T / R828D) rejects the request
+    /// with `InvalidParameter`. The change-notify handler in
+    /// `connect_source_panel` surfaces driver rejections as a
+    /// `TuneFailed` toast so the user gets a clear "your tuner
+    /// doesn't support this" rather than a silent no-op. Same
+    /// visibility gate as the rest of the RTL-SDR-specific
     /// rows. Per issue #539.
     pub offset_tuning_row: adw::SwitchRow,
     /// Network hostname entry.
@@ -584,12 +591,15 @@ fn build_rtlsdr_rows() -> (
 
     // Offset tuning — pushes the LO away from the requested
     // centre frequency to dodge the DC spike that lives at the
-    // LO position. Most relevant on E4000 tuners; effectively a
-    // no-op on R820T/R820T2 (the driver returns Ok but the
-    // hardware doesn't shift). Off by default. Per issue #539.
+    // LO position. Most relevant on E4000 tuners; support
+    // varies by tuner and driver. R820T/R828D reject the
+    // request with `InvalidParameter` (surfaced as a
+    // `TuneFailed` toast by the wiring in `window.rs`). Off by
+    // default to keep behavior predictable across hardware. Per
+    // issue #539.
     let offset_tuning_row = adw::SwitchRow::builder()
         .title("Offset Tuning")
-        .subtitle("Shift LO off the tuned freq to avoid the DC spike (E4000 only)")
+        .subtitle("Shift LO off the tuned freq to avoid the DC spike")
         .active(false)
         .build();
 
