@@ -3828,13 +3828,18 @@ fn apply_rtl_tcp_connect(
     };
 
     let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
-    // Guard the programmatic row rewrites so the persistence
-    // handlers don't clobber `KEY_SOURCE_NETWORK_*` (which
-    // belong to the user's independent raw-Network selection)
-    // with the RTL-TCP endpoint. The handlers still dispatch
-    // `SetNetworkConfig` so the running session re-points; only
-    // the disk-write is skipped. Per CodeRabbit round 1 on PR
-    // #558.
+    // Guard the programmatic row rewrites so the per-field
+    // handlers don't clobber `KEY_SOURCE_NETWORK_*` (which belong
+    // to the user's independent raw-Network selection) with the
+    // RTL-TCP endpoint. While the hydration flag is set, the
+    // handlers suppress BOTH the persistence write AND the
+    // per-edit `SetNetworkConfig` dispatch — three sequential row
+    // mutations otherwise fan out to three intermediate
+    // reconnects against a partially-rewritten triple. A single
+    // canonical `SetNetworkConfig` is dispatched further down
+    // (after the flag clears) so the DSP gets the fully-formed
+    // endpoint exactly once. Per `CodeRabbit` rounds 1, 2, and 5
+    // on PR #558.
     state.rtl_tcp_hydration_in_progress.set(true);
     protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
     hostname_row.set_text(host);
