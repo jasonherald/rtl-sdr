@@ -20,10 +20,18 @@ use crate::vad::VoiceActivityDetector;
 use crate::{denoise, model, resampler};
 
 /// Bounded channel capacity for audio buffers from DSP → backend.
-/// Each buffer is ~1024-4096 stereo samples (~20-80 ms). At 48 kHz with
-/// 5-second inference chunks, we need ~250 buffers to avoid drops during
-/// a single inference pass. 512 gives comfortable headroom.
-const AUDIO_CHANNEL_CAPACITY: usize = 512;
+/// Each buffer is ~1024-4096 stereo samples (~20-80 ms). At
+/// 48 kHz with 5-second inference chunks, we need ~250 buffers
+/// to avoid drops during a single inference pass; whisper
+/// inference can extend to several seconds on slower CPUs and
+/// CUDA-busy systems, and the previous `512` ceiling filled
+/// during long utterances and surfaced as a flood of
+/// `transcription channel full; retrying squelch edge next
+/// block` warns. `2048` gives enough headroom that a normal
+/// worker pause doesn't spam the log even when the warn is
+/// throttled. Per FYI-flood reported during PR for issues
+/// #538 / #539.
+const AUDIO_CHANNEL_CAPACITY: usize = 2048;
 
 /// Seconds of audio per transcription chunk.
 const CHUNK_SECONDS: usize = 5;
