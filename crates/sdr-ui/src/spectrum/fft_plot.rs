@@ -13,8 +13,12 @@ use super::frequency_axis;
 /// Highlight-band overlay color for the active scanner channel
 /// (when scanner-axis lock is engaged). Faint accent blue so
 /// the band reads as a "this is what we're sampling" affordance
-/// without obscuring the trace beneath it. Per issue #516.
-const SCANNER_HIGHLIGHT_COLOR: [f64; 4] = [0.3, 0.7, 1.0, 0.18];
+/// without obscuring the trace beneath it. `pub(super)` so
+/// the waterfall draw closure in `mod.rs` can paint a matching
+/// band — visual continuity between the FFT plot and waterfall
+/// panels matters here. Per issue #516 + `CodeRabbit` round 3
+/// on PR #562.
+pub(super) const SCANNER_HIGHLIGHT_COLOR: [f64; 4] = [0.3, 0.7, 1.0, 0.18];
 
 /// Maximum bins for display rendering.
 /// FFT data wider than this is max-pooled down before drawing.

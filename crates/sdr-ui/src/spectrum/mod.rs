@@ -18,7 +18,7 @@ use std::rc::Rc;
 use gtk4::glib;
 use gtk4::prelude::*;
 
-use fft_plot::FftPlotRenderer;
+use fft_plot::{FftPlotRenderer, SCANNER_HIGHLIGHT_COLOR};
 use signal_history::SignalHistoryRenderer;
 use vfo_overlay::{BwHandle, HitZone, VfoOverlayRenderer, VfoState};
 use waterfall::WaterfallRenderer;
@@ -865,10 +865,39 @@ fn build_waterfall_area(
             // don't apply to a multi-channel range. Per issue
             // #516.
             let lock = *scanner_axis_lock.borrow();
-            if lock.is_some() {
+            if let Some(lock) = lock {
                 let bw = full_bandwidth.get();
                 let half = bw / 2.0;
                 s.renderer.render(cr, width, height, -half, half, bw);
+                // Scanner-axis active-channel highlight band —
+                // mirrors the FFT plot's `render_locked` band
+                // so the user has a continuous visual anchor
+                // for "where is the scanner sampling right
+                // now?" across both panels. Drawn AFTER the
+                // texture blit so it overlays the data; spans
+                // the full height for visibility while the
+                // historical rows scroll past underneath. Per
+                // `CodeRabbit` round 3 on PR #562.
+                if let (Some(active_hz), Some(active_bw)) =
+                    (lock.active_channel_hz, lock.active_channel_bw_hz)
+                {
+                    let span = lock.max_hz - lock.min_hz;
+                    if span > 0.0 {
+                        let w = f64::from(width);
+                        let h = f64::from(height);
+                        let band_min_x = w * (active_hz - active_bw / 2.0 - lock.min_hz) / span;
+                        let band_max_x = w * (active_hz + active_bw / 2.0 - lock.min_hz) / span;
+                        let band_w = (band_max_x - band_min_x).max(1.0);
+                        cr.set_source_rgba(
+                            SCANNER_HIGHLIGHT_COLOR[0],
+                            SCANNER_HIGHLIGHT_COLOR[1],
+                            SCANNER_HIGHLIGHT_COLOR[2],
+                            SCANNER_HIGHLIGHT_COLOR[3],
+                        );
+                        cr.rectangle(band_min_x, 0.0, band_w, h);
+                        let _ = cr.fill();
+                    }
+                }
                 return;
             }
 

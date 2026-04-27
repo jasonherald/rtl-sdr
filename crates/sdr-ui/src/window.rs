@@ -1480,12 +1480,19 @@ fn handle_dsp_message(
                 ));
             }
             // Engine is already back to Idle — drop the master
-            // switch to match. `set_state` propagates to `active`
-            // and fires `notify::active`, which the master switch's
-            // `connect_active_notify` handler dispatches as a
-            // redundant `SetScannerEnabled(false)` — idempotent on
-            // the engine side (scanner's already Idle), so no harm.
-            scanner_panel.master_switch.set_state(false);
+            // switch to match. Use `set_active(false)` (NOT
+            // `set_state(false)`): per GtkSwitch semantics,
+            // `set_state` only fires `notify::state` and leaves
+            // `active` decoupled, so the master switch's
+            // `connect_active_notify` handler — which now also
+            // tears down the scanner-axis lock + Display panel
+            // status row (#516) — wouldn't run. `set_active`
+            // updates both properties and fires `notify::active`,
+            // dispatching a redundant `SetScannerEnabled(false)`
+            // (idempotent at the engine — scanner's already
+            // Idle) AND triggering the lock teardown. Per
+            // `CodeRabbit` round 3 on PR #562.
+            scanner_panel.master_switch.set_active(false);
             // Clear the active-channel surfaces locally rather
             // than waiting for a separate `ActiveChannelChanged
             // { key: None }` event — the engine sends it today,
@@ -1518,7 +1525,13 @@ fn handle_dsp_message(
                     "Recording stopped — Scanner activated"
                 }
                 sdr_core::messages::ScannerMutexReason::ScannerStoppedForRecording => {
-                    scanner_panel.master_switch.set_state(false);
+                    // `set_active(false)` (NOT `set_state(false)`)
+                    // so `connect_active_notify` fires and tears
+                    // down the scanner-axis lock + status row.
+                    // See `ScannerEmptyRotation` for the full
+                    // rationale. Per `CodeRabbit` round 3 on
+                    // PR #562.
+                    scanner_panel.master_switch.set_active(false);
                     clear_scanner_active_channel_ui(scanner_panel, state);
                     "Scanner stopped — recording started"
                 }
@@ -9094,12 +9107,19 @@ fn connect_scanner_panel(
     //   - `ScannerForceDisable::trigger` calls `set_active(false)`
     //     on the same switch for manual-tune force-disable.
     //   - DSP-origin widget syncs (ScannerEmptyRotation,
-    //     ScannerMutexStopped::ScannerStopped*) call `set_state`,
-    //     which also propagates to active and fires notify::active.
+    //     ScannerMutexStopped::ScannerStopped*) call
+    //     `set_active(false)` so notify::active fires here.
+    //     `set_state(false)` would NOT trigger this handler —
+    //     per GtkSwitch semantics, `state` and `active` are
+    //     separate properties; `set_state` fires only
+    //     notify::state. The previous comment claimed
+    //     otherwise; corrected per `CodeRabbit` round 3 on PR
+    //     #562 once the post-stop scanner-axis-lock teardown
+    //     started depending on this handler running.
     //     The resulting redundant `SetScannerEnabled(false)`
-    //     dispatch is idempotent at the engine — it's cheaper to
-    //     pay one extra message per event than to add a suppress
-    //     flag for every DSP-origin sync site.
+    //     dispatch is idempotent at the engine — it's cheaper
+    //     to pay one extra message per event than to add a
+    //     suppress flag for every DSP-origin sync site.
     // Master switch dispatches `SetScannerEnabled` AND drives
     // the spectrum's scanner-axis lock. On enable, compute the
     // (min, max) envelope of all scanner-flagged bookmarks and
