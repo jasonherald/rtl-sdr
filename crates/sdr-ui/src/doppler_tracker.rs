@@ -24,6 +24,34 @@ pub struct Candidate {
     pub elevation_deg: f64,
 }
 
+/// Whether the per-tick Doppler work (SGP4 propagate, candidate
+/// rebuild, offset compute, `SetVfoOffset` dispatch, status-bar
+/// update) should run at all this tick. Encapsulates the
+/// lifecycle gates the wiring layer applies in front of the 1 Hz
+/// trigger and 4 Hz recompute timers.
+///
+/// Returns `false` when:
+///
+/// * `master_enabled` is off — the user-facing Satellites-panel
+///   switch is off, so Doppler is dormant regardless. (The 1 Hz
+///   tick already short-circuits on this; the helper makes the
+///   condition explicit for both ticks + future call sites.)
+/// * `is_running` is off — Stop has been pressed and the DSP
+///   isn't processing samples. Dispatching `SetVfoOffset` to a
+///   stopped DSP queues changes that apply on the next Start,
+///   which presents as "the dial moved on its own while I was
+///   stopped"; suppressing dispatch keeps stop-means-stop. Per
+///   #567.
+///
+/// On resume, the next 4 Hz tick re-computes against the live
+/// satellite geometry (which has continued to move while we were
+/// paused), so picking up mid-pass after a stop produces a fresh
+/// correction rather than a stale one.
+#[must_use]
+pub fn should_tick(master_enabled: bool, is_running: bool) -> bool {
+    master_enabled && is_running
+}
+
 /// Pure trigger evaluation per spec §2: pick the catalog
 /// satellite (if any) the Doppler tracker should be locked to
 /// right now.
@@ -263,6 +291,21 @@ mod tests {
     #[test]
     fn freq_match_tolerance_is_20_khz() {
         assert!((FREQ_MATCH_TOLERANCE_HZ - 20_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn should_tick_requires_both_master_and_running() {
+        // Per #567: Doppler stops dispatching SetVfoOffset when the
+        // user presses Stop. The 4 Hz / 1 Hz tick wiring layer
+        // calls `should_tick` before doing any SGP4 / dispatch work.
+        // Truth table — both gates must be true for the tick to run.
+        assert!(!should_tick(false, false), "off + stopped");
+        assert!(!should_tick(false, true), "master off, running");
+        assert!(
+            !should_tick(true, false),
+            "master on but stopped — the #567 case"
+        );
+        assert!(should_tick(true, true), "both on — normal operation");
     }
 
     #[test]

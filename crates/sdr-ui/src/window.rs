@@ -10905,7 +10905,7 @@ fn connect_doppler_tracker(
 ) {
     use crate::doppler_tracker::{
         Candidate, DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz,
-        pick_active_satellite,
+        pick_active_satellite, should_tick,
     };
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Satellite, track};
 
@@ -10983,7 +10983,14 @@ fn connect_doppler_tracker(
                 return glib::ControlFlow::Break;
             };
             let mut t = tracker.borrow_mut();
-            if !t.master_enabled() {
+            // Lifecycle gate: master + running. While stopped,
+            // no candidate rebuild + no `set_active` transition,
+            // so a satellite setting below the horizon mid-stop
+            // doesn't fire a spurious disengage dispatch into a
+            // stopped DSP. On resume, this tick re-evaluates and
+            // engages / disengages naturally against the live
+            // geometry. Per #567.
+            if !should_tick(t.master_enabled(), state.is_running.get()) {
                 return glib::ControlFlow::Continue;
             }
             // Build the ground station from the live panel
@@ -11128,6 +11135,16 @@ fn connect_doppler_tracker(
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
+            // Lifecycle gate: master + running. The status-bar
+            // badge clears on the first not-running tick so the
+            // user gets immediate "Doppler is idle" feedback when
+            // they press Stop — `update_doppler(None)` is
+            // idempotent (set_visible(false) on an already-hidden
+            // label is a no-op). Per #567.
+            if !should_tick(tracker.borrow().master_enabled(), state.is_running.get()) {
+                status_bar.update_doppler(None);
+                return glib::ControlFlow::Continue;
+            }
             let active_sat = tracker.borrow().active();
             let Some(sat) = active_sat else {
                 return glib::ControlFlow::Continue;
