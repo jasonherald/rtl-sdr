@@ -513,14 +513,42 @@ pub fn build_window(
     // on close means that click is treated as "no such action"
     // rather than "tune via stale state". Per CR round 1 on PR #568.
     let app_for_close = app.clone();
+    let state_for_close = std::rc::Rc::clone(&state);
+    let config_for_close = std::sync::Arc::clone(config);
+    let toast_overlay_close = toast_overlay.downgrade();
+    let transcription_engine_close = std::rc::Rc::clone(&transcription_engine);
+    let window_for_close = window.clone();
     window.connect_close_request(move |_| {
         let bt = std::backtrace::Backtrace::capture();
-        tracing::info!(
-            backtrace = ?bt,
-            "main window close-request fired",
-        );
+        tracing::info!(backtrace = ?bt, "main window close-request fired");
+
+        // Close-to-tray: hide instead of destroy if both the user
+        // toggle is on AND the tray is actually available. If the
+        // tray failed to spawn, MUST proceed-to-close — otherwise
+        // the user is stuck with an invisible process. Per #512.
+        if state_for_close.close_to_tray.get() && state_for_close.tray_available.get() {
+            window_for_close.set_visible(false);
+            // First-close toast: fire exactly once per fresh config.
+            if !state_for_close.tray_first_close_seen.get() {
+                state_for_close.tray_first_close_seen.set(true);
+                config_for_close.write(|v| {
+                    v[crate::preferences::general_page::KEY_TRAY_FIRST_CLOSE_SEEN] =
+                        serde_json::json!(true);
+                });
+                if let Some(overlay) = toast_overlay_close.upgrade() {
+                    let toast = adw::Toast::builder()
+                        .title("App still running in tray — right-click tray icon and choose Quit, or disable in Settings → General → Behavior")
+                        .timeout(8)
+                        .build();
+                    overlay.add_toast(toast);
+                }
+            }
+            return glib::Propagation::Stop;
+        }
+
+        // Real close — original teardown.
         app_for_close.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
-        transcription_engine.borrow_mut().shutdown_nonblocking();
+        transcription_engine_close.borrow_mut().shutdown_nonblocking();
         glib::Propagation::Proceed
     });
 
