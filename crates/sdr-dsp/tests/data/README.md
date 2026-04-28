@@ -12,18 +12,21 @@ our APT decoder against real, known-good NOAA 19 audio.
 
 ## License
 
-noaa-apt is licensed under the GNU GPL v3.0. We use these files **only as test
-fixtures** — they are not redistributed as part of the SDR-RS binary, do not
-appear in any built artifact, and are not "linked" into our codebase by any
-reasonable interpretation. The fixtures are exclusively input to
-`tests/apt_integration.rs`, which feeds them to the SDR-RS APT decoder and
-asserts on the decoder's output.
+noaa-apt is licensed under the GNU GPL v3.0. These files are committed to this
+repository's source tree and so are redistributed as part of the git history
+and any source archive that includes the `crates/sdr-dsp/tests/data/` path.
+They are NOT included in compiled / published crate artifacts:
+`crates/sdr-dsp/Cargo.toml` excludes `tests/data/**` from `cargo package`
+output, so any binary or `crates.io` publish drops the fixtures.
 
-This usage is consistent with how test corpora are routinely shared across
-permissive and copyleft projects (e.g. how `cargo` itself ships test inputs
-sourced from various projects). Should the noaa-apt maintainer object, these
-fixtures can be removed without affecting any production-path code; the
-integration test would simply gate on `cfg!(any())` until alternatives are
+The fixtures are used exclusively as input to `tests/apt_integration.rs`,
+which feeds them to the SDR-RS APT decoder and asserts on the decoder's
+output. Anyone who clones / forks this repo is governed by the GPL-3.0 terms
+WITH RESPECT TO THESE FILES (i.e. the fixture WAVs themselves) — that is, if
+they redistribute the fixture files, they must do so under GPL-3.0 and
+include the original noaa-apt license/copyright notice.
+
+The SDR-RS source code itself remains MIT-licensed. If the noaa-apt maintainer
+objects, these fixtures can be removed without touching any production-path
+code; the integration test would gate on `cfg!(any())` until alternatives are
 sourced.
-
-The SDR-RS source code itself remains MIT-licensed.

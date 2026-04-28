@@ -144,7 +144,15 @@ impl Default for BrightnessMode {
 /// Lines accumulate in transmission order; the buffer never compresses
 /// or rewrites past entries, so `lines()` is a stable view callers can
 /// snapshot at any point during a live pass.
-#[derive(Debug)]
+///
+/// `Clone` is derived so the PNG-export path can snapshot the image
+/// quickly on the GTK main thread, then move the snapshot into a
+/// `gio::spawn_blocking` worker for the CPU-heavy
+/// finalize/rotate/encode without holding the UI. The clone copies
+/// every line's `pixels` + `raw_samples` (~10 KB/line), so a 1500-line
+/// pass is ~15 MB — bigger than ideal but cheaper than freezing GTK
+/// for the duration of the encode. Per CR round 1 on PR #571.
+#[derive(Debug, Clone)]
 pub struct AptImage {
     lines: Vec<AptImageLine>,
     pass_start: Instant,
@@ -464,10 +472,24 @@ impl AptImage {
         // first WIDTH/2 pixels of each row; Channel B is the
         // remainder. Compute per-channel histogram across all rows,
         // build the equalization LUT, apply.
+        //
+        // Pass `pass_through_quality` so the histogram + LUT are
+        // built from VALID rows only — gap-filled rows would
+        // otherwise dump a giant pile of 0s into bin 0, dragging
+        // the CDF and remapping `lut[0]` to a non-zero gray. Skipped
+        // rows are explicitly re-zeroed after the LUT pass to
+        // preserve the `finalize_grayscale` contract that gap rows
+        // stay black regardless of mode. Per CR round 1 on PR #571.
         let height = self.lines.len();
         let half = Self::WIDTH / 2;
-        equalize_channel_in_place(&mut baseline, height, 0, half);
-        equalize_channel_in_place(&mut baseline, height, half, Self::WIDTH);
+        equalize_channel_in_place(&mut baseline, height, 0, half, &pass_through_quality);
+        equalize_channel_in_place(
+            &mut baseline,
+            height,
+            half,
+            Self::WIDTH,
+            &pass_through_quality,
+        );
 
         out.extend(baseline);
     }
@@ -571,34 +593,55 @@ fn rotate_rectangle_180_in_place(
     }
 }
 
-/// Histogram-equalize one half of the image in place.
+/// Histogram-equalize one half of the image in place, ignoring
+/// gap-filled rows.
 ///
 /// `image` is row-major with `WIDTH` pixels per row, `height` rows.
 /// Pixels in columns `[col_start, col_end)` are equalized; the rest
 /// of the row is untouched. Standard CDF-based equalization.
+///
+/// `valid_row[i]` is true for rows whose `sync_quality` cleared
+/// [`MIN_VALID_SYNC_QUALITY`]. Rows where it's false are excluded
+/// from the histogram (so the CDF reflects real signal only) AND
+/// re-zeroed after equalization (so a non-zero `lut[0]` doesn't
+/// turn a gap row gray). Per CR round 1 on PR #571.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn equalize_channel_in_place(image: &mut [u8], height: usize, col_start: usize, col_end: usize) {
+fn equalize_channel_in_place(
+    image: &mut [u8],
+    height: usize,
+    col_start: usize,
+    col_end: usize,
+    valid_row: &[bool],
+) {
     let width = AptImage::WIDTH;
-    let n_pixels = (col_end - col_start) * height;
-    if n_pixels == 0 {
-        return;
-    }
-    // Histogram of u8 values across the half-image.
+    debug_assert_eq!(valid_row.len(), height);
+    // Histogram of u8 values across the half-image, valid rows only.
     let mut hist = [0_u32; 256];
+    let mut valid_pixel_count = 0_usize;
     for row in 0..height {
+        if !valid_row.get(row).copied().unwrap_or(false) {
+            continue;
+        }
         let row_start = row * width;
         for col in col_start..col_end {
             hist[image[row_start + col] as usize] += 1;
         }
+        valid_pixel_count += col_end - col_start;
+    }
+    if valid_pixel_count == 0 {
+        // No valid rows in this half — leave the half untouched.
+        // Gap rows already came in zeroed; there's nothing to remap.
+        return;
     }
     // Cumulative distribution, then equalization LUT.
     let mut lut = [0_u8; 256];
     let mut cumulative = 0_u32;
     #[allow(
         clippy::cast_precision_loss,
-        reason = "n_pixels = (col_end - col_start) * height — bounded by\n         WIDTH × MAX_LINES (~3 M), well inside f32 mantissa."
+        reason = "valid_pixel_count = (col_end - col_start) × valid_row_count — \
+                  bounded by WIDTH × MAX_LINES (~3 M), well inside f32 mantissa."
     )]
-    let denom = n_pixels as f32;
+    let denom = valid_pixel_count as f32;
     for (i, &count) in hist.iter().enumerate() {
         cumulative += count;
         #[allow(
@@ -612,12 +655,19 @@ fn equalize_channel_in_place(image: &mut [u8], height: usize, col_start: usize, 
             .clamp(0.0, 255.0) as u8;
         lut[i] = v;
     }
-    // Apply.
+    // Apply on valid rows only; re-zero invalid rows so a non-zero
+    // `lut[0]` doesn't turn the gap-fill gray.
     for row in 0..height {
         let row_start = row * width;
-        for col in col_start..col_end {
-            let idx = row_start + col;
-            image[idx] = lut[image[idx] as usize];
+        if valid_row.get(row).copied().unwrap_or(false) {
+            for col in col_start..col_end {
+                let idx = row_start + col;
+                image[idx] = lut[image[idx] as usize];
+            }
+        } else {
+            for col in col_start..col_end {
+                image[row_start + col] = 0;
+            }
         }
     }
 }

@@ -86,6 +86,15 @@ pub struct AptImageRenderer {
     /// image-wide normalization (re-derived from `raw_samples`).
     /// Reset via [`AptImageRenderer::clear`].
     apt_image: AptImage,
+    /// Whether this pass was on the satellite's ascending leg
+    /// (heading north) — set at AOS by the wiring layer's
+    /// `RecorderAction::StartAutoRecord` handler via
+    /// [`AptImageView::set_rotate_180`]. The toolbar `Export PNG`
+    /// button reads this so a manual export rotates the same way
+    /// as the auto-record save would. Reset to `false` on
+    /// [`AptImageRenderer::clear`] (per-pass scoping). Per CR round
+    /// 1 on PR #571.
+    rotate_180: bool,
 }
 
 impl Default for AptImageRenderer {
@@ -118,6 +127,7 @@ impl AptImageRenderer {
             surface,
             n_lines: 0,
             apt_image: AptImage::with_capacity(std::time::Instant::now(), MAX_LINES),
+            rotate_180: false,
         }
     }
 
@@ -171,7 +181,8 @@ impl AptImageRenderer {
     /// transparent everywhere) so subsequent passes start from a
     /// clean canvas; the surface itself is preserved. Also resets
     /// the parallel `AptImage` so PNG export sees only the new
-    /// pass's lines (per-pass calibration).
+    /// pass's lines (per-pass calibration), and clears the
+    /// rotate-180 flag (re-set at AOS for the next pass).
     pub fn clear(&mut self) {
         if let Ok(mut data) = self.surface.data() {
             data.fill(0);
@@ -181,6 +192,23 @@ impl AptImageRenderer {
         // pass-start `Instant` semantically correct as "moment of clear"
         // (= moment a new pass started capturing).
         self.apt_image = AptImage::with_capacity(std::time::Instant::now(), MAX_LINES);
+        self.rotate_180 = false;
+    }
+
+    /// Set the rotate-180 flag for the in-progress pass. Called by
+    /// the wiring layer's `RecorderAction::StartAutoRecord` handler
+    /// after it computes [`sdr_sat::is_ascending`] for this pass.
+    /// The flag is read by the toolbar `Export PNG` button so manual
+    /// exports match the auto-record orientation. Per CR round 1 on
+    /// PR #571.
+    pub fn set_rotate_180(&mut self, rotate_180: bool) {
+        self.rotate_180 = rotate_180;
+    }
+
+    /// Currently-stashed rotate-180 flag for the in-progress pass.
+    #[must_use]
+    pub fn rotate_180(&self) -> bool {
+        self.rotate_180
     }
 
     /// Number of scan lines currently buffered.
@@ -282,12 +310,19 @@ impl AptImageRenderer {
     /// re-derive pixels from the raw f32 envelope samples — gives
     /// proper image-wide contrast (vs. the live surface's per-line
     /// normalization). Per B1 of the noaa-apt parity work.
+    ///
+    /// Reads the renderer's stored `rotate_180` flag (set at AOS via
+    /// [`AptImageView::set_rotate_180`]) so a manual export from the
+    /// viewer toolbar matches what the auto-record save would
+    /// produce — was hard-coded `false` before, leaving manual
+    /// exports of ascending passes upside-down. Per CR round 1 on
+    /// PR #571.
     pub fn export_png_with_mode(
         &self,
         path: &Path,
         mode: BrightnessMode,
     ) -> Result<(), ViewerError> {
-        self.export_png_full(path, mode, false)
+        self.export_png_full(path, mode, self.rotate_180)
     }
 
     /// Like [`Self::export_png_with_mode`] but additionally rotates
@@ -295,71 +330,124 @@ impl AptImageRenderer {
     /// ascending passes (heading north) — see
     /// [`rotate_180_per_channel`] for the layout rationale. Per B2
     /// of the noaa-apt parity work.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    ///
+    /// Synchronous — runs the full finalize / rotate / encode chain
+    /// inline. Fine for offline tools and unit tests. **Live GTK
+    /// callers must use [`AptImageView::export_png_full_async`]**
+    /// instead, which snapshots the image on the main thread and
+    /// runs the encoder in `gio::spawn_blocking`. A 1500-line PNG
+    /// encode takes hundreds of milliseconds — long enough to
+    /// freeze the UI noticeably. Per CR round 1 on PR #571.
     pub fn export_png_full(
         &self,
         path: &Path,
         mode: BrightnessMode,
         rotate_180: bool,
     ) -> Result<(), ViewerError> {
-        if self.apt_image.is_empty() {
-            return Err(ViewerError::EmptyChannel { apid: None });
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
-                op: "create_dir_all",
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
+        // Delegate to the free function so the sync and async paths
+        // share one implementation. The free function takes
+        // `&AptImage` — the sync path borrows directly; the async
+        // path moves an owned snapshot into the worker closure and
+        // borrows from there. Per CR round 1 on PR #571.
+        render_and_save_apt_png(&self.apt_image, path, mode, rotate_180)
+    }
 
-        let height = self.apt_image.len();
-        let mut pixels = self.apt_image.finalize_grayscale(mode);
-        debug_assert_eq!(pixels.len(), AptImage::WIDTH * height);
-        if rotate_180 {
-            rotate_180_per_channel(&mut pixels, height);
-        }
+    /// Cheap clone of the renderer's `AptImage` for handing to a
+    /// `gio::spawn_blocking` worker. Cost is one large `memcpy`
+    /// (~10 KB / line × `n_lines`, ~15 MB at `MAX_LINES`); cheap
+    /// compared to the multi-second alternative of running the
+    /// encode synchronously on the GTK main loop. Per CR round 1
+    /// on PR #571.
+    pub fn snapshot_apt_image(&self) -> AptImage {
+        self.apt_image.clone()
+    }
+}
 
-        // Build a fresh ARGB32 surface from the grayscale Vec<u8>.
-        // Cairo's surface is the simplest path to PNG encoding from
-        // GTK code — it's already the export format we use elsewhere
-        // (LRPT viewer). Each pixel becomes opaque grey (R=G=B, A=0xFF).
-        let mut export_surface =
-            cairo::ImageSurface::create(cairo::Format::ARgb32, LINE_PIXELS as i32, height as i32)
-                .map_err(|e| ViewerError::Cairo {
+/// Send-safe PNG export. Takes an owned `AptImage` so it can be
+/// moved into a `gio::spawn_blocking` worker and run completely off
+/// the GTK main thread. Performs:
+///
+/// 1. `finalize_grayscale(mode)` — image-wide brightness mapping
+///    (sort for percentile, etc.).
+/// 2. `rotate_180_per_channel` if requested (vertical+horizontal
+///    flip of the two video sub-rectangles, leaving sync /
+///    telemetry strips alone).
+/// 3. Cairo ARGB32 surface build (every pixel R=G=B grey, A=0xFF).
+/// 4. PNG encode via Cairo's `write_to_png`.
+///
+/// Cairo objects are `!Send`, but we only ever create + use them
+/// inside this single function call, so they never cross thread
+/// boundaries — running this on a worker thread is fine.
+///
+/// # Errors
+///
+/// Returns [`ViewerError::EmptyChannel`] (with `apid: None` — APT
+/// has no APIDs) when the image has no lines, or a downstream
+/// `Cairo` / `Io` / `PngEncode` variant on the failing step.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub fn render_and_save_apt_png(
+    image: &AptImage,
+    path: &Path,
+    mode: BrightnessMode,
+    rotate_180: bool,
+) -> Result<(), ViewerError> {
+    if image.is_empty() {
+        return Err(ViewerError::EmptyChannel { apid: None });
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
+            op: "create_dir_all",
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+
+    let height = image.len();
+    let mut pixels = image.finalize_grayscale(mode);
+    debug_assert_eq!(pixels.len(), AptImage::WIDTH * height);
+    if rotate_180 {
+        rotate_180_per_channel(&mut pixels, height);
+    }
+
+    // Build a fresh ARGB32 surface from the grayscale Vec<u8>.
+    // Cairo's surface is the simplest path to PNG encoding from
+    // GTK code — it's already the export format we use elsewhere
+    // (LRPT viewer). Each pixel becomes opaque grey (R=G=B, A=0xFF).
+    let mut export_surface =
+        cairo::ImageSurface::create(cairo::Format::ARgb32, LINE_PIXELS as i32, height as i32)
+            .map_err(|e| ViewerError::Cairo {
                 op: "export surface",
                 source: e,
             })?;
-        let stride = usize::try_from(export_surface.stride())?;
-        {
-            let mut data = export_surface.data()?;
-            for (row, line) in pixels.chunks_exact(LINE_PIXELS).enumerate() {
-                let row_offset = row * stride;
-                for (col, &g) in line.iter().enumerate() {
-                    let p = row_offset + col * 4;
-                    data[p] = g;
-                    data[p + 1] = g;
-                    data[p + 2] = g;
-                    data[p + 3] = 0xFF;
-                }
+    let stride = usize::try_from(export_surface.stride())?;
+    {
+        let mut data = export_surface.data()?;
+        for (row, line) in pixels.chunks_exact(LINE_PIXELS).enumerate() {
+            let row_offset = row * stride;
+            for (col, &g) in line.iter().enumerate() {
+                let p = row_offset + col * 4;
+                data[p] = g;
+                data[p + 1] = g;
+                data[p + 2] = g;
+                data[p + 3] = 0xFF;
             }
         }
-
-        let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
-            op: "file create",
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        export_surface.write_to_png(&mut file)?;
-        tracing::info!(
-            ?path,
-            lines = height,
-            ?mode,
-            rotate_180,
-            "APT image exported to PNG (image-wide brightness)"
-        );
-        Ok(())
     }
+
+    let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
+        op: "file create",
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    export_surface.write_to_png(&mut file)?;
+    tracing::info!(
+        ?path,
+        lines = height,
+        ?mode,
+        rotate_180,
+        "APT image exported to PNG (image-wide brightness)"
+    );
+    Ok(())
 }
 
 // ─── GTK widget ─────────────────────────────────────────────────────────
@@ -472,10 +560,11 @@ impl AptImageView {
     }
 
     /// Save with image-wide brightness mapping + optional 180°
-    /// rotation. The wiring layer (`window.rs`) computes the rotate
-    /// flag from the satellite's orbital direction at AOS via
-    /// `sdr_sat::is_ascending` and passes it through here; B1+B2 of
-    /// the noaa-apt parity work.
+    /// rotation, **synchronously**. Tests use this for round-trip
+    /// validation; runtime callers must use
+    /// [`Self::export_png_full_async`] instead so the GTK main
+    /// loop doesn't freeze for the duration of the encode. Per CR
+    /// round 1 on PR #571.
     ///
     /// # Errors
     ///
@@ -491,10 +580,63 @@ impl AptImageView {
             .export_png_full(path, mode, rotate_180)
     }
 
+    /// Asynchronously export the assembled APT image to PNG.
+    ///
+    /// Snapshots the current image state on the GTK main thread
+    /// (cheap clone, ~15 MB worst-case for a full pass), spawns
+    /// a `gio::spawn_blocking` worker for the CPU-heavy encode,
+    /// then marshals the result back to the main context where
+    /// `on_complete` fires. The main loop stays responsive
+    /// throughout — the user can interact with the rest of the
+    /// UI while the PNG is being written. Per CR round 1 on PR
+    /// #571.
+    ///
+    /// `on_complete` runs on the GTK main thread, so it can
+    /// safely capture `Rc`-shared widgets / `WeakRef`s and post
+    /// toasts / close windows / etc.
+    pub fn export_png_full_async(
+        &self,
+        path: PathBuf,
+        mode: BrightnessMode,
+        rotate_180: bool,
+        on_complete: impl FnOnce(Result<(), ViewerError>) + 'static,
+    ) {
+        let snapshot = self.renderer.borrow().snapshot_apt_image();
+        glib::spawn_future_local(async move {
+            let join = gio::spawn_blocking(move || {
+                render_and_save_apt_png(&snapshot, &path, mode, rotate_180)
+            })
+            .await;
+            // `gio::spawn_blocking::JoinHandle` returns `Result<T, JoinError>`
+            // where the outer error is "the worker panicked". Treat a
+            // panic as an Internal-style failure so the on_complete
+            // callback's caller can still toast it.
+            let result = match join {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("APT PNG export worker panicked: {e:?}");
+                    Err(ViewerError::InvalidBuffer(
+                        "PNG export worker panicked — see logs".to_string(),
+                    ))
+                }
+            };
+            on_complete(result);
+        });
+    }
+
     /// Number of lines currently in the buffer.
     #[must_use]
     pub fn n_lines(&self) -> usize {
         self.renderer.borrow().n_lines()
+    }
+
+    /// Set the rotate-180 flag on the underlying renderer for the
+    /// in-progress pass. Called by the wiring layer's
+    /// `RecorderAction::StartAutoRecord` handler so the toolbar's
+    /// manual `Export PNG` button uses the same orientation as the
+    /// auto-record save. Per CR round 1 on PR #571.
+    pub fn set_rotate_180(&self, rotate_180: bool) {
+        self.renderer.borrow_mut().set_rotate_180(rotate_180);
     }
 }
 
@@ -578,15 +720,24 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
             return;
         };
         let path = default_export_path();
-        let toast = match export_view.export_png(&path) {
-            Ok(()) => adw::Toast::builder()
-                .title(format!("Saved {}", path.display()))
-                .build(),
-            Err(e) => adw::Toast::builder()
-                .title(format!("PNG export failed: {e}"))
-                .build(),
-        };
-        show_toast_in(&window_for_export, toast);
+        let path_for_msg = path.clone();
+        let window_weak = window_for_export.downgrade();
+        // Snapshot + offload to worker. On the click-event main-thread
+        // path we'd otherwise burn ~hundreds of ms encoding the PNG,
+        // freezing the UI. Per CR round 1 on PR #571.
+        export_view.export_png_full_async(path, BrightnessMode::default(), false, move |result| {
+            let toast = match result {
+                Ok(()) => adw::Toast::builder()
+                    .title(format!("Saved {}", path_for_msg.display()))
+                    .build(),
+                Err(e) => adw::Toast::builder()
+                    .title(format!("PNG export failed: {e}"))
+                    .build(),
+            };
+            if let Some(window) = window_weak.upgrade() {
+                show_toast_in(&window, toast);
+            }
+        });
     });
     header.pack_end(&export_btn);
 

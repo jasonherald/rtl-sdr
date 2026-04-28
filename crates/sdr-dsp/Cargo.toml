@@ -5,6 +5,12 @@ description = "Pure DSP library: math, filters, FFT, demodulation, resampling"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Exclude the APT integration-test fixtures from `cargo package` so a
+# `crates.io` publish doesn't ship the GPL-3-licensed WAV files
+# from noaa-apt's test corpus. The README.md stays out too — it
+# only documents the fixtures' provenance, no use post-publish.
+# Per CR round 1 on PR #571.
+exclude = ["tests/data/**"]
 
 [dependencies]
 sdr-types.workspace = true

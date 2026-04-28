@@ -10340,6 +10340,17 @@ fn connect_satellites_panel(
                         // valid anywhere mid-pass.
                         *state_a.apt_recording_pass.borrow_mut() =
                             Some((satellite.clone(), chrono::Utc::now()));
+                        // Push the rotate-180 flag down to the
+                        // renderer so the toolbar's manual `Export
+                        // PNG` button matches the auto-record
+                        // orientation. Without this, manual exports
+                        // of ascending passes come out upside-down
+                        // even though the auto-record save rotates
+                        // them. Per CR round 1 on PR #571.
+                        let rotate_180 = compute_apt_rotate_180(&state_a);
+                        if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                            view.set_rotate_180(rotate_180);
+                        }
                     }
                     sdr_sat::ImagingProtocol::Lrpt => {
                         // **Order is load-bearing.** Reset the
@@ -10416,12 +10427,6 @@ fn connect_satellites_panel(
                 state_a.send_dsp(UiToDsp::ResetImagingDecoders);
             }
             RecorderAction::SavePng(path) => {
-                // Toast based on the *actual* export outcome
-                // rather than announcing success up front — the
-                // recorder doesn't know whether the user closed
-                // the viewer mid-pass or whether disk write will
-                // succeed.
-                //
                 // Compute the rotate-180 flag for ascending passes
                 // (B2 of the noaa-apt parity work). The wiring layer
                 // looks up the recording pass info from AppState
@@ -10433,71 +10438,92 @@ fn connect_satellites_panel(
                 // safer default since it preserves north-at-top.
                 let rotate_180 = compute_apt_rotate_180(&state_a);
                 let mode = sdr_radio::apt_image::BrightnessMode::default();
-                let mut export_ok = false;
-                let result_msg = if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
-                    match view.export_png_full(&path, mode, rotate_180) {
-                        Ok(()) => {
-                            tracing::info!(rotate_180, ?mode, "auto-record PNG saved to {path:?}");
-                            export_ok = true;
-                            format!("Pass complete — image saved to {}", path.display())
-                        }
-                        Err(e) => {
-                            tracing::warn!("auto-record PNG export to {path:?} failed: {e}");
-                            format!("Pass complete but PNG save failed: {e}")
-                        }
-                    }
-                } else {
+                // Async export: snapshot the AptImage on the main
+                // thread NOW, hand the snapshot to a worker via
+                // `gio::spawn_blocking`. The encode for a 1500-line
+                // pass is multi-hundred-ms — synchronously running
+                // it here would freeze GTK during LOS, exactly when
+                // the user wants to see the toast and have the
+                // window auto-close cleanly. Per CR round 1 on PR
+                // #571.
+                let view_opt = state_a.apt_viewer.borrow().as_ref().cloned();
+                let Some(view) = view_opt else {
                     tracing::warn!(
                         "auto-record SavePng but no APT viewer is open (user closed mid-pass)",
                     );
-                    "Pass complete, but the APT viewer was closed — no image saved".to_string()
+                    post_toast(
+                        &toast_overlay_weak,
+                        "Pass complete, but the APT viewer was closed — no image saved",
+                    );
+                    *state_a.apt_recording_pass.borrow_mut() = None;
+                    return;
                 };
-                post_toast(&toast_overlay_weak, &result_msg);
-                // Close the APT viewer window now that the PNG
-                // is on disk — resets the viewer for the next
-                // pass instead of carrying stale lines forward.
-                // Per a user request during PR #554 live testing.
-                //
-                // Only close on a successful export — if the save
-                // failed (Cairo error, disk full, etc.) the user
-                // probably wants to inspect the in-memory image
-                // and manually retry the export. Closing would
-                // discard the only copy. Per CR round 9 on PR #554.
-                //
-                // Weak-ref upgrade fails closed: if the user
-                // already dismissed the window, there's nothing
-                // to close. The close-request handler in
-                // `open_apt_viewer_if_needed` clears both
-                // `apt_viewer` and `apt_viewer_window` slots so
-                // the next AOS opens a fresh viewer.
-                if export_ok {
-                    // Pull the upgraded `gtk::Window` out of the
-                    // RefCell into a local BEFORE calling
-                    // `window.close()`. The previous `if let` form
-                    // kept the `Ref` from `.borrow()` alive for the
-                    // duration of the `if`-block, but `close()`
-                    // synchronously emits the `close-request`
-                    // signal whose handler does
-                    // `apt_viewer_window.borrow_mut()` —
-                    // `RefCell already borrowed` panic, observed in
-                    // the live-pass smoke. Per #643. The let-and-
-                    // drop pattern releases the Ref at the
-                    // semicolon, so the close-request handler can
-                    // borrow_mut freely.
-                    let window_to_close = state_a
-                        .apt_viewer_window
-                        .borrow()
-                        .as_ref()
-                        .and_then(glib::WeakRef::upgrade);
-                    if let Some(window) = window_to_close {
-                        tracing::info!("auto-record LOS: closing APT viewer window after PNG save");
-                        window.close();
+                // Capture state needed by the async on_complete
+                // callback (the rest can be moved into the closure).
+                let path_for_msg = path.clone();
+                let path_for_export = path;
+                let toast_overlay_for_complete = toast_overlay_weak.clone();
+                let state_for_complete = Rc::clone(&state_a);
+                view.export_png_full_async(path_for_export, mode, rotate_180, move |result| {
+                    let (export_ok, msg) = match result {
+                        Ok(()) => {
+                            tracing::info!(
+                                rotate_180,
+                                ?mode,
+                                "auto-record PNG saved to {}",
+                                path_for_msg.display()
+                            );
+                            (
+                                true,
+                                format!(
+                                    "Pass complete — image saved to {}",
+                                    path_for_msg.display()
+                                ),
+                            )
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "auto-record PNG export to {} failed: {e}",
+                                path_for_msg.display()
+                            );
+                            (false, format!("Pass complete but PNG save failed: {e}"))
+                        }
+                    };
+                    post_toast(&toast_overlay_for_complete, &msg);
+                    // Close the APT viewer window now that the PNG
+                    // is on disk — resets the viewer for the next
+                    // pass instead of carrying stale lines forward.
+                    // Per a user request during PR #554 live
+                    // testing.
+                    //
+                    // Only close on a successful export — if the
+                    // save failed (Cairo error, disk full, etc.)
+                    // the user probably wants to inspect the
+                    // in-memory image and manually retry the
+                    // export. Per CR round 9 on PR #554.
+                    if export_ok {
+                        // Drop the Ref before calling `close()` to
+                        // avoid the `RefCell already borrowed`
+                        // panic the close-request handler would
+                        // otherwise trigger. Per #643 / CR round
+                        // 1 on PR #571.
+                        let window_to_close = state_for_complete
+                            .apt_viewer_window
+                            .borrow()
+                            .as_ref()
+                            .and_then(glib::WeakRef::upgrade);
+                        if let Some(window) = window_to_close {
+                            tracing::info!(
+                                "auto-record LOS: closing APT viewer window after PNG save",
+                            );
+                            window.close();
+                        }
                     }
-                }
-                // Clear the recording-pass info now that the PNG
-                // is on disk. A subsequent AOS will re-stash. Per
-                // B2 of the noaa-apt parity work.
-                *state_a.apt_recording_pass.borrow_mut() = None;
+                    // Clear the recording-pass info now that the
+                    // export is done — a subsequent AOS will
+                    // re-stash. Per B2 of the parity work.
+                    *state_for_complete.apt_recording_pass.borrow_mut() = None;
+                });
             }
             RecorderAction::SaveLrptPass(dir) => {
                 // Walk every APID present in the SHARED `LrptImage`

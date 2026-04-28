@@ -356,6 +356,20 @@ pub fn low_pass_dc_removal_kaiser(
     validate_positive_finite(transition_width, "transition_width")?;
     validate_positive_finite(atten_db, "atten_db")?;
     validate_positive_finite(sample_rate, "sample_rate")?;
+    // The bandpass is `lowpass(cutoff) − lowpass(transition_width/2)`,
+    // so we need `transition_width/2 < cutoff` (equivalently
+    // `transition_width < 2·cutoff`) for the difference to describe
+    // the documented bandpass-with-DC-notch. At or above the
+    // boundary, the inner lowpass would land at or past the outer
+    // one and the response collapses or inverts. Per CR round 1 on
+    // PR #571.
+    if transition_width >= 2.0 * cutoff {
+        return Err(DspError::InvalidParameter(format!(
+            "transition_width ({transition_width}) must be < 2·cutoff ({}) — \
+             at or above this the bandpass response collapses/inverts",
+            2.0 * cutoff
+        )));
+    }
     let nyquist = sample_rate / 2.0;
     if cutoff >= nyquist {
         return Err(DspError::InvalidParameter(format!(

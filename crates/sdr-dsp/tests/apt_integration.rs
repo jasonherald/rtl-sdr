@@ -22,6 +22,10 @@ use std::path::Path;
 
 use sdr_dsp::apt::{AptDecoder, AptLine, READY_QUEUE_CAP};
 
+/// Signed 16-bit PCM full-scale denominator. Hoisted to module scope
+/// to satisfy `clippy::items_after_statements`.
+const PCM16_SCALE: f32 = 32_768.0;
+
 /// Pull mono f32 samples from a 16-bit signed PCM WAV file.
 ///
 /// Used by every test in this module to load the fixture audio.
@@ -47,9 +51,14 @@ fn read_wav_mono_f32(path: &Path) -> (Vec<f32>, u32) {
         "fixture must be 16-bit PCM — got {}",
         spec.bits_per_sample
     );
+    // Signed 16-bit PCM normalizes by 2^15 = 32768, not by `i16::MAX`
+    // (= 32767). The former gives `i16::MIN` → exactly -1.0; the
+    // latter gives `i16::MIN` → -1.000031 which can drift
+    // amplitude-sensitive assertions over a long capture. Per CR
+    // round 1 on PR #571.
     let samples: Vec<f32> = reader
         .samples::<i16>()
-        .map(|s| f32::from(s.expect("WAV sample read")) / f32::from(i16::MAX))
+        .map(|s| f32::from(s.expect("WAV sample read")) / PCM16_SCALE)
         .collect();
     (samples, spec.sample_rate)
 }
@@ -77,15 +86,21 @@ fn decode_full_capture(samples: &[f32], rate_hz: u32) -> Vec<AptLine> {
             all_lines.push(std::mem::take(slot));
         }
     }
-    // One final flush call — drains any lines the decoder had
-    // queued but couldn't deliver into the bounded output slice on
-    // the last process(). Common case: the last few hundred ms of
-    // audio yield one trailing line that arrives on the next call.
-    let n = decoder
-        .process(&[], &mut output_buf)
-        .expect("APT final flush");
-    for slot in output_buf.iter_mut().take(n) {
-        all_lines.push(std::mem::take(slot));
+    // Drain remaining buffered lines. One `process(&[], ...)` call
+    // can return up to `output_buf.len()` lines and the decoder may
+    // hold more in its ready queue; loop until empty so we don't
+    // silently truncate the count assertion. Per CR round 1 on PR
+    // #571.
+    loop {
+        let n = decoder
+            .process(&[], &mut output_buf)
+            .expect("APT final flush");
+        if n == 0 {
+            break;
+        }
+        for slot in output_buf.iter_mut().take(n) {
+            all_lines.push(std::mem::take(slot));
+        }
     }
     all_lines
 }
@@ -106,6 +121,18 @@ fn decodes_real_noaa19_capture_into_recognizable_lines() {
     );
 
     let lines = decode_full_capture(&samples, rate);
+
+    // Defensive: every emitted line's sync_quality must be finite
+    // and within `[0, 1]` before we run aggregate stats over it.
+    // NaN propagates through `partial_cmp` as `Equal` (per the
+    // unwrap_or below), silently invalidating median/threshold
+    // checks. Per CR round 1 on PR #571.
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.sync_quality.is_finite() && (0.0..=1.0).contains(&l.sync_quality)),
+        "every sync_quality must be finite and within [0, 1]",
+    );
 
     // Line count: the fixture is 14m 24s long. At 2 lines/sec, the
     // theoretical maximum is 1728 lines. Our streaming decoder
@@ -165,6 +192,14 @@ fn noise_input_produces_low_quality_lines() {
     assert_eq!(rate, 11_025, "fixture rate sanity");
 
     let lines = decode_full_capture(&samples, rate);
+
+    // Defensive: same finite/range check as the signal test.
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.sync_quality.is_finite() && (0.0..=1.0).contains(&l.sync_quality)),
+        "every sync_quality must be finite and within [0, 1]",
+    );
 
     // The noise fixture is 30 s — at 2 lines/sec that's ~60 lines
     // in theory. The forward-march algorithm will emit something

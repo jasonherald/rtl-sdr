@@ -26,7 +26,8 @@
     clippy::print_stderr,
     clippy::trivially_copy_pass_by_ref,
     clippy::items_after_statements,
-    clippy::bool_to_int_with_if
+    clippy::bool_to_int_with_if,
+    clippy::too_many_lines
 )]
 
 use std::env;
@@ -123,15 +124,31 @@ fn main() {
     // than depending on apt_image (which lives in sdr-radio) so this
     // example stays inside the sdr-dsp crate.
     let height = lines.len();
-    let mut all_samples: Vec<f32> = Vec::with_capacity(height * LINE_PIXELS);
+    // Two-buffer split: `render_samples` carries every line including
+    // gap-filled zeros (so the final pixel write has the right shape);
+    // `valid_samples` carries only above-threshold lines (so the
+    // percentile reference range comes from the actual signal, not
+    // the zero-fill). Per CR round 1 on PR #571.
+    let mut render_samples: Vec<f32> = Vec::with_capacity(height * LINE_PIXELS);
+    let mut valid_samples: Vec<f32> = Vec::new();
     for line in &lines {
         if line.sync_quality < 0.5 {
-            all_samples.extend(std::iter::repeat_n(0.0_f32, LINE_PIXELS));
+            render_samples.extend(std::iter::repeat_n(0.0_f32, LINE_PIXELS));
             continue;
         }
-        all_samples.extend_from_slice(&line.raw_samples);
+        render_samples.extend_from_slice(&line.raw_samples);
+        valid_samples.extend_from_slice(&line.raw_samples);
     }
-    let mut sorted_samples = all_samples.clone();
+    if valid_samples.is_empty() {
+        eprintln!(
+            "decoded {} lines but none above the sync-quality threshold — \
+             nothing to render",
+            lines.len(),
+        );
+        std::process::exit(1);
+    }
+
+    let mut sorted_samples = valid_samples;
     sorted_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = sorted_samples.len();
     let p = 0.98_f32;
@@ -141,7 +158,7 @@ fn main() {
     let range = (hi - lo).max(1e-9);
     eprintln!("brightness range: lo={lo:.3} hi={hi:.3}");
 
-    let pixels: Vec<u8> = all_samples
+    let pixels: Vec<u8> = render_samples
         .iter()
         .map(|&v| {
             let norm = ((v - lo) / range).clamp(0.0, 1.0);

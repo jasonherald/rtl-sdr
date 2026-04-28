@@ -1030,7 +1030,7 @@ impl AptDecoder {
         // earlier `process` calls may have buffered enough samples for
         // another line, and the caller is asking for them now.
         if input.is_empty() {
-            produced = self.decode_into_output_or_queue(output, produced);
+            produced = self.decode_into_output_or_queue(output, produced)?;
         }
 
         Ok(produced)
@@ -1090,7 +1090,7 @@ impl AptDecoder {
 
             // Decode whatever lines are now sliceable, routing each one
             // either into the caller's output or into the ready queue.
-            produced = self.decode_into_output_or_queue(output, produced);
+            produced = self.decode_into_output_or_queue(output, produced)?;
 
             // Cap the raw accumulator. By construction we're at most
             // DECODER_BUFFER_CAP + SAMPLES_PER_LINE here, so we drop at
@@ -1130,7 +1130,7 @@ impl AptDecoder {
         &mut self,
         output: &mut [AptLine],
         mut produced: usize,
-    ) -> usize {
+    ) -> Result<usize, DspError> {
         while self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
             // Nowhere to put the next line — leave the accumulator alone
             // so the next `process` call can pick up from here.
@@ -1171,23 +1171,17 @@ impl AptDecoder {
             // resampler reset() ensures no state leaks between lines.
             self.final_resampler.reset();
             self.final_resamp_scratch.resize(LINE_PIXELS + 4, 0.0);
-            let n_pix = match self.final_resampler.process(
+            // Final-rate resampler error path propagates: per the
+            // sdr-dsp pure-DSP rule (no I/O / no side effects /
+            // return Result), we don't log + fabricate a black line
+            // here. Callers see the failure and can decide whether
+            // to log, retry, or surface a UI error. The scratch is
+            // sized for the expected output so this should never
+            // fire in practice. Per CR round 1 on PR #571.
+            let n_pix = self.final_resampler.process(
                 &self.accumulator[line_start..line_end],
                 &mut self.final_resamp_scratch,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    // Should not happen — the scratch is sized for the
-                    // expected output. If it does, log and emit a black
-                    // line so the timeline stays in step. The line will
-                    // mask out via `MIN_VALID_SYNC_QUALITY` at the
-                    // image level (sync_quality is set later, but a
-                    // resample-failure line can't have meaningful
-                    // pixel content anyway).
-                    tracing::warn!(error = %e, "APT final-rate resample failed; emitting black line");
-                    0
-                }
-            };
+            )?;
             // Copy raw f32 samples for image-wide post-processing
             // (B1 / `apt_image::finalize_grayscale`). Trailing pixels
             // beyond the resampler's output are zero-padded by
@@ -1210,7 +1204,7 @@ impl AptDecoder {
             self.accumulator.drain(..line_end);
             self.accumulator_start_intermediate_sample += line_end as u64;
         }
-        produced
+        Ok(produced)
     }
 
     /// Convert an offset within the envelope accumulator (intermediate-rate

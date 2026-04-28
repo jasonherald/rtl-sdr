@@ -558,19 +558,20 @@ mod tests {
 
     #[test]
     fn is_ascending_handles_propagation_error() {
-        // Far past any reasonable SGP4 epoch budget — should error,
-        // not panic. Tests the propagation error path.
+        // Sample very near `chrono::DateTime::<Utc>::MIN_UTC` so the
+        // 30 s offset to `when + Δ` stays representable but SGP4 is
+        // forced to extrapolate ~2000 years before any TLE epoch —
+        // far enough that all SGP4 implementations either return an
+        // error or produce nonsense. Either case must surface as an
+        // `Err` from `is_ascending`, NOT a panic and NOT silently a
+        // bool (the helper's contract per its own docstring).
+        // Per CR round 1 on PR #571.
         let sat = test_satellite();
-        let way_too_far = sat.epoch() + chrono::Duration::days(365 * 100);
+        let way_too_far = chrono::DateTime::<Utc>::MIN_UTC + chrono::Duration::seconds(60);
         let result = is_ascending(&sat, way_too_far);
-        // Either succeeds (SGP4 is loose about epoch budgets) or
-        // returns an error — both are acceptable; what we check is
-        // that no panic occurs. The bool is exercised by other tests;
-        // here we only care that a far-future propagate doesn't blow
-        // up the helper (no NaN-related panics, etc.).
-        if let Ok(_b) = result {
-            // Successful far-future propagation — fine, no further
-            // assertion needed (the bool is just true/false).
-        }
+        assert!(
+            result.is_err(),
+            "is_ascending at year ~0 should propagate an SGP4 error, got Ok({result:?})",
+        );
     }
 }
