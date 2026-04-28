@@ -76,9 +76,13 @@ crates/sdr-tray/
                          # pub enum TrayEvent { Show, Hide, ToggleVisibility, Quit }
                          # pub struct TrayHandle { stop_tx: mpsc::Sender<()>, join: JoinHandle<()> }
                          # pub enum SpawnError { TrayWatcherUnavailable, ... }
-    icon.rs              # tray icon ARGB32 byte buffer, rasterized once from
-                         # data/com.sdr.rs.svg via librsvg (transitive GTK dep)
-                         # Fallback: built-in 22×22 blue-square static bytes.
+    icon.rs              # tray icon ARGB32 byte buffer loaded via
+                         # include_bytes!("../../../data/com.sdr.rs.tray22.argb32").
+                         # The .argb32 asset is pre-baked from data/com.sdr.rs.svg
+                         # by scripts/regen-tray-icon.sh — no runtime SVG deps.
+                         # (Earlier draft used librsvg at runtime; reverted in
+                         # commit b2595ba — librsvg drags ~80 transitive crates
+                         # including unmaintained paste/fxhash.)
 ```
 
 The crate is `#![cfg(target_os = "linux")]`. It has zero workspace deps — no `sdr-types`, no `sdr-config`, no `sdr-ui`. It knows nothing about satellites, recording, or DSP. Its entire API is "spawn me, give me a sender, I'll send Show/Hide/Quit events."
@@ -102,7 +106,9 @@ The crate is `#![cfg(target_os = "linux")]`. It has zero workspace deps — no `
 
 ### Icon asset
 
-Reuse `data/com.sdr.rs.svg`. ksni accepts ARGB32 raw bytes — rasterize the SVG at 22×22 once at startup via `librsvg` (`rsvg` crate, transitively pulled in by GTK4) and hand the buffer to ksni. `icon.rs` rasterizes at 22×22 for v1; multi-size support (16/32/HiDPI) is a follow-up.
+`data/com.sdr.rs.tray22.argb32` — a pre-baked 1936-byte ARGB32 buffer (22 × 22 × 4) generated from `data/com.sdr.rs.svg` by `scripts/regen-tray-icon.sh` (uses `rsvg-convert` + Pillow). Committed to the repo so the runtime never has to rasterize. `icon.rs` loads it via `include_bytes!` with a compile-time `const_assert` that the byte length matches `width × height × 4`. Re-run the script whenever the SVG source changes.
+
+Multi-size support (16/32/48/HiDPI) is tracked in [#573](https://github.com/jasonherald/rtl-sdr/issues/573) — would expand the script to generate multiple `.argb32` files and have ksni's `icon_pixmap()` return a `Vec` of `Icon`s. (An earlier draft of this spec called for runtime SVG rasterization via `librsvg`; that was reverted in commit `b2595ba` because `librsvg`'s ~80-crate transitive dep tree dragged in unmaintained `paste` / `fxhash`. The pre-bake approach has zero runtime SVG deps.)
 
 ## Data flow
 
@@ -270,7 +276,7 @@ const KEY_TRAY_FIRST_CLOSE_SEEN: &str = "tray_first_close_seen";
 |---|---|---|---|
 | **Tray spawn fails** (no SNI watcher) | `sdr-tray::spawn` returns `Err(TrayWatcherUnavailable)` | App still launches, close-to-tray bypassed for this session, `state.tray_available = false`. **If `--start-hidden` was set on this launch**, force `window.present()` anyway so the user isn't left with an invisible process. | One-time toast at first failed close: `Tray unavailable — closing will exit the app. (Likely missing AppIndicator extension.)` Behavior switch greyed in prefs. If we override `--start-hidden`, additional toast at startup: `Tray unavailable — showing window instead.` |
 | **D-Bus drops mid-runtime** | ksni's run loop returns; tray-thread exits | Log `tracing::warn`. Don't respawn. Flag `tray_available = false`. Window's close-button reverts to real exit. | None — silent fallback |
-| **Tray icon SVG rasterize fails** | `rsvg::Loader` returns Err | Fall back to built-in 22×22 blue-square static bytes | None — log `tracing::warn` |
+| **Tray icon byte buffer is wrong size** | `const_assert` in `icon.rs` fails compilation | Buffer length must equal `width × height × 4`; the regen script's post-write guard catches this earlier with a clearer error. Run `scripts/regen-tray-icon.sh` to recompute. | Compile-time error, never reaches the user |
 | **Autostart enable: write fails** | `autostart::enable() → io::Result<()>` returns Err | Revert the switch (set_active false, suppressing recursive notify::active) | Toast: `Couldn't enable autostart: <err>` |
 | **Autostart disable: remove fails** | Same | Revert switch | Toast: `Couldn't disable autostart: <err>` |
 | **Autostart file missing but config says true** | Startup `is_enabled() == false`; config says true | Trust filesystem. Update config to false. | None — silent reconciliation |

@@ -5,6 +5,14 @@
 //! `crate::preferences::general_page` are the canonical reads
 //! (also called by `app.rs::connect_activate`); this suite locks
 //! their default fallbacks and explicit-override round-trips.
+//!
+//! `sdr-ui` itself is `#![cfg(target_os = "linux")]`, so on non-Linux
+//! workspace test compilation this crate produces an empty rlib —
+//! reaching into `sdr_ui::preferences::general_page` would fail to
+//! resolve. Gate the whole test file accordingly. Per CR round 1
+//! on PR #572.
+
+#![cfg(target_os = "linux")]
 
 use sdr_config::ConfigManager;
 use sdr_ui::preferences::general_page::{read_close_to_tray, read_tray_first_close_seen};

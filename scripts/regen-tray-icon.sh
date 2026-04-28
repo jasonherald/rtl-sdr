@@ -63,3 +63,14 @@ for i, (r, g, b, a) in enumerate(img.getdata()):
 Path(dst).write_bytes(bytes(out))
 print(f"wrote {dst} ({len(out)} bytes)")
 PY
+
+# Post-write guard: confirm the output is exactly width*height*4
+# bytes before the Rust compile-time assertion in icon.rs catches
+# it. Failing here gives a clearer error than `cargo build` would.
+# Per CR round 1 on PR #572.
+expected_bytes=$((SIZE * SIZE * 4))
+actual_bytes=$(wc -c < "$OUT")
+if [[ "$actual_bytes" -ne "$expected_bytes" ]]; then
+    echo "error: $OUT size mismatch: got $actual_bytes, expected $expected_bytes" >&2
+    exit 1
+fi

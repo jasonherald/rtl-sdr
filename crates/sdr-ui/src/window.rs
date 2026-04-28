@@ -517,8 +517,12 @@ pub fn build_window(
     let config_for_close = std::sync::Arc::clone(config);
     let toast_overlay_close = toast_overlay.downgrade();
     let transcription_engine_close = std::rc::Rc::clone(&transcription_engine);
-    let window_for_close = window.clone();
-    window.connect_close_request(move |_| {
+    // The closure receives `&window` as its parameter — use that
+    // instead of capturing a strong clone, otherwise the closure
+    // (which the window owns) would hold a strong ref back to its
+    // own window and form a retention cycle. Per CR round 1 on PR
+    // #572.
+    window.connect_close_request(move |w| {
         let bt = std::backtrace::Backtrace::capture();
         tracing::info!(backtrace = ?bt, "main window close-request fired");
 
@@ -527,7 +531,7 @@ pub fn build_window(
         // tray failed to spawn, MUST proceed-to-close — otherwise
         // the user is stuck with an invisible process. Per #512.
         if state_for_close.close_to_tray.get() && state_for_close.tray_available.get() {
-            window_for_close.set_visible(false);
+            w.set_visible(false);
             // First-close toast: fire exactly once per fresh config.
             if !state_for_close.tray_first_close_seen.get() {
                 state_for_close.tray_first_close_seen.set(true);
@@ -546,7 +550,14 @@ pub fn build_window(
             return glib::Propagation::Stop;
         }
 
-        // Real close — original teardown.
+        // Real close — tray failed to spawn (or the user disabled
+        // close-to-tray). Drop the application hold guard so the
+        // GApplication can release its reference and exit naturally
+        // once the window destroys. Without this, the window would
+        // close but `app.hold()` from connect_startup would keep
+        // the process alive headless with no way to interact.
+        // Per CR round 1 on PR #572.
+        let _ = state_for_close.app_hold_guard.borrow_mut().take();
         app_for_close.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
         transcription_engine_close.borrow_mut().shutdown_nonblocking();
         glib::Propagation::Proceed
@@ -12343,13 +12354,20 @@ fn setup_app_actions(
     rr_button: &gtk4::Button,
     state: &Rc<AppState>,
 ) {
-    // Quit action
+    // Quit action — Ctrl+Q and the menu's "Quit" entry. Routes
+    // through `tray-quit` (registered in `build_window`) so explicit
+    // quit goes through the same recording-confirmation modal +
+    // perform_real_quit teardown as the tray menu's Quit. Without
+    // this redirect, `window.close()` would hit the close-request
+    // handler and get swallowed into "hide to tray" — the user's
+    // Ctrl+Q would silently hide instead of exit. Per CR round 1
+    // on PR #572.
     let quit_action = gio::SimpleAction::new("quit", None);
     quit_action.connect_activate(glib::clone!(
         #[weak]
-        window,
+        app,
         move |_, _| {
-            window.close();
+            app.activate_action("tray-quit", None);
         }
     ));
     app.add_action(&quit_action);
@@ -12367,7 +12385,7 @@ fn setup_app_actions(
             let prefs_window = crate::preferences::build_preferences_window(
                 &window,
                 &config_for_prefs,
-                state_for_prefs.tray_available.get(),
+                &state_for_prefs,
             );
             // Update RR button visibility when preferences window closes
             let rr_btn = rr_button_prefs.clone();

@@ -12,7 +12,6 @@
 //! the app must work without us.
 
 #![cfg(target_os = "linux")]
-#![cfg_attr(test, allow(unsafe_code))]
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -141,12 +140,15 @@ impl ksni::Tray for SdrTray {
 /// `ksni::Error::Watcher` — indicate the desktop environment has no
 /// `StatusNotifierWatcher`. Everything else (D-Bus reachability
 /// problems, `WontShow`) falls into `Other` carrying the message.
-fn map_spawn_error(e: &ksni::Error) -> SpawnError {
-    let msg = e.to_string();
+///
+/// Takes the stringly error so callers in tests can exercise the
+/// mapping without needing a real `ksni::Error` value (the enum's
+/// variants are crate-private). Per CR round 1 on PR #572.
+fn map_spawn_error_msg(msg: &str) -> SpawnError {
     if msg.to_lowercase().contains("watcher") {
         SpawnError::TrayWatcherUnavailable
     } else {
-        SpawnError::Other(msg)
+        SpawnError::Other(msg.to_string())
     }
 }
 
@@ -191,7 +193,7 @@ pub fn spawn(events: mpsc::Sender<TrayEvent>) -> Result<TrayHandle, SpawnError> 
                         // _handle drops here, ksni tears down.
                     }
                     Err(e) => {
-                        let mapped = map_spawn_error(&e);
+                        let mapped = map_spawn_error_msg(&e.to_string());
                         let _ = ready_tx.send(Err(mapped));
                     }
                 }
@@ -228,32 +230,47 @@ pub fn spawn(events: mpsc::Sender<TrayEvent>) -> Result<TrayHandle, SpawnError> 
 mod tests {
     use super::*;
 
+    /// Pin the watcher-error mapping. Exercises the same string match
+    /// `spawn` performs on a real `ksni::Error::Watcher`, but without
+    /// touching env vars or D-Bus — the previous test mutated
+    /// `DBUS_SESSION_BUS_ADDRESS` via `unsafe { set_var }`, which is
+    /// fragile under parallel `cargo test`. Per CR round 1 on PR #572.
     #[test]
-    fn spawn_returns_error_when_dbus_session_unreachable() {
-        let prev = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
-        unsafe {
-            std::env::set_var(
-                "DBUS_SESSION_BUS_ADDRESS",
-                "unix:abstract=/nonexistent-tray-test",
+    fn map_spawn_error_msg_recognizes_watcher_strings() {
+        // The exact string ksni produces for `Error::Watcher`.
+        let msg = "failed to register to the StatusNotifierWatcher: …";
+        assert!(matches!(
+            map_spawn_error_msg(msg),
+            SpawnError::TrayWatcherUnavailable
+        ));
+    }
+
+    #[test]
+    fn map_spawn_error_msg_is_case_insensitive() {
+        // Defensive: future ksni / zbus version drift could change
+        // capitalization.
+        for variant in [
+            "WATCHER unavailable",
+            "no statusnotifierWATCHER",
+            "watcher missing on bus",
+        ] {
+            assert!(
+                matches!(
+                    map_spawn_error_msg(variant),
+                    SpawnError::TrayWatcherUnavailable
+                ),
+                "case-insensitive watcher match failed for: {variant}",
             );
         }
+    }
 
-        let (tx, _rx) = mpsc::channel::<TrayEvent>();
-        let result = spawn(tx);
-
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v),
-                None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
-            }
-        }
-
+    #[test]
+    fn map_spawn_error_msg_falls_back_to_other_with_message() {
+        let msg = "D-Bus connection error: address is invalid";
+        let result = map_spawn_error_msg(msg);
         assert!(
-            matches!(
-                result,
-                Err(SpawnError::TrayWatcherUnavailable | SpawnError::Other(_))
-            ),
-            "expected error variant, got {result:?}",
+            matches!(&result, SpawnError::Other(s) if s == msg),
+            "expected SpawnError::Other({msg:?}), got {result:?}",
         );
     }
 }
