@@ -205,7 +205,24 @@ fn tune_to_target(
     if let Some(idx) = demod_selector::demod_mode_to_index(mode) {
         demod_dropdown.set_selected(idx);
     }
+    // Update the bandwidth row's allowed range for the new mode
+    // BEFORE setting the value. The dropdown notify above only
+    // queues `SetDemodMode` to the DSP; the range update only
+    // happens when DSP echoes `DemodModeChanged` back, which is
+    // async. Without this synchronous update, `set_value(bw_hz)`
+    // below would clamp to the previous mode's range AND fire
+    // its own notify that dispatches a wrong `SetBandwidth`,
+    // overriding the correct `SetBandwidth(bw_hz)` we just sent
+    // at line 202. WFM→NFM retunes are the common failure case.
+    // Per CR round 2 on PR #574.
+    update_bandwidth_row_range_for_mode(radio_panel, state, mode);
+    // Suppress the bandwidth row's notify around `set_value` so
+    // it doesn't redispatch a redundant `SetBandwidth` —
+    // `tune_to_target` already sent the canonical command at
+    // line 202 above.
+    state.suppress_bandwidth_notify.set(true);
     bandwidth_row.set_value(bw_hz);
+    state.suppress_bandwidth_notify.set(false);
     // Mode-specific control visibility (e.g. squelch / deemph rows
     // shown only in NFM/WFM) — must be poked explicitly because
     // the demod-dropdown notify only covers the dropdown's own
@@ -9743,12 +9760,13 @@ fn connect_satellites_panel(
     panel
         .auto_record_quality_row
         .set_selected(initial_quality.to_index());
-    // Sensitivity tracks the auto-record switch — re-sync after
-    // hydration in case the persisted switch state differs from
-    // the panel's builder default.
-    panel
-        .auto_record_quality_row
-        .set_sensitive(panel.auto_record_switch.is_active());
+    // Sensitivity is wired in `build_satellites_panel` via the
+    // auto-record switch's `connect_active_notify` handler — it
+    // fires on every toggle, including the one triggered above
+    // by `auto_record_switch.set_active(load_auto_record_apt(...))`,
+    // so the persisted switch state propagates to the combo's
+    // sensitivity automatically. No re-sync needed here. Per CR
+    // round 2 on PR #574.
     panel
         .last_refresh_row
         .set_subtitle(&format_last_refresh(config));
