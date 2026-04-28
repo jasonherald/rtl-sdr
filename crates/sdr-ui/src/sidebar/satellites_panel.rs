@@ -621,8 +621,12 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     // no value. The recorder enforces this in `tick_idle`. Per
     // epic #469 task 7.4.
     let auto_record_audio_switch = adw::SwitchRow::builder()
-        .title("Also save audio (.wav)")
-        .subtitle("Capture demodulated audio alongside the image. Pairs with the PNG by filename. APT only — LRPT passes are silent.")
+        .title("Also save audio (.wav) — APT only")
+        .subtitle(
+            "Capture the demodulated audio alongside the PNG (paired by filename). \
+             Has no effect on Meteor-M LRPT passes — those have a silent demod and \
+             are skipped at the recorder regardless of this switch.",
+        )
         .active(false)
         .build();
     recording_group.add(&auto_record_audio_switch);
