@@ -279,6 +279,19 @@ pub struct LrptImageRenderer {
     /// is active so new lines accrue at the dropdown cadence
     /// (~1 Hz). Per #547.
     composite_cache: Option<CompositeSurface>,
+    /// `min(r_lines, g_lines, b_lines)` at the time `composite_cache`
+    /// was last built. The dropdown-refresh tick reads this to skip
+    /// a no-op rebuild when no source channel has advanced (e.g.,
+    /// LOS reached, or decoder stalled). Tracking the min — not
+    /// each channel's height — is sufficient because the composite
+    /// truncates to the shortest channel; advancing a non-limiting
+    /// channel produces a byte-identical output, so rebuilding it
+    /// would be pure waste. Without this gate, composite mode
+    /// burned ~5 ms × 3 memcpy + ~30 ms interleave + queued-redraw
+    /// on every 1 Hz tick for the rest of the viewer's life. Reset
+    /// to `None` on `clear()` and `clear_composite()`. Per CR
+    /// round 3 on PR #575.
+    composite_min_height: Option<usize>,
 }
 
 struct ChannelSurface {
@@ -345,6 +358,7 @@ impl LrptImageRenderer {
             active: None,
             active_composite: None,
             composite_cache: None,
+            composite_min_height: None,
         }
     }
 
@@ -484,6 +498,7 @@ impl LrptImageRenderer {
         self.active = None;
         self.active_composite = None;
         self.composite_cache = None;
+        self.composite_min_height = None;
     }
 
     /// Switch to composite mode and (re)build the cached ARGB32
@@ -522,6 +537,7 @@ impl LrptImageRenderer {
             );
             self.active_composite = Some(recipe);
             self.composite_cache = None;
+            self.composite_min_height = None;
             return false;
         };
         // Lock released. Heavy work runs on the GTK main thread,
@@ -538,6 +554,7 @@ impl LrptImageRenderer {
                 tracing::warn!(?recipe, error = %e, "composite ARGB32 surface build failed");
                 self.active_composite = Some(recipe);
                 self.composite_cache = None;
+                self.composite_min_height = None;
                 return false;
             }
         };
@@ -546,6 +563,7 @@ impl LrptImageRenderer {
             surface,
             height: snap.height,
         });
+        self.composite_min_height = Some(snap.height);
         true
     }
 
@@ -554,6 +572,7 @@ impl LrptImageRenderer {
     pub fn clear_composite(&mut self) {
         self.active_composite = None;
         self.composite_cache = None;
+        self.composite_min_height = None;
     }
 
     /// `true` when the renderer is currently in composite mode
@@ -570,6 +589,16 @@ impl LrptImageRenderer {
     #[must_use]
     pub fn active_composite(&self) -> Option<CompositeRecipe> {
         self.active_composite
+    }
+
+    /// `min(r_lines, g_lines, b_lines)` at the time the cached
+    /// composite surface was last built, or `None` if no cache is
+    /// populated. The dropdown-refresh tick reads this to skip a
+    /// no-op rebuild when the current min height matches what we
+    /// already painted. Per CR round 3 on PR #575.
+    #[must_use]
+    pub fn composite_min_height(&self) -> Option<usize> {
+        self.composite_min_height
     }
 
     /// Paint the active channel's image into `cr`, scaled to fit
@@ -1229,6 +1258,33 @@ impl LrptImageView {
         self.renderer.borrow().active_composite()
     }
 
+    /// `min(r_lines, g_lines, b_lines)` for `recipe` queried
+    /// against the live shared image *right now*. Returns `None`
+    /// if any source APID is missing or empty — matches
+    /// [`sdr_lrpt::image::ImageAssembler::clone_channels_for_composite`]'s
+    /// contract so the dropdown-refresh tick can compare this
+    /// directly to [`Self::cached_composite_min_height`] and skip
+    /// a no-op rebuild. Per CR round 3 on PR #575.
+    #[must_use]
+    pub fn current_composite_min_height(&self, recipe: CompositeRecipe) -> Option<usize> {
+        self.image.with_assembler(|a| {
+            let r = a.channel(recipe.r_apid)?.lines;
+            let g = a.channel(recipe.g_apid)?.lines;
+            let b = a.channel(recipe.b_apid)?.lines;
+            let m = r.min(g).min(b);
+            if m == 0 { None } else { Some(m) }
+        })
+    }
+
+    /// The min height the renderer's cached composite surface
+    /// was built against, or `None` if there's no current cache.
+    /// Used by the dropdown-refresh tick to decide whether a
+    /// rebuild would change anything. Per CR round 3 on PR #575.
+    #[must_use]
+    pub fn cached_composite_min_height(&self) -> Option<usize> {
+        self.renderer.borrow().composite_min_height()
+    }
+
     /// Pull every scan line that's new since the last call out
     /// of the shared [`LrptImage`] and into the per-APID
     /// renderer surfaces. Queues a single redraw if anything
@@ -1702,10 +1758,24 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
             // the pause contract says the canvas should freeze
             // until Resume is clicked. The next non-paused tick
             // catches up. Per #547 + CR round 1 on PR #575.
+            //
+            // Also skip when the source channels' min height
+            // hasn't advanced since the last build (e.g. LOS
+            // reached, decoder stalled, only a non-limiting
+            // channel grew). The composite truncates to
+            // `min(r, g, b)`, so a non-limiting channel growing
+            // produces byte-identical output — rebuilding then is
+            // pure waste (~3 memcpys + per-pixel interleave +
+            // queued redraw, every tick, forever). Per CR round 3
+            // on PR #575.
             if let Some(recipe) = view_for_tick.active_composite()
                 && !view_for_tick.is_paused()
             {
-                let _ = view_for_tick.set_composite(recipe);
+                let current = view_for_tick.current_composite_min_height(recipe);
+                let cached = view_for_tick.cached_composite_min_height();
+                if current != cached {
+                    let _ = view_for_tick.set_composite(recipe);
+                }
             }
 
             // If the entries match AND the dropdown's selected
@@ -1831,10 +1901,14 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     // ── Export PNG ────────────────────────────────────────
     let export_btn = gtk4::Button::builder()
         .icon_name("document-save-symbolic")
-        .tooltip_text("Export the current LRPT channel image to PNG")
+        // Wording covers both per-APID and composite exports — the
+        // button writes whatever the dropdown has selected
+        // (per-channel greyscale OR a false-colour composite). Per
+        // CR round 3 on PR #575.
+        .tooltip_text("Export the current LRPT image to PNG")
         .build();
     export_btn.update_property(&[gtk4::accessible::Property::Label(
-        "Export LRPT channel image to PNG",
+        "Export current LRPT image to PNG",
     )]);
     let export_view = view.clone();
     let window_for_export = window.downgrade();
@@ -1869,7 +1943,7 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
             show_toast_in(
                 &window_now,
                 adw::Toast::builder()
-                    .title("No LRPT channel data to export yet")
+                    .title("No LRPT image data to export yet")
                     .build(),
             );
             return;
@@ -2503,6 +2577,54 @@ mod tests {
         r.clear_composite();
         assert!(!r.is_composite_active());
         assert!(r.active_composite().is_none());
+    }
+
+    #[test]
+    fn composite_min_height_tracks_min_of_three_channels() {
+        // Pin the gate the dropdown tick uses to skip no-op
+        // composite rebuilds. Build with channels at lines
+        // (3, 5, 4); the renderer should remember 3 — only
+        // advancing the limiting channel can change the output.
+        // Per CR round 3 on PR #575.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        for _ in 0..3 {
+            image.push_line(recipe.r_apid, &vec![0x10; IMAGE_WIDTH]);
+        }
+        for _ in 0..5 {
+            image.push_line(recipe.g_apid, &vec![0x20; IMAGE_WIDTH]);
+        }
+        for _ in 0..4 {
+            image.push_line(recipe.b_apid, &vec![0x30; IMAGE_WIDTH]);
+        }
+        assert!(r.set_composite(recipe, &image));
+        assert_eq!(r.composite_min_height(), Some(3));
+
+        // Clearing the composite must drop the cached min so the
+        // tick treats the next activation as a fresh build.
+        r.clear_composite();
+        assert_eq!(r.composite_min_height(), None);
+
+        // Re-activating, then `clear()` (between-pass cleanup)
+        // also drops the cached min.
+        r.set_composite(recipe, &image);
+        assert_eq!(r.composite_min_height(), Some(3));
+        r.clear();
+        assert_eq!(r.composite_min_height(), None);
+    }
+
+    #[test]
+    fn composite_min_height_is_none_when_source_apids_missing() {
+        // Empty image — `set_composite` returns false and the
+        // cached min stays `None` so the tick keeps retrying
+        // (compares as `None != current_min`) until source
+        // channels appear. Per CR round 3 on PR #575.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        assert!(!r.set_composite(recipe, &image));
+        assert_eq!(r.composite_min_height(), None);
     }
 
     #[test]
