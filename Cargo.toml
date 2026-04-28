@@ -154,7 +154,7 @@ sdr-splash = { path = "crates/sdr-splash" }
 sdr-splash-gtk = { path = "crates/sdr-splash-gtk" }
 sdr-ui = { path = "crates/sdr-ui" }
 sdr-tray = { path = "crates/sdr-tray" }
-ksni = "0.3"
+ksni = { version = "0.3", default-features = false, features = ["async-io"] }
 smol = "2"
 
 # HTTP / XML (RadioReference)

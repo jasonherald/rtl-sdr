@@ -13,10 +13,12 @@
 
 #![cfg(target_os = "linux")]
 #![cfg_attr(test, allow(unsafe_code))]
-#![allow(unused_crate_dependencies)]
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+
+use ksni::TrayMethods;
+use ksni::menu::{MenuItem, StandardItem};
 
 mod icon;
 
@@ -42,6 +44,7 @@ pub enum SpawnError {
 /// to stop the thread.
 ///
 /// [`shutdown`]: TrayHandle::shutdown
+#[derive(Debug)]
 pub struct TrayHandle {
     stop_tx: mpsc::Sender<()>,
     join: Option<JoinHandle<()>>,
@@ -64,11 +67,193 @@ impl Drop for TrayHandle {
     }
 }
 
-/// Spawn the tray service. Stub — Task 2 lands the real ksni body.
+/// `ksni::Tray` implementation. Forwards user input to a `mpsc::Sender`
+/// owned by the UI side, so this struct stays tiny and Send.
+struct SdrTray {
+    events: mpsc::Sender<TrayEvent>,
+}
+
+impl SdrTray {
+    fn send(&self, event: TrayEvent) {
+        if let Err(e) = self.events.send(event) {
+            tracing::debug!("tray event receiver gone: {e}");
+        }
+    }
+}
+
+impl ksni::Tray for SdrTray {
+    fn id(&self) -> String {
+        "com.sdr.rs".to_string()
+    }
+
+    fn title(&self) -> String {
+        "SDR-RS".to_string()
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            icon_name: String::new(),
+            icon_pixmap: Vec::new(),
+            title: "SDR-RS".to_string(),
+            description: "Software-defined radio".to_string(),
+        }
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        let (width, height, data) = icon::current_icon();
+        vec![ksni::Icon {
+            width,
+            height,
+            data,
+        }]
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.send(TrayEvent::ToggleVisibility);
+    }
+
+    fn menu(&self) -> Vec<MenuItem<Self>> {
+        vec![
+            StandardItem {
+                label: "Show / Hide".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    tray.send(TrayEvent::ToggleVisibility);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "Quit".to_string(),
+                activate: Box::new(|tray: &mut Self| {
+                    tray.send(TrayEvent::Quit);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
+/// Map a ksni registration error into our public `SpawnError`.
+///
+/// Error strings containing "watcher" (case-insensitive) — i.e.
+/// `ksni::Error::Watcher` — indicate the desktop environment has no
+/// `StatusNotifierWatcher`. Everything else (D-Bus reachability
+/// problems, `WontShow`) falls into `Other` carrying the message.
+fn map_spawn_error(e: &ksni::Error) -> SpawnError {
+    let msg = e.to_string();
+    if msg.to_lowercase().contains("watcher") {
+        SpawnError::TrayWatcherUnavailable
+    } else {
+        SpawnError::Other(msg)
+    }
+}
+
+/// Spawn the tray service.
+///
+/// Blocks the calling thread until tray registration succeeds or
+/// fails. On success the returned `TrayHandle` owns a dedicated
+/// `std::thread` that drives the tray's lifecycle; drop it (or call
+/// [`TrayHandle::shutdown`]) to stop the tray.
 ///
 /// # Errors
 ///
-/// Always returns `Err(SpawnError::Other)` until Task 2.
-pub fn spawn(_events: mpsc::Sender<TrayEvent>) -> Result<TrayHandle, SpawnError> {
-    Err(SpawnError::Other("not yet implemented".to_string()))
+/// - `SpawnError::TrayWatcherUnavailable` if the session has no
+///   `StatusNotifierWatcher` (typically missing `AppIndicator`
+///   extension on GNOME, or no SNI host on minimal WMs).
+/// - `SpawnError::Other` for everything else (D-Bus unreachable,
+///   `WontShow`, etc.).
+pub fn spawn(events: mpsc::Sender<TrayEvent>) -> Result<TrayHandle, SpawnError> {
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), SpawnError>>();
+
+    let join = std::thread::Builder::new()
+        .name("sdr-tray".to_string())
+        .spawn(move || {
+            smol::block_on(async move {
+                let tray = SdrTray { events };
+                match tray.spawn().await {
+                    Ok(_handle) => {
+                        // Registration succeeded. Hold the handle in
+                        // scope until shutdown is signalled, then
+                        // drop it to tear down the SNI service.
+                        if ready_tx.send(Ok(())).is_err() {
+                            // Caller already gave up (e.g. dropped
+                            // the receiver after a panic). Bail out.
+                            return;
+                        }
+                        // Block on the std mpsc; we don't need to
+                        // poll any futures here because ksni's
+                        // background tasks live on its own internal
+                        // executor thread (async-io feature).
+                        let _ = stop_rx.recv();
+                        // _handle drops here, ksni tears down.
+                    }
+                    Err(e) => {
+                        let mapped = map_spawn_error(&e);
+                        let _ = ready_tx.send(Err(mapped));
+                    }
+                }
+            });
+        })
+        .map_err(|e| SpawnError::Other(format!("failed to spawn tray thread: {e}")))?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(TrayHandle {
+            stop_tx,
+            join: Some(join),
+        }),
+        Ok(Err(spawn_err)) => {
+            // Thread already exited after sending the error; reap
+            // it so we don't leave a zombie JoinHandle.
+            if let Err(e) = join.join() {
+                tracing::warn!("tray thread panicked while reporting error: {e:?}");
+            }
+            Err(spawn_err)
+        }
+        Err(_) => {
+            // Sender closed without sending — the thread panicked
+            // before reaching the await. Reap and report.
+            let panic_msg = match join.join() {
+                Ok(()) => "tray thread exited without reporting status".to_string(),
+                Err(e) => format!("tray thread panicked during init: {e:?}"),
+            };
+            Err(SpawnError::Other(panic_msg))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_returns_error_when_dbus_session_unreachable() {
+        let prev = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        unsafe {
+            std::env::set_var(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:abstract=/nonexistent-tray-test",
+            );
+        }
+
+        let (tx, _rx) = mpsc::channel::<TrayEvent>();
+        let result = spawn(tx);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v),
+                None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+            }
+        }
+
+        assert!(
+            matches!(
+                result,
+                Err(SpawnError::TrayWatcherUnavailable | SpawnError::Other(_))
+            ),
+            "expected error variant, got {result:?}",
+        );
+    }
 }
