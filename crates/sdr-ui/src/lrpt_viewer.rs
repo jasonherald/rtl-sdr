@@ -55,6 +55,86 @@ use sdr_radio::lrpt_image::LrptImage;
 use crate::messages::UiToDsp;
 use crate::viewer::ViewerError;
 
+// ─── False-colour composite catalog ────────────────────────────────────
+//
+// LRPT is multispectral — every Meteor-M pass usually decodes
+// three or more AVHRR-style channels in parallel. The composite
+// catalog below maps each user-facing recipe (chosen from the
+// viewer's channel dropdown after the "Composite —" prefix) to a
+// concrete R/G/B APID triple that
+// [`sdr_lrpt::image::ImageAssembler::composite_rgb`] then renders
+// into RGB pixels.
+//
+// Per #547. New recipes may only be appended, never inserted in
+// the middle — the dropdown is rebuilt on every refresh tick and
+// any reordering would silently shift the user's last selection
+// (we don't persist a recipe, but the principle still applies if
+// a future PR adds session memory).
+
+/// A named R/G/B APID triple for false-colour rendering. Hard-
+/// coded catalog entries cover the most common Meteor-M channel
+/// combos — the user picks one from the dropdown and the
+/// renderer composites the three named channels into RGB pixels.
+///
+/// Per #547. APID assignments follow Meteor-M N2-2's standard
+/// channel layout. The User-facing walkthrough is at
+/// `docs/guides/lrpt-reception.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompositeRecipe {
+    /// User-facing name. Shown in the dropdown after `Composite — `.
+    pub name: &'static str,
+    /// R, G, B APIDs in render order.
+    pub r_apid: u16,
+    pub g_apid: u16,
+    pub b_apid: u16,
+}
+
+/// Hard-coded composite catalog. Each entry combines three AVHRR-
+/// style channels into a single RGB image. Order matters — it's
+/// the dropdown order users see. New entries must append, not
+/// insert in the middle.
+///
+/// The three v1 entries pair the most-commonly-decoded Meteor
+/// channel combos with their conventional false-colour roles:
+///
+/// 1. **Natural colour (123)** — visible R / visible G / visible B.
+///    Rough true-colour for daylight passes.
+/// 2. **False-colour IR (124)** — visible / visible / IR. Vegetation
+///    reads bright red, water dark blue, snow white — the
+///    classic "weather wash" composite.
+/// 3. **Thermal IR (243)** — IR / IR / visible. Best for night
+///    passes where the visible channels are dark but thermal
+///    still discriminates land/sea/cloud.
+///
+/// APID values are the AVHRR slots Meteor-M N2-2 transmits on:
+/// 64 = ch1, 65 = ch2, 66 = ch3, 68 = ch4 (ch4 thermal is the
+/// commonly-active IR slot when operating in the standard
+/// "three visible plus one IR" mode). If a future Meteor variant
+/// ships a different APID assignment we'll add new recipes
+/// alongside these rather than mutate the existing values —
+/// composites that worked once must keep working as the catalog
+/// grows.
+pub const COMPOSITE_CATALOG: &[CompositeRecipe] = &[
+    CompositeRecipe {
+        name: "Natural colour (123)",
+        r_apid: 66,
+        g_apid: 65,
+        b_apid: 64,
+    },
+    CompositeRecipe {
+        name: "False-colour IR (124)",
+        r_apid: 68,
+        g_apid: 65,
+        b_apid: 64,
+    },
+    CompositeRecipe {
+        name: "Thermal IR (243)",
+        r_apid: 68,
+        g_apid: 66,
+        b_apid: 65,
+    },
+];
+
 /// Maximum lines we'll keep per channel. The MSU-MR scanner on
 /// Meteor-M produces AVHRR-style imagery at ~6 scan lines per
 /// second per channel; a long high-elevation pass (~15 min above
@@ -171,14 +251,52 @@ impl PushOutcome {
 /// guarantee the APT renderer offers.
 pub struct LrptImageRenderer {
     channels: HashMap<u16, ChannelSurface>,
-    /// APID currently selected for display. `None` if the user
-    /// hasn't picked a channel yet (or the renderer is empty).
+    /// APID currently selected for single-channel display. Ignored
+    /// when [`Self::active_composite`] is `Some(_)` (composite
+    /// mode takes precedence in [`Self::render`]). `None` if the
+    /// user hasn't picked a channel yet (or the renderer is
+    /// empty).
     active: Option<u16>,
+    /// `Some(recipe)` when the user picked a composite from the
+    /// dropdown. The cached surface in [`Self::composite_cache`]
+    /// was built for this recipe. `None` means single-channel
+    /// mode — [`Self::active`] drives the render in that case.
+    /// Per #547.
+    active_composite: Option<CompositeRecipe>,
+    /// Cached ARGB32 surface backing the active composite. Built
+    /// lazily by [`Self::set_composite`] from the source channels'
+    /// RGB bytes via
+    /// [`sdr_lrpt::image::ImageAssembler::composite_rgb`]. `None`
+    /// until the first composite render OR after [`Self::clear`].
+    /// The render code paints from this cached surface rather
+    /// than re-running the composite math on every redraw — it's
+    /// rebuilt on the dropdown-refresh tick when composite mode
+    /// is active so new lines accrue at the dropdown cadence
+    /// (~1 Hz). Per #547.
+    composite_cache: Option<CompositeSurface>,
 }
 
 struct ChannelSurface {
     surface: cairo::ImageSurface,
     n_lines: usize,
+}
+
+/// Pre-baked Cairo surface holding the active composite's pixels
+/// as ARGB32 (B/G/R/A on little-endian hosts). Replaces a
+/// composite-mode redraw's worst case from "iterate every pixel
+/// of every source channel and pack RGB on each frame" with "blit
+/// a single image surface" — same shape as the per-APID
+/// `ChannelSurface` cache.
+///
+/// The owning recipe is tracked on `LrptImageRenderer.active_composite`
+/// rather than here — keeping recipe identity in one place
+/// avoids a "which one is canonical" question. Per #547.
+struct CompositeSurface {
+    surface: cairo::ImageSurface,
+    /// Number of lines actually rendered. The composite
+    /// assembler truncates to `min(r.lines, g.lines, b.lines)`
+    /// so all three channels are valid for every painted row.
+    height: usize,
 }
 
 impl ChannelSurface {
@@ -220,6 +338,8 @@ impl LrptImageRenderer {
         Self {
             channels: HashMap::new(),
             active: None,
+            active_composite: None,
+            composite_cache: None,
         }
     }
 
@@ -346,19 +466,98 @@ impl LrptImageRenderer {
         PushOutcome::Pushed
     }
 
-    /// Drop all per-channel surfaces. The `HashMap` allocation
-    /// itself is preserved, but each ~51 MB surface is freed —
-    /// callers (between-pass cleanup) typically rebuild from
-    /// scratch as new channels reappear.
+    /// Drop all per-channel surfaces AND any cached composite.
+    /// The `HashMap` allocation itself is preserved, but each
+    /// ~51 MB surface is freed — callers (between-pass cleanup)
+    /// typically rebuild from scratch as new channels reappear.
+    /// The composite cache is also dropped so a fresh pass
+    /// doesn't paint stale RGB pixels until the dropdown
+    /// handler rebuilds against the new pass's per-APID
+    /// surfaces. Per #547.
     pub fn clear(&mut self) {
         self.channels.clear();
         self.active = None;
+        self.active_composite = None;
+        self.composite_cache = None;
+    }
+
+    /// Switch to composite mode and (re)build the cached ARGB32
+    /// surface from the current state of `image`. Returns `true`
+    /// if the composite was successfully built (all three source
+    /// channels exist and have at least one line each); `false`
+    /// otherwise — caller can fall back to single-channel mode
+    /// in that case (the dropdown handler does so by leaving the
+    /// previous active APID in place).
+    ///
+    /// V1 always rebuilds on activate / refresh — the per-APID
+    /// `push_line` paths don't update the composite cache (they
+    /// only write into per-APID surfaces). The dropdown's drain
+    /// tick re-invokes this on every poll while composite mode
+    /// is active so new lines accrue in near-real-time at the
+    /// dropdown cadence (~1 Hz). Per #547.
+    ///
+    /// On Cairo allocation / surface-data lock failure, logs a
+    /// warn and clears the cache without panicking — same
+    /// no-panic library-crate rule the rest of the renderer
+    /// follows.
+    pub fn set_composite(&mut self, recipe: CompositeRecipe, image: &LrptImage) -> bool {
+        let composite_bytes =
+            image.with_assembler(|a| a.composite_rgb(recipe.r_apid, recipe.g_apid, recipe.b_apid));
+        let Some((width, height, rgb)) = composite_bytes else {
+            tracing::debug!(
+                ?recipe,
+                "composite_rgb returned None — one or more source APIDs missing or empty",
+            );
+            self.active_composite = Some(recipe);
+            self.composite_cache = None;
+            return false;
+        };
+        let surface = match build_argb32_from_rgb(&rgb, width, height) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?recipe, error = %e, "composite ARGB32 surface build failed");
+                self.active_composite = Some(recipe);
+                self.composite_cache = None;
+                return false;
+            }
+        };
+        self.active_composite = Some(recipe);
+        self.composite_cache = Some(CompositeSurface { surface, height });
+        true
+    }
+
+    /// Switch back to single-APID mode — the next [`Self::render`]
+    /// paints the active per-APID surface as before. Per #547.
+    pub fn clear_composite(&mut self) {
+        self.active_composite = None;
+        self.composite_cache = None;
+    }
+
+    /// `true` when the renderer is currently in composite mode
+    /// (a composite recipe has been activated, regardless of
+    /// whether the cache is populated).
+    #[must_use]
+    pub fn is_composite_active(&self) -> bool {
+        self.active_composite.is_some()
+    }
+
+    /// The currently-active composite recipe, if any. Used by
+    /// the drain tick to re-issue [`Self::set_composite`] on
+    /// every refresh tick so new lines accrue in near-real-time.
+    #[must_use]
+    pub fn active_composite(&self) -> Option<CompositeRecipe> {
+        self.active_composite
     }
 
     /// Paint the active channel's image into `cr`, scaled to fit
     /// `(width, height)` while preserving the
     /// `IMAGE_WIDTH : n_lines` aspect. Centred horizontally,
     /// top-aligned vertically.
+    ///
+    /// Composite mode (when [`Self::is_composite_active`] is
+    /// `true` AND the cache is populated) takes precedence — the
+    /// cached ARGB32 surface paints in place of any per-APID
+    /// surface. Per #547.
     ///
     /// Returns `Ok(())` and paints just the background when no
     /// channel is active or the active channel has no lines —
@@ -369,13 +568,22 @@ impl LrptImageRenderer {
     /// Returns [`ViewerError::Cairo`] on paint failure. Callers
     /// usually log and continue — drawing failures shouldn't
     /// kill the UI. Per issue #545.
-    #[allow(clippy::cast_precision_loss)]
     pub fn render(&self, cr: &cairo::Context, width: i32, height: i32) -> Result<(), ViewerError> {
         cr.set_source_rgb(BACKGROUND_RGB[0], BACKGROUND_RGB[1], BACKGROUND_RGB[2]);
         cr.paint().map_err(|e| ViewerError::Cairo {
             op: "background paint",
             source: e,
         })?;
+
+        // Composite branch takes precedence when the cache is
+        // populated. A composite that's been activated but
+        // failed to build (None cache) falls through to the
+        // single-channel branch so the user still sees their
+        // last selected APID rather than a black canvas. Per
+        // #547.
+        if let Some(c) = &self.composite_cache {
+            return paint_image_surface(cr, &c.surface, c.height, width, height);
+        }
 
         let Some(apid) = self.active else {
             return Ok(());
@@ -386,33 +594,7 @@ impl LrptImageRenderer {
         if channel.n_lines == 0 || width <= 0 || height <= 0 {
             return Ok(());
         }
-
-        let img_w = IMAGE_WIDTH as f64;
-        let img_h = channel.n_lines as f64;
-        let scale = (f64::from(width) / img_w).min(f64::from(height) / img_h);
-        let off_x = (f64::from(width) - img_w * scale) / 2.0;
-
-        cr.save().map_err(|e| ViewerError::Cairo {
-            op: "save",
-            source: e,
-        })?;
-        cr.translate(off_x, 0.0);
-        cr.scale(scale, scale);
-        cr.set_source_surface(&channel.surface, 0.0, 0.0)
-            .map_err(|e| ViewerError::Cairo {
-                op: "set_source_surface",
-                source: e,
-            })?;
-        cr.rectangle(0.0, 0.0, img_w, img_h);
-        cr.fill().map_err(|e| ViewerError::Cairo {
-            op: "image fill",
-            source: e,
-        })?;
-        cr.restore().map_err(|e| ViewerError::Cairo {
-            op: "restore",
-            source: e,
-        })?;
-        Ok(())
+        paint_image_surface(cr, &channel.surface, channel.n_lines, width, height)
     }
 
     /// Save the active channel's image to a PNG file. Builds a
@@ -597,6 +779,115 @@ pub fn write_greyscale_png(
     Ok(())
 }
 
+/// Paint `surface` (an `IMAGE_WIDTH × n_lines` Cairo image
+/// surface) into `cr`, scaled to fit `(width, height)` while
+/// preserving the `IMAGE_WIDTH : n_lines` aspect. Centred
+/// horizontally, top-aligned vertically. Pulled out of
+/// [`LrptImageRenderer::render`] so the per-APID and composite
+/// paint paths share the same scale logic — only the source
+/// surface differs. Per #547.
+#[allow(clippy::cast_precision_loss)]
+fn paint_image_surface(
+    cr: &cairo::Context,
+    surface: &cairo::ImageSurface,
+    n_lines: usize,
+    width: i32,
+    height: i32,
+) -> Result<(), ViewerError> {
+    if n_lines == 0 || width <= 0 || height <= 0 {
+        return Ok(());
+    }
+    let img_w = IMAGE_WIDTH as f64;
+    let img_h = n_lines as f64;
+    let scale = (f64::from(width) / img_w).min(f64::from(height) / img_h);
+    let off_x = (f64::from(width) - img_w * scale) / 2.0;
+
+    cr.save().map_err(|e| ViewerError::Cairo {
+        op: "save",
+        source: e,
+    })?;
+    cr.translate(off_x, 0.0);
+    cr.scale(scale, scale);
+    cr.set_source_surface(surface, 0.0, 0.0)
+        .map_err(|e| ViewerError::Cairo {
+            op: "set_source_surface",
+            source: e,
+        })?;
+    cr.rectangle(0.0, 0.0, img_w, img_h);
+    cr.fill().map_err(|e| ViewerError::Cairo {
+        op: "image fill",
+        source: e,
+    })?;
+    cr.restore().map_err(|e| ViewerError::Cairo {
+        op: "restore",
+        source: e,
+    })?;
+    Ok(())
+}
+
+/// Build a Cairo `ARgb32` surface from an interleaved RGB byte
+/// buffer (3 bytes per pixel, row-major). Cairo's native ARGB32
+/// on little-endian hosts is laid out as B, G, R, A in memory;
+/// every supported sdr-rs platform (`x86_64`, `aarch64`) is
+/// little-endian, so the byte rewrite below assumes that layout.
+/// Per #547.
+///
+/// # Errors
+///
+/// Returns a `String` describing the failure — `set_composite`
+/// logs and falls back gracefully on any non-`Ok` outcome, so
+/// callers don't need to distinguish error cases. Causes:
+/// `width` / `height` exceeds `i32::MAX`, RGB buffer length
+/// doesn't match `width * height * 3`, Cairo allocation fails,
+/// or the surface's data lock can't be acquired.
+fn build_argb32_from_rgb(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<cairo::ImageSurface, String> {
+    let width_i32 =
+        i32::try_from(width).map_err(|_| format!("composite width {width} > i32::MAX"))?;
+    let height_i32 =
+        i32::try_from(height).map_err(|_| format!("composite height {height} > i32::MAX"))?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| format!("RGB buffer dimensions overflow usize: {width} × {height} × 3"))?;
+    if rgb.len() != expected {
+        return Err(format!(
+            "RGB buffer length {} doesn't match width*height*3 ({width} * {height} * 3 = {expected})",
+            rgb.len(),
+        ));
+    }
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width_i32, height_i32)
+        .map_err(|e| format!("ARGB32 surface alloc: {e}"))?;
+    let stride =
+        usize::try_from(surface.stride()).map_err(|e| format!("invalid surface stride: {e}"))?;
+    {
+        let mut data = surface
+            .data()
+            .map_err(|e| format!("surface data lock: {e}"))?;
+        for y in 0..height {
+            let src_row = y * width * 3;
+            let dst_row = y * stride;
+            for x in 0..width {
+                let r = rgb[src_row + x * 3];
+                let g = rgb[src_row + x * 3 + 1];
+                let b = rgb[src_row + x * 3 + 2];
+                let dst = dst_row + x * BYTES_PER_PIXEL;
+                // Cairo ARGB32 little-endian byte order:
+                //   data[0] = B, data[1] = G, data[2] = R, data[3] = A.
+                data[dst] = b;
+                data[dst + 1] = g;
+                data[dst + 2] = r;
+                data[dst + 3] = 0xFF;
+            }
+        }
+    }
+    surface.flush();
+    Ok(surface)
+}
+
 // ─── GTK widget ────────────────────────────────────────────────────────
 
 /// Live Meteor LRPT image viewer widget.
@@ -732,6 +1023,44 @@ impl LrptImageView {
     #[must_use]
     pub fn active_apid(&self) -> Option<u16> {
         self.renderer.borrow().active_apid()
+    }
+
+    /// Switch the viewer to composite mode for `recipe`. (Re-)builds
+    /// the cached ARGB32 surface from the underlying shared
+    /// `LrptImage` and queues a redraw. Returns `true` if the
+    /// composite was successfully built (all three source APIDs
+    /// have data); `false` otherwise. Per #547.
+    pub fn set_composite(&self, recipe: CompositeRecipe) -> bool {
+        let ok = self
+            .renderer
+            .borrow_mut()
+            .set_composite(recipe, &self.image);
+        // Always queue a redraw — even on the `false` path the
+        // background paint covers the previous render's pixels,
+        // so the user sees the canvas reset rather than stale
+        // composite data hanging around.
+        self.drawing_area.queue_draw();
+        ok
+    }
+
+    /// Drop composite mode; subsequent renders fall back to the
+    /// active per-APID channel. Queues a redraw so the canvas
+    /// updates immediately. Per #547.
+    pub fn clear_composite(&self) {
+        self.renderer.borrow_mut().clear_composite();
+        self.drawing_area.queue_draw();
+    }
+
+    /// `true` when composite mode is currently active.
+    #[must_use]
+    pub fn is_composite_active(&self) -> bool {
+        self.renderer.borrow().is_composite_active()
+    }
+
+    /// The active composite recipe, if any.
+    #[must_use]
+    pub fn active_composite(&self) -> Option<CompositeRecipe> {
+        self.renderer.borrow().active_composite()
     }
 
     /// Pull every scan line that's new since the last call out
@@ -989,31 +1318,80 @@ impl LrptImageView {
 
 // ─── Non-modal viewer window ───────────────────────────────────────────
 
+/// One row in the dropdown — either a single APID, or a
+/// composite recipe. Pulled out as a tagged enum (rather than
+/// the previous parallel `Vec<u16>`) so the
+/// `connect_selected_notify` handler can dispatch straight off
+/// the index without index-arithmetic against a "where do
+/// composites start" boundary that drifted any time the APID
+/// list changed. Per #547.
+#[derive(Clone, Copy, Debug)]
+enum DropdownEntry {
+    Apid(u16),
+    Composite(CompositeRecipe),
+}
+
 /// Build the dynamic channel-picker dropdown for the viewer
 /// header. APIDs aren't known at open time, so the dropdown
 /// starts dimmed-but-visible and a 1 Hz `glib` timer rebuilds
 /// its model whenever new APIDs appear in `view`. A parallel
-/// `Vec<u16>` lets us decode the dropdown's numeric `selected`
-/// index back into an APID without parsing the display string.
+/// `Vec<DropdownEntry>` lets us decode the dropdown's numeric
+/// `selected` index back into either an APID or a composite
+/// recipe without parsing the display string.
+///
+/// The model is laid out as: per-APID entries first (sorted),
+/// then every recipe in [`COMPOSITE_CATALOG`] in catalog order.
+/// Composite rows are listed unconditionally even when the
+/// underlying APIDs aren't all present yet — picking one in
+/// that state shows a black canvas with a debug log, and the
+/// dropdown's drain tick re-issues `set_composite` on every
+/// poll so the image populates the moment the missing channel
+/// arrives. Per #547.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the refresh tick is one logical block — building the desired \
+              entries list, detecting changes, optionally rebuilding the \
+              composite cache, then syncing the dropdown's selected index. \
+              Splitting it would force the borrow-scoping comments and the \
+              re-entrance-safety invariants out of the body that depends on \
+              them"
+)]
 fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     let model = gtk4::StringList::new(&[]);
     let dropdown = gtk4::DropDown::builder()
         .model(&model)
-        .tooltip_text("Which AVHRR channel (APID) to display")
+        .tooltip_text("Which AVHRR channel (APID) or composite to display")
         .sensitive(false)
         .build();
     dropdown.update_property(&[gtk4::accessible::Property::Label("LRPT channel selector")]);
-    let dropdown_apids: Rc<RefCell<Vec<u16>>> = Rc::new(RefCell::new(Vec::new()));
+    let dropdown_entries: Rc<RefCell<Vec<DropdownEntry>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // Selection → renderer.
+    // Selection → renderer. Per-APID picks route to
+    // `set_active_apid` and clear any active composite so the
+    // single-channel canvas paints; composite picks call
+    // `set_composite`, which builds the cached ARGB32 surface
+    // from the named source APIDs. Per #547.
     {
         let view = view.clone();
-        let dropdown_apids = Rc::clone(&dropdown_apids);
+        let dropdown_entries = Rc::clone(&dropdown_entries);
         dropdown.connect_selected_notify(move |dd| {
             let idx = dd.selected() as usize;
-            let apids = dropdown_apids.borrow();
-            if let Some(&apid) = apids.get(idx) {
-                let _ = view.set_active_apid(apid);
+            let entries = dropdown_entries.borrow();
+            let Some(&entry) = entries.get(idx) else {
+                return;
+            };
+            // Drop the borrow before any view mutation that
+            // might re-enter the dropdown handler (e.g. via
+            // a future `set_selected` call inside the view).
+            drop(entries);
+            match entry {
+                DropdownEntry::Apid(apid) => {
+                    view.clear_composite();
+                    let _ = view.set_active_apid(apid);
+                }
+                DropdownEntry::Composite(recipe) => {
+                    let _ = view.set_composite(recipe);
+                }
             }
         });
     }
@@ -1025,11 +1403,24 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     // `view.clone()` would keep the view + ~51 MB-per-channel
     // surfaces alive forever.
     //
+    // The tick has three jobs:
+    //   1. Rebuild the entries list when the APID set changes
+    //      (composite rows are always appended; per-APID rows
+    //      are sorted).
+    //   2. Re-sync the dropdown's `selected` to whichever APID
+    //      the renderer thinks is active (or the first APID if
+    //      the renderer has no selection yet).
+    //   3. When composite mode is active, re-issue
+    //      `view.set_composite(recipe)` so newly-decoded lines
+    //      from the source APIDs land in the cached composite
+    //      surface. The user sees lines accrue at the same
+    //      cadence the dropdown refreshes (~1 Hz). Per #547.
+    //
     // **Borrow scoping:** GTK4's `gtk4::DropDown::set_selected`
     // emits `notify::selected` SYNCHRONOUSLY inside the setter,
     // which means the `connect_selected_notify` handler above
-    // re-enters this same `dropdown_apids` `RefCell` to look
-    // up the APID for the new index. If we held a `borrow_mut()`
+    // re-enters this same `dropdown_entries` `RefCell` to look
+    // up the entry for the new index. If we held a `borrow_mut()`
     // across `set_selected(...)`, that re-entrance would panic
     // with "already borrowed". Per `CodeRabbit` round 3 on PR
     // #543. The borrows below are kept tight: an immutable
@@ -1041,43 +1432,100 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     let refresh_id = glib::timeout_add_local(
         std::time::Duration::from_millis(u64::from(DROPDOWN_REFRESH_INTERVAL_MS)),
         move || {
-            let mut current = view_for_tick.known_apids();
-            current.sort_unstable();
-            // Cheap sync check: bail out only if BOTH the APID
-            // list AND the dropdown's selected channel still
-            // match the renderer's active APID. The selected-
-            // sync arm guards against an external caller
-            // (`SaveLrptPass` walks active_apid through every
-            // channel; future programmatic API users) changing
-            // `view.active_apid()` without changing the list,
-            // which the previous list-only fast-path would have
-            // ignored — leaving the dropdown stuck on the wrong
-            // channel until the next list change. Per
-            // `CodeRabbit` round 6 on PR #543.
-            let active = view_for_tick.active_apid();
-            let apids_unchanged = *dropdown_apids.borrow() == current;
-            #[allow(clippy::cast_possible_truncation)]
-            let selected_apid = {
-                let apids = dropdown_apids.borrow();
-                apids.get(dropdown_clone.selected() as usize).copied()
+            let mut current_apids = view_for_tick.known_apids();
+            current_apids.sort_unstable();
+
+            // Build the desired full entries list: per-APID
+            // entries first (sorted), then catalog composites.
+            let mut desired: Vec<DropdownEntry> = current_apids
+                .iter()
+                .copied()
+                .map(DropdownEntry::Apid)
+                .collect();
+            desired.extend(
+                COMPOSITE_CATALOG
+                    .iter()
+                    .copied()
+                    .map(DropdownEntry::Composite),
+            );
+
+            let entries_unchanged = {
+                let cur = dropdown_entries.borrow();
+                cur.len() == desired.len()
+                    && cur.iter().zip(desired.iter()).all(|(a, b)| match (a, b) {
+                        (DropdownEntry::Apid(x), DropdownEntry::Apid(y)) => x == y,
+                        (DropdownEntry::Composite(x), DropdownEntry::Composite(y)) => x == y,
+                        _ => false,
+                    })
             };
-            if apids_unchanged && selected_apid == active {
+
+            // Always rebuild the composite cache when composite
+            // mode is active — new lines may have arrived in
+            // the underlying per-APID channels since the last
+            // tick. Cheap relative to the full pass: each rebuild
+            // walks `min(r,g,b).lines × IMAGE_WIDTH × 3` bytes.
+            // Per #547.
+            if let Some(recipe) = view_for_tick.active_composite() {
+                let _ = view_for_tick.set_composite(recipe);
+            }
+
+            // If the entries match AND the dropdown's selected
+            // entry still aligns with the renderer's active
+            // channel, there's nothing else to do this tick.
+            let active_apid = view_for_tick.active_apid();
+            let active_composite = view_for_tick.active_composite();
+            #[allow(clippy::cast_possible_truncation)]
+            let selected_entry = {
+                let entries = dropdown_entries.borrow();
+                entries.get(dropdown_clone.selected() as usize).copied()
+            };
+            let selected_aligned = match (selected_entry, active_composite, active_apid) {
+                (Some(DropdownEntry::Composite(s)), Some(a), _) => s == a,
+                (Some(DropdownEntry::Apid(s)), None, Some(a)) => s == a,
+                _ => false,
+            };
+            if entries_unchanged && selected_aligned {
                 return glib::ControlFlow::Continue;
             }
-            if !apids_unchanged {
+
+            if !entries_unchanged {
                 model.splice(0, model.n_items(), &[]);
-                for &apid in &current {
-                    model.append(&format!("APID {apid}"));
+                for entry in &desired {
+                    match entry {
+                        DropdownEntry::Apid(apid) => model.append(&format!("APID {apid}")),
+                        DropdownEntry::Composite(recipe) => {
+                            model.append(&format!("Composite — {}", recipe.name));
+                        }
+                    }
                 }
-                dropdown_apids.borrow_mut().clone_from(&current);
+                dropdown_entries.borrow_mut().clone_from(&desired);
             }
-            dropdown_clone.set_sensitive(!current.is_empty());
-            if let Some(active) = active {
-                if let Some(pos) = current.iter().position(|&a| a == active) {
+            // Always sensitive — composite catalog entries are
+            // present even before any APID arrives. Picking one
+            // pre-decode logs and falls through to the
+            // background-painted canvas; the next refresh tick
+            // rebuilds once data shows up. Per #547.
+            dropdown_clone.set_sensitive(!desired.is_empty());
+
+            // Sync the selected index to the renderer's active
+            // state. Composite mode wins over per-APID active.
+            if let Some(recipe) = active_composite {
+                if let Some(pos) = desired.iter().position(|e| match e {
+                    DropdownEntry::Composite(r) => *r == recipe,
+                    DropdownEntry::Apid(_) => false,
+                }) {
                     #[allow(clippy::cast_possible_truncation)]
                     dropdown_clone.set_selected(pos as u32);
                 }
-            } else if !current.is_empty() {
+            } else if let Some(active) = active_apid {
+                if let Some(pos) = desired.iter().position(|e| match e {
+                    DropdownEntry::Apid(a) => *a == active,
+                    DropdownEntry::Composite(_) => false,
+                }) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    dropdown_clone.set_selected(pos as u32);
+                }
+            } else if !current_apids.is_empty() {
                 // No previous selection — pick the first APID
                 // (sorted) so the user sees something the moment
                 // data arrives. The `selected_notify` handler above
@@ -1629,5 +2077,145 @@ mod tests {
         let result = write_greyscale_png(&path, &[1_u8], 0, 1);
         assert!(matches!(result, Err(crate::viewer::ViewerError::ZeroSized)));
         assert!(!path.exists());
+    }
+
+    // ─── Composite catalog (#547) ───────────────────────────
+
+    #[test]
+    fn composite_catalog_is_non_empty() {
+        // Defensive — if a future maintainer ever empties the
+        // catalog the dropdown silently loses every composite
+        // option. Catch that loud-and-early.
+        assert!(!COMPOSITE_CATALOG.is_empty());
+    }
+
+    #[test]
+    fn composite_catalog_has_unique_names() {
+        // Names show up in the dropdown with a `Composite — `
+        // prefix; duplicates would render two indistinguishable
+        // entries. Pin uniqueness so a copy-paste typo can't
+        // ship.
+        let names: Vec<&str> = COMPOSITE_CATALOG.iter().map(|r| r.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            names.len(),
+            sorted.len(),
+            "duplicate composite name in catalog",
+        );
+    }
+
+    #[test]
+    fn composite_catalog_apid_triples_are_distinct_per_entry() {
+        // A recipe with R == G (or any pair equal) collapses to a
+        // 2-channel composite — almost certainly a typo. The
+        // assembler still renders, but the result is misleading
+        // (one channel painted into two RGB slots). Pin
+        // distinctness as a sanity guard.
+        for r in COMPOSITE_CATALOG {
+            assert_ne!(r.r_apid, r.g_apid, "{}: r and g APIDs are the same", r.name);
+            assert_ne!(r.g_apid, r.b_apid, "{}: g and b APIDs are the same", r.name);
+            assert_ne!(r.r_apid, r.b_apid, "{}: r and b APIDs are the same", r.name);
+        }
+    }
+
+    #[test]
+    fn renderer_starts_in_single_channel_mode() {
+        let r = LrptImageRenderer::new();
+        assert!(!r.is_composite_active());
+        assert!(r.active_composite().is_none());
+    }
+
+    #[test]
+    fn set_composite_returns_false_when_source_apids_missing() {
+        // No data pushed yet — every recipe's source APIDs are
+        // missing, so `composite_rgb` returns None and
+        // `set_composite` reports false. The recipe is still
+        // remembered as the active composite (so the drain
+        // tick will retry every poll), but the cache stays
+        // empty.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        assert!(!r.set_composite(recipe, &image));
+        assert!(r.is_composite_active());
+        assert_eq!(r.active_composite(), Some(recipe));
+    }
+
+    #[test]
+    fn set_composite_succeeds_when_all_three_apids_have_data() {
+        // Push one line per source APID for the first catalog
+        // recipe, then activate it. The cache should populate
+        // and `is_composite_active` stays true.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        image.push_line(recipe.r_apid, &vec![0x10; IMAGE_WIDTH]);
+        image.push_line(recipe.g_apid, &vec![0x20; IMAGE_WIDTH]);
+        image.push_line(recipe.b_apid, &vec![0x30; IMAGE_WIDTH]);
+        assert!(r.set_composite(recipe, &image));
+        assert!(r.is_composite_active());
+        assert_eq!(r.active_composite(), Some(recipe));
+    }
+
+    #[test]
+    fn clear_composite_drops_recipe_and_cache() {
+        // Activate composite, then clear. Both the recipe and
+        // the cache must be gone so the next render falls back
+        // to single-channel mode.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        image.push_line(recipe.r_apid, &vec![0x10; IMAGE_WIDTH]);
+        image.push_line(recipe.g_apid, &vec![0x20; IMAGE_WIDTH]);
+        image.push_line(recipe.b_apid, &vec![0x30; IMAGE_WIDTH]);
+        r.set_composite(recipe, &image);
+        r.clear_composite();
+        assert!(!r.is_composite_active());
+        assert!(r.active_composite().is_none());
+    }
+
+    #[test]
+    fn renderer_clear_drops_composite_state() {
+        // `clear()` is between-pass cleanup; it must drop the
+        // composite alongside the per-APID surfaces so a fresh
+        // pass doesn't paint stale RGB pixels until the
+        // dropdown handler rebuilds.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        image.push_line(recipe.r_apid, &vec![0x10; IMAGE_WIDTH]);
+        image.push_line(recipe.g_apid, &vec![0x20; IMAGE_WIDTH]);
+        image.push_line(recipe.b_apid, &vec![0x30; IMAGE_WIDTH]);
+        r.set_composite(recipe, &image);
+        assert!(r.is_composite_active());
+        r.clear();
+        assert!(!r.is_composite_active());
+        assert!(r.active_composite().is_none());
+    }
+
+    #[test]
+    fn build_argb32_from_rgb_writes_bgra_byte_order() {
+        // Pin Cairo's ARGB32 little-endian byte order — the
+        // composite cache and the test assertion below would
+        // both flip in lockstep otherwise. R/G/B input bytes
+        // land at offsets +2 / +1 / +0 in the surface data;
+        // alpha is opaque.
+        let rgb = vec![0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33];
+        let mut surface = build_argb32_from_rgb(&rgb, 2, 1).expect("argb32 build");
+        let data = surface.data().expect("surface data");
+        assert_eq!(&data[0..4], &[0xCC, 0xBB, 0xAA, 0xFF]);
+        assert_eq!(&data[4..8], &[0x33, 0x22, 0x11, 0xFF]);
+    }
+
+    #[test]
+    fn build_argb32_from_rgb_rejects_size_mismatch() {
+        // Buffer length must equal width*height*3 — anything
+        // else is a caller bug. The error string is matched
+        // loosely; we just want to confirm the path doesn't
+        // build a malformed surface.
+        let rgb = vec![0; 10];
+        assert!(build_argb32_from_rgb(&rgb, 4, 4).is_err());
     }
 }
