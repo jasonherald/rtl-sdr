@@ -832,6 +832,13 @@ mod tests {
     use super::*;
     use chrono::{Duration as ChronoDuration, TimeZone};
 
+    /// Default `min_elev_deg` for `tick(...)` in this test module —
+    /// matches `AutoRecordQuality::DEFAULT.min_elev_deg()` (= 25°,
+    /// the "winners and good" tier). Centralized so a future bump to
+    /// the default tier doesn't sprinkle 56 literal updates across
+    /// the file. Per CR round 1 on PR #574.
+    const DEFAULT_MIN_ELEV_DEG: f64 = 25.0;
+
     /// Build a synthetic NOAA 19 pass starting `aos_offset_secs`
     /// from `now`, lasting `duration_secs`, with the given peak
     /// elevation. Mirrors the synthetic-pass fixture pattern used
@@ -876,7 +883,14 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass starts in 3 s — inside the 5 s lead-in.
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
-        let actions = r.tick(now, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::BeforePass { .. }));
         assert!(matches!(actions[0], Action::StartAutoRecord { .. }));
         // Pre-AOS arming reports "starting" — the pass hasn't
@@ -906,7 +920,14 @@ mod tests {
         // Pass started 30 s ago, ends in 9.5 min — eligible by
         // every other gate (NOAA, 50° peak, end > now).
         let pass = synthetic_noaa19(now, -30, 600, 50.0);
-        let actions = r.tick(now, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::BeforePass { .. }));
         match &actions[1] {
             Action::Toast { message, .. } => {
@@ -924,7 +945,14 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
-        let actions = r.tick(now, &[pass], false, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            false,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -935,7 +963,14 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // 20° peak — "marginal" tier, below the 25° "good" floor.
         let pass = synthetic_noaa19(now, 3, 720, 20.0);
-        let actions = r.tick(now, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -957,7 +992,14 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let mut pass = synthetic_noaa19(now, 3, 720, 50.0);
         pass.satellite = "ISS (ZARYA)".to_string();
-        let actions = r.tick(now, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -981,7 +1023,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Idle));
@@ -996,7 +1038,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::BeforePass { .. }));
@@ -1013,7 +1055,14 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass starts in 10 min. Way outside the 5 s lead-in.
         let pass = synthetic_noaa19(now, 600, 720, 50.0);
-        let actions = r.tick(now, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Idle));
         assert!(actions.is_empty());
     }
@@ -1029,7 +1078,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::BeforePass { .. }));
@@ -1040,13 +1089,20 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::BeforePass { .. }));
         // Past settle window: advance to Recording.
         let later = now + ChronoDuration::seconds(SETTLE_SECS);
-        r.tick(later, &[pass], true, false, 25.0, default_tune());
+        r.tick(
+            later,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Recording { .. }));
     }
 
@@ -1060,7 +1116,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
@@ -1069,13 +1125,20 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Recording { .. }));
         // Tick past LOS.
         let los_plus_one = pass.end + ChronoDuration::seconds(1);
-        let actions = r.tick(los_plus_one, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            los_plus_one,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Finalizing { .. }));
         // Only `SavePng` — the success / failure toast is the
         // wiring layer's responsibility now (it knows the export
@@ -1123,14 +1186,21 @@ mod tests {
             fm_if_nr_enabled: true,
         };
         // Walk all transitions.
-        r.tick(now, std::slice::from_ref(&pass), true, false, 25.0, saved);
+        r.tick(
+            now,
+            std::slice::from_ref(&pass),
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            saved,
+        );
         let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
         r.tick(
             after_settle,
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let los_plus = pass.end + ChronoDuration::seconds(1);
@@ -1139,11 +1209,18 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Finalizing { .. }));
-        let actions = r.tick(los_plus, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            los_plus,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(matches!(r.state(), State::Idle));
         // Restore action carries the original saved tune,
         // including the VFO offset (so a user's drag position
@@ -1192,7 +1269,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::BeforePass { .. }));
@@ -1203,7 +1280,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Finalizing { .. }));
@@ -1234,7 +1311,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::BeforePass { .. }));
@@ -1244,7 +1321,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Finalizing { .. }));
@@ -1262,7 +1339,7 @@ mod tests {
             std::slice::from_ref(&pass_a),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
@@ -1271,7 +1348,7 @@ mod tests {
             std::slice::from_ref(&pass_a),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Recording { .. }));
@@ -1284,7 +1361,7 @@ mod tests {
             &[pass_a, pass_b],
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Recording { .. }));
@@ -1362,7 +1439,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let audio_path = aos_actions
@@ -1383,7 +1460,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let los_plus = pass.end + ChronoDuration::seconds(1);
@@ -1392,7 +1469,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let png_path = los_actions
@@ -1437,7 +1514,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(
@@ -1461,11 +1538,18 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let los_plus = pass.end + ChronoDuration::seconds(1);
-        let los_actions = r.tick(los_plus, &[pass], true, true, 25.0, default_tune());
+        let los_actions = r.tick(
+            los_plus,
+            &[pass],
+            true,
+            true,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(los_actions.iter().any(|a| matches!(a, Action::SavePng(_))));
         assert!(
             !los_actions
@@ -1490,7 +1574,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let audio_path = aos_actions.iter().find_map(|a| match a {
@@ -1515,11 +1599,18 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let los_plus = pass.end + ChronoDuration::seconds(1);
-        let los_actions = r.tick(los_plus, &[pass], true, false, 25.0, default_tune());
+        let los_actions = r.tick(
+            los_plus,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert!(los_actions.iter().any(|a| matches!(a, Action::SavePng(_))));
         assert!(
             los_actions
@@ -1584,7 +1675,14 @@ mod tests {
         let mut r = AutoRecorder::with_supported_protocols(&[]);
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
-        let actions = r.tick(now, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         // No actions of any kind — no StartAutoRecord, no Toast,
         // no transition.
         assert!(
@@ -1614,7 +1712,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(aos.is_empty());
@@ -1627,7 +1725,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(mid.is_empty());
@@ -1643,7 +1741,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(
@@ -1671,7 +1769,14 @@ mod tests {
         let mut r = AutoRecorder::with_supported_protocols(&[sdr_sat::ImagingProtocol::Apt]);
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_noaa19(now, 3, 720, 50.0);
-        let actions = r.tick(now, &[pass], true, false, 25.0, default_tune());
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         let dispatched = actions.iter().find_map(|a| match a {
             Action::StartAutoRecord {
                 satellite,
@@ -1798,7 +1903,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         // CR-bait check: the LRPT arm must dispatch the
@@ -1819,7 +1924,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(matches!(r.state(), State::Recording { .. }));
@@ -1830,7 +1935,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(
@@ -1865,7 +1970,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0, // audio_record_on
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(
@@ -1884,7 +1989,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let after_los = pass.end + ChronoDuration::seconds(1);
@@ -1893,7 +1998,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(
@@ -1916,7 +2021,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             true,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         assert!(
@@ -1968,7 +2073,7 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let after_settle = now + ChronoDuration::seconds(SETTLE_SECS + 1);
@@ -1977,11 +2082,18 @@ mod tests {
             std::slice::from_ref(&pass),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let los_plus = pass.end + ChronoDuration::seconds(1);
-        let los_actions = r.tick(los_plus, &[pass], true, false, 25.0, default_tune());
+        let los_actions = r.tick(
+            los_plus,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         assert_save_before_reset(&los_actions, "single-pass LOS");
     }
 
@@ -2004,7 +2116,7 @@ mod tests {
             std::slice::from_ref(&pass1),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let after_settle_1 = now + ChronoDuration::seconds(SETTLE_SECS + 1);
@@ -2013,7 +2125,7 @@ mod tests {
             std::slice::from_ref(&pass1),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let los_1 = pass1.end + ChronoDuration::seconds(1);
@@ -2022,7 +2134,7 @@ mod tests {
             std::slice::from_ref(&pass1),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let reset_count_1 = los_1_actions
@@ -2035,7 +2147,14 @@ mod tests {
         // Settle from Finalizing back to Idle (the next tick after
         // LOS does Finalizing → Idle and emits RestoreTune).
         let post_los_1 = los_1 + ChronoDuration::seconds(1);
-        r.tick(post_los_1, &[pass1], true, false, 25.0, default_tune());
+        r.tick(
+            post_los_1,
+            &[pass1],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
 
         // Pass 2 — fresh AOS, schedule it after pass 1 completed.
         let pass2_aos = post_los_1 + ChronoDuration::seconds(60);
@@ -2045,7 +2164,7 @@ mod tests {
             std::slice::from_ref(&pass2),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let after_settle_2 = pass2_aos + ChronoDuration::seconds(SETTLE_SECS + 1);
@@ -2054,11 +2173,18 @@ mod tests {
             std::slice::from_ref(&pass2),
             true,
             false,
-            25.0,
+            DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
         let los_2 = pass2.end + ChronoDuration::seconds(1);
-        let los_2_actions = r.tick(los_2, &[pass2], true, false, 25.0, default_tune());
+        let los_2_actions = r.tick(
+            los_2,
+            &[pass2],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
         let reset_count_2 = los_2_actions
             .iter()
             .filter(|a| matches!(a, Action::ResetImagingDecoders))

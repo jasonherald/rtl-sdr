@@ -172,13 +172,18 @@ impl AutoRecordQuality {
 
     /// Minimum peak elevation (degrees) for this tier. The
     /// recorder's `tick_idle` gate compares
-    /// `pass.max_elevation_deg >= self.min_elev_deg()`.
+    /// `pass.max_elevation_deg >= self.min_elev_deg()`. Drives off
+    /// the same `QUALITY_*_DEG` constants the per-pass quality tag
+    /// (`pass_quality_label`) reads, so the user-facing tier name
+    /// in the row subtitle (`winner` / `good` / `marginal`) stays
+    /// numerically aligned with this combo's threshold. Per CR
+    /// round 1 on PR #574.
     #[must_use]
     pub fn min_elev_deg(self) -> f64 {
         match self {
-            Self::WinnersOnly => 40.0,
-            Self::WinnersAndGood => 25.0,
-            Self::MarginalOrBetter => 15.0,
+            Self::WinnersOnly => QUALITY_WINNER_DEG,
+            Self::WinnersAndGood => QUALITY_GOOD_DEG,
+            Self::MarginalOrBetter => QUALITY_MARGINAL_DEG,
             Self::AllPasses => MIN_PASS_ELEVATION_DEG,
         }
     }
@@ -723,6 +728,18 @@ pub fn load_auto_record_quality(config: &Arc<ConfigManager>) -> AutoRecordQualit
             .unwrap_or(AutoRecordQuality::DEFAULT.to_index())
     });
     AutoRecordQuality::from_index(idx)
+}
+
+/// Symmetric writer for [`load_auto_record_quality`]. Persists the
+/// combo's u32 index — `AutoRecordQuality::from_index` snaps any
+/// future-version / out-of-range value back to `DEFAULT` on the
+/// next read. Centralizes the enum→u32 mapping with the read helper
+/// rather than open-coding it at every call site. Per CR round 1 on
+/// PR #574.
+pub fn save_auto_record_quality(config: &Arc<ConfigManager>, quality: AutoRecordQuality) {
+    config.write(|v| {
+        v[KEY_AUTO_RECORD_QUALITY] = serde_json::json!(quality.to_index());
+    });
 }
 
 /// Load the persisted Doppler-tracking master switch. Defaults
@@ -1552,19 +1569,28 @@ mod tests {
         // Falls back to the default (true), not a panic.
         assert!(load_doppler_tracking_enabled(&config));
     }
-}
 
-#[cfg(test)]
-mod auto_record_quality_tests {
-    use super::*;
+    // ─── AutoRecordQuality (#511) ──────────────────────────────────
 
     #[test]
-    fn min_elev_deg_matches_tier_table() {
-        // Pin the four thresholds. If any of these change, the
-        // user-facing labels in `display_label` must change too.
-        assert!((AutoRecordQuality::WinnersOnly.min_elev_deg() - 40.0).abs() < f64::EPSILON);
-        assert!((AutoRecordQuality::WinnersAndGood.min_elev_deg() - 25.0).abs() < f64::EPSILON);
-        assert!((AutoRecordQuality::MarginalOrBetter.min_elev_deg() - 15.0).abs() < f64::EPSILON);
+    fn auto_record_quality_min_elev_deg_matches_canonical_constants() {
+        // Pin the four thresholds against the canonical
+        // `QUALITY_*_DEG` constants the per-pass quality tag also
+        // reads, so the combo's gate and the row subtitle's tier
+        // name (`winner`/`good`/`marginal`/`barely`) can never
+        // numerically drift.
+        assert!(
+            (AutoRecordQuality::WinnersOnly.min_elev_deg() - QUALITY_WINNER_DEG).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (AutoRecordQuality::WinnersAndGood.min_elev_deg() - QUALITY_GOOD_DEG).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (AutoRecordQuality::MarginalOrBetter.min_elev_deg() - QUALITY_MARGINAL_DEG).abs()
+                < f64::EPSILON
+        );
         assert!(
             (AutoRecordQuality::AllPasses.min_elev_deg() - MIN_PASS_ELEVATION_DEG).abs()
                 < f64::EPSILON
@@ -1572,26 +1598,28 @@ mod auto_record_quality_tests {
     }
 
     #[test]
-    fn default_is_winners_and_good() {
+    fn auto_record_quality_default_is_winners_and_good() {
         assert_eq!(
             AutoRecordQuality::DEFAULT,
             AutoRecordQuality::WinnersAndGood
         );
         // Critical: the default's threshold must equal the previously-
-        // hardcoded constant so existing users get the same behavior on
-        // upgrade. Per #511.
-        assert!((AutoRecordQuality::DEFAULT.min_elev_deg() - 25.0).abs() < f64::EPSILON);
+        // hardcoded `AUTO_RECORD_MIN_ELEV_DEG = 25.0` so existing
+        // users get the same behavior on upgrade. Per #511.
+        assert!(
+            (AutoRecordQuality::DEFAULT.min_elev_deg() - QUALITY_GOOD_DEG).abs() < f64::EPSILON
+        );
     }
 
     #[test]
-    fn from_index_round_trips() {
+    fn auto_record_quality_from_index_round_trips() {
         for variant in AutoRecordQuality::ALL {
             assert_eq!(AutoRecordQuality::from_index(variant.to_index()), variant);
         }
     }
 
     #[test]
-    fn from_index_oob_falls_back_to_default() {
+    fn auto_record_quality_from_index_oob_falls_back_to_default() {
         assert_eq!(
             AutoRecordQuality::from_index(99),
             AutoRecordQuality::DEFAULT
@@ -1603,7 +1631,7 @@ mod auto_record_quality_tests {
     }
 
     #[test]
-    fn all_indices_are_unique_and_sequential() {
+    fn auto_record_quality_all_indices_are_unique_and_sequential() {
         // Sanity check on the ALL ordering — if a future maintainer
         // accidentally adds a duplicate, the round-trip test would
         // miss it but this catches it directly.
@@ -1612,5 +1640,40 @@ mod auto_record_quality_tests {
             .map(|v| v.to_index())
             .collect();
         assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn auto_record_quality_display_label_numbers_match_min_elev_deg() {
+        // `display_label` returns `&'static str` to keep the
+        // `gtk4::StringList::new` call cheap and allocation-free,
+        // so we can't drive the labels' text directly off the
+        // `QUALITY_*_DEG` constants. Instead, this test pins that
+        // the integer floor in each label matches the tier's
+        // `min_elev_deg`. If anyone bumps a constant without
+        // updating the label string this fails. Per CR round 1
+        // on PR #574.
+        for tier in AutoRecordQuality::ALL {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "min_elev_deg returns positive f64 in the 0..50 range — fits i64 cleanly"
+            )]
+            let n = tier.min_elev_deg() as i64;
+            let needle = format!("≥ {n}°");
+            let label = tier.display_label();
+            assert!(
+                label.contains(&needle),
+                "label `{label}` should contain `{needle}` to match min_elev_deg",
+            );
+        }
+    }
+
+    #[test]
+    fn auto_record_quality_save_load_round_trips() {
+        let config = make_config();
+        for quality in AutoRecordQuality::ALL {
+            save_auto_record_quality(&config, quality);
+            assert_eq!(load_auto_record_quality(&config), quality);
+        }
     }
 }

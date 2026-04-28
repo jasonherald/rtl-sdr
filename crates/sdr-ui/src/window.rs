@@ -9689,13 +9689,13 @@ fn connect_satellites_panel(
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
-        AutoRecordQuality, KEY_AUTO_RECORD_QUALITY, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG,
-        KEY_STATION_LON_DEG, SatellitesPanelWeak, enumerate_upcoming_passes, format_downlink_mhz,
-        format_last_refresh, format_pass_subtitle, format_pass_title, load_auto_record_apt,
-        load_auto_record_audio, load_auto_record_quality, load_notify_lead_min, load_station_alt_m,
-        load_station_lat_deg, load_station_lon_deg, load_watched_satellites, norad_id_for_pass,
-        save_auto_record_apt, save_auto_record_audio, save_f64, save_tle_last_refresh,
-        save_watched_satellites, tune_target_for_pass,
+        AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
+        SatellitesPanelWeak, enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh,
+        format_pass_subtitle, format_pass_title, load_auto_record_apt, load_auto_record_audio,
+        load_auto_record_quality, load_notify_lead_min, load_station_alt_m, load_station_lat_deg,
+        load_station_lon_deg, load_watched_satellites, norad_id_for_pass, save_auto_record_apt,
+        save_auto_record_audio, save_f64, save_tle_last_refresh, save_watched_satellites,
+        tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
@@ -10042,17 +10042,31 @@ fn connect_satellites_panel(
             });
     }
 
-    // Persist the quality threshold on change. Per #511.
+    // Persist the quality threshold on change via the symmetric
+    // writer. Validating through `AutoRecordQuality::from_index`
+    // before the write protects the config against transient
+    // out-of-range indices that GTK can emit during model churn —
+    // an unrecognized value would round-trip back to the default
+    // tier on the next read otherwise. Per CR round 1 on PR #574.
     {
         let config_quality = std::sync::Arc::clone(config);
         panel
             .auto_record_quality_row
             .connect_selected_notify(move |row| {
-                let idx = row.selected();
-                config_quality.write(|v| {
-                    v[KEY_AUTO_RECORD_QUALITY] = serde_json::json!(idx);
-                });
-                tracing::info!(idx, "auto_record_quality persisted");
+                let raw = row.selected();
+                let quality = crate::sidebar::satellites_panel::AutoRecordQuality::from_index(raw);
+                if quality.to_index() != raw {
+                    // Transient model-churn value (e.g. mid-rebuild
+                    // selection-cleared). Skip the write so we don't
+                    // overwrite a valid persisted index with garbage.
+                    tracing::debug!(raw, "auto_record_quality: ignoring transient combo index");
+                    return;
+                }
+                crate::sidebar::satellites_panel::save_auto_record_quality(
+                    &config_quality,
+                    quality,
+                );
+                tracing::info!(idx = quality.to_index(), "auto_record_quality persisted");
             });
     }
 
