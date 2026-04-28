@@ -334,16 +334,16 @@ One PR. Estimated ~700–1,000 LOC: `aviation_panel.rs` (~250), `acars_viewer.rs
 6. **Multi-block messages.** ACARS messages > ~220 chars span multiple blocks marked `ETB` instead of `ETX`. v1 displays each block as its own row with `block_id` shown — readers can mentally chain. Reassembly is deferred (issue filed).
 7. **CPU/memory budget.** 6 parallel MSK demods at 12.5 ksps + decimation runs comfortably under 5% of one core (acarsdec runs on a Pi 3). Ring buffer = 500 messages × ~500 bytes = ~250 KB. Negligible.
 
-## Deferred items (issues to file under epic #474)
+## Deferred items (filed as issues under epic #474)
 
-| # | Topic | Source pointer |
+| Issue | Topic | Source pointer |
 |---|---|---|
-| a | Per-label field parsers (~40 from `label.c`) extracting structured fields per label | acarsdec `label.c` |
-| b | Output formatters / network feeders (JSON file log, airframes.io feeding) | acarsdec `output.c`, `netout.c` |
-| c | Aircraft-grouped viewer tab (collapsed-rows-per-tail-number, expandable) | this spec, Section 1 option B |
-| d | Multi-block message reassembly (ETB → ETX chaining) | this spec, edge case 6 |
-| e | International channel-set support (Europe, configurable lists) | hardcoded `us-6` in v1 |
-| f | ADS-B integration / aircraft enrichment (cross-correlate tail numbers) | future epic |
+| [#577](https://github.com/jasonherald/rtl-sdr/issues/577) | Per-label field parsers (~40 from `label.c`) extracting structured fields per label | acarsdec `label.c` |
+| [#578](https://github.com/jasonherald/rtl-sdr/issues/578) | Output formatters / network feeders (JSON file log, airframes.io feeding) | acarsdec `output.c`, `netout.c` |
+| [#579](https://github.com/jasonherald/rtl-sdr/issues/579) | Aircraft-grouped viewer tab (collapsed-rows-per-tail-number, expandable) | this spec, Section 1 option B |
+| [#580](https://github.com/jasonherald/rtl-sdr/issues/580) | Multi-block message reassembly (ETB → ETX chaining) | this spec, edge case 6 |
+| [#581](https://github.com/jasonherald/rtl-sdr/issues/581) | International channel-set support (Europe, configurable lists) | hardcoded `us-6` in v1 |
+| [#582](https://github.com/jasonherald/rtl-sdr/issues/582) | ADS-B integration / aircraft enrichment (cross-correlate tail numbers) | future epic |
 
 ## Decomposition summary
 
