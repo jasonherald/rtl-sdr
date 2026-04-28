@@ -257,6 +257,206 @@ where
         .collect()
 }
 
+/// Generate a Kaiser-windowed sinc lowpass FIR filter with explicit
+/// stopband-attenuation control. Designed using the Kaiser/Schafer
+/// (1980) formulas — `β` is derived from `atten_db` via
+/// [`window::kaiser_beta`] and tap count from [`window::kaiser_length`].
+///
+/// Inspired by noaa-apt's `filters::Lowpass::design`. Reimplemented
+/// from first principles to match the canonical Kaiser-windowed-sinc
+/// derivation (see Oppenheim & Schafer §7.6).
+///
+/// Use this instead of [`low_pass`] when you need to dial in a
+/// specific stopband attenuation (e.g. for APT decoding where we
+/// want a known >30 dB rejection of the `2·f_carrier` rectification
+/// harmonic). [`low_pass`] uses a Nuttall window with fixed
+/// attenuation pattern (~70 dB at our chosen tap-count factor),
+/// which is overkill for some applications and not enough for
+/// others.
+///
+/// # Errors
+///
+/// Returns [`DspError::InvalidParameter`] for non-positive / non-finite
+/// inputs or `cutoff >= Nyquist`.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn low_pass_kaiser(
+    cutoff: f64,
+    transition_width: f64,
+    atten_db: f64,
+    sample_rate: f64,
+) -> Result<Vec<f32>, DspError> {
+    validate_positive_finite(cutoff, "cutoff")?;
+    validate_positive_finite(transition_width, "transition_width")?;
+    validate_positive_finite(atten_db, "atten_db")?;
+    validate_positive_finite(sample_rate, "sample_rate")?;
+    let nyquist = sample_rate / 2.0;
+    if cutoff >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "cutoff ({cutoff}) must be less than Nyquist ({nyquist})"
+        )));
+    }
+    // Reject designs whose upper transition edge spills past Nyquist
+    // — the response above the cutoff folds back into the passband
+    // and the filter no longer meets its stated stopband. Per CR
+    // round 2 on PR #571.
+    let upper_transition_edge = cutoff + transition_width / 2.0;
+    if upper_transition_edge >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "upper transition edge (cutoff + transition_width/2 = {upper_transition_edge}) \
+             must be less than Nyquist ({nyquist}) — cutoff={cutoff}, \
+             transition_width={transition_width}"
+        )));
+    }
+    let transition_rad = math::hz_to_rads(transition_width, sample_rate);
+    let beta = crate::window::kaiser_beta(atten_db);
+    let count = crate::window::kaiser_length(atten_db, transition_rad);
+    // A single tap collapses the lowpass to a constant gain
+    // coefficient — silently the wrong filter shape. Reject the
+    // degenerate case so callers see an explicit error instead of a
+    // useless filter. Per CR round 3 on PR #571.
+    if count <= 1 {
+        return Err(DspError::InvalidParameter(format!(
+            "atten_db ({atten_db}) and transition_width ({transition_width}) \
+             yield a degenerate {count}-tap Kaiser design; increase atten_db \
+             or narrow transition_width"
+        )));
+    }
+    if count > MAX_TAP_COUNT {
+        return Err(DspError::InvalidParameter(format!(
+            "Kaiser tap count ({count}) exceeds maximum ({MAX_TAP_COUNT})"
+        )));
+    }
+    let omega = math::hz_to_rads(cutoff, sample_rate);
+    let half = count as f64 / 2.0;
+    let correction = omega / PI;
+
+    // Inline loop instead of `windowed_sinc` because the existing helper
+    // calls window_fn(t - half, count) — that argument convention is
+    // safe for cosine-family windows (Nuttall etc.) by trig periodicity,
+    // but Kaiser is not periodic so it'd produce asymmetric taps. Using
+    // `kaiser(i, count, β)` directly with the standard [0..N] argument
+    // convention preserves linear-phase symmetry.
+    let taps = (0..count)
+        .map(|i| {
+            let t = i as f64 - half + 0.5;
+            let win = crate::window::kaiser(i as f64, count as f64, beta);
+            (math::sinc(t * omega) * win * correction) as f32
+        })
+        .collect();
+
+    Ok(taps)
+}
+
+/// Generate a Kaiser-windowed sinc bandpass FIR filter that doubles
+/// as a DC-removal stage: transitions out of the DC notch over
+/// roughly `[0, transition_width]`, then passes the band
+/// `~[transition_width, cutoff]` while suppressing the upper
+/// stopband above `cutoff + transition_width/2`.
+///
+/// Implemented as the difference of two lowpass filters:
+/// `bandpass = lowpass(cutoff) − lowpass(transition_width/2)`.
+/// At DC both filters pass equally so the result nulls; in the
+/// passband only the wider lowpass passes; above cutoff both are in
+/// stopband. The inner lowpass's transition is centered at
+/// `transition_width/2`, so the guaranteed-flat passband begins
+/// near `transition_width` (not `transition_width/2`) — the lower
+/// edge `[transition_width/2, transition_width]` is still inside
+/// the inner filter's transition band, not the flat passband.
+/// Per CR round 4 on PR #571.
+///
+/// Inspired by noaa-apt's `filters::LowpassDcRemoval::design`.
+/// Reimplemented from the canonical "lowpass-difference" bandpass
+/// derivation rather than copied. APT uses this as its resampling
+/// filter so DC bias from the FM demod doesn't leak into the AM
+/// envelope detector and warp the brightness baseline.
+///
+/// # Errors
+///
+/// Returns [`DspError::InvalidParameter`] for invalid parameters
+/// (non-positive, non-finite, or `cutoff >= Nyquist`).
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn low_pass_dc_removal_kaiser(
+    cutoff: f64,
+    transition_width: f64,
+    atten_db: f64,
+    sample_rate: f64,
+) -> Result<Vec<f32>, DspError> {
+    validate_positive_finite(cutoff, "cutoff")?;
+    validate_positive_finite(transition_width, "transition_width")?;
+    validate_positive_finite(atten_db, "atten_db")?;
+    validate_positive_finite(sample_rate, "sample_rate")?;
+    // The bandpass is `lowpass(cutoff) − lowpass(transition_width/2)`,
+    // so we need `transition_width/2 < cutoff` (equivalently
+    // `transition_width < 2·cutoff`) for the difference to describe
+    // the documented bandpass-with-DC-notch. At or above the
+    // boundary, the inner lowpass would land at or past the outer
+    // one and the response collapses or inverts. Per CR round 1 on
+    // PR #571.
+    if transition_width >= 2.0 * cutoff {
+        return Err(DspError::InvalidParameter(format!(
+            "transition_width ({transition_width}) must be < 2·cutoff ({}) — \
+             at or above this the bandpass response collapses/inverts",
+            2.0 * cutoff
+        )));
+    }
+    let nyquist = sample_rate / 2.0;
+    if cutoff >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "cutoff ({cutoff}) must be less than Nyquist ({nyquist})"
+        )));
+    }
+    // Reject designs whose upper transition edge spills past Nyquist
+    // — the response above the cutoff folds back into the passband
+    // and the filter no longer meets its stated stopband. Per CR
+    // round 2 on PR #571.
+    let upper_transition_edge = cutoff + transition_width / 2.0;
+    if upper_transition_edge >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "upper transition edge (cutoff + transition_width/2 = {upper_transition_edge}) \
+             must be less than Nyquist ({nyquist}) — cutoff={cutoff}, \
+             transition_width={transition_width}"
+        )));
+    }
+    let transition_rad = math::hz_to_rads(transition_width, sample_rate);
+    let beta = crate::window::kaiser_beta(atten_db);
+    let count = crate::window::kaiser_length(atten_db, transition_rad);
+    // A single tap collapses the difference-of-lowpasses to a
+    // constant — the bandpass-with-DC-notch shape is gone. Reject
+    // the degenerate case explicitly. Per CR round 3 on PR #571.
+    if count <= 1 {
+        return Err(DspError::InvalidParameter(format!(
+            "atten_db ({atten_db}) and transition_width ({transition_width}) \
+             yield a degenerate {count}-tap Kaiser design; increase atten_db \
+             or narrow transition_width"
+        )));
+    }
+    if count > MAX_TAP_COUNT {
+        return Err(DspError::InvalidParameter(format!(
+            "Kaiser tap count ({count}) exceeds maximum ({MAX_TAP_COUNT})"
+        )));
+    }
+    let omega_main = math::hz_to_rads(cutoff, sample_rate);
+    let omega_dc = math::hz_to_rads(transition_width / 2.0, sample_rate);
+    let half = count as f64 / 2.0;
+    let correction_main = omega_main / PI;
+    let correction_dc = omega_dc / PI;
+
+    let taps = (0..count)
+        .map(|i| {
+            let t = i as f64 - half + 0.5;
+            let win = crate::window::kaiser(i as f64, count as f64, beta);
+            // Lowpass at the main cutoff, with DC-band lowpass
+            // subtracted to create the notch at zero. Both share
+            // the same Kaiser window for shape consistency.
+            let main = math::sinc(t * omega_main) * correction_main;
+            let dc = math::sinc(t * omega_dc) * correction_dc;
+            ((main - dc) * win) as f32
+        })
+        .collect();
+
+    Ok(taps)
+}
+
 /// Validate that a parameter is positive and finite.
 fn validate_positive_finite(value: f64, name: &str) -> Result<(), DspError> {
     if !value.is_finite() || value <= 0.0 {
@@ -417,5 +617,158 @@ mod tests {
                 taps[n - 1 - i]
             );
         }
+    }
+
+    /// FFT magnitude of a real-valued FIR — used to verify a designed
+    /// filter's frequency response across passband / transition /
+    /// stopband. Returned values are linear amplitudes in `[0, ~1]`.
+    fn abs_fft(signal: &[f32]) -> Vec<f64> {
+        use rustfft::FftPlanner;
+        use rustfft::num_complex::Complex;
+        // Zero-pad short FIRs up to a much larger FFT length so the
+        // stopband / passband assertions sample the frequency
+        // response at fine resolution. Without padding, an N-tap
+        // filter is sampled at only N frequencies — for the ~30-tap
+        // APT filters that's far too coarse to catch between-bin
+        // peaks and the spec checks risk false greens. Per CR
+        // round 4 on PR #571.
+        const MIN_FFT_LEN: usize = 8_192;
+        let fft_len = signal.len().max(MIN_FFT_LEN).next_power_of_two();
+        let mut buf: Vec<Complex<f64>> = signal
+            .iter()
+            .map(|&x| Complex::new(f64::from(x), 0.0))
+            .collect();
+        buf.resize(fft_len, Complex::new(0.0, 0.0));
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_len);
+        fft.process(&mut buf);
+        buf.iter().map(|c| c.norm()).collect()
+    }
+
+    #[test]
+    fn test_low_pass_kaiser_basic() {
+        // 5 kHz cutoff at 48 kHz sample rate, 1 kHz transition,
+        // 40 dB stopband. Validate the filter is symmetric and
+        // produces a reasonable tap count.
+        let taps = low_pass_kaiser(5_000.0, 1_000.0, 40.0, TEST_SAMPLE_RATE).unwrap();
+        assert_symmetric(&taps);
+        assert!(
+            !taps.is_empty() && taps.len() % 2 == 1,
+            "expected odd non-empty length, got {}",
+            taps.len()
+        );
+    }
+
+    #[test]
+    fn test_low_pass_kaiser_dc_gain() {
+        // DC gain (sum of taps) should be ~1.0 for a properly
+        // normalized lowpass filter.
+        let taps = low_pass_kaiser(5_000.0, 1_000.0, 40.0, TEST_SAMPLE_RATE).unwrap();
+        let sum: f32 = taps.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 0.05,
+            "DC gain should be ~1.0, got {sum}"
+        );
+    }
+
+    #[test]
+    fn test_low_pass_kaiser_meets_atten_target() {
+        // Frequency-domain sanity: the designed filter's stopband
+        // should be at least as deep as the requested attenuation
+        // (in linear amplitude units, that's `<= 10^(-A/20)`).
+        // Sample at fs=12480 Hz with cutoff=4800 Hz, transition=1000 Hz,
+        // atten=30 dB — these are the noaa-apt "standard" profile values
+        // for the resampling filter, our reference target.
+        let fs = 12_480.0;
+        let cutoff = 4_800.0;
+        let transition = 1_000.0;
+        let atten = 30.0;
+        let taps = low_pass_kaiser(cutoff, transition, atten, fs).unwrap();
+        let response = abs_fft(&taps);
+
+        // Linear stopband level: 10^(-A/20). For 30 dB this is ~0.0316.
+        // Allow 2× margin for FFT-bin discretization and the design
+        // formula's "approximately at or below A" guarantee.
+        let stopband_threshold = 2.0 * 10_f64.powf(-atten / 20.0);
+
+        // Stopband region: above (cutoff + transition/2). Walk the FFT
+        // bins covering [stop_start, fs/2] and assert all are below
+        // the linear-amplitude threshold.
+        let stop_start_hz = cutoff + transition / 2.0;
+        let nyquist_hz = fs / 2.0;
+        let n = response.len();
+        for (i, mag) in response.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let bin_hz = i as f64 * fs / n as f64;
+            if bin_hz > stop_start_hz && bin_hz < nyquist_hz {
+                assert!(
+                    *mag < stopband_threshold,
+                    "stopband ripple at {bin_hz:.0} Hz: {mag} > {stopband_threshold}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_low_pass_dc_removal_kaiser_nulls_dc() {
+        // The bandpass should kill DC (response near 0 at f=0).
+        // Standard noaa-apt resampling filter values.
+        let fs = 12_480.0;
+        let cutoff = 4_800.0;
+        let transition = 1_000.0;
+        let atten = 30.0;
+        let taps = low_pass_dc_removal_kaiser(cutoff, transition, atten, fs).unwrap();
+        // Sum of taps = DC gain. Should be near 0 (DC is suppressed).
+        let dc_gain: f32 = taps.iter().sum();
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "atten is a test fixture in the 30..50 dB range — well \
+                      within f32 precision"
+        )]
+        let dc_threshold = 2.0 * 10_f32.powf(-atten as f32 / 20.0);
+        assert!(
+            dc_gain.abs() < dc_threshold,
+            "DC gain should be ~0, got {dc_gain} (threshold {dc_threshold})"
+        );
+    }
+
+    #[test]
+    fn test_low_pass_dc_removal_kaiser_passes_passband() {
+        // Inside the guaranteed-flat passband (approximately
+        // `transition_width` to `cutoff - transition_width/2`),
+        // the response should be ~unity. The lower edge starts at
+        // `transition_width` (not `transition_width/2`) because the
+        // inner lowpass's transition is centered at
+        // `transition_width/2` — that lower band is still inside
+        // the inner filter's transition, not the flat passband.
+        // Matches the docstring on `low_pass_dc_removal_kaiser`. Per
+        // CR round 6 on PR #571.
+        let fs = 12_480.0;
+        let cutoff = 4_800.0;
+        let transition = 1_000.0;
+        let atten = 30.0;
+        let taps = low_pass_dc_removal_kaiser(cutoff, transition, atten, fs).unwrap();
+        let response = abs_fft(&taps);
+
+        let pass_start_hz = transition; // safely past the DC notch
+        let pass_end_hz = cutoff - transition / 2.0;
+        let n = response.len();
+        // Passband ripple tolerance for 30 dB Kaiser: ±0.05 (≈0.4 dB).
+        // We're checking with FFT-bin discretization so we allow a bit more.
+        let pass_lo = 0.7;
+        let pass_hi = 1.3;
+        let mut checked = 0;
+        for (i, mag) in response.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let bin_hz = i as f64 * fs / n as f64;
+            if bin_hz > pass_start_hz && bin_hz < pass_end_hz {
+                assert!(
+                    *mag > pass_lo && *mag < pass_hi,
+                    "passband ripple at {bin_hz:.0} Hz: {mag} not in [{pass_lo}, {pass_hi}]"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no FFT bins fell in passband — test invalid");
     }
 }

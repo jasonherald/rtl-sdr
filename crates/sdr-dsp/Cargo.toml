@@ -5,6 +5,12 @@ description = "Pure DSP library: math, filters, FFT, demodulation, resampling"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Exclude the APT integration-test fixtures from `cargo package` so a
+# `crates.io` publish doesn't ship the GPL-3-licensed WAV files
+# from noaa-apt's test corpus. The README.md stays out too — it
+# only documents the fixtures' provenance, no use post-publish.
+# Per CR round 1 on PR #571.
+exclude = ["tests/data/**"]
 
 [dependencies]
 sdr-types.workspace = true
@@ -29,6 +35,11 @@ serde_json.workspace = true
 # FIR filtering, waterfall colormap lookup, and energy detection so
 # every subsequent GPU sub-ticket has a fixed comparison surface.
 criterion.workspace = true
+# WAV reader for the APT integration test, which feeds a real NOAA
+# 19 capture (sourced from the noaa-apt project's test/ corpus,
+# GPL-3.0 — see `tests/data/README.md`) through the decoder and
+# asserts that recognizable APT lines come out the other end.
+hound.workspace = true
 
 [lints]
 workspace = true

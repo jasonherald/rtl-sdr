@@ -65,35 +65,99 @@ pub const SYNC_BURST_CYCLES: usize = 7;
 
 // ─── Internal working sample rate ───
 //
-// 20800 Hz is the smallest rate that simultaneously:
-//   * gives integer samples per pixel (20800 / 4160 = 5)
-//   * gives integer samples per Sync A cycle (20800 / 1040 = 20)
-//   * gives integer samples per Sync B cycle (20800 / 832  = 25)
-//   * places 2·f_subcarrier (4800 Hz) below Nyquist (10400 Hz) so the
-//     rectify-generated harmonic can be filtered out cleanly
+// 12480 Hz is the smallest multiple of 4160 (the pixel clock) that:
+//   * gives integer samples per pixel (12480 / 4160 = 3)
+//   * gives integer samples per Sync A cycle (12480 / 1040 = 12)
+//   * gives integer samples per Sync B cycle (12480 / 832  = 15) —
+//     half-cycle is fractional (7.5 samples), but the zero-mean
+//     adjustment in `build_square_template` handles that
+//   * places 2·f_subcarrier (4800 Hz) below Nyquist (6240 Hz) by a
+//     comfortable margin (~1.4 kHz of guard band for any post-demod
+//     LPF needed for image-band cleanup)
+//   * matches noaa-apt's "standard" profile work_rate exactly, so the
+//     filter cutoffs, transition widths, and atten values from their
+//     well-tested settings transfer 1:1
 //
-// Using this rate means every downstream index is an exact integer — no
-// fractional alignment headaches when slicing pixels or templates.
+// Using a clean integer multiple of the pixel clock means every
+// downstream index is an exact integer — no fractional alignment
+// headaches when slicing pixels or building templates.
+//
+// **Why not 20800 Hz?** Earlier versions of this module ran at 20800
+// (= 4160 × 5). It worked but used 1.67× the CPU + memory of 12480
+// for no decode-quality benefit. The lower rate matches noaa-apt's
+// "standard" profile, which has been validated against thousands of
+// real NOAA captures. Per the APT pipeline parity work.
 
-/// Intermediate sample rate the decoder runs its DSP at (20800 Hz).
-pub const INTERMEDIATE_RATE_HZ: u32 = 20_800;
+/// Intermediate sample rate the decoder runs its DSP at (12480 Hz).
+pub const INTERMEDIATE_RATE_HZ: u32 = 12_480;
 
-/// Samples per APT pixel at [`INTERMEDIATE_RATE_HZ`] (exactly 5).
-pub const SAMPLES_PER_PIXEL: usize = 5;
+/// Samples per APT pixel at [`INTERMEDIATE_RATE_HZ`] (exactly 3).
+pub const SAMPLES_PER_PIXEL: usize = 3;
 
-/// Samples per full scan line at [`INTERMEDIATE_RATE_HZ`] (10 400).
+/// Samples per full scan line at [`INTERMEDIATE_RATE_HZ`] (6240).
 pub const SAMPLES_PER_LINE: usize = LINE_PIXELS * SAMPLES_PER_PIXEL;
 
-/// Samples per one cycle of Sync A at [`INTERMEDIATE_RATE_HZ`] (exactly 20).
-pub const SAMPLES_PER_SYNC_A_CYCLE: usize = 20;
+/// Samples per one cycle of Sync A at [`INTERMEDIATE_RATE_HZ`] (exactly 12).
+pub const SAMPLES_PER_SYNC_A_CYCLE: usize = 12;
 
-/// Samples per one cycle of Sync B at [`INTERMEDIATE_RATE_HZ`] (exactly 25).
-pub const SAMPLES_PER_SYNC_B_CYCLE: usize = 25;
+/// Samples per one cycle of Sync B at [`INTERMEDIATE_RATE_HZ`] (exactly 15).
+/// The half-cycle is fractional (7.5 samples) — the matched-filter
+/// template builder applies a zero-mean correction so this doesn't
+/// bias the cross-correlation.
+pub const SAMPLES_PER_SYNC_B_CYCLE: usize = 15;
 
-/// Length of a Sync A template in samples (7 cycles × 20 = 140).
-pub const SYNC_A_TEMPLATE_LEN: usize = SYNC_BURST_CYCLES * SAMPLES_PER_SYNC_A_CYCLE;
+/// Sync A pixel-level layout, taken from the NOAA APT spec
+/// (per `noaa-apt`'s `decode::generate_sync_frame`):
+///
+/// ```text
+/// [2 px low | 7 cycles × (2 px low, 2 px high) = 28 px | 8 px low]
+///  └ leading silence ┘                                  └ trailing silence ┘
+/// ```
+///
+/// Total = 38 pixels. The leading + trailing low regions are part
+/// of the matched-filter template — they tell the cross-correlator
+/// that flanking the modulated burst should be quiet, which sharply
+/// rejects false-positive matches inside the video data (where
+/// brightness fluctuations alone could otherwise score high against
+/// a bare-modulation template).
+pub const SYNC_A_LEADING_PAD_PX: usize = 2;
+pub const SYNC_A_MODULATED_PX: usize = 28;
+pub const SYNC_A_TRAILING_PAD_PX: usize = 8;
+pub const SYNC_A_TOTAL_PX: usize =
+    SYNC_A_LEADING_PAD_PX + SYNC_A_MODULATED_PX + SYNC_A_TRAILING_PAD_PX;
+
+/// Leading silence in the Sync A matched-filter template, in
+/// intermediate-rate samples. This is part of the template pattern
+/// (mirroring the silence approach to Sync A in real APT signals)
+/// — NOT a slicing offset. A matched-filter hit at offset `M`
+/// indicates the line starts at `M`, not at `M +
+/// SYNC_A_LEADING_PAD_SAMPLES`. By NOAA APT spec the line begins
+/// at the start of the 39-px Sync A field, of which the first 4 px
+/// are minimum-modulation low (= leading pad + low half of cycle 1).
+/// The first HIGH transition lands at sample offset
+/// `SYNC_A_LEADING_PAD_SAMPLES + (SAMPLES_PER_SYNC_A_CYCLE / 2)`
+/// = 20 samples from the line start.
+pub const SYNC_A_LEADING_PAD_SAMPLES: usize = SYNC_A_LEADING_PAD_PX * SAMPLES_PER_PIXEL;
+
+/// Sample offset within the Sync A template (and equivalently
+/// within a real APT line, measured from line start) where the
+/// first ON-pulse (HIGH) transition occurs. Two regions of low
+/// precede it: the 2-px leading silence + the 2-px low half of
+/// cycle 1, totaling 4 px = 20 samples at our work rate.
+pub const SYNC_A_FIRST_HIGH_OFFSET_SAMPLES: usize =
+    SYNC_A_LEADING_PAD_SAMPLES + (SAMPLES_PER_SYNC_A_CYCLE / 2);
+
+/// Length of a Sync A template in samples (38 px × 3 samples/px = 114).
+/// Includes the leading + trailing silence flanks; only the middle
+/// 84 samples (7 modulated cycles × 12 samples/cycle) carry the
+/// alternating ±1 burst pattern.
+pub const SYNC_A_TEMPLATE_LEN: usize = SYNC_A_TOTAL_PX * SAMPLES_PER_PIXEL;
 
 /// Length of a Sync B template in samples (7 cycles × 25 = 175).
+/// Sync B is unused by the line-slicing path today — Sync A alone
+/// determines line boundaries, with Sync B implicit at the line
+/// midpoint. Kept defined for future exploration of dual-sync line
+/// validation.
 pub const SYNC_B_TEMPLATE_LEN: usize = SYNC_BURST_CYCLES * SAMPLES_PER_SYNC_B_CYCLE;
 
 // Compile-time sanity checks — if any of these fire, an upstream constant
@@ -118,15 +182,34 @@ pub enum SyncChannel {
 
 /// One decoded APT scan line.
 ///
-/// `pixels` is stored inline (~2 KB) so an `AptLine` is `Clone`-able and
-/// reusable as an output slot without per-line heap allocation — the
-/// `AptDecoder::process` contract takes `&mut [AptLine]` and writes new
-/// values into existing entries. Construct empty slots with
-/// `AptLine::default()`.
+/// Carries both per-line-normalized `pixels` (u8) for cheap live
+/// preview AND raw f32 envelope samples (`raw_samples`) for
+/// image-wide post-processing (telemetry-calibrated brightness,
+/// percentile clipping, histogram equalization at PNG-export time).
+///
+/// Stored inline so `AptLine` is `Clone`-able and reusable as an
+/// output slot — the `AptDecoder::process` contract takes
+/// `&mut [AptLine]` and writes new values into existing entries.
+/// Construct empty slots with `AptLine::default()`. Carries ~10 KB
+/// of payload (2 KB pixels + 8 KB `raw_samples` + metadata); send
+/// across the DSP→UI channel boxed (`Box<AptLine>`) to keep
+/// per-line message overhead constant.
 #[derive(Debug, Clone)]
 pub struct AptLine {
-    /// The 2080 greyscale pixels of this line, in transmission order.
+    /// The 2080 greyscale pixels of this line, in transmission order,
+    /// with **per-line min/max normalization** to 0..255. Used by the
+    /// live image viewer where image-wide statistics aren't yet known
+    /// — gives reasonable contrast within each line at the cost of
+    /// flicker between lines with different content.
     pub pixels: [u8; LINE_PIXELS],
+    /// Raw envelope samples in transmission order, one per pixel,
+    /// in the demodulator's native float scale (no normalization).
+    /// Used by [`crate::apt::PNG_EXPORT_BRIGHTNESS_MODES_CONST`] /
+    /// `apt_image::finalize_grayscale` to perform image-wide
+    /// brightness mapping (telemetry-calibrated, percentile,
+    /// histogram-equalized) at PNG export time, where the full
+    /// dynamic range of the entire pass is known.
+    pub raw_samples: [f32; LINE_PIXELS],
     /// Normalized cross-correlation peak against the matched sync template
     /// (range `[0.0, 1.0]`, higher = stronger lock).
     pub sync_quality: f32,
@@ -142,6 +225,7 @@ impl Default for AptLine {
     fn default() -> Self {
         Self {
             pixels: [0; LINE_PIXELS],
+            raw_samples: [0.0; LINE_PIXELS],
             sync_quality: 0.0,
             sync_channel: SyncChannel::A,
             input_sample_index: 0,
@@ -155,10 +239,15 @@ impl Default for AptLine {
 /// Rectifying a cosine-modulated carrier produces the envelope plus a
 /// component centered at `2 · SUBCARRIER_HZ` (4800 Hz). Passing the result
 /// through a lowpass with its stopband placed well below 4800 Hz cleanly
-/// removes the carrier copy and leaves the original video envelope. A
-/// Hilbert-magnitude approach would give a bit-perfect envelope but costs
-/// twice the FIR work — rectify + LPF is the traditional (and perfectly
-/// adequate) choice for APT, matching `noaa-apt` / `wxtoimg` behaviour.
+/// removes the carrier copy and leaves the original video envelope.
+///
+/// **Use [`Apt137Demodulator`] instead for new code.** This rectify+LPF
+/// approach was the original APT envelope path before the apt137
+/// closed-form 2-sample method was validated against noaa-apt. Kept for
+/// regression-testing the old behaviour and for callers that want a
+/// generic AM-envelope detector that doesn't need to know the carrier
+/// frequency. `Apt137Demodulator` produces a sharper, transient-free
+/// envelope and is what the live APT pipeline now uses.
 pub struct EnvelopeDetector {
     lpf: FirFilter,
     scratch: Vec<f32>,
@@ -242,6 +331,156 @@ impl EnvelopeDetector {
             *dst = src.abs();
         }
         self.lpf.process_f32(&self.scratch, output)
+    }
+}
+
+/// Closed-form 2-sample AM demodulator (the apt137 method).
+///
+/// Given a band-limited AM signal `s(t) = A(t) · cos(2π·f_c·t + θ)`
+/// sampled at `f_s`, two consecutive samples `x[i-1]` and `x[i]`
+/// uniquely determine the instantaneous envelope `A` (up to sign,
+/// which we resolve by taking the positive root):
+///
+/// ```text
+/// A = sqrt(x[i-1]² + x[i]² − 2·x[i-1]·x[i]·cos(φ)) / sin(φ)
+/// where φ = 2π · f_c / f_s
+/// ```
+///
+/// Derivation: write `x[i-1] = A·cos(α)` and `x[i] = A·cos(α + φ)` for
+/// some unknown phase α. Using the identity
+/// `cos²α + cos²(α+φ) − 2·cosα·cos(α+φ)·cosφ = sin²φ` (Lagrange's
+/// identity in trig form), the unknown α drops out and `A` falls out
+/// algebraically.
+///
+/// Inspired by Pieter Noordhuis's `apt137` (MIT) and noaa-apt's
+/// derived implementation; reimplemented from the trigonometric
+/// derivation above in our own DSP idioms (streaming-friendly, error
+/// types consistent with the rest of the crate).
+///
+/// **Why this beats `rectify+LPF` for APT:**
+///
+/// * **No `2·f_c` harmonic.** Rectifying creates a tone at `2 · 2400 = 4800`
+///   Hz that has to be filtered out; the closed form has no such
+///   harmonic to begin with.
+/// * **No filter transient.** The output is correct from the second
+///   sample (one sample of state needed). Rectify+LPF takes hundreds
+///   of samples to settle, throwing away the start of every chunk.
+/// * **DC-insensitive.** A constant offset on `x` produces a smooth
+///   distortion in the result, but no asymmetric rectifier bias.
+/// * **Phase-coherent.** Accuracy depends only on knowing `f_c`
+///   precisely, not on filter design choices.
+///
+/// The carrier frequency must be **strictly inside** `(0, f_s / 2)` —
+/// at the boundaries `sin(φ) = 0` and the formula has a removable
+/// singularity that we'd need to special-case (and that doesn't
+/// correspond to any physically useful APT setup).
+pub struct Apt137Demodulator {
+    /// `2 · cos(φ)` — used in the cross-product term `prev · curr · cosphi2`.
+    /// Precomputed at construction so the per-sample loop is just
+    /// 4 multiplies + 1 sqrt + 1 divide.
+    cosphi2: f32,
+    /// `1 / sin(φ)` — the trailing divide is reciprocal-multiplied
+    /// for ~3× speedup vs. division on f32.
+    inv_sinphi: f32,
+    /// Last input sample from the previous chunk. `None` on the very
+    /// first call; populated thereafter so chunked streaming
+    /// produces the same output as a single batch call (modulo the
+    /// first sample of the entire stream, which is set to zero
+    /// because there's no prior sample to pair it with).
+    prev: Option<f32>,
+}
+
+impl Apt137Demodulator {
+    /// Build a demod for an `f_s` Hz sample rate carrying a `f_c` Hz
+    /// AM signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DspError::InvalidParameter`] when `carrier_hz` is at
+    /// or outside the open interval `(0, sample_rate_hz / 2)` — at
+    /// the boundaries `sin(φ)` is zero and the closed form is
+    /// undefined.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn new(sample_rate_hz: f64, carrier_hz: f64) -> Result<Self, DspError> {
+        if !sample_rate_hz.is_finite() || sample_rate_hz <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "sample_rate_hz must be positive and finite, got {sample_rate_hz}"
+            )));
+        }
+        if !carrier_hz.is_finite() || carrier_hz <= 0.0 || carrier_hz >= sample_rate_hz / 2.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "carrier_hz ({carrier_hz}) must be in (0, sample_rate_hz/2={}) — \
+                 at the boundaries sin(φ) = 0 and the closed-form demod is \
+                 undefined",
+                sample_rate_hz / 2.0
+            )));
+        }
+        let phi = 2.0 * core::f64::consts::PI * carrier_hz / sample_rate_hz;
+        let sinphi = phi.sin();
+        if sinphi.abs() < f64::EPSILON {
+            return Err(DspError::InvalidParameter(format!(
+                "carrier_hz ({carrier_hz}) at sample_rate ({sample_rate_hz}) gives \
+                 sin(φ) ≈ 0 (φ = {phi}); closed-form demod undefined here"
+            )));
+        }
+        Ok(Self {
+            cosphi2: (2.0 * phi.cos()) as f32,
+            inv_sinphi: (1.0 / sinphi) as f32,
+            prev: None,
+        })
+    }
+
+    /// Reset internal state — call when restarting a stream.
+    pub fn reset(&mut self) {
+        self.prev = None;
+    }
+
+    /// Demodulate `input` into `output`. Returns the number of samples
+    /// written (always `input.len()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DspError::BufferTooSmall`] if `output.len() < input.len()`.
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<usize, DspError> {
+        if output.len() < input.len() {
+            return Err(DspError::BufferTooSmall {
+                need: input.len(),
+                got: output.len(),
+            });
+        }
+        if input.is_empty() {
+            return Ok(0);
+        }
+        let (mut prev, start) = if let Some(p) = self.prev {
+            // Continuing a stream: compute output[0] from the prior
+            // chunk's last sample paired with this chunk's first.
+            (p, 0_usize)
+        } else {
+            // First sample of the stream — no prior sample to pair
+            // with. Output zero (one sample of latency, irrelevant
+            // at APT scan rates) and seed `prev` from this sample
+            // for the rest of the chunk.
+            output[0] = 0.0;
+            let first = input[0];
+            if input.len() == 1 {
+                self.prev = Some(first);
+                return Ok(1);
+            }
+            (first, 1_usize)
+        };
+
+        for i in start..input.len() {
+            let curr = input[i];
+            let val = (prev * prev + curr * curr - prev * curr * self.cosphi2)
+                .max(0.0) // numerical noise can give a tiny negative
+                .sqrt()
+                * self.inv_sinphi;
+            output[i] = val;
+            prev = curr;
+        }
+
+        self.prev = Some(prev);
+        Ok(input.len())
     }
 }
 
@@ -359,7 +598,7 @@ impl SyncDetector {
     /// Build a fresh sync detector with pre-computed Sync A / Sync B templates.
     #[must_use]
     pub fn new() -> Self {
-        let (tpl_a, norm_a) = build_square_template(SAMPLES_PER_SYNC_A_CYCLE, SYNC_BURST_CYCLES);
+        let (tpl_a, norm_a) = build_padded_sync_a_template(SAMPLES_PER_PIXEL);
         let (tpl_b, norm_b) = build_square_template(SAMPLES_PER_SYNC_B_CYCLE, SYNC_BURST_CYCLES);
         Self {
             template_a: tpl_a,
@@ -427,7 +666,9 @@ impl SyncDetector {
 ///
 /// Half of each cycle is +1, the other half -1. Returns `(template, norm)`
 /// where `norm = sqrt(sum(template²))` so callers can skip recomputing it
-/// on every correlation.
+/// on every correlation. Used for Sync B (which has fractional half-period
+/// in samples — the leading/trailing pad approach used by Sync A doesn't
+/// produce a clean integer-sample template at our `work_rate`).
 #[allow(clippy::cast_precision_loss)]
 fn build_square_template(samples_per_cycle: usize, cycles: usize) -> (Vec<f32>, f32) {
     let len = samples_per_cycle * cycles;
@@ -442,6 +683,62 @@ fn build_square_template(samples_per_cycle: usize, cycles: usize) -> (Vec<f32>, 
     // Odd samples-per-cycle (e.g. B=25) leave a ±1/L DC bias after the
     // half/half split; remove it so the template is exactly zero-mean and
     // insensitive to envelope-level drift.
+    let mean = template.iter().sum::<f32>() / (len as f32);
+    for v in &mut template {
+        *v -= mean;
+    }
+    let norm = template.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (template, norm)
+}
+
+/// Build the padded Sync A matched-filter template.
+///
+/// Layout: `[2 px low | 7 cycles × (2 px low, 2 px high) | 8 px low]`
+/// = 38 px total. The flanking low regions reject false-positive matches
+/// inside the video data — a template of just the modulated cycles
+/// will score positively on any region whose brightness happens to
+/// alternate at the 1040 Hz beat. Adding leading/trailing low says
+/// "the modulation must be flanked by silence", which is true only at
+/// real Sync A boundaries.
+///
+/// Reimplemented from the layout in noaa-apt's `decode::generate_sync_frame`
+/// (see `original/noaa-apt/src/decode.rs`). Their template emits ±1
+/// integers; ours emits zero-mean f32 values for normalized cross-
+/// correlation against the envelope.
+///
+/// `samples_per_pixel` is the work-rate's pixel granularity
+/// (`samples_per_pixel = work_rate / PIXELS_PER_SECOND`). At our
+/// current 20800 Hz: 5 samples/px → 190 samples total. After A4 lowers
+/// us to 12480 Hz: 3 samples/px → 114 samples total. Both produce a
+/// 38-px-equivalent template.
+#[allow(clippy::cast_precision_loss)]
+fn build_padded_sync_a_template(samples_per_pixel: usize) -> (Vec<f32>, f32) {
+    // A1040 cycle = 4 pixels (2 low, 2 high) at any work rate, so the
+    // half-cycle is `2 * samples_per_pixel`. Derive directly from the
+    // parameter rather than the global `SAMPLES_PER_SYNC_A_CYCLE`
+    // constant — otherwise this function silently produces a
+    // mis-scaled template if ever called at a different work rate.
+    // Per CR round 2 on PR #571.
+    let half_cycle_samples = 2 * samples_per_pixel;
+    let leading_samples = SYNC_A_LEADING_PAD_PX * samples_per_pixel;
+    let trailing_samples = SYNC_A_TRAILING_PAD_PX * samples_per_pixel;
+    let modulated_samples = SYNC_A_MODULATED_PX * samples_per_pixel;
+    let len = leading_samples + modulated_samples + trailing_samples;
+
+    let mut template: Vec<f32> = Vec::with_capacity(len);
+    // Leading low.
+    template.extend(core::iter::repeat_n(-1.0_f32, leading_samples));
+    // 7 cycles of (low, high). Each cycle = `2·samples_per_pixel` low
+    // followed by `2·samples_per_pixel` high.
+    for _ in 0..SYNC_BURST_CYCLES {
+        template.extend(core::iter::repeat_n(-1.0_f32, half_cycle_samples));
+        template.extend(core::iter::repeat_n(1.0_f32, half_cycle_samples));
+    }
+    // Trailing low.
+    template.extend(core::iter::repeat_n(-1.0_f32, trailing_samples));
+    debug_assert_eq!(template.len(), len);
+
+    // Zero-mean (cancels DC sensitivity for normalized x-corr).
     let mean = template.iter().sum::<f32>() / (len as f32);
     for v in &mut template {
         *v -= mean;
@@ -497,8 +794,22 @@ const MIN_ACCUMULATOR_FOR_DECODE: usize = SAMPLES_PER_LINE * 2;
 /// crate's `apt_decode_tap` for an example.
 pub const READY_QUEUE_CAP: usize = 8;
 
+/// Cutoff frequency of the input-rate DC-removing bandpass filter
+/// (`AptDecoder::new`). 4800 Hz = 2·`SUBCARRIER_HZ` — high enough
+/// to pass the entire AM passband, low enough to kill out-of-band
+/// noise. Per noaa-apt's `standard` profile.
+const DC_BANDPASS_CUTOUT_HZ: f64 = 2.0 * SUBCARRIER_HZ;
+/// Transition-band width of the input-rate DC-removing bandpass.
+/// 1 kHz transition is a comfortable balance between filter length
+/// and rejection. The DC notch sits at frequencies below
+/// `transition/2` (~500 Hz), safely below any APT signal content.
+const DC_BANDPASS_TRANSITION_HZ: f64 = 1_000.0;
+/// Stopband attenuation target for the input-rate DC-removing
+/// bandpass. 30 dB matches noaa-apt's `standard` profile.
+const DC_BANDPASS_ATTEN_DB: f64 = 30.0;
+
 /// Maximum input audio samples processed through the resample → envelope
-/// stages in one pass. Keeps `resample_scratch`, `envelope_scratch`, and
+/// stages in one pass. Keeps `resample_scratch`, `demod_scratch`, and
 /// the resampler's internal complex scratch all strictly bounded
 /// regardless of how big a single `process` input chunk is. At the
 /// typical 48 kHz input rate, 8192 input samples yields ~3550 envelope
@@ -519,12 +830,34 @@ const INPUT_SUBCHUNK_SAMPLES: usize = 8_192;
 /// out low-confidence lines without the decoder second-guessing them.
 pub struct AptDecoder {
     input_rate_hz: u32,
+    /// Bandpass FIR with DC notch — filters input audio to the AM
+    /// passband `[~500 Hz, ~4800 Hz]` before resampling. Per noaa-apt's
+    /// `LowpassDcRemoval`. DC removal is defense in depth: the apt137
+    /// demod is itself DC-robust, but eliminating sub-500 Hz energy
+    /// before the resample gives the apt137 demod the cleanest possible
+    /// input.
+    dc_bandpass: FirFilter,
+    /// Filter scratch buffer, reused across chunks.
+    dc_bandpass_scratch: Vec<f32>,
     resampler: RealResampler,
-    envelope: EnvelopeDetector,
+    /// Closed-form AM demod (apt137 method). Replaces the previous
+    /// rectify+LPF path which had a long settling transient and
+    /// required filtering out a `2·f_c` harmonic. See
+    /// [`Apt137Demodulator`] for the math.
+    demod: Apt137Demodulator,
     sync_detector: SyncDetector,
 
+    /// Final-rate resampler: [`INTERMEDIATE_RATE_HZ`] (12480) → 4160
+    /// (one sample per pixel). Replaces the old per-pixel boxcar
+    /// average, which had a sinc-shaped response that attenuated the
+    /// upper half of the video band by 3 dB.
+    final_resampler: RealResampler,
+    /// Per-line scratch buffer for the final-resample stage.
+    /// Holds `LINE_PIXELS` f32 samples plus a sample of slack.
+    final_resamp_scratch: Vec<f32>,
+
     resample_scratch: Vec<f32>,
-    envelope_scratch: Vec<f32>,
+    demod_scratch: Vec<f32>,
     accumulator: Vec<f32>,
 
     // Decoded-but-undelivered scan lines. Lives separately from
@@ -586,16 +919,42 @@ impl AptDecoder {
             / u64::from(input_rate_hz))
             + 4) as usize;
 
+        // Build the input-rate DC-removing bandpass filter. Cutoff /
+        // transition / atten values come from noaa-apt's standard
+        // profile, validated against thousands of real captures:
+        //   cutout       = 4800 Hz (= 2·SUBCARRIER, kills out-of-band
+        //                            noise without touching the AM signal)
+        //   transition   = 1000 Hz
+        //   atten        = 30 dB stopband
+        // The DC notch sits at frequencies below `transition/2` (~500 Hz),
+        // safely below any APT signal content (the 2400 Hz subcarrier
+        // upper sideband bottoms out around 400 Hz from the carrier
+        // when modulated by the video band).
+        let dc_bandpass_taps = taps::low_pass_dc_removal_kaiser(
+            DC_BANDPASS_CUTOUT_HZ,
+            DC_BANDPASS_TRANSITION_HZ,
+            DC_BANDPASS_ATTEN_DB,
+            f64::from(input_rate_hz),
+        )?;
+        let dc_bandpass = FirFilter::new(dc_bandpass_taps)?;
+
         Ok(Self {
             input_rate_hz,
+            dc_bandpass,
+            dc_bandpass_scratch: Vec::with_capacity(INPUT_SUBCHUNK_SAMPLES),
             resampler: RealResampler::new(
                 f64::from(input_rate_hz),
                 f64::from(INTERMEDIATE_RATE_HZ),
             )?,
-            envelope: EnvelopeDetector::new(INTERMEDIATE_RATE_HZ)?,
+            demod: Apt137Demodulator::new(f64::from(INTERMEDIATE_RATE_HZ), SUBCARRIER_HZ)?,
             sync_detector: SyncDetector::new(),
+            final_resampler: RealResampler::new(
+                f64::from(INTERMEDIATE_RATE_HZ),
+                PIXELS_PER_SECOND,
+            )?,
+            final_resamp_scratch: Vec::with_capacity(LINE_PIXELS + 4),
             resample_scratch: Vec::with_capacity(max_subchunk_envelope),
-            envelope_scratch: Vec::with_capacity(max_subchunk_envelope),
+            demod_scratch: Vec::with_capacity(max_subchunk_envelope),
             // Reserve room for the *intentional* overshoot in chunked
             // ingestion: each chunk can take SAMPLES_PER_LINE more than
             // the cap before the post-chunk trim brings it back down.
@@ -609,8 +968,10 @@ impl AptDecoder {
 
     /// Flush all internal state back to a pre-first-sample state.
     pub fn reset(&mut self) {
+        self.dc_bandpass.reset();
         self.resampler.reset();
-        self.envelope.reset();
+        self.demod.reset();
+        self.final_resampler.reset();
         self.accumulator.clear();
         self.ready_lines.clear();
         self.accumulator_start_intermediate_sample = 0;
@@ -634,7 +995,7 @@ impl AptDecoder {
     /// 1. **Outer (input subchunk)**: `input` is fed through the
     ///    resampler and envelope detector in pieces of at most
     ///    `INPUT_SUBCHUNK_SAMPLES`, so `resample_scratch`,
-    ///    `envelope_scratch`, and the resampler's internal complex
+    ///    `demod_scratch`, and the resampler's internal complex
     ///    scratch never grow with caller chunk size.
     /// 2. **Inner (envelope subchunk)**: each subchunk's envelope output
     ///    is appended to the accumulator in slices bounded by
@@ -669,16 +1030,16 @@ impl AptDecoder {
         // earlier `process` calls may have buffered enough samples for
         // another line, and the caller is asking for them now.
         if input.is_empty() {
-            produced = self.decode_into_output_or_queue(output, produced);
+            produced = self.decode_into_output_or_queue(output, produced)?;
         }
 
         Ok(produced)
     }
 
-    /// Resample → envelope → accumulator-ingest one bounded subchunk of
-    /// input. Factored out of `process` so the outer subchunking loop
-    /// stays readable. All scratch buffers used here are sized to at
-    /// most `INPUT_SUBCHUNK_SAMPLES` worth of work.
+    /// DC-bandpass → resample → apt137 demod → accumulator-ingest one
+    /// bounded subchunk of input. Factored out of `process` so the
+    /// outer subchunking loop stays readable. All scratch buffers used
+    /// here are sized to at most `INPUT_SUBCHUNK_SAMPLES` worth of work.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn process_subchunk(
         &mut self,
@@ -686,23 +1047,33 @@ impl AptDecoder {
         output: &mut [AptLine],
         mut produced: usize,
     ) -> Result<usize, DspError> {
-        // 1. Resample this subchunk to the internal 20800 Hz grid.
+        // 1. DC-removing bandpass at the input rate. Strips DC bias +
+        //    sub-500 Hz rumble before resampling so the demod sees
+        //    only the AM passband. apt137 is itself DC-robust, but
+        //    eliminating low-frequency content here also helps the
+        //    resampler's antialias filter behave nicely (no spectral
+        //    leakage from a DC blob into the AA stopband).
+        self.dc_bandpass_scratch.resize(in_chunk.len(), 0.0);
+        let filtered = self
+            .dc_bandpass
+            .process_f32(in_chunk, &mut self.dc_bandpass_scratch)?;
+
+        // 2. Resample to the 12480 Hz work rate.
         let est_out = (in_chunk.len() as u64 * u64::from(INTERMEDIATE_RATE_HZ)
             / u64::from(self.input_rate_hz)) as usize
             + 4;
         self.resample_scratch.resize(est_out, 0.0);
-        let resampled = self
-            .resampler
-            .process(in_chunk, &mut self.resample_scratch)?;
-
-        // 2. Envelope-detect into a same-sized scratch.
-        self.envelope_scratch.resize(resampled, 0.0);
-        self.envelope.process(
-            &self.resample_scratch[..resampled],
-            &mut self.envelope_scratch,
+        let resampled = self.resampler.process(
+            &self.dc_bandpass_scratch[..filtered],
+            &mut self.resample_scratch,
         )?;
 
-        // 3. Feed the envelope into the accumulator in *chunks bounded
+        // 3. apt137 closed-form AM demod into a same-sized scratch.
+        self.demod_scratch.resize(resampled, 0.0);
+        self.demod
+            .process(&self.resample_scratch[..resampled], &mut self.demod_scratch)?;
+
+        // 4. Feed the demod output into the accumulator in *chunks bounded
         // by DECODER_BUFFER_CAP*. After each, run the decode + cap
         // cycle so accumulator growth stays bounded.
         let mut env_offset = 0_usize;
@@ -714,12 +1085,12 @@ impl AptDecoder {
             let max_take = space_until_cap.max(SAMPLES_PER_LINE);
             let take = (resampled - env_offset).min(max_take);
             self.accumulator
-                .extend_from_slice(&self.envelope_scratch[env_offset..env_offset + take]);
+                .extend_from_slice(&self.demod_scratch[env_offset..env_offset + take]);
             env_offset += take;
 
             // Decode whatever lines are now sliceable, routing each one
             // either into the caller's output or into the ready queue.
-            produced = self.decode_into_output_or_queue(output, produced);
+            produced = self.decode_into_output_or_queue(output, produced)?;
 
             // Cap the raw accumulator. By construction we're at most
             // DECODER_BUFFER_CAP + SAMPLES_PER_LINE here, so we drop at
@@ -759,7 +1130,7 @@ impl AptDecoder {
         &mut self,
         output: &mut [AptLine],
         mut produced: usize,
-    ) -> usize {
+    ) -> Result<usize, DspError> {
         while self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
             // Nowhere to put the next line — leave the accumulator alone
             // so the next `process` call can pick up from here.
@@ -778,6 +1149,12 @@ impl AptDecoder {
                 break;
             };
 
+            // The matched offset IS the line start: by NOAA APT spec
+            // the line begins at the start of the 39-px Sync A field,
+            // and the padded template's leading low aligns with the
+            // first 2 px of that field (not with the previous line's
+            // tail). This matches noaa-apt's slicing
+            // `signal[sync_pos[i]..sync_pos[i] + samples_per_work_row]`.
             let line_start = m.offset;
             let line_end = line_start + SAMPLES_PER_LINE;
 
@@ -785,7 +1162,33 @@ impl AptDecoder {
             // into the right destination. Stack alloc + memcpy avoids
             // heap traffic on the hot path.
             let mut line = AptLine::default();
-            decimate_into_pixels(&self.accumulator[line_start..line_end], &mut line.pixels);
+            // Resample line samples (SAMPLES_PER_LINE at the work rate)
+            // down to LINE_PIXELS (one sample per pixel). The previous
+            // implementation used a 5-sample boxcar (uniform-window
+            // FIR) whose sinc response attenuated the upper half of
+            // the video band by 3 dB; the proper FIR resample
+            // preserves it. Per A4 / noaa-apt parity. Per-line
+            // resampler reset() ensures no state leaks between lines.
+            self.final_resampler.reset();
+            self.final_resamp_scratch.resize(LINE_PIXELS + 4, 0.0);
+            // Final-rate resampler error path propagates: per the
+            // sdr-dsp pure-DSP rule (no I/O / no side effects /
+            // return Result), we don't log + fabricate a black line
+            // here. Callers see the failure and can decide whether
+            // to log, retry, or surface a UI error. The scratch is
+            // sized for the expected output so this should never
+            // fire in practice. Per CR round 1 on PR #571.
+            let n_pix = self.final_resampler.process(
+                &self.accumulator[line_start..line_end],
+                &mut self.final_resamp_scratch,
+            )?;
+            // Copy raw f32 samples for image-wide post-processing
+            // (B1 / `apt_image::finalize_grayscale`). Trailing pixels
+            // beyond the resampler's output are zero-padded by
+            // `AptLine::default()`.
+            let n_copy = n_pix.min(LINE_PIXELS);
+            line.raw_samples[..n_copy].copy_from_slice(&self.final_resamp_scratch[..n_copy]);
+            decimate_into_pixels(&self.final_resamp_scratch[..n_copy], &mut line.pixels);
             line.sync_quality = m.quality;
             line.sync_channel = SyncChannel::A;
             line.input_sample_index = self.accumulator_to_input_index(line_start);
@@ -801,7 +1204,7 @@ impl AptDecoder {
             self.accumulator.drain(..line_end);
             self.accumulator_start_intermediate_sample += line_end as u64;
         }
-        produced
+        Ok(produced)
     }
 
     /// Convert an offset within the envelope accumulator (intermediate-rate
@@ -814,39 +1217,46 @@ impl AptDecoder {
     }
 }
 
-/// Decimate one line's worth of envelope samples (`SAMPLES_PER_LINE`) into
+/// Convert one line's worth of demodulated envelope samples (already
+/// resampled to one-sample-per-pixel = `LINE_PIXELS` samples) into
 /// `LINE_PIXELS` 8-bit greyscale values, writing in place into `pixels`.
 ///
-/// Uses a simple boxcar average of `SAMPLES_PER_PIXEL` adjacent samples
-/// followed by per-line min/max normalization. Per-line normalization is a
-/// placeholder that always produces a visible image — long term the
-/// decoder should read the Wedge / Telemetry A & B reference bars for
-/// absolute calibration, but until that's wired in this keeps the pipeline
-/// producing something useful.
+/// Per A4 of the noaa-apt parity work: the input is the output of a
+/// proper FIR resample (`work_rate` → 4160 Hz) — no per-pixel boxcar
+/// averaging here, since the resampler already handled the
+/// antialiasing properly. If `samples.len() < LINE_PIXELS` (resample
+/// returned a few short due to phase rounding), the trailing pixels
+/// are zero-filled rather than panicking.
+///
+/// Uses per-line min/max normalization. The downstream `AptImage`
+/// stores these for live preview; absolute calibration via telemetry
+/// wedges 8/9 (B1 of the parity work, in `apt_image.rs`) re-normalizes
+/// the entire image at PNG-export time using a single image-wide
+/// reference range.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
 fn decimate_into_pixels(samples: &[f32], pixels: &mut [u8; LINE_PIXELS]) {
-    debug_assert_eq!(samples.len(), SAMPLES_PER_LINE);
+    let n = samples.len().min(LINE_PIXELS);
 
-    let mut pixel_vals = [0.0_f32; LINE_PIXELS];
-    for (i, chunk) in samples.chunks_exact(SAMPLES_PER_PIXEL).enumerate() {
-        let sum: f32 = chunk.iter().sum();
-        pixel_vals[i] = sum / (SAMPLES_PER_PIXEL as f32);
-    }
-
-    let (lo, hi) = pixel_vals
+    let (lo, hi) = samples[..n]
         .iter()
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
             (lo.min(v), hi.max(v))
         });
     let range = (hi - lo).max(1e-9);
 
-    for (dst, &v) in pixels.iter_mut().zip(pixel_vals.iter()) {
+    for (dst, &v) in pixels.iter_mut().zip(samples[..n].iter()) {
         let norm = ((v - lo) / range).clamp(0.0, 1.0);
         *dst = (norm * 255.0).round() as u8;
+    }
+    // If the resampler returned fewer than LINE_PIXELS samples (rare,
+    // can happen at chunk boundaries due to phase accumulation), the
+    // tail pixels are already zeroed by `AptLine::default()`.
+    for dst in pixels.iter_mut().skip(n) {
+        *dst = 0;
     }
 }
 
@@ -909,22 +1319,232 @@ mod tests {
         ((*state >> 16) & 0x7fff) as f32 / 32_767.0 - 0.5
     }
 
+    // ─── Apt137Demodulator tests ──────────────────────────────────────
+
+    /// Synthesize an AM signal: `(1 + depth·m(t)) · cos(2π·f_c·t)`
+    /// where `m(t)` is a low-frequency message wave at `f_msg`. Used
+    /// to feed the demod with a known shape we can recover.
+    fn synth_am_wave(
+        sample_rate: f64,
+        carrier_hz: f64,
+        msg_hz: f64,
+        depth: f32,
+        n_samples: usize,
+    ) -> Vec<f32> {
+        let dt = 1.0 / sample_rate;
+        let omega_c = 2.0 * core::f64::consts::PI * carrier_hz;
+        let omega_m = 2.0 * core::f64::consts::PI * msg_hz;
+        (0..n_samples)
+            .map(|i| {
+                let t = i as f64 * dt;
+                let envelope = 1.0 + f64::from(depth) * (omega_m * t).cos();
+                let carrier = (omega_c * t).cos();
+                (envelope * carrier) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apt137_demod_recovers_constant_envelope() {
+        // Pure unmodulated carrier `A·cos(2π·f_c·t)`. Demod should
+        // recover the constant amplitude `A` to within numerical
+        // noise after the one-sample warm-up.
+        let fs = 12_480.0_f64;
+        let fc = 2_400.0_f64;
+        let n = 256_usize;
+        let amplitude = 0.7_f32;
+        let signal: Vec<f32> = synth_am_wave(fs, fc, 0.0, 0.0, n)
+            .iter()
+            .map(|s| s * amplitude)
+            .collect();
+        let mut demod = Apt137Demodulator::new(fs, fc).unwrap();
+        let mut out = vec![0.0_f32; n];
+        let written = demod.process(&signal, &mut out).unwrap();
+        assert_eq!(written, n);
+        // First sample is by spec zero (no prior). Skip a few more to
+        // let any startup transient settle, then check the rest sit
+        // around the true amplitude.
+        for &v in &out[5..] {
+            assert!(
+                (v - amplitude).abs() < 0.01,
+                "expected ~{amplitude}, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn apt137_demod_recovers_modulated_envelope() {
+        // `(1 + 0.5·cos(2π·f_msg·t)) · cos(2π·f_c·t)` — a 100 Hz
+        // message on a 2400 Hz carrier. The recovered envelope
+        // should be `1 + 0.5·cos(2π·f_msg·t)` with the same shape.
+        let fs = 12_480.0_f64;
+        let fc = 2_400.0_f64;
+        let msg = 100.0_f64;
+        let depth = 0.5_f32;
+        let n = 4_096_usize;
+        let signal = synth_am_wave(fs, fc, msg, depth, n);
+        let mut demod = Apt137Demodulator::new(fs, fc).unwrap();
+        let mut out = vec![0.0_f32; n];
+        demod.process(&signal, &mut out).unwrap();
+
+        // Sample the recovered envelope at the message peak (t such
+        // that cos(ωm·t) = 1, near i = 0) and trough (cos = -1).
+        // Use indices well past the warm-up. At fs=12480 and
+        // f_msg=100, one message period spans 124.8 samples, so
+        // peak at i≈0, trough at i≈62, peak again at i≈125, etc.
+        let peak_i = 250; // 2nd full period peak
+        let trough_i = 250 + 62; // half period later
+        let peak = out[peak_i];
+        let trough = out[trough_i];
+        // Peak ≈ 1 + 0.5 = 1.5; trough ≈ 1 - 0.5 = 0.5.
+        assert!((peak - 1.5).abs() < 0.05, "peak = {peak}, expected ~1.5");
+        assert!(
+            (trough - 0.5).abs() < 0.05,
+            "trough = {trough}, expected ~0.5"
+        );
+    }
+
+    #[test]
+    fn apt137_demod_streaming_matches_batch() {
+        // Splitting a signal into chunks and processing them
+        // sequentially must produce the same output as a single
+        // big call (modulo the one-sample warm-up at the very
+        // start of the stream).
+        let fs = 12_480.0_f64;
+        let fc = 2_400.0_f64;
+        let n = 1_024_usize;
+        let signal = synth_am_wave(fs, fc, 50.0, 0.3, n);
+
+        let mut demod_batch = Apt137Demodulator::new(fs, fc).unwrap();
+        let mut batch = vec![0.0_f32; n];
+        demod_batch.process(&signal, &mut batch).unwrap();
+
+        let mut demod_streamed = Apt137Demodulator::new(fs, fc).unwrap();
+        let mut streamed = vec![0.0_f32; n];
+        // Three uneven chunks — covers chunk-boundary state handling.
+        let split_a = 137_usize;
+        let split_b = split_a + 511_usize;
+        demod_streamed
+            .process(&signal[..split_a], &mut streamed[..split_a])
+            .unwrap();
+        demod_streamed
+            .process(&signal[split_a..split_b], &mut streamed[split_a..split_b])
+            .unwrap();
+        demod_streamed
+            .process(&signal[split_b..], &mut streamed[split_b..])
+            .unwrap();
+
+        for i in 1..n {
+            assert!(
+                (batch[i] - streamed[i]).abs() < 1e-4,
+                "batch vs streamed at i={i}: {} vs {}",
+                batch[i],
+                streamed[i]
+            );
+        }
+    }
+
+    #[test]
+    fn apt137_demod_rejects_invalid_frequencies() {
+        // sample_rate must be positive.
+        assert!(Apt137Demodulator::new(0.0, 2_400.0).is_err());
+        assert!(Apt137Demodulator::new(-1.0, 2_400.0).is_err());
+        // carrier outside (0, fs/2).
+        assert!(Apt137Demodulator::new(12_480.0, 0.0).is_err());
+        assert!(Apt137Demodulator::new(12_480.0, -100.0).is_err());
+        assert!(Apt137Demodulator::new(12_480.0, 6_240.0).is_err()); // exactly Nyquist
+        assert!(Apt137Demodulator::new(12_480.0, 7_000.0).is_err()); // > Nyquist
+        // NaN / infinity.
+        assert!(Apt137Demodulator::new(f64::NAN, 2_400.0).is_err());
+        assert!(Apt137Demodulator::new(12_480.0, f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn apt137_demod_dc_robust() {
+        // Adding a constant DC offset to the carrier shouldn't dramatically
+        // distort the recovered envelope. Compare a clean carrier to one
+        // with +0.1 DC bias — apt137's signature property is that DC bias
+        // produces a smooth distortion proportional to the bias, not the
+        // ±asymmetry that breaks rectifier-based envelope detection.
+        let fs = 12_480.0_f64;
+        let fc = 2_400.0_f64;
+        let n = 1_024_usize;
+        let amplitude = 0.5_f32;
+        let signal: Vec<f32> = synth_am_wave(fs, fc, 0.0, 0.0, n)
+            .iter()
+            .map(|s| s * amplitude)
+            .collect();
+        let signal_with_dc: Vec<f32> = signal.iter().map(|s| s + 0.1).collect();
+
+        let mut demod = Apt137Demodulator::new(fs, fc).unwrap();
+        let mut clean = vec![0.0_f32; n];
+        demod.process(&signal, &mut clean).unwrap();
+        let mut demod = Apt137Demodulator::new(fs, fc).unwrap();
+        let mut biased = vec![0.0_f32; n];
+        demod.process(&signal_with_dc, &mut biased).unwrap();
+
+        // After warm-up, the per-sample distortion should be bounded.
+        // A DC bias of magnitude `b` produces an envelope error roughly
+        // proportional to `b` — well under 1.0 here.
+        for i in 50..n {
+            let diff = (clean[i] - biased[i]).abs();
+            assert!(
+                diff < 0.3,
+                "DC-biased envelope diverged too far at i={i}: |{} - {}| = {diff}",
+                clean[i],
+                biased[i]
+            );
+        }
+    }
+
+    #[test]
+    fn apt137_demod_reset_clears_state() {
+        let fs = 12_480.0_f64;
+        let fc = 2_400.0_f64;
+        let n = 64_usize;
+        let signal = synth_am_wave(fs, fc, 0.0, 0.0, n);
+        let mut demod = Apt137Demodulator::new(fs, fc).unwrap();
+        let mut out = vec![0.0_f32; n];
+        demod.process(&signal, &mut out).unwrap();
+        // First sample of fresh stream is zero (warm-up).
+        assert_eq!(out[0], 0.0);
+        // After reset, processing again should re-trigger the warm-up.
+        out.fill(99.0); // poison
+        demod.reset();
+        demod.process(&signal, &mut out).unwrap();
+        assert_eq!(out[0], 0.0, "reset() failed to clear `prev` state");
+    }
+
     #[test]
     fn pixel_and_line_invariants_hold() {
         assert_eq!(PIXELS_PER_SECOND as usize, 4160);
-        assert_eq!(SAMPLES_PER_LINE, 10_400);
+        // 12480 Hz / (2 lines/sec × 2080 px/line) = 3 samples/px,
+        // so SAMPLES_PER_LINE = 6240 at the new (lower) work rate.
+        assert_eq!(SAMPLES_PER_LINE, 6_240);
+        assert_eq!(SAMPLES_PER_PIXEL, 3);
         assert_eq!(
             INTERMEDIATE_RATE_HZ as usize,
             SAMPLES_PER_LINE * LINES_PER_SECOND as usize
         );
+        assert_eq!(INTERMEDIATE_RATE_HZ, 12_480);
+        // Padded Sync A template (per A3 / noaa-apt parity):
+        // 38 px = 2 leading + 28 modulated + 8 trailing.
+        // At 3 samples/px → 114 samples total, of which the middle
+        // 84 (= 7 cycles × 12 samples/cycle) carry the modulation.
+        assert_eq!(SYNC_A_TOTAL_PX, 38);
+        assert_eq!(SYNC_A_TEMPLATE_LEN, SYNC_A_TOTAL_PX * SAMPLES_PER_PIXEL);
+        assert_eq!(SYNC_A_TEMPLATE_LEN, 114);
         assert_eq!(
-            SYNC_A_TEMPLATE_LEN,
-            SYNC_BURST_CYCLES * SAMPLES_PER_SYNC_A_CYCLE
+            SYNC_A_LEADING_PAD_SAMPLES,
+            SYNC_A_LEADING_PAD_PX * SAMPLES_PER_PIXEL
         );
+        assert_eq!(SYNC_A_LEADING_PAD_SAMPLES, 6);
         assert_eq!(
             SYNC_B_TEMPLATE_LEN,
             SYNC_BURST_CYCLES * SAMPLES_PER_SYNC_B_CYCLE
         );
+        assert_eq!(SAMPLES_PER_SYNC_A_CYCLE, 12);
+        assert_eq!(SAMPLES_PER_SYNC_B_CYCLE, 15);
     }
 
     #[test]
@@ -966,13 +1586,19 @@ mod tests {
 
         // And confirm the 2·f_c (4800 Hz) ripple is actually suppressed —
         // peak-to-peak of the steady region should be small.
+        // Tolerance: at the new 12480 Hz work rate the 4800 Hz harmonic
+        // sits at 0.769·Nyquist (vs. 0.46·Nyquist when this test was
+        // originally written for 20800 Hz). The Nuttall LPF still
+        // rejects it, but with less margin — ~0.10 ripple is fine for
+        // the legacy-path EnvelopeDetector (which is no longer in the
+        // live APT pipeline; replaced by Apt137Demodulator in A4).
         let (min, max) = steady
             .iter()
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
                 (lo.min(v), hi.max(v))
             });
         assert!(
-            (max - min) < 0.05,
+            (max - min) < 0.10,
             "LPF residual ripple too large: [{min:.4}, {max:.4}]"
         );
     }
@@ -1191,10 +1817,18 @@ mod tests {
 
     #[test]
     fn sync_detector_locates_sync_a_exactly() {
-        let offset = 317;
+        // `synth_envelope_with_sync` plants the burst's first HIGH
+        // half-cycle at `burst_offset`. The padded template's first
+        // HIGH transition sits at sample
+        // `SYNC_A_FIRST_HIGH_OFFSET_SAMPLES` from template start, so
+        // a perfect match returns
+        // `m.offset = burst_offset - SYNC_A_FIRST_HIGH_OFFSET_SAMPLES`.
+        // Pick a burst offset that leaves room for both the leading
+        // template padding before it and the trailing tail after.
+        let burst_offset = 317;
         let buf = synth_envelope_with_sync(
             2_000,
-            offset,
+            burst_offset,
             SAMPLES_PER_SYNC_A_CYCLE,
             SYNC_BURST_CYCLES,
             0.1,
@@ -1204,7 +1838,14 @@ mod tests {
             .find_best(&buf, SyncChannel::A)
             .expect("should match");
         assert_eq!(m.channel, SyncChannel::A);
-        assert_eq!(m.offset, offset);
+        let expected_template_start = burst_offset - SYNC_A_FIRST_HIGH_OFFSET_SAMPLES;
+        assert_eq!(
+            m.offset, expected_template_start,
+            "expected template-start offset {expected_template_start} \
+             (= burst_offset {burst_offset} − SYNC_A_FIRST_HIGH_OFFSET_SAMPLES \
+             {SYNC_A_FIRST_HIGH_OFFSET_SAMPLES}), got {}",
+            m.offset,
+        );
         assert!(
             m.quality > TEST_SYNC_GOOD_LOCK,
             "quality too low: {:.3}",
@@ -1275,24 +1916,36 @@ mod tests {
     fn sync_detector_picks_stronger_of_two_bursts() {
         // Two bursts in the same buffer: one attenuated, one full-amp.
         // The detector must pick the full-amp one (higher SNR ⇒ higher NCC).
-        let weak_off = 100;
-        let strong_off = 1_000;
-        let mut buf = vec![0.1_f32; 2_000];
-        for i in 0..SYNC_A_TEMPLATE_LEN {
+        // Use `synth_envelope_with_sync` so the template gets a clean
+        // shape match — its layout (HIGH-LOW pairs starting HIGH) is
+        // what real APT signals produce; manual ±contrast plants in
+        // the test would have to mirror that exactly to score 1.0.
+        let weak_burst_off = 200;
+        let strong_burst_off = 1_000;
+        let mut buf = vec![0.1_f32; 2_500];
+        // Weak burst: 0.01 contrast above floor.
+        for i in 0..(SAMPLES_PER_SYNC_A_CYCLE * SYNC_BURST_CYCLES) {
             let phase = i % SAMPLES_PER_SYNC_A_CYCLE;
             let high = phase < SAMPLES_PER_SYNC_A_CYCLE / 2;
-            // Weak burst — only 0.01 contrast above floor.
-            buf[weak_off + i] = if high { 0.11 } else { 0.10 };
-            // Strong burst — 0.9 contrast above floor.
-            buf[strong_off + i] = if high { 1.0 } else { 0.1 };
+            buf[weak_burst_off + i] = if high { 0.11 } else { 0.10 };
+        }
+        // Strong burst: 0.9 contrast above floor.
+        for i in 0..(SAMPLES_PER_SYNC_A_CYCLE * SYNC_BURST_CYCLES) {
+            let phase = i % SAMPLES_PER_SYNC_A_CYCLE;
+            let high = phase < SAMPLES_PER_SYNC_A_CYCLE / 2;
+            buf[strong_burst_off + i] = if high { 1.0 } else { 0.1 };
         }
         let m = SyncDetector::new().find_best(&buf, SyncChannel::A).unwrap();
-        // Both bursts have perfectly-matched shape so NCC is ~1.0 for
-        // either — what must hold is that the detector does find one of
-        // the two exact offsets, not some in-between phase-slip position.
+        // The matched offset is `burst_first_high − SYNC_A_FIRST_HIGH_OFFSET_SAMPLES`
+        // for either burst. Both shapes correlate perfectly, so the detector
+        // will pick whichever has the larger raw NCC numerator (the strong
+        // one — higher amplitude swing).
+        let weak_template_start = weak_burst_off - SYNC_A_FIRST_HIGH_OFFSET_SAMPLES;
+        let strong_template_start = strong_burst_off - SYNC_A_FIRST_HIGH_OFFSET_SAMPLES;
         assert!(
-            m.offset == strong_off || m.offset == weak_off,
-            "expected offset at one of the burst starts, got {}",
+            m.offset == weak_template_start || m.offset == strong_template_start,
+            "expected one of {{{weak_template_start}, {strong_template_start}}}, \
+             got {}",
             m.offset,
         );
         assert!(m.quality > 0.9, "quality too low: {:.3}", m.quality);
@@ -1332,8 +1985,14 @@ mod tests {
         assert!(AptDecoder::new(0).is_err());
         assert!(AptDecoder::new(4_799).is_err());
         assert!(AptDecoder::new(4_800).is_err());
-        // 8000 Hz (telephony) is the smallest realistic rate we accept.
-        assert!(AptDecoder::new(8_000).is_ok());
+        // 8000 Hz used to be accepted but the A4 DC-removal Kaiser
+        // bandpass needs Nyquist > cutoff + transition/2 = 5300 Hz, so
+        // input rate must exceed ~10.6 kHz. 11025 Hz (CD-quality
+        // sub-rate) is the smallest realistic rate that still passes;
+        // the FM-demod output (48 kHz) is comfortably above this.
+        assert!(AptDecoder::new(8_000).is_err());
+        assert!(AptDecoder::new(11_025).is_ok());
+        assert!(AptDecoder::new(48_000).is_ok());
     }
 
     #[test]
@@ -1529,14 +2188,14 @@ mod tests {
     #[test]
     fn apt_decoder_huge_chunk_keeps_resample_scratch_bounded() {
         // Outer-loop subchunking guarantees that resample_scratch and
-        // envelope_scratch never need to grow with caller chunk size.
+        // demod_scratch never need to grow with caller chunk size.
         // Snapshot capacities, push a multi-megabyte input chunk, and
         // assert the scratch vectors haven't reallocated to fit the
         // input's full size.
         let rate = TEST_INPUT_RATE_HZ;
         let mut d = AptDecoder::new(rate).unwrap();
         let resample_cap_before = d.resample_scratch.capacity();
-        let envelope_cap_before = d.envelope_scratch.capacity();
+        let envelope_cap_before = d.demod_scratch.capacity();
 
         // 100 audio lines = 2.4 M samples = ~9.6 MB. Pre-bounded design,
         // resample_scratch must stay sized for one INPUT_SUBCHUNK_SAMPLES
@@ -1556,11 +2215,11 @@ mod tests {
             d.resample_scratch.capacity(),
         );
         assert_eq!(
-            d.envelope_scratch.capacity(),
+            d.demod_scratch.capacity(),
             envelope_cap_before,
-            "envelope_scratch reallocated under huge input — outer subchunk \
+            "demod_scratch reallocated under huge input — outer subchunk \
              bound is broken (cap was {envelope_cap_before}, now {})",
-            d.envelope_scratch.capacity(),
+            d.demod_scratch.capacity(),
         );
     }
 

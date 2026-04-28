@@ -1677,7 +1677,7 @@ fn handle_dsp_message(
             // lines from that moment on, rather than having to
             // pre-arm before AOS.
             if let Some(view) = state.apt_viewer.borrow().as_ref() {
-                view.push_line(&line.pixels);
+                view.push_line(&line);
             }
         }
         DspToUi::ScannerMutexStopped(reason) => {
@@ -9638,7 +9638,9 @@ fn connect_satellites_panel(
                 // user-initiated action and works on any catalog
                 // entry. Only the auto-record path filters on
                 // `Some(protocol)`.
-                if let Some((freq_hz, mode, bw_hz, _protocol)) = tune_target_for_pass(&pass) {
+                if let Some((freq_hz, mode, bw_hz, _protocol, _norad_id)) =
+                    tune_target_for_pass(&pass)
+                {
                     let play_btn = gtk4::Button::builder()
                         .icon_name("media-playback-start-symbolic")
                         .tooltip_text(format!(
@@ -10124,6 +10126,12 @@ fn connect_satellites_panel(
         let state_a = Rc::clone(state);
         let tune_a = Rc::clone(tune_to_satellite);
         let set_playing_a = Rc::clone(set_playing);
+        // Optional TLE cache — used by the SavePng wiring to compute
+        // `is_ascending` for the rotate-180 flag (B2 of the noaa-apt
+        // parity work). `None` when the host platform refused us a
+        // cache directory; the rotate path falls back to "no rotation"
+        // in that case.
+        let cache_a: Option<std::sync::Arc<TleCache>> = cache.as_ref().map(std::sync::Arc::clone);
         // Weak ref for the same lifecycle reason as
         // `parent_provider_for_recorder` — strong clone would pin
         // the toast overlay alive past window close.
@@ -10148,9 +10156,82 @@ fn connect_satellites_panel(
                 overlay.add_toast(adw::Toast::new(msg));
             }
         };
+        // Compute the rotate-180 flag for the currently-recording APT
+        // pass: `true` when the satellite is on the ascending leg of
+        // its orbit, which means the assembled image is upside-down +
+        // mirrored east/west (per `sdr_radio::apt_image::rotate_180_per_channel`).
+        // Falls back to `false` (no rotation) on any failure — TLE
+        // cache miss, parse failure, propagation error, or
+        // recording-pass info missing. The default is safe: NOAA
+        // satellites are sun-synchronous, so the descending pass is
+        // the typical case for daytime captures and no-rotation
+        // preserves north-at-top.
+        // Takes the recording-pass tuple directly (`norad_id`, `aos`)
+        // rather than reading it from `AppState`, so callers compute
+        // rotation against an explicit snapshot. Without this, the
+        // SavePng handler could read a freshly-overwritten slot if a
+        // back-to-back AOS landed between this pass's LOS dispatch
+        // and the rotation compute — exporting the older pass's
+        // image with the newer pass's orientation. Per CR round 6
+        // on PR #571.
+        let compute_apt_rotate_180_for_pass = {
+            let cache_a = cache_a.clone();
+            move |norad_id: u32, aos: chrono::DateTime<chrono::Utc>| -> bool {
+                let Some(cache) = cache_a.as_ref() else {
+                    return false;
+                };
+                // Look up by stable NORAD id (not display name) so
+                // a catalog rename doesn't silently break this
+                // path. Per CR round 2 on PR #571.
+                let Some(known) = sdr_sat::KNOWN_SATELLITES
+                    .iter()
+                    .find(|s| s.norad_id == norad_id)
+                else {
+                    tracing::debug!(
+                        norad_id,
+                        "APT rotate-180: satellite not in catalog; defaulting to no rotation",
+                    );
+                    return false;
+                };
+                let (line1, line2) = match cache.cached_tle_for(known.norad_id) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::debug!(
+                            norad_id,
+                            error = %e,
+                            "APT rotate-180: TLE unavailable; defaulting to no rotation",
+                        );
+                        return false;
+                    }
+                };
+                let parsed = match sdr_sat::Satellite::from_tle(known.name, &line1, &line2) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(
+                            norad_id,
+                            error = %e,
+                            "APT rotate-180: TLE parse failed; defaulting to no rotation",
+                        );
+                        return false;
+                    }
+                };
+                match sdr_sat::is_ascending(&parsed, aos) {
+                    Ok(asc) => asc,
+                    Err(e) => {
+                        tracing::debug!(
+                            norad_id,
+                            error = %e,
+                            "APT rotate-180: SGP4 propagate failed; defaulting to no rotation",
+                        );
+                        false
+                    }
+                }
+            }
+        };
         Rc::new(move |action: RecorderAction| match action {
             RecorderAction::StartAutoRecord {
                 satellite,
+                norad_id,
                 freq_hz,
                 mode,
                 bandwidth_hz,
@@ -10261,6 +10342,31 @@ fn connect_satellites_panel(
                         if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
                             view.clear();
                         }
+                        // Stash recording-pass info for the LOS-side
+                        // SavePng wiring to compute the auto-rotation
+                        // flag (B2 of the noaa-apt parity work). The
+                        // exact AOS time matters less than "around
+                        // when" — `is_ascending` checks the lat
+                        // derivative over a 30 s window, which is
+                        // valid anywhere mid-pass. NORAD id arrives
+                        // pre-resolved on the recorder action — no
+                        // name → catalog lookup at this layer means
+                        // no silent rotation breakage if the catalog
+                        // ever picks up alias drift. Per CR round 3
+                        // on PR #571.
+                        let aos = chrono::Utc::now();
+                        *state_a.apt_recording_pass.borrow_mut() = Some((norad_id, aos));
+                        // Push the rotate-180 flag down to the
+                        // renderer so the toolbar's manual `Export
+                        // PNG` button matches the auto-record
+                        // orientation. Without this, manual exports
+                        // of ascending passes come out upside-down
+                        // even though the auto-record save rotates
+                        // them. Per CR round 1 on PR #571.
+                        let rotate_180 = compute_apt_rotate_180_for_pass(norad_id, aos);
+                        if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
+                            view.set_rotate_180(rotate_180);
+                        }
                     }
                     sdr_sat::ImagingProtocol::Lrpt => {
                         // **Order is load-bearing.** Reset the
@@ -10337,58 +10443,147 @@ fn connect_satellites_panel(
                 state_a.send_dsp(UiToDsp::ResetImagingDecoders);
             }
             RecorderAction::SavePng(path) => {
-                // Toast based on the *actual* export outcome
-                // rather than announcing success up front — the
-                // recorder doesn't know whether the user closed
-                // the viewer mid-pass or whether disk write will
-                // succeed.
-                let mut export_ok = false;
-                let result_msg = if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
-                    match view.export_png(&path) {
-                        Ok(()) => {
-                            tracing::info!("auto-record PNG saved to {path:?}");
-                            export_ok = true;
-                            format!("Pass complete — image saved to {}", path.display())
-                        }
-                        Err(e) => {
-                            tracing::warn!("auto-record PNG export to {path:?} failed: {e}");
-                            format!("Pass complete but PNG save failed: {e}")
-                        }
-                    }
-                } else {
+                // Snapshot the recording-pass tuple FIRST so every
+                // pass-derived value (rotation flag, slot-clear
+                // check) reads from this stable view. If a new AOS
+                // overwrites the slot between this dispatch and the
+                // export — a back-to-back-pass race — we must use
+                // the snapshot, not the live slot, otherwise the
+                // older pass's image gets exported with the newer
+                // pass's orientation. Per CR round 6 on PR #571.
+                //
+                // The same snapshot also drives the "only clear if
+                // still-equal" guard on `apt_recording_pass` in both
+                // the early-return path below and the async-callback
+                // completion. Per CR rounds 4 and 5 on PR #571.
+                let exported_pass = *state_a.apt_recording_pass.borrow();
+                // Compute the rotate-180 flag for ascending passes
+                // (B2 of the noaa-apt parity work) FROM THE SNAPSHOT,
+                // not from the live `state_a.apt_recording_pass`. The
+                // helper resolves the satellite's TLE from the cache
+                // and calls `sdr_sat::is_ascending` at the snapshotted
+                // AOS sample point. Defaults to `false` (no rotation)
+                // if any step fails — descending-pass orientation is
+                // the safer default since it preserves north-at-top.
+                let rotate_180 = exported_pass
+                    .is_some_and(|(norad_id, aos)| compute_apt_rotate_180_for_pass(norad_id, aos));
+                let mode = sdr_radio::apt_image::BrightnessMode::default();
+                // Async export: snapshot the AptImage on the main
+                // thread NOW, hand the snapshot to a worker via
+                // `gio::spawn_blocking`. The encode for a 1500-line
+                // pass is multi-hundred-ms — synchronously running
+                // it here would freeze GTK during LOS, exactly when
+                // the user wants to see the toast and have the
+                // window auto-close cleanly. Per CR round 1 on PR
+                // #571.
+                let view_opt = state_a.apt_viewer.borrow().as_ref().cloned();
+                let Some(view) = view_opt else {
                     tracing::warn!(
                         "auto-record SavePng but no APT viewer is open (user closed mid-pass)",
                     );
-                    "Pass complete, but the APT viewer was closed — no image saved".to_string()
+                    post_toast(
+                        &toast_overlay_weak,
+                        "Pass complete, but the APT viewer was closed — no image saved",
+                    );
+                    // Same overlap-guard as the async-callback path:
+                    // only clear the slot if it still holds the pass
+                    // we entered this branch with. If a new AOS
+                    // wrote a fresh tuple in the meantime, leave it
+                    // alone.
+                    {
+                        let mut slot = state_a.apt_recording_pass.borrow_mut();
+                        if *slot == exported_pass {
+                            *slot = None;
+                        }
+                    }
+                    return;
                 };
-                post_toast(&toast_overlay_weak, &result_msg);
-                // Close the APT viewer window now that the PNG
-                // is on disk — resets the viewer for the next
-                // pass instead of carrying stale lines forward.
-                // Per a user request during PR #554 live testing.
-                //
-                // Only close on a successful export — if the save
-                // failed (Cairo error, disk full, etc.) the user
-                // probably wants to inspect the in-memory image
-                // and manually retry the export. Closing would
-                // discard the only copy. Per CR round 9 on PR #554.
-                //
-                // Weak-ref upgrade fails closed: if the user
-                // already dismissed the window, there's nothing
-                // to close. The close-request handler in
-                // `open_apt_viewer_if_needed` clears both
-                // `apt_viewer` and `apt_viewer_window` slots so
-                // the next AOS opens a fresh viewer.
-                if export_ok
-                    && let Some(window) = state_a
-                        .apt_viewer_window
-                        .borrow()
-                        .as_ref()
-                        .and_then(glib::WeakRef::upgrade)
-                {
-                    tracing::info!("auto-record LOS: closing APT viewer window after PNG save");
-                    window.close();
-                }
+                // Capture state needed by the async on_complete
+                // callback (the rest can be moved into the closure).
+                let path_for_msg = path.clone();
+                let path_for_export = path;
+                let toast_overlay_for_complete = toast_overlay_weak.clone();
+                let state_for_complete = Rc::clone(&state_a);
+                // Snapshot the *current* viewer-window WeakRef BEFORE
+                // spawning the worker. If the user closes the viewer
+                // mid-export and reopens it, `state.apt_viewer_window`
+                // will point at the new window by the time the
+                // callback fires; reading from there could close the
+                // wrong window. Cloning the WeakRef pins the
+                // identity of the window we'll attempt to close, while
+                // staying weak so a closed/dropped window upgrades to
+                // None and we no-op. Per CR round 3 on PR #571.
+                let exported_window_weak = state_a.apt_viewer_window.borrow().as_ref().cloned();
+                view.export_png_full_async(path_for_export, mode, rotate_180, move |result| {
+                    let (export_ok, msg) = match result {
+                        Ok(()) => {
+                            tracing::info!(
+                                rotate_180,
+                                ?mode,
+                                "auto-record PNG saved to {}",
+                                path_for_msg.display()
+                            );
+                            (
+                                true,
+                                format!(
+                                    "Pass complete — image saved to {}",
+                                    path_for_msg.display()
+                                ),
+                            )
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "auto-record PNG export to {} failed: {e}",
+                                path_for_msg.display()
+                            );
+                            (false, format!("Pass complete but PNG save failed: {e}"))
+                        }
+                    };
+                    post_toast(&toast_overlay_for_complete, &msg);
+                    // Close the APT viewer window now that the PNG
+                    // is on disk — resets the viewer for the next
+                    // pass instead of carrying stale lines forward.
+                    // Per a user request during PR #554 live
+                    // testing.
+                    //
+                    // Only close on a successful export — if the
+                    // save failed (Cairo error, disk full, etc.)
+                    // the user probably wants to inspect the
+                    // in-memory image and manually retry the
+                    // export. Per CR round 9 on PR #554.
+                    if export_ok {
+                        // Use the WeakRef we snapshotted at export
+                        // start (not the current `state.apt_viewer_window`)
+                        // so a viewer reopen during the async save
+                        // can't trick us into closing the wrong
+                        // window. Upgrade-or-skip — if the user
+                        // already closed it, the upgrade returns None
+                        // and we simply do nothing. Per CR round 3 on
+                        // PR #571.
+                        if let Some(window) = exported_window_weak
+                            .as_ref()
+                            .and_then(glib::WeakRef::upgrade)
+                        {
+                            tracing::info!(
+                                "auto-record LOS: closing APT viewer window after PNG save",
+                            );
+                            window.close();
+                        }
+                    }
+                    // Clear the recording-pass info now that the
+                    // export is done — but ONLY if the slot still
+                    // holds the same pass we just saved. If a new
+                    // AOS overwrote it while we were encoding, that
+                    // new pass owns the slot now and clearing it
+                    // would silently break the next LOS-side
+                    // rotate-180 lookup. Per CR round 4 on PR #571.
+                    {
+                        let mut slot = state_for_complete.apt_recording_pass.borrow_mut();
+                        if *slot == exported_pass {
+                            *slot = None;
+                        }
+                    }
+                });
             }
             RecorderAction::SaveLrptPass(dir) => {
                 // Walk every APID present in the SHARED `LrptImage`

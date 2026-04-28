@@ -71,9 +71,20 @@ pub enum AvhrrChannel {
 /// the renderer needs.
 #[derive(Debug, Clone)]
 pub struct AptImageLine {
-    /// 2080 8-bit greyscale pixels in transmission order. For sub-threshold
-    /// quality lines, this is all zeros (gap fill).
+    /// 2080 8-bit greyscale pixels in transmission order, with
+    /// per-line min/max normalization. For sub-threshold quality
+    /// lines, this is all zeros (gap fill). Used by the live image
+    /// viewer; PNG export ignores this in favor of `raw_samples`
+    /// for image-wide brightness modes (per [`BrightnessMode`]).
     pub pixels: [u8; LINE_PIXELS],
+    /// Raw f32 envelope samples — one per pixel, in the demodulator's
+    /// native float scale (no normalization). The PNG-export pipeline
+    /// (per `AptImage::finalize_grayscale`) re-normalizes these
+    /// across the entire image at write time, with the brightness
+    /// reference range chosen by [`BrightnessMode`].
+    /// Sub-threshold quality lines get zero-filled here too, matching
+    /// the gap-fill semantics of `pixels`.
+    pub raw_samples: [f32; LINE_PIXELS],
     /// The decoder's normalized cross-correlation score for this line's
     /// sync burst (`[0.0, 1.0]`). Preserved verbatim from the source
     /// `AptLine` even when `pixels` was gap-filled, so a UI overlay can
@@ -85,12 +96,63 @@ pub struct AptImageLine {
     pub received_at: Instant,
 }
 
+/// Brightness-mapping mode used when rendering the assembled image
+/// (typically at PNG-export time, when the entire pass's dynamic
+/// range is known). Inspired by noaa-apt's `Contrast` enum;
+/// reimplemented from first principles in our streaming model.
+#[derive(Debug, Clone, Copy)]
+pub enum BrightnessMode {
+    /// Map the lowest sample in the image to 0 and the highest to 255.
+    /// Naive — a single hot pixel from a noise spike sets the white
+    /// level for the whole image and dims everything real. Useful as
+    /// a fallback when nothing else is available.
+    MinMax,
+    /// Take a percentile band as the reference range, clipping the
+    /// outermost `(1 − p) / 2` of samples on each side. The default
+    /// `0.98` matches noaa-apt's `Contrast::Percent(0.98)` and
+    /// rejects the kind of impulsive noise that breaks `MinMax`
+    /// while preserving the image's full real dynamic range.
+    Percentile(f32),
+    /// Use the calibration grayscale ramp from the telemetry strips
+    /// for absolute brightness mapping: telemetry wedge 9 = pure
+    /// black (0), wedge 8 = pure white (255). Per noaa-apt's
+    /// `Contrast::Telemetry`. Best fidelity when at least a couple
+    /// of full telemetry frames have decoded; falls back to
+    /// `Percentile(0.98)` when the calibration ramp is unavailable
+    /// (short pass, telemetry not yet locked, or the wedge values
+    /// aren't monotonic which would indicate a misaligned decode).
+    TelemetryCalibrated,
+    /// Per-channel histogram equalization (separately on Channel A
+    /// and Channel B half-lines). Maximizes contrast at the cost of
+    /// not preserving absolute brightness — features get pushed to
+    /// the available 0..255 range regardless of their real
+    /// radiometric value. Per noaa-apt's `Contrast::Histogram`.
+    Histogram,
+}
+
+impl Default for BrightnessMode {
+    /// Default to the 98% percentile, matching noaa-apt's standard
+    /// profile and the most useful general-case mode (rejects
+    /// impulsive noise while preserving the bulk dynamic range).
+    fn default() -> Self {
+        Self::Percentile(0.98)
+    }
+}
+
 /// 2D image being assembled from a single NOAA APT satellite pass.
 ///
 /// Lines accumulate in transmission order; the buffer never compresses
 /// or rewrites past entries, so `lines()` is a stable view callers can
 /// snapshot at any point during a live pass.
-#[derive(Debug)]
+///
+/// `Clone` is derived so the PNG-export path can snapshot the image
+/// quickly on the GTK main thread, then move the snapshot into a
+/// `gio::spawn_blocking` worker for the CPU-heavy
+/// finalize/rotate/encode without holding the UI. The clone copies
+/// every line's `pixels` + `raw_samples` (~10 KB/line), so a 1500-line
+/// pass is ~15 MB — bigger than ideal but cheaper than freezing GTK
+/// for the duration of the encode. Per CR round 1 on PR #571.
+#[derive(Debug, Clone)]
 pub struct AptImage {
     lines: Vec<AptImageLine>,
     pass_start: Instant,
@@ -127,19 +189,30 @@ impl AptImage {
     /// Append a decoded scan line.
     ///
     /// If the source line's `sync_quality` is below
-    /// [`MIN_VALID_SYNC_QUALITY`], the stored pixels are replaced with
-    /// a black row — the original quality score is preserved verbatim
-    /// so the renderer can still overlay a quality strip if it wants.
-    /// This keeps a flapping squelch / sync-loss visible as a clean dark
-    /// horizontal band rather than a strip of meaningless pixel noise.
+    /// [`MIN_VALID_SYNC_QUALITY`], the stored pixels and `raw_samples`
+    /// are replaced with zero rows — the original quality score is
+    /// preserved verbatim so the renderer can still overlay a quality
+    /// strip if it wants. This keeps a flapping squelch / sync-loss
+    /// visible as a clean dark horizontal band rather than a strip of
+    /// meaningless pixel noise. Both fields go to zero in lock-step
+    /// so PNG export's image-wide normalization (per
+    /// [`BrightnessMode`]) doesn't pull from a "gap" line's
+    /// pre-gap-fill raw values.
     pub fn push_line(&mut self, line: &AptLine, received_at: Instant) {
-        let pixels = if line.sync_quality >= MIN_VALID_SYNC_QUALITY {
+        let valid = line.sync_quality >= MIN_VALID_SYNC_QUALITY;
+        let pixels = if valid {
             line.pixels
         } else {
             [0_u8; LINE_PIXELS]
         };
+        let raw_samples = if valid {
+            line.raw_samples
+        } else {
+            [0.0_f32; LINE_PIXELS]
+        };
         self.lines.push(AptImageLine {
             pixels,
+            raw_samples,
             sync_quality: line.sync_quality,
             received_at,
         });
@@ -195,6 +268,408 @@ impl AptImage {
     pub fn set_channel_b_id(&mut self, channel: AvhrrChannel) {
         self.channel_b_id = Some(channel);
     }
+
+    /// Render the assembled image to a flat row-major u8 buffer of
+    /// dimensions `WIDTH × len()`, applying image-wide brightness
+    /// mapping per the requested [`BrightnessMode`]. Used at PNG
+    /// export time to produce a properly-calibrated final image
+    /// rather than the per-line-normalized live preview.
+    ///
+    /// The returned `Vec<u8>` has length `WIDTH * len()` with each
+    /// row of `WIDTH` pixels in transmission order. Rows for
+    /// gap-filled lines (`sync_quality` < `MIN_VALID_SYNC_QUALITY`)
+    /// are emitted as black regardless of mode — gap lines have no
+    /// real signal to map.
+    #[must_use]
+    pub fn finalize_grayscale(&self, mode: BrightnessMode) -> Vec<u8> {
+        let pass_through_quality = self
+            .lines
+            .iter()
+            .map(|l| l.sync_quality >= MIN_VALID_SYNC_QUALITY);
+
+        // Compute the (low, high) brightness reference range
+        // applicable to the whole image. Each mode picks a different
+        // (low, high) pair; the actual u8 mapping below is identical.
+        // Histogram equalization is special-cased because it doesn't
+        // map by a single (low, high) range.
+        let mut out = Vec::with_capacity(Self::WIDTH * self.lines.len());
+        match mode {
+            BrightnessMode::MinMax => {
+                let (low, high) = self.signal_min_max();
+                self.append_with_range(&mut out, low, high, pass_through_quality);
+            }
+            BrightnessMode::Percentile(p) => {
+                let (low, high) = self.signal_percentile(p);
+                self.append_with_range(&mut out, low, high, pass_through_quality);
+            }
+            BrightnessMode::TelemetryCalibrated => {
+                if let Some((low, high)) = self.telemetry_calibration_range() {
+                    self.append_with_range(&mut out, low, high, pass_through_quality);
+                } else {
+                    // Telemetry not available / not monotonic — fall
+                    // back to the 98% percentile (the sensible
+                    // general-case mode and what noaa-apt's standard
+                    // profile uses pre-color).
+                    let (low, high) = self.signal_percentile(0.98);
+                    self.append_with_range(&mut out, low, high, pass_through_quality);
+                }
+            }
+            BrightnessMode::Histogram => {
+                self.append_histogram_equalized(&mut out);
+            }
+        }
+        out
+    }
+
+    /// Min and max across all valid (above-threshold) raw samples.
+    /// Returns `(0.0, 0.0)` if the image has no valid lines —
+    /// caller's downstream divide-by-range handles that with a
+    /// `max(EPS)` guard.
+    fn signal_min_max(&self) -> (f32, f32) {
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for line in &self.lines {
+            if line.sync_quality < MIN_VALID_SYNC_QUALITY {
+                continue;
+            }
+            for &v in &line.raw_samples {
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
+            }
+        }
+        if lo.is_infinite() {
+            (0.0, 0.0)
+        } else {
+            (lo, hi)
+        }
+    }
+
+    /// Percentile-based reference range.
+    ///
+    /// Takes the central `p` fraction of valid samples — clipping
+    /// `(1 − p) / 2` of the lowest and highest. Reimplemented from
+    /// noaa-apt's `misc::percent`; uses `select_nth_unstable` for
+    /// O(n) average-case selection (vs. their full-sort O(n log n)).
+    fn signal_percentile(&self, p: f32) -> (f32, f32) {
+        let p = p.clamp(0.0, 1.0);
+        // Gather all valid samples. ~16 MB for a typical 15-min pass
+        // — large but transient (drops as soon as we return).
+        let mut samples: Vec<f32> = Vec::new();
+        for line in &self.lines {
+            if line.sync_quality < MIN_VALID_SYNC_QUALITY {
+                continue;
+            }
+            samples.extend_from_slice(&line.raw_samples);
+        }
+        if samples.is_empty() {
+            return (0.0, 0.0);
+        }
+        let n = samples.len();
+        // (1 - p) / 2 fraction trimmed off each end.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            reason = "n is usize, p in [0,1] → tail in [0, n/2], fits usize"
+        )]
+        let tail = (((1.0 - p) / 2.0) * n as f32) as usize;
+        let lo_idx = tail.min(n.saturating_sub(1));
+        let hi_idx = (n - 1).saturating_sub(tail);
+        let (_, lo, _) = samples.select_nth_unstable_by(lo_idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let lo_v = *lo;
+        let (_, hi, _) = samples.select_nth_unstable_by(hi_idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        (lo_v, *hi)
+    }
+
+    /// Telemetry-calibrated reference range. Reads the calibration
+    /// grayscale ramp from the telemetry strips: wedge 9 = black,
+    /// wedge 8 = white. Returns `None` if telemetry hasn't been
+    /// decoded (channel ids unset) or if the implied range is
+    /// degenerate (high <= low, indicating a misaligned decode).
+    ///
+    /// Currently a placeholder returning `None` — the wedge-value
+    /// extraction lives in `apt_telemetry.rs`, but exposing it
+    /// requires plumbing the per-frame wedge values through the
+    /// `AptTelemetry` result. Tracked as a B1 follow-up; for now the
+    /// `TelemetryCalibrated` mode falls back to `Percentile(0.98)`,
+    /// which is what noaa-apt does when telemetry decode fails too.
+    #[allow(
+        clippy::unused_self,
+        reason = "placeholder — full impl wires telemetry decode through `&self`"
+    )]
+    fn telemetry_calibration_range(&self) -> Option<(f32, f32)> {
+        // TODO(#566 follow-up): decode telemetry on this image's
+        // `raw_samples` + line layout, return wedge-9 / wedge-8 means
+        // as the (low, high) reference. The current
+        // `apt_telemetry::decode_apt_telemetry` API operates on the
+        // u8 `pixels` and returns an `AptTelemetry` with classified
+        // channel ids — it doesn't expose the calibration float
+        // values. Wiring is straightforward but out of scope for
+        // the initial parity PR; falling back to percentile
+        // matches noaa-apt's behavior when telemetry isn't usable.
+        None
+    }
+
+    /// Append rows to `out`, mapping `raw_samples` from `[low, high]`
+    /// to `[0, 255]`. Gap lines (sync below threshold) emit as black.
+    /// Implementation factored so all the (low, high)-driven modes
+    /// share the same hot loop.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn append_with_range(
+        &self,
+        out: &mut Vec<u8>,
+        low: f32,
+        high: f32,
+        valid_iter: impl IntoIterator<Item = bool>,
+    ) {
+        let range = (high - low).max(1e-9);
+        for (line, valid) in self.lines.iter().zip(valid_iter) {
+            if !valid {
+                out.extend(core::iter::repeat_n(0_u8, Self::WIDTH));
+                continue;
+            }
+            for &v in &line.raw_samples {
+                let norm = ((v - low) / range).clamp(0.0, 1.0);
+                out.push((norm * 255.0).round() as u8);
+            }
+        }
+    }
+
+    /// Histogram-equalize per-channel (Channel A + Channel B
+    /// separately, matching noaa-apt's `processing::histogram_equalization`).
+    /// First runs a 98% percentile clip to map `raw_samples` to u8,
+    /// then equalizes the u8 histogram of each half independently.
+    /// The `pixels` and `raw_samples` aren't used directly here —
+    /// we re-derive a baseline u8 image from the percentile-clipped
+    /// `raw_samples` to ensure consistency with the other modes.
+    fn append_histogram_equalized(&self, out: &mut Vec<u8>) {
+        // Step 1: build a baseline u8 image from percentile-clipped
+        // `raw_samples`. This is the same starting point as
+        // `BrightnessMode::Percentile(0.98)`.
+        let (low, high) = self.signal_percentile(0.98);
+        let pass_through_quality: Vec<bool> = self
+            .lines
+            .iter()
+            .map(|l| l.sync_quality >= MIN_VALID_SYNC_QUALITY)
+            .collect();
+        let mut baseline = Vec::with_capacity(Self::WIDTH * self.lines.len());
+        self.append_with_range(
+            &mut baseline,
+            low,
+            high,
+            pass_through_quality.iter().copied(),
+        );
+
+        // Step 2: equalize each half separately. Channel A is the
+        // first WIDTH/2 pixels of each row; Channel B is the
+        // remainder. Compute per-channel histogram across all rows,
+        // build the equalization LUT, apply.
+        //
+        // Pass `pass_through_quality` so the histogram + LUT are
+        // built from VALID rows only — gap-filled rows would
+        // otherwise dump a giant pile of 0s into bin 0, dragging
+        // the CDF and remapping `lut[0]` to a non-zero gray. Skipped
+        // rows are explicitly re-zeroed after the LUT pass to
+        // preserve the `finalize_grayscale` contract that gap rows
+        // stay black regardless of mode. Per CR round 1 on PR #571.
+        let height = self.lines.len();
+        let half = Self::WIDTH / 2;
+        equalize_channel_in_place(&mut baseline, height, 0, half, &pass_through_quality);
+        equalize_channel_in_place(
+            &mut baseline,
+            height,
+            half,
+            Self::WIDTH,
+            &pass_through_quality,
+        );
+
+        out.extend(baseline);
+    }
+}
+
+/// Rotate the two video-data sub-rectangles of a finalized APT
+/// grayscale buffer 180° in place. Use for ascending passes (heading
+/// north), which transmit lines south-to-north so the assembled
+/// image is upside-down AND mirrored east-west.
+///
+/// **Layout assumption:** the input buffer is row-major with
+/// `AptImage::WIDTH` (= 2080) pixels per row, exactly as produced by
+/// [`AptImage::finalize_grayscale`]. The two video sub-rectangles
+/// rotated are:
+///
+/// * Channel A video: cols `[86, 86+909)` (= post-Sync-A,
+///   post-Space-A, pre-Telemetry-A)
+/// * Channel B video: cols `[86+1040, 86+1040+909)` (same offset
+///   into the Channel B half)
+///
+/// Sync / Space / Telemetry strips are **left untouched** so the
+/// telemetry-wedge calibration stays in its original position. This
+/// matches noaa-apt's `processing::rotate` behavior: rotating the
+/// whole image would scramble the wedge order, breaking
+/// telemetry-based contrast calibration.
+/// Pixels of "space" between Sync A and Channel A video data.
+/// 47 px per noaa-apt's `PX_SPACE_DATA` + spec.
+const PX_SPACE_DATA: usize = 47;
+/// Pixels of channel video data per channel (909 px) — between
+/// the space and telemetry strips.
+const PX_CHANNEL_IMAGE_DATA: usize = 909;
+/// Half-line stride: 2080 / 2 = 1040 px (= `Sync_A` + `Space_A` +
+/// `Video_A` + `Telemetry_A` = 39 + 47 + 909 + 45).
+const PX_PER_CHANNEL: usize = 1040;
+
+pub fn rotate_180_per_channel(image: &mut [u8], height: usize) {
+    use sdr_dsp::apt::SYNC_A_TOTAL_PX;
+
+    if image.len() != AptImage::WIDTH * height {
+        return; // defensive — caller violated the layout contract
+    }
+    let video_start_a = SYNC_A_TOTAL_PX + PX_SPACE_DATA; // 39 + 47 = 86
+    rotate_rectangle_180_in_place(
+        image,
+        height,
+        video_start_a,
+        video_start_a + PX_CHANNEL_IMAGE_DATA,
+    );
+    let video_start_b = video_start_a + PX_PER_CHANNEL;
+    rotate_rectangle_180_in_place(
+        image,
+        height,
+        video_start_b,
+        video_start_b + PX_CHANNEL_IMAGE_DATA,
+    );
+}
+
+/// Rotate a column-band sub-rectangle of a row-major image 180° in
+/// place. Used by [`rotate_180_per_channel`].
+///
+/// `image` is row-major with `AptImage::WIDTH` pixels per row.
+/// Pixels in `[col_start, col_end)` of every row are rotated 180°
+/// (= vertical flip + horizontal mirror within the band). Other
+/// columns are untouched.
+fn rotate_rectangle_180_in_place(
+    image: &mut [u8],
+    height: usize,
+    col_start: usize,
+    col_end: usize,
+) {
+    let width = AptImage::WIDTH;
+    let n_cols = col_end - col_start;
+    if n_cols == 0 || height == 0 {
+        return;
+    }
+    // Pair up rows from the outside in, swapping mirrored columns.
+    // The middle row (when height is odd) gets reversed in place
+    // separately below.
+    for row_a in 0..(height / 2) {
+        let row_b = height - 1 - row_a;
+        for off in 0..n_cols {
+            let col_a = col_start + off;
+            let col_b = col_start + (n_cols - 1 - off);
+            let i_a = row_a * width + col_a;
+            let i_b = row_b * width + col_b;
+            image.swap(i_a, i_b);
+        }
+    }
+    if height.is_multiple_of(2) {
+        return;
+    }
+    // Odd height: middle row needs an in-place reverse of the band.
+    let mid_row = height / 2;
+    let row_start = mid_row * width;
+    let mut left = col_start;
+    let mut right = col_end - 1;
+    while left < right {
+        image.swap(row_start + left, row_start + right);
+        left += 1;
+        right -= 1;
+    }
+}
+
+/// Histogram-equalize one half of the image in place, ignoring
+/// gap-filled rows.
+///
+/// `image` is row-major with `WIDTH` pixels per row, `height` rows.
+/// Pixels in columns `[col_start, col_end)` are equalized; the rest
+/// of the row is untouched. Standard CDF-based equalization.
+///
+/// `valid_row[i]` is true for rows whose `sync_quality` cleared
+/// [`MIN_VALID_SYNC_QUALITY`]. Rows where it's false are excluded
+/// from the histogram (so the CDF reflects real signal only) AND
+/// re-zeroed after equalization (so a non-zero `lut[0]` doesn't
+/// turn a gap row gray). Per CR round 1 on PR #571.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn equalize_channel_in_place(
+    image: &mut [u8],
+    height: usize,
+    col_start: usize,
+    col_end: usize,
+    valid_row: &[bool],
+) {
+    let width = AptImage::WIDTH;
+    debug_assert_eq!(valid_row.len(), height);
+    // Histogram of u8 values across the half-image, valid rows only.
+    let mut hist = [0_u32; 256];
+    let mut valid_pixel_count = 0_usize;
+    for row in 0..height {
+        if !valid_row.get(row).copied().unwrap_or(false) {
+            continue;
+        }
+        let row_start = row * width;
+        for col in col_start..col_end {
+            hist[image[row_start + col] as usize] += 1;
+        }
+        valid_pixel_count += col_end - col_start;
+    }
+    if valid_pixel_count == 0 {
+        // No valid rows in this half — leave the half untouched.
+        // Gap rows already came in zeroed; there's nothing to remap.
+        return;
+    }
+    // Cumulative distribution, then equalization LUT.
+    let mut lut = [0_u8; 256];
+    let mut cumulative = 0_u32;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "valid_pixel_count = (col_end - col_start) × valid_row_count — \
+                  bounded by WIDTH × MAX_LINES (~3 M), well inside f32 mantissa."
+    )]
+    let denom = valid_pixel_count as f32;
+    for (i, &count) in hist.iter().enumerate() {
+        cumulative += count;
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "CDF · 255 is in [0, 255]; clamp pins it before the cast"
+        )]
+        let v = ((cumulative as f32 / denom) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        lut[i] = v;
+    }
+    // Apply on valid rows only; re-zero invalid rows so a non-zero
+    // `lut[0]` doesn't turn the gap-fill gray.
+    for row in 0..height {
+        let row_start = row * width;
+        if valid_row.get(row).copied().unwrap_or(false) {
+            for col in col_start..col_end {
+                let idx = row_start + col;
+                image[idx] = lut[image[idx] as usize];
+            }
+        } else {
+            for col in col_start..col_end {
+                image[row_start + col] = 0;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +708,9 @@ mod tests {
 
     /// Build an `AptLine` with the given quality and a deterministic
     /// non-zero pixel pattern so we can verify pixel preservation.
+    /// Both `pixels` (u8) and `raw_samples` (f32) get matching
+    /// content so pre-/post-finalize semantics are easy to reason
+    /// about in tests.
     fn synth_line(quality: f32) -> AptLine {
         let mut line = AptLine {
             sync_quality: quality,
@@ -240,6 +718,17 @@ mod tests {
         };
         for (i, p) in line.pixels.iter_mut().enumerate() {
             *p = (i % TEST_PIXEL_PATTERN_MODULUS) as u8;
+        }
+        for (i, s) in line.raw_samples.iter_mut().enumerate() {
+            // Mirror the u8 pattern at unit-amplitude scale so
+            // image-wide finalization tests have a deterministic
+            // gradient to assert against.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "modulus is small (251); result fits in f32 exactly"
+            )]
+            let v = (i % TEST_PIXEL_PATTERN_MODULUS) as f32;
+            *s = v;
         }
         line
     }
@@ -360,5 +849,243 @@ mod tests {
     fn width_constant_matches_apt_line_pixels() {
         assert_eq!(AptImage::WIDTH, LINE_PIXELS);
         assert_eq!(AptImage::WIDTH, EXPECTED_APT_WIDTH_PIXELS);
+    }
+
+    #[test]
+    fn raw_samples_preserved_on_high_quality_push() {
+        let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+        let line = synth_line(TEST_GOOD_QUALITY);
+        img.push_line(&line, Instant::now());
+        let stored = &img.lines()[0];
+        // Raw samples must round-trip verbatim — the brightness
+        // modes need access to the actual demodulator output.
+        assert_eq!(stored.raw_samples, line.raw_samples);
+    }
+
+    #[test]
+    fn raw_samples_zeroed_on_gap_fill() {
+        // Sub-threshold lines have raw_samples zeroed alongside
+        // pixels so image-wide normalization doesn't pull from
+        // a "gap" line's pre-fill values.
+        let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+        let line = synth_line(TEST_BAD_QUALITY);
+        img.push_line(&line, Instant::now());
+        let stored = &img.lines()[0];
+        assert!(
+            stored.raw_samples.iter().all(|&v| v == 0.0),
+            "sub-threshold raw_samples should be zero-filled"
+        );
+    }
+
+    #[test]
+    fn finalize_grayscale_minmax_maps_to_full_range() {
+        let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+        // Build a line with raw_samples that explicitly span [0, 250]
+        // (by way of the `i % 251` pattern → values 0..=250).
+        let line = synth_line(TEST_GOOD_QUALITY);
+        img.push_line(&line, Instant::now());
+
+        let img_pixels = img.finalize_grayscale(BrightnessMode::MinMax);
+        assert_eq!(img_pixels.len(), AptImage::WIDTH);
+        // MinMax should map 0 → 0 and the max value → 255.
+        let min_p = *img_pixels.iter().min().expect("non-empty image");
+        let max_p = *img_pixels.iter().max().expect("non-empty image");
+        assert_eq!(min_p, 0);
+        assert_eq!(max_p, 255);
+    }
+
+    #[test]
+    fn finalize_grayscale_percentile_clips_outliers() {
+        // Build an image with a moderate ramp plus extreme outliers.
+        // Percentile mode should clip the outliers to 0/255 and use
+        // the bulk distribution as the reference range — MinMax
+        // would let the outliers DOMINATE the range, compressing
+        // the bulk into a narrow mid-gray band.
+        let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+        // 5 lines with a 0..=250 ramp.
+        for _ in 0..5 {
+            img.push_line(&synth_line(TEST_GOOD_QUALITY), Instant::now());
+        }
+        // 1 line with extreme outliers that would dominate MinMax.
+        let mut outlier = synth_line(TEST_GOOD_QUALITY);
+        outlier.raw_samples[0] = -10_000.0;
+        outlier.raw_samples[1] = 10_000.0;
+        img.push_line(&outlier, Instant::now());
+
+        let pixels_minmax = img.finalize_grayscale(BrightnessMode::MinMax);
+        let pixels_pct = img.finalize_grayscale(BrightnessMode::Percentile(0.98));
+
+        // Property 1: Percentile clips the outliers themselves —
+        // the negative outlier maps to 0, the positive to 255.
+        let neg_outlier_idx = AptImage::WIDTH * 5; // line 5, col 0
+        let pos_outlier_idx = AptImage::WIDTH * 5 + 1; // line 5, col 1
+        assert_eq!(
+            pixels_pct[neg_outlier_idx], 0,
+            "negative outlier should clip to 0"
+        );
+        assert_eq!(
+            pixels_pct[pos_outlier_idx], 255,
+            "positive outlier should clip to 255"
+        );
+
+        // Property 2: MinMax compresses the bulk into a narrow band.
+        // The bulk samples (0..=250) should span much less of the
+        // 0..255 range under MinMax than under Percentile.
+        // Sample a column inside the ramp to compare spreads.
+        let bulk_min_idx = AptImage::WIDTH * 2 + 50; // line 2, col 50 → value 50
+        let bulk_max_idx = AptImage::WIDTH * 2 + 200; // line 2, col 200 → value 200
+        let mm_spread = pixels_minmax[bulk_max_idx].saturating_sub(pixels_minmax[bulk_min_idx]);
+        let pct_spread = pixels_pct[bulk_max_idx].saturating_sub(pixels_pct[bulk_min_idx]);
+        assert!(
+            pct_spread > mm_spread,
+            "Percentile should preserve more bulk-pixel spread than MinMax-with-outliers: \
+             pct_spread={pct_spread}, mm_spread={mm_spread}"
+        );
+    }
+
+    #[test]
+    fn finalize_grayscale_telemetry_falls_back_when_unavailable() {
+        // TelemetryCalibrated falls back to Percentile(0.98) when the
+        // wedge calibration isn't available. Both should produce the
+        // same output here (no telemetry decoded yet).
+        let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+        for _ in 0..3 {
+            img.push_line(&synth_line(TEST_GOOD_QUALITY), Instant::now());
+        }
+        let tele = img.finalize_grayscale(BrightnessMode::TelemetryCalibrated);
+        let pct = img.finalize_grayscale(BrightnessMode::Percentile(0.98));
+        assert_eq!(tele, pct, "expected telemetry → percentile fallback");
+    }
+
+    #[test]
+    fn finalize_grayscale_histogram_spans_full_range() {
+        // Histogram equalization stretches the input distribution
+        // toward uniform across [0, 255]. The equalization LUT maps
+        // the lowest input bin to a small value (>0 because the
+        // CDF starts at the lowest-bin count, not 0) and the
+        // highest to ~255. The synth_line ramp 0..=250 gives a
+        // near-uniform input distribution — equalization is close
+        // to identity but with the boundaries pinned to the full
+        // byte range.
+        let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+        for _ in 0..10 {
+            img.push_line(&synth_line(TEST_GOOD_QUALITY), Instant::now());
+        }
+        let pixels = img.finalize_grayscale(BrightnessMode::Histogram);
+        let min_p = *pixels.iter().min().expect("non-empty image");
+        let max_p = *pixels.iter().max().expect("non-empty image");
+        // Min near 0 (a few % at most — the lowest-bin CDF entry).
+        assert!(
+            min_p < 16,
+            "min should be near 0 after equalization, got {min_p}"
+        );
+        // Max should reach the upper end of the byte range.
+        assert!(
+            max_p >= 240,
+            "histogram equalization should push max toward 255, got {max_p}"
+        );
+    }
+
+    #[test]
+    fn rotate_180_per_channel_flips_video_regions_only() {
+        // Build a 4-row image where each pixel encodes (row, col)
+        // so we can assert exactly where each pixel ended up after
+        // rotation. The sync (0..86), telemetry (995..1040), etc.
+        // strips should be UNTOUCHED; only the two video regions
+        // [86..995] and [1126..2035] should rotate 180°.
+        let height = 4;
+        let mut image = vec![0_u8; AptImage::WIDTH * height];
+        // Tag each pixel: high nibble = row, low nibble = col_bucket
+        // (col / 256, so we can stuff 8 buckets into low nibble).
+        for row in 0..height {
+            for col in 0..AptImage::WIDTH {
+                let col_bucket = (col / 256) as u8 & 0x0F;
+                #[allow(clippy::cast_possible_truncation)]
+                let tag = ((row as u8) << 4) | col_bucket;
+                image[row * AptImage::WIDTH + col] = tag;
+            }
+        }
+        let pre_sync_a = image[0]; // (row 0, col 0)
+        let pre_telem_a = image[995]; // (row 0, col 995, before rotation)
+        let pre_sync_b = image[1040]; // (row 0, col 1040 — start of channel B half)
+
+        rotate_180_per_channel(&mut image, height);
+
+        // Sync A strip (0..86) untouched.
+        let post_sync_a = image[0];
+        assert_eq!(
+            post_sync_a, pre_sync_a,
+            "Sync A strip (col 0) should be untouched",
+        );
+        // Telemetry A strip (995..1040) untouched.
+        let post_telem_a = image[995];
+        assert_eq!(
+            post_telem_a, pre_telem_a,
+            "Telemetry A strip (col 995) should be untouched",
+        );
+        // Sync B strip (1040..1126) untouched.
+        let post_sync_b = image[1040];
+        assert_eq!(
+            post_sync_b, pre_sync_b,
+            "Sync B strip (col 1040) should be untouched",
+        );
+
+        // Channel A video [86..995]: row 0 col 86 ↔ row 3 col 994.
+        // Tag was (0 << 4) | (86/256=0) = 0x00 originally at [0, 86].
+        // After 180° rotation, that pixel ends up at [3, 994] which
+        // had tag (3<<4) | (994/256=3) = 0x33 originally.
+        let post_video_a_top_left = image[86]; // (row 0, col 86) post-rotate
+        // Should now equal what was at (row 3, col 994) before.
+        let pre_value_at_3_994 = (3_u8 << 4) | ((994 / 256) as u8 & 0x0F);
+        assert_eq!(
+            post_video_a_top_left, pre_value_at_3_994,
+            "Channel A video [0,86] should now hold the pre-rotate value of [3,994]",
+        );
+    }
+
+    #[test]
+    fn rotate_180_per_channel_self_inverse() {
+        // Rotating twice returns to the original image — the
+        // simplest invariant of any 180° rotation.
+        let height = 5; // odd to exercise the middle-row path
+        let mut image: Vec<u8> = (0..AptImage::WIDTH * height)
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
+        let original = image.clone();
+        rotate_180_per_channel(&mut image, height);
+        rotate_180_per_channel(&mut image, height);
+        assert_eq!(
+            image, original,
+            "double 180° rotation should restore original image",
+        );
+    }
+
+    #[test]
+    fn rotate_180_per_channel_handles_zero_height() {
+        // Defensive: zero-height shouldn't panic (was an
+        // off-by-one risk in the original implementation).
+        let mut image = Vec::<u8>::new();
+        rotate_180_per_channel(&mut image, 0);
+        assert!(image.is_empty());
+    }
+
+    #[test]
+    fn finalize_grayscale_gap_lines_emit_black() {
+        // A low-quality line in the middle of the image should be a
+        // black row in the finalized grayscale output regardless of
+        // mode — gap lines have no real signal to map.
+        let mut img = AptImage::with_capacity(Instant::now(), TEST_MAX_LINES);
+        img.push_line(&synth_line(TEST_GOOD_QUALITY), Instant::now());
+        img.push_line(&synth_line(TEST_BAD_QUALITY), Instant::now()); // gap
+        img.push_line(&synth_line(TEST_GOOD_QUALITY), Instant::now());
+
+        let pixels = img.finalize_grayscale(BrightnessMode::Percentile(0.98));
+        // Row index 1 is the gap line. All its pixels must be 0.
+        let gap_row = &pixels[AptImage::WIDTH..2 * AptImage::WIDTH];
+        assert!(
+            gap_row.iter().all(|&p| p == 0),
+            "gap row not all-zero: first nonzero at {:?}",
+            gap_row.iter().position(|&p| p != 0),
+        );
     }
 }

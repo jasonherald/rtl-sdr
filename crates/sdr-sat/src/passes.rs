@@ -185,6 +185,46 @@ pub fn track(
     })
 }
 
+/// Whether `satellite` is on the ascending leg (heading north) at
+/// `when`.
+///
+/// Computed by propagating to `when` and `when + Δ` (a few seconds),
+/// converting both ECI positions to geocentric latitude, and comparing.
+/// `Δ` is small enough that the satellite barely moves — gives a clean
+/// derivative-via-finite-difference of latitude without needing the
+/// orbital velocity vector.
+///
+/// **Why this exists:** NOAA APT lines transmit in time order. For a
+/// descending pass (heading south) the first received line is the
+/// northernmost, so the assembled image is naturally "right-side up"
+/// (north at top). For an ascending pass the first line is the
+/// southernmost — the image is upside-down AND mirrored east/west.
+/// Rotating each video channel 180° (per noaa-apt's
+/// `processing::rotate`) fixes both.
+///
+/// # Errors
+///
+/// Returns [`SatelliteError`] if either propagation fails.
+pub fn is_ascending(satellite: &Satellite, when: DateTime<Utc>) -> Result<bool, SatelliteError> {
+    /// Sampling delta — 30 s gives a few hundred km of ground-track
+    /// movement (enough for a reliable lat-rate-of-change sign), well
+    /// inside any realistic SGP4 epoch budget.
+    const DELTA: chrono::Duration = chrono::Duration::seconds(30);
+
+    let s0 = satellite.propagate(when)?;
+    let s1 = satellite.propagate(when + DELTA)?;
+
+    // Geocentric latitude (in radians) from ECI position. The exact
+    // ECEF/geodetic latitude differs by a fraction of a degree near
+    // the equator due to Earth's oblateness — we only care about the
+    // SIGN of the change, which is preserved under either convention.
+    let lat = |p: [f64; 3]| -> f64 {
+        let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if r > 0.0 { (p[2] / r).asin() } else { 0.0 }
+    };
+    Ok(lat(s1.position_km) > lat(s0.position_km))
+}
+
 /// Enumerate all overhead passes of `satellite` from `from` to `to`
 /// (inclusive of `from`, exclusive of `to`) with peak elevation at
 /// or above `min_elevation_deg`.
@@ -486,6 +526,52 @@ mod tests {
                 TEST_MIN_ELEVATION_DEG
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn is_ascending_returns_consistent_bool() {
+        // Using Vanguard 1 — a real satellite — over time the sign
+        // of the latitude derivative flips between ascending and
+        // descending legs. We don't know which leg `epoch` falls
+        // on without recomputing, so just verify:
+        // (a) is_ascending returns a bool (no error) at epoch
+        // (b) the bool flips sign somewhere over a half-orbit
+        //     (indicating we're actually computing a meaningful
+        //     latitude derivative, not always returning the same
+        //     value)
+        let sat = test_satellite();
+        let epoch = sat.epoch();
+        let v_at_epoch = is_ascending(&sat, epoch).unwrap();
+        // Half an orbit later (Vanguard 1 has ~133 min period;
+        // sampling at +/− 67 min from epoch should land on the
+        // opposite leg).
+        let half_period_min = 67;
+        let v_half_later =
+            is_ascending(&sat, epoch + chrono::Duration::minutes(half_period_min)).unwrap();
+        assert_ne!(
+            v_at_epoch, v_half_later,
+            "is_ascending should flip across a half-orbit (epoch={v_at_epoch}, +{half_period_min}min={v_half_later}); \
+             constant return suggests the latitude derivative isn't being computed",
+        );
+    }
+
+    #[test]
+    fn is_ascending_handles_propagation_error() {
+        // Sample very near `chrono::DateTime::<Utc>::MIN_UTC` so the
+        // 30 s offset to `when + Δ` stays representable but SGP4 is
+        // forced to extrapolate ~2000 years before any TLE epoch —
+        // far enough that all SGP4 implementations either return an
+        // error or produce nonsense. Either case must surface as an
+        // `Err` from `is_ascending`, NOT a panic and NOT silently a
+        // bool (the helper's contract per its own docstring).
+        // Per CR round 1 on PR #571.
+        let sat = test_satellite();
+        let way_too_far = chrono::DateTime::<Utc>::MIN_UTC + chrono::Duration::seconds(60);
+        let result = is_ascending(&sat, way_too_far);
+        assert!(
+            result.is_err(),
+            "is_ascending at year ~0 should propagate an SGP4 error, got Ok({result:?})",
         );
     }
 }

@@ -244,6 +244,13 @@ pub enum Action {
     /// epic #472). Per #514.
     StartAutoRecord {
         satellite: String,
+        /// Stable NORAD catalog id of the satellite. Threaded through
+        /// from the recorder's `KnownSatellite` lookup so the wiring
+        /// layer can stash it as the rotation-pass key without a
+        /// fragile name → catalog re-lookup. Per CR round 3 on PR
+        /// #571 (and the catalog-rename / alias-drift class of bugs
+        /// it guards against).
+        norad_id: u32,
         freq_hz: u64,
         mode: DemodMode,
         bandwidth_hz: u32,
@@ -466,7 +473,8 @@ impl AutoRecorder {
         // 5. AOS is within `AOS_LEAD_SECS` (start tuning a few
         //    seconds early so the pipeline is ready at AOS proper).
         for pass in passes {
-            let Some((freq_hz, mode, bandwidth_hz, Some(protocol))) = tune_target_for_pass(pass)
+            let Some((freq_hz, mode, bandwidth_hz, Some(protocol), norad_id)) =
+                tune_target_for_pass(pass)
             else {
                 continue;
             };
@@ -532,6 +540,7 @@ impl AutoRecorder {
             let mut actions = Vec::with_capacity(3);
             actions.push(Action::StartAutoRecord {
                 satellite: pass.satellite.clone(),
+                norad_id,
                 freq_hz,
                 mode,
                 bandwidth_hz,

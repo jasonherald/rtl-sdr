@@ -811,6 +811,7 @@ pub fn tune_target_for_pass(
     sdr_types::DemodMode,
     u32,
     Option<sdr_sat::ImagingProtocol>,
+    u32,
 )> {
     known_satellite_for_pass(pass).map(|s| {
         (
@@ -818,6 +819,7 @@ pub fn tune_target_for_pass(
             s.demod_mode,
             s.bandwidth_hz,
             s.imaging_protocol,
+            s.norad_id,
         )
     })
 }
@@ -1228,12 +1230,16 @@ mod tests {
     }
 
     #[test]
-    fn tune_target_for_pass_returns_full_tuning_quadruple() {
+    fn tune_target_for_pass_returns_full_tuning_quintuple() {
         // Pin the (downlink_hz, demod_mode, bandwidth_hz,
-        // imaging_protocol) quadruple for a known catalog entry.
-        // A future refactor that splits or reorders the tuple —
-        // or that drifts the catalog values — fails here before
-        // reaching the play-button wiring layer or the recorder.
+        // imaging_protocol, norad_id) quintuple for a known catalog
+        // entry. A future refactor that splits or reorders the
+        // tuple — or that drifts the catalog values — fails here
+        // before reaching the play-button wiring layer or the
+        // recorder. NORAD id is threaded out of the catalog so the
+        // recorder's `Action::StartAutoRecord` can carry it without
+        // a name → catalog re-lookup at the wiring layer (per CR
+        // round 3 on PR #571).
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let pass = synthetic_pass(now, 30); // satellite = "NOAA 19"
         let target = tune_target_for_pass(&pass).expect("NOAA 19 is in catalog");
@@ -1241,6 +1247,7 @@ mod tests {
         assert_eq!(target.1, sdr_types::DemodMode::Nfm);
         assert_eq!(target.2, 38_000);
         assert_eq!(target.3, Some(sdr_sat::ImagingProtocol::Apt));
+        assert_eq!(target.4, 33_591); // NOAA 19 NORAD ID
     }
 
     #[test]
