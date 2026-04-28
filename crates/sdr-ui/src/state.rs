@@ -173,6 +173,15 @@ pub struct AppState {
     /// `lrpt_viewer_window` weak-ref pattern. Per a user
     /// request during PR #554 live testing.
     pub apt_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// `(satellite_name, aos_time)` for the currently-recording APT
+    /// pass, or `None` when no auto-record is in flight. Set by the
+    /// `RecorderAction::StartAutoRecord` wiring at AOS, cleared after
+    /// `RecorderAction::SavePng` consumes it. Used to compute the
+    /// rotate-180 flag for image export — the wiring layer needs the
+    /// satellite + AOS time to evaluate `sdr_sat::is_ascending`, and
+    /// the recorder's `Action::SavePng(PathBuf)` doesn't carry that.
+    /// Per B2 of the noaa-apt parity work.
+    pub apt_recording_pass: RefCell<Option<(String, chrono::DateTime<chrono::Utc>)>>,
     /// Currently-open Meteor-M LRPT viewer window, or `None`
     /// when no viewer is open. Same lifecycle pattern as
     /// `apt_viewer` above. Per epic #469 task 7.
@@ -220,6 +229,7 @@ impl AppState {
             rtl_tcp_hydration_in_progress: std::cell::Cell::new(false),
             apt_viewer: RefCell::new(None),
             apt_viewer_window: RefCell::new(None),
+            apt_recording_pass: RefCell::new(None),
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),

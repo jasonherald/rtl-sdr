@@ -36,7 +36,8 @@ use gtk4::{cairo, gio, glib};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use sdr_dsp::apt::LINE_PIXELS;
+use sdr_dsp::apt::{AptLine, LINE_PIXELS};
+use sdr_radio::apt_image::{AptImage, BrightnessMode, rotate_180_per_channel};
 
 use crate::viewer::ViewerError;
 
@@ -72,9 +73,19 @@ const VIEWER_WINDOW_HEIGHT: i32 = 600;
 pub struct AptImageRenderer {
     /// Persistent ARGB32 surface, `LINE_PIXELS × MAX_LINES`. Rows
     /// past `n_lines` stay zeroed (alpha 0); render-time clipping
-    /// keeps them out of the visible output.
+    /// keeps them out of the visible output. Holds the live
+    /// preview pixels (per-line min/max normalized) so the user
+    /// gets immediate feedback as lines come in.
     surface: cairo::ImageSurface,
     n_lines: usize,
+    /// Parallel storage of raw f32 envelope samples + per-line
+    /// metadata, used at PNG-export time to apply image-wide
+    /// brightness modes (per [`BrightnessMode`]). Lives separately
+    /// from the Cairo surface because the live preview uses
+    /// per-line normalization (already-u8) while export uses
+    /// image-wide normalization (re-derived from `raw_samples`).
+    /// Reset via [`AptImageRenderer::clear`].
+    apt_image: AptImage,
 }
 
 impl Default for AptImageRenderer {
@@ -106,16 +117,18 @@ impl AptImageRenderer {
         Self {
             surface,
             n_lines: 0,
+            apt_image: AptImage::with_capacity(std::time::Instant::now(), MAX_LINES),
         }
     }
 
-    /// Append one APT scan line of width [`LINE_PIXELS`] to the
-    /// image. Greyscale values go straight into the surface's
-    /// backing data as ARGB32 (B/G/R/A — Cairo's
-    /// little-endian ARGB32 layout, alpha = `0xFF`). No allocation,
-    /// no buffer growth — we wrote the row directly into the
-    /// pre-allocated surface. No-op once [`MAX_LINES`] is reached.
-    pub fn push_line(&mut self, pixels: &[u8; LINE_PIXELS]) {
+    /// Append one APT scan line. The line's per-line-normalized
+    /// `pixels` go straight into the live preview surface as
+    /// ARGB32. The line's raw f32 `raw_samples` are stored in the
+    /// parallel `AptImage` for image-wide brightness mapping at
+    /// PNG-export time. No allocation, no buffer growth — we write
+    /// the row directly into the pre-allocated surface. No-op once
+    /// [`MAX_LINES`] is reached.
+    pub fn push_line(&mut self, line: &AptLine) {
         if self.n_lines >= MAX_LINES {
             return;
         }
@@ -134,7 +147,7 @@ impl AptImageRenderer {
                 return;
             }
         };
-        for (i, &g) in pixels.iter().enumerate() {
+        for (i, &g) in line.pixels.iter().enumerate() {
             let pixel_offset = row_offset + i * 4;
             data[pixel_offset] = g;
             data[pixel_offset + 1] = g;
@@ -144,16 +157,30 @@ impl AptImageRenderer {
         // `data` guard drops here, flushing the surface for cairo.
         drop(data);
         self.n_lines += 1;
+
+        // Mirror into the AptImage for image-wide PNG export.
+        // `apt_image::push_line` honors the sync_quality threshold
+        // independently — a line we drew via the per-line surface
+        // may still go to the image as gap-filled if quality is low.
+        // The two paths can disagree on a borderline line; this is
+        // intentional (live preview is forgiving, export is strict).
+        self.apt_image.push_line(line, std::time::Instant::now());
     }
 
     /// Reset to an empty image. Zeroes the surface bytes (fully
     /// transparent everywhere) so subsequent passes start from a
-    /// clean canvas; the surface itself is preserved.
+    /// clean canvas; the surface itself is preserved. Also resets
+    /// the parallel `AptImage` so PNG export sees only the new
+    /// pass's lines (per-pass calibration).
     pub fn clear(&mut self) {
         if let Ok(mut data) = self.surface.data() {
             data.fill(0);
         }
         self.n_lines = 0;
+        // Replace the AptImage rather than mutate — keeps the
+        // pass-start `Instant` semantically correct as "moment of clear"
+        // (= moment a new pass started capturing).
+        self.apt_image = AptImage::with_capacity(std::time::Instant::now(), MAX_LINES);
     }
 
     /// Number of scan lines currently buffered.
@@ -245,7 +272,37 @@ impl AptImageRenderer {
     /// Per issue #545 (was `Result<(), String>` before).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn export_png(&self, path: &Path) -> Result<(), ViewerError> {
-        if self.n_lines == 0 {
+        self.export_png_with_mode(path, BrightnessMode::default())
+    }
+
+    /// Export the assembled APT image to a PNG file with image-wide
+    /// brightness mapping per the requested [`BrightnessMode`].
+    ///
+    /// Uses the parallel `AptImage`'s `finalize_grayscale` to
+    /// re-derive pixels from the raw f32 envelope samples — gives
+    /// proper image-wide contrast (vs. the live surface's per-line
+    /// normalization). Per B1 of the noaa-apt parity work.
+    pub fn export_png_with_mode(
+        &self,
+        path: &Path,
+        mode: BrightnessMode,
+    ) -> Result<(), ViewerError> {
+        self.export_png_full(path, mode, false)
+    }
+
+    /// Like [`Self::export_png_with_mode`] but additionally rotates
+    /// each video channel 180° if `rotate_180` is true. Use for
+    /// ascending passes (heading north) — see
+    /// [`rotate_180_per_channel`] for the layout rationale. Per B2
+    /// of the noaa-apt parity work.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn export_png_full(
+        &self,
+        path: &Path,
+        mode: BrightnessMode,
+        rotate_180: bool,
+    ) -> Result<(), ViewerError> {
+        if self.apt_image.is_empty() {
             return Err(ViewerError::EmptyChannel { apid: None });
         }
         if let Some(parent) = path.parent() {
@@ -256,33 +313,37 @@ impl AptImageRenderer {
             })?;
         }
 
-        let export_surface = cairo::ImageSurface::create(
-            cairo::Format::ARgb32,
-            LINE_PIXELS as i32,
-            self.n_lines as i32,
-        )
-        .map_err(|e| ViewerError::Cairo {
-            op: "export surface",
-            source: e,
-        })?;
-        let cr = cairo::Context::new(&export_surface).map_err(|e| ViewerError::Cairo {
-            op: "export context",
-            source: e,
-        })?;
-        cr.set_source_surface(&self.surface, 0.0, 0.0)
-            .map_err(|e| ViewerError::Cairo {
-                op: "export set_source_surface",
+        let height = self.apt_image.len();
+        let mut pixels = self.apt_image.finalize_grayscale(mode);
+        debug_assert_eq!(pixels.len(), AptImage::WIDTH * height);
+        if rotate_180 {
+            rotate_180_per_channel(&mut pixels, height);
+        }
+
+        // Build a fresh ARGB32 surface from the grayscale Vec<u8>.
+        // Cairo's surface is the simplest path to PNG encoding from
+        // GTK code — it's already the export format we use elsewhere
+        // (LRPT viewer). Each pixel becomes opaque grey (R=G=B, A=0xFF).
+        let mut export_surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, LINE_PIXELS as i32, height as i32)
+                .map_err(|e| ViewerError::Cairo {
+                op: "export surface",
                 source: e,
             })?;
-        // LINE_PIXELS / n_lines are both bounded by MAX_LINES — well
-        // under f64's 52-bit mantissa, no real precision loss.
-        #[allow(clippy::cast_precision_loss)]
-        cr.rectangle(0.0, 0.0, LINE_PIXELS as f64, self.n_lines as f64);
-        cr.fill().map_err(|e| ViewerError::Cairo {
-            op: "export fill",
-            source: e,
-        })?;
-        drop(cr);
+        let stride = usize::try_from(export_surface.stride())?;
+        {
+            let mut data = export_surface.data()?;
+            for (row, line) in pixels.chunks_exact(LINE_PIXELS).enumerate() {
+                let row_offset = row * stride;
+                for (col, &g) in line.iter().enumerate() {
+                    let p = row_offset + col * 4;
+                    data[p] = g;
+                    data[p + 1] = g;
+                    data[p + 2] = g;
+                    data[p + 3] = 0xFF;
+                }
+            }
+        }
 
         let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
             op: "file create",
@@ -290,7 +351,13 @@ impl AptImageRenderer {
             source: e,
         })?;
         export_surface.write_to_png(&mut file)?;
-        tracing::info!(?path, lines = self.n_lines, "APT image exported to PNG");
+        tracing::info!(
+            ?path,
+            lines = height,
+            ?mode,
+            rotate_180,
+            "APT image exported to PNG (image-wide brightness)"
+        );
         Ok(())
     }
 }
@@ -360,8 +427,8 @@ impl AptImageView {
     /// scanlines while inspecting the image (a paused live pass on
     /// the real radio path would otherwise produce a PNG with gaps
     /// for whatever rows arrived during the inspection window).
-    pub fn push_line(&self, pixels: &[u8; LINE_PIXELS]) {
-        self.renderer.borrow_mut().push_line(pixels);
+    pub fn push_line(&self, line: &AptLine) {
+        self.renderer.borrow_mut().push_line(line);
         if !self.paused.get() {
             self.drawing_area.queue_draw();
         }
@@ -402,6 +469,26 @@ impl AptImageView {
     /// before).
     pub fn export_png(&self, path: &Path) -> Result<(), ViewerError> {
         self.renderer.borrow().export_png(path)
+    }
+
+    /// Save with image-wide brightness mapping + optional 180°
+    /// rotation. The wiring layer (`window.rs`) computes the rotate
+    /// flag from the satellite's orbital direction at AOS via
+    /// `sdr_sat::is_ascending` and passes it through here; B1+B2 of
+    /// the noaa-apt parity work.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`ViewerError`] from the underlying renderer.
+    pub fn export_png_full(
+        &self,
+        path: &Path,
+        mode: BrightnessMode,
+        rotate_180: bool,
+    ) -> Result<(), ViewerError> {
+        self.renderer
+            .borrow()
+            .export_png_full(path, mode, rotate_180)
     }
 
     /// Number of lines currently in the buffer.
@@ -623,13 +710,28 @@ mod tests {
     /// while still exercising more than one line of buffer growth.
     const TEST_LINE_COUNT: usize = 16;
 
-    fn synth_line(seed: u8) -> [u8; LINE_PIXELS] {
-        let mut line = [0_u8; LINE_PIXELS];
-        for (i, p) in line.iter_mut().enumerate() {
+    /// Build a synthetic `AptLine` with deterministic per-line content.
+    /// Uses high `sync_quality` so the line passes the gap-fill threshold
+    /// in the parallel `AptImage`. `raw_samples` mirror `pixels` to keep
+    /// `finalize_grayscale` predictable.
+    fn synth_line(seed: u8) -> AptLine {
+        let mut line = AptLine {
+            sync_quality: 0.95,
+            ..AptLine::default()
+        };
+        for (i, p) in line.pixels.iter_mut().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             {
                 *p = ((i + usize::from(seed)) & 0xff) as u8;
             }
+        }
+        for (i, s) in line.raw_samples.iter_mut().enumerate() {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "value is in [0, 255]; fits f32 mantissa exactly"
+            )]
+            let v = ((i + usize::from(seed)) & 0xff) as f32;
+            *s = v;
         }
         line
     }
@@ -699,9 +801,12 @@ mod tests {
     #[test]
     fn pixel_layout_is_argb32_with_grayscale_in_bgr_channels() {
         let mut r = AptImageRenderer::new();
-        let mut line = [0_u8; LINE_PIXELS];
-        line[0] = 0x80;
-        line[1] = 0xC0;
+        let mut line = AptLine {
+            sync_quality: 0.95,
+            ..AptLine::default()
+        };
+        line.pixels[0] = 0x80;
+        line.pixels[1] = 0xC0;
         r.push_line(&line);
         // Cairo ARGB32 little-endian: B, G, R, A
         let data = r.surface.data().unwrap();

@@ -30,7 +30,7 @@ pub mod sgp4_core;
 pub mod tle_cache;
 
 pub use elevation::{ElevationLookupError, lookup_elevation_m};
-pub use passes::{GroundStation, Pass, Track, track, upcoming_passes};
+pub use passes::{GroundStation, Pass, Track, is_ascending, track, upcoming_passes};
 pub use postal_lookup::{PostalLocation, PostalLookupError, lookup_us_zip};
 pub use sgp4_core::{Satellite, SatelliteError};
 pub use tle_cache::{TleCache, TleCacheError, celestrak_gp_url};

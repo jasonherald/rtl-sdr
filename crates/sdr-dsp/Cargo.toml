@@ -29,6 +29,11 @@ serde_json.workspace = true
 # FIR filtering, waterfall colormap lookup, and energy detection so
 # every subsequent GPU sub-ticket has a fixed comparison surface.
 criterion.workspace = true
+# WAV reader for the APT integration test, which feeds a real NOAA
+# 19 capture (sourced from the noaa-apt project's test/ corpus,
+# GPL-3.0 — see `tests/data/README.md`) through the decoder and
+# asserts that recognizable APT lines come out the other end.
+hound.workspace = true
 
 [lints]
 workspace = true

@@ -2742,6 +2742,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "criterion",
+ "hound",
  "pollster",
  "rustfft",
  "sdr-types",
