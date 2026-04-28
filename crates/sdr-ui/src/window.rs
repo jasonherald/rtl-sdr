@@ -9709,9 +9709,10 @@ fn connect_satellites_panel(
         AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
         SatellitesPanelWeak, enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh,
         format_pass_subtitle, format_pass_title, load_auto_record_apt, load_auto_record_audio,
-        load_auto_record_quality, load_notify_lead_min, load_station_alt_m, load_station_lat_deg,
-        load_station_lon_deg, load_watched_satellites, norad_id_for_pass, save_auto_record_apt,
-        save_auto_record_audio, save_f64, save_tle_last_refresh, save_watched_satellites,
+        load_auto_record_composites, load_auto_record_quality, load_notify_lead_min,
+        load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
+        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
+        save_auto_record_composites, save_f64, save_tle_last_refresh, save_watched_satellites,
         tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
@@ -9756,6 +9757,9 @@ fn connect_satellites_panel(
     panel
         .auto_record_audio_switch
         .set_active(load_auto_record_audio(config));
+    panel
+        .auto_record_composites_switch
+        .set_active(load_auto_record_composites(config));
     let initial_quality = load_auto_record_quality(config);
     panel
         .auto_record_quality_row
@@ -10057,6 +10061,22 @@ fn connect_satellites_panel(
             .auto_record_audio_switch
             .connect_active_notify(move |sw| {
                 save_auto_record_audio(&config_audio, sw.is_active());
+            });
+    }
+
+    // "Save false-colour composites" toggle — persist only. The
+    // `RecorderAction::SaveLrptPass` handler reads
+    // `panel.auto_record_composites_switch.is_active()` at LOS
+    // (mirrors the audio-save sampling pattern — flipping
+    // mid-pass doesn't retroactively start or stop anything).
+    // Per #547.
+    {
+        let config_comp = std::sync::Arc::clone(config);
+        panel
+            .auto_record_composites_switch
+            .connect_active_notify(move |sw| {
+                save_auto_record_composites(&config_comp, sw.is_active());
+                tracing::info!(on = sw.is_active(), "auto_record_composites persisted");
             });
     }
 
@@ -10415,6 +10435,12 @@ fn connect_satellites_panel(
         let squelch_level_row_a = panels.radio.squelch_level_row.clone();
         let ctcss_row_a = panels.radio.ctcss_row.clone();
         let fm_if_nr_row_a = panels.radio.fm_if_nr_row.clone();
+        // Composite-save toggle — read at LOS by the
+        // `SaveLrptPass` handler. Strong clone so the closure
+        // doesn't need to upgrade a weak ref against panel
+        // teardown ordering: every other panel widget the
+        // closure captures is a strong clone too. Per #547.
+        let auto_record_composites_switch_a = panel.auto_record_composites_switch.clone();
         let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
             if let Some(overlay) = overlay_weak.upgrade() {
                 overlay.add_toast(adw::Toast::new(msg));
@@ -10680,7 +10706,16 @@ fn connect_satellites_panel(
                         // Mirror into AppState so is_recording() (used by
                         // the close-to-tray Quit confirmation modal)
                         // reflects an in-progress LRPT pass. Per #512.
-                        state_a.lrpt_recording_active.set(true);
+                        // The `(norad_id, aos)` tuple lets the LOS
+                        // completion path snapshot-and-compare so an
+                        // overlapping pass-N+1 AOS that starts during
+                        // pass-N's encode doesn't have its `is_recording`
+                        // flag clobbered when pass-N's completion
+                        // fires. Mirrors the APT
+                        // `apt_recording_pass` pattern from PR #571
+                        // round 4. Per CR round 2 on PR #575.
+                        let aos = chrono::Utc::now();
+                        *state_a.lrpt_recording_pass.borrow_mut() = Some((norad_id, aos));
                     }
                 }
             }
@@ -10896,12 +10931,67 @@ fn connect_satellites_panel(
                         })
                         .collect()
                 };
+                // Composite snapshots — only when the user opted in
+                // via the panel toggle. Each entry is the recipe +
+                // a [`CompositeSnapshot`] (cloned source channel
+                // pixel buffers + truncated height). Built on the
+                // GTK main thread but the assembler lock is held
+                // only long enough to memcpy the source channels
+                // (~5 ms per recipe for full-pass data, vs ~30 ms
+                // for the full RGB interleave that happens in the
+                // worker). The expensive per-pixel interleave +
+                // PNG encode runs inside `gio::spawn_blocking`
+                // below. Per CR round 1 on PR #575.
+                let composites_on = auto_record_composites_switch_a.is_active();
+                let composite_snapshots: Vec<(
+                    crate::lrpt_viewer::CompositeRecipe,
+                    sdr_lrpt::image::CompositeSnapshot,
+                )> = if composites_on {
+                    state_a.lrpt_image.with_assembler(|a| {
+                        crate::lrpt_viewer::COMPOSITE_CATALOG
+                            .iter()
+                            .filter_map(|recipe| {
+                                a.clone_channels_for_composite(
+                                    recipe.r_apid,
+                                    recipe.g_apid,
+                                    recipe.b_apid,
+                                )
+                                .map(|snap| (*recipe, snap))
+                            })
+                            .collect()
+                    })
+                } else {
+                    Vec::new()
+                };
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
                 // Clone state for the post-save viewer-close
-                // — we need to read `state.lrpt_viewer_window`
+                // — we need to read `state.lrpt_recording_pass`
                 // after the spawn_blocking completes, which
                 // requires capturing state into the future.
                 let state_lrpt_close = Rc::clone(&state_a);
+                // Snapshot the *current* viewer-window WeakRef BEFORE
+                // spawning the worker, mirroring the APT path's
+                // pattern from PR #571 round 3. If the user closes
+                // the LRPT viewer mid-export and reopens it,
+                // `state.lrpt_viewer_window` will point at the new
+                // window by the time the callback fires; reading
+                // from there could close the wrong window. Cloning
+                // the WeakRef pins the identity of the window we'll
+                // attempt to close, while staying weak so a
+                // closed/dropped window upgrades to None and we
+                // no-op. Per CR round 2 on PR #575.
+                let exported_lrpt_window_weak =
+                    state_a.lrpt_viewer_window.borrow().as_ref().cloned();
+                // Snapshot the recording-pass tuple FIRST so the
+                // post-save clear is gated on "this is still the
+                // pass we entered with". An overlapping pass-N+1
+                // AOS that starts while pass-N is still encoding
+                // would otherwise have its slot clobbered when
+                // pass-N's completion callback fires `*slot =
+                // None`. Same shape as the APT compare-and-clear
+                // at `RecorderAction::SavePng`. Per CR round 2 on
+                // PR #575.
+                let exported_lrpt_pass = *state_a.lrpt_recording_pass.borrow();
                 glib::spawn_future_local(async move {
                     let dir_for_msg = dir.clone();
                     // Tuple return: (toast message, saved-at-least-one).
@@ -10965,14 +11055,62 @@ fn connect_satellites_panel(
                                 }
                             }
                         }
+                        // Composite PNGs alongside the per-APID
+                        // files. Filename is `composite-{slug}.png`
+                        // where `slug` is the recipe name with
+                        // spaces replaced by `-` and path
+                        // separators replaced by `_` so the disk
+                        // layout is portable across filesystems.
+                        //
+                        // The RGB interleave runs HERE — inside the
+                        // `gio::spawn_blocking` worker — so the
+                        // ~30 ms per-recipe per-pixel walk doesn't
+                        // block the GTK main thread. The assembler
+                        // lock was released after the cheap channel
+                        // memcpy in the snapshot phase above. Per
+                        // CR round 1 on PR #575.
+                        for (recipe, snap) in composite_snapshots {
+                            let rgb = sdr_lrpt::image::assemble_rgb_composite(
+                                &snap.r_pixels,
+                                &snap.g_pixels,
+                                &snap.b_pixels,
+                                snap.height,
+                            );
+                            let width = sdr_lrpt::image::IMAGE_WIDTH;
+                            let height = snap.height;
+                            let slug = recipe
+                                .name
+                                .replace(' ', "-")
+                                .replace(['/', '\\'], "_");
+                            let path = dir.join(format!("composite-{slug}.png"));
+                            match crate::lrpt_viewer::write_rgb_png(&path, &rgb, width, height) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        ?path,
+                                        recipe = recipe.name,
+                                        width,
+                                        height,
+                                        "auto-record LRPT composite saved",
+                                    );
+                                    saved += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "auto-record LRPT composite {} to {path:?} failed: {e}",
+                                        recipe.name,
+                                    );
+                                    errors.push(format!("Composite {}: {e}", recipe.name));
+                                }
+                            }
+                        }
                         let msg = if errors.is_empty() {
                             format!(
-                                "Pass complete — {saved} LRPT channel(s) saved to {}",
+                                "Pass complete — {saved} LRPT file(s) saved to {}",
                                 dir.display()
                             )
                         } else {
                             format!(
-                                "Pass complete — {saved} channel(s) saved, {} failed: {}",
+                                "Pass complete — {saved} file(s) saved, {} failed: {}",
                                 errors.len(),
                                 errors.join("; ")
                             )
@@ -11010,7 +11148,23 @@ fn connect_satellites_panel(
                     // We clear regardless of save_ok — the pass itself
                     // is over (LOS already happened); save_ok only
                     // controls whether to close the viewer. Per #512.
-                    state_lrpt_close.lrpt_recording_active.set(false);
+                    //
+                    // **Compare-and-clear:** only clear the slot if
+                    // it still holds the same pass we entered this
+                    // branch with. If a new AOS overwrote it
+                    // mid-export (overlapping passes can happen now
+                    // that composites widen the LOS window), that
+                    // new pass owns the slot — wiping it would lie
+                    // to the close-to-tray predicate about the
+                    // in-flight pass. Mirrors the APT
+                    // `apt_recording_pass` compare-and-clear from
+                    // PR #571 round 4. Per CR round 2 on PR #575.
+                    {
+                        let mut slot = state_lrpt_close.lrpt_recording_pass.borrow_mut();
+                        if *slot == exported_lrpt_pass {
+                            *slot = None;
+                        }
+                    }
                     // Close the LRPT viewer window now that the
                     // PNGs are on disk — resets the viewer for
                     // the next pass instead of carrying stale
@@ -11035,10 +11189,16 @@ fn connect_satellites_panel(
                     // handler in `open_lrpt_viewer_if_needed`
                     // clears the AppState slots so the next AOS
                     // opens a fresh viewer.
+                    //
+                    // Use the WeakRef we snapshotted at export
+                    // start (not the current
+                    // `state.lrpt_viewer_window`) so a viewer
+                    // reopen during the async save can't trick us
+                    // into closing the wrong window — same shape
+                    // as the APT path's snapshot pattern. Per CR
+                    // round 2 on PR #575.
                     if save_ok
-                        && let Some(window) = state_lrpt_close
-                            .lrpt_viewer_window
-                            .borrow()
+                        && let Some(window) = exported_lrpt_window_weak
                             .as_ref()
                             .and_then(glib::WeakRef::upgrade)
                     {

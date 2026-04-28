@@ -132,6 +132,24 @@ pub enum ViewerError {
         apid: Option<u16>,
     },
 
+    /// Composite mode is active but the cached composite
+    /// surface isn't built — one or more source APIDs are
+    /// missing or empty, or the last build failed. Distinct
+    /// from [`Self::EmptyChannel`] so the toast can name the
+    /// recipe rather than an APID. Per CR round 4 on PR #575:
+    /// previously the renderer/export silently fell back to the
+    /// per-APID surface here, but the dropdown still says
+    /// "Composite — ..." — that's misleading. Surfacing the
+    /// pending state explicitly keeps the UI honest.
+    #[error("composite \"{recipe_name}\" has no data to export yet")]
+    EmptyComposite {
+        /// Display name of the active composite recipe
+        /// (e.g. "Natural colour (123)"). `&'static str`
+        /// because all current recipes come from the static
+        /// `COMPOSITE_CATALOG`.
+        recipe_name: &'static str,
+    },
+
     /// Export dimension exceeds Cairo's `i32` API limit.
     /// `dim` identifies which axis (`"width"`, `"height"`,
     /// `"width × height"` for the multiply-overflow case).
