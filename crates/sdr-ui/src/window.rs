@@ -10706,7 +10706,16 @@ fn connect_satellites_panel(
                         // Mirror into AppState so is_recording() (used by
                         // the close-to-tray Quit confirmation modal)
                         // reflects an in-progress LRPT pass. Per #512.
-                        state_a.lrpt_recording_active.set(true);
+                        // The `(norad_id, aos)` tuple lets the LOS
+                        // completion path snapshot-and-compare so an
+                        // overlapping pass-N+1 AOS that starts during
+                        // pass-N's encode doesn't have its `is_recording`
+                        // flag clobbered when pass-N's completion
+                        // fires. Mirrors the APT
+                        // `apt_recording_pass` pattern from PR #571
+                        // round 4. Per CR round 2 on PR #575.
+                        let aos = chrono::Utc::now();
+                        *state_a.lrpt_recording_pass.borrow_mut() = Some((norad_id, aos));
                     }
                 }
             }
@@ -10956,10 +10965,33 @@ fn connect_satellites_panel(
                 };
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
                 // Clone state for the post-save viewer-close
-                // — we need to read `state.lrpt_viewer_window`
+                // — we need to read `state.lrpt_recording_pass`
                 // after the spawn_blocking completes, which
                 // requires capturing state into the future.
                 let state_lrpt_close = Rc::clone(&state_a);
+                // Snapshot the *current* viewer-window WeakRef BEFORE
+                // spawning the worker, mirroring the APT path's
+                // pattern from PR #571 round 3. If the user closes
+                // the LRPT viewer mid-export and reopens it,
+                // `state.lrpt_viewer_window` will point at the new
+                // window by the time the callback fires; reading
+                // from there could close the wrong window. Cloning
+                // the WeakRef pins the identity of the window we'll
+                // attempt to close, while staying weak so a
+                // closed/dropped window upgrades to None and we
+                // no-op. Per CR round 2 on PR #575.
+                let exported_lrpt_window_weak =
+                    state_a.lrpt_viewer_window.borrow().as_ref().cloned();
+                // Snapshot the recording-pass tuple FIRST so the
+                // post-save clear is gated on "this is still the
+                // pass we entered with". An overlapping pass-N+1
+                // AOS that starts while pass-N is still encoding
+                // would otherwise have its slot clobbered when
+                // pass-N's completion callback fires `*slot =
+                // None`. Same shape as the APT compare-and-clear
+                // at `RecorderAction::SavePng`. Per CR round 2 on
+                // PR #575.
+                let exported_lrpt_pass = *state_a.lrpt_recording_pass.borrow();
                 glib::spawn_future_local(async move {
                     let dir_for_msg = dir.clone();
                     // Tuple return: (toast message, saved-at-least-one).
@@ -11116,7 +11148,23 @@ fn connect_satellites_panel(
                     // We clear regardless of save_ok — the pass itself
                     // is over (LOS already happened); save_ok only
                     // controls whether to close the viewer. Per #512.
-                    state_lrpt_close.lrpt_recording_active.set(false);
+                    //
+                    // **Compare-and-clear:** only clear the slot if
+                    // it still holds the same pass we entered this
+                    // branch with. If a new AOS overwrote it
+                    // mid-export (overlapping passes can happen now
+                    // that composites widen the LOS window), that
+                    // new pass owns the slot — wiping it would lie
+                    // to the close-to-tray predicate about the
+                    // in-flight pass. Mirrors the APT
+                    // `apt_recording_pass` compare-and-clear from
+                    // PR #571 round 4. Per CR round 2 on PR #575.
+                    {
+                        let mut slot = state_lrpt_close.lrpt_recording_pass.borrow_mut();
+                        if *slot == exported_lrpt_pass {
+                            *slot = None;
+                        }
+                    }
                     // Close the LRPT viewer window now that the
                     // PNGs are on disk — resets the viewer for
                     // the next pass instead of carrying stale
@@ -11141,10 +11189,16 @@ fn connect_satellites_panel(
                     // handler in `open_lrpt_viewer_if_needed`
                     // clears the AppState slots so the next AOS
                     // opens a fresh viewer.
+                    //
+                    // Use the WeakRef we snapshotted at export
+                    // start (not the current
+                    // `state.lrpt_viewer_window`) so a viewer
+                    // reopen during the async save can't trick us
+                    // into closing the wrong window — same shape
+                    // as the APT path's snapshot pattern. Per CR
+                    // round 2 on PR #575.
                     if save_ok
-                        && let Some(window) = state_lrpt_close
-                            .lrpt_viewer_window
-                            .borrow()
+                        && let Some(window) = exported_lrpt_window_weak
                             .as_ref()
                             .and_then(glib::WeakRef::upgrade)
                     {

@@ -205,8 +205,20 @@ pub struct AppState {
     pub audio_recording_active: Cell<bool>,
     /// `true` while a `StartIqRecording` is in flight. Per #512.
     pub iq_recording_active: Cell<bool>,
-    /// `true` between an LRPT auto-record AOS and LOS. Per #512.
-    pub lrpt_recording_active: Cell<bool>,
+    /// `(satellite_norad_id, aos_time)` for the currently-recording
+    /// LRPT pass, or `None` between passes. Set by the
+    /// `RecorderAction::StartAutoRecord` LRPT arm at AOS, cleared
+    /// after `RecorderAction::SaveLrptPass` completes its async
+    /// composite + per-APID PNG export — but only if the slot
+    /// still holds the same pass we entered the LOS export with.
+    /// Mirrors the [`Self::apt_recording_pass`] compare-and-clear
+    /// pattern from PR #571 round 4: with composite work added to
+    /// LOS, the export window grew long enough that pass N+1 can
+    /// AOS while pass N is still encoding. Without the snapshot +
+    /// compare guard, pass N's completion would clobber the new
+    /// pass's slot to `None` and `is_recording()` would lie about
+    /// the in-flight pass. Per CR round 2 on PR #575.
+    pub lrpt_recording_pass: RefCell<Option<(u32, chrono::DateTime<chrono::Utc>)>>,
     /// Owned handle to the tray service. Held in `AppState` so the
     /// `tray-quit` action can `shutdown()` to join the worker thread
     /// before `app.release()`. Per #512.
@@ -270,7 +282,7 @@ impl AppState {
             tray_available: Cell::new(true),
             audio_recording_active: Cell::new(false),
             iq_recording_active: Cell::new(false),
-            lrpt_recording_active: Cell::new(false),
+            lrpt_recording_pass: RefCell::new(None),
             tray_handle: RefCell::new(None),
             app_hold_guard: RefCell::new(None),
             lrpt_viewer: RefCell::new(None),
@@ -297,7 +309,7 @@ impl AppState {
     #[must_use]
     pub fn is_recording(&self) -> bool {
         self.apt_recording_pass.borrow().is_some()
-            || self.lrpt_recording_active.get()
+            || self.lrpt_recording_pass.borrow().is_some()
             || self.audio_recording_active.get()
             || self.iq_recording_active.get()
     }
@@ -389,7 +401,7 @@ mod tests {
         assert!(s.tray_available.get());
         assert!(!s.audio_recording_active.get());
         assert!(!s.iq_recording_active.get());
-        assert!(!s.lrpt_recording_active.get());
+        assert!(s.lrpt_recording_pass.borrow().is_none());
     }
 
     #[test]
@@ -416,7 +428,12 @@ mod tests {
             if apt {
                 *s.apt_recording_pass.borrow_mut() = Some((33_591, chrono::Utc::now()));
             }
-            s.lrpt_recording_active.set(lrpt);
+            if lrpt {
+                // NORAD 33_592 = NOAA 19 placeholder; matches the
+                // shape `apt_recording_pass` uses above. Per CR
+                // round 2 on PR #575.
+                *s.lrpt_recording_pass.borrow_mut() = Some((33_592, chrono::Utc::now()));
+            }
             s.audio_recording_active.set(audio);
             s.iq_recording_active.set(iq);
             assert_eq!(
