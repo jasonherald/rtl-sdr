@@ -628,13 +628,21 @@ impl LrptImageRenderer {
         })?;
 
         // Composite branch takes precedence when the cache is
-        // populated. A composite that's been activated but
-        // failed to build (None cache) falls through to the
-        // single-channel branch so the user still sees their
-        // last selected APID rather than a black canvas. Per
-        // #547.
+        // populated. Per #547.
         if let Some(c) = &self.composite_cache {
             return paint_image_surface(cr, &c.surface, c.height, width, height);
+        }
+
+        // Composite is selected but the cache isn't built yet
+        // (one or more source APIDs missing/empty, or the last
+        // build failed). Paint just the background and stop —
+        // falling through to the per-APID branch would render a
+        // single-channel greyscale image while the dropdown
+        // still says "Composite — ...", which the user would
+        // read as "this IS the composite". Per CR round 4 on
+        // PR #575.
+        if self.active_composite.is_some() {
+            return Ok(());
         }
 
         let Some(apid) = self.active else {
@@ -664,19 +672,30 @@ impl LrptImageRenderer {
     /// Returns [`ViewerError::NoActiveChannel`] when neither a
     /// composite nor a per-APID channel is selected,
     /// [`ViewerError::EmptyChannel`] when the active per-APID
-    /// channel has no decoded rows yet, or `Cairo` / `Io` /
-    /// `PngEncode` on the failing step. Per issue #545.
+    /// channel has no decoded rows yet,
+    /// [`ViewerError::EmptyComposite`] when a composite recipe
+    /// is selected but the cache isn't populated yet, or
+    /// `Cairo` / `Io` / `PngEncode` on the failing step. Per
+    /// issue #545.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn export_png(&self, path: &Path) -> Result<(), ViewerError> {
         // Composite branch wins when the cache is populated —
         // matches `Self::render`'s precedence so the PNG and the
         // on-screen pixels are bit-identical for the same
-        // (recipe, line count) state. A composite that's been
-        // activated but failed to build (None cache) falls
-        // through to the single-channel branch — same fallback
-        // shape `Self::render` uses. Per CR round 2 on PR #575.
+        // (recipe, line count) state. Per CR round 2 on PR #575.
         if let Some(c) = &self.composite_cache {
             return Self::export_png_from_surface(path, &c.surface, c.height, None);
+        }
+        // Composite selected but the cache isn't built yet (one
+        // or more source APIDs missing/empty, or the last build
+        // failed). Surface this as `EmptyComposite` rather than
+        // fall through to the per-APID branch, which would
+        // silently export a different image than the dropdown
+        // advertises. Per CR round 4 on PR #575.
+        if let Some(recipe) = self.active_composite {
+            return Err(ViewerError::EmptyComposite {
+                recipe_name: recipe.name,
+            });
         }
         let Some(apid) = self.active else {
             return Err(ViewerError::NoActiveChannel);
@@ -1545,29 +1564,30 @@ impl LrptImageView {
     /// pending rows from the shared `LrptImage` first so the
     /// snapshot captures the tail of the pass.
     ///
-    /// Returns `None` if there's nothing to export — neither a
-    /// composite recipe with all three source channels, nor an
-    /// active per-APID channel with at least one decoded line.
-    /// Per CR round 2 on PR #575.
+    /// Returns `None` if there's nothing to export — either no
+    /// channel/composite selected, an active per-APID channel
+    /// with no decoded lines, or a composite recipe whose
+    /// source APIDs aren't all populated yet. Per CR round 2
+    /// on PR #575.
     pub fn snapshot_for_export(&self) -> Option<ExportSnapshot> {
         self.drain_new_lines();
         if let Some(recipe) = self.renderer.borrow().active_composite() {
-            // Composite mode wins. `clone_channels_for_composite`
-            // returns `None` if any of the three source APIDs is
-            // missing or empty — fall through to the per-APID
-            // path so the user still gets *something* (the
-            // dropdown's last single-channel pick) rather than a
-            // toast about an empty composite. Mirrors the renderer
-            // fallback logic in `Self::render`.
+            // Composite selection is authoritative. If
+            // `clone_channels_for_composite` returns `None` (one
+            // or more source APIDs missing/empty), return `None`
+            // — never fall back to the per-APID path. The
+            // dropdown still says "Composite — ..." and exporting
+            // the last greyscale APID under that label would
+            // silently mislead the user (the on-screen canvas
+            // doesn't fall back either; both stay consistent
+            // until the composite is buildable). The export-
+            // button toast handler surfaces the resulting `None`
+            // as "No LRPT image data to export yet". Per CR
+            // round 4 on PR #575.
             let snap = self.image.with_assembler(|a| {
                 a.clone_channels_for_composite(recipe.r_apid, recipe.g_apid, recipe.b_apid)
             });
-            if let Some(snap) = snap {
-                return Some(ExportSnapshot::Composite {
-                    recipe,
-                    snapshot: snap,
-                });
-            }
+            return snap.map(|snapshot| ExportSnapshot::Composite { recipe, snapshot });
         }
         let (apid, buffer) = self.snapshot_active_channel()?;
         Some(ExportSnapshot::Channel { apid, buffer })
@@ -2384,6 +2404,65 @@ mod tests {
             "exported file isn't a valid PNG (header mismatch)",
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn export_png_refuses_when_composite_active_but_cache_empty() {
+        // Per CR round 4 on PR #575: composite mode is
+        // authoritative — when a recipe is active but the
+        // cache hasn't built yet (source APIDs missing/empty),
+        // `export_png` must fail loudly with `EmptyComposite`
+        // rather than silently fall through to whatever
+        // single-APID was last selected. The dropdown still
+        // says "Composite — ..." in that state, so a per-APID
+        // export would mislead.
+        let mut r = LrptImageRenderer::new();
+        // Activate a composite without any source data — this
+        // sets active_composite + leaves cache None.
+        let recipe = COMPOSITE_CATALOG[0];
+        let empty = LrptImage::new();
+        assert!(!r.set_composite(recipe, &empty));
+        // Also feed one line into a per-APID surface that
+        // ISN'T part of the recipe — the bug we're guarding
+        // against is "fall through and export this one".
+        r.push_line(99, &synth_line(TEST_PIXEL));
+        let path = std::env::temp_dir().join("lrpt-test-empty-composite-should-not-be-written.png");
+        let result = r.export_png(&path);
+        assert!(matches!(
+            result,
+            Err(crate::viewer::ViewerError::EmptyComposite { recipe_name })
+                if recipe_name == recipe.name
+        ));
+        assert!(
+            !path.exists(),
+            "no file should be created on EmptyComposite",
+        );
+    }
+
+    #[test]
+    fn render_paints_only_background_when_composite_active_but_cache_empty() {
+        // Sibling guarantee to `export_png_refuses_when_composite_active_but_cache_empty`:
+        // the on-screen render path must also stay on
+        // background-only paint when composite is active but
+        // unbuilt — never fall through to per-APID. We can't
+        // easily inspect Cairo's surface state in a unit test,
+        // but the function returns `Ok(())` without panicking
+        // along the no-fall-through path, and the no-image-
+        // surface-blit branch is the only one that reaches
+        // that state with both `composite_cache: None` and
+        // `active_composite: Some(_)`. Per CR round 4 on
+        // PR #575.
+        let mut r = LrptImageRenderer::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        let empty = LrptImage::new();
+        assert!(!r.set_composite(recipe, &empty));
+        // Per-APID surface for an unrelated APID — what the
+        // pre-fix render would have painted.
+        r.push_line(99, &synth_line(TEST_PIXEL));
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, 32, 32).expect("test surface alloc");
+        let cr = cairo::Context::new(&surface).expect("cairo ctx");
+        r.render(&cr, 32, 32).expect("render");
     }
 
     #[test]
