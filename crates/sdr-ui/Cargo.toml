@@ -85,6 +85,12 @@ gtk4.workspace = true
 libadwaita.workspace = true
 cairo-rs.workspace = true
 
+[dev-dependencies]
+# Isolated temp directories for autostart unit tests — exercises the
+# XDG .desktop writer against a private path so tests never touch
+# ~/.config/autostart/ on the dev box.
+tempfile = { workspace = true }
+
 # Benchmarks — Linux only because `sdr-ui` itself is Linux-gated
 # (see the top-of-file `#![cfg(target_os = "linux")]` in lib.rs).
 [target.'cfg(target_os = "linux")'.dev-dependencies]

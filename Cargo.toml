@@ -282,6 +282,11 @@ librsvg = "2"
 # the CPU baseline harness in sdr-dsp.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
+# Temporary-directory helpers for tests. Used by sdr-ui's autostart module
+# tests to exercise the XDG .desktop writer against an isolated path
+# without touching ~/.config/autostart/ on the dev box.
+tempfile = "3"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
