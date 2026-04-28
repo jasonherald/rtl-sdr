@@ -1,12 +1,16 @@
 //! General preferences page — directory settings for recordings and screenshots.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
+use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
+
+use crate::state::AppState;
 
 /// Config key for the recording directory path.
 const KEY_RECORDING_DIR: &str = "recording_directory";
@@ -14,18 +18,164 @@ const KEY_RECORDING_DIR: &str = "recording_directory";
 /// Config key for the screenshot directory path.
 const KEY_SCREENSHOT_DIR: &str = "screenshot_directory";
 
+/// Config key for the close-to-tray behavior toggle.
+pub(crate) const KEY_CLOSE_TO_TRAY: &str = "close_to_tray";
+
+/// Config key for the autostart-on-login toggle.
+pub(crate) const KEY_AUTOSTART: &str = "autostart";
+
+/// Config key for the "we already showed the close-to-tray toast"
+/// flag. Only ever flipped once per fresh config; the close-request
+/// handler in `window.rs` reads it (default false) to decide whether
+/// to fire the explanatory toast.
+pub(crate) const KEY_TRAY_FIRST_CLOSE_SEEN: &str = "tray_first_close_seen";
+
+/// Read the persisted close-to-tray boolean (default true). Used by
+/// the prefs row's initial active state and by `build_window` to
+/// hydrate `state.close_to_tray`.
+#[must_use]
+pub fn read_close_to_tray(config: &ConfigManager) -> bool {
+    config.read(|v| {
+        v.get(KEY_CLOSE_TO_TRAY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    })
+}
+
+/// Read the "we already showed the close-to-tray toast" flag. Default false.
+#[must_use]
+pub fn read_tray_first_close_seen(config: &ConfigManager) -> bool {
+    config.read(|v| {
+        v.get(KEY_TRAY_FIRST_CLOSE_SEEN)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
 /// Default recording directory name under `$HOME`.
 const DEFAULT_RECORDING_DIR_NAME: &str = "sdr-recordings";
+
+/// Build the "Behavior" preferences group: close-to-tray and
+/// autostart-on-login switches. Per #512.
+fn build_behavior_group(
+    window: &adw::PreferencesWindow,
+    config: &Arc<ConfigManager>,
+    state: &Rc<AppState>,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Behavior")
+        .description("How the app responds to closing the window and to login")
+        .build();
+
+    // --- Close-to-tray switch ---
+    let close_to_tray_row = adw::SwitchRow::builder()
+        .title("Keep running in tray when window is closed")
+        .subtitle(
+            "Hide to the system tray instead of exiting; useful for scheduled satellite passes",
+        )
+        .active(read_close_to_tray(config))
+        .build();
+    if !state.tray_available.get() {
+        close_to_tray_row.set_sensitive(false);
+        close_to_tray_row
+            .set_tooltip_text(Some("Disabled — no system tray detected on this session."));
+    }
+    // Mirror the toggle into AppState immediately so the running
+    // session's close-request handler picks up the new behavior
+    // without a restart. The config write is the cross-session
+    // mirror; the cell flip is what actually drives this session.
+    // Per CR round 1 on PR #572.
+    let config_ctt = Arc::clone(config);
+    let state_ctt = Rc::clone(state);
+    close_to_tray_row.connect_active_notify(move |row| {
+        let value = row.is_active();
+        state_ctt.close_to_tray.set(value);
+        config_ctt.write(|v| {
+            v[KEY_CLOSE_TO_TRAY] = serde_json::json!(value);
+        });
+        tracing::info!(value, "close_to_tray toggle applied to state and config");
+    });
+    group.add(&close_to_tray_row);
+
+    // --- Autostart switch ---
+    let autostart_row = adw::SwitchRow::builder()
+        .title("Start at login")
+        .subtitle("Launch SDR-RS hidden in the tray when you log in")
+        .active(crate::autostart::is_enabled())
+        .build();
+
+    // Suppress the recursive notify::active that set_active(!want)
+    // triggers when we revert on filesystem error.
+    let suppress = Rc::new(std::cell::Cell::new(false));
+    let suppress_inner = Rc::clone(&suppress);
+    let config_as = Arc::clone(config);
+    let window_for_toast = window.clone();
+    let row_for_revert = autostart_row.clone();
+    autostart_row.connect_active_notify(move |row| {
+        if suppress_inner.get() {
+            return;
+        }
+        let want = row.is_active();
+        // Offload filesystem I/O off the GTK main thread — on slow
+        // or network-backed config homes the write/remove can stall
+        // the UI. Capture `want` and dispatch to a worker; marshal
+        // the result back via `glib::spawn_future_local`. Per CR
+        // round 1 on PR #572.
+        let config_as = Arc::clone(&config_as);
+        let window_for_toast = window_for_toast.clone();
+        let suppress_inner = Rc::clone(&suppress_inner);
+        let row_for_revert = row_for_revert.clone();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || {
+                if want {
+                    crate::autostart::enable()
+                } else {
+                    crate::autostart::disable()
+                }
+            })
+            .await
+            .unwrap_or_else(|panic| {
+                tracing::warn!("autostart worker panicked: {panic:?}");
+                Err(std::io::Error::other("autostart worker thread panicked"))
+            });
+            match result {
+                Ok(()) => {
+                    config_as.write(|v| {
+                        v[KEY_AUTOSTART] = serde_json::json!(want);
+                    });
+                    tracing::info!(want, "autostart toggle persisted");
+                }
+                Err(e) => {
+                    tracing::warn!(want, error = %e, "autostart toggle failed, reverting");
+                    let toast = adw::Toast::new(&format!(
+                        "Couldn't {} autostart: {e}",
+                        if want { "enable" } else { "disable" },
+                    ));
+                    window_for_toast.add_toast(toast);
+                    suppress_inner.set(true);
+                    row_for_revert.set_active(!want);
+                    suppress_inner.set(false);
+                }
+            }
+        });
+    });
+    group.add(&autostart_row);
+
+    group
+}
 
 /// Build the General preferences page.
 pub fn build_general_page(
     window: &adw::PreferencesWindow,
     config: &Arc<ConfigManager>,
+    state: &Rc<AppState>,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("General")
         .icon_name("preferences-system-symbolic")
         .build();
+
+    page.add(&build_behavior_group(window, config, state));
 
     let directories_group = adw::PreferencesGroup::builder()
         .title("Directories")

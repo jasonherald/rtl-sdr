@@ -24,6 +24,10 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::from(u8::try_from(exit_code).unwrap_or(1));
     }
 
+    // Autostart `.desktop` Exec line passes `--start-hidden` so the
+    // app launches into the tray without presenting a window. Per #512.
+    let start_hidden = std::env::args().any(|a| a == "--start-hidden");
+
     // Limit glibc malloc arenas before any threads spawn.
     // Without this, glibc creates up to 8*cores arenas that each keep
     // their high-water mark, causing RSS to grow indefinitely with 40+ threads.
@@ -54,7 +58,7 @@ fn main() -> glib::ExitCode {
     // so the existing window raises, and exit 0 cleanly. This avoids
     // two processes racing on the RTL-SDR USB device, config file
     // writes, and sherpa model downloads.
-    let app = sdr_ui::build_app();
+    let app = sdr_ui::build_app_with_options(start_hidden);
     if !sdr_ui::register_and_check_primary(&app) {
         return glib::ExitCode::SUCCESS;
     }

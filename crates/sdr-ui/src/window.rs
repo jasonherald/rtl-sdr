@@ -150,9 +150,19 @@ fn apply_manual_tune(
     radio_panel.update_distance_frequency(freq_hz);
 }
 
-/// Build and present the main application window.
+/// Build the main application window and return the shared
+/// [`AppState`]. The caller (currently `app.rs::connect_activate`)
+/// decides whether to call `window.present()` based on the
+/// `--start-hidden` CLI flag and tray availability — per #512.
+///
+/// Returns `None` if the DSP engine failed to start; in that case
+/// `app.quit()` has already been requested and the caller should
+/// skip tray spawn and window present.
 #[allow(clippy::too_many_lines)]
-pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::ConfigManager>) {
+pub fn build_window(
+    app: &adw::Application,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) -> Option<std::rc::Rc<crate::state::AppState>> {
     // --- Engine bootstrap ---
     //
     // The headless engine (sdr-core) owns the DSP controller thread, the
@@ -181,7 +191,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         Err(err) => {
             tracing::error!(error = %err, "failed to spawn DSP engine — aborting window build");
             app.quit();
-            return;
+            return None;
         }
     };
     let ui_tx = engine.command_sender();
@@ -195,7 +205,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
              already took the event receiver"
         );
         app.quit();
-        return;
+        return None;
     };
     let fft_shared = engine.fft_buffer();
 
@@ -473,7 +483,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     #[allow(clippy::cast_precision_loss)]
     status_bar.update_frequency(freq_selector.frequency() as f64);
 
-    setup_app_actions(app, &window, config, &rr_button);
+    setup_app_actions(app, &window, config, &rr_button, &state);
 
     // Wire transcript panel (separate from sidebar panels).
     let transcription_engine = connect_transcript_panel(
@@ -503,16 +513,154 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
     // on close means that click is treated as "no such action"
     // rather than "tune via stale state". Per CR round 1 on PR #568.
     let app_for_close = app.clone();
-    window.connect_close_request(move |_| {
+    let state_for_close = std::rc::Rc::clone(&state);
+    let config_for_close = std::sync::Arc::clone(config);
+    let toast_overlay_close = toast_overlay.downgrade();
+    let transcription_engine_close = std::rc::Rc::clone(&transcription_engine);
+    // The closure receives `&window` as its parameter — use that
+    // instead of capturing a strong clone, otherwise the closure
+    // (which the window owns) would hold a strong ref back to its
+    // own window and form a retention cycle. Per CR round 1 on PR
+    // #572.
+    window.connect_close_request(move |w| {
         let bt = std::backtrace::Backtrace::capture();
-        tracing::info!(
-            backtrace = ?bt,
-            "main window close-request fired",
-        );
+        tracing::info!(backtrace = ?bt, "main window close-request fired");
+
+        // Close-to-tray: hide instead of destroy if both the user
+        // toggle is on AND the tray is actually available. If the
+        // tray failed to spawn, MUST proceed-to-close — otherwise
+        // the user is stuck with an invisible process. Per #512.
+        if state_for_close.close_to_tray.get() && state_for_close.tray_available.get() {
+            w.set_visible(false);
+            // First-close toast: fire exactly once per fresh config.
+            if !state_for_close.tray_first_close_seen.get() {
+                state_for_close.tray_first_close_seen.set(true);
+                config_for_close.write(|v| {
+                    v[crate::preferences::general_page::KEY_TRAY_FIRST_CLOSE_SEEN] =
+                        serde_json::json!(true);
+                });
+                if let Some(overlay) = toast_overlay_close.upgrade() {
+                    let toast = adw::Toast::builder()
+                        .title("App still running in tray — right-click tray icon and choose Quit, or disable in Settings → General → Behavior")
+                        .timeout(8)
+                        .build();
+                    overlay.add_toast(toast);
+                }
+            }
+            return glib::Propagation::Stop;
+        }
+
+        // Real close — tray failed to spawn (or the user disabled
+        // close-to-tray). Drop the application hold guard so the
+        // GApplication can release its reference and exit naturally
+        // once the window destroys. Without this, the window would
+        // close but `app.hold()` from connect_startup would keep
+        // the process alive headless with no way to interact.
+        // Per CR round 1 on PR #572.
+        let _ = state_for_close.app_hold_guard.borrow_mut().take();
         app_for_close.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
-        transcription_engine.borrow_mut().shutdown_nonblocking();
+        transcription_engine_close.borrow_mut().shutdown_nonblocking();
         glib::Propagation::Proceed
     });
+
+    // --- tray-* GIO actions (per #512 close-to-tray) ---
+    //
+    // These are activated by `app.rs::spawn_tray_and_route` which
+    // forwards `sdr_tray::TrayEvent`s from the tray worker thread
+    // to the GTK main loop via `app.activate_action(...)`.
+    //
+    // Registered here (rather than in `setup_app_actions`) because
+    // the `tray-quit` handler captures `transcription_engine`, which
+    // is only constructed below the `setup_app_actions(...)` call.
+
+    let tray_show = gio::SimpleAction::new("tray-show", None);
+    tray_show.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            window.present();
+        }
+    ));
+    app.add_action(&tray_show);
+
+    let tray_hide = gio::SimpleAction::new("tray-hide", None);
+    tray_hide.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            window.set_visible(false);
+        }
+    ));
+    app.add_action(&tray_hide);
+
+    let tray_toggle = gio::SimpleAction::new("tray-toggle", None);
+    tray_toggle.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            if window.is_visible() {
+                window.set_visible(false);
+            } else {
+                window.present();
+            }
+        }
+    ));
+    app.add_action(&tray_toggle);
+
+    // tray-quit: confirm if recording is active, otherwise tear down
+    // immediately. The teardown sequence: stop the tray worker thread,
+    // drop the application hold guard (which Drop-fires `release()`),
+    // remove the tune-satellite action (its closure captures
+    // window-owned widgets), shut down transcription, destroy the
+    // window. Once the hold guard is dropped and the window is gone,
+    // the GApplication's reference count drops to zero and the main
+    // loop exits naturally.
+    let tray_quit = gio::SimpleAction::new("tray-quit", None);
+    let app_for_quit = app.clone();
+    let state_for_quit = Rc::clone(&state);
+    let window_for_quit = window.clone();
+    let transcription_for_quit = Rc::clone(&transcription_engine);
+    tray_quit.connect_activate(move |_, _| {
+        if state_for_quit.is_recording() {
+            // Confirmation modal. WM-close (clicking the dialog's X)
+            // maps to "cancel" via `set_close_response`.
+            let dialog = adw::MessageDialog::builder()
+                .transient_for(&window_for_quit)
+                .modal(true)
+                .heading("Recording in progress")
+                .body("Quit anyway? The current pass will not be saved.")
+                .build();
+            dialog.add_response("cancel", "_Cancel");
+            dialog.add_response("quit", "_Quit anyway");
+            dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let app_for_response = app_for_quit.clone();
+            let state_for_response = Rc::clone(&state_for_quit);
+            let window_for_response = window_for_quit.clone();
+            let transcription_for_response = Rc::clone(&transcription_for_quit);
+            dialog.connect_response(None, move |dlg, response| {
+                if response == "quit" {
+                    perform_real_quit(
+                        &app_for_response,
+                        &state_for_response,
+                        &window_for_response,
+                        &transcription_for_response,
+                    );
+                }
+                dlg.close();
+            });
+            dialog.present();
+            return;
+        }
+        perform_real_quit(
+            &app_for_quit,
+            &state_for_quit,
+            &window_for_quit,
+            &transcription_for_quit,
+        );
+    });
+    app.add_action(&tray_quit);
 
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(
@@ -995,7 +1143,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         glib::ControlFlow::Continue
     });
 
-    window.present();
+    Some(state)
 }
 
 /// Outcome of a [`refresh_scanner_axis_lock`] call. Lets the
@@ -1265,6 +1413,10 @@ fn handle_dsp_message(
         }
         DspToUi::AudioRecordingStarted(path) => {
             tracing::info!(?path, "audio recording started");
+            // Mirror into AppState so is_recording() (used by the
+            // close-to-tray Quit confirmation modal) reflects reality.
+            // Per #512.
+            state.audio_recording_active.set(true);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let name = path
                     .file_name()
@@ -1275,6 +1427,8 @@ fn handle_dsp_message(
         }
         DspToUi::AudioRecordingStopped => {
             tracing::info!("audio recording stopped");
+            // Mirror into AppState. Per #512.
+            state.audio_recording_active.set(false);
             record_audio_row.set_active(false);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let toast = adw::Toast::new("Audio recording saved");
@@ -1283,6 +1437,10 @@ fn handle_dsp_message(
         }
         DspToUi::IqRecordingStarted(path) => {
             tracing::info!(?path, "IQ recording started");
+            // Mirror into AppState so is_recording() (used by the
+            // close-to-tray Quit confirmation modal) reflects reality.
+            // Per #512.
+            state.iq_recording_active.set(true);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let name = path
                     .file_name()
@@ -1293,6 +1451,8 @@ fn handle_dsp_message(
         }
         DspToUi::IqRecordingStopped => {
             tracing::info!("IQ recording stopped");
+            // Mirror into AppState. Per #512.
+            state.iq_recording_active.set(false);
             record_iq_row.set_active(false);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let toast = adw::Toast::new("IQ recording saved");
@@ -10413,6 +10573,10 @@ fn connect_satellites_panel(
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
                         state_a.dispatch_vfo_offset(0.0);
+                        // Mirror into AppState so is_recording() (used by
+                        // the close-to-tray Quit confirmation modal)
+                        // reflects an in-progress LRPT pass. Per #512.
+                        state_a.lrpt_recording_active.set(true);
                     }
                 }
             }
@@ -10737,6 +10901,12 @@ fn connect_satellites_panel(
                         )
                     });
                     post_toast(&toast_overlay_weak_for_save, &result_msg);
+                    // Mark the LRPT pass as no-longer-recording for
+                    // the close-to-tray Quit-confirmation predicate.
+                    // We clear regardless of save_ok — the pass itself
+                    // is over (LOS already happened); save_ok only
+                    // controls whether to close the viewer. Per #512.
+                    state_lrpt_close.lrpt_recording_active.set(false);
                     // Close the LRPT viewer window now that the
                     // PNGs are on disk — resets the viewer for
                     // the next pass instead of carrying stale
@@ -12182,14 +12352,22 @@ fn setup_app_actions(
     window: &adw::ApplicationWindow,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     rr_button: &gtk4::Button,
+    state: &Rc<AppState>,
 ) {
-    // Quit action
+    // Quit action — Ctrl+Q and the menu's "Quit" entry. Routes
+    // through `tray-quit` (registered in `build_window`) so explicit
+    // quit goes through the same recording-confirmation modal +
+    // perform_real_quit teardown as the tray menu's Quit. Without
+    // this redirect, `window.close()` would hit the close-request
+    // handler and get swallowed into "hide to tray" — the user's
+    // Ctrl+Q would silently hide instead of exit. Per CR round 1
+    // on PR #572.
     let quit_action = gio::SimpleAction::new("quit", None);
     quit_action.connect_activate(glib::clone!(
         #[weak]
-        window,
+        app,
         move |_, _| {
-            window.close();
+            app.activate_action("tray-quit", None);
         }
     ));
     app.add_action(&quit_action);
@@ -12199,12 +12377,16 @@ fn setup_app_actions(
     let prefs_action = gio::SimpleAction::new("preferences", None);
     let config_for_prefs = std::sync::Arc::clone(config);
     let rr_button_prefs = rr_button.clone();
+    let state_for_prefs = Rc::clone(state);
     prefs_action.connect_activate(glib::clone!(
         #[weak]
         window,
         move |_, _| {
-            let prefs_window =
-                crate::preferences::build_preferences_window(&window, &config_for_prefs);
+            let prefs_window = crate::preferences::build_preferences_window(
+                &window,
+                &config_for_prefs,
+                &state_for_prefs,
+            );
             // Update RR button visibility when preferences window closes
             let rr_btn = rr_button_prefs.clone();
             prefs_window.connect_close_request(move |_| {
@@ -12266,6 +12448,36 @@ fn recording_path(prefix: &str) -> std::path::PathBuf {
         .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
         .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
     base.join(format!("{prefix}-{timestamp}.wav"))
+}
+
+/// Tear down the application after a tray-Quit confirmation. Joins
+/// the tray worker thread, drops the `app.hold()` guard so the
+/// `GApplication` can release naturally, removes the notification
+/// action whose closure captures window-owned widgets, shuts down
+/// the transcription engine, and destroys the window. Per #512.
+fn perform_real_quit(
+    app: &adw::Application,
+    state: &Rc<AppState>,
+    window: &adw::ApplicationWindow,
+    transcription_engine: &Rc<RefCell<sdr_transcription::TranscriptionEngine>>,
+) {
+    tracing::info!("tray-quit: shutting down");
+    // Join the tray worker thread first so its callbacks can't fire
+    // against torn-down state during the rest of this teardown.
+    if let Some(mut handle) = state.tray_handle.borrow_mut().take() {
+        handle.shutdown();
+    }
+    // Drop the app-hold guard. Its `Drop` impl calls
+    // `g_application_release()`, which decrements the application's
+    // reference count. Combined with the upcoming `window.destroy()`
+    // (no other windows alive), this lets the GApplication's main
+    // loop exit naturally on the next iteration.
+    let _ = state.app_hold_guard.borrow_mut().take();
+    // Same teardown the original close-request handler did before
+    // close-to-tray took it over.
+    app.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
+    transcription_engine.borrow_mut().shutdown_nonblocking();
+    window.destroy();
 }
 
 #[cfg(test)]

@@ -72,6 +72,7 @@ sdr-rtltcp-discovery.workspace = true
 # Using the path form (not `workspace = true`) because current cargo
 # rejects child-side `default-features = false` when inheriting.
 sdr-server-rtltcp = { path = "../sdr-server-rtltcp", default-features = false }
+sdr-tray.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true
@@ -83,6 +84,12 @@ bytemuck.workspace = true
 gtk4.workspace = true
 libadwaita.workspace = true
 cairo-rs.workspace = true
+
+[dev-dependencies]
+# Isolated temp directories for autostart unit tests — exercises the
+# XDG .desktop writer against a private path so tests never touch
+# ~/.config/autostart/ on the dev box.
+tempfile = { workspace = true }
 
 # Benchmarks — Linux only because `sdr-ui` itself is Linux-gated
 # (see the top-of-file `#![cfg(target_os = "linux")]` in lib.rs).
