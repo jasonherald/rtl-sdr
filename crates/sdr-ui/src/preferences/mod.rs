@@ -21,6 +21,7 @@ const PREFS_HEIGHT: i32 = 500;
 pub fn build_preferences_window(
     parent: &adw::ApplicationWindow,
     config: &Arc<ConfigManager>,
+    tray_available: bool,
 ) -> adw::PreferencesWindow {
     let window = adw::PreferencesWindow::builder()
         .title("Preferences")
@@ -30,7 +31,7 @@ pub fn build_preferences_window(
         .transient_for(parent)
         .build();
 
-    let general_page = general_page::build_general_page(&window, config);
+    let general_page = general_page::build_general_page(&window, config, tray_available);
     window.add(&general_page);
 
     let (accounts_page, _has_credentials) = accounts_page::build_accounts_page();
