@@ -10485,6 +10485,18 @@ fn connect_satellites_panel(
                 // staying weak so a closed/dropped window upgrades to
                 // None and we no-op. Per CR round 3 on PR #571.
                 let exported_window_weak = state_a.apt_viewer_window.borrow().as_ref().cloned();
+                // Snapshot the recording-pass tuple BEFORE spawning
+                // the worker. If a *new* AOS arrives while this PNG
+                // is still encoding, the new pass writes into
+                // `apt_recording_pass`; we must not erase that
+                // brand-new entry when our own (older) export
+                // finishes. The callback only clears the slot if
+                // its current value still matches what we're saving
+                // here — overlapping passes leave the new entry
+                // intact, and a stuck-pending future export can't
+                // wipe a pass that began after it. Per CR round 4
+                // on PR #571.
+                let exported_pass = *state_a.apt_recording_pass.borrow();
                 view.export_png_full_async(path_for_export, mode, rotate_180, move |result| {
                     let (export_ok, msg) = match result {
                         Ok(()) => {
@@ -10542,9 +10554,18 @@ fn connect_satellites_panel(
                         }
                     }
                     // Clear the recording-pass info now that the
-                    // export is done — a subsequent AOS will
-                    // re-stash. Per B2 of the parity work.
-                    *state_for_complete.apt_recording_pass.borrow_mut() = None;
+                    // export is done — but ONLY if the slot still
+                    // holds the same pass we just saved. If a new
+                    // AOS overwrote it while we were encoding, that
+                    // new pass owns the slot now and clearing it
+                    // would silently break the next LOS-side
+                    // rotate-180 lookup. Per CR round 4 on PR #571.
+                    {
+                        let mut slot = state_for_complete.apt_recording_pass.borrow_mut();
+                        if *slot == exported_pass {
+                            *slot = None;
+                        }
+                    }
                 });
             }
             RecorderAction::SaveLrptPass(dir) => {

@@ -202,8 +202,14 @@ impl AptImageRenderer {
     /// transparent everywhere) so subsequent passes start from a
     /// clean canvas; the surface itself is preserved. Also resets
     /// the parallel `AptImage` so PNG export sees only the new
-    /// pass's lines (per-pass calibration), and clears the
-    /// rotate-180 flag (re-set at AOS for the next pass).
+    /// pass's lines (per-pass calibration). Preserves the
+    /// `rotate_180` flag — the AOS flow always calls
+    /// [`AptImageView::set_rotate_180`] right after `clear`, so
+    /// the AOS path doesn't depend on this reset; meanwhile a
+    /// mid-pass user Clear must NOT lose the AOS-stamped pass
+    /// orientation, otherwise a manual export of a half-cleared
+    /// ascending pass comes out unrotated. Per CR round 4 on
+    /// PR #571.
     pub fn clear(&mut self) {
         if let Ok(mut data) = self.surface.data() {
             data.fill(0);
@@ -213,7 +219,6 @@ impl AptImageRenderer {
         // pass-start `Instant` semantically correct as "moment of clear"
         // (= moment a new pass started capturing).
         self.apt_image = AptImage::with_capacity(std::time::Instant::now(), MAX_LINES);
-        self.rotate_180 = false;
     }
 
     /// Set the rotate-180 flag for the in-progress pass. Called by

@@ -348,15 +348,21 @@ pub fn low_pass_kaiser(
 }
 
 /// Generate a Kaiser-windowed sinc bandpass FIR filter that doubles
-/// as a DC-removal stage: passes the band `[transition_width/2, cutoff]`
-/// while suppressing both DC (everything below `transition_width/2`)
-/// and stopband (everything above `cutoff + transition_width/2`).
+/// as a DC-removal stage: transitions out of the DC notch over
+/// roughly `[0, transition_width]`, then passes the band
+/// `~[transition_width, cutoff]` while suppressing the upper
+/// stopband above `cutoff + transition_width/2`.
 ///
 /// Implemented as the difference of two lowpass filters:
 /// `bandpass = lowpass(cutoff) − lowpass(transition_width/2)`.
 /// At DC both filters pass equally so the result nulls; in the
 /// passband only the wider lowpass passes; above cutoff both are in
-/// stopband.
+/// stopband. The inner lowpass's transition is centered at
+/// `transition_width/2`, so the guaranteed-flat passband begins
+/// near `transition_width` (not `transition_width/2`) — the lower
+/// edge `[transition_width/2, transition_width]` is still inside
+/// the inner filter's transition band, not the flat passband.
+/// Per CR round 4 on PR #571.
 ///
 /// Inspired by noaa-apt's `filters::LowpassDcRemoval::design`.
 /// Reimplemented from the canonical "lowpass-difference" bandpass
@@ -619,12 +625,22 @@ mod tests {
     fn abs_fft(signal: &[f32]) -> Vec<f64> {
         use rustfft::FftPlanner;
         use rustfft::num_complex::Complex;
+        // Zero-pad short FIRs up to a much larger FFT length so the
+        // stopband / passband assertions sample the frequency
+        // response at fine resolution. Without padding, an N-tap
+        // filter is sampled at only N frequencies — for the ~30-tap
+        // APT filters that's far too coarse to catch between-bin
+        // peaks and the spec checks risk false greens. Per CR
+        // round 4 on PR #571.
+        const MIN_FFT_LEN: usize = 8_192;
+        let fft_len = signal.len().max(MIN_FFT_LEN).next_power_of_two();
         let mut buf: Vec<Complex<f64>> = signal
             .iter()
             .map(|&x| Complex::new(f64::from(x), 0.0))
             .collect();
+        buf.resize(fft_len, Complex::new(0.0, 0.0));
         let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(buf.len());
+        let fft = planner.plan_fft_forward(fft_len);
         fft.process(&mut buf);
         buf.iter().map(|c| c.norm()).collect()
     }

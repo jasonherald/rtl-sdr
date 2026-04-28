@@ -91,12 +91,47 @@ fn main() {
     // — keeps amplitude symmetric and matches the integration test
     // path. Per CR round 2 on PR #571.
     const PCM16_SCALE: f32 = 32_768.0;
+    // Handle truncated WAVs and non-finite floats gracefully rather
+    // than panicking deep in `unwrap()`. A truncated file aborts the
+    // decode with a clear CLI error; non-finite floats (NaN /
+    // ±Infinity) get filtered out before they reach `AptDecoder` —
+    // they would otherwise propagate through the demod arithmetic
+    // and silently taint the rest of the pipeline. Per CR round 4
+    // on PR #571.
     let raw: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => reader
-            .samples::<i16>()
-            .map(|s| f32::from(s.unwrap()) / PCM16_SCALE)
-            .collect(),
-        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+        hound::SampleFormat::Int => {
+            let mut out = Vec::with_capacity(reader.duration() as usize);
+            for sample in reader.samples::<i16>() {
+                match sample {
+                    Ok(s) => out.push(f32::from(s) / PCM16_SCALE),
+                    Err(e) => {
+                        eprintln!("WAV truncated or corrupt at sample {}: {e}", out.len());
+                        std::process::exit(2);
+                    }
+                }
+            }
+            out
+        }
+        hound::SampleFormat::Float => {
+            let mut out = Vec::with_capacity(reader.duration() as usize);
+            let mut skipped_non_finite = 0_usize;
+            for sample in reader.samples::<f32>() {
+                match sample {
+                    Ok(s) if s.is_finite() => out.push(s),
+                    Ok(_) => skipped_non_finite += 1,
+                    Err(e) => {
+                        eprintln!("WAV truncated or corrupt at sample {}: {e}", out.len());
+                        std::process::exit(2);
+                    }
+                }
+            }
+            if skipped_non_finite > 0 {
+                eprintln!(
+                    "warning: skipped {skipped_non_finite} non-finite f32 samples (NaN / ±Inf)"
+                );
+            }
+            out
+        }
     };
     let samples: Vec<f32> = if spec.channels == 1 {
         raw
