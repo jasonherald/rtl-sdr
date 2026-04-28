@@ -129,20 +129,29 @@ impl ImageAssembler {
         self.channels.get(&apid)
     }
 
-    /// Build an RGB composite from three channels. Returns
-    /// `(width, height, RGB bytes)` or `None` if any of the
-    /// three channels is missing or empty.
+    /// Snapshot of three channels' pixel buffers + their truncated
+    /// height, ready to be handed off to a worker thread for
+    /// composite assembly without holding the assembler lock.
+    /// Returns `None` if any APID is missing or any channel is
+    /// empty. Per CR round 1 on PR #575.
     ///
-    /// Composite height is `min(r.lines, g.lines, b.lines)` — we
-    /// stop at the shortest channel so every output row has
-    /// data from all three.
+    /// Width is implicit ([`IMAGE_WIDTH`]); height is
+    /// `min(r.lines, g.lines, b.lines)` — same shortest-wins rule
+    /// `composite_rgb` uses, so every output row has data from all
+    /// three channels.
+    ///
+    /// The clone is a triple memcpy of the channels' `Vec<u8>`
+    /// buffers (~3 MB each for a full pass). Pure memory-bandwidth
+    /// work — no per-pixel logic — so the lock hold is short
+    /// enough not to back up the decoder thread. Compose the RGB
+    /// bytes via [`assemble_rgb_composite`] outside the lock.
     #[must_use]
-    pub fn composite_rgb(
+    pub fn clone_channels_for_composite(
         &self,
         r_apid: u16,
         g_apid: u16,
         b_apid: u16,
-    ) -> Option<(usize, usize, Vec<u8>)> {
+    ) -> Option<CompositeSnapshot> {
         let r = self.channels.get(&r_apid)?;
         let g = self.channels.get(&g_apid)?;
         let b = self.channels.get(&b_apid)?;
@@ -150,21 +159,91 @@ impl ImageAssembler {
             return None;
         }
         let height = r.lines.min(g.lines).min(b.lines);
-        let mut rgb = Vec::with_capacity(IMAGE_WIDTH * height * 3);
-        for row in 0..height {
-            for col in 0..IMAGE_WIDTH {
-                let idx = row * IMAGE_WIDTH + col;
-                rgb.push(r.pixels[idx]);
-                rgb.push(g.pixels[idx]);
-                rgb.push(b.pixels[idx]);
-            }
-        }
-        Some((IMAGE_WIDTH, height, rgb))
+        Some(CompositeSnapshot {
+            r_pixels: r.pixels.clone(),
+            g_pixels: g.pixels.clone(),
+            b_pixels: b.pixels.clone(),
+            height,
+        })
+    }
+
+    /// Build an RGB composite from three channels. Returns
+    /// `(width, height, RGB bytes)` or `None` if any of the
+    /// three channels is missing or empty.
+    ///
+    /// Composite height is `min(r.lines, g.lines, b.lines)` — we
+    /// stop at the shortest channel so every output row has
+    /// data from all three.
+    ///
+    /// Performs both the channel snapshot AND the RGB interleave
+    /// while holding the assembler's lock. For background-thread
+    /// callers (the LRPT viewer's composite mode + the recorder's
+    /// LOS save), prefer [`Self::clone_channels_for_composite`]
+    /// followed by [`assemble_rgb_composite`] — that pattern
+    /// holds the lock only long enough to memcpy the source
+    /// buffers, then runs the per-pixel interleave outside.
+    /// Per CR round 1 on PR #575.
+    #[must_use]
+    pub fn composite_rgb(
+        &self,
+        r_apid: u16,
+        g_apid: u16,
+        b_apid: u16,
+    ) -> Option<(usize, usize, Vec<u8>)> {
+        let snap = self.clone_channels_for_composite(r_apid, g_apid, b_apid)?;
+        let rgb =
+            assemble_rgb_composite(&snap.r_pixels, &snap.g_pixels, &snap.b_pixels, snap.height);
+        Some((IMAGE_WIDTH, snap.height, rgb))
     }
 
     pub fn clear(&mut self) {
         self.channels.clear();
     }
+}
+
+/// Cloned channel pixels for one (r, g, b) composite recipe,
+/// produced by [`ImageAssembler::clone_channels_for_composite`]
+/// under the assembler's lock. Hand off to a worker thread (or
+/// run inline) and assemble via [`assemble_rgb_composite`]
+/// without holding the lock. Per CR round 1 on PR #575.
+#[derive(Clone, Debug)]
+pub struct CompositeSnapshot {
+    /// Cloned pixel buffer for the R channel (greyscale, row-major,
+    /// width = [`IMAGE_WIDTH`]). Length must be `IMAGE_WIDTH * height`.
+    pub r_pixels: Vec<u8>,
+    /// Cloned pixel buffer for the G channel.
+    pub g_pixels: Vec<u8>,
+    /// Cloned pixel buffer for the B channel.
+    pub b_pixels: Vec<u8>,
+    /// `min(r.lines, g.lines, b.lines)` — every row in the output
+    /// has data from all three channels.
+    pub height: usize,
+}
+
+/// Interleave three same-shape greyscale channel buffers into an
+/// RGB byte buffer ([R, G, B, R, G, B, …], row-major, width =
+/// [`IMAGE_WIDTH`]). Pure CPU work — call this OUTSIDE the
+/// assembler lock, on the snapshot returned by
+/// [`ImageAssembler::clone_channels_for_composite`]. Per CR round
+/// 1 on PR #575.
+///
+/// Out-of-bounds reads are panic-prevented by truncating to
+/// `min(r.len(), g.len(), b.len(), IMAGE_WIDTH * height)` —
+/// callers passing a [`CompositeSnapshot`] always satisfy the
+/// shape contract, but defensive bounds keep a corrupted
+/// snapshot from panicking inside a `gio::spawn_blocking` worker
+/// where the panic payload is harder to surface.
+#[must_use]
+pub fn assemble_rgb_composite(r: &[u8], g: &[u8], b: &[u8], height: usize) -> Vec<u8> {
+    let total_pixels = IMAGE_WIDTH.saturating_mul(height);
+    let bound = total_pixels.min(r.len()).min(g.len()).min(b.len());
+    let mut rgb = Vec::with_capacity(bound * 3);
+    for idx in 0..bound {
+        rgb.push(r[idx]);
+        rgb.push(g[idx]);
+        rgb.push(b[idx]);
+    }
+    rgb
 }
 
 #[cfg(test)]

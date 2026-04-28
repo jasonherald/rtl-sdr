@@ -10923,29 +10923,31 @@ fn connect_satellites_panel(
                         .collect()
                 };
                 // Composite snapshots — only when the user opted in
-                // via the panel toggle. Each entry is the recipe
-                // alongside the ready-to-encode RGB byte buffer
-                // (interleaved 3-bytes-per-pixel). Built on the
-                // GTK main thread under one shared-image mutex
-                // hold so the worker thread doesn't have to
-                // re-enter the assembler. Recipes whose source
-                // APIDs aren't all present silently filter out
-                // here — we only carry composites that
-                // `composite_rgb` could actually produce. Per
-                // #547.
+                // via the panel toggle. Each entry is the recipe +
+                // a [`CompositeSnapshot`] (cloned source channel
+                // pixel buffers + truncated height). Built on the
+                // GTK main thread but the assembler lock is held
+                // only long enough to memcpy the source channels
+                // (~5 ms per recipe for full-pass data, vs ~30 ms
+                // for the full RGB interleave that happens in the
+                // worker). The expensive per-pixel interleave +
+                // PNG encode runs inside `gio::spawn_blocking`
+                // below. Per CR round 1 on PR #575.
                 let composites_on = auto_record_composites_switch_a.is_active();
                 let composite_snapshots: Vec<(
                     crate::lrpt_viewer::CompositeRecipe,
-                    usize,
-                    usize,
-                    Vec<u8>,
+                    sdr_lrpt::image::CompositeSnapshot,
                 )> = if composites_on {
                     state_a.lrpt_image.with_assembler(|a| {
                         crate::lrpt_viewer::COMPOSITE_CATALOG
                             .iter()
                             .filter_map(|recipe| {
-                                a.composite_rgb(recipe.r_apid, recipe.g_apid, recipe.b_apid)
-                                    .map(|(w, h, rgb)| (*recipe, w, h, rgb))
+                                a.clone_channels_for_composite(
+                                    recipe.r_apid,
+                                    recipe.g_apid,
+                                    recipe.b_apid,
+                                )
+                                .map(|snap| (*recipe, snap))
                             })
                             .collect()
                     })
@@ -11027,8 +11029,23 @@ fn connect_satellites_panel(
                         // spaces replaced by `-` and path
                         // separators replaced by `_` so the disk
                         // layout is portable across filesystems.
-                        // Per #547.
-                        for (recipe, width, height, rgb) in composite_snapshots {
+                        //
+                        // The RGB interleave runs HERE — inside the
+                        // `gio::spawn_blocking` worker — so the
+                        // ~30 ms per-recipe per-pixel walk doesn't
+                        // block the GTK main thread. The assembler
+                        // lock was released after the cheap channel
+                        // memcpy in the snapshot phase above. Per
+                        // CR round 1 on PR #575.
+                        for (recipe, snap) in composite_snapshots {
+                            let rgb = sdr_lrpt::image::assemble_rgb_composite(
+                                &snap.r_pixels,
+                                &snap.g_pixels,
+                                &snap.b_pixels,
+                                snap.height,
+                            );
+                            let width = sdr_lrpt::image::IMAGE_WIDTH;
+                            let height = snap.height;
                             let slug = recipe
                                 .name
                                 .replace(' ', "-")

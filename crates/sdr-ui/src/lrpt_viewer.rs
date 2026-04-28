@@ -129,9 +129,14 @@ pub const COMPOSITE_CATALOG: &[CompositeRecipe] = &[
     },
     CompositeRecipe {
         name: "Thermal IR (243)",
-        r_apid: 68,
-        g_apid: 66,
-        b_apid: 65,
+        // The "243" label denotes channels 2/4/3 in canonical
+        // Meteor channel notation: R=channel-2 (APID 65),
+        // G=channel-4 (APID 68), B=channel-3 (APID 66). The
+        // earlier draft swapped the green and red slots — flagged
+        // by CR round 1 on PR #575.
+        r_apid: 65,
+        g_apid: 68,
+        b_apid: 66,
     },
 ];
 
@@ -501,18 +506,33 @@ impl LrptImageRenderer {
     /// no-panic library-crate rule the rest of the renderer
     /// follows.
     pub fn set_composite(&mut self, recipe: CompositeRecipe, image: &LrptImage) -> bool {
-        let composite_bytes =
-            image.with_assembler(|a| a.composite_rgb(recipe.r_apid, recipe.g_apid, recipe.b_apid));
-        let Some((width, height, rgb)) = composite_bytes else {
+        // Two-phase pattern: hold the assembler lock only long
+        // enough to memcpy the three source channel buffers, then
+        // do the per-pixel RGB interleave + ARGB32 surface build
+        // OUTSIDE the lock. The decoder thread doesn't get blocked
+        // behind a full-frame walk anymore. Per CR round 1 on PR
+        // #575.
+        let snap = image.with_assembler(|a| {
+            a.clone_channels_for_composite(recipe.r_apid, recipe.g_apid, recipe.b_apid)
+        });
+        let Some(snap) = snap else {
             tracing::debug!(
                 ?recipe,
-                "composite_rgb returned None — one or more source APIDs missing or empty",
+                "clone_channels_for_composite returned None — one or more source APIDs missing or empty",
             );
             self.active_composite = Some(recipe);
             self.composite_cache = None;
             return false;
         };
-        let surface = match build_argb32_from_rgb(&rgb, width, height) {
+        // Lock released. Heavy work runs on the GTK main thread,
+        // but no longer racing with the decoder.
+        let rgb = sdr_lrpt::image::assemble_rgb_composite(
+            &snap.r_pixels,
+            &snap.g_pixels,
+            &snap.b_pixels,
+            snap.height,
+        );
+        let surface = match build_argb32_from_rgb(&rgb, IMAGE_WIDTH, snap.height) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(?recipe, error = %e, "composite ARGB32 surface build failed");
@@ -522,7 +542,10 @@ impl LrptImageRenderer {
             }
         };
         self.active_composite = Some(recipe);
-        self.composite_cache = Some(CompositeSurface { surface, height });
+        self.composite_cache = Some(CompositeSurface {
+            surface,
+            height: snap.height,
+        });
         true
     }
 
@@ -1565,13 +1588,16 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
                     })
             };
 
-            // Always rebuild the composite cache when composite
-            // mode is active — new lines may have arrived in
-            // the underlying per-APID channels since the last
-            // tick. Cheap relative to the full pass: each rebuild
-            // walks `min(r,g,b).lines × IMAGE_WIDTH × 3` bytes.
-            // Per #547.
-            if let Some(recipe) = view_for_tick.active_composite() {
+            // Rebuild the composite cache when composite mode is
+            // active so newly-decoded lines accrue in near-real-
+            // time. Skip the rebuild while the user has the viewer
+            // paused — `set_composite` always queues a redraw, and
+            // the pause contract says the canvas should freeze
+            // until Resume is clicked. The next non-paused tick
+            // catches up. Per #547 + CR round 1 on PR #575.
+            if let Some(recipe) = view_for_tick.active_composite()
+                && !view_for_tick.is_paused()
+            {
                 let _ = view_for_tick.set_composite(recipe);
             }
 
