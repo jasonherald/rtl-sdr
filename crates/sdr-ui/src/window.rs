@@ -552,6 +552,105 @@ pub fn build_window(
         glib::Propagation::Proceed
     });
 
+    // --- tray-* GIO actions (per #512 close-to-tray) ---
+    //
+    // These are activated by `app.rs::spawn_tray_and_route` which
+    // forwards `sdr_tray::TrayEvent`s from the tray worker thread
+    // to the GTK main loop via `app.activate_action(...)`.
+    //
+    // Registered here (rather than in `setup_app_actions`) because
+    // the `tray-quit` handler captures `transcription_engine`, which
+    // is only constructed below the `setup_app_actions(...)` call.
+
+    let tray_show = gio::SimpleAction::new("tray-show", None);
+    tray_show.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            window.present();
+        }
+    ));
+    app.add_action(&tray_show);
+
+    let tray_hide = gio::SimpleAction::new("tray-hide", None);
+    tray_hide.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            window.set_visible(false);
+        }
+    ));
+    app.add_action(&tray_hide);
+
+    let tray_toggle = gio::SimpleAction::new("tray-toggle", None);
+    tray_toggle.connect_activate(glib::clone!(
+        #[weak]
+        window,
+        move |_, _| {
+            if window.is_visible() {
+                window.set_visible(false);
+            } else {
+                window.present();
+            }
+        }
+    ));
+    app.add_action(&tray_toggle);
+
+    // tray-quit: confirm if recording is active, otherwise tear down
+    // immediately. The teardown sequence: stop the tray worker thread,
+    // drop the application hold guard (which Drop-fires `release()`),
+    // remove the tune-satellite action (its closure captures
+    // window-owned widgets), shut down transcription, destroy the
+    // window. Once the hold guard is dropped and the window is gone,
+    // the GApplication's reference count drops to zero and the main
+    // loop exits naturally.
+    let tray_quit = gio::SimpleAction::new("tray-quit", None);
+    let app_for_quit = app.clone();
+    let state_for_quit = Rc::clone(&state);
+    let window_for_quit = window.clone();
+    let transcription_for_quit = Rc::clone(&transcription_engine);
+    tray_quit.connect_activate(move |_, _| {
+        if state_for_quit.is_recording() {
+            // Confirmation modal. WM-close (clicking the dialog's X)
+            // maps to "cancel" via `set_close_response`.
+            let dialog = adw::MessageDialog::builder()
+                .transient_for(&window_for_quit)
+                .modal(true)
+                .heading("Recording in progress")
+                .body("Quit anyway? The current pass will not be saved.")
+                .build();
+            dialog.add_response("cancel", "_Cancel");
+            dialog.add_response("quit", "_Quit anyway");
+            dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let app_for_response = app_for_quit.clone();
+            let state_for_response = Rc::clone(&state_for_quit);
+            let window_for_response = window_for_quit.clone();
+            let transcription_for_response = Rc::clone(&transcription_for_quit);
+            dialog.connect_response(None, move |dlg, response| {
+                if response == "quit" {
+                    perform_real_quit(
+                        &app_for_response,
+                        &state_for_response,
+                        &window_for_response,
+                        &transcription_for_response,
+                    );
+                }
+                dlg.close();
+            });
+            dialog.present();
+            return;
+        }
+        perform_real_quit(
+            &app_for_quit,
+            &state_for_quit,
+            &window_for_quit,
+            &transcription_for_quit,
+        );
+    });
+    app.add_action(&tray_quit);
+
     // --- Keyboard shortcuts ---
     shortcuts::setup_shortcuts(
         &window,
@@ -12331,6 +12430,36 @@ fn recording_path(prefix: &str) -> std::path::PathBuf {
         .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
         .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
     base.join(format!("{prefix}-{timestamp}.wav"))
+}
+
+/// Tear down the application after a tray-Quit confirmation. Joins
+/// the tray worker thread, drops the `app.hold()` guard so the
+/// `GApplication` can release naturally, removes the notification
+/// action whose closure captures window-owned widgets, shuts down
+/// the transcription engine, and destroys the window. Per #512.
+fn perform_real_quit(
+    app: &adw::Application,
+    state: &Rc<AppState>,
+    window: &adw::ApplicationWindow,
+    transcription_engine: &Rc<RefCell<sdr_transcription::TranscriptionEngine>>,
+) {
+    tracing::info!("tray-quit: shutting down");
+    // Join the tray worker thread first so its callbacks can't fire
+    // against torn-down state during the rest of this teardown.
+    if let Some(mut handle) = state.tray_handle.borrow_mut().take() {
+        handle.shutdown();
+    }
+    // Drop the app-hold guard. Its `Drop` impl calls
+    // `g_application_release()`, which decrements the application's
+    // reference count. Combined with the upcoming `window.destroy()`
+    // (no other windows alive), this lets the GApplication's main
+    // loop exit naturally on the next iteration.
+    let _ = state.app_hold_guard.borrow_mut().take();
+    // Same teardown the original close-request handler did before
+    // close-to-tray took it over.
+    app.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
+    transcription_engine.borrow_mut().shutdown_nonblocking();
+    window.destroy();
 }
 
 #[cfg(test)]
