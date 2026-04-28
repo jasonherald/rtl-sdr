@@ -1,0 +1,15 @@
+[package]
+name = "sdr-tray"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "StatusNotifierItem tray-icon sidecar for sdr-rs (Linux only)"
+
+[dependencies]
+ksni = "0.3"
+smol = "2"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

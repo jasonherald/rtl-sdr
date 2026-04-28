@@ -120,6 +120,7 @@ members = [
     "crates/sdr-splash",
     "crates/sdr-splash-gtk",
     "crates/sdr-ui",
+    "crates/sdr-tray",
 ]
 
 [workspace.package]
@@ -152,6 +153,9 @@ sdr-ffi = { path = "crates/sdr-ffi" }
 sdr-splash = { path = "crates/sdr-splash" }
 sdr-splash-gtk = { path = "crates/sdr-splash-gtk" }
 sdr-ui = { path = "crates/sdr-ui" }
+sdr-tray = { path = "crates/sdr-tray" }
+ksni = "0.3"
+smol = "2"
 
 # HTTP / XML (RadioReference)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
