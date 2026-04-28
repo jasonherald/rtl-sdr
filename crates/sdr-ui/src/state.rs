@@ -185,6 +185,32 @@ pub struct AppState {
     /// lookup. Per B2 of the noaa-apt parity work + CR round 2 on
     /// PR #571.
     pub apt_recording_pass: RefCell<Option<(u32, chrono::DateTime<chrono::Utc>)>>,
+    /// `true` when the user closes the window the app should hide
+    /// instead of exiting. Default `true` — set by `build_window`
+    /// from the persisted config (key `close_to_tray`). Per #512.
+    pub close_to_tray: Cell<bool>,
+    /// `true` once the user has hidden the window at least once with
+    /// the close button — used to fire the "App still running in
+    /// tray …" toast exactly once per fresh config. Per #512.
+    pub tray_first_close_seen: Cell<bool>,
+    /// `true` while the tray service is alive and registered with
+    /// the session bus. Defaults `true` (optimistic) and is flipped
+    /// to `false` if `sdr_tray::spawn` returns Err. The close-request
+    /// handler short-circuits to `Propagation::Proceed` when this is
+    /// false. Per #512.
+    pub tray_available: Cell<bool>,
+    /// `true` while a `StartAudioRecording` is in flight. Used by
+    /// `AppState::is_recording` to gate the tray-Quit confirmation.
+    /// Per #512.
+    pub audio_recording_active: Cell<bool>,
+    /// `true` while a `StartIqRecording` is in flight. Per #512.
+    pub iq_recording_active: Cell<bool>,
+    /// `true` between an LRPT auto-record AOS and LOS. Per #512.
+    pub lrpt_recording_active: Cell<bool>,
+    /// Owned handle to the tray service. Held in `AppState` so the
+    /// `tray-quit` action can `shutdown()` to join the worker thread
+    /// before `app.release()`. Per #512.
+    pub tray_handle: RefCell<Option<sdr_tray::TrayHandle>>,
     /// Currently-open Meteor-M LRPT viewer window, or `None`
     /// when no viewer is open. Same lifecycle pattern as
     /// `apt_viewer` above. Per epic #469 task 7.
@@ -233,6 +259,13 @@ impl AppState {
             apt_viewer: RefCell::new(None),
             apt_viewer_window: RefCell::new(None),
             apt_recording_pass: RefCell::new(None),
+            close_to_tray: Cell::new(true),
+            tray_first_close_seen: Cell::new(false),
+            tray_available: Cell::new(true),
+            audio_recording_active: Cell::new(false),
+            iq_recording_active: Cell::new(false),
+            lrpt_recording_active: Cell::new(false),
+            tray_handle: RefCell::new(None),
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
@@ -244,6 +277,22 @@ impl AppState {
         if let Err(e) = self.ui_tx.send(msg) {
             tracing::warn!("failed to send DSP command: {e}");
         }
+    }
+
+    /// `true` if the app is actively writing pass artifacts to disk —
+    /// any APT pass, LRPT pass, audio recording, or IQ recording.
+    /// Used to gate the tray-Quit confirmation modal.
+    ///
+    /// Maintenance contract: every new "we're writing pass artifacts"
+    /// state added to `AppState` MUST be OR-ed in here, and the
+    /// table-driven test in `is_recording_table` must be extended.
+    /// Otherwise a future recording type can be silently dropped on Quit.
+    #[must_use]
+    pub fn is_recording(&self) -> bool {
+        self.apt_recording_pass.borrow().is_some()
+            || self.lrpt_recording_active.get()
+            || self.audio_recording_active.get()
+            || self.iq_recording_active.get()
     }
 
     /// Dispatch `UiToDsp::SetVfoOffset(hz)` AND synchronously
@@ -323,6 +372,52 @@ mod tests {
         drop(rx);
         // Should not panic — just logs a warning.
         state.send_dsp(UiToDsp::Stop);
+    }
+
+    #[test]
+    fn defaults_are_safe_for_close_to_tray() {
+        let s = make_test_state();
+        assert!(s.close_to_tray.get(), "default close_to_tray must be true");
+        assert!(!s.tray_first_close_seen.get());
+        assert!(s.tray_available.get());
+        assert!(!s.audio_recording_active.get());
+        assert!(!s.iq_recording_active.get());
+        assert!(!s.lrpt_recording_active.get());
+    }
+
+    #[test]
+    fn is_recording_is_false_when_idle() {
+        let s = make_test_state();
+        assert!(!s.is_recording());
+    }
+
+    #[test]
+    fn is_recording_table() {
+        // Each row: (apt, lrpt, audio, iq, expected)
+        let cases = [
+            (false, false, false, false, false),
+            (true, false, false, false, true),
+            (false, true, false, false, true),
+            (false, false, true, false, true),
+            (false, false, false, true, true),
+            (true, true, true, true, true),
+            (true, false, false, true, true),
+            (false, true, true, false, true),
+        ];
+        for (apt, lrpt, audio, iq, expected) in cases {
+            let s = make_test_state();
+            if apt {
+                *s.apt_recording_pass.borrow_mut() = Some((33_591, chrono::Utc::now()));
+            }
+            s.lrpt_recording_active.set(lrpt);
+            s.audio_recording_active.set(audio);
+            s.iq_recording_active.set(iq);
+            assert_eq!(
+                s.is_recording(),
+                expected,
+                "row apt={apt} lrpt={lrpt} audio={audio} iq={iq}",
+            );
+        }
     }
 
     #[test]
