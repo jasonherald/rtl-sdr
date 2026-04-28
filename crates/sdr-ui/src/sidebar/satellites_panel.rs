@@ -128,6 +128,14 @@ pub const KEY_AUTO_RECORD_AUDIO: &str = "sat_auto_record_audio";
 /// Config key for the auto-record quality threshold (selected
 /// `AutoRecordQuality` tier). Per #511.
 pub const KEY_AUTO_RECORD_QUALITY: &str = "sat_auto_record_quality";
+/// Persisted "save false-colour composites alongside per-APID
+/// PNGs" toggle. Pairs with [`KEY_AUTO_RECORD_APT`] but only
+/// has effect for LRPT passes (where multiple APIDs are
+/// decoded and the composite recipes have something to combine);
+/// NOAA APT passes are single-channel and ignore this. Default:
+/// `false` (opt-in — composites add a few MB per pass and not
+/// every user wants the extras). Per #547.
+pub const KEY_AUTO_RECORD_COMPOSITES: &str = "sat_auto_record_composites";
 
 /// Pass-quality tiers that gate the auto-record-on-pass feature.
 /// User-selectable via the `AdwComboRow` next to the auto-record
@@ -300,6 +308,13 @@ pub struct SatellitesPanel {
     /// demodulated audio lands in `~/sdr-recordings/audio-{slug}-
     /// {timestamp}.wav` paired with the PNG. Per #533.
     pub auto_record_audio_switch: adw::SwitchRow,
+    /// "Save false-colour composites" toggle — LRPT only. When
+    /// on AND `auto_record_switch` is on, the recorder's
+    /// `SaveLrptPass` handler writes one extra PNG per recipe in
+    /// `lrpt_viewer::COMPOSITE_CATALOG` into the per-pass
+    /// directory, named `composite-{slug}.png`. NOAA APT passes
+    /// ignore this — they're single-channel by nature. Per #547.
+    pub auto_record_composites_switch: adw::SwitchRow,
     /// Combo row selecting which pass-quality tier triggers
     /// auto-record. Sensitive only when `auto_record_switch` is
     /// on. Per #511.
@@ -366,6 +381,8 @@ pub struct SatellitesPanelWeak {
     pub auto_record_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::auto_record_audio_switch`].
     pub auto_record_audio_switch: glib::WeakRef<adw::SwitchRow>,
+    /// Weak ref to [`SatellitesPanel::auto_record_composites_switch`].
+    pub auto_record_composites_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::auto_record_quality_row`].
     pub auto_record_quality_row: glib::WeakRef<adw::ComboRow>,
     /// Weak ref to [`SatellitesPanel::doppler_switch`].
@@ -396,6 +413,7 @@ impl SatellitesPanel {
             notify_lead_row: self.notify_lead_row.downgrade(),
             auto_record_switch: self.auto_record_switch.downgrade(),
             auto_record_audio_switch: self.auto_record_audio_switch.downgrade(),
+            auto_record_composites_switch: self.auto_record_composites_switch.downgrade(),
             auto_record_quality_row: self.auto_record_quality_row.downgrade(),
             doppler_switch: self.doppler_switch.downgrade(),
             passes_group: self.passes_group.downgrade(),
@@ -426,6 +444,7 @@ impl SatellitesPanelWeak {
             notify_lead_row: self.notify_lead_row.upgrade()?,
             auto_record_switch: self.auto_record_switch.upgrade()?,
             auto_record_audio_switch: self.auto_record_audio_switch.upgrade()?,
+            auto_record_composites_switch: self.auto_record_composites_switch.upgrade()?,
             auto_record_quality_row: self.auto_record_quality_row.upgrade()?,
             doppler_switch: self.doppler_switch.upgrade()?,
             passes_group: self.passes_group.upgrade()?,
@@ -631,6 +650,25 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .build();
     recording_group.add(&auto_record_audio_switch);
 
+    // False-colour composites — LRPT only. Off by default —
+    // composites add a few PNG files per pass (one per recipe in
+    // `lrpt_viewer::COMPOSITE_CATALOG`, currently 3) and not
+    // every user wants the extras. NOAA APT passes ignore this
+    // toggle by nature: APT is a single-channel format and the
+    // recorder branches on `RecorderAction::SavePng` (per-pass
+    // single PNG) vs. `RecorderAction::SaveLrptPass` (per-pass
+    // directory) before reading this switch. Per #547.
+    let auto_record_composites_switch = adw::SwitchRow::builder()
+        .title("Save false-colour composites — LRPT only")
+        .subtitle(
+            "Write RGB composite PNGs (Natural colour, False-colour IR, Thermal IR) \
+             alongside the per-APID files. NOAA APT passes ignore this — they're \
+             single-channel by nature.",
+        )
+        .active(false)
+        .build();
+    recording_group.add(&auto_record_composites_switch);
+
     let doppler_switch = adw::SwitchRow::builder()
         .title("Doppler tracking")
         .subtitle("Auto-correct frequency drift during satellite passes")
@@ -676,6 +714,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         notify_lead_row,
         auto_record_switch,
         auto_record_audio_switch,
+        auto_record_composites_switch,
         auto_record_quality_row,
         doppler_switch,
         passes_group,
@@ -718,6 +757,14 @@ pub fn load_auto_record_apt(config: &Arc<ConfigManager>) -> bool {
 #[must_use]
 pub fn load_auto_record_audio(config: &Arc<ConfigManager>) -> bool {
     read_bool_or(config, KEY_AUTO_RECORD_AUDIO, false)
+}
+
+/// Read the persisted "save false-colour composites" toggle.
+/// Defaults to `false` (opt-in — composites add a few MB per
+/// pass and not every user wants the extras). Per #547.
+#[must_use]
+pub fn load_auto_record_composites(config: &Arc<ConfigManager>) -> bool {
+    read_bool_or(config, KEY_AUTO_RECORD_COMPOSITES, false)
 }
 
 /// Read the persisted auto-record quality threshold. Defaults to
@@ -777,6 +824,13 @@ pub fn save_auto_record_apt(config: &Arc<ConfigManager>, value: bool) {
 pub fn save_auto_record_audio(config: &Arc<ConfigManager>, value: bool) {
     config.write(|v| {
         v[KEY_AUTO_RECORD_AUDIO] = serde_json::json!(value);
+    });
+}
+
+/// Symmetric writer for [`load_auto_record_composites`]. Per #547.
+pub fn save_auto_record_composites(config: &Arc<ConfigManager>, value: bool) {
+    config.write(|v| {
+        v[KEY_AUTO_RECORD_COMPOSITES] = serde_json::json!(value);
     });
 }
 
@@ -1679,5 +1733,26 @@ mod tests {
             save_auto_record_quality(&config, quality);
             assert_eq!(load_auto_record_quality(&config), quality);
         }
+    }
+
+    // ─── Composites toggle (#547) ──────────────────────────────────
+
+    #[test]
+    fn auto_record_composites_default_is_false() {
+        // Opt-in: a fresh install must NOT start writing extra
+        // composite PNGs without the user asking. Pin the
+        // default so a future read-helper refactor can't flip it
+        // accidentally. Per #547.
+        let config = make_config();
+        assert!(!load_auto_record_composites(&config));
+    }
+
+    #[test]
+    fn auto_record_composites_save_load_round_trips() {
+        let config = make_config();
+        save_auto_record_composites(&config, true);
+        assert!(load_auto_record_composites(&config));
+        save_auto_record_composites(&config, false);
+        assert!(!load_auto_record_composites(&config));
     }
 }

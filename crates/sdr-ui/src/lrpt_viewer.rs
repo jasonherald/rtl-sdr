@@ -779,6 +779,112 @@ pub fn write_greyscale_png(
     Ok(())
 }
 
+/// Write a tightly-sized PNG of interleaved RGB `pixels` (3 bytes
+/// per pixel — R, G, B — row-major, length `width * height * 3`)
+/// to `path`. Mirror of [`write_greyscale_png`] for the LRPT
+/// composite LOS-save path: the recorder snapshots
+/// `ImageAssembler::composite_rgb` output (which already returns
+/// interleaved RGB) and hands it straight here. Same Cairo
+/// `write_to_png` pipeline as the greyscale path so error
+/// semantics line up across both writers. Per #547.
+///
+/// Cairo's PNG encoder emits the surface as RGBA when the format
+/// is `ARgb32`; alpha is unconditionally `0xFF` in this writer
+/// (no transparency in LRPT imagery), so consumers that only
+/// understand RGB read the same pixels as if alpha were absent.
+///
+/// # Errors
+///
+/// Returns the same [`ViewerError`] variants as
+/// [`write_greyscale_png`]: `DimensionTooLarge`, `ZeroSized`,
+/// `InvalidBuffer`, `Io`, `Cairo`, `SurfaceDataLock`,
+/// `InvalidStride`, `PngEncode`.
+pub fn write_rgb_png(
+    path: &Path,
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<(), ViewerError> {
+    // Validate dimensions fit Cairo's `i32` API up front, same
+    // shape as `write_greyscale_png`. Practically unreachable
+    // for LRPT (IMAGE_WIDTH = 1568, MAX_LINES = 8192) but the
+    // defensive try_from keeps `write_rgb_png` honest as a `pub`
+    // library function — same rationale as the greyscale
+    // writer's round-9 fix on PR #543.
+    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "width",
+        value: width,
+    })?;
+    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "height",
+        value: height,
+    })?;
+    // Zero-size guard runs BEFORE buffer-shape validation so a
+    // call with zero dimensions reports `ZeroSized` rather than
+    // masking it as a generic `InvalidBuffer` length-mismatch —
+    // same ordering as `write_greyscale_png` (per CR on PR
+    // #550).
+    if width == 0 || height == 0 {
+        return Err(ViewerError::ZeroSized);
+    }
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or(ViewerError::DimensionTooLarge {
+            dim: "width × height × 3",
+            value: usize::MAX,
+        })?;
+    if pixels.len() != expected {
+        return Err(ViewerError::InvalidBuffer(format!(
+            "RGB PNG pixel buffer length {} doesn't match width*height*3 ({}*{}*3 = {})",
+            pixels.len(),
+            width,
+            height,
+            expected,
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
+            op: "create_dir_all",
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width_i32, height_i32)
+        .map_err(|e| ViewerError::Cairo {
+            op: "export surface",
+            source: e,
+        })?;
+    {
+        let stride = usize::try_from(surface.stride())?;
+        let mut data = surface.data()?;
+        for row in 0..height {
+            let row_offset = row * stride;
+            let pixel_row_offset = row * width * 3;
+            for col in 0..width {
+                let r = pixels[pixel_row_offset + col * 3];
+                let g = pixels[pixel_row_offset + col * 3 + 1];
+                let b = pixels[pixel_row_offset + col * 3 + 2];
+                let pixel_offset = row_offset + col * BYTES_PER_PIXEL;
+                // Cairo ARGB32 little-endian byte order:
+                //   data[0] = B, data[1] = G, data[2] = R, data[3] = A.
+                data[pixel_offset] = b;
+                data[pixel_offset + 1] = g;
+                data[pixel_offset + 2] = r;
+                data[pixel_offset + 3] = 0xFF;
+            }
+        }
+    }
+    let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
+        op: "file create",
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    surface.write_to_png(&mut file)?;
+    Ok(())
+}
+
 /// Paint `surface` (an `IMAGE_WIDTH × n_lines` Cairo image
 /// surface) into `cr`, scaled to fit `(width, height)` while
 /// preserving the `IMAGE_WIDTH : n_lines` aspect. Centred
@@ -2217,5 +2323,64 @@ mod tests {
         // build a malformed surface.
         let rgb = vec![0; 10];
         assert!(build_argb32_from_rgb(&rgb, 4, 4).is_err());
+    }
+
+    // ─── write_rgb_png (#547) ───────────────────────────────
+
+    #[test]
+    fn write_rgb_png_round_trips_to_a_real_file() {
+        // Pin the new RGB writer used by the LRPT composite
+        // LOS-save path. Per #547.
+        use std::io::Read;
+        const W: usize = 32;
+        const H: usize = 8;
+        let pixels: Vec<u8> = (0..W * H * 3)
+            .map(|i| u8::try_from(i & 0xff).unwrap_or(0))
+            .collect();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = std::env::temp_dir().join(format!("sdr-ui-lrpt-rgb-{nanos}.png"));
+        write_rgb_png(&path, &pixels, W, H).expect("write_rgb_png");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert!(metadata.len() > 0);
+        let mut header = [0_u8; 8];
+        let mut f = std::fs::File::open(&path).expect("open");
+        f.read_exact(&mut header).expect("read_exact");
+        assert_eq!(&header, b"\x89PNG\r\n\x1a\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_rgb_png_rejects_size_mismatch() {
+        let path = std::env::temp_dir().join("sdr-ui-lrpt-rgb-mismatch.png");
+        // 10 bytes can't equal 4*4*3 = 48 — should fail without
+        // creating the file.
+        let result = write_rgb_png(&path, &[0_u8; 10], 4, 4);
+        assert!(result.is_err());
+        assert!(
+            !path.exists(),
+            "no file should be written on size-mismatch error",
+        );
+    }
+
+    #[test]
+    fn write_rgb_png_rejects_zero_size() {
+        let path = std::env::temp_dir().join("sdr-ui-lrpt-rgb-zero.png");
+        let result = write_rgb_png(&path, &[], 0, 0);
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_rgb_png_zero_dim_with_pixels_reports_zero_sized() {
+        // Same ordering invariant `write_greyscale_png` has: a
+        // zero-dim call with a non-empty pixel buffer surfaces as
+        // `ZeroSized`, not as the generic `InvalidBuffer`
+        // length-mismatch.
+        let path = std::env::temp_dir().join("sdr-ui-lrpt-rgb-zero-dim.png");
+        let result = write_rgb_png(&path, &[1_u8, 2, 3], 0, 1);
+        assert!(matches!(result, Err(crate::viewer::ViewerError::ZeroSized)));
+        assert!(!path.exists());
     }
 }

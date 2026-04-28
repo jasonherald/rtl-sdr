@@ -9709,9 +9709,10 @@ fn connect_satellites_panel(
         AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
         SatellitesPanelWeak, enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh,
         format_pass_subtitle, format_pass_title, load_auto_record_apt, load_auto_record_audio,
-        load_auto_record_quality, load_notify_lead_min, load_station_alt_m, load_station_lat_deg,
-        load_station_lon_deg, load_watched_satellites, norad_id_for_pass, save_auto_record_apt,
-        save_auto_record_audio, save_f64, save_tle_last_refresh, save_watched_satellites,
+        load_auto_record_composites, load_auto_record_quality, load_notify_lead_min,
+        load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
+        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
+        save_auto_record_composites, save_f64, save_tle_last_refresh, save_watched_satellites,
         tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
@@ -9756,6 +9757,9 @@ fn connect_satellites_panel(
     panel
         .auto_record_audio_switch
         .set_active(load_auto_record_audio(config));
+    panel
+        .auto_record_composites_switch
+        .set_active(load_auto_record_composites(config));
     let initial_quality = load_auto_record_quality(config);
     panel
         .auto_record_quality_row
@@ -10057,6 +10061,22 @@ fn connect_satellites_panel(
             .auto_record_audio_switch
             .connect_active_notify(move |sw| {
                 save_auto_record_audio(&config_audio, sw.is_active());
+            });
+    }
+
+    // "Save false-colour composites" toggle — persist only. The
+    // `RecorderAction::SaveLrptPass` handler reads
+    // `panel.auto_record_composites_switch.is_active()` at LOS
+    // (mirrors the audio-save sampling pattern — flipping
+    // mid-pass doesn't retroactively start or stop anything).
+    // Per #547.
+    {
+        let config_comp = std::sync::Arc::clone(config);
+        panel
+            .auto_record_composites_switch
+            .connect_active_notify(move |sw| {
+                save_auto_record_composites(&config_comp, sw.is_active());
+                tracing::info!(on = sw.is_active(), "auto_record_composites persisted");
             });
     }
 
@@ -10415,6 +10435,12 @@ fn connect_satellites_panel(
         let squelch_level_row_a = panels.radio.squelch_level_row.clone();
         let ctcss_row_a = panels.radio.ctcss_row.clone();
         let fm_if_nr_row_a = panels.radio.fm_if_nr_row.clone();
+        // Composite-save toggle — read at LOS by the
+        // `SaveLrptPass` handler. Strong clone so the closure
+        // doesn't need to upgrade a weak ref against panel
+        // teardown ordering: every other panel widget the
+        // closure captures is a strong clone too. Per #547.
+        let auto_record_composites_switch_a = panel.auto_record_composites_switch.clone();
         let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
             if let Some(overlay) = overlay_weak.upgrade() {
                 overlay.add_toast(adw::Toast::new(msg));
@@ -10896,6 +10922,36 @@ fn connect_satellites_panel(
                         })
                         .collect()
                 };
+                // Composite snapshots — only when the user opted in
+                // via the panel toggle. Each entry is the recipe
+                // alongside the ready-to-encode RGB byte buffer
+                // (interleaved 3-bytes-per-pixel). Built on the
+                // GTK main thread under one shared-image mutex
+                // hold so the worker thread doesn't have to
+                // re-enter the assembler. Recipes whose source
+                // APIDs aren't all present silently filter out
+                // here — we only carry composites that
+                // `composite_rgb` could actually produce. Per
+                // #547.
+                let composites_on = auto_record_composites_switch_a.is_active();
+                let composite_snapshots: Vec<(
+                    crate::lrpt_viewer::CompositeRecipe,
+                    usize,
+                    usize,
+                    Vec<u8>,
+                )> = if composites_on {
+                    state_a.lrpt_image.with_assembler(|a| {
+                        crate::lrpt_viewer::COMPOSITE_CATALOG
+                            .iter()
+                            .filter_map(|recipe| {
+                                a.composite_rgb(recipe.r_apid, recipe.g_apid, recipe.b_apid)
+                                    .map(|(w, h, rgb)| (*recipe, w, h, rgb))
+                            })
+                            .collect()
+                    })
+                } else {
+                    Vec::new()
+                };
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
                 // Clone state for the post-save viewer-close
                 // — we need to read `state.lrpt_viewer_window`
@@ -10965,14 +11021,47 @@ fn connect_satellites_panel(
                                 }
                             }
                         }
+                        // Composite PNGs alongside the per-APID
+                        // files. Filename is `composite-{slug}.png`
+                        // where `slug` is the recipe name with
+                        // spaces replaced by `-` and path
+                        // separators replaced by `_` so the disk
+                        // layout is portable across filesystems.
+                        // Per #547.
+                        for (recipe, width, height, rgb) in composite_snapshots {
+                            let slug = recipe
+                                .name
+                                .replace(' ', "-")
+                                .replace(['/', '\\'], "_");
+                            let path = dir.join(format!("composite-{slug}.png"));
+                            match crate::lrpt_viewer::write_rgb_png(&path, &rgb, width, height) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        ?path,
+                                        recipe = recipe.name,
+                                        width,
+                                        height,
+                                        "auto-record LRPT composite saved",
+                                    );
+                                    saved += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "auto-record LRPT composite {} to {path:?} failed: {e}",
+                                        recipe.name,
+                                    );
+                                    errors.push(format!("Composite {}: {e}", recipe.name));
+                                }
+                            }
+                        }
                         let msg = if errors.is_empty() {
                             format!(
-                                "Pass complete — {saved} LRPT channel(s) saved to {}",
+                                "Pass complete — {saved} LRPT file(s) saved to {}",
                                 dir.display()
                             )
                         } else {
                             format!(
-                                "Pass complete — {saved} channel(s) saved, {} failed: {}",
+                                "Pass complete — {saved} file(s) saved, {} failed: {}",
                                 errors.len(),
                                 errors.join("; ")
                             )
