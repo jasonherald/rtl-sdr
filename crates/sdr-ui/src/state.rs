@@ -211,6 +211,12 @@ pub struct AppState {
     /// `tray-quit` action can `shutdown()` to join the worker thread
     /// before `app.release()`. Per #512.
     pub tray_handle: RefCell<Option<sdr_tray::TrayHandle>>,
+    /// RAII guard for `app.hold()`. The gio binding turns hold/release
+    /// into a guard whose `Drop` calls `release()`. Stash it here so
+    /// the application keeps running across last-window-close — the
+    /// `tray-quit` action (added in CT-11) takes + drops it to
+    /// trigger the natural shutdown. Per #512.
+    pub app_hold_guard: RefCell<Option<gtk4::gio::ApplicationHoldGuard>>,
     /// Currently-open Meteor-M LRPT viewer window, or `None`
     /// when no viewer is open. Same lifecycle pattern as
     /// `apt_viewer` above. Per epic #469 task 7.
@@ -266,6 +272,7 @@ impl AppState {
             iq_recording_active: Cell::new(false),
             lrpt_recording_active: Cell::new(false),
             tray_handle: RefCell::new(None),
+            app_hold_guard: RefCell::new(None),
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),

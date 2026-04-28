@@ -150,9 +150,19 @@ fn apply_manual_tune(
     radio_panel.update_distance_frequency(freq_hz);
 }
 
-/// Build and present the main application window.
+/// Build the main application window and return the shared
+/// [`AppState`]. The caller (currently `app.rs::connect_activate`)
+/// decides whether to call `window.present()` based on the
+/// `--start-hidden` CLI flag and tray availability — per #512.
+///
+/// Returns `None` if the DSP engine failed to start; in that case
+/// `app.quit()` has already been requested and the caller should
+/// skip tray spawn and window present.
 #[allow(clippy::too_many_lines)]
-pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::ConfigManager>) {
+pub fn build_window(
+    app: &adw::Application,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) -> Option<std::rc::Rc<crate::state::AppState>> {
     // --- Engine bootstrap ---
     //
     // The headless engine (sdr-core) owns the DSP controller thread, the
@@ -181,7 +191,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         Err(err) => {
             tracing::error!(error = %err, "failed to spawn DSP engine — aborting window build");
             app.quit();
-            return;
+            return None;
         }
     };
     let ui_tx = engine.command_sender();
@@ -195,7 +205,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
              already took the event receiver"
         );
         app.quit();
-        return;
+        return None;
     };
     let fft_shared = engine.fft_buffer();
 
@@ -995,7 +1005,7 @@ pub fn build_window(app: &adw::Application, config: &std::sync::Arc<sdr_config::
         glib::ControlFlow::Continue
     });
 
-    window.present();
+    Some(state)
 }
 
 /// Outcome of a [`refresh_scanner_axis_lock`] call. Lets the

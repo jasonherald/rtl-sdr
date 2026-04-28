@@ -52,6 +52,14 @@ pub fn build_app() -> adw::Application {
     app::build_app()
 }
 
+/// Build the `AdwApplication`, optionally suppressing the initial
+/// `window.present()` so the app launches into the tray. Used by
+/// `main.rs` to forward the `--start-hidden` CLI flag through to
+/// [`app::build_app_with_options`]. Per #512.
+pub fn build_app_with_options(start_hidden: bool) -> adw::Application {
+    app::build_app_with_options(start_hidden)
+}
+
 /// Register the application on the session bus and determine whether
 /// we're the primary instance.
 ///
@@ -80,8 +88,12 @@ pub fn register_and_check_primary(app: &adw::Application) -> bool {
 }
 
 /// Run the SDR-RS application, returning the GTK exit code.
-pub fn run() -> glib::ExitCode {
-    let app = app::build_app();
+///
+/// `start_hidden` skips the initial `window.present()` so the app
+/// launches with only the tray icon visible — used by the autostart
+/// `.desktop` Exec line.
+pub fn run(start_hidden: bool) -> glib::ExitCode {
+    let app = app::build_app_with_options(start_hidden);
     if !register_and_check_primary(&app) {
         return glib::ExitCode::SUCCESS;
     }
