@@ -1,0 +1,25 @@
+[package]
+name = "sdr-acars"
+version = "0.1.0"
+description = "ACARS (VHF aircraft datalink) DSP, frame parser, and CLI"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arrayvec = { workspace = true }
+clap = { workspace = true }
+hound = { workspace = true }
+num-complex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# (Empty for now; tests use std-only assertions plus workspace fixtures.)
+
+[[bin]]
+name = "sdr-acars-cli"
+path = "src/bin/sdr-acars-cli.rs"

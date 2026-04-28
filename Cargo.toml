@@ -97,6 +97,7 @@ workspace = true
 resolver = "3"
 members = [
     ".",
+    "crates/sdr-acars",
     "crates/sdr-types",
     "crates/sdr-dsp",
     "crates/sdr-pipeline",
@@ -259,6 +260,19 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 
 # Zero-copy type casting
 bytemuck = { version = "1", features = ["derive"] }
+
+# Stack-allocated bounded vectors. Used by sdr-acars for fixed-size
+# ACARS frame buffers (max payload 220 bytes per ARINC 618) without
+# heap churn on the per-block decode path.
+arrayvec = "0.7"
+
+# Complex-number arithmetic for sdr-acars MSK demodulation.
+num-complex = "0.4"
+
+# Command-line argument parsing for the sdr-acars-cli binary
+# (Task 9 of the ACARS DSP crate plan). Derive macros keep the
+# argument struct declarative and self-documenting.
+clap = { version = "4", features = ["derive"] }
 
 # GPU compute (epic #452 phase 2+). Used by sdr-dsp for the wgpu-backed
 # FFT engine behind the `FftEngine` trait. We target the default wgpu
