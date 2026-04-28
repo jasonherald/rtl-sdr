@@ -273,7 +273,6 @@ pollster = "0.4"
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9", features = ["v1_5"] }
 cairo-rs = { version = "0.22", features = ["png"] }
-librsvg = "2"
 
 # Benchmarking. `default-features = false` drops the `rayon`-backed
 # HTML reporting; we only need the `cargo bench` harness support, which

@@ -6,9 +6,7 @@ license = "MIT"
 description = "StatusNotifierItem tray-icon sidecar for sdr-rs (Linux only)"
 
 [dependencies]
-cairo-rs = { workspace = true }
 ksni = { workspace = true }
-librsvg = { workspace = true }
 smol = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
