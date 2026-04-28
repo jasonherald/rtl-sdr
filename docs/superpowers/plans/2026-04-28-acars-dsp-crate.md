@@ -335,111 +335,154 @@ EOF
 **Files:**
 - Create: `crates/sdr-acars/src/syndrom.rs`
 
-ACARS uses 7-bit ASCII with odd parity per character. Bytes that fail parity are flagged for correction. `acars.c` runs two correction passes:
+> **REVISED.** An earlier draft of this task got the data structure wrong (described `SD[256][4]` of `(byte_offset, bit_mask)` pairs). The actual `original/acarsdec/syndrom.h` is a **flat `unsigned short syndrom[]` array of 1936 entries**. The structure described below matches the C source. The Task 2 implementer already corrected the same kind of error in the CRC; this section was rewritten for the same reason.
 
-1. `fixprerr`: for bytes with parity error, try flipping each of 8 bit positions; check if the resulting frame's CRC syndrome matches a known single-bit-error pattern from `syndrom.h`. Recursive over multiple parity errors (up to `MAXPERR = 3`).
-2. `fixdberr`: for frames where parity all looks fine but CRC fails, try every pair of bit flips in any byte, checking the syndrom table for a match.
+ACARS uses 7-bit ASCII with odd parity per character. Bytes that fail parity get flagged for correction. `acars.c` runs two correction passes:
 
-C reference:
-- `original/acarsdec/syndrom.h` — `static const struct sd { unsigned char b[2]; unsigned char e; } SD[256][4]` table, ~295 lines
-- `original/acarsdec/acars.c:45-50` — `fixprerr` (recursive single-parity-error fixer)
-- `original/acarsdec/acars.c:66-90` — `fixdberr` (double-error fixer)
+1. **`fixprerr`** (acars.c:39-64): for each parity-error byte, recursively try flipping each of 8 bit positions. The XOR with the precomputed syndrome `syndrom[i + 8*(blk->len - byte_pos + 1)]` updates the running CRC. If at end of recursion the CRC is `0` OR matches one of the first 16 entries (single-bit error in BCS itself), the fix succeeded. Bounded by `MAXPERR = 3`.
+2. **`fixdberr`** (acars.c:66-90): for frames where parity all looks fine but CRC fails, try every pair of bit flips in any byte: if `crc XOR syndrom[i+bo] XOR syndrom[j+bo] == 0`, flip both bits.
 
-- [ ] **Step 1: Read syndrom.h to understand the table layout**
+### Data structure
+
+`syndrom[]` is a flat `[u16; 1936]` array. Each entry stores a CRC syndrome — the value the CRC register would XOR to if a specific single bit were flipped. Index by `i + 8*j` where:
+
+- `i ∈ [0,7]` = bit position within a byte (LSB-first to match the wire convention).
+- `j` = byte offset from the **end** of the message.
+  - `j = 0`: bits 0-7 of BCS byte 1 (the high CRC byte, transmitted second).
+  - `j = 1`: bits 0-7 of BCS byte 0 (the low CRC byte, transmitted first).
+  - `j = 2`: bits 0-7 of the LAST text byte.
+  - `j = 3`: bits 0-7 of the second-to-last text byte.
+  - … etc.
+
+So `syndrom[0..16]` covers single-bit errors in the BCS (used as the recursion-base check in `fixprerr`); higher entries cover errors in the message payload.
+
+`fixprerr` and `fixdberr` walk the table by indexing into this flat array — never as a 2D `[256][4]` — with `bo = 8 * (blk->len - byte_pos + 1)` as the base offset for byte position `byte_pos`.
+
+### Step 1: Read the C reference
 
 ```bash
-head -50 original/acarsdec/syndrom.h
+sed -n '37,90p' original/acarsdec/acars.c
+sed -n '52,55p' original/acarsdec/syndrom.h    # First syndrom values
 ```
 
-The structure: each entry `SD[s][i]` (where `s` is a CRC syndrome byte, `i` is one of up to 4 alternative locations) maps a syndrome to the byte position(s) and bit mask(s) where the corresponding error occurred.
+Confirm to yourself:
+- The flat `syndrom[]` is at `syndrom.h:52` onward (the file's earlier `crc_ccitt_table[256]` is the table-driven CRC, already covered by Task 2's bit-by-bit implementation).
+- `fixprerr` at `acars.c:39` and `fixdberr` at `acars.c:66` both index `syndrom[…]` directly with arithmetic — no `[256][4]` two-D access anywhere.
 
-- [ ] **Step 2: Port the table verbatim**
+### Step 2: Port the table verbatim
 
 Create `crates/sdr-acars/src/syndrom.rs`:
 
 ```rust
-//! Reed-Solomon-style FEC for ACARS character frames. Uses a
-//! pre-computed syndrome → error-location table to map a CRC
-//! syndrome (post-frame-CRC) back to a probable single-byte
-//! error and its bit position. Multiple parity errors are
-//! handled by recursive single-bit fixes; if parity all looks
-//! clean but the CRC fails, [`fix_double_error`] tries pairs
-//! of bit flips.
+//! Single- and double-bit error correction for ACARS frames.
 //!
-//! Faithful port of `original/acarsdec/syndrom.h` (table) and
-//! `original/acarsdec/acars.c::fixprerr` / `fixdberr` (logic).
-//! Per CR memory `feedback_port_fidelity.md`: don't simplify
-//! beyond what's needed for safe Rust.
+//! Faithful port of `original/acarsdec/syndrom.h` (the `syndrom[]`
+//! lookup table) and `original/acarsdec/acars.c::fixprerr` /
+//! `fixdberr` (the correction logic). The table is a flat
+//! `[u16; 1936]` of CRC syndromes for single-bit errors at
+//! every bit position of every possible byte location in the
+//! frame; the correction functions walk it via simple
+//! arithmetic indexing matching the C.
 
-/// One alternative error-location entry. `byte_offset` is the
-/// position within the frame (counting from the start of Mode);
-/// `bit_mask` is the single-bit XOR that recovers the original
-/// byte.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ErrorLocation {
-    pub byte_offset: u8,
-    pub bit_mask: u8,
-}
-
-/// Up to 4 alternative locations per syndrome value (some
-/// syndromes are ambiguous in ACARS' code geometry).
-pub type SyndromeEntry = [Option<ErrorLocation>; 4];
-
-/// Generated from `original/acarsdec/syndrom.h`. 256 entries
-/// (one per syndrome byte), each with up to 4 alternatives.
-///
-/// CONVERSION INSTRUCTIONS for the implementer: open
-/// `original/acarsdec/syndrom.h`, read the `SD[256][4]` array,
-/// and produce this table. Each C entry `{0xAA, 0xBB, 0xCC}`
-/// becomes `Some(ErrorLocation { byte_offset: 0xAA, bit_mask: 0xCC })`
-/// (the second C byte is unused per acarsdec's structure layout
-/// — verify by reading the header). Empty C entries (all zero)
-/// become `None`.
-///
-/// This is mechanical translation. Don't paraphrase. The full
-/// table is ~256 entries × 4 alternatives = up to 1024
-/// `Option<ErrorLocation>` values; expect ~10-20 KB of source.
-pub const SYNDROM_TABLE: [SyndromeEntry; 256] = {
-    // IMPLEMENTER: paste the translated table here.
-    // The compile will fail until the placeholder is replaced.
-    [[None; 4]; 256]
-};
+use crate::crc;
 
 /// Maximum number of parity errors `fix_parity_errors` will
-/// attempt to correct. Matches acarsdec's `MAXPERR` define.
+/// attempt to correct. Matches acarsdec's `MAXPERR` define
+/// (acars.c:91).
 pub const MAX_PARITY_ERRORS: usize = 3;
+
+/// Flat syndrome table — `syndrom[]` from
+/// `original/acarsdec/syndrom.h:52-295`. 1936 entries
+/// (= 8 bits × 242 byte positions).
+///
+/// Indexed as `SYNDROM[i + 8*j]` where `i` is the bit position
+/// within a byte (0-7) and `j` is the byte offset measured
+/// from the end of the message:
+///
+/// - `j = 0`: bits 0-7 of BCS high byte
+/// - `j = 1`: bits 0-7 of BCS low byte
+/// - `j = 2`: bits 0-7 of the last text byte
+/// - `j = 3`: bits 0-7 of the second-to-last text byte, etc.
+///
+/// IMPLEMENTER: paste the translated `syndrom[]` array here,
+/// preserving the C file's 8-entries-per-line layout so the
+/// table is grep-comparable to the source. Don't paraphrase.
+/// The full array is 1936 entries.
+pub static SYNDROM: [u16; 1936] = [
+    // IMPLEMENTER: replace this placeholder with the translated
+    // entries from `original/acarsdec/syndrom.h:52-295`.
+    // The first row should start: 0x1189, 0x2312, 0x4624, 0x8c48,
+    //                              0x1081, 0x2102, 0x4204, 0x8408,
+    // Compile will fail until placeholder is replaced.
+    0; 1936
+];
 
 /// Try to recover a frame with one or more parity errors by
 /// flipping bits at the syndrome-indicated positions. Returns
-/// `Some(corrected_count)` on success, `None` if the syndrome
-/// doesn't match any known pattern after exhausting
-/// alternatives. Caller passes a mutable frame buffer; this
-/// function modifies it in place when corrections are applied.
+/// `true` and modifies `frame` in place on success; `false`
+/// if no combination of single-bit flips at the
+/// `parity_error_offsets` positions resolves the CRC.
 ///
-/// `parity_error_offsets` is the list of byte positions that
-/// failed parity check. Mirrors `fixprerr` in acars.c:45-50.
+/// `crc` is the running CRC syndrome over `frame` (whose CRC
+/// has already been computed by the caller). Bounded by
+/// `MAX_PARITY_ERRORS` (recursion depth).
+///
+/// Mirrors `fixprerr` (acars.c:39-64). Translation notes:
+/// the C uses pointer arithmetic (`int *pr` advanced by `pr+1`)
+/// to walk the parity-error list; the Rust version uses a
+/// slice index. The C's `blk->len` is `frame.len()` here.
+/// The C's `blk->txt[*pr] ^= (1 << i)` becomes
+/// `frame[parity_error_offsets[0]] ^= 1 << i`.
 pub fn fix_parity_errors(
     frame: &mut [u8],
+    crc: u16,
     parity_error_offsets: &[usize],
-    initial_syndrome: u16,
-) -> Option<u8> {
-    // IMPLEMENTER: port `fixprerr` from acars.c. Recursive
-    // backtracking over each alternative in SYNDROM_TABLE for
-    // each parity-flagged byte. Stack depth bounded by
-    // MAX_PARITY_ERRORS.
-    let _ = (frame, parity_error_offsets, initial_syndrome);
-    None
+) -> bool {
+    // IMPLEMENTER: port acars.c:39-64 here. Recursive structure:
+    //   if !parity_error_offsets.is_empty() {
+    //       for i in 0..8 {
+    //           let new_crc = crc ^ SYNDROM[i + 8 * (frame.len() - parity_error_offsets[0] + 1)];
+    //           if fix_parity_errors(frame, new_crc, &parity_error_offsets[1..]) {
+    //               frame[parity_error_offsets[0]] ^= 1 << i;
+    //               return true;
+    //           }
+    //       }
+    //       false
+    //   } else {
+    //       // Recursion base: matches acars.c:53-62.
+    //       if crc == 0 { return true; }
+    //       SYNDROM[..16].iter().any(|&s| s == crc)
+    //   }
+    let _ = (frame, crc, parity_error_offsets);
+    unimplemented!("port acars.c::fixprerr here")
 }
 
-/// For frames with no parity errors but a non-zero CRC
-/// syndrome, try every pair of bit flips in every byte and
-/// check whether the result satisfies the syndrome. Returns
-/// `Some(())` on success (with corrections applied to `frame`),
-/// `None` otherwise. Mirrors `fixdberr` in acars.c:66-90.
-pub fn fix_double_error(frame: &mut [u8], syndrome: u16) -> Option<()> {
-    // IMPLEMENTER: port `fixdberr` from acars.c.
-    let _ = (frame, syndrome);
-    None
+/// Try to recover a frame with no parity errors but a
+/// non-zero CRC by flipping every pair of bits in every byte.
+/// Returns `true` and modifies `frame` in place on success.
+///
+/// Mirrors `fixdberr` (acars.c:66-90).
+pub fn fix_double_error(frame: &mut [u8], crc: u16) -> bool {
+    // IMPLEMENTER: port acars.c:66-90 here. Structure:
+    //   // First: any single-bit error in CRC bytes themselves?
+    //   if SYNDROM[..16].iter().any(|&s| s == crc) { return true; }
+    //   // Then: pair of bit flips in any single byte.
+    //   for k in 0..frame.len() {
+    //       let bo = 8 * (frame.len() - k + 1);
+    //       for i in 0..8 {
+    //           for j in 0..8 {
+    //               if i == j { continue; }
+    //               if crc ^ SYNDROM[i + bo] ^ SYNDROM[j + bo] == 0 {
+    //                   frame[k] ^= 1 << i;
+    //                   frame[k] ^= 1 << j;
+    //                   return true;
+    //               }
+    //           }
+    //       }
+    //   }
+    //   false
+    let _ = (frame, crc);
+    unimplemented!("port acars.c::fixdberr here")
 }
 
 #[cfg(test)]
@@ -448,76 +491,144 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_size_matches_spec() {
-        // Pin the table dimensions so a future format change
-        // (e.g. wider syndromes) can't silently shrink it.
-        assert_eq!(SYNDROM_TABLE.len(), 256);
-        assert_eq!(SYNDROM_TABLE[0].len(), 4);
+    fn syndrom_table_has_expected_size() {
+        // 1936 = 8 bits × 242 byte positions. Pin so a partial
+        // copy can't silently ship.
+        assert_eq!(SYNDROM.len(), 1936);
+        assert_eq!(SYNDROM.len() % 8, 0);
     }
 
     #[test]
-    fn at_least_one_syndrome_has_a_concrete_location() {
-        // Sanity check that the table isn't all-None — catches
-        // the placeholder being left in by mistake.
-        let any_some = SYNDROM_TABLE
-            .iter()
-            .flat_map(|alts| alts.iter())
-            .any(|alt| alt.is_some());
-        assert!(any_some, "SYNDROM_TABLE is all-None — table not ported");
+    fn syndrom_first_row_matches_c() {
+        // Spot-check: syndrom.h line 53 = "0x1189,0x2312,0x4624,0x8c48,0x1081,0x2102,0x4204,0x8408,"
+        assert_eq!(SYNDROM[0], 0x1189);
+        assert_eq!(SYNDROM[1], 0x2312);
+        assert_eq!(SYNDROM[2], 0x4624);
+        assert_eq!(SYNDROM[3], 0x8c48);
+        assert_eq!(SYNDROM[4], 0x1081);
+        assert_eq!(SYNDROM[5], 0x2102);
+        assert_eq!(SYNDROM[6], 0x4204);
+        assert_eq!(SYNDROM[7], 0x8408);
     }
 
-    // IMPLEMENTER: add per-syndrome tests for at least 5
-    // representative entries, picking syndromes from acarsdec's
-    // syndrom.h that have known error patterns. Use:
-    //   1. A known-good 13-byte frame (Mode + 7-byte Address +
-    //      1-byte ACK + 2-byte Label + 1-byte Block ID + STX).
-    //   2. Flip one bit at a known position.
-    //   3. Compute the CRC syndrome.
-    //   4. Verify SYNDROM_TABLE[syndrome] points to that
-    //      bit position.
+    #[test]
+    fn syndrom_last_row_matches_c() {
+        // Spot-check: last group (index 1928..1936) — pulled
+        // from the final line of syndrom.h. IMPLEMENTER: read
+        // the actual last 8 values from the C file and replace
+        // the placeholder hex below.
+        // Approximate location: tail -1 of the array section.
+        assert_ne!(SYNDROM[1928], 0, "last row not populated");
+        assert_ne!(SYNDROM[1935], 0, "last entry not populated");
+        // IMPLEMENTER: replace these `assert_ne!` lines with
+        // exact `assert_eq!(SYNDROM[N], 0xVVVV)` checks for
+        // the actual final values. The non-zero asserts above
+        // catch a "translated only the first line" bug.
+    }
+
+    #[test]
+    fn syndrom_is_a_pure_static_table() {
+        // No-op test that just ensures the whole table is
+        // accessible at compile + load time. (Indexing past
+        // bounds at compile time would be a hard error; this
+        // smoke test catches the runtime / loader case.)
+        let _last = SYNDROM[1935];
+    }
+
+    #[test]
+    fn single_bit_flip_in_last_byte_recovers() {
+        // Build a 13-byte payload, compute its CRC, flip bit 3
+        // of the last byte, then verify fix_parity_errors with
+        // parity_error_offsets=[12] reverts the flip.
+        let original: Vec<u8> = b"HELLO ACARS!!".to_vec();
+        let crc_orig = crc::compute(&original);
+        let mut frame = original.clone();
+        let bit = 3_usize;
+        let pos = frame.len() - 1;
+        frame[pos] ^= 1 << bit;
+        // The new "running CRC" is the one over the corrupted
+        // frame:
+        let crc_corrupted = crc::compute(&frame);
+        // fix_parity_errors expects the CRC after the corruption.
+        let recovered = fix_parity_errors(&mut frame, crc_corrupted, &[pos]);
+        assert!(recovered, "fix_parity_errors didn't find the bit flip");
+        assert_eq!(frame, original, "frame not restored after fix");
+        assert_eq!(crc::compute(&frame), crc_orig);
+    }
+
+    #[test]
+    fn no_correction_when_no_parity_errors_and_zero_crc() {
+        // If the running CRC is already 0 and no parity
+        // errors were flagged, fix_parity_errors with empty
+        // offsets should return true (the "nothing to fix"
+        // base case in fixprerr).
+        let mut frame = b"clean".to_vec();
+        assert!(fix_parity_errors(&mut frame, 0, &[]));
+    }
+
+    #[test]
+    fn fix_double_error_handles_two_bit_flip_in_one_byte() {
+        // Build a payload, flip TWO bits in one byte (no
+        // parity flag possible since two flips preserve
+        // parity), and verify fix_double_error recovers.
+        let original = b"DOUBLE ERROR!".to_vec();
+        let mut frame = original.clone();
+        let pos = frame.len() / 2;
+        frame[pos] ^= 0b0000_1001; // flip bits 0 and 3 — even parity preserved
+        let crc_corrupted = crc::compute(&frame);
+        let recovered = fix_double_error(&mut frame, crc_corrupted);
+        assert!(recovered, "fix_double_error didn't find the pair");
+        assert_eq!(frame, original, "frame not restored");
+    }
 }
 ```
 
-- [ ] **Step 3: Run the tests, see them fail at the all-None assert**
+Note: tests reference `crate::crc`; that module landed in Task 2 with the corrected init=0 / poly=0x8408 implementation.
+
+### Step 3: Run the tests, see size + first-row + table-access tests fail
 
 ```bash
 cargo test -p sdr-acars syndrom::tests
-# Expected: `at_least_one_syndrome_has_a_concrete_location` FAILS — placeholder still in.
+# Expected: failures on `syndrom_table_has_expected_size`,
+# `syndrom_first_row_matches_c`, `syndrom_last_row_matches_c`,
+# and the recovery tests (which `unimplemented!()`).
 ```
 
-- [ ] **Step 4: Translate the table from `syndrom.h`**
+### Step 4: Translate the table from `syndrom.h:52-295`
 
-Read `original/acarsdec/syndrom.h` and replace `[[None; 4]; 256]` with the translated entries.
+Replace the `[0; 1936]` placeholder with the translated entries. The C file lays out 8 hex values per line; preserve that layout in the Rust file so a future `diff` against the C is grep-friendly. ~1936 entries, mechanical translation, ~242 lines of Rust.
 
-This is mechanical — don't paraphrase, don't reorder. If the C struct has fields you can't readily map, stop and ask: ambiguous translation here is much worse than asking.
+The `syndrom_first_row_matches_c` test pins the first 8 values; replace the `assert_ne!` placeholders in `syndrom_last_row_matches_c` with exact final-row values once you've translated.
 
-- [ ] **Step 5: Implement `fix_parity_errors` and `fix_double_error`**
+### Step 5: Implement `fix_parity_errors` and `fix_double_error`
 
-Port `fixprerr` (acars.c:45-50) and `fixdberr` (acars.c:66-90) faithfully. The recursion in `fixprerr` is bounded by `MAX_PARITY_ERRORS`; convert to iterative with an explicit stack if Rust's borrow checker fights you, but prefer a recursive translation that mirrors the C structure.
+Port `fixprerr` (acars.c:39-64) and `fixdberr` (acars.c:66-90) per the structural pseudocode in the IMPLEMENTER comments above. Recursive translation matches the C; if the borrow checker pushes back, an explicit stack-based version is acceptable but call it out in your report.
 
-- [ ] **Step 6: Add the per-syndrome tests as marked in the test stub**
-
-Pick 5 representative syndromes. Use the procedure in the comment.
-
-- [ ] **Step 7: Run all tests**
+### Step 6: Run the full test set
 
 ```bash
 cargo test -p sdr-acars syndrom::tests
-# Expected: all pass.
+# Expected: all 6 tests pass.
 ```
 
-- [ ] **Step 8: Commit**
+### Step 7: Commit
 
 ```bash
 git add crates/sdr-acars/src/syndrom.rs
 git commit -m "$(cat <<'EOF'
 feat(sdr-acars): syndrom table + parity-error FEC correction
 
-Faithful port of original/acarsdec/{syndrom.h,acars.c} —
-SYNDROM_TABLE[256][4] mapping CRC syndromes to error locations,
-plus fix_parity_errors (acars.c::fixprerr) and fix_double_error
-(acars.c::fixdberr). Pinned with table-size + concrete-location
-asserts plus 5 per-syndrome correction round-trips.
+Faithful port of original/acarsdec/{syndrom.h,acars.c}:
+- SYNDROM: [u16; 1936] flat lookup table indexed by
+  i + 8 * (msg_len - byte_pos + 1).
+- fix_parity_errors: recursive single-bit-flip walker matching
+  acars.c::fixprerr. Bounded by MAX_PARITY_ERRORS = 3.
+- fix_double_error: pairwise bit-flip search matching
+  acars.c::fixdberr.
+
+Table size + first-row + last-row spot-checks pin translation
+fidelity; single-bit and double-bit recovery round-trips against
+the Task 2 CRC pin algorithmic correctness.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
