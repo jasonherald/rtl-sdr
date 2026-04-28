@@ -91,9 +91,12 @@ pub struct AptImageRenderer {
     /// `RecorderAction::StartAutoRecord` handler via
     /// [`AptImageView::set_rotate_180`]. The toolbar `Export PNG`
     /// button reads this so a manual export rotates the same way
-    /// as the auto-record save would. Reset to `false` on
-    /// [`AptImageRenderer::clear`] (per-pass scoping). Per CR round
-    /// 1 on PR #571.
+    /// as the auto-record save would. **Preserved** across
+    /// [`AptImageRenderer::clear`] so a mid-pass user Clear does
+    /// not drop the AOS-stamped pass orientation; the AOS path
+    /// always calls `set_rotate_180` immediately after `clear`,
+    /// so AOS sees the new value either way. Per CR rounds 1 and
+    /// 4 on PR #571.
     rotate_180: bool,
 }
 

@@ -10166,13 +10166,18 @@ fn connect_satellites_panel(
         // satellites are sun-synchronous, so the descending pass is
         // the typical case for daytime captures and no-rotation
         // preserves north-at-top.
-        let compute_apt_rotate_180 = {
+        // Takes the recording-pass tuple directly (`norad_id`, `aos`)
+        // rather than reading it from `AppState`, so callers compute
+        // rotation against an explicit snapshot. Without this, the
+        // SavePng handler could read a freshly-overwritten slot if a
+        // back-to-back AOS landed between this pass's LOS dispatch
+        // and the rotation compute — exporting the older pass's
+        // image with the newer pass's orientation. Per CR round 6
+        // on PR #571.
+        let compute_apt_rotate_180_for_pass = {
             let cache_a = cache_a.clone();
-            move |state: &Rc<AppState>| -> bool {
+            move |norad_id: u32, aos: chrono::DateTime<chrono::Utc>| -> bool {
                 let Some(cache) = cache_a.as_ref() else {
-                    return false;
-                };
-                let Some((norad_id, aos)) = *state.apt_recording_pass.borrow() else {
                     return false;
                 };
                 // Look up by stable NORAD id (not display name) so
@@ -10349,8 +10354,8 @@ fn connect_satellites_panel(
                         // no silent rotation breakage if the catalog
                         // ever picks up alias drift. Per CR round 3
                         // on PR #571.
-                        *state_a.apt_recording_pass.borrow_mut() =
-                            Some((norad_id, chrono::Utc::now()));
+                        let aos = chrono::Utc::now();
+                        *state_a.apt_recording_pass.borrow_mut() = Some((norad_id, aos));
                         // Push the rotate-180 flag down to the
                         // renderer so the toolbar's manual `Export
                         // PNG` button matches the auto-record
@@ -10358,7 +10363,7 @@ fn connect_satellites_panel(
                         // of ascending passes come out upside-down
                         // even though the auto-record save rotates
                         // them. Per CR round 1 on PR #571.
-                        let rotate_180 = compute_apt_rotate_180(&state_a);
+                        let rotate_180 = compute_apt_rotate_180_for_pass(norad_id, aos);
                         if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
                             view.set_rotate_180(rotate_180);
                         }
@@ -10438,16 +10443,30 @@ fn connect_satellites_panel(
                 state_a.send_dsp(UiToDsp::ResetImagingDecoders);
             }
             RecorderAction::SavePng(path) => {
+                // Snapshot the recording-pass tuple FIRST so every
+                // pass-derived value (rotation flag, slot-clear
+                // check) reads from this stable view. If a new AOS
+                // overwrites the slot between this dispatch and the
+                // export — a back-to-back-pass race — we must use
+                // the snapshot, not the live slot, otherwise the
+                // older pass's image gets exported with the newer
+                // pass's orientation. Per CR round 6 on PR #571.
+                //
+                // The same snapshot also drives the "only clear if
+                // still-equal" guard on `apt_recording_pass` in both
+                // the early-return path below and the async-callback
+                // completion. Per CR rounds 4 and 5 on PR #571.
+                let exported_pass = *state_a.apt_recording_pass.borrow();
                 // Compute the rotate-180 flag for ascending passes
-                // (B2 of the noaa-apt parity work). The wiring layer
-                // looks up the recording pass info from AppState
-                // (set at AOS by `RecorderAction::StartAutoRecord`),
-                // resolves the satellite's TLE from the cache, and
-                // calls `sdr_sat::is_ascending` at the AOS sample
-                // point. Defaults to `false` (no rotation) if any
-                // step fails — descending-pass orientation is the
-                // safer default since it preserves north-at-top.
-                let rotate_180 = compute_apt_rotate_180(&state_a);
+                // (B2 of the noaa-apt parity work) FROM THE SNAPSHOT,
+                // not from the live `state_a.apt_recording_pass`. The
+                // helper resolves the satellite's TLE from the cache
+                // and calls `sdr_sat::is_ascending` at the snapshotted
+                // AOS sample point. Defaults to `false` (no rotation)
+                // if any step fails — descending-pass orientation is
+                // the safer default since it preserves north-at-top.
+                let rotate_180 = exported_pass
+                    .is_some_and(|(norad_id, aos)| compute_apt_rotate_180_for_pass(norad_id, aos));
                 let mode = sdr_radio::apt_image::BrightnessMode::default();
                 // Async export: snapshot the AptImage on the main
                 // thread NOW, hand the snapshot to a worker via
@@ -10457,21 +10476,6 @@ fn connect_satellites_panel(
                 // the user wants to see the toast and have the
                 // window auto-close cleanly. Per CR round 1 on PR
                 // #571.
-                // Snapshot the recording-pass tuple BEFORE spawning
-                // the worker (and BEFORE the early-return path
-                // below). If a *new* AOS arrives while this PNG is
-                // still encoding, the new pass writes into
-                // `apt_recording_pass`; we must not erase that
-                // brand-new entry when our own (older) export
-                // finishes. The callback only clears the slot if
-                // its current value still matches what we're saving
-                // here — overlapping passes leave the new entry
-                // intact, and a stuck-pending future export can't
-                // wipe a pass that began after it. Per CR round 4
-                // on PR #571 (and round 5: same guard now also
-                // applies to the early-return path below, which
-                // previously cleared the slot unconditionally).
-                let exported_pass = *state_a.apt_recording_pass.borrow();
                 let view_opt = state_a.apt_viewer.borrow().as_ref().cloned();
                 let Some(view) = view_opt else {
                     tracing::warn!(

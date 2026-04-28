@@ -734,8 +734,15 @@ mod tests {
 
     #[test]
     fn test_low_pass_dc_removal_kaiser_passes_passband() {
-        // Inside the passband (between transition_width/2 and
-        // cutoff - transition_width/2) the response should be ~unity.
+        // Inside the guaranteed-flat passband (approximately
+        // `transition_width` to `cutoff - transition_width/2`),
+        // the response should be ~unity. The lower edge starts at
+        // `transition_width` (not `transition_width/2`) because the
+        // inner lowpass's transition is centered at
+        // `transition_width/2` — that lower band is still inside
+        // the inner filter's transition, not the flat passband.
+        // Matches the docstring on `low_pass_dc_removal_kaiser`. Per
+        // CR round 6 on PR #571.
         let fs = 12_480.0;
         let cutoff = 4_800.0;
         let transition = 1_000.0;
