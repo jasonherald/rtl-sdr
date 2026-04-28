@@ -256,42 +256,77 @@ impl PushOutcome {
 /// guarantee the APT renderer offers.
 pub struct LrptImageRenderer {
     channels: HashMap<u16, ChannelSurface>,
-    /// APID currently selected for single-channel display. Ignored
-    /// when [`Self::active_composite`] is `Some(_)` (composite
-    /// mode takes precedence in [`Self::render`]). `None` if the
-    /// user hasn't picked a channel yet (or the renderer is
-    /// empty).
-    active: Option<u16>,
-    /// `Some(recipe)` when the user picked a composite from the
-    /// dropdown. The cached surface in [`Self::composite_cache`]
-    /// was built for this recipe. `None` means single-channel
-    /// mode — [`Self::active`] drives the render in that case.
-    /// Per #547.
-    active_composite: Option<CompositeRecipe>,
+    /// What the renderer is currently showing. `Apid(_)` paints
+    /// the per-channel greyscale surface for that APID;
+    /// `Composite(_)` paints the cached ARGB32 surface in
+    /// [`Self::composite_cache`] (or, if that cache hasn't been
+    /// built yet, just the background — composite mode is
+    /// authoritative, per CR round 4 on PR #575). `None` until
+    /// the first per-APID line auto-selects via
+    /// [`Self::push_line`]. Per CR round 5 on PR #575:
+    /// previously two parallel `Option` fields lived here
+    /// (`active` + `active_composite`); collapsing into one
+    /// enum makes mode transitions atomic and removes the "did
+    /// I remember to clear the other one" footgun the parallel
+    /// fields invited.
+    selection: Option<ActiveSelection>,
     /// Cached ARGB32 surface backing the active composite. Built
-    /// lazily by [`Self::set_composite`] from the source channels'
-    /// RGB bytes via
-    /// [`sdr_lrpt::image::ImageAssembler::composite_rgb`]. `None`
-    /// until the first composite render OR after [`Self::clear`].
+    /// off the GTK main thread by the View's `set_composite` —
+    /// the worker calls [`Self::install_composite_cache`] when
+    /// it returns. `None` until the first successful build for
+    /// the current selection OR after [`Self::clear`] /
+    /// [`Self::clear_composite`] / [`Self::mark_composite_pending`].
     /// The render code paints from this cached surface rather
-    /// than re-running the composite math on every redraw — it's
-    /// rebuilt on the dropdown-refresh tick when composite mode
-    /// is active so new lines accrue at the dropdown cadence
-    /// (~1 Hz). Per #547.
+    /// than re-running the composite math on every redraw —
+    /// it's rebuilt on the dropdown-refresh tick when composite
+    /// mode is active so new lines accrue at the dropdown
+    /// cadence (~1 Hz). Per #547.
     composite_cache: Option<CompositeSurface>,
-    /// `min(r_lines, g_lines, b_lines)` at the time `composite_cache`
-    /// was last built. The dropdown-refresh tick reads this to skip
-    /// a no-op rebuild when no source channel has advanced (e.g.,
-    /// LOS reached, or decoder stalled). Tracking the min — not
-    /// each channel's height — is sufficient because the composite
-    /// truncates to the shortest channel; advancing a non-limiting
-    /// channel produces a byte-identical output, so rebuilding it
-    /// would be pure waste. Without this gate, composite mode
-    /// burned ~5 ms × 3 memcpy + ~30 ms interleave + queued-redraw
-    /// on every 1 Hz tick for the rest of the viewer's life. Reset
-    /// to `None` on `clear()` and `clear_composite()`. Per CR
-    /// round 3 on PR #575.
+    /// `min(r_lines, g_lines, b_lines)` for the composite that
+    /// is either currently cached OR currently being built by
+    /// an in-flight worker. The dropdown-refresh tick reads
+    /// this to skip a no-op rebuild when no source channel has
+    /// advanced past the most recent build target (e.g., LOS
+    /// reached, decoder stalled, or a non-limiting channel
+    /// grew). Tracking the min — not each channel's height —
+    /// is sufficient because the composite truncates to the
+    /// shortest channel; advancing a non-limiting channel
+    /// produces byte-identical output, so rebuilding it would
+    /// be pure waste. Without this gate, composite mode burned
+    /// ~5 ms × 3 memcpy + ~30 ms interleave + queued-redraw on
+    /// every 1 Hz tick for the rest of the viewer's life.
+    /// Per CR rounds 3 + 5 on PR #575: round 3 added the
+    /// gate; round 5 extended it to also pin the in-flight
+    /// build target so a long-running worker doesn't get
+    /// duplicated by the next tick. Reset to `None` on
+    /// `clear()`, `clear_composite()`, and
+    /// `mark_composite_pending()`.
     composite_min_height: Option<usize>,
+    /// Monotonic counter bumped by every selection-changing
+    /// method (`set_active_apid`, `mark_composite_pending`,
+    /// `prepare_composite_build`, `clear`, `clear_composite`).
+    /// The View's async composite-build path captures this
+    /// before spawning a worker; on completion, only installs
+    /// the cache if the value still matches — otherwise the
+    /// user has changed selection mid-flight and the worker's
+    /// surface is stale. Wraps at `u64::MAX` (a billion ticks
+    /// per second for half a millennium); not a concern. Per
+    /// CR round 5 on PR #575.
+    composite_gen: u64,
+}
+
+/// What the renderer is showing right now. Replaces the
+/// previous parallel `active: Option<u16>` +
+/// `active_composite: Option<CompositeRecipe>` fields, where
+/// keeping both consistent across mode switches required the
+/// caller to remember to clear the other one. Per CR round 5
+/// on PR #575.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveSelection {
+    /// Single per-APID greyscale channel.
+    Apid(u16),
+    /// Three-channel false-colour composite.
+    Composite(CompositeRecipe),
 }
 
 struct ChannelSurface {
@@ -306,9 +341,10 @@ struct ChannelSurface {
 /// a single image surface" — same shape as the per-APID
 /// `ChannelSurface` cache.
 ///
-/// The owning recipe is tracked on `LrptImageRenderer.active_composite`
-/// rather than here — keeping recipe identity in one place
-/// avoids a "which one is canonical" question. Per #547.
+/// The owning recipe is tracked on `LrptImageRenderer.selection`
+/// (as the `Composite(recipe)` variant) rather than here —
+/// keeping recipe identity in one place avoids a "which one is
+/// canonical" question. Per #547 + CR round 5 on PR #575.
 struct CompositeSurface {
     surface: cairo::ImageSurface,
     /// Number of lines actually rendered. The composite
@@ -355,10 +391,10 @@ impl LrptImageRenderer {
     pub fn new() -> Self {
         Self {
             channels: HashMap::new(),
-            active: None,
-            active_composite: None,
+            selection: None,
             composite_cache: None,
             composite_min_height: None,
+            composite_gen: 0,
         }
     }
 
@@ -369,10 +405,17 @@ impl LrptImageRenderer {
         self.channels.keys().copied().collect()
     }
 
-    /// APID currently selected for display, if any.
+    /// APID currently selected for display, if any. Returns
+    /// `None` when the renderer is in composite mode (or empty)
+    /// — composite vs. per-APID is a single-source-of-truth
+    /// enum now (per CR round 5 on PR #575), so this is just a
+    /// pattern-match into the [`ActiveSelection::Apid`] variant.
     #[must_use]
     pub fn active_apid(&self) -> Option<u16> {
-        self.active
+        match self.selection {
+            Some(ActiveSelection::Apid(apid)) => Some(apid),
+            _ => None,
+        }
     }
 
     /// Set which APID's channel is shown. A no-op (returns
@@ -380,10 +423,19 @@ impl LrptImageRenderer {
     /// that APID — without a backing surface there's nothing to
     /// paint, and silently switching to a missing channel would
     /// leave the user staring at a blank canvas with no
-    /// feedback.
+    /// feedback. Successful switch atomically drops any active
+    /// composite cache so the per-APID surface paints clean
+    /// (no stale RGB pixels). Per CR round 5 on PR #575: the
+    /// dropdown handler used to need a paired
+    /// `clear_composite()` call before this; the enum-based
+    /// selection makes that implicit, but the explicit call is
+    /// still harmless and we leave it for readability.
     pub fn set_active_apid(&mut self, apid: u16) -> bool {
         if self.channels.contains_key(&apid) {
-            self.active = Some(apid);
+            self.selection = Some(ActiveSelection::Apid(apid));
+            self.composite_cache = None;
+            self.composite_min_height = None;
+            self.composite_gen = self.composite_gen.wrapping_add(1);
             true
         } else {
             false
@@ -479,8 +531,12 @@ impl LrptImageRenderer {
         // First-ever push for any channel — auto-select it so
         // the user sees something the moment data starts
         // flowing, without having to discover the dropdown.
-        if self.active.is_none() {
-            self.active = Some(apid);
+        // Skip when a composite is already selected; that mode
+        // is authoritative (per CR round 4 on PR #575) so
+        // shadow-tracking a per-APID would just be dead state.
+        if self.selection.is_none() {
+            self.selection = Some(ActiveSelection::Apid(apid));
+            self.composite_gen = self.composite_gen.wrapping_add(1);
         }
         PushOutcome::Pushed
     }
@@ -495,38 +551,91 @@ impl LrptImageRenderer {
     /// surfaces. Per #547.
     pub fn clear(&mut self) {
         self.channels.clear();
-        self.active = None;
-        self.active_composite = None;
+        self.selection = None;
         self.composite_cache = None;
         self.composite_min_height = None;
+        self.composite_gen = self.composite_gen.wrapping_add(1);
     }
 
-    /// Switch to composite mode and (re)build the cached ARGB32
-    /// surface from the current state of `image`. Returns `true`
-    /// if the composite was successfully built (all three source
-    /// channels exist and have at least one line each); `false`
-    /// otherwise — caller can fall back to single-channel mode
-    /// in that case (the dropdown handler does so by leaving the
-    /// previous active APID in place).
+    /// Mark composite mode as "selected but cache not yet
+    /// built". Bumps the generation counter so any in-flight
+    /// worker sees its captured generation no longer matches
+    /// and discards its result. Used by the View's async path
+    /// when the snapshot fails (one or more source APIDs
+    /// missing/empty), and by [`Self::set_composite`] (the
+    /// synchronous test path) on every error branch. Per CR
+    /// round 5 on PR #575.
+    pub fn mark_composite_pending(&mut self, recipe: CompositeRecipe) {
+        self.selection = Some(ActiveSelection::Composite(recipe));
+        self.composite_cache = None;
+        self.composite_min_height = None;
+        self.composite_gen = self.composite_gen.wrapping_add(1);
+    }
+
+    /// Mark composite mode as "selected, build for `target_height`
+    /// is in flight". Same as [`Self::mark_composite_pending`]
+    /// but pins `composite_min_height` to the snapshot's height
+    /// so the 1 Hz refresh tick's `cached_min_height ==
+    /// current_min_height` gate doesn't kick off a redundant
+    /// worker for the same height while the first one is still
+    /// running. Returns the new generation token the caller
+    /// should pass to [`Self::install_composite_cache`] when
+    /// the worker completes. Per CR round 5 on PR #575.
+    pub fn prepare_composite_build(
+        &mut self,
+        recipe: CompositeRecipe,
+        target_height: usize,
+    ) -> u64 {
+        self.selection = Some(ActiveSelection::Composite(recipe));
+        self.composite_cache = None;
+        self.composite_min_height = Some(target_height);
+        self.composite_gen = self.composite_gen.wrapping_add(1);
+        self.composite_gen
+    }
+
+    /// Install a freshly-built composite surface as the cache.
+    /// Returns `true` if installed, `false` if the worker
+    /// raced a selection change (selection moved away or a
+    /// newer build for the same selection bumped the
+    /// generation) and the surface should be dropped on the
+    /// floor. Per CR round 5 on PR #575.
+    pub fn install_composite_cache(
+        &mut self,
+        recipe: CompositeRecipe,
+        expected_gen: u64,
+        height: usize,
+        surface: cairo::ImageSurface,
+    ) -> bool {
+        if self.composite_gen != expected_gen
+            || self.selection != Some(ActiveSelection::Composite(recipe))
+        {
+            return false;
+        }
+        self.composite_cache = Some(CompositeSurface { surface, height });
+        self.composite_min_height = Some(height);
+        true
+    }
+
+    /// Synchronous one-shot composite build. Used by the test
+    /// suite (which doesn't have a GTK main context) and as a
+    /// fallback for callers that need the bool return value
+    /// to know "did the build succeed end-to-end". Production
+    /// code (the dropdown handler + 1 Hz tick) should use
+    /// [`LrptImageView::set_composite`] instead, which does
+    /// the same work but off the GTK thread via
+    /// `gio::spawn_blocking`. Per CR rounds 1 + 5 on PR #575.
     ///
-    /// V1 always rebuilds on activate / refresh — the per-APID
-    /// `push_line` paths don't update the composite cache (they
-    /// only write into per-APID surfaces). The dropdown's drain
-    /// tick re-invokes this on every poll while composite mode
-    /// is active so new lines accrue in near-real-time at the
-    /// dropdown cadence (~1 Hz). Per #547.
-    ///
+    /// On snapshot failure (any source APID missing/empty)
+    /// returns `false` and leaves the renderer in
+    /// composite-pending state ([`Self::mark_composite_pending`]).
     /// On Cairo allocation / surface-data lock failure, logs a
-    /// warn and clears the cache without panicking — same
-    /// no-panic library-crate rule the rest of the renderer
-    /// follows.
+    /// warn and same — clears the cache without panicking.
     pub fn set_composite(&mut self, recipe: CompositeRecipe, image: &LrptImage) -> bool {
-        // Two-phase pattern: hold the assembler lock only long
-        // enough to memcpy the three source channel buffers, then
-        // do the per-pixel RGB interleave + ARGB32 surface build
-        // OUTSIDE the lock. The decoder thread doesn't get blocked
-        // behind a full-frame walk anymore. Per CR round 1 on PR
-        // #575.
+        // Hold the assembler lock only long enough to memcpy
+        // the three source channel buffers; do the per-pixel
+        // interleave + ARGB32 surface build OUTSIDE the lock so
+        // the decoder thread doesn't get blocked behind a
+        // full-frame walk. Per CR round 1 on PR #575.
         let snap = image.with_assembler(|a| {
             a.clone_channels_for_composite(recipe.r_apid, recipe.g_apid, recipe.b_apid)
         });
@@ -535,13 +644,9 @@ impl LrptImageRenderer {
                 ?recipe,
                 "clone_channels_for_composite returned None — one or more source APIDs missing or empty",
             );
-            self.active_composite = Some(recipe);
-            self.composite_cache = None;
-            self.composite_min_height = None;
+            self.mark_composite_pending(recipe);
             return false;
         };
-        // Lock released. Heavy work runs on the GTK main thread,
-        // but no longer racing with the decoder.
         let rgb = sdr_lrpt::image::assemble_rgb_composite(
             &snap.r_pixels,
             &snap.g_pixels,
@@ -552,27 +657,36 @@ impl LrptImageRenderer {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(?recipe, error = %e, "composite ARGB32 surface build failed");
-                self.active_composite = Some(recipe);
-                self.composite_cache = None;
-                self.composite_min_height = None;
+                self.mark_composite_pending(recipe);
                 return false;
             }
         };
-        self.active_composite = Some(recipe);
-        self.composite_cache = Some(CompositeSurface {
-            surface,
-            height: snap.height,
-        });
-        self.composite_min_height = Some(snap.height);
+        let generation = self.prepare_composite_build(recipe, snap.height);
+        let installed = self.install_composite_cache(recipe, generation, snap.height, surface);
+        debug_assert!(
+            installed,
+            "sync set_composite: install_composite_cache should always succeed \
+             — no race window between prepare_composite_build and install",
+        );
         true
     }
 
-    /// Switch back to single-APID mode — the next [`Self::render`]
-    /// paints the active per-APID surface as before. Per #547.
+    /// Switch back to "nothing selected" — the next
+    /// [`Self::render`] paints just the background. Per CR
+    /// round 5 on PR #575: previously this only cleared
+    /// composite-related fields and left a shadow-tracked
+    /// `active: Option<u16>` to fall back to. With the
+    /// [`ActiveSelection`] enum collapse there's no shadow
+    /// state to fall back to; callers that want a per-APID
+    /// fallback (the dropdown handler) call
+    /// [`Self::set_active_apid`] explicitly afterwards.
     pub fn clear_composite(&mut self) {
-        self.active_composite = None;
+        if matches!(self.selection, Some(ActiveSelection::Composite(_))) {
+            self.selection = None;
+        }
         self.composite_cache = None;
         self.composite_min_height = None;
+        self.composite_gen = self.composite_gen.wrapping_add(1);
     }
 
     /// `true` when the renderer is currently in composite mode
@@ -580,25 +694,41 @@ impl LrptImageRenderer {
     /// whether the cache is populated).
     #[must_use]
     pub fn is_composite_active(&self) -> bool {
-        self.active_composite.is_some()
+        matches!(self.selection, Some(ActiveSelection::Composite(_)))
     }
 
     /// The currently-active composite recipe, if any. Used by
-    /// the drain tick to re-issue [`Self::set_composite`] on
-    /// every refresh tick so new lines accrue in near-real-time.
+    /// the drain tick to re-issue
+    /// [`LrptImageView::set_composite`] on every refresh tick
+    /// so new lines accrue in near-real-time.
     #[must_use]
     pub fn active_composite(&self) -> Option<CompositeRecipe> {
-        self.active_composite
+        match self.selection {
+            Some(ActiveSelection::Composite(recipe)) => Some(recipe),
+            _ => None,
+        }
     }
 
-    /// `min(r_lines, g_lines, b_lines)` at the time the cached
-    /// composite surface was last built, or `None` if no cache is
-    /// populated. The dropdown-refresh tick reads this to skip a
-    /// no-op rebuild when the current min height matches what we
-    /// already painted. Per CR round 3 on PR #575.
+    /// `min(r_lines, g_lines, b_lines)` for the composite that
+    /// is either currently cached OR currently being built by
+    /// an in-flight worker. The dropdown-refresh tick reads
+    /// this to skip a no-op rebuild when the current min height
+    /// matches what we've already painted (or are painting).
+    /// Per CR round 3 on PR #575, extended round 5 to cover
+    /// the in-flight case.
     #[must_use]
     pub fn composite_min_height(&self) -> Option<usize> {
         self.composite_min_height
+    }
+
+    /// Current value of the composite generation counter. Used
+    /// by the View's async path: capture before spawning a
+    /// worker, pass back to [`Self::install_composite_cache`]
+    /// to detect mid-flight selection changes. Per CR round 5
+    /// on PR #575.
+    #[must_use]
+    pub fn composite_gen(&self) -> u64 {
+        self.composite_gen
     }
 
     /// Paint the active channel's image into `cr`, scaled to fit
@@ -635,17 +765,13 @@ impl LrptImageRenderer {
 
         // Composite is selected but the cache isn't built yet
         // (one or more source APIDs missing/empty, or the last
-        // build failed). Paint just the background and stop —
-        // falling through to the per-APID branch would render a
-        // single-channel greyscale image while the dropdown
-        // still says "Composite — ...", which the user would
-        // read as "this IS the composite". Per CR round 4 on
-        // PR #575.
-        if self.active_composite.is_some() {
-            return Ok(());
-        }
-
-        let Some(apid) = self.active else {
+        // build failed / is still pending). Paint just the
+        // background and stop — falling through to the per-APID
+        // branch would render a single-channel greyscale image
+        // while the dropdown still says "Composite — ...", which
+        // the user would read as "this IS the composite". Per
+        // CR round 4 on PR #575.
+        let Some(ActiveSelection::Apid(apid)) = self.selection else {
             return Ok(());
         };
         let Some(channel) = self.channels.get(&apid) else {
@@ -687,18 +813,20 @@ impl LrptImageRenderer {
             return Self::export_png_from_surface(path, &c.surface, c.height, None);
         }
         // Composite selected but the cache isn't built yet (one
-        // or more source APIDs missing/empty, or the last build
-        // failed). Surface this as `EmptyComposite` rather than
-        // fall through to the per-APID branch, which would
-        // silently export a different image than the dropdown
-        // advertises. Per CR round 4 on PR #575.
-        if let Some(recipe) = self.active_composite {
-            return Err(ViewerError::EmptyComposite {
-                recipe_name: recipe.name,
-            });
-        }
-        let Some(apid) = self.active else {
-            return Err(ViewerError::NoActiveChannel);
+        // or more source APIDs missing/empty, the last build
+        // failed, or a worker is still in flight). Surface this
+        // as `EmptyComposite` rather than fall through to the
+        // per-APID branch, which would silently export a
+        // different image than the dropdown advertises. Per CR
+        // round 4 on PR #575.
+        let apid = match self.selection {
+            Some(ActiveSelection::Apid(apid)) => apid,
+            Some(ActiveSelection::Composite(recipe)) => {
+                return Err(ViewerError::EmptyComposite {
+                    recipe_name: recipe.name,
+                });
+            }
+            None => return Err(ViewerError::NoActiveChannel),
         };
         let Some(channel) = self.channels.get(&apid) else {
             return Err(ViewerError::EmptyChannel { apid: Some(apid) });
@@ -1102,6 +1230,143 @@ fn build_argb32_from_rgb(
     Ok(surface)
 }
 
+/// Pack the three source channels of `snap` directly into a
+/// flat `Vec<u8>` of BGRA bytes (Cairo's native ARGB32 little-
+/// endian byte order: B / G / R / A per pixel, row-major,
+/// stride = `width * 4`). Pure CPU; no Cairo state touched.
+/// Used by [`LrptImageView::set_composite`]'s worker thread —
+/// `cairo::ImageSurface` isn't `Send` so we can't build the
+/// surface inside `gio::spawn_blocking`; instead we hand the
+/// worker the snapshot, get back this byte buffer, and wrap
+/// it via [`build_argb32_surface_from_bgra`] on the main
+/// thread. Per CR round 5 on PR #575.
+///
+/// # Panics
+///
+/// Asserts (debug builds only) that each source channel has
+/// exactly `IMAGE_WIDTH * snap.height` bytes — that's the
+/// `clone_channels_for_composite` contract (truncated
+/// `CompositeSnapshot`). The release path silently does the
+/// wrong thing if a caller violates the contract; the assert
+/// catches the bug in CI / dev builds.
+fn build_bgra_composite_bytes(snap: &sdr_lrpt::image::CompositeSnapshot) -> Vec<u8> {
+    let width = IMAGE_WIDTH;
+    let height = snap.height;
+    let n = width * height;
+    debug_assert_eq!(
+        snap.r_pixels.len(),
+        n,
+        "r_pixels length doesn't match width*height",
+    );
+    debug_assert_eq!(
+        snap.g_pixels.len(),
+        n,
+        "g_pixels length doesn't match width*height",
+    );
+    debug_assert_eq!(
+        snap.b_pixels.len(),
+        n,
+        "b_pixels length doesn't match width*height",
+    );
+    let mut bgra = Vec::with_capacity(n * BYTES_PER_PIXEL);
+    for i in 0..n {
+        bgra.push(snap.b_pixels[i]);
+        bgra.push(snap.g_pixels[i]);
+        bgra.push(snap.r_pixels[i]);
+        bgra.push(0xFF);
+    }
+    bgra
+}
+
+/// Wrap a `width * height * 4`-byte BGRA buffer (Cairo's
+/// ARGB32 native byte order on little-endian hosts) in a
+/// `cairo::ImageSurface` via `create_for_data`. Re-packs to
+/// Cairo's required stride if `stride_for_width(ARgb32, width)`
+/// differs from `width * 4` (in practice never, for ARGB32 +
+/// the LRPT 1568-pixel width — but the re-pack guards against
+/// platforms or future widths where Cairo demands extra
+/// padding). Per CR round 5 on PR #575.
+///
+/// Used by [`LrptImageView::set_composite`]'s post-await
+/// callback to install the worker's BGRA bytes as the
+/// composite cache surface.
+///
+/// # Errors
+///
+/// Same set as [`build_argb32_from_rgb`]: `DimensionTooLarge`,
+/// `InvalidBuffer`, `Cairo`. Callers (the View's worker
+/// callback) log and reset the in-flight build — they don't
+/// need to distinguish.
+#[allow(clippy::cast_sign_loss)]
+fn build_argb32_surface_from_bgra(
+    bgra: Vec<u8>,
+    width: usize,
+    height: usize,
+) -> Result<cairo::ImageSurface, ViewerError> {
+    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite width",
+        value: width,
+    })?;
+    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite height",
+        value: height,
+    })?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(BYTES_PER_PIXEL))
+        .ok_or(ViewerError::DimensionTooLarge {
+            dim: "composite width × height × 4",
+            value: usize::MAX,
+        })?;
+    if bgra.len() != expected {
+        return Err(ViewerError::InvalidBuffer(format!(
+            "composite BGRA buffer length {} doesn't match width*height*4 ({width} * {height} * 4 = {expected})",
+            bgra.len(),
+        )));
+    }
+    let cairo_width = u32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite width",
+        value: width,
+    })?;
+    let stride = cairo::Format::ARgb32
+        .stride_for_width(cairo_width)
+        .map_err(|e| ViewerError::Cairo {
+            op: "composite ARGB32 stride",
+            source: e,
+        })?;
+    let packed_stride = i32::try_from(width.checked_mul(BYTES_PER_PIXEL).ok_or(
+        ViewerError::DimensionTooLarge {
+            dim: "composite width × 4",
+            value: usize::MAX,
+        },
+    )?)
+    .map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite packed stride",
+        value: width * BYTES_PER_PIXEL,
+    })?;
+    // Common case (ARGB32 at any reasonable width): Cairo's
+    // stride matches our packed layout — hand the buffer over
+    // verbatim. Otherwise re-pack with the padding Cairo wants.
+    let buf = if stride == packed_stride {
+        bgra
+    } else {
+        let stride_usize = stride as usize;
+        let row_bytes = width * BYTES_PER_PIXEL;
+        let mut padded = vec![0u8; stride_usize * height];
+        for row in 0..height {
+            let src = row * row_bytes;
+            let dst = row * stride_usize;
+            padded[dst..dst + row_bytes].copy_from_slice(&bgra[src..src + row_bytes]);
+        }
+        padded
+    };
+    cairo::ImageSurface::create_for_data(buf, cairo::Format::ARgb32, width_i32, height_i32, stride)
+        .map_err(|e| ViewerError::Cairo {
+            op: "composite ARGB32 surface (create_for_data)",
+            source: e,
+        })
+}
+
 // ─── GTK widget ────────────────────────────────────────────────────────
 
 /// Live Meteor LRPT image viewer widget.
@@ -1239,22 +1504,136 @@ impl LrptImageView {
         self.renderer.borrow().active_apid()
     }
 
-    /// Switch the viewer to composite mode for `recipe`. (Re-)builds
-    /// the cached ARGB32 surface from the underlying shared
-    /// `LrptImage` and queues a redraw. Returns `true` if the
-    /// composite was successfully built (all three source APIDs
-    /// have data); `false` otherwise. Per #547.
+    /// Switch the viewer to composite mode for `recipe` and
+    /// kick off an off-thread rebuild of the cached ARGB32
+    /// surface. Returns `true` if the snapshot succeeded (all
+    /// three source APIDs have data — the worker will install
+    /// the cache when it returns); `false` if the snapshot
+    /// failed (one or more source APIDs missing/empty). The
+    /// canvas always queues a redraw immediately so background-
+    /// vs-stale-pixels stays consistent.
+    ///
+    /// Two-phase work split:
+    ///
+    /// - **GTK main thread (synchronous, fast):** clone the
+    ///   three source channel buffers under the assembler lock
+    ///   (3 memcpy of `IMAGE_WIDTH * height` bytes), then mark
+    ///   the renderer's selection as "composite, build for
+    ///   `snap.height` in flight" and capture the generation
+    ///   token. Tens of milliseconds at most, even on a full
+    ///   pass.
+    /// - **Worker thread (`gio::spawn_blocking`):** per-pixel
+    ///   R/G/B interleave (`assemble_rgb_composite`) + ARGB32
+    ///   surface build (`build_argb32_from_rgb`). Tens of
+    ///   milliseconds on a full pass — that's what we're
+    ///   moving off the GTK main loop. Returns the freshly-
+    ///   built `cairo::ImageSurface`.
+    /// - **Main thread (post-await):** if the renderer's
+    ///   generation still matches the captured token (no
+    ///   selection change mid-flight), call
+    ///   [`LrptImageRenderer::install_composite_cache`] to
+    ///   adopt the surface and queue a redraw. Otherwise drop
+    ///   the surface; the user has moved on.
+    ///
+    /// Per CR round 5 on PR #575: previously the per-pixel
+    /// interleave + Cairo surface build ran synchronously on
+    /// the GTK main thread on every dropdown click + every
+    /// 1 Hz refresh tick. Composite mode could hitch the UI on
+    /// a full pass.
     pub fn set_composite(&self, recipe: CompositeRecipe) -> bool {
-        let ok = self
+        // Phase 1 — under the assembler lock: snapshot the
+        // three source channels into owned `Vec<u8>`s. Lock
+        // released as soon as the closure returns.
+        let snap = self.image.with_assembler(|a| {
+            a.clone_channels_for_composite(recipe.r_apid, recipe.g_apid, recipe.b_apid)
+        });
+        let Some(snap) = snap else {
+            tracing::debug!(
+                ?recipe,
+                "clone_channels_for_composite returned None — one or more source APIDs missing or empty",
+            );
+            self.renderer.borrow_mut().mark_composite_pending(recipe);
+            self.drawing_area.queue_draw();
+            return false;
+        };
+        // Pin the in-flight build height in the renderer so
+        // the 1 Hz refresh-tick gate (`cached_min_height ==
+        // current_min_height`) doesn't kick off a duplicate
+        // worker for the same height while this one runs.
+        // Capture the generation token at the same time;
+        // mismatch on completion = stale = drop on the floor.
+        let target_height = snap.height;
+        let captured_gen = self
             .renderer
             .borrow_mut()
-            .set_composite(recipe, &self.image);
-        // Always queue a redraw — even on the `false` path the
-        // background paint covers the previous render's pixels,
-        // so the user sees the canvas reset rather than stale
-        // composite data hanging around.
+            .prepare_composite_build(recipe, target_height);
+        // Always queue a redraw — even before the worker
+        // returns, the background paint covers any previous
+        // render's pixels so the user sees the canvas reset
+        // rather than stale composite data hanging around
+        // until the new surface lands.
         self.drawing_area.queue_draw();
-        ok
+        // Phase 2 — off the main thread: assemble RGB +
+        // ARGB32. Phase 3 (post-await) runs back on the main
+        // thread.
+        let renderer = Rc::clone(&self.renderer);
+        let drawing_area = self.drawing_area.clone();
+        glib::spawn_future_local(async move {
+            // Worker: pure CPU. Reads three source channels'
+            // owned `Vec<u8>`s from the captured `snap` (no
+            // mutex), packs into a flat BGRA `Vec<u8>` ready
+            // for Cairo. Returns the bytes — `cairo::ImageSurface`
+            // isn't `Send` so the surface itself is built on
+            // the main thread post-await.
+            let bytes_result = gio::spawn_blocking(move || build_bgra_composite_bytes(&snap)).await;
+            // Main thread: wrap the worker's BGRA bytes in a
+            // Cairo surface via `create_for_data`. Cheap (no
+            // memcpy in the common stride case) — the heavy
+            // per-pixel pack already ran on the worker.
+            let surface_result = match bytes_result {
+                Ok(bgra) => build_argb32_surface_from_bgra(bgra, IMAGE_WIDTH, target_height),
+                Err(panic) => {
+                    tracing::warn!(?recipe, "composite worker panicked: {panic:?}");
+                    let mut r = renderer.borrow_mut();
+                    if r.composite_gen() == captured_gen {
+                        r.mark_composite_pending(recipe);
+                    }
+                    return;
+                }
+            };
+            match surface_result {
+                Ok(surface) => {
+                    let installed = renderer.borrow_mut().install_composite_cache(
+                        recipe,
+                        captured_gen,
+                        target_height,
+                        surface,
+                    );
+                    if installed {
+                        drawing_area.queue_draw();
+                    } else {
+                        tracing::debug!(
+                            ?recipe,
+                            captured_gen,
+                            "stale composite worker — selection changed mid-flight, dropping built surface",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(?recipe, error = %e, "composite ARGB32 surface build failed");
+                    // Reset the in-flight target so the next
+                    // 1 Hz tick retries — only if the user
+                    // hasn't moved on. Gate on generation match
+                    // to avoid clobbering a newer build that
+                    // started while ours was running.
+                    let mut r = renderer.borrow_mut();
+                    if r.composite_gen() == captured_gen {
+                        r.mark_composite_pending(recipe);
+                    }
+                }
+            }
+        });
+        true
     }
 
     /// Drop composite mode; subsequent renders fall back to the
@@ -2704,6 +3083,153 @@ mod tests {
         let recipe = COMPOSITE_CATALOG[0];
         assert!(!r.set_composite(recipe, &image));
         assert_eq!(r.composite_min_height(), None);
+    }
+
+    #[test]
+    fn selection_enum_makes_apid_and_composite_mutually_exclusive() {
+        // Per CR round 5 on PR #575: collapsing the parallel
+        // `active`/`active_composite` fields into one enum
+        // means switching modes is atomic — picking an APID
+        // implicitly drops the composite cache, picking a
+        // composite implicitly hides any per-APID. Pin both
+        // directions so a future field-split-and-add doesn't
+        // silently regress.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        // Seed three source channels + a non-recipe APID.
+        image.push_line(recipe.r_apid, &vec![0x10; IMAGE_WIDTH]);
+        image.push_line(recipe.g_apid, &vec![0x20; IMAGE_WIDTH]);
+        image.push_line(recipe.b_apid, &vec![0x30; IMAGE_WIDTH]);
+        r.push_line(99, &synth_line(TEST_PIXEL));
+
+        // APID first → set composite. Composite mode wins;
+        // active_apid() must return None (not the prior APID).
+        assert!(r.set_active_apid(99));
+        assert_eq!(r.active_apid(), Some(99));
+        assert_eq!(r.active_composite(), None);
+        assert!(r.set_composite(recipe, &image));
+        assert_eq!(r.active_apid(), None);
+        assert_eq!(r.active_composite(), Some(recipe));
+
+        // Composite first → set APID. APID wins; cache + min
+        // are dropped atomically (no leftover composite state).
+        assert!(r.set_active_apid(99));
+        assert_eq!(r.active_apid(), Some(99));
+        assert_eq!(r.active_composite(), None);
+        assert!(!r.is_composite_active());
+        assert_eq!(r.composite_min_height(), None);
+    }
+
+    #[test]
+    fn composite_gen_bumps_on_every_selection_change() {
+        // Pin the generation-counter contract: every
+        // selection-changing method bumps it so an in-flight
+        // worker's captured token mismatches and its result
+        // gets dropped on the floor instead of installed.
+        // Per CR round 5 on PR #575.
+        let mut r = LrptImageRenderer::new();
+        let image = LrptImage::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        image.push_line(recipe.r_apid, &vec![0x10; IMAGE_WIDTH]);
+        image.push_line(recipe.g_apid, &vec![0x20; IMAGE_WIDTH]);
+        image.push_line(recipe.b_apid, &vec![0x30; IMAGE_WIDTH]);
+        r.push_line(99, &synth_line(TEST_PIXEL));
+
+        let g0 = r.composite_gen();
+        r.set_active_apid(99);
+        let g1 = r.composite_gen();
+        assert_ne!(g0, g1, "set_active_apid must bump");
+
+        r.mark_composite_pending(recipe);
+        let g2 = r.composite_gen();
+        assert_ne!(g1, g2, "mark_composite_pending must bump");
+
+        let g3 = r.prepare_composite_build(recipe, 5);
+        assert_ne!(g2, g3, "prepare_composite_build must bump");
+        assert_eq!(g3, r.composite_gen(), "returned gen matches stored");
+
+        r.clear_composite();
+        let g4 = r.composite_gen();
+        assert_ne!(g3, g4, "clear_composite must bump");
+
+        r.clear();
+        let g5 = r.composite_gen();
+        assert_ne!(g4, g5, "clear must bump");
+    }
+
+    #[test]
+    fn install_composite_cache_drops_stale_workers() {
+        // Pin the async-path stale-result guard: a worker that
+        // captures gen=N then returns after a selection change
+        // (gen=N+1) must not install its surface. Per CR round
+        // 5 on PR #575.
+        let mut r = LrptImageRenderer::new();
+        let recipe = COMPOSITE_CATALOG[0];
+        let captured_gen = r.prepare_composite_build(recipe, 5);
+        // Simulate the user picking a different recipe before
+        // the worker returns — bumps gen.
+        let other = COMPOSITE_CATALOG[1];
+        r.mark_composite_pending(other);
+        // Build a dummy 5-line surface (the worker's output).
+        let bytes = vec![0xFFu8; IMAGE_WIDTH * 5 * BYTES_PER_PIXEL];
+        let surface = build_argb32_surface_from_bgra(bytes, IMAGE_WIDTH, 5)
+            .expect("surface build for stale-worker test");
+        // Old gen no longer matches; install must refuse.
+        assert!(!r.install_composite_cache(recipe, captured_gen, 5, surface));
+    }
+
+    #[test]
+    fn build_bgra_composite_bytes_matches_build_argb32_from_rgb() {
+        // Cross-check the two paths produce byte-identical
+        // pixels: the worker BGRA path (build_bgra_composite_bytes)
+        // and the legacy sync path (assemble_rgb_composite +
+        // build_argb32_from_rgb). Per CR round 5 on PR #575.
+        let height = 4;
+        let n = IMAGE_WIDTH * height;
+        // Synthetic gradient — three different patterns per
+        // channel so any byte mix-up shows.
+        let r_pixels: Vec<u8> = (0..n)
+            .map(|i| u8::try_from(i & 0xFF).unwrap_or(0))
+            .collect();
+        let g_pixels: Vec<u8> = (0..n)
+            .map(|i| u8::try_from((i.wrapping_mul(3)) & 0xFF).unwrap_or(0))
+            .collect();
+        let b_pixels: Vec<u8> = (0..n)
+            .map(|i| u8::try_from((i.wrapping_mul(7)) & 0xFF).unwrap_or(0))
+            .collect();
+        let snap = sdr_lrpt::image::CompositeSnapshot {
+            r_pixels: r_pixels.clone(),
+            g_pixels: g_pixels.clone(),
+            b_pixels: b_pixels.clone(),
+            height,
+        };
+
+        // Worker path: build BGRA bytes directly from the snap.
+        let bgra_worker = build_bgra_composite_bytes(&snap);
+
+        // Legacy path: assemble_rgb_composite → build_argb32_from_rgb,
+        // then read BGRA out of the surface for compare.
+        let rgb = sdr_lrpt::image::assemble_rgb_composite(&r_pixels, &g_pixels, &b_pixels, height);
+        let mut surface_legacy =
+            build_argb32_from_rgb(&rgb, IMAGE_WIDTH, height).expect("legacy surface build");
+        let stride_legacy =
+            usize::try_from(surface_legacy.stride()).expect("legacy stride non-negative");
+        let data_legacy = surface_legacy.data().expect("legacy surface data");
+
+        // Worker output uses packed stride (width * 4); the
+        // legacy surface uses Cairo's stride which is also
+        // width * 4 for ARGB32. Compare row-by-row to be
+        // robust against future stride drift.
+        let row_bytes = IMAGE_WIDTH * BYTES_PER_PIXEL;
+        for row in 0..height {
+            let worker_row = &bgra_worker[row * row_bytes..row * row_bytes + row_bytes];
+            let legacy_row = &data_legacy[row * stride_legacy..row * stride_legacy + row_bytes];
+            assert_eq!(
+                worker_row, legacy_row,
+                "BGRA mismatch on row {row}: worker path vs legacy path",
+            );
+        }
     }
 
     #[test]
