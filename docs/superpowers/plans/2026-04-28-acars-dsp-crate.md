@@ -17,7 +17,7 @@
 | `crates/sdr-acars/Cargo.toml` | Crate manifest, deps, lints inherited from workspace |
 | `crates/sdr-acars/src/lib.rs` | Public API: `ChannelBank`, `AcarsMessage`, `ChannelStats`, `ChannelLockState`, re-exports |
 | `crates/sdr-acars/src/error.rs` | `AcarsError` (`thiserror`) — all fallible operations return this |
-| `crates/sdr-acars/src/crc.rs` | CRC-CCITT-16 (poly 0x1021, init 0xFFFF). Standalone, no deps. |
+| `crates/sdr-acars/src/crc.rs` | CRC-CCITT-16 KERMIT (poly 0x1021 reflected = 0x8408, init 0x0000). Standalone, no deps. |
 | `crates/sdr-acars/src/syndrom.rs` | Static `SYNDROM[256][4]` table from `syndrom.h` + `fixprerr` / `fixdberr` correction |
 | `crates/sdr-acars/src/label.rs` | `Lbl[]` table (~150 entries: code → human name) + `lookup(label) -> Option<&'static str>` |
 | `crates/sdr-acars/src/msk.rs` | `MskDemod`: 12.5 kHz real-audio → bits via PLL + matched filter (port of `msk.c`) |
@@ -223,7 +223,7 @@ EOF
 **Files:**
 - Create: `crates/sdr-acars/src/crc.rs`
 
-ACARS uses CRC-CCITT-16 with polynomial `0x1021` and initial value `0xFFFF`, computed over the message bytes from `Mode` through the end of `Text` (not including the BCS bytes themselves). The receiver verifies by feeding the entire frame including BCS through the same CRC; the result must be `0`.
+ACARS uses CRC-CCITT-16 (KERMIT variant) with polynomial `0x1021` (reflected `0x8408`) and **initial value `0x0000`**, computed over the message bytes from `Mode` through the end of `Text` (not including the BCS bytes themselves). The receiver verifies by feeding the entire frame including BCS through the same CRC; the result must be `0`. NOTE: this corrects an earlier draft of this plan that said init=`0xFFFF` (the X-25 variant); the actual `acarsdec` source at `acars.c:159` initializes `crc = 0`. The Task 2 implementer caught this and the correction propagates here for downstream tasks.
 
 C reference: `original/acarsdec/acars.c` — search for `update_crc` and the trailing CRC verification at the end of `decodeAcars()`.
 
@@ -1036,7 +1036,7 @@ impl FrameParser {
             n_bits: 8,
             buf: Vec::with_capacity(256),
             parity_errors: Vec::new(),
-            crc: 0xFFFF,
+            crc: 0x0000,  // ACARS uses KERMIT init=0, not X-25 init=0xFFFF — see crc.rs Task 2 implementer notes
             channel_idx,
             channel_freq_hz,
         }
@@ -1050,7 +1050,7 @@ impl FrameParser {
         self.n_bits = 8;
         self.buf.clear();
         self.parity_errors.clear();
-        self.crc = 0xFFFF;
+        self.crc = 0x0000;
     }
 
     /// Consume one fully-assembled byte. Drives the state
