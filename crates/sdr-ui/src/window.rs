@@ -10170,15 +10170,18 @@ fn connect_satellites_panel(
                 let Some(cache) = cache_a.as_ref() else {
                     return false;
                 };
-                let Some((sat_name, aos)) = state.apt_recording_pass.borrow().clone() else {
+                let Some((norad_id, aos)) = *state.apt_recording_pass.borrow() else {
                     return false;
                 };
+                // Look up by stable NORAD id (not display name) so
+                // a catalog rename doesn't silently break this
+                // path. Per CR round 2 on PR #571.
                 let Some(known) = sdr_sat::KNOWN_SATELLITES
                     .iter()
-                    .find(|s| s.name == sat_name)
+                    .find(|s| s.norad_id == norad_id)
                 else {
                     tracing::debug!(
-                        sat_name,
+                        norad_id,
                         "APT rotate-180: satellite not in catalog; defaulting to no rotation",
                     );
                     return false;
@@ -10187,7 +10190,7 @@ fn connect_satellites_panel(
                     Ok(t) => t,
                     Err(e) => {
                         tracing::debug!(
-                            sat_name,
+                            norad_id,
                             error = %e,
                             "APT rotate-180: TLE unavailable; defaulting to no rotation",
                         );
@@ -10198,7 +10201,7 @@ fn connect_satellites_panel(
                     Ok(s) => s,
                     Err(e) => {
                         tracing::debug!(
-                            sat_name,
+                            norad_id,
                             error = %e,
                             "APT rotate-180: TLE parse failed; defaulting to no rotation",
                         );
@@ -10209,7 +10212,7 @@ fn connect_satellites_panel(
                     Ok(asc) => asc,
                     Err(e) => {
                         tracing::debug!(
-                            sat_name,
+                            norad_id,
                             error = %e,
                             "APT rotate-180: SGP4 propagate failed; defaulting to no rotation",
                         );
@@ -10337,9 +10340,14 @@ fn connect_satellites_panel(
                         // exact AOS time matters less than "around
                         // when" — `is_ascending` checks the lat
                         // derivative over a 30 s window, which is
-                        // valid anywhere mid-pass.
-                        *state_a.apt_recording_pass.borrow_mut() =
-                            Some((satellite.clone(), chrono::Utc::now()));
+                        // valid anywhere mid-pass. Store the stable
+                        // NORAD id (not the display name) so a
+                        // future catalog rename doesn't break the
+                        // rotation lookup. Per CR round 2 on PR #571.
+                        *state_a.apt_recording_pass.borrow_mut() = sdr_sat::KNOWN_SATELLITES
+                            .iter()
+                            .find(|s| s.name == satellite)
+                            .map(|s| (s.norad_id, chrono::Utc::now()));
                         // Push the rotate-180 flag down to the
                         // renderer so the toolbar's manual `Export
                         // PNG` button matches the auto-record

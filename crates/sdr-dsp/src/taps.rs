@@ -295,6 +295,18 @@ pub fn low_pass_kaiser(
             "cutoff ({cutoff}) must be less than Nyquist ({nyquist})"
         )));
     }
+    // Reject designs whose upper transition edge spills past Nyquist
+    // — the response above the cutoff folds back into the passband
+    // and the filter no longer meets its stated stopband. Per CR
+    // round 2 on PR #571.
+    let upper_transition_edge = cutoff + transition_width / 2.0;
+    if upper_transition_edge >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "upper transition edge (cutoff + transition_width/2 = {upper_transition_edge}) \
+             must be less than Nyquist ({nyquist}) — cutoff={cutoff}, \
+             transition_width={transition_width}"
+        )));
+    }
     let transition_rad = math::hz_to_rads(transition_width, sample_rate);
     let beta = crate::window::kaiser_beta(atten_db);
     let count = crate::window::kaiser_length(atten_db, transition_rad);
@@ -374,6 +386,18 @@ pub fn low_pass_dc_removal_kaiser(
     if cutoff >= nyquist {
         return Err(DspError::InvalidParameter(format!(
             "cutoff ({cutoff}) must be less than Nyquist ({nyquist})"
+        )));
+    }
+    // Reject designs whose upper transition edge spills past Nyquist
+    // — the response above the cutoff folds back into the passband
+    // and the filter no longer meets its stated stopband. Per CR
+    // round 2 on PR #571.
+    let upper_transition_edge = cutoff + transition_width / 2.0;
+    if upper_transition_edge >= nyquist {
+        return Err(DspError::InvalidParameter(format!(
+            "upper transition edge (cutoff + transition_width/2 = {upper_transition_edge}) \
+             must be less than Nyquist ({nyquist}) — cutoff={cutoff}, \
+             transition_width={transition_width}"
         )));
     }
     let transition_rad = math::hz_to_rads(transition_width, sample_rate);

@@ -65,11 +65,15 @@ fn main() {
     }
 
     // Read all samples, normalize to f32 in [-1, 1], average channels
-    // to mono if needed.
+    // to mono if needed. Signed 16-bit PCM normalizes by 2^15 = 32768
+    // (not by `i16::MAX` = 32767) so `i16::MIN` maps to exactly -1.0
+    // — keeps amplitude symmetric and matches the integration test
+    // path. Per CR round 2 on PR #571.
+    const PCM16_SCALE: f32 = 32_768.0;
     let raw: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => reader
             .samples::<i16>()
-            .map(|s| f32::from(s.unwrap()) / f32::from(i16::MAX))
+            .map(|s| f32::from(s.unwrap()) / PCM16_SCALE)
             .collect(),
         hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
     };
@@ -99,10 +103,18 @@ fn main() {
             lines.push(std::mem::take(slot));
         }
     }
-    // Final flush.
-    let n = decoder.process(&[], &mut buf).expect("APT flush");
-    for slot in buf.iter_mut().take(n) {
-        lines.push(std::mem::take(slot));
+    // Drain remaining buffered lines. One `process(&[], ...)` call
+    // can return up to `buf.len()` lines and the decoder may hold
+    // more in its ready queue; loop until empty so we don't silently
+    // truncate the line count. Per CR round 2 on PR #571.
+    loop {
+        let n = decoder.process(&[], &mut buf).expect("APT flush");
+        if n == 0 {
+            break;
+        }
+        for slot in buf.iter_mut().take(n) {
+            lines.push(std::mem::take(slot));
+        }
     }
 
     let qualities: Vec<f32> = lines.iter().map(|l| l.sync_quality).collect();

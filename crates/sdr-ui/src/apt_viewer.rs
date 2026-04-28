@@ -394,7 +394,12 @@ pub fn render_and_save_apt_png(
     if image.is_empty() {
         return Err(ViewerError::EmptyChannel { apid: None });
     }
-    if let Some(parent) = path.parent() {
+    // For bare filenames like "foo.png", `path.parent()` returns
+    // `Some("")`, and `create_dir_all("")` errors with NotFound.
+    // Skip the call entirely when the parent is empty — the file
+    // will be created in the current working directory. Per CR
+    // round 2 on PR #571.
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
             op: "create_dir_all",
             path: parent.to_path_buf(),
@@ -638,6 +643,15 @@ impl AptImageView {
     pub fn set_rotate_180(&self, rotate_180: bool) {
         self.renderer.borrow_mut().set_rotate_180(rotate_180);
     }
+
+    /// Read the renderer's stored `rotate_180` flag. Used by the
+    /// toolbar `Export PNG` button so manual exports respect the
+    /// auto-record orientation pinned at AOS. Per CR round 2 on PR
+    /// #571.
+    #[must_use]
+    pub fn rotate_180(&self) -> bool {
+        self.renderer.borrow().rotate_180()
+    }
 }
 
 // ─── Non-modal viewer window ───────────────────────────────────────────
@@ -722,22 +736,32 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         let path = default_export_path();
         let path_for_msg = path.clone();
         let window_weak = window_for_export.downgrade();
+        // Read the renderer's stored orientation so manual toolbar
+        // exports match the auto-record save's orientation (set at
+        // AOS based on the pass direction). Per CR round 2 on PR
+        // #571.
+        let rotate_180 = export_view.rotate_180();
         // Snapshot + offload to worker. On the click-event main-thread
         // path we'd otherwise burn ~hundreds of ms encoding the PNG,
         // freezing the UI. Per CR round 1 on PR #571.
-        export_view.export_png_full_async(path, BrightnessMode::default(), false, move |result| {
-            let toast = match result {
-                Ok(()) => adw::Toast::builder()
-                    .title(format!("Saved {}", path_for_msg.display()))
-                    .build(),
-                Err(e) => adw::Toast::builder()
-                    .title(format!("PNG export failed: {e}"))
-                    .build(),
-            };
-            if let Some(window) = window_weak.upgrade() {
-                show_toast_in(&window, toast);
-            }
-        });
+        export_view.export_png_full_async(
+            path,
+            BrightnessMode::default(),
+            rotate_180,
+            move |result| {
+                let toast = match result {
+                    Ok(()) => adw::Toast::builder()
+                        .title(format!("Saved {}", path_for_msg.display()))
+                        .build(),
+                    Err(e) => adw::Toast::builder()
+                        .title(format!("PNG export failed: {e}"))
+                        .build(),
+                };
+                if let Some(window) = window_weak.upgrade() {
+                    show_toast_in(&window, toast);
+                }
+            },
+        );
     });
     header.pack_end(&export_btn);
 

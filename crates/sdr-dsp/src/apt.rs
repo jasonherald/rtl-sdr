@@ -713,13 +713,13 @@ fn build_square_template(samples_per_cycle: usize, cycles: usize) -> (Vec<f32>, 
 /// 38-px-equivalent template.
 #[allow(clippy::cast_precision_loss)]
 fn build_padded_sync_a_template(samples_per_pixel: usize) -> (Vec<f32>, f32) {
-    // Half-cycle width (2 pixels) and pulse-pair width (4 pixels).
-    let half_cycle_samples = SAMPLES_PER_SYNC_A_CYCLE / 2;
-    debug_assert_eq!(
-        half_cycle_samples,
-        2 * samples_per_pixel,
-        "A1040 half-cycle should be exactly 2 pixels wide",
-    );
+    // A1040 cycle = 4 pixels (2 low, 2 high) at any work rate, so the
+    // half-cycle is `2 * samples_per_pixel`. Derive directly from the
+    // parameter rather than the global `SAMPLES_PER_SYNC_A_CYCLE`
+    // constant — otherwise this function silently produces a
+    // mis-scaled template if ever called at a different work rate.
+    // Per CR round 2 on PR #571.
+    let half_cycle_samples = 2 * samples_per_pixel;
     let leading_samples = SYNC_A_LEADING_PAD_PX * samples_per_pixel;
     let trailing_samples = SYNC_A_TRAILING_PAD_PX * samples_per_pixel;
     let modulated_samples = SYNC_A_MODULATED_PX * samples_per_pixel;
