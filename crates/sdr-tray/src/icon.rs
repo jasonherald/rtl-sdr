@@ -1,6 +1,8 @@
-//! Tray icon byte buffers. Task 4 expands this with librsvg
+//! Tray icon byte buffers. Task 3 expands this with librsvg
 //! rasterization; for now only the static fallback exists so the
 //! Task 2 ksni wiring has something to draw.
+
+#![allow(dead_code, reason = "stubs consumed by sdr-tray::lib in Task 2")]
 
 pub(crate) const TRAY_ICON_SIZE: i32 = 22;
 

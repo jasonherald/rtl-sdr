@@ -1,6 +1,6 @@
-//! StatusNotifierItem tray-icon sidecar for sdr-rs.
+//! `StatusNotifierItem` tray-icon sidecar for sdr-rs.
 //!
-//! Pure-Rust StatusNotifierItem implementation via `ksni`, run on a
+//! Pure-Rust `StatusNotifierItem` implementation via `ksni`, run on a
 //! dedicated `std::thread` with a per-thread `smol` runtime so the
 //! main `sdr-ui` GTK loop never has to be aware of async. Linux-only.
 //!
@@ -50,10 +50,10 @@ pub struct TrayHandle {
 impl TrayHandle {
     pub fn shutdown(&mut self) {
         let _ = self.stop_tx.send(());
-        if let Some(join) = self.join.take() {
-            if let Err(e) = join.join() {
-                tracing::warn!("tray thread panicked during shutdown: {e:?}");
-            }
+        if let Some(join) = self.join.take()
+            && let Err(e) = join.join()
+        {
+            tracing::warn!("tray thread panicked during shutdown: {e:?}");
         }
     }
 }
