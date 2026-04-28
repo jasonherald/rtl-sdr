@@ -150,6 +150,91 @@ fn apply_manual_tune(
     radio_panel.update_distance_frequency(freq_hz);
 }
 
+/// Apply the canonical tune-target dispatch — the 13 widget /
+/// state / DSP mirror steps that bookmark recall, the satellite
+/// play button, and auto-record-on-pass all need to perform when
+/// retuning to a new (frequency, demod mode, bandwidth) target.
+///
+/// This is the single source of truth for the mirror sequence. Each
+/// caller layers its own pre/post calls (e.g. bookmark recall calls
+/// `restore_bookmark_profile` after; auto-record AOS layers
+/// `force_audio_chain_off` + `set_playing(true)` before and
+/// `dispatch_vfo_offset(0.0)` after). Per #509.
+///
+/// `reason` is the context string passed to
+/// `ScannerForceDisable::trigger` so the scanner-disabled toast says
+/// *why* (`"satellite tune"`, `"preset/bookmark selection"`, etc.).
+///
+/// Note: `SetDemodMode` is intentionally NOT sent directly here —
+/// the demod dropdown's `notify::selected` handler dispatches it as
+/// a side effect of `set_selected` below. This mirrors the existing
+/// pattern that both call sites historically used.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "consolidating the duplicated 13-step mirror sequence into a single \
+              source of truth requires every captured widget / handle the two \
+              call sites used to capture; threading them through is the point"
+)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "freq_hz is bounded by the user-tunable RTL-SDR range (≤6 GHz) and \
+              well below f64's 2^53 mantissa ceiling"
+)]
+fn tune_to_target(
+    state: &Rc<AppState>,
+    freq_selector: &header::frequency_selector::FrequencySelector,
+    demod_dropdown: &gtk4::DropDown,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    scanner_force_disable: &ScannerForceDisable,
+    bandwidth_row: &adw::SpinRow,
+    radio_panel: &sidebar::radio_panel::RadioPanel,
+    status_bar: &Rc<StatusBar>,
+    freq_hz: u64,
+    mode: sdr_types::DemodMode,
+    bw_hz: f64,
+    reason: &'static str,
+) {
+    scanner_force_disable.trigger(reason);
+    let freq_f64 = freq_hz as f64;
+    state.center_frequency.set(freq_f64);
+    state.demod_mode.set(mode);
+    state.send_dsp(UiToDsp::Tune(freq_f64));
+    state.send_dsp(UiToDsp::SetBandwidth(bw_hz));
+    freq_selector.set_frequency(freq_hz);
+    spectrum_handle.set_center_frequency(freq_f64);
+    if let Some(idx) = demod_selector::demod_mode_to_index(mode) {
+        demod_dropdown.set_selected(idx);
+    }
+    // Update the bandwidth row's allowed range for the new mode
+    // BEFORE setting the value. The dropdown notify above only
+    // queues `SetDemodMode` to the DSP; the range update only
+    // happens when DSP echoes `DemodModeChanged` back, which is
+    // async. Without this synchronous update, `set_value(bw_hz)`
+    // below would clamp to the previous mode's range AND fire
+    // its own notify that dispatches a wrong `SetBandwidth`,
+    // overriding the correct `SetBandwidth(bw_hz)` we just sent
+    // at line 202. WFM→NFM retunes are the common failure case.
+    // Per CR round 2 on PR #574.
+    update_bandwidth_row_range_for_mode(radio_panel, state, mode);
+    // Suppress the bandwidth row's notify around `set_value` so
+    // it doesn't redispatch a redundant `SetBandwidth` —
+    // `tune_to_target` already sent the canonical command at
+    // line 202 above.
+    state.suppress_bandwidth_notify.set(true);
+    bandwidth_row.set_value(bw_hz);
+    state.suppress_bandwidth_notify.set(false);
+    // Mode-specific control visibility (e.g. squelch / deemph rows
+    // shown only in NFM/WFM) — must be poked explicitly because
+    // the demod-dropdown notify only covers the dropdown's own
+    // state.
+    radio_panel.apply_demod_visibility(mode);
+    // Status bar mirrors. Done last so a panic anywhere upstream
+    // doesn't leave the indicator showing an optimistic value that
+    // the DSP never received.
+    status_bar.update_frequency(freq_f64);
+    status_bar.update_demod(header::demod_mode_label(mode), bw_hz);
+}
+
 /// Build the main application window and return the shared
 /// [`AppState`]. The caller (currently `app.rs::connect_activate`)
 /// decides whether to call `window.present()` based on the
@@ -3354,34 +3439,20 @@ fn connect_sidebar_panels(
         let radio_panel_t = panels.radio.clone();
         let status_bar_t = Rc::clone(status_bar);
         Rc::new(move |freq_hz, mode, bw_hz| {
-            force_disable_t.trigger("satellite tune");
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "downlink frequencies sit in the 100s of MHz, far \
-                          below f64's 2^53 mantissa ceiling"
-            )]
-            let freq_f64 = freq_hz as f64;
-            let bw_f64 = f64::from(bw_hz);
-            state_t.center_frequency.set(freq_f64);
-            state_t.demod_mode.set(mode);
-            state_t.send_dsp(UiToDsp::Tune(freq_f64));
-            state_t.send_dsp(UiToDsp::SetBandwidth(bw_f64));
-            freq_selector_t.set_frequency(freq_hz);
-            spectrum_t.set_center_frequency(freq_f64);
-            if let Some(idx) = demod_selector::demod_mode_to_index(mode) {
-                demod_dropdown_t.set_selected(idx);
-            }
-            bandwidth_row_t.set_value(bw_f64);
-            // Mode-specific control visibility (e.g. squelch /
-            // deemph rows shown only in NFM/WFM) — must be poked
-            // explicitly because the demod-dropdown notify only
-            // covers the dropdown's own state.
-            radio_panel_t.apply_demod_visibility(mode);
-            // Status bar mirrors. Done last so a panic anywhere
-            // upstream doesn't leave the indicator showing an
-            // optimistic value that the DSP never received.
-            status_bar_t.update_frequency(freq_f64);
-            status_bar_t.update_demod(header::demod_mode_label(mode), bw_f64);
+            tune_to_target(
+                &state_t,
+                &freq_selector_t,
+                &demod_dropdown_t,
+                &spectrum_t,
+                &force_disable_t,
+                &bandwidth_row_t,
+                &radio_panel_t,
+                &status_bar_t,
+                freq_hz,
+                mode,
+                f64::from(bw_hz),
+                "satellite tune",
+            );
         })
     };
     // Register `app.tune-satellite` so the "Tune" button on a #510
@@ -8860,7 +8931,13 @@ fn connect_navigation_panel(
     // Navigation callback: restore full tuning profile from bookmark.
     let state_nav = Rc::clone(state);
     let fs = freq_selector.clone();
-    let dd_weak = demod_dropdown.downgrade();
+    // Strong clone — single-threaded GTK main loop, the closure
+    // outlives the dropdown only at teardown which drops both at
+    // once. Pre-#509 this was a `WeakRef` upgraded inside the
+    // closure; `tune_to_target` takes `&gtk4::DropDown`, and the
+    // strong clone keeps the call shape uniform with the satellite
+    // closure (which has always held a strong clone).
+    let dd = demod_dropdown.clone();
     let sb = Rc::clone(status_bar);
     let spectrum_nav = Rc::clone(spectrum_handle);
     let radio_nav = panels.radio.clone();
@@ -8868,6 +8945,7 @@ fn connect_navigation_panel(
     let source_nav_agc = panels.source.agc_row.clone();
     let force_disable_nav = Rc::clone(scanner_force_disable);
     let volume_button_nav = volume_button.clone();
+    let bandwidth_row_nav = panels.radio.bandwidth_row.clone();
 
     panels.bookmarks.connect_navigate(move |bookmark| {
         // Both bookmark recall AND band-preset selection come in
@@ -8875,37 +8953,31 @@ fn connect_navigation_panel(
         // `connect_preset_to_bookmarks` invokes `on_navigate` with
         // a synthesized Bookmark). Keep the toast reason neutral
         // so a preset click doesn't claim "bookmark recall".
-        force_disable_nav.trigger("preset/bookmark selection");
-
         let freq = bookmark.frequency;
         let mode = sidebar::navigation_panel::parse_demod_mode(&bookmark.demod_mode);
         let bw = bookmark.bandwidth;
 
-        #[allow(clippy::cast_precision_loss)]
-        let freq_f64 = freq as f64;
-        state_nav.center_frequency.set(freq_f64);
-        state_nav.demod_mode.set(mode);
+        // Canonical 13-step mirror sequence — single source of
+        // truth shared with the satellite tune path. Per #509.
+        tune_to_target(
+            &state_nav,
+            &fs,
+            &dd,
+            &spectrum_nav,
+            &force_disable_nav,
+            &bandwidth_row_nav,
+            &radio_nav,
+            &sb,
+            freq,
+            mode,
+            bw,
+            "preset/bookmark selection",
+        );
 
-        // Send Tune and Bandwidth directly. SetDemodMode is sent by the
-        // demod dropdown callback when we update its selection below.
-        state_nav.send_dsp(UiToDsp::Tune(freq_f64));
-        state_nav.send_dsp(UiToDsp::SetBandwidth(bw));
-
-        // Update frequency selector display (does NOT fire callback — no duplicate Tune).
-        fs.set_frequency(freq);
-        spectrum_nav.set_center_frequency(freq_f64);
-
-        // Update demod dropdown — its callback sends SetDemodMode to DSP.
-        if let Some(dd) = dd_weak.upgrade()
-            && let Some(idx) = demod_selector::demod_mode_to_index(mode)
-        {
-            dd.set_selected(idx);
-        }
-
-        // Update bandwidth widget (fires its own DSP callback).
-        radio_nav.bandwidth_row.set_value(bw);
-
-        // Restore optional tuning-profile settings (squelch, gain, etc.).
+        // Restore optional tuning-profile settings (squelch, gain,
+        // etc.). Bookmark-specific layer on top of the canonical
+        // mirror sequence — auto-record / satellite play don't
+        // need this.
         restore_bookmark_profile(
             bookmark,
             &state_nav,
@@ -8914,14 +8986,6 @@ fn connect_navigation_panel(
             &source_nav_agc,
             &volume_button_nav,
         );
-
-        // Update mode-specific control visibility for the restored mode.
-        radio_nav.apply_demod_visibility(mode);
-
-        // Update status bar
-        sb.update_frequency(freq_f64);
-        let label = header::demod_mode_label(mode);
-        sb.update_demod(label, bw);
 
         tracing::info!(
             frequency = freq,
@@ -9642,12 +9706,13 @@ fn connect_satellites_panel(
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
-        KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, SatellitesPanelWeak,
-        enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh, format_pass_subtitle,
-        format_pass_title, load_auto_record_apt, load_auto_record_audio, load_notify_lead_min,
-        load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
-        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio, save_f64,
-        save_tle_last_refresh, save_watched_satellites, tune_target_for_pass,
+        AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
+        SatellitesPanelWeak, enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh,
+        format_pass_subtitle, format_pass_title, load_auto_record_apt, load_auto_record_audio,
+        load_auto_record_quality, load_notify_lead_min, load_station_alt_m, load_station_lat_deg,
+        load_station_lon_deg, load_watched_satellites, norad_id_for_pass, save_auto_record_apt,
+        save_auto_record_audio, save_f64, save_tle_last_refresh, save_watched_satellites,
+        tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
@@ -9691,6 +9756,17 @@ fn connect_satellites_panel(
     panel
         .auto_record_audio_switch
         .set_active(load_auto_record_audio(config));
+    let initial_quality = load_auto_record_quality(config);
+    panel
+        .auto_record_quality_row
+        .set_selected(initial_quality.to_index());
+    // Sensitivity is wired in `build_satellites_panel` via the
+    // auto-record switch's `connect_active_notify` handler — it
+    // fires on every toggle, including the one triggered above
+    // by `auto_record_switch.set_active(load_auto_record_apt(...))`,
+    // so the persisted switch state propagates to the combo's
+    // sensitivity automatically. No re-sync needed here. Per CR
+    // round 2 on PR #574.
     panel
         .last_refresh_row
         .set_subtitle(&format_last_refresh(config));
@@ -9981,6 +10057,34 @@ fn connect_satellites_panel(
             .auto_record_audio_switch
             .connect_active_notify(move |sw| {
                 save_auto_record_audio(&config_audio, sw.is_active());
+            });
+    }
+
+    // Persist the quality threshold on change via the symmetric
+    // writer. Validating through `AutoRecordQuality::from_index`
+    // before the write protects the config against transient
+    // out-of-range indices that GTK can emit during model churn —
+    // an unrecognized value would round-trip back to the default
+    // tier on the next read otherwise. Per CR round 1 on PR #574.
+    {
+        let config_quality = std::sync::Arc::clone(config);
+        panel
+            .auto_record_quality_row
+            .connect_selected_notify(move |row| {
+                let raw = row.selected();
+                let quality = crate::sidebar::satellites_panel::AutoRecordQuality::from_index(raw);
+                if quality.to_index() != raw {
+                    // Transient model-churn value (e.g. mid-rebuild
+                    // selection-cleared). Skip the write so we don't
+                    // overwrite a valid persisted index with garbage.
+                    tracing::debug!(raw, "auto_record_quality: ignoring transient combo index");
+                    return;
+                }
+                crate::sidebar::satellites_panel::save_auto_record_quality(
+                    &config_quality,
+                    quality,
+                );
+                tracing::info!(idx = quality.to_index(), "auto_record_quality persisted");
             });
     }
 
@@ -11144,11 +11248,19 @@ fn connect_satellites_panel(
                 ),
                 fm_if_nr_enabled: fm_if_nr_row_tick.is_active(),
             };
+            // Read the user's selected quality tier on every
+            // tick — cheap (just a ComboRow.selected() call), and
+            // means a mid-pass change applies immediately to the
+            // next eligible pass without a restart. Per #511.
+            let min_elev_deg =
+                AutoRecordQuality::from_index(panel.auto_record_quality_row.selected())
+                    .min_elev_deg();
             let actions = recorder_tick.borrow_mut().tick(
                 now,
                 &passes_snapshot,
                 auto_record_on,
                 audio_record_on,
+                min_elev_deg,
                 now_tune,
             );
             for action in actions {
