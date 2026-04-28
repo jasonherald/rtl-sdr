@@ -10457,6 +10457,21 @@ fn connect_satellites_panel(
                 // the user wants to see the toast and have the
                 // window auto-close cleanly. Per CR round 1 on PR
                 // #571.
+                // Snapshot the recording-pass tuple BEFORE spawning
+                // the worker (and BEFORE the early-return path
+                // below). If a *new* AOS arrives while this PNG is
+                // still encoding, the new pass writes into
+                // `apt_recording_pass`; we must not erase that
+                // brand-new entry when our own (older) export
+                // finishes. The callback only clears the slot if
+                // its current value still matches what we're saving
+                // here — overlapping passes leave the new entry
+                // intact, and a stuck-pending future export can't
+                // wipe a pass that began after it. Per CR round 4
+                // on PR #571 (and round 5: same guard now also
+                // applies to the early-return path below, which
+                // previously cleared the slot unconditionally).
+                let exported_pass = *state_a.apt_recording_pass.borrow();
                 let view_opt = state_a.apt_viewer.borrow().as_ref().cloned();
                 let Some(view) = view_opt else {
                     tracing::warn!(
@@ -10466,7 +10481,17 @@ fn connect_satellites_panel(
                         &toast_overlay_weak,
                         "Pass complete, but the APT viewer was closed — no image saved",
                     );
-                    *state_a.apt_recording_pass.borrow_mut() = None;
+                    // Same overlap-guard as the async-callback path:
+                    // only clear the slot if it still holds the pass
+                    // we entered this branch with. If a new AOS
+                    // wrote a fresh tuple in the meantime, leave it
+                    // alone.
+                    {
+                        let mut slot = state_a.apt_recording_pass.borrow_mut();
+                        if *slot == exported_pass {
+                            *slot = None;
+                        }
+                    }
                     return;
                 };
                 // Capture state needed by the async on_complete
@@ -10485,18 +10510,6 @@ fn connect_satellites_panel(
                 // staying weak so a closed/dropped window upgrades to
                 // None and we no-op. Per CR round 3 on PR #571.
                 let exported_window_weak = state_a.apt_viewer_window.borrow().as_ref().cloned();
-                // Snapshot the recording-pass tuple BEFORE spawning
-                // the worker. If a *new* AOS arrives while this PNG
-                // is still encoding, the new pass writes into
-                // `apt_recording_pass`; we must not erase that
-                // brand-new entry when our own (older) export
-                // finishes. The callback only clears the slot if
-                // its current value still matches what we're saving
-                // here — overlapping passes leave the new entry
-                // intact, and a stuck-pending future export can't
-                // wipe a pass that began after it. Per CR round 4
-                // on PR #571.
-                let exported_pass = *state_a.apt_recording_pass.borrow();
                 view.export_png_full_async(path_for_export, mode, rotate_180, move |result| {
                     let (export_ok, msg) = match result {
                         Ok(()) => {

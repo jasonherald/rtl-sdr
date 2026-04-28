@@ -42,7 +42,8 @@ fn main() {
     if args.len() != 3 {
         eprintln!(
             "usage: {} <input.wav> <output.png>\n\
-             input.wav must be PCM 16-bit, mono, sample rate >= 11025 Hz",
+             input.wav: PCM 16-bit OR float WAV, sample rate >= 11025 Hz; \
+             multi-channel input is downmixed to mono",
             args[0]
         );
         std::process::exit(2);
@@ -114,20 +115,37 @@ fn main() {
         }
         hound::SampleFormat::Float => {
             let mut out = Vec::with_capacity(reader.duration() as usize);
-            let mut skipped_non_finite = 0_usize;
+            let mut sanitized_non_finite = 0_usize;
             for sample in reader.samples::<f32>() {
                 match sample {
-                    Ok(s) if s.is_finite() => out.push(s),
-                    Ok(_) => skipped_non_finite += 1,
+                    Ok(s) => {
+                        // Replace non-finite samples with 0.0 instead
+                        // of dropping them. The interleaved stream
+                        // gets regrouped by `chunks_exact(channels)`
+                        // below, so dropping a single sample shifts
+                        // every subsequent frame's channel ordering
+                        // and corrupts the rest of the decode.
+                        // Replacement preserves frame alignment;
+                        // 0.0 = silence on the offending slot, which
+                        // is the least-misleading thing we can do
+                        // for a stream we can't otherwise interpret.
+                        // Per CR round 5 on PR #571.
+                        if s.is_finite() {
+                            out.push(s);
+                        } else {
+                            sanitized_non_finite += 1;
+                            out.push(0.0);
+                        }
+                    }
                     Err(e) => {
                         eprintln!("WAV truncated or corrupt at sample {}: {e}", out.len());
                         std::process::exit(2);
                     }
                 }
             }
-            if skipped_non_finite > 0 {
+            if sanitized_non_finite > 0 {
                 eprintln!(
-                    "warning: skipped {skipped_non_finite} non-finite f32 samples (NaN / ±Inf)"
+                    "warning: replaced {sanitized_non_finite} non-finite f32 samples (NaN / ±Inf) with 0.0"
                 );
             }
             out

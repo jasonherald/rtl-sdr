@@ -139,7 +139,14 @@ impl AptImageRenderer {
     /// the row directly into the pre-allocated surface. No-op once
     /// [`MAX_LINES`] is reached.
     pub fn push_line(&mut self, line: &AptLine) {
-        if self.n_lines >= MAX_LINES {
+        // Cap on the export-state mirror's length, NOT `n_lines`.
+        // `n_lines` only advances on a successful Cairo preview
+        // write — if the preview rail has been failing for a
+        // stretch the mirror could otherwise grow unbounded past
+        // `MAX_LINES`. Gating on `apt_image.len()` keeps both rails
+        // bounded by the same cap independent of preview health.
+        // Per CR round 5 on PR #571.
+        if self.apt_image.len() >= MAX_LINES {
             return;
         }
         // Try the live-preview write first, but never let a Cairo
@@ -150,7 +157,17 @@ impl AptImageRenderer {
         // failure should at worst cost us one rendered row in the
         // live view — it must not silently delete the line from
         // disk output. Per CR round 3 on PR #571.
-        let preview_ok = self.write_line_to_surface(line);
+        //
+        // Also defend the preview surface: only attempt the row
+        // write while `n_lines < MAX_LINES` so a stuck-failing
+        // mirror push (we'd never have reached this point if the
+        // mirror had hit the cap, but defensive) can't drive the
+        // surface write past row index `MAX_LINES - 1`.
+        let preview_ok = if self.n_lines < MAX_LINES {
+            self.write_line_to_surface(line)
+        } else {
+            false
+        };
         if preview_ok {
             self.n_lines += 1;
         }
@@ -755,10 +772,32 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     // alive after the user closes the viewer. Upgrade-or-skip
     // means a stray click on a button mid-teardown is a no-op.
     let window_for_export = window.downgrade();
+    // Disable the button on click and re-enable in the completion
+    // callback so a fast double-click can't fire two concurrent
+    // writers against the same auto-generated path. The default
+    // filename is second-granularity, and `gio::spawn_blocking`
+    // doesn't serialize work — without re-entry blocking, two
+    // workers could truncate or interleave bytes in the same PNG.
+    // The button uses a WeakRef so the callback closure doesn't
+    // form a retention cycle (the button owns the closure via
+    // `connect_clicked`). Per CR round 5 on PR #571.
+    let export_btn_weak = export_btn.downgrade();
     export_btn.connect_clicked(move |_| {
         let Some(window_for_export) = window_for_export.upgrade() else {
             return;
         };
+        let Some(btn) = export_btn_weak.upgrade() else {
+            return;
+        };
+        if !btn.is_sensitive() {
+            // A previous click is still saving. The visual signal
+            // (greyed-out button) is the user-facing cue; this
+            // guard makes the no-op explicit even if some
+            // accessibility path bypasses sensitivity styling.
+            return;
+        }
+        btn.set_sensitive(false);
+        let btn_for_complete = btn.downgrade();
         let path = default_export_path();
         let path_for_msg = path.clone();
         let window_weak = window_for_export.downgrade();
@@ -785,6 +824,12 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
                 };
                 if let Some(window) = window_weak.upgrade() {
                     show_toast_in(&window, toast);
+                }
+                // Re-enable the export button on both Ok and Err
+                // so a permanent disable can't strand the user
+                // after a transient export failure.
+                if let Some(btn) = btn_for_complete.upgrade() {
+                    btn.set_sensitive(true);
                 }
             },
         );
