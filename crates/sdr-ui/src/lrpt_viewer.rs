@@ -2048,14 +2048,48 @@ enum DropdownEntry {
               them"
 )]
 fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
-    let model = gtk4::StringList::new(&[]);
+    // Seed with the static composite catalog so users can pick
+    // a composite from the moment the viewer opens — no waiting
+    // for the first 1 Hz refresh tick. APIDs prepend to this
+    // list as they're decoded (the tick rebuilds the model
+    // sorted-APIDs-first, then composites). Per CR round 6 on
+    // PR #575: previously the dropdown started empty + dimmed
+    // until the tick fired, which made the new composite rows
+    // invisible for up to a second every viewer open.
+    let seed_entries: Vec<DropdownEntry> = COMPOSITE_CATALOG
+        .iter()
+        .copied()
+        .map(DropdownEntry::Composite)
+        .collect();
+    let seed_labels: Vec<String> = seed_entries
+        .iter()
+        .map(|e| match e {
+            DropdownEntry::Apid(apid) => format!("APID {apid}"),
+            DropdownEntry::Composite(recipe) => format!("Composite — {}", recipe.name),
+        })
+        .collect();
+    let seed_label_refs: Vec<&str> = seed_labels.iter().map(String::as_str).collect();
+    let model = gtk4::StringList::new(&seed_label_refs);
     let dropdown = gtk4::DropDown::builder()
         .model(&model)
         .tooltip_text("Which AVHRR channel (APID) or composite to display")
-        .sensitive(false)
+        // Seeded with composites — user can pick before any
+        // APID arrives. Per CR round 6 on PR #575.
+        .sensitive(true)
         .build();
     dropdown.update_property(&[gtk4::accessible::Property::Label("LRPT channel selector")]);
-    let dropdown_entries: Rc<RefCell<Vec<DropdownEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    // GTK4 `DropDown` defaults `selected` to `0` for a
+    // non-empty model, which would silently activate composite
+    // #0 the moment the dropdown is built (the
+    // `selected_notify` handler can't distinguish "user picked"
+    // from "GTK auto-selected at construction"). Pin it to
+    // `INVALID_LIST_POSITION` so the renderer's auto-select
+    // path (`push_line` on first APID line received) drives
+    // the initial selection instead — matching the pre-CR-6
+    // behavior where opening the viewer didn't activate
+    // anything until data flowed. Per CR round 6 on PR #575.
+    dropdown.set_selected(gtk4::INVALID_LIST_POSITION);
+    let dropdown_entries: Rc<RefCell<Vec<DropdownEntry>>> = Rc::new(RefCell::new(seed_entries));
 
     // Selection → renderer. Per-APID picks route to
     // `set_active_apid` and clear any active composite so the
