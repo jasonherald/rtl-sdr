@@ -119,9 +119,14 @@ mod tests {
         assert_eq!(w, 22);
         assert_eq!(h, 22);
         assert_eq!(bytes.len(), 22 * 22 * 4);
+        // `out` is laid out as `[A, R, G, B]` per pixel — see the
+        // byte-swap loop in `rasterize_svg_to_argb32`. So `p[0]` is
+        // the alpha channel; checking `!= 0` confirms at least one
+        // non-transparent pixel landed in the buffer (otherwise SNI
+        // would just draw a hole).
         assert!(
-            bytes.chunks(4).any(|p| p[3] != 0),
-            "rasterized icon is fully transparent",
+            bytes.chunks(4).any(|p| p[0] != 0),
+            "rasterized icon has zero alpha everywhere",
         );
     }
 
